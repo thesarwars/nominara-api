@@ -42,34 +42,60 @@ describe("STORY-006 · extensions, conventions & migration tooling", () => {
     await client.end();
   });
 
-  it("scenario 1 — applies all migrations from empty, in order", async () => {
-    const applied = await migrateUp(client);
-    expect(applied).toEqual(["0001_extensions_and_conventions"]);
-
-    const ext = await client.query("SELECT extname FROM pg_extension ORDER BY extname");
-    const names = ext.rows.map((r) => r.extname);
-    for (const required of ["pgcrypto", "citext", "vector", "pg_trgm", "btree_gin", "pg_stat_statements"]) {
-      expect(names).toContain(required);
+  // Scoped to an isolated copy of migration 0001 alone, rather than the real
+  // MIGRATIONS_DIR — these tests assert exact migration-name/count results
+  // for THIS story's one migration, and must not break every time a later
+  // story (0002, 0003, ...) adds another one to the real directory.
+  async function isolate0001(): Promise<string> {
+    const tempDir = await mkdtemp(path.join(tmpdir(), "nominara-story006-isolated-"));
+    for (const ext of ["up", "down"] as const) {
+      const content = await readFile(
+        path.join(MIGRATIONS_DIR, `0001_extensions_and_conventions.${ext}.sql`),
+        "utf8",
+      );
+      await writeFile(path.join(tempDir, `0001_extensions_and_conventions.${ext}.sql`), content);
     }
+    return tempDir;
+  }
 
-    const schema = await client.query(
-      "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'app'",
-    );
-    expect(schema.rowCount).toBe(1);
+  it("scenario 1 — applies all migrations from empty, in order", async () => {
+    const tempDir = await isolate0001();
+    try {
+      const applied = await migrateUp(client, tempDir);
+      expect(applied).toEqual(["0001_extensions_and_conventions"]);
+
+      const ext = await client.query("SELECT extname FROM pg_extension ORDER BY extname");
+      const names = ext.rows.map((r) => r.extname);
+      for (const required of ["pgcrypto", "citext", "vector", "pg_trgm", "btree_gin", "pg_stat_statements"]) {
+        expect(names).toContain(required);
+      }
+
+      const schema = await client.query(
+        "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'app'",
+      );
+      expect(schema.rowCount).toBe(1);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("scenario 2 — rolls back every migration, back to empty", async () => {
-    await migrateUp(client);
-    const rolledBack = await rollbackAll(client);
-    expect(rolledBack).toEqual(["0001_extensions_and_conventions"]);
+    const tempDir = await isolate0001();
+    try {
+      await migrateUp(client, tempDir);
+      const rolledBack = await rollbackAll(client, tempDir);
+      expect(rolledBack).toEqual(["0001_extensions_and_conventions"]);
 
-    const schema = await client.query(
-      "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'app'",
-    );
-    expect(schema.rowCount).toBe(0);
+      const schema = await client.query(
+        "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'app'",
+      );
+      expect(schema.rowCount).toBe(0);
 
-    const applied = await client.query("SELECT name FROM _migrations.applied");
-    expect(applied.rowCount).toBe(0);
+      const applied = await client.query("SELECT name FROM _migrations.applied");
+      expect(applied.rowCount).toBe(0);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("scenario 3 — a migration that diverges from conventions.ts fails the drift check", async () => {
@@ -267,11 +293,16 @@ describe("STORY-006 · extensions, conventions & migration tooling", () => {
   });
 
   it("migrateUp is idempotent — a second call against an already-migrated database applies nothing", async () => {
-    const firstRun = await migrateUp(client);
-    expect(firstRun).toEqual(["0001_extensions_and_conventions"]);
+    const tempDir = await isolate0001();
+    try {
+      const firstRun = await migrateUp(client, tempDir);
+      expect(firstRun).toEqual(["0001_extensions_and_conventions"]);
 
-    const secondRun = await migrateUp(client);
-    expect(secondRun).toEqual([]);
+      const secondRun = await migrateUp(client, tempDir);
+      expect(secondRun).toEqual([]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("migrateUp rolls back and does not record a migration that fails mid-transaction", async () => {

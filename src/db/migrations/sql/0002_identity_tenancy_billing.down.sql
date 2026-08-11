@@ -1,0 +1,22 @@
+DROP TABLE IF EXISTS invoices;
+DROP TABLE IF EXISTS usage_ledger;
+DROP TABLE IF EXISTS usage_counters;
+DROP TABLE IF EXISTS subscription_addons;
+DROP TABLE IF EXISTS credit_purchases;
+DROP TABLE IF EXISTS credit_packs;
+DROP TABLE IF EXISTS credit_ledger;
+DROP TABLE IF EXISTS credit_daily_counters;
+DROP TABLE IF EXISTS credit_wallets;
+DROP TABLE IF EXISTS subscriptions;
+DROP TABLE IF EXISTS support_grants;
+DROP TABLE IF EXISTS api_keys;
+DROP TABLE IF EXISTS sso_configurations;
+DROP TABLE IF EXISTS workspace_invitations;
+DROP TABLE IF EXISTS workspace_members;
+DROP TABLE IF EXISTS workspace_keys;
+DROP TABLE IF EXISTS workspaces;
+DROP TABLE IF EXISTS user_credentials;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS plans;
+
+DROP FUNCTION IF EXISTS app.reject_mutation();

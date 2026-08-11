@@ -9,7 +9,10 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - nominara-postgres-data:/var/lib/postgresql/data
+      # PG18's image wants a single mount at /var/lib/postgresql (data lands
+      # in a version-specific subdirectory) rather than /var/lib/postgresql/data
+      # directly — mounting the old path makes the container refuse to start.
+      - nominara-postgres-data:/var/lib/postgresql
 
 volumes:
   nominara-postgres-data:

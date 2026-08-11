@@ -11,7 +11,7 @@ export default tseslint.config(
     rules: {
       // Sequence numbers double as the migration ordering contract — an
       // unused import here usually means a copy-paste error worth seeing.
-      "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
+      "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
     },
   },
 );
