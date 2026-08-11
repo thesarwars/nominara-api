@@ -1,0 +1,38 @@
+{
+  "name": "nominara-api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "db:generate": "tsx src/db/generate.ts",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:rollback": "tsx src/db/rollback.ts",
+    "db:drift-check": "tsx src/db/drift-check.ts",
+    "db:reset": "tsx src/db/reset.ts",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration --pool=forks"
+  },
+  "dependencies": {
+    "drizzle-orm": "0.45.2",
+    "pg": "8.23.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@testcontainers/postgresql": "12.1.0",
+    "@types/node": "26.2.0",
+    "@types/pg": "8.21.0",
+    "drizzle-kit": "0.31.10",
+    "eslint": "10.8.1",
+    "testcontainers": "12.1.0",
+    "tsx": "4.23.12",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.67.0",
+    "vitest": "4.1.10"
+  }
+}

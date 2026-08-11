@@ -1,0 +1,15 @@
+# Valkey and pgBouncer join this file in STORY-010 (database roles & pgBouncer wiring).
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: nominara
+      POSTGRES_PASSWORD: nominara
+      POSTGRES_DB: nominara
+    ports:
+      - "5432:5432"
+    volumes:
+      - nominara-postgres-data:/var/lib/postgresql/data
+
+volumes:
+  nominara-postgres-data:
