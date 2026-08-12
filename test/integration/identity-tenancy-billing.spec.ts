@@ -1,14 +1,23 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { migrateUp, rollbackLast } from "../../src/db/migrate-runner.js";
+import { MIGRATIONS_DIR, migrateUp, rollbackLast } from "../../src/db/migrate-runner.js";
 
 // STORY-007 · DDL 1: identity, tenancy, billing catalog. Same pattern as
 // STORY-006's suite: one shared container, hard schema reset per test.
+//
+// Isolated to a temp copy of just 0001+0002 (not the real MIGRATIONS_DIR) —
+// this file's tests assert exact table/migration-name results for STORY-007
+// alone, and must not break every time a later story adds another migration
+// to the real directory (STORY-008 already did, which is what caught this).
 describe("STORY-007 · identity, tenancy & billing DDL", () => {
   let container: StartedPostgreSqlContainer;
   let client: Client;
   let seq = 0;
+  let migrationsDir: string;
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18")
@@ -16,10 +25,19 @@ describe("STORY-007 · identity, tenancy & billing DDL", () => {
       .withUsername("nominara")
       .withPassword("nominara")
       .start();
+
+    migrationsDir = await mkdtemp(path.join(tmpdir(), "nominara-story007-isolated-"));
+    for (const name of ["0001_extensions_and_conventions", "0002_identity_tenancy_billing"]) {
+      for (const ext of ["up", "down"] as const) {
+        const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");
+        await writeFile(path.join(migrationsDir, `${name}.${ext}.sql`), content);
+      }
+    }
   }, 120_000);
 
   afterAll(async () => {
     await container.stop();
+    await rm(migrationsDir, { recursive: true, force: true });
   });
 
   beforeEach(async () => {
@@ -29,7 +47,7 @@ describe("STORY-007 · identity, tenancy & billing DDL", () => {
     await client.query("DROP SCHEMA IF EXISTS _migrations CASCADE");
     await client.query("DROP SCHEMA public CASCADE");
     await client.query("CREATE SCHEMA public");
-    await migrateUp(client);
+    await migrateUp(client, migrationsDir);
     seq = 0;
   });
 
@@ -634,7 +652,7 @@ describe("STORY-007 · identity, tenancy & billing DDL", () => {
   // ---- scenario 11 -----------------------------------------------------
 
   it("scenario 11 — rolling the migration back is clean", async () => {
-    const rolledBack = await rollbackLast(client);
+    const rolledBack = await rollbackLast(client, migrationsDir);
     expect(rolledBack).toBe("0002_identity_tenancy_billing");
 
     const result = await client.query<{ table_name: string }>(

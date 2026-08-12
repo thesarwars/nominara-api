@@ -46,9 +46,11 @@ export async function bootstrap(client: Client): Promise<void> {
 }
 
 export async function appliedMigrationNames(client: Client): Promise<Set<string>> {
-  const result = await client.query<{ name: string }>(
-    "SELECT name FROM _migrations.applied ORDER BY applied_at ASC",
-  );
+  // Ordered by name, not applied_at: migration names are zero-padded and
+  // sortable, so this ordering is exact and tie-free by construction.
+  // applied_at is wall-clock and can tie under fast, back-to-back
+  // transactions (observed under testcontainers — see rollbackLast below).
+  const result = await client.query<{ name: string }>("SELECT name FROM _migrations.applied ORDER BY name ASC");
   return new Set(result.rows.map((row) => row.name));
 }
 
@@ -85,9 +87,13 @@ export async function migrateUp(client: Client, migrationsDir: string = MIGRATIO
 /** Rolls back the most recently applied migration. Returns its name, or null if none are applied. */
 export async function rollbackLast(client: Client, migrationsDir: string = MIGRATIONS_DIR): Promise<string | null> {
   await bootstrap(client);
-  const result = await client.query<{ name: string }>(
-    "SELECT name FROM _migrations.applied ORDER BY applied_at DESC LIMIT 1",
-  );
+  // ORDER BY name, not applied_at: two migrations applied in quick
+  // succession (routine under testcontainers, where a full chain applies in
+  // milliseconds) can receive the same transaction-start timestamp,
+  // making "most recent" ambiguous under timestamp ordering. Migration
+  // names are zero-padded and sort exactly in application order, with no
+  // possibility of a tie.
+  const result = await client.query<{ name: string }>("SELECT name FROM _migrations.applied ORDER BY name DESC LIMIT 1");
   const last = result.rows[0]?.name;
   if (!last) {
     return null;
