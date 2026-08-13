@@ -1,15 +1,27 @@
 import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { migrateUp, rollbackLast } from "../../src/db/migrate-runner.js";
+import { MIGRATIONS_DIR, migrateUp, rollbackLast } from "../../src/db/migrate-runner.js";
 
 // STORY-008 · DDL 2: projects, prompts, captures, partitioned facts. Same
 // pattern as STORY-006/007: one shared container, hard schema reset per test.
+//
+// Isolated to a temp copy of just 0001+0002+0003 (not the real
+// MIGRATIONS_DIR) — this file's tests assert exact table/migration-name
+// results for STORY-008 alone, and must not break every time a later story
+// adds another migration to the real directory. STORY-009 already hit this
+// exact regression once (rollback test had to roll back 0004 before 0003 to
+// keep passing); same treatment as identity-tenancy-billing.spec.ts's
+// STORY-007 isolation and migrations.spec.ts's isolate0001() helper.
 describe("STORY-008 · projects, prompts & captures DDL", () => {
   let container: StartedPostgreSqlContainer;
   let client: Client;
   let seq = 0;
+  let migrationsDir: string;
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18")
@@ -17,10 +29,23 @@ describe("STORY-008 · projects, prompts & captures DDL", () => {
       .withUsername("nominara")
       .withPassword("nominara")
       .start();
+
+    migrationsDir = await mkdtemp(path.join(tmpdir(), "nominara-story008-isolated-"));
+    for (const name of [
+      "0001_extensions_and_conventions",
+      "0002_identity_tenancy_billing",
+      "0003_projects_prompts_captures",
+    ]) {
+      for (const ext of ["up", "down"] as const) {
+        const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");
+        await writeFile(path.join(migrationsDir, `${name}.${ext}.sql`), content);
+      }
+    }
   }, 120_000);
 
   afterAll(async () => {
     await container.stop();
+    await rm(migrationsDir, { recursive: true, force: true });
   });
 
   beforeEach(async () => {
@@ -35,7 +60,7 @@ describe("STORY-008 · projects, prompts & captures DDL", () => {
     await client.query("DROP SCHEMA IF EXISTS _migrations CASCADE");
     await client.query("DROP SCHEMA public CASCADE");
     await client.query("CREATE SCHEMA public");
-    await migrateUp(client);
+    await migrateUp(client, migrationsDir);
     seq = 0;
   });
 
@@ -563,7 +588,7 @@ describe("STORY-008 · projects, prompts & captures DDL", () => {
   // ---- scenario 10 --------------------------------------------------------
 
   it("scenario 10 — rolling the migration back is clean, partitions dropped with their parents", async () => {
-    const rolledBack = await rollbackLast(client);
+    const rolledBack = await rollbackLast(client, migrationsDir);
     expect(rolledBack).toBe("0003_projects_prompts_captures");
 
     const tables = await client.query<{ table_name: string }>(

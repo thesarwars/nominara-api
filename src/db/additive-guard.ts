@@ -106,3 +106,37 @@ export async function assertAdditiveOnly(sql: string, client: Client): Promise<v
     );
   }
 }
+
+// STORY-009: matviews bypass the RLS of their base tables at query time
+// (ISO-16, data-model.md §1 "Pre-aggregation"), so this rule is a security
+// property, not a style preference — it is deliberately NOT folded into
+// assertAdditiveOnly's `-- @contract-phase` exemption path. There is no
+// legitimate reason to ever create one, so no annotation can permit it.
+//
+// The regex requires the three words contiguous and in order ("create ...
+// materialized ... view"), tolerant of any run of whitespace (including
+// newlines) between them. This deliberately does NOT match a plain
+// `CREATE VIEW`, and does NOT match prose that merely discusses materialized
+// views without that literal contiguous sequence (e.g. "no materialized view
+// is created here" — the word "create" and the phrase "materialized view"
+// both appear, but never adjacent in that order).
+const MATERIALIZED_VIEW_PATTERN = /create\s+materialized\s+view\b/gi;
+
+export function findMaterializedViewSteps(sql: string): string[] {
+  return Array.from(sql.matchAll(MATERIALIZED_VIEW_PATTERN), (match) => match[0]);
+}
+
+/**
+ * Rejects a migration that creates a materialized view, unconditionally —
+ * no annotation bypasses this check.
+ */
+export function assertNoMaterializedViews(sql: string): void {
+  const steps = findMaterializedViewSteps(sql);
+  if (steps.length > 0) {
+    throw new Error(
+      `materialized-view guard: ${steps.length} CREATE MATERIALIZED VIEW step(s) found. ` +
+        `Materialized views are prohibited (ISO-16) — they do not enforce the RLS of their ` +
+        `base tables. Use an ordinary table maintained incrementally instead.`,
+    );
+  }
+}

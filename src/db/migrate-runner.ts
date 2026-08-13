@@ -2,7 +2,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Client } from "pg";
-import { assertAdditiveOnly } from "./additive-guard.js";
+import { assertAdditiveOnly, assertNoMaterializedViews } from "./additive-guard.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const MIGRATIONS_DIR = path.join(__dirname, "migrations", "sql");
@@ -67,6 +67,10 @@ export async function migrateUp(client: Client, migrationsDir: string = MIGRATIO
     }
 
     const sql = await readFile(file.upPath, "utf8");
+    // Unconditional — no `-- @contract-phase` annotation bypasses this one
+    // (ISO-16: matviews bypass RLS on their base tables, a security property
+    // rather than a destructiveness judgement call).
+    assertNoMaterializedViews(sql);
     await assertAdditiveOnly(sql, client);
 
     await client.query("BEGIN");

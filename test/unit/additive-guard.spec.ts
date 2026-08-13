@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   CONTRACT_PHASE_ANNOTATION,
+  assertNoMaterializedViews,
   findDestructiveSteps,
+  findMaterializedViewSteps,
   hasContractPhaseAnnotation,
 } from "../../src/db/additive-guard.js";
 
@@ -118,6 +120,81 @@ describe("STORY-006 · additive-guard pure logic", () => {
       expect(() => findDestructiveSteps("DROP TABLE probe$destructive;")).not.toThrow();
       // A genuinely unsafe shape: multiple dots, which SAFE_IDENTIFIER rejects.
       expect(() => findDestructiveSteps("DROP TABLE a.b.c;")).toThrow(/cannot safely parse table identifier/);
+    });
+  });
+});
+
+// STORY-009 · the materialized-view lint rule: pure, regex-based,
+// unconditional — no `-- @contract-phase` annotation exempts it, because a
+// matview bypassing RLS on its base tables is a security property (ISO-16),
+// not a destructiveness judgement call. (Not one of this story's numbered
+// known-gap/defect list, E-1..E-6 — those are documented in STORY-009's
+// Technical Notes; this rule is a design decision, not a gap.)
+describe("STORY-009 · materialized-view guard", () => {
+  describe("findMaterializedViewSteps", () => {
+    it("detects a plain CREATE MATERIALIZED VIEW", () => {
+      expect(findMaterializedViewSteps("CREATE MATERIALIZED VIEW foo AS SELECT 1;")).toEqual([
+        "CREATE MATERIALIZED VIEW",
+      ]);
+    });
+
+    it("is case-insensitive", () => {
+      expect(findMaterializedViewSteps("create materialized view foo as select 1;")).toEqual([
+        "create materialized view",
+      ]);
+    });
+
+    it("tolerates newlines and irregular whitespace between the three words", () => {
+      expect(
+        findMaterializedViewSteps("CREATE\n  MATERIALIZED\t\nVIEW foo AS SELECT 1;"),
+      ).toHaveLength(1);
+    });
+
+    it("detects CREATE MATERIALIZED VIEW IF NOT EXISTS", () => {
+      expect(findMaterializedViewSteps("CREATE MATERIALIZED VIEW IF NOT EXISTS foo AS SELECT 1;")).toHaveLength(1);
+    });
+
+    it("collects every match when a migration creates several matviews", () => {
+      const sql = `
+        CREATE MATERIALIZED VIEW foo AS SELECT 1;
+        CREATE MATERIALIZED VIEW bar AS SELECT 2;
+      `;
+      expect(findMaterializedViewSteps(sql)).toHaveLength(2);
+    });
+
+    it("does NOT flag a plain CREATE VIEW", () => {
+      expect(findMaterializedViewSteps("CREATE VIEW foo AS SELECT 1;")).toEqual([]);
+    });
+
+    it("does NOT flag prose that merely mentions materialized views without the literal contiguous sequence", () => {
+      expect(
+        findMaterializedViewSteps(
+          "-- no materialized view is created here; every pre-aggregation is an ordinary table",
+        ),
+      ).toEqual([]);
+    });
+
+    it("returns no steps for an ordinary additive migration", () => {
+      expect(findMaterializedViewSteps("CREATE TABLE foo (id uuid PRIMARY KEY);")).toEqual([]);
+    });
+  });
+
+  describe("assertNoMaterializedViews", () => {
+    it("throws when a materialized view is present", () => {
+      expect(() => assertNoMaterializedViews("CREATE MATERIALIZED VIEW foo AS SELECT 1;")).toThrow(
+        /materialized view/i,
+      );
+    });
+
+    it("does not throw for a plain CREATE VIEW or an ordinary CREATE TABLE", () => {
+      expect(() => assertNoMaterializedViews("CREATE VIEW foo AS SELECT 1;")).not.toThrow();
+      expect(() => assertNoMaterializedViews("CREATE TABLE foo (id uuid PRIMARY KEY);")).not.toThrow();
+    });
+
+    it("throws even when the file carries the contract-phase annotation — this rule is unconditional", () => {
+      expect(() =>
+        assertNoMaterializedViews(`${CONTRACT_PHASE_ANNOTATION}\nCREATE MATERIALIZED VIEW foo AS SELECT 1;`),
+      ).toThrow(/materialized view/i);
     });
   });
 });
