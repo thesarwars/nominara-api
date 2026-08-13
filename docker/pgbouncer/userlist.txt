@@ -1,0 +1,26 @@
+;; ============================================================================
+;; LOCAL-DEVELOPMENT-ONLY (STORY-010 gap G-2). Plaintext passwords in a
+;; checked-in file are acceptable ONLY because docker-compose's Postgres is a
+;; throwaway local instance holding no real tenant data.
+;;
+;; Production NEVER uses this file. It authenticates via auth_user/auth_query
+;; against a lookup that pgBouncer runs on the server, itself backed by
+;; credentials issued by Secrets Manager with 30-day automatic rotation
+;; (NFR-SEC-16, security-and-tenancy.md §13) — there is no static password
+;; list in production at all.
+;;
+;; src/db/dev-credentials.ts sets these SAME passwords on the runtime roles
+;; locally (sourced from environment variables, defaulting to the values
+;; below, never written by a migration). Keep the two in sync if you change
+;; either one.
+;;
+;; nominara_breakglass is deliberately ABSENT here: break-glass access
+;; connects directly to Postgres, never through the pooler — its
+;; CONNECTION LIMIT 2 and incident-response purpose make sharing a pooled
+;; connection with anything else actively wrong.
+;; ============================================================================
+"nominara"          "nominara"
+"nominara_app"      "nominara_app_dev_local"
+"nominara_worker"   "nominara_worker_dev_local"
+"nominara_report"   "nominara_report_dev_local"
+"nominara_portal"   "nominara_portal_dev_local"

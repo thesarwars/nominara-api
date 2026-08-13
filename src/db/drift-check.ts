@@ -1,16 +1,28 @@
 import { fileURLToPath } from "node:url";
 import type { Client } from "pg";
-import { INTERNAL_SCHEMA, REQUIRED_EXTENSIONS, REQUIRED_INTERNAL_FUNCTIONS } from "./conventions.js";
+import { DATABASE_ROLES, INTERNAL_SCHEMA, REQUIRED_EXTENSIONS, REQUIRED_INTERNAL_FUNCTIONS } from "./conventions.js";
 import { MIGRATIONS_DIR, migrateUp } from "./migrate-runner.js";
 import { connect, requireDatabaseUrl } from "./client.js";
 
 export interface DriftResult {
   missingExtensions: string[];
   missingFunctions: string[];
+  // STORY-010 — additive to the STORY-006 shape above. missingRoles: a role
+  // named in DATABASE_ROLES (src/db/conventions.ts) that migration 0005
+  // should have created but pg_roles doesn't show. roleAttributeMismatches:
+  // a role that exists but whose login/bypassrls/connection-limit attributes
+  // don't match its DatabaseRoleSpec — e.g. hand-altered outside a migration.
+  missingRoles: string[];
+  roleAttributeMismatches: string[];
 }
 
 export function isClean(result: DriftResult): boolean {
-  return result.missingExtensions.length === 0 && result.missingFunctions.length === 0;
+  return (
+    result.missingExtensions.length === 0 &&
+    result.missingFunctions.length === 0 &&
+    result.missingRoles.length === 0 &&
+    result.roleAttributeMismatches.length === 0
+  );
 }
 
 /**
@@ -32,7 +44,49 @@ export async function checkDrift(client: Client, migrationsDir: string = MIGRATI
   const installedFunctions = new Set(fnResult.rows.map((row) => row.proname));
   const missingFunctions = REQUIRED_INTERNAL_FUNCTIONS.filter((fn) => !installedFunctions.has(fn));
 
-  return { missingExtensions, missingFunctions };
+  const roleNames = Object.keys(DATABASE_ROLES);
+  const roleResult = await client.query<{
+    rolname: string;
+    rolcanlogin: boolean;
+    rolbypassrls: boolean;
+    rolconnlimit: number;
+    rolinherit: boolean;
+  }>(
+    "SELECT rolname, rolcanlogin, rolbypassrls, rolconnlimit, rolinherit FROM pg_roles WHERE rolname = ANY($1::text[])",
+    [roleNames],
+  );
+  const installedRoles = new Map(roleResult.rows.map((row) => [row.rolname, row]));
+
+  const missingRoles = roleNames.filter((name) => !installedRoles.has(name));
+  const roleAttributeMismatches: string[] = [];
+  for (const [name, spec] of Object.entries(DATABASE_ROLES)) {
+    const actual = installedRoles.get(name);
+    if (!actual) {
+      continue; // already reported in missingRoles
+    }
+    if (actual.rolcanlogin !== spec.login) {
+      roleAttributeMismatches.push(
+        `${name}: expected login=${spec.login}, got ${actual.rolcanlogin}`,
+      );
+    }
+    if (actual.rolbypassrls !== spec.bypassrls) {
+      roleAttributeMismatches.push(
+        `${name}: expected bypassrls=${spec.bypassrls}, got ${actual.rolbypassrls}`,
+      );
+    }
+    if (actual.rolconnlimit !== spec.connectionLimit) {
+      roleAttributeMismatches.push(
+        `${name}: expected connectionLimit=${spec.connectionLimit}, got ${actual.rolconnlimit}`,
+      );
+    }
+    if (actual.rolinherit !== spec.inherit) {
+      roleAttributeMismatches.push(
+        `${name}: expected inherit=${spec.inherit}, got ${actual.rolinherit}`,
+      );
+    }
+  }
+
+  return { missingExtensions, missingFunctions, missingRoles, roleAttributeMismatches };
 }
 
 async function main() {
@@ -70,6 +124,12 @@ async function main() {
     }
     if (result.missingFunctions.length > 0) {
       console.error(`  missing app-schema functions: ${result.missingFunctions.join(", ")}`);
+    }
+    if (result.missingRoles.length > 0) {
+      console.error(`  missing roles: ${result.missingRoles.join(", ")}`);
+    }
+    if (result.roleAttributeMismatches.length > 0) {
+      console.error(`  role attribute mismatches: ${result.roleAttributeMismatches.join("; ")}`);
     }
     process.exit(1);
   }

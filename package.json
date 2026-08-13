@@ -12,6 +12,8 @@
     "db:rollback": "tsx src/db/rollback.ts",
     "db:drift-check": "tsx src/db/drift-check.ts",
     "db:reset": "tsx src/db/reset.ts",
+    "db:role-check": "tsx src/db/role-check.ts",
+    "db:dev-credentials": "tsx src/db/dev-credentials.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

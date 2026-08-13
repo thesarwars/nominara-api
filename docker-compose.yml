@@ -1,4 +1,5 @@
-# Valkey and pgBouncer join this file in STORY-010 (database roles & pgBouncer wiring).
+# pgBouncer joins this file in STORY-010 (database roles & pgBouncer wiring).
+# Valkey is NOT in STORY-010's scope — it joins in STORY-030 (queues).
 services:
   postgres:
     image: pgvector/pgvector:pg18
@@ -13,6 +14,23 @@ services:
       # in a version-specific subdirectory) rather than /var/lib/postgresql/data
       # directly — mounting the old path makes the container refuse to start.
       - nominara-postgres-data:/var/lib/postgresql
+
+  # Transaction-mode pooler in front of Postgres. Config lives entirely in
+  # docker/pgbouncer/{pgbouncer.ini,userlist.txt} — not compose env vars — so
+  # the exact same files are used here and by
+  # test/integration/pgbouncer-transaction-mode.spec.ts's testcontainers
+  # fixture. DATABASE_URL (port 5432, direct) stays the migration/DDL
+  # connection and never routes through this pooler; DATABASE_URL_POOLED
+  # (port 6432, see .env.example) is what application code uses.
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.25.2-p0 # >= 1.25.2 is a stated security floor, system-architecture.md
+    depends_on:
+      - postgres
+    volumes:
+      - ./docker/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./docker/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "6432:5432"
 
 volumes:
   nominara-postgres-data:

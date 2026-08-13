@@ -441,4 +441,57 @@ describe("STORY-006 · extensions, conventions & migration tooling", () => {
     const result = await rollbackLast(client);
     expect(result).toBeNull();
   });
+
+  // ---- STORY-010 post-review fix #5 — drift-check role-drift detection ------
+  // Mutation-tested by qa-reviewer: forcing missingRoles/roleAttributeMismatches
+  // to always return [] left every then-existing test passing, because
+  // nothing exercised the detection code path itself. These force a real
+  // hand-alteration outside any migration, then prove checkDrift notices.
+
+  it("STORY-010 fix #5a — a hand-altered BYPASSRLS on a runtime role is caught by checkDrift as a roleAttributeMismatch naming the role and 'bypassrls'", async () => {
+    await migrateUp(client);
+    await client.query("ALTER ROLE nominara_app BYPASSRLS");
+    try {
+      const result = await checkDrift(client);
+      expect(isClean(result)).toBe(false);
+      expect(
+        result.roleAttributeMismatches.some((m) => m.includes("nominara_app") && /bypassrls/i.test(m)),
+      ).toBe(true);
+    } finally {
+      await client.query("ALTER ROLE nominara_app NOBYPASSRLS");
+    }
+  });
+
+  it("STORY-010 fix #5b — a hand-altered CONNECTION LIMIT on a runtime role is caught by checkDrift as a roleAttributeMismatch naming 'connectionLimit'", async () => {
+    await migrateUp(client);
+    await client.query("ALTER ROLE nominara_report CONNECTION LIMIT 999");
+    try {
+      const result = await checkDrift(client);
+      expect(isClean(result)).toBe(false);
+      expect(
+        result.roleAttributeMismatches.some((m) => m.includes("nominara_report") && /connectionLimit/i.test(m)),
+      ).toBe(true);
+    } finally {
+      await client.query("ALTER ROLE nominara_report CONNECTION LIMIT 40");
+    }
+  });
+
+  it("STORY-010 fix #9 — a hand-altered INHERIT on a runtime role is caught by checkDrift as a roleAttributeMismatch naming 'inherit'", async () => {
+    // conventions.ts's DatabaseRoleSpec previously had no `inherit` field at
+    // all — drift-check could not have noticed this even in principle. Every
+    // role in this project is created NOINHERIT (security-relevant: an
+    // inheriting role silently picks up the privileges of every role it is a
+    // member of), so this closes that gap.
+    await migrateUp(client);
+    await client.query("ALTER ROLE nominara_worker INHERIT");
+    try {
+      const result = await checkDrift(client);
+      expect(isClean(result)).toBe(false);
+      expect(
+        result.roleAttributeMismatches.some((m) => m.includes("nominara_worker") && /inherit/i.test(m)),
+      ).toBe(true);
+    } finally {
+      await client.query("ALTER ROLE nominara_worker NOINHERIT");
+    }
+  });
 });
