@@ -59,6 +59,7 @@ describe("STORY-009 · rollups, AUX, tasks, GEO, tools & agency DDL", () => {
   beforeEach(async () => {
     client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();
+    // eslint-disable-next-line nominara/no-session-scoped-config -- test-fixture convenience on a direct (non-pgBouncer-pooled) testcontainers connection, not tenant-context traffic; NFR-SEC-02's leak risk doesn't apply outside transaction-mode pooling.
     await client.query("SET TIME ZONE 'UTC'");
     await client.query("DROP SCHEMA IF EXISTS app CASCADE");
     await client.query("DROP SCHEMA IF EXISTS _migrations CASCADE");
@@ -1065,6 +1066,7 @@ describe("STORY-009 · rollups, AUX, tasks, GEO, tools & agency DDL", () => {
         ],
       );
     }
+    // eslint-disable-next-line nominara/no-session-scoped-config -- test-fixture convenience on a dedicated test connection to force an index scan for verification, not tenant-context traffic; SET LOCAL would silently no-op outside an explicit transaction here.
     await client.query("SET enable_seqscan = off");
     const explain = await client.query(
       "EXPLAIN SELECT id FROM content_chunks ORDER BY embedding <=> $1 LIMIT 5",
@@ -1132,6 +1134,7 @@ describe("STORY-009 · rollups, AUX, tasks, GEO, tools & agency DDL", () => {
         ],
       );
     }
+    // eslint-disable-next-line nominara/no-session-scoped-config -- test-fixture convenience on a dedicated test connection to force an index scan for verification, not tenant-context traffic; SET LOCAL would silently no-op outside an explicit transaction here.
     await client.query("SET enable_seqscan = off");
     const explain = await client.query(
       "EXPLAIN SELECT id FROM corpus_passages ORDER BY embedding <=> $1 LIMIT 5",

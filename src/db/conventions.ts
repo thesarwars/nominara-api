@@ -24,6 +24,18 @@ export const REQUIRED_INTERNAL_FUNCTIONS = [
   "assert_jsonb_size",
   "reject_mutation", // STORY-007 — generic append-only guard, first used by credit_ledger
   "breakglass_login_alert", // STORY-010 — ON login event trigger function; drift-check must notice if it disappears
+  // STORY-011 — security-and-tenancy.md §3's three context accessor
+  // functions, verbatim. STABLE + PARALLEL SAFE so the planner can inline
+  // them into every generated policy's USING/WITH CHECK clause.
+  "current_workspace",
+  "current_actor",
+  "current_scope_projects",
+  // STORY-011 — the reusable partition-RLS-application function
+  // (src/db/rls/generate.ts's partition DO block calls this once per
+  // discovered partition child). STORY-013's monthly partition-maintenance
+  // job is the next consumer: exactly one call per new partition, or the
+  // partition reopens the RLS bypass this story found and fixed.
+  "apply_tenant_rls",
 ] as const;
 
 // STORY-009 — data-model.md §2 "Table census", verbatim. The census
@@ -49,7 +61,14 @@ export const GLOBAL_TABLES = [
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
 // explicitly so the tenant-scope assertion stays fail-closed rather than
 // silently excluding it.
-export const TENANT_SCOPE_COLUMN: Record<string, string> = { workspaces: "id" };
+//
+// Frozen (Object.freeze + `as const`) — unlike this file's other exported
+// constants, this one was a mutable Record, which is out of place for a
+// load-bearing input to BOTH src/db/rls/generate.ts (the RLS generator) and
+// src/db/rls/rls-check.ts (the drift checker): a stray runtime mutation here
+// would make the generator and the checker silently agree on a wrong answer
+// together, rather than disagree loudly.
+export const TENANT_SCOPE_COLUMN: Readonly<Record<string, string>> = Object.freeze({ workspaces: "id" } as const);
 
 // STORY-009 AC "no ordering column exists anywhere" (tasks specifically —
 // no hand-authored ordering/priority-lane column may exist on tasks or
@@ -110,6 +129,62 @@ export const DATABASE_ROLES: Record<string, DatabaseRoleSpec> = {
   nominara_report: { login: true, bypassrls: false, connectionLimit: 40, inherit: false },
   nominara_portal: { login: true, bypassrls: false, connectionLimit: 60, inherit: false },
   [BREAKGLASS_ROLE]: { login: true, bypassrls: true, connectionLimit: 2, inherit: false },
+};
+
+// STORY-011 — schemas/README.md "Tenancy" section's portal-readable
+// enumeration, REVISED (fix pass STORY-011-E-2 — see that story's
+// Implementation Decisions section) to 18 entries, down from the doc's
+// literal 20: `source_domains` and `brand_themes` are workspace-scoped-only
+// tables with no `project_id` column, so their portal policy could only ever
+// filter by workspace, never by project. security-and-tenancy.md's own
+// ISO-09 requires a share-token session be unable to read a project outside
+// its scope "even within the same workspace", and AC 26 explicitly disallows
+// enforcing portal scope via a join — so a project-scoped share token in an
+// agency workspace with two competing clients as separate projects could
+// enumerate EVERY domain/theme in the workspace, including ones that only
+// ever appeared in a project outside the token's scope. Removed from this
+// list rather than shipped with that gap; revisited by a future story with a
+// real product requirement (e.g. a `project_id` column, or a join the AC
+// would need to be revised to permit). src/db/rls/generate.ts imports this
+// rather than redeclaring it, so the generator and this list can never
+// silently diverge.
+export const PORTAL_READABLE_TABLES = [
+  "projects",
+  "competitors",
+  "tracked_prompts",
+  "answer_captures",
+  "mention_facts",
+  "citation_facts",
+  "metric_daily",
+  "milestones",
+  "aux_audits",
+  "aux_findings",
+  "displacement_events",
+  "tasks",
+  "goals",
+  "project_source_index",
+  "topic_clusters",
+  "geo_analyses",
+  "entity_nodes",
+  "attribution_url_rollup",
+] as const;
+
+// security-and-tenancy.md §3's own `portal_scope_projects` example policy
+// scopes by the table's own `id`, not a `project_id` column — `projects` is
+// the only portal-readable table where that applies, declared explicitly
+// (mirroring TENANT_SCOPE_COLUMN's own workspaces exception) rather than
+// special-cased in src/db/rls/generate.ts.
+export const PORTAL_SELF_SCOPED_TABLES = ["projects"] as const;
+
+// STORY-011 — which runtime roles receive which generated policy. Every
+// FOR ALL ws_isolation_* policy is granted to `forAll`; every portal_scope_*
+// SELECT-only policy is granted to `portal`. Kept here as declared data
+// (not literals inside generate.ts) so a future 5th runtime role forces a
+// conscious decision about which bucket it belongs to — see this file's own
+// test asserting RLS_POLICY_ROLES stays consistent with RUNTIME_ROLES.
+export const RLS_POLICY_ROLES = {
+  forAll: ["nominara_app", "nominara_worker", "nominara_report"] as const,
+  portal: "nominara_portal" as const,
 };
 
 export type TablePrivilege = "SELECT" | "INSERT" | "UPDATE" | "DELETE";

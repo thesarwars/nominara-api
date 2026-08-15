@@ -246,6 +246,7 @@ describe("STORY-010 · pgBouncer transaction-mode pooling", () => {
       // ONE server connection to ever hand out, so B's next query is
       // guaranteed to land on the exact same backend A just used.
       await clientA.query(
+        // eslint-disable-next-line nominara/no-session-scoped-config -- STORY-011's mandatory negative control: this line deliberately uses session-scoped set_config(..., false) to PROVE it leaks across pooled connections, which is the entire point of this test.
         "SELECT set_config('app.leak_test_marker', $1::text, false)",
         ["leaked-from-A"],
       );
@@ -269,6 +270,7 @@ describe("STORY-010 · pgBouncer transaction-mode pooling", () => {
       // next and happens to land on this same pooled server connection —
       // this makes it safe under reordering/shuffling too.
       // set_config(name, NULL, false) is equivalent to RESET.
+      // eslint-disable-next-line nominara/no-session-scoped-config -- cleanup half of the same deliberate negative control above; also session-scoped by necessity (it must reset the SAME session-scoped GUC the leak demonstration set).
       await clientB.query("SELECT set_config('app.leak_test_marker', NULL, false)");
     } finally {
       await clientA.end();

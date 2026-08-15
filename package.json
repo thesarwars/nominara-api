@@ -14,11 +14,13 @@
     "db:reset": "tsx src/db/reset.ts",
     "db:role-check": "tsx src/db/role-check.ts",
     "db:dev-credentials": "tsx src/db/dev-credentials.ts",
+    "db:rls-generate": "tsx src/db/rls/generate.ts",
+    "db:rls-check": "tsx src/db/rls/rls-check.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run test/unit",
-    "test:integration": "vitest run test/integration --pool=forks"
+    "test:integration": "vitest run --config vitest.integration.config.ts"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",

@@ -40,6 +40,8 @@ users don't need either.
 | `pnpm db:reset` | Drops everything this project owns (`public`, `app`, `_migrations`) and rebuilds from empty. |
 | `pnpm db:role-check` | Inspects the role the current `DATABASE_URL` connection is actually authenticated as, and fails if it's the migration owner (STORY-010). |
 | `pnpm db:dev-credentials` | Sets local-development passwords on the runtime + break-glass roles created by migration `0005` (never done by a migration itself — STORY-010). |
+| `pnpm db:rls-generate` | Regenerates `0006_generated_rls_policies.up.sql` **and** `src/db/rls/tenant-tables.generated.ts` (the `TENANT_TABLES` set — fix pass item 11) from `src/db/rls/generate.ts` against a disposable shadow database. `--check` fails instead of writing, if either committed file would differ (STORY-011). |
+| `pnpm db:rls-check` | Applies every committed migration to a disposable shadow database and reports 5 independent RLS-drift buckets — unclassified tables, missing RLS flags, missing/unexpected policies, `FOR ALL` policies without a `with_check`, and stray policies on `GLOBAL_TABLES` (STORY-011). |
 
 **Why hand-rolled instead of drizzle-kit's own migrator:** drizzle-kit's
 migration runner is forward-only — it has no paired down-migration concept.
@@ -124,6 +126,60 @@ test in EPIC-01: it proves two tenants sharing one pooled server connection
 never see each other's `SET LOCAL` context, and — via a mandatory negative
 control — that a session-scoped `SET` (banned in application code by
 `NFR-SEC-02`) *would* leak if anyone ever used one.
+
+## Row-level security & tenant context (STORY-011)
+
+**This is the single most load-bearing story in the repository.** Migration
+`0006_generated_rls_policies.up.sql` is **generated, not hand-written** —
+regenerate it with `pnpm db:rls-generate` after touching `src/db/schema/`,
+never hand-edit the file. Full spec: `security-and-tenancy.md` §3–4.
+
+- `src/db/rls/generate.ts` — a pure function, `generateRlsSql(tables)`, with
+  no table-name literals of its own. Every table-specific decision comes
+  from `src/db/conventions.ts`'s `GLOBAL_TABLES` / `TENANT_SCOPE_COLUMN` /
+  `PORTAL_READABLE_TABLES` / `PORTAL_SELF_SCOPED_TABLES`. A table with
+  neither a `workspace_id` column nor an explicit decision in one of those
+  lists makes the generator **throw**, naming the three remedies — a new
+  table cannot ship without an explicit isolation decision.
+- **The partition RLS hole, found and fixed by this story.** `ENABLE`/`FORCE
+  ROW LEVEL SECURITY` on a partitioned parent table (`answer_captures`,
+  `mention_facts`, `citation_facts`) does **not** cascade to its partition
+  children — verified by direct probe: querying a partition child directly,
+  as a non-superuser runtime role with no context set, returned every
+  tenant's rows. `app.apply_tenant_rls(target regclass)` fixes this for one
+  partition at a time (discovers the parent via `pg_inherits`, copies its
+  `ws_isolation_*` policy predicate onto the child, idempotent); a
+  `pg_inherits`-driven `DO` block in `0006` applies it to every partition
+  that exists today. **STORY-013's monthly partition-maintenance job must
+  call this exactly once per new partition it creates**, or every new
+  partition reopens this hole — recorded in that story's own Technical
+  Notes.
+- `src/tenancy/tenant-context.ts` — `withTenantContext(client, context, fn)`
+  opens one transaction, sets the three GUCs via parameterized
+  `set_config(..., true)` calls, runs `fn` inside an `AsyncLocalStorage`
+  store, commits on success, rolls back and rethrows the original error on
+  throw. Framework-agnostic (no NestJS scaffold exists in this repo yet) —
+  a future interceptor calls into this with a few lines of glue.
+- `src/tenancy/with-tenant-job.ts` — `withTenantJob` verifies a queue job's
+  HMAC-SHA256 signature **before** any `set_config` call, so a poisoned
+  queue entry can never redirect a worker into another tenant's context.
+  `hmacSha256JobVerifier` is a real (if minimal) verifier; queue
+  integration itself (BullMQ, Valkey, key rotation) is out of scope here —
+  a future queue-epic story's job.
+- `src/tenancy/query-guard.ts` — `assertTenantContext`/`tenantAware` throw
+  `TenantContextMissingError` when a tenant table is queried outside an
+  active `withTenantContext` **on the same client the query is running on**
+  (fix pass item 11(c) — the original check only verified SOME context was
+  ambiently active, not that it was active on the client actually issuing
+  the query). Checks against `src/db/rls/tenant-tables.generated.ts`'s
+  `TENANT_TABLES` — a real, generated 59-member set (fix pass item 11(b);
+  previously nothing generated one, despite `NFR-SEC-01` naming it). A regex
+  heuristic over SQL text passed to `.query(...)`, **not** the security
+  boundary (RLS is) — see gap G-6.
+- `eslint-rules/no-session-scoped-config.js` — bans `set_config(..., false)`,
+  a `set_config` call with fewer than 3 arguments, and any bare `SET`
+  statement other than `SET LOCAL`/`SET ROLE` (`NFR-SEC-02`), wired in as a
+  local flat-config plugin (`nominara/no-session-scoped-config`).
 
 ## Testing
 
@@ -213,3 +269,41 @@ A role stripped of every privilege is harmless residue, and the guarded
 `CREATE ROLE` / converging `ALTER ROLE` pattern in `0005.up.sql` already
 makes re-applying the migration idempotent regardless of whether the role
 pre-existed.
+
+## Disclosed gaps (STORY-011)
+
+- **G-5 — `pnpm db:rls-check` runs locally only, not in CI.** AC 32 ("the
+  generator runs in the migration pipeline and in CI") is satisfied here by
+  the CLI itself plus `test/integration/rls-check.spec.ts` exercising it —
+  this repo has no `.github/workflows/` at all yet (see "Known gaps against
+  EPIC-00" above), so there is no pipeline for it to run IN today. Not a new
+  gap this story introduces, the same disclosed absence as every prior
+  story's gates.
+- **G-6 — the query guard (`src/tenancy/query-guard.ts`) is a `pg` client
+  wrapper using regex-based table extraction, not a real Drizzle
+  `beforeQuery` hook.** `drizzle-orm` is a dependency of this repo but is
+  used **nowhere** for actual queries — every migration, seed script, and
+  integration test in this codebase issues SQL through the raw `pg` client
+  directly. Confirmed by inspection: no `src/` file imports a Drizzle query
+  builder. Wiring a real Drizzle hook (which would get exact table names
+  from the query builder's own AST instead of a heuristic) is a standing
+  observation for whichever future story actually introduces Drizzle-built
+  queries, not something this story fixes retroactively.
+- **G-7 — no logger, metric, or span exists anywhere in this story's code**
+  (consistent with no observability stack existing yet in this repo — see
+  "Known gaps against EPIC-00" above). `pnpm db:rls-check`'s CLI output and
+  `app.breakglass_login_alert`'s `RAISE LOG` line (STORY-010) are the only
+  structured signals this area of the codebase emits today; nothing from
+  this story adds a `nominara_<subsystem>_<measure>` metric, a span, or a
+  redacted log line. A standing observation for whichever future story wires
+  the actual observability stack.
+- **G-8 — `TENANT_TABLES` (`src/db/rls/tenant-tables.generated.ts`, fix pass
+  item 11) covers every classifiable tenant BASE table by name, but
+  structurally cannot cover partition CHILD table names** (e.g.
+  `answer_captures_2026_08`), because those are computed dynamically at
+  migration-apply time / by a future STORY-013 maintenance job, not known
+  ahead of time the way a base table's name is. A query naming a partition
+  child directly, instead of its parent, is therefore invisible to
+  `src/tenancy/query-guard.ts`'s heuristic — RLS itself (migration `0006` +
+  `app.apply_tenant_rls`) is the actual security boundary and is not fooled
+  by this gap; see that migration's own partition-hole test.

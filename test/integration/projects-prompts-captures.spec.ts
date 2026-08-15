@@ -55,6 +55,7 @@ describe("STORY-008 · projects, prompts & captures DDL", () => {
     // this suite's JS-side (UTC) computation of the same boundaries can never
     // silently diverge around a month edge because of an environment default —
     // QA coverage audit flagged this as an unstated assumption otherwise.
+    // eslint-disable-next-line nominara/no-session-scoped-config -- test-fixture convenience on a direct (non-pgBouncer-pooled) testcontainers connection, not tenant-context traffic; NFR-SEC-02's leak risk doesn't apply outside transaction-mode pooling.
     await client.query("SET TIME ZONE 'UTC'");
     await client.query("DROP SCHEMA IF EXISTS app CASCADE");
     await client.query("DROP SCHEMA IF EXISTS _migrations CASCADE");
@@ -373,6 +374,7 @@ describe("STORY-008 · projects, prompts & captures DDL", () => {
     // Session-scoped, not LOCAL: this client isn't in an explicit transaction,
     // so SET LOCAL would silently no-op past the end of its own implicit one.
     // Fine here — this is a dedicated test connection, not app runtime code.
+    // eslint-disable-next-line nominara/no-session-scoped-config -- test-fixture convenience on a dedicated test connection to force an index scan for verification, not tenant-context traffic; SET LOCAL would silently no-op outside an explicit transaction here.
     await client.query("SET enable_seqscan = off");
     const explain = await client.query(
       `EXPLAIN SELECT id FROM tracked_prompts ORDER BY embedding <=> $1 LIMIT 5`,
@@ -529,6 +531,7 @@ describe("STORY-008 · projects, prompts & captures DDL", () => {
         [workspaceId, projectId, `cluster ${i}`, halfvecLiteral(i)],
       );
     }
+    // eslint-disable-next-line nominara/no-session-scoped-config -- test-fixture convenience on a dedicated test connection to force an index scan for verification, not tenant-context traffic; SET LOCAL would silently no-op outside an explicit transaction here.
     await client.query("SET enable_seqscan = off");
     const explain = await client.query("EXPLAIN SELECT id FROM topic_clusters ORDER BY centroid <=> $1 LIMIT 5", [
       halfvecLiteral(0),
