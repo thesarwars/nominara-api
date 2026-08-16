@@ -184,13 +184,103 @@ never hand-edit the file. Full spec: `security-and-tenancy.md` §3–4.
 ## Testing
 
 ```bash
-pnpm test:unit          # pure functions — no network, clock, or DB
-pnpm test:integration   # real Postgres via testcontainers, pgvector/pgvector:pg18
+pnpm test:unit               # pure functions — no network, clock, or DB
+pnpm test:integration        # real Postgres via testcontainers, pgvector/pgvector:pg18
+pnpm test:isolation          # STORY-012 — the 16 isolation assertions + ISO-00, one shared container
+pnpm test:isolation:breakers # every assertion demonstrated failing against its own breaker
 ```
 
 No test suite depends on a live external vendor. See
 `references/testing-strategy.md` for the full pyramid and which gates block a
 merge.
+
+## Isolation verification suite (STORY-012)
+
+`test/isolation` — sixteen assertions (`security-and-tenancy.md` §10,
+`ISO-01`…`ISO-16`) plus this repo's own `ISO-00` anti-vacuity guard. Blocking
+by policy on every pull request; nightly against staging is a **capability**,
+not yet scheduled (no CI exists — see gap G-9 below).
+
+- **Architecture.** Every assertion is an exported function under
+  `test/isolation/assertions/iso-NN-*.ts`, called both by a green spec wrapper
+  (`test/isolation/*.spec.ts`) and by the breaker matrix
+  (`test/isolation/breakers/breaker-execution.spec.ts`). No assertion is ever
+  written inline inside an `it()`. `test/isolation/assertions/registry.ts`
+  aggregates all 17 as `{ id, assert, assertUnderBreaker, breaker, readOnly,
+  needsFixture }` — `test/isolation/meta/breaker-matrix.spec.ts` asserts the
+  registry's size and ID set structurally, so an assertion added without a
+  breaker fails there, not silently.
+- **One shared container.** `test/isolation/support/global-setup.ts` (Vitest
+  `globalSetup` + `provide`/`inject`) starts ONE Postgres container, runs the
+  full migration chain once, seeds the three-tenant fixture once, and builds
+  a second database (`nominara_iso_breaker_template`) as a byte-for-byte
+  template for breakers — never per test file, which would blow the runtime
+  budget.
+- **Discovery, not enumeration.** `test/isolation/support/discovery.ts`
+  derives the tenant table set, the global table set, partition children, and
+  every `*_enc` column live from the catalog, and cross-checks the result
+  against `src/db/conventions.ts`'s `GLOBAL_TABLES` and
+  `src/db/rls/tenant-tables.generated.ts`'s `TENANT_TABLES` — a table added
+  without an isolation decision fails the census (`ISO-06`), not silently
+  shrinks every other loop.
+- **The fixture.** `test/isolation/support/three-tenant-fixture.ts` seeds 3
+  tenants × 50 projects, with every one of the 59 tenant tables mapped
+  (mostly 1:1 onto a project) so every genuine per-project `UNIQUE`
+  constraint in the schema is satisfied automatically. Two tables are
+  structurally capped at exactly 1 row per tenant by their own primary key
+  (`credit_wallets`, `workspaces` itself) — documented, not fought.
+  D-7's four "awkward shapes" (a single-prompt project, a common-word brand,
+  a multi-word brand, a substring-colliding competitor pair) are present in
+  every tenant. `test/isolation/three-tenant-fixture-coverage.spec.ts` is the
+  fixture's own coverage spec.
+- **Breakers.** `test/isolation/support/broken-database.ts` templates a
+  disposable, throwaway database off `nominara_iso_breaker_template` per
+  breaker (`CREATE DATABASE ... TEMPLATE ...`) so a breaker's mutation can
+  never contaminate the shared fixture every other spec file reads. Three
+  assertions (`ISO-11`, `ISO-13`, `ISO-14`) are pure application-layer/scanner
+  properties with no database policy to mutate — their breakers operate on
+  the application layer or on a planted `src/lib/_isoNN_breaker_probe.ts`
+  file instead, cleaned up in `revert()`.
+- **`ISO-12`** exercises a real (if minimal, non-KMS) envelope-encryption
+  implementation added by this story: `src/lib/crypto/envelope.ts`
+  (AES-256-GCM, `v1:{dek_id}:{iv}:{ct}`, AAD = `workspace_id|table|column|row_id`).
+- **`ISO-13`/`ISO-14`** are fail-closed *scanners* over cache-key/object-key
+  construction sites in `src/` (`test/isolation/support/key-construction-scanner.ts`),
+  not a real Valkey/S3 integration — neither exists in this repo yet (D-3,
+  D-4). Each scanner self-tests against a small fixture directory of known
+  good/bad literals first, so an empty result against `src/` is a trustworthy
+  "nothing constructs a key yet", not indistinguishable from a broken scanner.
+  **Disclosed limitation:** the scanner's regex only matches template
+  literals that OPEN with an interpolation (`` `${...}` ``) — a literal that
+  opens with plain text before its first interpolation (e.g.
+  `` `answers:${workspaceId}:${promptId}` ``) is not inspected at all. This is
+  fail-open for that shape, not fail-closed; widening the pattern safely
+  (without false-positiving on unrelated template literals such as error
+  messages) is left for STORY-030's real Valkey/S3 integration rather than
+  done here.
+- **`ISO-08`** fuzzes at the data-access boundary (`withTenantContext` + the
+  query guard), not the HTTP boundary — no NestJS app exists yet (D-1;
+  STORY-022 extends this).
+- **`ISOLATION_TARGET`** (`local` default, `pooled`, `staging`) switches
+  `global-setup.ts`'s behavior; `staging` requires
+  `ISOLATION_STAGING_DATABASE_URL`, seeds nothing, refuses to proceed unless
+  `_migrations.applied` proves this suite's own migration chain created the
+  target database, and narrows to the read-only, fixture-independent subset
+  (`registry.ts`'s `selectAssertionsForTarget`) — a **runner-side capability**
+  only (D-6); nothing schedules a nightly run yet (gap G-9).
+- **`pnpm test:isolation:breakers`** stayed in the always-run set rather than
+  splitting to nightly-only (D-8) — measured at ~8s locally, comfortably
+  inside the 5-minute budget (D-5) alongside `pnpm test:isolation` itself
+  (~15-25s locally).
+- `test/isolation/pgbouncer.spec.ts` (T23) runs the data-path property
+  through a real pgBouncer at `default_pool_size=1` (reusing
+  `test/support/pgbouncer-fixture.ts`), with an interleaved two-tenant
+  sequence over the same pooled server connection.
+- `test/isolation/widen.spec.ts` (T26) covers the edge cases outside the 16
+  spec'd assertions: empty/malformed GUCs, `workspaces`' own `id`-scoped
+  policy, a partition child queried by name, a table with `NULL` in every
+  row's scope column, the empty-collection trap, and two concurrent contexts
+  on two different clients.
 
 ## Known gaps against EPIC-00
 
@@ -307,3 +397,31 @@ pre-existed.
   `src/tenancy/query-guard.ts`'s heuristic — RLS itself (migration `0006` +
   `app.apply_tenant_rls`) is the actual security boundary and is not fooled
   by this gap; see that migration's own partition-hole test.
+
+## Disclosed gaps (STORY-012)
+
+- **G-9 — the isolation suite is blocking by policy, but nothing schedules
+  it.** `pnpm test:isolation`/`:breakers` exist and pass locally; the "nightly
+  against staging" half of the Definition of Done is a **capability**
+  (`ISOLATION_TARGET=staging`, D-6) rather than a running schedule — no CI
+  exists in this repo at all (gap G-5, unchanged), so there is no pipeline to
+  schedule it IN yet. Not a new class of gap, the same disclosed absence as
+  every prior story's gates; picked up once STORY-002/003 land.
+- `ISO-13`/`ISO-14` remain scanner-based, not a real Valkey/S3 integration
+  test (D-3/D-4) — real containers join in STORY-030 and whichever story
+  introduces object-storage infra. The scanner's own correctness is
+  self-tested against a fixture directory each run (see the Testing section
+  above), so this is a scope limitation, not an untested one.
+- `ISO-12`'s envelope encryption (`src/lib/crypto/envelope.ts`) uses a local,
+  in-memory test DEK — no KMS integration exists (D-2). DEK rotation,
+  `workspace_keys.wrapped_dek` unwrapping, and the 90-day rotation job are all
+  future-story territory.
+- `ISO-08`'s fuzz assertion runs at the data-access boundary
+  (`withTenantContext` + the query guard), not the HTTP boundary — no NestJS
+  app exists yet (D-1). STORY-022 is expected to extend it to assert
+  403/404 at the actual route layer.
+- `ISO-15`'s fixture-derived anonymity check runs an ad hoc aggregate query
+  written by this assertion itself, not any real production benchmark/rollup
+  aggregation path (none exists yet). It is a self-fulfilling property test
+  of the anonymization *shape*, not evidence a real rollup job never leaks a
+  tenant id — picked up once a real aggregation job exists to test instead.
