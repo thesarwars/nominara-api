@@ -1,0 +1,143 @@
+import { Test } from "@nestjs/testing";
+import type { CallHandler, ExecutionContext } from "@nestjs/common";
+import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
+import type { Observable } from "rxjs";
+import { tap } from "rxjs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiModule } from "./api.module.js";
+import { AuthGuard } from "./guards/auth.guard.js";
+import { WorkspaceGuard } from "./guards/workspace.guard.js";
+import { RbacGuard } from "./guards/rbac.guard.js";
+import { EntitlementGuard } from "./guards/entitlement.guard.js";
+import { QuotaGuard } from "./guards/quota.guard.js";
+import { DailyCapGuard } from "./guards/daily-cap.guard.js";
+import { RateLimitGuard } from "./guards/rate-limit.guard.js";
+import { CreditGuard } from "./guards/credit.guard.js";
+import { IdempotencyInterceptor } from "./interceptors/idempotency.interceptor.js";
+import { TenantContextInterceptor } from "./interceptors/tenant-context.interceptor.js";
+import { AuditInterceptor } from "./interceptors/audit.interceptor.js";
+import { CreditInterceptor } from "./interceptors/credit.interceptor.js";
+
+// STORY-022 — locks the composition root's global guard/interceptor order
+// against a silent regression (this story's "critical implementation
+// nuance"). Exercises the REAL production classes, wired through
+// ApiModule exactly as production boots them, over an actual HTTP request
+// to the (@Public()) /health/live route — not stand-ins.
+
+const GUARD_ORDER = [
+  AuthGuard,
+  WorkspaceGuard,
+  RbacGuard,
+  EntitlementGuard,
+  QuotaGuard,
+  DailyCapGuard,
+  RateLimitGuard,
+  CreditGuard,
+] as const;
+
+// Registration order in api.module.ts's APP_INTERCEPTOR providers array.
+// NestJS enters interceptors' "before" logic (the code before `next.handle()`
+// is called) in THIS order, and their "after" logic (anything the returned
+// Observable does once the handler's result arrives) in the REVERSE of it.
+const INTERCEPTOR_REGISTRATION_ORDER = [
+  IdempotencyInterceptor,
+  TenantContextInterceptor,
+  AuditInterceptor,
+  CreditInterceptor,
+] as const;
+
+describe("STORY-022 · composition root guard/interceptor order", () => {
+  const originalDatabaseUrl = process.env.DATABASE_URL;
+  const originalDatabaseUrlPooled = process.env.DATABASE_URL_POOLED;
+
+  beforeEach(() => {
+    // DbModule's PG_POOL factory only constructs a lazy pg.Pool (no
+    // connection attempted at construction) — a fake connection string is
+    // safe here since /health/live never queries Postgres.
+    process.env.DATABASE_URL = "postgres://fake:fake@localhost:5432/fake";
+    process.env.DATABASE_URL_POOLED = "postgres://fake:fake@localhost:5432/fake";
+  });
+
+  afterEach(() => {
+    process.env.DATABASE_URL = originalDatabaseUrl;
+    process.env.DATABASE_URL_POOLED = originalDatabaseUrlPooled;
+    vi.restoreAllMocks();
+  });
+
+  it("invokes all 8 global guards, in the STORY-022-E-1 corrected order, before the handler runs", async () => {
+    const calls: string[] = [];
+    for (const Guard of GUARD_ORDER) {
+      const original = Guard.prototype.canActivate;
+      vi.spyOn(Guard.prototype, "canActivate").mockImplementation(function (this: unknown, ...args) {
+        calls.push(Guard.name);
+        return original.apply(this, args as never);
+      });
+    }
+
+    const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
+    const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+
+    const response = await app.inject({ method: "GET", url: "/health/live" });
+
+    expect(response.statusCode).toBe(200);
+    expect(calls).toEqual(GUARD_ORDER.map((Guard) => Guard.name));
+
+    await app.close();
+  });
+
+  it("enters interceptors in registration order and completes them in REVERSE registration order", async () => {
+    const entries: string[] = [];
+    const exits: string[] = [];
+
+    for (const Interceptor of INTERCEPTOR_REGISTRATION_ORDER) {
+      const original = Interceptor.prototype.intercept as (
+        context: ExecutionContext,
+        next: CallHandler,
+      ) => Observable<unknown> | Promise<Observable<unknown>>;
+
+      const traced = function (
+        this: unknown,
+        context: ExecutionContext,
+        next: CallHandler,
+      ): Observable<unknown> | Promise<Observable<unknown>> {
+        entries.push(Interceptor.name);
+        const record = () => exits.push(Interceptor.name);
+        // Real rxjs .pipe(tap(...)) — preserves the actual Observable
+        // instance (Nest's own interceptor chaining relies on it being a
+        // true Observable, not just an object exposing `subscribe`).
+        const wrap = (observable$: Observable<unknown>): Observable<unknown> =>
+          observable$.pipe(tap({ complete: record, error: record }));
+
+        // .call(this, ...) — the real intercept() needs its instance's own
+        // injected fields (e.g. TenantContextInterceptor's this.reflector),
+        // which a plain `original(context, next)` call would lose.
+        const result = original.call(this, context, next);
+        // TenantContextInterceptor's intercept() is itself async and
+        // resolves to an Observable — every other interceptor here returns
+        // an Observable synchronously (today's no-ops). Handle both shapes
+        // without altering the real return value.
+        if (result && typeof (result as Promise<unknown>).then === "function") {
+          return (result as Promise<Observable<unknown>>).then(wrap);
+        }
+        return wrap(result as Observable<unknown>);
+      };
+
+      vi.spyOn(Interceptor.prototype, "intercept").mockImplementation(traced as never);
+    }
+
+    const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
+    const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+
+    const response = await app.inject({ method: "GET", url: "/health/live" });
+
+    expect(response.statusCode).toBe(200);
+    expect(entries).toEqual(INTERCEPTOR_REGISTRATION_ORDER.map((I) => I.name));
+    expect(exits).toEqual([...INTERCEPTOR_REGISTRATION_ORDER].reverse().map((I) => I.name));
+
+    await app.close();
+  });
+});

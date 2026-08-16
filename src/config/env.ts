@@ -1,0 +1,40 @@
+import { envSchema, type Env } from "./env.schema.js";
+
+// STORY-022-E-4. Test scenario 6: "Start with a required configuration value
+// missing → Refuses to start, naming the value." Thrown at import/bootstrap
+// time (src/main.ts, src/worker.ts, src/gateway.ts all call loadEnv() before
+// anything else), never discovered lazily on first use.
+export class EnvValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EnvValidationError";
+  }
+}
+
+const KNOWN_KEYS = ["NODE_ENV", "PORT", "GATEWAY_PORT", "DATABASE_URL", "DATABASE_URL_POOLED", "WORKER_GROUP"] as const;
+
+/**
+ * process.env carries many OS/CI-supplied keys that are none of this
+ * schema's business (PATH, HOME, ...) — picking only the keys the schema
+ * knows about before parsing lets envSchema stay `.strict()` (catching a
+ * typo IN THIS FILE'S OWN key list) without rejecting the ambient
+ * environment wholesale, which would make every process unbootable.
+ */
+function pickKnown(source: NodeJS.ProcessEnv): Record<string, string | undefined> {
+  const picked: Record<string, string | undefined> = {};
+  for (const key of KNOWN_KEYS) {
+    if (source[key] !== undefined) {
+      picked[key] = source[key];
+    }
+  }
+  return picked;
+}
+
+export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
+  const result = envSchema.safeParse(pickKnown(source));
+  if (!result.success) {
+    const issues = result.error.issues.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`);
+    throw new EnvValidationError(`invalid environment configuration:\n  ${issues.join("\n  ")}`);
+  }
+  return result.data;
+}
