@@ -56,6 +56,11 @@ export const GLOBAL_TABLES = [
   "aux_rule_catalog",
   "task_generation_rules", // versioned reference catalogs
   "engine_health", // vendor reliability telemetry, not tenant data
+  // STORY-013 — release-train deploy-gate telemetry (src/db/purge-check.ts),
+  // same class as engine_health: platform ops state, not tenant data, and
+  // written by a job with no single tenant context. Migration
+  // 0007_partition_maintenance_and_retention.up.sql.
+  "purge_failures",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -199,6 +204,68 @@ const NO_PRIVILEGES: readonly TablePrivilege[] = [];
 // called out by security-and-tenancy.md §1/§2 — user_credentials (reachable
 // only by the auth path, nominara_app) and audit_log (append-only: insert
 // and select, never update or delete, for the two write-capable roles).
+// STORY-013 — data-model.md §5 partitioning / §8 vacuum and maintenance.
+// PARTITIONED_FACT_TABLES is the single source of truth src/workers/rollup/
+// maintenance.ts and retention.ts both import, rather than three separate
+// hand-typed literal arrays that could silently drift apart.
+export const PARTITIONED_FACT_TABLES = ["answer_captures", "mention_facts", "citation_facts"] as const;
+export type PartitionedFactTable = (typeof PARTITIONED_FACT_TABLES)[number];
+
+/** How many months AHEAD of the current month app.ensure_partitions-equivalent logic creates — data-model.md §5. */
+export const PARTITION_LEAD_MONTHS = 3;
+
+/** data-model.md §8 step 2 — partitions older than this move to COLD_TABLESPACE with fillfactor=100. */
+export const HOT_WINDOW_DAYS = 90;
+
+/** data-model.md §8 step 2. Provisioned outside migrations (a physical filesystem location, environment-specific — see this story's Implementation Decisions), never created by a portable migration. */
+export const COLD_TABLESPACE = "cold_tier";
+
+export interface VacuumTuning {
+  readonly vacuumScaleFactor: number;
+  readonly analyzeScaleFactor: number;
+  readonly fillfactor?: number;
+  readonly vacuumThreshold?: number;
+  readonly analyzeThreshold?: number;
+}
+
+// data-model.md §8 — "autovacuum_vacuum_scale_factor = 0.02 and
+// autovacuum_analyze_scale_factor = 0.01" on all six; usage_counters and
+// credit_wallets additionally get fillfactor=70 (already applied at table
+// creation, migration 0002) plus "a dedicated aggressive threshold" the
+// reference names but does not number — see this story's Implementation
+// Decisions section for the chosen values (25/25, half Postgres's own
+// default of 50).
+export const VACUUM_TUNED_TABLES: Readonly<Record<string, VacuumTuning>> = Object.freeze({
+  answer_captures: { vacuumScaleFactor: 0.02, analyzeScaleFactor: 0.01 },
+  mention_facts: { vacuumScaleFactor: 0.02, analyzeScaleFactor: 0.01 },
+  citation_facts: { vacuumScaleFactor: 0.02, analyzeScaleFactor: 0.01 },
+  metric_daily: { vacuumScaleFactor: 0.02, analyzeScaleFactor: 0.01 },
+  usage_counters: { vacuumScaleFactor: 0.02, analyzeScaleFactor: 0.01, fillfactor: 70, vacuumThreshold: 25, analyzeThreshold: 25 },
+  credit_wallets: { vacuumScaleFactor: 0.02, analyzeScaleFactor: 0.01, fillfactor: 70, vacuumThreshold: 25, analyzeThreshold: 25 },
+});
+
+export interface HnswIndexedTable {
+  readonly table: string;
+  readonly column: string;
+  readonly indexName: string;
+}
+
+// data-model.md §6 "Vector ANN" — deliberately excludes semantic_nodes (E-3
+// known defect, STORY-009: that table's literal DDL has neither an HNSW
+// index nor an embedding_model column, diverging from the reference table).
+export const HNSW_INDEXED_TABLES: readonly HnswIndexedTable[] = [
+  { table: "tracked_prompts", column: "embedding", indexName: "ix_prompts_embedding" },
+  { table: "topic_clusters", column: "centroid", indexName: "ix_topic_clusters_hnsw" },
+  { table: "content_chunks", column: "embedding", indexName: "ix_content_chunks_hnsw" },
+  { table: "corpus_passages", column: "embedding", indexName: "ix_corpus_hnsw" },
+] as const;
+
+/** data-model.md §8 step 4 — "regressed below 0.98". */
+export const VECTOR_RECALL_THRESHOLD = 0.98;
+
+/** data-model.md §8 step 4 — "rebuilding with ef_construction = 128". */
+export const HNSW_REBUILD_EF_CONSTRUCTION = 128;
+
 export function expectedTablePrivileges(role: string, table: string): readonly TablePrivilege[] {
   if (table === "user_credentials") {
     return role === "nominara_app" ? FULL_WRITE : NO_PRIVILEGES;

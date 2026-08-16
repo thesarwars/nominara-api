@@ -3,6 +3,7 @@ import { assertIso06Census } from "./assertions/iso-06-census.js";
 import { assertIso05PolicyShape } from "./assertions/iso-05-policy-shape.js";
 import { assertIso07NoBypassRls } from "./assertions/iso-07-no-bypassrls.js";
 import { assertIso16NoMaterializedViews } from "./assertions/iso-16-no-matviews.js";
+import { assertIso17PartitionRlsApplied } from "./assertions/iso-17-partition-rls-applied.js";
 import { getAssertionContext } from "./support/context.js";
 
 // STORY-012 Phase 1 (catalog) — order matters, ISO-06 first: the census is
@@ -28,5 +29,11 @@ describe("ISO-07 · no runtime role holds BYPASSRLS except nominara_breakglass",
 describe("ISO-16 · no materialized view exists; migration lint enforces it", () => {
   it("holds against the live schema and every committed migration file", async () => {
     await expect(assertIso16NoMaterializedViews(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-17 · a partition the maintenance job creates carries app.apply_tenant_rls before it takes writes", () => {
+  it("queried directly, with no tenant context, as nominara_app — zero rows", async () => {
+    await expect(assertIso17PartitionRlsApplied(getAssertionContext())).resolves.toBeUndefined();
   });
 });

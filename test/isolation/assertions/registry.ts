@@ -18,6 +18,7 @@ import { assertIso13CacheNamespacing, iso13Breaker } from "./iso-13-cache-namesp
 import { assertIso14ObjectNamespacing, iso14Breaker } from "./iso-14-object-namespace.js";
 import { assertIso15AggregateAnonymity, iso15Breaker } from "./iso-15-aggregate-anonymity.js";
 import { assertIso16NoMaterializedViews, iso16Breaker } from "./iso-16-no-matviews.js";
+import { assertIso17AgainstMissingApplyTenantRls, assertIso17PartitionRlsApplied, iso17Breaker } from "./iso-17-partition-rls-applied.js";
 
 // STORY-012 — the single place every registered assertion AND its paired
 // breaker are aggregated. test/isolation/meta/breaker-matrix.spec.ts (T27)
@@ -118,6 +119,17 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
   },
   { id: "ISO-15", needsDatabase: true, readOnly: false, needsFixture: true, assert: assertIso15AggregateAnonymity, assertUnderBreaker: assertIso15AggregateAnonymity, breaker: iso15Breaker },
   { id: "ISO-16", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso16NoMaterializedViews, assertUnderBreaker: assertIso16NoMaterializedViews, breaker: iso16Breaker },
+  // readOnly: false — creates a partition and inserts a probe row (DDL + a
+  // write), so it is excluded from the staging read-only subset like ISO-10.
+  {
+    id: "ISO-17",
+    needsDatabase: true,
+    readOnly: false,
+    needsFixture: false,
+    assert: assertIso17PartitionRlsApplied,
+    assertUnderBreaker: assertIso17AgainstMissingApplyTenantRls,
+    breaker: iso17Breaker,
+  },
 ];
 
 // STORY-012 T24 · D-6 — ISOLATION_TARGET=staging runs ONLY the read-only,

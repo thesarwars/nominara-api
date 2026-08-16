@@ -1,0 +1,764 @@
+import { fileURLToPath } from "node:url";
+import type { ClientBase } from "pg";
+import type { PurgeFailureDetail } from "../../../contracts/ops/purge-failure-detail.schema.js";
+import { connect, requireDatabaseUrl } from "../../db/client.js";
+import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
+import { withTenantContext } from "../../tenancy/tenant-context.js";
+import { listPartitions } from "./maintenance.js";
+
+// STORY-013 — data-model.md §7 "Retention, erasure and the deletion
+// cascade". The nightly retention cascade + orphan scan. Same "plain,
+// exported, dependency-free TS function" surface as maintenance.ts — see
+// that file's header comment for the full rationale.
+//
+// PRIVILEGE CONTRACT (corrected, second-engineer review — the previous
+// wording was wrong for exactly two functions, see below):
+//
+// - Genuinely workspace/project-SCOPED functions that open (or are called
+//   within) their own `withTenantContext` transaction and issue only
+//   ordinary DML — `softDeleteProject`, `hardDeleteProject`,
+//   `requestWorkspaceDeletion`, `expireRawCaptures`, `expireRollups`,
+//   `expireDerivedAnalyses`, `expireAttributionDaily`,
+//   `expireToolSnapshotsForWorkspace`, `tryPurgeProject`, `withExportLock` —
+//   ARE safe on the ordinary `nominara_worker` runtime role: `nominara_worker`
+//   holds SELECT/INSERT/UPDATE/DELETE on every tenant table (migration 0005)
+//   and RLS enforces the single workspace named by the context that was set.
+//   Proven, not just claimed: test/integration/retention-cascade.spec.ts
+//   connects as `nominara_worker` (via `connectAsRole`) for every one of
+//   these.
+//
+// - Functions that DISCOVER targets ACROSS every workspace with NO tenant
+//   context set — `runNightlySweep`, `runDailyPurgeCycle`,
+//   `scanForOrphans`/`runOrphanScan`, `resolveWorkspaceRetention`,
+//   `collectComplianceExport`, `workspaceProjectsWithOpenExports` — issue a
+//   cross-tenant SELECT against tables
+//   that carry FORCE ROW LEVEL SECURITY (migration 0006). Under
+//   `nominara_worker` (no BYPASSRLS, not the table owner), a query with no
+//   `app.current_workspace_id` set is filtered to ZERO rows by the
+//   `ws_isolation_*` policies — not merely "unsafe", genuinely unable to see
+//   anything, so the sweep would silently do nothing every night. This needs
+//   the SAME privileged-connection contract `pnpm db:rls-check`/
+//   `db:rls-generate` and every migration already run under (README.md gap
+//   G-4). Proven, not just claimed: retention-cascade.spec.ts includes an
+//   explicit test connecting as `nominara_worker` with no context set and
+//   asserting it sees zero workspaces/fact rows where the superuser
+//   connection sees real ones.
+//
+// - `executeWorkspaceHardDelete`/`requestIndividualErasure` ALSO need a
+//   privileged connection, for a THIRD, DIFFERENT reason that has nothing to
+//   do with RLS filtering: both issue `ALTER TABLE ... DISABLE/ENABLE
+//   TRIGGER` on `audit_log`/`credit_ledger`, which requires TABLE OWNERSHIP
+//   — `nominara_worker`'s GRANTs (even APPEND_ONLY on audit_log) never confer
+//   that, no matter what tenant context is set. (The previous version of this
+//   comment incorrectly lumped these two into the first, "safe on
+//   nominara_worker" bucket, because they ARE single-workspace/single-user
+//   scoped — that part was true, but irrelevant to why they need privilege.)
+//   Proven, not just claimed: retention-cascade.spec.ts includes an explicit
+//   test connecting as `nominara_worker` and asserting the `ALTER TABLE ...
+//   DISABLE TRIGGER` step fails with a permission error.
+
+function quoteIdent(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+// ---------------------------------------------------------------------------
+// Retention-window resolution — plans.entitlements->>'retention.*_days'.
+// `null` and the literal string "unlimited" both mean "never purge" (this
+// story's own instruction); a numeric value is a day count.
+// ---------------------------------------------------------------------------
+
+export type RetentionWindow = number | "unlimited" | null;
+
+export function resolveRetentionCutoff(window: RetentionWindow, referenceDate: Date): Date | null {
+  if (window === null || window === "unlimited") {
+    return null;
+  }
+  return new Date(referenceDate.getTime() - window * 86_400_000);
+}
+
+export interface WorkspaceRetention {
+  readonly rawCapturesDays: RetentionWindow;
+  readonly rollupsDays: RetentionWindow;
+}
+
+export async function resolveWorkspaceRetention(client: ClientBase, workspaceId: string): Promise<WorkspaceRetention> {
+  const result = await client.query<{ raw: unknown; rollups: unknown }>(
+    `SELECT p.entitlements->'retention.raw_captures_days' AS raw,
+            p.entitlements->'retention.rollups_days'       AS rollups
+       FROM workspaces w
+       JOIN plans p ON p.key = w.plan_key
+      WHERE w.id = $1`,
+    [workspaceId],
+  );
+  const row = result.rows[0];
+  if (!row) {
+    throw new Error(`resolveWorkspaceRetention: workspace ${workspaceId} not found`);
+  }
+  return { rawCapturesDays: row.raw as RetentionWindow, rollupsDays: row.rollups as RetentionWindow };
+}
+
+// ---------------------------------------------------------------------------
+// Project soft delete — data-model.md §7 "immediate": deleted_at set, prompts
+// paused, scheduled runs cancelled, data retained.
+// ---------------------------------------------------------------------------
+
+export async function softDeleteProject(
+  client: ClientBase,
+  workspaceId: string,
+  projectId: string,
+  actorId: string = SYSTEM_ACTOR_ID,
+): Promise<void> {
+  await withTenantContext(client, { workspaceId, actorId }, async (tx) => {
+    await tx.query("UPDATE projects SET deleted_at = now(), next_run_at = NULL WHERE id = $1 AND deleted_at IS NULL", [
+      projectId,
+    ]);
+    await tx.query("UPDATE tracked_prompts SET status = 'paused' WHERE project_id = $1 AND status = 'active'", [projectId]);
+    await tx.query("UPDATE capture_runs SET status = 'canceled' WHERE project_id = $1 AND status = 'queued'", [projectId]);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Project hard delete (≤24h after soft delete + 30d grace, or on request) —
+// data-model.md §7. Everything EXCEPT the three partitioned fact tables
+// cascades automatically via `project_id REFERENCES projects(id) ON DELETE
+// CASCADE` (rollups, milestones, tasks, AUX rows, alignment sessions, chunks,
+// passages, semantic nodes, patches, source index all carry that FK already
+// — see this story's Implementation Decisions). This function therefore
+// orchestrates ONLY the no-FK fact-table deletes and the S3-prefix delete,
+// per this story's own Technical Notes.
+// ---------------------------------------------------------------------------
+
+export interface HardDeleteProjectOptions {
+  readonly actorId?: string;
+  /** `{env}/{workspace_id}/...` — security-and-tenancy.md §10 ISO-14's object-key namespacing convention. Defaults to `process.env.NOMINARA_ENV ?? "local"`. */
+  readonly env?: string;
+  readonly deleteObjectPrefix?: (prefix: string) => Promise<void>;
+}
+
+export async function hardDeleteProject(
+  client: ClientBase,
+  workspaceId: string,
+  projectId: string,
+  options: HardDeleteProjectOptions = {},
+): Promise<void> {
+  await withTenantContext(client, { workspaceId, actorId: options.actorId ?? SYSTEM_ACTOR_ID }, async (tx) => {
+    await tx.query("DELETE FROM citation_facts WHERE project_id = $1", [projectId]);
+    await tx.query("DELETE FROM mention_facts WHERE project_id = $1", [projectId]);
+    await tx.query("DELETE FROM answer_captures WHERE project_id = $1", [projectId]);
+    await tx.query("DELETE FROM projects WHERE id = $1", [projectId]);
+  });
+
+  if (!options.deleteObjectPrefix) {
+    throw new Error(
+      "hardDeleteProject: no deleteObjectPrefix callback supplied — no object-storage client exists in this repo yet (disclosed gap, see README.md)",
+    );
+  }
+  const env = options.env ?? process.env.NOMINARA_ENV ?? "local";
+  await options.deleteObjectPrefix(`${env}/${workspaceId}/projects/${projectId}/`);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace deletion request — immediate lock, 30-day grace.
+// ---------------------------------------------------------------------------
+
+export const WORKSPACE_DELETION_GRACE_DAYS = 30;
+
+export async function requestWorkspaceDeletion(
+  client: ClientBase,
+  workspaceId: string,
+  referenceDate: Date = new Date(),
+): Promise<void> {
+  const executeAt = new Date(referenceDate.getTime() + WORKSPACE_DELETION_GRACE_DAYS * 86_400_000);
+  await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+    await tx.query(
+      `UPDATE workspaces
+          SET status = 'pending_deletion', deletion_requested_at = $2, deletion_execute_at = $3
+        WHERE id = $1`,
+      [workspaceId, referenceDate.toISOString(), executeAt.toISOString()],
+    );
+    await tx.query("UPDATE share_tokens SET revoked_at = now() WHERE workspace_id = $1 AND revoked_at IS NULL", [workspaceId]);
+    await tx.query("UPDATE custom_domains SET status = 'disabled' WHERE workspace_id = $1 AND status <> 'disabled'", [
+      workspaceId,
+    ]);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Workspace hard delete (at deletion_execute_at) — export the two surviving
+// record sets FIRST, then the cascade. Requires a PRIVILEGED (table-owner)
+// connection: `audit_log`/`credit_ledger` both carry the append-only
+// `reject_update_delete` trigger (migration 0002/0004), which blocks the
+// `ON DELETE CASCADE` from `workspaces` from ever completing (STORY-007's
+// own "KNOWN OPEN CONSTRAINT" — see 0002_identity_tenancy_billing.up.sql).
+// This is that constraint's resolution: the trigger is disabled for the
+// span of this one controlled, export-then-purge operation, and
+// unconditionally re-enabled afterward (even on failure).
+// ---------------------------------------------------------------------------
+
+export interface ComplianceExportRow {
+  readonly table: "audit_log" | "credit_ledger";
+  readonly rows: readonly Record<string, unknown>[];
+}
+
+export async function collectComplianceExport(client: ClientBase, workspaceId: string): Promise<ComplianceExportRow[]> {
+  const auditLog = await client.query("SELECT * FROM audit_log WHERE workspace_id = $1 ORDER BY seq", [workspaceId]);
+  const creditLedger = await client.query("SELECT * FROM credit_ledger WHERE workspace_id = $1 ORDER BY occurred_at", [
+    workspaceId,
+  ]);
+  return [
+    { table: "audit_log", rows: auditLog.rows },
+    { table: "credit_ledger", rows: creditLedger.rows },
+  ];
+}
+
+export interface ExecuteWorkspaceHardDeleteOptions {
+  readonly exportComplianceRecords: (records: readonly ComplianceExportRow[]) => Promise<void>;
+}
+
+export async function executeWorkspaceHardDelete(
+  privilegedClient: ClientBase,
+  workspaceId: string,
+  options: ExecuteWorkspaceHardDeleteOptions,
+): Promise<void> {
+  const exportData = await collectComplianceExport(privilegedClient, workspaceId);
+  // Export precedes the cascade — data-model.md §7: "The cascade would
+  // otherwise delete them, which is why the export precedes it rather than
+  // following it."
+  await options.exportComplianceRecords(exportData);
+
+  // Blocking (code review): ENABLE TRIGGER used to run in a `finally` block
+  // AFTER COMMIT — as new, separately autocommitted statements. Once COMMIT
+  // ran, the disabled-trigger state was durable and visible to every OTHER
+  // session for the entire window until those ENABLE calls completed (a
+  // concurrent session could UPDATE/DELETE ANY workspace's audit_log/
+  // credit_ledger with no append-only guard), and a crash between COMMIT and
+  // ENABLE left the trigger permanently disabled with no recovery path.
+  // `ALTER TABLE ... DISABLE/ENABLE TRIGGER` is itself transactional DDL, so
+  // moving ENABLE TRIGGER to run INSIDE this transaction, before COMMIT,
+  // closes both problems: on the success path the trigger is re-enabled
+  // before anyone else can observe the disabled state, and on any failure
+  // the ROLLBACK undoes the DISABLE automatically — no separate re-enable
+  // step is needed or run on that path.
+  await privilegedClient.query("BEGIN");
+  try {
+    await privilegedClient.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
+    await privilegedClient.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
+    await privilegedClient.query("DELETE FROM workspaces WHERE id = $1", [workspaceId]);
+    await privilegedClient.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
+    await privilegedClient.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
+    await privilegedClient.query("COMMIT");
+  } catch (error) {
+    await privilegedClient.query("ROLLBACK");
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Individual erasure request — anonymise `users`, reassign authored
+// task_events/milestones to SYSTEM_ACTOR_ID, pseudonymise audit_log/
+// credit_ledger actor ids. Blocked outright if the requester is the sole
+// active owner of any workspace (ux_members_single_owner).
+// ---------------------------------------------------------------------------
+
+export const SOLE_OWNER_ERASURE_BLOCK_REASON =
+  "You are the sole owner of at least one workspace. Transfer ownership, or delete the workspace, before an erasure request can be completed.";
+
+export type ErasureResult = { readonly blocked: true; readonly reason: string } | { readonly blocked: false };
+
+export async function requestIndividualErasure(privilegedClient: ClientBase, userId: string): Promise<ErasureResult> {
+  // audit_log and credit_ledger both carry the append-only
+  // `reject_update_delete` trigger (migrations 0002/0004) — it raises on
+  // ANY UPDATE unconditionally, so pseudonymising actor_id on either table
+  // needs the SAME disable/re-enable dance as executeWorkspaceHardDelete's
+  // resolution of STORY-007's deferred cascade constraint.
+  //
+  // Should-fix #8 (TOCTOU): the sole-owner check now runs INSIDE this same
+  // transaction, with `FOR UPDATE` locking the requester's own active-owner
+  // row(s) — it used to run as a standalone query BEFORE BEGIN, so a
+  // concurrent ownership transfer could complete between the check and the
+  // anonymization work below. Locking the row here means a concurrent
+  // transfer touching the SAME row blocks until this transaction finishes,
+  // closing that gap.
+  //
+  // Blocking (code review, same fix as executeWorkspaceHardDelete): ENABLE
+  // TRIGGER now runs INSIDE this transaction, before COMMIT, not in a
+  // `finally` after it — `ALTER TABLE ... DISABLE/ENABLE TRIGGER` is
+  // transactional DDL, so a ROLLBACK already undoes the DISABLE with no
+  // separate re-enable step needed.
+  await privilegedClient.query("BEGIN");
+  try {
+    const soleOwner = await privilegedClient.query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM workspace_members WHERE user_id = $1 AND role = 'owner' AND status = 'active' FOR UPDATE
+       ) AS exists`,
+      [userId],
+    );
+    if (soleOwner.rows[0]!.exists) {
+      await privilegedClient.query("ROLLBACK");
+      return { blocked: true, reason: SOLE_OWNER_ERASURE_BLOCK_REASON };
+    }
+
+    await privilegedClient.query(
+      `UPDATE users
+          SET email = 'deleted+' || id || '@nominara.invalid',
+              full_name = NULL,
+              avatar_url = NULL,
+              status = 'deleted',
+              deleted_at = now()
+        WHERE id = $1`,
+      [userId],
+    );
+    await privilegedClient.query("UPDATE workspace_members SET status = 'removed' WHERE user_id = $1", [userId]);
+    await privilegedClient.query("UPDATE task_events SET actor_id = $2, actor_type = 'system' WHERE actor_id = $1", [
+      userId,
+      SYSTEM_ACTOR_ID,
+    ]);
+    await privilegedClient.query("UPDATE milestones SET created_by = $2 WHERE created_by = $1", [userId, SYSTEM_ACTOR_ID]);
+    await privilegedClient.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
+    await privilegedClient.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
+    await privilegedClient.query("UPDATE audit_log SET actor_id = $2 WHERE actor_id = $1", [userId, SYSTEM_ACTOR_ID]);
+    await privilegedClient.query("UPDATE credit_ledger SET actor_id = $2 WHERE actor_id = $1", [userId, SYSTEM_ACTOR_ID]);
+    await privilegedClient.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
+    await privilegedClient.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
+    await privilegedClient.query("COMMIT");
+  } catch (error) {
+    await privilegedClient.query("ROLLBACK");
+    throw error;
+  }
+  return { blocked: false };
+}
+
+// ---------------------------------------------------------------------------
+// Raw-capture expiry — nulls raw_object_key, marks payload.raw_expired,
+// retains rollups (metric_daily) and the excerpt (response_excerpt).
+// ---------------------------------------------------------------------------
+
+export async function expireRawCaptures(
+  client: ClientBase,
+  workspaceId: string,
+  retentionDays: RetentionWindow,
+  referenceDate: Date = new Date(),
+): Promise<number> {
+  const cutoff = resolveRetentionCutoff(retentionDays, referenceDate);
+  if (cutoff === null) return 0;
+  return withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+    const result = await tx.query(
+      `UPDATE answer_captures
+          SET raw_object_key = NULL,
+              payload = jsonb_set(payload, '{raw_expired}', 'true'::jsonb, true)
+        WHERE workspace_id = $1 AND captured_at < $2 AND raw_object_key IS NOT NULL`,
+      [workspaceId, cutoff.toISOString()],
+    );
+    return result.rowCount ?? 0;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Rollup expiry — metric_daily deleted; milestones NEVER touched here.
+// ---------------------------------------------------------------------------
+
+export async function expireRollups(
+  client: ClientBase,
+  workspaceId: string,
+  rollupsRetentionDays: RetentionWindow,
+  referenceDate: Date = new Date(),
+): Promise<number> {
+  const cutoff = resolveRetentionCutoff(rollupsRetentionDays, referenceDate);
+  if (cutoff === null) return 0;
+  return withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+    const result = await tx.query("DELETE FROM metric_daily WHERE workspace_id = $1 AND metric_date < $2", [
+      workspaceId,
+      cutoff.toISOString().slice(0, 10),
+    ]);
+    return result.rowCount ?? 0;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Derived-analysis expiry — geo_analyses, attribution_url_rollup,
+// topic_clusters, all at rollup-retention cadence (recomputable from facts).
+// ---------------------------------------------------------------------------
+
+export interface DerivedAnalysesExpired {
+  readonly geoAnalyses: number;
+  readonly attributionUrlRollup: number;
+  readonly topicClusters: number;
+}
+
+export async function expireDerivedAnalyses(
+  client: ClientBase,
+  workspaceId: string,
+  rollupsRetentionDays: RetentionWindow,
+  referenceDate: Date = new Date(),
+): Promise<DerivedAnalysesExpired> {
+  const cutoff = resolveRetentionCutoff(rollupsRetentionDays, referenceDate);
+  if (cutoff === null) return { geoAnalyses: 0, attributionUrlRollup: 0, topicClusters: 0 };
+  return withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+    const geo = await tx.query("DELETE FROM geo_analyses WHERE workspace_id = $1 AND computed_at < $2", [
+      workspaceId,
+      cutoff.toISOString(),
+    ]);
+    const attribution = await tx.query(
+      "DELETE FROM attribution_url_rollup WHERE workspace_id = $1 AND computed_at < $2",
+      [workspaceId, cutoff.toISOString()],
+    );
+    const topics = await tx.query("DELETE FROM topic_clusters WHERE workspace_id = $1 AND computed_at < $2", [
+      workspaceId,
+      cutoff.toISOString(),
+    ]);
+    return {
+      geoAnalyses: geo.rowCount ?? 0,
+      attributionUrlRollup: attribution.rowCount ?? 0,
+      topicClusters: topics.rowCount ?? 0,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// attribution_daily expiry — rollup retention cadence, never per-visitor.
+// ---------------------------------------------------------------------------
+
+export async function expireAttributionDaily(
+  client: ClientBase,
+  workspaceId: string,
+  rollupsRetentionDays: RetentionWindow,
+  referenceDate: Date = new Date(),
+): Promise<number> {
+  const cutoff = resolveRetentionCutoff(rollupsRetentionDays, referenceDate);
+  if (cutoff === null) return 0;
+  return withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+    const result = await tx.query("DELETE FROM attribution_daily WHERE workspace_id = $1 AND metric_date < $2", [
+      workspaceId,
+      cutoff.toISOString().slice(0, 10),
+    ]);
+    return result.rowCount ?? 0;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tool-snapshot expiry — nulls result_json, keeps headline metrics
+// (sov_estimate, citation_count, sentiment_label, brand_present, aux_score,
+// entities_found, pages_scanned, items_kept), sets status='expired'.
+// ---------------------------------------------------------------------------
+
+export async function expireToolSnapshotsForWorkspace(
+  client: ClientBase,
+  workspaceId: string,
+  referenceDate: Date = new Date(),
+): Promise<number> {
+  return withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+    const result = await tx.query(
+      `UPDATE tool_runs
+          SET status = 'expired', result_json = NULL
+        WHERE workspace_id = $1 AND status <> 'expired' AND expires_at <= $2`,
+      [workspaceId, referenceDate.toISOString()],
+    );
+    return result.rowCount ?? 0;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Nightly orphan scan — data-model.md §5 "the price of partitioning without
+// foreign keys": zero fact rows without a parent answer_captures row for
+// that (captured_at, result_id), per partition, and PAGES on non-zero.
+//
+// No PagerDuty/alert-paging integration exists anywhere in this repo yet
+// (the same disclosed absence as README.md gap G-1 — this is not a new
+// gap). A thrown error (non-zero process exit from `pnpm db:maintenance:
+// sweep`) is the strongest "page" a script-only environment can produce
+// today, and is deliberately NOT a passive log line — see this story's
+// Implementation Decisions.
+// ---------------------------------------------------------------------------
+
+export interface OrphanReport {
+  readonly table: "mention_facts" | "citation_facts";
+  readonly partition: string;
+  readonly orphanCount: number;
+}
+
+export async function scanForOrphans(client: ClientBase): Promise<OrphanReport[]> {
+  const reports: OrphanReport[] = [];
+  for (const table of ["mention_facts", "citation_facts"] as const) {
+    for (const partition of await listPartitions(client, table)) {
+      const result = await client.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM ${quoteIdent(partition.name)} f
+          WHERE NOT EXISTS (
+            SELECT 1 FROM answer_captures a WHERE a.id = f.result_id AND a.captured_at = f.captured_at
+          )`,
+      );
+      const orphanCount = Number(result.rows[0]!.count);
+      if (orphanCount > 0) {
+        reports.push({ table, partition: partition.name, orphanCount });
+      }
+    }
+  }
+  return reports;
+}
+
+export const ORPHAN_SCAN_PAGE_MESSAGE = "orphan fact row(s) detected — a fact was written outside its parent's transaction";
+
+export async function runOrphanScan(client: ClientBase): Promise<OrphanReport[]> {
+  const reports = await scanForOrphans(client);
+  if (reports.length > 0) {
+    // Deliberately not an interpolated-segment-then-slash shape (ISO-14's
+    // scanner over src/ flags that exact shape as a possible un-namespaced
+    // object key) — this is a diagnostic message, not an object key.
+    const detail = reports.map((r) => `table=${r.table} partition=${r.partition} count=${r.orphanCount}`).join(", ");
+    throw new Error(`${ORPHAN_SCAN_PAGE_MESSAGE}: ${detail}`);
+  }
+  return reports;
+}
+
+// ---------------------------------------------------------------------------
+// Export lock blocks purge — an active export holds a BLOCKING advisory lock
+// on the project's purge for the export's duration; the purge job's
+// per-project loop uses `pg_try_advisory_lock` and skips+retries next cycle.
+// ---------------------------------------------------------------------------
+
+function purgeLockKey(projectId: string): string {
+  return `export.purge.${projectId}`;
+}
+
+export async function withExportLock<T>(client: ClientBase, projectId: string, fn: () => Promise<T>): Promise<T> {
+  await client.query("SELECT pg_advisory_lock(hashtext($1)::bigint)", [purgeLockKey(projectId)]);
+  try {
+    return await fn();
+  } finally {
+    await client.query("SELECT pg_advisory_unlock(hashtext($1)::bigint)", [purgeLockKey(projectId)]);
+  }
+}
+
+export interface PurgeSkipped {
+  readonly scope: "project" | "workspace";
+  readonly scopeId: string;
+  readonly reason: "export-lock-held";
+}
+
+export type TryPurgeOutcome = PurgeSkipped | { readonly scope: "project"; readonly scopeId: string; readonly purged: true };
+
+export async function tryPurgeProject(
+  client: ClientBase,
+  projectId: string,
+  fn: (client: ClientBase) => Promise<void>,
+): Promise<TryPurgeOutcome> {
+  const acquired = await client.query<{ locked: boolean }>("SELECT pg_try_advisory_lock(hashtext($1)::bigint) AS locked", [
+    purgeLockKey(projectId),
+  ]);
+  if (!acquired.rows[0]!.locked) {
+    return { scope: "project", scopeId: projectId, reason: "export-lock-held" };
+  }
+  try {
+    await fn(client);
+    return { scope: "project", scopeId: projectId, purged: true };
+  } finally {
+    await client.query("SELECT pg_advisory_unlock(hashtext($1)::bigint)", [purgeLockKey(projectId)]);
+  }
+}
+
+/**
+ * The project ids WITHIN `workspaceId` that currently hold an open export
+ * lock — a non-mutating probe (acquires then immediately releases
+ * `pg_try_advisory_lock` for every project that ISN'T locked, to avoid
+ * leaking a lock this function never intended to hold).
+ */
+export async function workspaceProjectsWithOpenExports(client: ClientBase, workspaceId: string): Promise<string[]> {
+  const projects = await client.query<{ id: string }>("SELECT id FROM projects WHERE workspace_id = $1", [workspaceId]);
+  const locked: string[] = [];
+  for (const { id } of projects.rows) {
+    const probe = await client.query<{ locked: boolean }>("SELECT pg_try_advisory_lock(hashtext($1)::bigint) AS locked", [
+      purgeLockKey(id),
+    ]);
+    if (probe.rows[0]!.locked) {
+      await client.query("SELECT pg_advisory_unlock(hashtext($1)::bigint)", [purgeLockKey(id)]);
+    } else {
+      locked.push(id);
+    }
+  }
+  return locked;
+}
+
+// ---------------------------------------------------------------------------
+// purge_failures persistence — a purge job failure requires an explicit
+// resolution (`resolved_at` set), never a silent retry-clears-it path.
+// ---------------------------------------------------------------------------
+
+export interface RecordPurgeFailureInput {
+  readonly scope: "project" | "workspace";
+  readonly scopeId: string;
+  readonly reason: string;
+  readonly detail?: PurgeFailureDetail;
+}
+
+export async function recordPurgeFailure(client: ClientBase, input: RecordPurgeFailureInput): Promise<void> {
+  await client.query("INSERT INTO purge_failures (scope, scope_id, reason, detail) VALUES ($1, $2, $3, $4)", [
+    input.scope,
+    input.scopeId,
+    input.reason,
+    input.detail === undefined ? null : JSON.stringify(input.detail),
+  ]);
+}
+
+export async function resolvePurgeFailure(client: ClientBase, id: string, resolvedBy: string): Promise<void> {
+  await client.query("UPDATE purge_failures SET resolved_at = now(), resolved_by = $2 WHERE id = $1", [id, resolvedBy]);
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration — the nightly sweep (expiries + orphan scan, per active
+// workspace) and the daily purge cycle (project/workspace hard deletes,
+// export-lock aware).
+// ---------------------------------------------------------------------------
+
+export interface NightlySweepResult {
+  readonly rawCapturesExpired: number;
+  readonly rollupsExpired: number;
+  readonly derivedAnalysesExpired: DerivedAnalysesExpired;
+  readonly attributionDailyExpired: number;
+  readonly toolSnapshotsExpired: number;
+  readonly orphans: readonly OrphanReport[];
+}
+
+export async function runNightlySweep(privilegedClient: ClientBase, referenceDate: Date = new Date()): Promise<NightlySweepResult> {
+  const workspaces = await privilegedClient.query<{ id: string }>(
+    "SELECT id FROM workspaces WHERE deleted_at IS NULL AND status <> 'pending_deletion'",
+  );
+
+  let rawCapturesExpired = 0;
+  let rollupsExpired = 0;
+  let attributionDailyExpired = 0;
+  let toolSnapshotsExpired = 0;
+  const derivedAnalysesExpired: { geoAnalyses: number; attributionUrlRollup: number; topicClusters: number } = {
+    geoAnalyses: 0,
+    attributionUrlRollup: 0,
+    topicClusters: 0,
+  };
+
+  for (const { id: workspaceId } of workspaces.rows) {
+    const retention = await resolveWorkspaceRetention(privilegedClient, workspaceId);
+    rawCapturesExpired += await expireRawCaptures(privilegedClient, workspaceId, retention.rawCapturesDays, referenceDate);
+    rollupsExpired += await expireRollups(privilegedClient, workspaceId, retention.rollupsDays, referenceDate);
+    const derived = await expireDerivedAnalyses(privilegedClient, workspaceId, retention.rollupsDays, referenceDate);
+    derivedAnalysesExpired.geoAnalyses += derived.geoAnalyses;
+    derivedAnalysesExpired.attributionUrlRollup += derived.attributionUrlRollup;
+    derivedAnalysesExpired.topicClusters += derived.topicClusters;
+    attributionDailyExpired += await expireAttributionDaily(privilegedClient, workspaceId, retention.rollupsDays, referenceDate);
+    toolSnapshotsExpired += await expireToolSnapshotsForWorkspace(privilegedClient, workspaceId, referenceDate);
+  }
+
+  const orphans = await scanForOrphans(privilegedClient);
+
+  return {
+    rawCapturesExpired,
+    rollupsExpired,
+    derivedAnalysesExpired,
+    attributionDailyExpired,
+    toolSnapshotsExpired,
+    orphans,
+  };
+}
+
+export interface DailyPurgeCycleOptions {
+  readonly referenceDate?: Date;
+  readonly deleteObjectPrefix?: (prefix: string) => Promise<void>;
+  readonly exportComplianceRecords?: (records: readonly ComplianceExportRow[]) => Promise<void>;
+}
+
+export interface DailyPurgeCycleResult {
+  readonly projectsPurged: readonly string[];
+  readonly workspacesPurged: readonly string[];
+  readonly skipped: readonly PurgeSkipped[];
+}
+
+export async function runDailyPurgeCycle(
+  privilegedClient: ClientBase,
+  options: DailyPurgeCycleOptions = {},
+): Promise<DailyPurgeCycleResult> {
+  const referenceDate = options.referenceDate ?? new Date();
+  const hardDeleteCutoff = new Date(referenceDate.getTime() - 30 * 86_400_000);
+
+  const dueProjects = await privilegedClient.query<{ id: string; workspace_id: string }>(
+    "SELECT id, workspace_id FROM projects WHERE deleted_at IS NOT NULL AND deleted_at <= $1",
+    [hardDeleteCutoff.toISOString()],
+  );
+
+  const projectsPurged: string[] = [];
+  const skipped: PurgeSkipped[] = [];
+  for (const project of dueProjects.rows) {
+    // Blocking (code review): one project's purge failure must not abort
+    // every remaining dueProjects row AND the entire dueWorkspaces loop that
+    // follows. recordPurgeFailure already persisted the failure (inside
+    // tryPurgeProject's callback below) before this rethrows — this try/catch
+    // exists ONLY to stop that rethrow from propagating past this one
+    // project's iteration.
+    try {
+      const outcome = await tryPurgeProject(privilegedClient, project.id, async (tx) => {
+        try {
+          const hardDeleteOptions: HardDeleteProjectOptions = options.deleteObjectPrefix
+            ? { deleteObjectPrefix: options.deleteObjectPrefix }
+            : {};
+          await hardDeleteProject(tx, project.workspace_id, project.id, hardDeleteOptions);
+        } catch (error) {
+          await recordPurgeFailure(tx, { scope: "project", scopeId: project.id, reason: (error as Error).message });
+          throw error;
+        }
+      });
+      if ("purged" in outcome) {
+        projectsPurged.push(project.id);
+      } else {
+        skipped.push(outcome);
+      }
+    } catch {
+      // Already recorded in purge_failures above; continue with the next
+      // due project rather than aborting the whole cycle.
+    }
+  }
+
+  const dueWorkspaces = await privilegedClient.query<{ id: string }>(
+    "SELECT id FROM workspaces WHERE status = 'pending_deletion' AND deletion_execute_at <= $1",
+    [referenceDate.toISOString()],
+  );
+  const workspacesPurged: string[] = [];
+  for (const workspace of dueWorkspaces.rows) {
+    const openExports = await workspaceProjectsWithOpenExports(privilegedClient, workspace.id);
+    if (openExports.length > 0) {
+      skipped.push({ scope: "workspace", scopeId: workspace.id, reason: "export-lock-held" });
+      continue;
+    }
+    try {
+      await executeWorkspaceHardDelete(privilegedClient, workspace.id, {
+        exportComplianceRecords:
+          options.exportComplianceRecords ??
+          (async () => {
+            throw new Error(
+              "executeWorkspaceHardDelete: no exportComplianceRecords callback supplied — no object-storage client exists in this repo yet (disclosed gap)",
+            );
+          }),
+      });
+      workspacesPurged.push(workspace.id);
+    } catch (error) {
+      await recordPurgeFailure(privilegedClient, { scope: "workspace", scopeId: workspace.id, reason: (error as Error).message });
+    }
+  }
+
+  return { projectsPurged, workspacesPurged, skipped };
+}
+
+async function main(): Promise<void> {
+  const client = await connect(requireDatabaseUrl());
+  try {
+    const sweep = await runNightlySweep(client);
+    console.log(JSON.stringify(sweep, null, 2));
+    const purgeCycle = await runDailyPurgeCycle(client);
+    console.log(JSON.stringify(purgeCycle, null, 2));
+    if (sweep.orphans.length > 0) {
+      console.error(`db:maintenance:sweep: ${ORPHAN_SCAN_PAGE_MESSAGE}: ${JSON.stringify(sweep.orphans)}`);
+      process.exitCode = 1;
+    }
+  } finally {
+    await client.end();
+  }
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  await main();
+}

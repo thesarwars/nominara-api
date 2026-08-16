@@ -391,8 +391,9 @@ pre-existed.
   item 11) covers every classifiable tenant BASE table by name, but
   structurally cannot cover partition CHILD table names** (e.g.
   `answer_captures_2026_08`), because those are computed dynamically at
-  migration-apply time / by a future STORY-013 maintenance job, not known
-  ahead of time the way a base table's name is. A query naming a partition
+  migration-apply time / by STORY-013's maintenance job
+  (`src/workers/rollup/maintenance.ts`), not known ahead of time the way a
+  base table's name is. A query naming a partition
   child directly, instead of its parent, is therefore invisible to
   `src/tenancy/query-guard.ts`'s heuristic — RLS itself (migration `0006` +
   `app.apply_tenant_rls`) is the actual security boundary and is not fooled
@@ -425,3 +426,76 @@ pre-existed.
   aggregation path (none exists yet). It is a self-fulfilling property test
   of the anonymization *shape*, not evidence a real rollup job never leaks a
   tenant id — picked up once a real aggregation job exists to test instead.
+
+## Disclosed gaps (STORY-013)
+
+- **G-10 — no cron registration or queue-scheduler wiring for the
+  partition-maintenance/retention jobs.** `src/workers/rollup/maintenance.ts`
+  and `src/workers/rollup/retention.ts` are plain, exported, dependency-free
+  TS functions (no BullMQ, no Nest) — STORY-022 (Nest bootstrap) and
+  STORY-030 (queue topology, `worker.ts`, `WORKER_GROUP` selection) are both
+  still `Backlog`. Runnable today only via `pnpm db:maintenance:run` (the
+  monthly job) and `pnpm db:maintenance:sweep` (the nightly retention
+  cascade + orphan scan), same standing as STORY-011/012's CI-scheduling
+  gaps (G-5/G-9). STORY-030's BullMQ processor for the `rollup` worker group
+  imports these same exported functions unchanged as its handler body when
+  it lands — no rewrite, no move, just a new caller.
+- **The orphan scan pages by throwing (a non-zero exit from `pnpm
+  db:maintenance:sweep`), not by log line — but no real PagerDuty/alerting
+  integration exists anywhere in this repo yet**, the same disclosed absence
+  as G-1 (`app.breakglass_login_alert`'s `RAISE LOG`). A thrown error is the
+  strongest signal a script-only environment can produce today; wiring it to
+  an actual on-call page is a future observability-stack story's job, not a
+  new gap this story introduces.
+- **`pnpm db:purge-check` runs locally only, not in CI**, same absence as
+  G-5 ("no CI to run it in"). `NFR-CMP-05`'s "blocks the next release train"
+  requires an actual pipeline to block, which this repo does not have yet.
+- **Cold tablespace provisioning is environment-specific and deliberately
+  not a migration.** `CREATE TABLESPACE` requires a physical filesystem
+  location on the database server, which a portable migration cannot
+  embed — `test/integration/partition-maintenance.spec.ts` provisions a real
+  one inside the testcontainers fixture (`container.exec` + `CREATE
+  TABLESPACE`); production provisioning is infrastructure's responsibility
+  (Terraform/EBS volume — gap against EPIC-00, unchanged).
+- **`resolveDetachDropCutoffDays` does not merge `workspaces
+  .entitlement_overrides`** — only the plan's own `entitlements` JSON. A
+  workspace-level override that shortens or lengthens raw-capture retention
+  is invisible to the detach/drop safety calculation. Scoped simplification,
+  disclosed rather than silently assumed correct; revisit if a future story
+  actually exercises per-workspace overrides for this entitlement.
+- **Workspace deletion request's "custom domains released" is a status
+  flip (`custom_domains.status = 'disabled'`), not a real DNS/ACM
+  release** — no DNS or certificate-authority integration exists in this
+  repo yet.
+- **`executeWorkspaceHardDelete`/`requestIndividualErasure` require a
+  PRIVILEGED (table-owner-class) connection**, not the ordinary
+  `nominara_worker` runtime role: both disable/re-enable `audit_log`'s and
+  `credit_ledger`'s `reject_update_delete` trigger for the span of one
+  controlled operation (`ALTER TABLE ... DISABLE/ENABLE TRIGGER` requires
+  ownership). This is the resolution of STORY-007's own deferred "KNOWN
+  OPEN CONSTRAINT" comment on `credit_ledger`'s cascade — not a new
+  limitation, the one that comment always said a future story would need to
+  resolve.
+- **The cross-tenant DISCOVERY functions (`runNightlySweep`,
+  `runDailyPurgeCycle`, `scanForOrphans`/`runOrphanScan`,
+  `resolveWorkspaceRetention`, `collectComplianceExport`) also require a
+  privileged connection**, for a separate reason from the DDL-ownership one
+  above: each issues a SELECT spanning every workspace with NO tenant
+  context set, and `workspaces`/every fact table carry FORCE ROW LEVEL
+  SECURITY (migration 0006) — under `nominara_worker` (no BYPASSRLS, not the
+  table owner), that SELECT is filtered to zero rows, not merely "unsafe".
+  Proven, not just claimed, by a dedicated test in
+  `test/integration/retention-cascade.spec.ts` connecting as
+  `nominara_worker` and asserting it sees nothing where the privileged
+  connection sees real rows.
+- **`0007_partition_maintenance_and_retention.down.sql`'s `DELETE FROM
+  users` (the seeded system actor) has a known rollback limitation.** It
+  fails with a foreign-key violation if any
+  `credit_ledger.actor_id`/`milestones.created_by`/`task_events.actor_id`
+  row has already been reassigned to it by a real
+  `requestIndividualErasure` run. A fresh/empty shadow database (`pnpm
+  migrate:check`) never exercises that path, so it passes there every time —
+  this is a landmine only in an environment that has processed at least one
+  individual erasure. Not fixed (no safe general "reassign back to the
+  original, now-discarded actor" exists); disclosed here rather than left
+  silent.
