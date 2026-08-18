@@ -6,6 +6,7 @@ import { PG_POOL } from "../../db/pg-pool.js";
 import { TenantContextMissingError } from "../../tenancy/errors.js";
 import { withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
+import { SKIP_TENANT_CONTEXT_KEY } from "../decorators/skip-tenant-context.decorator.js";
 
 // STORY-022 — security-and-tenancy.md §4's TenantContextInterceptor,
 // wired into a real HTTP pipeline for the first time. This is the adapter
@@ -36,6 +37,18 @@ export class TenantContextInterceptor implements NestInterceptor {
       context.getClass(),
     ]);
     if (isPublic) {
+      return next.handle();
+    }
+
+    // @SkipTenantContext() — session-authenticated (AuthGuard still ran) but
+    // genuinely tenant-less routes (e.g. /me/passkeys, before any workspace
+    // exists). Distinct from @Public(): this route required a valid access
+    // token to reach here.
+    const skipTenantContext = this.reflector.getAllAndOverride<boolean>(SKIP_TENANT_CONTEXT_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (skipTenantContext) {
       return next.handle();
     }
 

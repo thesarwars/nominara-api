@@ -1,4 +1,40 @@
-// STORY-022 — scaffold only. DTOs are ALWAYS derived from a zod schema in
-// contracts/ (never hand-written, coding-standards.md §2) — they land with
-// this bounded area's own future story, once its contracts/ schemas exist.
-export {};
+// DTOs are z.infer<> re-exports of contracts/ schemas (coding-standards.md
+// §2) — never hand-written. STORY-014 fills this in for the first time.
+export {
+  registrationOptionsRequestSchema,
+  type RegistrationOptionsRequest,
+} from "../../../../contracts/identity/registration-options-request.schema.js";
+export {
+  assertionOptionsRequestSchema,
+  type AssertionOptionsRequest,
+} from "../../../../contracts/identity/assertion-options-request.schema.js";
+export {
+  passkeyOptionsRequestSchema,
+  type PasskeyOptionsRequest,
+} from "../../../../contracts/identity/passkey-options-request.schema.js";
+export {
+  registrationVerifyRequestSchema,
+  type RegistrationVerifyRequest,
+} from "../../../../contracts/identity/registration-verify-request.schema.js";
+export {
+  assertionVerifyRequestSchema,
+  type AssertionVerifyRequest,
+} from "../../../../contracts/identity/assertion-verify-request.schema.js";
+export {
+  passkeyVerifyRequestSchema,
+  type PasskeyVerifyRequest,
+} from "../../../../contracts/identity/passkey-verify-request.schema.js";
+export {
+  passkeyRenameRequestSchema,
+  type PasskeyRenameRequest,
+} from "../../../../contracts/identity/passkey-rename-request.schema.js";
+export {
+  passkeyListItemSchema,
+  passkeyListResponseSchema,
+  type PasskeyListItem,
+  type PasskeyListResponse,
+} from "../../../../contracts/identity/passkey-list-response.schema.js";
+export {
+  accessTokenClaimsSchema,
+  type AccessTokenClaims,
+} from "../../../../contracts/identity/access-token-claims.schema.js";

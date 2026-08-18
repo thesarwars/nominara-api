@@ -9,6 +9,11 @@ import { envSchema } from "../../src/config/env.schema.js";
 const VALID: NodeJS.ProcessEnv = {
   DATABASE_URL: "postgres://nominara:nominara@localhost:5432/nominara",
   DATABASE_URL_POOLED: "postgres://nominara_app:x@localhost:6432/nominara",
+  WEBAUTHN_RP_ID: "localhost",
+  WEBAUTHN_RP_NAME: "Nominara",
+  WEBAUTHN_ORIGIN: "http://localhost:3000",
+  AUTH_TOKEN_ED25519_PRIVATE_KEY: "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1",
+  AUTH_TOKEN_ED25519_PUBLIC_KEY: "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=",
 };
 
 describe("STORY-022 · env validation — refuses to start on missing/malformed config", () => {

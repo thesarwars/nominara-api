@@ -28,6 +28,20 @@ export const envSchema = z
     DATABASE_URL_POOLED: requiredString,
     // src/worker.ts — selects which of the 6 queue groups this worker process serves.
     WORKER_GROUP: z.enum(WORKER_GROUPS).optional(),
+
+    // STORY-014 — WebAuthn relying-party identity. Read at ceremony-options
+    // and verify time (never hardcoded), so a credential minted against one
+    // environment's rpID/origin fails verification against another's.
+    WEBAUTHN_RP_ID: requiredString,
+    WEBAUTHN_RP_NAME: requiredString,
+    WEBAUTHN_ORIGIN: requiredString,
+
+    // STORY-014 — the access token's EdDSA (Ed25519) signing keypair, each
+    // base64-encoded DER (PKCS8 private / SPKI public) — single-line, so no
+    // PEM-newline escaping is needed in a .env file. Env-supplied for now;
+    // STORY-017 owns rotation-with-overlap.
+    AUTH_TOKEN_ED25519_PRIVATE_KEY: requiredString,
+    AUTH_TOKEN_ED25519_PUBLIC_KEY: requiredString,
   })
   .strict();
 

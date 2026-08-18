@@ -11,7 +11,19 @@ export class EnvValidationError extends Error {
   }
 }
 
-const KNOWN_KEYS = ["NODE_ENV", "PORT", "GATEWAY_PORT", "DATABASE_URL", "DATABASE_URL_POOLED", "WORKER_GROUP"] as const;
+const KNOWN_KEYS = [
+  "NODE_ENV",
+  "PORT",
+  "GATEWAY_PORT",
+  "DATABASE_URL",
+  "DATABASE_URL_POOLED",
+  "WORKER_GROUP",
+  "WEBAUTHN_RP_ID",
+  "WEBAUTHN_RP_NAME",
+  "WEBAUTHN_ORIGIN",
+  "AUTH_TOKEN_ED25519_PRIVATE_KEY",
+  "AUTH_TOKEN_ED25519_PUBLIC_KEY",
+] as const;
 
 /**
  * process.env carries many OS/CI-supplied keys that are none of this

@@ -38,6 +38,11 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
   beforeEach(async () => {
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
+    process.env.WEBAUTHN_RP_ID = "localhost";
+    process.env.WEBAUTHN_RP_NAME = "Nominara";
+    process.env.WEBAUTHN_ORIGIN = "http://localhost:3000";
+    process.env.AUTH_TOKEN_ED25519_PRIVATE_KEY = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
+    process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
 
     const client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();

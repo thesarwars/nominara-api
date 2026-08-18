@@ -2,8 +2,11 @@ import { Controller, Get } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { ApiModule } from "../api.module.js";
 import { Public } from "../decorators/public.decorator.js";
+
+const PRIVATE_KEY_DER = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
 
 // A route that always throws, added only to this test's root module — not
 // part of ApiModule/production. Global guards/interceptors/ProblemFilter
@@ -29,12 +32,16 @@ class ThrowingController {
 // call to .catch() — the current spec.ts before this fix never provoked it.
 describe("STORY-022 · ProblemFilter over real HTTP", () => {
   let app: NestFastifyApplication;
-  const originalDatabaseUrl = process.env.DATABASE_URL;
-  const originalDatabaseUrlPooled = process.env.DATABASE_URL_POOLED;
+  const originalEnv = { ...process.env };
 
   beforeEach(async () => {
     process.env.DATABASE_URL = "postgres://fake:fake@localhost:5432/fake";
     process.env.DATABASE_URL_POOLED = "postgres://fake:fake@localhost:5432/fake";
+    process.env.WEBAUTHN_RP_ID = "localhost";
+    process.env.WEBAUTHN_RP_NAME = "Nominara";
+    process.env.WEBAUTHN_ORIGIN = "http://localhost:3000";
+    process.env.AUTH_TOKEN_ED25519_PRIVATE_KEY = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
+    process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
 
     const moduleRef = await Test.createTestingModule({
       imports: [ApiModule],
@@ -47,8 +54,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
 
   afterEach(async () => {
     await app.close();
-    process.env.DATABASE_URL = originalDatabaseUrl;
-    process.env.DATABASE_URL_POOLED = originalDatabaseUrlPooled;
+    process.env = { ...originalEnv };
   });
 
   it("maps an unmatched route (framework 404) to a problem+json body", async () => {
@@ -72,7 +78,19 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
   });
 
   it("maps TenantContextMissingError (a private route with no tenant set) to a well-formed 500 problem+json", async () => {
-    const response = await app.inject({ method: "GET", url: "/test-only/private-no-tenant" });
+    // AuthGuard is real as of STORY-014 — this route is private, so it needs
+    // a validly signed token to get past AuthGuard at all before reaching
+    // the TenantContextInterceptor behavior this test actually exercises.
+    const privateKey = importEd25519PrivateKeyFromDer(PRIVATE_KEY_DER);
+    const { token } = await signAccessToken(
+      { sub: "0192f1a0-0000-7000-8000-000000000001", ws: null, role: null, scope: null, entV: null },
+      privateKey,
+    );
+    const response = await app.inject({
+      method: "GET",
+      url: "/test-only/private-no-tenant",
+      headers: { authorization: `Bearer ${token}` },
+    });
 
     expect(response.statusCode).toBe(500);
     expect(response.json()).toEqual({

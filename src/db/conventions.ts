@@ -61,6 +61,11 @@ export const GLOBAL_TABLES = [
   // written by a job with no single tenant context. Migration
   // 0007_partition_maintenance_and_retention.up.sql.
   "purge_failures",
+  // STORY-014 — WebAuthn ceremony state (challenge/rp_id/origin), not tenant
+  // data, GRANT-protected the same way as user_credentials (see
+  // expectedTablePrivileges below). Migration
+  // 0008_identity_authenticator_attachment.up.sql.
+  "webauthn_challenges",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -267,7 +272,7 @@ export const VECTOR_RECALL_THRESHOLD = 0.98;
 export const HNSW_REBUILD_EF_CONSTRUCTION = 128;
 
 export function expectedTablePrivileges(role: string, table: string): readonly TablePrivilege[] {
-  if (table === "user_credentials") {
+  if (table === "user_credentials" || table === "webauthn_challenges") {
     return role === "nominara_app" ? FULL_WRITE : NO_PRIVILEGES;
   }
   if (table === "audit_log") {

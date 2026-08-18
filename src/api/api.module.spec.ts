@@ -47,8 +47,7 @@ const INTERCEPTOR_REGISTRATION_ORDER = [
 ] as const;
 
 describe("STORY-022 · composition root guard/interceptor order", () => {
-  const originalDatabaseUrl = process.env.DATABASE_URL;
-  const originalDatabaseUrlPooled = process.env.DATABASE_URL_POOLED;
+  const originalEnv = { ...process.env };
 
   beforeEach(() => {
     // DbModule's PG_POOL factory only constructs a lazy pg.Pool (no
@@ -56,19 +55,28 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
     // safe here since /health/live never queries Postgres.
     process.env.DATABASE_URL = "postgres://fake:fake@localhost:5432/fake";
     process.env.DATABASE_URL_POOLED = "postgres://fake:fake@localhost:5432/fake";
+    process.env.WEBAUTHN_RP_ID = "localhost";
+    process.env.WEBAUTHN_RP_NAME = "Nominara";
+    process.env.WEBAUTHN_ORIGIN = "http://localhost:3000";
+    process.env.AUTH_TOKEN_ED25519_PRIVATE_KEY = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
+    process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
   });
 
   afterEach(() => {
-    process.env.DATABASE_URL = originalDatabaseUrl;
-    process.env.DATABASE_URL_POOLED = originalDatabaseUrlPooled;
+    process.env = { ...originalEnv };
     vi.restoreAllMocks();
   });
 
   it("invokes all 8 global guards, in the STORY-022-E-1 corrected order, before the handler runs", async () => {
     const calls: string[] = [];
     for (const Guard of GUARD_ORDER) {
-      const original = Guard.prototype.canActivate;
-      vi.spyOn(Guard.prototype, "canActivate").mockImplementation(function (this: unknown, ...args) {
+      // AuthGuard.canActivate is async (STORY-014 fix: `jose` verification is
+      // Promise-based); the other seven guards are still synchronous no-ops.
+      // Cast to a uniform signature so vi.spyOn doesn't have to reconcile a
+      // union of incompatible `this`/return types across heterogeneous classes.
+      const proto = Guard.prototype as unknown as { canActivate: (...args: unknown[]) => boolean | Promise<boolean> };
+      const original = proto.canActivate;
+      vi.spyOn(proto, "canActivate").mockImplementation(function (this: unknown, ...args: unknown[]) {
         calls.push(Guard.name);
         return original.apply(this, args as never);
       });
