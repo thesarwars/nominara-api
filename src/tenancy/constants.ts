@@ -16,3 +16,9 @@ export const SYSTEM_ACTOR_ID = "00000000-0000-0000-0000-000000000000";
 export const WORKSPACE_GUC = "app.current_workspace_id";
 export const ACTOR_GUC = "app.current_actor_id";
 export const SCOPE_GUC = "app.current_scope_projects";
+
+// STORY-018 — the header a key-authenticated request carries the target
+// workspace on (security-and-tenancy.md §5's enforcement chain: "X-Nominara-
+// Workspace for an API key"). Session requests carry the workspace in the
+// `ws` JWT claim instead and never send this header.
+export const WORKSPACE_HEADER_NAME = "x-nominara-workspace";
