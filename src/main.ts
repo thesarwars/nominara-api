@@ -4,6 +4,7 @@ import { Logger } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { ApiModule } from "./api/api.module.js";
+import { registerCookiePlugin } from "./api/register-cookies.js";
 import { loadEnv } from "./config/env.js";
 
 // STORY-022 — API bootstrap (project-structure.md §2: "src/main.ts API
@@ -16,6 +17,7 @@ export async function bootstrap(): Promise<NestFastifyApplication> {
     bufferLogs: true,
   });
   app.enableShutdownHooks();
+  await registerCookiePlugin(app);
   await app.listen({ port: env.PORT, host: "0.0.0.0" });
   new Logger("bootstrap").log(`API listening on :${env.PORT}`);
   return app;

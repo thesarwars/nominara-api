@@ -14,10 +14,10 @@ import {
 import type { Pool } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { PG_POOL } from "../../db/pg-pool.js";
-import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { nextCounter } from "../../lib/webauthn/sign-counter-policy.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { SessionService, type SessionTokens } from "./session.service.js";
 import type {
   AssertionOptionsRequest,
   PasskeyListItem,
@@ -45,15 +45,14 @@ export interface PasskeyOptionsResult {
   readonly options: PublicKeyCredentialCreationOptionsJSON | PublicKeyCredentialRequestOptionsJSON;
 }
 
-export interface PasskeyVerifyResult {
-  readonly token: string;
-}
-
 @Injectable()
 export class IdentityService {
   private readonly logger = new Logger(IdentityService.name);
 
-  constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+  constructor(
+    @Inject(PG_POOL) private readonly pool: Pool,
+    private readonly sessions: SessionService,
+  ) {}
 
   async createOptions(input: PasskeyOptionsRequest): Promise<PasskeyOptionsResult> {
     if (input.purpose === "registration") {
@@ -170,7 +169,7 @@ export class IdentityService {
     return result.rows[0]!;
   }
 
-  async verifyPasskey(input: PasskeyVerifyRequest): Promise<PasskeyVerifyResult> {
+  async verifyPasskey(input: PasskeyVerifyRequest): Promise<SessionTokens> {
     const env = loadEnv();
     const client = await this.pool.connect();
     try {
@@ -191,8 +190,8 @@ export class IdentityService {
     userId: string,
     expectedChallenge: string,
     input: PasskeyVerifyRequest,
-    env: { WEBAUTHN_RP_ID: string; WEBAUTHN_ORIGIN: string; AUTH_TOKEN_ED25519_PRIVATE_KEY: string },
-  ): Promise<PasskeyVerifyResult> {
+    env: { WEBAUTHN_RP_ID: string; WEBAUTHN_ORIGIN: string },
+  ): Promise<SessionTokens> {
     // The library throws on a bad attestation, a wrong origin, or an RP ID
     // hash mismatch (the last of which is what makes a credential minted in
     // one environment unusable in another — STORY-014 test scenario 7).
@@ -230,15 +229,15 @@ export class IdentityService {
     this.logger.log(`passkey registered user_id=${userId}`);
     incrementCounter("nominara_identity_passkey_registered_total", { user_id: userId });
 
-    return await this.mintToken(userId, env);
+    return await this.sessions.createSession(userId);
   }
 
   private async finishAssertion(
     client: { query: Pool["query"] },
     expectedChallenge: string,
     input: PasskeyVerifyRequest,
-    env: { WEBAUTHN_RP_ID: string; WEBAUTHN_ORIGIN: string; AUTH_TOKEN_ED25519_PRIVATE_KEY: string },
-  ): Promise<PasskeyVerifyResult> {
+    env: { WEBAUTHN_RP_ID: string; WEBAUTHN_ORIGIN: string },
+  ): Promise<SessionTokens> {
     const rawId = (input.response as { rawId: string }).rawId;
     const credentialResult = await client.query<{
       id: string;
@@ -306,13 +305,7 @@ export class IdentityService {
       row.id,
     ]);
 
-    return await this.mintToken(row.user_id, env);
-  }
-
-  private async mintToken(userId: string, env: { AUTH_TOKEN_ED25519_PRIVATE_KEY: string }): Promise<PasskeyVerifyResult> {
-    const privateKey = importEd25519PrivateKeyFromDer(env.AUTH_TOKEN_ED25519_PRIVATE_KEY);
-    const { token } = await signAccessToken({ sub: userId, ws: null, role: null, scope: null, entV: null }, privateKey);
-    return { token };
+    return await this.sessions.createSession(row.user_id);
   }
 
   async listPasskeys(userId: string): Promise<PasskeyListItem[]> {

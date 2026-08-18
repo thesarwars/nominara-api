@@ -14,6 +14,8 @@ const VALID: NodeJS.ProcessEnv = {
   WEBAUTHN_ORIGIN: "http://localhost:3000",
   AUTH_TOKEN_ED25519_PRIVATE_KEY: "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1",
   AUTH_TOKEN_ED25519_PUBLIC_KEY: "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=",
+  AUTH_TOKEN_ED25519_KID: "test-kid-1",
+  CSRF_SECRET: "test-csrf-secret",
 };
 
 describe("STORY-022 · env validation — refuses to start on missing/malformed config", () => {

@@ -162,7 +162,7 @@ export interface CensusResult {
 /**
  * The ISO-06 census: tenant and global counts computed INDEPENDENTLY (never
  * one by subtracting the other from a total), then cross-checked against
- * each other and against the fixed numbers (59/10/69) and against this
+ * each other and against the fixed numbers (59/14/73) and against this
  * repo's own committed GLOBAL_TABLES / TENANT_TABLES declarations.
  */
 export async function computeCensus(client: Client): Promise<CensusResult> {

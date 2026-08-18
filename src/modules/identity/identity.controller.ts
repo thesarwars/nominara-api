@@ -1,8 +1,10 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Req } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
+import type { FastifyReply } from "fastify";
 import type { AuthenticatedRequest } from "../../api/guards/auth.guard.js";
 import { Public } from "../../api/decorators/public.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
+import { REFRESH_COOKIE_NAME, clearAuthCookies, setAuthCookies } from "../../lib/auth/cookies.js";
 import {
   passkeyOptionsRequestSchema,
   passkeyRenameRequestSchema,
@@ -11,14 +13,18 @@ import {
   type PasskeyRenameRequest,
   type PasskeyVerifyRequest,
 } from "./dto/index.js";
-import { IdentityService, type PasskeyOptionsResult, type PasskeyVerifyResult } from "./identity.service.js";
+import { IdentityService, type PasskeyOptionsResult } from "./identity.service.js";
+import { SessionService } from "./session.service.js";
 
 // STORY-014 — thin HTTP surface only (coding-standards.md §1: a conditional
 // here is a smell). Every branch on ceremony purpose lives in
 // IdentityService; this file validates and delegates, one call each.
 @Controller()
 export class IdentityController {
-  constructor(private readonly service: IdentityService) {}
+  constructor(
+    private readonly service: IdentityService,
+    private readonly sessions: SessionService,
+  ) {}
 
   @Post("auth/passkey/options")
   @Public()
@@ -26,12 +32,40 @@ export class IdentityController {
     return this.service.createOptions(body);
   }
 
+  // STORY-017 — no token in the body: sets Set-Cookie (access, refresh,
+  // CSRF) instead. Supersedes STORY-014's Bearer-in-body contract.
   @Post("auth/passkey/verify")
   @Public()
-  verify(
+  @HttpCode(200)
+  async verify(
     @Body(new ZodValidationPipe(passkeyVerifyRequestSchema)) body: PasskeyVerifyRequest,
-  ): Promise<PasskeyVerifyResult> {
-    return this.service.verifyPasskey(body);
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ): Promise<void> {
+    const tokens = await this.service.verifyPasskey(body);
+    setAuthCookies(reply, tokens);
+  }
+
+  @Post("auth/refresh")
+  @Public()
+  @HttpCode(200)
+  async refresh(
+    @Req() req: AuthenticatedRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ): Promise<void> {
+    const rawRefreshToken = req.cookies?.[REFRESH_COOKIE_NAME];
+    if (!rawRefreshToken) {
+      throw new UnauthorizedException("missing refresh token cookie");
+    }
+    const tokens = await this.sessions.refresh(rawRefreshToken);
+    setAuthCookies(reply, tokens);
+  }
+
+  @Post("auth/logout")
+  @SkipTenantContext()
+  @HttpCode(200)
+  async logout(@Req() req: AuthenticatedRequest, @Res({ passthrough: true }) reply: FastifyReply): Promise<void> {
+    await this.sessions.logout(req.auth!.sid);
+    clearAuthCookies(reply);
   }
 
   // @SkipTenantContext() — session-authenticated (AuthGuard requires a real

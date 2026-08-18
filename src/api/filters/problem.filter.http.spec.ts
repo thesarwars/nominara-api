@@ -3,10 +3,15 @@ import { Test } from "@nestjs/testing";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
+import { ACCESS_COOKIE_NAME } from "../../lib/auth/cookies.js";
+import { PG_POOL } from "../../db/pg-pool.js";
 import { ApiModule } from "../api.module.js";
 import { Public } from "../decorators/public.decorator.js";
+import { registerCookiePlugin } from "../register-cookies.js";
 
 const PRIVATE_KEY_DER = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
+const KID = "test-kid-1";
+const SID = "0192f1a0-0000-7000-8000-000000000098";
 
 // A route that always throws, added only to this test's root module — not
 // part of ApiModule/production. Global guards/interceptors/ProblemFilter
@@ -42,12 +47,24 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     process.env.WEBAUTHN_ORIGIN = "http://localhost:3000";
     process.env.AUTH_TOKEN_ED25519_PRIVATE_KEY = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
     process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
+    process.env.AUTH_TOKEN_ED25519_KID = "test-kid-1";
+    process.env.CSRF_SECRET = "test-csrf-secret";
 
     const moduleRef = await Test.createTestingModule({
       imports: [ApiModule],
       controllers: [ThrowingController],
-    }).compile();
+    })
+      // STORY-017 — AuthGuard now loads the live session row through
+      // PG_POOL; DATABASE_URL above is a fake connection string, so this
+      // stub is what lets a validly signed token actually reach the
+      // TenantContextInterceptor behavior this suite exercises, rather than
+      // failing for an unrelated connection-refused reason that would
+      // coincidentally produce the same 500 body.
+      .overrideProvider(PG_POOL)
+      .useValue({ query: async () => ({ rows: [{ revoked_at: null }] }), end: async () => {} })
+      .compile();
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await registerCookiePlugin(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
   });
@@ -83,13 +100,14 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     // the TenantContextInterceptor behavior this test actually exercises.
     const privateKey = importEd25519PrivateKeyFromDer(PRIVATE_KEY_DER);
     const { token } = await signAccessToken(
-      { sub: "0192f1a0-0000-7000-8000-000000000001", ws: null, role: null, scope: null, entV: null },
+      { sub: "0192f1a0-0000-7000-8000-000000000001", sid: SID, ws: null, role: null, scope: null, entV: null },
       privateKey,
+      KID,
     );
     const response = await app.inject({
       method: "GET",
       url: "/test-only/private-no-tenant",
-      headers: { authorization: `Bearer ${token}` },
+      cookies: { [ACCESS_COOKIE_NAME]: token },
     });
 
     expect(response.statusCode).toBe(500);

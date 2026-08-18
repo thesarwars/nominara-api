@@ -1,15 +1,21 @@
 import "reflect-metadata";
 import { generateKeyPairSync } from "node:crypto";
 import type { ExecutionContext } from "@nestjs/common";
-import { UnauthorizedException } from "@nestjs/common";
+import { ForbiddenException, UnauthorizedException } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { Pool } from "pg";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { signAccessToken, importEd25519PrivateKeyFromDer } from "../../lib/auth/access-token.js";
+import { computeCsrfToken } from "../../lib/auth/csrf.js";
+import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../lib/auth/cookies.js";
 import { Public } from "../decorators/public.decorator.js";
 import { AuthGuard, type AuthenticatedRequest } from "./auth.guard.js";
 
 const PRIVATE_KEY_DER = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
 const PUBLIC_KEY_DER = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
+const KID = "test-kid-1";
+const CSRF_SECRET = "test-csrf-secret";
+const SID = "0192f1a0-0000-7000-8000-000000000099";
 
 class PrivateController {
   handler(): void {}
@@ -29,12 +35,26 @@ function makeContext(ctor: new () => object, req: AuthenticatedRequest): Executi
   } as unknown as ExecutionContext;
 }
 
-// STORY-014 — AuthGuard becomes real: EdDSA signature + expiry verification
-// ONLY (no session-load, no jti deny-list — no sessions table exists until
-// STORY-017). Must still bypass entirely on @Public() routes, or the
-// existing STORY-022 guard-order test (which exercises this class against
-// the unauthenticated /health/live route) breaks.
-describe("STORY-014 · AuthGuard", () => {
+function fakePool(rows: Array<{ revoked_at: Date | null }>): Pool {
+  return { query: vi.fn().mockResolvedValue({ rows }) } as unknown as Pool;
+}
+
+async function mintToken(overrides: { now?: Date; kid?: string; privateKeyDer?: string } = {}): Promise<string> {
+  const privateKey = importEd25519PrivateKeyFromDer(overrides.privateKeyDer ?? PRIVATE_KEY_DER);
+  const { token } = await signAccessToken(
+    { sub: "0192f1a0-0000-7000-8000-000000000001", sid: SID, ws: null, role: null, scope: null, entV: null },
+    privateKey,
+    overrides.kid ?? KID,
+    overrides.now,
+  );
+  return token;
+}
+
+// STORY-017 — AuthGuard becomes cookie-only + session-load/deny-check: the
+// highest-stakes lines in this diff alongside session.service.ts's rotation
+// SQL. No Authorization: Bearer fallback exists at all — a session is
+// authenticated by a cookie or it isn't authenticated.
+describe("STORY-017 · AuthGuard", () => {
   const originalEnv = { ...process.env };
 
   beforeEach(() => {
@@ -45,68 +65,117 @@ describe("STORY-014 · AuthGuard", () => {
     process.env.WEBAUTHN_ORIGIN = "http://localhost:3000";
     process.env.AUTH_TOKEN_ED25519_PRIVATE_KEY = PRIVATE_KEY_DER;
     process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = PUBLIC_KEY_DER;
+    process.env.AUTH_TOKEN_ED25519_KID = KID;
+    process.env.CSRF_SECRET = CSRF_SECRET;
+    delete process.env.AUTH_TOKEN_ED25519_PREVIOUS_PUBLIC_KEY;
+    delete process.env.AUTH_TOKEN_ED25519_PREVIOUS_KID;
   });
 
   afterEach(() => {
     process.env = { ...originalEnv };
   });
 
-  it("bypasses verification entirely on a @Public() route with no Authorization header", async () => {
-    const guard = new AuthGuard(new Reflector());
+  it("bypasses verification entirely on a @Public() route with no cookies at all", async () => {
+    const guard = new AuthGuard(new Reflector(), fakePool([]));
     const context = makeContext(PublicController, {});
 
     await expect(guard.canActivate(context)).resolves.toBe(true);
   });
 
-  it("rejects a private route with no Authorization header", async () => {
-    const guard = new AuthGuard(new Reflector());
-    const context = makeContext(PrivateController, { headers: {} });
+  it("rejects a private route with no session cookie", async () => {
+    const guard = new AuthGuard(new Reflector(), fakePool([]));
+    const context = makeContext(PrivateController, { cookies: {} });
 
     await expect(guard.canActivate(context)).rejects.toThrow(UnauthorizedException);
   });
 
-  it("rejects a malformed Authorization header (not Bearer)", async () => {
-    const guard = new AuthGuard(new Reflector());
-    const context = makeContext(PrivateController, { headers: { authorization: "Basic xyz" } });
-
-    await expect(guard.canActivate(context)).rejects.toThrow(UnauthorizedException);
-  });
-
-  it("accepts a validly signed, unexpired token and attaches claims to the request", async () => {
-    const privateKey = importEd25519PrivateKeyFromDer(PRIVATE_KEY_DER);
-    const { token, claims } = await signAccessToken(
-      { sub: "0192f1a0-0000-7000-8000-000000000001", ws: null, role: null, scope: null, entV: null },
-      privateKey,
-    );
-    const guard = new AuthGuard(new Reflector());
-    const req: AuthenticatedRequest = { headers: { authorization: `Bearer ${token}` } };
+  it("STORY-017 · scenario 1 — accepts a validly signed, unexpired token, loads the live session, and attaches claims to the request", async () => {
+    const token = await mintToken();
+    const pool = fakePool([{ revoked_at: null }]);
+    const guard = new AuthGuard(new Reflector(), pool);
+    const req: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" };
     const context = makeContext(PrivateController, req);
 
     await expect(guard.canActivate(context)).resolves.toBe(true);
-    expect(req.auth).toEqual(claims);
+    expect(req.auth?.sid).toBe(SID);
+    expect(req.authMethod).toBe("session");
+    expect(pool.query).toHaveBeenCalledWith(expect.stringContaining("FROM sessions"), [SID]);
   });
 
-  it("rejects an expired token", async () => {
-    const privateKey = importEd25519PrivateKeyFromDer(PRIVATE_KEY_DER);
-    const { token } = await signAccessToken(
-      { sub: "0192f1a0-0000-7000-8000-000000000001", ws: null, role: null, scope: null, entV: null },
-      privateKey,
-      new Date("2020-01-01T00:00:00.000Z"),
-    );
-    const guard = new AuthGuard(new Reflector());
-    const context = makeContext(PrivateController, { headers: { authorization: `Bearer ${token}` } });
+  it("STORY-017 · scenario 2 — rejects an expired token with a distinguishable expiry message", async () => {
+    const token = await mintToken({ now: new Date("2020-01-01T00:00:00.000Z") });
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
 
-    await expect(guard.canActivate(context)).rejects.toThrow(UnauthorizedException);
+    await expect(guard.canActivate(context)).rejects.toThrow("access token expired");
   });
 
   it("rejects a token signed by a foreign keypair", async () => {
     const { privateKey: foreignPrivateKey } = generateKeyPairSync("ed25519");
     const { token } = await signAccessToken(
-      { sub: "0192f1a0-0000-7000-8000-000000000001", ws: null, role: null, scope: null, entV: null },
+      { sub: "0192f1a0-0000-7000-8000-000000000001", sid: SID, ws: null, role: null, scope: null, entV: null },
       foreignPrivateKey,
+      KID,
     );
-    const guard = new AuthGuard(new Reflector());
-    const context = makeContext(PrivateController, { headers: { authorization: `Bearer ${token}` } });
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
+
+    await expect(guard.canActivate(context)).rejects.toThrow(UnauthorizedException);
+  });
+
+  it("STORY-017 · scenario 5 — refuses via the deny list once the session is revoked, even with a structurally valid, unexpired token", async () => {
+    const token = await mintToken();
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: new Date() }]));
+    const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
+
+    await expect(guard.canActivate(context)).rejects.toThrow("session revoked");
+  });
+
+  it("STORY-017 · refuses via the deny list when the session row no longer exists at all", async () => {
+    const token = await mintToken();
+    const guard = new AuthGuard(new Reflector(), fakePool([]));
+    const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
+
+    await expect(guard.canActivate(context)).rejects.toThrow("session revoked");
+  });
+
+  it("STORY-017 · scenario 6 — a mutating request with the session cookie but no double-submit token is refused", async () => {
+    const token = await mintToken();
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const req: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "POST", headers: {} };
+    const context = makeContext(PrivateController, req);
+
+    await expect(guard.canActivate(context)).rejects.toThrow(ForbiddenException);
+  });
+
+  it("STORY-017 · a mutating request carrying a matching double-submit cookie and header is permitted", async () => {
+    const token = await mintToken();
+    const csrfToken = computeCsrfToken(SID, CSRF_SECRET);
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const req: AuthenticatedRequest = {
+      cookies: { [ACCESS_COOKIE_NAME]: token, [CSRF_COOKIE_NAME]: csrfToken },
+      headers: { [CSRF_HEADER_NAME]: csrfToken },
+      method: "POST",
+    };
+    const context = makeContext(PrivateController, req);
+
+    await expect(guard.canActivate(context)).resolves.toBe(true);
+  });
+
+  it("STORY-017 · scenario 9 — a token signed by the previous key still verifies through the guard during a rotation's overlap window", async () => {
+    process.env.AUTH_TOKEN_ED25519_PREVIOUS_KID = "previous-kid";
+    process.env.AUTH_TOKEN_ED25519_PREVIOUS_PUBLIC_KEY = PUBLIC_KEY_DER;
+    const token = await mintToken({ kid: "previous-kid" });
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
+
+    await expect(guard.canActivate(context)).resolves.toBe(true);
+  });
+
+  it("rejects a token whose kid the guard's key map does not recognize", async () => {
+    const token = await mintToken({ kid: "unknown-kid" });
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
 
     await expect(guard.canActivate(context)).rejects.toThrow(UnauthorizedException);
   });

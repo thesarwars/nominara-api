@@ -38,10 +38,18 @@ export const envSchema = z
 
     // STORY-014 — the access token's EdDSA (Ed25519) signing keypair, each
     // base64-encoded DER (PKCS8 private / SPKI public) — single-line, so no
-    // PEM-newline escaping is needed in a .env file. Env-supplied for now;
-    // STORY-017 owns rotation-with-overlap.
+    // PEM-newline escaping is needed in a .env file.
     AUTH_TOKEN_ED25519_PRIVATE_KEY: requiredString,
     AUTH_TOKEN_ED25519_PUBLIC_KEY: requiredString,
+    // STORY-017 — kid identifying the current signing key (goes in the JWS
+    // protected header, never the claim payload). The previous key/kid pair
+    // is optional and only present during a rotation's overlap window — a
+    // token signed with it must still verify for its remaining lifetime.
+    AUTH_TOKEN_ED25519_KID: requiredString,
+    AUTH_TOKEN_ED25519_PREVIOUS_PUBLIC_KEY: requiredString.optional(),
+    AUTH_TOKEN_ED25519_PREVIOUS_KID: requiredString.optional(),
+    // STORY-017 — HMAC-SHA256(sid, secret) double-submit CSRF token secret.
+    CSRF_SECRET: requiredString,
   })
   .strict();
 

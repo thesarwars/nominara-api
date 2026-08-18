@@ -18,6 +18,8 @@ describe("STORY-014 · IdentityModule compiles", () => {
     process.env.WEBAUTHN_ORIGIN = "http://localhost:3000";
     process.env.AUTH_TOKEN_ED25519_PRIVATE_KEY = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
     process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
+    process.env.AUTH_TOKEN_ED25519_KID = "test-kid-1";
+    process.env.CSRF_SECRET = "test-csrf-secret";
   });
 
   afterEach(() => {

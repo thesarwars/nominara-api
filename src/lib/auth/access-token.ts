@@ -33,22 +33,33 @@ export class AccessTokenError extends Error {
 
 export interface MintAccessTokenInput {
   readonly sub: string;
+  /** STORY-017 — caller-supplied, not auto-generated: stays stable across a workspace switch's re-mint. */
+  readonly sid: string;
   readonly ws: string | null;
   readonly role: string | null;
   readonly scope: readonly string[] | null;
   readonly entV: number | null;
 }
 
-/** Mints a fresh access token: fresh UUIDv7 sid/jti, 15-minute TTL from `now`. */
+/**
+ * STORY-017 — resolves a JWS `kid` header to the public key that verifies it.
+ * Thrown/rejected for an unrecognized kid; the caller (AuthGuard) never sees
+ * the distinction between "unknown kid" and any other signature failure —
+ * both fail closed as an invalid token.
+ */
+export type KeyResolver = (kid: string | undefined) => KeyObject;
+
+/** Mints a fresh access token: caller-supplied sid, fresh UUIDv7 jti, 15-minute TTL from `now`. */
 export async function signAccessToken(
   input: MintAccessTokenInput,
   privateKey: KeyObject,
+  kid: string,
   now: Date = new Date(),
 ): Promise<{ token: string; claims: AccessTokenClaims }> {
   const iat = Math.floor(now.getTime() / 1000);
   const claims: AccessTokenClaims = {
     sub: input.sub,
-    sid: uuidV7(),
+    sid: input.sid,
     ws: input.ws,
     role: input.role,
     scope: input.scope === null ? null : [...input.scope],
@@ -58,7 +69,9 @@ export async function signAccessToken(
     jti: uuidV7(),
   };
 
-  const token = await new SignJWT(claims).setProtectedHeader(JWS_PROTECTED_HEADER).sign(privateKey);
+  const token = await new SignJWT(claims)
+    .setProtectedHeader({ ...JWS_PROTECTED_HEADER, kid })
+    .sign(privateKey);
 
   return { token, claims };
 }
@@ -66,12 +79,15 @@ export async function signAccessToken(
 /** Verifies signature + expiry ONLY (no session load, no jti deny-list — see AuthGuard's Technical Notes). */
 export async function verifyAccessToken(
   token: string,
-  publicKey: KeyObject,
+  resolveKey: KeyResolver,
   now: Date = new Date(),
 ): Promise<AccessTokenClaims> {
   let payload: unknown;
   try {
-    ({ payload } = await jwtVerify(token, publicKey, { algorithms: ["EdDSA"], currentDate: now }));
+    ({ payload } = await jwtVerify(token, (header) => resolveKey(header.kid), {
+      algorithms: ["EdDSA"],
+      currentDate: now,
+    }));
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ERR_JWT_EXPIRED") {
       throw new AccessTokenError("token expired");

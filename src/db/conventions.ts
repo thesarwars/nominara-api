@@ -38,9 +38,9 @@ export const REQUIRED_INTERNAL_FUNCTIONS = [
   "apply_tenant_rls",
 ] as const;
 
-// STORY-009 — data-model.md §2 "Table census", verbatim. The census
-// assertion (69 tables: 59 tenant-scoped, 10 global) depends on this
-// partition being exact, so a new table is either tenant-scoped with RLS or
+// STORY-009 — data-model.md §2 "Table census", verbatim (STORY-017 update:
+// 73 tables, 59 tenant-scoped, 14 global). The census assertion depends on
+// this partition being exact, so a new table is either tenant-scoped with RLS or
 // an explicit, reviewed addition here — there is no third option.
 // STORY-011's src/db/rls/generate.ts should import GLOBAL_TABLES and
 // TENANT_SCOPE_COLUMN from here rather than redeclaring them, so the
@@ -66,6 +66,12 @@ export const GLOBAL_TABLES = [
   // expectedTablePrivileges below). Migration
   // 0008_identity_authenticator_attachment.up.sql.
   "webauthn_challenges",
+  // STORY-017 — session identity state: a `sid` stays stable across a
+  // workspace switch, so this is not tenant data, same reasoning as
+  // user_credentials. GRANT-protected the same way. Migration
+  // 0009_session_model_and_refresh_tokens.up.sql.
+  "sessions",
+  "refresh_tokens",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -272,7 +278,7 @@ export const VECTOR_RECALL_THRESHOLD = 0.98;
 export const HNSW_REBUILD_EF_CONSTRUCTION = 128;
 
 export function expectedTablePrivileges(role: string, table: string): readonly TablePrivilege[] {
-  if (table === "user_credentials" || table === "webauthn_challenges") {
+  if (table === "user_credentials" || table === "webauthn_challenges" || table === "sessions" || table === "refresh_tokens") {
     return role === "nominara_app" ? FULL_WRITE : NO_PRIVILEGES;
   }
   if (table === "audit_log") {

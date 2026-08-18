@@ -1,0 +1,379 @@
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import { Client, Pool } from "pg";
+import { UnauthorizedException } from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { Test } from "@nestjs/testing";
+import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { migrateUp } from "../../src/db/migrate-runner.js";
+import { SessionService } from "../../src/modules/identity/session.service.js";
+import { AuthGuard, type AuthenticatedRequest } from "../../src/api/guards/auth.guard.js";
+import { ApiModule } from "../../src/api/api.module.js";
+import { registerCookiePlugin } from "../../src/api/register-cookies.js";
+import {
+  ACCESS_COOKIE_NAME,
+  CSRF_COOKIE_NAME,
+  CSRF_HEADER_NAME,
+  REFRESH_COOKIE_NAME,
+} from "../../src/lib/auth/cookies.js";
+import * as metrics from "../../src/lib/telemetry/metrics.js";
+
+interface ParsedCookie {
+  name: string;
+  value: string;
+  path?: string;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: string;
+  maxAge?: number;
+  expires?: Date;
+}
+
+function cookiesByName(res: { cookies: Array<{ name: string; value: string }> }): Map<string, ParsedCookie> {
+  return new Map(res.cookies.map((c) => [c.name, c as unknown as ParsedCookie]));
+}
+
+function decodeClaims(token: string): Record<string, unknown> {
+  const [, payloadB64url] = token.split(".");
+  return JSON.parse(Buffer.from(payloadB64url!, "base64url").toString("utf8"));
+}
+
+function makeContext(req: AuthenticatedRequest) {
+  return {
+    getHandler: () => (): void => {},
+    getClass: () => class {},
+    switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
+  } as unknown as Parameters<AuthGuard["canActivate"]>[0];
+}
+
+// STORY-017 — dangerous area: rotation and full-history reuse detection.
+// Real Postgres (testcontainers, testing-strategy.md §1) — the correctness
+// of SELECT ... FOR UPDATE row locking and the BEGIN/COMMIT/ROLLBACK
+// boundaries in session.service.ts cannot be trusted against a mocked pg
+// Pool.
+describe("STORY-017 · session model, rotating refresh, reuse detection", () => {
+  let container: StartedPostgreSqlContainer;
+  let db: Client;
+  let pool: Pool;
+  let sessions: SessionService;
+  let userId: string;
+  const originalEnv = { ...process.env };
+
+  beforeAll(async () => {
+    container = await new PostgreSqlContainer("pgvector/pgvector:pg18")
+      .withDatabase("nominara_test")
+      .withUsername("nominara")
+      .withPassword("nominara")
+      .start();
+  }, 120_000);
+
+  afterAll(async () => {
+    await container.stop();
+    process.env = { ...originalEnv };
+  });
+
+  beforeEach(async () => {
+    process.env.WEBAUTHN_RP_ID = "localhost";
+    process.env.WEBAUTHN_RP_NAME = "Nominara";
+    process.env.WEBAUTHN_ORIGIN = "http://localhost:3000";
+    process.env.AUTH_TOKEN_ED25519_PRIVATE_KEY = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
+    process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
+    process.env.AUTH_TOKEN_ED25519_KID = "test-kid-1";
+    process.env.CSRF_SECRET = "test-csrf-secret";
+    process.env.DATABASE_URL = container.getConnectionUri();
+    process.env.DATABASE_URL_POOLED = container.getConnectionUri();
+
+    db = new Client({ connectionString: container.getConnectionUri() });
+    await db.connect();
+    await db.query("DROP SCHEMA IF EXISTS app CASCADE");
+    await db.query("DROP SCHEMA IF EXISTS _migrations CASCADE");
+    await db.query("DROP SCHEMA public CASCADE");
+    await db.query("CREATE SCHEMA public");
+    await migrateUp(db);
+
+    const userRow = await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [
+      "session-model@example.com",
+    ]);
+    userId = userRow.rows[0]!.id;
+
+    pool = new Pool({ connectionString: container.getConnectionUri() });
+    sessions = new SessionService(pool);
+  });
+
+  afterEach(async () => {
+    await pool.end();
+    await db.end();
+    vi.restoreAllMocks();
+  });
+
+  it("STORY-017 · scenario 1 — a freshly created session's access token authorises a protected request", async () => {
+    const tokens = await sessions.createSession(userId);
+    const guard = new AuthGuard(new Reflector(), pool);
+    const req: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: tokens.accessToken }, method: "GET" };
+
+    await expect(guard.canActivate(makeContext(req))).resolves.toBe(true);
+    expect(req.auth?.sid).toBe(tokens.sid);
+  });
+
+  it("STORY-017 · scenario 3 — refresh rotates: a new access and refresh token are issued, and the old refresh token is dead", async () => {
+    const initial = await sessions.createSession(userId);
+
+    const rotated = await sessions.refresh(initial.refreshToken);
+
+    expect(rotated.sid).toBe(initial.sid);
+    expect(rotated.accessToken).not.toBe(initial.accessToken);
+    expect(rotated.refreshToken).not.toBe(initial.refreshToken);
+
+    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow(UnauthorizedException);
+  });
+
+  it("STORY-017 · scenario 4 — presenting a consumed refresh token revokes the whole family and raises a security event", async () => {
+    const counterSpy = vi.spyOn(metrics, "incrementCounter");
+    const initial = await sessions.createSession(userId);
+    await sessions.refresh(initial.refreshToken);
+
+    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+
+    const sessionRow = await db.query<{ revoked_at: Date | null; revoked_reason: string | null }>(
+      "SELECT revoked_at, revoked_reason FROM sessions WHERE id = $1",
+      [initial.sid],
+    );
+    expect(sessionRow.rows[0]!.revoked_at).not.toBeNull();
+    expect(sessionRow.rows[0]!.revoked_reason).toBe("reuse_detected");
+    expect(counterSpy).toHaveBeenCalledWith(
+      "nominara_identity_session_reuse_detected_total",
+      expect.objectContaining({ session_id: initial.sid }),
+    );
+  });
+
+  it("STORY-017 · full-history reuse detection — replaying a token from two rotations back still revokes the family and kills the still-unconsumed latest token", async () => {
+    const initial = await sessions.createSession(userId);
+    const afterFirstRotation = await sessions.refresh(initial.refreshToken);
+    const afterSecondRotation = await sessions.refresh(afterFirstRotation.refreshToken);
+
+    // Three refresh_tokens rows now exist for this session: initial
+    // (consumed by the first rotation), afterFirstRotation's token
+    // (consumed by the second rotation), and afterSecondRotation's token
+    // (still active). Replay the ORIGINAL — two rotations stale, not the
+    // immediately-previous token scenario 4 already covers.
+    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+
+    const sessionRow = await db.query<{ revoked_at: Date | null; revoked_reason: string | null }>(
+      "SELECT revoked_at, revoked_reason FROM sessions WHERE id = $1",
+      [initial.sid],
+    );
+    expect(sessionRow.rows[0]!.revoked_at).not.toBeNull();
+    expect(sessionRow.rows[0]!.revoked_reason).toBe("reuse_detected");
+
+    // The latest refresh token was never itself presented twice and was
+    // still unconsumed at the moment of reuse — but the whole family died,
+    // so it is dead too.
+    await expect(sessions.refresh(afterSecondRotation.refreshToken)).rejects.toThrow("session revoked");
+  });
+
+  it("STORY-017 · scenario 5 — a previously-issued access token is refused via the deny list once family revocation has happened", async () => {
+    const initial = await sessions.createSession(userId);
+    const rotated = await sessions.refresh(initial.refreshToken);
+    // Reuse of the now-consumed original refresh token revokes the family.
+    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+
+    const guard = new AuthGuard(new Reflector(), pool);
+    const req: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: rotated.accessToken }, method: "GET" };
+
+    await expect(guard.canActivate(makeContext(req))).rejects.toThrow("session revoked");
+  });
+
+  it("STORY-017 · scenario 8 — switching workspace mints a new token bearing the same sid but a new ws claim; the old token still carries no workspace", async () => {
+    const initial = await sessions.createSession(userId);
+    const initialClaims = decodeClaims(initial.accessToken);
+    expect(initialClaims.ws).toBeNull();
+
+    const switched = await sessions.switchWorkspace(
+      initial.sid,
+      userId,
+      "0192f1a0-aaaa-7000-8000-000000000001",
+      "owner",
+      ["read", "write"],
+      3,
+    );
+    const switchedClaims = decodeClaims(switched.accessToken);
+
+    expect(switchedClaims.sid).toBe(initial.sid);
+    expect(switchedClaims.ws).toBe("0192f1a0-aaaa-7000-8000-000000000001");
+    expect(switchedClaims.ws).not.toBe(initialClaims.ws);
+  });
+
+  it("STORY-017 · logout revokes the family; the session's still-unconsumed refresh token can no longer be redeemed", async () => {
+    const initial = await sessions.createSession(userId);
+
+    await sessions.logout(initial.sid);
+
+    const sessionRow = await db.query<{ revoked_at: Date | null; revoked_reason: string | null }>(
+      "SELECT revoked_at, revoked_reason FROM sessions WHERE id = $1",
+      [initial.sid],
+    );
+    expect(sessionRow.rows[0]!.revoked_at).not.toBeNull();
+    expect(sessionRow.rows[0]!.revoked_reason).toBe("logout");
+
+    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("session revoked");
+  });
+
+  it("STORY-017 · scenario 10 (narrowed) — AuthGuard authorises identical requests regardless of the role claim's value", async () => {
+    const ownerTokens = await sessions.createSession(userId);
+    const asOwner = await sessions.switchWorkspace(
+      ownerTokens.sid,
+      userId,
+      "0192f1a0-aaaa-7000-8000-000000000001",
+      "owner",
+      null,
+      1,
+    );
+    const asViewer = await sessions.switchWorkspace(
+      ownerTokens.sid,
+      userId,
+      "0192f1a0-aaaa-7000-8000-000000000001",
+      "viewer",
+      null,
+      1,
+    );
+
+    const guard = new AuthGuard(new Reflector(), pool);
+    const ownerReq: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: asOwner.accessToken }, method: "GET" };
+    const viewerReq: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: asViewer.accessToken }, method: "GET" };
+
+    await expect(guard.canActivate(makeContext(ownerReq))).resolves.toBe(true);
+    await expect(guard.canActivate(makeContext(viewerReq))).resolves.toBe(true);
+    expect(ownerReq.auth?.role).toBe("owner");
+    expect(viewerReq.auth?.role).toBe("viewer");
+  });
+
+  // Post-QA-review gap fill — /auth/refresh and /auth/logout previously had
+  // zero HTTP-level coverage; every test above drives SessionService/
+  // AuthGuard directly as plain classes, so a bug in IdentityController's
+  // routing, cookie-reading, or Set-Cookie writing could not be caught.
+  // Boots the REAL, deployed ApiModule (every guard/interceptor
+  // api.module.ts actually registers) — not a stripped test module — so
+  // this also proves @SkipTenantContext() is wired on /auth/logout the same
+  // way identity-passkey-webauthn.spec.ts already proved it for
+  // /me/passkeys: logout is reachable through the real
+  // TenantContextInterceptor, which fails closed on any non-@Public() route
+  // with no req.tenant.
+  describe("STORY-017 · /auth/refresh and /auth/logout through the real, deployed ApiModule", () => {
+    let app: NestFastifyApplication;
+
+    beforeEach(async () => {
+      const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
+      app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+      await registerCookiePlugin(app);
+      await app.init();
+      await app.getHttpAdapter().getInstance().ready();
+    });
+
+    afterEach(async () => {
+      await app.close();
+    });
+
+    it("POST /auth/refresh with a valid refresh cookie returns 200, sets new access/refresh/csrf cookies, and kills the old refresh token", async () => {
+      const sessionService = app.get(SessionService);
+      const initial = await sessionService.createSession(userId);
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/auth/refresh",
+        cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const byName = cookiesByName(res);
+      const access = byName.get(ACCESS_COOKIE_NAME);
+      const refresh = byName.get(REFRESH_COOKIE_NAME);
+      const csrf = byName.get(CSRF_COOKIE_NAME);
+      expect(access?.value).toBeTruthy();
+      expect(refresh?.value).toBeTruthy();
+      expect(csrf?.value).toBeTruthy();
+      expect(refresh?.value).not.toBe(initial.refreshToken);
+
+      const replay = await app.inject({
+        method: "POST",
+        url: "/auth/refresh",
+        cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
+      });
+      expect(replay.statusCode).toBe(401);
+    });
+
+    it("POST /auth/refresh with no refresh cookie is refused", async () => {
+      const res = await app.inject({ method: "POST", url: "/auth/refresh" });
+      expect(res.statusCode).toBe(401);
+    });
+
+    it("POST /auth/logout revokes the family (a subsequent refresh with the same family's token fails) and clears the auth cookies in its response", async () => {
+      const sessionService = app.get(SessionService);
+      const initial = await sessionService.createSession(userId);
+
+      const logoutRes = await app.inject({
+        method: "POST",
+        url: "/auth/logout",
+        cookies: { [ACCESS_COOKIE_NAME]: initial.accessToken, [CSRF_COOKIE_NAME]: initial.csrfToken },
+        headers: { [CSRF_HEADER_NAME]: initial.csrfToken },
+      });
+      expect(logoutRes.statusCode).toBe(200);
+
+      // clearAuthCookies (src/lib/auth/cookies.ts) calls reply.clearCookie
+      // for each of the three cookies with `{ path: "/" }` only — @fastify/
+      // cookie's clearCookie forces `value: ""`, `maxAge: 0`, and
+      // `expires: new Date(0)` regardless of what's passed, so THAT is the
+      // wire behavior to assert, not made-up flags the code never sets.
+      const byName = cookiesByName(logoutRes);
+      for (const name of [ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, CSRF_COOKIE_NAME]) {
+        const cleared = byName.get(name);
+        expect(cleared).toBeDefined();
+        expect(cleared?.value).toBe("");
+        expect(cleared?.maxAge).toBe(0);
+        expect(cleared?.expires && cleared.expires.getTime()).toBe(0);
+      }
+
+      const refreshAttempt = await app.inject({
+        method: "POST",
+        url: "/auth/refresh",
+        cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
+      });
+      expect(refreshAttempt.statusCode).toBe(401);
+    });
+
+    // Post-QA-review gap fill — no test previously parsed the actual
+    // Set-Cookie response headers for the hardened flag set / __Host-
+    // prefix the story's Implementation Decisions require verbatim.
+    it("cookie hardening on the wire — HttpOnly split, Secure, SameSite=Lax, Path=/, and the __Host- prefix on all three cookies", async () => {
+      const sessionService = app.get(SessionService);
+      const initial = await sessionService.createSession(userId);
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/auth/refresh",
+        cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
+      });
+      expect(res.statusCode).toBe(200);
+
+      const byName = cookiesByName(res);
+      const access = byName.get(ACCESS_COOKIE_NAME);
+      const refresh = byName.get(REFRESH_COOKIE_NAME);
+      const csrf = byName.get(CSRF_COOKIE_NAME);
+      expect(access).toBeDefined();
+      expect(refresh).toBeDefined();
+      expect(csrf).toBeDefined();
+
+      for (const cookie of [access, refresh, csrf]) {
+        expect(cookie?.name.startsWith("__Host-")).toBe(true);
+        expect(cookie?.secure).toBe(true);
+        expect(cookie?.sameSite).toBe("Lax");
+        expect(cookie?.path).toBe("/");
+      }
+
+      // HttpOnly on access + refresh; explicitly NOT on the CSRF cookie —
+      // client JS must read it to mirror it into X-Nominara-CSRF-Token.
+      expect(access?.httpOnly).toBe(true);
+      expect(refresh?.httpOnly).toBe(true);
+      expect(csrf?.httpOnly).toBeFalsy();
+    });
+  });
+});

@@ -8,7 +8,7 @@ import { getAssertionContext } from "./support/context.js";
 
 // STORY-012 Phase 1 (catalog) — order matters, ISO-06 first: the census is
 // the guard on every other assertion's table-set assumption.
-describe("ISO-06 · census — 59 tenant / 10 global / 69 total, independently derived", () => {
+describe("ISO-06 · census — 59 tenant / 14 global / 73 total, independently derived", () => {
   it("matches the fixed numbers and cross-checks against src/db/conventions.ts", async () => {
     await expect(assertIso06Census(getAssertionContext())).resolves.toBeUndefined();
   });
