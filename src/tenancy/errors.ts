@@ -73,3 +73,37 @@ export class EntitlementStaleException extends UnauthorizedException {
     super({ code: "entitlement_stale" satisfies WorkspaceGuardFailureCode, message });
   }
 }
+
+// STORY-019 — RbacGuard's three distinguishable failure modes (security-and-
+// tenancy.md §6/§7). A permission denial is deliberately a 403 naming the
+// permission, never a 404 — the resource's existence within the tenant is
+// already known to the caller. An out-of-scope project is a DISTINCT code
+// from a plain permission denial, because the remediation differs (ask for
+// broader scope vs. ask for the permission itself). Step-up is a 401, not a
+// 403 — the caller IS permitted, they just haven't proven presence recently
+// enough; distinct from EntitlementStaleException above only in that it
+// carries the acceptable methods so the interface can prompt correctly.
+
+export type RbacGuardFailureCode = "forbidden" | "project_out_of_scope" | "step_up_required";
+
+export class PermissionDeniedException extends ForbiddenException {
+  constructor(requiredPermission: string, message = `missing required permission: ${requiredPermission}`) {
+    super({
+      code: "forbidden" satisfies RbacGuardFailureCode,
+      message,
+      details: { required_permission: requiredPermission },
+    });
+  }
+}
+
+export class ProjectOutOfScopeException extends ForbiddenException {
+  constructor(message = "this project is outside your assigned scope") {
+    super({ code: "project_out_of_scope" satisfies RbacGuardFailureCode, message });
+  }
+}
+
+export class StepUpRequiredException extends UnauthorizedException {
+  constructor(methods: readonly string[], message = "step-up re-authentication required") {
+    super({ code: "step_up_required" satisfies RbacGuardFailureCode, message, details: { methods } });
+  }
+}

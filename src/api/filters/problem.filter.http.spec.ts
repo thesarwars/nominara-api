@@ -5,6 +5,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { ACCESS_COOKIE_NAME } from "../../lib/auth/cookies.js";
 import { PG_POOL } from "../../db/pg-pool.js";
+import {
+  PermissionDeniedException,
+  ProjectOutOfScopeException,
+  StepUpRequiredException,
+  WorkspaceSuspendedException,
+} from "../../tenancy/errors.js";
 import { ApiModule } from "../api.module.js";
 import { Public } from "../decorators/public.decorator.js";
 import { registerCookiePlugin } from "../register-cookies.js";
@@ -28,6 +34,33 @@ class ThrowingController {
   @Get("private-no-tenant")
   privateNoTenant(): { ok: true } {
     return { ok: true };
+  }
+
+  // Code-review finding (STORY-019) — these routes prove ProblemFilter
+  // serializes `code`/`details` from getResponse() over real HTTP, not just
+  // at the exception-object level the unit spec already covered.
+  @Get("throws-permission-denied")
+  @Public()
+  throwsPermissionDenied(): never {
+    throw new PermissionDeniedException("workspace:delete");
+  }
+
+  @Get("throws-project-out-of-scope")
+  @Public()
+  throwsProjectOutOfScope(): never {
+    throw new ProjectOutOfScopeException();
+  }
+
+  @Get("throws-step-up-required")
+  @Public()
+  throwsStepUpRequired(): never {
+    throw new StepUpRequiredException(["webauthn"]);
+  }
+
+  @Get("throws-workspace-suspended")
+  @Public()
+  throwsWorkspaceSuspended(): never {
+    throw new WorkspaceSuspendedException();
   }
 }
 
@@ -116,6 +149,60 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
       status: 500,
       title: "INTERNAL_SERVER_ERROR",
       detail: "internal server error",
+    });
+  });
+
+  it("REQ-019-4 · serializes PermissionDeniedException's code/details over the wire", async () => {
+    const response = await app.inject({ method: "GET", url: "/test-only/throws-permission-denied" });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({
+      type: "about:blank",
+      status: 403,
+      title: "FORBIDDEN",
+      detail: "missing required permission: workspace:delete",
+      code: "forbidden",
+      details: { required_permission: "workspace:delete" },
+    });
+  });
+
+  it("REQ-019-3 · serializes ProjectOutOfScopeException's distinct code over the wire", async () => {
+    const response = await app.inject({ method: "GET", url: "/test-only/throws-project-out-of-scope" });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({
+      type: "about:blank",
+      status: 403,
+      title: "FORBIDDEN",
+      detail: "this project is outside your assigned scope",
+      code: "project_out_of_scope",
+    });
+  });
+
+  it("REQ-019-5 · serializes StepUpRequiredException's acceptable methods over the wire", async () => {
+    const response = await app.inject({ method: "GET", url: "/test-only/throws-step-up-required" });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({
+      type: "about:blank",
+      status: 401,
+      title: "UNAUTHORIZED",
+      detail: "step-up re-authentication required",
+      code: "step_up_required",
+      details: { methods: ["webauthn"] },
+    });
+  });
+
+  it("STORY-018 regression · serializes WorkspaceSuspendedException's code over the wire", async () => {
+    const response = await app.inject({ method: "GET", url: "/test-only/throws-workspace-suspended" });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({
+      type: "about:blank",
+      status: 403,
+      title: "FORBIDDEN",
+      detail: "this workspace is suspended",
+      code: "workspace_suspended",
     });
   });
 });

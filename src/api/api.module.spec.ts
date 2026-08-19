@@ -17,6 +17,7 @@ import { IdempotencyInterceptor } from "./interceptors/idempotency.interceptor.j
 import { TenantContextInterceptor } from "./interceptors/tenant-context.interceptor.js";
 import { AuditInterceptor } from "./interceptors/audit.interceptor.js";
 import { CreditInterceptor } from "./interceptors/credit.interceptor.js";
+import { PermissionDeniedException } from "../tenancy/errors.js";
 
 // STORY-022 — locks the composition root's global guard/interceptor order
 // against a silent regression (this story's "critical implementation
@@ -93,6 +94,47 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
 
     expect(response.statusCode).toBe(200);
     expect(calls).toEqual(GUARD_ORDER.map((Guard) => Guard.name));
+
+    await app.close();
+  });
+
+  // STORY-019 — QA finding: the guard-order test above only ever observes
+  // RbacGuard returning true (every guard here is a no-op except AuthGuard,
+  // /health/live is @Public()). It never proves a refusal SHORT-CIRCUITS
+  // the chain. EntitlementGuard/QuotaGuard/DailyCapGuard/RateLimitGuard/
+  // CreditGuard are still no-ops today, so there is no side effect (e.g. a
+  // credit reservation) for this test to prove was skipped yet — once any
+  // of them stops being a no-op, a test asserting that side effect never
+  // ran on a 403 must be added alongside it. What this test pins now: a
+  // thrown PermissionDeniedException stops NestJS's guard pipeline before
+  // any guard registered after RbacGuard is even invoked.
+  it("an RbacGuard refusal short-circuits the chain before any later guard runs", async () => {
+    const calls: string[] = [];
+    for (const Guard of GUARD_ORDER) {
+      const proto = Guard.prototype as unknown as { canActivate: (...args: unknown[]) => boolean | Promise<boolean> };
+      const original = proto.canActivate;
+      if (Guard === RbacGuard) {
+        vi.spyOn(proto, "canActivate").mockImplementation(function (this: unknown) {
+          calls.push(Guard.name);
+          throw new PermissionDeniedException("workspace:delete");
+        });
+        continue;
+      }
+      vi.spyOn(proto, "canActivate").mockImplementation(function (this: unknown, ...args: unknown[]) {
+        calls.push(Guard.name);
+        return original.apply(this, args as never);
+      });
+    }
+
+    const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
+    const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+
+    const response = await app.inject({ method: "GET", url: "/health/live" });
+
+    expect(response.statusCode).toBe(403);
+    expect(calls).toEqual([AuthGuard.name, WorkspaceGuard.name, RbacGuard.name]);
 
     await app.close();
   });

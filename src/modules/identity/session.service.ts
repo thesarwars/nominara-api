@@ -179,6 +179,21 @@ export class SessionService {
     return this.mintAccessAndCsrf(sid, userId, now, ws, role, scope, entV);
   }
 
+  /**
+   * STORY-019 — test seam only, same precedent as STORY-018-E-5's
+   * MembershipService.removeMember/updateRole: there is no real step-up
+   * re-verification HTTP endpoint in this story (a documented follow-up,
+   * not built here). Lets RbacGuard's step-up tests set up a session with a
+   * real last_strong_auth_at/method instead of simulating the column.
+   */
+  async recordStrongAuth(sessionId: string, method: "webauthn", at: Date = new Date()): Promise<void> {
+    await this.pool.query("UPDATE sessions SET last_strong_auth_at = $2, last_strong_auth_method = $3 WHERE id = $1", [
+      sessionId,
+      at,
+      method,
+    ]);
+  }
+
   /** Revokes the family and adds the current jti to the deny list for its remaining lifetime (sessions.revoked_at IS the deny list). */
   async logout(sid: string): Promise<void> {
     const client = await this.pool.connect();

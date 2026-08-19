@@ -15,12 +15,18 @@ import { verifyDoubleSubmit } from "../../lib/auth/csrf.js";
 import type { AccessTokenClaims } from "../../../contracts/identity/access-token-claims.schema.js";
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
 
+export interface SessionStrongAuth {
+  readonly lastStrongAuthAt: Date | null;
+  readonly lastStrongAuthMethod: string | null;
+}
+
 export interface AuthenticatedRequest {
   headers?: Record<string, string | string[] | undefined>;
   cookies?: Record<string, string | undefined>;
   method?: string;
   auth?: AccessTokenClaims;
   authMethod?: "session" | "apiKey";
+  session?: SessionStrongAuth;
 }
 
 function firstValue(value: string | string[] | undefined): string | undefined {
@@ -91,10 +97,14 @@ export class AuthGuard implements CanActivate {
       throw error;
     }
 
-    const sessionResult = await this.pool.query<{ revoked_at: Date | null }>(
-      "SELECT revoked_at FROM sessions WHERE id = $1",
-      [claims.sid],
-    );
+    // STORY-019 — the same query now also carries the strong-auth freshness
+    // RbacGuard needs for step-up, so its own added-lookup count stays zero
+    // (security-and-tenancy.md §5's step-up line).
+    const sessionResult = await this.pool.query<{
+      revoked_at: Date | null;
+      last_strong_auth_at: Date | null;
+      last_strong_auth_method: string | null;
+    }>("SELECT revoked_at, last_strong_auth_at, last_strong_auth_method FROM sessions WHERE id = $1", [claims.sid]);
     const session = sessionResult.rows[0];
     if (!session || session.revoked_at !== null) {
       throw new UnauthorizedException("session revoked");
@@ -102,6 +112,10 @@ export class AuthGuard implements CanActivate {
 
     req.auth = claims;
     req.authMethod = "session";
+    req.session = {
+      lastStrongAuthAt: session.last_strong_auth_at ?? null,
+      lastStrongAuthMethod: session.last_strong_auth_method ?? null,
+    };
 
     const permitted = verifyDoubleSubmit({
       authMethod: "session",
