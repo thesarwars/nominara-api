@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { RECHAINED_MARKER_ACTION } from "../../src/lib/crypto/audit-chain.js";
+import { pseudonymiseWorkspaceId } from "../../src/lib/crypto/pseudonymise.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
@@ -387,7 +389,10 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     const milestone = await client.query<{ created_by: string }>("SELECT created_by FROM milestones WHERE id = $1", [milestoneId]);
     expect(milestone.rows[0]!.created_by).toBe(SYSTEM_ACTOR_ID);
 
-    const audit = await client.query<{ actor_id: string }>("SELECT actor_id FROM audit_log WHERE workspace_id = $1", [workspaceId]);
+    const audit = await client.query<{ actor_id: string }>(
+      "SELECT actor_id FROM audit_log WHERE workspace_id = $1 AND action <> $2",
+      [workspaceId, RECHAINED_MARKER_ACTION],
+    );
     expect(audit.rows[0]!.actor_id).toBe(SYSTEM_ACTOR_ID);
 
     const ledger = await client.query<{ actor_id: string }>("SELECT actor_id FROM credit_ledger WHERE workspace_id = $1", [
@@ -402,6 +407,48 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     await expect(client.query("UPDATE audit_log SET actor_id = $1 WHERE workspace_id = $2", [SYSTEM_ACTOR_ID, otherWorkspace])).rejects.toThrow(
       /append-only/,
     );
+  });
+
+  // -- STORY-020 D-4 — erasure appends a re-chain marker per affected workspace
+
+  it("STORY-020 · individual erasure appends one audit.chain.rechained marker row to each workspace whose audit_log rows had this actor", async () => {
+    const userId = await createUser();
+    const workspaceId = await createWorkspace();
+    await client.query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1, $2, 'analyst', 'active')", [
+      workspaceId,
+      userId,
+    ]);
+    await insertAuditLog(workspaceId, userId);
+
+    const result = await requestIndividualErasure(client, userId);
+    expect(result).toEqual({ blocked: false });
+
+    const marker = await client.query<{ actor_type: string }>(
+      "SELECT actor_type FROM audit_log WHERE workspace_id = $1 AND action = $2",
+      [workspaceId, RECHAINED_MARKER_ACTION],
+    );
+    expect(marker.rowCount).toBe(1);
+    expect(marker.rows[0]!.actor_type).toBe("system");
+  });
+
+  it("STORY-020 · individual erasure appends no re-chain marker anywhere when the erased user has no audit_log rows", async () => {
+    const userId = await createUser();
+    const workspaceId = await createWorkspace();
+    await client.query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1, $2, 'analyst', 'active')", [
+      workspaceId,
+      userId,
+    ]);
+
+    const before = await client.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM audit_log WHERE action = $1",
+      [RECHAINED_MARKER_ACTION],
+    );
+    await requestIndividualErasure(client, userId);
+    const after = await client.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM audit_log WHERE action = $1",
+      [RECHAINED_MARKER_ACTION],
+    );
+    expect(after.rows[0]!.count).toBe(before.rows[0]!.count);
   });
 
   it("privilege proof (qa-reviewer blocking #4) · nominara_worker CANNOT disable audit_log's append-only trigger — the exact reason executeWorkspaceHardDelete/requestIndividualErasure need a privileged connection, not a claim taken on faith", async () => {
@@ -627,6 +674,31 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     const otherUser = await createUser();
     await insertAuditLog(otherWorkspace, otherUser);
     await expect(client.query("DELETE FROM audit_log WHERE workspace_id = $1", [otherWorkspace])).rejects.toThrow(/append-only/);
+  });
+
+  // -- STORY-020 D-6 — audit_log has no FK cascade from workspaces, so hard
+  // delete must explicitly delete it, and the exported copy's workspace_id
+  // must be pseudonymised (AC "rows are retained only in the immutable
+  // export, with the workspace identifier pseudonymised").
+
+  it("STORY-020 · workspace hard delete: audit_log rows do not survive live, and the exported copy has workspace_id pseudonymised", async () => {
+    const workspaceId = await createWorkspace();
+    const userId = await createUser();
+    await insertAuditLog(workspaceId, userId);
+
+    let exportedAuditRows: readonly Record<string, unknown>[] = [];
+    await executeWorkspaceHardDelete(client, workspaceId, {
+      exportComplianceRecords: async (records) => {
+        exportedAuditRows = records.find((r) => r.table === "audit_log")!.rows;
+      },
+    });
+
+    expect(exportedAuditRows).toHaveLength(1);
+    expect(exportedAuditRows[0]!.workspace_id).toBe(pseudonymiseWorkspaceId(workspaceId));
+    expect(exportedAuditRows[0]!.workspace_id).not.toBe(workspaceId);
+
+    const live = await client.query("SELECT 1 FROM audit_log WHERE workspace_id = $1", [workspaceId]);
+    expect(live.rowCount).toBe(0);
   });
 
   // collectComplianceExport, like the cross-tenant discovery functions

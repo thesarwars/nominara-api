@@ -2,9 +2,14 @@ import { fileURLToPath } from "node:url";
 import type { ClientBase } from "pg";
 import type { PurgeFailureDetail } from "../../../contracts/ops/purge-failure-detail.schema.js";
 import { connect, requireDatabaseUrl } from "../../db/client.js";
+import { RECHAINED_MARKER_ACTION } from "../../lib/crypto/audit-chain.js";
+import { pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
+import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { listPartitions } from "./maintenance.js";
+
+const auditChain = new AuditChainService();
 
 // STORY-013 — data-model.md §7 "Retention, erasure and the deletion
 // cascade". The nightly retention cascade + orphan scan. Same "plain,
@@ -221,10 +226,19 @@ export async function executeWorkspaceHardDelete(
   options: ExecuteWorkspaceHardDeleteOptions,
 ): Promise<void> {
   const exportData = await collectComplianceExport(privilegedClient, workspaceId);
+  // STORY-020 AC "rows are retained only in the immutable export, with the
+  // workspace identifier pseudonymised" — the export copy's audit_log rows
+  // carry the pseudonym; credit_ledger is untouched (out of this story's
+  // scope, its own STORY-013 export behavior is unchanged).
+  const pseudonymisedExportData: ComplianceExportRow[] = exportData.map((record) =>
+    record.table === "audit_log"
+      ? { ...record, rows: record.rows.map((row) => ({ ...row, workspace_id: pseudonymiseWorkspaceId(workspaceId) })) }
+      : record,
+  );
   // Export precedes the cascade — data-model.md §7: "The cascade would
   // otherwise delete them, which is why the export precedes it rather than
   // following it."
-  await options.exportComplianceRecords(exportData);
+  await options.exportComplianceRecords(pseudonymisedExportData);
 
   // Blocking (code review): ENABLE TRIGGER used to run in a `finally` block
   // AFTER COMMIT — as new, separately autocommitted statements. Once COMMIT
@@ -243,6 +257,11 @@ export async function executeWorkspaceHardDelete(
   try {
     await privilegedClient.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
+    // audit_log carries NO foreign key from workspaces (deliberately — see
+    // 0004's schema comment), unlike credit_ledger's `ON DELETE CASCADE`, so
+    // it survives `DELETE FROM workspaces` untouched unless deleted here
+    // explicitly (STORY-020 D-6).
+    await privilegedClient.query("DELETE FROM audit_log WHERE workspace_id = $1", [workspaceId]);
     await privilegedClient.query("DELETE FROM workspaces WHERE id = $1", [workspaceId]);
     await privilegedClient.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
@@ -314,12 +333,47 @@ export async function requestIndividualErasure(privilegedClient: ClientBase, use
       SYSTEM_ACTOR_ID,
     ]);
     await privilegedClient.query("UPDATE milestones SET created_by = $2 WHERE created_by = $1", [userId, SYSTEM_ACTOR_ID]);
+
+    // STORY-020 D-4 / STORY-020-E-9: the workspaces touched by this
+    // pseudonymisation must be captured BEFORE the UPDATE below overwrites
+    // actor_id — after the UPDATE, this SELECT could never find them again.
+    const affectedWorkspaces = await privilegedClient.query<{ workspace_id: string }>(
+      "SELECT DISTINCT workspace_id FROM audit_log WHERE actor_id = $1",
+      [userId],
+    );
+
     await privilegedClient.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
     await privilegedClient.query("UPDATE audit_log SET actor_id = $2 WHERE actor_id = $1", [userId, SYSTEM_ACTOR_ID]);
     await privilegedClient.query("UPDATE credit_ledger SET actor_id = $2 WHERE actor_id = $1", [userId, SYSTEM_ACTOR_ID]);
     await privilegedClient.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
+
+    // Documents exactly when/why the rows just pseudonymised stopped
+    // matching their own row_hash, moving verifyChain's strict-verification
+    // boundary forward past this event (see audit-chain.ts's own doc comment
+    // on RECHAINED_MARKER_ACTION for the full trade-off, disclosed as
+    // STORY-020-E-9). A plain INSERT — the append-only trigger only rejects
+    // UPDATE/DELETE, never INSERT — so this runs fine with the trigger
+    // already re-enabled above.
+    for (const { workspace_id: affectedWorkspaceId } of affectedWorkspaces.rows) {
+      await auditChain.append(privilegedClient, {
+        workspaceId: affectedWorkspaceId,
+        actorType: "system",
+        actorId: SYSTEM_ACTOR_ID,
+        actorIp: null,
+        actorUa: null,
+        action: RECHAINED_MARKER_ACTION,
+        resourceType: "audit_log",
+        resourceId: null,
+        beforeState: null,
+        afterState: { reason: "individual_erasure" },
+        requestId: `erasure-${affectedWorkspaceId}`,
+        supportGrantId: null,
+        severity: "notice",
+      });
+    }
+
     await privilegedClient.query("COMMIT");
   } catch (error) {
     await privilegedClient.query("ROLLBACK");

@@ -20,6 +20,7 @@ import { CreditsModule } from "../modules/credits/credits.module.js";
 import { EntitlementsModule } from "../modules/entitlements/entitlements.module.js";
 import { CommandModule } from "../modules/command/command.module.js";
 import { AdminModule } from "../modules/admin/admin.module.js";
+import { AuditModule } from "../modules/audit/audit.module.js";
 import { AuthGuard } from "./guards/auth.guard.js";
 import { WorkspaceGuard } from "./guards/workspace.guard.js";
 import { RbacGuard } from "./guards/rbac.guard.js";
@@ -69,6 +70,7 @@ import { ProblemFilter } from "./filters/problem.filter.js";
     EntitlementsModule,
     CommandModule,
     AdminModule,
+    AuditModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: AuthGuard },

@@ -18,6 +18,37 @@ export class TenantContextMissingError extends Error {
 }
 
 /**
+ * Thrown by AuditInterceptor (STORY-020) when a mutating route has no
+ * @Audit() metadata, or when no tenant context store is active for it to
+ * write into. Fail-closed, same shape as TenantContextMissingError: "an
+ * unaudited mutation is not an acceptable outcome" (AC2) means a forgotten
+ * decorator must be a loud failure, not a silent audit gap.
+ */
+export class AuditMetadataMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuditMetadataMissingError";
+  }
+}
+
+/**
+ * Thrown by AuditInterceptor (STORY-020 fix pass, qa-reviewer blocking
+ * finding 2) when an @Audit()-annotated mutating route's resource_id cannot
+ * be resolved into a usable value — the configured param is absent from
+ * `req.params`, or the resolved string (from params or the response body) is
+ * not a valid UUID. Fail-closed, same posture as AuditMetadataMissingError:
+ * silently writing `null`, or letting a malformed value reach Postgres as a
+ * raw `22P02 invalid input syntax for type uuid` error, are both worse than
+ * a loud, attributable failure at the point the decorator was misconfigured.
+ */
+export class AuditResourceIdUnresolvedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuditResourceIdUnresolvedError";
+  }
+}
+
+/**
  * Thrown by a JobVerifier (see with-tenant-job.ts) when a queue job's payload
  * signature does not verify. Raised BEFORE any set_config call, so a
  * tampered/poisoned queue entry can never redirect a worker into another
