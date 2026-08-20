@@ -1,5 +1,5 @@
 import { Injectable } from "@nestjs/common";
-import type { Pool } from "pg";
+import type { ClientBase, Pool } from "pg";
 import { MembershipCacheService, type CachedMembership } from "../../tenancy/membership-cache.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -88,35 +88,76 @@ export class MembershipService {
     }
   }
 
-  /** STORY-018's own minimal mutation seam so this story's test scenarios (remove/downgrade) are real, not simulated — STORY-021's full member-management surface reuses this method rather than duplicating the invalidation. */
-  async removeMember(pool: Pool, workspaceId: string, userId: string): Promise<void> {
-    const client = await pool.connect();
-    try {
-      await withTenantContext(client, { workspaceId, actorId: userId }, async (tx) => {
-        await tx.query(
-          "UPDATE workspace_members SET status = 'removed', updated_at = now() WHERE workspace_id = $1 AND user_id = $2",
-          [workspaceId, userId],
-        );
-      });
-    } finally {
-      client.release();
+  /**
+   * STORY-018's own minimal mutation seam so this story's test scenarios
+   * (remove/downgrade) are real, not simulated — STORY-021's full
+   * member-management surface reuses this method rather than duplicating
+   * the invalidation.
+   *
+   * `ambientClient`, when supplied (STORY-021 code-review fix), is an
+   * already-open, context-carrying client (e.g. currentTenantStore()!.client
+   * from an ordinary /members/{id} route) — the UPDATE runs directly on it
+   * instead of opening a second, competing transaction, so this mutation
+   * commits or rolls back atomically with TenantContextInterceptor's ambient
+   * transaction and AuditInterceptor's audit write. Without this, the
+   * mutation could commit on its own connection while the audit write later
+   * failed and rolled back the ambient transaction — a split-brain where the
+   * client is told the request failed but the role/removal change already
+   * stuck. Callers with no ambient transaction (STORY-018's own tests) keep
+   * passing a bare `pool` and get the old own-transaction behavior.
+   */
+  async removeMember(pool: Pool, workspaceId: string, userId: string, ambientClient?: ClientBase): Promise<void> {
+    if (ambientClient) {
+      await ambientClient.query(
+        "UPDATE workspace_members SET status = 'removed', updated_at = now() WHERE workspace_id = $1 AND user_id = $2",
+        [workspaceId, userId],
+      );
+    } else {
+      const client = await pool.connect();
+      try {
+        await withTenantContext(client, { workspaceId, actorId: userId }, async (tx) => {
+          await tx.query(
+            "UPDATE workspace_members SET status = 'removed', updated_at = now() WHERE workspace_id = $1 AND user_id = $2",
+            [workspaceId, userId],
+          );
+        });
+      } finally {
+        client.release();
+      }
     }
     // Synchronous, in the same method as the mutation — not left to expiry.
+    // NOTE: this fires even when ambientClient's enclosing transaction later
+    // rolls back (e.g. the audit write fails) — an over-eager cache
+    // invalidation just means the next read re-checks Postgres, the safe
+    // direction to be wrong in (see getLiveMembership's own comment).
     this.cache.invalidate(userId, workspaceId);
   }
 
-  /** See removeMember's note — same seam, for a role change instead of removal. */
-  async updateRole(pool: Pool, workspaceId: string, userId: string, role: string): Promise<void> {
-    const client = await pool.connect();
-    try {
-      await withTenantContext(client, { workspaceId, actorId: userId }, async (tx) => {
-        await tx.query(
-          "UPDATE workspace_members SET role = $3, updated_at = now() WHERE workspace_id = $1 AND user_id = $2",
-          [workspaceId, userId, role],
-        );
-      });
-    } finally {
-      client.release();
+  /** See removeMember's note — same seam and same ambientClient behavior, for a role change instead of removal. */
+  async updateRole(
+    pool: Pool,
+    workspaceId: string,
+    userId: string,
+    role: string,
+    ambientClient?: ClientBase,
+  ): Promise<void> {
+    if (ambientClient) {
+      await ambientClient.query(
+        "UPDATE workspace_members SET role = $3, updated_at = now() WHERE workspace_id = $1 AND user_id = $2",
+        [workspaceId, userId, role],
+      );
+    } else {
+      const client = await pool.connect();
+      try {
+        await withTenantContext(client, { workspaceId, actorId: userId }, async (tx) => {
+          await tx.query(
+            "UPDATE workspace_members SET role = $3, updated_at = now() WHERE workspace_id = $1 AND user_id = $2",
+            [workspaceId, userId, role],
+          );
+        });
+      } finally {
+        client.release();
+      }
     }
     this.cache.invalidate(userId, workspaceId);
   }

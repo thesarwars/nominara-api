@@ -88,3 +88,76 @@ export async function withTenantContext<T>(
     throw error;
   }
 }
+
+// STORY-021 / ADR-0001 — "Actor-self-scoped RLS policy class for cross-
+// workspace self-reads". A deliberately SEPARATE type and AsyncLocalStorage
+// instance from TenantContext/TenantContextStore/storage above — NOT
+// TenantContext with an optional workspaceId — so no call site can
+// structurally smuggle a workspace id through this path. Used only for the
+// two reads ADR-0001 covers (GET /workspaces, the 409 conflict's "naming the
+// existing workspace" detail): every other tenant-scoped query must keep
+// using withTenantContext.
+
+export interface ActorOnlyContext {
+  readonly actorId: string;
+}
+
+/** What src/tenancy/query-guard.ts reads via AsyncLocalStorage to know an actor-only-context transaction is active. */
+export interface ActorContextStore {
+  readonly client: ClientBase;
+  readonly context: ActorOnlyContext;
+}
+
+const actorStorage = new AsyncLocalStorage<ActorContextStore>();
+
+/** Returns the active actor-only context store, or undefined outside any withActorContext call. */
+export function currentActorStore(): ActorContextStore | undefined {
+  return actorStorage.getStore();
+}
+
+/**
+ * Opens ONE transaction in the actor-only context ADR-0001 defines:
+ *
+ *   BEGIN
+ *   → SET LOCAL TRANSACTION READ ONLY                                  -- defense-in-depth beyond RLS's own WITH CHECK
+ *   → SELECT set_config('app.current_workspace_id', '', true)          -- EXPLICITLY cleared, never left merely unset
+ *   → SELECT set_config('app.current_actor_id',     $actorId, true)
+ *   → fn(client), run inside AsyncLocalStorage.run so query-guard.ts sees the active actor-only store
+ *   → COMMIT on success
+ *   → ROLLBACK on throw, then rethrow the ORIGINAL error (same posture as withTenantContext)
+ *
+ * The workspace GUC is cleared to an empty string, not merely left unset —
+ * `app.current_workspace()` reads it via `NULLIF(current_setting(...), '')`,
+ * so an explicit clear and an unset GUC are indistinguishable to every
+ * policy, but an explicit clear cannot be confused with "the caller forgot
+ * to set it" (STORY-021-E-11 / ADR-0001). `is_local => true` on every
+ * set_config call, same pgBouncer transaction-mode-pooling reasoning as
+ * withTenantContext above.
+ */
+export async function withActorContext<T>(
+  client: ClientBase,
+  context: ActorOnlyContext,
+  fn: (tx: ClientBase) => Promise<T>,
+): Promise<T> {
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL TRANSACTION READ ONLY");
+
+    await client.query("SELECT set_config($1, $2, true)", [WORKSPACE_GUC, ""]);
+    await client.query("SELECT set_config($1, $2, true)", [ACTOR_GUC, context.actorId]);
+
+    const store: ActorContextStore = { client, context };
+    const result = await actorStorage.run(store, () => fn(client));
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      if (error instanceof Error && error.cause === undefined) {
+        error.cause = rollbackError;
+      }
+    }
+    throw error;
+  }
+}

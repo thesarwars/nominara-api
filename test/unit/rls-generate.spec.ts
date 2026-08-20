@@ -1,12 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
+  ACTOR_SELF_SCOPED_TABLES,
   GLOBAL_TABLES,
   PORTAL_READABLE_TABLES,
   RLS_POLICY_ROLES,
   RUNTIME_ROLES,
   TENANT_SCOPE_COLUMN,
 } from "../../src/db/conventions.js";
-import { generateRlsSql, resolveProjectPredicate, type TableDescriptor } from "../../src/db/rls/generate.js";
+import {
+  computeActorSelfScopedPolicies,
+  generateActorSelfScopedRlsSql,
+  generateRlsSql,
+  resolveProjectPredicate,
+  type TableDescriptor,
+} from "../../src/db/rls/generate.js";
 
 // STORY-011 · the RLS policy generator is a PURE function — no database
 // access anywhere in this file. `REAL_SCHEMA_TABLES` below mirrors the
@@ -306,5 +313,91 @@ describe("STORY-011 · src/db/rls/generate.ts — RLS policy generator", () => {
     const policyRoles = [...RLS_POLICY_ROLES.forAll, RLS_POLICY_ROLES.portal].slice().sort();
     const runtimeRoles = [...RUNTIME_ROLES].sort();
     expect(policyRoles).toEqual(runtimeRoles);
+  });
+});
+
+// ---- STORY-021 · ADR-0001 — computeActorSelfScopedPolicies/generateActorSelfScopedRlsSql --------
+
+describe("STORY-021 · src/db/rls/generate.ts — computeActorSelfScopedPolicies (ADR-0001)", () => {
+  it("returns exactly the two ADR-0001 policies, SELECT-only, granted to RLS_POLICY_ROLES.actorSelfScoped, no WITH CHECK", () => {
+    const policies = computeActorSelfScopedPolicies(REAL_SCHEMA_TABLES);
+    expect(policies).toHaveLength(2);
+    for (const policy of policies) {
+      expect(policy.cmd).toBe("SELECT");
+      expect(policy.roles).toEqual(RLS_POLICY_ROLES.actorSelfScoped);
+      expect(policy.withCheck).toBeNull();
+    }
+  });
+
+  it("the workspace_members policy names itself self_membership_workspace_members and checks actor identity only (no status conjunct)", () => {
+    const policies = computeActorSelfScopedPolicies(REAL_SCHEMA_TABLES);
+    const policy = policies.find((p) => p.table === "workspace_members");
+    expect(policy).toBeDefined();
+    expect(policy!.policyName).toBe("self_membership_workspace_members");
+    expect(policy!.using).toBe("app.current_workspace() IS NULL AND user_id = app.current_actor()");
+  });
+
+  it("the workspaces policy names itself self_membership_workspaces and requires an ACTIVE membership via EXISTS", () => {
+    const policies = computeActorSelfScopedPolicies(REAL_SCHEMA_TABLES);
+    const policy = policies.find((p) => p.table === "workspaces");
+    expect(policy).toBeDefined();
+    expect(policy!.policyName).toBe("self_membership_workspaces");
+    expect(policy!.using).toContain("app.current_workspace() IS NULL AND EXISTS (SELECT 1 FROM workspace_members m");
+    expect(policy!.using).toContain("m.status = 'active'::text");
+  });
+
+  it("ACTOR_SELF_SCOPED_TABLES is pinned to exactly {workspaces, workspace_members}, and every policy's table is one of them", () => {
+    expect(new Set(ACTOR_SELF_SCOPED_TABLES)).toEqual(new Set(["workspaces", "workspace_members"]));
+    const policies = computeActorSelfScopedPolicies(REAL_SCHEMA_TABLES);
+    for (const policy of policies) {
+      expect(ACTOR_SELF_SCOPED_TABLES as readonly string[]).toContain(policy.table);
+    }
+  });
+
+  // ---- the fail-loud guard clause, both directions --------------------------
+
+  it("throws, naming the missing table, when 'workspaces' is absent from the introspected schema", () => {
+    const withoutWorkspaces = REAL_SCHEMA_TABLES.filter((table) => table.name !== "workspaces");
+    expect(() => computeActorSelfScopedPolicies(withoutWorkspaces)).toThrow(/ACTOR_SELF_SCOPED_TABLES names "workspaces"/);
+  });
+
+  it("throws, naming the missing table, when 'workspace_members' is absent from the introspected schema", () => {
+    const withoutMembers = REAL_SCHEMA_TABLES.filter((table) => table.name !== "workspace_members");
+    expect(() => computeActorSelfScopedPolicies(withoutMembers)).toThrow(/ACTOR_SELF_SCOPED_TABLES names "workspace_members"/);
+  });
+
+  it("does not throw when both ACTOR_SELF_SCOPED_TABLES entries are present in the introspected schema", () => {
+    expect(() => computeActorSelfScopedPolicies(REAL_SCHEMA_TABLES)).not.toThrow();
+  });
+});
+
+describe("STORY-021 · src/db/rls/generate.ts — generateActorSelfScopedRlsSql (ADR-0001)", () => {
+  it("carries a header naming ADR-0001 and states it is purely additive to migration 0006", () => {
+    const sql = generateActorSelfScopedRlsSql(REAL_SCHEMA_TABLES);
+    expect(sql).toMatch(/ADR-0001/);
+    expect(sql).toMatch(/Purely additive to migration 0006/);
+  });
+
+  it("emits both CREATE POLICY blocks, FOR SELECT TO nominara_app — the role list interpolated from RLS_POLICY_ROLES.actorSelfScoped, not a hardcoded literal", () => {
+    const sql = generateActorSelfScopedRlsSql(REAL_SCHEMA_TABLES);
+    const expectedRoleList = RLS_POLICY_ROLES.actorSelfScoped.join(", ");
+    expect(sql).toMatch(new RegExp(`CREATE POLICY self_membership_workspace_members ON workspace_members\\s*\\n\\s*FOR SELECT TO ${expectedRoleList}`));
+    expect(sql).toMatch(new RegExp(`CREATE POLICY self_membership_workspaces ON workspaces\\s*\\n\\s*FOR SELECT TO ${expectedRoleList}`));
+  });
+
+  it("emits no WITH CHECK clause for either policy (SELECT-only)", () => {
+    const sql = generateActorSelfScopedRlsSql(REAL_SCHEMA_TABLES);
+    expect(sql).not.toContain("WITH CHECK");
+  });
+
+  it("does not re-emit ENABLE/FORCE ROW LEVEL SECURITY statements (migration 0006 already does — only the header's prose mentions them)", () => {
+    const sql = generateActorSelfScopedRlsSql(REAL_SCHEMA_TABLES);
+    expect(sql).not.toMatch(/ALTER TABLE \w+ ENABLE ROW LEVEL SECURITY/);
+    expect(sql).not.toMatch(/ALTER TABLE \w+ FORCE {2}ROW LEVEL SECURITY/);
+  });
+
+  it("propagates computeActorSelfScopedPolicies' own fail-loud throw when a table is missing", () => {
+    const withoutWorkspaces = REAL_SCHEMA_TABLES.filter((table) => table.name !== "workspaces");
+    expect(() => generateActorSelfScopedRlsSql(withoutWorkspaces)).toThrow(/ACTOR_SELF_SCOPED_TABLES names "workspaces"/);
   });
 });

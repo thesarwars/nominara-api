@@ -50,6 +50,24 @@ export const envSchema = z
     AUTH_TOKEN_ED25519_PREVIOUS_KID: requiredString.optional(),
     // STORY-017 — HMAC-SHA256(sid, secret) double-submit CSRF token secret.
     CSRF_SECRET: requiredString,
+
+    // STORY-021-E-10 — LocalDekProvisioner's wrapping key (AES-256-GCM,
+    // node:crypto only, no KMS). Base64-encoded, exactly 32 bytes so it is
+    // usable directly as an AES-256 key.
+    WORKSPACE_DEK_WRAPPING_KEY: requiredString.refine(
+      (value) => {
+        try {
+          return Buffer.from(value, "base64").length === 32;
+        } catch {
+          return false;
+        }
+      },
+      { message: "must be base64-encoded and decode to exactly 32 bytes" },
+    ),
+    // Recorded verbatim into workspace_keys.kms_key_arn — no KMS story
+    // exists yet, so "local:dev" is the honest default rather than a
+    // fabricated ARN shape.
+    WORKSPACE_KMS_KEY_ARN: requiredString.default("local:dev"),
   })
   .strict();
 

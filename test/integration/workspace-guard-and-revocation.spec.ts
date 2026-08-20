@@ -8,6 +8,8 @@ import { MembershipService } from "../../src/modules/workspaces/membership.servi
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
+import type { DekProvisioner } from "../../src/modules/workspaces/ports/dek-provisioner.js";
 import { WORKSPACE_HEADER_NAME } from "../../src/tenancy/constants.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import type { AccessTokenClaims } from "../../contracts/identity/access-token-claims.schema.js";
@@ -74,6 +76,11 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
     process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
     process.env.AUTH_TOKEN_ED25519_KID = "test-kid-1";
     process.env.CSRF_SECRET = "test-csrf-secret";
+    // STORY-021 — WORKSPACE_DEK_WRAPPING_KEY became required by the global
+    // env schema this story extended (config/env.schema.ts); SessionService's
+    // loadEnv() call now needs it even though nothing in this file touches a
+    // DEK directly.
+    process.env.WORKSPACE_DEK_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 
@@ -88,7 +95,21 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
     pool = new Pool({ connectionString: container.getConnectionUri() });
     cache = new MembershipCacheService();
     membership = new MembershipService(cache);
-    workspaces = new WorkspacesService();
+    // STORY-021 — suspend/bumpEntitlementVersion (this story's own methods,
+    // called below with an explicit `pool` argument) never touch these new
+    // constructor dependencies; unused stand-ins keep this test compiling.
+    const unusedDekProvisioner: DekProvisioner = {
+      provision: () => {
+        throw new Error("not used by this test");
+      },
+    };
+    workspaces = new WorkspacesService(
+      pool,
+      unusedDekProvisioner,
+      new AuditChainService(),
+      membership,
+      new SessionService(pool),
+    );
     guard = new WorkspaceGuard(pool, membership, new Reflector());
   });
 

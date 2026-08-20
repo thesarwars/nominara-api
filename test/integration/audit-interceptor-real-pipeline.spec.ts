@@ -108,6 +108,9 @@ describe("STORY-020 fix pass · AuditInterceptor through a real Nest HTTP pipeli
     process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
     process.env.AUTH_TOKEN_ED25519_KID = "test-kid-1";
     process.env.CSRF_SECRET = "test-csrf-secret";
+    // STORY-021 — DbModule's PG_POOL factory now calls loadEnv(), which
+    // requires this even though this file never touches workspace DEKs.
+    process.env.WORKSPACE_DEK_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
 
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();

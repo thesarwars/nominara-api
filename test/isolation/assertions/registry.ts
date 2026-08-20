@@ -19,6 +19,11 @@ import { assertIso14ObjectNamespacing, iso14Breaker } from "./iso-14-object-name
 import { assertIso15AggregateAnonymity, iso15Breaker } from "./iso-15-aggregate-anonymity.js";
 import { assertIso16NoMaterializedViews, iso16Breaker } from "./iso-16-no-matviews.js";
 import { assertIso17AgainstMissingApplyTenantRls, assertIso17PartitionRlsApplied, iso17Breaker } from "./iso-17-partition-rls-applied.js";
+import { assertIso18ActorSelfScopedMultiActor, iso18Breaker } from "./iso-18-actor-self-scoped-multi-actor.js";
+import { assertIso19NoGucsZeroRows, iso19Breaker } from "./iso-19-actor-scoped-no-context-zero-rows.js";
+import { assertIso20ActorPolicyInertUnderTenantContext, iso20Breaker } from "./iso-20-actor-policy-inert-under-tenant-context.js";
+import { assertIso21ActorOnlyWritesDenied, assertIso21AgainstMissingReadOnly, iso21Breaker } from "./iso-21-actor-only-writes-denied.js";
+import { assertIso22ActorOnlyFuzzReplay, iso22Breaker } from "./iso-22-actor-only-fuzz-replay.js";
 
 // STORY-012 — the single place every registered assertion AND its paired
 // breaker are aggregated. test/isolation/meta/breaker-matrix.spec.ts (T27)
@@ -129,6 +134,56 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
     assert: assertIso17PartitionRlsApplied,
     assertUnderBreaker: assertIso17AgainstMissingApplyTenantRls,
     breaker: iso17Breaker,
+  },
+  // STORY-021 / ADR-0001 — actor-self-scoped RLS policy class (see
+  // docs/adr/ADR-0001-actor-self-scoped-rls-for-cross-workspace-self-reads.md).
+  {
+    id: "ISO-18",
+    needsDatabase: true,
+    readOnly: false,
+    needsFixture: true,
+    assert: assertIso18ActorSelfScopedMultiActor,
+    assertUnderBreaker: assertIso18ActorSelfScopedMultiActor,
+    breaker: iso18Breaker,
+  },
+  {
+    id: "ISO-19",
+    needsDatabase: true,
+    readOnly: true,
+    needsFixture: false,
+    assert: assertIso19NoGucsZeroRows,
+    assertUnderBreaker: assertIso19NoGucsZeroRows,
+    breaker: iso19Breaker,
+  },
+  {
+    id: "ISO-20",
+    needsDatabase: true,
+    readOnly: true,
+    needsFixture: true,
+    assert: assertIso20ActorPolicyInertUnderTenantContext,
+    assertUnderBreaker: assertIso20ActorPolicyInertUnderTenantContext,
+    breaker: iso20Breaker,
+  },
+  // readOnly: false — issues INSERT/UPDATE/DELETE probes (each rolled back
+  // automatically via withActorContext's own catch/rollback), same posture
+  // as ISO-03/04.
+  {
+    id: "ISO-21",
+    needsDatabase: true,
+    readOnly: false,
+    needsFixture: true,
+    assert: assertIso21ActorOnlyWritesDenied,
+    assertUnderBreaker: assertIso21AgainstMissingReadOnly,
+    breaker: iso21Breaker,
+  },
+  {
+    id: "ISO-22",
+    needsDatabase: true,
+    readOnly: true,
+    needsFixture: true,
+    assert: assertIso22ActorOnlyFuzzReplay,
+    assertUnderBreaker: assertIso22ActorOnlyFuzzReplay,
+    breaker: iso22Breaker,
   },
 ];
 

@@ -1,4 +1,4 @@
-import { ForbiddenException, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, UnauthorizedException } from "@nestjs/common";
 
 // STORY-011 — the two typed errors this module's guardrails raise. Kept
 // separate from tenant-context.ts/query-guard.ts/with-tenant-job.ts so any
@@ -136,5 +136,42 @@ export class ProjectOutOfScopeException extends ForbiddenException {
 export class StepUpRequiredException extends UnauthorizedException {
   constructor(methods: readonly string[], message = "step-up re-authentication required") {
     super({ code: "step_up_required" satisfies RbacGuardFailureCode, message, details: { methods } });
+  }
+}
+
+// STORY-021-E-5 — the ONE constraint (SQLSTATE 23505 on
+// ux_one_owned_workspace_per_user) that maps to this code. Every other
+// unique violation in workspace creation is a plain 409 conflict — see
+// WorkspacesService.create's catch path.
+export interface ExistingOwnedWorkspace {
+  readonly id: string;
+  readonly name: string;
+  readonly slug: string;
+}
+
+export class WorkspaceLimitReachedException extends ConflictException {
+  constructor(existing: ExistingOwnedWorkspace) {
+    super({
+      code: "workspace_limit_reached",
+      message: `you already own a workspace ("${existing.name}") — transfer ownership before creating another`,
+      details: {
+        existing_workspace_id: existing.id,
+        existing_workspace_name: existing.name,
+        existing_workspace_slug: existing.slug,
+        transfer_path: "POST /workspaces/{id}/transfer-ownership",
+      },
+    });
+  }
+}
+
+// STORY-021-E-7 — the invite/accept enumeration surface: uniform whether or
+// not the token is real, so no reason-specific message ever leaves this
+// exception (never distinguishes expired vs. revoked vs. already-accepted
+// vs. unknown token). Plain message, no `code`, mirroring AccessTokenError's
+// existing precedent (auth.guard.ts) rather than inventing a new taxonomy
+// code for a case none of the five reserved codes describe.
+export class InvitationInvalidException extends BadRequestException {
+  constructor() {
+    super("this invitation is invalid, expired, or already used");
   }
 }

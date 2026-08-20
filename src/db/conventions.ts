@@ -192,6 +192,14 @@ export const PORTAL_READABLE_TABLES = [
 // special-cased in src/db/rls/generate.ts.
 export const PORTAL_SELF_SCOPED_TABLES = ["projects"] as const;
 
+// STORY-021 — ADR-0001 "Actor-self-scoped RLS policy class for cross-
+// workspace self-reads". Pinned to exactly these two tables; extending this
+// list is a new decision, not a precedent the ADR pre-approves. Consumed by
+// a SEPARATE policy branch in src/db/rls/generate.ts
+// (computeActorSelfScopedPolicies) from the ws_isolation_*/portal_scope_*
+// branches, and by src/tenancy/query-guard.ts's actor-only-mode allow-list.
+export const ACTOR_SELF_SCOPED_TABLES = ["workspaces", "workspace_members"] as const;
+
 // STORY-011 — which runtime roles receive which generated policy. Every
 // FOR ALL ws_isolation_* policy is granted to `forAll`; every portal_scope_*
 // SELECT-only policy is granted to `portal`. Kept here as declared data
@@ -201,6 +209,10 @@ export const PORTAL_SELF_SCOPED_TABLES = ["projects"] as const;
 export const RLS_POLICY_ROLES = {
   forAll: ["nominara_app", "nominara_worker", "nominara_report"] as const,
   portal: "nominara_portal" as const,
+  // STORY-021 — ADR-0001's self_membership_* policies are granted TO
+  // nominara_app ONLY, never the other forAll roles (a background worker or
+  // reporting replica has no actor session to key a self-read off of).
+  actorSelfScoped: ["nominara_app"] as const,
 };
 
 export type TablePrivilege = "SELECT" | "INSERT" | "UPDATE" | "DELETE";

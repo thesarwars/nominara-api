@@ -3,7 +3,14 @@ import type { ClientBase } from "pg";
 import { describe, expect, it } from "vitest";
 import { ACTOR_GUC, SCOPE_GUC, SYSTEM_ACTOR_ID, WORKSPACE_GUC } from "../../src/tenancy/constants.js";
 import { JobSignatureError } from "../../src/tenancy/errors.js";
-import { currentTenantStore, withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
+import {
+  currentActorStore,
+  currentTenantStore,
+  withActorContext,
+  withTenantContext,
+  type ActorOnlyContext,
+  type TenantContext,
+} from "../../src/tenancy/tenant-context.js";
 import { hmacSha256JobVerifier, withTenantJob, type TenantJob } from "../../src/tenancy/with-tenant-job.js";
 
 // STORY-011 · src/tenancy/tenant-context.ts and with-tenant-job.ts. No real
@@ -158,6 +165,86 @@ describe("STORY-011 · withTenantContext — exact call order and bind parameter
     expect(observed).toEqual({ workspaceId: "ws-2", actorId: "actor-2" });
     // Outside the call, no store is active.
     expect(currentTenantStore()).toBeUndefined();
+  });
+});
+
+describe("STORY-021 · withActorContext — ADR-0001 actor-only context, exact call order", () => {
+  it("BEGIN → READ ONLY → clear-workspace set_config → actor set_config → body → COMMIT, in that exact order", async () => {
+    const { client, log } = createFakeClient();
+    const context: ActorOnlyContext = { actorId: "actor-1" };
+    const bodyCalls: string[] = [];
+
+    const result = await withActorContext(client, context, async (tx) => {
+      bodyCalls.push("body");
+      expect(tx).toBe(client);
+      return "ok";
+    });
+
+    expect(result).toBe("ok");
+    expect(bodyCalls).toEqual(["body"]);
+    expect(log.map((q) => q.text)).toEqual([
+      "BEGIN",
+      "SET LOCAL TRANSACTION READ ONLY",
+      "SELECT set_config($1, $2, true)",
+      "SELECT set_config($1, $2, true)",
+      "COMMIT",
+    ]);
+    expect(log[2]!.params).toEqual([WORKSPACE_GUC, ""]);
+    expect(log[3]!.params).toEqual([ACTOR_GUC, "actor-1"]);
+  });
+
+  it("the workspace GUC is EXPLICITLY cleared to an empty string, never left unset or non-empty", async () => {
+    const { client, log } = createFakeClient();
+    await withActorContext(client, { actorId: "actor-1" }, async () => "x");
+    const workspaceClearCall = log.find((q) => q.params?.[0] === WORKSPACE_GUC);
+    expect(workspaceClearCall?.params).toEqual([WORKSPACE_GUC, ""]);
+  });
+
+  it("ROLLBACK then rethrows the ORIGINAL error when the body throws", async () => {
+    const { client, log } = createFakeClient();
+    const boom = new Error("boom");
+
+    await expect(
+      withActorContext(client, { actorId: "actor-1" }, async () => {
+        throw boom;
+      }),
+    ).rejects.toBe(boom);
+
+    expect(log.map((q) => q.text)).toEqual([
+      "BEGIN",
+      "SET LOCAL TRANSACTION READ ONLY",
+      "SELECT set_config($1, $2, true)",
+      "SELECT set_config($1, $2, true)",
+      "ROLLBACK",
+    ]);
+  });
+
+  it("a ROLLBACK failure is attached as .cause and does NOT mask the original error", async () => {
+    const { client } = createFakeClient({ failOn: (text) => text === "ROLLBACK" });
+    const original = new Error("original failure");
+
+    await expect(
+      withActorContext(client, { actorId: "actor-1" }, async () => {
+        throw original;
+      }),
+    ).rejects.toBe(original);
+
+    expect(original.cause).toBeInstanceOf(Error);
+    expect((original.cause as Error).message).toContain("ROLLBACK");
+  });
+
+  it("runs the body inside its OWN AsyncLocalStorage store — currentActorStore() reflects it, currentTenantStore() stays undefined", async () => {
+    const { client } = createFakeClient();
+    let observedActor: ActorOnlyContext | undefined;
+    let observedTenant: TenantContext | undefined;
+    await withActorContext(client, { actorId: "actor-2" }, async () => {
+      observedActor = currentActorStore()?.context;
+      observedTenant = currentTenantStore()?.context;
+    });
+    expect(observedActor).toEqual({ actorId: "actor-2" });
+    expect(observedTenant).toBeUndefined();
+    // Outside the call, no store is active.
+    expect(currentActorStore()).toBeUndefined();
   });
 });
 

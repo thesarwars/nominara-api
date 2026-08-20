@@ -3,7 +3,8 @@ import { describe, expect, it } from "vitest";
 import { TENANT_TABLES } from "../../src/db/rls/tenant-tables.generated.js";
 import { TenantContextMissingError } from "../../src/tenancy/errors.js";
 import { assertTenantContext, tenantAware } from "../../src/tenancy/query-guard.js";
-import { currentTenantStore, withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { currentTenantStore, withActorContext, withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { ACTOR_SELF_SCOPED_TABLES } from "../../src/db/conventions.js";
 
 // STORY-011 · src/tenancy/query-guard.ts. The module's own header explains
 // this is a heuristic (regex over SQL text), not a real SQL parser, and not
@@ -155,6 +156,59 @@ describe("STORY-011 · assertTenantContext — the heuristic table check", () =>
         expect(() => guardedB.query("SELECT * FROM projects")).toThrow(TenantContextMissingError);
       });
     });
+  });
+});
+
+describe("STORY-021 · assertTenantContext — actor-only context (ADR-0001 allow-list)", () => {
+  it("does not throw for a workspaces/workspace_members query while inside withActorContext on the SAME client", async () => {
+    const client = createFakeClient();
+    await withActorContext(client, { actorId: "actor-1" }, async () => {
+      expect(() => assertTenantContext("SELECT * FROM workspaces", TENANT_TABLES, client)).not.toThrow();
+      expect(() => assertTenantContext("SELECT * FROM workspace_members", TENANT_TABLES, client)).not.toThrow();
+    });
+  });
+
+  it("throws for a tenant table OUTSIDE ACTOR_SELF_SCOPED_TABLES while inside withActorContext on the SAME client", async () => {
+    const client = createFakeClient();
+    await withActorContext(client, { actorId: "actor-1" }, async () => {
+      expect(() => assertTenantContext("SELECT * FROM projects", TENANT_TABLES, client)).toThrow(
+        TenantContextMissingError,
+      );
+    });
+  });
+
+  it("throws for a query joining an allow-listed table with a non-allow-listed tenant table under an actor-only context", async () => {
+    const client = createFakeClient();
+    await withActorContext(client, { actorId: "actor-1" }, async () => {
+      expect(() =>
+        assertTenantContext(
+          "SELECT * FROM workspaces w JOIN projects p ON p.workspace_id = w.id",
+          TENANT_TABLES,
+          client,
+        ),
+      ).toThrow(TenantContextMissingError);
+    });
+  });
+
+  it("still throws for a tenant-table query with no context of any kind active (unchanged original behavior)", () => {
+    const client = createFakeClient();
+    expect(() => assertTenantContext("SELECT * FROM workspaces", TENANT_TABLES, client)).toThrow(
+      TenantContextMissingError,
+    );
+  });
+
+  it("an actor-only context on client A does not authorize a workspaces query on client B (client-identity check applies here too)", async () => {
+    const clientA = createFakeClient();
+    const clientB = createFakeClient();
+    await withActorContext(clientA, { actorId: "actor-1" }, async () => {
+      expect(() => assertTenantContext("SELECT * FROM workspaces", TENANT_TABLES, clientB)).toThrow(
+        TenantContextMissingError,
+      );
+    });
+  });
+
+  it("sanity — ACTOR_SELF_SCOPED_TABLES is exactly {workspaces, workspace_members}, per ADR-0001", () => {
+    expect(new Set(ACTOR_SELF_SCOPED_TABLES)).toEqual(new Set(["workspaces", "workspace_members"]));
   });
 });
 

@@ -16,6 +16,7 @@ const VALID: NodeJS.ProcessEnv = {
   AUTH_TOKEN_ED25519_PUBLIC_KEY: "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=",
   AUTH_TOKEN_ED25519_KID: "test-kid-1",
   CSRF_SECRET: "test-csrf-secret",
+  WORKSPACE_DEK_WRAPPING_KEY: Buffer.alloc(32, 7).toString("base64"),
 };
 
 describe("STORY-022 · env validation — refuses to start on missing/malformed config", () => {
@@ -27,6 +28,13 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
     expect(env.PORT).toBe(3000);
     expect(env.GATEWAY_PORT).toBe(3001);
     expect(env.WORKER_GROUP).toBeUndefined();
+    expect(env.WORKSPACE_KMS_KEY_ARN).toBe("local:dev");
+  });
+
+  it("STORY-021-E-10 · a WORKSPACE_DEK_WRAPPING_KEY that does not decode to 32 bytes throws, naming that exact key", () => {
+    expect(() => loadEnv({ ...VALID, WORKSPACE_DEK_WRAPPING_KEY: Buffer.alloc(16).toString("base64") })).toThrow(
+      /WORKSPACE_DEK_WRAPPING_KEY/,
+    );
   });
 
   it("a MISSING required var throws EnvValidationError naming that exact key", () => {

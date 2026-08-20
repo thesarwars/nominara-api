@@ -16,6 +16,7 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
     process.env.AUTH_TOKEN_ED25519_KID = "test-kid-1";
     process.env.CSRF_SECRET = "test-csrf-secret";
+    process.env.WORKSPACE_DEK_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
   });
 
   afterEach(() => {

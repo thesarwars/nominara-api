@@ -3,7 +3,13 @@ import type { Client } from "pg";
 import { GLOBAL_TABLES } from "../conventions.js";
 import { connect, requireDatabaseUrl } from "../client.js";
 import { MIGRATIONS_DIR, migrateUp } from "../migrate-runner.js";
-import { computeExpectedPolicies, generateRlsSql, type ExpectedPolicy, type TableDescriptor } from "./generate.js";
+import {
+  computeActorSelfScopedPolicies,
+  computeExpectedPolicies,
+  generateRlsSql,
+  type ExpectedPolicy,
+  type TableDescriptor,
+} from "./generate.js";
 import { introspectTables } from "./introspect.js";
 
 // STORY-011 — `pnpm db:rls-check`, modeled on src/db/drift-check.ts's own
@@ -192,7 +198,14 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
     }
   }
 
-  const expectedPolicies: ExpectedPolicy[] = computeExpectedPolicies(classifiable);
+  // STORY-021 / ADR-0001 — the actor-self-scoped policies are additive to
+  // the ws_isolation_*/portal_scope_* set above, on the same two
+  // (already-classifiable) tables, so they merge into the same expected set
+  // rather than a separate comparison bucket.
+  const expectedPolicies: ExpectedPolicy[] = [
+    ...computeExpectedPolicies(classifiable),
+    ...computeActorSelfScopedPolicies(classifiable),
+  ];
 
   // Fix pass item 1 — every partition child is expected to carry a
   // ws_isolation_<child> policy that is a verbatim copy of its parent's own

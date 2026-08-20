@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
-import { currentTenantStore } from "./tenant-context.js";
+import { ACTOR_SELF_SCOPED_TABLES } from "../db/conventions.js";
+import { currentActorStore, currentTenantStore } from "./tenant-context.js";
 import { TenantContextMissingError } from "./errors.js";
 
 // STORY-011 — security-and-tenancy.md §4's NFR-SEC-01. IMPORTANT: the table
@@ -26,6 +27,8 @@ function extractTableNames(sqlText: string): string[] {
   return names;
 }
 
+const ACTOR_SELF_SCOPED_TABLE_SET = new Set<string>(ACTOR_SELF_SCOPED_TABLES);
+
 /**
  * Throws TenantContextMissingError if `sqlText` appears to touch any table
  * in `tenantTables` while `client` is not the SAME client instance the
@@ -37,19 +40,46 @@ function extractTableNames(sqlText: string): string[] {
  * each other's queries). BEGIN/COMMIT/ROLLBACK/set_config and any query
  * touching only global tables pass through untouched, because none of their
  * SQL text matches TABLE_REF_PATTERN against a tenant name.
+ *
+ * STORY-021 / ADR-0001 — a SECOND allow-list check, only reached when no
+ * ordinary tenant context is active on this client: if an actor-only
+ * context (withActorContext) IS active on this client, the query is allowed
+ * ONLY when every referenced tenant table is in ACTOR_SELF_SCOPED_TABLES.
+ * A query reaching for any other tenant table under an actor-only context —
+ * e.g. a future accidental reuse of withActorContext against `projects` —
+ * still throws loudly here, rather than relying on RLS's silent zero-rows
+ * behavior as the only backstop.
  */
 export function assertTenantContext(sqlText: string, tenantTables: ReadonlySet<string>, client: ClientBase): void {
   const referenced = extractTableNames(sqlText);
-  const touchesTenantTable = referenced.some((name) => tenantTables.has(name));
-  const store = currentTenantStore();
-  const contextActiveOnThisClient = store !== undefined && store.client === client;
-  if (touchesTenantTable && !contextActiveOnThisClient) {
+  const referencedTenantTables = referenced.filter((name) => tenantTables.has(name));
+  if (referencedTenantTables.length === 0) {
+    return;
+  }
+
+  const tenantStore = currentTenantStore();
+  if (tenantStore !== undefined && tenantStore.client === client) {
+    return;
+  }
+
+  const actorStore = currentActorStore();
+  if (actorStore !== undefined && actorStore.client === client) {
+    const outsideAllowList = referencedTenantTables.filter((name) => !ACTOR_SELF_SCOPED_TABLE_SET.has(name));
+    if (outsideAllowList.length === 0) {
+      return;
+    }
     throw new TenantContextMissingError(
-      `query touches tenant table(s) [${referenced.filter((n) => tenantTables.has(n)).join(", ")}] outside a ` +
-        "context-carrying transaction on THIS client — wrap the call in withTenantContext/withTenantJob using " +
-        "the same client the query runs on.",
+      `query touches tenant table(s) [${outsideAllowList.join(", ")}] outside ACTOR_SELF_SCOPED_TABLES ` +
+        `[${[...ACTOR_SELF_SCOPED_TABLE_SET].join(", ")}] while an actor-only context (withActorContext) is ` +
+        "active on THIS client — actor-only context may only reach the ADR-0001 allow-list.",
     );
   }
+
+  throw new TenantContextMissingError(
+    `query touches tenant table(s) [${referencedTenantTables.join(", ")}] outside a ` +
+      "context-carrying transaction on THIS client — wrap the call in withTenantContext/withTenantJob using " +
+      "the same client the query runs on.",
+  );
 }
 
 /**

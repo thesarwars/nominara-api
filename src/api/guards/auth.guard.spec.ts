@@ -67,6 +67,7 @@ describe("STORY-017 · AuthGuard", () => {
     process.env.AUTH_TOKEN_ED25519_PUBLIC_KEY = PUBLIC_KEY_DER;
     process.env.AUTH_TOKEN_ED25519_KID = KID;
     process.env.CSRF_SECRET = CSRF_SECRET;
+    process.env.WORKSPACE_DEK_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
     delete process.env.AUTH_TOKEN_ED25519_PREVIOUS_PUBLIC_KEY;
     delete process.env.AUTH_TOKEN_ED25519_PREVIOUS_KID;
   });

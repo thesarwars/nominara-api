@@ -35,6 +35,12 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       "0004_rollups_aux_tasks_geo_tools",
       "0005_roles_grants_and_pooling",
       "0006_generated_rls_policies",
+      // STORY-021 — checkRls() now unconditionally expects the two
+      // ADR-0001 self-scoped policies once workspace_members/workspaces
+      // exist (from 0002), regardless of which later migration created
+      // them. Without 0012 here, this fixture is a "0006-only" schema
+      // that checkRls (correctly) flags as missing those two policies.
+      "0012_actor_self_scoped_membership_policies",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");
