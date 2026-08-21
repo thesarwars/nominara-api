@@ -9,7 +9,8 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
 import { AuthGuard, type AuthenticatedRequest } from "../../src/api/guards/auth.guard.js";
 import { ApiModule } from "../../src/api/api.module.js";
-import { registerCookiePlugin } from "../../src/api/register-cookies.js";
+import { configureApp } from "../../src/api/configure-app.js";
+import { apiUrl } from "../support/api-url.js";
 import {
   ACCESS_COOKIE_NAME,
   CSRF_COOKIE_NAME,
@@ -270,7 +271,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     beforeEach(async () => {
       const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
       app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
-      await registerCookiePlugin(app);
+      await configureApp(app);
       await app.init();
       await app.getHttpAdapter().getInstance().ready();
     });
@@ -285,7 +286,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
 
       const res = await app.inject({
         method: "POST",
-        url: "/auth/refresh",
+        url: apiUrl("/auth/refresh"),
         cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
       });
 
@@ -301,14 +302,14 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
 
       const replay = await app.inject({
         method: "POST",
-        url: "/auth/refresh",
+        url: apiUrl("/auth/refresh"),
         cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
       });
       expect(replay.statusCode).toBe(401);
     });
 
     it("POST /auth/refresh with no refresh cookie is refused", async () => {
-      const res = await app.inject({ method: "POST", url: "/auth/refresh" });
+      const res = await app.inject({ method: "POST", url: apiUrl("/auth/refresh") });
       expect(res.statusCode).toBe(401);
     });
 
@@ -318,7 +319,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
 
       const logoutRes = await app.inject({
         method: "POST",
-        url: "/auth/logout",
+        url: apiUrl("/auth/logout"),
         cookies: { [ACCESS_COOKIE_NAME]: initial.accessToken, [CSRF_COOKIE_NAME]: initial.csrfToken },
         headers: { [CSRF_HEADER_NAME]: initial.csrfToken },
       });
@@ -340,7 +341,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
 
       const refreshAttempt = await app.inject({
         method: "POST",
-        url: "/auth/refresh",
+        url: apiUrl("/auth/refresh"),
         cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
       });
       expect(refreshAttempt.statusCode).toBe(401);
@@ -355,7 +356,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
 
       const res = await app.inject({
         method: "POST",
-        url: "/auth/refresh",
+        url: apiUrl("/auth/refresh"),
         cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
       });
       expect(res.statusCode).toBe(200);

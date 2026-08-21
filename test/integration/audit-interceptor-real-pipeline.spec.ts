@@ -14,6 +14,8 @@ import { AuditInterceptor } from "../../src/api/interceptors/audit.interceptor.j
 import { TenantContextInterceptor } from "../../src/api/interceptors/tenant-context.interceptor.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { currentTenantStore } from "../../src/tenancy/tenant-context.js";
+import { configureApp } from "../../src/api/configure-app.js";
+import { apiUrl } from "../support/api-url.js";
 
 // STORY-020 fix pass (qa-reviewer blocking finding 2) — no route in this
 // repo carries @Audit() yet, so nothing exercised AuditInterceptor through a
@@ -137,6 +139,7 @@ describe("STORY-020 fix pass · AuditInterceptor through a real Nest HTTP pipeli
     }).compile();
 
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
   }, 180_000);
@@ -155,7 +158,7 @@ describe("STORY-020 fix pass · AuditInterceptor through a real Nest HTTP pipeli
 
     const res = await app.inject({
       method: "PATCH",
-      url: `/test-audit/projects/${resourceId}`,
+      url: apiUrl(`/test-audit/projects/${resourceId}`),
       headers: { "x-test-workspace-id": workspaceId, "x-test-actor-id": actorId },
     });
 
@@ -179,7 +182,7 @@ describe("STORY-020 fix pass · AuditInterceptor through a real Nest HTTP pipeli
 
     const res = await app.inject({
       method: "PATCH",
-      url: `/test-audit/projects/${randomUUID()}`,
+      url: apiUrl(`/test-audit/projects/${randomUUID()}`),
       headers: { "x-test-workspace-id": workspaceId, "x-test-actor-id": "not-a-uuid" },
     });
 
@@ -197,7 +200,7 @@ describe("STORY-020 fix pass · AuditInterceptor through a real Nest HTTP pipeli
 
     const res = await app.inject({
       method: "PATCH",
-      url: "/test-audit/projects/not-a-uuid",
+      url: apiUrl("/test-audit/projects/not-a-uuid"),
       headers: { "x-test-workspace-id": workspaceId, "x-test-actor-id": actorId },
     });
 
@@ -211,7 +214,7 @@ describe("STORY-020 fix pass · AuditInterceptor through a real Nest HTTP pipeli
 
     const res = await app.inject({
       method: "PATCH",
-      url: "/test-audit/mismatched/some-value",
+      url: apiUrl("/test-audit/mismatched/some-value"),
       headers: { "x-test-workspace-id": workspaceId, "x-test-actor-id": actorId },
     });
 

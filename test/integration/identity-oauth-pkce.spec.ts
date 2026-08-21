@@ -7,7 +7,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, t
 import { verifyRegistrationResponse } from "@simplewebauthn/server";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
-import { registerCookiePlugin } from "../../src/api/register-cookies.js";
+import { configureApp } from "../../src/api/configure-app.js";
+import { apiUrl } from "../support/api-url.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import {
   OAUTH_CLIENT,
@@ -192,7 +193,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       .useValue(fakeClient)
       .compile();
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
-    await registerCookiePlugin(app);
+    await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
   });
@@ -211,7 +212,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     const path = opts.purpose === "link" ? `/auth/oauth/${provider}/link/start` : `/auth/oauth/${provider}/start`;
     const res = await app.inject({
       method: "POST",
-      url: path,
+      url: apiUrl(path),
       ...(opts.cookies ? { cookies: opts.cookies } : {}),
       ...(opts.headers ? { headers: opts.headers } : {}),
     });
@@ -232,7 +233,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
 
   function callback(provider: string, query: Record<string, string>, cookies: Record<string, string> = {}) {
     const qs = new URLSearchParams(query).toString();
-    return app.inject({ method: "GET", url: `/auth/oauth/${provider}/callback?${qs}`, cookies });
+    return app.inject({ method: "GET", url: apiUrl(`/auth/oauth/${provider}/callback?${qs}`), cookies });
   }
 
   async function completeLogin(
@@ -253,7 +254,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
   async function registerPasskeyForEmail(email: string, credentialIdB64url: string): Promise<void> {
     const optionsRes = await app.inject({
       method: "POST",
-      url: "/auth/passkey/options",
+      url: apiUrl("/auth/passkey/options"),
       payload: { purpose: "registration", email },
     });
     verifyRegistrationMock.mockResolvedValue({
@@ -266,7 +267,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     });
     await app.inject({
       method: "POST",
-      url: "/auth/passkey/verify",
+      url: apiUrl("/auth/passkey/verify"),
       payload: {
         ceremony_id: optionsRes.json().ceremony_id,
         response: {
@@ -462,7 +463,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     expect(login.cookies).not.toBeNull();
     const createRes = await app.inject({
       method: "POST",
-      url: "/workspaces",
+      url: apiUrl("/workspaces"),
       payload: { name: "Should Be Refused" },
       ...mutatingHeaders(login.cookies!),
     });
@@ -629,7 +630,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
   // ---- Task 12 / AC5 --------------------------------------------------------
 
   it("STORY-015 · AC5 — POST /auth/oauth/:provider/link/start with no authenticated session is refused with 401", async () => {
-    const res = await app.inject({ method: "POST", url: "/auth/oauth/google/link/start" });
+    const res = await app.inject({ method: "POST", url: apiUrl("/auth/oauth/google/link/start") });
     expect(res.statusCode).toBe(401);
   });
 
@@ -701,7 +702,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     );
     const res = await app.inject({
       method: "POST",
-      url: "/auth/oauth/google/link/start",
+      url: apiUrl("/auth/oauth/google/link/start"),
       cookies: { [ACCESS_COOKIE_NAME]: owner.cookies!.access, [CSRF_COOKIE_NAME]: owner.cookies!.csrf },
     });
     expect(res.statusCode).toBe(403);
@@ -715,7 +716,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     );
     const res = await app.inject({
       method: "POST",
-      url: "/auth/oauth/google/link/start",
+      url: apiUrl("/auth/oauth/google/link/start"),
       headers: { [CSRF_HEADER_NAME]: "not-the-right-token" },
       cookies: { [ACCESS_COOKIE_NAME]: owner.cookies!.access, [CSRF_COOKIE_NAME]: owner.cookies!.csrf },
     });
@@ -735,7 +736,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     );
     const res = await app.inject({
       method: "POST",
-      url: "/auth/oauth/google/link/start",
+      url: apiUrl("/auth/oauth/google/link/start"),
       headers: { [CSRF_HEADER_NAME]: other.cookies!.csrf },
       cookies: { [ACCESS_COOKIE_NAME]: owner.cookies!.access, [CSRF_COOKIE_NAME]: other.cookies!.csrf },
     });
@@ -750,7 +751,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     );
     const res = await app.inject({
       method: "DELETE",
-      url: "/me/oauth/google",
+      url: apiUrl("/me/oauth/google"),
       cookies: { [ACCESS_COOKIE_NAME]: owner.cookies!.access, [CSRF_COOKIE_NAME]: owner.cookies!.csrf },
     });
     expect(res.statusCode).toBe(403);
@@ -768,7 +769,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
 
     const res = await app.inject({
       method: "DELETE",
-      url: "/me/oauth/google",
+      url: apiUrl("/me/oauth/google"),
       ...mutatingHeaders(login.cookies!),
     });
     expect(res.statusCode).toBe(409);
@@ -786,7 +787,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
 
     const res = await app.inject({
       method: "DELETE",
-      url: "/me/oauth/google",
+      url: apiUrl("/me/oauth/google"),
       ...mutatingHeaders(login.cookies!),
     });
     expect(res.statusCode).toBe(200);
@@ -935,7 +936,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     const email = "passkey-promote@example.com";
     const optionsRes = await app.inject({
       method: "POST",
-      url: "/auth/passkey/options",
+      url: apiUrl("/auth/passkey/options"),
       payload: { purpose: "registration", email },
     });
     expect(optionsRes.statusCode).toBe(201);
@@ -952,7 +953,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     const email = "passkey-workspace@example.com";
     const optionsRes = await app.inject({
       method: "POST",
-      url: "/auth/passkey/options",
+      url: apiUrl("/auth/passkey/options"),
       payload: { purpose: "registration", email },
     });
     verifyRegistrationMock.mockResolvedValue({
@@ -965,7 +966,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     });
     const verifyRes = await app.inject({
       method: "POST",
-      url: "/auth/passkey/verify",
+      url: apiUrl("/auth/passkey/verify"),
       payload: {
         ceremony_id: optionsRes.json().ceremony_id,
         response: {
@@ -983,7 +984,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
 
     const createRes = await app.inject({
       method: "POST",
-      url: "/workspaces",
+      url: apiUrl("/workspaces"),
       payload: { name: "Passkey Owned Workspace" },
       ...mutatingHeaders(cookies!),
     });
@@ -1027,8 +1028,8 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     expect(activeBefore.rows[0].c).toBe(2);
 
     const [a, b] = await Promise.all([
-      app.inject({ method: "DELETE", url: "/me/oauth/google", ...mutatingHeaders(login.cookies!) }),
-      app.inject({ method: "DELETE", url: "/me/oauth/github", ...mutatingHeaders(login.cookies!) }),
+      app.inject({ method: "DELETE", url: apiUrl("/me/oauth/google"), ...mutatingHeaders(login.cookies!) }),
+      app.inject({ method: "DELETE", url: apiUrl("/me/oauth/github"), ...mutatingHeaders(login.cookies!) }),
     ]);
     const codes = [a.statusCode, b.statusCode].sort();
     const activeAfter = await db.query(
@@ -1127,7 +1128,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     expect(login.statusCode).toBe(200);
     await registerPasskeyForEmail(email, Buffer.from("cred-relink", "utf8").toString("base64url"));
 
-    const unlink = await app.inject({ method: "DELETE", url: "/me/oauth/google", ...mutatingHeaders(login.cookies!) });
+    const unlink = await app.inject({ method: "DELETE", url: apiUrl("/me/oauth/google"), ...mutatingHeaders(login.cookies!) });
     expect(unlink.statusCode).toBe(200);
 
     const start = await startFlow("google", { purpose: "link", ...mutatingHeaders(login.cookies!) });
@@ -1157,7 +1158,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     );
     const userId = decodeClaims(login.cookies!.access).sub;
     await registerPasskeyForEmail(email, Buffer.from("cred-relogin", "utf8").toString("base64url"));
-    const unlink = await app.inject({ method: "DELETE", url: "/me/oauth/google", ...mutatingHeaders(login.cookies!) });
+    const unlink = await app.inject({ method: "DELETE", url: apiUrl("/me/oauth/google"), ...mutatingHeaders(login.cookies!) });
     expect(unlink.statusCode).toBe(200);
 
     const again = await completeLogin("google", { externalSubject: "sub-relogin", email, emailVerified: true }, "code-relogin-2");
@@ -1205,7 +1206,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
   });
 
   it("STORY-015 · AC3 — the binding cookie is __Host- prefixed, httpOnly, Secure, SameSite=Lax (NOT Strict) and Path=/", async () => {
-    const res = await app.inject({ method: "POST", url: "/auth/oauth/google/start" });
+    const res = await app.inject({ method: "POST", url: apiUrl("/auth/oauth/google/start") });
     const cookie = res.cookies.find((c) => c.name === OAUTH_BINDING_COOKIE_NAME) as
       | { name: string; httpOnly?: boolean; secure?: boolean; sameSite?: string; path?: string; maxAge?: number }
       | undefined;
@@ -1327,7 +1328,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     );
     const ownerUnlink = await app.inject({
       method: "DELETE",
-      url: "/me/oauth/google",
+      url: apiUrl("/me/oauth/google"),
       ...mutatingHeaders(owner.cookies!),
     });
     expect(ownerUnlink.statusCode).toBe(200);
@@ -1375,7 +1376,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     );
     const res = await app.inject({
       method: "DELETE",
-      url: "/me/oauth/microsoft",
+      url: apiUrl("/me/oauth/microsoft"),
       ...mutatingHeaders(login.cookies!),
     });
     expect(res.statusCode).toBe(403);

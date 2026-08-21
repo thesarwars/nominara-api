@@ -6,7 +6,8 @@ import { Test } from "@nestjs/testing";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
-import { registerCookiePlugin } from "../../src/api/register-cookies.js";
+import { configureApp } from "../../src/api/configure-app.js";
+import { apiUrl } from "../support/api-url.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
@@ -218,7 +219,7 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
     beforeEach(async () => {
       const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
       app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
-      await registerCookiePlugin(app);
+      await configureApp(app);
       await app.init();
       await app.getHttpAdapter().getInstance().ready();
     });
@@ -235,7 +236,7 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
 
       const createRes = await app.inject({
         method: "POST",
-        url: "/workspaces",
+        url: apiUrl("/workspaces"),
         cookies: { [ACCESS_COOKIE_NAME]: tokens.accessToken, [CSRF_COOKIE_NAME]: csrf },
         headers: { [CSRF_HEADER_NAME]: csrf },
         payload: { name: `Guarded Co ${randomUUID()}` },
@@ -247,7 +248,7 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
       // pre-switch access token, which carries `ws: null`.
       const patchRes = await app.inject({
         method: "PATCH",
-        url: `/workspaces/${workspace.id}`,
+        url: apiUrl(`/workspaces/${workspace.id}`),
         cookies: { [ACCESS_COOKIE_NAME]: tokens.accessToken, [CSRF_COOKIE_NAME]: csrf },
         headers: { [CSRF_HEADER_NAME]: csrf },
         payload: { name: "Should not apply" },
