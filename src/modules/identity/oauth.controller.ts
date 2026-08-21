@@ -1,13 +1,16 @@
 import { Controller, Delete, Param, Post, Query, Get, Req, Res } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import type { AuthenticatedRequest } from "../../api/guards/auth.guard.js";
+import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Public } from "../../api/decorators/public.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { OAUTH_BINDING_COOKIE_NAME, ACCESS_COOKIE_NAME, setAuthCookies, setOauthBindingCookie } from "../../lib/auth/cookies.js";
 import {
   oauthCallbackQuerySchema,
+  oauthCallbackResponseSchema,
   oauthProviderSchema,
+  oauthStartResponseSchema,
   type OauthCallbackQuery,
   type OauthCallbackResponse,
   type OauthProvider,
@@ -32,6 +35,7 @@ export class OauthController {
 
   @Post("auth/oauth/:provider/start")
   @Public()
+  @ApiContract({ operationId: "startOauth", paramsSchema: oauthProviderSchema, responseSchema: oauthStartResponseSchema })
   async start(
     @Param("provider", new ZodValidationPipe(oauthProviderSchema)) provider: OauthProvider,
     @Res({ passthrough: true }) reply: FastifyReply,
@@ -43,6 +47,7 @@ export class OauthController {
 
   @Post("auth/oauth/:provider/link/start")
   @SkipTenantContext()
+  @ApiContract({ operationId: "startOauthLink", paramsSchema: oauthProviderSchema, responseSchema: oauthStartResponseSchema })
   async linkStart(
     @Req() req: AuthenticatedRequest,
     @Param("provider", new ZodValidationPipe(oauthProviderSchema)) provider: OauthProvider,
@@ -56,6 +61,12 @@ export class OauthController {
   @Get("auth/oauth/:provider/callback")
   @Public()
   @SkipTenantContext()
+  @ApiContract({
+    operationId: "oauthCallback",
+    paramsSchema: oauthProviderSchema,
+    querySchema: oauthCallbackQuerySchema,
+    responseSchema: oauthCallbackResponseSchema,
+  })
   async callback(
     @Req() req: OauthRequest,
     @Param("provider", new ZodValidationPipe(oauthProviderSchema)) provider: OauthProvider,
@@ -75,6 +86,7 @@ export class OauthController {
 
   @Delete("me/oauth/:provider")
   @SkipTenantContext()
+  @ApiContract({ operationId: "unlinkOauth", paramsSchema: oauthProviderSchema })
   unlink(
     @Req() req: AuthenticatedRequest,
     @Param("provider", new ZodValidationPipe(oauthProviderSchema)) provider: OauthProvider,

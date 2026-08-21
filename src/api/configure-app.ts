@@ -1,6 +1,7 @@
 import { RequestMethod } from "@nestjs/common";
 import type { NestFastifyApplication } from "@nestjs/platform-fastify";
 import { registerCookiePlugin } from "./register-cookies.js";
+import { registerOpenApiRoute } from "./register-openapi.js";
 
 // STORY-023 (EPIC-03 execution plan, decision D1) — the single seam for
 // everything `bootstrap()` needs an app instance configured with, shared by
@@ -25,6 +26,7 @@ export async function configureApp(app: NestFastifyApplication): Promise<void> {
     ],
   });
   await registerCookiePlugin(app);
+  registerOpenApiRoute(app);
 
   // app.enableShutdownHooks() deliberately stays out of this function: it is
   // a process-lifecycle concern (SIGTERM/SIGINT -> Nest's onModuleDestroy

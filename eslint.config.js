@@ -37,7 +37,7 @@ export default tseslint.config(
     // STORY-022 — NFR-ARCH-01. The request path: module controllers/services
     // and the HTTP composition root. Excludes src/workers/** entirely —
     // workers are where the enqueued call is dequeued and actually made.
-    files: ["src/modules/**/*.controller.ts", "src/modules/**/*.service.ts", "src/api/**/*.ts"],
+    files: ["src/modules/**/*.controller.ts", "src/modules/**/*.service.ts", "src/api/**/*.ts", "src/contracts/**/*.ts"],
     rules: {
       "nominara/no-request-handler-network-call": "error",
     },
