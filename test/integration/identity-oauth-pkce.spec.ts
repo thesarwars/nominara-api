@@ -1413,4 +1413,59 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     expect(typeof body.details.request_id).toBe("string");
     expect(body.details.request_id.length).toBeGreaterThan(0);
   });
+
+  // ---- STORY-023 T2 (RED step, coordinator-flagged defect) -----------------
+  //
+  // T0c's global `/v1` prefix (src/api/configure-app.ts, API_VERSION_PREFIX)
+  // moved this route to `/v1/auth/oauth/:provider/callback`
+  // (oauth.controller.ts:56, `@Get("auth/oauth/:provider/callback")` under
+  // the prefix), but oauth.service.ts's private `redirectUriFor()` still
+  // builds the UNPREFIXED "/auth/oauth/:provider/callback" and both hands it
+  // to the provider as `redirect_uri` AND persists it to
+  // `oauth_authorization_requests.redirect_uri`. In production the provider
+  // redirects the browser back to a path this API no longer serves — a 404.
+  //
+  // Why the rest of this 1400-line suite never caught it: every OTHER
+  // `callback()` call in this file reaches the handler through
+  // `apiUrl(...)` (the real, prefixed router path) directly, never through
+  // the value OauthService itself derived — and the real token-exchange
+  // adapter (openid-client.adapter.ts:91) only ever rebuilds `currentUrl`
+  // from the STORED redirect_uri, comparing it against itself, never against
+  // the router. Nothing before this test connects "what OauthService
+  // constructs" to "what the router serves" — the same class of gap as
+  // this task's blocker B1, one layer down.
+  //
+  // Deliberately does NOT hard-code "/v1/auth/oauth/google/callback" — that
+  // would just re-encode this bug's mirror image and pass forever even if
+  // configureApp's prefix changed again. Two independent, non-hardcoded
+  // checks instead: (1) exact equality against `apiUrl(...)`, the same
+  // API_VERSION_PREFIX-derived seam every other test in this file already
+  // trusts as the router's real path; (2) a LIVE probe of the real app
+  // router with the EXACT path OauthService derived — the router's own
+  // registered routes are the ultimate ground truth for "a path the Nest
+  // router actually serves".
+  it("STORY-023 · the redirect_uri POST /auth/oauth/:provider/start hands to the provider is a path the Nest router actually serves", async () => {
+    const start = await startFlow("google");
+    expect(start.statusCode).toBe(201);
+
+    const authorizationUrl = new URL(start.authorizationUrl!);
+    const redirectUri = authorizationUrl.searchParams.get("redirect_uri");
+    expect(redirectUri, "start() must hand the provider a redirect_uri").toBeTruthy();
+    const redirectPath = new URL(redirectUri!).pathname;
+
+    // (1) — derived from API_VERSION_PREFIX via the same apiUrl() seam this
+    // whole file already routes every real callback() call through.
+    expect(redirectPath).toBe(apiUrl("/auth/oauth/google/callback"));
+
+    // (2) — the router's own registered routes are the ultimate ground
+    // truth: probing the EXACT path OauthService derived must not 404. No
+    // query string is supplied, so a route that DOES exist still fails
+    // downstream (missing state/code) — the only thing this proves is
+    // whether the router recognizes the path shape at all.
+    const probe = await app.inject({ method: "GET", url: redirectPath });
+    expect(
+      probe.statusCode,
+      `the router returned 404 for the exact redirect_uri path OauthService constructed (${redirectPath}) — the provider would redirect the browser to a route this API does not serve`,
+    ).not.toBe(404);
+  });
 });
