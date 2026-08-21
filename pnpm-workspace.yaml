@@ -1,0 +1,23 @@
+# pnpm 11 no longer reads the `pnpm` field in package.json — it warns
+# "The following keys were ignored" on every command — so the fastify
+# override lives here instead. Without it, fastify 5.11.3 and 5.12.0 both
+# resolve, @fastify/cookie and @nestjs/platform-fastify disagree on the
+# FastifyInstance type, and `pnpm typecheck` fails at
+# src/api/register-cookies.ts. system-architecture.md §11 pins the floor.
+overrides:
+  fastify: 5.12.0
+
+# pnpm 11 runs a dependency-status check before every script and exits 1
+# with ERR_PNPM_IGNORED_BUILDS while any build script is unapproved — which
+# made EVERY `pnpm <script>` in this repo fail before it ran. These are the
+# decisions `pnpm approve-builds` writes.
+#
+# esbuild alone needs its install script: it fetches the platform binary
+# vitest's transform pipeline runs on. The other three are optional native
+# accelerators pulled in transitively by testcontainers/dockerode and
+# degrade gracefully to their JavaScript paths.
+allowBuilds:
+  cpu-features: false
+  esbuild: true
+  protobufjs: false
+  ssh2: false
