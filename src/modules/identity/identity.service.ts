@@ -211,20 +211,39 @@ export class IdentityService {
     const { credential } = verification.registrationInfo;
     const attachment = (input.response as { authenticatorAttachment?: string }).authenticatorAttachment ?? null;
 
-    await client.query(
-      `INSERT INTO user_credentials
-         (id, user_id, kind, credential_id, public_key, sign_count, transports, authenticator_attachment, device_label)
-       VALUES ($1, $2, 'passkey', $3, $4, $5, $6, $7, NULL)`,
-      [
-        uuidV7(),
-        userId,
-        Buffer.from(credential.id, "base64url"),
-        Buffer.from(credential.publicKey),
-        credential.counter,
-        credential.transports ?? null,
-        attachment,
-      ],
-    );
+    // Same explicit BEGIN/COMMIT/ROLLBACK shape as revokePasskey/
+    // OauthService.unlink() — a crash between the insert and the status
+    // promotion below can't leave a credential inserted with the user
+    // still stuck 'unverified'.
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO user_credentials
+           (id, user_id, kind, credential_id, public_key, sign_count, transports, authenticator_attachment, device_label)
+         VALUES ($1, $2, 'passkey', $3, $4, $5, $6, $7, NULL)`,
+        [
+          uuidV7(),
+          userId,
+          Buffer.from(credential.id, "base64url"),
+          Buffer.from(credential.publicKey),
+          credential.counter,
+          credential.transports ?? null,
+          attachment,
+        ],
+      );
+
+      // STORY-015 (approved fix, bundled here) — createRegistrationOptions
+      // always creates the users row 'unverified'; a completed, verified
+      // attestation is exactly the "confirmed the address is reachable and
+      // controlled" signal that promotes it. Without this, every passkey
+      // user would silently lose STORY-015's workspace-create right on
+      // merge, since that gate reads users.status.
+      await client.query(`UPDATE users SET status = 'active' WHERE id = $1 AND status = 'unverified'`, [userId]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    }
 
     this.logger.log(`passkey registered user_id=${userId}`);
     incrementCounter("nominara_identity_passkey_registered_total", { user_id: userId });

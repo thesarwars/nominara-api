@@ -17,6 +17,11 @@ const VALID: NodeJS.ProcessEnv = {
   AUTH_TOKEN_ED25519_KID: "test-kid-1",
   CSRF_SECRET: "test-csrf-secret",
   WORKSPACE_DEK_WRAPPING_KEY: Buffer.alloc(32, 7).toString("base64"),
+  // STORY-015 — OAuth 2.1 + PKCE. Required regardless of which provider
+  // credentials are configured; the provider CLIENT_ID/SECRET pairs
+  // themselves stay optional (tests fake the provider at a port boundary).
+  OAUTH_REDIRECT_BASE_URL: "http://localhost:3000",
+  OAUTH_STATE_SECRET: "test-oauth-state-secret",
 };
 
 describe("STORY-022 · env validation — refuses to start on missing/malformed config", () => {
@@ -57,6 +62,28 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
 
   it("a non-numeric PORT throws, naming that exact key", () => {
     expect(() => loadEnv({ ...VALID, PORT: "not-a-number" })).toThrow(/PORT/);
+  });
+
+  it("STORY-015 · boots successfully with zero OAuth provider credentials present — every provider CLIENT_ID/SECRET is optional config", () => {
+    const env = loadEnv(VALID);
+    expect(env.GOOGLE_OAUTH_CLIENT_ID).toBeUndefined();
+    expect(env.GOOGLE_OAUTH_CLIENT_SECRET).toBeUndefined();
+    expect(env.GITHUB_OAUTH_CLIENT_ID).toBeUndefined();
+    expect(env.GITHUB_OAUTH_CLIENT_SECRET).toBeUndefined();
+    expect(env.MICROSOFT_OAUTH_CLIENT_ID).toBeUndefined();
+    expect(env.MICROSOFT_OAUTH_CLIENT_SECRET).toBeUndefined();
+    expect(env.OAUTH_REDIRECT_BASE_URL).toBe(VALID.OAUTH_REDIRECT_BASE_URL);
+    expect(env.OAUTH_STATE_SECRET).toBe(VALID.OAUTH_STATE_SECRET);
+  });
+
+  it("STORY-015 · a MISSING OAUTH_STATE_SECRET throws, naming that exact key", () => {
+    const { OAUTH_STATE_SECRET: _drop, ...rest } = VALID;
+    expect(() => loadEnv(rest)).toThrow(/OAUTH_STATE_SECRET/);
+  });
+
+  it("STORY-015 · a MISSING OAUTH_REDIRECT_BASE_URL throws, naming that exact key", () => {
+    const { OAUTH_REDIRECT_BASE_URL: _drop, ...rest } = VALID;
+    expect(() => loadEnv(rest)).toThrow(/OAUTH_REDIRECT_BASE_URL/);
   });
 
   it("an unknown key is rejected the same way any strict contract schema rejects mass assignment", () => {

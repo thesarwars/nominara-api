@@ -38,3 +38,19 @@ export {
   accessTokenClaimsSchema,
   type AccessTokenClaims,
 } from "../../../../contracts/identity/access-token-claims.schema.js";
+export {
+  oauthProviderSchema,
+  type OauthProvider,
+} from "../../../../contracts/identity/oauth-provider.schema.js";
+export {
+  oauthStartResponseSchema,
+  type OauthStartResponse,
+} from "../../../../contracts/identity/oauth-start-response.schema.js";
+export {
+  oauthCallbackQuerySchema,
+  type OauthCallbackQuery,
+} from "../../../../contracts/identity/oauth-callback-query.schema.js";
+export {
+  oauthCallbackResponseSchema,
+  type OauthCallbackResponse,
+} from "../../../../contracts/identity/oauth-callback-response.schema.js";

@@ -68,6 +68,8 @@ describe("STORY-017 · AuthGuard", () => {
     process.env.AUTH_TOKEN_ED25519_KID = KID;
     process.env.CSRF_SECRET = CSRF_SECRET;
     process.env.WORKSPACE_DEK_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
+    process.env.OAUTH_REDIRECT_BASE_URL = "http://localhost:3000";
+    process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     delete process.env.AUTH_TOKEN_ED25519_PREVIOUS_PUBLIC_KEY;
     delete process.env.AUTH_TOKEN_ED25519_PREVIOUS_KID;
   });

@@ -175,3 +175,29 @@ export class InvitationInvalidException extends BadRequestException {
     super("this invitation is invalid, expired, or already used");
   }
 }
+
+// STORY-015 — AC "An email the provider did not verify creates the account
+// in an unverified state with no workspace-create right." Thrown by
+// WorkspacesService.create() when the acting user's users.status is
+// 'unverified' (set by OauthService.resolveOrCreateForLogin when a
+// provider does not confirm the address).
+export class EmailNotVerifiedException extends ForbiddenException {
+  constructor(message = "email must be verified before creating a workspace") {
+    super({ code: "email_not_verified", message });
+  }
+}
+
+// STORY-015 AC "A provider error returns a neutral message with the
+// request identifier, and never reflects the provider's raw error into the
+// response." Every rejection in OauthService.callback() (bad state, a
+// replayed/unknown/expired state, a binding mismatch, a link re-auth
+// failure, a subject/email conflict, a provider error, a failed token
+// exchange) funnels through this ONE exception — same fixed message and
+// shape regardless of which reason applied, so no response ever
+// distinguishes them for a caller (the distinguishing detail lives only in
+// the server-side warn log, keyed by the SAME request_id).
+export class OauthFailedException extends BadRequestException {
+  constructor(requestId: string, message = "sign-in with this provider could not be completed") {
+    super({ code: "oauth_failed", message, details: { request_id: requestId } });
+  }
+}

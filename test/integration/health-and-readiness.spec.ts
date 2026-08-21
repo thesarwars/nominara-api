@@ -48,6 +48,8 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
     // STORY-021 — DbModule's PG_POOL factory now calls loadEnv(), which
     // requires this even though this file never touches workspace DEKs.
     process.env.WORKSPACE_DEK_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
+    process.env.OAUTH_REDIRECT_BASE_URL = "http://localhost:3000";
+    process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
 
     const client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();

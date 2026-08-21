@@ -6,6 +6,7 @@ import { PG_POOL } from "../../db/pg-pool.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import {
+  EmailNotVerifiedException,
   NotAMemberException,
   PermissionDeniedException,
   WorkspaceLimitReachedException,
@@ -206,6 +207,19 @@ export class WorkspacesService {
     timezone: string,
     meta: AuditRequestMeta,
   ): Promise<WorkspaceResponse> {
+    // STORY-015 — AC "An email the provider did not verify creates the
+    // account in an unverified state with no workspace-create right."
+    // Inside this transaction (not before it, and not via a separate
+    // round-trip on this.pool): a status check outside the transaction a
+    // slug-collision retry re-opens could race a concurrent email
+    // verification, and gating here — right before the first mutating
+    // statement — means a rolled-back attempt never leaves a workspace
+    // behind for an acting user this resolves as unverified.
+    const actor = await tx.query<{ status: string }>("SELECT status FROM users WHERE id = $1", [userId]);
+    if (actor.rows[0]?.status === "unverified") {
+      throw new EmailNotVerifiedException();
+    }
+
     const workspaceResult = await tx.query<WorkspaceRow>(
       `INSERT INTO workspaces (id, name, slug, org_type, region, timezone, plan_key)
        VALUES ($1,$2,$3,$4,$5,$6,'free')

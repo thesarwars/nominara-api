@@ -55,6 +55,8 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
     process.env.AUTH_TOKEN_ED25519_KID = KID;
     process.env.CSRF_SECRET = "test-csrf-secret";
     process.env.WORKSPACE_DEK_WRAPPING_KEY = WRAPPING_KEY.toString("base64");
+    process.env.OAUTH_REDIRECT_BASE_URL = "http://localhost:3000";
+    process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 

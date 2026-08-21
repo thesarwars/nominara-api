@@ -68,6 +68,29 @@ export const envSchema = z
     // exists yet, so "local:dev" is the honest default rather than a
     // fabricated ARN shape.
     WORKSPACE_KMS_KEY_ARN: requiredString.default("local:dev"),
+
+    // STORY-015 — OAuth 2.1 + PKCE (Google, GitHub, Microsoft), via
+    // `openid-client`. Provider credentials are OPTIONAL config: every test
+    // fakes the provider at a port boundary (same pattern as STORY-014's
+    // WebAuthn mocking), so the suite stays green with zero real
+    // credentials, and real credentials arrive later gating only manual
+    // end-to-end verification, never the merge.
+    GOOGLE_OAUTH_CLIENT_ID: requiredString.optional(),
+    GOOGLE_OAUTH_CLIENT_SECRET: requiredString.optional(),
+    GITHUB_OAUTH_CLIENT_ID: requiredString.optional(),
+    GITHUB_OAUTH_CLIENT_SECRET: requiredString.optional(),
+    MICROSOFT_OAUTH_CLIENT_ID: requiredString.optional(),
+    MICROSOFT_OAUTH_CLIENT_SECRET: requiredString.optional(),
+    // The base URL each provider's redirect_uri is built from — the
+    // callback path (auth/oauth/:provider/callback) is appended to this
+    // value at runtime, never hardcoded, so a callback minted for one
+    // environment cannot be replayed against another's.
+    OAUTH_REDIRECT_BASE_URL: requiredString,
+    // Signs the state parameter (security-and-tenancy.md §5: "signed,
+    // single-use, short-lived, and bound to the initiating session"). A NEW
+    // secret, distinct from CSRF_SECRET — key separation, so rotating one
+    // never silently affects the other.
+    OAUTH_STATE_SECRET: requiredString,
   })
   .strict();
 

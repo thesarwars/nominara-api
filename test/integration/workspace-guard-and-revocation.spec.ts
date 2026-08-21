@@ -81,6 +81,8 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
     // loadEnv() call now needs it even though nothing in this file touches a
     // DEK directly.
     process.env.WORKSPACE_DEK_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
+    process.env.OAUTH_REDIRECT_BASE_URL = "http://localhost:3000";
+    process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 

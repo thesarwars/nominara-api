@@ -111,6 +111,8 @@ describe("STORY-020 fix pass · AuditInterceptor through a real Nest HTTP pipeli
     // STORY-021 — DbModule's PG_POOL factory now calls loadEnv(), which
     // requires this even though this file never touches workspace DEKs.
     process.env.WORKSPACE_DEK_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
+    process.env.OAUTH_REDIRECT_BASE_URL = "http://localhost:3000";
+    process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
 
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
