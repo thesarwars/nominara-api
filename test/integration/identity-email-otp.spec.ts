@@ -5,6 +5,7 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { dataOf } from "../support/envelope.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { registerCookiePlugin } from "../../src/api/register-cookies.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
@@ -133,6 +134,15 @@ function comparableBody(response: { json: () => unknown }): string {
   const error = body.error as Record<string, unknown> | undefined;
   if (error?.request_id !== undefined) error.request_id = "<request-id>";
   if (body.request_id !== undefined) body.request_id = "<request-id>";
+
+  // STORY-024 T10 — a SUCCESS body is now enveloped, and `meta` carries two
+  // per-request values: the identifier and `computed_at`. Both are produced
+  // identically on every path regardless of whether the address exists, so
+  // neither distinguishes anything about the account; `data` is compared
+  // verbatim, which is where an enumeration leak would actually appear.
+  const meta = body.meta as Record<string, unknown> | undefined;
+  if (meta?.request_id !== undefined) meta.request_id = "<request-id>";
+  if (meta?.computed_at !== undefined) meta.computed_at = "<computed-at>";
   return JSON.stringify(body);
 }
 
@@ -259,7 +269,8 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
     const reqRes = await requestOtp(email);
     expect(reqRes.statusCode).toBe(OTP_REQUEST_SUCCESS_STATUS);
-    expect(reqRes.json()).toEqual({ status: "sent", expires_in_seconds: 600 });
+    // STORY-024 T10 — §1's envelope wraps the resource under `data`.
+    expect(dataOf(reqRes)).toEqual({ status: "sent", expires_in_seconds: 600 });
 
     const code = fakeSender.latestCodeFor(email);
     expect(code).toMatch(/^\d{8}$/);
@@ -699,7 +710,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     // semantics) — creates the account 'unverified', still issues a session.
     const startRes = await app.inject({ method: "POST", url: "/auth/oauth/google/start" });
     expect(startRes.statusCode).toBe(201);
-    const startBody = startRes.json() as { authorization_url: string };
+    const startBody = dataOf<{ authorization_url: string }>(startRes);
     const state = new URL(startBody.authorization_url).searchParams.get("state")!;
     fakeOauthClient.registerExchange("code-cross-story", {
       externalSubject: "sub-cross-story",
@@ -713,7 +724,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
       cookies: bindingCookie ? { "__Host-nominara-oauth-binding": bindingCookie } : {},
     });
     expect(callbackRes.statusCode).toBe(200);
-    expect((callbackRes.json() as { user_status: string }).user_status).toBe("unverified");
+    expect(dataOf<{ user_status: string }>(callbackRes).user_status).toBe("unverified");
     const loginCookies = extractAuthCookies(callbackRes);
     expect(loginCookies).not.toBeNull();
 

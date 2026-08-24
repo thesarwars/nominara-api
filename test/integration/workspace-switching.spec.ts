@@ -8,6 +8,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { apiUrl } from "../support/api-url.js";
+import { dataOf } from "../support/envelope.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
@@ -244,7 +245,7 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
         payload: { name: `Guarded Co ${randomUUID()}` },
       });
       expect(createRes.statusCode).toBe(201);
-      const workspace = createRes.json() as { id: string };
+      const workspace = dataOf<{ id: string }>(createRes);
 
       // Never called /workspaces/{id}/switch — this is still the ORIGINAL,
       // pre-switch access token, which carries `ws: null`.

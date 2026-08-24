@@ -15,6 +15,7 @@ import { DailyCapGuard } from "./guards/daily-cap.guard.js";
 import { RateLimitGuard } from "./guards/rate-limit.guard.js";
 import { CreditGuard } from "./guards/credit.guard.js";
 import { IdempotencyInterceptor } from "./interceptors/idempotency.interceptor.js";
+import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.interceptor.js";
 import { TenantContextInterceptor } from "./interceptors/tenant-context.interceptor.js";
 import { AuditInterceptor } from "./interceptors/audit.interceptor.js";
 import { CreditInterceptor } from "./interceptors/credit.interceptor.js";
@@ -43,6 +44,11 @@ const GUARD_ORDER = [
 // Observable does once the handler's result arrives) in the REVERSE of it.
 const INTERCEPTOR_REGISTRATION_ORDER = [
   IdempotencyInterceptor,
+  // STORY-024 T10 — index 1. This list is also what the test INSTRUMENTS, so
+  // an interceptor missing from it is not merely unasserted, it is invisible:
+  // the order test passed unchanged when ResponseEnvelopeInterceptor was
+  // first registered, because it was not named here.
+  ResponseEnvelopeInterceptor,
   TenantContextInterceptor,
   AuditInterceptor,
   CreditInterceptor,
@@ -200,5 +206,25 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
     expect(exits).toEqual([...INTERCEPTOR_REGISTRATION_ORDER].reverse().map((I) => I.name));
 
     await app.close();
+  });
+
+  // STORY-024 T10 — the array equality above pins the ORDER; these two
+  // assertions pin the REASONS, so a future reorder fails with the
+  // consequence named rather than as an opaque list mismatch.
+  it("the envelope is applied inside Idempotency's after-logic and outside Audit's", () => {
+    const exitOrder = [...INTERCEPTOR_REGISTRATION_ORDER].reverse().map((I) => I.name);
+    const envelope = exitOrder.indexOf(ResponseEnvelopeInterceptor.name);
+    const idempotency = exitOrder.indexOf(IdempotencyInterceptor.name);
+    const audit = exitOrder.indexOf(AuditInterceptor.name);
+
+    expect(
+      audit,
+      "AuditInterceptor must exit BEFORE the envelope is applied — resourceIdFromResponse() reads body.id, and {data:{...}} makes every audited mutation fail with AuditResourceIdUnresolvedError",
+    ).toBeLessThan(envelope);
+
+    expect(
+      envelope,
+      "the envelope must be applied BEFORE IdempotencyInterceptor exits — STORY-025 requires the store to hold the response envelope, not just a marker, so a replay returns a byte-identical body",
+    ).toBeLessThan(idempotency);
   });
 });

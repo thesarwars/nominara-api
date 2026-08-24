@@ -9,6 +9,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { apiUrl } from "../support/api-url.js";
+import { dataOf } from "../support/envelope.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import {
   OAUTH_CLIENT,
@@ -235,7 +236,8 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     if (res.statusCode >= 400) {
       return { statusCode: res.statusCode };
     }
-    const body = res.json() as { authorization_url: string; state_expires_at: string };
+    // STORY-024 T10 — the success body is enveloped; the resource is under `data`.
+    const body = dataOf<{ authorization_url: string; state_expires_at: string }>(res);
     const url = new URL(body.authorization_url);
     const bindingCookie = res.cookies.find((c) => c.name === OAUTH_BINDING_COOKIE_NAME)?.value;
     return {
@@ -285,7 +287,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       method: "POST",
       url: apiUrl("/auth/passkey/verify"),
       payload: {
-        ceremony_id: optionsRes.json().ceremony_id,
+        ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id,
         response: {
           id: credentialIdB64url,
           rawId: credentialIdB64url,
@@ -318,7 +320,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
         { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie! },
       );
       expect(callbackRes.statusCode).toBe(200);
-      const body = callbackRes.json();
+      const body = dataOf<{ outcome: string; user_status: string }>(callbackRes);
       expect(body.outcome).toBe("signed_in");
       expect(body.user_status).toBe("active");
       const cookies = extractAuthCookies(callbackRes);
@@ -468,7 +470,8 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       "code-unverified",
     );
     expect(login.statusCode).toBe(200);
-    expect((login.body as { user_status: string }).user_status).toBe("unverified");
+    // STORY-024 T10 — the success body is enveloped; the resource is under `data`.
+    expect((login.body as { data: { user_status: string } }).data.user_status).toBe("unverified");
 
     const userRow = await db.query("SELECT status, email_verified_at FROM users WHERE email = $1", [
       "unverified@example.com",
@@ -923,8 +926,8 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       // duplicate-key error this fix closes) — both are a clean success
       // resolving to the SAME account.
       expect([a.statusCode, b.statusCode]).toEqual([200, 200]);
-      expect(a.json().outcome).toBe("signed_in");
-      expect(b.json().outcome).toBe("signed_in");
+      expect(dataOf<{ outcome: string }>(a).outcome).toBe("signed_in");
+      expect(dataOf<{ outcome: string }>(b).outcome).toBe("signed_in");
 
       const cookiesOfA = extractAuthCookies(a);
       const cookiesOfB = extractAuthCookies(b);
@@ -984,7 +987,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       method: "POST",
       url: apiUrl("/auth/passkey/verify"),
       payload: {
-        ceremony_id: optionsRes.json().ceremony_id,
+        ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id,
         response: {
           id: "cred-ws-b64",
           rawId: "cred-ws-b64",
@@ -1035,7 +1038,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       },
     );
     expect(linkRes.statusCode).toBe(200);
-    expect(linkRes.json().outcome).toBe("linked");
+    expect(dataOf<{ outcome: string }>(linkRes).outcome).toBe("linked");
 
     const activeBefore = await db.query(
       "SELECT count(*)::int AS c FROM user_credentials WHERE user_id = $1 AND revoked_at IS NULL",
@@ -1160,7 +1163,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie!, [ACCESS_COOKIE_NAME]: login.cookies!.access },
     );
     expect(res.statusCode).toBe(200);
-    expect(res.json().outcome).toBe("linked");
+    expect(dataOf<{ outcome: string }>(res).outcome).toBe("linked");
 
     const rows = await db.query(
       "SELECT revoked_at FROM user_credentials WHERE provider = 'google' AND external_subject = 'sub-relink'",

@@ -33,13 +33,25 @@ import { useApiHarness } from "../support/api-harness.js";
 // The set of `@Public()` routes is DISCOVERED, never hardcoded. The plan for
 // this task said "the five @Public() routes"; STORY-016 has since added two
 // more, and a hardcoded five would now assert less than it claims to.
+// Resolved exactly as ResponseEnvelopeInterceptor resolves it —
+// `getAllAndOverride([handler, class])`, i.e. method first, then class.
+// Reading the method alone would miss a CLASS-level exemption applied to an
+// authentication controller, which is the very mistake this file exists to
+// catch.
+function isEnvelopeExempt(route: { handler: object; controllerClass: object }): boolean {
+  return (
+    Reflect.getMetadata(NO_ENVELOPE_KEY, route.handler) === true ||
+    Reflect.getMetadata(NO_ENVELOPE_KEY, route.controllerClass) === true
+  );
+}
+
 describe("STORY-024 · T10 envelope scope — probes exempt, authentication routes NOT", () => {
   const harness = useApiHarness();
 
   it("the exemption marker is on the health probes and on nothing else", async () => {
     const routes = await discoverRealRoutes();
     const exempted = routes
-      .filter((route) => Reflect.getMetadata(NO_ENVELOPE_KEY, route.handler) === true)
+      .filter((route) => isEnvelopeExempt(route))
       .map((route) => `${route.controllerName}.${route.methodName} (${route.fullPath})`);
 
     const probes = routes
@@ -57,7 +69,7 @@ describe("STORY-024 · T10 envelope scope — probes exempt, authentication rout
     const publicButExempt = routes
       .filter((route) => route.controllerClass !== HealthController)
       .filter((route) => Reflect.getMetadata(IS_PUBLIC_KEY, route.handler) === true)
-      .filter((route) => Reflect.getMetadata(NO_ENVELOPE_KEY, route.handler) === true)
+      .filter((route) => isEnvelopeExempt(route))
       .map((route) => `${route.controllerName}.${route.methodName} (${route.fullPath})`);
 
     expect(

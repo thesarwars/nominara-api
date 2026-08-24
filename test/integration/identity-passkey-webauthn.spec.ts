@@ -15,6 +15,7 @@ import { ProblemFilter } from "../../src/api/filters/problem.filter.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { apiUrl } from "../support/api-url.js";
+import { dataOf } from "../support/envelope.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME, REFRESH_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 
 // STORY-014 — real Postgres (testcontainers, testing-strategy.md §1: never
@@ -190,7 +191,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       payload: { purpose: "registration", email },
     });
     expect(optionsRes.statusCode).toBe(201);
-    const ceremonyId = optionsRes.json().ceremony_id;
+    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
 
     mockRegistration(credentialIdB64url, counter);
     const verifyRes = await app.inject({
@@ -211,7 +212,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
 
   async function assertPasskey(credentialIdB64url: string, reportedCounter: number) {
     const optionsRes = await app.inject({ method: "POST", url: apiUrl("/auth/passkey/options"), payload: { purpose: "assertion" } });
-    const ceremonyId = optionsRes.json().ceremony_id;
+    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
     mockAssertion(reportedCounter);
     const res = await app.inject({
       method: "POST",
@@ -248,7 +249,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       url: apiUrl("/auth/passkey/options"),
       payload: { purpose: "registration", email: "bob@example.com" },
     });
-    const ceremonyId = optionsRes.json().ceremony_id;
+    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
     mockRegistration(credId("cred-b"), 0);
     const verifyRes = await app.inject({
       method: "POST",
@@ -269,7 +270,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       url: apiUrl("/auth/passkey/options"),
       payload: { purpose: "registration", email: "carol@example.com" },
     });
-    const ceremonyId = optionsRes.json().ceremony_id;
+    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
     mockRegistration(credId("cred-carol"), 0);
     const body = { ceremony_id: ceremonyId, response: credentialResponse(credId("cred-carol")) };
 
@@ -312,7 +313,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       url: apiUrl("/me/passkeys"),
       cookies: sessionCookieHeader(cookies),
     });
-    const [{ id }] = listRes.json();
+    const { id } = dataOf<{ id: string }[]>(listRes)[0]!;
 
     const revokeRes = await app.inject({
       method: "DELETE",
@@ -340,7 +341,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
     process.env.WEBAUTHN_RP_ID = "env-b.example.com";
     process.env.WEBAUTHN_ORIGIN = "https://env-b.example.com";
     const optionsRes = await app.inject({ method: "POST", url: apiUrl("/auth/passkey/options"), payload: { purpose: "assertion" } });
-    const ceremonyId = optionsRes.json().ceremony_id;
+    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
     const res = await app.inject({
       method: "POST",
       url: apiUrl("/auth/passkey/verify"),
@@ -365,7 +366,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       cookies: sessionCookieHeader(cookies),
     });
     expect(listRes.statusCode).toBe(200);
-    const [item] = listRes.json();
+    const item = dataOf<Record<string, unknown>[]>(listRes)[0]!;
     expect(Object.keys(item).sort()).toEqual(
       ["id", "device_label", "authenticator_attachment", "transports", "last_used_at", "created_at"].sort(),
     );
@@ -402,7 +403,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
     await app.inject({
       method: "POST",
       url: apiUrl("/auth/passkey/verify"),
-      payload: { ceremony_id: optionsRes.json().ceremony_id, response: credentialResponse(credId("cred-judy-2")) },
+      payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id, response: credentialResponse(credId("cred-judy-2")) },
     });
 
     const list = (
@@ -435,7 +436,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
     await app.inject({
       method: "POST",
       url: apiUrl("/auth/passkey/verify"),
-      payload: { ceremony_id: optionsRes.json().ceremony_id, response: credentialResponse(credId("cred-leo")) },
+      payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id, response: credentialResponse(credId("cred-leo")) },
     });
     const { cookies: cookiesB } = await registerPasskey("leo2@example.com", credId("cred-leo2"), 0);
 
@@ -465,7 +466,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       url: apiUrl("/auth/passkey/options"),
       payload: { purpose: "registration", email: "mia@example.com" },
     });
-    const ceremonyId = optionsRes.json().ceremony_id;
+    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
     await db.query("UPDATE webauthn_challenges SET expires_at = now() - interval '1 minute' WHERE id = $1", [
       ceremonyId,
     ]);
@@ -485,7 +486,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       url: apiUrl("/auth/passkey/options"),
       payload: { purpose: "registration", email: "nate@example.com" },
     });
-    const ceremonyId = optionsRes.json().ceremony_id;
+    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
     mockRegistration(credId("cred-nate"), 0);
     const body = { ceremony_id: ceremonyId, response: credentialResponse(credId("cred-nate")) };
 
@@ -528,7 +529,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
     await app.inject({
       method: "POST",
       url: apiUrl("/auth/passkey/verify"),
-      payload: { ceremony_id: secondOptionsRes.json().ceremony_id, response: credentialResponse(credId("cred-tina-2")) },
+      payload: { ceremony_id: dataOf<{ ceremony_id: string }>(secondOptionsRes).ceremony_id, response: credentialResponse(credId("cred-tina-2")) },
     });
 
     const list = (
@@ -663,7 +664,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
         payload: { purpose: "registration", email: "sam@example.com" },
       });
       expect(optionsRes.statusCode).toBe(201);
-      const ceremonyId = optionsRes.json().ceremony_id;
+      const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
 
       mockRegistration(credId("cred-sam"), 0);
       const verifyRes = await apiApp.inject({
@@ -682,11 +683,19 @@ describe("STORY-014 · passkey registration and assertion", () => {
         payload: { purpose: "registration", email: "sam@example.com" },
       });
       mockRegistration(credId("cred-sam-2"), 0);
-      await apiApp.inject({
+      const secondVerifyRes = await apiApp.inject({
         method: "POST",
         url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: secondOptionsRes.json().ceremony_id, response: credentialResponse(credId("cred-sam-2")) },
+        payload: {
+          ceremony_id: dataOf<{ ceremony_id: string }>(secondOptionsRes).ceremony_id,
+          response: credentialResponse(credId("cred-sam-2")),
+        },
       });
+      // Asserted rather than assumed: this registration was previously
+      // fire-and-forget, so when it silently stopped working the failure
+      // surfaced further down as "expected 2 credentials, got 1" instead of
+      // here, where the cause is.
+      expect(secondVerifyRes.statusCode).toBe(200);
 
       const listRes = await apiApp.inject({
         method: "GET",
@@ -694,12 +703,12 @@ describe("STORY-014 · passkey registration and assertion", () => {
         cookies: sessionCookieHeader(cookies),
       });
       expect(listRes.statusCode).toBe(200);
-      const credentials = listRes.json();
+      const credentials = dataOf<{ id: string }[]>(listRes);
       expect(credentials).toHaveLength(2);
 
       const renameRes = await apiApp.inject({
         method: "PATCH",
-        url: apiUrl(`/me/passkeys/${credentials[0].id}`),
+        url: apiUrl(`/me/passkeys/${credentials[0]!.id}`),
         payload: { device_label: "Sam's Yubikey" },
         ...mutatingHeaders(cookies),
       });
@@ -707,7 +716,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
 
       const revokeRes = await apiApp.inject({
         method: "DELETE",
-        url: apiUrl(`/me/passkeys/${credentials[0].id}`),
+        url: apiUrl(`/me/passkeys/${credentials[0]!.id}`),
         ...mutatingHeaders(cookies),
       });
       expect(revokeRes.statusCode).toBe(200);
@@ -728,7 +737,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       const verifyA = await apiApp.inject({
         method: "POST",
         url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: optionsA.json().ceremony_id, response: credentialResponse(credId("cred-paul")) },
+        payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsA).ceremony_id, response: credentialResponse(credId("cred-paul")) },
       });
       const cookiesA = extractAuthCookies(verifyA);
 
@@ -741,7 +750,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       await apiApp.inject({
         method: "POST",
         url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: optionsQuinn.json().ceremony_id, response: credentialResponse(credId("cred-quinn")) },
+        payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsQuinn).ceremony_id, response: credentialResponse(credId("cred-quinn")) },
       });
 
       const optionsB = await apiApp.inject({
@@ -753,16 +762,16 @@ describe("STORY-014 · passkey registration and assertion", () => {
       const verifyB = await apiApp.inject({
         method: "POST",
         url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: optionsB.json().ceremony_id, response: credentialResponse(credId("cred-quinn2")) },
+        payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsB).ceremony_id, response: credentialResponse(credId("cred-quinn2")) },
       });
       const cookiesB = extractAuthCookies(verifyB);
 
-      const listA = (
-        await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookiesA) })
-      ).json();
-      const listB = (
-        await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookiesB) })
-      ).json();
+      const listA = dataOf<{ id: string }[]>(
+        await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookiesA) }),
+      );
+      const listB = dataOf<{ id: string }[]>(
+        await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookiesB) }),
+      );
 
       expect(listA.map((c: { id: string }) => c.id)).not.toEqual(
         expect.arrayContaining(listB.map((c: { id: string }) => c.id)),
@@ -782,12 +791,12 @@ describe("STORY-014 · passkey registration and assertion", () => {
       const verifyRes = await apiApp.inject({
         method: "POST",
         url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: optionsRes.json().ceremony_id, response: credentialResponse(credId("cred-rex")) },
+        payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id, response: credentialResponse(credId("cred-rex")) },
       });
       const cookies = extractAuthCookies(verifyRes);
-      const [{ id }] = (
-        await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) })
-      ).json();
+      const { id } = dataOf<{ id: string }[]>(
+        await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) }),
+      )[0]!;
 
       const res = await apiApp.inject({
         method: "PATCH",

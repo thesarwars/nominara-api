@@ -1,0 +1,127 @@
+import { Logger, type CallHandler, type ExecutionContext } from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { of, lastValueFrom } from "rxjs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { envelopeMetaSchema } from "../../../contracts/common/envelope.schema.js";
+import { NoEnvelope } from "../decorators/no-envelope.decorator.js";
+import { ResponseEnvelopeInterceptor, SCORING_VERSION } from "./response-envelope.interceptor.js";
+
+// STORY-024 T10 — coding-standards.md §7: "Every story adds at least one
+// metric and one log line, and both are verified, not assumed."
+//
+// Verified HERE rather than by grepping a test run's output, because vitest
+// suppresses stdout for passing tests — a log line "confirmed" by eyeballing
+// a green run is confirmed by nothing at all. Both the counter (via
+// metrics.ts's own Logger) and the interceptor's log line go through
+// Logger.prototype.log, so one spy sees both.
+class Wrapped {}
+class Exempt {
+  static marked = false;
+}
+NoEnvelope()(Exempt);
+
+function contextFor(controller: object, workspaceId: string | null, headers: Record<string, string> = {}) {
+  const header = vi.fn();
+  const request = { id: "req-1", headers, auth: workspaceId === null ? undefined : { ws: workspaceId } };
+  return {
+    context: {
+      getHandler: () => function handler() {},
+      getClass: () => controller,
+      switchToHttp: () => ({ getRequest: () => request, getResponse: () => ({ header }) }),
+    } as unknown as ExecutionContext,
+    header,
+  };
+}
+
+const handlerReturning = (value: unknown): CallHandler => ({ handle: () => of(value) });
+
+describe("STORY-024 · ResponseEnvelopeInterceptor", () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  const logged = (): Record<string, unknown>[] =>
+    (logSpy.mock.calls as unknown[][]).map((call) => call[0] as Record<string, unknown>);
+
+  it("wraps a resource in §1's envelope with a valid meta", async () => {
+    const { context } = contextFor(Wrapped, "11111111-1111-4111-8111-111111111111");
+    const result = (await lastValueFrom(
+      new ResponseEnvelopeInterceptor(new Reflector()).intercept(context, handlerReturning({ id: "abc" })),
+    )) as { data: unknown; meta: unknown };
+
+    expect(result.data).toEqual({ id: "abc" });
+    expect(envelopeMetaSchema.safeParse(result.meta).success).toBe(true);
+    expect((result.meta as { scoring_version: string }).scoring_version).toBe(SCORING_VERSION);
+  });
+
+  it("a void handler still carries the identifier — data is explicitly null, never a missing member", async () => {
+    const { context } = contextFor(Wrapped, null);
+    const result = (await lastValueFrom(
+      new ResponseEnvelopeInterceptor(new Reflector()).intercept(context, handlerReturning(undefined)),
+    )) as Record<string, unknown>;
+
+    expect(result).toHaveProperty("data", null);
+    expect(result).toHaveProperty("meta");
+  });
+
+  it("leaves an exempt controller's body untouched", async () => {
+    const { context } = contextFor(Exempt, null);
+    const result = await lastValueFrom(
+      new ResponseEnvelopeInterceptor(new Reflector()).intercept(context, handlerReturning({ status: "ok" })),
+    );
+
+    expect(result, "a probe body must reach the orchestrator unwrapped").toEqual({ status: "ok" });
+  });
+
+  it("echoes the request identifier on the response, honouring an inbound one", async () => {
+    const { context, header } = contextFor(Wrapped, null, { "x-request-id": "from-caller" });
+    await lastValueFrom(new ResponseEnvelopeInterceptor(new Reflector()).intercept(context, handlerReturning({})));
+
+    expect(header).toHaveBeenCalledWith("x-request-id", "from-caller");
+  });
+
+  it("emits the counter, labelled by whether the body was wrapped", async () => {
+    const { context } = contextFor(Wrapped, null);
+    await lastValueFrom(new ResponseEnvelopeInterceptor(new Reflector()).intercept(context, handlerReturning({})));
+
+    expect(logged()).toContainEqual(
+      expect.objectContaining({ metric: "nominara_api_response_envelope_total", wrapped: "true" }),
+    );
+
+    logSpy.mockClear();
+    const exempt = contextFor(Exempt, null);
+    await lastValueFrom(
+      new ResponseEnvelopeInterceptor(new Reflector()).intercept(exempt.context, handlerReturning({})),
+    );
+    expect(logged()).toContainEqual(
+      expect.objectContaining({ metric: "nominara_api_response_envelope_total", wrapped: "false" }),
+    );
+  });
+
+  // §7: "A log line carries the workspace ID, never the workspace name.
+  // Names are customer data; IDs are not."
+  it("logs the workspace ID and nothing resembling a name or a body", async () => {
+    const workspaceId = "22222222-2222-4222-8222-222222222222";
+    const { context } = contextFor(Wrapped, workspaceId);
+    await lastValueFrom(
+      new ResponseEnvelopeInterceptor(new Reflector()).intercept(
+        context,
+        handlerReturning({ id: "abc", name: "Acme Corporation", secret: "s3cret" }),
+      ),
+    );
+
+    const line = logged().find((entry: Record<string, unknown>) => entry.message === "response enveloped");
+    expect(line, "the story's one log line must be emitted").toBeDefined();
+    expect(line).toEqual({ message: "response enveloped", request_id: "req-1", workspace_id: workspaceId });
+
+    const serialized = JSON.stringify(logged());
+    expect(serialized, "a workspace NAME must never reach a log line").not.toContain("Acme Corporation");
+    expect(serialized, "no response body content belongs in a log line").not.toContain("s3cret");
+  });
+});

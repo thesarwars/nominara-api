@@ -34,6 +34,7 @@ import { TenantContextInterceptor } from "./interceptors/tenant-context.intercep
 import { AuditInterceptor } from "./interceptors/audit.interceptor.js";
 import { CreditInterceptor } from "./interceptors/credit.interceptor.js";
 import { ProblemFilter } from "./filters/problem.filter.js";
+import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.interceptor.js";
 
 // STORY-022 — the HTTP composition root (project-structure.md §2: "src/api/
 // HTTP composition root: global guards, interceptors, filters"). The global
@@ -90,6 +91,11 @@ import { ProblemFilter } from "./filters/problem.filter.js";
     // TenantContextInterceptor's transaction stays open across both —
     // locked by composition-root.spec.ts.
     { provide: APP_INTERCEPTOR, useClass: IdempotencyInterceptor },
+    // STORY-024 T10 — index 1 exactly: INNER to Idempotency (so STORY-025
+    // caches the envelope, not the bare body) and OUTER to Audit (whose
+    // resourceIdFromResponse reads body.id and would break on {data}).
+    // See response-envelope.interceptor.ts for the full ordering argument.
+    { provide: APP_INTERCEPTOR, useClass: ResponseEnvelopeInterceptor },
     { provide: APP_INTERCEPTOR, useClass: TenantContextInterceptor },
     { provide: APP_INTERCEPTOR, useClass: AuditInterceptor },
     { provide: APP_INTERCEPTOR, useClass: CreditInterceptor },

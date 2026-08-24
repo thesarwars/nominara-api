@@ -8,6 +8,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { apiUrl } from "../support/api-url.js";
+import { dataOf } from "../support/envelope.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import type { ChainMismatchAlert, PagingNotifier } from "../../src/modules/audit/ports/paging-notifier.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
@@ -144,7 +145,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       payload: { name: `Audited Co ${randomUUID()}` },
     });
     expect(createRes.statusCode).toBe(201);
-    const workspace = createRes.json() as { id: string };
+    const workspace = dataOf<{ id: string }>(createRes);
     const created = await auditRow(workspace.id, "workspace.created");
     expect(created).toEqual({ actor_id: owner.userId, resource_id: workspace.id });
 
@@ -227,7 +228,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       payload: { email: `invitee-${randomUUID()}@example.com`, role: "viewer" },
     });
     expect(inviteRes.statusCode).toBe(201);
-    const invitation = inviteRes.json() as { id: string; token: string };
+    const invitation = dataOf<{ id: string; token: string }>(inviteRes);
     const invited = await auditRow(workspace.id, "member.invited");
     expect(invited).toEqual({ actor_id: owner.userId, resource_id: invitation.id });
 
@@ -241,7 +242,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       payload: { token: invitation.token },
     });
     expect(acceptRes.statusCode).toBe(200);
-    const acceptedMember = acceptRes.json() as { id: string };
+    const acceptedMember = dataOf<{ id: string }>(acceptRes);
     const accepted = await auditRow(workspace.id, "member.invitation_accepted");
     expect(accepted).toEqual({ actor_id: invitee.userId, resource_id: acceptedMember.id });
 
@@ -284,7 +285,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       headers: { [CSRF_HEADER_NAME]: owner.csrf },
       payload: { name: `Rollback Co ${randomUUID()}` },
     });
-    const workspace = createRes.json() as { id: string };
+    const workspace = dataOf<{ id: string }>(createRes);
 
     const switchRes = await app.inject({
       method: "POST",
@@ -361,7 +362,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       headers: { [CSRF_HEADER_NAME]: owner.csrf },
       payload: { name: `Matrix Co ${randomUUID()}` },
     });
-    const workspace = createRes.json() as { id: string };
+    const workspace = dataOf<{ id: string }>(createRes);
 
     const admin = await newSession();
     await addMember(workspace.id, admin.userId, "admin");
