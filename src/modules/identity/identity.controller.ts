@@ -1,11 +1,13 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import type { AuthenticatedRequest } from "../../api/guards/auth.guard.js";
+import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Public } from "../../api/decorators/public.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { REFRESH_COOKIE_NAME, clearAuthCookies, setAuthCookies } from "../../lib/auth/cookies.js";
 import {
+  passkeyListResponseSchema,
   passkeyOptionsRequestSchema,
   passkeyRenameRequestSchema,
   passkeyVerifyRequestSchema,
@@ -28,6 +30,7 @@ export class IdentityController {
 
   @Post("auth/passkey/options")
   @Public()
+  @ApiContract({ operationId: "createPasskeyOptions", requestSchema: passkeyOptionsRequestSchema })
   options(@Body(new ZodValidationPipe(passkeyOptionsRequestSchema)) body: PasskeyOptionsRequest): Promise<PasskeyOptionsResult> {
     return this.service.createOptions(body);
   }
@@ -37,6 +40,7 @@ export class IdentityController {
   @Post("auth/passkey/verify")
   @Public()
   @HttpCode(200)
+  @ApiContract({ operationId: "verifyPasskey", requestSchema: passkeyVerifyRequestSchema })
   async verify(
     @Body(new ZodValidationPipe(passkeyVerifyRequestSchema)) body: PasskeyVerifyRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
@@ -48,6 +52,7 @@ export class IdentityController {
   @Post("auth/refresh")
   @Public()
   @HttpCode(200)
+  @ApiContract({ operationId: "refreshSession" })
   async refresh(
     @Req() req: AuthenticatedRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
@@ -63,6 +68,7 @@ export class IdentityController {
   @Post("auth/logout")
   @SkipTenantContext()
   @HttpCode(200)
+  @ApiContract({ operationId: "logout" })
   async logout(@Req() req: AuthenticatedRequest, @Res({ passthrough: true }) reply: FastifyReply): Promise<void> {
     await this.sessions.logout(req.auth!.sid);
     clearAuthCookies(reply);
@@ -75,12 +81,14 @@ export class IdentityController {
   // that the way it does for every other private route.
   @Get("me/passkeys")
   @SkipTenantContext()
+  @ApiContract({ operationId: "listPasskeys", responseSchema: passkeyListResponseSchema })
   list(@Req() req: AuthenticatedRequest) {
     return this.service.listPasskeys(req.auth!.sub);
   }
 
   @Patch("me/passkeys/:id")
   @SkipTenantContext()
+  @ApiContract({ operationId: "renamePasskey", requestSchema: passkeyRenameRequestSchema })
   rename(
     @Req() req: AuthenticatedRequest,
     @Param("id") id: string,
@@ -91,6 +99,7 @@ export class IdentityController {
 
   @Delete("me/passkeys/:id")
   @SkipTenantContext()
+  @ApiContract({ operationId: "revokePasskey" })
   revoke(@Req() req: AuthenticatedRequest, @Param("id") id: string): Promise<void> {
     return this.service.revokePasskey(req.auth!.sub, id);
   }

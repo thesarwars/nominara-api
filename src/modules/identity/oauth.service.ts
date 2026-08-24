@@ -1,6 +1,7 @@
 import { ConflictException, ForbiddenException, Inject, Injectable, Logger } from "@nestjs/common";
 import type { KeyObject } from "node:crypto";
 import type { Pool } from "pg";
+import { API_VERSION_PREFIX } from "../../api/configure-app.js";
 import { loadEnv } from "../../config/env.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { importEd25519PublicKeyFromDer, verifyAccessToken, type KeyResolver } from "../../lib/auth/access-token.js";
@@ -97,8 +98,25 @@ export class OauthService {
     };
   }
 
+  // The path MUST be derived from API_VERSION_PREFIX — the same constant
+  // configure-app.ts's setGlobalPrefix() and test/support/api-url.ts's
+  // apiUrl() read — never a second hardcoded copy of the route path.
+  //
+  // A hardcoded "/auth/oauth/:provider/callback" here is what broke when
+  // decision D1's global /v1 prefix landed: this value is handed to the
+  // provider as `redirect_uri` AND persisted to
+  // oauth_authorization_requests.redirect_uri, so the provider bounced the
+  // browser to a route the API no longer served, and the token exchange —
+  // which must present the identical redirect_uri — went with it. The whole
+  // 1400-line OAuth suite stayed green because every other test reaches the
+  // callback through the router path directly, while the adapter rebuilds
+  // its `currentUrl` from the STORED redirect_uri, comparing it to itself.
+  //
+  // OPERATIONAL NOTE: this changes the redirect_uri sent to Google, GitHub
+  // and Microsoft, so the registered redirect URIs in each provider's
+  // console must be updated to the /v1-prefixed path before deploy.
   private redirectUriFor(provider: OauthProvider): string {
-    return new URL(`/auth/oauth/${provider}/callback`, this.redirectBaseUrl).toString();
+    return new URL(`/${API_VERSION_PREFIX}/auth/oauth/${provider}/callback`, this.redirectBaseUrl).toString();
   }
 
   /** POST /auth/oauth/:provider/start and /link/start — purpose='link' carries the authenticated caller's own id, never anyone else's. */

@@ -19,6 +19,9 @@
     "db:maintenance:run": "tsx src/workers/rollup/maintenance.ts",
     "db:maintenance:sweep": "tsx src/workers/rollup/retention.ts",
     "db:purge-check": "tsx src/db/purge-check.ts",
+    "contracts:generate": "tsx src/contracts/generate.ts",
+    "contracts:check": "tsx src/contracts/check.ts",
+    "contracts:diff": "tsx src/contracts/diff.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
@@ -46,11 +49,6 @@
     "rxjs": "7.8.2",
     "socket.io": "4.8.3",
     "zod": "4.4.3"
-  },
-  "pnpm": {
-    "overrides": {
-      "fastify": "5.12.0"
-    }
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

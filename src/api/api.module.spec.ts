@@ -5,6 +5,7 @@ import type { Observable } from "rxjs";
 import { tap } from "rxjs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiModule } from "./api.module.js";
+import { configureApp } from "./configure-app.js";
 import { AuthGuard } from "./guards/auth.guard.js";
 import { WorkspaceGuard } from "./guards/workspace.guard.js";
 import { RbacGuard } from "./guards/rbac.guard.js";
@@ -92,6 +93,7 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
 
     const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
     const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
 
@@ -133,6 +135,7 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
 
     const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
     const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
 
@@ -186,6 +189,7 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
 
     const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
     const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
 

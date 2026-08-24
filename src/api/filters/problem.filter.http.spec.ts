@@ -12,8 +12,9 @@ import {
   WorkspaceSuspendedException,
 } from "../../tenancy/errors.js";
 import { ApiModule } from "../api.module.js";
+import { configureApp } from "../configure-app.js";
 import { Public } from "../decorators/public.decorator.js";
-import { registerCookiePlugin } from "../register-cookies.js";
+import { apiUrl } from "../../../test/support/api-url.js";
 
 const PRIVATE_KEY_DER = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
 const KID = "test-kid-1";
@@ -102,7 +103,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
       .useValue({ query: async () => ({ rows: [{ revoked_at: null }] }), end: async () => {} })
       .compile();
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
-    await registerCookiePlugin(app);
+    await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
   });
@@ -121,7 +122,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
   });
 
   it("maps a generic Error thrown by a handler to a 500 problem+json without leaking its message", async () => {
-    const response = await app.inject({ method: "GET", url: "/test-only/public-throws" });
+    const response = await app.inject({ method: "GET", url: apiUrl("/test-only/public-throws") });
 
     expect(response.statusCode).toBe(500);
     expect(response.json()).toEqual({
@@ -144,7 +145,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     );
     const response = await app.inject({
       method: "GET",
-      url: "/test-only/private-no-tenant",
+      url: apiUrl("/test-only/private-no-tenant"),
       cookies: { [ACCESS_COOKIE_NAME]: token },
     });
 
@@ -158,7 +159,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
   });
 
   it("REQ-019-4 · serializes PermissionDeniedException's code/details over the wire", async () => {
-    const response = await app.inject({ method: "GET", url: "/test-only/throws-permission-denied" });
+    const response = await app.inject({ method: "GET", url: apiUrl("/test-only/throws-permission-denied") });
 
     expect(response.statusCode).toBe(403);
     expect(response.json()).toEqual({
@@ -172,7 +173,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
   });
 
   it("REQ-019-3 · serializes ProjectOutOfScopeException's distinct code over the wire", async () => {
-    const response = await app.inject({ method: "GET", url: "/test-only/throws-project-out-of-scope" });
+    const response = await app.inject({ method: "GET", url: apiUrl("/test-only/throws-project-out-of-scope") });
 
     expect(response.statusCode).toBe(403);
     expect(response.json()).toEqual({
@@ -185,7 +186,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
   });
 
   it("REQ-019-5 · serializes StepUpRequiredException's acceptable methods over the wire", async () => {
-    const response = await app.inject({ method: "GET", url: "/test-only/throws-step-up-required" });
+    const response = await app.inject({ method: "GET", url: apiUrl("/test-only/throws-step-up-required") });
 
     expect(response.statusCode).toBe(401);
     expect(response.json()).toEqual({
@@ -199,7 +200,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
   });
 
   it("STORY-018 regression · serializes WorkspaceSuspendedException's code over the wire", async () => {
-    const response = await app.inject({ method: "GET", url: "/test-only/throws-workspace-suspended" });
+    const response = await app.inject({ method: "GET", url: apiUrl("/test-only/throws-workspace-suspended") });
 
     expect(response.statusCode).toBe(403);
     expect(response.json()).toEqual({

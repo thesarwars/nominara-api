@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
+import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
@@ -12,8 +13,12 @@ import {
   acceptInvitationRequestSchema,
   createInvitationRequestSchema,
   createWorkspaceRequestSchema,
+  invitationResponseSchema,
+  memberResponseSchema,
   updateMemberRoleRequestSchema,
   updateWorkspaceRequestSchema,
+  workspaceListResponseSchema,
+  workspaceResponseSchema,
   type AcceptInvitationRequest,
   type CreateInvitationRequest,
   type CreateWorkspaceRequest,
@@ -51,6 +56,7 @@ export class WorkspacesController {
 
   @Post("workspaces")
   @SkipTenantContext()
+  @ApiContract({ operationId: "createWorkspace", requestSchema: createWorkspaceRequestSchema, responseSchema: workspaceResponseSchema })
   create(
     @Req() req: AuditableRequest,
     @Body(new ZodValidationPipe(createWorkspaceRequestSchema)) body: CreateWorkspaceRequest,
@@ -60,6 +66,7 @@ export class WorkspacesController {
 
   @Get("workspaces")
   @SkipTenantContext()
+  @ApiContract({ operationId: "listWorkspaces", responseSchema: workspaceListResponseSchema })
   list(@Req() req: AuditableRequest): Promise<WorkspaceListResponse> {
     return this.service.listForActor(req.auth!.sub);
   }
@@ -67,6 +74,7 @@ export class WorkspacesController {
   @Patch("workspaces/:id")
   @RequirePermission("workspace:update")
   @Audit({ action: "workspace.updated", resourceType: "workspace" })
+  @ApiContract({ operationId: "updateWorkspace", requestSchema: updateWorkspaceRequestSchema, responseSchema: workspaceResponseSchema })
   update(
     @Req() req: RbacScopedRequest,
     @Param("id") id: string,
@@ -79,6 +87,7 @@ export class WorkspacesController {
   @Post("workspaces/:id/switch")
   @SkipTenantContext()
   @HttpCode(200)
+  @ApiContract({ operationId: "switchWorkspace" })
   async switchWorkspace(
     @Req() req: AuditableRequest,
     @Param("id") id: string,
@@ -94,6 +103,7 @@ export class WorkspacesController {
 
   @Get("workspaces/:id/members")
   @RequirePermission("workspace:read")
+  @ApiContract({ operationId: "listWorkspaceMembers" })
   listMembers(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<MemberResponse[]> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
     return this.service.listMembers();
@@ -102,6 +112,7 @@ export class WorkspacesController {
   @Patch("members/:id")
   @RequirePermission("member:update_role")
   @Audit({ action: "member.role_changed", resourceType: "workspace_member" })
+  @ApiContract({ operationId: "updateMemberRole", requestSchema: updateMemberRoleRequestSchema, responseSchema: memberResponseSchema })
   updateMemberRole(
     @Req() req: RbacScopedRequest,
     @Param("id") id: string,
@@ -113,6 +124,7 @@ export class WorkspacesController {
   @Delete("members/:id")
   @RequirePermission("member:remove")
   @Audit({ action: "member.removed", resourceType: "workspace_member" })
+  @ApiContract({ operationId: "removeMember" })
   removeMember(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<void> {
     return this.service.removeMemberById(req.tenant!.workspaceId, id);
   }
@@ -120,6 +132,7 @@ export class WorkspacesController {
   @Post("workspaces/:id/invitations")
   @RequirePermission("member:invite")
   @Audit({ action: "member.invited", resourceType: "invitation", resourceIdFrom: "response" })
+  @ApiContract({ operationId: "createInvitation", requestSchema: createInvitationRequestSchema, responseSchema: invitationResponseSchema })
   createInvitation(
     @Req() req: RbacScopedRequest,
     @Param("id") id: string,
@@ -131,6 +144,7 @@ export class WorkspacesController {
 
   @Get("workspaces/:id/invitations")
   @RequirePermission("member:invite")
+  @ApiContract({ operationId: "listInvitations" })
   listInvitations(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<InvitationResponse[]> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
     return this.invitations.list(id);
@@ -139,6 +153,7 @@ export class WorkspacesController {
   @Post("workspaces/:id/invitations/accept")
   @SkipTenantContext()
   @HttpCode(200)
+  @ApiContract({ operationId: "acceptInvitation", requestSchema: acceptInvitationRequestSchema, responseSchema: memberResponseSchema })
   acceptInvitation(
     @Req() req: AuditableRequest,
     @Param("id") id: string,

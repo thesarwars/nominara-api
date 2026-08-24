@@ -10,6 +10,7 @@ import { DbModule } from "../../src/db/db.module.js";
 import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
 import { HealthModule } from "../../src/modules/health/health.module.js";
 import { HealthService, MIGRATIONS_DIR_TOKEN } from "../../src/modules/health/health.service.js";
+import { configureApp } from "../../src/api/configure-app.js";
 
 // STORY-022 — HealthModule against a real Postgres (testing-strategy.md §1:
 // integration tests never mock the database). Each scenario builds its own
@@ -142,9 +143,13 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
   it("GET /health/ready returns HTTP 503 before migrating, and HTTP 200 once migrated", async () => {
     const moduleRef = await Test.createTestingModule({ imports: [DbModule, HealthModule] }).compile();
     const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
 
+    // D1 — the health probes are excluded from the /v1 global prefix so the
+    // orchestrator keeps unversioned readiness. These stay unprefixed
+    // deliberately; this is what proves the exclusion, not an oversight.
     const before = await app.inject({ method: "GET", url: "/health/ready" });
     expect(before.statusCode).toBe(503);
     expect(before.json().status).toBe("not_ready");

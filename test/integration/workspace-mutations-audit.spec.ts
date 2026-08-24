@@ -6,7 +6,8 @@ import { Test } from "@nestjs/testing";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
-import { registerCookiePlugin } from "../../src/api/register-cookies.js";
+import { configureApp } from "../../src/api/configure-app.js";
+import { apiUrl } from "../support/api-url.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import type { ChainMismatchAlert, PagingNotifier } from "../../src/modules/audit/ports/paging-notifier.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
@@ -91,7 +92,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
 
     const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
-    await registerCookiePlugin(app);
+    await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
   }, 60_000);
@@ -137,7 +138,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     const owner = await newSession();
     const createRes = await app.inject({
       method: "POST",
-      url: "/workspaces",
+      url: apiUrl("/workspaces"),
       cookies: { [ACCESS_COOKIE_NAME]: owner.accessToken, [CSRF_COOKIE_NAME]: owner.csrf },
       headers: { [CSRF_HEADER_NAME]: owner.csrf },
       payload: { name: `Audited Co ${randomUUID()}` },
@@ -152,7 +153,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     // workspace-scoped route needs a ws-claiming token first)
     const switchRes = await app.inject({
       method: "POST",
-      url: `/workspaces/${workspace.id}/switch`,
+      url: apiUrl(`/workspaces/${workspace.id}/switch`),
       cookies: {
         [ACCESS_COOKIE_NAME]: owner.accessToken,
         [CSRF_COOKIE_NAME]: owner.csrf,
@@ -179,7 +180,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     // ---- (2) PATCH /workspaces/:id -> workspace.updated --------------------
     const updateRes = await app.inject({
       method: "PATCH",
-      url: `/workspaces/${workspace.id}`,
+      url: apiUrl(`/workspaces/${workspace.id}`),
       cookies: scoped,
       headers: csrfHeader,
       payload: { name: "Renamed Co" },
@@ -197,7 +198,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     // ---- (4) PATCH /members/:id -> member.role_changed ----------------------
     const roleRes = await app.inject({
       method: "PATCH",
-      url: `/members/${memberId}`,
+      url: apiUrl(`/members/${memberId}`),
       cookies: scoped,
       headers: csrfHeader,
       payload: { role: "admin" },
@@ -209,7 +210,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     // ---- (5) DELETE /members/:id -> member.removed --------------------------
     const removeRes = await app.inject({
       method: "DELETE",
-      url: `/members/${removeTargetId}`,
+      url: apiUrl(`/members/${removeTargetId}`),
       cookies: scoped,
       headers: csrfHeader,
     });
@@ -220,7 +221,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     // ---- (6) POST /workspaces/:id/invitations -> member.invited -------------
     const inviteRes = await app.inject({
       method: "POST",
-      url: `/workspaces/${workspace.id}/invitations`,
+      url: apiUrl(`/workspaces/${workspace.id}/invitations`),
       cookies: scoped,
       headers: csrfHeader,
       payload: { email: `invitee-${randomUUID()}@example.com`, role: "viewer" },
@@ -234,7 +235,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     const invitee = await newSession();
     const acceptRes = await app.inject({
       method: "POST",
-      url: `/workspaces/${workspace.id}/invitations/accept`,
+      url: apiUrl(`/workspaces/${workspace.id}/invitations/accept`),
       cookies: { [ACCESS_COOKIE_NAME]: invitee.accessToken, [CSRF_COOKIE_NAME]: invitee.csrf },
       headers: { [CSRF_HEADER_NAME]: invitee.csrf },
       payload: { token: invitation.token },
@@ -278,7 +279,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     const owner = await newSession();
     const createRes = await app.inject({
       method: "POST",
-      url: "/workspaces",
+      url: apiUrl("/workspaces"),
       cookies: { [ACCESS_COOKIE_NAME]: owner.accessToken, [CSRF_COOKIE_NAME]: owner.csrf },
       headers: { [CSRF_HEADER_NAME]: owner.csrf },
       payload: { name: `Rollback Co ${randomUUID()}` },
@@ -287,7 +288,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
 
     const switchRes = await app.inject({
       method: "POST",
-      url: `/workspaces/${workspace.id}/switch`,
+      url: apiUrl(`/workspaces/${workspace.id}/switch`),
       cookies: {
         [ACCESS_COOKIE_NAME]: owner.accessToken,
         [CSRF_COOKIE_NAME]: owner.csrf,
@@ -309,7 +310,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
 
     const roleRes = await app.inject({
       method: "PATCH",
-      url: `/members/${memberId}`,
+      url: apiUrl(`/members/${memberId}`),
       cookies: scoped,
       headers: csrfHeader,
       payload: { role: "admin" },
@@ -331,7 +332,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
 
     const removeRes = await app.inject({
       method: "DELETE",
-      url: `/members/${removeTargetId}`,
+      url: apiUrl(`/members/${removeTargetId}`),
       cookies: scoped,
       headers: csrfHeader,
     });
@@ -355,7 +356,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     const owner = await newSession();
     const createRes = await app.inject({
       method: "POST",
-      url: "/workspaces",
+      url: apiUrl("/workspaces"),
       cookies: { [ACCESS_COOKIE_NAME]: owner.accessToken, [CSRF_COOKIE_NAME]: owner.csrf },
       headers: { [CSRF_HEADER_NAME]: owner.csrf },
       payload: { name: `Matrix Co ${randomUUID()}` },
@@ -367,7 +368,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
 
     const adminSwitchRes = await app.inject({
       method: "POST",
-      url: `/workspaces/${workspace.id}/switch`,
+      url: apiUrl(`/workspaces/${workspace.id}/switch`),
       cookies: {
         [ACCESS_COOKIE_NAME]: admin.accessToken,
         [CSRF_COOKIE_NAME]: admin.csrf,
@@ -387,7 +388,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
 
     const res = await app.inject({
       method: "PATCH",
-      url: `/members/${targetMemberId}`,
+      url: apiUrl(`/members/${targetMemberId}`),
       cookies: adminScoped,
       headers: adminCsrfHeader,
       payload: { role: "owner" },
