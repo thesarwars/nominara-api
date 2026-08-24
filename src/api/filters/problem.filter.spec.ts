@@ -49,6 +49,19 @@ function bodyFrom(exception: unknown, headers?: Record<string, string>): Record<
 }
 
 // STORY-024 T9 — decision D2's dual shape, replacing STORY-022's flat stub.
+// STORY-024 T12 — AC2 is now a typecheck: a code with a required details
+// shape cannot be constructed without one. These fixtures are the smallest
+// payloads satisfying §2's shapes, and every one of them was previously
+// `new …Error()` with nothing at all — which compiled, and passed.
+const INSUFFICIENT_CREDITS_DETAILS = {
+  required: 10,
+  available: 2,
+  wallet: { included_balance: 0, purchased_balance: 2, reserved: 0, cycle_end: "2026-09-01T00:00:00.000Z" },
+  packs: [{ key: "small", credits: 100, price_usd: "10.00" }],
+};
+
+const STEP_UP_DETAILS = { methods: ["passkey"] };
+
 describe("STORY-024 · ProblemFilter emits RFC 9457 plus the `error` extension member", () => {
   it("a domain error produces a body satisfying problemDetailsSchema", () => {
     const body = bodyFrom(
@@ -62,7 +75,7 @@ describe("STORY-024 · ProblemFilter emits RFC 9457 plus the `error` extension m
   });
 
   it("§2's title convention — the code in title case, not the HTTP status name", () => {
-    const body = bodyFrom(new InsufficientCreditsError({ message: "not enough credits" }));
+    const body = bodyFrom(new InsufficientCreditsError({ message: "not enough credits", details: INSUFFICIENT_CREDITS_DETAILS }));
     expect(body.title).toBe("Insufficient Credits");
   });
 
@@ -75,15 +88,15 @@ describe("STORY-024 · ProblemFilter emits RFC 9457 plus the `error` extension m
   });
 
   it("carries the request identifier, honouring an inbound X-Request-Id", () => {
-    expect((bodyFrom(new StepUpRequiredError()).error as Record<string, unknown>).request_id).toBe(REQUEST_ID);
+    expect((bodyFrom(new StepUpRequiredError({ details: STEP_UP_DETAILS })).error as Record<string, unknown>).request_id).toBe(REQUEST_ID);
     expect(
-      (bodyFrom(new StepUpRequiredError(), { "x-request-id": "from-caller" }).error as Record<string, unknown>)
+      (bodyFrom(new StepUpRequiredError({ details: STEP_UP_DETAILS }), { "x-request-id": "from-caller" }).error as Record<string, unknown>)
         .request_id,
     ).toBe("from-caller");
   });
 
   it("carries the code's remediation so a client can act without a second request", () => {
-    const error = bodyFrom(new InsufficientCreditsError()).error as Record<string, unknown>;
+    const error = bodyFrom(new InsufficientCreditsError({ details: INSUFFICIENT_CREDITS_DETAILS })).error as Record<string, unknown>;
     expect(error.remediation).toEqual({ kind: "purchase_credits" });
   });
 });

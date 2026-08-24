@@ -1,6 +1,10 @@
 import { HttpException } from "@nestjs/common";
+import type { z } from "zod";
 import type { ErrorCode } from "../../../contracts/common/error-code.schema.js";
-import type { SpendAndLimitRemediationKind } from "../../../contracts/common/error-details.schema.js";
+import {
+  errorDetailsSchemaByCode,
+  type SpendAndLimitRemediationKind,
+} from "../../../contracts/common/error-details.schema.js";
 
 // STORY-024 T9 — AC1: "Every error in the taxonomy has a typed domain error
 // class, and a filter maps it to the wire shape. A controller never builds an
@@ -85,6 +89,66 @@ function remediationFor(code: ErrorCode): DomainRemediation | undefined {
 
 export type DomainErrorClass = new (init?: DomainErrorInit) => DomainError;
 
+// ---------------------------------------------------------------------------
+// STORY-024 T12 — AC2 as a TYPECHECK, not a fixture
+// ---------------------------------------------------------------------------
+// AC2: "Every error carries the detail a client needs to remediate without a
+// second request." T7 shipped fourteen `.strict()` details shapes and T9's
+// commit said "this map is what T9's typed domain errors validate their own
+// payloads against". That is not what shipped: `DomainErrorInit.details` was
+// `unknown`, `errorDetailsSchemaByCode` had zero references in `src/`, and
+//
+//     new InsufficientCreditsError()                        // 402, no details
+//     new EntitlementExceededError({ details: { limit: 3 }})  // no key, no current
+//
+// both compiled. `problem.filter.spec.ts` already constructed the first of
+// those and passed. Nothing — not the type system, not a runtime check, not
+// a test — enforced the criterion.
+//
+// The three cases below are all derived from `errorDetailsSchemaByCode`, so
+// the schema stays the single source and a shape change propagates to every
+// call site as a compile error:
+//
+//   a required-field shape   `details` is REQUIRED and typed
+//                            (insufficient_credits, entitlement_exceeded, …)
+//   an all-optional shape    `details` is optional but still typed
+//                            (conflict — §2 gives it only `current_state?`)
+//   no shape at all          `details` cannot be passed AT ALL. §2 states no
+//                            details for quota_exceeded, precondition_unmet
+//                            and the rest, and T7's rule was to model only
+//                            what §2 states — so inventing one at a throw
+//                            site is now a type error rather than a silent
+//                            new contract nobody reviewed.
+type ErrorDetailsShapes = typeof errorDetailsSchemaByCode;
+type CodeWithDetails = keyof ErrorDetailsShapes;
+type EmptyObject = Record<PropertyKey, never>;
+
+type DetailsOf<Code extends ErrorCode> = Code extends CodeWithDetails
+  ? z.infer<ErrorDetailsShapes[Code]>
+  : never;
+
+type DetailsMember<Code extends ErrorCode> = Code extends CodeWithDetails
+  ? EmptyObject extends DetailsOf<Code>
+    ? { readonly details?: DetailsOf<Code> }
+    : { readonly details: DetailsOf<Code> }
+  : { readonly details?: never };
+
+export type DomainErrorInitFor<Code extends ErrorCode> = {
+  readonly message?: string;
+  readonly remediation?: DomainRemediation;
+} & DetailsMember<Code>;
+
+// The `init` argument is optional exactly when nothing in it is required, so
+// `new NotFoundError()` still reads as it did while
+// `new InsufficientCreditsError()` no longer compiles.
+type DomainErrorCtorArgs<Code extends ErrorCode> = EmptyObject extends DomainErrorInitFor<Code>
+  ? [init?: DomainErrorInitFor<Code>]
+  : [init: DomainErrorInitFor<Code>];
+
+export type DomainErrorClassFor<Code extends ErrorCode> = new (
+  ...args: DomainErrorCtorArgs<Code>
+) => DomainError;
+
 // The per-code exports below are VALUES holding classes, not class
 // declarations, so `ValidationFailedError` is usable with `new` and
 // `instanceof` but NOT as a type annotation. Annotate with `DomainError`
@@ -94,7 +158,7 @@ export type DomainErrorClass = new (init?: DomainErrorInit) => DomainError;
 // One named class per code. `name` is set explicitly so a stack trace and a
 // `instanceof`-less log both still identify which error was thrown — an
 // anonymous subclass reports "DomainError" for all 27.
-function defineDomainError(code: ErrorCode, className: string): DomainErrorClass {
+function defineDomainError<Code extends ErrorCode>(code: Code, className: string): DomainErrorClassFor<Code> {
   const status = ERROR_STATUS_BY_CODE[code];
   const cls = class extends DomainError {
     constructor(init: DomainErrorInit = {}) {
@@ -102,7 +166,7 @@ function defineDomainError(code: ErrorCode, className: string): DomainErrorClass
     }
   };
   Object.defineProperty(cls, "name", { value: className });
-  return cls;
+  return cls as unknown as DomainErrorClassFor<Code>;
 }
 
 export const ValidationFailedError = defineDomainError("validation_failed", "ValidationFailedError");
@@ -133,7 +197,10 @@ export const EngineUnavailableError = defineDomainError("engine_unavailable", "E
 export const DegradedError = defineDomainError("degraded", "DegradedError");
 export const RetentionExceededError = defineDomainError("retention_exceeded", "RetentionExceededError");
 
-export const DOMAIN_ERROR_CLASSES: Record<ErrorCode, DomainErrorClass> = {
+// Each entry keeps its OWN code's precise constructor type, so this map is a
+// lookup table and not a place where the per-code typing is quietly widened
+// back to `unknown` details.
+export const DOMAIN_ERROR_CLASSES: { readonly [Code in ErrorCode]: DomainErrorClassFor<Code> } = {
   validation_failed: ValidationFailedError,
   unsupported_engine: UnsupportedEngineError,
   unauthenticated: UnauthenticatedError,
@@ -163,7 +230,39 @@ export const DOMAIN_ERROR_CLASSES: Record<ErrorCode, DomainErrorClass> = {
   retention_exceeded: RetentionExceededError,
 };
 
-/** Constructs the class registered for `code`. Used where the code is data rather than a literal. */
+/**
+ * Constructs the class registered for `code`. Used where the code is DATA
+ * rather than a literal — the filter's D12 legacy mapping, and tests that
+ * sweep the whole taxonomy.
+ *
+ * The per-code details typing cannot help here, because `code` is not known
+ * until runtime. So this is the one door through which a wrong-shaped
+ * `details` could still reach the wire, and it is closed at runtime instead:
+ * the payload is validated against the code's own schema and a mismatch
+ * throws HERE, at the throw site, rather than becoming a response that
+ * violates the published contract. Codes with no shape in §2 must carry no
+ * details at all, for the same reason the type forbids it on the literal
+ * path.
+ */
 export function domainErrorFor(code: ErrorCode, init?: DomainErrorInit): DomainError {
-  return new DOMAIN_ERROR_CLASSES[code](init);
+  if (init?.details !== undefined) {
+    const schema = errorDetailsSchemaByCode[code as keyof typeof errorDetailsSchemaByCode] as
+      | { safeParse: (value: unknown) => { success: boolean } }
+      | undefined;
+    if (schema === undefined) {
+      throw new TypeError(
+        `domainErrorFor("${code}") was given details, but api-specification.md §2 defines no details shape ` +
+          "for that code. Add the shape to errorDetailsSchemaByCode first — a details member invented at a " +
+          "throw site is an unreviewed addition to a published contract.",
+      );
+    }
+    if (!schema.safeParse(init.details).success) {
+      throw new TypeError(
+        `domainErrorFor("${code}") was given details that do not satisfy that code's shape in ` +
+          "errorDetailsSchemaByCode.",
+      );
+    }
+  }
+  const ctor = DOMAIN_ERROR_CLASSES[code] as DomainErrorClass;
+  return new ctor(init);
 }

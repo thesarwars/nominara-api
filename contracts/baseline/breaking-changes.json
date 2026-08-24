@@ -1,0 +1,24 @@
+{
+  "$comment": "STORY-024 T12. NFR-API-04: within v1 only additive changes ship. A change that is NOT additive is a deviation, and a deviation that lives only in a commit message is not a gate — it cannot be re-checked, and it never expires. Every entry here is asserted by test/unit/contract-breaking-changes.spec.ts: the recorded change must still be VISIBLE in the current document, so silently reverting one turns the build red and deleting the record has to be a deliberate act. Adding an entry here is not a way to make a gate pass — it is a way to make a deviation legible. A new entry needs a human decision, exactly like a new dependency.",
+  "changes": [
+    {
+      "id": "2026-08-24-response-envelope",
+      "recorded": "2026-08-24",
+      "story": "STORY-024",
+      "task": "T11",
+      "scope": "every operation not marked @NoEnvelope()",
+      "from": "the bare resource representation, e.g. Workspace",
+      "to": "api-specification.md §1's response envelope, { data, meta }",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": true,
+      "reason": "ResponseEnvelopeInterceptor (T10) wrapped every non-exempt response, but the generated document still described the unwrapped representation. The published contract therefore described a body the server had not sent since T10, and a client generated from it could not read a single response. There was no backward-compatible option: preserving the old shape would have preserved a fiction. The previous-minor proxy was re-authored rather than the change avoided, and both sides of client-previous-minor.spec.ts moved in the same commit — which is precisely why this record exists.",
+      "assert": {
+        "operation": "createWorkspace",
+        "path": "/v1/workspaces",
+        "method": "post",
+        "status": "201",
+        "response_properties": ["data", "meta"]
+      }
+    }
+  ]
+}
