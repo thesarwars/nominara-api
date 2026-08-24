@@ -395,8 +395,9 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     });
 
     expect(res.statusCode).toBe(403);
-    const body = res.json() as { details?: { required_permission?: string } };
-    expect(body.details?.required_permission).toBe("workspace:transfer_ownership");
+    // STORY-024 T9 — decision D2's dual shape nests code/details under `error`.
+    const body = res.json() as { error?: { details?: { required_permission?: string } } };
+    expect(body.error?.details?.required_permission).toBe("workspace:transfer_ownership");
 
     const target = await memberRow(targetMemberId);
     expect(target.role).toBe("viewer");

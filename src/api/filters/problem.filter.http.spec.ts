@@ -118,7 +118,11 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
 
     expect(response.statusCode).toBe(404);
     const body = response.json();
-    expect(body).toMatchObject({ type: "about:blank", status: 404, title: "NOT_FOUND" });
+    // STORY-024 T9 — a framework-raised 404 predates the taxonomy but still
+    // lands on §2's vocabulary, because §2 is the only vocabulary the wire
+    // has. Title is the code in title case, per §2's own example.
+    expect(body).toMatchObject({ type: "about:blank", status: 404, title: "Not Found" });
+    expect(body.error).toMatchObject({ code: "not_found", request_id: expect.any(String) });
   });
 
   it("maps a generic Error thrown by a handler to a 500 problem+json without leaking its message", async () => {
@@ -130,6 +134,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
       status: 500,
       title: "INTERNAL_SERVER_ERROR",
       detail: "internal server error",
+      request_id: expect.any(String),
     });
   });
 
@@ -155,6 +160,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
       status: 500,
       title: "INTERNAL_SERVER_ERROR",
       detail: "internal server error",
+      request_id: expect.any(String),
     });
   });
 
@@ -165,10 +171,14 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     expect(response.json()).toEqual({
       type: "about:blank",
       status: 403,
-      title: "FORBIDDEN",
+      title: "Forbidden",
       detail: "missing required permission: workspace:delete",
-      code: "forbidden",
-      details: { required_permission: "workspace:delete" },
+      error: {
+        code: "forbidden",
+        message: "missing required permission: workspace:delete",
+        details: { required_permission: "workspace:delete" },
+        request_id: expect.any(String),
+      },
     });
   });
 
@@ -179,9 +189,13 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     expect(response.json()).toEqual({
       type: "about:blank",
       status: 403,
-      title: "FORBIDDEN",
+      title: "Project Out Of Scope",
       detail: "this project is outside your assigned scope",
-      code: "project_out_of_scope",
+      error: {
+        code: "project_out_of_scope",
+        message: "this project is outside your assigned scope",
+        request_id: expect.any(String),
+      },
     });
   });
 
@@ -192,23 +206,36 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     expect(response.json()).toEqual({
       type: "about:blank",
       status: 401,
-      title: "UNAUTHORIZED",
+      title: "Step Up Required",
       detail: "step-up re-authentication required",
-      code: "step_up_required",
-      details: { methods: ["webauthn"] },
+      error: {
+        code: "step_up_required",
+        message: "step-up re-authentication required",
+        details: { methods: ["webauthn"] },
+        request_id: expect.any(String),
+      },
     });
   });
 
-  it("STORY-018 regression · serializes WorkspaceSuspendedException's code over the wire", async () => {
+  // STORY-024 decision D12 — `workspace_suspended` is NOT one of §2's 27
+  // codes, so it cannot go on the wire as itself. It is mapped to `forbidden`
+  // and keeps its identity in `details.reason`; the exception class is
+  // unchanged and still throws `workspace_suspended` internally.
+  it("STORY-018 regression · WorkspaceSuspendedException reaches the wire as a mapped taxonomy code", async () => {
     const response = await app.inject({ method: "GET", url: apiUrl("/test-only/throws-workspace-suspended") });
 
     expect(response.statusCode).toBe(403);
     expect(response.json()).toEqual({
       type: "about:blank",
       status: 403,
-      title: "FORBIDDEN",
+      title: "Forbidden",
       detail: "this workspace is suspended",
-      code: "workspace_suspended",
+      error: {
+        code: "forbidden",
+        message: "this workspace is suspended",
+        details: { reason: "workspace_suspended" },
+        request_id: expect.any(String),
+      },
     });
   });
 });

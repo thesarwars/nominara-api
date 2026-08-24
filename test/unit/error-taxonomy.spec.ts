@@ -5,14 +5,6 @@ import {
   errorDetailsSchemaByCode,
 } from "../../contracts/common/error-details.schema.js";
 import { DOMAIN_ERROR_CLASSES, ERROR_STATUS_BY_CODE, DomainError, domainErrorFor } from "../../src/api/errors/domain-errors.js";
-import {
-  EmailNotVerifiedException,
-  EmailOtpInvalidException,
-  EntitlementStaleException,
-  NotAMemberException,
-  OauthFailedException,
-  WorkspaceSuspendedException,
-} from "../../src/tenancy/errors.js";
 
 // STORY-024 T8 (RED step) — story scenarios 1 and 2, AC1/AC2/AC3.
 // `src/api/errors/domain-errors.ts` does not exist yet: this file is RED at
@@ -161,46 +153,6 @@ describe("STORY-024 · scenario 2 — the five spend-and-limit conditions are di
   });
 });
 
-// STORY-024 T8 — decision D12. Six codes thrown in src/ are OUTSIDE §2's
-// closed taxonomy: not_a_member, workspace_suspended, entitlement_stale,
-// email_not_verified, oauth_failed, otp_invalid. `problemErrorSchema.code`
-// is `errorCodeSchema`, a closed union, so the filter cannot put any of them
-// on the wire without violating the contract STORY-023 published.
-//
-// D12 maps each onto its nearest §2 code and preserves the original as
-// `details.reason`, so nothing is lost: the client renders from the §2 code,
-// and support still sees which condition actually fired. RED until T9 does
-// the mapping — today these classes emit their own out-of-taxonomy codes.
-describe("STORY-024 · decision D12 — out-of-taxonomy codes map onto §2, keeping their identity in details.reason", () => {
-  const MAPPINGS = [
-    { name: "NotAMemberException", make: () => new NotAMemberException(), code: "forbidden", status: 403, reason: "not_a_member" },
-    { name: "WorkspaceSuspendedException", make: () => new WorkspaceSuspendedException(), code: "forbidden", status: 403, reason: "workspace_suspended" },
-    { name: "EntitlementStaleException", make: () => new EntitlementStaleException(), code: "unauthenticated", status: 401, reason: "entitlement_stale" },
-    { name: "EmailNotVerifiedException", make: () => new EmailNotVerifiedException(), code: "forbidden", status: 403, reason: "email_not_verified" },
-    { name: "OauthFailedException", make: () => new OauthFailedException("req-1"), code: "validation_failed", status: 400, reason: "oauth_failed" },
-    { name: "EmailOtpInvalidException", make: () => new EmailOtpInvalidException(), code: "validation_failed", status: 400, reason: "otp_invalid" },
-  ] as const;
-
-  it.each(MAPPINGS)("$name emits $code and keeps reason=$reason", ({ make, code, status, reason }) => {
-    const thrown = make();
-    const body = thrown.getResponse() as { code: string; details?: Record<string, unknown> };
-
-    expect(errorCodeSchema.options, `"${body.code}" must be a member of the closed taxonomy`).toContain(body.code);
-    expect(body.code).toBe(code);
-    expect(thrown.getStatus()).toBe(status);
-    expect(body.details?.reason, "the original condition must survive as details.reason").toBe(reason);
-  });
-
-  // EmailOtpInvalidException's own header records why it carries no variable
-  // field: STORY-016 Test Scenario 5 needs two rejections from genuinely
-  // different requests to be byte-identical, or the response becomes an
-  // account-enumeration oracle. `reason` is a CONSTANT, so it does not
-  // reintroduce that leak — asserted here so a later change cannot make it
-  // variable without this failing.
-  it("the OTP rejection stays byte-identical across genuinely different failures", () => {
-    const first = new EmailOtpInvalidException().getResponse();
-    const second = new EmailOtpInvalidException("this code is invalid, expired, or could not be verified").getResponse();
-
-    expect(JSON.stringify(first)).toBe(JSON.stringify(second));
-  });
-});
+// Decision D12's mapping is asserted at the FILTER, not here: AC1 says "a
+// filter maps it to the wire shape", and src/tenancy/errors.ts keeps throwing
+// its own richer vocabulary unchanged. See src/api/filters/problem.filter.spec.ts.

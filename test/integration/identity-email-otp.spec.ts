@@ -117,6 +117,25 @@ function mutatingHeaders(cookies: AuthCookies): { headers: Record<string, string
   };
 }
 
+// STORY-024 T9 — §2 requires EVERY error body to carry `error.request_id`, and
+// it necessarily differs between two requests. These enumeration-resistance
+// assertions compare bodies for byte-identity, so the identifier is normalised
+// out before comparison — and ONLY the identifier.
+//
+// That does not weaken the guarantee. What AC6 forbids is a response that
+// reveals WHICH rejection path fired, or whether the address exists. A
+// per-request identifier is generated the same way on every path regardless of
+// outcome, so it distinguishes nothing about the account. Every other field is
+// still compared verbatim, so a genuinely differing message, code, status or
+// detail still fails these tests exactly as before.
+function comparableBody(response: { json: () => unknown }): string {
+  const body = response.json() as Record<string, unknown>;
+  const error = body.error as Record<string, unknown> | undefined;
+  if (error?.request_id !== undefined) error.request_id = "<request-id>";
+  if (body.request_id !== undefined) body.request_id = "<request-id>";
+  return JSON.stringify(body);
+}
+
 describe("STORY-016 · email OTP fallback sign-in", () => {
   let container: StartedPostgreSqlContainer;
   let app: NestFastifyApplication;
@@ -272,7 +291,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     expect(afterKnown.rows[0].c).toBe(before.rows[0].c + 1);
 
     expect(knownRes.statusCode).toBe(unknownRes.statusCode);
-    expect(JSON.stringify(knownRes.json())).toBe(JSON.stringify(unknownRes.json()));
+    expect(comparableBody(knownRes)).toBe(comparableBody(unknownRes));
   });
 
   // ---- Scenario 4 -----------------------------------------------------------
@@ -315,7 +334,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     const reusedRejection = await verifyOtp(reusedEmail, reusedCode); // second use is the reference rejection
 
     expect(expiredRes.statusCode).toBe(reusedRejection.statusCode);
-    expect(JSON.stringify(expiredRes.json())).toBe(JSON.stringify(reusedRejection.json()));
+    expect(comparableBody(expiredRes)).toBe(comparableBody(reusedRejection));
   });
 
   // ---- Scenario 6 -----------------------------------------------------------
@@ -355,10 +374,12 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     const fourth = await requestOtp(email);
 
     expect(fourth.statusCode).toBe(429);
-    const body = fourth.json() as { code: string; details: { retry_after_seconds: number } };
-    expect(body.code).toBe("rate_limited");
-    expect(body.details.retry_after_seconds).toBeGreaterThan(0);
-    expect(body.details.retry_after_seconds).toBeLessThanOrEqual(3600);
+    // STORY-024 T9/D13 — the taxonomy body nests under `error`, and
+    // NFR-API-05 makes the duration integer milliseconds with a `_ms` suffix.
+    const body = fourth.json() as { error: { code: string; details: { retry_after_ms: number } } };
+    expect(body.error.code).toBe("rate_limited");
+    expect(body.error.details.retry_after_ms).toBeGreaterThan(0);
+    expect(body.error.details.retry_after_ms).toBeLessThanOrEqual(3_600_000);
   });
 
   // ---- Scenario 8 -----------------------------------------------------------
@@ -465,7 +486,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     const after = await db.query("SELECT count(*)::int AS c FROM email_otp_codes");
 
     expect(neverRequestedRejection.statusCode).toBe(referenceRejection.statusCode);
-    expect(JSON.stringify(neverRequestedRejection.json())).toBe(JSON.stringify(referenceRejection.json()));
+    expect(comparableBody(neverRequestedRejection)).toBe(comparableBody(referenceRejection));
     expect(after.rows[0].c).toBe(before.rows[0].c);
   });
 
@@ -500,7 +521,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
     const bodies = [suspendedRes, deletedRes, unknownRes].map((r) => ({
       status: r.statusCode,
-      body: JSON.stringify(r.json()),
+      body: comparableBody(r),
     }));
     expect(bodies[0]).toEqual(bodies[1]);
     expect(bodies[1]).toEqual(bodies[2]);
@@ -582,7 +603,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     // byte-identical to the known address's 4th response — a differing
     // outcome between the two on this 4th request would itself be an
     // enumeration oracle, the exact thing D5 exists to prevent.
-    expect(JSON.stringify(unknownResults[3]!.json())).toBe(JSON.stringify(knownResults[3]!.json()));
+    expect(comparableBody(unknownResults[3]!)).toBe(comparableBody(knownResults[3]!));
   });
 
   // ---- Gap 2 (qa-reviewer, AC6): every internal rejection path cross-compares byte-identical ----
@@ -620,10 +641,10 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     expect(unknownRes.statusCode).not.toBe(200);
 
     const shapes = [
-      { label: "wrong_code", status: wrongCodeRes.statusCode, body: JSON.stringify(wrongCodeRes.json()) },
-      { label: "expired_code", status: expiredRes.statusCode, body: JSON.stringify(expiredRes.json()) },
-      { label: "exhausted_attempts", status: exhaustedRes.statusCode, body: JSON.stringify(exhaustedRes.json()) },
-      { label: "unknown_address", status: unknownRes.statusCode, body: JSON.stringify(unknownRes.json()) },
+      { label: "wrong_code", status: wrongCodeRes.statusCode, body: comparableBody(wrongCodeRes) },
+      { label: "expired_code", status: expiredRes.statusCode, body: comparableBody(expiredRes) },
+      { label: "exhausted_attempts", status: exhaustedRes.statusCode, body: comparableBody(exhaustedRes) },
+      { label: "unknown_address", status: unknownRes.statusCode, body: comparableBody(unknownRes) },
     ];
 
     // Explicit multi-way check: every pair, not just each-against-the-first,
@@ -663,10 +684,10 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
     const last = results[30]!;
     expect(last.statusCode).toBe(429);
-    const body = last.json() as { code: string; details: { retry_after_seconds: number } };
-    expect(body.code).toBe("rate_limited");
-    expect(body.details.retry_after_seconds).toBeGreaterThan(0);
-    expect(body.details.retry_after_seconds).toBeLessThanOrEqual(60);
+    const body = last.json() as { error: { code: string; details: { retry_after_ms: number } } };
+    expect(body.error.code).toBe("rate_limited");
+    expect(body.error.details.retry_after_ms).toBeGreaterThan(0);
+    expect(body.error.details.retry_after_ms).toBeLessThanOrEqual(60_000);
   });
 
   // ---- Cross-story: D2 promotion unlocks the workspace-create right ---------
