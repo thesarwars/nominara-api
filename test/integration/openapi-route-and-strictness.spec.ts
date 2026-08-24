@@ -10,6 +10,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { applyFakeApiEnv } from "../support/fake-env.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { computeCsrfToken } from "../../src/lib/auth/csrf.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
@@ -64,6 +65,13 @@ describe("STORY-023 · GET /v1/openapi.json and the real POST /v1/workspaces str
   });
 
   beforeEach(async () => {
+    // Every REQUIRED key first, from the one shared helper, so a new required
+    // env var (STORY-016 added OTP_EMAIL_HASH_PEPPER and OTP_EMAIL_FROM) can
+    // never again take this file down with an EnvValidationError raised inside
+    // DbModule's PG_POOL factory. This file's own deliberate values — the
+    // signing keys its assertions depend on, and the container URI — are
+    // assigned AFTER, so they still win.
+    applyFakeApiEnv();
     process.env.WEBAUTHN_RP_ID = "localhost";
     process.env.WEBAUTHN_RP_NAME = "Nominara";
     process.env.WEBAUTHN_ORIGIN = "http://localhost:3000";
