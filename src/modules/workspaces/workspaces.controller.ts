@@ -1,6 +1,8 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { entityTagFor, formatEntityTag } from "../../api/etag/entity-tag.js";
+import { parseIfMatch } from "../../api/etag/if-match.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
@@ -56,12 +58,24 @@ export class WorkspacesController {
 
   @Post("workspaces")
   @SkipTenantContext()
-  @ApiContract({ operationId: "createWorkspace", requestSchema: createWorkspaceRequestSchema, responseSchema: workspaceResponseSchema })
-  create(
+  @ApiContract({
+    operationId: "createWorkspace",
+    requestSchema: createWorkspaceRequestSchema,
+    responseSchema: workspaceResponseSchema,
+    emitsEntityTag: true,
+  })
+  async create(
     @Req() req: AuditableRequest,
     @Body(new ZodValidationPipe(createWorkspaceRequestSchema)) body: CreateWorkspaceRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
   ): Promise<WorkspaceResponse> {
-    return this.service.create(req.auth!.sub, body, auditMeta(req));
+    const workspace = await this.service.create(req.auth!.sub, body, auditMeta(req));
+    // The only route that hands a caller their FIRST tag for a workspace:
+    // there is no item-level GET /workspaces/{id} yet (a STORY-021 gap, not
+    // something this task invents), so without this a client would have no
+    // way to obtain a tag for the PATCH below except `If-Match: *`.
+    reply.header("ETag", formatEntityTag(entityTagFor(workspace)));
+    return workspace;
   }
 
   @Get("workspaces")
@@ -74,14 +88,25 @@ export class WorkspacesController {
   @Patch("workspaces/:id")
   @RequirePermission("workspace:update")
   @Audit({ action: "workspace.updated", resourceType: "workspace" })
-  @ApiContract({ operationId: "updateWorkspace", requestSchema: updateWorkspaceRequestSchema, responseSchema: workspaceResponseSchema })
-  update(
+  @ApiContract({
+    operationId: "updateWorkspace",
+    requestSchema: updateWorkspaceRequestSchema,
+    responseSchema: workspaceResponseSchema,
+    requiresIfMatch: true,
+    emitsEntityTag: true,
+  })
+  async update(
     @Req() req: RbacScopedRequest,
     @Param("id") id: string,
     @Body(new ZodValidationPipe(updateWorkspaceRequestSchema)) body: UpdateWorkspaceRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
   ): Promise<WorkspaceResponse> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
-    return this.service.update(id, body);
+    // Parsed here, ENFORCED in the service — the comparison has to happen
+    // under the same row lock as the write or it is check-then-act.
+    const workspace = await this.service.update(id, body, parseIfMatch(firstHeaderValue(req.headers?.["if-match"]) ?? undefined));
+    reply.header("ETag", formatEntityTag(entityTagFor(workspace)));
+    return workspace;
   }
 
   @Post("workspaces/:id/switch")

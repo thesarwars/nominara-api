@@ -3,7 +3,7 @@
   "info": {
     "title": "Nominara API",
     "version": "1.0.0",
-    "description": "STORY-023 OQ-8 fixture — NOT a real published release. There is no CI/publish pipeline in this repository yet (NFR-REPO-02), so there is no genuine N-1 tag to test against. This document is a hand-authored PROXY standing in for 'the previous minor', committed at this exact path per the coordinator's OQ-8 resolution, so client-previous-minor.spec.ts can prove shape compatibility (a fixture consumer written against THIS narrower document still type-checks against the client generated from the current, additively-wider one). It does not prove the published-matrix half of NFR-REPO-03, which needs real CI and is explicitly out of scope here — see client-previous-minor.spec.ts's own comment."
+    "description": "STORY-023 OQ-8 fixture \u2014 NOT a real published release. There is no CI/publish pipeline in this repository yet (NFR-REPO-02), so there is no genuine N-1 tag to test against. This document is a hand-authored PROXY standing in for 'the previous minor', committed at this exact path per the coordinator's OQ-8 resolution, so client-previous-minor.spec.ts can prove shape compatibility (a fixture consumer written against THIS narrower document still type-checks against the client generated from the current, additively-wider one). It does not prove the published-matrix half of NFR-REPO-03, which needs real CI and is explicitly out of scope here \u2014 see client-previous-minor.spec.ts's own comment. STORY-024 T11: this proxy was re-authored to carry api-specification.md \u00a71's response ENVELOPE ({data, meta}). Before T11 the generated document described the bare representation for every route while ResponseEnvelopeInterceptor (T10) had already been wrapping every response \u2014 so the pre-T11 shape was never what the server sent, and there was no backward-compatible option to preserve. This is a BREAKING contract change, recorded as one; the proxy was not adjusted to make a test pass."
   },
   "paths": {
     "/v1/workspaces": {
@@ -16,9 +16,15 @@
               "schema": {
                 "type": "object",
                 "properties": {
-                  "name": { "type": "string", "minLength": 1, "maxLength": 200 }
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
                 },
-                "required": ["name"],
+                "required": [
+                  "name"
+                ],
                 "additionalProperties": false
               }
             }
@@ -32,31 +38,101 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "id": { "type": "string", "format": "uuid" },
-                    "name": { "type": "string" },
-                    "slug": { "type": "string" },
-                    "org_type": { "type": "string", "enum": ["in_house", "agency"] },
-                    "region": { "type": "string", "enum": ["us-east-1", "eu-central-1"] },
-                    "timezone": { "type": "string" },
-                    "plan_key": { "type": "string" },
-                    "status": {
-                      "type": "string",
-                      "enum": ["trialing", "active", "past_due", "soft_capped", "suspended", "pending_deletion", "deleted"]
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "slug": {
+                          "type": "string"
+                        },
+                        "org_type": {
+                          "type": "string",
+                          "enum": [
+                            "in_house",
+                            "agency"
+                          ]
+                        },
+                        "region": {
+                          "type": "string",
+                          "enum": [
+                            "us-east-1",
+                            "eu-central-1"
+                          ]
+                        },
+                        "timezone": {
+                          "type": "string"
+                        },
+                        "plan_key": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "trialing",
+                            "active",
+                            "past_due",
+                            "soft_capped",
+                            "suspended",
+                            "pending_deletion",
+                            "deleted"
+                          ]
+                        },
+                        "created_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "updated_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "name",
+                        "slug",
+                        "org_type",
+                        "region",
+                        "timezone",
+                        "plan_key",
+                        "status",
+                        "created_at",
+                        "updated_at"
+                      ],
+                      "additionalProperties": false
                     },
-                    "created_at": { "type": "string", "format": "date-time" },
-                    "updated_at": { "type": "string", "format": "date-time" }
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "scoring_version": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "computed_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      },
+                      "required": [
+                        "request_id",
+                        "scoring_version",
+                        "computed_at"
+                      ],
+                      "additionalProperties": false
+                    }
                   },
                   "required": [
-                    "id",
-                    "name",
-                    "slug",
-                    "org_type",
-                    "region",
-                    "timezone",
-                    "plan_key",
-                    "status",
-                    "created_at",
-                    "updated_at"
+                    "data",
+                    "meta"
                   ],
                   "additionalProperties": false
                 }

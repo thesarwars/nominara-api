@@ -4,6 +4,11 @@ import { fileURLToPath } from "node:url";
 import openapiTS, { astToString } from "openapi-typescript";
 import { z, type ZodType } from "zod";
 import { errorCodeSchema } from "../../contracts/common/error-code.schema.js";
+import { envelopeSchema } from "../../contracts/common/envelope.schema.js";
+import {
+  PAGINATION_LIMIT_DEFAULT,
+  PAGINATION_LIMIT_MAX,
+} from "../../contracts/common/pagination.schema.js";
 import { API_VERSION_PREFIX } from "../api/configure-app.js";
 import { discoverContractRoutes, type DiscoveredContractRoute } from "./discover-routes.js";
 
@@ -31,19 +36,25 @@ interface JsonSchemaObject {
   [key: string]: unknown;
 }
 
-interface OpenApiParameter {
+export interface OpenApiParameter {
   readonly name: string;
-  readonly in: "query" | "path";
+  readonly in: "query" | "path" | "header";
   readonly required: boolean;
   readonly schema: Record<string, unknown>;
 }
 
-interface OpenApiResponse {
-  readonly description: string;
-  readonly content?: { readonly "application/json": { readonly schema: Record<string, unknown> } };
+export interface OpenApiResponseHeader {
+  readonly required: boolean;
+  readonly schema: Record<string, unknown>;
 }
 
-interface OpenApiOperation {
+export interface OpenApiResponse {
+  readonly description: string;
+  readonly content?: { readonly "application/json": { readonly schema: Record<string, unknown> } };
+  headers?: Record<string, OpenApiResponseHeader>;
+}
+
+export interface OpenApiOperation {
   operationId: string;
   requestBody?: { content: { "application/json": { schema: Record<string, unknown> } } };
   parameters?: OpenApiParameter[];
@@ -96,7 +107,7 @@ function pathParamNames(fullPath: string): string[] {
  * field names of its own to decompose — it is mapped onto the route's own
  * single `:param` path placeholder instead.
  */
-function buildParameters(schema: ZodType, location: "query" | "path", fullPath: string): OpenApiParameter[] {
+export function buildParameters(schema: ZodType, location: "query" | "path", fullPath: string): OpenApiParameter[] {
   const jsonSchema = toJsonSchema(schema, REQUEST_JSON_SCHEMA_OPTIONS) as JsonSchemaObject;
 
   if (jsonSchema.type === "object" && jsonSchema.properties) {
@@ -120,6 +131,108 @@ function buildParameters(schema: ZodType, location: "query" | "path", fullPath: 
   );
 }
 
+/**
+ * STORY-024 T11 — the schema of the body the server ACTUALLY sends.
+ *
+ * `@ApiContract({ responseSchema })` names the resource representation. Since
+ * T10 that is not what crosses the wire: ResponseEnvelopeInterceptor wraps
+ * every non-exempt response in api-specification.md §1's envelope. The
+ * document generated before this change described the unwrapped
+ * representation for every single route — so `@nominara/client`, whose types
+ * come from this document, typed `createWorkspace()` as returning a
+ * `Workspace` while the server returned `{data: Workspace, meta: {...}}`.
+ * Every property access in a generated consumer would have been undefined at
+ * runtime, and `contracts:check` reported the document as clean throughout,
+ * because it compares generated-against-committed and BOTH sides carried the
+ * same omission. A drift gate cannot catch a defect upstream of the drift.
+ *
+ * Three cases, matching the interceptor exactly:
+ *   exempt          `@NoEnvelope()` (the health probes) — the bare schema.
+ *   no responseSchema  a `Promise<void>` handler. The interceptor still
+ *                   envelopes it and emits `data: null` explicitly rather
+ *                   than dropping the member, so the document says so too:
+ *                   these routes DO have a response body.
+ *   otherwise       the representation, enveloped.
+ *
+ * `pagination` is emitted only for a `listOf` operation. envelopeSchema()
+ * marks the member optional so a single-resource response would still
+ * validate, but advertising a member that can never appear is a contract a
+ * consumer has to write dead branches against.
+ */
+function responseSchemaFor(route: DiscoveredContractRoute): ZodType {
+  const contract = route.contract!;
+  const data = contract.responseSchema ?? z.null();
+  if (route.envelopeExempt) {
+    if (contract.responseSchema === undefined) {
+      throw new Error(
+        `contracts:generate — route "${contract.operationId}" is @NoEnvelope() and declares no responseSchema, ` +
+          "so it has no describable body at all. Give it a responseSchema or remove the exemption.",
+      );
+    }
+    return contract.responseSchema;
+  }
+  const enveloped = envelopeSchema(data);
+  return contract.listOf === true ? enveloped : enveloped.omit({ pagination: true });
+}
+
+// STORY-024 T11 — AC6: "Pagination is cursor-based … Offset pagination
+// exists on no time-series endpoint." api-specification.md §1 is stronger
+// still: offset pagination "is not offered on ANY endpoint".
+//
+// No list endpoint exists yet, so AC6 would otherwise be vacuously true —
+// satisfied today by the absence of the thing it governs and quietly
+// violated by whichever story ships the first list route. These two checks
+// run inside `contracts:generate`, so they fail the BUILD (and with it
+// `contracts:check`), not merely a test someone can be tempted to skip.
+//
+// Exactly the four names test/unit/cursor.spec.ts already refuses on the
+// request schema, so the parameter-level and schema-level rules cannot
+// drift apart into two different definitions of "offset pagination".
+const OFFSET_PAGINATION_PARAMETER_NAMES = new Set(["offset", "page", "page_number", "skip"]);
+
+export function assertNoOffsetPagination(route: DiscoveredContractRoute, operation: OpenApiOperation): void {
+  const operationId = route.contract!.operationId;
+
+  const declared = [
+    ...(operation.parameters ?? []).map((parameter) => parameter.name),
+    ...Object.keys(
+      (operation.requestBody?.content["application/json"].schema as JsonSchemaObject | undefined)?.properties ?? {},
+    ),
+  ];
+  for (const name of declared) {
+    if (OFFSET_PAGINATION_PARAMETER_NAMES.has(name)) {
+      throw new Error(
+        `contracts:generate — operation "${operationId}" declares "${name}", which is offset pagination. ` +
+          "api-specification.md §1 offers it on no endpoint; page with an opaque cursor " +
+          "(src/api/pagination/cursor.ts) and paginationRequestSchema instead.",
+      );
+    }
+  }
+
+  if (route.contract!.listOf !== true) return;
+
+  // "Uses the cursor helper", expressed as something the CONTRACT can be
+  // checked against: a listOf operation must carry paginationRequestSchema's
+  // own two fields with its own two bounds. A route that re-derived the
+  // numbers, or paginated by some other means, fails here.
+  const parametersByName = new Map((operation.parameters ?? []).map((parameter) => [parameter.name, parameter]));
+  const limit = parametersByName.get("limit");
+  if (!parametersByName.has("cursor") || limit === undefined) {
+    throw new Error(
+      `contracts:generate — operation "${operationId}" is marked listOf but does not declare both ` +
+        "`cursor` and `limit` query parameters. Extend paginationRequestSchema in its querySchema.",
+    );
+  }
+  if (limit.schema.maximum !== PAGINATION_LIMIT_MAX || limit.schema.default !== PAGINATION_LIMIT_DEFAULT) {
+    throw new Error(
+      `contracts:generate — operation "${operationId}" declares a \`limit\` with ` +
+        `maximum=${String(limit.schema.maximum)} default=${String(limit.schema.default)}, not NFR-API-03's ` +
+        `cap of ${PAGINATION_LIMIT_MAX} and default of ${PAGINATION_LIMIT_DEFAULT}. ` +
+        "Extend paginationRequestSchema rather than re-deriving the bounds.",
+    );
+  }
+}
+
 function buildOperation(route: DiscoveredContractRoute): OpenApiOperation {
   const contract = route.contract!;
   const operation: OpenApiOperation = { operationId: contract.operationId, responses: {} };
@@ -133,16 +246,35 @@ function buildOperation(route: DiscoveredContractRoute): OpenApiOperation {
   const parameters: OpenApiParameter[] = [];
   if (contract.paramsSchema) parameters.push(...buildParameters(contract.paramsSchema, "path", route.fullPath));
   if (contract.querySchema) parameters.push(...buildParameters(contract.querySchema, "query", route.fullPath));
+  // STORY-024 T11 — a REQUIRED request header is as much a part of the
+  // contract as a required body field. Omitted, `@nominara/client` would
+  // generate a call that this server refuses with 422 every time, and the
+  // drift gate would report the document as clean while it did.
+  if (contract.requiresIfMatch) {
+    parameters.push({
+      name: "If-Match",
+      in: "header",
+      required: true,
+      schema: { type: "string" },
+    });
+  }
   if (parameters.length > 0) operation.parameters = parameters;
 
   const status = String(route.httpStatus);
-  operation.responses[status] = contract.responseSchema
-    ? {
-        description: `${contract.operationId} response`,
-        content: { "application/json": { schema: toJsonSchema(contract.responseSchema, RESPONSE_JSON_SCHEMA_OPTIONS) } },
-      }
-    : { description: `${contract.operationId} — no response body` };
+  operation.responses[status] = {
+    description: `${contract.operationId} response`,
+    content: {
+      "application/json": { schema: toJsonSchema(responseSchemaFor(route), RESPONSE_JSON_SCHEMA_OPTIONS) },
+    },
+  };
 
+  if (contract.emitsEntityTag) {
+    operation.responses[status]!.headers = {
+      ETag: { required: true, schema: { type: "string" } },
+    };
+  }
+
+  assertNoOffsetPagination(route, operation);
   return operation;
 }
 

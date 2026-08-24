@@ -35,6 +35,27 @@ export interface ApiContractOptions {
   readonly paramsSchema?: ZodType;
   /** Absent when the route carries no error shape beyond the shared `problemDetailsSchema`. */
   readonly errorSchema?: ZodType;
+  /**
+   * STORY-024 T11 — the route is a cursor-paginated collection (NFR-API-03).
+   * A BOOLEAN, not a schema: it marks the operation so the build-time
+   * assertion in test/unit/pagination-contract.spec.ts can require it to
+   * carry `paginationRequestSchema`'s fields and declare no offset/page
+   * parameter. Nothing about the shape is described here — the schema is
+   * still the only description of the contract.
+   */
+  readonly listOf?: boolean;
+  /**
+   * STORY-024 T11 — the route requires an `If-Match` precondition (AC8). A
+   * required REQUEST HEADER is part of the contract: without emitting it,
+   * `@nominara/client` would generate a call that cannot succeed against a
+   * route whose every unconditioned request is refused with 422.
+   */
+  readonly requiresIfMatch?: boolean;
+  /**
+   * STORY-024 T11 — the route returns an `ETag` response header carrying the
+   * concurrency tag for the representation in its body.
+   */
+  readonly emitsEntityTag?: boolean;
 }
 
 export const API_CONTRACT_KEY = "apiContract";

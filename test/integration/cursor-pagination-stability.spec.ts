@@ -1,18 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { decodeCursor, encodeCursor } from "../../src/api/pagination/cursor.js";
+import { AuditChainService, type AppendAuditRowInput } from "../../src/modules/audit/audit-chain.service.js";
 import { useApiHarness } from "../support/api-harness.js";
 
-// STORY-024 T8 (RED step) — story scenario 4 ("Page a list while inserting
-// rows → **No duplicates, no skips**") and AC7. RED at module resolution
-// until T11 creates src/api/pagination/cursor.ts.
+// STORY-024 T8 (RED) / T11 (GREEN) — story scenario 4 ("Page a list while
+// inserting rows → **No duplicates, no skips**") and AC7.
 //
 // *** WHAT THIS FILE PROVES, STATED PRECISELY ***
 // The demonstrator is `audit_log`, not `GET /v1/workspaces`. That route is
 // NOT a paginable list: it is `@SkipTenantContext()`, runs under
 // `withActorContext` as a cross-tenant self-read under ADR-0001's actor-only
 // policy class, and returns `{owned, joined}` rather than a flat collection.
-// `audit_log` is append-only with a monotonic per-workspace `seq`, which is
-// exactly a sort-key tuple.
+// `audit_log` is append-only with a monotonic `seq`, which is exactly a
+// sort-key tuple.
 //
 // Two things about that table constrain what this file may CLAIM:
 //
@@ -24,42 +24,166 @@ import { useApiHarness } from "../support/api-harness.js";
 //
 // So this proves **a reader interleaved with SERIALISED appends** — no
 // duplicates, no skips, under insertion. It does NOT prove behaviour under
-// concurrent writes, because the table cannot exhibit concurrent writes by
-// construction. That is what AC7 asks for, and claiming the stronger
-// property would be a false statement about the evidence.
+// concurrent writes, because the table cannot exhibit concurrent writes to
+// one workspace by construction. That is what AC7 asks for, and claiming the
+// stronger property would be a false statement about the evidence.
+//
+// The serialisation is also what makes a bigserial cursor SOUND here. A
+// bigserial is allocated before commit, so in general a row with a lower
+// `seq` can become visible after one with a higher `seq` — and a keyset
+// reader would skip it permanently. Per workspace, `append()` takes the
+// advisory lock BEFORE its INSERT, so allocation order, commit order and
+// visibility order are the same order. A future list route over a table
+// WITHOUT that lock cannot reuse this cursor unaltered.
+
+const WORKSPACE_ID = "aaaaaaaa-0000-0000-0000-0000000000c1";
+const OTHER_WORKSPACE_ID = "aaaaaaaa-0000-0000-0000-0000000000c2";
+
+function appendInput(workspaceId: string, action: string): AppendAuditRowInput {
+  return {
+    workspaceId,
+    actorType: "user",
+    actorId: "22222222-2222-2222-2222-222222222222",
+    actorIp: "127.0.0.1",
+    actorUa: "vitest",
+    action,
+    resourceType: "project",
+    resourceId: "33333333-3333-3333-3333-333333333333",
+    beforeState: null,
+    afterState: { name: "Acme" },
+    requestId: "req-cursor",
+    supportGrantId: null,
+    severity: "info",
+  };
+}
+
+interface PageResult {
+  readonly actions: string[];
+  readonly cursorNext: string | null;
+  readonly hasMore: boolean;
+}
+
 describe("STORY-024 · scenario 4 — a cursor is stable across an interleaved insert", () => {
-  useApiHarness();
+  const harness = useApiHarness();
+  const chain = new AuditChainService();
 
-  // Page boundaries are where a cursor is either exactly right or silently
-  // wrong; a cursor that round-trips but compares as a STRING would order
-  // seq 10 before seq 9.
+  /**
+   * One page of `audit_log`, keyed on the cursor rather than an offset.
+   *
+   * `limit + 1` rows are fetched so `has_more` is answered by whether a
+   * further row EXISTS, never by `rows.length === limit` — which is wrong on
+   * the exact page where the last row lands flush against the limit.
+   *
+   * `seq` is bigserial and node-postgres returns bigint as a STRING; it is
+   * converted here so the cursor carries an integer. A stringified sort key
+   * would compare "10" < "9" and the paging loop would silently stop early.
+   */
+  async function readPage(workspaceId: string, limit: number, cursor?: string): Promise<PageResult> {
+    const afterSeq = cursor === undefined ? null : (decodeCursor(cursor)[1] as number);
+
+    const result = await harness.db().query<{ seq: string; action: string }>(
+      `SELECT seq, action FROM audit_log
+        WHERE workspace_id = $1 AND ($2::bigint IS NULL OR seq > $2::bigint)
+        ORDER BY seq ASC
+        LIMIT $3`,
+      [workspaceId, afterSeq, limit + 1],
+    );
+
+    const hasMore = result.rows.length > limit;
+    const rows = result.rows.slice(0, limit);
+    const last = rows.at(-1);
+    return {
+      actions: rows.map((row) => row.action),
+      cursorNext: hasMore && last !== undefined ? encodeCursor([workspaceId, Number(last.seq)]) : null,
+      hasMore,
+    };
+  }
+
+  async function append(workspaceId: string, actions: string[]): Promise<void> {
+    for (const action of actions) {
+      await chain.append(harness.db(), appendInput(workspaceId, action));
+    }
+  }
+
+  it("pages every pre-existing row exactly once while new rows are appended mid-traversal", async () => {
+    const original = ["a1", "a2", "a3", "a4", "a5"];
+    await append(WORKSPACE_ID, original);
+
+    const seen: string[] = [];
+    let page = await readPage(WORKSPACE_ID, 2);
+    seen.push(...page.actions);
+
+    // The insert happens BETWEEN two page reads — the exact interleaving the
+    // scenario names, and the one offset pagination gets wrong.
+    await append(WORKSPACE_ID, ["b1", "b2", "b3"]);
+
+    while (page.cursorNext !== null) {
+      page = await readPage(WORKSPACE_ID, 2, page.cursorNext);
+      seen.push(...page.actions);
+    }
+
+    // No duplicates: paging returned each row once, not once per page it
+    // straddled.
+    expect(new Set(seen).size, `a row was returned twice: ${seen.join(",")}`).toBe(seen.length);
+
+    // No skips of anything that existed when paging began — the property
+    // AC7 is actually about.
+    for (const action of original) {
+      expect(seen, `${action} existed before paging began and must not be skipped`).toContain(action);
+    }
+
+    // Rows appended mid-traversal sort strictly after the cursor of every
+    // page already returned, so they can only ever appear LATER — never
+    // duplicated onto a page already served.
+    expect(seen.slice(0, original.length)).toEqual(original);
+  });
+
+  it("a page boundary flush against the limit does not report a further page that does not exist", async () => {
+    await append(WORKSPACE_ID, ["only1", "only2"]);
+
+    const page = await readPage(WORKSPACE_ID, 2);
+    expect(page.actions).toEqual(["only1", "only2"]);
+    // The `limit + 1` read is what makes this answerable: rows.length === limit
+    // on the final page too, so a naive has_more would hand out a cursor to
+    // an empty page.
+    expect(page.hasMore).toBe(false);
+    expect(page.cursorNext).toBeNull();
+  });
+
+  it("the sort key is scoped to one workspace — another tenant's rows never enter the page", async () => {
+    await append(WORKSPACE_ID, ["mine1", "mine2"]);
+    await append(OTHER_WORKSPACE_ID, ["theirs1", "theirs2"]);
+
+    const page = await readPage(WORKSPACE_ID, 10);
+    expect(page.actions).toEqual(["mine1", "mine2"]);
+  });
+
+  it("a cursor from one page cannot be replayed to re-read rows before it", async () => {
+    await append(WORKSPACE_ID, ["r1", "r2", "r3", "r4"]);
+
+    const first = await readPage(WORKSPACE_ID, 2);
+    const second = await readPage(WORKSPACE_ID, 2, first.cursorNext!);
+
+    expect(first.actions).toEqual(["r1", "r2"]);
+    expect(second.actions).toEqual(["r3", "r4"]);
+    // Re-using the FIRST cursor is idempotent, not a rewind that re-serves
+    // page one.
+    const replayed = await readPage(WORKSPACE_ID, 2, first.cursorNext!);
+    expect(replayed.actions).toEqual(second.actions);
+  });
+
+  it("the cursor is opaque on the wire — a caller cannot read a sequence number out of it", async () => {
+    await append(WORKSPACE_ID, ["o1", "o2"]);
+    const page = await readPage(WORKSPACE_ID, 1);
+
+    expect(page.cursorNext).not.toBeNull();
+    expect(page.cursorNext!).not.toContain(WORKSPACE_ID);
+    expect(page.cursorNext!).not.toMatch(/^[0-9]+$/);
+  });
+
   it("a sequence cursor round-trips as an integer, not a stringified one", () => {
-    const decoded = decodeCursor(encodeCursor(["ws-1", 9]));
-    expect(decoded).toEqual(["ws-1", 9]);
-    expect(typeof (decoded as unknown[])[1]).toBe("number");
-  });
-
-  it("orders by the tuple, so seq 10 follows seq 9 rather than preceding it", () => {
-    const ninth = decodeCursor(encodeCursor(["ws-1", 9])) as [string, number];
-    const tenth = decodeCursor(encodeCursor(["ws-1", 10])) as [string, number];
-    expect(tenth[1]).toBeGreaterThan(ninth[1]);
-  });
-
-  // The stability property itself, stated as the invariant a paging loop must
-  // hold: a row appended AFTER a page was taken has a seq strictly greater
-  // than that page's cursor, so it can only ever appear on a LATER page —
-  // never duplicated onto one already returned, never skipped.
-  it("a row appended after a page was cut sorts strictly after that page's cursor", () => {
-    const pageCursor = encodeCursor(["ws-1", 100]);
-    const [, cursorSeq] = decodeCursor(pageCursor) as [string, number];
-    const appendedAfter = 101;
-
-    expect(appendedAfter).toBeGreaterThan(cursorSeq);
-  });
-
-  it("the cursor is opaque on the wire — a caller cannot read a sequence number out of it", () => {
-    const cursor = encodeCursor(["ws-1", 100]);
-    expect(cursor).not.toContain("100");
-    expect(cursor).not.toContain("ws-1");
+    const decoded = decodeCursor(encodeCursor([WORKSPACE_ID, 9]));
+    expect(decoded).toEqual([WORKSPACE_ID, 9]);
+    expect(typeof decoded[1]).toBe("number");
   });
 });

@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { ConflictException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
+import { entityTagFor } from "../../api/etag/entity-tag.js";
+import { assertIfMatch } from "../../api/etag/if-match.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
@@ -348,22 +350,48 @@ export class WorkspacesService {
    * verified against the URL by assertMatchesTenant in the controller).
    * `region` is accepted so it can be refused with an explanation rather
    * than rejected as an unrecognized key.
+   *
+   * STORY-024 T11 — AC8. `ifMatch` is the parsed `If-Match` precondition and
+   * is REQUIRED: assertIfMatch() refuses `undefined` with 422
+   * `precondition_unmet` and a stale tag with 409 `conflict`.
+   *
+   * The whole read-check-write runs on ONE statement sequence inside the
+   * ambient transaction that TenantContextInterceptor opened
+   * (`currentTenantStore()!.client`), and the read takes `FOR UPDATE`. Both
+   * are load-bearing: without the row lock this is check-then-act, and a
+   * concurrent writer committing between the SELECT and the UPDATE would be
+   * silently overwritten — which is the exact lost update the precondition
+   * exists to detect, reintroduced one line below the check for it.
+   *
+   * The `FOR UPDATE` also closes the same race on the pre-existing region
+   * immutability check, which read without a lock before this change.
    */
-  async update(workspaceId: string, input: UpdateWorkspaceRequest): Promise<WorkspaceResponse> {
+  async update(
+    workspaceId: string,
+    input: UpdateWorkspaceRequest,
+    ifMatch: string[] | "*" | undefined,
+  ): Promise<WorkspaceResponse> {
     const client = currentTenantStore()!.client;
 
-    const current = await client.query<{ region: string }>("SELECT region FROM workspaces WHERE id = $1", [
-      workspaceId,
-    ]);
-    const currentRegion = current.rows[0]?.region;
-    if (currentRegion === undefined) {
+    const current = await client.query<WorkspaceRow>(
+      `SELECT ${WORKSPACE_COLUMNS} FROM workspaces WHERE id = $1 FOR UPDATE`,
+      [workspaceId],
+    );
+    const currentRow = current.rows[0];
+    if (currentRow === undefined) {
       throw new NotFoundException();
     }
-    if (input.region !== undefined && input.region !== currentRegion) {
+
+    // Ordered before the region check so a caller holding a stale tag is
+    // told THAT, rather than being told their region is immutable on the
+    // basis of a representation they never saw.
+    assertIfMatch(ifMatch, entityTagFor(toWorkspaceResponse(currentRow)));
+
+    if (input.region !== undefined && input.region !== currentRow.region) {
       throw new ConflictException({
         code: "conflict",
         message: "data residency is fixed at creation and cannot be changed",
-        details: { field: "region", current: currentRegion, reason: "region_immutable" },
+        details: { field: "region", current: currentRow.region, reason: "region_immutable" },
       });
     }
 
