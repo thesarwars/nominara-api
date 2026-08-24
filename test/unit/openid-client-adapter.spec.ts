@@ -19,6 +19,8 @@ const ENV = {
   WORKSPACE_DEK_WRAPPING_KEY: Buffer.alloc(32, 7).toString("base64"),
   OAUTH_REDIRECT_BASE_URL: "https://api.example.com",
   OAUTH_STATE_SECRET: "test-oauth-state-secret",
+  OTP_EMAIL_HASH_PEPPER: "test-otp-email-hash-pepper",
+  OTP_EMAIL_FROM: "Nominara <no-reply@nominara.test>",
   GOOGLE_OAUTH_CLIENT_ID: "google-client-id",
   GITHUB_OAUTH_CLIENT_ID: "github-client-id",
   MICROSOFT_OAUTH_CLIENT_ID: "microsoft-client-id",

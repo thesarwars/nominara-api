@@ -91,6 +91,17 @@ export const envSchema = z
     // secret, distinct from CSRF_SECRET — key separation, so rotating one
     // never silently affects the other.
     OAUTH_STATE_SECRET: requiredString,
+
+    // STORY-016 — email OTP (fallback sign-in). Peppers the rate-limit
+    // ledger's email hash (security-and-tenancy.md §5 "Email OTP") — an
+    // email address is not high-entropy, so an unpeppered hash would let
+    // anyone with DB read access dictionary-attack the ledger to confirm who
+    // requested a code. A NEW secret, distinct from CSRF_SECRET and
+    // OAUTH_STATE_SECRET — same key-separation reasoning.
+    OTP_EMAIL_HASH_PEPPER: requiredString,
+    // Non-secret display string for the delivered email's "from" header,
+    // read by the EMAIL_SENDER port's logging adapter — never hardcoded.
+    OTP_EMAIL_FROM: requiredString,
   })
   .strict();
 

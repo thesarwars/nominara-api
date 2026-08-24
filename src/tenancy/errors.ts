@@ -1,4 +1,11 @@
-import { BadRequestException, ConflictException, ForbiddenException, UnauthorizedException } from "@nestjs/common";
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  HttpException,
+  HttpStatus,
+  UnauthorizedException,
+} from "@nestjs/common";
 
 // STORY-011 — the two typed errors this module's guardrails raise. Kept
 // separate from tenant-context.ts/query-guard.ts/with-tenant-job.ts so any
@@ -199,5 +206,32 @@ export class EmailNotVerifiedException extends ForbiddenException {
 export class OauthFailedException extends BadRequestException {
   constructor(requestId: string, message = "sign-in with this provider could not be completed") {
     super({ code: "oauth_failed", message, details: { request_id: requestId } });
+  }
+}
+
+// STORY-016 D5/D6 — POST /auth/otp/request's rate-limit refusal, keyed on
+// either the per-address (1h) or per-source (1m) bucket. `retry_after_seconds`
+// is the only variable field; standard rate-limit headers are STORY-025's
+// deliverable, not invented here.
+export class OtpRateLimitedException extends HttpException {
+  constructor(retryAfterSeconds: number, message = "too many code requests — try again later") {
+    super(
+      { code: "rate_limited", message, details: { retry_after_seconds: retryAfterSeconds } },
+      HttpStatus.TOO_MANY_REQUESTS,
+    );
+  }
+}
+
+// STORY-016 AC "Verification failures return one message for every failure
+// mode: wrong code, expired code, exhausted attempts, unknown address."
+// Deliberately carries NO variable field, unlike OauthFailedException's
+// request_id-in-details shape: Test Scenario 5 requires two rejections
+// from GENUINELY DIFFERENT requests (an expired code vs. a reused code) to
+// be byte-identical, which a per-request request_id would break by
+// construction. The real reason is a server-side warn log only, keyed by
+// its own request_id there — never reflected into the response body.
+export class EmailOtpInvalidException extends BadRequestException {
+  constructor(message = "this code is invalid, expired, or could not be verified") {
+    super({ code: "otp_invalid", message });
   }
 }

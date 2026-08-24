@@ -32,6 +32,8 @@ describe("STORY-022 · gateway.ts cold start", () => {
     process.env.WORKSPACE_DEK_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
     process.env.OAUTH_REDIRECT_BASE_URL = "http://localhost:3000";
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
+    process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
+    process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
   });
 
   afterEach(() => {

@@ -14,19 +14,24 @@ import { NOOP_REVERT, type Breaker } from "../support/breakers.js";
 // 74/59/15 as of STORY-015: `oauth_authorization_requests` (global — the
 // OAuth state parameter's server-held payload, GRANT-protected the same way)
 // is the one new table migration 0013 adds. Tenant count (59) is unchanged.
+//
+// 76/59/17 as of STORY-016: `email_otp_codes` and `email_otp_requests`
+// (both global — pre-tenant auth-path state, GRANT-protected the same way)
+// are the two new tables migration 0014 adds. Tenant count (59) is
+// unchanged.
 export async function assertIso06Census(ctx: AssertionContext): Promise<void> {
   const client = await connectSuperuser(ctx);
   try {
     const census = await computeCensus(client);
 
-    if (census.totalTables !== 74) {
-      throw new Error(`ISO-06: expected 74 total base tables, discovered ${census.totalTables}`);
+    if (census.totalTables !== 76) {
+      throw new Error(`ISO-06: expected 76 total base tables, discovered ${census.totalTables}`);
     }
     if (census.tenantTables.length !== 59) {
       throw new Error(`ISO-06: expected 59 tenant tables, discovered ${census.tenantTables.length}`);
     }
-    if (census.globalTables.length !== 15) {
-      throw new Error(`ISO-06: expected 15 global tables, discovered ${census.globalTables.length}`);
+    if (census.globalTables.length !== 17) {
+      throw new Error(`ISO-06: expected 17 global tables, discovered ${census.globalTables.length}`);
     }
     // Each of the 59 resolves a REAL scope column (non-empty string) — not
     // just present in the list.

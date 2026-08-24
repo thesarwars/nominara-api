@@ -22,6 +22,12 @@ const VALID: NodeJS.ProcessEnv = {
   // themselves stay optional (tests fake the provider at a port boundary).
   OAUTH_REDIRECT_BASE_URL: "http://localhost:3000",
   OAUTH_STATE_SECRET: "test-oauth-state-secret",
+  // STORY-016 — email OTP. OTP_EMAIL_HASH_PEPPER keys the rate-limit
+  // ledger's peppered email hash; a new secret, distinct from
+  // CSRF_SECRET/OAUTH_STATE_SECRET. OTP_EMAIL_FROM is a non-secret display
+  // string for the sender address shown on the delivered email.
+  OTP_EMAIL_HASH_PEPPER: "test-otp-email-hash-pepper",
+  OTP_EMAIL_FROM: "Nominara <no-reply@nominara.test>",
 };
 
 describe("STORY-022 · env validation — refuses to start on missing/malformed config", () => {
@@ -84,6 +90,22 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
   it("STORY-015 · a MISSING OAUTH_REDIRECT_BASE_URL throws, naming that exact key", () => {
     const { OAUTH_REDIRECT_BASE_URL: _drop, ...rest } = VALID;
     expect(() => loadEnv(rest)).toThrow(/OAUTH_REDIRECT_BASE_URL/);
+  });
+
+  it("STORY-016 · boots successfully with OTP_EMAIL_HASH_PEPPER and OTP_EMAIL_FROM present", () => {
+    const env = loadEnv(VALID);
+    expect(env.OTP_EMAIL_HASH_PEPPER).toBe(VALID.OTP_EMAIL_HASH_PEPPER);
+    expect(env.OTP_EMAIL_FROM).toBe(VALID.OTP_EMAIL_FROM);
+  });
+
+  it("STORY-016 · a MISSING OTP_EMAIL_HASH_PEPPER throws, naming that exact key", () => {
+    const { OTP_EMAIL_HASH_PEPPER: _drop, ...rest } = VALID;
+    expect(() => loadEnv(rest)).toThrow(/OTP_EMAIL_HASH_PEPPER/);
+  });
+
+  it("STORY-016 · a MISSING OTP_EMAIL_FROM throws, naming that exact key", () => {
+    const { OTP_EMAIL_FROM: _drop, ...rest } = VALID;
+    expect(() => loadEnv(rest)).toThrow(/OTP_EMAIL_FROM/);
   });
 
   it("an unknown key is rejected the same way any strict contract schema rejects mass assignment", () => {

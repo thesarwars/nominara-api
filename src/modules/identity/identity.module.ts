@@ -1,10 +1,14 @@
 import { Module } from "@nestjs/common";
 import { DbModule } from "../../db/db.module.js";
+import { LoggingEmailSenderAdapter } from "./adapters/logging-email-sender.adapter.js";
 import { OpenidClientAdapter } from "./adapters/openid-client.adapter.js";
+import { EmailOtpController } from "./email-otp.controller.js";
+import { EmailOtpService } from "./email-otp.service.js";
 import { IdentityController } from "./identity.controller.js";
 import { IdentityService } from "./identity.service.js";
 import { OauthController } from "./oauth.controller.js";
 import { OauthService } from "./oauth.service.js";
+import { EMAIL_SENDER } from "./ports/email-sender.js";
 import { OAUTH_CLIENT } from "./ports/oauth-client.js";
 import { SessionService } from "./session.service.js";
 
@@ -22,8 +26,15 @@ import { SessionService } from "./session.service.js";
 // itself carries zero test coverage from this module.
 @Module({
   imports: [DbModule],
-  controllers: [IdentityController, OauthController],
-  providers: [IdentityService, SessionService, OauthService, { provide: OAUTH_CLIENT, useClass: OpenidClientAdapter }],
+  controllers: [IdentityController, OauthController, EmailOtpController],
+  providers: [
+    IdentityService,
+    SessionService,
+    OauthService,
+    EmailOtpService,
+    { provide: OAUTH_CLIENT, useClass: OpenidClientAdapter },
+    { provide: EMAIL_SENDER, useClass: LoggingEmailSenderAdapter },
+  ],
   exports: [SessionService],
 })
 export class IdentityModule {}

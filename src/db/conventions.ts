@@ -40,7 +40,8 @@ export const REQUIRED_INTERNAL_FUNCTIONS = [
 
 // STORY-009 — data-model.md §2 "Table census", verbatim (STORY-017 update:
 // 73 tables, 59 tenant-scoped, 14 global; STORY-015 update: 74 tables, 59
-// tenant-scoped, 15 global). The census assertion depends on
+// tenant-scoped, 15 global; STORY-016 update: 76 tables, 59 tenant-scoped,
+// 17 global). The census assertion depends on
 // this partition being exact, so a new table is either tenant-scoped with RLS or
 // an explicit, reviewed addition here — there is no third option.
 // STORY-011's src/db/rls/generate.ts should import GLOBAL_TABLES and
@@ -81,6 +82,15 @@ export const GLOBAL_TABLES = [
   // reads a live PKCE verifier. Migration
   // 0013_oauth_authorization_requests.up.sql.
   "oauth_authorization_requests",
+  // STORY-016 — email OTP (fallback sign-in). Both new tables are pre-tenant
+  // auth-path state, not tenant data, GRANT-protected the same way as
+  // user_credentials/webauthn_challenges: email_otp_codes holds a live
+  // Argon2id code hash per user, and email_otp_requests is the rate-limit
+  // ledger keyed on a peppered email hash — deliberately NOT linked to
+  // `users`, since it must accept addresses with no account. Migration
+  // 0014_email_otp.up.sql.
+  "email_otp_codes",
+  "email_otp_requests",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -304,7 +314,9 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
     table === "webauthn_challenges" ||
     table === "sessions" ||
     table === "refresh_tokens" ||
-    table === "oauth_authorization_requests"
+    table === "oauth_authorization_requests" ||
+    table === "email_otp_codes" ||
+    table === "email_otp_requests"
   ) {
     return role === "nominara_app" ? FULL_WRITE : NO_PRIVILEGES;
   }

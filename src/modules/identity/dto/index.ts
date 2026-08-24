@@ -54,3 +54,15 @@ export {
   oauthCallbackResponseSchema,
   type OauthCallbackResponse,
 } from "../../../../contracts/identity/oauth-callback-response.schema.js";
+export {
+  emailOtpRequestSchema,
+  type EmailOtpRequest,
+} from "../../../../contracts/identity/email-otp-request.schema.js";
+export {
+  emailOtpVerifyRequestSchema,
+  type EmailOtpVerifyRequest,
+} from "../../../../contracts/identity/email-otp-verify-request.schema.js";
+export {
+  emailOtpRequestResponseSchema,
+  type EmailOtpRequestResponse,
+} from "../../../../contracts/identity/email-otp-request-response.schema.js";
