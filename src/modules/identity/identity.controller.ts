@@ -9,6 +9,7 @@ import { REFRESH_COOKIE_NAME, clearAuthCookies, setAuthCookies } from "../../lib
 import {
   passkeyListResponseSchema,
   passkeyOptionsRequestSchema,
+  passkeyOptionsResponseSchema,
   passkeyRenameRequestSchema,
   passkeyVerifyRequestSchema,
   type PasskeyOptionsRequest,
@@ -30,7 +31,11 @@ export class IdentityController {
 
   @Post("auth/passkey/options")
   @Public()
-  @ApiContract({ operationId: "createPasskeyOptions", requestSchema: passkeyOptionsRequestSchema })
+  @ApiContract({
+    operationId: "createPasskeyOptions",
+    requestSchema: passkeyOptionsRequestSchema,
+    responseSchema: passkeyOptionsResponseSchema,
+  })
   options(@Body(new ZodValidationPipe(passkeyOptionsRequestSchema)) body: PasskeyOptionsRequest): Promise<PasskeyOptionsResult> {
     return this.service.createOptions(body);
   }
@@ -40,7 +45,7 @@ export class IdentityController {
   @Post("auth/passkey/verify")
   @Public()
   @HttpCode(200)
-  @ApiContract({ operationId: "verifyPasskey", requestSchema: passkeyVerifyRequestSchema })
+  @ApiContract({ operationId: "verifyPasskey", requestSchema: passkeyVerifyRequestSchema, voidResponse: true })
   async verify(
     @Body(new ZodValidationPipe(passkeyVerifyRequestSchema)) body: PasskeyVerifyRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
@@ -52,7 +57,7 @@ export class IdentityController {
   @Post("auth/refresh")
   @Public()
   @HttpCode(200)
-  @ApiContract({ operationId: "refreshSession" })
+  @ApiContract({ operationId: "refreshSession", voidResponse: true })
   async refresh(
     @Req() req: AuthenticatedRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
@@ -68,7 +73,7 @@ export class IdentityController {
   @Post("auth/logout")
   @SkipTenantContext()
   @HttpCode(200)
-  @ApiContract({ operationId: "logout" })
+  @ApiContract({ operationId: "logout", voidResponse: true })
   async logout(@Req() req: AuthenticatedRequest, @Res({ passthrough: true }) reply: FastifyReply): Promise<void> {
     await this.sessions.logout(req.auth!.sid);
     clearAuthCookies(reply);
@@ -88,7 +93,7 @@ export class IdentityController {
 
   @Patch("me/passkeys/:id")
   @SkipTenantContext()
-  @ApiContract({ operationId: "renamePasskey", requestSchema: passkeyRenameRequestSchema })
+  @ApiContract({ operationId: "renamePasskey", requestSchema: passkeyRenameRequestSchema, voidResponse: true })
   rename(
     @Req() req: AuthenticatedRequest,
     @Param("id") id: string,
@@ -99,7 +104,7 @@ export class IdentityController {
 
   @Delete("me/passkeys/:id")
   @SkipTenantContext()
-  @ApiContract({ operationId: "revokePasskey" })
+  @ApiContract({ operationId: "revokePasskey", voidResponse: true })
   revoke(@Req() req: AuthenticatedRequest, @Param("id") id: string): Promise<void> {
     return this.service.revokePasskey(req.auth!.sub, id);
   }

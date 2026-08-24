@@ -1,7 +1,9 @@
-import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus } from "@nestjs/common";
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from "@nestjs/common";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { ErrorCode } from "../../../contracts/common/error-code.schema.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { DomainError, ERROR_STATUS_BY_CODE, type DomainRemediation } from "../errors/domain-errors.js";
+import type { AuthenticatedRequest } from "../guards/auth.guard.js";
 
 // STORY-024 T9 — AC1: "a filter maps it to the wire shape". Decision D2's
 // dual shape, from api-specification.md §2: RFC 9457's top-level members
@@ -14,6 +16,8 @@ import { DomainError, ERROR_STATUS_BY_CODE, type DomainRemediation } from "../er
 // Replaces STORY-022's stub, which emitted `code`/`details` FLAT at the top
 // level, carried no request_id, and sent application/json.
 const PROBLEM_CONTENT_TYPE = "application/problem+json; charset=utf-8";
+
+const logger = new Logger("problem-filter");
 
 // Decision D12 — six codes thrown inside src/ are OUTSIDE §2's closed
 // taxonomy. `problemErrorSchema.code` is `errorCodeSchema`, so putting any
@@ -144,16 +148,30 @@ export class ProblemFilter implements ExceptionFilter {
     // omits the `error` member entirely. A 500 is exactly the case where a
     // user most needs a reference to quote, so dropping the identifier too
     // would be the worst possible trade.
+    //
+    // STORY-024 T12 — this branch is gated on 5xx, NOT on "we have no code".
+    // T9 keyed it on `code === undefined` alone, and codeForStatus() covers
+    // only six statuses, so every 4xx outside that set — 415 from an
+    // unsupported media type, a bare 422, and anything else the framework
+    // raises — took the error-less branch too. Those bodies violate the
+    // repo's own contract twice over: problemDetailsSchema is `.strict()`
+    // with `error` REQUIRED, so a missing `error` and an unknown top-level
+    // `request_id` are both rejected by the schema this API publishes. A 4xx
+    // with no mapped code now falls back to the taxonomy's nearest
+    // structural match rather than emitting an unpublishable shape.
+    const isServerError = status >= HttpStatus.INTERNAL_SERVER_ERROR;
+    const wireCode = code ?? (isServerError ? undefined : "validation_failed");
+
     const body =
-      code === undefined
+      wireCode === undefined
         ? { type: "about:blank", title: HttpStatus[status] ?? "error", status, detail: message, request_id: requestId }
         : {
             type: "about:blank",
-            title: titleFor(code),
+            title: titleFor(wireCode),
             status,
             detail: message,
             error: {
-              code,
+              code: wireCode,
               message,
               ...(details !== undefined ? { details } : {}),
               ...(remediation !== undefined ? { remediation } : {}),
@@ -161,6 +179,35 @@ export class ProblemFilter implements ExceptionFilter {
             },
           };
 
+    // STORY-024 T12 — coding-standards.md §7: one metric, one redacted log
+    // line. The filter owns EVERY error path, and it had neither: because it
+    // is @Catch() and globally registered, Nest's own ExceptionsHandler
+    // logging never runs, and ResponseEnvelopeInterceptor's log sits inside
+    // map(), which never fires on an error. An unexpected 500 wrote zero
+    // lines anywhere — while this same filter put a request_id on the body
+    // on the stated grounds that a user needs "a reference to quote". There
+    // was nothing on the other end of that reference to look up.
+    //
+    // IDs only, never names, and never `detail` for a 5xx — an unexpected
+    // exception's message is the one string most likely to carry a
+    // connection string, a row, or a customer's data.
+    incrementCounter("nominara_api_error_total", { code: wireCode ?? "unmapped", status: String(status) });
+    logger.error({
+      message: "request refused",
+      request_id: requestId,
+      status,
+      code: wireCode ?? null,
+      workspace_id: (request as AuthenticatedRequest).auth?.ws ?? null,
+      ...(isServerError ? {} : { detail: message }),
+    });
+
+    // A representation tag may already be on the reply: WorkspacesController
+    // sets `ETag` inside the ambient transaction, BEFORE TenantContext-
+    // Interceptor commits. If the commit or the audit append then fails, the
+    // client would receive a 500 carrying the tag of a row that never
+    // existed — and with no item-level GET to re-read from, a client caching
+    // tags per URL would be wedged into permanent 409s.
+    reply.removeHeader("etag");
     reply.status(status).header("content-type", PROBLEM_CONTENT_TYPE).send(body);
   }
 }

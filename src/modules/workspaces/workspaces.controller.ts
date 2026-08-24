@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
+import { z } from "zod";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { entityTagFor, formatEntityTag } from "../../api/etag/entity-tag.js";
 import { parseIfMatch } from "../../api/etag/if-match.js";
@@ -112,7 +113,7 @@ export class WorkspacesController {
   @Post("workspaces/:id/switch")
   @SkipTenantContext()
   @HttpCode(200)
-  @ApiContract({ operationId: "switchWorkspace" })
+  @ApiContract({ operationId: "switchWorkspace", voidResponse: true })
   async switchWorkspace(
     @Req() req: AuditableRequest,
     @Param("id") id: string,
@@ -128,7 +129,7 @@ export class WorkspacesController {
 
   @Get("workspaces/:id/members")
   @RequirePermission("workspace:read")
-  @ApiContract({ operationId: "listWorkspaceMembers" })
+  @ApiContract({ operationId: "listWorkspaceMembers", responseSchema: z.array(memberResponseSchema) })
   listMembers(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<MemberResponse[]> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
     return this.service.listMembers();
@@ -149,7 +150,7 @@ export class WorkspacesController {
   @Delete("members/:id")
   @RequirePermission("member:remove")
   @Audit({ action: "member.removed", resourceType: "workspace_member" })
-  @ApiContract({ operationId: "removeMember" })
+  @ApiContract({ operationId: "removeMember", voidResponse: true })
   removeMember(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<void> {
     return this.service.removeMemberById(req.tenant!.workspaceId, id);
   }
@@ -169,7 +170,7 @@ export class WorkspacesController {
 
   @Get("workspaces/:id/invitations")
   @RequirePermission("member:invite")
-  @ApiContract({ operationId: "listInvitations" })
+  @ApiContract({ operationId: "listInvitations", responseSchema: z.array(invitationResponseSchema) })
   listInvitations(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<InvitationResponse[]> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
     return this.invitations.list(id);

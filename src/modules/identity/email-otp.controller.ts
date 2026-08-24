@@ -50,7 +50,7 @@ export class EmailOtpController {
   @Public()
   @SkipTenantContext()
   @HttpCode(200)
-  @ApiContract({ operationId: "verifyEmailOtp", requestSchema: emailOtpVerifyRequestSchema })
+  @ApiContract({ operationId: "verifyEmailOtp", requestSchema: emailOtpVerifyRequestSchema, voidResponse: true })
   async verify(
     @Body(new ZodValidationPipe(emailOtpVerifyRequestSchema)) body: EmailOtpVerifyRequest,
     @Req() req: EmailOtpRequestReq,

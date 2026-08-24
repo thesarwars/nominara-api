@@ -161,17 +161,38 @@ export function buildParameters(schema: ZodType, location: "query" | "path", ful
  */
 function responseSchemaFor(route: DiscoveredContractRoute): ZodType {
   const contract = route.contract!;
-  const data = contract.responseSchema ?? z.null();
+
+  // A missing `responseSchema` is an ABSENCE OF INFORMATION, never evidence
+  // that the route returns nothing. Inferring `z.null()` from it is what
+  // published `data: {"type":"null"}` for three routes that return a body.
+  // The author declares `voidResponse: true` or supplies a schema; the
+  // generator does not guess, and this fails the BUILD rather than a test.
+  if (contract.responseSchema === undefined && contract.voidResponse !== true) {
+    throw new Error(
+      `contracts:generate — route "${contract.operationId}" declares neither a responseSchema nor ` +
+        "voidResponse: true, so its response body cannot be described. Add the schema, or declare " +
+        "voidResponse: true if the handler really returns Promise<void>. The generator will not infer " +
+        "one from the other.",
+    );
+  }
+  if (contract.responseSchema !== undefined && contract.voidResponse === true) {
+    throw new Error(
+      `contracts:generate — route "${contract.operationId}" declares BOTH a responseSchema and ` +
+        "voidResponse: true. It cannot be both; one of the two is wrong.",
+    );
+  }
+
   if (route.envelopeExempt) {
     if (contract.responseSchema === undefined) {
       throw new Error(
-        `contracts:generate — route "${contract.operationId}" is @NoEnvelope() and declares no responseSchema, ` +
-          "so it has no describable body at all. Give it a responseSchema or remove the exemption.",
+        `contracts:generate — route "${contract.operationId}" is @NoEnvelope() and returns no body, ` +
+          "so it has no describable response at all. Give it a responseSchema or remove the exemption.",
       );
     }
     return contract.responseSchema;
   }
-  const enveloped = envelopeSchema(data);
+
+  const enveloped = envelopeSchema(contract.responseSchema ?? z.null());
   return contract.listOf === true ? enveloped : enveloped.omit({ pagination: true });
 }
 

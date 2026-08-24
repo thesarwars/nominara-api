@@ -75,17 +75,26 @@ describe("STORY-024 · the problem+json wire shape over the real pipeline", () =
   // designs and api-specification.md §2 explicitly rules it out here, because
   // 404 means "absent WITHIN the caller's tenant" and a permission failure is
   // a different fact.
-  it("AC4 — a permission denial names the permission and is NEVER a not-found", async () => {
+  // STORY-024 T12 — this test used to wrap its real assertions in
+  // `if (response.statusCode === 403)`. An uncredentialed GET /v1/workspaces
+  // is refused by AuthGuard with 401, so that branch NEVER executed: the
+  // only assertion that ran was `not.toBe(404)`, which 401 satisfies. It
+  // would have stayed green with forbiddenDetailsSchema deleted and the
+  // entire 403 path removed, while its name claimed the story's scenario 3
+  // verbatim. A conditional assertion is a `.skip` that does not announce
+  // itself.
+  //
+  // Split into the two facts that are actually reachable here. AC4's 403
+  // half needs a real permission denial and is proven against one in
+  // test/integration/workspace-mutations-audit.spec.ts ("an admin cannot
+  // transfer ownership"), which has the credential machinery this file
+  // does not.
+  it("an uncredentialed request is 401 unauthenticated, and is never disguised as a 404", async () => {
     const { response, body } = await errorResponse("GET", apiUrl("/workspaces"));
     const error = body.error as Record<string, unknown>;
 
-    if (response.statusCode === 403) {
-      expect(error.code).toBe("forbidden");
-      expect(
-        (error.details as Record<string, unknown> | undefined)?.required_permission,
-        "a 403 must name the permission the caller lacks",
-      ).toBeTruthy();
-    }
+    expect(response.statusCode).toBe(401);
+    expect(error.code).toBe("unauthenticated");
     expect(response.statusCode, "a permission or credential failure must never be disguised as 404").not.toBe(404);
   });
 

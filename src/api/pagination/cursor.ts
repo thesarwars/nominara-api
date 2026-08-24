@@ -60,8 +60,17 @@ export function encodeCursor(key: readonly CursorKeyElement[]): string {
 /**
  * Decodes a wire cursor back to its sort-key tuple, refusing anything that
  * is not exactly a cursor this server issued at the current payload version.
+ *
+ * `expectedKeyLength` is how a caller pins the ARITY of the tuple, and
+ * callers with a fixed sort key should always pass it. `v` pins the encoding
+ * version but says nothing about the shape of `k`, so without this a forged
+ * cursor whose tuple is SHORTER than the reader expects decodes cleanly and
+ * every element the reader indexes past the end comes back `undefined`. In a
+ * keyset query that `undefined` binds as SQL NULL, `(… IS NULL OR seq > …)`
+ * collapses to true, and the page silently rewinds to the first row — a
+ * wrong page, from client-supplied input, with no error anywhere.
  */
-export function decodeCursor(cursor: string): CursorKeyElement[] {
+export function decodeCursor(cursor: string, expectedKeyLength?: number): CursorKeyElement[] {
   // Shape first, before any decoding: base64url charset and the length cap.
   // `Buffer.from(…, "base64url")` is LENIENT — it silently ignores bytes it
   // cannot decode rather than throwing — so "not a cursor!!" would otherwise
@@ -94,6 +103,11 @@ export function decodeCursor(cursor: string): CursorKeyElement[] {
   const payload = cursorPayloadSchema.safeParse(parsed);
   if (!payload.success) {
     throw refuse(payload.error.issues[0]?.message ?? "cursor payload is not valid");
+  }
+  if (expectedKeyLength !== undefined && payload.data.k.length !== expectedKeyLength) {
+    throw refuse(
+      `cursor carries ${payload.data.k.length} sort-key element(s); this list is keyed on ${expectedKeyLength}`,
+    );
   }
   return payload.data.k;
 }

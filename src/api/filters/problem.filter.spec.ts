@@ -1,5 +1,5 @@
 import type { ArgumentsHost } from "@nestjs/common";
-import { HttpException, HttpStatus } from "@nestjs/common";
+import { HttpException, HttpStatus, NotFoundException, UnsupportedMediaTypeException } from "@nestjs/common";
 import { describe, expect, it, vi } from "vitest";
 import { problemDetailsSchema } from "../../../contracts/common/problem-details.schema.js";
 import {
@@ -21,17 +21,24 @@ function makeHost(headers: Record<string, string> = {}): {
   status: ReturnType<typeof vi.fn>;
   header: ReturnType<typeof vi.fn>;
   send: ReturnType<typeof vi.fn>;
+  removeHeader: ReturnType<typeof vi.fn>;
 } {
   const send = vi.fn();
   const header = vi.fn(() => ({ send }));
   const status = vi.fn(() => ({ header, send }));
+  // STORY-024 T12 — `removeHeader` is real FastifyReply API and the filter
+  // calls it to strip a pre-commit ETag off an error response. It was
+  // missing from this fake, so the fake was a more permissive object than
+  // the thing it stands in for; the filter threw TypeError in production
+  // shape while every test here passed.
+  const removeHeader = vi.fn();
   const host = {
     switchToHttp: () => ({
-      getResponse: () => ({ status }),
+      getResponse: () => ({ status, removeHeader }),
       getRequest: () => ({ id: REQUEST_ID, headers }),
     }),
   } as unknown as ArgumentsHost;
-  return { host, status, header, send };
+  return { host, status, header, send, removeHeader };
 }
 
 function bodyFrom(exception: unknown, headers?: Record<string, string>): Record<string, unknown> {
@@ -164,5 +171,52 @@ describe("STORY-024 · errors outside the taxonomy", () => {
   it("a bare HttpException is given the taxonomy code its status implies", () => {
     const error = bodyFrom(new HttpException("nope", HttpStatus.FORBIDDEN)).error as Record<string, unknown>;
     expect(error.code).toBe("forbidden");
+  });
+
+  // STORY-024 T12 — the assertion that would have caught the 4xx defect.
+  // T9 keyed the error-less branch on `code === undefined` rather than on
+  // 5xx, so every 4xx outside codeForStatus()'s six statuses emitted a body
+  // with no `error` member and an unknown top-level `request_id` — a shape
+  // problemDetailsSchema rejects on both counts. Every test here asserted
+  // with toEqual({...}) and none ran the body through the schema, which is
+  // the one check that makes the filter and the published contract agree.
+  describe("the emitted body satisfies the contract this API publishes", () => {
+    it.each([
+      ["415 unsupported media type", new UnsupportedMediaTypeException("nope"), HttpStatus.UNSUPPORTED_MEDIA_TYPE],
+      ["a bare 422", new HttpException("nope", HttpStatus.UNPROCESSABLE_ENTITY), HttpStatus.UNPROCESSABLE_ENTITY],
+      ["a bare 405", new HttpException("nope", HttpStatus.METHOD_NOT_ALLOWED), HttpStatus.METHOD_NOT_ALLOWED],
+    ])("%s is a well-formed problem+json carrying an error member", (_label, exception, expectedStatus) => {
+      const body = bodyFrom(exception);
+      expect(body.status).toBe(expectedStatus);
+      const parsed = problemDetailsSchema.safeParse(body);
+      expect(
+        parsed.success,
+        `body must satisfy problemDetailsSchema: ${JSON.stringify(parsed.success ? {} : parsed.error.issues)}`,
+      ).toBe(true);
+    });
+
+    it("a mapped 4xx also satisfies it", () => {
+      const parsed = problemDetailsSchema.safeParse(bodyFrom(new NotFoundException()));
+      expect(parsed.success).toBe(true);
+    });
+
+    // NAMED DEVIATION, not an oversight. api-specification.md §2's table runs
+    // 400…507 and contains NO code for "we did not model this", so an
+    // unexpected 5xx has no taxonomy member to carry and its body omits
+    // `error` — which problemDetailsSchema, being `.strict()` with `error`
+    // required, therefore rejects. This test PINS that deviation rather than
+    // leaving it invisible: it goes red the moment the 5xx body starts
+    // conforming, which is exactly when the follow-up story (an
+    // `internal_error` taxonomy code) lands and this waiver should be
+    // deleted rather than quietly outliving its reason.
+    it("an unexpected 5xx deliberately does NOT satisfy it — §2 has no code for an unmodelled error", () => {
+      const body = bodyFrom(new Error("boom"));
+      expect(body.status).toBe(HttpStatus.INTERNAL_SERVER_ERROR);
+      expect(body).not.toHaveProperty("error");
+      expect(
+        problemDetailsSchema.safeParse(body).success,
+        "if this is now true, §2 gained a code for an unmodelled 5xx — delete this waiver",
+      ).toBe(false);
+    });
   });
 });

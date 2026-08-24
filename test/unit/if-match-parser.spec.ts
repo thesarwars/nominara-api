@@ -1,24 +1,25 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { parseIfMatch } from "../../src/api/etag/if-match.js";
-import { useApiHarness } from "../support/api-harness.js";
 
-// STORY-024 T8 (RED step) — story scenarios 6 and 7, AC7. RED at module
-// resolution until T11 creates src/api/etag/if-match.ts.
+// STORY-024 T8 (RED step), relocated in T12 — the `If-Match` PARSER's
+// contract (RFC 9110 §13.1.1). Nothing here touches Postgres, HTTP, or the
+// Nest container, and it no longer pretends to.
 //
-// §1: "`If-Match: <etag>` — on PATCH of mutable config. Optimistic
-// concurrency on `projects`, `tracked_prompts`, `share_tokens`." None of
-// those three resources has an endpoint yet, so this task applies the
-// mechanism to `PATCH /v1/workspaces/{id}` — the one mutable-configuration
-// PATCH that exists (the plan's T11 scope, deliberately narrow).
+// As an integration spec this file called useApiHarness() and DISCARDED the
+// return value: it paid for a Postgres container, a schema drop, a full
+// migrateUp and an entire ApiModule boot PER TEST — six times — to assert
+// that parseIfMatch('"abc123"') returns ["abc123"]. Its describe claimed
+// "a stale concurrency tag is refused, a current one succeeds" and neither
+// half was exercised anywhere in it; a header comment said the HTTP cases
+// were "marked", and no case was marked. That is the same shape as the
+// cursor spec that asserted expect(101).toBeGreaterThan(100).
 //
-// The HTTP half needs a real session, which this file does not mint; those
-// cases are marked and assert the helper's contract instead, so a green run
-// is never read as "the route enforces it". T11 wires the route and extends
-// test/integration/workspace-mutations-audit.spec.ts, which already has the
-// credential machinery, with the end-to-end 409.
-describe("STORY-024 · AC7 — a stale concurrency tag is refused, a current one succeeds", () => {
-  useApiHarness();
+// AC7's HTTP half is proven for real in
+// test/integration/workspace-mutations-audit.spec.ts (stale → 409, current
+// → 200 with a new tag, missing → 422, weak → 400), and the concurrency
+// half in test/integration/etag-lost-update-concurrency.spec.ts.
+describe("STORY-024 · the If-Match parser's contract (RFC 9110 §13.1.1)", () => {
 
   it("parses a strong ETag from an If-Match header", () => {
     expect(parseIfMatch('"abc123"')).toEqual(["abc123"]);

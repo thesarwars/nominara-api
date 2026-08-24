@@ -13,6 +13,10 @@ export {
   type PasskeyOptionsRequest,
 } from "../../../../contracts/identity/passkey-options-request.schema.js";
 export {
+  passkeyOptionsResponseSchema,
+  type PasskeyOptionsResponse,
+} from "../../../../contracts/identity/passkey-options-response.schema.js";
+export {
   registrationVerifyRequestSchema,
   type RegistrationVerifyRequest,
 } from "../../../../contracts/identity/registration-verify-request.schema.js";

@@ -79,7 +79,13 @@ describe("STORY-024 · scenario 4 — a cursor is stable across an interleaved i
    * would compare "10" < "9" and the paging loop would silently stop early.
    */
   async function readPage(workspaceId: string, limit: number, cursor?: string): Promise<PageResult> {
-    const afterSeq = cursor === undefined ? null : (decodeCursor(cursor)[1] as number);
+    // Keyed on `seq` ALONE. An earlier draft used [workspace_id, seq]; the
+    // tenant is established server-side by the caller's context and putting
+    // it in the cursor only invites the next author to filter on
+    // `decoded[0]`, which is client-supplied and forgeable. There is now
+    // nothing in the cursor worth forging. The arity is pinned so a
+    // shorter forged tuple is refused rather than read as NULL.
+    const afterSeq = cursor === undefined ? null : (decodeCursor(cursor, 1)[0] as number);
 
     const result = await harness.db().query<{ seq: string; action: string }>(
       `SELECT seq, action FROM audit_log
@@ -94,7 +100,7 @@ describe("STORY-024 · scenario 4 — a cursor is stable across an interleaved i
     const last = rows.at(-1);
     return {
       actions: rows.map((row) => row.action),
-      cursorNext: hasMore && last !== undefined ? encodeCursor([workspaceId, Number(last.seq)]) : null,
+      cursorNext: hasMore && last !== undefined ? encodeCursor([Number(last.seq)]) : null,
       hasMore,
     };
   }
@@ -172,18 +178,49 @@ describe("STORY-024 · scenario 4 — a cursor is stable across an interleaved i
     expect(replayed.actions).toEqual(second.actions);
   });
 
-  it("the cursor is opaque on the wire — a caller cannot read a sequence number out of it", async () => {
+  // The previous version of this test claimed "a caller cannot read a
+  // sequence number out of it" and asserted `not.toContain(WORKSPACE_ID)`
+  // and `not.toMatch(/^[0-9]+$/)` — both vacuously true of ANY base64
+  // string, including one that spells out the sequence number, which this
+  // one does. §1 asks for "an opaque base64", which is what shipped:
+  // opaque means the CLIENT must not interpret it, not that it is
+  // confidential. The honest assertions are these.
+  it("the cursor carries no tenant identifier at all — there is nothing in it to forge", async () => {
     await append(WORKSPACE_ID, ["o1", "o2"]);
     const page = await readPage(WORKSPACE_ID, 1);
 
     expect(page.cursorNext).not.toBeNull();
-    expect(page.cursorNext!).not.toContain(WORKSPACE_ID);
-    expect(page.cursorNext!).not.toMatch(/^[0-9]+$/);
+    const payload = Buffer.from(page.cursorNext!, "base64url").toString("utf8");
+    expect(payload, "a decoded cursor must not name a workspace").not.toContain(WORKSPACE_ID);
+    expect(JSON.parse(payload)).toEqual({ v: 1, k: [expect.any(Number)] });
+  });
+
+  it("a forged cursor of the wrong arity is refused, not read as NULL and rewound to page one", async () => {
+    await append(WORKSPACE_ID, ["f1", "f2", "f3", "f4"]);
+    const page = await readPage(WORKSPACE_ID, 2);
+    expect(page.actions).toEqual(["f1", "f2"]);
+
+    // An empty tuple is already refused by the schema; a WELL-FORMED tuple
+    // of the wrong length is the dangerous one, because it decodes cleanly.
+    const forged = encodeCursor(["not-a-seq", 1]);
+    let refusal: { details?: { issues?: { message?: string }[] } } | undefined;
+    try {
+      decodeCursor(forged, 1);
+    } catch (error) {
+      refusal = error as typeof refusal;
+    }
+    expect(refusal, "a two-element cursor must not satisfy a one-element sort key").toBeDefined();
+    // The reason travels in `details.issues`, not in the message — the
+    // message is the client-facing constant. Asserting the reason is what
+    // distinguishes "refused for arity" from "refused for anything at all".
+    expect(refusal!.details?.issues?.[0]?.message).toMatch(/sort-key element/);
+
+    await expect(readPage(WORKSPACE_ID, 2, forged)).rejects.toThrow();
   });
 
   it("a sequence cursor round-trips as an integer, not a stringified one", () => {
-    const decoded = decodeCursor(encodeCursor([WORKSPACE_ID, 9]));
-    expect(decoded).toEqual([WORKSPACE_ID, 9]);
-    expect(typeof decoded[1]).toBe("number");
+    const decoded = decodeCursor(encodeCursor([9]), 1);
+    expect(decoded).toEqual([9]);
+    expect(typeof decoded[0]).toBe("number");
   });
 });

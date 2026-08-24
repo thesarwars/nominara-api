@@ -56,6 +56,20 @@ export interface ApiContractOptions {
    * concurrency tag for the representation in its body.
    */
   readonly emitsEntityTag?: boolean;
+  /**
+   * STORY-024 T12 — the route returns NO body, so the envelope carries
+   * `data: null`. This must be DECLARED, never inferred from the absence of
+   * `responseSchema`.
+   *
+   * T11 inferred it, and the inference was unsound: `responseSchema` is
+   * optional, so `createPasskeyOptions`, `listWorkspaceMembers` and
+   * `listInvitations` — all of which return a body — were published as
+   * `data: {"type":"null"}`. Before T11 those read "no response body", a
+   * visible omission; after T11 they were a positive, machine-checkable
+   * falsehood that `@nominara/client` would have compiled against. An
+   * absent schema now fails `contracts:generate` instead.
+   */
+  readonly voidResponse?: boolean;
 }
 
 export const API_CONTRACT_KEY = "apiContract";
