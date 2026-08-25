@@ -27,6 +27,7 @@ import { applyFakeApiEnv } from "../support/fake-env.js";
 
 const REFUSED: RateLimitDecision = {
   allowed: false,
+  applied: true,
   exhausted: { scope: "user", limit: 60, hardCap: false },
   limit: 60,
   remaining: 0,
@@ -113,7 +114,7 @@ describe("STORY-025 · an allowed request still publishes its remaining capacity
       .overrideProvider(RateLimitBuckets)
       .useValue({
         check: (): Promise<RateLimitDecision> =>
-          Promise.resolve({ allowed: true, limit: 300, remaining: 299, resetAfterMs: 200 }),
+          Promise.resolve({ allowed: true, applied: true, limit: 300, remaining: 299, resetAfterMs: 200 }),
       })
       .compile();
 

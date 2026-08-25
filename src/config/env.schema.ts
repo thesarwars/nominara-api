@@ -111,7 +111,49 @@ export const envSchema = z
     // VALKEY_URL precisely so the second one cannot quietly land on the
     // first: an eviction policy that discards a queued job is data loss,
     // and one that refuses to evict a cache is an outage.
-    VALKEY_CACHE_URL: requiredString,
+    // A URL, validated here rather than at first use — this schema exists so a
+    // malformed value is a failed deploy instead of a customer-visible
+    // incident, and `requiredString` alone accepted anything non-blank.
+    VALKEY_CACHE_URL: requiredString.refine((value) => URL.canParse(value), {
+      message: "must be a valid connection URL, e.g. redis://host:6379",
+    }),
+
+    // STORY-025, corrected by STORY-026's audit — the key namespace for the
+    // cache.
+    //
+    // It defaults to NODE_ENV, and NODE_ENV CANNOT EXPRESS A DEPLOYMENT. It is
+    // one of development|test|production, so a staging deployment either fails
+    // to boot or runs as "production" — and then shares production's
+    // idempotency records and rate-limit counters key for key. The original
+    // claim that the `{env}` segment kept staging out of production's data was
+    // simply false as built.
+    //
+    // The PRIMARY boundary is still a separate Valkey instance per environment
+    // (VALKEY_CACHE_URL). This is defence in depth, and it exists so an
+    // environment that does share an instance can still be separated — set it
+    // to something that names the deployment, not its build mode.
+    CACHE_KEY_NAMESPACE: requiredString.optional(),
+
+    // STORY-026 audit fix — how many trusted proxies sit in front of this
+    // process.
+    //
+    // Fastify's `request.ip` is the IMMEDIATE PEER unless told otherwise.
+    // Behind any load balancer that is the balancer, so every §12 per-IP
+    // bucket collapses onto one key: `auth` at 30/min becomes thirty sign-ins
+    // per minute for the ENTIRE PLATFORM, across all tenants. That is a
+    // platform-wide sign-in outage on the first deploy behind an ingress.
+    //
+    // A HOP COUNT, never `trustProxy: true`. Bare `true` trusts the whole
+    // X-Forwarded-For chain, so any caller can forge a header and land in a
+    // fresh bucket — which turns a denial-of-service bug into a trivial
+    // evasion, strictly worse than what it replaced. The count says how many
+    // proxies YOU operate; everything beyond them is caller-supplied and
+    // ignored.
+    //
+    // UNSET MEANS NO PROXY, and that is the safe default rather than a
+    // convenient one: with no value the peer address is used, which is correct
+    // when nothing sits in front and merely coarse when something does.
+    TRUST_PROXY_HOPS: z.coerce.number().int().nonnegative().optional(),
   })
   .strict();
 

@@ -187,6 +187,7 @@ describe("STORY-025 · additive evaluation", () => {
       get: (key) => inner.get(key),
       set: (key, value, options) => inner.set(key, value, options),
       delete: (key) => inner.delete(key),
+      deleteIf: (key, expected) => inner.deleteIf(key, expected),
       increment: (key, ttlMs) => inner.increment(key, ttlMs),
       timeToLiveMs: (key) => inner.timeToLiveMs(key),
       consume: (key, bucket) => {
@@ -210,17 +211,38 @@ describe("STORY-025 · additive evaluation", () => {
     expect(afterRefusal.some((key) => key.includes(":workspace:"))).toBe(false);
   });
 
-  it("row 9 — a changed limit takes effect with no restart", async () => {
-    const { subject: strict } = buckets(ONE_PER_MINUTE);
-    await strict.check("writes", IDENTITY);
-    await strict.check("writes", IDENTITY);
-    expect((await strict.check("writes", IDENTITY)).allowed).toBe(false);
-
-    const relaxed = rateLimitConfigSchema.parse(
-      ONE_PER_MINUTE.map((entry) => ({ ...entry, burst: 10, buckets: entry.buckets.map((b) => ({ ...b, limit: 100 })) })),
+  // ROW 9 / AC10 IS NOT MET, AND THE TEST THAT CLAIMED IT WAS VACUOUS.
+  //
+  // It built a SECOND RateLimitBuckets over a FRESH cache and asserted the
+  // first request was allowed — which is true of any new bucket store,
+  // whatever its configuration. The code review mutated it to remove the
+  // configuration change entirely and it still passed.
+  //
+  // AC10 says "bucket configuration is data, so a limit change needs no
+  // redeploy". RATE_LIMIT_DEFAULTS is a compiled-in constant; nothing reads
+  // `{env}:global:ratelimit:config`, and `rateLimitConfigKey` is referenced
+  // only by its own test. A limit change requires a redeploy today. The plan's
+  // OQ-5 decided for a Valkey-held document read on a short TTL with fallback,
+  // and that is unbuilt.
+  //
+  // So the assertion below is the one that IS true — configuration is injected
+  // rather than reached for — and AC10 is reported unmet rather than covered
+  // by a test that cannot fail.
+  it("takes its limits from injected configuration, not from a module-level constant", async () => {
+    const strict = rateLimitConfigSchema.parse(
+      rateLimitRouteClassSchema.options.map((routeClass) => ({
+        route_class: routeClass,
+        burst: 1,
+        buckets: [{ scope: "user", limit: 1, window: "rolling", window_ms: 60_000 }],
+      })),
     );
-    const { subject: loosened } = buckets(relaxed);
-    expect((await loosened.check("writes", IDENTITY)).allowed).toBe(true);
+    const { subject } = buckets(strict);
+
+    expect((await subject.check("writes", IDENTITY)).allowed).toBe(true);
+    expect(
+      (await subject.check("writes", IDENTITY)).allowed,
+      "the injected limit, not RATE_LIMIT_DEFAULTS, must be what refuses",
+    ).toBe(false);
   });
 
   it("row 10 — an allowed request reports the TIGHTEST applicable bucket, so a client paces itself against the real constraint", async () => {
@@ -228,14 +250,54 @@ describe("STORY-025 · additive evaluation", () => {
     const first = await subject.check("writes", IDENTITY);
     expect(first.allowed).toBe(true);
     // user 2/min is tighter than workspace 4/min.
+    // Tokens, not the window rate — the two must be in one unit or a client
+    // cannot subtract them. The tightest bucket here is the user one, and its
+    // capacity is the class burst.
     expect(first.limit).toBe(2);
+    expect(first.applied).toBe(true);
   });
 
-  it("counts two workspaces separately", async () => {
-    const { subject } = buckets(ONE_PER_MINUTE);
-    for (let i = 0; i < 4; i++) await subject.check("writes", IDENTITY);
+  it("counts two workspaces separately on a WORKSPACE-scoped bucket", async () => {
+    const workspaceOnly = rateLimitConfigSchema.parse(
+      rateLimitRouteClassSchema.options.map((routeClass) => ({
+        route_class: routeClass,
+        burst: 2,
+        buckets: [{ scope: "workspace" as const, limit: 2, window: "rolling" as const, window_ms: 60_000 }],
+      })),
+    );
+    const { subject } = buckets(workspaceOnly);
+    for (let i = 0; i < 3; i++) await subject.check("writes", IDENTITY);
+
     const other = await subject.check("writes", { ...IDENTITY, workspaceId: "0192f1a0-0000-7000-8000-00000000000b" });
     expect(other.allowed).toBe(true);
+  });
+
+  it("does NOT give one user a fresh per-user allowance in each workspace", async () => {
+    // §12 says "60/min per user". Keyed under the workspace it became 60/min
+    // per user PER WORKSPACE — and workspace creation is self-serve, so the
+    // limit was multipliable at will by exactly the person it exists to limit.
+    // Found by the dangerous-area audit.
+    const { subject } = buckets(ONE_PER_MINUTE);
+    await subject.check("writes", IDENTITY);
+    await subject.check("writes", IDENTITY);
+
+    const elsewhere = await subject.check("writes", {
+      ...IDENTITY,
+      workspaceId: "0192f1a0-0000-7000-8000-00000000000b",
+    });
+    expect(elsewhere.allowed, "a second workspace must not reset a per-user limit").toBe(false);
+    expect(elsewhere.exhausted?.scope).toBe("user");
+  });
+
+  it("does NOT give one user a fresh allowance by dropping their workspace claim", async () => {
+    // WorkspaceGuard permits `req.auth.ws === null`, so this is a reachable
+    // token state rather than an edge case — and it used to be a third bucket.
+    const { subject } = buckets(ONE_PER_MINUTE);
+    await subject.check("writes", IDENTITY);
+    await subject.check("writes", IDENTITY);
+
+    const unscoped = await subject.check("writes", { env: "test", userId: IDENTITY.userId, ip: IDENTITY.ip });
+    expect(unscoped.allowed).toBe(false);
   });
 
   it("refuses a route class it has no configuration for, rather than allowing it", async () => {
@@ -275,49 +337,72 @@ describe("STORY-025 · the UTC-day hard cap", () => {
     expect(second.exhausted?.scope, "the workspace daily bucket, not the per-minute one").toBe("workspace");
   });
 
-  it("allows exactly the cap across a day once the slower buckets have refilled, then frees it at midnight", async () => {
-    const { subject, clock } = buckets(RATE_LIMIT_DEFAULTS);
-    const capped = "capture_backed_tools_capped_tiers" as const;
-    const EIGHT_HOURS = 8 * 60 * 60 * 1000;
+  it("allows exactly the cap in a day, then frees the whole allowance at midnight", async () => {
+    // ISOLATED from §12's real numbers deliberately. Under the literal reading
+    // recorded in §12 — one Burst per row, applied to every bucket in it — the
+    // capped tier's workspace `3/day` bucket holds ONE token and refills one
+    // per eight hours, so within a single UTC day it permits three calls and
+    // the cap can never be the binding constraint. That is asserted separately
+    // above. This test is about the CAP's own behaviour, so the rolling bucket
+    // beside it is generous and the cap is the only thing that can refuse.
+    const generousRolling = rateLimitConfigSchema.parse(
+      rateLimitRouteClassSchema.options.map((routeClass) => ({
+        route_class: routeClass,
+        burst: 50,
+        buckets: [
+          { scope: "user", limit: 1_000, window: "rolling", window_ms: 60_000 },
+          { scope: "user", limit: 3, window: "utc_day", hard_cap: true },
+        ],
+      })),
+    );
+    const { subject, clock } = buckets(generousRolling);
+    clock.ms = Date.UTC(2026, 7, 25, 6, 0, 0);
 
-    // Start just after midnight so three eight-hourly calls fit inside one UTC
-    // day, which is what makes the cap — rather than a refill — the thing that
-    // refuses the fourth.
-    clock.ms = Date.UTC(2026, 7, 25, 0, 0, 1);
     const allowed: boolean[] = [];
-    for (let i = 0; i < 3; i++) {
-      allowed.push((await subject.check(capped, IDENTITY)).allowed);
-      clock.ms += EIGHT_HOURS;
+    for (let i = 0; i < 4; i++) {
+      allowed.push((await subject.check("capture_backed_tools_capped_tiers", IDENTITY)).allowed);
     }
-    expect(allowed).toEqual([true, true, true]);
+    expect(allowed).toEqual([true, true, true, false]);
 
-    // The fourth is inside the same UTC day and hits the hard cap.
-    clock.ms = Date.UTC(2026, 7, 25, 23, 59, 0);
-    const fourth = await subject.check(capped, IDENTITY);
-    expect(fourth.allowed).toBe(false);
-    expect(fourth.exhausted?.hardCap).toBe(true);
+    const refused = await subject.check("capture_backed_tools_capped_tiers", IDENTITY);
+    expect(refused.exhausted?.hardCap, "a hard cap is not liftable by buying credits").toBe(true);
 
-    // Midnight frees the WHOLE allowance at once, not gradually.
+    // Midnight frees the WHOLE allowance at once, not gradually — which is the
+    // difference between a calendar cap and a token bucket, and the reason the
+    // day stamp is part of the key rather than a scheduled expiry.
     clock.ms = Date.UTC(2026, 7, 26, 0, 0, 1);
-    expect((await subject.check(capped, IDENTITY)).allowed).toBe(true);
+    expect((await subject.check("capture_backed_tools_capped_tiers", IDENTITY)).allowed).toBe(true);
   });
 
-  it("names a hard-cap refusal as such, so the guard can render the right remediation", async () => {
+  it("does NOT spend the hard cap on a request a rolling bucket refused", async () => {
+    // Found by the dangerous-area audit. Evaluated in §12's table order the cap
+    // came BEFORE the workspace bucket, so a request the workspace bucket
+    // refused had already burned a unit of a daily allowance that is, by
+    // definition, not liftable by buying credits. The customer lost the
+    // allowance with no remedy, for a request that never ran.
     const { subject, clock } = buckets(RATE_LIMIT_DEFAULTS);
     const capped = "capture_backed_tools_capped_tiers" as const;
-    const EIGHT_HOURS = 8 * 60 * 60 * 1000;
-
     clock.ms = Date.UTC(2026, 7, 25, 0, 0, 1);
-    for (let i = 0; i < 3; i++) {
-      await subject.check(capped, IDENTITY);
-      clock.ms += EIGHT_HOURS;
-    }
-    clock.ms = Date.UTC(2026, 7, 25, 23, 59, 0);
 
+    // First call succeeds and spends one of the three.
+    expect((await subject.check(capped, IDENTITY)).allowed).toBe(true);
+
+    // Second call a minute later: the per-minute bucket has refilled, the
+    // workspace 3/day bucket has not. It must be refused WITHOUT touching the
+    // cap.
+    clock.ms += 61_000;
     const refused = await subject.check(capped, IDENTITY);
     expect(refused.allowed).toBe(false);
-    expect(refused.exhausted?.hardCap, "a hard cap is not liftable by buying credits").toBe(true);
+    expect(refused.exhausted?.hardCap, "a rolling refusal is not a hard cap").toBe(false);
+
+    // Nine hours on, the rolling buckets have capacity again — and the cap must
+    // still have two of its three left, not one.
+    clock.ms += 9 * 60 * 60 * 1000;
+    expect((await subject.check(capped, IDENTITY)).allowed).toBe(true);
+    clock.ms += 9 * 60 * 60 * 1000;
+    expect((await subject.check(capped, IDENTITY)).allowed, "the refused request must not have cost a unit").toBe(true);
   });
+
 });
 
 // ---- unauthenticated traffic --------------------------------------------
@@ -363,6 +448,7 @@ describe("STORY-025 · the three §12 rows whose callers have no workspace", () 
       get: (key) => inner.get(key),
       set: (key, value, options) => inner.set(key, value, options),
       delete: (key) => inner.delete(key),
+      deleteIf: (key, expected) => inner.deleteIf(key, expected),
       increment: (key, ttlMs) => inner.increment(key, ttlMs),
       timeToLiveMs: (key) => inner.timeToLiveMs(key),
       consume: (key, bucket) => {
@@ -385,6 +471,7 @@ describe("STORY-025 · the three §12 rows whose callers have no workspace", () 
       get: (key) => inner.get(key),
       set: (key, value, options) => inner.set(key, value, options),
       delete: (key) => inner.delete(key),
+      deleteIf: (key, expected) => inner.deleteIf(key, expected),
       increment: (key, ttlMs) => inner.increment(key, ttlMs),
       timeToLiveMs: (key) => inner.timeToLiveMs(key),
       consume: (key, bucket) => {
@@ -397,6 +484,6 @@ describe("STORY-025 · the three §12 rows whose callers have no workspace", () 
 
     // `{env}:global:…` — pre-authentication traffic is not attributable to a
     // tenant, so it must not sit under one.
-    expect(consumed[0]).toBe("test:global:ratelimit:public_niche_reports:ip:203.0.113.7");
+    expect(consumed[0]).toBe("test:global:ratelimit:public_niche_reports:ip:r3600000:203.0.113.7");
   });
 });

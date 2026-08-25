@@ -1,13 +1,12 @@
 import { Module } from "@nestjs/common";
 import { loadEnv } from "../../config/env.js";
-import { MembershipCacheService } from "../../tenancy/membership-cache.js";
+import { TenancyAccessModule } from "../../tenancy/tenancy-access.module.js";
 import { AuditModule } from "../audit/audit.module.js";
 import { IdentityModule } from "../identity/identity.module.js";
 import { LocalDekProvisioner } from "./adapters/local-dek-provisioner.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { WorkspacesController } from "./workspaces.controller.js";
 import { WorkspacesService } from "./workspaces.service.js";
-import { MembershipService } from "./membership.service.js";
 import { InvitationsService } from "./invitations.service.js";
 
 // STORY-022 module registration, extended by STORY-018 (MembershipService/
@@ -18,13 +17,18 @@ import { InvitationsService } from "./invitations.service.js";
 // existing switchWorkspace seam). DEK_PROVISIONER is the STORY-020-E-3/E-4
 // port-plus-local-adapter precedent — swapped for a real KMS-backed adapter
 // by a future story without touching WorkspacesService.
+// STORY-026 T21 — MembershipService and MembershipCacheService are no longer
+// DECLARED here. They come from TenancyAccessModule, which is controller-free
+// so the gateway can import it without mounting this module's HTTP surface.
+// Both are re-exported, so every existing consumer of WorkspacesModule keeps
+// resolving them unchanged — and there is exactly ONE cache instance per
+// process, which is what stops a revoked member being served from a second Map
+// for thirty seconds (security-and-tenancy.md §7).
 @Module({
-  imports: [AuditModule, IdentityModule],
+  imports: [AuditModule, IdentityModule, TenancyAccessModule],
   controllers: [WorkspacesController],
   providers: [
     WorkspacesService,
-    MembershipService,
-    MembershipCacheService,
     InvitationsService,
     {
       provide: DEK_PROVISIONER,
@@ -34,6 +38,6 @@ import { InvitationsService } from "./invitations.service.js";
       },
     },
   ],
-  exports: [WorkspacesService, MembershipService, MembershipCacheService],
+  exports: [WorkspacesService, TenancyAccessModule],
 })
 export class WorkspacesModule {}

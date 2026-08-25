@@ -31,6 +31,19 @@ export const idempotencyKeySchema = z.string().min(1).max(IDEMPOTENCY_KEY_MAX_LE
 export const IDEMPOTENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * How long an UNFINISHED claim survives — a bounded request lifetime, not the
+ * replay window.
+ *
+ * The claim used to carry the full 24 hours, and a process killed between
+ * claiming and completing then POISONED the key for a day: every retry read
+ * `in_flight` and got a 409, and the effect never happened at all. A SIGKILL,
+ * an OOM eviction or a rescheduled pod is enough. The replay window belongs on
+ * the RECORD, which is written once the effect has actually occurred; a claim
+ * only has to outlive the handler.
+ */
+export const IDEMPOTENCY_CLAIM_TTL_MS = 60_000;
+
+/**
  * Decision D6 — a replay carries `Idempotency-Replayed: true`.
  *
  * The BODY is byte-identical to the original, which is what STORY-025 AC2

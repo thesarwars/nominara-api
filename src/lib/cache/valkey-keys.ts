@@ -76,7 +76,16 @@ export function rateLimitConfigKey(env: string): string {
 }
 
 /**
- * `{env}:{workspace_id}:ratelimit:{route_class}:{scope}:{id}`
+ * `{env}:{workspace_id}:ratelimit:{route_class}:{scope}:{window}:{id}`
+ *
+ * THE `{window}` SEGMENT IS NOT DECORATION. §12 gives some route classes TWO
+ * buckets of the same scope — capture-backed tools carry a user bucket at
+ * 5/min AND one at 40/day. Without a segment distinguishing them the two
+ * produce an identical key, so they share one token-bucket state and clobber
+ * each other: the daily allowance effectively ceases to exist, and the
+ * per-minute bucket is read with the daily one's refill rate half the time.
+ * Found by the dangerous-area audit of this story, and missed here because the
+ * behavioural tests used a synthetic config with one bucket per scope.
  *
  * Tenant-scoped even for an IP-scoped bucket. An IP counter shared across
  * workspaces would let one tenant's traffic exhaust another's capacity from
@@ -88,10 +97,11 @@ export function rateLimitCounterKey(
   workspaceId: string,
   routeClass: string,
   scope: string,
+  window: string,
   id: string,
   ...extra: readonly string[]
 ): string {
-  return tenantKey(env, workspaceId, "ratelimit", routeClass, scope, id, ...extra);
+  return tenantKey(env, workspaceId, "ratelimit", routeClass, scope, window, id, ...extra);
 }
 
 /** `{env}:{workspace_id}:idem:{fingerprint}` — see idempotencyFingerprint for what the fingerprint covers. */
@@ -130,8 +140,18 @@ export function idempotencyScopeFingerprint(input: {
   readonly userId: string;
   readonly route: string;
 }): string {
+  // LENGTH-PREFIXED, not space-joined. A space delimiter is not injective when
+  // the caller controls one field: `key` may contain spaces (§1 caps length,
+  // not charset) and `route` contains one, so two different triples can
+  // serialise identically. It is not exploitable today — `sub` is a
+  // server-assigned uuid, so the attacker's own 36 characters would have to
+  // land at an exact offset inside the victim's — but that is a property of
+  // the CLAIMS SCHEMA, not of this function, and `assertSegment` exists a few
+  // lines up precisely because "today's callers make it safe" is not the
+  // standard here. Found by the dangerous-area audit.
+  const parts = [input.key, input.userId, input.route];
   return createHash("sha256")
-    .update([input.key, input.userId, input.route].join(" "))
+    .update(parts.map((part) => `${String(part.length)}:${part}`).join(""))
     .digest("hex");
 }
 

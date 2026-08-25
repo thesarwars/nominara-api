@@ -30,6 +30,14 @@ const logger = new Logger("valkey-cache");
  * never close, and the rate limit would stop working exactly when it is being
  * exercised.
  */
+/** Compare-and-delete. GET then DEL over two round trips is the very race this closes. */
+const DELETE_IF_UNCHANGED = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
+
 const INCREMENT_WITH_TTL_ON_CREATE = `
 local value = redis.call('INCR', KEYS[1])
 if value == 1 then
@@ -100,10 +108,18 @@ export class ValkeyCacheAdapter implements Cache, OnModuleDestroy {
 
   constructor(url: string) {
     this.client = new Redis(url, {
-      // A cache miss must never become a hung request. If Valkey is
-      // unreachable the call fails fast and the caller decides — for
-      // idempotency that means executing the request, which is the same
-      // degradation as an evicted record.
+      // A cache miss must never become a hung request: the call fails fast
+      // rather than queueing.
+      //
+      // WHAT THE CALLER DOES WITH THAT FAILURE IS NOT UNIFORM, and this
+      // comment used to claim it was. An unreachable Valkey makes `claim()`
+      // reject, and IdempotencyInterceptor lets it propagate — the request is
+      // REFUSED, not executed. That is the right posture for idempotency,
+      // where executing unprotected is the one thing NFR-API-07 forbids, and
+      // it is the wrong posture for an abuse control, where a cache outage
+      // currently turns every request including reads into a 5xx. Failing open
+      // on rate limits is a deliberate decision nobody has taken yet; it is
+      // recorded rather than assumed. Found by code review.
       maxRetriesPerRequest: 2,
       enableOfflineQueue: false,
       lazyConnect: true,
@@ -139,6 +155,11 @@ export class ValkeyCacheAdapter implements Cache, OnModuleDestroy {
     await this.client.del(key);
   }
 
+  async deleteIf(key: string, expected: string): Promise<boolean> {
+    const deleted = await this.client.eval(DELETE_IF_UNCHANGED, 1, key, expected);
+    return Number(deleted) === 1;
+  }
+
   async increment(key: string, ttlMs: number): Promise<number> {
     const value = await this.client.eval(INCREMENT_WITH_TTL_ON_CREATE, 1, key, String(ttlMs));
     return Number(value);
@@ -160,7 +181,15 @@ export class ValkeyCacheAdapter implements Cache, OnModuleDestroy {
       key,
       String(bucket.capacity),
       String(msPerToken),
-      String(Math.ceil(bucket.refillWindowMs)),
+      // THE TTL IS THE TIME TO REFILL THE WHOLE BUCKET, not one window.
+      // `refillWindowMs` is only correct when capacity equals the window's
+      // rate. With capacity 10 and 2 per minute, expiring after one minute
+      // drops a bucket that still held 8 tokens' worth of state and hands the
+      // next caller a FULL bucket — five times the intended allowance. The
+      // in-memory adapter refills linearly and would have given 2. Found by
+      // code review; invisible to the conformance suite, which used
+      // capacity === refillTokens for every case.
+      String(Math.ceil(bucket.capacity * msPerToken)),
     )) as [number, number, number];
 
     return { allowed: reply[0] === 1, remaining: reply[1], resetAfterMs: reply[2] };

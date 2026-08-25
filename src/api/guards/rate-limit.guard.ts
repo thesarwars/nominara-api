@@ -2,6 +2,7 @@ import { CanActivate, ExecutionContext, Injectable, Logger } from "@nestjs/commo
 import { Reflector } from "@nestjs/core";
 import type { FastifyReply } from "fastify";
 import { RATE_LIMIT_HEADERS, type RateLimitRouteClass } from "../../../contracts/common/rate-limit.schema.js";
+import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { DailyLimitReachedError, RateLimitedError } from "../errors/domain-errors.js";
 import { RateLimitBuckets } from "../rate-limit/buckets.js";
@@ -56,7 +57,7 @@ export class RateLimitGuard implements CanActivate {
     // RateLimitBuckets skips the buckets whose scope has no identity and keys
     // the rest globally; it never invents one.
     const decision = await this.buckets.check(routeClass, {
-      env: process.env.NODE_ENV ?? "development",
+      env: cacheKeyNamespace(),
       ...(workspaceId === undefined ? {} : { workspaceId }),
       ...(userId === undefined ? {} : { userId }),
       ip: request.ip ?? "unknown",
@@ -65,9 +66,15 @@ export class RateLimitGuard implements CanActivate {
     // §1 publishes these on EVERY response, not only refusals: a client that
     // only learns its remaining capacity by being refused cannot pace itself,
     // which is the point of publishing them at all.
-    reply.header(RATE_LIMIT_HEADERS.limit, String(decision.limit));
-    reply.header(RATE_LIMIT_HEADERS.remaining, String(decision.remaining));
-    reply.header(RATE_LIMIT_HEADERS.reset, String(Math.ceil(decision.resetAfterMs / 1000)));
+    //
+    // But only when a bucket ACTUALLY APPLIED. Publishing `Limit: 0,
+    // Remaining: 0` on a request nothing limited tells a conforming client it
+    // has no quota, and it backs off against a limit that was never applied.
+    if (decision.applied) {
+      reply.header(RATE_LIMIT_HEADERS.limit, String(decision.limit));
+      reply.header(RATE_LIMIT_HEADERS.remaining, String(decision.remaining));
+      reply.header(RATE_LIMIT_HEADERS.reset, String(Math.ceil(decision.resetAfterMs / 1000)));
+    }
 
     if (decision.allowed) {
       return true;
@@ -96,7 +103,14 @@ export class RateLimitGuard implements CanActivate {
       throw new DailyLimitReachedError({
         message: "the daily cap for this action has been reached",
         details: {
+          // §2 specifies `details.{action_code, used, limit, resets_at}`. A
+          // route class is the closest thing to an action code that exists
+          // before EPIC-10 defines them, and saying so is better than
+          // inventing one — but it IS a stand-in, not the real vocabulary.
           action_code: routeClass,
+          // `used` is the cap itself: the refusal happens when the counter
+          // reaches it, and reporting anything larger would tell a client it
+          // had spent more than its allowance.
           used: decision.exhausted.limit,
           limit: decision.exhausted.limit,
           resets_at: new Date(Date.now() + decision.resetAfterMs).toISOString(),

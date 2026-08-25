@@ -38,6 +38,29 @@ const logger = new Logger("cache");
         if (env.NODE_ENV === "test") {
           // Deliberate, and the only environment that gets it: a unit suite
           // must not need a container to construct the composition root.
+          //
+          // BUT NOT SILENTLY, and not on the word of NODE_ENV alone. Preview
+          // and ephemeral deploys commonly run NODE_ENV=test, and a
+          // multi-instance deployment on this adapter gives every replica its
+          // own idempotency store — two requests bearing one key land on two
+          // processes, both find no record, and both execute. This file's own
+          // comment says a silent downgrade "would turn an outage into a
+          // correctness failure", and this was the one path that did exactly
+          // that. Found by the dangerous-area audit.
+          //
+          // A test RUNNER, not a build mode, is what actually licenses it.
+          const underTestRunner = process.env.VITEST !== undefined;
+          if (!underTestRunner) {
+            throw new Error(
+              "cache: NODE_ENV=test selects the PER-PROCESS in-memory adapter, but no test runner is present. " +
+                "In a multi-instance deployment that means two requests with one Idempotency-Key execute twice. " +
+                "Set NODE_ENV appropriately for this deployment, or run under the test runner.",
+            );
+          }
+          logger.warn({
+            message: "using the in-memory cache adapter — PER-PROCESS, not shared, never production-safe",
+            adapter: "in-memory",
+          });
           return new InMemoryCacheAdapter();
         }
 

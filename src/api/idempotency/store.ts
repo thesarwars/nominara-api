@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import {
+  IDEMPOTENCY_CLAIM_TTL_MS,
   IDEMPOTENCY_WINDOW_MS,
   idempotencyStoredSchema,
   type IdempotencyStored,
@@ -27,6 +28,13 @@ export interface CompletedRecord {
 
 @Injectable()
 export class IdempotencyStore {
+  /**
+   * What this process wrote when it claimed, so `release` can prove the record
+   * is still its own. Process-local by design: another process's claim is not
+   * this one's to release.
+   */
+  private readonly claims = new Map<string, string>();
+
   constructor(@Inject(CACHE) private readonly cache: Cache) {}
 
   /**
@@ -38,10 +46,15 @@ export class IdempotencyStore {
    */
   async claim(key: string, requestHash: string, startedAt: string): Promise<boolean> {
     const inFlight: IdempotencyStored = { state: "in_flight", request_hash: requestHash, started_at: startedAt };
-    return this.cache.set(key, JSON.stringify(inFlight), {
-      ttlMs: IDEMPOTENCY_WINDOW_MS,
+    // A BOUNDED lifetime, not the replay window. A claim carrying 24 hours
+    // poisons the key for a day if the process dies before completing: every
+    // retry reads `in_flight`, gets a 409, and the effect never happens.
+    const claimed = await this.cache.set(key, JSON.stringify(inFlight), {
+      ttlMs: IDEMPOTENCY_CLAIM_TTL_MS,
       onlyIfAbsent: true,
     });
+    if (claimed) this.claims.set(key, JSON.stringify(inFlight));
+    return claimed;
   }
 
   /**
@@ -80,6 +93,9 @@ export class IdempotencyStore {
       response_body: record.responseBody,
       recorded_at: record.recordedAt,
     };
+    // The RECORD carries the 24-hour replay window — it is written once the
+    // effect has actually happened, which is what §1 dates the window from.
+    this.claims.delete(key);
     await this.cache.set(key, JSON.stringify(completed), { ttlMs: IDEMPOTENCY_WINDOW_MS });
   }
 
@@ -91,7 +107,15 @@ export class IdempotencyStore {
    * after a transient failure would be refused for a day. Only the failure
    * path calls this; a successful request's claim is replaced by complete().
    */
-  async release(key: string): Promise<void> {
-    await this.cache.delete(key);
+  async release(key: string): Promise<boolean> {
+    const mine = this.claims.get(key);
+    this.claims.delete(key);
+    if (mine === undefined) return false;
+    // COMPARE-AND-DELETE, never an unconditional one. Under `allkeys-lru` the
+    // claim can be evicted, a second request can claim the free key, run the
+    // effect and write its record — and an unconditional delete here would
+    // remove THAT record, so the second client's retry would execute the
+    // billable effect again.
+    return this.cache.deleteIf(key, mine);
   }
 }

@@ -314,7 +314,7 @@ Owner agents: `api-dev`, `code-reviewer`, `dangerous-area-auditor`. (`frontend-d
 - **Key forms, fixed here so they are not invented at implementation time** (`project-structure.md` §8):
   - **Bucket configuration document — platform-wide, `{env}:global:` form**, e.g. `{env}:global:ratelimit:config`. It is not tenant data.
   - **Per-bucket counters — tenant-scoped, `{env}:{workspace_id}:…` form**, e.g. `{env}:{workspace_id}:ratelimit:{route_class}:{scope}:{id}`. **These are a tenant boundary in a store with no RLS, exactly like the idempotency key.** A counter key missing `{workspace_id}` lets one tenant's traffic exhaust another's bucket.
-  - **Idempotency:** `{env}:{workspace_id}:idem:{sha256(key|user|route|body)}`.
+  - **Idempotency:** `{env}:{workspace_id}:idem:{sha256(key|user|route)}`, with the BODY hash stored INSIDE the record rather than in the key. *(Corrected during T16. The form originally written here — body included in the key — makes the `409 idempotency_conflict` case structurally unreachable: two bodies under one key land on two different records, both are claimed, and both execute. Confirmed independently by the STORY-025 code review.)*
 - **Naming collision preempted:** STORY-030's title also says "idempotency keys". Those are per-queue **job** keys (`cap:{prompt}:{engine}:{run}`, `NFR-SIM-03`) — a different mechanism from `NFR-API-07`'s HTTP request keys. State it in the file header so the two are never merged.
 - **Test containers:** `GenericContainer` from the already-installed `testcontainers` package — **no new test dependency.**
 

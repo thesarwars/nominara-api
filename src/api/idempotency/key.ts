@@ -30,15 +30,33 @@ export interface IdempotencyIdentity {
 /**
  * The route component of the fingerprint.
  *
- * The PATH, with the query string stripped — not the route pattern. Two
- * different resources served by one handler (`/things/1` and `/things/2`) are
- * different requests and must not share a record, which a pattern-based
- * identity would collapse. The query is dropped because it is not part of a
- * POST's identity here; the body is, and it is hashed separately.
+ * The PATH **and the query**, not the route pattern. Two different resources
+ * served by one handler (`/things/1` and `/things/2`) are different requests
+ * and must not share a record, which a pattern-based identity would collapse.
+ *
+ * THE QUERY USED TO BE DROPPED, AND THAT WAS A WRONG-ANSWER BUG. The reasoning
+ * was "a POST's identity is its body"; the counter-example is
+ * `POST /exports?format=csv&notify=false` against
+ * `POST /exports?format=pdf&notify=true` with the same key and the same body —
+ * two different operations, and the second received the first's response.
+ * Found by the dangerous-area audit of STORY-025.
+ *
+ * Parameters are SORTED before hashing, so a client that reorders them between
+ * a request and its retry still gets a replay rather than a second execution.
+ * That is the same reasoning that canonicalises the body: two encodings of one
+ * request are one request, and deciding otherwise would make the safety of a
+ * retry depend on how the other end serialises a URL.
  */
 export function routeIdentity(method: string, url: string): string {
-  const [path] = url.split("?");
-  return `${method.toUpperCase()} ${path ?? url}`;
+  const [path, query] = url.split("?");
+  const canonicalQuery =
+    query === undefined || query.length === 0
+      ? ""
+      : `?${[...new URLSearchParams(query).entries()]
+          .sort(([a, av], [b, bv]) => (a === b ? (av < bv ? -1 : av > bv ? 1 : 0) : a < b ? -1 : 1))
+          .map(([name, value]) => `${name}=${value}`)
+          .join("&")}`;
+  return `${method.toUpperCase()} ${path ?? url}${canonicalQuery}`;
 }
 
 /**

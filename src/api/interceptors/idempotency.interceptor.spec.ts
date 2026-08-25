@@ -2,7 +2,10 @@ import { Reflector } from "@nestjs/core";
 import type { CallHandler, ExecutionContext } from "@nestjs/common";
 import { from, of, lastValueFrom, throwError } from "rxjs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { IDEMPOTENCY_REPLAYED_HEADER } from "../../../contracts/common/idempotency.schema.js";
+import {
+  IDEMPOTENCY_CLAIM_TTL_MS,
+  IDEMPOTENCY_REPLAYED_HEADER,
+} from "../../../contracts/common/idempotency.schema.js";
 import { InMemoryCacheAdapter } from "../../lib/cache/in-memory-cache.adapter.js";
 import { IDEMPOTENT_KEY } from "../decorators/idempotent.decorator.js";
 import { DomainError } from "../errors/domain-errors.js";
@@ -20,6 +23,10 @@ import { IdempotencyInterceptor } from "./idempotency.interceptor.js";
 // the one row where being wrong is a data leak rather than a double charge.
 
 const WS_A = "0192f1a0-0000-7000-8000-00000000000a";
+
+/** The schema pins request_hash to a full sha256; a short stand-in is silently rejected on read. */
+const HASH_A = "a".repeat(64);
+const HASH_B = "b".repeat(64);
 const WS_B = "0192f1a0-0000-7000-8000-00000000000b";
 
 interface Harness {
@@ -368,18 +375,121 @@ describe("STORY-025 · IdempotencyInterceptor", () => {
     expect(spy).toHaveBeenCalledTimes(2);
   });
 
-  it("ignores the query string when identifying the route", async () => {
+  it("treats a different query as a DIFFERENT request — it is a different operation", async () => {
+    // This test asserted the opposite until the STORY-025 audit. The
+    // counter-example is POST /exports?format=csv against
+    // POST /exports?format=pdf with the same key and the same body: two
+    // different operations, and the second was receiving the first's response.
     const spy = vi.fn(() => of(ORIGINAL_ENVELOPE));
     await run(
       harness,
-      contextFor({ key: "k1", url: "/v1/things?trace=1", header: harness.header, status: harness.status }),
+      contextFor({ key: "k1", url: "/v1/exports?format=csv", header: harness.header, status: harness.status }),
       { handle: spy },
     );
     await run(
       harness,
-      contextFor({ key: "k1", url: "/v1/things?trace=2", header: harness.header, status: harness.status }),
+      contextFor({ key: "k1", url: "/v1/exports?format=pdf", header: harness.header, status: harness.status }),
+      { handle: spy },
+    );
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it("still replays when only the ORDER of the query parameters changed", async () => {
+    // A retry that re-serialises its URL must be a replay, for the same reason
+    // a retry that reorders its JSON keys must be: two encodings of one request
+    // are one request.
+    const spy = vi.fn(() => of(ORIGINAL_ENVELOPE));
+    await run(
+      harness,
+      contextFor({ key: "k1", url: "/v1/exports?a=1&b=2", header: harness.header, status: harness.status }),
+      { handle: spy },
+    );
+    await run(
+      harness,
+      contextFor({ key: "k1", url: "/v1/exports?b=2&a=1", header: harness.header, status: harness.status }),
       { handle: spy },
     );
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  // ---- found by the STORY-025 code review -------------------------------
+
+  describe("a RECORDING failure is not a handler failure", () => {
+    it("does NOT free the key when the effect already happened, so a retry cannot execute it twice", async () => {
+      // The single try/catch this replaced released the claim on anything that
+      // threw — including a cache write that failed AFTER the handler had
+      // committed a billable effect. The client's retry then won a fresh claim
+      // and ran the effect a second time, which is the exact loop NFR-API-07
+      // exists to break.
+      const failingComplete = new IdempotencyStore(harness.cache);
+      vi.spyOn(failingComplete, "complete").mockRejectedValue(new Error("valkey blip"));
+      const interceptor = new IdempotencyInterceptor(new Reflector(), failingComplete);
+
+      const spy = vi.fn(() => of(ORIGINAL_ENVELOPE));
+      const first = await lastValueFrom(
+        await interceptor.intercept(contextFor({ key: "k1", header: harness.header, status: harness.status }), {
+          handle: spy,
+        }),
+      );
+      expect(first, "the caller still gets its answer").toEqual(ORIGINAL_ENVELOPE);
+
+      // The claim is still standing, so the retry is refused rather than run.
+      const retry = await run(
+        harness,
+        contextFor({ key: "k1", header: harness.header, status: harness.status }),
+        { handle: spy },
+      );
+      expect("error" in retry && retry.error.code).toBe("conflict");
+      expect(spy, "the billable effect must not happen twice").toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("the claim is bounded, so a killed process does not poison the key for a day", () => {
+    it("expires the claim well inside the 24-hour replay window", async () => {
+      const store = new IdempotencyStore(harness.cache);
+      await store.claim("orphan", HASH_A, new Date().toISOString());
+
+      // A process SIGKILLed here never calls complete() or release().
+      harness.clock.ms += IDEMPOTENCY_CLAIM_TTL_MS;
+
+      await expect(
+        store.claim("orphan", HASH_A, new Date().toISOString()),
+        "a retry must be able to take the key back",
+      ).resolves.toBe(true);
+      expect(IDEMPOTENCY_CLAIM_TTL_MS).toBeLessThan(24 * 60 * 60 * 1000);
+    });
+
+    it("still gives a COMPLETED record the full 24-hour window", async () => {
+      const store = new IdempotencyStore(harness.cache);
+      await store.claim("k", HASH_A, new Date().toISOString());
+      await store.complete("k", { requestHash: HASH_A, statusCode: 201, responseBody: {}, recordedAt: "2026-08-25T09:00:00.000Z" });
+
+      harness.clock.ms += IDEMPOTENCY_CLAIM_TTL_MS * 2;
+      await expect(store.read("k")).resolves.toMatchObject({ state: "completed" });
+    });
+  });
+
+  describe("release deletes only its OWN claim", () => {
+    it("does not delete a record another request wrote after an eviction", async () => {
+      // allkeys-lru makes this ordinary, not exotic: A claims, the cache evicts
+      // the claim, B claims the free key and records a completed response, then
+      // A fails. An unconditional delete would remove B's record and B's retry
+      // would execute the billable effect again.
+      const store = new IdempotencyStore(harness.cache);
+      await store.claim("contended", HASH_A, new Date().toISOString());
+
+      await harness.cache.delete("contended"); // the eviction
+      const other = new IdempotencyStore(harness.cache);
+      await other.claim("contended", HASH_B, new Date().toISOString());
+      await other.complete("contended", {
+        requestHash: HASH_B,
+        statusCode: 201,
+        responseBody: { owner: "B" },
+        recordedAt: "2026-08-25T09:00:00.000Z",
+      });
+
+      await expect(store.release("contended"), "A must not be able to delete B's record").resolves.toBe(false);
+      await expect(other.read("contended")).resolves.toMatchObject({ state: "completed" });
+    });
   });
 });

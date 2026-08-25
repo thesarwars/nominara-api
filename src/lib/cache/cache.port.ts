@@ -33,6 +33,18 @@ export interface Cache {
   delete(key: string): Promise<void>;
 
   /**
+   * Deletes a key ONLY if it still holds `expected`. Returns whether it did.
+   *
+   * An unconditional delete is unsafe under `allkeys-lru`, and the sequence is
+   * not exotic: request A claims a key; the cache evicts it under memory
+   * pressure; request B claims the now-absent key, runs the effect, and writes
+   * its completed record; request A then fails and deletes B's record. B's
+   * client retries and the billable effect happens a SECOND time — which is
+   * the one outcome `NFR-API-07` exists to prevent.
+   */
+  deleteIf(key: string, expected: string): Promise<boolean>;
+
+  /**
    * Increments a counter and returns the new value, setting the TTL only when
    * the key is created.
    *

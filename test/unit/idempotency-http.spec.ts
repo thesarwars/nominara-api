@@ -64,7 +64,7 @@ describe("STORY-025 · an idempotent route over real HTTP", () => {
       controllers: [BillableController],
     })
       .overrideProvider(RateLimitBuckets)
-      .useValue({ check: () => Promise.resolve({ allowed: true, limit: 100, remaining: 99, resetAfterMs: 0 }) })
+      .useValue({ check: () => Promise.resolve({ allowed: true, applied: true, limit: 100, remaining: 99, resetAfterMs: 0 }) })
       .compile();
 
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());

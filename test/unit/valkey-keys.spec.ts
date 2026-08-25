@@ -45,14 +45,23 @@ describe("STORY-025 · the workspace segment", () => {
     // A shared egress address — an office, a VPN, a CI runner — must not let
     // one tenant exhaust another's capacity. That is a denial of service
     // between tenants, not an abuse control.
-    expect(rateLimitCounterKey("test", WS_A, "writes", "ip", "203.0.113.7")).not.toBe(
-      rateLimitCounterKey("test", WS_B, "writes", "ip", "203.0.113.7"),
+    expect(rateLimitCounterKey("test", WS_A, "writes", "ip", "r60000", "203.0.113.7")).not.toBe(
+      rateLimitCounterKey("test", WS_B, "writes", "ip", "r60000", "203.0.113.7"),
     );
   });
 
   it("puts the workspace immediately after the environment, before anything else", () => {
-    expect(rateLimitCounterKey("test", WS_A, "writes", "user", "u1")).toBe(
-      `test:${WS_A}:ratelimit:writes:user:u1`,
+    expect(rateLimitCounterKey("test", WS_A, "writes", "user", "r60000", "u1")).toBe(
+      `test:${WS_A}:ratelimit:writes:user:r60000:u1`,
+    );
+  });
+
+  it("keeps two buckets of the SAME scope apart by their window", () => {
+    // §12 gives capture-backed tools a user bucket at 5/min AND one at 40/day.
+    // Keyed on scope alone they collide, share one token state, and the daily
+    // allowance stops existing. Found by the dangerous-area audit.
+    expect(rateLimitCounterKey("test", WS_A, "capture_backed_tools", "user", "r60000", "u1")).not.toBe(
+      rateLimitCounterKey("test", WS_A, "capture_backed_tools", "user", "r86400000", "u1"),
     );
   });
 
@@ -73,7 +82,7 @@ describe("STORY-025 · segment integrity", () => {
   it.each([
     ["a workspace carrying a separator", () => tenantKey("test", "a:global", "idem")],
     ["an environment carrying a separator", () => tenantKey("te:st", WS_A, "idem")],
-    ["a part carrying a separator", () => rateLimitCounterKey("test", WS_A, "writes", "user", "u:1")],
+    ["a part carrying a separator", () => rateLimitCounterKey("test", WS_A, "writes", "user", "r60000", "u:1")],
   ])("refuses %s — it would shift every segment after it", (_label, build) => {
     expect(build).toThrow(/must not contain/);
   });

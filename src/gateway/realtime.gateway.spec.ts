@@ -7,7 +7,7 @@ import { RealtimeGateway, SERVER_DRAINING_EVENT } from "./realtime.gateway.js";
 // exercised here, is emitting the drain notice as the module tears down.
 describe("STORY-022 · RealtimeGateway shutdown draining", () => {
   it("emits server.draining to the /rt namespace on module destroy", () => {
-    const gateway = new RealtimeGateway();
+    const gateway = new RealtimeGateway({} as never);
     gateway.server = { emit: vi.fn() } as never;
 
     gateway.onModuleDestroy();
@@ -16,7 +16,7 @@ describe("STORY-022 · RealtimeGateway shutdown draining", () => {
   });
 
   it("does not throw when torn down before the server is attached", () => {
-    const gateway = new RealtimeGateway();
+    const gateway = new RealtimeGateway({} as never);
 
     expect(() => gateway.onModuleDestroy()).not.toThrow();
   });

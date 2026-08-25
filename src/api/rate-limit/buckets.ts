@@ -29,10 +29,39 @@ export interface RateLimitDecision {
   readonly allowed: boolean;
   /** The bucket that refused, for the log line. Absent when the request was allowed. */
   readonly exhausted?: { readonly scope: string; readonly limit: number; readonly hardCap: boolean };
-  /** §1's headers come from the TIGHTEST applicable bucket, so a client paces itself against the real constraint. */
+  /**
+   * False when NO bucket applied — an unauthenticated request to a class whose
+   * buckets are all user- or workspace-scoped. The guard then publishes no
+   * headers at all, rather than `Limit: 0, Remaining: 0`, which a conforming
+   * client reads as "you have no quota" and backs off against a limit that was
+   * never applied. Found by code review.
+   */
+  readonly applied: boolean;
+  /**
+   * BOTH NUMBERS ARE TOKENS, in the same unit.
+   *
+   * `limit` used to be the bucket's window RATE while `remaining` was leftover
+   * BURST tokens, so the first allowed capture-backed request advertised
+   * `Limit: 40, Remaining: 0` and a conforming client backed off immediately.
+   * A limit and a remainder that cannot be subtracted from each other are not a
+   * budget. Found by code review.
+   */
   readonly limit: number;
   readonly remaining: number;
   readonly resetAfterMs: number;
+}
+
+/**
+ * What distinguishes two buckets of the SAME scope inside one route class.
+ *
+ * §12 gives capture-backed tools a user bucket at 5/min and another at 40/day.
+ * Keyed on scope alone the two collide, share one token state, and the daily
+ * allowance stops existing. The window is what tells them apart, and it is the
+ * only thing that does — two buckets of the same scope and the same window
+ * would be one bucket written twice.
+ */
+export function bucketWindowTag(bucket: RateLimitBucket): string {
+  return bucket.window === "utc_day" ? "utcday" : `r${String(bucket.window_ms)}`;
 }
 
 /** Milliseconds from `now` to the next UTC midnight — the boundary a `utc_day` bucket resets on. */
@@ -85,6 +114,16 @@ export class RateLimitBuckets {
    * shared office, VPN or CI runner, which is a denial of service between
    * tenants rather than an abuse control.
    *
+   * IP-scoped counters stay under the workspace for authenticated traffic, and
+   * the COST of that is worth writing down beside the rationale: §12's "10/hour
+   * per IP" becomes 10/hour per IP PER WORKSPACE, so a tenant with several
+   * workspaces gets a correspondingly larger allowance from one address. The
+   * alternative — a shared IP counter across tenants — lets one tenant's
+   * traffic exhaust another's from a shared office, VPN or CI runner, which is
+   * a denial of service BETWEEN tenants. The looser limit was chosen
+   * deliberately over the cross-tenant one; both directions are wrong in some
+   * way and only one of them is wrong across a tenant boundary.
+   *
    * GLOBAL when there is no workspace, which is the case for exactly the three
    * §12 rows that matter most here: `/auth/*`, `/portal/session` and
    * `/public/niche-reports*`. Pre-authentication traffic is not attributable to
@@ -105,9 +144,23 @@ export class RateLimitBuckets {
     id: string,
     ...extra: readonly string[]
   ): string {
-    return identity.workspaceId === undefined
-      ? globalKey(identity.env, "ratelimit", routeClass, bucket.scope, id, ...extra)
-      : rateLimitCounterKey(identity.env, identity.workspaceId, routeClass, bucket.scope, id, ...extra);
+    const window = bucketWindowTag(bucket);
+
+    // A USER-SCOPED BUCKET IS ALWAYS GLOBAL, and that is a fix rather than a
+    // simplification. Keying it under the workspace gave one human a separate
+    // per-user allowance in every workspace they belong to, PLUS another for
+    // the workspace-less token state that WorkspaceGuard explicitly permits
+    // (`req.auth.ws === null`). §12's "60/min per user" became 60/min per user
+    // per workspace, and workspace creation is self-serve — so the limit was
+    // multipliable at will by the person it exists to limit. Found by the
+    // dangerous-area audit.
+    //
+    // A user id identifies one human across every tenant, so a global key is
+    // the accurate one. No tenant DATA is keyed here — only a count.
+    const tenantScoped = bucket.scope !== "user" && identity.workspaceId !== undefined;
+    return tenantScoped
+      ? rateLimitCounterKey(identity.env, identity.workspaceId!, routeClass, bucket.scope, window, id, ...extra)
+      : globalKey(identity.env, "ratelimit", routeClass, bucket.scope, window, id, ...extra);
   }
 
   /**
@@ -124,7 +177,25 @@ export class RateLimitBuckets {
     const nowMs = this.now();
     let tightest: RateLimitDecision | undefined;
 
-    for (const bucket of config.buckets) {
+    // ROLLING BUCKETS FIRST, CALENDAR CAPS LAST, AND THE ORDER IS A CORRECTNESS
+    // PROPERTY RATHER THAN A PREFERENCE.
+    //
+    // A token spent on a rolling bucket comes back; a unit spent on a UTC-day
+    // hard cap does not until midnight. Evaluated in §12's table order, a
+    // request that passed the cap and was then refused by the workspace bucket
+    // would have BURNED a unit of its daily allowance on a request that never
+    // ran — and a hard cap is by definition not liftable by buying credits, so
+    // the customer loses the allowance with no remedy.
+    //
+    // Ordering the irreversible check last means a refused request can still
+    // spend rolling tokens, which refill. That is the cheap direction to be
+    // wrong in. Found by the dangerous-area audit of this story.
+    const ordered = [...config.buckets].sort((a, b) => {
+      const irreversible = (bucket: RateLimitBucket): number => (bucket.window === "utc_day" ? 1 : 0);
+      return irreversible(a) - irreversible(b);
+    });
+
+    for (const bucket of ordered) {
       const id = this.identityFor(bucket, identity);
       // A bucket whose scope this caller has no identity for is SKIPPED, not
       // guessed at. Before authentication there is no user and no workspace,
@@ -144,19 +215,28 @@ export class RateLimitBuckets {
       if (!outcome.allowed) {
         return {
           allowed: false,
+          applied: true,
           exhausted: { scope: bucket.scope, limit: bucket.limit, hardCap: bucket.hard_cap },
-          limit: bucket.limit,
+          // Tokens, matching `remaining`. A calendar cap has no burst, so its
+          // own limit IS its capacity.
+          limit: bucket.window === "utc_day" ? bucket.limit : config.burst,
           remaining: 0,
           resetAfterMs: outcome.resetAfterMs,
         };
       }
 
       if (tightest === undefined || outcome.remaining < tightest.remaining) {
-        tightest = { allowed: true, limit: bucket.limit, remaining: outcome.remaining, resetAfterMs: outcome.resetAfterMs };
+        tightest = {
+          allowed: true,
+          applied: true,
+          limit: bucket.window === "utc_day" ? bucket.limit : config.burst,
+          remaining: outcome.remaining,
+          resetAfterMs: outcome.resetAfterMs,
+        };
       }
     }
 
-    return tightest ?? { allowed: true, limit: 0, remaining: 0, resetAfterMs: 0 };
+    return tightest ?? { allowed: true, applied: false, limit: 0, remaining: 0, resetAfterMs: 0 };
   }
 
   /**

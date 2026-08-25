@@ -58,7 +58,17 @@ export class InMemoryCacheAdapter implements Cache {
 
   delete(key: string): Promise<void> {
     this.entries.delete(key);
+    // A bucket and an entry can share a key; dropping one must drop both, or
+    // a deleted key keeps its token state and the next caller inherits it.
+    this.buckets.delete(key);
     return Promise.resolve();
+  }
+
+  deleteIf(key: string, expected: string): Promise<boolean> {
+    const entry = this.live(key);
+    if (entry === undefined || entry.value !== expected) return Promise.resolve(false);
+    this.entries.delete(key);
+    return Promise.resolve(true);
   }
 
   increment(key: string, ttlMs: number): Promise<number> {

@@ -6,6 +6,7 @@ import {
   IDEMPOTENCY_REPLAYED_HEADER,
   idempotencyKeySchema,
 } from "../../../contracts/common/idempotency.schema.js";
+import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { IDEMPOTENT_KEY } from "../decorators/idempotent.decorator.js";
 import { STREAMING_KEY } from "../decorators/streaming.decorator.js";
@@ -108,7 +109,7 @@ export class IdempotencyInterceptor implements NestInterceptor {
 
     const identity = identifyIdempotentRequest(
       {
-        env: process.env.NODE_ENV ?? "development",
+        env: cacheKeyNamespace(),
         workspaceId,
         userId,
         method: request.method ?? "POST",
@@ -177,6 +178,15 @@ export class IdempotencyInterceptor implements NestInterceptor {
       });
     }
 
+    // A REPLAY WRITES NO AUDIT ROW, and that is deliberate rather than
+    // overlooked. Short-circuiting at index 0 means TenantContextInterceptor,
+    // AuditInterceptor and CreditInterceptor never run — so one effect
+    // produces one audit row, which is what an audit log of EFFECTS should
+    // say. The alternative, a row per replay, would make a retried network
+    // call look like a repeated action by the operator. Written down because
+    // AuditInterceptor is fail-closed everywhere else, and a reader is
+    // entitled to wonder why not here.
+    //
     // A genuine replay. Decision D6's header is what lets a client tell "my
     // retry was absorbed" from "it ran again and produced the same answer" —
     // those call for different reporting in a UI.
@@ -198,8 +208,30 @@ export class IdempotencyInterceptor implements NestInterceptor {
     reply: FastifyReply,
     next: CallHandler,
   ): Promise<unknown> {
+    let body: unknown;
+
+    // THE TWO FAILURES ARE NOT THE SAME FAILURE, AND TREATING THEM AS ONE IS A
+    // DOUBLE CHARGE.
+    //
+    // This used to be a single try/catch releasing the claim on anything that
+    // threw. But a throw from `complete()` means the HANDLER SUCCEEDED and only
+    // the cache write failed — the effect has already happened. Releasing then
+    // frees the key, the client's retry wins a fresh claim, and the billable
+    // action runs a second time. That is precisely the loop NFR-API-07 exists
+    // to break. Found by code review.
     try {
-      const body = await lastValueFrom(next.handle());
+      body = await lastValueFrom(next.handle());
+    } catch (error) {
+      // The handler failed, so there is no effect and nothing worth replaying.
+      // Releasing is right here, and only here: leaving the claim would lock
+      // the key until it expires, refusing a client retrying after a transient
+      // fault.
+      await this.store.release(cacheKey);
+      incrementCounter("nominara_api_idempotency_replay_total", { outcome: "released" });
+      throw error;
+    }
+
+    try {
       await this.store.complete(cacheKey, {
         requestHash,
         statusCode: reply.statusCode,
@@ -207,14 +239,19 @@ export class IdempotencyInterceptor implements NestInterceptor {
         recordedAt: new Date().toISOString(),
       });
       incrementCounter("nominara_api_idempotency_replay_total", { outcome: "recorded" });
-      return body;
     } catch (error) {
-      // A failed request has no response worth replaying, and leaving the
-      // claim would lock the key for the full 24-hour window — so a client
-      // retrying after a transient failure would be refused for a day.
-      await this.store.release(cacheKey);
-      incrementCounter("nominara_api_idempotency_replay_total", { outcome: "released" });
-      throw error;
+      // Deliberately NOT released. The claim stands until it expires, so a
+      // retry inside that window gets a 409 rather than a second execution —
+      // the safe direction when the effect has already happened and we cannot
+      // prove we recorded it.
+      incrementCounter("nominara_api_idempotency_replay_total", { outcome: "record_failed" });
+      logger.error({
+        message: "idempotency record write failed AFTER the effect; claim left in place to block a re-execution",
+        cache_key_suffix: cacheKey.slice(-16),
+        error: error instanceof Error ? error.name : "unknown",
+      });
     }
+
+    return body;
   }
 }

@@ -205,6 +205,26 @@ describe.each(adapters)("STORY-025 · the cache port, as implemented by %s", (na
       expect(outcomes.filter((outcome) => outcome.allowed)).toHaveLength(3);
     });
 
+    // THE CASE THE SUITE COULD NOT SEE. Every other consume test uses
+    // capacity === refillTokens, and the two adapters agree trivially there.
+    // With capacity 6 and 2 per second they diverged: Valkey expired the key
+    // after ONE window and handed the next caller a FULL bucket, while the
+    // in-memory adapter refilled linearly to 2. Every shipped §12 row happens
+    // to have limit >= burst, so nothing production-shaped exposed it — but
+    // AC10 exists so limits can change. Found by code review.
+    it("refills at the RATE after idling, rather than resetting to full", async () => {
+      const wide = { capacity: 6, refillTokens: 2, refillWindowMs: 400 };
+      const k = key("tb-wide");
+      for (let i = 0; i < 6; i++) await cache.consume(k, wide);
+      await expect(cache.consume(k, wide)).resolves.toMatchObject({ allowed: false });
+
+      // One full window of idleness: two tokens back, not six.
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      const allowed: boolean[] = [];
+      for (let i = 0; i < 4; i++) allowed.push((await cache.consume(k, wide)).allowed);
+      expect(allowed.filter(Boolean).length, "an idle bucket must not reset to full").toBeLessThanOrEqual(3);
+    });
+
     it("counts two keys independently", async () => {
       const a = key("tb-a");
       const b = key("tb-b");
