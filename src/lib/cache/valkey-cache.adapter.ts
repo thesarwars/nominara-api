@@ -3,7 +3,7 @@ import { Injectable, Logger, type OnModuleDestroy } from "@nestjs/common";
 // NodeNext resolution its default export resolves to the module NAMESPACE,
 // which is neither constructable nor usable as a type.
 import { Redis } from "ioredis";
-import type { Cache, CacheSetOptions } from "./cache.port.js";
+import type { Cache, CacheSetOptions, TokenBucketOutcome, TokenBucketSpec } from "./cache.port.js";
 
 // STORY-025 T14 — the production adapter, over the Valkey CACHE instance
 // (docker-compose.yml's `valkey-cache`, VALKEY_CACHE_URL). Valkey speaks the
@@ -36,6 +36,62 @@ if value == 1 then
   redis.call('PEXPIRE', KEYS[1], ARGV[1])
 end
 return value
+`;
+
+/**
+ * A token bucket, refilled and decremented in ONE atomic step.
+ *
+ * Held as two fields under one hash so both are read and written together:
+ * the token count and the millisecond timestamp it was last computed at.
+ * Doing this over `GET` then `SET` would be a read-modify-write, and two
+ * concurrent requests would each read the same count and each spend it — the
+ * bucket would grant twice its capacity under exactly the load it exists to
+ * limit.
+ *
+ * `TIME` comes from the SERVER, not from the caller. Several API instances
+ * share this bucket and their clocks do not agree; a client-supplied
+ * timestamp that ran fast would refill the bucket early, and one that ran
+ * slow would throttle a tenant for someone else's clock drift.
+ *
+ * The key expires after one full refill period of idleness. A bucket nobody
+ * has touched for that long is indistinguishable from a fresh one, so
+ * dropping it costs nothing and stops idle tenants accumulating keys.
+ */
+const CONSUME_TOKEN = `
+local capacity = tonumber(ARGV[1])
+local ms_per_token = tonumber(ARGV[2])
+local ttl_ms = tonumber(ARGV[3])
+
+local time = redis.call('TIME')
+local now = (tonumber(time[1]) * 1000) + math.floor(tonumber(time[2]) / 1000)
+
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'at')
+local tokens = tonumber(state[1])
+local last = tonumber(state[2])
+
+if tokens == nil or last == nil then
+  tokens = capacity
+else
+  tokens = math.min(capacity, tokens + ((now - last) / ms_per_token))
+end
+
+local allowed = 0
+local reset_after = 0
+if tokens >= 1 then
+  allowed = 1
+  tokens = tokens - 1
+  if tokens >= capacity then
+    reset_after = 0
+  else
+    reset_after = math.ceil(ms_per_token)
+  end
+else
+  reset_after = math.ceil((1 - tokens) * ms_per_token)
+end
+
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'at', now)
+redis.call('PEXPIRE', KEYS[1], ttl_ms)
+return { allowed, math.floor(tokens), reset_after }
 `;
 
 @Injectable()
@@ -94,6 +150,20 @@ export class ValkeyCacheAdapter implements Cache, OnModuleDestroy {
     // make "expires in -2 ms" a value a caller could do arithmetic on.
     const ttl = await this.client.pttl(key);
     return ttl < 0 ? undefined : ttl;
+  }
+
+  async consume(key: string, bucket: TokenBucketSpec): Promise<TokenBucketOutcome> {
+    const msPerToken = bucket.refillWindowMs / bucket.refillTokens;
+    const reply = (await this.client.eval(
+      CONSUME_TOKEN,
+      1,
+      key,
+      String(bucket.capacity),
+      String(msPerToken),
+      String(Math.ceil(bucket.refillWindowMs)),
+    )) as [number, number, number];
+
+    return { allowed: reply[0] === 1, remaining: reply[1], resetAfterMs: reply[2] };
   }
 
   /** Opens the connection. Called explicitly rather than on construction, so a boot failure is attributable. */

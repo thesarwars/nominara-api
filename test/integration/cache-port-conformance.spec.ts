@@ -152,6 +152,68 @@ describe.each(adapters)("STORY-025 · the cache port, as implemented by %s", (na
     });
   });
 
+  describe("consume — the token bucket §12 actually specifies", () => {
+    // capacity = §12's Burst column, refill rate = §12's rate column. The two
+    // are only non-redundant in this model, which is why the port carries it.
+    const bucket = { capacity: 3, refillTokens: 3, refillWindowMs: 3_000 };
+
+    it("allows up to capacity immediately, then refuses", async () => {
+      const k = key("tb");
+      await expect(cache.consume(k, bucket)).resolves.toMatchObject({ allowed: true, remaining: 2 });
+      await expect(cache.consume(k, bucket)).resolves.toMatchObject({ allowed: true, remaining: 1 });
+      await expect(cache.consume(k, bucket)).resolves.toMatchObject({ allowed: true, remaining: 0 });
+      await expect(cache.consume(k, bucket)).resolves.toMatchObject({ allowed: false, remaining: 0 });
+    });
+
+    it("tells a refused caller when the next token arrives", async () => {
+      const k = key("tb-reset");
+      for (let i = 0; i < 3; i++) await cache.consume(k, bucket);
+      const refused = await cache.consume(k, bucket);
+      expect(refused.allowed).toBe(false);
+      expect(refused.resetAfterMs).toBeGreaterThan(0);
+      // One token every 1000ms at 3 per 3s. Never longer than that, or a
+      // client told to wait would wait longer than it needed to.
+      expect(refused.resetAfterMs).toBeLessThanOrEqual(1_000);
+    });
+
+    it("refills over time rather than at a window boundary", async () => {
+      const k = key("tb-refill");
+      for (let i = 0; i < 3; i++) await cache.consume(k, bucket);
+      await expect(cache.consume(k, bucket)).resolves.toMatchObject({ allowed: false });
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      await expect(cache.consume(k, bucket)).resolves.toMatchObject({ allowed: true });
+    });
+
+    it("never refills past capacity, however long the bucket sat idle", async () => {
+      const k = key("tb-cap");
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      for (let i = 0; i < 3; i++) {
+        await expect(cache.consume(k, bucket)).resolves.toMatchObject({ allowed: true });
+      }
+      await expect(cache.consume(k, bucket)).resolves.toMatchObject({ allowed: false });
+    });
+
+    it("grants capacity exactly once under concurrency", async () => {
+      // The property the limit rests on. Against a read-modify-write
+      // implementation more than `capacity` callers would be allowed, and the
+      // bucket would grant capacity it does not have under precisely the load
+      // it exists to limit.
+      const k = key("tb-race");
+      const outcomes = await Promise.all(
+        Array.from({ length: 12 }, () => cache.consume(k, bucket)),
+      );
+      expect(outcomes.filter((outcome) => outcome.allowed)).toHaveLength(3);
+    });
+
+    it("counts two keys independently", async () => {
+      const a = key("tb-a");
+      const b = key("tb-b");
+      for (let i = 0; i < 3; i++) await cache.consume(a, bucket);
+      await expect(cache.consume(a, bucket)).resolves.toMatchObject({ allowed: false });
+      await expect(cache.consume(b, bucket)).resolves.toMatchObject({ allowed: true });
+    });
+  });
+
   it("deletes a key", async () => {
     await cache.set(key("d"), "v", { ttlMs: 10_000 });
     await cache.delete(key("d"));

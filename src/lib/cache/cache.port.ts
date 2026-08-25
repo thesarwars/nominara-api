@@ -46,4 +46,39 @@ export interface Cache {
 
   /** Milliseconds until the key expires, or undefined if it has none or does not exist. */
   timeToLiveMs(key: string): Promise<number | undefined>;
+
+  /**
+   * Takes one token from a token bucket, atomically.
+   *
+   * api-specification.md §12 says "token buckets", and its table carries a
+   * Burst column ALONGSIDE each rate — two columns that are only
+   * non-redundant in the token-bucket model, where `capacity` is what a
+   * client may spend at once and the rate is how fast it comes back. A fixed
+   * window counter has nowhere to put the second number, so it would have to
+   * be ignored, and ignoring a column of the reference is not implementing
+   * it.
+   *
+   * The sixth operation on a port whose comment argues for a small surface,
+   * and the reason is the same one that argues for smallness: this cannot be
+   * built from the other five. Refill-check-decrement over `get`/`set` is a
+   * read-modify-write, and two concurrent requests would both read the same
+   * token count and both spend it.
+   */
+  consume(key: string, bucket: TokenBucketSpec): Promise<TokenBucketOutcome>;
+}
+
+export interface TokenBucketSpec {
+  /** What may be spent at once — §12's Burst column. */
+  readonly capacity: number;
+  /** How many tokens return per `refillWindowMs` — §12's rate column. */
+  readonly refillTokens: number;
+  readonly refillWindowMs: number;
+}
+
+export interface TokenBucketOutcome {
+  readonly allowed: boolean;
+  /** Whole tokens left after this call. `X-RateLimit-Remaining` is this number. */
+  readonly remaining: number;
+  /** Milliseconds until the NEXT token is available. `Retry-After` and `X-RateLimit-Reset` come from this. */
+  readonly resetAfterMs: number;
 }

@@ -1,5 +1,5 @@
 import { Injectable } from "@nestjs/common";
-import type { Cache, CacheSetOptions } from "./cache.port.js";
+import type { Cache, CacheSetOptions, TokenBucketOutcome, TokenBucketSpec } from "./cache.port.js";
 
 // STORY-025 T14 — the in-process adapter.
 //
@@ -21,9 +21,15 @@ interface Entry {
   readonly expiresAtMs: number;
 }
 
+interface BucketState {
+  readonly tokens: number;
+  readonly lastMs: number;
+}
+
 @Injectable()
 export class InMemoryCacheAdapter implements Cache {
   private readonly entries = new Map<string, Entry>();
+  private readonly buckets = new Map<string, BucketState>();
 
   /** Injectable so a test can advance time without sleeping. Defaults to the real clock. */
   constructor(private readonly now: () => number = () => Date.now()) {}
@@ -74,8 +80,40 @@ export class InMemoryCacheAdapter implements Cache {
     return Promise.resolve(entry === undefined ? undefined : entry.expiresAtMs - this.now());
   }
 
+  consume(key: string, bucket: TokenBucketSpec): Promise<TokenBucketOutcome> {
+    const now = this.now();
+    const state = this.buckets.get(key);
+    const msPerToken = bucket.refillWindowMs / bucket.refillTokens;
+
+    // A bucket the caller has not touched inside a full refill period is
+    // indistinguishable from a fresh one, so it starts full. Keeping stale
+    // state around would let a client that paused for an hour still be
+    // throttled by what it did before the pause.
+    const elapsed = state === undefined ? bucket.refillWindowMs : now - state.lastMs;
+    const carried = state === undefined ? bucket.capacity : state.tokens;
+    const tokens = Math.min(bucket.capacity, carried + elapsed / msPerToken);
+
+    if (tokens < 1) {
+      this.buckets.set(key, { tokens, lastMs: now });
+      return Promise.resolve({
+        allowed: false,
+        remaining: 0,
+        resetAfterMs: Math.ceil((1 - tokens) * msPerToken),
+      });
+    }
+
+    const left = tokens - 1;
+    this.buckets.set(key, { tokens: left, lastMs: now });
+    return Promise.resolve({
+      allowed: true,
+      remaining: Math.floor(left),
+      resetAfterMs: left >= bucket.capacity ? 0 : Math.ceil(msPerToken),
+    });
+  }
+
   /** Test affordance only — never part of the port, so no production path can reach it. */
   clear(): void {
     this.entries.clear();
+    this.buckets.clear();
   }
 }

@@ -1,0 +1,148 @@
+import {
+  rateLimitConfigSchema,
+  type RateLimitConfig,
+} from "../../../contracts/common/rate-limit.schema.js";
+
+// STORY-025 T17 — api-specification.md §12's table, transcribed.
+//
+// coding-standards.md §11: "Numeric constants match the reference exactly —
+// not a plausible neighbour." Every number below is read off §12 and nothing
+// is rounded, harmonised or inferred. Where §12 is ambiguous the ambiguity is
+// named rather than resolved silently.
+//
+// THIRTEEN classes. STORY-025's own acceptance criteria list nine; the
+// reference outranks the story, so thirteen ship and the story text goes on
+// the hand-carried specification-fix list.
+//
+// The two columns are NOT redundant. §12 says "token buckets", so the rate
+// column is the refill and the Burst column is the bucket's capacity: a
+// client may spend `burst` at once, then proceeds at the steady rate. A fixed
+// window counter would have nowhere to put the second number.
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * §12's table, row for row and in its order.
+ *
+ * TWO READINGS ARE RECORDED HERE RATHER THAN GUESSED AT:
+ *
+ *   "40/day" (capture-backed tools) versus "3/**UTC-day** hard cap" (capped
+ *   tiers). §12 marks only the second as a calendar day and only the second
+ *   as hard, so the first is read as a rolling 24 hours. The difference is
+ *   visible to a customer — a rolling window frees capacity continuously, a
+ *   UTC-day cap frees it all at midnight — so if the reference meant both to
+ *   be calendar days, this is the line to correct.
+ *
+ *   `POST /portal/session` also carries "5 failed passwords → 15-min lock per
+ *   token". That is a LOCK, not a bucket: it counts failures rather than
+ *   requests and it is per share token rather than per identity. It belongs to
+ *   the portal story that owns share tokens, and inventing a bucket shaped
+ *   like it here would be a mechanism nobody asked for. Only the 10/hour IP
+ *   bucket is encoded.
+ */
+export const RATE_LIMIT_DEFAULTS: RateLimitConfig = rateLimitConfigSchema.parse([
+  {
+    route_class: "auth",
+    burst: 5,
+    buckets: [
+      { scope: "user", limit: 10, window: "rolling", window_ms: MINUTE_MS },
+      { scope: "ip", limit: 30, window: "rolling", window_ms: MINUTE_MS },
+    ],
+  },
+  {
+    route_class: "reads",
+    burst: 60,
+    buckets: [
+      { scope: "user", limit: 300, window: "rolling", window_ms: MINUTE_MS },
+      { scope: "workspace", limit: 1_200, window: "rolling", window_ms: MINUTE_MS },
+    ],
+  },
+  {
+    route_class: "writes",
+    burst: 20,
+    buckets: [
+      { scope: "user", limit: 60, window: "rolling", window_ms: MINUTE_MS },
+      { scope: "workspace", limit: 240, window: "rolling", window_ms: MINUTE_MS },
+    ],
+  },
+  {
+    route_class: "capture_backed_tools",
+    burst: 2,
+    buckets: [
+      { scope: "user", limit: 5, window: "rolling", window_ms: MINUTE_MS },
+      { scope: "user", limit: 40, window: "rolling", window_ms: DAY_MS },
+      { scope: "workspace", limit: 20, window: "rolling", window_ms: MINUTE_MS },
+    ],
+  },
+  {
+    route_class: "capture_backed_tools_capped_tiers",
+    burst: 1,
+    buckets: [
+      { scope: "user", limit: 1, window: "rolling", window_ms: MINUTE_MS },
+      // The one hard cap in the whole table. Not liftable by buying credits,
+      // which is what separates `daily_limit_reached` from
+      // `insufficient_credits` — two of the five conditions NFR-API-13
+      // forbids collapsing.
+      { scope: "user", limit: 3, window: "utc_day", hard_cap: true },
+      { scope: "workspace", limit: 3, window: "rolling", window_ms: DAY_MS },
+      { scope: "ip", limit: 10, window: "rolling", window_ms: HOUR_MS },
+    ],
+  },
+  {
+    route_class: "project_runs",
+    burst: 2,
+    buckets: [
+      { scope: "user", limit: 6, window: "rolling", window_ms: HOUR_MS },
+      { scope: "workspace", limit: 30, window: "rolling", window_ms: HOUR_MS },
+    ],
+  },
+  {
+    route_class: "project_aux_audits",
+    burst: 3,
+    buckets: [
+      { scope: "user", limit: 10, window: "rolling", window_ms: HOUR_MS },
+      { scope: "workspace", limit: 60, window: "rolling", window_ms: HOUR_MS },
+    ],
+  },
+  {
+    route_class: "geo_alignment",
+    burst: 5,
+    buckets: [
+      { scope: "user", limit: 30, window: "rolling", window_ms: HOUR_MS },
+      { scope: "workspace", limit: 120, window: "rolling", window_ms: HOUR_MS },
+    ],
+  },
+  {
+    route_class: "command_parse",
+    burst: 30,
+    buckets: [{ scope: "user", limit: 120, window: "rolling", window_ms: MINUTE_MS }],
+  },
+  {
+    route_class: "command_execute",
+    burst: 5,
+    buckets: [
+      { scope: "user", limit: 20, window: "rolling", window_ms: MINUTE_MS },
+      { scope: "workspace", limit: 60, window: "rolling", window_ms: MINUTE_MS },
+    ],
+  },
+  {
+    route_class: "credit_pack_purchase",
+    burst: 2,
+    buckets: [
+      { scope: "user", limit: 5, window: "rolling", window_ms: HOUR_MS },
+      { scope: "workspace", limit: 10, window: "rolling", window_ms: HOUR_MS },
+    ],
+  },
+  {
+    route_class: "portal_session",
+    burst: 2,
+    buckets: [{ scope: "ip", limit: 10, window: "rolling", window_ms: HOUR_MS }],
+  },
+  {
+    route_class: "public_niche_reports",
+    burst: 1,
+    buckets: [{ scope: "ip", limit: 120, window: "rolling", window_ms: HOUR_MS }],
+  },
+]);

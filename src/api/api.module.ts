@@ -31,6 +31,8 @@ import { DailyCapGuard } from "./guards/daily-cap.guard.js";
 import { RateLimitGuard } from "./guards/rate-limit.guard.js";
 import { CreditGuard } from "./guards/credit.guard.js";
 import { IdempotencyStore } from "./idempotency/store.js";
+import { CACHE, type Cache } from "../lib/cache/cache.port.js";
+import { RateLimitBuckets } from "./rate-limit/buckets.js";
 import { IdempotencyInterceptor } from "./interceptors/idempotency.interceptor.js";
 import { TenantContextInterceptor } from "./interceptors/tenant-context.interceptor.js";
 import { AuditInterceptor } from "./interceptors/audit.interceptor.js";
@@ -80,6 +82,15 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     // STORY-025 T16 — the idempotency record store, injected into
     // IdempotencyInterceptor. Not a global: only the interceptor uses it.
     IdempotencyStore,
+    // STORY-025 T17 — the token buckets RateLimitGuard evaluates. Registered
+    // through a factory rather than by class: the constructor takes the
+    // configuration and a clock as optional arguments so a test can supply
+    // both, and Nest cannot resolve an Array or a Function by type.
+    {
+      provide: RateLimitBuckets,
+      useFactory: (cache: Cache): RateLimitBuckets => new RateLimitBuckets(cache),
+      inject: [CACHE],
+    },
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_GUARD, useClass: WorkspaceGuard },
     { provide: APP_GUARD, useClass: RbacGuard },
