@@ -102,6 +102,16 @@ export const envSchema = z
     // Non-secret display string for the delivered email's "from" header,
     // read by the EMAIL_SENDER port's logging adapter — never hardcoded.
     OTP_EMAIL_FROM: requiredString,
+
+    // STORY-025 — the Valkey CACHE instance. system-architecture.md §11
+    // mandates two: this one (allkeys-lru, persistence off) for token
+    // buckets, idempotency records, locks and memoisation, and a separate
+    // QUEUE instance (noeviction, persistence on) for BullMQ, which arrives
+    // with STORY-030 as VALKEY_QUEUE_URL. Named for its role rather than
+    // VALKEY_URL precisely so the second one cannot quietly land on the
+    // first: an eviction policy that discards a queued job is data loss,
+    // and one that refuses to evict a cache is an outage.
+    VALKEY_CACHE_URL: requiredString,
   })
   .strict();
 

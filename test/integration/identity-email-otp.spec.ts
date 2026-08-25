@@ -182,6 +182,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
+    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
 
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();

@@ -1,5 +1,12 @@
 # pgBouncer joins this file in STORY-010 (database roles & pgBouncer wiring).
-# Valkey is NOT in STORY-010's scope — it joins in STORY-030 (queues).
+#
+# Valkey arrives as TWO instances, not one — system-architecture.md §11. The
+# CACHE instance is here (STORY-025: token buckets, idempotency records,
+# locks, memoisation, pub/sub) with allkeys-lru and no persistence. The QUEUE
+# instance joins in STORY-030 with noeviction and persistence on, holding
+# BullMQ's queues. The split is not tidiness: evicting a queued job under
+# memory pressure is silent data loss, and refusing to evict a cache is an
+# outage. One instance cannot have both policies.
 services:
   postgres:
     image: pgvector/pgvector:pg18
@@ -31,6 +38,36 @@ services:
       - ./docker/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
     ports:
       - "6432:5432"
+
+  # STORY-025 — the CACHE instance. allkeys-lru because every key here is
+  # reconstructible: a token bucket evicted early grants a little extra
+  # capacity, an idempotency record evicted early turns a replay into a
+  # re-execution. Both are degradations, not corruption, which is exactly
+  # what makes eviction the right policy for this instance and the wrong one
+  # for the queue.
+  #
+  # No volume, deliberately. Persistence here would preserve state that is
+  # meant to expire, and would make a local restart behave differently from
+  # the managed cache this stands in for.
+  valkey-cache:
+    image: valkey/valkey:8.1-alpine
+    command:
+      - valkey-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   nominara-postgres-data:

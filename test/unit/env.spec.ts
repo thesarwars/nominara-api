@@ -28,6 +28,10 @@ const VALID: NodeJS.ProcessEnv = {
   // string for the sender address shown on the delivered email.
   OTP_EMAIL_HASH_PEPPER: "test-otp-email-hash-pepper",
   OTP_EMAIL_FROM: "Nominara <no-reply@nominara.test>",
+  // STORY-025 — the Valkey CACHE instance. Required, with no default: a
+  // default connection string is how a service silently talks to the wrong
+  // cache, and this schema exists to make that a failed boot instead.
+  VALKEY_CACHE_URL: "redis://localhost:6379",
 };
 
 describe("STORY-022 · env validation — refuses to start on missing/malformed config", () => {

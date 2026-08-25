@@ -89,6 +89,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
+    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 

@@ -27,4 +27,5 @@ export function applyFakeApiEnv(): void {
   // them the real ApiModule cannot be constructed at all.
   process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
   process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
+  process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
 }
