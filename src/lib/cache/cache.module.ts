@@ -2,6 +2,7 @@ import { Global, Logger, Module } from "@nestjs/common";
 import { loadEnv } from "../../config/env.js";
 import { CACHE, type Cache } from "./cache.port.js";
 import { InMemoryCacheAdapter } from "./in-memory-cache.adapter.js";
+import { ValkeyCacheAdapter } from "./valkey-cache.adapter.js";
 
 // STORY-025 T14/T16 — the CACHE provider.
 //
@@ -11,22 +12,19 @@ import { InMemoryCacheAdapter } from "./in-memory-cache.adapter.js";
 // each of them import a module to get it would spread the wiring rather than
 // centralise it.
 //
-// *** DISCLOSED GAP — THIS IS NOT PRODUCTION-READY. ***
-// The production adapter is Valkey over `ioredis`, approved as decision D3 of
-// the EPIC-03 execution plan. `pnpm add ioredis` was REFUSED by this
-// environment's command classifier, so the adapter does not exist yet and the
-// in-memory one is what is wired.
+// TWO ADAPTERS, ONE PORT, AND THE CHOICE IS BY ENVIRONMENT — never by
+// availability. A factory that fell back to the in-memory adapter when Valkey
+// was unreachable would turn an outage into a correctness failure: with more
+// than one API instance, two requests bearing the same idempotency key land on
+// different processes, each find no record, and both execute. That is the
+// double effect `NFR-API-07` exists to prevent, and it would happen silently.
+// So the only thing that selects the adapter is NODE_ENV, and a Valkey that
+// cannot be reached is a failed boot rather than a quiet downgrade.
 //
-// The in-memory adapter is per-process. With more than one API instance, two
-// requests bearing the same idempotency key can land on different processes,
-// each find no record, and both execute — which is precisely the double
-// effect `NFR-API-07` exists to prevent. It is correct for tests and for a
-// single-process development run, and wrong for anything else.
-//
-// So this fails closed rather than shipping quietly: production refuses to
-// boot, and every other environment logs what it is using on every start. The
-// alternative — wiring it silently and writing the gap in a README — is how a
-// per-process cache reaches production with every gate green.
+// The two are not assumed to agree. test/integration/cache-port-conformance
+// .spec.ts runs ONE suite against BOTH — including the concurrent-claim race
+// and the non-sliding window — so a behavioural difference is a test failure
+// rather than a production surprise.
 const logger = new Logger("cache");
 
 @Global()
@@ -34,20 +32,19 @@ const logger = new Logger("cache");
   providers: [
     {
       provide: CACHE,
-      useFactory: (): Cache => {
+      useFactory: async (): Promise<Cache> => {
         const env = loadEnv();
-        if (env.NODE_ENV === "production") {
-          throw new Error(
-            "cache: the Valkey adapter is not implemented (ioredis is not installed), and the in-memory " +
-              "adapter is PER-PROCESS. Two API instances would each miss the other's idempotency records and " +
-              "both execute the same billable request. Refusing to start rather than serve production from it.",
-          );
+
+        if (env.NODE_ENV === "test") {
+          // Deliberate, and the only environment that gets it: a unit suite
+          // must not need a container to construct the composition root.
+          return new InMemoryCacheAdapter();
         }
-        logger.warn({
-          message: "using the in-memory cache adapter — per-process, not shared, NOT production-safe",
-          valkey_cache_url_configured: env.VALKEY_CACHE_URL.length > 0,
-        });
-        return new InMemoryCacheAdapter();
+
+        const adapter = new ValkeyCacheAdapter(env.VALKEY_CACHE_URL);
+        await adapter.connect();
+        logger.log({ message: "cache connected", adapter: "valkey" });
+        return adapter;
       },
     },
   ],
