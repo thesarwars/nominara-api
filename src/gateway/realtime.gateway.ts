@@ -1,13 +1,30 @@
-import type { OnModuleDestroy } from "@nestjs/common";
+import { Inject, type OnModuleDestroy } from "@nestjs/common";
 import { MessageBody, ConnectedSocket, SubscribeMessage, WebSocketGateway, WebSocketServer } from "@nestjs/websockets";
 import type { Server, Socket } from "socket.io";
 import { Logger } from "@nestjs/common";
 import { incrementCounter } from "../lib/telemetry/metrics.js";
 import { RESYNC_DIRECTIVE, SocketBackpressure, drainReconnectAfterMs } from "./backpressure.js";
 import { ROOM_FORBIDDEN_CLOSE_CODE, RoomAuthorizationService, workspaceRoom } from "./room-authorization.service.js";
+import { Redis } from "ioredis";
+import { memberChangedEventSchema } from "../../contracts/events/platform-events.schema.js";
 import { attachValkeyAdapter, type ValkeyAdapterHandle } from "./valkey-adapter.js";
 
 const logger = new Logger("realtime-gateway");
+
+/** security-and-tenancy.md §7 — the longest a revoked membership may keep a socket. */
+export const SOCKET_REVALIDATION_MS = 60_000;
+
+/**
+ * DI token for the interval above.
+ *
+ * A token rather than a `useFactory` registration of the gateway itself, and
+ * the reason is not style: Nest discovers WebSocket gateways from a provider's
+ * METATYPE, which a factory-provided instance does not have. Registering
+ * `RealtimeGateway` through `useFactory` silently produced a process with no
+ * `/rt` namespace at all — every socket connection failed at the handshake,
+ * and nothing in the module said why.
+ */
+export const SOCKET_REVALIDATION_INTERVAL = Symbol("SOCKET_REVALIDATION_INTERVAL");
 
 // The event name clients listen for during a rolling deploy — a plain
 // string constant, not hardcoded inline at each use site.
@@ -26,9 +43,24 @@ export class RealtimeGateway implements OnModuleDestroy {
   server!: Server;
 
   private adapter: ValkeyAdapterHandle | undefined;
+  private control: Redis | undefined;
   private readonly pressure = new Map<string, SocketBackpressure>();
 
-  constructor(private readonly rooms: RoomAuthorizationService) {}
+  /**
+   * Who is on each socket, recorded at join.
+   *
+   * Needed because a revocation names a USER and a WORKSPACE, and closing the
+   * right sockets means knowing which ones those are. socket.io can find a
+   * ROOM's members; it cannot answer "which of these is user X".
+   */
+  private readonly joined = new Map<string, { userId: string; workspaceId: string }>();
+  private readonly revalidations = new Map<string, ReturnType<typeof setInterval>>();
+
+  constructor(
+    private readonly rooms: RoomAuthorizationService,
+    /** §7's bound. Zero disables it, which is how row 3a proves the EVENT closes the socket rather than the timer. */
+    @Inject(SOCKET_REVALIDATION_INTERVAL) private readonly revalidationMs: number = SOCKET_REVALIDATION_MS,
+  ) {}
 
   /**
    * STORY-026 T22 — AC4. Called by the bootstrap once the server exists.
@@ -74,8 +106,73 @@ export class RealtimeGateway implements OnModuleDestroy {
     incrementCounter("nominara_gateway_dropped_events_total", { event });
   }
 
+  /**
+   * STORY-026 T22 — the gateway side of `member.changed`.
+   *
+   * §11 says the event "forces socket re-auth", and that has to happen HERE:
+   * an event delivered only to clients relies on the client to disconnect
+   * itself, which is not a security control. The API publishes to a control
+   * channel every gateway process subscribes to, and each process closes the
+   * sockets it owns.
+   */
+  attachControlChannel(url: string, channel: string): void {
+    const subscriber = new Redis(url, { maxRetriesPerRequest: 2 });
+    this.control = subscriber;
+    subscriber.on("error", (error: Error) => {
+      logger.error({ message: "control channel error", error: error.name });
+    });
+    void subscriber.subscribe(channel);
+    subscriber.on("message", (_channel: string, raw: string) => {
+      this.onMemberChanged(raw);
+    });
+  }
+
+  /** Exposed for tests: applies one control message without a Valkey in the middle. */
+  onMemberChanged(raw: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const event = memberChangedEventSchema.safeParse(parsed);
+    if (!event.success) return;
+
+    // EVERY membership change closes the socket, not only a removal. A demotion
+    // leaves an already-authorised socket over-privileged for whatever it was
+    // authorised to see, and the cheapest correct answer is to make it
+    // re-authorise from scratch. A reconnect costs one handshake; getting the
+    // "which changes matter" judgement wrong costs a leak.
+    for (const [socketId, who] of this.joined) {
+      if (who.userId !== event.data.user_id || who.workspaceId !== event.data.workspace_id) continue;
+      const socket = this.socketById(socketId);
+      incrementCounter("nominara_gateway_forced_reauth_total", { reason: event.data.status });
+      logger.warn({
+        message: "membership changed; closing socket for re-auth",
+        workspace_id: event.data.workspace_id,
+        status: event.data.status,
+      });
+      socket?.emit("error", { close_code: ROOM_FORBIDDEN_CLOSE_CODE, reason: "membership_changed" });
+      socket?.disconnect(true);
+      this.forget(socketId);
+    }
+  }
+
+  private socketById(socketId: string): Socket | undefined {
+    const sockets = (this.server as unknown as { sockets?: Map<string, Socket> } | undefined)?.sockets;
+    return sockets?.get(socketId);
+  }
+
+  private forget(socketId: string): void {
+    this.pressure.delete(socketId);
+    this.joined.delete(socketId);
+    const timer = this.revalidations.get(socketId);
+    if (timer !== undefined) clearInterval(timer);
+    this.revalidations.delete(socketId);
+  }
+
   handleDisconnect(socket: Socket): void {
-    this.pressure.delete(socket.id);
+    this.forget(socket.id);
   }
 
   /**
@@ -117,7 +214,35 @@ export class RealtimeGateway implements OnModuleDestroy {
 
     const room = workspaceRoom(workspaceId);
     await socket.join(room);
+    this.joined.set(socket.id, { userId: decision.userId!, workspaceId });
+    this.startRevalidation(socket, workspaceId);
     return { joined: true, room };
+  }
+
+  /**
+   * The SECOND path that closes a revoked socket: a periodic re-check.
+   *
+   * `member.changed` closes it immediately, and this closes it eventually. Both
+   * exist because they fail differently — a dropped control message, a gateway
+   * that started after the event, a membership changed directly in the database
+   * by an operator. Sixty seconds is the bound §7 puts on how long a revoked
+   * session may persist, and this is what makes that bound true rather than
+   * best-effort.
+   */
+  private startRevalidation(socket: Socket, workspaceId: string): void {
+    if (this.revalidationMs <= 0) return;
+    const timer = setInterval(() => {
+      void this.rooms.authorizeWorkspaceRoom(socket.handshake, workspaceId).then((decision) => {
+        if (decision.allowed) return;
+        incrementCounter("nominara_gateway_forced_reauth_total", { reason: "revalidation" });
+        socket.emit("error", { close_code: ROOM_FORBIDDEN_CLOSE_CODE, reason: "revalidation_failed" });
+        socket.disconnect(true);
+        this.forget(socket.id);
+      });
+    }, this.revalidationMs);
+    // Never hold the process open for a periodic check.
+    timer.unref?.();
+    this.revalidations.set(socket.id, timer);
   }
 
   // NFR-ARCH-07 — zero-downtime deploys: "WebSocket clients receive
@@ -139,5 +264,7 @@ export class RealtimeGateway implements OnModuleDestroy {
     // An unclosed subscriber keeps the process alive and turns a graceful
     // drain into a hung one.
     await this.adapter?.close();
+    await this.control?.quit();
+    for (const timer of this.revalidations.values()) clearInterval(timer);
   }
 }

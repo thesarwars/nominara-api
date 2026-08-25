@@ -590,7 +590,7 @@ export class WorkspacesService {
     // of the event: a role change can make an already-authorised socket
     // over-privileged, and without this the only thing closing that window is
     // the gateway's 60-second re-validation timer.
-    this.realtime.toWorkspace(workspaceId, "member.changed", {
+    this.realtime.memberChanged(workspaceId, {
       workspace_id: workspaceId,
       user_id: targetRow.user_id,
       role: response.role,
@@ -631,7 +631,7 @@ export class WorkspacesService {
     // the authoritative answer is the API the client refetches. Failing the
     // removal because a cache was briefly unreachable would trade a committed,
     // security-relevant change for a notification.
-    this.realtime.toWorkspace(workspaceId, "member.changed", {
+    this.realtime.memberChanged(workspaceId, {
       workspace_id: workspaceId,
       user_id: targetRow.user_id,
       role: targetRow.role as MemberResponse["role"],

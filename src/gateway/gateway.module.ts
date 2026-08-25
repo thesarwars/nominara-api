@@ -5,7 +5,11 @@ import { AuthGuard } from "../api/guards/auth.guard.js";
 import { WorkspaceGuard } from "../api/guards/workspace.guard.js";
 import { RbacGuard } from "../api/guards/rbac.guard.js";
 import { RoomAuthorizationService } from "./room-authorization.service.js";
-import { RealtimeGateway } from "./realtime.gateway.js";
+import {
+  RealtimeGateway,
+  SOCKET_REVALIDATION_INTERVAL,
+  SOCKET_REVALIDATION_MS,
+} from "./realtime.gateway.js";
 
 // STORY-026 T21 — the gateway process's module graph.
 //
@@ -33,7 +37,21 @@ import { RealtimeGateway } from "./realtime.gateway.js";
 // uses on every request.
 @Module({
   imports: [DbModule, TenancyAccessModule],
-  providers: [AuthGuard, WorkspaceGuard, RbacGuard, RoomAuthorizationService, RealtimeGateway],
+  providers: [
+    AuthGuard,
+    WorkspaceGuard,
+    RbacGuard,
+    RoomAuthorizationService,
+    // A PLAIN CLASS PROVIDER, deliberately. Nest discovers WebSocket gateways
+    // from a provider's metatype, which a `useFactory` instance does not have —
+    // registering it that way produced a process with no `/rt` namespace at
+    // all, and every socket failed at the handshake with nothing in the module
+    // to point at. The re-validation interval comes through its own token
+    // instead, which keeps it injectable without hiding the class from
+    // discovery.
+    RealtimeGateway,
+    { provide: SOCKET_REVALIDATION_INTERVAL, useValue: SOCKET_REVALIDATION_MS },
+  ],
   exports: [RoomAuthorizationService],
 })
 export class RealtimeModule {}

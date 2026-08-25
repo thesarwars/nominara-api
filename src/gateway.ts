@@ -6,6 +6,8 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { loadEnv } from "./config/env.js";
 import { RealtimeModule } from "./gateway/gateway.module.js";
 import { RealtimeGateway } from "./gateway/realtime.gateway.js";
+import { cacheKeyNamespace } from "./lib/cache/key-namespace.js";
+import { realtimeControlChannel } from "./lib/cache/realtime-publisher.js";
 
 // STORY-022 — WebSocket gateway bootstrap (project-structure.md §2:
 // "src/gateway.ts WebSocket gateway bootstrap"). A separate process/port
@@ -31,7 +33,12 @@ export async function bootstrapGateway(): Promise<NestFastifyApplication> {
   // replica's sockets and silently drop them for every other client, which
   // looks like a flaky product rather than a failed dependency.
   if (env.NODE_ENV !== "test") {
-    app.get(RealtimeGateway).attachAdapter(env.VALKEY_CACHE_URL);
+    const gateway = app.get(RealtimeGateway);
+    gateway.attachAdapter(env.VALKEY_CACHE_URL);
+    // The control channel is what makes `member.changed` close a socket rather
+    // than merely inform a client. Without it the only thing closing a revoked
+    // socket is the sixty-second timer.
+    gateway.attachControlChannel(env.VALKEY_CACHE_URL, realtimeControlChannel(cacheKeyNamespace()));
   }
   new Logger("bootstrap").log(`gateway listening on :${env.GATEWAY_PORT}`);
   return app;

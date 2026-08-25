@@ -4,6 +4,8 @@ import { Redis } from "ioredis";
 import type { RealtimeEventPayloads } from "../../../contracts/events/catalog.schema.js";
 import type { RealtimeEventName } from "../../../contracts/events/event-name.schema.js";
 import { loadEnv } from "../../config/env.js";
+import { cacheKeyNamespace } from "./key-namespace.js";
+import { globalKey } from "./valkey-keys.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 
 // STORY-026 T22, decision D9 — how the API process publishes realtime events.
@@ -38,6 +40,19 @@ export function workspaceRoomName(workspaceId: string): string {
   return `ws:${workspaceId}`;
 }
 
+/**
+ * The channel the GATEWAY subscribes to, as opposed to the rooms clients sit in.
+ *
+ * A control message and a client event are different things travelling to
+ * different audiences: `member.changed` must reach every gateway PROCESS so it
+ * can close the affected sockets, and a room emit reaches CLIENTS. The gateway
+ * cannot read its own room emits, and subscribing to the adapter's internal
+ * channels to try would be reading a private wire format.
+ */
+export function realtimeControlChannel(namespace: string): string {
+  return globalKey(namespace, "rt", "control");
+}
+
 export interface RealtimePublisher {
   /** Publishes to every socket in a workspace's room, across every gateway instance. */
   toWorkspace<Name extends RealtimeEventName>(
@@ -45,6 +60,18 @@ export interface RealtimePublisher {
     event: Name,
     payload: RealtimeEventPayloads[Name],
   ): void;
+
+  /**
+   * `member.changed` — to clients AND to every gateway process, in one call.
+   *
+   * One method rather than two calls at each site, because the two halves are
+   * not optional relative to each other: the client notification without the
+   * control message leaves a revoked member's socket open until the
+   * re-validation timer fires, which is the sixty-second window §7 exists to
+   * close. A caller that could do one and forget the other would eventually
+   * do exactly that.
+   */
+  memberChanged(workspaceId: string, payload: RealtimeEventPayloads["member.changed"]): void;
 }
 
 @Injectable()
@@ -74,6 +101,11 @@ export class ValkeyRealtimePublisher implements RealtimePublisher, OnModuleDestr
     incrementCounter("nominara_realtime_published_total", { event });
   }
 
+  memberChanged(workspaceId: string, payload: RealtimeEventPayloads["member.changed"]): void {
+    this.toWorkspace(workspaceId, "member.changed", payload);
+    void this.client.publish(realtimeControlChannel(cacheKeyNamespace()), JSON.stringify(payload));
+  }
+
   async onModuleDestroy(): Promise<void> {
     await this.client.quit();
   }
@@ -97,6 +129,10 @@ export class NoopRealtimePublisher implements RealtimePublisher {
   ): void {
     this.published.push({ workspaceId, event, payload });
     incrementCounter("nominara_realtime_published_total", { event, transport: "noop" });
+  }
+
+  memberChanged(workspaceId: string, payload: RealtimeEventPayloads["member.changed"]): void {
+    this.toWorkspace(workspaceId, "member.changed", payload);
   }
 }
 
