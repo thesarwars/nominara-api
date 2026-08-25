@@ -6,6 +6,8 @@ import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { dataOf } from "../support/envelope.js";
+import { eachRequestFromItsOwnClient } from "../support/distinct-source.js";
+import { EmailOtpService } from "../../src/modules/identity/email-otp.service.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { registerCookiePlugin } from "../../src/api/register-cookies.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
@@ -204,6 +206,10 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     await registerCookiePlugin(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
+    // STORY-025 T18 — §12's per-IP auth bucket is real now, and this suite
+    // drives dozens of /auth/* requests. See the helper for what that
+    // trades away and where it is covered instead.
+    eachRequestFromItsOwnClient(app);
   });
 
   afterEach(async () => {
@@ -673,33 +679,55 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
   // ---- Gap 3 (qa-reviewer, AC4): the per-source (30/min) rate limit is independently enforced ----
 
-  it("STORY-016 · gap 3 (AC4) — the per-source (30/min) limit refuses the 31st request even though every address is well under its own 3/hour limit", async () => {
+  // STORY-025 T18 — THIS TEST MOVED DOWN A LAYER, AND THE REASON IS A REAL
+  // COLLISION rather than a test-harness inconvenience.
+  //
+  // `/auth/otp/request` now carries TWO rate limits on the same axis:
+  //
+  //   §12's `Auth (/auth/*)` row — 30/min per IP, BURST 5, enforced by
+  //   RateLimitGuard as of STORY-025 T17.
+  //   STORY-016's own ledger — 30/min per source, a plain counter with no
+  //   burst, enforced inside EmailOtpService.
+  //
+  // Same routes, same number, different burst. Over HTTP the platform bucket
+  // refuses at the sixth request, so the thirty-first can no longer be reached
+  // and this assertion cannot be made through `app.inject` at all.
+  //
+  // Neither limiter was removed — deleting a working defence-in-depth control
+  // to make a test reachable would be the wrong trade. Instead the assertion
+  // moved to the layer that OWNS the ledger it is about. What is given up is
+  // that this no longer proves the refusal reaches the wire as a 429; that is
+  // covered for the platform bucket by test/unit/rate-limit-before-credit.spec
+  // .ts, and the rejection shape is asserted directly below.
+  //
+  // The redundancy itself is a decision for a human: one of these two probably
+  // should not exist.
+  it("STORY-016 · gap 3 (AC4) — the per-source (30/min) ledger refuses the 31st request even though every address is well under its own 3/hour limit", async () => {
     const source = "203.0.113.55";
     const emails = Array.from({ length: 31 }, (_, i) => `gap3-source-${i}@example.com`);
     for (const email of emails) {
       await createUser(email);
     }
 
-    const results = [];
-    for (const email of emails) {
-      const res = await app.inject({
-        method: "POST",
-        url: "/auth/otp/request",
-        remoteAddress: source,
-        payload: { email },
-      });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      results.push(res);
+    const service = app.get(EmailOtpService);
+    for (const email of emails.slice(0, 30)) {
+      await expect(service.requestCode(email, source, randomUUID())).resolves.toBeDefined();
     }
 
-    expect(results.slice(0, 30).map((r) => r.statusCode)).toEqual(Array(30).fill(OTP_REQUEST_SUCCESS_STATUS));
+    // The 31st, from the same source, every address well inside its own hourly
+    // allowance — so the only thing that can refuse it is the per-source ledger.
+    let refusal: { code: string; details: { retry_after_ms: number } } | undefined;
+    try {
+      await service.requestCode(emails[30]!, source, randomUUID());
+    } catch (error) {
+      const response = (error as { getResponse: () => unknown }).getResponse();
+      refusal = response as { code: string; details: { retry_after_ms: number } };
+    }
 
-    const last = results[30]!;
-    expect(last.statusCode).toBe(429);
-    const body = last.json() as { error: { code: string; details: { retry_after_ms: number } } };
-    expect(body.error.code).toBe("rate_limited");
-    expect(body.error.details.retry_after_ms).toBeGreaterThan(0);
-    expect(body.error.details.retry_after_ms).toBeLessThanOrEqual(60_000);
+    expect(refusal, "the 31st request from one source must be refused").toBeDefined();
+    expect(refusal!.code).toBe("rate_limited");
+    expect(refusal!.details.retry_after_ms).toBeGreaterThan(0);
+    expect(refusal!.details.retry_after_ms).toBeLessThanOrEqual(60_000);
   });
 
   // ---- Cross-story: D2 promotion unlocks the workspace-create right ---------

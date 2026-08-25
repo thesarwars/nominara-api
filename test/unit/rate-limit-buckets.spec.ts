@@ -319,3 +319,84 @@ describe("STORY-025 · the UTC-day hard cap", () => {
     expect(refused.exhausted?.hardCap, "a hard cap is not liftable by buying credits").toBe(true);
   });
 });
+
+// ---- unauthenticated traffic --------------------------------------------
+
+describe("STORY-025 · the three §12 rows whose callers have no workspace", () => {
+  const ANONYMOUS = { env: "test", ip: "203.0.113.7" };
+
+  it("limits sign-in by IP even though there is no workspace or user", async () => {
+    // The defect this replaced: an authenticated-only guard returned true for
+    // every pre-authentication request, so `/auth/*` — the row §12 gives the
+    // tightest numbers in the whole table — was completely unlimited.
+    const { subject } = buckets();
+    const outcomes: boolean[] = [];
+    for (let i = 0; i < 7; i++) {
+      outcomes.push((await subject.check("auth", ANONYMOUS)).allowed);
+    }
+    // auth bursts at 5 and the IP bucket is 30/min, so the sixth is refused.
+    expect(outcomes.filter(Boolean)).toHaveLength(5);
+    expect(outcomes[5]).toBe(false);
+  });
+
+  it("names the IP bucket as the one that refused", async () => {
+    const { subject } = buckets();
+    for (let i = 0; i < 5; i++) await subject.check("auth", ANONYMOUS);
+    const refused = await subject.check("auth", ANONYMOUS);
+    expect(refused.exhausted?.scope).toBe("ip");
+  });
+
+  it("counts two addresses separately", async () => {
+    const { subject } = buckets();
+    for (let i = 0; i < 6; i++) await subject.check("auth", ANONYMOUS);
+    const other = await subject.check("auth", { ...ANONYMOUS, ip: "198.51.100.2" });
+    expect(other.allowed).toBe(true);
+  });
+
+  it("SKIPS the user bucket rather than counting every anonymous caller against one key", async () => {
+    // Falling back to a shared placeholder identity would let any one
+    // unauthenticated caller exhaust the per-user limit for all of them.
+    const consumed: string[] = [];
+    const clock = { ms: Date.UTC(2026, 7, 25, 12, 0, 0) };
+    const inner = new InMemoryCacheAdapter(() => clock.ms);
+    const counting: Cache = {
+      get: (key) => inner.get(key),
+      set: (key, value, options) => inner.set(key, value, options),
+      delete: (key) => inner.delete(key),
+      increment: (key, ttlMs) => inner.increment(key, ttlMs),
+      timeToLiveMs: (key) => inner.timeToLiveMs(key),
+      consume: (key, bucket) => {
+        consumed.push(key);
+        return inner.consume(key, bucket);
+      },
+    };
+
+    await new RateLimitBuckets(counting, RATE_LIMIT_DEFAULTS, () => clock.ms).check("auth", ANONYMOUS);
+
+    expect(consumed).toHaveLength(1);
+    expect(consumed[0]).toContain(":ip:");
+    expect(consumed.some((key) => key.includes(":user:"))).toBe(false);
+  });
+
+  it("keys an anonymous bucket globally, never under a workspace", async () => {
+    const consumed: string[] = [];
+    const inner = new InMemoryCacheAdapter();
+    const counting: Cache = {
+      get: (key) => inner.get(key),
+      set: (key, value, options) => inner.set(key, value, options),
+      delete: (key) => inner.delete(key),
+      increment: (key, ttlMs) => inner.increment(key, ttlMs),
+      timeToLiveMs: (key) => inner.timeToLiveMs(key),
+      consume: (key, bucket) => {
+        consumed.push(key);
+        return inner.consume(key, bucket);
+      },
+    };
+
+    await new RateLimitBuckets(counting).check("public_niche_reports", ANONYMOUS);
+
+    // `{env}:global:…` — pre-authentication traffic is not attributable to a
+    // tenant, so it must not sit under one.
+    expect(consumed[0]).toBe("test:global:ratelimit:public_niche_reports:ip:203.0.113.7");
+  });
+});

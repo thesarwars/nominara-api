@@ -40,17 +40,8 @@ export class RateLimitGuard implements CanActivate {
     const request = http.getRequest<RateLimitedRequest>();
     const reply = http.getResponse<FastifyReply>();
 
-    const workspaceId = request.auth?.ws;
-    const userId = request.auth?.sub;
-    if (!workspaceId || !userId) {
-      // An unauthenticated request has no identity to count against. The
-      // counters are tenant-scoped keys (Valkey has no row-level security), so
-      // there is no key to write that would not be a cross-tenant key. Public
-      // and pre-authentication routes are limited by the surface in front of
-      // this service; inventing a shared bucket here would let one caller
-      // exhaust every other caller's capacity.
-      return true;
-    }
+    const workspaceId = request.auth?.ws ?? undefined;
+    const userId = request.auth?.sub ?? undefined;
 
     const declared = this.reflector.getAllAndOverride<RateLimitRouteClass>(RATE_LIMIT_CLASS_KEY, [
       context.getHandler(),
@@ -58,10 +49,16 @@ export class RateLimitGuard implements CanActivate {
     ]);
     const routeClass = declared ?? defaultRouteClass(request.method ?? "GET", request.url ?? "");
 
+    // Unauthenticated traffic is limited, not skipped. §12 gives `/auth/*`,
+    // `/portal/session` and `/public/niche-reports*` IP buckets precisely
+    // BECAUSE those callers have no identity yet, and an authenticated-only
+    // guard would leave sign-in — the tightest row in the table — unlimited.
+    // RateLimitBuckets skips the buckets whose scope has no identity and keys
+    // the rest globally; it never invents one.
     const decision = await this.buckets.check(routeClass, {
       env: process.env.NODE_ENV ?? "development",
-      workspaceId,
-      userId,
+      ...(workspaceId === undefined ? {} : { workspaceId }),
+      ...(userId === undefined ? {} : { userId }),
       ip: request.ip ?? "unknown",
     });
 
@@ -83,7 +80,7 @@ export class RateLimitGuard implements CanActivate {
     });
     logger.warn({
       message: "rate limit exhausted",
-      workspace_id: workspaceId,
+      workspace_id: workspaceId ?? null,
       route_class: routeClass,
       bucket: decision.exhausted?.scope ?? "unknown",
       limit: decision.exhausted?.limit ?? null,

@@ -5,7 +5,7 @@ import type {
   RateLimitRouteClassConfig,
 } from "../../../contracts/common/rate-limit.schema.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
-import { rateLimitCounterKey } from "../../lib/cache/valkey-keys.js";
+import { globalKey, rateLimitCounterKey } from "../../lib/cache/valkey-keys.js";
 import { RATE_LIMIT_DEFAULTS } from "./defaults.js";
 
 // STORY-025 T17 — additive bucket evaluation.
@@ -19,8 +19,9 @@ import { RATE_LIMIT_DEFAULTS } from "./defaults.js";
 
 export interface RateLimitIdentity {
   readonly env: string;
-  readonly workspaceId: string;
-  readonly userId: string;
+  /** Absent before authentication — §12's `/auth/*`, `/portal/session` and `/public/niche-reports*` rows. */
+  readonly workspaceId?: string;
+  readonly userId?: string;
   readonly ip: string;
 }
 
@@ -65,7 +66,7 @@ export class RateLimitBuckets {
     return found;
   }
 
-  private identityFor(bucket: RateLimitBucket, identity: RateLimitIdentity): string {
+  private identityFor(bucket: RateLimitBucket, identity: RateLimitIdentity): string | undefined {
     switch (bucket.scope) {
       case "user":
         return identity.userId;
@@ -74,6 +75,39 @@ export class RateLimitBuckets {
       case "ip":
         return identity.ip;
     }
+  }
+
+  /**
+   * Where a bucket's counter lives.
+   *
+   * Tenant-scoped when the caller is authenticated — an IP counter shared
+   * across workspaces would let one tenant's traffic exhaust another's from a
+   * shared office, VPN or CI runner, which is a denial of service between
+   * tenants rather than an abuse control.
+   *
+   * GLOBAL when there is no workspace, which is the case for exactly the three
+   * §12 rows that matter most here: `/auth/*`, `/portal/session` and
+   * `/public/niche-reports*`. Pre-authentication traffic is not attributable to
+   * a tenant, so there is no tenant to scope it to — and a global bucket is the
+   * only way those three rows are enforceable at all. Skipping them instead,
+   * which is what an authenticated-only guard does, leaves sign-in unlimited:
+   * the surface §12 gives the tightest numbers in the whole table.
+   *
+   * Both forms go through src/lib/cache/valkey-keys.ts. Nothing here
+   * concatenates a key by hand, including the calendar cap's day stamp — that
+   * file owns the separator and the segment checks, and a key built beside it
+   * is a key those checks never see.
+   */
+  private keyFor(
+    routeClass: RateLimitRouteClass,
+    bucket: RateLimitBucket,
+    identity: RateLimitIdentity,
+    id: string,
+    ...extra: readonly string[]
+  ): string {
+    return identity.workspaceId === undefined
+      ? globalKey(identity.env, "ratelimit", routeClass, bucket.scope, id, ...extra)
+      : rateLimitCounterKey(identity.env, identity.workspaceId, routeClass, bucket.scope, id, ...extra);
   }
 
   /**
@@ -91,18 +125,17 @@ export class RateLimitBuckets {
     let tightest: RateLimitDecision | undefined;
 
     for (const bucket of config.buckets) {
-      const key = rateLimitCounterKey(
-        identity.env,
-        identity.workspaceId,
-        routeClass,
-        bucket.scope,
-        this.identityFor(bucket, identity),
-      );
+      const id = this.identityFor(bucket, identity);
+      // A bucket whose scope this caller has no identity for is SKIPPED, not
+      // guessed at. Before authentication there is no user and no workspace,
+      // and counting every anonymous caller against one shared key would let
+      // any one of them exhaust the limit for all of them.
+      if (id === undefined) continue;
 
       const outcome =
         bucket.window === "utc_day"
-          ? await this.checkCalendarCap(key, bucket, nowMs)
-          : await this.cache.consume(key, {
+          ? await this.checkCalendarCap(routeClass, bucket, identity, id, nowMs)
+          : await this.cache.consume(this.keyFor(routeClass, bucket, identity, id), {
               capacity: config.burst,
               refillTokens: bucket.limit,
               refillWindowMs: bucket.window_ms!,
@@ -137,12 +170,15 @@ export class RateLimitBuckets {
    * window can.
    */
   private async checkCalendarCap(
-    key: string,
+    routeClass: RateLimitRouteClass,
     bucket: RateLimitBucket,
+    identity: RateLimitIdentity,
+    id: string,
     nowMs: number,
   ): Promise<{ allowed: boolean; remaining: number; resetAfterMs: number }> {
     const untilMidnight = msUntilUtcMidnight(nowMs);
-    const used = await this.cache.increment(`${key}:${utcDayStamp(nowMs)}`, untilMidnight);
+    const key = this.keyFor(routeClass, bucket, identity, id, utcDayStamp(nowMs));
+    const used = await this.cache.increment(key, untilMidnight);
     return {
       allowed: used <= bucket.limit,
       remaining: Math.max(0, bucket.limit - used),

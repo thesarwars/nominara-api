@@ -16,6 +16,7 @@ import { ApiModule } from "../../src/api/api.module.js";
 import { ResponseEnvelopeInterceptor } from "../../src/api/interceptors/response-envelope.interceptor.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { apiUrl } from "../support/api-url.js";
+import { eachRequestFromItsOwnClient } from "../support/distinct-source.js";
 import { dataOf } from "../support/envelope.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME, REFRESH_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 
@@ -181,6 +182,10 @@ describe("STORY-014 · passkey registration and assertion", () => {
     await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
+    // STORY-025 T18 — §12's per-IP auth bucket is real now, and this suite
+    // drives dozens of /auth/* requests. See the helper for what that
+    // trades away and where it is covered instead.
+    eachRequestFromItsOwnClient(app);
   });
 
   afterEach(async () => {
@@ -661,6 +666,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
       await configureApp(apiApp);
       await apiApp.init();
       await apiApp.getHttpAdapter().getInstance().ready();
+      eachRequestFromItsOwnClient(apiApp);
     });
 
     afterEach(async () => {

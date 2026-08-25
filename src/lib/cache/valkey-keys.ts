@@ -89,8 +89,9 @@ export function rateLimitCounterKey(
   routeClass: string,
   scope: string,
   id: string,
+  ...extra: readonly string[]
 ): string {
-  return tenantKey(env, workspaceId, "ratelimit", routeClass, scope, id);
+  return tenantKey(env, workspaceId, "ratelimit", routeClass, scope, id, ...extra);
 }
 
 /** `{env}:{workspace_id}:idem:{fingerprint}` — see idempotencyFingerprint for what the fingerprint covers. */
