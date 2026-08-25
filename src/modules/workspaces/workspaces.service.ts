@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 import { ConflictException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
 import { entityTagFor } from "../../api/etag/entity-tag.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { Page, pageFrom } from "../../api/pagination/page.js";
 import { assertIfMatch } from "../../api/etag/if-match.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { PG_POOL } from "../../db/pg-pool.js";
@@ -18,12 +20,13 @@ import { currentTenantStore, withActorContext, withTenantContext } from "../../t
 import { SessionService } from "../identity/session.service.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { MembershipService } from "./membership.service.js";
+import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import type {
   CreateWorkspaceRequest,
   MemberResponse,
   UpdateMemberRoleRequest,
   UpdateWorkspaceRequest,
-  WorkspaceListResponse,
+  WorkspaceListItemWithRelationship,
   WorkspaceResponse,
 } from "./dto/index.js";
 
@@ -302,8 +305,26 @@ export class WorkspacesService {
     }
   }
 
-  /** STORY-021 AC5/E-11 — GET /workspaces. Cross-tenant self-read under the ADR-0001 actor-only policy class, never withTenantContext. */
-  async listForActor(userId: string): Promise<WorkspaceListResponse> {
+  /**
+   * STORY-021 AC5/E-11 — GET /workspaces. Cross-tenant self-read under the
+   * ADR-0001 actor-only policy class, never withTenantContext.
+   *
+   * STORY-117 — cursor-paginated (`NFR-API-03`), and flat rather than
+   * `{owned, joined}`: one envelope carries one `pagination` member and two
+   * arrays would need two cursors. `relationship` preserves the distinction
+   * per item; see workspace-list-response.schema.ts for why that is the same
+   * product requirement rather than a weakening of it.
+   *
+   * The sort key is `(created_at, id)`, not `created_at` alone. Two
+   * workspaces created in the same transaction share a timestamp, and a
+   * cursor keyed on a non-unique tuple skips and repeats across the page
+   * boundary — the one failure cursor pagination exists to prevent. The key
+   * travels as Postgres's own text rendering of the timestamp: a JS Date is
+   * millisecond-precision and timestamptz is microsecond, so round-tripping
+   * through Date would truncate the key and reintroduce the same bug.
+   */
+  async listForActor(userId: string, pagination: PaginationRequest): Promise<Page<WorkspaceListItemWithRelationship>> {
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
     const client = await this.pool.connect();
     try {
       return await withActorContext(client, { actorId: userId }, async (tx) => {
@@ -314,29 +335,34 @@ export class WorkspacesService {
           role: string;
           plan_key: string;
           status: string;
+          created_at_key: string;
         }>(
-          `SELECT w.id AS workspace_id, w.name, w.slug, m.role, w.plan_key, w.status
+          `SELECT w.id AS workspace_id, w.name, w.slug, m.role, w.plan_key, w.status,
+                  w.created_at::text AS created_at_key
            FROM workspace_members m
            JOIN workspaces w ON w.id = m.workspace_id
            WHERE m.user_id = $1 AND m.status = 'active'
-           ORDER BY w.created_at ASC`,
-          [userId],
+             AND ($2::timestamptz IS NULL OR (w.created_at, w.id) > ($2::timestamptz, $3::uuid))
+           ORDER BY w.created_at ASC, w.id ASC
+           LIMIT $4`,
+          [userId, after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
         );
 
-        const owned: WorkspaceListResponse["owned"] = [];
-        const joined: WorkspaceListResponse["joined"] = [];
-        for (const row of result.rows) {
-          const item = {
+        return pageFrom(
+          result.rows,
+          pagination.limit,
+          (row) => ({
             workspace_id: row.workspace_id,
             name: row.name,
             slug: row.slug,
             role: row.role as MemberResponse["role"],
             plan_key: row.plan_key,
             status: row.status as WorkspaceResponse["status"],
-          };
-          (row.role === "owner" ? owned : joined).push(item);
-        }
-        return { owned, joined };
+            // The same split STORY-021 made into two arrays, per item.
+            relationship: row.role === "owner" ? ("owned" as const) : ("joined" as const),
+          }),
+          (row) => [row.created_at_key, row.workspace_id],
+        );
       });
     } finally {
       client.release();
@@ -475,12 +501,27 @@ export class WorkspacesService {
   }
 
   /** STORY-021 AC7 — GET /workspaces/{id}/members. Ordinary route, ambient transaction. */
-  async listMembers(): Promise<MemberResponse[]> {
+  /**
+   * STORY-117 — cursor-paginated (`NFR-API-03`). Sort key `(joined_at, id)`:
+   * an owner and the first member are created in the SAME transaction at
+   * workspace creation and therefore share `joined_at` exactly, so the
+   * primary-key tie-break is not a refinement here — it is the correctness
+   * condition. No workspace filter: RLS scopes the read to the ambient
+   * tenant, exactly as before this change.
+   */
+  async listMembers(pagination: PaginationRequest): Promise<Page<MemberResponse>> {
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
     const client = currentTenantStore()!.client;
-    const result = await client.query<MemberRow>(
-      `SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE status <> 'removed' ORDER BY joined_at ASC`,
+    const result = await client.query<MemberRow & { joined_at_key: string }>(
+      `SELECT ${MEMBER_COLUMNS}, joined_at::text AS joined_at_key
+       FROM workspace_members
+       WHERE status <> 'removed'
+         AND ($1::timestamptz IS NULL OR (joined_at, id) > ($1::timestamptz, $2::uuid))
+       ORDER BY joined_at ASC, id ASC
+       LIMIT $3`,
+      [after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
     );
-    return result.rows.map(toMemberResponse);
+    return pageFrom(result.rows, pagination.limit, toMemberResponse, (row) => [row.joined_at_key, row.id]);
   }
 
   /**

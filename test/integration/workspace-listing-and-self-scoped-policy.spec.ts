@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { PAGINATION_LIMIT_DEFAULT, type PaginationRequest } from "../../contracts/common/pagination.schema.js";
+import type { WorkspaceListItemWithRelationship } from "../../contracts/workspaces/workspace-list-response.schema.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -102,10 +104,29 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
 
   // ---- scenario 5 ---------------------------------------------------------
 
+  // STORY-117 — listForActor returns a cursor-paginated Page of items each
+  // carrying `relationship`, not `{owned, joined}`. These assertions are about
+  // the SEPARATION, which survives the reshape, so the grouping is derived
+  // here — from the item field — rather than read off two server-built arrays.
+  // Doing it in the test is the point: it proves a client can do it too.
+  const FIRST_PAGE: PaginationRequest = { limit: PAGINATION_LIMIT_DEFAULT };
+
+  async function listGroups(userId: string): Promise<{
+    owned: readonly WorkspaceListItemWithRelationship[];
+    joined: readonly WorkspaceListItemWithRelationship[];
+  }> {
+    const page = await workspaces.listForActor(userId, FIRST_PAGE);
+    return {
+      owned: page.items.filter((w) => w.relationship === "owned"),
+      joined: page.items.filter((w) => w.relationship === "joined"),
+    };
+  }
+
+
   it("scenario 5 — a brand-new user with no workspaces gets an empty owned and joined list", async () => {
     const userId = await createUser();
 
-    const result = await workspaces.listForActor(userId);
+    const result = await listGroups(userId);
 
     expect(result).toEqual({ owned: [], joined: [] });
   });
@@ -114,7 +135,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
     const userId = await createUser();
     const workspace = await workspaces.create(userId, { name: `Owned ${randomUUID()}` }, meta);
 
-    const result = await workspaces.listForActor(userId);
+    const result = await listGroups(userId);
 
     expect(result.owned).toHaveLength(1);
     expect(result.joined).toHaveLength(0);
@@ -125,6 +146,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
       role: "owner",
       plan_key: "free",
       status: "active",
+      relationship: "owned",
     });
   });
 
@@ -134,7 +156,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
     const workspace = await workspaces.create(ownerId, { name: `Shared ${randomUUID()}` }, meta);
     await addMember(workspace.id, memberId, "analyst");
 
-    const result = await workspaces.listForActor(memberId);
+    const result = await listGroups(memberId);
 
     expect(result.owned).toHaveLength(0);
     expect(result.joined).toHaveLength(1);
@@ -145,6 +167,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
       role: "analyst",
       plan_key: "free",
       status: "active",
+      relationship: "joined",
     });
   });
 
@@ -160,7 +183,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
     const workspaceB = await workspaces.create(otherOwnerB, { name: `B ${randomUUID()}` }, meta);
     await addMember(workspaceB.id, userId, "viewer");
 
-    const result = await workspaces.listForActor(userId);
+    const result = await listGroups(userId);
 
     expect(result.owned.map((w) => w.workspace_id)).toEqual([owned.id]);
     expect(result.joined.map((w) => w.workspace_id).sort()).toEqual([workspaceA.id, workspaceB.id].sort());
@@ -171,7 +194,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
     const otherUserId = await createUser();
     await workspaces.create(otherUserId, { name: `Not mine ${randomUUID()}` }, meta);
 
-    const result = await workspaces.listForActor(userId);
+    const result = await listGroups(userId);
 
     expect(result).toEqual({ owned: [], joined: [] });
   });
@@ -182,7 +205,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
     const workspace = await workspaces.create(ownerId, { name: `Removed-from ${randomUUID()}` }, meta);
     await addMember(workspace.id, memberId, "viewer", "removed");
 
-    const result = await workspaces.listForActor(memberId);
+    const result = await listGroups(memberId);
 
     expect(result).toEqual({ owned: [], joined: [] });
   });
@@ -202,7 +225,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
     await addMember(joined.id, userId, "admin");
     await db.query("UPDATE workspaces SET plan_key = 'business' WHERE id = $1", [joined.id]);
 
-    const result = await workspaces.listForActor(userId);
+    const result = await listGroups(userId);
 
     expect(result.owned).toHaveLength(1);
     expect(result.owned[0]!.plan_key).toBe("free");
@@ -219,7 +242,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
     const joined = await workspaces.create(otherOwnerId, { name: `Theirs ${randomUUID()}` }, meta);
     await addMember(joined.id, userId, "admin");
 
-    const result = await workspaces.listForActor(userId);
+    const result = await listGroups(userId);
 
     expect(result.owned).toHaveLength(1);
     expect(result.owned[0]!.plan_key).toBe("business");
@@ -233,7 +256,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
     const workspace = await workspaces.create(ownerId, { name: `Suspended-member ${randomUUID()}` }, meta);
     await addMember(workspace.id, memberId, "viewer", "suspended");
 
-    const result = await workspaces.listForActor(memberId);
+    const result = await listGroups(memberId);
 
     expect(result).toEqual({ owned: [], joined: [] });
   });

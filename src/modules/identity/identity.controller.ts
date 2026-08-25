@@ -1,6 +1,8 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import type { AuthenticatedRequest } from "../../api/guards/auth.guard.js";
+import { paginationRequestSchema, type PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Public } from "../../api/decorators/public.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
@@ -8,6 +10,7 @@ import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { REFRESH_COOKIE_NAME, clearAuthCookies, setAuthCookies } from "../../lib/auth/cookies.js";
 import {
   passkeyListResponseSchema,
+  type PasskeyListItem,
   passkeyOptionsRequestSchema,
   passkeyOptionsResponseSchema,
   passkeyRenameRequestSchema,
@@ -86,9 +89,17 @@ export class IdentityController {
   // that the way it does for every other private route.
   @Get("me/passkeys")
   @SkipTenantContext()
-  @ApiContract({ operationId: "listPasskeys", responseSchema: passkeyListResponseSchema })
-  list(@Req() req: AuthenticatedRequest) {
-    return this.service.listPasskeys(req.auth!.sub);
+  @ApiContract({
+    operationId: "listPasskeys",
+    querySchema: paginationRequestSchema,
+    responseSchema: passkeyListResponseSchema,
+    listOf: true,
+  })
+  list(
+    @Req() req: AuthenticatedRequest,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<PasskeyListItem>> {
+    return this.service.listPasskeys(req.auth!.sub, pagination);
   }
 
   @Patch("me/passkeys/:id")

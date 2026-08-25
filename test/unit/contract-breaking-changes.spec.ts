@@ -30,12 +30,15 @@ interface RecordedChange {
   readonly story: string;
   readonly reason: string;
   readonly breaking: boolean;
+  readonly previous_minor_baseline_rewritten: boolean;
   readonly assert: {
     readonly operation: string;
     readonly path: string;
     readonly method: string;
     readonly status: string;
     readonly response_properties: string[];
+    /** For a change INSIDE `data` — the envelope is unchanged, so top-level properties cannot show it. */
+    readonly data_properties?: string[];
   };
 }
 
@@ -84,14 +87,53 @@ describe("NFR-API-04 · every recorded breaking change stays visible in the cont
     },
   );
 
+  // STORY-117 — this assertion USED to demand that the baseline exhibit the
+  // same shape as the current document, unconditionally. That is backwards for
+  // a breaking change in general: if the two agree, nothing broke. It was
+  // written for T11, which rewrote the baseline in the same commit — the very
+  // handling this file exists to stop from recurring silently.
+  //
+  // So the record now says which happened, and this asserts the one it claims:
+  //
+  //   rewritten: true   the baseline was re-authored to match (T11). The two
+  //                     must agree, and the entry is what makes that visible.
+  //   rewritten: false  the baseline was LEFT ALONE. The two must therefore
+  //                     NOT agree — or the change did not actually break
+  //                     anything and the record is describing a fiction.
+  //
+  // The proxy covers one path (STORY-023 OQ-8: there is no published N-1 to
+  // test against), so "absent" is a legitimate form of "does not agree" and is
+  // reported as such rather than silently passing.
   it.each(record.changes.map((change) => [change.id, change] as const))(
-    "%s is also carried by the previous-minor baseline, so the N-1 gate compares like with like",
+    "%s stands in the correct relation to the previous-minor baseline",
     (_id, change) => {
       const schema = responseSchemaOf(baseline, change);
-      expect(schema, `${change.assert.operation} is missing from the previous-minor baseline`).toBeDefined();
-      expect(Object.keys((schema as { properties?: object }).properties ?? {}).sort()).toEqual(
-        [...change.assert.response_properties].sort(),
-      );
+      if (change.previous_minor_baseline_rewritten) {
+        expect(schema, `${change.assert.operation} is missing from the previous-minor baseline`).toBeDefined();
+        expect(Object.keys((schema as { properties?: object }).properties ?? {}).sort()).toEqual(
+          [...change.assert.response_properties].sort(),
+        );
+        return;
+      }
+      if (schema === undefined) return; // the proxy does not cover this route at all
+      expect(
+        Object.keys((schema as { properties?: object }).properties ?? {}).sort(),
+        `${change.assert.operation} looks IDENTICAL in the previous-minor baseline, so nothing broke — ` +
+          "either the record is wrong or the baseline was quietly rewritten",
+      ).not.toEqual([...change.assert.response_properties].sort());
     },
   );
+
+  // A change inside `data` leaves the envelope untouched, so the top-level
+  // assertion above cannot see it. This one reaches into the payload.
+  it.each(
+    record.changes.filter((change) => change.assert.data_properties !== undefined).map((c) => [c.id, c] as const),
+  )("%s is exhibited by the CURRENT document's data payload", (_id, change) => {
+    const schema = responseSchemaOf(document, change) as
+      | { properties?: { data?: { properties?: object; items?: { properties?: object } } } }
+      | undefined;
+    const data = schema?.properties?.data;
+    const properties = data?.properties ?? data?.items?.properties ?? {};
+    expect(Object.keys(properties).sort()).toEqual([...change.assert.data_properties!].sort());
+  });
 });

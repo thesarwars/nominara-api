@@ -95,7 +95,7 @@ describe("STORY-021 · workspaceResponseSchema", () => {
   });
 });
 
-describe("STORY-021 · workspaceListResponseSchema (scenario 5 — owned/joined separation with plan badge)", () => {
+describe("STORY-117 · workspaceListResponseSchema — a flat list, separation kept per item", () => {
   const ownedItem = {
     workspace_id: VALID_WORKSPACE_ID,
     name: "Acme",
@@ -103,20 +103,35 @@ describe("STORY-021 · workspaceListResponseSchema (scenario 5 — owned/joined 
     role: "owner",
     plan_key: "free",
     status: "active",
+    relationship: "owned",
   };
-  const joinedItem = { ...ownedItem, role: "manager", plan_key: "growth" };
+  const joinedItem = { ...ownedItem, role: "manager", plan_key: "growth", relationship: "joined" };
 
-  it("accepts separate owned and joined arrays, each carrying a plan_key badge", () => {
-    const result = workspaceListResponseSchema.safeParse({ owned: [ownedItem], joined: [joinedItem] });
-    expect(result.success).toBe(true);
+  it("accepts a flat list whose items each declare their relationship and plan badge", () => {
+    expect(workspaceListResponseSchema.safeParse([ownedItem, joinedItem]).success).toBe(true);
   });
 
-  it("accepts empty owned/joined arrays (a user with no owned workspace yet)", () => {
-    expect(workspaceListResponseSchema.safeParse({ owned: [], joined: [] }).success).toBe(true);
+  it("accepts an empty list (a user with no memberships yet)", () => {
+    expect(workspaceListResponseSchema.safeParse([]).success).toBe(true);
   });
 
-  it("rejects a response missing the owned/joined split (a flat array)", () => {
-    expect(workspaceListResponseSchema.safeParse([ownedItem]).success).toBe(false);
+  // STORY-021's separation is the requirement and it survives — but it is now
+  // carried by the item, so an item WITHOUT it is a response a switcher cannot
+  // group. That must fail rather than default to one bucket.
+  it("rejects an item with no relationship — the separation is not optional", () => {
+    const { relationship: _dropped, ...withoutRelationship } = ownedItem;
+    expect(workspaceListResponseSchema.safeParse([withoutRelationship]).success).toBe(false);
+  });
+
+  it("rejects a relationship outside owned|joined", () => {
+    expect(workspaceListResponseSchema.safeParse([{ ...ownedItem, relationship: "invited" }]).success).toBe(false);
+  });
+
+  // Pins the N-1 break itself: the old shape must NOT still validate, or the
+  // record in contracts/baseline/breaking-changes.json would describe a change
+  // that did not happen.
+  it("rejects the previous {owned, joined} shape", () => {
+    expect(workspaceListResponseSchema.safeParse({ owned: [ownedItem], joined: [joinedItem] }).success).toBe(false);
   });
 
   it("rejects an unrecognized key on a list item (.strict())", () => {

@@ -270,7 +270,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     const reqRes = await requestOtp(email);
     expect(reqRes.statusCode).toBe(OTP_REQUEST_SUCCESS_STATUS);
     // STORY-024 T10 — §1's envelope wraps the resource under `data`.
-    expect(dataOf(reqRes)).toEqual({ status: "sent", expires_in_seconds: 600 });
+    expect(dataOf(reqRes)).toEqual({ status: "sent", expires_in_ms: 600_000 });
 
     const code = fakeSender.latestCodeFor(email);
     expect(code).toMatch(/^\d{8}$/);

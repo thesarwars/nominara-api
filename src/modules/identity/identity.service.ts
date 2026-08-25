@@ -13,6 +13,9 @@ import {
 } from "@simplewebauthn/server";
 import type { Pool } from "pg";
 import { loadEnv } from "../../config/env.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { Page, pageFrom } from "../../api/pagination/page.js";
+import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { nextCounter } from "../../lib/webauthn/sign-counter-policy.js";
@@ -327,18 +330,37 @@ export class IdentityService {
     return await this.sessions.createSession(row.user_id);
   }
 
-  async listPasskeys(userId: string): Promise<PasskeyListItem[]> {
+  /**
+   * STORY-117 — cursor-paginated (`NFR-API-03`). There is no documented cap
+   * on passkeys per user and the reference's endpoint registry did not list
+   * this route at all, so "it is naturally small" was an assumption rather
+   * than a bound. `(created_at, id)` because a user can register two
+   * credentials in the same transaction during a device-migration flow.
+   *
+   * `created_at_key` is Postgres's own text rendering, used ONLY as the
+   * cursor key and stripped before the row reaches the response — the schema
+   * is `.strict()`, and an extra member would fail it.
+   */
+  async listPasskeys(userId: string, pagination: PaginationRequest): Promise<Page<PasskeyListItem>> {
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
     const client = await this.pool.connect();
     try {
-      const result = await client.query<PasskeyListItem>(
+      const result = await client.query<PasskeyListItem & { created_at_key: string }>(
         `SELECT id, device_label, authenticator_attachment, transports,
-                last_used_at, created_at
+                last_used_at, created_at, created_at::text AS created_at_key
          FROM user_credentials
          WHERE user_id = $1 AND kind = 'passkey' AND revoked_at IS NULL
-         ORDER BY created_at ASC`,
-        [userId],
+           AND ($2::timestamptz IS NULL OR (created_at, id) > ($2::timestamptz, $3::uuid))
+         ORDER BY created_at ASC, id ASC
+         LIMIT $4`,
+        [userId, after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
       );
-      return result.rows;
+      return pageFrom(
+        result.rows,
+        pagination.limit,
+        ({ created_at_key: _key, ...item }) => item,
+        (row) => [row.created_at_key, row.id],
+      );
     } finally {
       client.release();
     }

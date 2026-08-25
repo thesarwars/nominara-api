@@ -17,7 +17,68 @@
         "path": "/v1/workspaces",
         "method": "post",
         "status": "201",
-        "response_properties": ["data", "meta"]
+        "response_properties": [
+          "data",
+          "meta"
+        ]
+      }
+    },
+    {
+      "id": "2026-08-25-workspace-list-flattened",
+      "recorded": "2026-08-25",
+      "story": "STORY-117",
+      "task": "T1",
+      "scope": "listWorkspaces (GET /v1/workspaces)",
+      "from": "{ owned: WorkspaceListItem[], joined: WorkspaceListItem[] }",
+      "to": "WorkspaceListItem[] with a per-item `relationship` of owned|joined, plus the envelope's `pagination` member",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "NFR-API-03 makes every list cursor-paginated and api-specification.md §1's envelope carries exactly one `pagination` member, which cannot describe two independent cursors over two arrays. STORY-021's requirement is that a caller can tell an owned workspace from a joined one; that is preserved per item rather than by shape, so the switcher still groups and badges them with one filter. The one-owned invariant caps `owned` at a single row, so `joined` was always the only unbounded half. There was no additive option: leaving the two arrays would have left the route permanently outside NFR-API-03. The previous-minor proxy was deliberately NOT rewritten this time, so the N-1 comparison shows the break instead of hiding it.",
+      "assert": {
+        "operation": "listWorkspaces",
+        "path": "/v1/workspaces",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "workspace_id",
+          "name",
+          "slug",
+          "role",
+          "plan_key",
+          "status",
+          "relationship"
+        ]
+      }
+    },
+    {
+      "id": "2026-08-25-otp-duration-units",
+      "recorded": "2026-08-25",
+      "story": "STORY-117",
+      "task": "T1 (rider)",
+      "scope": "requestEmailOtp (POST /v1/auth/otp/request)",
+      "from": "expires_in_seconds: 600",
+      "to": "expires_in_ms: 600000",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "NFR-API-05 states that all durations are integer milliseconds with a `_ms` suffix. No reference document ever named this field; it was invented in code during STORY-016 and published, so the taxonomy sweep in money-and-formats.spec carried a named exemption for it (decision D14) with a guard asserting the exemption still described a real field. That guard has now fired. Both the unit and the name change together, because a renamed unit keeping the old name is worse than either alone: a consumer reading `expires_in_seconds` and getting 600000 would show a ten-thousand-minute expiry.",
+      "assert": {
+        "operation": "requestEmailOtp",
+        "path": "/v1/auth/otp/request",
+        "method": "post",
+        "status": "201",
+        "response_properties": [
+          "data",
+          "meta"
+        ],
+        "data_properties": [
+          "status",
+          "expires_in_ms"
+        ]
       }
     }
   ]

@@ -7,6 +7,7 @@ import { map } from "rxjs/operators";
 import type { EnvelopeMeta } from "../../../contracts/common/envelope.schema.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { NO_ENVELOPE_KEY } from "../decorators/no-envelope.decorator.js";
+import { Page } from "../pagination/page.js";
 import type { AuthenticatedRequest } from "../guards/auth.guard.js";
 
 // STORY-024 T10 — AC5: api-specification.md §1's response envelope,
@@ -94,6 +95,20 @@ export class ResponseEnvelopeInterceptor implements NestInterceptor {
           request_id: requestId,
           workspace_id: request.auth?.ws ?? null,
         });
+
+        // STORY-117 — a list handler returns a Page, and the `pagination`
+        // member §1 shows is filled in HERE, from it. Before this the member
+        // was declared in the envelope schema and populated by nothing: every
+        // list route sent an unbounded array and no cursor, so `NFR-API-03`
+        // was unmet on every one of them while the envelope advertised the
+        // shape that would have satisfied it.
+        //
+        // `pagination` appears on a list response and NOWHERE else — never as
+        // an empty or null placeholder on a single resource, which would be a
+        // member a consumer has to write a dead branch against.
+        if (body instanceof Page) {
+          return { data: body.items, pagination: body.pagination, meta };
+        }
 
         // A handler returning `Promise<void>` (auth/refresh, auth/logout,
         // both verify routes, and the workspaces mutations) has no resource

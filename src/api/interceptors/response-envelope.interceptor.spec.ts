@@ -4,6 +4,7 @@ import { of, lastValueFrom } from "rxjs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { envelopeMetaSchema } from "../../../contracts/common/envelope.schema.js";
 import { NoEnvelope } from "../decorators/no-envelope.decorator.js";
+import { Page } from "../pagination/page.js";
 import { ResponseEnvelopeInterceptor, SCORING_VERSION } from "./response-envelope.interceptor.js";
 
 // STORY-024 T10 — coding-standards.md §7: "Every story adds at least one
@@ -123,5 +124,51 @@ describe("STORY-024 · ResponseEnvelopeInterceptor", () => {
     const serialized = JSON.stringify(logged());
     expect(serialized, "a workspace NAME must never reach a log line").not.toContain("Acme Corporation");
     expect(serialized, "no response body content belongs in a log line").not.toContain("s3cret");
+  });
+
+  // STORY-117 — the `pagination` member. Declared in the envelope since
+  // STORY-023 and populated by nothing until now, which is how four list
+  // endpoints shipped unbounded arrays while the published contract described
+  // the shape that would have satisfied NFR-API-03.
+  describe("a Page becomes the pagination member", () => {
+    const pagination = { cursor_next: "eyJ2IjoxLCJrIjpbMV19", has_more: true, limit: 50 };
+
+    it("splits a Page into data and pagination, and does not nest it under data", async () => {
+      const interceptor = new ResponseEnvelopeInterceptor(new Reflector());
+      const { context } = contextFor(Wrapped, "ws-1");
+      const body = (await lastValueFrom(
+        interceptor.intercept(context, handlerReturning(new Page([{ id: "a" }], pagination))),
+      )) as Record<string, unknown>;
+
+      expect(body.data).toEqual([{ id: "a" }]);
+      expect(body.pagination).toEqual(pagination);
+      expect(envelopeMetaSchema.safeParse(body.meta).success).toBe(true);
+    });
+
+    it("omits pagination entirely for a single resource — never an empty or null placeholder", async () => {
+      const interceptor = new ResponseEnvelopeInterceptor(new Reflector());
+      const { context } = contextFor(Wrapped, "ws-1");
+      const body = (await lastValueFrom(
+        interceptor.intercept(context, handlerReturning({ id: "a" })),
+      )) as Record<string, unknown>;
+
+      expect(body).not.toHaveProperty("pagination");
+      expect(body.data).toEqual({ id: "a" });
+    });
+
+    // A plain object carrying the same two fields must NOT be mistaken for a
+    // page: that would silently reshape any resource that happened to have an
+    // `items` and a `pagination` property.
+    it("treats a look-alike object as ordinary data", async () => {
+      const interceptor = new ResponseEnvelopeInterceptor(new Reflector());
+      const { context } = contextFor(Wrapped, "ws-1");
+      const lookalike = { items: [{ id: "a" }], pagination };
+      const body = (await lastValueFrom(
+        interceptor.intercept(context, handlerReturning(lookalike)),
+      )) as Record<string, unknown>;
+
+      expect(body.data).toEqual(lookalike);
+      expect(body).not.toHaveProperty("pagination");
+    });
   });
 });

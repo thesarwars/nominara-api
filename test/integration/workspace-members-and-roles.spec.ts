@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { PAGINATION_LIMIT_DEFAULT } from "../../contracts/common/pagination.schema.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -229,13 +230,13 @@ describe("STORY-021 · member listing, role changes, and removal within the matr
   it("member listing returns every non-removed member, and removal excludes a member from a subsequent listing", async () => {
     const f = await makeFixture();
 
-    const before = await runInTenant(f.workspaceId, f.ownerId, () => service.listMembers());
+    const before = (await runInTenant(f.workspaceId, f.ownerId, () => service.listMembers({ limit: PAGINATION_LIMIT_DEFAULT }))).items;
     expect(before).toHaveLength(3);
     expect(before.map((m) => m.role).sort()).toEqual(["admin", "owner", "viewer"]);
 
     await runInTenant(f.workspaceId, f.adminId, () => service.removeMemberById(f.workspaceId, f.viewerMemberId));
 
-    const after = await runInTenant(f.workspaceId, f.ownerId, () => service.listMembers());
+    const after = (await runInTenant(f.workspaceId, f.ownerId, () => service.listMembers({ limit: PAGINATION_LIMIT_DEFAULT }))).items;
     expect(after).toHaveLength(2);
     expect(after.some((m) => m.id === f.viewerMemberId)).toBe(false);
 

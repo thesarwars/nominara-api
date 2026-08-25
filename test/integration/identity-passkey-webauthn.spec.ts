@@ -1,7 +1,7 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Test } from "@nestjs/testing";
 import { ConflictException } from "@nestjs/common";
-import { APP_FILTER, APP_GUARD } from "@nestjs/core";
+import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
@@ -13,6 +13,7 @@ import { IdentityService } from "../../src/modules/identity/identity.service.js"
 import { AuthGuard } from "../../src/api/guards/auth.guard.js";
 import { ProblemFilter } from "../../src/api/filters/problem.filter.js";
 import { ApiModule } from "../../src/api/api.module.js";
+import { ResponseEnvelopeInterceptor } from "../../src/api/interceptors/response-envelope.interceptor.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { apiUrl } from "../support/api-url.js";
 import { dataOf } from "../support/envelope.js";
@@ -164,6 +165,14 @@ describe("STORY-014 · passkey registration and assertion", () => {
       imports: [DbModule, IdentityModule],
       providers: [
         { provide: APP_GUARD, useClass: AuthGuard },
+        // STORY-117 — this app is deliberately partial (no ApiModule), and
+        // until now it also had no envelope, so every assertion here read a
+        // body shape production has not sent since STORY-024 T10. `dataOf`
+        // tolerates both, which is exactly why nobody noticed. Registering
+        // the real interceptor makes these tests assert what a client
+        // actually receives — including `/me/passkeys`, which is a paginated
+        // list as of this story and whose Page must be split, not serialized.
+        { provide: APP_INTERCEPTOR, useClass: ResponseEnvelopeInterceptor },
         { provide: APP_FILTER, useClass: ProblemFilter },
       ],
     }).compile();
@@ -374,9 +383,9 @@ describe("STORY-014 · passkey registration and assertion", () => {
 
   it("STORY-014 · renaming a credential updates its device label", async () => {
     const { cookies } = await registerPasskey("ivan@example.com", credId("cred-ivan"), 0);
-    const [{ id }] = (
-      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) })
-    ).json();
+    const { id } = dataOf<{ id: string }[]>(
+      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) }),
+    )[0]!;
 
     const renameRes = await app.inject({
       method: "PATCH",
@@ -386,9 +395,9 @@ describe("STORY-014 · passkey registration and assertion", () => {
     });
     expect(renameRes.statusCode).toBe(200);
 
-    const [after] = (
-      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) })
-    ).json();
+    const after = dataOf<{ device_label: string }[]>(
+      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) }),
+    )[0]!;
     expect(after.device_label).toBe("My Yubikey");
   });
 
@@ -406,14 +415,14 @@ describe("STORY-014 · passkey registration and assertion", () => {
       payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id, response: credentialResponse(credId("cred-judy-2")) },
     });
 
-    const list = (
-      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) })
-    ).json();
+    const list = dataOf<{ id: string }[]>(
+      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) }),
+    );
     expect(list).toHaveLength(2);
 
     const revokeRes = await app.inject({
       method: "DELETE",
-      url: apiUrl(`/me/passkeys/${list[0].id}`),
+      url: apiUrl(`/me/passkeys/${list[0]!.id}`),
       ...mutatingHeaders(cookies),
     });
     expect(revokeRes.statusCode).toBe(200);
@@ -440,9 +449,9 @@ describe("STORY-014 · passkey registration and assertion", () => {
     });
     const { cookies: cookiesB } = await registerPasskey("leo2@example.com", credId("cred-leo2"), 0);
 
-    const [{ id: kimCredentialId }] = (
-      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookiesA) })
-    ).json();
+    const kimCredentialId = dataOf<{ id: string }[]>(
+      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookiesA) }),
+    )[0]!.id;
 
     const renameRes = await app.inject({
       method: "PATCH",
@@ -532,9 +541,9 @@ describe("STORY-014 · passkey registration and assertion", () => {
       payload: { ceremony_id: dataOf<{ ceremony_id: string }>(secondOptionsRes).ceremony_id, response: credentialResponse(credId("cred-tina-2")) },
     });
 
-    const list = (
-      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) })
-    ).json();
+    const list = dataOf<{ id: string }[]>(
+      await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) }),
+    );
     expect(list).toHaveLength(2);
 
     // Driven directly against IdentityService (real Postgres, real
@@ -586,8 +595,8 @@ describe("STORY-014 · passkey registration and assertion", () => {
     let outcomes: PromiseSettledResult<void>[];
     try {
       outcomes = await Promise.allSettled([
-        service.revokePasskey(sub, list[0].id),
-        service.revokePasskey(sub, list[1].id),
+        service.revokePasskey(sub, list[0]!.id),
+        service.revokePasskey(sub, list[1]!.id),
       ]);
     } finally {
       querySpy.mockRestore();

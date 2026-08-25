@@ -359,14 +359,14 @@
                           "type": "string",
                           "const": "sent"
                         },
-                        "expires_in_seconds": {
+                        "expires_in_ms": {
                           "type": "number",
-                          "const": 600
+                          "const": 600000
                         }
                       },
                       "required": [
                         "status",
-                        "expires_in_seconds"
+                        "expires_in_ms"
                       ],
                       "additionalProperties": false
                     },
@@ -1001,6 +1001,36 @@
                         "additionalProperties": false
                       }
                     },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "cursor_next": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "has_more": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 200
+                        }
+                      },
+                      "required": [
+                        "cursor_next",
+                        "has_more",
+                        "limit"
+                      ],
+                      "additionalProperties": false
+                    },
                     "meta": {
                       "type": "object",
                       "properties": {
@@ -1028,6 +1058,7 @@
                   },
                   "required": [
                     "data",
+                    "pagination",
                     "meta"
                   ],
                   "additionalProperties": false
@@ -1035,7 +1066,29 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 200
+            }
+          }
+        ]
       }
     },
     "/v1/me/passkeys/{id}": {
@@ -1551,118 +1604,93 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "type": "object",
-                      "properties": {
-                        "owned": {
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "properties": {
-                              "workspace_id": {
-                                "type": "string",
-                                "format": "uuid",
-                                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-                              },
-                              "name": {
-                                "type": "string"
-                              },
-                              "slug": {
-                                "type": "string"
-                              },
-                              "role": {
-                                "type": "string",
-                                "enum": [
-                                  "owner",
-                                  "admin",
-                                  "manager",
-                                  "analyst",
-                                  "viewer"
-                                ]
-                              },
-                              "plan_key": {
-                                "type": "string"
-                              },
-                              "status": {
-                                "type": "string",
-                                "enum": [
-                                  "trialing",
-                                  "active",
-                                  "past_due",
-                                  "soft_capped",
-                                  "suspended",
-                                  "pending_deletion",
-                                  "deleted"
-                                ]
-                              }
-                            },
-                            "required": [
-                              "workspace_id",
-                              "name",
-                              "slug",
-                              "role",
-                              "plan_key",
-                              "status"
-                            ],
-                            "additionalProperties": false
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "workspace_id": {
+                            "type": "string",
+                            "format": "uuid",
+                            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "slug": {
+                            "type": "string"
+                          },
+                          "role": {
+                            "type": "string",
+                            "enum": [
+                              "owner",
+                              "admin",
+                              "manager",
+                              "analyst",
+                              "viewer"
+                            ]
+                          },
+                          "plan_key": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "trialing",
+                              "active",
+                              "past_due",
+                              "soft_capped",
+                              "suspended",
+                              "pending_deletion",
+                              "deleted"
+                            ]
+                          },
+                          "relationship": {
+                            "type": "string",
+                            "enum": [
+                              "owned",
+                              "joined"
+                            ]
                           }
                         },
-                        "joined": {
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "properties": {
-                              "workspace_id": {
-                                "type": "string",
-                                "format": "uuid",
-                                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-                              },
-                              "name": {
-                                "type": "string"
-                              },
-                              "slug": {
-                                "type": "string"
-                              },
-                              "role": {
-                                "type": "string",
-                                "enum": [
-                                  "owner",
-                                  "admin",
-                                  "manager",
-                                  "analyst",
-                                  "viewer"
-                                ]
-                              },
-                              "plan_key": {
-                                "type": "string"
-                              },
-                              "status": {
-                                "type": "string",
-                                "enum": [
-                                  "trialing",
-                                  "active",
-                                  "past_due",
-                                  "soft_capped",
-                                  "suspended",
-                                  "pending_deletion",
-                                  "deleted"
-                                ]
-                              }
+                        "required": [
+                          "workspace_id",
+                          "name",
+                          "slug",
+                          "role",
+                          "plan_key",
+                          "status",
+                          "relationship"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "cursor_next": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "minLength": 1
                             },
-                            "required": [
-                              "workspace_id",
-                              "name",
-                              "slug",
-                              "role",
-                              "plan_key",
-                              "status"
-                            ],
-                            "additionalProperties": false
-                          }
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "has_more": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 200
                         }
                       },
                       "required": [
-                        "owned",
-                        "joined"
+                        "cursor_next",
+                        "has_more",
+                        "limit"
                       ],
                       "additionalProperties": false
                     },
@@ -1693,6 +1721,7 @@
                   },
                   "required": [
                     "data",
+                    "pagination",
                     "meta"
                   ],
                   "additionalProperties": false
@@ -1700,7 +1729,29 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 200
+            }
+          }
+        ]
       }
     },
     "/v1/workspaces/{id}": {
@@ -2113,6 +2164,36 @@
                         "additionalProperties": false
                       }
                     },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "cursor_next": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "has_more": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 200
+                        }
+                      },
+                      "required": [
+                        "cursor_next",
+                        "has_more",
+                        "limit"
+                      ],
+                      "additionalProperties": false
+                    },
                     "meta": {
                       "type": "object",
                       "properties": {
@@ -2140,6 +2221,7 @@
                   },
                   "required": [
                     "data",
+                    "pagination",
                     "meta"
                   ],
                   "additionalProperties": false
@@ -2147,7 +2229,29 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 200
+            }
+          }
+        ]
       }
     },
     "/v1/workspaces/{id}/invitations/accept": {
@@ -2381,6 +2485,36 @@
                         "additionalProperties": false
                       }
                     },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "cursor_next": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "has_more": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 200
+                        }
+                      },
+                      "required": [
+                        "cursor_next",
+                        "has_more",
+                        "limit"
+                      ],
+                      "additionalProperties": false
+                    },
                     "meta": {
                       "type": "object",
                       "properties": {
@@ -2408,6 +2542,7 @@
                   },
                   "required": [
                     "data",
+                    "pagination",
                     "meta"
                   ],
                   "additionalProperties": false
@@ -2415,7 +2550,29 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 200
+            }
+          }
+        ]
       }
     },
     "/v1/workspaces/{id}/switch": {

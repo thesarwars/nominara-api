@@ -5,6 +5,9 @@ import { PG_POOL } from "../../db/pg-pool.js";
 import { generateInvitationToken, hashInvitationToken, INVITATION_TTL_MS } from "../../lib/auth/invitation-token.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { InvitationInvalidException } from "../../tenancy/errors.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { Page, pageFrom } from "../../api/pagination/page.js";
+import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 import type { AuditRequestMeta } from "./workspaces.service.js";
 import type { CreateInvitationRequest, InvitationResponse, MemberResponse } from "./dto/index.js";
@@ -101,16 +104,34 @@ export class InvitationsService {
     return toInvitationResponse(result.rows[0]!, rawToken);
   }
 
-  /** STORY-021 AC "one pending invitation per address" — lists outstanding (not yet accepted or revoked) invitations. */
-  async list(workspaceId: string): Promise<InvitationResponse[]> {
+  /**
+   * STORY-021 AC "one pending invitation per address" — lists outstanding
+   * (not yet accepted or revoked) invitations.
+   *
+   * STORY-117 — cursor-paginated (`NFR-API-03`), newest first as before. The
+   * sort key is `(created_at, id)`: re-inviting an address revokes and
+   * re-inserts in ONE transaction, so two rows here can share `created_at` to
+   * the microsecond, and a cursor keyed on the timestamp alone would drop or
+   * repeat one of them at a page boundary.
+   */
+  async list(workspaceId: string, pagination: PaginationRequest): Promise<Page<InvitationResponse>> {
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
     const client = currentTenantStore()!.client;
-    const result = await client.query<InvitationRow>(
-      `SELECT ${INVITATION_COLUMNS} FROM workspace_invitations
+    const result = await client.query<InvitationRow & { created_at_key: string }>(
+      `SELECT ${INVITATION_COLUMNS}, created_at::text AS created_at_key
+       FROM workspace_invitations
        WHERE workspace_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL
-       ORDER BY created_at DESC`,
-      [workspaceId],
+         AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+       ORDER BY created_at DESC, id DESC
+       LIMIT $4`,
+      [workspaceId, after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
     );
-    return result.rows.map((row) => toInvitationResponse(row));
+    return pageFrom(
+      result.rows,
+      pagination.limit,
+      (row) => toInvitationResponse(row),
+      (row) => [row.created_at_key, row.id],
+    );
   }
 
   /**

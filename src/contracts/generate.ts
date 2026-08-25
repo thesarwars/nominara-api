@@ -5,6 +5,7 @@ import openapiTS, { astToString } from "openapi-typescript";
 import { z, type ZodType } from "zod";
 import { errorCodeSchema } from "../../contracts/common/error-code.schema.js";
 import { envelopeSchema } from "../../contracts/common/envelope.schema.js";
+import { paginationResponseSchema } from "../../contracts/common/pagination.schema.js";
 import {
   PAGINATION_LIMIT_DEFAULT,
   PAGINATION_LIMIT_MAX,
@@ -193,7 +194,13 @@ function responseSchemaFor(route: DiscoveredContractRoute): ZodType {
   }
 
   const enveloped = envelopeSchema(contract.responseSchema ?? z.null());
-  return contract.listOf === true ? enveloped : enveloped.omit({ pagination: true });
+  // STORY-117 — REQUIRED on a list, absent everywhere else. envelopeSchema
+  // declares the member optional so that one schema can serve both, but a
+  // published list contract that says "pagination may or may not be here" is
+  // a contract a consumer must branch on, and the server always sends it.
+  return contract.listOf === true
+    ? enveloped.extend({ pagination: paginationResponseSchema })
+    : enveloped.omit({ pagination: true });
 }
 
 // STORY-024 T11 — AC6: "Pagination is cursor-based … Offset pagination

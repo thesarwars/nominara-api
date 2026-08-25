@@ -1,6 +1,8 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import { z } from "zod";
+import { paginationRequestSchema, type PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { entityTagFor, formatEntityTag } from "../../api/etag/entity-tag.js";
 import { parseIfMatch } from "../../api/etag/if-match.js";
@@ -29,7 +31,7 @@ import {
   type MemberResponse,
   type UpdateMemberRoleRequest,
   type UpdateWorkspaceRequest,
-  type WorkspaceListResponse,
+  type WorkspaceListItemWithRelationship,
   type WorkspaceResponse,
 } from "./dto/index.js";
 import { InvitationsService } from "./invitations.service.js";
@@ -81,9 +83,17 @@ export class WorkspacesController {
 
   @Get("workspaces")
   @SkipTenantContext()
-  @ApiContract({ operationId: "listWorkspaces", responseSchema: workspaceListResponseSchema })
-  list(@Req() req: AuditableRequest): Promise<WorkspaceListResponse> {
-    return this.service.listForActor(req.auth!.sub);
+  @ApiContract({
+    operationId: "listWorkspaces",
+    querySchema: paginationRequestSchema,
+    responseSchema: workspaceListResponseSchema,
+    listOf: true,
+  })
+  list(
+    @Req() req: AuditableRequest,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<WorkspaceListItemWithRelationship>> {
+    return this.service.listForActor(req.auth!.sub, pagination);
   }
 
   @Patch("workspaces/:id")
@@ -129,10 +139,19 @@ export class WorkspacesController {
 
   @Get("workspaces/:id/members")
   @RequirePermission("workspace:read")
-  @ApiContract({ operationId: "listWorkspaceMembers", responseSchema: z.array(memberResponseSchema) })
-  listMembers(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<MemberResponse[]> {
+  @ApiContract({
+    operationId: "listWorkspaceMembers",
+    querySchema: paginationRequestSchema,
+    responseSchema: z.array(memberResponseSchema),
+    listOf: true,
+  })
+  listMembers(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<MemberResponse>> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
-    return this.service.listMembers();
+    return this.service.listMembers(pagination);
   }
 
   @Patch("members/:id")
@@ -170,10 +189,19 @@ export class WorkspacesController {
 
   @Get("workspaces/:id/invitations")
   @RequirePermission("member:invite")
-  @ApiContract({ operationId: "listInvitations", responseSchema: z.array(invitationResponseSchema) })
-  listInvitations(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<InvitationResponse[]> {
+  @ApiContract({
+    operationId: "listInvitations",
+    querySchema: paginationRequestSchema,
+    responseSchema: z.array(invitationResponseSchema),
+    listOf: true,
+  })
+  listInvitations(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<InvitationResponse>> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
-    return this.invitations.list(id);
+    return this.invitations.list(id, pagination);
   }
 
   @Post("workspaces/:id/invitations/accept")

@@ -79,19 +79,14 @@ describe("STORY-024 · AC10 — the contract sources obey NFR-API-05 everywhere"
     expect(files.length).toBeGreaterThan(30);
   });
 
-  // ONE named exemption (decision D14), never a silent skip. This sweep does
-  // NOT cover `expires_in_seconds` on emailOtpRequestResponseSchema, and that
-  // field IS an NFR-API-05 violation — a duration that is neither integer
-  // milliseconds nor `_ms`-suffixed. It is exempt because it is STORY-016's
-  // PUBLISHED surface: it sits in contracts/openapi.generated.json and the
-  // generated client, and correcting it means editing another story's schema,
-  // service, and two of its tests. Deferred to a follow-up story rather than
-  // absorbed into STORY-024 — now STORY-117, which carries it as a rider
-  // alongside the list-endpoint reshape because both are breaking wire
-  // changes and share one baseline record; when it lands, this set empties
-  // and this comment goes with it. Read a green run of this test as "AC10 holds
-  // everywhere EXCEPT this named field", never as "AC10 holds everywhere".
-  const AC10_DURATION_EXEMPTIONS = new Set(["contracts/identity/email-otp-request-response.schema.ts: expires_in_seconds"]);
+  // STORY-117 — there was ONE named exemption here (decision D14):
+  // `expires_in_seconds` on emailOtpRequestResponseSchema, an NFR-API-05
+  // violation left standing because it sat in the published document and
+  // correcting it meant editing another story's schema, service and tests.
+  // STORY-117 did exactly that, so the exemption set is EMPTY and the sweep
+  // below is now unqualified. A green run means "everywhere", with no
+  // asterisk — which is what it always claimed and did not mean.
+  const AC10_DURATION_EXEMPTIONS = new Set<string>();
 
   it("every duration field ends in _ms and is an integer, never a bare _seconds/_millis spelling", () => {
     const offenders: string[] = [];
@@ -105,15 +100,17 @@ describe("STORY-024 · AC10 — the contract sources obey NFR-API-05 everywhere"
     expect(offenders, "NFR-API-05 names the unit _ms; these fields use another spelling").toEqual([]);
   });
 
-  // The exemption must not outlive the field it names. If the follow-up story
-  // lands and renames it, this test goes red and the exemption gets deleted —
-  // an exemption nobody removes is how a permanent deviation is born.
-  it("the D14 exemption still describes a field that actually exists", () => {
+  // The D14 guard that lived here asserted the exempted field still existed,
+  // so that an exemption could not outlive its reason. It fired: the field is
+  // gone. Both it and the exemption are deleted rather than carried forward
+  // as a set that matches nothing — the whole point was that it would end.
+  it("no duration field anywhere is spelled in seconds", () => {
     const source = readFileSync(resolve(REPO_ROOT, "contracts/identity/email-otp-request-response.schema.ts"), "utf8");
-    expect(
-      source,
-      "expires_in_seconds is gone — delete the D14 exemption above, this deviation is fixed",
-    ).toContain("expires_in_seconds");
+    // A DECLARATION, not any occurrence: the file's own comment records the
+    // old name as history, and history is not a violation. The sweep above
+    // uses the same shape for the same reason.
+    expect([...source.matchAll(/^\s*([a-z_]*_seconds)\s*:/gm)].map((m) => m[1])).toEqual([]);
+    expect(source).toContain("expires_in_ms:");
   });
 
   it("no money-looking field is typed as a number", () => {

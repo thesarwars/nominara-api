@@ -184,10 +184,16 @@ export class EmailOtpService {
       });
     }
 
-    // Literal, not OTP_TTL_MS / 1000 — the response schema pins this as
-    // z.literal(600) (D8's fixed-constant-body requirement), so the value
-    // is written as the same literal here rather than a computed number.
-    return { status: "sent", expires_in_seconds: 600 };
+    // STORY-117 — the field is milliseconds now (`NFR-API-05`: "all durations
+    // are integer milliseconds with a `_ms` suffix"). It was
+    // `expires_in_seconds: 600`, which no reference ever asked for.
+    //
+    // Still a literal rather than OTP_TTL_MS: D8 requires a FIXED-CONSTANT
+    // body, the schema pins z.literal(600_000), and OTP_TTL_MS is written as
+    // `10 * 60 * 1000`, which TypeScript widens to `number` — so it cannot
+    // satisfy the literal type. The two numbers agree and
+    // email-otp-fixed-response.spec asserts they still do.
+    return { status: "sent", expires_in_ms: 600_000 };
   }
 
   private async checkRateLimit(
