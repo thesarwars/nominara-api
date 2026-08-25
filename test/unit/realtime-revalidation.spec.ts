@@ -152,3 +152,75 @@ describe("STORY-026 · row 3b — the timer is the second path, and it is bounde
     spy.mockRestore();
   });
 });
+
+describe("STORY-026 · re-validation intervals do not accumulate", () => {
+  it("a repeated join replaces its timer instead of orphaning it", () => {
+    // `revalidations` is keyed by socket id, so a second `setInterval` stored
+    // over the first leaves the first running with nothing able to clear it.
+    // Each orphan re-runs the full guard chain every 60s for the life of the
+    // process, outliving the socket. `join:workspace` is client-controlled and
+    // unlimited, so this is reachable by an ordinary reconnecting client, not
+    // only a hostile one.
+    vi.useFakeTimers();
+    try {
+      const cleared = vi.spyOn(globalThis, "clearInterval");
+      const socket = socketStub("sock-1");
+      const rooms = { authorizeWorkspaceRoom: vi.fn().mockResolvedValue({ allowed: true, userId: USER }) };
+      const gateway = new RealtimeGateway(rooms as never, 60_000);
+      (gateway as unknown as { server: unknown }).server = { sockets: new Map([[socket.id, socket]]) };
+      const start = (gateway as unknown as { startRevalidation: (s: unknown, w: string) => void }).startRevalidation.bind(gateway);
+
+      start(socket, WS);
+      start(socket, WS);
+      start(socket, WS);
+
+      expect(cleared, "each re-join must clear the timer it replaces").toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount(), "exactly one interval may survive per socket").toBe(1);
+      cleared.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("STORY-026 · a closed socket cannot walk straight back in", () => {
+  it("invalidates THIS process's membership cache when it closes the socket", () => {
+    // The gateway and the API hold SEPARATE per-process membership Maps.
+    // `MembershipService` invalidates the API's; nothing invalidated the
+    // gateway's. socket.io reconnects by default, so the client was back in
+    // about a second and `getLiveMembership` answered `active` from a Map that
+    // had never heard about the removal — the forced close manufacturing the
+    // re-join it exists to prevent. Reproduced by the dangerous-area audit
+    // against a real socket and a real database.
+    //
+    // Every existing test missed it because they all pass `reconnection: false`.
+    const invalidated: [string, string][] = [];
+    const cache = { invalidate: (u: string, w: string) => invalidated.push([u, w]) };
+    const socket = socketStub("sock-1");
+    const gateway = new RealtimeGateway({} as never, 0, cache as never);
+    (gateway as unknown as { server: unknown }).server = { sockets: new Map([[socket.id, socket]]) };
+    (gateway as unknown as { joined: Map<string, unknown> }).joined.set(socket.id, {
+      userId: USER,
+      workspaceId: WS,
+    });
+
+    gateway.onMemberChanged(changed());
+
+    expect(socket.disconnect).toHaveBeenCalledWith(true);
+    expect(invalidated, "the close is worthless while the cache still says active").toEqual([[USER, WS]]);
+  });
+
+  it("invalidates even when this process holds no socket for the member", () => {
+    // A gateway with a stale entry but no socket still authorises the NEXT
+    // join from it. Scoping the invalidation to the loop over `joined` would
+    // leave every other replica stale.
+    const invalidated: [string, string][] = [];
+    const cache = { invalidate: (u: string, w: string) => invalidated.push([u, w]) };
+    const gateway = new RealtimeGateway({} as never, 0, cache as never);
+    (gateway as unknown as { server: unknown }).server = { sockets: new Map() };
+
+    gateway.onMemberChanged(changed());
+
+    expect(invalidated).toEqual([[USER, WS]]);
+  });
+});

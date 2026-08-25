@@ -160,3 +160,53 @@ describe("STORY-026 · discard", () => {
     expect(cleared).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("STORY-026 · a flush already scheduled is cancelled when the window is passed", () => {
+  it("never emits a stale payload after a newer one", () => {
+    // Found in the STORY-026 review, with this reproduction.
+    //
+    // The immediate-emit branch fires when the window has elapsed, but it used
+    // to leave an ALREADY-SCHEDULED flush in place. If the event loop is busy
+    // past the flush's due time — a batch of pub/sub messages straddling the
+    // boundary is the ordinary case — the newer payload is emitted first and
+    // the held older one lands milliseconds later. The client watches progress
+    // run backwards, and two `run.progress` arrive inside one 750 ms window
+    // that §11 caps at one.
+    const emitted: unknown[] = [];
+    let clock = 0;
+    const scheduled: (() => void)[] = [];
+    const coalescer = new Coalescer(
+      (_event, payload) => emitted.push(payload),
+      () => clock,
+      { setTimeout: (handler) => { scheduled.push(handler); return scheduled.length; }, clearTimeout: () => undefined },
+    );
+
+    coalescer.submit("run.progress", "run-1", { pct: 10 });
+    clock = 700;
+    coalescer.submit("run.progress", "run-1", { pct: 40 }); // held, due at 750
+    clock = 760;
+    coalescer.submit("run.progress", "run-1", { pct: 90 }); // window passed, emits now
+    for (const flush of scheduled) flush();                 // the late timer runs
+
+    expect(emitted, "the held 40 must not land after 90").toEqual([{ pct: 10 }, { pct: 90 }]);
+  });
+
+  it("clears the pending handle rather than only dropping the payload", () => {
+    // Dropping the entry without clearing the timer would leave a timer that
+    // fires into nothing — harmless here, but it is the same leak shape as the
+    // re-validation intervals, and one per progress event adds up.
+    let cleared = 0;
+    let clock = 0;
+    const coalescer = new Coalescer(
+      () => undefined,
+      () => clock,
+      { setTimeout: () => 1, clearTimeout: () => { cleared += 1; } },
+    );
+    coalescer.submit("run.progress", "run-1", { pct: 10 });
+    clock = 700;
+    coalescer.submit("run.progress", "run-1", { pct: 40 });
+    clock = 760;
+    coalescer.submit("run.progress", "run-1", { pct: 90 });
+    expect(cleared).toBe(1);
+  });
+});

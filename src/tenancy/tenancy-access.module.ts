@@ -32,7 +32,7 @@ import { MembershipCacheService } from "./membership-cache.js";
 // and leave the other serving a removed member for up to thirty seconds. That
 // is precisely the revocation leak `security-and-tenancy.md` §7 exists to
 // prevent, and it would be invisible — every test that resolved either
-// instance would pass. `membership-cache-single-instance.spec.ts` asserts the
+// instance would pass. `test/unit/gateway-structure.spec.ts` asserts the
 // identity of the instance reached through both paths.
 @Module({
   providers: [MembershipService, MembershipCacheService],

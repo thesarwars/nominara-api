@@ -23,3 +23,21 @@ export function cacheKeyNamespace(): string {
   if (namespace !== undefined && namespace.trim().length > 0) return namespace;
   return process.env.NODE_ENV ?? "development";
 }
+
+/**
+ * The socket.io pub/sub channel prefix for a deployment.
+ *
+ * `@socket.io/redis-adapter` and `@socket.io/redis-emitter` both build their
+ * channels as `<key>#<namespace>#...` and both default `key` to the literal
+ * "socket.io". That default is constructed inside the libraries, so it never
+ * passes through `valkey-keys.ts` and carries no deployment segment: two
+ * environments pointed at one Valkey cache instance would deliver each other's
+ * realtime events, every workspace, in both directions.
+ *
+ * The adapter and the emitter MUST be given the same value. They are two ends
+ * of one channel, and a mismatch is silent — the api process publishes and no
+ * gateway is subscribed, so `member.changed` simply never arrives.
+ */
+export function socketIoChannelPrefix(namespace: string): string {
+  return `${namespace}:socket.io`;
+}

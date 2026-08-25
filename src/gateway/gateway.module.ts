@@ -22,7 +22,7 @@ import {
 // all live in `ApiModule`. Importing it here would mount an unauthenticated,
 // unaudited tenant-mutation surface on GATEWAY_PORT: workspace create and
 // update, member role changes, invitations, and the OAuth callback.
-// `gateway-has-no-http-routes.spec.ts` locks that shut.
+// `test/unit/gateway-structure.spec.ts` locks that shut.
 //
 // `@Global()` DOES NOT SELF-REGISTER. `CacheModule` and any other global module
 // only becomes ambient once something in the graph imports it, and this module

@@ -70,6 +70,17 @@ export class Coalescer {
     const now = this.now();
 
     if (last === undefined || now - last >= windowMs) {
+      // Cancel any flush still scheduled for this slot FIRST. The window has
+      // passed, so a payload held for it is now older than the one in hand,
+      // and a busy event loop can run this submit before an overdue timer
+      // callback — emitting the newer value and then the stale one behind it.
+      // The client sees progress run backwards, and two events land inside one
+      // window against §11's cap of one.
+      const stale = this.pending.get(slot);
+      if (stale !== undefined) {
+        this.timers.clearTimeout(stale.handle);
+        this.pending.delete(slot);
+      }
       this.lastEmittedAt.set(slot, now);
       this.emit(event, payload);
       return;

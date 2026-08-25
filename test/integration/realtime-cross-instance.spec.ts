@@ -179,8 +179,24 @@ describe("STORY-026 · a broadcast from one gateway reaches a client on another"
     const first = await joinedClientOnA();
     const second = await joinedClientOnA();
 
-    const wrongInbox: unknown[] = [];
-    second.client.on("run.completed", (payload: unknown) => wrongInbox.push(payload));
+    // THE NEGATIVE ASSERTION MUST BE GIVEN TIME TO FAIL.
+    //
+    // This previously awaited the intended recipient and then checked the
+    // other socket's inbox immediately. Both frames are in flight together, so
+    // that check ran in the same tick the first handler fired — before the
+    // second client had parsed anything. The dangerous-area audit mutated
+    // `serverB.to(room).emit(...)` to `serverB.emit(...)` — a real
+    // namespace-wide fan-out, the exact cross-tenant leak this test names —
+    // and measured: wrongInbox 0 at the moment of the check, 1 after a 250ms
+    // settle. Green against a gateway broadcasting every workspace's events to
+    // every socket in /rt.
+    //
+    // So the wrong recipient is now raced against a deadline and the DEADLINE
+    // must win. A leaked frame beats the timer; silence does not.
+    const leaked = new Promise<"leaked">((resolve) => {
+      second.client.on("run.completed", () => resolve("leaked"));
+    });
+    const quiet = new Promise<"quiet">((resolve) => setTimeout(() => resolve("quiet"), 1_000));
 
     const arrived = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -197,6 +213,9 @@ describe("STORY-026 · a broadcast from one gateway reaches a client on another"
     serverB.to(workspaceRoom(first.workspaceId)).emit("run.completed", { run_id: "r-2", status: "completed" });
 
     await arrived;
-    expect(wrongInbox, "another workspace's socket must receive nothing").toHaveLength(0);
+    await expect(
+      Promise.race([leaked, quiet]),
+      "another workspace's socket must receive nothing",
+    ).resolves.toBe("quiet");
   }, 60_000);
 });

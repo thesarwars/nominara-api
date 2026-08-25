@@ -1,4 +1,4 @@
-import { Inject, type OnModuleDestroy } from "@nestjs/common";
+import { Inject, type OnApplicationShutdown, type OnModuleDestroy } from "@nestjs/common";
 import { MessageBody, ConnectedSocket, SubscribeMessage, WebSocketGateway, WebSocketServer } from "@nestjs/websockets";
 import type { Server, Socket } from "socket.io";
 import { Logger } from "@nestjs/common";
@@ -8,6 +8,7 @@ import { ROOM_FORBIDDEN_CLOSE_CODE, RoomAuthorizationService, workspaceRoom } fr
 import { Redis } from "ioredis";
 import { memberChangedEventSchema } from "../../contracts/events/platform-events.schema.js";
 import { attachValkeyAdapter, type ValkeyAdapterHandle } from "./valkey-adapter.js";
+import { MembershipCacheService } from "../tenancy/membership-cache.js";
 
 const logger = new Logger("realtime-gateway");
 
@@ -38,7 +39,7 @@ export const JOIN_WORKSPACE_MESSAGE = "join:workspace";
 // path uses (system-architecture.md §9), and nothing else: the Valkey adapter,
 // coalescing, backpressure and the typed emitters are T22.
 @WebSocketGateway({ namespace: "/rt" })
-export class RealtimeGateway implements OnModuleDestroy {
+export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
   @WebSocketServer()
   server!: Server;
 
@@ -60,6 +61,15 @@ export class RealtimeGateway implements OnModuleDestroy {
     private readonly rooms: RoomAuthorizationService,
     /** §7's bound. Zero disables it, which is how row 3a proves the EVENT closes the socket rather than the timer. */
     @Inject(SOCKET_REVALIDATION_INTERVAL) private readonly revalidationMs: number = SOCKET_REVALIDATION_MS,
+    /**
+     * THIS process's membership cache — a different Map from the API's.
+     *
+     * `MembershipService` invalidates the API process's copy when it mutates a
+     * membership. Nothing invalidates the gateway's, so without this the close
+     * below manufactures the re-join it exists to prevent. Optional so the
+     * existing two-argument construction in the unit suite keeps working.
+     */
+    private readonly memberships?: MembershipCacheService,
   ) {}
 
   /**
@@ -164,6 +174,21 @@ export class RealtimeGateway implements OnModuleDestroy {
       socket?.disconnect(true);
       this.forget(socketId);
     }
+
+    // INVALIDATE BEFORE THE CLIENT COMES BACK, and note this runs whether or
+    // not a socket was found — a gateway holding a stale entry but no socket
+    // still authorises the next join from it.
+    //
+    // socket.io clients reconnect automatically by default. Closing the socket
+    // without clearing this process's membership cache means the client is
+    // back within about a second, `getLiveMembership` answers from a Map that
+    // still says `active`, and the re-join succeeds — so the forced close
+    // manufactured exactly the re-join it exists to prevent, and the real
+    // revocation bound became the 30s cache TTL plus the 60s timer rather than
+    // `security-and-tenancy.md` §7's sixty seconds. Reproduced by the
+    // dangerous-area audit against a real socket and a real database; every
+    // existing test missed it because they all set `reconnection: false`.
+    this.memberships?.invalidate(event.data.user_id, event.data.workspace_id);
   }
 
   private socketById(socketId: string): Socket | undefined {
@@ -239,6 +264,17 @@ export class RealtimeGateway implements OnModuleDestroy {
    */
   private startRevalidation(socket: Socket, workspaceId: string): void {
     if (this.revalidationMs <= 0) return;
+    // One interval per socket, always. `revalidations` is keyed by socket id,
+    // so setting a second handle over the first ORPHANS it: `forget()` can
+    // only ever clear the last one, and `onModuleDestroy` iterates the same
+    // Map. Every orphan then runs the whole guard chain — a session read, a
+    // workspace-status read, a membership read — once a minute for the life of
+    // the process, and it outlives the socket that created it. `join:workspace`
+    // is a client-controlled message with no arrival limit, so a client that
+    // re-joins on every route change (or in a loop) leaves permanent
+    // per-minute database load behind it. Found in the STORY-026 review.
+    const running = this.revalidations.get(socket.id);
+    if (running !== undefined) clearInterval(running);
     const timer = setInterval(() => {
       void this.rooms.authorizeWorkspaceRoom(socket.handshake, workspaceId).then((decision) => {
         if (decision.allowed) return;
@@ -269,10 +305,33 @@ export class RealtimeGateway implements OnModuleDestroy {
     for (const socket of sockets?.values() ?? []) {
       socket.emit(SERVER_DRAINING_EVENT, { reconnect_after_ms: drainReconnectAfterMs() });
     }
-    // An unclosed subscriber keeps the process alive and turns a graceful
-    // drain into a hung one.
-    await this.adapter?.close();
     this.control?.disconnect();
     for (const timer of this.revalidations.values()) clearInterval(timer);
+  }
+
+  /**
+   * Quits the adapter's two Valkey connections. An unclosed subscriber keeps
+   * the process alive and turns a graceful drain into a hung one.
+   *
+   * DELIBERATELY NOT `onModuleDestroy`, and the ordering is the whole point.
+   * Nest runs `onModuleDestroy` -> `beforeApplicationShutdown` -> CLOSE THE
+   * SERVER -> `onApplicationShutdown`, and closing the server is what makes
+   * socket.io call `RedisAdapter.close()` on every namespace. That method
+   * issues `subClient.punsubscribe(...)` and `subClient.unsubscribe([...])`
+   * and does not catch the promises ioredis returns
+   * (`@socket.io/redis-adapter@8.3.0` dist/index.js:679-698). Quitting the
+   * clients in `onModuleDestroy` therefore closed them BEFORE the unsubscribes
+   * were issued, and every one of those uncaught promises rejected with
+   * "Connection is closed" as an UNHANDLED REJECTION.
+   *
+   * That was previously recorded in this repository as unavoidable
+   * library-internal teardown noise. It was neither: it was a lifecycle
+   * ordering bug on this side, and it made `pnpm test:integration` exit 1 with
+   * 573 of 573 tests passing — a gate command that always failed, which is
+   * strictly worse than a loud one. Unsubscribing first, on connections that
+   * are still open, leaves nothing to reject.
+   */
+  async onApplicationShutdown(): Promise<void> {
+    await this.adapter?.close();
   }
 }

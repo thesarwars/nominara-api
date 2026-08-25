@@ -12,7 +12,7 @@ import type { ExecutionContext } from "@nestjs/common";
 //
 // Synthesising the context instead means the guards run UNMODIFIED — the same
 // classes, resolved from the same DI container, with the same logic. Not
-// "equivalent logic": the same objects. `realtime-guard-parity.spec.ts`
+// "equivalent logic": the same objects. `test/unit/gateway-structure.spec.ts`
 // asserts the instances are identical to the ones the HTTP path uses, because
 // "we reuse the guards" is exactly the kind of claim that quietly stops being
 // true.
@@ -59,9 +59,35 @@ export function parseCookieHeader(header: string | undefined): Record<string, st
     const name = part.slice(0, index).trim();
     const value = part.slice(index + 1).trim();
     if (name.length === 0) continue;
-    cookies[name] = decodeURIComponent(value);
+    // FIRST WINS, matching `cookie`'s own semantics as bundled by
+    // `@fastify/cookie`. This kept the LAST occurrence, so a duplicate cookie
+    // name resolved to a different value on a socket than on an HTTP request
+    // with the identical header.
+    if (Object.prototype.hasOwnProperty.call(cookies, name)) continue;
+    cookies[name] = decodeValue(value);
   }
   return cookies;
+}
+
+/**
+ * Decodes one cookie value, falling back to the raw string.
+ *
+ * `decodeURIComponent` THROWS on a malformed escape, and `cookie`'s own decode
+ * catches that and returns the value untouched. This did not, and the throw
+ * escaped `parseCookieHeader` -> `requestFromHandshake` -> outside the guard
+ * loop's try/catch, so a handshake carrying `__Host-nominara-access=a%b` got a
+ * generic exception frame instead of a 4403, STAYED CONNECTED, and incremented
+ * no refusal metric. That is the enumeration oracle `joinWorkspace`'s own
+ * comment forbids, reachable with one character. Found by the dangerous-area
+ * audit and reproduced end to end.
+ */
+function decodeValue(value: string): string {
+  if (!value.includes("%")) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 /**
@@ -105,7 +131,7 @@ export function executionContextForSocket(request: WsScopedRequest): ExecutionCo
     getResponse: (): never => {
       throw new Error(
         "ws-execution-context: a socket join has no HTTP response. A guard that writes to the reply cannot be " +
-          "reused on the socket path as-is — see realtime-guard-parity.spec.ts.",
+          "reused on the socket path as-is — see test/unit/gateway-structure.spec.ts.",
       );
     },
     getNext: (): never => {

@@ -51,7 +51,7 @@ export class RoomAuthorizationService {
   /**
    * The guards, in the order the HTTP chain runs them.
    *
-   * Exposed so `realtime-guard-parity.spec.ts` can assert these are the SAME
+   * Exposed so `test/unit/gateway-structure.spec.ts` can assert these are the SAME
    * INSTANCES the container provides, rather than trusting a comment saying
    * they are. "We reuse the guards" is exactly the kind of claim that quietly
    * stops being true.
@@ -73,7 +73,18 @@ export class RoomAuthorizationService {
    * that true here without a second implementation to keep in step.
    */
   async authorizeWorkspaceRoom(handshake: HandshakeLike, workspaceId: string): Promise<RoomAuthorizationResult> {
-    const request = requestFromHandshake(handshake);
+    // SYNTHESIS INSIDE THE REFUSAL PATH. This sat outside the guard loop's
+    // try/catch, so anything thrown while building the request escaped as a
+    // generic exception frame — no 4403, no disconnect, no refusal metric —
+    // rather than as the refusal every other failure here produces. A
+    // malformed cookie value was enough to reach it. Fail closed: a handshake
+    // we cannot even parse is a handshake we cannot authorise.
+    let request: ReturnType<typeof requestFromHandshake>;
+    try {
+      request = requestFromHandshake(handshake);
+    } catch {
+      return this.refuse(workspaceId, undefined, "malformed_handshake");
+    }
     const context = executionContextForSocket(request);
 
     for (const guard of this.chain) {

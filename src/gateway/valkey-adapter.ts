@@ -1,6 +1,7 @@
 import { Logger } from "@nestjs/common";
 import { createAdapter } from "@socket.io/redis-adapter";
 import { Redis } from "ioredis";
+import { cacheKeyNamespace, socketIoChannelPrefix } from "../lib/cache/key-namespace.js";
 import type { Server } from "socket.io";
 
 // STORY-026 T22 — AC4: "The gateway requires NO STICKY SESSIONS: broadcast
@@ -51,7 +52,15 @@ export function attachValkeyAdapter(server: Server, url: string): ValkeyAdapterH
     });
   }
 
-  server.adapter(createAdapter(pub, sub));
+  // NAMESPACED, like every other key this service writes. `createAdapter`
+  // defaults its channel prefix to the literal "socket.io", which is built
+  // INSIDE the library and so bypasses `valkey-keys.ts` entirely — the file
+  // whose first line claims every Valkey key this service writes is built
+  // there. Two deployments sharing one Valkey cache instance would therefore
+  // cross-broadcast every realtime event of every workspace to each other,
+  // which is the precise failure `CACHE_KEY_NAMESPACE` exists to prevent and
+  // the one hazard T22 was written to avoid. Found in the STORY-026 review.
+  server.adapter(createAdapter(pub, sub, { key: socketIoChannelPrefix(cacheKeyNamespace()) }));
   logger.log({ message: "valkey adapter attached — broadcast is cross-instance, no sticky sessions" });
 
   return {
@@ -61,13 +70,12 @@ export function attachValkeyAdapter(server: Server, url: string): ValkeyAdapterH
       // still be in flight, and losing that broadcast is a real if small
       // product defect.
       //
-      // Shutting down still surfaces "Connection is closed" rejections from
-      // INSIDE `@socket.io/redis-adapter`'s own request machinery — its
-      // subscription outlives this call and rejects when the socket goes. They
-      // are not reachable from here: `disconnect()` produces the same ones,
-      // and so does reordering teardown. Both were tried. The library owns
-      // that promise, so this is recorded rather than papered over, and it is
-      // teardown-only — nothing in a running process depends on it.
+      // CALL THIS ONLY AFTER SOCKET.IO HAS CLOSED ITS SERVER. Closing the
+      // server is what makes socket.io call `RedisAdapter.close()`, which
+      // issues unsubscribes on `sub` without catching the promises ioredis
+      // returns. Quit first and every one of them rejects with "Connection is
+      // closed" as an unhandled rejection. `RealtimeGateway` does this from
+      // `onApplicationShutdown` for exactly that reason; see the note there.
       await Promise.allSettled([pub.quit(), sub.quit()]);
     },
   };

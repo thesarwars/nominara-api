@@ -32,6 +32,19 @@ export async function bootstrapGateway(): Promise<NestFastifyApplication> {
   // the adapter because Valkey was unreachable would deliver events to one
   // replica's sockets and silently drop them for every other client, which
   // looks like a flaky product rather than a failed dependency.
+  if (env.NODE_ENV === "test" && process.env.VITEST === undefined) {
+    // NOT ON THE WORD OF NODE_ENV ALONE — see `cache.module.ts` and
+    // `RealtimePublisherProvider.create()`, which now carry the same guard.
+    // A preview or ephemeral deploy running NODE_ENV=test would start a
+    // gateway with no adapter and no control channel: events reach only the
+    // replica that emitted them, and a revoked member keeps a socket for the
+    // full sixty seconds. Both silently. Found in the STORY-026 review.
+    throw new Error(
+      "gateway: NODE_ENV=test skips the Valkey adapter and the control channel, but no test runner is present. " +
+        "That gateway would broadcast to one replica only and could not revoke a socket before the 60s timer. " +
+        "Set NODE_ENV appropriately for this deployment, or run under the test runner.",
+    );
+  }
   if (env.NODE_ENV !== "test") {
     const gateway = app.get(RealtimeGateway);
     gateway.attachAdapter(env.VALKEY_CACHE_URL);

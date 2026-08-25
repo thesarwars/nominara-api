@@ -4,7 +4,7 @@ import { Redis } from "ioredis";
 import type { RealtimeEventPayloads } from "../../../contracts/events/catalog.schema.js";
 import type { RealtimeEventName } from "../../../contracts/events/event-name.schema.js";
 import { loadEnv } from "../../config/env.js";
-import { cacheKeyNamespace } from "./key-namespace.js";
+import { cacheKeyNamespace, socketIoChannelPrefix } from "./key-namespace.js";
 import { globalKey } from "./valkey-keys.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 
@@ -84,7 +84,41 @@ export class ValkeyRealtimePublisher implements RealtimePublisher, OnModuleDestr
     this.client.on("error", (error: Error) => {
       logger.error({ message: "realtime publisher connection error", error: error.name });
     });
-    this.emitter = new Emitter(this.client, undefined, "/rt");
+    // The emitter is handed a PUBLISH-ONLY WRAPPER rather than the client
+    // itself. `@socket.io/redis-emitter@5.1.0` calls exactly one method on
+    // whatever it is given — `publish` — and discards the promise, so an
+    // unreachable Valkey turns every emit into an unhandled rejection, which
+    // Node 24 answers by terminating the process. Wrapping is the whole fix
+    // and needs no patching: same connection underneath, same single failure
+    // mode, but nothing is left dangling.
+    this.emitter = new Emitter(
+      { publish: (channel: string, message: string | Buffer) => { this.publish(channel, message); } } as never,
+      // The same namespaced prefix the gateway's adapter uses. These two must
+      // agree exactly or the api process publishes into channels no gateway is
+      // listening on, and `member.changed` reaches nobody.
+      { key: socketIoChannelPrefix(cacheKeyNamespace()) },
+      "/rt",
+    );
+  }
+
+  /**
+   * Publishes without waiting, and without discarding the rejection.
+   *
+   * FIRE AND FORGET IS NOT DISCARD. `void promise` silences the lint rule and
+   * changes nothing about what happens when the promise rejects: on Node 24 an
+   * unhandled rejection ends the process. So the shape written to stop a cache
+   * blip from failing a committed workspace mutation would instead have taken
+   * the API down, on the one path where Valkey is already unwell.
+   *
+   * A dropped event is the correct outcome here — the client refetches from
+   * the authoritative API — but it must be a LOGGED outcome. The connection
+   * error handler above fires for the same condition, so no separate metric is
+   * introduced for it.
+   */
+  private publish(channel: string, message: string | Buffer): void {
+    void this.client.publish(channel, message as string).catch((error: Error) => {
+      logger.error({ message: "realtime publish failed; the event was dropped", error: error.name });
+    });
   }
 
   toWorkspace<Name extends RealtimeEventName>(
@@ -103,7 +137,7 @@ export class ValkeyRealtimePublisher implements RealtimePublisher, OnModuleDestr
 
   memberChanged(workspaceId: string, payload: RealtimeEventPayloads["member.changed"]): void {
     this.toWorkspace(workspaceId, "member.changed", payload);
-    void this.client.publish(realtimeControlChannel(cacheKeyNamespace()), JSON.stringify(payload));
+    this.publish(realtimeControlChannel(cacheKeyNamespace()), JSON.stringify(payload));
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -141,7 +175,27 @@ export class RealtimePublisherProvider {
   /** Chosen by environment, exactly as the cache adapter is — never by availability. */
   static create(): RealtimePublisher {
     const env = loadEnv();
-    if (env.NODE_ENV === "test") return new NoopRealtimePublisher();
+    if (env.NODE_ENV === "test") {
+      // NOT ON THE WORD OF NODE_ENV ALONE — the same guard `cache.module.ts`
+      // carries, for the same reason, and this file quoted that file's
+      // rationale without carrying over its check. Preview and ephemeral
+      // deploys commonly run NODE_ENV=test, and `NoopRealtimePublisher`
+      // publishes NOTHING to the control channel: no cross-instance broadcast,
+      // and no immediate socket revocation, leaving only the sixty-second
+      // timer that `security-and-tenancy.md` §7 treats as the ceiling rather
+      // than the mechanism. Silently. Found in the STORY-026 review.
+      //
+      // A test RUNNER, not a build mode, is what licenses it.
+      if (process.env.VITEST === undefined) {
+        throw new Error(
+          "realtime: NODE_ENV=test selects the no-op publisher, but no test runner is present. " +
+            "That deployment would have no cross-instance broadcast and no immediate socket revocation — " +
+            "a removed member keeps a live socket for up to 60s. " +
+            "Set NODE_ENV appropriately for this deployment, or run under the test runner.",
+        );
+      }
+      return new NoopRealtimePublisher();
+    }
     return new ValkeyRealtimePublisher(env.VALKEY_CACHE_URL);
   }
 }
