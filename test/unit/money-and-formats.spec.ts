@@ -6,7 +6,7 @@ import { MONEY_AMOUNT_USD_PATTERN, moneySchema } from "../../contracts/common/mo
 import { OtpRateLimitedException } from "../../src/tenancy/errors.js";
 
 // STORY-024 T8 — story scenario 9 ("Inspect a money field → The documented
-// shape") and AC9 ("Timestamps, durations, and money follow the documented
+// shape") and AC10 ("Timestamps, durations, and money follow the documented
 // formats everywhere"). `NFR-API-05`: "All timestamps are RFC 3339 with an
 // explicit Z or offset; all durations are integer milliseconds with a `_ms`
 // suffix; all money is `{amount_usd: string, currency: "USD"}`."
@@ -45,7 +45,7 @@ describe("STORY-024 · scenario 9 — money is the documented shape", () => {
   });
 });
 
-describe("STORY-024 · AC9 — durations are integer milliseconds with a _ms suffix (NFR-API-05)", () => {
+describe("STORY-024 · AC10 — durations are integer milliseconds with a _ms suffix (NFR-API-05)", () => {
   it("a rate-limit error reports retry_after_ms, not seconds (decision D13)", () => {
     const details = (new OtpRateLimitedException(3600).getResponse() as { details: Record<string, unknown> })
       .details;
@@ -60,9 +60,9 @@ describe("STORY-024 · AC9 — durations are integer milliseconds with a _ms suf
   });
 });
 
-// A sweep, not a spot check: AC9 says "everywhere". Reading the contract
+// A sweep, not a spot check: AC10 says "everywhere". Reading the contract
 // sources directly is what makes this hold for schemas no test has imported.
-describe("STORY-024 · AC9 — the contract sources obey NFR-API-05 everywhere", () => {
+describe("STORY-024 · AC10 — the contract sources obey NFR-API-05 everywhere", () => {
   function contractFiles(dir: string): string[] {
     return readdirSync(resolve(REPO_ROOT, dir), { withFileTypes: true }).flatMap((entry) =>
       entry.isDirectory()
@@ -86,9 +86,12 @@ describe("STORY-024 · AC9 — the contract sources obey NFR-API-05 everywhere",
   // PUBLISHED surface: it sits in contracts/openapi.generated.json and the
   // generated client, and correcting it means editing another story's schema,
   // service, and two of its tests. Deferred to a follow-up story rather than
-  // absorbed into STORY-024. Read a green run of this test as "AC9 holds
-  // everywhere EXCEPT this named field", never as "AC9 holds everywhere".
-  const AC9_DURATION_EXEMPTIONS = new Set(["contracts/identity/email-otp-request-response.schema.ts: expires_in_seconds"]);
+  // absorbed into STORY-024 — now STORY-117, which carries it as a rider
+  // alongside the list-endpoint reshape because both are breaking wire
+  // changes and share one baseline record; when it lands, this set empties
+  // and this comment goes with it. Read a green run of this test as "AC10 holds
+  // everywhere EXCEPT this named field", never as "AC10 holds everywhere".
+  const AC10_DURATION_EXEMPTIONS = new Set(["contracts/identity/email-otp-request-response.schema.ts: expires_in_seconds"]);
 
   it("every duration field ends in _ms and is an integer, never a bare _seconds/_millis spelling", () => {
     const offenders: string[] = [];
@@ -96,7 +99,7 @@ describe("STORY-024 · AC9 — the contract sources obey NFR-API-05 everywhere",
       const source = readFileSync(resolve(REPO_ROOT, file), "utf8");
       for (const match of source.matchAll(/^\s*([a-z_]*(?:_seconds|_millis|_msec))\s*:/gm)) {
         const offender = `${file}: ${match[1]}`;
-        if (!AC9_DURATION_EXEMPTIONS.has(offender)) offenders.push(offender);
+        if (!AC10_DURATION_EXEMPTIONS.has(offender)) offenders.push(offender);
       }
     }
     expect(offenders, "NFR-API-05 names the unit _ms; these fields use another spelling").toEqual([]);

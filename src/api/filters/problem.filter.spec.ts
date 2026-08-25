@@ -219,9 +219,10 @@ describe("STORY-024 · errors outside the taxonomy", () => {
     // `error` — which problemDetailsSchema, being `.strict()` with `error`
     // required, therefore rejects. This test PINS that deviation rather than
     // leaving it invisible: it goes red the moment the 5xx body starts
-    // conforming, which is exactly when the follow-up story (an
-    // `internal_error` taxonomy code) lands and this waiver should be
-    // deleted rather than quietly outliving its reason.
+    // conforming, which is exactly when the follow-up story lands —
+    // STORY-119, which adds a taxonomy member for the unmodelled failure —
+    // and this waiver should be deleted rather than quietly outliving its
+    // reason.
     it("an unexpected 5xx deliberately does NOT satisfy it — §2 has no code for an unmodelled error", () => {
       const body = bodyFrom(new Error("boom"));
       expect(body.status).toBe(HttpStatus.INTERNAL_SERVER_ERROR);

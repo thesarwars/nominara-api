@@ -3,11 +3,11 @@ import { envelopeMetaSchema } from "../../contracts/common/envelope.schema.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
 
-// STORY-024 T8 (RED step) — story scenario 8 and AC5/AC8. Red until T10
+// STORY-024 T8 (RED step) — story scenario 8 and AC5/AC9. Red until T10
 // adds the response-envelope interceptor: no route wraps its body today.
 //
 // *** NFR-API-08 IS SPLIT, AND THIS FILE PROVES ONLY ONE HALF ***
-// AC8 reads "The request identifier IS the trace identifier, so a support
+// AC9 reads "The request identifier IS the trace identifier, so a support
 // ticket resolves to a single trace with no lookup step."
 //
 //   Provable here: every response carries `meta.request_id`; an inbound
@@ -20,7 +20,7 @@ import { useApiHarness } from "../support/api-harness.js";
 //   no `@opentelemetry/*` dependency, no trace_id anywhere in src/, and
 //   src/lib/telemetry/metrics.ts is a Logger shim whose own comment says no
 //   metrics library exists. `req.id` is Fastify's `req-N` counter. That half
-//   of AC8 is pending STORY-005 (telemetry, unmerged) and must be reported
+//   of AC9 is pending STORY-005 (telemetry, unmerged) and must be reported
 //   as pending — never ticked off the back of a green run of this file.
 //
 //   Also not covered here: that `meta.request_id` equals the value
