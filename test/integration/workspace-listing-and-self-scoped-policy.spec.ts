@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { PAGINATION_LIMIT_DEFAULT, type PaginationRequest } from "../../contracts/common/pagination.schema.js";
 import type { WorkspaceListItemWithRelationship } from "../../contracts/workspaces/workspace-list-response.schema.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
@@ -76,6 +77,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
       new AuditChainService(),
       membership,
       sessions,
+      new NoopRealtimePublisher(),
     );
   });
 

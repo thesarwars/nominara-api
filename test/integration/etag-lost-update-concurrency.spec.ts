@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -97,8 +98,7 @@ describe("STORY-024 · AC8 — two overlapping PATCHes cannot both win", () => {
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
       new MembershipService(new MembershipCacheService()),
-      new SessionService(pool),
-    );
+      new SessionService(pool), new NoopRealtimePublisher());
   }
 
   async function createUser(): Promise<string> {

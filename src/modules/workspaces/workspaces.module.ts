@@ -1,6 +1,11 @@
 import { Module } from "@nestjs/common";
 import { loadEnv } from "../../config/env.js";
 import { TenancyAccessModule } from "../../tenancy/tenancy-access.module.js";
+import {
+  REALTIME_PUBLISHER,
+  RealtimePublisherProvider,
+  type RealtimePublisher,
+} from "../../lib/cache/realtime-publisher.js";
 import { AuditModule } from "../audit/audit.module.js";
 import { IdentityModule } from "../identity/identity.module.js";
 import { LocalDekProvisioner } from "./adapters/local-dek-provisioner.js";
@@ -30,6 +35,13 @@ import { InvitationsService } from "./invitations.service.js";
   providers: [
     WorkspacesService,
     InvitationsService,
+    // STORY-026 T22 / D9 — the API process publishes realtime events through
+    // @socket.io/redis-emitter, never by standing up a socket.io server of its
+    // own. Chosen by environment exactly as the cache adapter is.
+    {
+      provide: REALTIME_PUBLISHER,
+      useFactory: (): RealtimePublisher => RealtimePublisherProvider.create(),
+    },
     {
       provide: DEK_PROVISIONER,
       useFactory: (): DekProvisioner => {

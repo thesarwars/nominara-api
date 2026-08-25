@@ -7,6 +7,7 @@ import { Page, pageFrom } from "../../api/pagination/page.js";
 import { assertIfMatch } from "../../api/etag/if-match.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { PG_POOL } from "../../db/pg-pool.js";
+import { REALTIME_PUBLISHER, type RealtimePublisher } from "../../lib/cache/realtime-publisher.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import {
@@ -123,6 +124,7 @@ export class WorkspacesService {
     private readonly auditChain: AuditChainService,
     private readonly membership: MembershipService,
     private readonly sessions: SessionService,
+    @Inject(REALTIME_PUBLISHER) private readonly realtime: RealtimePublisher,
   ) {}
 
   /** Test scenario 8 (STORY-018): a suspended workspace refuses access immediately (WorkspaceGuard reads status live, never cached). */
@@ -581,7 +583,21 @@ export class WorkspacesService {
     const updated = await client.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE id = $1`, [
       memberId,
     ]);
-    return toMemberResponse(updated.rows[0]!);
+    const response = toMemberResponse(updated.rows[0]!);
+
+    // STORY-026 T22, decision D7 — `member.changed`. §11 lists `api` as its
+    // producer and notes it "forces socket re-auth", which is the entire point
+    // of the event: a role change can make an already-authorised socket
+    // over-privileged, and without this the only thing closing that window is
+    // the gateway's 60-second re-validation timer.
+    this.realtime.toWorkspace(workspaceId, "member.changed", {
+      workspace_id: workspaceId,
+      user_id: targetRow.user_id,
+      role: response.role,
+      status: response.status,
+    });
+
+    return response;
   }
 
   /** STORY-021 AC8/E-9 — DELETE /members/{id}. The owner cannot be removed at all; ownership must be transferred. */
@@ -605,5 +621,21 @@ export class WorkspacesService {
 
     // Ambient client (code-review fix) — see updateMemberRole's comment.
     await this.membership.removeMember(this.pool, workspaceId, targetRow.user_id, client);
+
+    // STORY-026 T22, decision D7. Removal is the case that matters most: the
+    // socket is now unauthorised outright, and this is what shortens the
+    // revocation window from sixty seconds to immediate
+    // (security-and-tenancy.md §7).
+    //
+    // Emitted AFTER the mutation and never awaited. A realtime event is a hint;
+    // the authoritative answer is the API the client refetches. Failing the
+    // removal because a cache was briefly unreachable would trade a committed,
+    // security-relevant change for a notification.
+    this.realtime.toWorkspace(workspaceId, "member.changed", {
+      workspace_id: workspaceId,
+      user_id: targetRow.user_id,
+      role: targetRow.role as MemberResponse["role"],
+      status: "removed",
+    });
   }
 }

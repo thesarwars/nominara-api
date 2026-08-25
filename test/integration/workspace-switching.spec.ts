@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
@@ -82,6 +83,7 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
       new AuditChainService(),
       membership,
       sessions,
+      new NoopRealtimePublisher(),
     );
   });
 

@@ -1,4 +1,5 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { Client, Pool } from "pg";
 import { describe, expect, it, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
@@ -113,8 +114,7 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
       unusedDekProvisioner,
       new AuditChainService(),
       membership,
-      new SessionService(pool),
-    );
+      new SessionService(pool), new NoopRealtimePublisher());
     guard = new WorkspaceGuard(pool, membership, new Reflector());
   });
 

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
+import { REALTIME_EVENT_PAYLOADS } from "../../contracts/events/catalog.schema.js";
 import { PAGINATION_LIMIT_DEFAULT } from "../../contracts/common/pagination.schema.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
@@ -26,6 +28,7 @@ describe("STORY-021 · member listing, role changes, and removal within the matr
   let db: Client;
   let pool: Pool;
   let service: WorkspacesService;
+  let realtime: NoopRealtimePublisher;
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18")
@@ -53,12 +56,14 @@ describe("STORY-021 · member listing, role changes, and removal within the matr
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
     const membership = new MembershipService(new MembershipCacheService());
+    realtime = new NoopRealtimePublisher();
     service = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
       membership,
       new SessionService(pool),
+      realtime,
     );
   });
 
@@ -260,6 +265,61 @@ describe("STORY-021 · member listing, role changes, and removal within the matr
     expect(err.getResponse()).toMatchObject({
       code: "forbidden",
       details: { required_permission: "workspace:transfer_ownership" },
+    });
+  });
+
+  // ---- STORY-026 T22 / decision D7 — member.changed --------------------
+
+  describe("STORY-026 · member.changed forces socket re-auth", () => {
+    it("is emitted when a member's role changes", async () => {
+      const f = await makeFixture();
+      await runInTenant(f.workspaceId, f.ownerId, () =>
+        service.updateMemberRole(f.workspaceId, "owner", f.viewerMemberId, { role: "analyst" }),
+      );
+
+      expect(realtime.published).toHaveLength(1);
+      expect(realtime.published[0]).toEqual({
+        workspaceId: f.workspaceId,
+        event: "member.changed",
+        payload: { workspace_id: f.workspaceId, user_id: f.viewerId, role: "analyst", status: "active" },
+      });
+    });
+
+    it("is emitted when a member is removed, carrying status removed", async () => {
+      // The case that matters most. §11 notes this event "forces socket
+      // re-auth", and without it the only thing closing the window between a
+      // removal and the socket noticing is the gateway's 60-second
+      // re-validation timer (security-and-tenancy.md §7).
+      const f = await makeFixture();
+      await runInTenant(f.workspaceId, f.ownerId, () => service.removeMemberById(f.workspaceId, f.viewerMemberId));
+
+      expect(realtime.published).toHaveLength(1);
+      expect(realtime.published[0]!.event).toBe("member.changed");
+      expect(realtime.published[0]!.payload).toMatchObject({ user_id: f.viewerId, status: "removed" });
+    });
+
+    it("publishes to the workspace's own room and no other", async () => {
+      const f = await makeFixture();
+      await runInTenant(f.workspaceId, f.ownerId, () => service.removeMemberById(f.workspaceId, f.viewerMemberId));
+      expect(realtime.published[0]!.workspaceId).toBe(f.workspaceId);
+    });
+
+    it("emits nothing when the mutation is REFUSED", async () => {
+      // An event announcing a change that did not happen would make every
+      // client refetch and see the old state — and, for a removal, would tell
+      // a workspace someone had been removed when they had not.
+      const f = await makeFixture();
+      await expect(
+        runInTenant(f.workspaceId, f.ownerId, () => service.removeMemberById(f.workspaceId, f.ownerMemberId)),
+      ).rejects.toThrow();
+      expect(realtime.published).toHaveLength(0);
+    });
+
+    it("carries a payload the published catalog accepts", async () => {
+      const f = await makeFixture();
+      await runInTenant(f.workspaceId, f.ownerId, () => service.removeMemberById(f.workspaceId, f.viewerMemberId));
+      const parsed = REALTIME_EVENT_PAYLOADS["member.changed"].safeParse(realtime.published[0]!.payload);
+      expect(parsed.success, "a producer must not emit a shape the catalog does not describe").toBe(true);
     });
   });
 });

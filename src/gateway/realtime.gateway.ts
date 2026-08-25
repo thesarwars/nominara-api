@@ -1,7 +1,13 @@
 import type { OnModuleDestroy } from "@nestjs/common";
 import { MessageBody, ConnectedSocket, SubscribeMessage, WebSocketGateway, WebSocketServer } from "@nestjs/websockets";
 import type { Server, Socket } from "socket.io";
+import { Logger } from "@nestjs/common";
+import { incrementCounter } from "../lib/telemetry/metrics.js";
+import { RESYNC_DIRECTIVE, SocketBackpressure, drainReconnectAfterMs } from "./backpressure.js";
 import { ROOM_FORBIDDEN_CLOSE_CODE, RoomAuthorizationService, workspaceRoom } from "./room-authorization.service.js";
+import { attachValkeyAdapter, type ValkeyAdapterHandle } from "./valkey-adapter.js";
+
+const logger = new Logger("realtime-gateway");
 
 // The event name clients listen for during a rolling deploy — a plain
 // string constant, not hardcoded inline at each use site.
@@ -19,7 +25,58 @@ export class RealtimeGateway implements OnModuleDestroy {
   @WebSocketServer()
   server!: Server;
 
+  private adapter: ValkeyAdapterHandle | undefined;
+  private readonly pressure = new Map<string, SocketBackpressure>();
+
   constructor(private readonly rooms: RoomAuthorizationService) {}
+
+  /**
+   * STORY-026 T22 — AC4. Called by the bootstrap once the server exists.
+   *
+   * `@WebSocketServer()` on a NAMESPACED gateway injects the Namespace, not
+   * the io Server, and `.adapter()` lives on the Server. Reaching through
+   * `namespace.server` is what makes the adapter apply to the whole
+   * deployment rather than failing with "adapter is not a function" at boot —
+   * which is where this first showed up.
+   */
+  attachAdapter(url: string): void {
+    const io = (this.server as unknown as { server?: Server }).server ?? this.server;
+    this.adapter = attachValkeyAdapter(io, url);
+  }
+
+  /**
+   * Sends one event to a socket, honouring §9's twenty-per-second cap.
+   *
+   * A throttled socket is told ONCE to resync and further messages are
+   * DROPPED, never queued — AC7's "no backlog". Buffering would move a slow
+   * consumer's problem into the gateway's memory, where it becomes every
+   * client's problem, and would eventually deliver a flood of stale state the
+   * client must apply in order.
+   */
+  sendTo(socket: Socket, event: string, payload: unknown): void {
+    let budget = this.pressure.get(socket.id);
+    if (budget === undefined) {
+      budget = new SocketBackpressure();
+      this.pressure.set(socket.id, budget);
+    }
+
+    const verdict = budget.admit();
+    if (verdict.action === "send") {
+      socket.emit(event, payload);
+      return;
+    }
+    if (verdict.action === "resync") {
+      logger.warn({ message: "socket throttled; resync directive sent", socket_id: socket.id, event });
+      incrementCounter("nominara_gateway_resync_directive_total", { event });
+      socket.emit(RESYNC_DIRECTIVE, { reason: "rate_limited" });
+      return;
+    }
+    incrementCounter("nominara_gateway_dropped_events_total", { event });
+  }
+
+  handleDisconnect(socket: Socket): void {
+    this.pressure.delete(socket.id);
+  }
 
   /**
    * Joins `ws:{workspace_id}` after authorising the socket.
@@ -67,11 +124,20 @@ export class RealtimeGateway implements OnModuleDestroy {
   // server.draining and reconnect with jitter." Emitted to every connected
   // client in the /rt namespace as this module tears down, ahead of the
   // process actually exiting (src/gateway.ts calls enableShutdownHooks()).
-  //
-  // The jittered `reconnect_after_ms` payload is T22's — this keeps
-  // STORY-022's behaviour unchanged until the emitter that owns the jitter
-  // exists, rather than inventing a constant here that T22 would replace.
-  onModuleDestroy(): void {
-    this.server?.emit(SERVER_DRAINING_EVENT);
+  async onModuleDestroy(): Promise<void> {
+    // STORY-026 T22 — AC9. Each socket gets its OWN jittered delay, computed
+    // here rather than left to clients: a client that ignored the advice would
+    // be indistinguishable from one that never received it, and every client
+    // reconnecting at the same instant is a thundering herd against a gateway
+    // that has just lost capacity.
+    // `server` here is the /rt Namespace; its connected sockets live on
+    // `.sockets`, a Map keyed by socket id.
+    const sockets = (this.server as unknown as { sockets?: Map<string, Socket> } | undefined)?.sockets;
+    for (const socket of sockets?.values() ?? []) {
+      socket.emit(SERVER_DRAINING_EVENT, { reconnect_after_ms: drainReconnectAfterMs() });
+    }
+    // An unclosed subscriber keeps the process alive and turns a graceful
+    // drain into a hung one.
+    await this.adapter?.close();
   }
 }

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { PAGINATION_LIMIT_DEFAULT } from "../../contracts/common/pagination.schema.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
@@ -74,8 +75,7 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
       membership,
-      new SessionService(pool),
-    );
+      new SessionService(pool), new NoopRealtimePublisher());
     invitations = new InvitationsService(pool, new AuditChainService());
   });
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { NotFoundException } from "@nestjs/common";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
@@ -78,7 +79,7 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
   });
 
   function makeService(dekProvisioner: DekProvisioner = new LocalDekProvisioner(WRAPPING_KEY, "local:dev")): WorkspacesService {
-    return new WorkspacesService(pool, dekProvisioner, new AuditChainService(), membership, new SessionService(pool));
+    return new WorkspacesService(pool, dekProvisioner, new AuditChainService(), membership, new SessionService(pool), new NoopRealtimePublisher());
   }
 
   async function createUser(email = `owner-${randomUUID()}@example.com`): Promise<string> {

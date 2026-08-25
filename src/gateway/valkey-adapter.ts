@@ -1,0 +1,62 @@
+import { Logger } from "@nestjs/common";
+import { createAdapter } from "@socket.io/redis-adapter";
+import { Redis } from "ioredis";
+import type { Server } from "socket.io";
+
+// STORY-026 T22 — AC4: "The gateway requires NO STICKY SESSIONS: broadcast
+// goes through the Valkey adapter."
+//
+// Without this, a broadcast reaches only the sockets attached to the instance
+// that emitted it. Two gateway replicas and a client is served by whichever
+// one the balancer picked — so half the events silently do not arrive, which
+// looks like a flaky product rather than a missing adapter. Sticky sessions
+// "fix" that by pinning a client to one instance, and then a rolling deploy
+// disconnects every pinned client at once and a hot instance cannot shed load.
+//
+// TWO CONNECTIONS, NOT ONE, and it is not optional. A Redis/Valkey connection
+// in subscriber mode may issue no other commands, so the adapter needs a
+// separate publisher. Sharing one client leaves the adapter unable to publish
+// the moment it subscribes.
+//
+// This is `@socket.io/redis-adapter`'s own construction (decision D3). Its
+// channel format is private and changes between minors; hand-rolling a
+// publisher against it would produce a realtime outage on a routine
+// dependency bump, with nothing in the diff to point at.
+
+const logger = new Logger("valkey-adapter");
+
+export interface ValkeyAdapterHandle {
+  close(): Promise<void>;
+}
+
+/**
+ * Attaches the Valkey adapter to a socket.io server.
+ *
+ * Returns a handle rather than nothing so the caller can close both
+ * connections on shutdown — an unclosed subscriber keeps the process alive and
+ * turns a graceful drain into a hung one.
+ */
+export function attachValkeyAdapter(server: Server, url: string): ValkeyAdapterHandle {
+  const pub = new Redis(url, { maxRetriesPerRequest: 2, lazyConnect: false });
+  const sub = pub.duplicate();
+
+  for (const [name, client] of [
+    ["publisher", pub],
+    ["subscriber", sub],
+  ] as const) {
+    client.on("error", (error: Error) => {
+      // The error NAME only: a connection error can carry the URL, and the URL
+      // can carry credentials.
+      logger.error({ message: "valkey adapter connection error", client: name, error: error.name });
+    });
+  }
+
+  server.adapter(createAdapter(pub, sub));
+  logger.log({ message: "valkey adapter attached — broadcast is cross-instance, no sticky sessions" });
+
+  return {
+    close: async (): Promise<void> => {
+      await Promise.allSettled([pub.quit(), sub.quit()]);
+    },
+  };
+}

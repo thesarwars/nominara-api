@@ -5,6 +5,7 @@ import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { loadEnv } from "./config/env.js";
 import { RealtimeModule } from "./gateway/gateway.module.js";
+import { RealtimeGateway } from "./gateway/realtime.gateway.js";
 
 // STORY-022 — WebSocket gateway bootstrap (project-structure.md §2:
 // "src/gateway.ts WebSocket gateway bootstrap"). A separate process/port
@@ -17,6 +18,21 @@ export async function bootstrapGateway(): Promise<NestFastifyApplication> {
   });
   app.enableShutdownHooks();
   await app.listen({ port: env.GATEWAY_PORT, host: "0.0.0.0" });
+
+  // STORY-026 T22 — AC4. Without the adapter a broadcast reaches only the
+  // sockets attached to THIS replica, so with two gateways half the events
+  // silently do not arrive. That looks like a flaky product rather than a
+  // missing adapter, and the usual "fix" — sticky sessions — makes a rolling
+  // deploy disconnect every pinned client at once.
+  // Skipped under the test runner for the same reason the cache adapter is:
+  // a unit suite must not need a Valkey to boot the process. Chosen by
+  // ENVIRONMENT, never by availability — a gateway that quietly ran without
+  // the adapter because Valkey was unreachable would deliver events to one
+  // replica's sockets and silently drop them for every other client, which
+  // looks like a flaky product rather than a failed dependency.
+  if (env.NODE_ENV !== "test") {
+    app.get(RealtimeGateway).attachAdapter(env.VALKEY_CACHE_URL);
+  }
   new Logger("bootstrap").log(`gateway listening on :${env.GATEWAY_PORT}`);
   return app;
 }
