@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common";
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from "@nestjs/core";
 import { DbModule } from "../db/db.module.js";
+import { CacheModule } from "../lib/cache/cache.module.js";
 import { HealthModule } from "../modules/health/health.module.js";
 import { IdentityModule } from "../modules/identity/identity.module.js";
 import { WorkspacesModule } from "../modules/workspaces/workspaces.module.js";
@@ -29,6 +30,7 @@ import { QuotaGuard } from "./guards/quota.guard.js";
 import { DailyCapGuard } from "./guards/daily-cap.guard.js";
 import { RateLimitGuard } from "./guards/rate-limit.guard.js";
 import { CreditGuard } from "./guards/credit.guard.js";
+import { IdempotencyStore } from "./idempotency/store.js";
 import { IdempotencyInterceptor } from "./interceptors/idempotency.interceptor.js";
 import { TenantContextInterceptor } from "./interceptors/tenant-context.interceptor.js";
 import { AuditInterceptor } from "./interceptors/audit.interceptor.js";
@@ -52,6 +54,7 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
 @Module({
   imports: [
     DbModule,
+    CacheModule,
     HealthModule,
     IdentityModule,
     WorkspacesModule,
@@ -74,6 +77,9 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     AuditModule,
   ],
   providers: [
+    // STORY-025 T16 — the idempotency record store, injected into
+    // IdempotencyInterceptor. Not a global: only the interceptor uses it.
+    IdempotencyStore,
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_GUARD, useClass: WorkspaceGuard },
     { provide: APP_GUARD, useClass: RbacGuard },

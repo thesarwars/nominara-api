@@ -440,6 +440,18 @@ pre-existed.
   gaps (G-5/G-9). STORY-030's BullMQ processor for the `rollup` worker group
   imports these same exported functions unchanged as its handler body when
   it lands — no rewrite, no move, just a new caller.
+- **G-11 — the cache is IN-MEMORY, per-process, and refuses to run in
+  production.** `src/lib/cache/cache.module.ts` provides `CACHE` from
+  `InMemoryCacheAdapter` because the Valkey adapter needs `ioredis`, whose
+  installation was refused by this environment's command classifier (approved
+  as decision D3 of the EPIC-03 execution plan, `docs/plans/`). With more than
+  one API instance, two requests bearing the same `Idempotency-Key` land on
+  different processes, each find no record, and both execute — the exact
+  double effect `NFR-API-07` exists to prevent. The factory therefore THROWS
+  when `NODE_ENV=production` and warns on every other start, rather than
+  serving quietly. `VALKEY_CACHE_URL`, `docker-compose.yml`'s `valkey-cache`
+  service, the key builder and the cache port are all in place; the adapter is
+  a thin file against an interface that already exists.
 - **The orphan scan pages by throwing (a non-zero exit from `pnpm
   db:maintenance:sweep`), not by log line — but no real PagerDuty/alerting
   integration exists anywhere in this repo yet**, the same disclosed absence

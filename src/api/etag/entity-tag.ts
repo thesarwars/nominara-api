@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { canonicalize } from "../../lib/json/canonical.js";
 
 // STORY-024 T11 — AC8: "Mutable configuration endpoints emit a concurrency
 // tag and require it on modification, refusing a stale one with a conflict."
@@ -25,18 +26,9 @@ import { createHash } from "node:crypto";
 // because the precondition it lets through is LITERALLY TRUE: the caller's
 // write lands on a representation byte-identical to the one they read.
 
-/**
- * Canonical JSON: object keys sorted at every depth, so two structurally
- * equal representations always hash identically regardless of the key order
- * a driver, a `RETURNING` clause or a `JSON.stringify` happened to produce.
- * Array order is significant and preserved — it is part of the value.
- */
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (value === null || typeof value !== "object") return value;
-  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return Object.fromEntries(entries.map(([key, inner]) => [key, canonicalize(inner)]));
-}
+// STORY-025 T16 — the canonicalisation moved to src/lib/json/canonical.ts
+// when the idempotency fingerprint needed the identical rule. Two copies of
+// "does key order change the answer" are two chances for one to drift.
 
 /**
  * The opaque tag VALUE for a representation — no surrounding quotes, which

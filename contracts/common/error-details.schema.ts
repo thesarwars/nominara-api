@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { idempotencyConflictDetailsSchema } from "./idempotency.schema.js";
 import type { ErrorCode } from "./error-code.schema.js";
 import { MONEY_AMOUNT_USD_PATTERN } from "./money.schema.js";
 
@@ -268,6 +269,7 @@ export const errorDetailsSchemaByCode = {
   entitlement_exceeded: entitlementExceededDetailsSchema,
   feature_not_in_plan: featureNotInPlanDetailsSchema,
   conflict: conflictDetailsSchema,
+  idempotency_conflict: idempotencyConflictDetailsSchema,
   workspace_limit_reached: workspaceLimitReachedDetailsSchema,
   price_changed: priceChangedDetailsSchema,
   unsafe_target: unsafeTargetDetailsSchema,

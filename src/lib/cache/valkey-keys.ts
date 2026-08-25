@@ -99,36 +99,47 @@ export function idempotencyRecordKey(env: string, workspaceId: string, fingerpri
 }
 
 /**
- * sha256 over key, user, route and body.
+ * sha256 over key, user and route — what identifies the RECORD.
  *
- * All four, deliberately:
+ * The body is deliberately NOT in here, and that is the whole mechanism.
+ * api-specification.md §1: "identical key + identical body returns the cached
+ * response; identical key + DIFFERENT body is `409 idempotency_conflict`."
+ * If the body were part of this hash, two bodies under one key would land on
+ * two different records, both would be claimed, and both would execute — the
+ * conflict case would be structurally undetectable and the double effect it
+ * exists to prevent would happen silently. The body is hashed separately,
+ * stored INSIDE the record, and compared on read.
  *
- *   key    the caller's `Idempotency-Key`, which is the whole point.
- *   user   two users of the SAME workspace presenting the same key are two
- *          requests, not a replay. Without this, a shared or guessable key
+ * The three that ARE here:
+ *
+ *   key    the caller's `Idempotency-Key`, which is the point.
+ *   user   two users of the same workspace presenting the same key are two
+ *          requests, not a replay. Without this a shared or guessable key
  *          would hand one user another's response body.
- *   route  the same key on a different route is a different operation. A
- *          client reusing a key across endpoints deserves a conflict rather
+ *   route  the same key on a different endpoint is a different operation, and
+ *          a client reusing a key across endpoints deserves a conflict rather
  *          than another endpoint's cached body.
- *   body   api-specification.md §1: "identical key + identical body returns
- *          the cached response; identical key + different body is `409
- *          idempotency_conflict`." The hash is what makes that comparison
- *          possible without storing the original body.
  *
- * The workspace is NOT in the fingerprint because it is already a key
- * segment. Putting it in both would make the tenant boundary look like it
- * lives in the hash, where it cannot be inspected, instead of in the key,
- * where it can.
+ * The workspace is NOT here because it is already a key segment. Putting it in
+ * both would make the tenant boundary look like it lives in the hash, where it
+ * cannot be inspected, instead of in the key, where it can.
  */
-export function idempotencyFingerprint(input: {
+export function idempotencyScopeFingerprint(input: {
   readonly key: string;
   readonly userId: string;
   readonly route: string;
-  readonly body: string;
 }): string {
   return createHash("sha256")
-    .update([input.key, input.userId, input.route, input.body].join(" "))
+    .update([input.key, input.userId, input.route].join(" "))
     .digest("hex");
+}
+
+/**
+ * sha256 of the canonical request body — stored in the record and compared on
+ * every replay. This is the half that tells a replay from a conflict.
+ */
+export function requestBodyHash(canonicalBody: string): string {
+  return createHash("sha256").update(canonicalBody).digest("hex");
 }
 
 /** The hash recorded in a 409's detail, so a conflict is auditable without echoing the key itself. */

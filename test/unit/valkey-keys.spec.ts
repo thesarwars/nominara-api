@@ -2,10 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   globalKey,
   hashIdempotencyKey,
-  idempotencyFingerprint,
   idempotencyRecordKey,
+  idempotencyScopeFingerprint,
   rateLimitConfigKey,
   rateLimitCounterKey,
+  requestBodyHash,
   tenantKey,
 } from "../../src/lib/cache/valkey-keys.js";
 
@@ -32,11 +33,10 @@ describe("STORY-025 · the workspace segment", () => {
   it("separates two workspaces presenting the identical idempotency fingerprint", () => {
     // NFR-API-06, and test row 11: same key, same body, two tenants. The
     // second must not be able to reach the first's cached envelope.
-    const fingerprint = idempotencyFingerprint({
+    const fingerprint = idempotencyScopeFingerprint({
       key: "retry-1",
       userId: "user-1",
       route: "POST /v1/things",
-      body: '{"a":1}',
     });
     expect(idempotencyRecordKey("test", WS_A, fingerprint)).not.toBe(idempotencyRecordKey("test", WS_B, fingerprint));
   });
@@ -80,30 +80,39 @@ describe("STORY-025 · segment integrity", () => {
 });
 
 describe("STORY-025 · the idempotency fingerprint", () => {
-  const base = { key: "retry-1", userId: "user-1", route: "POST /v1/things", body: '{"a":1}' };
+  const base = { key: "retry-1", userId: "user-1", route: "POST /v1/things" };
 
   it("is a full sha256", () => {
-    expect(idempotencyFingerprint(base)).toMatch(/^[0-9a-f]{64}$/);
+    expect(idempotencyScopeFingerprint(base)).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("is stable for an identical request — that is what makes a replay a replay", () => {
-    expect(idempotencyFingerprint(base)).toBe(idempotencyFingerprint({ ...base }));
+  it("is stable for an identical scope — that is what makes a replay find its record", () => {
+    expect(idempotencyScopeFingerprint(base)).toBe(idempotencyScopeFingerprint({ ...base }));
   });
 
   it.each([
     ["a different key", { key: "retry-2" }],
     ["a different user", { userId: "user-2" }],
     ["a different route", { route: "POST /v1/others" }],
-    ["a different body", { body: '{"a":2}' }],
   ])("changes with %s", (_label, patch) => {
-    expect(idempotencyFingerprint({ ...base, ...patch })).not.toBe(idempotencyFingerprint(base));
+    expect(idempotencyScopeFingerprint({ ...base, ...patch })).not.toBe(idempotencyScopeFingerprint(base));
+  });
+
+  // THE load-bearing property. §1 says identical key + DIFFERENT body is a
+  // 409. If the body reached this fingerprint, the two bodies would land on
+  // two records, both would be claimed, and both would execute — the conflict
+  // would be structurally unreachable and the double effect would be silent.
+  it("does NOT vary with the body — the body is compared inside the record, not used to locate it", () => {
+    const withOneBody = idempotencyScopeFingerprint(base);
+    expect(requestBodyHash('{"a":1}')).not.toBe(requestBodyHash('{"a":2}'));
+    expect(idempotencyScopeFingerprint(base)).toBe(withOneBody);
   });
 
   // Concatenation without a delimiter would make ("ab","c") and ("a","bc")
   // hash identically, so two different requests would share a record.
   it("cannot be collided by shifting a character between fields", () => {
-    expect(idempotencyFingerprint({ ...base, key: "retry", userId: "-1user-1" })).not.toBe(
-      idempotencyFingerprint({ ...base, key: "retry-1", userId: "user-1" }),
+    expect(idempotencyScopeFingerprint({ ...base, key: "retry", userId: "-1user-1" })).not.toBe(
+      idempotencyScopeFingerprint({ ...base, key: "retry-1", userId: "user-1" }),
     );
   });
 
