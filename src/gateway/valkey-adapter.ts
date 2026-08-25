@@ -56,6 +56,18 @@ export function attachValkeyAdapter(server: Server, url: string): ValkeyAdapterH
 
   return {
     close: async (): Promise<void> => {
+      // `quit()`, which drains in-flight commands, rather than `disconnect()`,
+      // which abandons them. A rolling deploy closes this while a broadcast may
+      // still be in flight, and losing that broadcast is a real if small
+      // product defect.
+      //
+      // Shutting down still surfaces "Connection is closed" rejections from
+      // INSIDE `@socket.io/redis-adapter`'s own request machinery — its
+      // subscription outlives this call and rejects when the socket goes. They
+      // are not reachable from here: `disconnect()` produces the same ones,
+      // and so does reordering teardown. Both were tried. The library owns
+      // that promise, so this is recorded rather than papered over, and it is
+      // teardown-only — nothing in a running process depends on it.
       await Promise.allSettled([pub.quit(), sub.quit()]);
     },
   };

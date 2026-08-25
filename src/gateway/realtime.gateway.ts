@@ -121,7 +121,15 @@ export class RealtimeGateway implements OnModuleDestroy {
     subscriber.on("error", (error: Error) => {
       logger.error({ message: "control channel error", error: error.name });
     });
-    void subscriber.subscribe(channel);
+    // A rejection here must not become an unhandled one: the subscribe can
+    // fail while Valkey is still coming up, and an unhandled rejection in a
+    // gateway process is a crash rather than a degraded subscription.
+    subscriber.subscribe(channel).catch((error: unknown) => {
+      logger.error({
+        message: "control channel subscribe failed; revocation falls back to the re-validation timer",
+        error: error instanceof Error ? error.name : "unknown",
+      });
+    });
     subscriber.on("message", (_channel: string, raw: string) => {
       this.onMemberChanged(raw);
     });
@@ -264,7 +272,7 @@ export class RealtimeGateway implements OnModuleDestroy {
     // An unclosed subscriber keeps the process alive and turns a graceful
     // drain into a hung one.
     await this.adapter?.close();
-    await this.control?.quit();
+    this.control?.disconnect();
     for (const timer of this.revalidations.values()) clearInterval(timer);
   }
 }
