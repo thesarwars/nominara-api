@@ -7,6 +7,7 @@ import { TenantContextMissingError } from "../../tenancy/errors.js";
 import { withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
 import { SKIP_TENANT_CONTEXT_KEY } from "../decorators/skip-tenant-context.decorator.js";
+import { STREAMING_KEY } from "../decorators/streaming.decorator.js";
 
 // STORY-022 — security-and-tenancy.md §4's TenantContextInterceptor,
 // wired into a real HTTP pipeline for the first time. This is the adapter
@@ -49,6 +50,22 @@ export class TenantContextInterceptor implements NestInterceptor {
       context.getClass(),
     ]);
     if (skipTenantContext) {
+      return next.handle();
+    }
+
+    // STORY-026 T23 — THE ONE THAT WOULD HAVE BITTEN SILENTLY. This
+    // interceptor awaits `lastValueFrom(next.handle())` inside
+    // withTenantContext. A streaming handler writes to reply.raw and returns
+    // nothing, so the observable completes without emitting and lastValueFrom
+    // REJECTS with EmptyError — rolling back the transaction of a request that
+    // succeeded. Holding a transaction open for a sixty-second stream would be
+    // wrong even if it worked, so a streaming route opens its own short-lived
+    // contexts instead, exactly as a @SkipTenantContext() route does.
+    const streaming = this.reflector.getAllAndOverride<boolean>(STREAMING_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (streaming) {
       return next.handle();
     }
 

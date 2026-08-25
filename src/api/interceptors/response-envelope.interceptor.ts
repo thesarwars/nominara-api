@@ -7,6 +7,7 @@ import { map } from "rxjs/operators";
 import type { EnvelopeMeta } from "../../../contracts/common/envelope.schema.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { NO_ENVELOPE_KEY } from "../decorators/no-envelope.decorator.js";
+import { STREAMING_KEY } from "../decorators/streaming.decorator.js";
 import { Page } from "../pagination/page.js";
 import type { AuthenticatedRequest } from "../guards/auth.guard.js";
 
@@ -59,8 +60,12 @@ export class ResponseEnvelopeInterceptor implements NestInterceptor {
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
     // Method first, then class: HealthController carries the marker at class
     // level so all three probes are exempt as a group.
+    // STORY-026 T23 — a streaming route writes its own body to reply.raw and
+    // returns nothing. Enveloping that would append a JSON object to a
+    // text/event-stream response that has already been written.
     const exempt =
-      this.reflector.getAllAndOverride<boolean>(NO_ENVELOPE_KEY, [context.getHandler(), context.getClass()]) === true;
+      this.reflector.getAllAndOverride<boolean>(NO_ENVELOPE_KEY, [context.getHandler(), context.getClass()]) === true ||
+      this.reflector.getAllAndOverride<boolean>(STREAMING_KEY, [context.getHandler(), context.getClass()]) === true;
 
     const http = context.switchToHttp();
     const request = http.getRequest<AuthenticatedRequest & { id?: string | number }>();

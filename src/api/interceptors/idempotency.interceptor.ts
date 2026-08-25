@@ -8,6 +8,7 @@ import {
 } from "../../../contracts/common/idempotency.schema.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { IDEMPOTENT_KEY } from "../decorators/idempotent.decorator.js";
+import { STREAMING_KEY } from "../decorators/streaming.decorator.js";
 import { ConflictError, IdempotencyConflictError, ValidationFailedError } from "../errors/domain-errors.js";
 import type { AuthenticatedRequest } from "../guards/auth.guard.js";
 import { identifyIdempotentRequest } from "../idempotency/key.js";
@@ -61,7 +62,14 @@ export class IdempotencyInterceptor implements NestInterceptor {
   async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<unknown>> {
     const required =
       this.reflector.getAllAndOverride<boolean>(IDEMPOTENT_KEY, [context.getHandler(), context.getClass()]) === true;
-    if (!required) {
+    // STORY-026 T23 — a streaming route has no response body to record. Its
+    // handler returns nothing, so what would be stored as the replayable
+    // response is `undefined`, and a replay would answer a stream request with
+    // an empty JSON body. Marking a route both @Idempotent() and @Streaming()
+    // is a contradiction; streaming wins, loudly, rather than recording a lie.
+    const streaming =
+      this.reflector.getAllAndOverride<boolean>(STREAMING_KEY, [context.getHandler(), context.getClass()]) === true;
+    if (!required || streaming) {
       return next.handle();
     }
 
