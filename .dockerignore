@@ -1,0 +1,30 @@
+# Keeping the build context small is the point, but two entries here are about
+# correctness rather than speed:
+#
+#   node_modules  a host install is macOS/arm64 and the image is alpine/musl.
+#                 Copying it in would ship binaries that cannot load, and the
+#                 failure appears at runtime rather than at build time.
+#   .env          real secrets. The image must never carry them; compose
+#                 injects them as environment at run time instead.
+node_modules
+.env
+.env.*
+!.env.example
+
+dist
+client/dist
+client/src
+
+.git
+.gitignore
+test
+docs
+eslint-rules
+eslint.config.js
+vitest.config.ts
+vitest.integration.config.ts
+vitest.isolation.config.ts
+Dockerfile
+.dockerignore
+docker-compose.yml
+README.md

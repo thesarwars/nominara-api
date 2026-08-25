@@ -7,6 +7,9 @@
     "node": ">=24"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/src/main.js",
+    "start:gateway": "node dist/src/gateway.js",
     "db:generate": "tsx src/db/generate.ts",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:rollback": "tsx src/db/rollback.ts",

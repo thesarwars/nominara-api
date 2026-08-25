@@ -1,0 +1,21 @@
+{
+  // The build tsconfig. `tsconfig.json` includes `test`, which is right for
+  // `pnpm typecheck` (the suite must typecheck) and wrong for an image —
+  // compiling it would ship the test tree, testcontainers imports and all,
+  // into a production artifact.
+  //
+  // `tsc` rather than esbuild/tsx, and that is not a preference. NestJS reads
+  // constructor parameter types from `emitDecoratorMetadata`, which esbuild
+  // does not implement — `tsx src/main.ts` fails at boot with "Nest can't
+  // resolve dependencies of the AuthGuard (?, Symbol(PG_POOL))", because the
+  // Reflector parameter has no emitted type. Only `tsc` produces a runnable
+  // build.
+  // `**/*.spec.ts` is excluded as well as the `test` tree, because this
+  // repository keeps some specs beside the code they cover — e.g.
+  // src/api/filters/problem.filter.http.spec.ts — and those import from
+  // test/support. Dropping `test` without dropping them fails the build on a
+  // missing module, and shipping them would put testcontainers in the image.
+  "extends": "./tsconfig.json",
+  "include": ["contracts", "src"],
+  "exclude": ["**/*.spec.ts"]
+}
