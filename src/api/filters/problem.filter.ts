@@ -141,43 +141,41 @@ export class ProblemFilter implements ExceptionFilter {
     const { status, code, message, details, remediation } = classify(exception);
     const requestId = requestIdOf(request);
 
-    // §2 has NO code for an unexpected 5xx — its table runs 400…507 with
-    // nothing for "we did not model this". Rather than invent a taxonomy
-    // member or force an unrelated one, such a response carries RFC 9457's
-    // members plus a top-level `request_id` (a legal extension member) and
-    // omits the `error` member entirely. A 500 is exactly the case where a
-    // user most needs a reference to quote, so dropping the identifier too
-    // would be the worst possible trade.
+    // EVERY response leaving this filter carries an `error` member, because
+    // §2's first paragraph says every error response does and
+    // problemDetailsSchema is `.strict()` with `error` required. There is no
+    // status that opts out, and there is no second place a request
+    // identifier can live.
     //
-    // STORY-024 T12 — this branch is gated on 5xx, NOT on "we have no code".
-    // T9 keyed it on `code === undefined` alone, and codeForStatus() covers
-    // only six statuses, so every 4xx outside that set — 415 from an
-    // unsupported media type, a bare 422, and anything else the framework
-    // raises — took the error-less branch too. Those bodies violate the
-    // repo's own contract twice over: problemDetailsSchema is `.strict()`
-    // with `error` REQUIRED, so a missing `error` and an unknown top-level
-    // `request_id` are both rejected by the schema this API publishes. A 4xx
-    // with no mapped code now falls back to the taxonomy's nearest
-    // structural match rather than emitting an unpublishable shape.
+    // Two fallbacks, one for each side of the 5xx line, and neither invents
+    // a code — both name a member of §2's table:
+    //
+    //   5xx — `internal_error` (STORY-119). §2 previously ran 400…507 with
+    //   nothing for "we did not model this", so the only ways to answer were
+    //   to force an unrelated code or to drop the `error` member. This filter
+    //   dropped it, and the resulting body failed the very schema this API
+    //   publishes. §2 now has a 500 row and the choice is gone.
+    //
+    //   4xx — `validation_failed` (STORY-024 T12). codeForStatus() covers six
+    //   statuses, so 415, a bare 422, 405 and anything else the framework
+    //   raises arrive unclassified; they are client-side failures and this is
+    //   the taxonomy's nearest structural match.
     const isServerError = status >= HttpStatus.INTERNAL_SERVER_ERROR;
-    const wireCode = code ?? (isServerError ? undefined : "validation_failed");
+    const wireCode: ErrorCode = code ?? (isServerError ? "internal_error" : "validation_failed");
 
-    const body =
-      wireCode === undefined
-        ? { type: "about:blank", title: HttpStatus[status] ?? "error", status, detail: message, request_id: requestId }
-        : {
-            type: "about:blank",
-            title: titleFor(wireCode),
-            status,
-            detail: message,
-            error: {
-              code: wireCode,
-              message,
-              ...(details !== undefined ? { details } : {}),
-              ...(remediation !== undefined ? { remediation } : {}),
-              request_id: requestId,
-            },
-          };
+    const body = {
+      type: "about:blank",
+      title: titleFor(wireCode),
+      status,
+      detail: message,
+      error: {
+        code: wireCode,
+        message,
+        ...(details !== undefined ? { details } : {}),
+        ...(remediation !== undefined ? { remediation } : {}),
+        request_id: requestId,
+      },
+    };
 
     // STORY-024 T12 — coding-standards.md §7: one metric, one redacted log
     // line. The filter owns EVERY error path, and it had neither: because it
@@ -191,12 +189,12 @@ export class ProblemFilter implements ExceptionFilter {
     // IDs only, never names, and never `detail` for a 5xx — an unexpected
     // exception's message is the one string most likely to carry a
     // connection string, a row, or a customer's data.
-    incrementCounter("nominara_api_error_total", { code: wireCode ?? "unmapped", status: String(status) });
+    incrementCounter("nominara_api_error_total", { code: wireCode, status: String(status) });
     logger.error({
       message: "request refused",
       request_id: requestId,
       status,
-      code: wireCode ?? null,
+      code: wireCode,
       workspace_id: (request as AuthenticatedRequest).auth?.ws ?? null,
       ...(isServerError ? {} : { detail: message }),
     });

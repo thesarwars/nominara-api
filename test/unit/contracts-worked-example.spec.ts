@@ -176,7 +176,7 @@ describe("STORY-023 · scenario 10 — the worked example (POST /v1/workspaces):
 
   // M4 — AC4: "The typed client is generated with request and response
   // types, a fetch client, realtime event types, and the error-code union."
-  // Compared against errorCodeSchema.options (currently 27 members) —
+  // Compared against errorCodeSchema.options (currently 28 members) —
   // NEVER a hardcoded list, so this test cannot silently go stale the next
   // time §2's taxonomy grows or shrinks by one code.
   //
@@ -184,7 +184,7 @@ describe("STORY-023 · scenario 10 — the worked example (POST /v1/workspaces):
   // deferred, not covered here, so that scope does not silently drift onto
   // this task.
   describe("5. error-code union (AC4)", () => {
-    it("the generated client's output contains every one of errorCodeSchema's 27 members", async () => {
+    it("the generated client's output contains every one of errorCodeSchema's 28 members", async () => {
       const document = await generateOpenApiDocument();
 
       tempClientDir = mkdtempSync(resolve(REPO_ROOT, "node_modules/.tmp-story023-error-code-client-"));

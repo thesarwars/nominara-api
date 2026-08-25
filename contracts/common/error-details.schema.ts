@@ -252,7 +252,7 @@ export const engineUnavailableDetailsSchema = z.object({ circuit_opened_at: z.is
 // The code → details binding
 // ---------------------------------------------------------------------------
 // A map, not a discriminated union folded into `problemDetailsSchema`.
-// Binding `error.code` to `error.details` as a 27-member union belongs with
+// Binding `error.code` to `error.details` as a 28-member union belongs with
 // the change that first puts error RESPONSES into the OpenAPI document
 // (T9/T10) — today `buildOperation()` emits success statuses only, so a
 // union here would be a contract nothing serves yet. This map is what T9's

@@ -4,6 +4,7 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { ACCESS_COOKIE_NAME } from "../../lib/auth/cookies.js";
+import { problemDetailsSchema } from "../../../contracts/common/problem-details.schema.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import {
   PermissionDeniedException,
@@ -129,13 +130,21 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     const response = await app.inject({ method: "GET", url: apiUrl("/test-only/public-throws") });
 
     expect(response.statusCode).toBe(500);
-    expect(response.json()).toEqual({
+    const body = response.json();
+    expect(body).toEqual({
       type: "about:blank",
       status: 500,
-      title: "INTERNAL_SERVER_ERROR",
+      title: "Internal Error",
       detail: "internal server error",
-      request_id: expect.any(String),
+      error: {
+        code: "internal_error",
+        message: "internal server error",
+        request_id: expect.any(String),
+      },
     });
+    // STORY-119 — over real HTTP, not just at the filter's own seam: the 500
+    // body satisfies the schema this API publishes. It did not before.
+    expect(problemDetailsSchema.safeParse(body).success).toBe(true);
   });
 
   it("maps TenantContextMissingError (a private route with no tenant set) to a well-formed 500 problem+json", async () => {
@@ -155,13 +164,21 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     });
 
     expect(response.statusCode).toBe(500);
-    expect(response.json()).toEqual({
+    const body = response.json();
+    expect(body).toEqual({
       type: "about:blank",
       status: 500,
-      title: "INTERNAL_SERVER_ERROR",
+      title: "Internal Error",
       detail: "internal server error",
-      request_id: expect.any(String),
+      error: {
+        code: "internal_error",
+        message: "internal server error",
+        request_id: expect.any(String),
+      },
     });
+    // STORY-119 — over real HTTP, not just at the filter's own seam: the 500
+    // body satisfies the schema this API publishes. It did not before.
+    expect(problemDetailsSchema.safeParse(body).success).toBe(true);
   });
 
   it("REQ-019-4 · serializes PermissionDeniedException's code/details over the wire", async () => {
@@ -217,7 +234,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     });
   });
 
-  // STORY-024 decision D12 — `workspace_suspended` is NOT one of §2's 27
+  // STORY-024 decision D12 — `workspace_suspended` is NOT one of §2's 28
   // codes, so it cannot go on the wire as itself. It is mapped to `forbidden`
   // and keeps its identity in `details.reason`; the exception class is
   // unchanged and still throws `workspace_suspended` internally.

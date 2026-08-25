@@ -145,7 +145,7 @@ function decodeClaims(token: string): { sub: string } {
 }
 
 // STORY-024 decision D12 — `oauth_failed` is NOT one of api-specification.md
-// §2's 27 codes, and `problemErrorSchema.code` is a closed union, so it cannot
+// §2's 28 codes, and `problemErrorSchema.code` is a closed union, so it cannot
 // travel as itself. ProblemFilter maps it to `validation_failed` and preserves
 // the original condition as `error.details.reason`. OauthFailedException is
 // unchanged and still throws `oauth_failed` internally — the mapping is at the

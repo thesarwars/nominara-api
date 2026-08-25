@@ -40,6 +40,7 @@ export const ERROR_STATUS_BY_CODE: Record<ErrorCode, number> = {
   quota_exceeded: 429,
   daily_limit_reached: 429,
   capture_mode_unavailable: 451,
+  internal_error: 500,
   engine_unavailable: 502,
   degraded: 503,
   retention_exceeded: 507,
@@ -157,7 +158,7 @@ export type DomainErrorClassFor<Code extends ErrorCode> = new (
 
 // One named class per code. `name` is set explicitly so a stack trace and a
 // `instanceof`-less log both still identify which error was thrown — an
-// anonymous subclass reports "DomainError" for all 27.
+// anonymous subclass reports "DomainError" for all 28.
 function defineDomainError<Code extends ErrorCode>(code: Code, className: string): DomainErrorClassFor<Code> {
   const status = ERROR_STATUS_BY_CODE[code];
   const cls = class extends DomainError {
@@ -197,6 +198,13 @@ export const EngineUnavailableError = defineDomainError("engine_unavailable", "E
 export const DegradedError = defineDomainError("degraded", "DegradedError");
 export const RetentionExceededError = defineDomainError("retention_exceeded", "RetentionExceededError");
 
+// STORY-119. Exists because ErrorCode is exhaustive here and a member with no
+// class would be a hole in the registry, NOT because a handler should throw
+// it: `internal_error` is what ProblemFilter falls back to when nothing else
+// classified the failure. A handler that knows enough to construct this knows
+// enough to throw something the taxonomy already models.
+export const InternalError = defineDomainError("internal_error", "InternalError");
+
 // Each entry keeps its OWN code's precise constructor type, so this map is a
 // lookup table and not a place where the per-code typing is quietly widened
 // back to `unknown` details.
@@ -228,6 +236,7 @@ export const DOMAIN_ERROR_CLASSES: { readonly [Code in ErrorCode]: DomainErrorCl
   engine_unavailable: EngineUnavailableError,
   degraded: DegradedError,
   retention_exceeded: RetentionExceededError,
+  internal_error: InternalError,
 };
 
 /**

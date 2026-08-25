@@ -11,7 +11,13 @@ import {
   TenantContextMissingError,
   WorkspaceSuspendedException,
 } from "../../tenancy/errors.js";
-import { InsufficientCreditsError, StepUpRequiredError } from "../errors/domain-errors.js";
+import {
+  DegradedError,
+  EngineUnavailableError,
+  InsufficientCreditsError,
+  RetentionExceededError,
+  StepUpRequiredError,
+} from "../errors/domain-errors.js";
 import { ProblemFilter } from "./problem.filter.js";
 
 const REQUEST_ID = "req-42";
@@ -157,20 +163,61 @@ describe("STORY-024 · decision D12 — out-of-taxonomy codes are mapped on the 
 });
 
 describe("STORY-024 · errors outside the taxonomy", () => {
-  // §2's table has no row for an unexpected 5xx, so there is no code to put
-  // in an `error` member. Such a response carries RFC 9457's members plus a
-  // top-level request_id — a 500 is exactly when a user needs a reference to
-  // quote, so the identifier stays even though the taxonomy code cannot.
-  it("a generic Error is a 500 that leaks no internal message but still identifies the request", () => {
+  // STORY-119 — §2 now has a 500 row, so an unexpected failure has a member
+  // of the taxonomy to carry and the body is an ordinary problem+json like
+  // every other error. Before it, the filter had to choose between inventing
+  // a code and dropping the `error` member; it dropped the member, and the
+  // resulting body failed the schema this API publishes.
+  it("a generic Error is a 500 carrying `internal_error`, and leaks no internal message", () => {
     const body = bodyFrom(new Error("raw internal detail"));
 
     expect(body).toEqual({
       type: "about:blank",
-      title: "INTERNAL_SERVER_ERROR",
+      title: "Internal Error",
       status: HttpStatus.INTERNAL_SERVER_ERROR,
       detail: "internal server error",
-      request_id: REQUEST_ID,
+      error: {
+        code: "internal_error",
+        message: "internal server error",
+        request_id: REQUEST_ID,
+      },
     });
+  });
+
+  // The identifier used to sit at the top level BECAUSE there was no `error`
+  // member to put it in. Now that there is one, leaving it in both places
+  // would give a client two answers to one question — and problemDetailsSchema
+  // is `.strict()`, so a leftover top-level member fails the contract outright.
+  it("carries the request identifier in exactly one place", () => {
+    const body = bodyFrom(new Error("boom"));
+    expect(body).not.toHaveProperty("request_id");
+    expect((body.error as Record<string, unknown>).request_id).toBe(REQUEST_ID);
+  });
+
+  // The exception's own message is the string most likely to carry a
+  // connection string, a row, or customer data. It must appear under NO
+  // member — not `detail`, not `error.message`, not `error.details`.
+  it("puts the exception's own text nowhere in the body", () => {
+    const secret = "postgres://user:hunter2@10.0.0.4:5432/nominara";
+    expect(JSON.stringify(bodyFrom(new Error(secret)))).not.toContain("hunter2");
+  });
+
+  // `internal_error` is for the UNMODELLED failure. A 5xx that §2 already
+  // models keeps its own code — collapsing these into one would erase the
+  // distinction the table exists to draw, and a client would render "retry"
+  // where "the circuit is open" or "partial results are available" was true.
+  it.each([
+    [
+      new EngineUnavailableError({ details: { circuit_opened_at: "2026-08-25T09:00:00.000Z" } }),
+      "engine_unavailable",
+      HttpStatus.BAD_GATEWAY,
+    ],
+    [new DegradedError(), "degraded", HttpStatus.SERVICE_UNAVAILABLE],
+    [new RetentionExceededError(), "retention_exceeded", HttpStatus.INSUFFICIENT_STORAGE],
+  ])("a modelled 5xx keeps its own code, never internal_error (%#)", (exception, expectedCode, expectedStatus) => {
+    const body = bodyFrom(exception);
+    expect(body.status).toBe(expectedStatus);
+    expect((body.error as Record<string, unknown>).code).toBe(expectedCode);
   });
 
   it("TenantContextMissingError (a plain Error, not an HttpException) is a well-formed 500", () => {
@@ -213,24 +260,21 @@ describe("STORY-024 · errors outside the taxonomy", () => {
       expect(parsed.success).toBe(true);
     });
 
-    // NAMED DEVIATION, not an oversight. api-specification.md §2's table runs
-    // 400…507 and contains NO code for "we did not model this", so an
-    // unexpected 5xx has no taxonomy member to carry and its body omits
-    // `error` — which problemDetailsSchema, being `.strict()` with `error`
-    // required, therefore rejects. This test PINS that deviation rather than
-    // leaving it invisible: it goes red the moment the 5xx body starts
-    // conforming, which is exactly when the follow-up story lands —
-    // STORY-119, which adds a taxonomy member for the unmodelled failure —
-    // and this waiver should be deleted rather than quietly outliving its
-    // reason.
-    it("an unexpected 5xx deliberately does NOT satisfy it — §2 has no code for an unmodelled error", () => {
+    // STORY-119 — this was a NAMED WAIVER asserting the opposite: that an
+    // unexpected 5xx did NOT satisfy the schema, because §2 had no code for
+    // an unmodelled failure and the body therefore omitted `error`. §2 now
+    // has one, so the waiver is deleted rather than left to outlive its
+    // reason, and the assertion is inverted into the requirement.
+    //
+    // There is no status the service can emit that is exempt from this.
+    it("an unexpected 5xx satisfies it too — no status is exempt from the published contract", () => {
       const body = bodyFrom(new Error("boom"));
       expect(body.status).toBe(HttpStatus.INTERNAL_SERVER_ERROR);
-      expect(body).not.toHaveProperty("error");
+      const parsed = problemDetailsSchema.safeParse(body);
       expect(
-        problemDetailsSchema.safeParse(body).success,
-        "if this is now true, §2 gained a code for an unmodelled 5xx — delete this waiver",
-      ).toBe(false);
+        parsed.success,
+        `body must satisfy problemDetailsSchema: ${JSON.stringify(parsed.success ? {} : parsed.error.issues)}`,
+      ).toBe(true);
     });
   });
 });

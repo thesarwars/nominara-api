@@ -41,13 +41,14 @@ const STATUS_FROM_SPECIFICATION: Record<ErrorCode, number> = {
   quota_exceeded: 429,
   daily_limit_reached: 429,
   capture_mode_unavailable: 451,
+  internal_error: 500,
   engine_unavailable: 502,
   degraded: 503,
   retention_exceeded: 507,
 };
 
 describe("STORY-024 · scenario 1 — every taxonomy code has a typed domain error with §2's status", () => {
-  it("the transcribed §2 status table covers exactly the 27 codes of errorCodeSchema (guards this file against going stale)", () => {
+  it("the transcribed §2 status table covers exactly the 28 codes of errorCodeSchema (guards this file against going stale)", () => {
     expect(Object.keys(STATUS_FROM_SPECIFICATION).sort()).toEqual([...errorCodeSchema.options].sort());
   });
 
