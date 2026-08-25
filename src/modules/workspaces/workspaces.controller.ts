@@ -1,6 +1,11 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
+import { z } from "zod";
+import { paginationRequestSchema, type PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { entityTagFor, formatEntityTag } from "../../api/etag/entity-tag.js";
+import { parseIfMatch } from "../../api/etag/if-match.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
@@ -26,7 +31,7 @@ import {
   type MemberResponse,
   type UpdateMemberRoleRequest,
   type UpdateWorkspaceRequest,
-  type WorkspaceListResponse,
+  type WorkspaceListItemWithRelationship,
   type WorkspaceResponse,
 } from "./dto/index.js";
 import { InvitationsService } from "./invitations.service.js";
@@ -56,38 +61,69 @@ export class WorkspacesController {
 
   @Post("workspaces")
   @SkipTenantContext()
-  @ApiContract({ operationId: "createWorkspace", requestSchema: createWorkspaceRequestSchema, responseSchema: workspaceResponseSchema })
-  create(
+  @ApiContract({
+    operationId: "createWorkspace",
+    requestSchema: createWorkspaceRequestSchema,
+    responseSchema: workspaceResponseSchema,
+    emitsEntityTag: true,
+  })
+  async create(
     @Req() req: AuditableRequest,
     @Body(new ZodValidationPipe(createWorkspaceRequestSchema)) body: CreateWorkspaceRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
   ): Promise<WorkspaceResponse> {
-    return this.service.create(req.auth!.sub, body, auditMeta(req));
+    const workspace = await this.service.create(req.auth!.sub, body, auditMeta(req));
+    // The only route that hands a caller their FIRST tag for a workspace:
+    // there is no item-level GET /workspaces/{id} yet (a STORY-021 gap, not
+    // something this task invents), so without this a client would have no
+    // way to obtain a tag for the PATCH below except `If-Match: *`.
+    reply.header("ETag", formatEntityTag(entityTagFor(workspace)));
+    return workspace;
   }
 
   @Get("workspaces")
   @SkipTenantContext()
-  @ApiContract({ operationId: "listWorkspaces", responseSchema: workspaceListResponseSchema })
-  list(@Req() req: AuditableRequest): Promise<WorkspaceListResponse> {
-    return this.service.listForActor(req.auth!.sub);
+  @ApiContract({
+    operationId: "listWorkspaces",
+    querySchema: paginationRequestSchema,
+    responseSchema: workspaceListResponseSchema,
+    listOf: true,
+  })
+  list(
+    @Req() req: AuditableRequest,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<WorkspaceListItemWithRelationship>> {
+    return this.service.listForActor(req.auth!.sub, pagination);
   }
 
   @Patch("workspaces/:id")
   @RequirePermission("workspace:update")
   @Audit({ action: "workspace.updated", resourceType: "workspace" })
-  @ApiContract({ operationId: "updateWorkspace", requestSchema: updateWorkspaceRequestSchema, responseSchema: workspaceResponseSchema })
-  update(
+  @ApiContract({
+    operationId: "updateWorkspace",
+    requestSchema: updateWorkspaceRequestSchema,
+    responseSchema: workspaceResponseSchema,
+    requiresIfMatch: true,
+    emitsEntityTag: true,
+  })
+  async update(
     @Req() req: RbacScopedRequest,
     @Param("id") id: string,
     @Body(new ZodValidationPipe(updateWorkspaceRequestSchema)) body: UpdateWorkspaceRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
   ): Promise<WorkspaceResponse> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
-    return this.service.update(id, body);
+    // Parsed here, ENFORCED in the service — the comparison has to happen
+    // under the same row lock as the write or it is check-then-act.
+    const workspace = await this.service.update(id, body, parseIfMatch(firstHeaderValue(req.headers?.["if-match"]) ?? undefined));
+    reply.header("ETag", formatEntityTag(entityTagFor(workspace)));
+    return workspace;
   }
 
   @Post("workspaces/:id/switch")
   @SkipTenantContext()
   @HttpCode(200)
-  @ApiContract({ operationId: "switchWorkspace" })
+  @ApiContract({ operationId: "switchWorkspace", voidResponse: true })
   async switchWorkspace(
     @Req() req: AuditableRequest,
     @Param("id") id: string,
@@ -103,10 +139,19 @@ export class WorkspacesController {
 
   @Get("workspaces/:id/members")
   @RequirePermission("workspace:read")
-  @ApiContract({ operationId: "listWorkspaceMembers" })
-  listMembers(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<MemberResponse[]> {
+  @ApiContract({
+    operationId: "listWorkspaceMembers",
+    querySchema: paginationRequestSchema,
+    responseSchema: z.array(memberResponseSchema),
+    listOf: true,
+  })
+  listMembers(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<MemberResponse>> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
-    return this.service.listMembers();
+    return this.service.listMembers(pagination);
   }
 
   @Patch("members/:id")
@@ -124,7 +169,7 @@ export class WorkspacesController {
   @Delete("members/:id")
   @RequirePermission("member:remove")
   @Audit({ action: "member.removed", resourceType: "workspace_member" })
-  @ApiContract({ operationId: "removeMember" })
+  @ApiContract({ operationId: "removeMember", voidResponse: true })
   removeMember(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<void> {
     return this.service.removeMemberById(req.tenant!.workspaceId, id);
   }
@@ -144,10 +189,19 @@ export class WorkspacesController {
 
   @Get("workspaces/:id/invitations")
   @RequirePermission("member:invite")
-  @ApiContract({ operationId: "listInvitations" })
-  listInvitations(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<InvitationResponse[]> {
+  @ApiContract({
+    operationId: "listInvitations",
+    querySchema: paginationRequestSchema,
+    responseSchema: z.array(invitationResponseSchema),
+    listOf: true,
+  })
+  listInvitations(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<InvitationResponse>> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
-    return this.invitations.list(id);
+    return this.invitations.list(id, pagination);
   }
 
   @Post("workspaces/:id/invitations/accept")

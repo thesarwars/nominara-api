@@ -35,6 +35,41 @@ export interface ApiContractOptions {
   readonly paramsSchema?: ZodType;
   /** Absent when the route carries no error shape beyond the shared `problemDetailsSchema`. */
   readonly errorSchema?: ZodType;
+  /**
+   * STORY-024 T11 — the route is a cursor-paginated collection (NFR-API-03).
+   * A BOOLEAN, not a schema: it marks the operation so the build-time
+   * assertion in test/unit/pagination-contract.spec.ts can require it to
+   * carry `paginationRequestSchema`'s fields and declare no offset/page
+   * parameter. Nothing about the shape is described here — the schema is
+   * still the only description of the contract.
+   */
+  readonly listOf?: boolean;
+  /**
+   * STORY-024 T11 — the route requires an `If-Match` precondition (AC8). A
+   * required REQUEST HEADER is part of the contract: without emitting it,
+   * `@nominara/client` would generate a call that cannot succeed against a
+   * route whose every unconditioned request is refused with 422.
+   */
+  readonly requiresIfMatch?: boolean;
+  /**
+   * STORY-024 T11 — the route returns an `ETag` response header carrying the
+   * concurrency tag for the representation in its body.
+   */
+  readonly emitsEntityTag?: boolean;
+  /**
+   * STORY-024 T12 — the route returns NO body, so the envelope carries
+   * `data: null`. This must be DECLARED, never inferred from the absence of
+   * `responseSchema`.
+   *
+   * T11 inferred it, and the inference was unsound: `responseSchema` is
+   * optional, so `createPasskeyOptions`, `listWorkspaceMembers` and
+   * `listInvitations` — all of which return a body — were published as
+   * `data: {"type":"null"}`. Before T11 those read "no response body", a
+   * visible omission; after T11 they were a positive, machine-checkable
+   * falsehood that `@nominara/client` would have compiled against. An
+   * absent schema now fails `contracts:generate` instead.
+   */
+  readonly voidResponse?: boolean;
 }
 
 export const API_CONTRACT_KEY = "apiContract";

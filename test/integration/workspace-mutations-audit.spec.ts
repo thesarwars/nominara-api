@@ -8,6 +8,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { apiUrl } from "../support/api-url.js";
+import { dataOf } from "../support/envelope.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import type { ChainMismatchAlert, PagingNotifier } from "../../src/modules/audit/ports/paging-notifier.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
@@ -79,6 +80,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
+    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 
@@ -144,7 +146,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       payload: { name: `Audited Co ${randomUUID()}` },
     });
     expect(createRes.statusCode).toBe(201);
-    const workspace = createRes.json() as { id: string };
+    const workspace = dataOf<{ id: string }>(createRes);
     const created = await auditRow(workspace.id, "workspace.created");
     expect(created).toEqual({ actor_id: owner.userId, resource_id: workspace.id });
 
@@ -178,11 +180,18 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     const csrfHeader = { [CSRF_HEADER_NAME]: owner.csrf };
 
     // ---- (2) PATCH /workspaces/:id -> workspace.updated --------------------
+    // STORY-024 T11 — this PATCH now REQUIRES an If-Match precondition (AC8).
+    // The tag comes from the create response above: POST is the only route
+    // that hands a caller their first tag for a workspace, there being no
+    // item-level GET /workspaces/{id}.
+    const createdEtag = createRes.headers.etag as string;
+    expect(createdEtag, "POST /workspaces must emit the ETag a later PATCH needs").toMatch(/^"[^"]+"$/);
+
     const updateRes = await app.inject({
       method: "PATCH",
       url: apiUrl(`/workspaces/${workspace.id}`),
       cookies: scoped,
-      headers: csrfHeader,
+      headers: { ...csrfHeader, "if-match": createdEtag },
       payload: { name: "Renamed Co" },
     });
     expect(updateRes.statusCode).toBe(200);
@@ -227,7 +236,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       payload: { email: `invitee-${randomUUID()}@example.com`, role: "viewer" },
     });
     expect(inviteRes.statusCode).toBe(201);
-    const invitation = inviteRes.json() as { id: string; token: string };
+    const invitation = dataOf<{ id: string; token: string }>(inviteRes);
     const invited = await auditRow(workspace.id, "member.invited");
     expect(invited).toEqual({ actor_id: owner.userId, resource_id: invitation.id });
 
@@ -241,7 +250,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       payload: { token: invitation.token },
     });
     expect(acceptRes.statusCode).toBe(200);
-    const acceptedMember = acceptRes.json() as { id: string };
+    const acceptedMember = dataOf<{ id: string }>(acceptRes);
     const accepted = await auditRow(workspace.id, "member.invitation_accepted");
     expect(accepted).toEqual({ actor_id: invitee.userId, resource_id: acceptedMember.id });
 
@@ -284,7 +293,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       headers: { [CSRF_HEADER_NAME]: owner.csrf },
       payload: { name: `Rollback Co ${randomUUID()}` },
     });
-    const workspace = createRes.json() as { id: string };
+    const workspace = dataOf<{ id: string }>(createRes);
 
     const switchRes = await app.inject({
       method: "POST",
@@ -361,7 +370,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
       headers: { [CSRF_HEADER_NAME]: owner.csrf },
       payload: { name: `Matrix Co ${randomUUID()}` },
     });
-    const workspace = createRes.json() as { id: string };
+    const workspace = dataOf<{ id: string }>(createRes);
 
     const admin = await newSession();
     await addMember(workspace.id, admin.userId, "admin");
@@ -395,10 +404,148 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     });
 
     expect(res.statusCode).toBe(403);
-    const body = res.json() as { details?: { required_permission?: string } };
-    expect(body.details?.required_permission).toBe("workspace:transfer_ownership");
+    // STORY-024 T9 — decision D2's dual shape nests code/details under `error`.
+    const body = res.json() as { error?: { details?: { required_permission?: string } } };
+    expect(body.error?.details?.required_permission).toBe("workspace:transfer_ownership");
 
     const target = await memberRow(targetMemberId);
     expect(target.role).toBe("viewer");
+  });
+  // -------------------------------------------------------------------------
+  // STORY-024 T11 — AC8 / story scenarios 6 and 7, end to end over the real
+  // composition root. test/integration/etag-optimistic-concurrency.spec.ts
+  // covers the parser's own contract; these are the HTTP cases, which need a
+  // real session and therefore live in the file that already mints one.
+  // -------------------------------------------------------------------------
+
+  /** Creates a workspace, switches into it, and returns everything a PATCH needs. */
+  async function workspaceScopedSession() {
+    const owner = await newSession();
+    const createRes = await app.inject({
+      method: "POST",
+      url: apiUrl("/workspaces"),
+      cookies: { [ACCESS_COOKIE_NAME]: owner.accessToken, [CSRF_COOKIE_NAME]: owner.csrf },
+      headers: { [CSRF_HEADER_NAME]: owner.csrf },
+      payload: { name: `Concurrency Co ${randomUUID()}` },
+    });
+    expect(createRes.statusCode).toBe(201);
+
+    const switchRes = await app.inject({
+      method: "POST",
+      url: apiUrl(`/workspaces/${dataOf<{ id: string }>(createRes).id}/switch`),
+      cookies: {
+        [ACCESS_COOKIE_NAME]: owner.accessToken,
+        [CSRF_COOKIE_NAME]: owner.csrf,
+        [REFRESH_COOKIE_NAME]: owner.refreshToken,
+      },
+      headers: { [CSRF_HEADER_NAME]: owner.csrf },
+    });
+    expect(switchRes.statusCode).toBe(200);
+    const scopedAccessToken = new Map(switchRes.cookies.map((c) => [c.name, c.value as string])).get(
+      ACCESS_COOKIE_NAME,
+    )!;
+
+    return {
+      workspaceId: dataOf<{ id: string }>(createRes).id,
+      etag: createRes.headers.etag as string,
+      cookies: { [ACCESS_COOKIE_NAME]: scopedAccessToken, [CSRF_COOKIE_NAME]: owner.csrf },
+      headers: { [CSRF_HEADER_NAME]: owner.csrf },
+    };
+  }
+
+  function patch(
+    session: Awaited<ReturnType<typeof workspaceScopedSession>>,
+    payload: Record<string, unknown>,
+    ifMatch?: string,
+  ) {
+    return app.inject({
+      method: "PATCH",
+      url: apiUrl(`/workspaces/${session.workspaceId}`),
+      cookies: session.cookies,
+      headers: ifMatch === undefined ? session.headers : { ...session.headers, "if-match": ifMatch },
+      payload,
+    });
+  }
+
+  it("scenario 7 — a current concurrency tag succeeds and a NEW tag comes back", async () => {
+    const session = await workspaceScopedSession();
+
+    const res = await patch(session, { name: "First Rename" }, session.etag);
+
+    expect(res.statusCode).toBe(200);
+    expect(dataOf<{ name: string }>(res).name).toBe("First Rename");
+    // "Success, new tag returned" — a route that echoed the old tag would
+    // make the second write of a sequence unconditionally fail.
+    expect(res.headers.etag).toBeTruthy();
+    expect(res.headers.etag).not.toBe(session.etag);
+  });
+
+  it("scenario 6 — a STALE tag is refused with a conflict, and the write does not land", async () => {
+    const session = await workspaceScopedSession();
+
+    // Someone else's write moves the resource on, invalidating the tag this
+    // caller is still holding.
+    const first = await patch(session, { name: "Winner" }, session.etag);
+    expect(first.statusCode).toBe(200);
+
+    const stale = await patch(session, { name: "Loser" }, session.etag);
+
+    expect(stale.statusCode).toBe(409);
+    const body = stale.json() as { error?: { code?: string } };
+    expect(body.error?.code).toBe("conflict");
+
+    // The refusal has to be a refusal, not a 409 reported after the row was
+    // already overwritten.
+    const row = await db.query<{ name: string }>("SELECT name FROM workspaces WHERE id = $1", [session.workspaceId]);
+    expect(row.rows[0]!.name).toBe("Winner");
+  });
+
+  it("a MISSING precondition is refused as precondition_unmet, not conflated with a stale one", async () => {
+    const session = await workspaceScopedSession();
+
+    const res = await patch(session, { name: "No Precondition" });
+
+    expect(res.statusCode).toBe(422);
+    const body = res.json() as { error?: { code?: string } };
+    expect(body.error?.code).toBe("precondition_unmet");
+    // Distinguishable from scenario 6 above by BOTH status and code — the
+    // remediation differs (send the tag you have vs re-read and retry).
+    expect(res.statusCode).not.toBe(409);
+  });
+
+  it("If-Match: * succeeds — the documented path for a caller with no tag yet", async () => {
+    const session = await workspaceScopedSession();
+
+    const res = await patch(session, { name: "Wildcard" }, "*");
+
+    expect(res.statusCode).toBe(200);
+    expect(dataOf<{ name: string }>(res).name).toBe("Wildcard");
+  });
+
+  it("a weak validator is refused rather than silently compared as a strong one", async () => {
+    const session = await workspaceScopedSession();
+
+    const res = await patch(session, { name: "Weak" }, `W/${session.etag}`);
+
+    expect(res.statusCode).toBe(400);
+    const row = await db.query<{ name: string }>("SELECT name FROM workspaces WHERE id = $1", [session.workspaceId]);
+    expect(row.rows[0]!.name).not.toBe("Weak");
+  });
+
+  it("the tag tracks the representation — an unrelated field changing invalidates it", async () => {
+    const session = await workspaceScopedSession();
+
+    const renamed = await patch(session, { name: "Tracked" }, session.etag);
+    expect(renamed.statusCode).toBe(200);
+    const afterRename = renamed.headers.etag as string;
+
+    // A DIFFERENT field moves next; the tag from the rename must not survive
+    // it, or a caller could overwrite a timezone change they never saw.
+    const retimed = await patch(session, { timezone: "Europe/Berlin" }, afterRename);
+    expect(retimed.statusCode).toBe(200);
+    expect(retimed.headers.etag).not.toBe(afterRename);
+
+    const replayed = await patch(session, { name: "Overwrite" }, afterRename);
+    expect(replayed.statusCode).toBe(409);
   });
 });

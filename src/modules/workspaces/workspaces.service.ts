@@ -1,8 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { ConflictException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
+import { entityTagFor } from "../../api/etag/entity-tag.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { Page, pageFrom } from "../../api/pagination/page.js";
+import { assertIfMatch } from "../../api/etag/if-match.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { PG_POOL } from "../../db/pg-pool.js";
+import { REALTIME_PUBLISHER, type RealtimePublisher } from "../../lib/cache/realtime-publisher.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import {
@@ -16,12 +21,13 @@ import { currentTenantStore, withActorContext, withTenantContext } from "../../t
 import { SessionService } from "../identity/session.service.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { MembershipService } from "./membership.service.js";
+import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import type {
   CreateWorkspaceRequest,
   MemberResponse,
   UpdateMemberRoleRequest,
   UpdateWorkspaceRequest,
-  WorkspaceListResponse,
+  WorkspaceListItemWithRelationship,
   WorkspaceResponse,
 } from "./dto/index.js";
 
@@ -118,6 +124,7 @@ export class WorkspacesService {
     private readonly auditChain: AuditChainService,
     private readonly membership: MembershipService,
     private readonly sessions: SessionService,
+    @Inject(REALTIME_PUBLISHER) private readonly realtime: RealtimePublisher,
   ) {}
 
   /** Test scenario 8 (STORY-018): a suspended workspace refuses access immediately (WorkspaceGuard reads status live, never cached). */
@@ -300,8 +307,26 @@ export class WorkspacesService {
     }
   }
 
-  /** STORY-021 AC5/E-11 — GET /workspaces. Cross-tenant self-read under the ADR-0001 actor-only policy class, never withTenantContext. */
-  async listForActor(userId: string): Promise<WorkspaceListResponse> {
+  /**
+   * STORY-021 AC5/E-11 — GET /workspaces. Cross-tenant self-read under the
+   * ADR-0001 actor-only policy class, never withTenantContext.
+   *
+   * STORY-117 — cursor-paginated (`NFR-API-03`), and flat rather than
+   * `{owned, joined}`: one envelope carries one `pagination` member and two
+   * arrays would need two cursors. `relationship` preserves the distinction
+   * per item; see workspace-list-response.schema.ts for why that is the same
+   * product requirement rather than a weakening of it.
+   *
+   * The sort key is `(created_at, id)`, not `created_at` alone. Two
+   * workspaces created in the same transaction share a timestamp, and a
+   * cursor keyed on a non-unique tuple skips and repeats across the page
+   * boundary — the one failure cursor pagination exists to prevent. The key
+   * travels as Postgres's own text rendering of the timestamp: a JS Date is
+   * millisecond-precision and timestamptz is microsecond, so round-tripping
+   * through Date would truncate the key and reintroduce the same bug.
+   */
+  async listForActor(userId: string, pagination: PaginationRequest): Promise<Page<WorkspaceListItemWithRelationship>> {
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
     const client = await this.pool.connect();
     try {
       return await withActorContext(client, { actorId: userId }, async (tx) => {
@@ -312,29 +337,34 @@ export class WorkspacesService {
           role: string;
           plan_key: string;
           status: string;
+          created_at_key: string;
         }>(
-          `SELECT w.id AS workspace_id, w.name, w.slug, m.role, w.plan_key, w.status
+          `SELECT w.id AS workspace_id, w.name, w.slug, m.role, w.plan_key, w.status,
+                  w.created_at::text AS created_at_key
            FROM workspace_members m
            JOIN workspaces w ON w.id = m.workspace_id
            WHERE m.user_id = $1 AND m.status = 'active'
-           ORDER BY w.created_at ASC`,
-          [userId],
+             AND ($2::timestamptz IS NULL OR (w.created_at, w.id) > ($2::timestamptz, $3::uuid))
+           ORDER BY w.created_at ASC, w.id ASC
+           LIMIT $4`,
+          [userId, after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
         );
 
-        const owned: WorkspaceListResponse["owned"] = [];
-        const joined: WorkspaceListResponse["joined"] = [];
-        for (const row of result.rows) {
-          const item = {
+        return pageFrom(
+          result.rows,
+          pagination.limit,
+          (row) => ({
             workspace_id: row.workspace_id,
             name: row.name,
             slug: row.slug,
             role: row.role as MemberResponse["role"],
             plan_key: row.plan_key,
             status: row.status as WorkspaceResponse["status"],
-          };
-          (row.role === "owner" ? owned : joined).push(item);
-        }
-        return { owned, joined };
+            // The same split STORY-021 made into two arrays, per item.
+            relationship: row.role === "owner" ? ("owned" as const) : ("joined" as const),
+          }),
+          (row) => [row.created_at_key, row.workspace_id],
+        );
       });
     } finally {
       client.release();
@@ -348,22 +378,48 @@ export class WorkspacesService {
    * verified against the URL by assertMatchesTenant in the controller).
    * `region` is accepted so it can be refused with an explanation rather
    * than rejected as an unrecognized key.
+   *
+   * STORY-024 T11 — AC8. `ifMatch` is the parsed `If-Match` precondition and
+   * is REQUIRED: assertIfMatch() refuses `undefined` with 422
+   * `precondition_unmet` and a stale tag with 409 `conflict`.
+   *
+   * The whole read-check-write runs on ONE statement sequence inside the
+   * ambient transaction that TenantContextInterceptor opened
+   * (`currentTenantStore()!.client`), and the read takes `FOR UPDATE`. Both
+   * are load-bearing: without the row lock this is check-then-act, and a
+   * concurrent writer committing between the SELECT and the UPDATE would be
+   * silently overwritten — which is the exact lost update the precondition
+   * exists to detect, reintroduced one line below the check for it.
+   *
+   * The `FOR UPDATE` also closes the same race on the pre-existing region
+   * immutability check, which read without a lock before this change.
    */
-  async update(workspaceId: string, input: UpdateWorkspaceRequest): Promise<WorkspaceResponse> {
+  async update(
+    workspaceId: string,
+    input: UpdateWorkspaceRequest,
+    ifMatch: string[] | "*" | undefined,
+  ): Promise<WorkspaceResponse> {
     const client = currentTenantStore()!.client;
 
-    const current = await client.query<{ region: string }>("SELECT region FROM workspaces WHERE id = $1", [
-      workspaceId,
-    ]);
-    const currentRegion = current.rows[0]?.region;
-    if (currentRegion === undefined) {
+    const current = await client.query<WorkspaceRow>(
+      `SELECT ${WORKSPACE_COLUMNS} FROM workspaces WHERE id = $1 FOR UPDATE`,
+      [workspaceId],
+    );
+    const currentRow = current.rows[0];
+    if (currentRow === undefined) {
       throw new NotFoundException();
     }
-    if (input.region !== undefined && input.region !== currentRegion) {
+
+    // Ordered before the region check so a caller holding a stale tag is
+    // told THAT, rather than being told their region is immutable on the
+    // basis of a representation they never saw.
+    assertIfMatch(ifMatch, entityTagFor(toWorkspaceResponse(currentRow)));
+
+    if (input.region !== undefined && input.region !== currentRow.region) {
       throw new ConflictException({
         code: "conflict",
         message: "data residency is fixed at creation and cannot be changed",
-        details: { field: "region", current: currentRegion, reason: "region_immutable" },
+        details: { field: "region", current: currentRow.region, reason: "region_immutable" },
       });
     }
 
@@ -447,12 +503,27 @@ export class WorkspacesService {
   }
 
   /** STORY-021 AC7 — GET /workspaces/{id}/members. Ordinary route, ambient transaction. */
-  async listMembers(): Promise<MemberResponse[]> {
+  /**
+   * STORY-117 — cursor-paginated (`NFR-API-03`). Sort key `(joined_at, id)`:
+   * an owner and the first member are created in the SAME transaction at
+   * workspace creation and therefore share `joined_at` exactly, so the
+   * primary-key tie-break is not a refinement here — it is the correctness
+   * condition. No workspace filter: RLS scopes the read to the ambient
+   * tenant, exactly as before this change.
+   */
+  async listMembers(pagination: PaginationRequest): Promise<Page<MemberResponse>> {
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
     const client = currentTenantStore()!.client;
-    const result = await client.query<MemberRow>(
-      `SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE status <> 'removed' ORDER BY joined_at ASC`,
+    const result = await client.query<MemberRow & { joined_at_key: string }>(
+      `SELECT ${MEMBER_COLUMNS}, joined_at::text AS joined_at_key
+       FROM workspace_members
+       WHERE status <> 'removed'
+         AND ($1::timestamptz IS NULL OR (joined_at, id) > ($1::timestamptz, $2::uuid))
+       ORDER BY joined_at ASC, id ASC
+       LIMIT $3`,
+      [after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
     );
-    return result.rows.map(toMemberResponse);
+    return pageFrom(result.rows, pagination.limit, toMemberResponse, (row) => [row.joined_at_key, row.id]);
   }
 
   /**
@@ -512,7 +583,21 @@ export class WorkspacesService {
     const updated = await client.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE id = $1`, [
       memberId,
     ]);
-    return toMemberResponse(updated.rows[0]!);
+    const response = toMemberResponse(updated.rows[0]!);
+
+    // STORY-026 T22, decision D7 — `member.changed`. §11 lists `api` as its
+    // producer and notes it "forces socket re-auth", which is the entire point
+    // of the event: a role change can make an already-authorised socket
+    // over-privileged, and without this the only thing closing that window is
+    // the gateway's 60-second re-validation timer.
+    this.realtime.memberChanged(workspaceId, {
+      workspace_id: workspaceId,
+      user_id: targetRow.user_id,
+      role: response.role,
+      status: response.status,
+    });
+
+    return response;
   }
 
   /** STORY-021 AC8/E-9 — DELETE /members/{id}. The owner cannot be removed at all; ownership must be transferred. */
@@ -536,5 +621,21 @@ export class WorkspacesService {
 
     // Ambient client (code-review fix) — see updateMemberRole's comment.
     await this.membership.removeMember(this.pool, workspaceId, targetRow.user_id, client);
+
+    // STORY-026 T22, decision D7. Removal is the case that matters most: the
+    // socket is now unauthorised outright, and this is what shortens the
+    // revocation window from sixty seconds to immediate
+    // (security-and-tenancy.md §7).
+    //
+    // Emitted AFTER the mutation and never awaited. A realtime event is a hint;
+    // the authoritative answer is the API the client refetches. Failing the
+    // removal because a cache was briefly unreachable would trade a committed,
+    // security-relevant change for a notification.
+    this.realtime.memberChanged(workspaceId, {
+      workspace_id: workspaceId,
+      user_id: targetRow.user_id,
+      role: targetRow.role as MemberResponse["role"],
+      status: "removed",
+    });
   }
 }

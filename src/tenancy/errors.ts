@@ -214,9 +214,15 @@ export class OauthFailedException extends BadRequestException {
 // is the only variable field; standard rate-limit headers are STORY-025's
 // deliverable, not invented here.
 export class OtpRateLimitedException extends HttpException {
+  // STORY-024 decision D13 — api-specification.md §2 gives this code
+  // `details.retry_after_ms`, and NFR-API-05 requires every duration to be
+  // integer milliseconds with a `_ms` suffix. The constructor still takes
+  // SECONDS because that is the unit the buckets and the `Retry-After`
+  // header are expressed in (RFC 9110 §10.2.3); the conversion happens once,
+  // here, rather than at each call site.
   constructor(retryAfterSeconds: number, message = "too many code requests — try again later") {
     super(
-      { code: "rate_limited", message, details: { retry_after_seconds: retryAfterSeconds } },
+      { code: "rate_limited", message, details: { retry_after_ms: retryAfterSeconds * 1000 } },
       HttpStatus.TOO_MANY_REQUESTS,
     );
   }

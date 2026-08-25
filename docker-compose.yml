@@ -1,5 +1,12 @@
 # pgBouncer joins this file in STORY-010 (database roles & pgBouncer wiring).
-# Valkey is NOT in STORY-010's scope — it joins in STORY-030 (queues).
+#
+# Valkey arrives as TWO instances, not one — system-architecture.md §11. The
+# CACHE instance is here (STORY-025: token buckets, idempotency records,
+# locks, memoisation, pub/sub) with allkeys-lru and no persistence. The QUEUE
+# instance joins in STORY-030 with noeviction and persistence on, holding
+# BullMQ's queues. The split is not tidiness: evicting a queued job under
+# memory pressure is silent data loss, and refusing to evict a cache is an
+# outage. One instance cannot have both policies.
 services:
   postgres:
     image: pgvector/pgvector:pg18
@@ -8,12 +15,24 @@ services:
       POSTGRES_PASSWORD: nominara
       POSTGRES_DB: nominara
     ports:
-      - "5432:5432"
+      # Host port overridable: 5432 is the most commonly already-occupied port
+      # on a developer machine, and a hard-coded mapping makes the whole stack
+      # refuse to start because of something unrelated. The CONTAINER port
+      # never moves — service-to-service URLs do not depend on this.
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       # PG18's image wants a single mount at /var/lib/postgresql (data lands
       # in a version-specific subdirectory) rather than /var/lib/postgresql/data
       # directly — mounting the old path makes the container refuse to start.
       - nominara-postgres-data:/var/lib/postgresql
+    # Without this, `depends_on` only waits for the CONTAINER, not for Postgres
+    # to accept connections — so migrate would race the database and fail on a
+    # cold start roughly every time.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nominara -d nominara"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   # Transaction-mode pooler in front of Postgres. Config lives entirely in
   # docker/pgbouncer/{pgbouncer.ini,userlist.txt} — not compose env vars — so
@@ -25,12 +44,142 @@ services:
   pgbouncer:
     image: edoburu/pgbouncer:v1.25.2-p0 # >= 1.25.2 is a stated security floor, system-architecture.md
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     volumes:
       - ./docker/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
       - ./docker/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
     ports:
-      - "6432:5432"
+      - "${PGBOUNCER_PORT:-6432}:5432"
+
+  # STORY-025 — the CACHE instance. allkeys-lru because every key here is
+  # reconstructible: a token bucket evicted early grants a little extra
+  # capacity, an idempotency record evicted early turns a replay into a
+  # re-execution. Both are degradations, not corruption, which is exactly
+  # what makes eviction the right policy for this instance and the wrong one
+  # for the queue.
+  #
+  # No volume, deliberately. Persistence here would preserve state that is
+  # meant to expire, and would make a local restart behave differently from
+  # the managed cache this stands in for.
+  valkey-cache:
+    image: valkey/valkey:8.1-alpine
+    command:
+      - valkey-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      - "${VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---- application ---------------------------------------------------------
+  #
+  # Every service below overrides the three connection URLs from .env, because
+  # .env's values are `localhost` — correct when you run the app on the host,
+  # wrong inside the network where the hostnames are the service names. Note
+  # pgbouncer is reached on 5432, its CONTAINER port; 6432 is only the host
+  # mapping.
+  #
+  # Two one-shot services run before the app, in order, each waiting for the
+  # previous to EXIT SUCCESSFULLY rather than merely to start.
+
+  migrate:
+    build: .
+    image: nominara-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
+    # Direct to Postgres, never through the pooler: migrations need a real
+    # session-scoped connection, which transaction-mode pooling cannot give.
+    command: ["node", "dist/src/db/migrate.js"]
+    restart: "no"
+
+  dev-credentials:
+    build: .
+    image: nominara-api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
+    # Migration 0005 creates the runtime roles and deliberately sets NO
+    # password. Without this step `nominara_app` cannot authenticate and
+    # DATABASE_URL_POOLED fails — the roles exist but cannot log in.
+    # LOCAL ONLY: production issues these through Secrets Manager (NFR-SEC-16).
+    command: ["node", "dist/src/db/dev-credentials.js"]
+    restart: "no"
+
+  api:
+    build: .
+    image: nominara-api
+    depends_on:
+      dev-credentials:
+        condition: service_completed_successfully
+      valkey-cache:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # NOT `test`. That value selects the per-process in-memory cache, which
+      # now refuses to start outside a test runner: with more than one replica
+      # it gives each its own idempotency store, so two requests carrying one
+      # Idempotency-Key both execute.
+      NODE_ENV: development
+      PORT: "3000"
+      DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
+      DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
+      VALKEY_CACHE_URL: redis://valkey-cache:6379
+    ports:
+      - "${API_PORT:-3000}:3000"
+    command: ["node", "dist/src/main.js"]
+
+  gateway:
+    build: .
+    image: nominara-api
+    depends_on:
+      dev-credentials:
+        condition: service_completed_successfully
+      valkey-cache:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      GATEWAY_PORT: "3001"
+      DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
+      DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
+      VALKEY_CACHE_URL: redis://valkey-cache:6379
+    ports:
+      - "${GATEWAY_HOST_PORT:-3001}:3001"
+    # A SEPARATE process from the API, matching the deployment topology's
+    # standalone svc-gateway. It attaches the Valkey adapter, which is what
+    # makes a broadcast cross instances — run more than one replica and they
+    # still reach each other's sockets, with no sticky sessions.
+    command: ["node", "dist/src/gateway.js"]
+    # The gateway serves no HTTP routes by design, so it has no /health/live to
+    # probe. Overriding the image's healthcheck avoids reporting a healthy
+    # process as unhealthy.
+    healthcheck:
+      disable: true
+
 
 volumes:
   nominara-postgres-data:

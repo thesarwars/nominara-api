@@ -1,11 +1,13 @@
 import { Body, Controller, HttpCode, Post, Req, Res } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import type { AuthenticatedRequest } from "../../api/guards/auth.guard.js";
+import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Public } from "../../api/decorators/public.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { setAuthCookies } from "../../lib/auth/cookies.js";
 import {
+  emailOtpRequestResponseSchema,
   emailOtpRequestSchema,
   emailOtpVerifyRequestSchema,
   type EmailOtpRequest,
@@ -34,6 +36,7 @@ export class EmailOtpController {
   @Post("auth/otp/request")
   @Public()
   @SkipTenantContext()
+  @ApiContract({ operationId: "requestEmailOtp", requestSchema: emailOtpRequestSchema, responseSchema: emailOtpRequestResponseSchema })
   request(
     @Body(new ZodValidationPipe(emailOtpRequestSchema)) body: EmailOtpRequest,
     @Req() req: EmailOtpRequestReq,
@@ -47,6 +50,7 @@ export class EmailOtpController {
   @Public()
   @SkipTenantContext()
   @HttpCode(200)
+  @ApiContract({ operationId: "verifyEmailOtp", requestSchema: emailOtpVerifyRequestSchema, voidResponse: true })
   async verify(
     @Body(new ZodValidationPipe(emailOtpVerifyRequestSchema)) body: EmailOtpVerifyRequest,
     @Req() req: EmailOtpRequestReq,

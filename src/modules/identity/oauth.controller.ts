@@ -86,7 +86,7 @@ export class OauthController {
 
   @Delete("me/oauth/:provider")
   @SkipTenantContext()
-  @ApiContract({ operationId: "unlinkOauth", paramsSchema: oauthProviderSchema })
+  @ApiContract({ operationId: "unlinkOauth", paramsSchema: oauthProviderSchema, voidResponse: true })
   unlink(
     @Req() req: AuthenticatedRequest,
     @Param("provider", new ZodValidationPipe(oauthProviderSchema)) provider: OauthProvider,

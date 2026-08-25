@@ -20,7 +20,7 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    ignores: ["dist/**", "node_modules/**"],
+    ignores: ["dist/**", "node_modules/**", "client/src/**", "client/dist/**"],
   },
   {
     plugins: {
@@ -37,7 +37,19 @@ export default tseslint.config(
     // STORY-022 — NFR-ARCH-01. The request path: module controllers/services
     // and the HTTP composition root. Excludes src/workers/** entirely —
     // workers are where the enqueued call is dequeued and actually made.
-    files: ["src/modules/**/*.controller.ts", "src/modules/**/*.service.ts", "src/api/**/*.ts", "src/contracts/**/*.ts"],
+    //
+    // `src/gateway/**` is here because OQ-12 settled it there and only
+    // `src/contracts/**` was actually added — leaving the largest new surface
+    // in EPIC-03, and the one that opens raw Redis connections, outside the
+    // epic's own lint-enforced quality criterion. Found in the STORY-026
+    // review. This TIGHTENS a gate, never relaxes one.
+    files: [
+      "src/modules/**/*.controller.ts",
+      "src/modules/**/*.service.ts",
+      "src/api/**/*.ts",
+      "src/contracts/**/*.ts",
+      "src/gateway/**/*.ts",
+    ],
     rules: {
       "nominara/no-request-handler-network-call": "error",
     },

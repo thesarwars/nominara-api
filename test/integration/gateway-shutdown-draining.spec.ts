@@ -4,6 +4,7 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { io, type Socket } from "socket.io-client";
 import { afterEach, describe, expect, it } from "vitest";
 import { RealtimeModule } from "../../src/gateway/gateway.module.js";
+import { applyFakeApiEnv } from "../support/fake-env.js";
 import { SERVER_DRAINING_EVENT } from "../../src/gateway/realtime.gateway.js";
 
 function getFreePort(): Promise<number> {
@@ -35,6 +36,13 @@ describe("STORY-022 · gateway shutdown draining", () => {
 
   it("emits server.draining to a connected /rt client before the process shuts down", async () => {
     const port = await getFreePort();
+    // STORY-026 T21 — RealtimeModule now imports DbModule (for PG_POOL, which
+
+    // room authorisation needs), and DbModule's factory calls loadEnv(). This
+
+    // spec set no environment and so crashed its worker at module construction.
+
+    applyFakeApiEnv();
     app = await NestFactory.create<NestFastifyApplication>(RealtimeModule, new FastifyAdapter());
     await app.listen({ port, host: "127.0.0.1" });
 

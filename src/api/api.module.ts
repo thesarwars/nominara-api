@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common";
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from "@nestjs/core";
 import { DbModule } from "../db/db.module.js";
+import { CacheModule } from "../lib/cache/cache.module.js";
 import { HealthModule } from "../modules/health/health.module.js";
 import { IdentityModule } from "../modules/identity/identity.module.js";
 import { WorkspacesModule } from "../modules/workspaces/workspaces.module.js";
@@ -29,11 +30,15 @@ import { QuotaGuard } from "./guards/quota.guard.js";
 import { DailyCapGuard } from "./guards/daily-cap.guard.js";
 import { RateLimitGuard } from "./guards/rate-limit.guard.js";
 import { CreditGuard } from "./guards/credit.guard.js";
+import { IdempotencyStore } from "./idempotency/store.js";
+import { CACHE, type Cache } from "../lib/cache/cache.port.js";
+import { RateLimitBuckets } from "./rate-limit/buckets.js";
 import { IdempotencyInterceptor } from "./interceptors/idempotency.interceptor.js";
 import { TenantContextInterceptor } from "./interceptors/tenant-context.interceptor.js";
 import { AuditInterceptor } from "./interceptors/audit.interceptor.js";
 import { CreditInterceptor } from "./interceptors/credit.interceptor.js";
 import { ProblemFilter } from "./filters/problem.filter.js";
+import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.interceptor.js";
 
 // STORY-022 — the HTTP composition root (project-structure.md §2: "src/api/
 // HTTP composition root: global guards, interceptors, filters"). The global
@@ -51,6 +56,7 @@ import { ProblemFilter } from "./filters/problem.filter.js";
 @Module({
   imports: [
     DbModule,
+    CacheModule,
     HealthModule,
     IdentityModule,
     WorkspacesModule,
@@ -73,6 +79,18 @@ import { ProblemFilter } from "./filters/problem.filter.js";
     AuditModule,
   ],
   providers: [
+    // STORY-025 T16 — the idempotency record store, injected into
+    // IdempotencyInterceptor. Not a global: only the interceptor uses it.
+    IdempotencyStore,
+    // STORY-025 T17 — the token buckets RateLimitGuard evaluates. Registered
+    // through a factory rather than by class: the constructor takes the
+    // configuration and a clock as optional arguments so a test can supply
+    // both, and Nest cannot resolve an Array or a Function by type.
+    {
+      provide: RateLimitBuckets,
+      useFactory: (cache: Cache): RateLimitBuckets => new RateLimitBuckets(cache),
+      inject: [CACHE],
+    },
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_GUARD, useClass: WorkspaceGuard },
     { provide: APP_GUARD, useClass: RbacGuard },
@@ -90,6 +108,11 @@ import { ProblemFilter } from "./filters/problem.filter.js";
     // TenantContextInterceptor's transaction stays open across both —
     // locked by composition-root.spec.ts.
     { provide: APP_INTERCEPTOR, useClass: IdempotencyInterceptor },
+    // STORY-024 T10 — index 1 exactly: INNER to Idempotency (so STORY-025
+    // caches the envelope, not the bare body) and OUTER to Audit (whose
+    // resourceIdFromResponse reads body.id and would break on {data}).
+    // See response-envelope.interceptor.ts for the full ordering argument.
+    { provide: APP_INTERCEPTOR, useClass: ResponseEnvelopeInterceptor },
     { provide: APP_INTERCEPTOR, useClass: TenantContextInterceptor },
     { provide: APP_INTERCEPTOR, useClass: AuditInterceptor },
     { provide: APP_INTERCEPTOR, useClass: CreditInterceptor },

@@ -8,7 +8,12 @@ import { z } from "zod";
 export const emailOtpRequestResponseSchema = z
   .object({
     status: z.literal("sent"),
-    expires_in_seconds: z.literal(600),
+    // STORY-117 — was `expires_in_seconds: 600`, which `NFR-API-05` forbids:
+    // "all durations are integer milliseconds with a `_ms` suffix". No
+    // reference document ever asked for seconds; the field was invented in
+    // code. The unit AND the name change together — a renamed unit keeping
+    // the old name would be worse than either alone.
+    expires_in_ms: z.literal(600_000),
   })
   .strict();
 

@@ -5,6 +5,9 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { dataOf } from "../support/envelope.js";
+import { eachRequestFromItsOwnClient } from "../support/distinct-source.js";
+import { EmailOtpService } from "../../src/modules/identity/email-otp.service.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { registerCookiePlugin } from "../../src/api/register-cookies.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
@@ -117,6 +120,34 @@ function mutatingHeaders(cookies: AuthCookies): { headers: Record<string, string
   };
 }
 
+// STORY-024 T9 — §2 requires EVERY error body to carry `error.request_id`, and
+// it necessarily differs between two requests. These enumeration-resistance
+// assertions compare bodies for byte-identity, so the identifier is normalised
+// out before comparison — and ONLY the identifier.
+//
+// That does not weaken the guarantee. What AC6 forbids is a response that
+// reveals WHICH rejection path fired, or whether the address exists. A
+// per-request identifier is generated the same way on every path regardless of
+// outcome, so it distinguishes nothing about the account. Every other field is
+// still compared verbatim, so a genuinely differing message, code, status or
+// detail still fails these tests exactly as before.
+function comparableBody(response: { json: () => unknown }): string {
+  const body = response.json() as Record<string, unknown>;
+  const error = body.error as Record<string, unknown> | undefined;
+  if (error?.request_id !== undefined) error.request_id = "<request-id>";
+  if (body.request_id !== undefined) body.request_id = "<request-id>";
+
+  // STORY-024 T10 — a SUCCESS body is now enveloped, and `meta` carries two
+  // per-request values: the identifier and `computed_at`. Both are produced
+  // identically on every path regardless of whether the address exists, so
+  // neither distinguishes anything about the account; `data` is compared
+  // verbatim, which is where an enumeration leak would actually appear.
+  const meta = body.meta as Record<string, unknown> | undefined;
+  if (meta?.request_id !== undefined) meta.request_id = "<request-id>";
+  if (meta?.computed_at !== undefined) meta.computed_at = "<computed-at>";
+  return JSON.stringify(body);
+}
+
 describe("STORY-016 · email OTP fallback sign-in", () => {
   let container: StartedPostgreSqlContainer;
   let app: NestFastifyApplication;
@@ -153,6 +184,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
+    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
 
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
@@ -174,6 +206,10 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     await registerCookiePlugin(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
+    // STORY-025 T18 — §12's per-IP auth bucket is real now, and this suite
+    // drives dozens of /auth/* requests. See the helper for what that
+    // trades away and where it is covered instead.
+    eachRequestFromItsOwnClient(app);
   });
 
   afterEach(async () => {
@@ -240,7 +276,8 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
     const reqRes = await requestOtp(email);
     expect(reqRes.statusCode).toBe(OTP_REQUEST_SUCCESS_STATUS);
-    expect(reqRes.json()).toEqual({ status: "sent", expires_in_seconds: 600 });
+    // STORY-024 T10 — §1's envelope wraps the resource under `data`.
+    expect(dataOf(reqRes)).toEqual({ status: "sent", expires_in_ms: 600_000 });
 
     const code = fakeSender.latestCodeFor(email);
     expect(code).toMatch(/^\d{8}$/);
@@ -272,7 +309,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     expect(afterKnown.rows[0].c).toBe(before.rows[0].c + 1);
 
     expect(knownRes.statusCode).toBe(unknownRes.statusCode);
-    expect(JSON.stringify(knownRes.json())).toBe(JSON.stringify(unknownRes.json()));
+    expect(comparableBody(knownRes)).toBe(comparableBody(unknownRes));
   });
 
   // ---- Scenario 4 -----------------------------------------------------------
@@ -315,7 +352,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     const reusedRejection = await verifyOtp(reusedEmail, reusedCode); // second use is the reference rejection
 
     expect(expiredRes.statusCode).toBe(reusedRejection.statusCode);
-    expect(JSON.stringify(expiredRes.json())).toBe(JSON.stringify(reusedRejection.json()));
+    expect(comparableBody(expiredRes)).toBe(comparableBody(reusedRejection));
   });
 
   // ---- Scenario 6 -----------------------------------------------------------
@@ -355,10 +392,12 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     const fourth = await requestOtp(email);
 
     expect(fourth.statusCode).toBe(429);
-    const body = fourth.json() as { code: string; details: { retry_after_seconds: number } };
-    expect(body.code).toBe("rate_limited");
-    expect(body.details.retry_after_seconds).toBeGreaterThan(0);
-    expect(body.details.retry_after_seconds).toBeLessThanOrEqual(3600);
+    // STORY-024 T9/D13 — the taxonomy body nests under `error`, and
+    // NFR-API-05 makes the duration integer milliseconds with a `_ms` suffix.
+    const body = fourth.json() as { error: { code: string; details: { retry_after_ms: number } } };
+    expect(body.error.code).toBe("rate_limited");
+    expect(body.error.details.retry_after_ms).toBeGreaterThan(0);
+    expect(body.error.details.retry_after_ms).toBeLessThanOrEqual(3_600_000);
   });
 
   // ---- Scenario 8 -----------------------------------------------------------
@@ -465,7 +504,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     const after = await db.query("SELECT count(*)::int AS c FROM email_otp_codes");
 
     expect(neverRequestedRejection.statusCode).toBe(referenceRejection.statusCode);
-    expect(JSON.stringify(neverRequestedRejection.json())).toBe(JSON.stringify(referenceRejection.json()));
+    expect(comparableBody(neverRequestedRejection)).toBe(comparableBody(referenceRejection));
     expect(after.rows[0].c).toBe(before.rows[0].c);
   });
 
@@ -500,7 +539,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
     const bodies = [suspendedRes, deletedRes, unknownRes].map((r) => ({
       status: r.statusCode,
-      body: JSON.stringify(r.json()),
+      body: comparableBody(r),
     }));
     expect(bodies[0]).toEqual(bodies[1]);
     expect(bodies[1]).toEqual(bodies[2]);
@@ -582,7 +621,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     // byte-identical to the known address's 4th response — a differing
     // outcome between the two on this 4th request would itself be an
     // enumeration oracle, the exact thing D5 exists to prevent.
-    expect(JSON.stringify(unknownResults[3]!.json())).toBe(JSON.stringify(knownResults[3]!.json()));
+    expect(comparableBody(unknownResults[3]!)).toBe(comparableBody(knownResults[3]!));
   });
 
   // ---- Gap 2 (qa-reviewer, AC6): every internal rejection path cross-compares byte-identical ----
@@ -620,10 +659,10 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     expect(unknownRes.statusCode).not.toBe(200);
 
     const shapes = [
-      { label: "wrong_code", status: wrongCodeRes.statusCode, body: JSON.stringify(wrongCodeRes.json()) },
-      { label: "expired_code", status: expiredRes.statusCode, body: JSON.stringify(expiredRes.json()) },
-      { label: "exhausted_attempts", status: exhaustedRes.statusCode, body: JSON.stringify(exhaustedRes.json()) },
-      { label: "unknown_address", status: unknownRes.statusCode, body: JSON.stringify(unknownRes.json()) },
+      { label: "wrong_code", status: wrongCodeRes.statusCode, body: comparableBody(wrongCodeRes) },
+      { label: "expired_code", status: expiredRes.statusCode, body: comparableBody(expiredRes) },
+      { label: "exhausted_attempts", status: exhaustedRes.statusCode, body: comparableBody(exhaustedRes) },
+      { label: "unknown_address", status: unknownRes.statusCode, body: comparableBody(unknownRes) },
     ];
 
     // Explicit multi-way check: every pair, not just each-against-the-first,
@@ -640,33 +679,55 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
   // ---- Gap 3 (qa-reviewer, AC4): the per-source (30/min) rate limit is independently enforced ----
 
-  it("STORY-016 · gap 3 (AC4) — the per-source (30/min) limit refuses the 31st request even though every address is well under its own 3/hour limit", async () => {
+  // STORY-025 T18 — THIS TEST MOVED DOWN A LAYER, AND THE REASON IS A REAL
+  // COLLISION rather than a test-harness inconvenience.
+  //
+  // `/auth/otp/request` now carries TWO rate limits on the same axis:
+  //
+  //   §12's `Auth (/auth/*)` row — 30/min per IP, BURST 5, enforced by
+  //   RateLimitGuard as of STORY-025 T17.
+  //   STORY-016's own ledger — 30/min per source, a plain counter with no
+  //   burst, enforced inside EmailOtpService.
+  //
+  // Same routes, same number, different burst. Over HTTP the platform bucket
+  // refuses at the sixth request, so the thirty-first can no longer be reached
+  // and this assertion cannot be made through `app.inject` at all.
+  //
+  // Neither limiter was removed — deleting a working defence-in-depth control
+  // to make a test reachable would be the wrong trade. Instead the assertion
+  // moved to the layer that OWNS the ledger it is about. What is given up is
+  // that this no longer proves the refusal reaches the wire as a 429; that is
+  // covered for the platform bucket by test/unit/rate-limit-before-credit.spec
+  // .ts, and the rejection shape is asserted directly below.
+  //
+  // The redundancy itself is a decision for a human: one of these two probably
+  // should not exist.
+  it("STORY-016 · gap 3 (AC4) — the per-source (30/min) ledger refuses the 31st request even though every address is well under its own 3/hour limit", async () => {
     const source = "203.0.113.55";
     const emails = Array.from({ length: 31 }, (_, i) => `gap3-source-${i}@example.com`);
     for (const email of emails) {
       await createUser(email);
     }
 
-    const results = [];
-    for (const email of emails) {
-      const res = await app.inject({
-        method: "POST",
-        url: "/auth/otp/request",
-        remoteAddress: source,
-        payload: { email },
-      });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      results.push(res);
+    const service = app.get(EmailOtpService);
+    for (const email of emails.slice(0, 30)) {
+      await expect(service.requestCode(email, source, randomUUID())).resolves.toBeDefined();
     }
 
-    expect(results.slice(0, 30).map((r) => r.statusCode)).toEqual(Array(30).fill(OTP_REQUEST_SUCCESS_STATUS));
+    // The 31st, from the same source, every address well inside its own hourly
+    // allowance — so the only thing that can refuse it is the per-source ledger.
+    let refusal: { code: string; details: { retry_after_ms: number } } | undefined;
+    try {
+      await service.requestCode(emails[30]!, source, randomUUID());
+    } catch (error) {
+      const response = (error as { getResponse: () => unknown }).getResponse();
+      refusal = response as { code: string; details: { retry_after_ms: number } };
+    }
 
-    const last = results[30]!;
-    expect(last.statusCode).toBe(429);
-    const body = last.json() as { code: string; details: { retry_after_seconds: number } };
-    expect(body.code).toBe("rate_limited");
-    expect(body.details.retry_after_seconds).toBeGreaterThan(0);
-    expect(body.details.retry_after_seconds).toBeLessThanOrEqual(60);
+    expect(refusal, "the 31st request from one source must be refused").toBeDefined();
+    expect(refusal!.code).toBe("rate_limited");
+    expect(refusal!.details.retry_after_ms).toBeGreaterThan(0);
+    expect(refusal!.details.retry_after_ms).toBeLessThanOrEqual(60_000);
   });
 
   // ---- Cross-story: D2 promotion unlocks the workspace-create right ---------
@@ -678,7 +739,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     // semantics) — creates the account 'unverified', still issues a session.
     const startRes = await app.inject({ method: "POST", url: "/auth/oauth/google/start" });
     expect(startRes.statusCode).toBe(201);
-    const startBody = startRes.json() as { authorization_url: string };
+    const startBody = dataOf<{ authorization_url: string }>(startRes);
     const state = new URL(startBody.authorization_url).searchParams.get("state")!;
     fakeOauthClient.registerExchange("code-cross-story", {
       externalSubject: "sub-cross-story",
@@ -692,7 +753,7 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
       cookies: bindingCookie ? { "__Host-nominara-oauth-binding": bindingCookie } : {},
     });
     expect(callbackRes.statusCode).toBe(200);
-    expect((callbackRes.json() as { user_status: string }).user_status).toBe("unverified");
+    expect(dataOf<{ user_status: string }>(callbackRes).user_status).toBe("unverified");
     const loginCookies = extractAuthCookies(callbackRes);
     expect(loginCookies).not.toBeNull();
 

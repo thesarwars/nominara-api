@@ -4,6 +4,7 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { ACCESS_COOKIE_NAME } from "../../lib/auth/cookies.js";
+import { problemDetailsSchema } from "../../../contracts/common/problem-details.schema.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import {
   PermissionDeniedException,
@@ -88,6 +89,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
+    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
 
     const moduleRef = await Test.createTestingModule({
       imports: [ApiModule],
@@ -118,19 +120,32 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
 
     expect(response.statusCode).toBe(404);
     const body = response.json();
-    expect(body).toMatchObject({ type: "about:blank", status: 404, title: "NOT_FOUND" });
+    // STORY-024 T9 — a framework-raised 404 predates the taxonomy but still
+    // lands on §2's vocabulary, because §2 is the only vocabulary the wire
+    // has. Title is the code in title case, per §2's own example.
+    expect(body).toMatchObject({ type: "about:blank", status: 404, title: "Not Found" });
+    expect(body.error).toMatchObject({ code: "not_found", request_id: expect.any(String) });
   });
 
   it("maps a generic Error thrown by a handler to a 500 problem+json without leaking its message", async () => {
     const response = await app.inject({ method: "GET", url: apiUrl("/test-only/public-throws") });
 
     expect(response.statusCode).toBe(500);
-    expect(response.json()).toEqual({
+    const body = response.json();
+    expect(body).toEqual({
       type: "about:blank",
       status: 500,
-      title: "INTERNAL_SERVER_ERROR",
+      title: "Internal Error",
       detail: "internal server error",
+      error: {
+        code: "internal_error",
+        message: "internal server error",
+        request_id: expect.any(String),
+      },
     });
+    // STORY-119 — over real HTTP, not just at the filter's own seam: the 500
+    // body satisfies the schema this API publishes. It did not before.
+    expect(problemDetailsSchema.safeParse(body).success).toBe(true);
   });
 
   it("maps TenantContextMissingError (a private route with no tenant set) to a well-formed 500 problem+json", async () => {
@@ -150,12 +165,21 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     });
 
     expect(response.statusCode).toBe(500);
-    expect(response.json()).toEqual({
+    const body = response.json();
+    expect(body).toEqual({
       type: "about:blank",
       status: 500,
-      title: "INTERNAL_SERVER_ERROR",
+      title: "Internal Error",
       detail: "internal server error",
+      error: {
+        code: "internal_error",
+        message: "internal server error",
+        request_id: expect.any(String),
+      },
     });
+    // STORY-119 — over real HTTP, not just at the filter's own seam: the 500
+    // body satisfies the schema this API publishes. It did not before.
+    expect(problemDetailsSchema.safeParse(body).success).toBe(true);
   });
 
   it("REQ-019-4 · serializes PermissionDeniedException's code/details over the wire", async () => {
@@ -165,10 +189,14 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     expect(response.json()).toEqual({
       type: "about:blank",
       status: 403,
-      title: "FORBIDDEN",
+      title: "Forbidden",
       detail: "missing required permission: workspace:delete",
-      code: "forbidden",
-      details: { required_permission: "workspace:delete" },
+      error: {
+        code: "forbidden",
+        message: "missing required permission: workspace:delete",
+        details: { required_permission: "workspace:delete" },
+        request_id: expect.any(String),
+      },
     });
   });
 
@@ -179,9 +207,13 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     expect(response.json()).toEqual({
       type: "about:blank",
       status: 403,
-      title: "FORBIDDEN",
+      title: "Project Out Of Scope",
       detail: "this project is outside your assigned scope",
-      code: "project_out_of_scope",
+      error: {
+        code: "project_out_of_scope",
+        message: "this project is outside your assigned scope",
+        request_id: expect.any(String),
+      },
     });
   });
 
@@ -192,23 +224,36 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
     expect(response.json()).toEqual({
       type: "about:blank",
       status: 401,
-      title: "UNAUTHORIZED",
+      title: "Step Up Required",
       detail: "step-up re-authentication required",
-      code: "step_up_required",
-      details: { methods: ["webauthn"] },
+      error: {
+        code: "step_up_required",
+        message: "step-up re-authentication required",
+        details: { methods: ["webauthn"] },
+        request_id: expect.any(String),
+      },
     });
   });
 
-  it("STORY-018 regression · serializes WorkspaceSuspendedException's code over the wire", async () => {
+  // STORY-024 decision D12 — `workspace_suspended` is NOT one of §2's 28
+  // codes, so it cannot go on the wire as itself. It is mapped to `forbidden`
+  // and keeps its identity in `details.reason`; the exception class is
+  // unchanged and still throws `workspace_suspended` internally.
+  it("STORY-018 regression · WorkspaceSuspendedException reaches the wire as a mapped taxonomy code", async () => {
     const response = await app.inject({ method: "GET", url: apiUrl("/test-only/throws-workspace-suspended") });
 
     expect(response.statusCode).toBe(403);
     expect(response.json()).toEqual({
       type: "about:blank",
       status: 403,
-      title: "FORBIDDEN",
+      title: "Forbidden",
       detail: "this workspace is suspended",
-      code: "workspace_suspended",
+      error: {
+        code: "forbidden",
+        message: "this workspace is suspended",
+        details: { reason: "workspace_suspended" },
+        request_id: expect.any(String),
+      },
     });
   });
 });

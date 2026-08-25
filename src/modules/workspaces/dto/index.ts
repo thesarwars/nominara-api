@@ -14,8 +14,10 @@ export {
 } from "../../../../contracts/workspaces/workspace-response.schema.js";
 export {
   workspaceListItemSchema,
+  workspaceListItemWithRelationshipSchema,
   workspaceListResponseSchema,
   type WorkspaceListItem,
+  type WorkspaceListItemWithRelationship,
   type WorkspaceListResponse,
 } from "../../../../contracts/workspaces/workspace-list-response.schema.js";
 export {

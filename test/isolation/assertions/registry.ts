@@ -14,7 +14,7 @@ import { assertIso09PortalReadScope, iso09Breaker } from "./iso-09-portal-read-s
 import { assertIso10PortalWriteDenied, iso10Breaker } from "./iso-10-portal-write-denied.js";
 import { assertIso11TamperedJobRejectedPreContext, assertIso11AgainstBrokenOrdering, iso11Breaker } from "./iso-11-tampered-job-signature.js";
 import { assertIso12EnvelopeAad, assertIso12AgainstAadBlindDecrypt, iso12Breaker } from "./iso-12-envelope-aad.js";
-import { assertIso13CacheNamespacing, iso13Breaker } from "./iso-13-cache-namespace.js";
+import { assertIso13CacheNamespacing, iso13ConstructorBreaker } from "./iso-13-cache-namespace.js";
 import { assertIso14ObjectNamespacing, iso14Breaker } from "./iso-14-object-namespace.js";
 import { assertIso15AggregateAnonymity, iso15Breaker } from "./iso-15-aggregate-anonymity.js";
 import { assertIso16NoMaterializedViews, iso16Breaker } from "./iso-16-no-matviews.js";
@@ -111,7 +111,12 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
     needsFixture: false,
     assert: () => ignoreCtx(assertIso13CacheNamespacing),
     assertUnderBreaker: () => ignoreCtx(assertIso13CacheNamespacing),
-    breaker: iso13Breaker,
+    // STORY-026 audit fix — the breaker now removes the workspace segment from
+    // the REAL constructor rather than planting a literal in src/. The old one
+    // exercised the scanner, which the assertion's own fixture self-test
+    // already proves is not vacuous; nothing proved the CONSTRUCTORS were
+    // guarded, and deleting the tenant boundary left this gate green.
+    breaker: iso13ConstructorBreaker,
   },
   {
     id: "ISO-14",

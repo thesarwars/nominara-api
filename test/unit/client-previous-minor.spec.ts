@@ -63,7 +63,8 @@ const TSC_BIN = resolve(REPO_ROOT, "node_modules/.bin/tsc");
 // requestBody does not, and never `entitlement_version`, a
 // current-schema-only RESPONSE field), because a consumer coded against
 // N-1 cannot know about a field N-1 does not have. Response side reads
-// `slug` — present in both documents (M5).
+// `slug` — present in both documents (M5) — THROUGH the envelope's `data`
+// member (STORY-024 T11), which both documents now carry.
 const FIXTURE_CONSUMER_SOURCE = `
 import type { paths } from "./types.js";
 import createClient from "openapi-fetch";
@@ -74,7 +75,7 @@ export async function createWorkspaceAgainstPreviousMinorShape() {
   const { data, error } = await client.POST("/v1/workspaces", {
     body: { name: "Acme Co" },
   });
-  const slug: string | undefined = data?.slug;
+  const slug: string | undefined = data?.data.slug;
   return { slug, error };
 }
 `;

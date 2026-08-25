@@ -9,6 +9,8 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { apiUrl } from "../support/api-url.js";
+import { eachRequestFromItsOwnClient } from "../support/distinct-source.js";
+import { dataOf } from "../support/envelope.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import {
   OAUTH_CLIENT,
@@ -143,6 +145,20 @@ function decodeClaims(token: string): { sub: string } {
   return JSON.parse(Buffer.from(payloadB64url!, "base64url").toString("utf8"));
 }
 
+// STORY-024 decision D12 — `oauth_failed` is NOT one of api-specification.md
+// §2's 28 codes, and `problemErrorSchema.code` is a closed union, so it cannot
+// travel as itself. ProblemFilter maps it to `validation_failed` and preserves
+// the original condition as `error.details.reason`. OauthFailedException is
+// unchanged and still throws `oauth_failed` internally — the mapping is at the
+// wire boundary only, which is what AC1 means by "a filter maps it to the wire
+// shape". Asserting both halves here keeps the mapping honest: a regression
+// that dropped `reason` would still be caught.
+function expectOauthFailure(body: unknown): void {
+  const error = (body as { error?: { code?: string; details?: { reason?: string } } }).error;
+  expect(error?.code).toBe("validation_failed");
+  expect(error?.details?.reason).toBe("oauth_failed");
+}
+
 describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
   let container: StartedPostgreSqlContainer;
   let app: NestFastifyApplication;
@@ -178,6 +194,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
+    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
 
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
@@ -198,6 +215,10 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     await configureApp(app);
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
+    // STORY-025 T18 — §12's per-IP auth bucket is real now, and this suite
+    // drives dozens of /auth/* requests. See the helper for what that
+    // trades away and where it is covered instead.
+    eachRequestFromItsOwnClient(app);
   });
 
   afterEach(async () => {
@@ -221,7 +242,8 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     if (res.statusCode >= 400) {
       return { statusCode: res.statusCode };
     }
-    const body = res.json() as { authorization_url: string; state_expires_at: string };
+    // STORY-024 T10 — the success body is enveloped; the resource is under `data`.
+    const body = dataOf<{ authorization_url: string; state_expires_at: string }>(res);
     const url = new URL(body.authorization_url);
     const bindingCookie = res.cookies.find((c) => c.name === OAUTH_BINDING_COOKIE_NAME)?.value;
     return {
@@ -271,7 +293,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       method: "POST",
       url: apiUrl("/auth/passkey/verify"),
       payload: {
-        ceremony_id: optionsRes.json().ceremony_id,
+        ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id,
         response: {
           id: credentialIdB64url,
           rawId: credentialIdB64url,
@@ -304,7 +326,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
         { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie! },
       );
       expect(callbackRes.statusCode).toBe(200);
-      const body = callbackRes.json();
+      const body = dataOf<{ outcome: string; user_status: string }>(callbackRes);
       expect(body.outcome).toBe("signed_in");
       expect(body.user_status).toBe("active");
       const cookies = extractAuthCookies(callbackRes);
@@ -338,7 +360,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     const replay = await callback("google", { state: start.state ?? "", code: "code-replay" }, cookies);
     expect(replay.statusCode).toBe(400);
     const body = replay.json();
-    expect(body.code).toBe("oauth_failed");
+    expectOauthFailure(body);
   });
 
   // ---- Task 7 / Test Scenario 3 -------------------------------------------
@@ -353,7 +375,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
 
     const res = await callback("google", { state: start.state ?? "", code: "code-no-binding" }, {});
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("oauth_failed");
+    expectOauthFailure(res.json());
   });
 
   it("STORY-015 · scenario 3 — a valid, unconsumed state presented with the WRONG session-binding cookie is refused", async () => {
@@ -370,7 +392,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { [OAUTH_BINDING_COOKIE_NAME]: "not-the-value-issued-at-start" },
     );
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("oauth_failed");
+    expectOauthFailure(res.json());
   });
 
   // ---- Task 8 / Test Scenario 4 -------------------------------------------
@@ -440,7 +462,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie! },
     );
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("oauth_failed");
+    expectOauthFailure(res.json());
     const created = await db.query("SELECT id FROM users WHERE email = 'tampered-verifier@example.com'");
     expect(created.rows).toHaveLength(0);
   });
@@ -454,7 +476,8 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       "code-unverified",
     );
     expect(login.statusCode).toBe(200);
-    expect((login.body as { user_status: string }).user_status).toBe("unverified");
+    // STORY-024 T10 — the success body is enveloped; the resource is under `data`.
+    expect((login.body as { data: { user_status: string } }).data.user_status).toBe("unverified");
 
     const userRow = await db.query("SELECT status, email_verified_at FROM users WHERE email = $1", [
       "unverified@example.com",
@@ -523,7 +546,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     // existing account by email — the same neutral failure shape as
     // scenarios 2/3.
     expect(impostor.statusCode).toBe(400);
-    expect((impostor.body as { code: string }).code).toBe("oauth_failed");
+    expectOauthFailure(impostor.body);
 
     const usersWithEmail = await db.query("SELECT id FROM users WHERE email = $1", ["shared@example.com"]);
     expect(usersWithEmail.rows).toHaveLength(1);
@@ -691,7 +714,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       start.bindingCookie ? { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie } : {},
     );
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("oauth_failed");
+    expectOauthFailure(res.json());
   });
 
   // ---- QA-ADDED (temporary): CSRF enforcement on /link/start ---------------
@@ -909,8 +932,8 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       // duplicate-key error this fix closes) — both are a clean success
       // resolving to the SAME account.
       expect([a.statusCode, b.statusCode]).toEqual([200, 200]);
-      expect(a.json().outcome).toBe("signed_in");
-      expect(b.json().outcome).toBe("signed_in");
+      expect(dataOf<{ outcome: string }>(a).outcome).toBe("signed_in");
+      expect(dataOf<{ outcome: string }>(b).outcome).toBe("signed_in");
 
       const cookiesOfA = extractAuthCookies(a);
       const cookiesOfB = extractAuthCookies(b);
@@ -970,7 +993,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       method: "POST",
       url: apiUrl("/auth/passkey/verify"),
       payload: {
-        ceremony_id: optionsRes.json().ceremony_id,
+        ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id,
         response: {
           id: "cred-ws-b64",
           rawId: "cred-ws-b64",
@@ -1021,7 +1044,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       },
     );
     expect(linkRes.statusCode).toBe(200);
-    expect(linkRes.json().outcome).toBe("linked");
+    expect(dataOf<{ outcome: string }>(linkRes).outcome).toBe("linked");
 
     const activeBefore = await db.query(
       "SELECT count(*)::int AS c FROM user_credentials WHERE user_id = $1 AND revoked_at IS NULL",
@@ -1111,7 +1134,11 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     // Every rejection is indistinguishable once request_id is normalized.
     const normalized = dump.map((entry) => ({
       status: entry.status,
-      body: entry.body.replace(/"request_id":"[^"]*"/, '"request_id":"<X>"'),
+      // STORY-024 T9 — the body now carries TWO request identifiers: the one
+      // OauthFailedException puts in details, and the one §2 requires on every
+      // error. Both vary per request and neither distinguishes a rejection
+      // path, so both are normalised — the `g` flag is what makes that true.
+      body: entry.body.replace(/"request_id":"[^"]*"/g, '"request_id":"<X>"'),
     }));
     for (const n of normalized) {
       expect(n).toEqual(normalized[0]);
@@ -1142,7 +1169,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie!, [ACCESS_COOKIE_NAME]: login.cookies!.access },
     );
     expect(res.statusCode).toBe(200);
-    expect(res.json().outcome).toBe("linked");
+    expect(dataOf<{ outcome: string }>(res).outcome).toBe("linked");
 
     const rows = await db.query(
       "SELECT revoked_at FROM user_credentials WHERE provider = 'google' AND external_subject = 'sub-relink'",
@@ -1235,7 +1262,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie! },
     );
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("oauth_failed");
+    expectOauthFailure(res.json());
     const created = await db.query("SELECT id FROM users WHERE email = 'cross@example.com'");
     expect(created.rows).toHaveLength(0);
   });
@@ -1267,7 +1294,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie!, [ACCESS_COOKIE_NAME]: other.cookies!.access },
     );
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("oauth_failed");
+    expectOauthFailure(res.json());
     for (const id of [starterId, otherId]) {
       const creds = await db.query(
         "SELECT provider FROM user_credentials WHERE user_id = $1 AND provider = 'microsoft' AND revoked_at IS NULL",
@@ -1304,7 +1331,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie!, [ACCESS_COOKIE_NAME]: thief.cookies!.access },
     );
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("oauth_failed");
+    expectOauthFailure(res.json());
     const row = await db.query(
       "SELECT user_id FROM user_credentials WHERE provider = 'google' AND external_subject = 'sub-contested' AND revoked_at IS NULL",
     );
@@ -1355,7 +1382,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie!, [ACCESS_COOKIE_NAME]: thief.cookies!.access },
     );
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("oauth_failed");
+    expectOauthFailure(res.json());
 
     const row = await db.query(
       "SELECT user_id, revoked_at FROM user_credentials WHERE provider = 'google' AND external_subject = 'sub-contested-revoked'",
@@ -1392,10 +1419,11 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie! },
     );
     expect(res.statusCode).toBe(400);
-    const body = res.json() as { code: string; detail: string; details: { request_id: string } };
-    expect(body.code).toBe("oauth_failed");
-    expect(typeof body.details.request_id).toBe("string");
-    expect(body.details.request_id.length).toBeGreaterThan(0);
+    const body = res.json() as { detail: string; error: { details: { request_id: string }; request_id: string } };
+    expectOauthFailure(body);
+    expect(typeof body.error.details.request_id).toBe("string");
+    expect(body.error.request_id, "§2 requires a request identifier on every error body").toBeTruthy();
+    expect(body.error.details.request_id.length).toBeGreaterThan(0);
   });
 
   // ---- Task 14 / Test Scenario 9 -------------------------------------------
@@ -1410,10 +1438,10 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     expect(res.statusCode).toBe(400);
     const raw = res.payload;
     expect(raw).not.toContain(SENTINEL_PROVIDER_ERROR);
-    const body = res.json() as { code: string; details: { request_id: string } };
-    expect(body.code).toBe("oauth_failed");
-    expect(typeof body.details.request_id).toBe("string");
-    expect(body.details.request_id.length).toBeGreaterThan(0);
+    const body = res.json() as { error: { details: { request_id: string } } };
+    expectOauthFailure(body);
+    expect(typeof body.error.details.request_id).toBe("string");
+    expect(body.error.details.request_id.length).toBeGreaterThan(0);
   });
 
   // ---- STORY-023 T2 (RED step, coordinator-flagged defect) -----------------

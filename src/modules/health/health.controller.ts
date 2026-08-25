@@ -1,14 +1,27 @@
 import { Controller, Get, HttpStatus, Res } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import type { LivenessResponse, ReadinessResponse } from "../../../contracts/common/health.schema.js";
+import { NoEnvelope } from "../../api/decorators/no-envelope.decorator.js";
 import { Public } from "../../api/decorators/public.decorator.js";
 import { HealthService } from "./health.service.js";
 
 // STORY-022 — HealthModule. @Public() on the whole controller: probes are
 // unauthenticated, so WorkspaceGuard never populates req.tenant for them,
 // and TenantContextInterceptor must not fail-closed on that (E-3).
+// STORY-024 T10 — @NoEnvelope() is the response envelope's ONLY exemption,
+// and these three probes are the only routes that carry it. An orchestrator
+// reads `status` at the TOP level; livenessResponseSchema is `.strict()` with
+// exactly `{status}`, so a wrapped body is not a cosmetic difference — it is
+// a probe that never reports healthy again, which would break EPIC-03's own
+// first acceptance criterion.
+//
+// The marker is deliberately NOT keyed on @Public() above it: @Public() sits
+// on seven real authentication routes whose responses §1 requires to carry
+// the envelope. See test/integration/envelope-scope-and-probe-exemption.spec.ts,
+// which asserts both halves.
 @Controller("health")
 @Public()
+@NoEnvelope()
 export class HealthController {
   constructor(private readonly health: HealthService) {}
 

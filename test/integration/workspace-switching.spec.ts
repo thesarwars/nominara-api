@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
@@ -8,6 +9,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { apiUrl } from "../support/api-url.js";
+import { dataOf } from "../support/envelope.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
@@ -60,6 +62,7 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
+    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 
@@ -80,6 +83,7 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
       new AuditChainService(),
       membership,
       sessions,
+      new NoopRealtimePublisher(),
     );
   });
 
@@ -244,7 +248,7 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
         payload: { name: `Guarded Co ${randomUUID()}` },
       });
       expect(createRes.statusCode).toBe(201);
-      const workspace = createRes.json() as { id: string };
+      const workspace = dataOf<{ id: string }>(createRes);
 
       // Never called /workspaces/{id}/switch — this is still the ORIGINAL,
       // pre-switch access token, which carries `ws: null`.

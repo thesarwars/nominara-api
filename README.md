@@ -10,7 +10,8 @@ without an ADR.
 
 ```bash
 pnpm install
-docker compose up -d          # Postgres 18 + pgvector on localhost:5432, pgBouncer on localhost:6432
+docker compose up -d          # Postgres 18 + pgvector on localhost:5432, pgBouncer on localhost:6432,
+                              # Valkey cache on localhost:6379 (STORY-025 — required outside NODE_ENV=test)
 cp .env.example .env
 pnpm db:migrate
 pnpm db:dev-credentials        # local-dev passwords for the runtime + break-glass roles (STORY-010)
@@ -429,6 +430,15 @@ pre-existed.
 
 ## Disclosed gaps (STORY-013)
 
+- **G-12 — one test reads the reference from OUTSIDE this repository.**
+  `test/unit/realtime-event-catalog.spec.ts` checks the §11 event catalog
+  against `../Nominara-Dev-Docs-main/references/api-specification.md` itself,
+  because a list transcribed into the test would only prove the transcription
+  matches itself. That snapshot has no git history and is not part of a fresh
+  clone, so when CI exists it must be given the reference — a submodule, a
+  vendored copy, or a fetch step. Which of those is a decision, not something
+  the test can make. The failure names the problem rather than reading as a
+  broken assertion.
 - **G-10 — no cron registration or queue-scheduler wiring for the
   partition-maintenance/retention jobs.** `src/workers/rollup/maintenance.ts`
   and `src/workers/rollup/retention.ts` are plain, exported, dependency-free

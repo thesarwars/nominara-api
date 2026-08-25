@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
+import { PAGINATION_LIMIT_DEFAULT } from "../../contracts/common/pagination.schema.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -73,8 +75,7 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
       membership,
-      new SessionService(pool),
-    );
+      new SessionService(pool), new NoopRealtimePublisher());
     invitations = new InvitationsService(pool, new AuditChainService());
   });
 
@@ -226,7 +227,7 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
     expect(row.rows[0]!.token_hash).toEqual(hashInvitationToken(created.token!));
     expect(row.rows[0]!.token_hash.toString("utf8")).not.toContain(created.token);
 
-    const list = await createInWorkspaceContext(workspace.id, ownerId, () => invitations.list(workspace.id));
+    const list = (await createInWorkspaceContext(workspace.id, ownerId, () => invitations.list(workspace.id, { limit: PAGINATION_LIMIT_DEFAULT }))).items;
     expect(list).toHaveLength(1);
     expect(list[0]).not.toHaveProperty("token");
   });
@@ -432,7 +433,7 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
     );
     expect(firstRow.rows[0]!.revoked_at).not.toBeNull();
 
-    const pending = await createInWorkspaceContext(workspace.id, ownerId, () => invitations.list(workspace.id));
+    const pending = (await createInWorkspaceContext(workspace.id, ownerId, () => invitations.list(workspace.id, { limit: PAGINATION_LIMIT_DEFAULT }))).items;
     const pendingForEmail = pending.filter((i) => i.email === email);
     expect(pendingForEmail).toHaveLength(1);
     expect(pendingForEmail[0]!.role).toBe("manager");

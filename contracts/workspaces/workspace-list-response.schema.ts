@@ -24,12 +24,23 @@ export const workspaceListItemSchema = z
   })
   .strict();
 
-export const workspaceListResponseSchema = z
-  .object({
-    owned: z.array(workspaceListItemSchema),
-    joined: z.array(workspaceListItemSchema),
-  })
+// STORY-117 — this was `{owned: [...], joined: [...]}`. `NFR-API-03` makes
+// every list cursor-paginated, one envelope carries one `pagination` member,
+// and two arrays would need two independent cursors it cannot describe.
+//
+// The product requirement is that the switcher can GROUP and BADGE the two —
+// a joined workspace's limits come from its own subscription, and a user
+// seeing one undifferentiated list will assume otherwise (STORY-021's own
+// reasoning). A per-item `relationship` keeps exactly that and costs the
+// caller one `filter` per group. It is also the cheap direction: the
+// one-owned invariant caps `owned` at a single row, so `joined` was always
+// the unbounded half and the only one that needed paging at all.
+export const workspaceListItemWithRelationshipSchema = workspaceListItemSchema
+  .extend({ relationship: z.enum(["owned", "joined"]) })
   .strict();
 
+export const workspaceListResponseSchema = z.array(workspaceListItemWithRelationshipSchema);
+
 export type WorkspaceListItem = z.infer<typeof workspaceListItemSchema>;
+export type WorkspaceListItemWithRelationship = z.infer<typeof workspaceListItemWithRelationshipSchema>;
 export type WorkspaceListResponse = z.infer<typeof workspaceListResponseSchema>;

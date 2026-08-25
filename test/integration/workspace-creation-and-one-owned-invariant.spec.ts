@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { NotFoundException } from "@nestjs/common";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
@@ -78,7 +79,7 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
   });
 
   function makeService(dekProvisioner: DekProvisioner = new LocalDekProvisioner(WRAPPING_KEY, "local:dev")): WorkspacesService {
-    return new WorkspacesService(pool, dekProvisioner, new AuditChainService(), membership, new SessionService(pool));
+    return new WorkspacesService(pool, dekProvisioner, new AuditChainService(), membership, new SessionService(pool), new NoopRealtimePublisher());
   }
 
   async function createUser(email = `owner-${randomUUID()}@example.com`): Promise<string> {
@@ -239,7 +240,11 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
     try {
       await expect(
         withTenantContext(client, { workspaceId: created.id, actorId: userId }, () =>
-          service.update(created.id, { region: "eu-central-1" }),
+          // STORY-024 T11 — `"*"` is RFC 9110's "any current representation":
+          // these three cases are about region immutability and the 404, not
+          // about optimistic concurrency, so the precondition is satisfied
+          // unconditionally rather than being the thing under test.
+          service.update(created.id, { region: "eu-central-1" }, "*"),
         ),
       ).rejects.toMatchObject({
         response: {
@@ -263,7 +268,7 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
     const client = await pool.connect();
     try {
       const updated = await withTenantContext(client, { workspaceId: created.id, actorId: userId }, () =>
-        service.update(created.id, { name: "Renamed Co", timezone: "Europe/Berlin", region: "us-east-1" }),
+        service.update(created.id, { name: "Renamed Co", timezone: "Europe/Berlin", region: "us-east-1" }, "*"),
       );
       expect(updated.name).toBe("Renamed Co");
       expect(updated.timezone).toBe("Europe/Berlin");
@@ -280,7 +285,7 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
       const missingId = randomUUID();
       await expect(
         withTenantContext(client, { workspaceId: missingId, actorId: randomUUID() }, () =>
-          service.update(missingId, { name: "Nope" }),
+          service.update(missingId, { name: "Nope" }, "*"),
         ),
       ).rejects.toBeInstanceOf(NotFoundException);
     } finally {

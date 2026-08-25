@@ -143,8 +143,23 @@ describe("STORY-008 · projects, prompts & captures DDL", () => {
     promptId: string,
     overrides: Partial<{ engineKey: string; sampleIndex: number; capturedAt: string }> = {},
   ): Promise<string> {
-    const { engineKey = "chatgpt", sampleIndex = 0, capturedAt = new Date().toISOString() } = overrides;
+    // STORY-024 T12 — `seq` offsets the timestamp, and that is load-bearing.
+    // ux_answer_capture is UNIQUE (run_id, prompt_id, engine_key,
+    // sample_index, captured_at), and this default was millisecond-precision
+    // `now()`: two fixture captures created for the same run/prompt/engine
+    // inside one millisecond produced IDENTICAL key tuples and the second
+    // insert died on the constraint. It surfaced as a duplicate-key error in
+    // an unrelated displacement_events test further down the file, and only
+    // on a fast enough run — the file passes in isolation and failed
+    // reliably once the suite ahead of it grew.
+    //
+    // The constraint is correct and untouched; the FIXTURE was generating
+    // colliding data by accident. `seq` already existed for contentHash and
+    // is simply reused, so every capture now has a distinct captured_at.
+    // Offset forward, never back, so the row cannot fall out of the current
+    // month's partition at a month boundary.
     seq += 1;
+    const { engineKey = "chatgpt", sampleIndex = 0, capturedAt = new Date(Date.now() + seq).toISOString() } = overrides;
     const contentHash = createHash("sha256").update(`content-${seq}`).digest();
     const result = await client.query<{ id: string }>(
       `INSERT INTO answer_captures

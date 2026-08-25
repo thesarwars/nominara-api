@@ -5,8 +5,9 @@ import { z } from "zod";
 // the generated OpenAPI document and the published `@nominara/client`.
 //
 // api-specification.md §2 "Error taxonomy" (as corrected by task T0d /
-// decision D2) enumerates exactly 27 `code` values across its table. Per the
-// coordinator's decision recorded in STORY-023's execution plan, all 27 are
+// decision D2, and extended by STORY-119) enumerates exactly 28 `code`
+// values across its table. Per the
+// coordinator's decision recorded in STORY-023's execution plan, all 28 are
 // shipped here now rather than split across T1/T7 — a partial enum would
 // flow into the generated specification and the published client within the
 // same run, publishing a knowingly-wrong union, which is exactly what AC5
@@ -48,6 +49,10 @@ export const errorCodeSchema = z.enum([
   "daily_limit_reached",
   // 451
   "capture_mode_unavailable",
+  // 500 — STORY-119. The unmodelled server-side failure. Reserved for
+  // exactly that: a 5xx §2 already models keeps its own code, and absorbing
+  // one into this member would erase the distinction the table draws.
+  "internal_error",
   // 502
   "engine_unavailable",
   // 503

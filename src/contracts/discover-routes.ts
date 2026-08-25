@@ -3,6 +3,7 @@ import { readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { API_CONTRACT_KEY, type ApiContractOptions } from "../api/decorators/api-contract.decorator.js";
+import { NO_ENVELOPE_KEY } from "../api/decorators/no-envelope.decorator.js";
 
 // STORY-023 T3 — ADR-0002 says `contracts:generate` "must either boot the
 // Nest container or walk route metadata via DiscoveryService". Empirically
@@ -69,6 +70,15 @@ export interface DiscoveredContractRoute {
   readonly fullPath: string;
   readonly httpStatus: number;
   readonly contract: ApiContractOptions | undefined;
+  /**
+   * STORY-024 T11 — whether `@NoEnvelope()` exempts this route from the
+   * response envelope, read method-then-class exactly as
+   * ResponseEnvelopeInterceptor reads it (HealthController carries it at
+   * class level to mark all three probes as a group). The generator needs
+   * it because the envelope changes the RESPONSE BODY, and a document that
+   * describes the unwrapped body describes something the server never sends.
+   */
+  readonly envelopeExempt: boolean;
 }
 
 function normalizeSegment(segment: string | undefined): string {
@@ -146,6 +156,9 @@ export async function discoverContractRoutes(): Promise<DiscoveredContractRoute[
           fullPath: joinPath(classPath, Array.isArray(methodPathMeta) ? (methodPathMeta[0] ?? "") : methodPathMeta),
           httpStatus: explicitStatus ?? defaultStatusFor(httpMethod),
           contract: Reflect.getMetadata(API_CONTRACT_KEY, handler) as ApiContractOptions | undefined,
+          envelopeExempt:
+            (Reflect.getMetadata(NO_ENVELOPE_KEY, handler) as boolean | undefined) === true ||
+            (Reflect.getMetadata(NO_ENVELOPE_KEY, exported) as boolean | undefined) === true,
         });
       }
     }

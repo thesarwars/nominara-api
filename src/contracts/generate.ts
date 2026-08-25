@@ -1,5 +1,17 @@
+import { writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import openapiTS, { astToString } from "openapi-typescript";
 import { z, type ZodType } from "zod";
+import { errorCodeSchema } from "../../contracts/common/error-code.schema.js";
+import { REALTIME_EVENT_PAYLOADS } from "../../contracts/events/catalog.schema.js";
+import { realtimeEventNameSchema } from "../../contracts/events/event-name.schema.js";
+import { envelopeSchema } from "../../contracts/common/envelope.schema.js";
+import { paginationResponseSchema } from "../../contracts/common/pagination.schema.js";
+import {
+  PAGINATION_LIMIT_DEFAULT,
+  PAGINATION_LIMIT_MAX,
+} from "../../contracts/common/pagination.schema.js";
 import { API_VERSION_PREFIX } from "../api/configure-app.js";
 import { discoverContractRoutes, type DiscoveredContractRoute } from "./discover-routes.js";
 
@@ -27,19 +39,25 @@ interface JsonSchemaObject {
   [key: string]: unknown;
 }
 
-interface OpenApiParameter {
+export interface OpenApiParameter {
   readonly name: string;
-  readonly in: "query" | "path";
+  readonly in: "query" | "path" | "header";
   readonly required: boolean;
   readonly schema: Record<string, unknown>;
 }
 
-interface OpenApiResponse {
-  readonly description: string;
-  readonly content?: { readonly "application/json": { readonly schema: Record<string, unknown> } };
+export interface OpenApiResponseHeader {
+  readonly required: boolean;
+  readonly schema: Record<string, unknown>;
 }
 
-interface OpenApiOperation {
+export interface OpenApiResponse {
+  readonly description: string;
+  readonly content?: { readonly "application/json": { readonly schema: Record<string, unknown> } };
+  headers?: Record<string, OpenApiResponseHeader>;
+}
+
+export interface OpenApiOperation {
   operationId: string;
   requestBody?: { content: { "application/json": { schema: Record<string, unknown> } } };
   parameters?: OpenApiParameter[];
@@ -92,7 +110,7 @@ function pathParamNames(fullPath: string): string[] {
  * field names of its own to decompose — it is mapped onto the route's own
  * single `:param` path placeholder instead.
  */
-function buildParameters(schema: ZodType, location: "query" | "path", fullPath: string): OpenApiParameter[] {
+export function buildParameters(schema: ZodType, location: "query" | "path", fullPath: string): OpenApiParameter[] {
   const jsonSchema = toJsonSchema(schema, REQUEST_JSON_SCHEMA_OPTIONS) as JsonSchemaObject;
 
   if (jsonSchema.type === "object" && jsonSchema.properties) {
@@ -116,6 +134,135 @@ function buildParameters(schema: ZodType, location: "query" | "path", fullPath: 
   );
 }
 
+/**
+ * STORY-024 T11 — the schema of the body the server ACTUALLY sends.
+ *
+ * `@ApiContract({ responseSchema })` names the resource representation. Since
+ * T10 that is not what crosses the wire: ResponseEnvelopeInterceptor wraps
+ * every non-exempt response in api-specification.md §1's envelope. The
+ * document generated before this change described the unwrapped
+ * representation for every single route — so `@nominara/client`, whose types
+ * come from this document, typed `createWorkspace()` as returning a
+ * `Workspace` while the server returned `{data: Workspace, meta: {...}}`.
+ * Every property access in a generated consumer would have been undefined at
+ * runtime, and `contracts:check` reported the document as clean throughout,
+ * because it compares generated-against-committed and BOTH sides carried the
+ * same omission. A drift gate cannot catch a defect upstream of the drift.
+ *
+ * Three cases, matching the interceptor exactly:
+ *   exempt          `@NoEnvelope()` (the health probes) — the bare schema.
+ *   no responseSchema  a `Promise<void>` handler. The interceptor still
+ *                   envelopes it and emits `data: null` explicitly rather
+ *                   than dropping the member, so the document says so too:
+ *                   these routes DO have a response body.
+ *   otherwise       the representation, enveloped.
+ *
+ * `pagination` is emitted only for a `listOf` operation. envelopeSchema()
+ * marks the member optional so a single-resource response would still
+ * validate, but advertising a member that can never appear is a contract a
+ * consumer has to write dead branches against.
+ */
+function responseSchemaFor(route: DiscoveredContractRoute): ZodType {
+  const contract = route.contract!;
+
+  // A missing `responseSchema` is an ABSENCE OF INFORMATION, never evidence
+  // that the route returns nothing. Inferring `z.null()` from it is what
+  // published `data: {"type":"null"}` for three routes that return a body.
+  // The author declares `voidResponse: true` or supplies a schema; the
+  // generator does not guess, and this fails the BUILD rather than a test.
+  if (contract.responseSchema === undefined && contract.voidResponse !== true) {
+    throw new Error(
+      `contracts:generate — route "${contract.operationId}" declares neither a responseSchema nor ` +
+        "voidResponse: true, so its response body cannot be described. Add the schema, or declare " +
+        "voidResponse: true if the handler really returns Promise<void>. The generator will not infer " +
+        "one from the other.",
+    );
+  }
+  if (contract.responseSchema !== undefined && contract.voidResponse === true) {
+    throw new Error(
+      `contracts:generate — route "${contract.operationId}" declares BOTH a responseSchema and ` +
+        "voidResponse: true. It cannot be both; one of the two is wrong.",
+    );
+  }
+
+  if (route.envelopeExempt) {
+    if (contract.responseSchema === undefined) {
+      throw new Error(
+        `contracts:generate — route "${contract.operationId}" is @NoEnvelope() and returns no body, ` +
+          "so it has no describable response at all. Give it a responseSchema or remove the exemption.",
+      );
+    }
+    return contract.responseSchema;
+  }
+
+  const enveloped = envelopeSchema(contract.responseSchema ?? z.null());
+  // STORY-117 — REQUIRED on a list, absent everywhere else. envelopeSchema
+  // declares the member optional so that one schema can serve both, but a
+  // published list contract that says "pagination may or may not be here" is
+  // a contract a consumer must branch on, and the server always sends it.
+  return contract.listOf === true
+    ? enveloped.extend({ pagination: paginationResponseSchema })
+    : enveloped.omit({ pagination: true });
+}
+
+// STORY-024 T11 — AC6: "Pagination is cursor-based … Offset pagination
+// exists on no time-series endpoint." api-specification.md §1 is stronger
+// still: offset pagination "is not offered on ANY endpoint".
+//
+// No list endpoint exists yet, so AC6 would otherwise be vacuously true —
+// satisfied today by the absence of the thing it governs and quietly
+// violated by whichever story ships the first list route. These two checks
+// run inside `contracts:generate`, so they fail the BUILD (and with it
+// `contracts:check`), not merely a test someone can be tempted to skip.
+//
+// Exactly the four names test/unit/cursor.spec.ts already refuses on the
+// request schema, so the parameter-level and schema-level rules cannot
+// drift apart into two different definitions of "offset pagination".
+const OFFSET_PAGINATION_PARAMETER_NAMES = new Set(["offset", "page", "page_number", "skip"]);
+
+export function assertNoOffsetPagination(route: DiscoveredContractRoute, operation: OpenApiOperation): void {
+  const operationId = route.contract!.operationId;
+
+  const declared = [
+    ...(operation.parameters ?? []).map((parameter) => parameter.name),
+    ...Object.keys(
+      (operation.requestBody?.content["application/json"].schema as JsonSchemaObject | undefined)?.properties ?? {},
+    ),
+  ];
+  for (const name of declared) {
+    if (OFFSET_PAGINATION_PARAMETER_NAMES.has(name)) {
+      throw new Error(
+        `contracts:generate — operation "${operationId}" declares "${name}", which is offset pagination. ` +
+          "api-specification.md §1 offers it on no endpoint; page with an opaque cursor " +
+          "(src/api/pagination/cursor.ts) and paginationRequestSchema instead.",
+      );
+    }
+  }
+
+  if (route.contract!.listOf !== true) return;
+
+  // "Uses the cursor helper", expressed as something the CONTRACT can be
+  // checked against: a listOf operation must carry paginationRequestSchema's
+  // own two fields with its own two bounds. A route that re-derived the
+  // numbers, or paginated by some other means, fails here.
+  const parametersByName = new Map((operation.parameters ?? []).map((parameter) => [parameter.name, parameter]));
+  const limit = parametersByName.get("limit");
+  if (!parametersByName.has("cursor") || limit === undefined) {
+    throw new Error(
+      `contracts:generate — operation "${operationId}" is marked listOf but does not declare both ` +
+        "`cursor` and `limit` query parameters. Extend paginationRequestSchema in its querySchema.",
+    );
+  }
+  if (limit.schema.maximum !== PAGINATION_LIMIT_MAX || limit.schema.default !== PAGINATION_LIMIT_DEFAULT) {
+    throw new Error(
+      `contracts:generate — operation "${operationId}" declares a \`limit\` with ` +
+        `maximum=${String(limit.schema.maximum)} default=${String(limit.schema.default)}, not NFR-API-03's ` +
+        `cap of ${PAGINATION_LIMIT_MAX} and default of ${PAGINATION_LIMIT_DEFAULT}. ` +
+        "Extend paginationRequestSchema rather than re-deriving the bounds.",
+    );
+  }
+}
+
 function buildOperation(route: DiscoveredContractRoute): OpenApiOperation {
   const contract = route.contract!;
   const operation: OpenApiOperation = { operationId: contract.operationId, responses: {} };
@@ -129,16 +276,35 @@ function buildOperation(route: DiscoveredContractRoute): OpenApiOperation {
   const parameters: OpenApiParameter[] = [];
   if (contract.paramsSchema) parameters.push(...buildParameters(contract.paramsSchema, "path", route.fullPath));
   if (contract.querySchema) parameters.push(...buildParameters(contract.querySchema, "query", route.fullPath));
+  // STORY-024 T11 — a REQUIRED request header is as much a part of the
+  // contract as a required body field. Omitted, `@nominara/client` would
+  // generate a call that this server refuses with 422 every time, and the
+  // drift gate would report the document as clean while it did.
+  if (contract.requiresIfMatch) {
+    parameters.push({
+      name: "If-Match",
+      in: "header",
+      required: true,
+      schema: { type: "string" },
+    });
+  }
   if (parameters.length > 0) operation.parameters = parameters;
 
   const status = String(route.httpStatus);
-  operation.responses[status] = contract.responseSchema
-    ? {
-        description: `${contract.operationId} response`,
-        content: { "application/json": { schema: toJsonSchema(contract.responseSchema, RESPONSE_JSON_SCHEMA_OPTIONS) } },
-      }
-    : { description: `${contract.operationId} — no response body` };
+  operation.responses[status] = {
+    description: `${contract.operationId} response`,
+    content: {
+      "application/json": { schema: toJsonSchema(responseSchemaFor(route), RESPONSE_JSON_SCHEMA_OPTIONS) },
+    },
+  };
 
+  if (contract.emitsEntityTag) {
+    operation.responses[status]!.headers = {
+      ETag: { required: true, schema: { type: "string" } },
+    };
+  }
+
+  assertNoOffsetPagination(route, operation);
   return operation;
 }
 
@@ -183,24 +349,151 @@ export async function generateOpenApiDocument(): Promise<OpenApiDocument> {
   };
 }
 
-// STORY-023 task T4's job, deliberately NOT implemented here (scope
-// boundary — T3's brief is explicit: "Do NOT write the client generator").
-// Exported with the real signature the RED-step spec files already commit
-// to (contracts-worked-example.spec.ts, client-previous-minor.spec.ts) so
-// converting their dynamic `import()` loaders to literal static imports —
-// authorised, and required, by this task — still type-checks; calling it
-// throws, which is the correct, expected failure for every assertion that
-// depends on it until T4 lands.
-export async function generateClient(_document: OpenApiDocument, _outDir: string): Promise<void> {
-  throw new Error("generateClient() is not implemented yet — STORY-023 task T4 (the published client generator).");
+// STORY-023 T4 (GREEN step) — AC4: "The typed client is generated with
+// request and response types, a fetch client, realtime event types, and the
+// error-code union." project-structure.md §6 on `@nominara/client`:
+// "Generated, never hand-written." Three emitted modules, in that spirit:
+//
+//   types.ts   openapi-typescript over the SAME document contracts:check
+//              gates — never a second walk of the decorators, so the client
+//              cannot describe a route the published specification does not.
+//   events.ts  §11's realtime catalog — the event-name union plus each
+//              payload's JSON Schema, rendered from contracts/events/. This
+//              is the half of AC5 that STORY-023 shipped without, and the
+//              reason it could not: the catalog did not exist until STORY-026.
+//   errors.ts  the error-code union, rendered from errorCodeSchema.options
+//              rather than transcribed. The document carries no error
+//              responses yet (buildOperation() emits the success status
+//              only; problem-details wiring is STORY-024's envelope work),
+//              so the union genuinely cannot be read back out of `document`
+//              — it is taken from the one zod enum that defines it.
+//   index.ts   the fetch client: openapi-fetch's createClient bound to
+//              `paths`, which is the whole reason openapi-fetch is a RUNTIME
+//              dependency of the published package (§6's third boundary row).
+//
+// WebSocket event types are STORY-026 task T24's, deliberately absent here
+// so that scope does not drift onto this task — AC4 is therefore partially,
+// not fully, delivered by this function.
+const CLIENT_GENERATED_HEADER = `// GENERATED by "pnpm client:generate" (src/contracts/generate.ts) — DO NOT EDIT.
+// Regenerate instead; a hand edit here is a second description of the
+// contract and exactly what NFR-REPO-01's drift gate exists to prevent.
+`;
+
+/**
+ * The realtime event module — STORY-023 AC5's "realtime event types", which
+ * STORY-026 T24 finally makes true.
+ *
+ * Rendered from the CATALOG rather than transcribed, and typed per event
+ * rather than as one loose union: a client handling `run.progress` should get
+ * `run.progress`'s payload and not the union of nineteen, or it has to narrow
+ * by hand at every handler and the types stop paying for themselves.
+ *
+ * The payload SHAPES come from `z.toJSONSchema` through openapi-typescript in
+ * types.ts for HTTP; events are not HTTP and appear in no path, so their
+ * shapes are emitted here directly from the same zod schemas. One source
+ * either way.
+ */
+function renderRealtimeEventsModule(): string {
+  const names = realtimeEventNameSchema.options.map((name) => `  "${name}",`).join("\n");
+  const payloads = realtimeEventNameSchema.options
+    .map((name) => {
+      const schema = JSON.stringify(
+        toJsonSchema(REALTIME_EVENT_PAYLOADS[name], RESPONSE_JSON_SCHEMA_OPTIONS),
+        null,
+        2,
+      )
+        .split("\n")
+        .map((line, index) => (index === 0 ? line : `  ${line}`))
+        .join("\n");
+      return `  "${name}": ${schema},`;
+    })
+    .join("\n");
+
+  return `${CLIENT_GENERATED_HEADER}
+/** Every event the realtime gateway can send — api-specification.md §11's catalog. */
+export const REALTIME_EVENTS = [
+${names}
+] as const;
+
+export type RealtimeEventName = (typeof REALTIME_EVENTS)[number];
+
+/** Narrows an unknown event name off the socket to the union above. */
+export function isRealtimeEvent(value: unknown): value is RealtimeEventName {
+  return typeof value === "string" && (REALTIME_EVENTS as readonly string[]).includes(value);
+}
+
+/**
+ * The JSON Schema for each event's payload, keyed by event name.
+ *
+ * Emitted as data rather than as TypeScript interfaces because a consumer that
+ * wants runtime validation of a socket frame — which every consumer should,
+ * since a socket carries no status code to check — needs the schema, not just
+ * the type. The rooms a client joins are \`ws:{workspace_id}\` and
+ * \`proj:{project_id}\`.
+ */
+export const REALTIME_EVENT_SCHEMAS = {
+${payloads}
+} as const;
+`;
+}
+
+function renderErrorCodesModule(): string {
+  const members = errorCodeSchema.options.map((code) => `  "${code}",`).join("\n");
+  return `${CLIENT_GENERATED_HEADER}
+/** Every \`error.code\` the API can return — api-specification.md §2's closed taxonomy. */
+export const ERROR_CODES = [
+${members}
+] as const;
+
+export type ErrorCode = (typeof ERROR_CODES)[number];
+
+/** Narrows an unknown \`error.code\` off the wire to the union above. */
+export function isErrorCode(value: unknown): value is ErrorCode {
+  return typeof value === "string" && (ERROR_CODES as readonly string[]).includes(value);
+}
+`;
+}
+
+function renderIndexModule(): string {
+  return `${CLIENT_GENERATED_HEADER}
+import createClient, { type Client, type ClientOptions } from "openapi-fetch";
+import type { paths } from "./types.js";
+
+export type { components, operations, paths, webhooks } from "./types.js";
+export { ERROR_CODES, isErrorCode, type ErrorCode } from "./errors.js";
+export {
+  REALTIME_EVENTS,
+  REALTIME_EVENT_SCHEMAS,
+  isRealtimeEvent,
+  type RealtimeEventName,
+} from "./events.js";
+
+export type NominaraClient = Client<paths>;
+
+/** The typed fetch client (AC4). \`baseUrl\` should include no version segment — every path already carries "${API_VERSION_PREFIX}". */
+export function createNominaraClient(options: ClientOptions): NominaraClient {
+  return createClient<paths>(options);
+}
+`;
+}
+
+export async function generateClient(document: OpenApiDocument, outDir: string): Promise<void> {
+  // openapiTS accepts an in-memory document object as well as a path/URL,
+  // which is what lets both the live document and the committed
+  // previous-minor proxy go through this one code path (scenario 9) without
+  // either being written to disk first.
+  const types = astToString(await openapiTS(document as unknown as Parameters<typeof openapiTS>[0]));
+
+  writeFileSync(join(outDir, "types.ts"), `${CLIENT_GENERATED_HEADER}\n${types}`, "utf8");
+  writeFileSync(join(outDir, "errors.ts"), renderErrorCodesModule(), "utf8");
+  writeFileSync(join(outDir, "events.ts"), renderRealtimeEventsModule(), "utf8");
+  writeFileSync(join(outDir, "index.ts"), renderIndexModule(), "utf8");
 }
 
 async function main(): Promise<void> {
-  const { writeFile } = await import("node:fs/promises");
-  const { resolve } = await import("node:path");
   const document = await generateOpenApiDocument();
   const outPath = resolve(fileURLToPath(new URL("../..", import.meta.url)), "contracts/openapi.generated.json");
-  await writeFile(outPath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+  writeFileSync(outPath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
   console.log(`contracts:generate — wrote ${outPath}`);
 }
 

@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { errorCodeSchema } from "../../contracts/common/error-code.schema.js";
+import { envelopeSchema } from "../../contracts/common/envelope.schema.js";
 import {
   createWorkspaceRequestSchema,
   type CreateWorkspaceRequest,
@@ -131,13 +132,29 @@ describe("STORY-023 · scenario 10 — the worked example (POST /v1/workspaces):
         withoutSchemaMarker(requestJsonSchema(createWorkspaceRequestSchema)),
       );
 
-      // POST /workspaces returns the bare WorkspaceResponse today (STORY-021)
-      // — envelope wrapping ({data, pagination, meta}) is STORY-024's job,
-      // not retrofitted here, so the specification entry is expected to
-      // agree with workspaceResponseSchema directly, unwrapped.
+      // STORY-024 T11 — the document describes the body the server SENDS,
+      // which since T10 is api-specification.md §1's envelope, not the bare
+      // representation. This assertion is the one that should have caught
+      // that: it compared the document against workspaceResponseSchema while
+      // ResponseEnvelopeInterceptor was already wrapping every response, and
+      // `contracts:check` could not see the gap because it compares
+      // generated-against-committed and both sides shared the omission.
+      //
+      // `pagination` is absent: envelopeSchema() marks it optional, and
+      // createWorkspace is not a listOf operation, so advertising a member
+      // that can never appear would make a consumer write a dead branch.
       const responseSchema = operation!.responses["201"]?.content?.["application/json"].schema;
       expect(responseSchema, "POST /v1/workspaces must have a 201 response schema").toBeDefined();
       expect(withoutSchemaMarker(resolveJsonSchemaRef(responseSchema!, document))).toEqual(
+        withoutSchemaMarker(responseJsonSchema(envelopeSchema(workspaceResponseSchema).omit({ pagination: true }))),
+      );
+
+      // The representation itself is unchanged by the wrapping — `data` still
+      // agrees with the source schema, so this is an envelope, not a rewrite.
+      const enveloped = resolveJsonSchemaRef(responseSchema!, document) as {
+        properties: { data: Record<string, unknown> };
+      };
+      expect(withoutSchemaMarker(enveloped.properties.data)).toEqual(
         withoutSchemaMarker(responseJsonSchema(workspaceResponseSchema)),
       );
     });
@@ -159,7 +176,7 @@ describe("STORY-023 · scenario 10 — the worked example (POST /v1/workspaces):
 
   // M4 — AC4: "The typed client is generated with request and response
   // types, a fetch client, realtime event types, and the error-code union."
-  // Compared against errorCodeSchema.options (currently 27 members) —
+  // Compared against errorCodeSchema.options (currently 28 members) —
   // NEVER a hardcoded list, so this test cannot silently go stale the next
   // time §2's taxonomy grows or shrinks by one code.
   //
@@ -167,7 +184,7 @@ describe("STORY-023 · scenario 10 — the worked example (POST /v1/workspaces):
   // deferred, not covered here, so that scope does not silently drift onto
   // this task.
   describe("5. error-code union (AC4)", () => {
-    it("the generated client's output contains every one of errorCodeSchema's 27 members", async () => {
+    it("the generated client's output contains every one of errorCodeSchema's 28 members", async () => {
       const document = await generateOpenApiDocument();
 
       tempClientDir = mkdtempSync(resolve(REPO_ROOT, "node_modules/.tmp-story023-error-code-client-"));

@@ -21,6 +21,7 @@ const ENV = {
   OAUTH_STATE_SECRET: "test-oauth-state-secret",
   OTP_EMAIL_HASH_PEPPER: "test-otp-email-hash-pepper",
   OTP_EMAIL_FROM: "Nominara <no-reply@nominara.test>",
+  VALKEY_CACHE_URL: "redis://localhost:6379",
   GOOGLE_OAUTH_CLIENT_ID: "google-client-id",
   GITHUB_OAUTH_CLIENT_ID: "github-client-id",
   MICROSOFT_OAUTH_CLIENT_ID: "microsoft-client-id",

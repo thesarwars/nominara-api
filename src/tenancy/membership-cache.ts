@@ -1,4 +1,6 @@
 import { Injectable } from "@nestjs/common";
+import { cacheKeyNamespace } from "../lib/cache/key-namespace.js";
+import { tenantKey } from "../lib/cache/valkey-keys.js";
 
 // STORY-018 — security-and-tenancy.md §7 layer 1: "WorkspaceGuard reads
 // workspace_members, cached ... for 30 s keyed mem:{user}:{ws} and
@@ -22,8 +24,20 @@ export interface CachedMembership {
   readonly projectScope: readonly string[] | null;
 }
 
+/**
+ * STORY-026 audit fix — routed through the one module that owns Valkey keys.
+ *
+ * This built `mem:{user}:{ws}` by hand: no `{env}` prefix, and the workspace
+ * segment LAST rather than first. Harmless while the store is an in-process
+ * Map — and §7 says this cache lives in Valkey, so STORY-030's swap ("swaps
+ * the body of this class, not its callers") would have carried an unprefixed,
+ * wrongly-ordered key straight onto the shared cache instance. Meanwhile
+ * `valkey-keys.ts` opens by claiming every Valkey key is built there, which
+ * was already untrue. One line now, rather than a leak later. Found by the
+ * dangerous-area audit of STORY-025.
+ */
 function membershipCacheKey(userId: string, workspaceId: string): string {
-  return `mem:${userId}:${workspaceId}`;
+  return tenantKey(cacheKeyNamespace(), workspaceId, "mem", userId);
 }
 
 // Second-engineer review finding 1 (STORY-018) — stale-read-after-invalidate
