@@ -142,11 +142,30 @@ export class CircuitBreaker {
     }
   }
 
-  private open(): void {
+  private open(at?: number): void {
     this.internalState = "open";
-    this.openedAt = this.config.clock();
+    this.openedAt = at ?? this.config.clock();
     this.window = [];
     this.halfOpenSuccesses = 0;
+  }
+
+  /**
+   * STORY-031 D3 — the ONLY addition this story makes to this class: an
+   * external trigger, for a breaker whose OPEN condition is decided
+   * entirely outside this class (e.g. the engine breaker's blocks/attempts
+   * ratio, or an immediate open on `quota_exhausted`) rather than by this
+   * class's own rolling error-rate window. Every other method/default is
+   * untouched — `record()`'s internal `this.open()` call site above still
+   * defaults to the injected clock exactly as before.
+   *
+   * `at` lets a caller align this breaker's `openedAt` to an externally
+   * persisted timestamp (e.g. one read back from a shared store) so this
+   * instance's OWN clock-based open→half_open computation agrees with that
+   * external source of truth — it defaults to the injected clock, same as
+   * the no-argument case always did.
+   */
+  forceOpen(at?: number): void {
+    this.open(at);
   }
 
   private close(): void {

@@ -39,6 +39,18 @@ const VALID: NodeJS.ProcessEnv = {
   QUEUE_REDIS_URL: "redis://localhost:6380",
   QUEUE_JOB_SIGNING_KEY: Buffer.alloc(32, 1).toString("base64"),
   QUEUE_JOB_SIGNING_KID: "test-queue-kid-1",
+  // STORY-031 D7 — per-engine token-bucket capacity/refill JSON, on the
+  // SAME cache Valkey instance as VALKEY_CACHE_URL above (D6, consolidated
+  // onto STORY-025's instance rather than a second one). ENGINE_SPEND_CEILINGS_USD
+  // (D13) is deliberately absent here — it is optional config, covered separately.
+  ENGINE_TOKEN_BUCKETS: JSON.stringify({
+    google_aio: { capacity: 10, refillPerSecond: 1 },
+    google_ai_mode: { capacity: 10, refillPerSecond: 1 },
+    perplexity: { capacity: 10, refillPerSecond: 1 },
+    chatgpt: { capacity: 10, refillPerSecond: 1 },
+    gemini: { capacity: 10, refillPerSecond: 1 },
+    claude: { capacity: 10, refillPerSecond: 1 },
+  }),
 };
 
 describe("STORY-022 · env validation — refuses to start on missing/malformed config", () => {
@@ -164,6 +176,50 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
     expect(() =>
       loadEnv({ ...VALID, QUEUE_JOB_SIGNING_PREVIOUS_KEY: Buffer.alloc(16).toString("base64") }),
     ).toThrow(/QUEUE_JOB_SIGNING_PREVIOUS_KEY/);
+  });
+
+  it("STORY-031 · boots successfully with ENGINE_TOKEN_BUCKETS present, no spend ceilings", () => {
+    const env = loadEnv(VALID);
+    expect(env.ENGINE_TOKEN_BUCKETS).toBe(VALID.ENGINE_TOKEN_BUCKETS);
+    expect(env.ENGINE_SPEND_CEILINGS_USD).toBeUndefined();
+  });
+
+  // STORY-025 declares VALKEY_CACHE_URL; no test in this file exercised its
+  // required-ness until STORY-031 (which reuses this same cache instance
+  // for token buckets/breaker state, D6) needed to touch this area anyway.
+  it("STORY-025 · a MISSING VALKEY_CACHE_URL throws, naming that exact key", () => {
+    const { VALKEY_CACHE_URL: _drop, ...rest } = VALID;
+    expect(() => loadEnv(rest)).toThrow(/VALKEY_CACHE_URL/);
+  });
+
+  it("STORY-031 · a MISSING ENGINE_TOKEN_BUCKETS throws, naming that exact key", () => {
+    const { ENGINE_TOKEN_BUCKETS: _drop, ...rest } = VALID;
+    expect(() => loadEnv(rest)).toThrow(/ENGINE_TOKEN_BUCKETS/);
+  });
+
+  it("STORY-031 · an ENGINE_TOKEN_BUCKETS that isn't JSON throws, naming that exact key", () => {
+    expect(() => loadEnv({ ...VALID, ENGINE_TOKEN_BUCKETS: "not-json" })).toThrow(/ENGINE_TOKEN_BUCKETS/);
+  });
+
+  it("STORY-031 · an ENGINE_TOKEN_BUCKETS with an unknown engine key throws", () => {
+    const malformed = JSON.stringify({ not_a_real_engine: { capacity: 10, refillPerSecond: 1 } });
+    expect(() => loadEnv({ ...VALID, ENGINE_TOKEN_BUCKETS: malformed })).toThrow(/ENGINE_TOKEN_BUCKETS/);
+  });
+
+  it("STORY-031 · an ENGINE_TOKEN_BUCKETS entry with a non-positive capacity throws", () => {
+    const malformed = JSON.stringify({ chatgpt: { capacity: 0, refillPerSecond: 1 } });
+    expect(() => loadEnv({ ...VALID, ENGINE_TOKEN_BUCKETS: malformed })).toThrow(/ENGINE_TOKEN_BUCKETS/);
+  });
+
+  it("STORY-031 · boots successfully with ENGINE_SPEND_CEILINGS_USD present", () => {
+    const ceilings = JSON.stringify({ chatgpt: 500, claude: 250 });
+    const env = loadEnv({ ...VALID, ENGINE_SPEND_CEILINGS_USD: ceilings });
+    expect(env.ENGINE_SPEND_CEILINGS_USD).toBe(ceilings);
+  });
+
+  it("STORY-031 · an ENGINE_SPEND_CEILINGS_USD with a non-positive ceiling throws", () => {
+    const malformed = JSON.stringify({ chatgpt: 0 });
+    expect(() => loadEnv({ ...VALID, ENGINE_SPEND_CEILINGS_USD: malformed })).toThrow(/ENGINE_SPEND_CEILINGS_USD/);
   });
 
   it("an unknown key is rejected the same way any strict contract schema rejects mass assignment", () => {

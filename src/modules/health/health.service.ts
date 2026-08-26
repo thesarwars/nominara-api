@@ -5,12 +5,15 @@ import type { Redis } from "ioredis";
 import type { Pool } from "pg";
 import type {
   DependencyHealth,
+  EngineHealthSummary,
   LivenessResponse,
   QueueDepth,
   ReadinessResponse,
 } from "../../../contracts/common/health.schema.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { appliedMigrationNames, listMigrationFiles } from "../../db/migrate-runner.js";
+import { ACTIVE_ENGINE_KEYS } from "../../lib/engines/registry.js";
+import { EngineBreakerRegistry } from "../../lib/engines/engine-breaker-registry.js";
 import { CircuitBreaker } from "../../lib/resilience/circuit-breaker.js";
 import { buildQueue } from "../../lib/queue/queue-factory.js";
 import { QUEUE_TOPOLOGY } from "../../lib/queue/topology.js";
@@ -44,6 +47,10 @@ export const MIGRATIONS_DIR_TOKEN = Symbol("HEALTH_MIGRATIONS_DIR");
 export const QUEUE_CONNECTION_TOKEN = Symbol("HEALTH_QUEUE_CONNECTION");
 export const QUEUE_KEY_PREFIX_TOKEN = Symbol("HEALTH_QUEUE_KEY_PREFIX");
 
+// STORY-031 Phase I — the cache Valkey instance, read-only here (breaker
+// state only — HealthService never opens/closes a breaker itself).
+export const CACHE_CONNECTION_TOKEN = Symbol("HEALTH_CACHE_CONNECTION");
+
 @Injectable()
 export class HealthService implements OnModuleDestroy {
   private readonly logger = new Logger(HealthService.name);
@@ -53,6 +60,7 @@ export class HealthService implements OnModuleDestroy {
   private readonly postgresBreaker = new CircuitBreaker({ name: "postgres" });
   private lastMigrationState: MigrationState = { applied: null, expected: null, matches: false };
   private queuesByName: ReadonlyMap<string, Queue> | undefined;
+  private readonly breakers: EngineBreakerRegistry;
 
   constructor(
     @Inject(PG_POOL) private readonly pool: Pool,
@@ -61,13 +69,17 @@ export class HealthService implements OnModuleDestroy {
     private readonly healthIndicatorService: HealthIndicatorService,
     @Inject(QUEUE_CONNECTION_TOKEN) private readonly queueConnection: Redis,
     @Inject(QUEUE_KEY_PREFIX_TOKEN) private readonly queueKeyPrefixValue: string,
-  ) {}
+    @Inject(CACHE_CONNECTION_TOKEN) private readonly cacheConnection: Redis,
+  ) {
+    this.breakers = new EngineBreakerRegistry(this.cacheConnection);
+  }
 
   async onModuleDestroy(): Promise<void> {
     if (this.queuesByName) {
       await Promise.all(Array.from(this.queuesByName.values()).map((queue) => queue.close()));
     }
     await this.queueConnection.quit().catch(() => undefined);
+    await this.cacheConnection.quit().catch(() => undefined);
   }
 
   liveness(): LivenessResponse {
@@ -103,6 +115,7 @@ export class HealthService implements OnModuleDestroy {
     // readiness gate — a failure reading it never flips `ready` to
     // `not_ready`, it only leaves this array empty for that one call.
     const queues = await this.queueDepths();
+    const engines = await this.engineSummaries();
 
     const ready = result.status === "ok" && this.lastMigrationState.matches;
     this.logger.log(`readiness check: ${ready ? "ready" : "not_ready"}`);
@@ -112,7 +125,49 @@ export class HealthService implements OnModuleDestroy {
       migrationVersion: this.lastMigrationState,
       dependencies,
       queues,
+      engines,
     };
+  }
+
+  /**
+   * STORY-031 Phase I — D16: one entry per active engine, combining
+   * `engines.status` (Postgres) with the breaker's `circuitState` (cache
+   * Valkey, via EngineBreakerRegistry). `healthy` is true only when BOTH
+   * are the fully-nominal value — `active` and `closed`.
+   *
+   * A Postgres read failure degrades this to an empty array — same posture
+   * STORY-030's D11 established for `queueDepths` above: engine health is
+   * observability, never a readiness gate. A cache Valkey failure does NOT
+   * blank the array the same way: EngineBreaker.state() already fails
+   * CLOSED to its own last-known state per D19 (never throws), so a cache
+   * outage degrades PER ENGINE (falling back to `closed`) rather than
+   * discarding perfectly good Postgres data just because the breaker read
+   * alongside it had a hiccup.
+   */
+  private async engineSummaries(): Promise<EngineHealthSummary[]> {
+    try {
+      const result = await this.pool.query<{ key: string; status: string }>(
+        "SELECT key, status FROM engines WHERE key = ANY($1)",
+        [ACTIVE_ENGINE_KEYS],
+      );
+      const statusByKey = new Map(result.rows.map((row) => [row.key, row.status]));
+
+      return await Promise.all(
+        ACTIVE_ENGINE_KEYS.map(async (engineKey) => {
+          const status = (statusByKey.get(engineKey) ?? "active") as EngineHealthSummary["status"];
+          const circuitState = await this.breakers.for(engineKey).state();
+          return {
+            engineKey,
+            status,
+            circuitState,
+            healthy: status === "active" && circuitState === "closed",
+          };
+        }),
+      );
+    } catch (error) {
+      this.logger.error(`failed to read engine health summary: ${(error as Error).message}`);
+      return [];
+    }
   }
 
   /** One BullMQ `Queue` handle per QUEUE_TOPOLOGY entry, sharing this service's single connection — built once, lazily, and reused across calls. */

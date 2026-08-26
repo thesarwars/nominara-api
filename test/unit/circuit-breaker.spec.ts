@@ -140,3 +140,67 @@ describe("STORY-022 · CircuitBreaker — 50% error threshold, 30s open, 3-reque
     expect(cb.state).toBe("open");
   });
 });
+
+// STORY-031 D3 — the engine breaker composes THIS class rather than
+// reimplementing a parallel state machine, by adding ONE new public method.
+// Every test above this point must stay green, UNCHANGED, proving the
+// Postgres breaker's own behavior is byte-identical after this addition.
+describe("STORY-031 D3 · CircuitBreaker.forceOpen() — a new addition, no existing behavior changed", () => {
+  it("forces a closed breaker open immediately, with no prior failures at all", async () => {
+    const nowRef = { now: 0 };
+    const cb = breaker(nowRef);
+    expect(cb.state).toBe("closed");
+
+    cb.forceOpen();
+    expect(cb.state).toBe("open");
+
+    let called = false;
+    await expect(
+      cb.execute(async () => {
+        called = true;
+        return "unreachable";
+      }),
+    ).rejects.toBeInstanceOf(CircuitOpenError);
+    expect(called).toBe(false);
+  });
+
+  it("accepts an explicit `at` timestamp — the breaker computes open/half_open from THAT moment, not from when forceOpen() was called", () => {
+    const nowRef = { now: 10_000 };
+    const cb = breaker(nowRef);
+
+    // Force-opened as if it happened 30s in the past — already past the
+    // default 30s openDurationMs, so it should read as half_open right away.
+    cb.forceOpen(nowRef.now - 30_000);
+    expect(cb.state).toBe("half_open");
+  });
+
+  it("forceOpen() with no argument defaults to the injected clock — same as the existing open() default", () => {
+    const nowRef = { now: 5_000 };
+    const cb = breaker(nowRef);
+    cb.forceOpen();
+    expect(cb.state).toBe("open");
+
+    nowRef.now += 29_999;
+    expect(cb.state).toBe("open");
+    nowRef.now += 1;
+    expect(cb.state).toBe("half_open");
+  });
+
+  it("forceOpen() resets any prior rolling window — a subsequent success doesn't inherit stale failure history", async () => {
+    const nowRef = { now: 0 };
+    const cb = breaker(nowRef);
+    await cb.execute(async () => Promise.reject(new Error("one"))).catch(() => undefined);
+    await cb.execute(async () => Promise.reject(new Error("two"))).catch(() => undefined);
+    expect(cb.state).toBe("closed"); // below the 50%-of-4 volume threshold
+
+    cb.forceOpen();
+    nowRef.now += 30_000;
+    expect(cb.state).toBe("half_open");
+
+    // Half-open recovery is unaffected by the pre-forceOpen() history.
+    await cb.execute(async () => "ok");
+    await cb.execute(async () => "ok");
+    await cb.execute(async () => "ok");
+    expect(cb.state).toBe("closed");
+  });
+});

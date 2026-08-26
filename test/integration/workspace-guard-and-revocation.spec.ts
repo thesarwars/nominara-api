@@ -91,6 +91,7 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
     // Phase B) also requires the queue-signing env vars even though this
     // file never signs a job payload itself.
     process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
     process.env.DATABASE_URL = container.getConnectionUri();

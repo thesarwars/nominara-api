@@ -42,6 +42,24 @@ export const queueDepthSchema = z
 
 export type QueueDepth = z.infer<typeof queueDepthSchema>;
 
+// STORY-031 D16 — AC10's "per-engine status surface" so a customer can
+// distinguish a platform problem from a vendor problem. `status` mirrors
+// `engines.status`'s own DB CHECK (0003_projects_prompts_captures.up.sql);
+// `circuitState` mirrors the per-engine breaker's three states (same set
+// dependencyHealthSchema.state already uses for Postgres). `engineKey` is a
+// plain string here (not the capture domain's EngineKey enum) — same
+// generic-string precedent as dependencyHealthSchema.name above.
+export const engineHealthSummarySchema = z
+  .object({
+    engineKey: z.string().min(1),
+    status: z.enum(["active", "degraded", "disabled", "beta"]),
+    circuitState: z.enum(["closed", "open", "half_open"]),
+    healthy: z.boolean(),
+  })
+  .strict();
+
+export type EngineHealthSummary = z.infer<typeof engineHealthSummarySchema>;
+
 export const readinessResponseSchema = z
   .object({
     status: z.enum(["ready", "not_ready"]),
@@ -52,6 +70,12 @@ export const readinessResponseSchema = z
     }).strict(),
     dependencies: z.array(dependencyHealthSchema),
     queues: z.array(queueDepthSchema),
+    // STORY-031 Phase A — RESERVED, always-empty array until this story's
+    // later phases wire real per-engine health reads (same shape
+    // STORY-022-E-5 established for `queues` before STORY-030 populated it).
+    // A read failure degrades this to an empty array — it NEVER flips
+    // `status` to `not_ready` (same posture as `queues` above).
+    engines: z.array(engineHealthSummarySchema),
   })
   .strict();
 

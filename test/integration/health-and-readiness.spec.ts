@@ -67,6 +67,11 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
     process.env.QUEUE_REDIS_URL = valkeyFixture.connectionString;
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
+    // STORY-031 — the NEW second Valkey instance (cache tier). This file
+    // never reads it (no token-bucket lease is exercised here) — loadEnv()
+    // still requires it present to boot.
+    process.env.ENGINE_TOKEN_BUCKETS =
+      '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
 
     const client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();
@@ -109,6 +114,19 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
     for (const queue of after.queues) {
       expect(Number.isInteger(queue.depth)).toBe(true);
       expect(queue.depth).toBeGreaterThanOrEqual(0);
+    }
+    // STORY-031 Phase I — no longer the reserved-empty array: one entry per
+    // active engine. This file never seeds the `engines` table (unlike
+    // test/integration/health-engines-summary.spec.ts, which does), so
+    // status defaults to "active"; VALKEY_CACHE_URL here is a placeholder
+    // address (no real cache fixture in this file), so circuitState falls
+    // back to "closed" per D19 — both are the documented, honest defaults,
+    // not reserved emptiness.
+    expect(after.engines).toHaveLength(6);
+    for (const engine of after.engines) {
+      expect(engine.status).toBe("active");
+      expect(engine.circuitState).toBe("closed");
+      expect(engine.healthy).toBe(true);
     }
 
     await moduleRef.close();

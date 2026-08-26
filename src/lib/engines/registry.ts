@@ -47,6 +47,13 @@ const REGISTRY: Record<EngineKey, EngineRegistration> = {
   deepseek: { status: "disabled" },
 };
 
+// STORY-031 — derived from REGISTRY (never hand-duplicated) so the canary
+// (canary.ts) and anything else needing "every dispatching engine" can
+// never drift from this file's own active/disabled classification.
+export const ACTIVE_ENGINE_KEYS: readonly EngineKey[] = (Object.keys(REGISTRY) as EngineKey[]).filter(
+  (key) => REGISTRY[key].status === "active",
+);
+
 export function resolveEngine(engineKey: string): CaptureAdapter {
   const parsed = engineKeySchema.safeParse(engineKey);
   if (!parsed.success) {

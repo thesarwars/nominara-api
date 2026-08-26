@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { engineKeySchema } from "../lib/engines/contract.js";
 
 // STORY-022-E-4 — configuration validation lives here, as zod (already a
 // dependency), NOT Joi/class-validator/@nestjs/config. coding-standards.md
@@ -17,6 +18,38 @@ const requiredString = z
 // (src/lib/queue/topology.ts) is a documented worker group too, and
 // WORKER_GROUP must accept every group that actually owns a queue.
 export const WORKER_GROUPS = ["capture", "parse", "crawl", "embed", "rollup", "report", "deploy"] as const;
+
+// STORY-031 D7 — per-engine token-bucket shape. Exported so
+// src/lib/engines/token-bucket.ts parses ENGINE_TOKEN_BUCKETS against the
+// SAME schema this boot-time check uses, rather than a second hand-derived
+// one that could silently drift from it.
+const engineTokenBucketEntrySchema = z
+  .object({
+    capacity: z.number().int().positive(),
+    refillPerSecond: z.number().positive(),
+  })
+  .strict();
+// `z.record` over a zod enum key demands an entry for EVERY enum member
+// (zod 4 semantics) — wrong here, since only some engine keys are active
+// (src/lib/engines/registry.ts) and a deployer configures only those.
+// `z.partialRecord` is the exhaustive-but-optional-per-key form.
+export const engineTokenBucketsSchema = z.partialRecord(engineKeySchema, engineTokenBucketEntrySchema);
+export type EngineTokenBuckets = z.infer<typeof engineTokenBucketsSchema>;
+
+// STORY-031 D13 — optional per-engine monthly spend ceiling, in USD. Not a
+// persisted `numeric(12,2)` money column — a config-level threshold compared
+// against a Valkey-metered running total (src/lib/engines/spend-meter.ts).
+export const engineSpendCeilingsSchema = z.partialRecord(engineKeySchema, z.number().positive());
+export type EngineSpendCeilings = z.infer<typeof engineSpendCeilingsSchema>;
+
+/** Well-formed JSON parsing against `schema` — used by refine() below since a refine can only report true/false, never transform. */
+function parsesAgainst(schema: z.ZodTypeAny, value: string): boolean {
+  try {
+    return schema.safeParse(JSON.parse(value)).success;
+  } catch {
+    return false;
+  }
+}
 
 export const envSchema = z
   .object({
@@ -192,6 +225,30 @@ export const envSchema = z
       )
       .optional(),
     QUEUE_JOB_SIGNING_PREVIOUS_KID: requiredString.optional(),
+
+    // STORY-031 D6 (revised) — token buckets, the breaker's shared state,
+    // and everything else this story puts on the cache tier live on the
+    // SAME cache instance STORY-025 already declared above (VALKEY_CACHE_URL)
+    // — not a second, redundant instance. Original D6 built a duplicate
+    // CACHE_REDIS_URL before EPIC-03 (which shipped first) was in this
+    // branch's history; consolidated onto VALKEY_CACHE_URL once EPIC-03
+    // merged, so system-architecture.md §11's "two Valkey instances, not
+    // three" is what's actually deployed. NEVER the queue instance above
+    // (QUEUE_REDIS_URL).
+    // STORY-031 D7 — per-engine token-bucket capacity/refill rate is
+    // undocumented anywhere in the spec, so it is injected config, never a
+    // baked-in default number in src/lib/engines/token-bucket.ts.
+    ENGINE_TOKEN_BUCKETS: requiredString.refine((value) => parsesAgainst(engineTokenBucketsSchema, value), {
+      message: "must be a JSON object mapping engine keys to { capacity: positive int, refillPerSecond: positive number }",
+    }),
+    // STORY-031 D13 — optional: undocumented dollar ceilings, injected only
+    // when known. Absent entirely (or absent for one engine key) disables
+    // ONLY that engine's 100% hard stop; 80%/95% alerting still runs.
+    ENGINE_SPEND_CEILINGS_USD: requiredString
+      .refine((value) => parsesAgainst(engineSpendCeilingsSchema, value), {
+        message: "must be a JSON object mapping engine keys to a positive USD ceiling",
+      })
+      .optional(),
   })
   .strict();
 

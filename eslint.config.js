@@ -3,6 +3,7 @@ import tseslint from "typescript-eslint";
 import noRepositoryLayer from "./eslint-rules/no-repository-layer.js";
 import noRequestHandlerNetworkCall from "./eslint-rules/no-request-handler-network-call.js";
 import noSessionScopedConfig from "./eslint-rules/no-session-scoped-config.js";
+import noSpendMeterPostgresAccess from "./eslint-rules/no-spend-meter-postgres-access.js";
 
 // STORY-011 — NFR-SEC-02. An inline local plugin (flat config supports this
 // natively, no new dependency) rather than a published package: the rule is
@@ -13,6 +14,7 @@ const nominaraLocalPlugin = {
     "no-session-scoped-config": noSessionScopedConfig,
     "no-request-handler-network-call": noRequestHandlerNetworkCall,
     "no-repository-layer": noRepositoryLayer,
+    "no-spend-meter-postgres-access": noSpendMeterPostgresAccess,
   },
 };
 
@@ -61,6 +63,15 @@ export default tseslint.config(
     files: ["src/modules/**/*.ts"],
     rules: {
       "nominara/no-repository-layer": "error",
+    },
+  },
+  {
+    // STORY-031 D12. Scoped to exactly this one file — the AST-level
+    // enforcement of D12's guarantee, replacing the defeatable text-regex
+    // structural test in test/unit/engines/spend-meter.spec.ts.
+    files: ["src/lib/engines/spend-meter.ts"],
+    rules: {
+      "nominara/no-spend-meter-postgres-access": "error",
     },
   },
 );

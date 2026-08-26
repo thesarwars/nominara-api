@@ -1,5 +1,6 @@
 export type {
   DependencyHealth,
+  EngineHealthSummary,
   LivenessResponse,
   QueueDepth,
   ReadinessResponse,

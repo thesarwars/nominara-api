@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { Logger } from "@nestjs/common";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapWorker, WorkerGroupError } from "./worker.js";
 
 // STORY-022 — NFR-ARCH-06 cold start (<=8s) plus the worker's own
@@ -23,6 +24,7 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
     process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
     process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 1).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
   });
@@ -47,5 +49,39 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     expect(elapsedMs).toBeLessThan(8000);
 
     await app.close();
+  }, 15_000);
+
+  // qa-reviewer finding — D13's "absent ceiling logs a boot warning"
+  // (src/lib/engines/spend-meter.ts's warnMissingSpendCeilings) had no
+  // production caller anywhere. The capture group is where every other
+  // engine-scoped boot concern (the canary) is already wired.
+  it("D13: logs a boot warning per active engine missing an ENGINE_SPEND_CEILINGS_USD entry, for the capture group", async () => {
+    process.env.WORKER_GROUP = "capture";
+    delete process.env.ENGINE_SPEND_CEILINGS_USD;
+    const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+
+    const app = await bootstrapWorker();
+    try {
+      const messages = warnSpy.mock.calls.map((call) => String(call[0]));
+      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'chatgpt'"))).toBe(true);
+    } finally {
+      await app.close();
+      warnSpy.mockRestore();
+    }
+  }, 15_000);
+
+  it("does not log a spend-ceiling boot warning for a non-capture group", async () => {
+    process.env.WORKER_GROUP = "parse";
+    delete process.env.ENGINE_SPEND_CEILINGS_USD;
+    const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+
+    const app = await bootstrapWorker();
+    try {
+      const messages = warnSpy.mock.calls.map((call) => String(call[0]));
+      expect(messages.some((message) => message.includes("ENGINE_SPEND_CEILINGS_USD"))).toBe(false);
+    } finally {
+      await app.close();
+      warnSpy.mockRestore();
+    }
   }, 15_000);
 });
