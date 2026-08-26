@@ -1,0 +1,334 @@
+import { describe, expect, it } from "vitest";
+import { QUEUE_TOPOLOGY, queueTopologySchema } from "../../../src/lib/queue/topology.js";
+
+// STORY-030 T1 (RED step) — architecture reference §4's 21-queue table,
+// transcribed by hand so this file is the executable ground truth for
+// concurrency, retry ladder, priority, idempotency key, and tenant scoping.
+// `src/lib/queue/topology.ts` does not exist yet; this file only proves the
+// shape every queue must satisfy once it does.
+
+const GLOBAL_REMOVE_ON_COMPLETE = { age: 3600, count: 5000 } as const;
+const GLOBAL_REMOVE_ON_FAIL = { age: 604800 } as const;
+
+// Retry ladders: capture.plan states explicit millisecond endpoints
+// ("3× exp 2s→8s") that fully determine its 3-step array, used verbatim.
+// capture.execute states ONLY its endpoints and step count ("4× exp
+// 5s→120s ... max 4 attempts", per edge-cases-and-slos.md EC-06) — the two
+// INTERIOR values (attempts 2 and 3) are not derivable from anything cited,
+// so this file does not pin them; see the dedicated capture.execute test
+// below, which checks exactly what IS specified (4 steps, 5000, 120000,
+// strictly increasing) rather than re-asserting the implementation's own
+// interpolation choice. Every other queue with a retry count and no stated
+// endpoints (whether written "N× exp" or bare "N×") defaults to
+// base-2000ms doubling, delaysMs[i] = 2000 * 2^i, for N steps — that
+// convention is this story's own documented choice, not presented as
+// spec, so pinning its exact output is legitimate. deploy.cms states "no
+// automatic retry", so its ladder is empty.
+function doubling(steps: number): number[] {
+  return Array.from({ length: steps }, (_, i) => 2000 * 2 ** i);
+}
+
+const QUEUES_WITH_UNSPECIFIED_INTERIOR_RETRY_VALUES = new Set(["capture.execute"]);
+
+const EXPECTED_QUEUE_TOPOLOGY = [
+  {
+    name: "capture.plan",
+    producer: "scheduler cron, API",
+    workerGroup: "capture",
+    concurrency: 4,
+    retry: { delaysMs: [2000, 4000, 8000] },
+    priority: 5,
+    idempotencyKeyPattern: "run:{project}:{window}",
+    tenantScoped: true,
+  },
+  {
+    name: "capture.execute",
+    producer: "capture.plan",
+    workerGroup: "capture",
+    concurrency: 6,
+    // Interior values (15000, 45000) are this implementation's own
+    // interpolation between the spec's stated endpoints — excluded from
+    // the entry-for-entry equality check below; see the dedicated test.
+    retry: { delaysMs: [5000, 15000, 45000, 120000] },
+    priority: { scheduled: 5, interactive: 1 },
+    idempotencyKeyPattern: "cap:{prompt}:{engine}:{run}",
+    tenantScoped: true,
+  },
+  {
+    name: "capture.parse",
+    producer: "capture",
+    workerGroup: "parse",
+    concurrency: 12,
+    retry: { delaysMs: doubling(3) },
+    priority: 4,
+    idempotencyKeyPattern: "parse:{result}",
+    tenantScoped: true,
+  },
+  {
+    name: "capture.arbitrate",
+    producer: "parse",
+    workerGroup: "parse",
+    concurrency: 6,
+    retry: { delaysMs: doubling(2) },
+    priority: 4,
+    idempotencyKeyPattern: "arb:{mention}",
+    tenantScoped: true,
+  },
+  {
+    name: "lookup.execute",
+    producer: "API (tools)",
+    workerGroup: "capture",
+    concurrency: 8,
+    retry: { delaysMs: doubling(2) },
+    priority: 1,
+    idempotencyKeyPattern: "lookup:{tool_run_id}",
+    tenantScoped: true,
+  },
+  {
+    name: "crawl.discover",
+    producer: "POST /projects",
+    workerGroup: "crawl",
+    concurrency: 3,
+    retry: { delaysMs: doubling(2) },
+    priority: 1,
+    idempotencyKeyPattern: "disc:{project}",
+    tenantScoped: true,
+  },
+  {
+    name: "crawl.fingerprint",
+    producer: "projects module",
+    workerGroup: "crawl",
+    concurrency: 4,
+    retry: { delaysMs: doubling(2) },
+    priority: 3,
+    idempotencyKeyPattern: "fp:{project}",
+    tenantScoped: true,
+  },
+  {
+    name: "crawl.audit",
+    producer: "API, cron",
+    workerGroup: "crawl",
+    concurrency: 3,
+    retry: { delaysMs: doubling(3) },
+    priority: 6,
+    idempotencyKeyPattern: "aux:{project}:{audit}",
+    tenantScoped: true,
+  },
+  {
+    name: "embed.batch",
+    producer: "parse, geo, crawl",
+    workerGroup: "embed",
+    concurrency: 4,
+    retry: { delaysMs: doubling(3) },
+    priority: 6,
+    idempotencyKeyPattern: "emb:{sha256(batch)}",
+    tenantScoped: true,
+  },
+  {
+    name: "rollup.metric_daily",
+    producer: "cron hourly, parse",
+    workerGroup: "rollup",
+    concurrency: 2,
+    retry: { delaysMs: doubling(5) },
+    priority: 7,
+    idempotencyKeyPattern: "rollup:{project}:{date}",
+    tenantScoped: true,
+  },
+  {
+    name: "displacement.detect",
+    producer: "rollup, after each parse batch",
+    workerGroup: "rollup",
+    concurrency: 4,
+    retry: { delaysMs: doubling(3) },
+    priority: 5,
+    idempotencyKeyPattern: "disp:{project}:{prompt}:{engine}:{run}",
+    tenantScoped: true,
+  },
+  {
+    name: "geo.analyze",
+    producer: "cron daily, API",
+    workerGroup: "rollup",
+    concurrency: 2,
+    retry: { delaysMs: doubling(3) },
+    priority: 6,
+    idempotencyKeyPattern: "geo:{project}:{analysis}:{window}",
+    tenantScoped: true,
+  },
+  {
+    name: "topic.cluster",
+    producer: "prompt-set change >= 10%, cron weekly",
+    workerGroup: "embed",
+    concurrency: 2,
+    retry: { delaysMs: doubling(3) },
+    priority: 7,
+    idempotencyKeyPattern: "topic:{project}:{prompt_set_hash}",
+    tenantScoped: true,
+  },
+  {
+    name: "task.generate",
+    producer: "rollup, aux",
+    workerGroup: "rollup",
+    concurrency: 4,
+    retry: { delaysMs: doubling(3) },
+    priority: 6,
+    idempotencyKeyPattern: "taskgen:{project}:{rule}:{fingerprint}",
+    tenantScoped: true,
+  },
+  {
+    name: "attribution.rollup",
+    producer: "cron hourly, ingest watermark",
+    workerGroup: "rollup",
+    concurrency: 2,
+    retry: { delaysMs: doubling(3) },
+    priority: 7,
+    idempotencyKeyPattern: "attr:{project}:{window}",
+    tenantScoped: true,
+  },
+  {
+    name: "gsc.sync",
+    producer: "cron daily, API",
+    workerGroup: "crawl",
+    concurrency: 2,
+    retry: { delaysMs: doubling(4) },
+    priority: 7,
+    idempotencyKeyPattern: "gsc:{connection}:{date}",
+    tenantScoped: true,
+  },
+  {
+    name: "credit.reconcile",
+    producer: "cron every 10 min",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "creditrec:{bucket}",
+    tenantScoped: false,
+  },
+  {
+    name: "report.build",
+    producer: "API, cron",
+    workerGroup: "report",
+    concurrency: 3,
+    retry: { delaysMs: doubling(3) },
+    priority: 8,
+    idempotencyKeyPattern: "rep:{report}:{period}",
+    tenantScoped: true,
+  },
+  {
+    name: "notify.dispatch",
+    producer: "any",
+    workerGroup: "rollup",
+    concurrency: 8,
+    retry: { delaysMs: doubling(5) },
+    priority: 8,
+    idempotencyKeyPattern: "ntf:{event}",
+    tenantScoped: true,
+  },
+  {
+    name: "maintenance.partition",
+    producer: "cron monthly",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "part:{yyyy_mm}",
+    tenantScoped: false,
+  },
+  {
+    name: "deploy.cms",
+    producer: "API",
+    workerGroup: "deploy",
+    concurrency: 2,
+    retry: { delaysMs: [] },
+    priority: 1,
+    idempotencyKeyPattern: "deploy:{Idempotency-Key}",
+    tenantScoped: true,
+  },
+].map((entry) => ({
+  ...entry,
+  removeOnComplete: GLOBAL_REMOVE_ON_COMPLETE,
+  removeOnFail: GLOBAL_REMOVE_ON_FAIL,
+}));
+
+const EXPECTED_GROUP_COUNTS: Record<string, number> = {
+  capture: 3,
+  parse: 2,
+  crawl: 4,
+  embed: 2,
+  rollup: 8,
+  report: 1,
+  deploy: 1,
+};
+
+describe("STORY-030 · queue topology declares all 21 queues per architecture reference §4", () => {
+  it("declares exactly 21 queues, matching the transcribed reference table entry-for-entry", () => {
+    expect(EXPECTED_QUEUE_TOPOLOGY).toHaveLength(21);
+    expect(QUEUE_TOPOLOGY).toHaveLength(21);
+
+    const byName = new Map(QUEUE_TOPOLOGY.map((entry) => [entry.name, entry]));
+    for (const expected of EXPECTED_QUEUE_TOPOLOGY) {
+      const actual = byName.get(expected.name);
+      if (QUEUES_WITH_UNSPECIFIED_INTERIOR_RETRY_VALUES.has(expected.name)) {
+        // capture.execute's interior retry values are not spec-derivable —
+        // compare every OTHER field exactly, and leave the retry ladder's
+        // shape to the dedicated test below.
+        const { retry: _expectedRetry, ...expectedRest } = expected;
+        const { retry: _actualRetry, ...actualRest } = actual ?? ({} as typeof expected);
+        expect(actualRest).toEqual(expectedRest);
+      } else {
+        expect(actual).toEqual(expected);
+      }
+    }
+  });
+
+  it("capture.execute's retry ladder matches only what the reference actually specifies — 4 attempts, 5s→120s, strictly increasing (interior values are this implementation's own interpolation, not from the spec)", () => {
+    const captureExecute = QUEUE_TOPOLOGY.find((entry) => entry.name === "capture.execute");
+    const delaysMs = captureExecute?.retry.delaysMs ?? [];
+    expect(delaysMs).toHaveLength(4);
+    expect(delaysMs[0]).toBe(5000);
+    expect(delaysMs[3]).toBe(120000);
+    for (let i = 1; i < delaysMs.length; i++) {
+      expect(delaysMs[i]).toBeGreaterThan(delaysMs[i - 1]!);
+    }
+  });
+
+  it("has the documented per-worker-group queue counts (capture 3 / parse 2 / crawl 4 / embed 2 / rollup 8 / report 1 / deploy 1)", () => {
+    const actualCounts: Record<string, number> = {};
+    for (const entry of QUEUE_TOPOLOGY) {
+      actualCounts[entry.workerGroup] = (actualCounts[entry.workerGroup] ?? 0) + 1;
+    }
+    expect(actualCounts).toEqual(EXPECTED_GROUP_COUNTS);
+  });
+
+  it("uses a .strict() zod schema, and every one of the 21 entries parses against it", () => {
+    // A `.strict()` object schema rejects an unknown key — the defining,
+    // load-bearing behavior distinguishing it from a passthrough schema.
+    const strictnessProbe = queueTopologySchema.safeParse({
+      ...EXPECTED_QUEUE_TOPOLOGY[0],
+      unknownKey: "should not be tolerated",
+    });
+    expect(strictnessProbe.success).toBe(false);
+
+    for (const entry of QUEUE_TOPOLOGY) {
+      const result = queueTopologySchema.safeParse(entry);
+      expect(result.success, `queue "${entry.name}" must parse against queueTopologySchema`).toBe(true);
+    }
+  });
+
+  it("applies the global removeOnComplete/removeOnFail defaults to every one of the 21 entries", () => {
+    for (const entry of QUEUE_TOPOLOGY) {
+      expect(entry.removeOnComplete, `${entry.name}.removeOnComplete`).toEqual(GLOBAL_REMOVE_ON_COMPLETE);
+      expect(entry.removeOnFail, `${entry.name}.removeOnFail`).toEqual(GLOBAL_REMOVE_ON_FAIL);
+    }
+  });
+
+  it("marks tenantScoped=false only for credit.reconcile and maintenance.partition; true for every other queue", () => {
+    const systemScoped = QUEUE_TOPOLOGY.filter((entry) => !entry.tenantScoped).map((entry) => entry.name).sort();
+    expect(systemScoped).toEqual(["credit.reconcile", "maintenance.partition"]);
+  });
+
+  it("configures deploy.cms with an empty retry ladder — a single attempt, no automatic retry", () => {
+    const deployCms = QUEUE_TOPOLOGY.find((entry) => entry.name === "deploy.cms");
+    expect(deployCms?.retry.delaysMs).toEqual([]);
+  });
+});

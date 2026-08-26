@@ -37,7 +37,13 @@ export async function withTenantJob<T>(
   return withTenantContext(client, { workspaceId: job.data.workspaceId, actorId: SYSTEM_ACTOR_ID }, fn);
 }
 
-function canonicalJson(value: unknown): string {
+/**
+ * Exported for src/lib/queue/signing.ts's rotating verifier and the queue
+ * producer side that signs a job payload before enqueueing — both must
+ * canonicalize exactly the way hmacSha256JobVerifier below does, or a
+ * genuinely correctly-signed job would fail to verify.
+ */
+export function canonicalJson(value: unknown): string {
   return JSON.stringify(sortKeysDeep(value));
 }
 

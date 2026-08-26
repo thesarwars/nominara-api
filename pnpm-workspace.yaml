@@ -1,3 +1,9 @@
+# Single-package repo, but pnpm 11 requires this file to declare `packages`
+# once it exists at all — otherwise every command exits with "packages field
+# missing or empty" before it runs anything.
+packages:
+  - "."
+
 # pnpm 11 no longer reads the `pnpm` field in package.json — it warns
 # "The following keys were ignored" on every command — so the fastify
 # override lives here instead. Without it, fastify 5.11.3 and 5.12.0 both
@@ -13,11 +19,12 @@ overrides:
 # decisions `pnpm approve-builds` writes.
 #
 # esbuild alone needs its install script: it fetches the platform binary
-# vitest's transform pipeline runs on. The other three are optional native
-# accelerators pulled in transitively by testcontainers/dockerode and
-# degrade gracefully to their JavaScript paths.
+# vitest's transform pipeline runs on. The others are optional native
+# accelerators pulled in transitively (testcontainers/dockerode, and now
+# bullmq/ioredis's msgpackr) and degrade gracefully to their JS paths.
 allowBuilds:
   cpu-features: false
   esbuild: true
+  msgpackr-extract: false
   protobufjs: false
   ssh2: false

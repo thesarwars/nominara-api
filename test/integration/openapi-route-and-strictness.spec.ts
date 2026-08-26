@@ -82,6 +82,16 @@ describe("STORY-023 · GET /v1/openapi.json and the real POST /v1/workspaces str
     process.env.WORKSPACE_DEK_WRAPPING_KEY = WRAPPING_KEY.toString("base64");
     process.env.OAUTH_REDIRECT_BASE_URL = "http://localhost:3000";
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
+    // Pre-existing gap (predates STORY-030) — this file never set these two,
+    // required since STORY-016's email OTP.
+    process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
+    process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
+    // STORY-030 — DbModule's PG_POOL factory calls loadEnv(), which (since
+    // Phase B) also requires the queue-signing env vars even though this
+    // file never signs a job payload itself.
+    process.env.QUEUE_REDIS_URL = "redis://localhost:6379";
+    process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
+    process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 

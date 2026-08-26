@@ -1,5 +1,7 @@
-import { Inject, Injectable, Logger, Optional, ServiceUnavailableException } from "@nestjs/common";
+import { Inject, Injectable, Logger, Optional, ServiceUnavailableException, type OnModuleDestroy } from "@nestjs/common";
 import { HealthCheckService, HealthIndicatorService, type HealthCheckResult } from "@nestjs/terminus";
+import type { Queue } from "bullmq";
+import type { Redis } from "ioredis";
 import type { Pool } from "pg";
 import type {
   DependencyHealth,
@@ -10,6 +12,8 @@ import type {
 import { PG_POOL } from "../../db/pg-pool.js";
 import { appliedMigrationNames, listMigrationFiles } from "../../db/migrate-runner.js";
 import { CircuitBreaker } from "../../lib/resilience/circuit-breaker.js";
+import { buildQueue } from "../../lib/queue/queue-factory.js";
+import { QUEUE_TOPOLOGY } from "../../lib/queue/topology.js";
 
 // STORY-022 — HealthModule (system-architecture.md §5): "Liveness,
 // readiness, circuit-breaker state, queue depth" with `@nestjs/terminus` as
@@ -33,21 +37,38 @@ interface MigrationState {
 // real MIGRATIONS_DIR.
 export const MIGRATIONS_DIR_TOKEN = Symbol("HEALTH_MIGRATIONS_DIR");
 
+// STORY-030 Task 28 — the queue instance's own dedicated Valkey connection
+// (system-architecture.md §11: "never the cache instance"), used ONLY to
+// read depth (getJobCounts) — this process never runs a Worker against any
+// of these queues.
+export const QUEUE_CONNECTION_TOKEN = Symbol("HEALTH_QUEUE_CONNECTION");
+export const QUEUE_KEY_PREFIX_TOKEN = Symbol("HEALTH_QUEUE_KEY_PREFIX");
+
 @Injectable()
-export class HealthService {
+export class HealthService implements OnModuleDestroy {
   private readonly logger = new Logger(HealthService.name);
   // NFR-ARCH-05's exact numbers (50% error threshold, 30s open, 3-request
   // half-open) — sampleSize is this class's own implementation detail, not
   // one of those reference constants.
   private readonly postgresBreaker = new CircuitBreaker({ name: "postgres" });
   private lastMigrationState: MigrationState = { applied: null, expected: null, matches: false };
+  private queuesByName: ReadonlyMap<string, Queue> | undefined;
 
   constructor(
     @Inject(PG_POOL) private readonly pool: Pool,
     @Optional() @Inject(MIGRATIONS_DIR_TOKEN) private readonly migrationsDir: string | undefined,
     private readonly healthCheckService: HealthCheckService,
     private readonly healthIndicatorService: HealthIndicatorService,
+    @Inject(QUEUE_CONNECTION_TOKEN) private readonly queueConnection: Redis,
+    @Inject(QUEUE_KEY_PREFIX_TOKEN) private readonly queueKeyPrefixValue: string,
   ) {}
+
+  async onModuleDestroy(): Promise<void> {
+    if (this.queuesByName) {
+      await Promise.all(Array.from(this.queuesByName.values()).map((queue) => queue.close()));
+    }
+    await this.queueConnection.quit().catch(() => undefined);
+  }
 
   liveness(): LivenessResponse {
     return { status: "ok" };
@@ -77,8 +98,11 @@ export class HealthService {
         healthy: postgresDetail?.status === "up",
       },
     ];
-    // STORY-022-E-5 — reserved, always empty until STORY-030 wires BullMQ.
-    const queues: QueueDepth[] = [];
+    // STORY-030 Task 28 — real per-queue depth (waiting+active), one entry
+    // per QUEUE_TOPOLOGY queue. Queue depth is observability, not a
+    // readiness gate — a failure reading it never flips `ready` to
+    // `not_ready`, it only leaves this array empty for that one call.
+    const queues = await this.queueDepths();
 
     const ready = result.status === "ok" && this.lastMigrationState.matches;
     this.logger.log(`readiness check: ${ready ? "ready" : "not_ready"}`);
@@ -89,6 +113,43 @@ export class HealthService {
       dependencies,
       queues,
     };
+  }
+
+  /** One BullMQ `Queue` handle per QUEUE_TOPOLOGY entry, sharing this service's single connection — built once, lazily, and reused across calls. */
+  private queues(): ReadonlyMap<string, Queue> {
+    if (!this.queuesByName) {
+      this.queuesByName = new Map(
+        QUEUE_TOPOLOGY.map((entry) => [
+          entry.name,
+          buildQueue(entry, { connection: this.queueConnection, prefix: this.queueKeyPrefixValue }),
+        ]),
+      );
+    }
+    return this.queuesByName;
+  }
+
+  /**
+   * Real per-queue depth (waiting+active), one entry per documented queue.
+   * Every QUEUE_TOPOLOGY entry carries a documented `priority`
+   * (queue-factory.ts's `enqueueJob` always sets one), so a job not yet
+   * picked up by a worker sits in BullMQ's own separate `prioritized` state,
+   * never `waiting` — that state is counted alongside `waiting`+`active`
+   * here, or an unprocessed backlog would silently read as depth 0.
+   * A Valkey read failure is logged and reported as an empty list — never a
+   * thrown error, since queue depth is observability, not a readiness gate.
+   */
+  private async queueDepths(): Promise<QueueDepth[]> {
+    try {
+      return await Promise.all(
+        Array.from(this.queues().entries()).map(async ([name, queue]) => {
+          const counts = await queue.getJobCounts("waiting", "active", "prioritized");
+          return { name, depth: (counts.waiting ?? 0) + (counts.active ?? 0) + (counts.prioritized ?? 0) };
+        }),
+      );
+    } catch (error) {
+      this.logger.error(`failed to read queue depth: ${(error as Error).message}`);
+      return [];
+    }
   }
 
   /**

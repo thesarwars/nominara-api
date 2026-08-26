@@ -13,7 +13,10 @@ const requiredString = z
   .string()
   .refine((value) => value.trim().length > 0, { message: "must not be empty or whitespace-only" });
 
-export const WORKER_GROUPS = ["capture", "parse", "crawl", "embed", "rollup", "report"] as const;
+// STORY-030 — "deploy" added alongside the original six: deploy.cms
+// (src/lib/queue/topology.ts) is a documented worker group too, and
+// WORKER_GROUP must accept every group that actually owns a queue.
+export const WORKER_GROUPS = ["capture", "parse", "crawl", "embed", "rollup", "report", "deploy"] as const;
 
 export const envSchema = z
   .object({
@@ -154,6 +157,41 @@ export const envSchema = z
     // convenient one: with no value the peer address is used, which is correct
     // when nothing sits in front and merely coarse when something does.
     TRUST_PROXY_HOPS: z.coerce.number().int().nonnegative().optional(),
+
+    // STORY-030 — the queue instance's dedicated Valkey connection
+    // (system-architecture.md §4/§11: "never the cache instance"). BullMQ/
+    // ioredis connect here.
+    QUEUE_REDIS_URL: requiredString,
+    // Rotating HMAC-SHA256 key signing every tenant-scoped job payload
+    // (src/lib/queue/signing.ts), base64-encoded, exactly 32 bytes — same
+    // shape as WORKSPACE_DEK_WRAPPING_KEY above. QUEUE_JOB_SIGNING_KID
+    // identifies the current key; the previous key/kid pair is optional
+    // and only present during a rotation's overlap window, so a job
+    // signed with it still verifies for the window's duration.
+    QUEUE_JOB_SIGNING_KEY: requiredString.refine(
+      (value) => {
+        try {
+          return Buffer.from(value, "base64").length === 32;
+        } catch {
+          return false;
+        }
+      },
+      { message: "must be base64-encoded and decode to exactly 32 bytes" },
+    ),
+    QUEUE_JOB_SIGNING_KID: requiredString,
+    QUEUE_JOB_SIGNING_PREVIOUS_KEY: requiredString
+      .refine(
+        (value) => {
+          try {
+            return Buffer.from(value, "base64").length === 32;
+          } catch {
+            return false;
+          }
+        },
+        { message: "must be base64-encoded and decode to exactly 32 bytes" },
+      )
+      .optional(),
+    QUEUE_JOB_SIGNING_PREVIOUS_KID: requiredString.optional(),
   })
   .strict();
 

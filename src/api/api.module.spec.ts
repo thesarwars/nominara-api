@@ -76,6 +76,9 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
     process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 1).toString("base64");
+    process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
   });
 
   afterEach(() => {

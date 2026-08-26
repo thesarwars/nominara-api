@@ -90,6 +90,12 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
     process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    // STORY-030 — DbModule's PG_POOL factory calls loadEnv(), which (since
+    // Phase B) also requires the queue-signing env vars even though this
+    // file never signs a job payload itself.
+    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
+    process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 

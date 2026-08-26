@@ -32,6 +32,13 @@ const VALID: NodeJS.ProcessEnv = {
   // default connection string is how a service silently talks to the wrong
   // cache, and this schema exists to make that a failed boot instead.
   VALKEY_CACHE_URL: "redis://localhost:6379",
+  // STORY-030 — the queue instance's connection, and the rotating
+  // HMAC-SHA256 key that signs every tenant-scoped job payload
+  // (src/lib/queue/signing.ts). QUEUE_JOB_SIGNING_PREVIOUS_KEY/_KID are
+  // optional — set only during a rotation's overlap window.
+  QUEUE_REDIS_URL: "redis://localhost:6380",
+  QUEUE_JOB_SIGNING_KEY: Buffer.alloc(32, 1).toString("base64"),
+  QUEUE_JOB_SIGNING_KID: "test-queue-kid-1",
 };
 
 describe("STORY-022 · env validation — refuses to start on missing/malformed config", () => {
@@ -110,6 +117,53 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
   it("STORY-016 · a MISSING OTP_EMAIL_FROM throws, naming that exact key", () => {
     const { OTP_EMAIL_FROM: _drop, ...rest } = VALID;
     expect(() => loadEnv(rest)).toThrow(/OTP_EMAIL_FROM/);
+  });
+
+  it("STORY-030 · boots successfully with the queue connection and current signing key, no previous key/kid present", () => {
+    const env = loadEnv(VALID);
+    expect(env.QUEUE_REDIS_URL).toBe(VALID.QUEUE_REDIS_URL);
+    expect(env.QUEUE_JOB_SIGNING_KEY).toBe(VALID.QUEUE_JOB_SIGNING_KEY);
+    expect(env.QUEUE_JOB_SIGNING_KID).toBe(VALID.QUEUE_JOB_SIGNING_KID);
+    expect(env.QUEUE_JOB_SIGNING_PREVIOUS_KEY).toBeUndefined();
+    expect(env.QUEUE_JOB_SIGNING_PREVIOUS_KID).toBeUndefined();
+  });
+
+  it("STORY-030 · boots successfully with a previous key/kid present — a rotation's overlap window", () => {
+    const previousKey = Buffer.alloc(32, 2).toString("base64");
+    const env = loadEnv({
+      ...VALID,
+      QUEUE_JOB_SIGNING_PREVIOUS_KEY: previousKey,
+      QUEUE_JOB_SIGNING_PREVIOUS_KID: "test-queue-kid-0",
+    });
+    expect(env.QUEUE_JOB_SIGNING_PREVIOUS_KEY).toBe(previousKey);
+    expect(env.QUEUE_JOB_SIGNING_PREVIOUS_KID).toBe("test-queue-kid-0");
+  });
+
+  it("STORY-030 · a MISSING QUEUE_REDIS_URL throws, naming that exact key", () => {
+    const { QUEUE_REDIS_URL: _drop, ...rest } = VALID;
+    expect(() => loadEnv(rest)).toThrow(/QUEUE_REDIS_URL/);
+  });
+
+  it("STORY-030 · a MISSING QUEUE_JOB_SIGNING_KEY throws, naming that exact key", () => {
+    const { QUEUE_JOB_SIGNING_KEY: _drop, ...rest } = VALID;
+    expect(() => loadEnv(rest)).toThrow(/QUEUE_JOB_SIGNING_KEY/);
+  });
+
+  it("STORY-030 · a QUEUE_JOB_SIGNING_KEY that does not decode to 32 bytes throws, naming that exact key", () => {
+    expect(() =>
+      loadEnv({ ...VALID, QUEUE_JOB_SIGNING_KEY: Buffer.alloc(16).toString("base64") }),
+    ).toThrow(/QUEUE_JOB_SIGNING_KEY/);
+  });
+
+  it("STORY-030 · a MISSING QUEUE_JOB_SIGNING_KID throws, naming that exact key", () => {
+    const { QUEUE_JOB_SIGNING_KID: _drop, ...rest } = VALID;
+    expect(() => loadEnv(rest)).toThrow(/QUEUE_JOB_SIGNING_KID/);
+  });
+
+  it("STORY-030 · a QUEUE_JOB_SIGNING_PREVIOUS_KEY that does not decode to 32 bytes throws, naming that exact key", () => {
+    expect(() =>
+      loadEnv({ ...VALID, QUEUE_JOB_SIGNING_PREVIOUS_KEY: Buffer.alloc(16).toString("base64") }),
+    ).toThrow(/QUEUE_JOB_SIGNING_PREVIOUS_KEY/);
   });
 
   it("an unknown key is rejected the same way any strict contract schema rejects mass assignment", () => {

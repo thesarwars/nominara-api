@@ -3,11 +3,24 @@
 # Valkey arrives as TWO instances, not one — system-architecture.md §11. The
 # CACHE instance is here (STORY-025: token buckets, idempotency records,
 # locks, memoisation, pub/sub) with allkeys-lru and no persistence. The QUEUE
-# instance joins in STORY-030 with noeviction and persistence on, holding
-# BullMQ's queues. The split is not tidiness: evicting a queued job under
-# memory pressure is silent data loss, and refusing to evict a cache is an
-# outage. One instance cannot have both policies.
+# instance joins in STORY-030 (below, `valkey`) with noeviction and
+# persistence on, holding BullMQ's queues. The split is not tidiness:
+# evicting a queued job under memory pressure is silent data loss, and
+# refusing to evict a cache is an outage. One instance cannot have both
+# policies.
 services:
+  # STORY-030 — the QUEUE instance. Separate host port from valkey-cache's
+  # VALKEY_PORT below (both default container-side to 6379, but two services
+  # cannot both bind host port 6379) — override with VALKEY_QUEUE_PORT if it
+  # collides with something else already running.
+  valkey:
+    image: valkey/valkey:9.1
+    command: valkey-server --maxmemory-policy noeviction --appendonly yes
+    ports:
+      - "${VALKEY_QUEUE_PORT:-6380}:6379"
+    volumes:
+      - nominara-valkey-data:/data
+
   postgres:
     image: pgvector/pgvector:pg18
     environment:
@@ -183,3 +196,4 @@ services:
 
 volumes:
   nominara-postgres-data:
+  nominara-valkey-data:

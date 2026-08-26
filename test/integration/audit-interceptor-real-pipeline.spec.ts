@@ -118,6 +118,12 @@ describe("STORY-020 fix pass · AuditInterceptor through a real Nest HTTP pipeli
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
     process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    // STORY-030 — DbModule's PG_POOL factory calls loadEnv(), which (since
+    // Phase B) also requires the queue-signing env vars even though this
+    // file never signs a job payload itself.
+    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
+    process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
 
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();

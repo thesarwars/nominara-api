@@ -11,6 +11,10 @@ import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
 import { HealthModule } from "../../src/modules/health/health.module.js";
 import { HealthService, MIGRATIONS_DIR_TOKEN } from "../../src/modules/health/health.service.js";
 import { configureApp } from "../../src/api/configure-app.js";
+import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
+import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
+import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixture.js";
 
 // STORY-022 — HealthModule against a real Postgres (testing-strategy.md §1:
 // integration tests never mock the database). Each scenario builds its own
@@ -19,6 +23,7 @@ import { configureApp } from "../../src/api/configure-app.js";
 // afterward so no scenario's readiness state leaks into the next.
 describe("STORY-022 · health/readiness against real Postgres", () => {
   let container: StartedPostgreSqlContainer;
+  let valkeyFixture: ValkeyFixture;
   const originalDatabaseUrl = process.env.DATABASE_URL;
   const originalDatabaseUrlPooled = process.env.DATABASE_URL_POOLED;
 
@@ -28,10 +33,12 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
       .withUsername("nominara")
       .withPassword("nominara")
       .start();
+    valkeyFixture = await startValkeyFixture();
   }, 120_000);
 
   afterAll(async () => {
     await container.stop();
+    await valkeyFixture.stop();
     process.env.DATABASE_URL = originalDatabaseUrl;
     process.env.DATABASE_URL_POOLED = originalDatabaseUrlPooled;
   });
@@ -54,6 +61,12 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
     process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    // STORY-030 — DbModule/HealthModule's providers call loadEnv(), which
+    // (since Phase B) also requires the queue-signing env vars even though
+    // this file never signs a job payload itself.
+    process.env.QUEUE_REDIS_URL = valkeyFixture.connectionString;
+    process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
+    process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
 
     const client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();
@@ -89,9 +102,48 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
     expect(after.status).toBe("ready");
     expect(after.migrationVersion.matches).toBe(true);
     expect(after.dependencies).toEqual([{ name: "postgres", state: "closed", healthy: true }]);
-    expect(after.queues).toEqual([]);
+    // STORY-030 Task 28 — no longer the reserved-empty array: one entry per
+    // documented queue, each a non-negative depth.
+    expect(after.queues).toHaveLength(QUEUE_TOPOLOGY.length);
+    expect(after.queues.map((q) => q.name).sort()).toEqual(QUEUE_TOPOLOGY.map((e) => e.name).slice().sort());
+    for (const queue of after.queues) {
+      expect(Number.isInteger(queue.depth)).toBe(true);
+      expect(queue.depth).toBeGreaterThanOrEqual(0);
+    }
 
     await moduleRef.close();
+  });
+
+  it("STORY-030 · readiness's queues array reports each queue's real waiting+active depth", async () => {
+    const client = new Client({ connectionString: container.getConnectionUri() });
+    await client.connect();
+    await migrateUp(client);
+    await client.end();
+
+    const prefix = queueKeyPrefix(process.env.NODE_ENV ?? "development");
+    const entry = QUEUE_TOPOLOGY.find((candidate) => candidate.name === "credit.reconcile")!; // non-tenant-scoped — no signing envelope needed
+    const producerConnection = createQueueConnection(valkeyFixture.connectionString);
+    const queue = buildQueue(entry, { connection: producerConnection, prefix });
+
+    try {
+      await enqueueJob(queue, entry, { bucket: "b1" }, { idempotencyKey: "health-depth-test-1" });
+      await enqueueJob(queue, entry, { bucket: "b2" }, { idempotencyKey: "health-depth-test-2" });
+
+      const moduleRef = await Test.createTestingModule({ imports: [DbModule, HealthModule] }).compile();
+      const service = moduleRef.get(HealthService);
+
+      const result = await service.readiness();
+      const depth = result.queues.find((q) => q.name === entry.name);
+      expect(depth?.depth).toBeGreaterThanOrEqual(2);
+
+      const other = result.queues.find((q) => q.name === "deploy.cms");
+      expect(other?.depth).toBe(0);
+
+      await moduleRef.close();
+    } finally {
+      await queue.close();
+      await producerConnection.quit().catch(() => undefined);
+    }
   });
 
   // Rollback-superset boundary case — an older build instance (this
