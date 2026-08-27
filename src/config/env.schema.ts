@@ -55,7 +55,12 @@ export const envSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
     // src/main.ts — the HTTP entry point's listen port.
-    PORT: z.coerce.number().int().positive().default(3000),
+    // 4000 — the port this project's API runs on. Deliberately NOT 3000:
+    // that is the frontend's (Next.js's own default), and the two run side by
+    // side in development. WEBAUTHN_ORIGIN and REALTIME_ALLOWED_ORIGINS still
+    // name port 3000 because they are BROWSER origins, not this service's
+    // address.
+    PORT: z.coerce.number().int().positive().default(4000),
     // src/gateway.ts — the WebSocket gateway's listen port.
     GATEWAY_PORT: z.coerce.number().int().positive().default(3001),
     // Migration/DDL connection — direct to Postgres, never through pgBouncer (docker-compose.yml).
@@ -86,6 +91,21 @@ export const envSchema = z
     AUTH_TOKEN_ED25519_PREVIOUS_KID: requiredString.optional(),
     // STORY-017 — HMAC-SHA256(sid, secret) double-submit CSRF token secret.
     CSRF_SECRET: requiredString,
+
+    // STORY-026 — the socket handshake's Origin allow-list, comma-separated.
+    //
+    // Optional HERE and mandatory in the gateway, which is the only process
+    // that opens sockets. Making it globally required forced the API, the
+    // worker and the one-shot migrate container to carry a key none of them
+    // reads, and would fail a deployment for omitting configuration
+    // irrelevant to it.
+    //
+    // That is NOT a soft default. src/gateway/gateway.module.ts's provider
+    // throws when it is missing or empty, so the gateway does not start
+    // without an allow-list — the check cannot quietly become a no-op, which
+    // is the failure this codebase keeps finding. The requirement lives with
+    // the thing that needs it.
+    REALTIME_ALLOWED_ORIGINS: requiredString.optional(),
 
     // STORY-021-E-10 — LocalDekProvisioner's wrapping key (AES-256-GCM,
     // node:crypto only, no KMS). Base64-encoded, exactly 32 bytes so it is

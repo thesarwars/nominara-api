@@ -9,7 +9,7 @@ import { RealtimeModule } from "../../src/gateway/gateway.module.js";
 import { JOIN_WORKSPACE_MESSAGE } from "../../src/gateway/realtime.gateway.js";
 import { ROOM_FORBIDDEN_CLOSE_CODE } from "../../src/gateway/room-authorization.service.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { ACCESS_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
+import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
@@ -103,10 +103,18 @@ describe("STORY-026 · room authorisation over a real socket", () => {
   }
 
   /** A socket carrying the same access cookie the HTTP path would send. */
-  function connect(accessToken: string): ClientSocket {
+  function connect(accessToken: string, csrfToken = ""): ClientSocket {
     const client = io(`http://127.0.0.1:${String(port)}/rt`, {
       transports: ["websocket"],
-      extraHeaders: { cookie: `${ACCESS_COOKIE_NAME}=${accessToken}` },
+      extraHeaders: {
+        cookie: `${ACCESS_COOKIE_NAME}=${accessToken}; ${CSRF_COOKIE_NAME}=${csrfToken}`,
+      },
+      // STORY-026 — the handshake now carries the double-submit token, the
+      // same as any other cookie-authenticated request. socket.io puts it in
+      // `auth` because a browser cannot set a header on a WebSocket
+      // handshake; the server copies it into the header slot AuthGuard
+      // already reads.
+      auth: { csrf: csrfToken },
       reconnection: false,
     });
     clients.push(client);
@@ -155,7 +163,7 @@ describe("STORY-026 · room authorisation over a real socket", () => {
     const session = await sessions.createSession(ownerId);
     const pinned = await sessions.switchWorkspace(session.sid, ownerId, workspace.id, "owner", null, 1);
 
-    const client = connect(pinned.accessToken);
+    const client = connect(pinned.accessToken, pinned.csrfToken);
     await new Promise<void>((resolve) => client.on("connect", () => resolve()));
 
     const reply = await joined(client, workspace.id);
@@ -176,7 +184,7 @@ describe("STORY-026 · room authorisation over a real socket", () => {
     const session = await sessions.createSession(ownerId);
     const pinned = await sessions.switchWorkspace(session.sid, ownerId, mine.id, "owner", null, 1);
 
-    const client = connect(pinned.accessToken);
+    const client = connect(pinned.accessToken, pinned.csrfToken);
     await new Promise<void>((resolve) => client.on("connect", () => resolve()));
 
     const closure = disconnected(client);
@@ -197,7 +205,7 @@ describe("STORY-026 · room authorisation over a real socket", () => {
     const workspace = await workspaces.create(ownerId, { name: `Closed ${randomUUID()}` }, meta);
 
     const tokens = await sessions.createSession(outsiderId);
-    const client = connect(tokens.accessToken);
+    const client = connect(tokens.accessToken, tokens.csrfToken);
     await new Promise<void>((resolve) => client.on("connect", () => resolve()));
 
     const closure = disconnected(client);
@@ -225,7 +233,7 @@ describe("STORY-026 · room authorisation over a real socket", () => {
   it("row 2 — a join with no workspace id is refused rather than defaulting to one", async () => {
     const userId = await createUser();
     const tokens = await sessions.createSession(userId);
-    const client = connect(tokens.accessToken);
+    const client = connect(tokens.accessToken, tokens.csrfToken);
     await new Promise<void>((resolve) => client.on("connect", () => resolve()));
 
     const closure = disconnected(client);
@@ -264,7 +272,7 @@ describe("STORY-026 · room authorisation over a real socket", () => {
     const session = await sessions.createSession(userId);
     const pinned = await sessions.switchWorkspace(session.sid, userId, mine.id, "owner", null, 1);
 
-    const client = connect(pinned.accessToken);
+    const client = connect(pinned.accessToken, pinned.csrfToken);
     await new Promise<void>((resolve) => client.on("connect", () => resolve()));
 
     const closure = disconnected(client);
@@ -297,7 +305,7 @@ describe("STORY-026 · room authorisation over a real socket", () => {
       memberId,
     ]);
 
-    const client = connect(pinned.accessToken);
+    const client = connect(pinned.accessToken, pinned.csrfToken);
     await new Promise<void>((resolve) => client.on("connect", () => resolve()));
 
     const closure = disconnected(client);

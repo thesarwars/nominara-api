@@ -9,7 +9,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { RealtimeModule } from "../../src/gateway/gateway.module.js";
 import { JOIN_WORKSPACE_MESSAGE, RealtimeGateway } from "../../src/gateway/realtime.gateway.js";
 import { workspaceRoom } from "../../src/gateway/room-authorization.service.js";
-import { ACCESS_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
+import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
@@ -138,7 +138,15 @@ describe("STORY-026 · a broadcast from one gateway reaches a client on another"
 
     const client = io(`http://127.0.0.1:${String(portA)}/rt`, {
       transports: ["websocket"],
-      extraHeaders: { cookie: `${ACCESS_COOKIE_NAME}=${pinned.accessToken}` },
+      extraHeaders: {
+        cookie: `${ACCESS_COOKIE_NAME}=${pinned.accessToken}; ${CSRF_COOKIE_NAME}=${pinned.csrfToken}`,
+      },
+      // STORY-026 — the handshake now carries the double-submit token, the
+      // same as any other cookie-authenticated request. socket.io puts it in
+      // `auth` because a browser cannot set a header on a WebSocket
+      // handshake; the server copies it into the header slot AuthGuard
+      // already reads.
+      auth: { csrf: pinned.csrfToken },
       reconnection: false,
     });
     clients.push(client);

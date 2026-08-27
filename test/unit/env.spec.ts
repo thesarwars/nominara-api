@@ -59,7 +59,10 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
     expect(env.DATABASE_URL).toBe(VALID.DATABASE_URL);
     expect(env.DATABASE_URL_POOLED).toBe(VALID.DATABASE_URL_POOLED);
     expect(env.NODE_ENV).toBe("development");
-    expect(env.PORT).toBe(3000);
+    // 4000, not 3000 — 3000 is the frontend's port, and the two run side by
+    // side in development. WEBAUTHN_ORIGIN above still names 3000 because it
+    // is a BROWSER origin, not this service's address.
+    expect(env.PORT).toBe(4000);
     expect(env.GATEWAY_PORT).toBe(3001);
     expect(env.WORKER_GROUP).toBeUndefined();
     expect(env.WORKSPACE_KMS_KEY_ARN).toBe("local:dev");

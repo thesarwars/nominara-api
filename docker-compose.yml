@@ -180,7 +180,7 @@ services:
       # it gives each its own idempotency store, so two requests carrying one
       # Idempotency-Key both execute.
       NODE_ENV: development
-      PORT: "3000"
+      PORT: "4000"
       DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
       DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
       VALKEY_CACHE_URL: redis://valkey-cache:6379
@@ -189,7 +189,7 @@ services:
       # this the readiness probe below can never answer.
       QUEUE_REDIS_URL: redis://valkey:6379
     ports:
-      - "${API_PORT:-3000}:3000"
+      - "${API_PORT:-4000}:4000"
     command: ["node", "dist/src/main.js"]
     # STORY-120 — the healthcheck revisit its Definition of Done calls for.
     #
@@ -217,7 +217,7 @@ services:
           "CMD",
           "node",
           "-e",
-          "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+          "fetch('http://127.0.0.1:4000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
         ]
       interval: 10s
       timeout: 3s

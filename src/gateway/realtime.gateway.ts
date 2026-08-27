@@ -4,7 +4,12 @@ import type { Server, Socket } from "socket.io";
 import { Logger } from "@nestjs/common";
 import { incrementCounter } from "../lib/telemetry/metrics.js";
 import { RESYNC_DIRECTIVE, SocketBackpressure, drainReconnectAfterMs } from "./backpressure.js";
-import { ROOM_FORBIDDEN_CLOSE_CODE, RoomAuthorizationService, workspaceRoom } from "./room-authorization.service.js";
+import {
+  ROOM_FORBIDDEN_CLOSE_CODE,
+  RoomAuthorizationService,
+  projectRoom,
+  workspaceRoom,
+} from "./room-authorization.service.js";
 import { Redis } from "ioredis";
 import { memberChangedEventSchema } from "../../contracts/events/platform-events.schema.js";
 import { attachValkeyAdapter, type ValkeyAdapterHandle } from "./valkey-adapter.js";
@@ -34,6 +39,9 @@ export const SERVER_DRAINING_EVENT = "server.draining";
 /** The message a client sends to join its workspace room. */
 export const JOIN_WORKSPACE_MESSAGE = "join:workspace";
 
+/** The message a client sends to join a project room — AC1's `proj:{project_id}`. */
+export const JOIN_PROJECT_MESSAGE = "join:project";
+
 // STORY-022 stood up the /rt namespace and the shutdown-drain notice.
 // STORY-026 T21 adds room authorisation through the SAME guard chain the HTTP
 // path uses (system-architecture.md §9), and nothing else: the Valkey adapter,
@@ -55,6 +63,9 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
    * ROOM's members; it cannot answer "which of these is user X".
    */
   private readonly joined = new Map<string, { userId: string; workspaceId: string }>();
+
+  /** Project rooms this socket holds, so the periodic re-check can re-authorise each. */
+  private readonly joinedProjects = new Map<string, Set<string>>();
   private readonly revalidations = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(
@@ -199,6 +210,7 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
   private forget(socketId: string): void {
     this.pressure.delete(socketId);
     this.joined.delete(socketId);
+    this.joinedProjects.delete(socketId);
     const timer = this.revalidations.get(socketId);
     if (timer !== undefined) clearInterval(timer);
     this.revalidations.delete(socketId);
@@ -253,6 +265,47 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
   }
 
   /**
+   * Joins `proj:{project_id}` — AC1's second room form.
+   *
+   * Refuses the same way `join:workspace` does, and for the same reason: a
+   * socket asking for a room it cannot have is disconnected rather than told
+   * no, so a refusal cannot be used to enumerate project ids.
+   *
+   * This is the join that makes `workspace_members.project_scope` mean
+   * something on the realtime path. `project:read` is scoped for manager and
+   * viewer in §6's matrix, so RbacGuard's `assertInScope` runs here and
+   * refuses a project outside the caller's own scope list.
+   */
+  @SubscribeMessage(JOIN_PROJECT_MESSAGE)
+  async joinProject(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: { project_id?: unknown },
+  ): Promise<{ joined: boolean; room?: string }> {
+    const projectId = typeof body?.project_id === "string" ? body.project_id : "";
+    if (projectId.length === 0) {
+      socket.disconnect(true);
+      return { joined: false };
+    }
+
+    const decision = await this.rooms.authorizeProjectRoom(socket.handshake, projectId);
+    if (!decision.allowed) {
+      socket.emit("error", { close_code: decision.closeCode ?? ROOM_FORBIDDEN_CLOSE_CODE });
+      socket.disconnect(true);
+      return { joined: false };
+    }
+
+    const room = projectRoom(projectId);
+    await socket.join(room);
+    // Recorded so the periodic re-check below can re-authorise it. A scope
+    // NARROWED after the join is the same class of revocation as a membership
+    // removed after one, and the workspace re-check cannot see it.
+    const rooms = this.joinedProjects.get(socket.id) ?? new Set<string>();
+    rooms.add(projectId);
+    this.joinedProjects.set(socket.id, rooms);
+    return { joined: true, room };
+  }
+
+  /**
    * The SECOND path that closes a revoked socket: a periodic re-check.
    *
    * `member.changed` closes it immediately, and this closes it eventually. Both
@@ -276,17 +329,44 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
     const running = this.revalidations.get(socket.id);
     if (running !== undefined) clearInterval(running);
     const timer = setInterval(() => {
-      void this.rooms.authorizeWorkspaceRoom(socket.handshake, workspaceId).then((decision) => {
-        if (decision.allowed) return;
-        incrementCounter("nominara_gateway_forced_reauth_total", { reason: "revalidation" });
-        socket.emit("error", { close_code: ROOM_FORBIDDEN_CLOSE_CODE, reason: "revalidation_failed" });
-        socket.disconnect(true);
-        this.forget(socket.id);
-      });
+      void this.revalidate(socket, workspaceId);
     }, this.revalidationMs);
     // Never hold the process open for a periodic check.
     timer.unref?.();
     this.revalidations.set(socket.id, timer);
+  }
+
+  /**
+   * One re-check: the workspace room, then every project room this socket
+   * holds.
+   *
+   * The project half is not decoration. A membership REVOKED after the join
+   * is caught by the workspace check; a `project_scope` NARROWED after the
+   * join is not — the member is still active in the workspace, so that check
+   * passes while the socket keeps receiving a project it no longer has. Both
+   * are the same class of change and §7 bounds both the same way.
+   */
+  private async revalidate(socket: Socket, workspaceId: string): Promise<void> {
+    const close = (reason: string): void => {
+      incrementCounter("nominara_gateway_forced_reauth_total", { reason });
+      socket.emit("error", { close_code: ROOM_FORBIDDEN_CLOSE_CODE, reason });
+      socket.disconnect(true);
+      this.forget(socket.id);
+    };
+
+    const workspace = await this.rooms.authorizeWorkspaceRoom(socket.handshake, workspaceId);
+    if (!workspace.allowed) {
+      close("revalidation_failed");
+      return;
+    }
+
+    for (const projectId of this.joinedProjects.get(socket.id) ?? []) {
+      const project = await this.rooms.authorizeProjectRoom(socket.handshake, projectId);
+      if (!project.allowed) {
+        close("project_scope_revalidation_failed");
+        return;
+      }
+    }
   }
 
   // NFR-ARCH-07 — zero-downtime deploys: "WebSocket clients receive

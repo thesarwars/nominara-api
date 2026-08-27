@@ -64,15 +64,15 @@ COPY --from=build /app/contracts/openapi.generated.json ./dist/contracts/openapi
 # unwrapped DEK-wrapping key and the token-signing private key in memory.
 USER node
 
-# 3000 is the API (PORT), 3001 the gateway (GATEWAY_PORT). One image, two
+# 4000 is the API (PORT), 3001 the gateway (GATEWAY_PORT). One image, two
 # roles, selected by the compose `command`.
-EXPOSE 3000 3001
+EXPOSE 4000 3001
 
 # /health/live, not /health/ready. Readiness deliberately FAILS until the
 # database migration version matches the build's, so using it here would mean
 # a correctly-waiting container reported itself broken. Node 24 has global
 # fetch, so this needs no curl in the image.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=6 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||4000)+'/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "dist/src/main.js"]

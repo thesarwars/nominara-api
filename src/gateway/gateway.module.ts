@@ -5,6 +5,9 @@ import { AuthGuard } from "../api/guards/auth.guard.js";
 import { WorkspaceGuard } from "../api/guards/workspace.guard.js";
 import { RbacGuard } from "../api/guards/rbac.guard.js";
 import { RoomAuthorizationService } from "./room-authorization.service.js";
+import { REALTIME_ALLOWED_ORIGINS } from "./gateway.tokens.js";
+import { parseAllowedOrigins } from "./allowed-origins.js";
+import { loadEnv } from "../config/env.js";
 import {
   RealtimeGateway,
   SOCKET_REVALIDATION_INTERVAL,
@@ -51,6 +54,14 @@ import {
     // discovery.
     RealtimeGateway,
     { provide: SOCKET_REVALIDATION_INTERVAL, useValue: SOCKET_REVALIDATION_MS },
+    {
+      // STORY-026 — REALTIME_ALLOWED_ORIGINS, split once at construction
+      // rather than per handshake. parseAllowedOrigins() refuses an empty
+      // list; see allowed-origins.ts for why that is a throw and not a
+      // permissive default.
+      provide: REALTIME_ALLOWED_ORIGINS,
+      useFactory: (): readonly string[] => parseAllowedOrigins(loadEnv().REALTIME_ALLOWED_ORIGINS),
+    },
   ],
   exports: [RoomAuthorizationService],
 })
