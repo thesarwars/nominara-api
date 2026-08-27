@@ -55,7 +55,12 @@ export const envSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
     // src/main.ts — the HTTP entry point's listen port.
-    PORT: z.coerce.number().int().positive().default(3000),
+    // 4000 — the port this project's API runs on. Deliberately NOT 3000:
+    // that is the frontend's (Next.js's own default), and the two run side by
+    // side in development. WEBAUTHN_ORIGIN and REALTIME_ALLOWED_ORIGINS still
+    // name port 3000 because they are BROWSER origins, not this service's
+    // address.
+    PORT: z.coerce.number().int().positive().default(4000),
     // src/gateway.ts — the WebSocket gateway's listen port.
     GATEWAY_PORT: z.coerce.number().int().positive().default(3001),
     // Migration/DDL connection — direct to Postgres, never through pgBouncer (docker-compose.yml).
