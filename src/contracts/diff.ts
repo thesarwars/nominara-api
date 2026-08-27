@@ -31,7 +31,13 @@ export interface JsonSchemaObjectLike {
 export interface OperationLike {
   operationId: string;
   requestBody?: { content: { "application/json": { schema: JsonSchemaObjectLike } } };
-  responses: Record<string, { content?: { "application/json": { schema: JsonSchemaObjectLike } } }>;
+  // Keyed by media type. Pinned to "application/json" until STORY-119, which
+  // meant the walk below could not see `application/problem+json` at all —
+  // so once error responses existed, NARROWING the published error body
+  // (dropping a member from the code union a client switches on) classified
+  // as `none`. A breaking change published as a patch, with the drift gate
+  // reporting clean.
+  responses: Record<string, { content?: Record<string, { schema: JsonSchemaObjectLike }> }>;
 }
 
 export interface OpenApiDocumentLike {
@@ -126,8 +132,11 @@ function compareObjectSchema(
   return bump;
 }
 
-function responseSchemaOf(operation: OperationLike, status: string): JsonSchemaObjectLike | undefined {
-  return operation.responses[status]?.content?.["application/json"].schema;
+function responseContentOf(
+  operation: OperationLike,
+  status: string,
+): Record<string, { schema: JsonSchemaObjectLike }> {
+  return operation.responses[status]?.content ?? {};
 }
 
 function compareOperation(previous: OperationLike, current: OperationLike): SemverBump {
@@ -148,7 +157,25 @@ function compareOperation(previous: OperationLike, current: OperationLike): Semv
       bump = mostSevere(bump, "patch"); // a new response status is additive
       continue;
     }
-    bump = mostSevere(bump, compareObjectSchema(responseSchemaOf(previous, status), responseSchemaOf(current, status)));
+    // Every media type this status carries, compared on its own. A success
+    // body is application/json and an error body is
+    // application/problem+json; comparing only the first would leave the
+    // other unwatched.
+    const previousContent = responseContentOf(previous, status);
+    const currentContent = responseContentOf(current, status);
+    for (const mediaType of new Set([...Object.keys(previousContent), ...Object.keys(currentContent)])) {
+      const previousSchema = previousContent[mediaType]?.schema;
+      const currentSchema = currentContent[mediaType]?.schema;
+      if (previousSchema !== undefined && currentSchema === undefined) {
+        bump = mostSevere(bump, "major"); // a body shape a consumer parsed disappeared
+        continue;
+      }
+      if (previousSchema === undefined && currentSchema !== undefined) {
+        bump = mostSevere(bump, "patch"); // a newly described body is additive
+        continue;
+      }
+      bump = mostSevere(bump, compareObjectSchema(previousSchema, currentSchema));
+    }
   }
 
   return bump;

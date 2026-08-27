@@ -52,6 +52,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       }
@@ -119,6 +337,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -240,6 +676,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "parameters": [
@@ -317,6 +971,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -403,6 +1275,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "requestBody": {
@@ -469,6 +1559,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -569,6 +1877,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "requestBody": {
@@ -662,6 +2188,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -844,6 +2588,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       }
@@ -890,6 +2852,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -1065,6 +3245,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "parameters": [
@@ -1138,6 +3536,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "requestBody": {
@@ -1202,6 +3818,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -1330,6 +4164,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "requestBody": {
@@ -1414,6 +4466,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -1549,6 +4819,224 @@
                 "required": true,
                 "schema": {
                   "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
                 }
               }
             }
@@ -1728,6 +5216,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "parameters": [
@@ -1883,6 +5589,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "requestBody": {
@@ -2031,6 +5955,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -2228,6 +6370,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "parameters": [
@@ -2368,6 +6728,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -2549,6 +7127,224 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         },
         "parameters": [
@@ -2617,6 +7413,224 @@
                   "required": [
                     "data",
                     "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
                   ],
                   "additionalProperties": false
                 }

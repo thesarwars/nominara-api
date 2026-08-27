@@ -143,7 +143,7 @@ describe("STORY-023 · scenario 10 — the worked example (POST /v1/workspaces):
       // `pagination` is absent: envelopeSchema() marks it optional, and
       // createWorkspace is not a listOf operation, so advertising a member
       // that can never appear would make a consumer write a dead branch.
-      const responseSchema = operation!.responses["201"]?.content?.["application/json"].schema;
+      const responseSchema = operation!.responses["201"]?.content?.["application/json"]?.schema;
       expect(responseSchema, "POST /v1/workspaces must have a 201 response schema").toBeDefined();
       expect(withoutSchemaMarker(resolveJsonSchemaRef(responseSchema!, document))).toEqual(
         withoutSchemaMarker(responseJsonSchema(envelopeSchema(workspaceResponseSchema).omit({ pagination: true }))),
