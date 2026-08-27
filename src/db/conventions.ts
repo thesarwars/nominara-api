@@ -166,6 +166,41 @@ export const DATABASE_ROLES: Record<string, DatabaseRoleSpec> = {
   [BREAKGLASS_ROLE]: { login: true, bypassrls: true, connectionLimit: 2, inherit: false },
 };
 
+// STORY-120 — the migration ledger (src/db/migrate-runner.ts's BOOTSTRAP_SQL)
+// lives in its OWN schema, outside the `public` census that
+// expectedTablePrivileges below describes, so it needs its own declared
+// expectation or nothing asserts it at all. Migration 0005 granted
+// `USAGE ON SCHEMA app, public` and never `_migrations`, which is why
+// readiness — which compares the applied set against the build's own — could
+// never succeed for the role that actually serves.
+export const MIGRATION_LEDGER_SCHEMA = "_migrations";
+export const MIGRATION_LEDGER_TABLE = "_migrations.applied";
+
+/**
+ * The runtime roles that may READ the ledger, and by omission the ones that
+ * may not. Each was decided, not defaulted:
+ *
+ * - `nominara_app`  — YES. It is the pooled connection behind `/health/ready`
+ *   (docker-compose.yml, .env.example), and readiness must report what the
+ *   APPLICATION's own connection can see or it is a probe for the migration
+ *   tool instead.
+ * - `nominara_worker` — NO. Workers expose no readiness probe today (there is
+ *   no worker service in docker-compose.yml, and src/worker.ts builds an
+ *   application CONTEXT with no HTTP listener). When one is added, adding
+ *   the role here is that story's decision to make deliberately. Note the
+ *   worker also opens its pool from DATABASE_URL_POOLED, which is
+ *   `nominara_app` today — so this row is a statement of intent about the
+ *   role, not a description of a connection any process currently makes.
+ * - `nominara_report` — NO. Read-only and replica-only; it serves no probe.
+ * - `nominara_portal` — NO. The share-token portal serves no probe, and the
+ *   ledger is platform state that a share-token session has no claim on.
+ *
+ * READ means exactly `USAGE` on the schema plus `SELECT` on the ledger. No
+ * runtime role may write it: an application that can rewrite the record of
+ * its own schema version can lie to its own readiness probe.
+ */
+export const MIGRATION_LEDGER_READERS: readonly RuntimeRole[] = ["nominara_app"];
+
 // STORY-011 — schemas/README.md "Tenancy" section's portal-readable
 // enumeration, REVISED (fix pass STORY-011-E-2 — see that story's
 // Implementation Decisions section) to 18 entries, down from the doc's

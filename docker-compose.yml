@@ -98,11 +98,19 @@ services:
 
   # ---- application ---------------------------------------------------------
   #
-  # Every service below overrides the three connection URLs from .env, because
+  # Every service below overrides the FOUR connection URLs from .env, because
   # .env's values are `localhost` — correct when you run the app on the host,
   # wrong inside the network where the hostnames are the service names. Note
   # pgbouncer is reached on 5432, its CONTAINER port; 6432 is only the host
   # mapping.
+  #
+  # STORY-120 review: this said "three" and listed three while STORY-030 had
+  # already added a fourth, QUEUE_REDIS_URL. The api container therefore
+  # inherited `redis://localhost:6380` — its OWN localhost, where nothing
+  # listens — and because src/lib/queue/connection.ts sets
+  # `maxRetriesPerRequest: null` (BullMQ's own requirement), the resulting
+  # read never rejects and never resolves. /health/ready hung forever rather
+  # than failing, which no probe could report and no test covered.
   #
   # Two one-shot services run before the app, in order, each waiting for the
   # previous to EXIT SUCCESSFULLY rather than merely to start.
@@ -149,6 +157,21 @@ services:
         condition: service_completed_successfully
       valkey-cache:
         condition: service_healthy
+      # STORY-120 review — DATABASE_URL_POOLED points at pgbouncer, so this
+      # service cannot reach its database without it, yet it did not depend
+      # on it: `docker compose up -d api` left the pooler down and the API
+      # answering nothing. It went unnoticed because the old liveness
+      # healthcheck reported HEALTHY in exactly that state, which is this
+      # story's whole point. `service_started` rather than `service_healthy`
+      # because pgbouncer declares no healthcheck; the readiness probe below
+      # is what actually verifies the connection works.
+      pgbouncer:
+        condition: service_started
+      # Same gap, same cause: /health/ready reads queue depth, so the QUEUE
+      # instance is a startup dependency of a service whose readiness gate
+      # asks about it.
+      valkey:
+        condition: service_started
     env_file:
       - .env
     environment:
@@ -161,9 +184,45 @@ services:
       DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
       DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
       VALKEY_CACHE_URL: redis://valkey-cache:6379
+      # The QUEUE instance, and NEVER valkey-cache — system-architecture.md
+      # §11 keeps the two apart. /health/ready reads queue depth, so without
+      # this the readiness probe below can never answer.
+      QUEUE_REDIS_URL: redis://valkey:6379
     ports:
       - "${API_PORT:-3000}:3000"
     command: ["node", "dist/src/main.js"]
+    # STORY-120 — the healthcheck revisit its Definition of Done calls for.
+    #
+    # The IMAGE's HEALTHCHECK (Dockerfile) stays on /health/live and should:
+    # Docker treats an unhealthy container as a restart signal, and readiness
+    # legitimately says "not yet" while migrations are still landing —
+    # restarting on that would turn a normal rolling deploy into a crash
+    # loop.
+    #
+    # Compose is the opposite case. Nothing here restarts on unhealthy, so a
+    # service healthcheck is purely a readiness GATE: it is what
+    # `docker compose up --wait` and any `depends_on: service_healthy` block
+    # on. Until STORY-120 that gate was liveness, which cannot tell anyone
+    # the API is ready to serve — it reported healthy while /health/ready
+    # answered 503, which it did in every environment. This override makes
+    # the local gate mean what it claims.
+    #
+    # A real orchestrator wants BOTH probes pointed at their matching
+    # endpoints (livenessProbe -> /health/live, readinessProbe ->
+    # /health/ready). That belongs to the deployment manifests, which do not
+    # exist in this repository yet (KAD-10, nominara-infra).
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 6
 
   gateway:
     build: .
@@ -173,6 +232,21 @@ services:
         condition: service_completed_successfully
       valkey-cache:
         condition: service_healthy
+      # STORY-120 review — DATABASE_URL_POOLED points at pgbouncer, so this
+      # service cannot reach its database without it, yet it did not depend
+      # on it: `docker compose up -d api` left the pooler down and the API
+      # answering nothing. It went unnoticed because the old liveness
+      # healthcheck reported HEALTHY in exactly that state, which is this
+      # story's whole point. `service_started` rather than `service_healthy`
+      # because pgbouncer declares no healthcheck; the readiness probe below
+      # is what actually verifies the connection works.
+      pgbouncer:
+        condition: service_started
+      # Same gap, same cause: /health/ready reads queue depth, so the QUEUE
+      # instance is a startup dependency of a service whose readiness gate
+      # asks about it.
+      valkey:
+        condition: service_started
     env_file:
       - .env
     environment:
@@ -181,6 +255,11 @@ services:
       DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
       DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
       VALKEY_CACHE_URL: redis://valkey-cache:6379
+      # The gateway opens no queue connection today. Overridden anyway: an
+      # environment that carries a URL pointing at nothing is a trap for
+      # whatever reads it next, and this file's own convention is that every
+      # service corrects every connection URL.
+      QUEUE_REDIS_URL: redis://valkey:6379
     ports:
       - "${GATEWAY_HOST_PORT:-3001}:3001"
     # A SEPARATE process from the API, matching the deployment topology's
