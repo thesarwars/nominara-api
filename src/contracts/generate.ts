@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import openapiTS, { astToString } from "openapi-typescript";
 import { z, type ZodType } from "zod";
 import { errorCodeSchema } from "../../contracts/common/error-code.schema.js";
+import { problemDetailsSchema } from "../../contracts/common/problem-details.schema.js";
 import { REALTIME_EVENT_PAYLOADS } from "../../contracts/events/catalog.schema.js";
 import { realtimeEventNameSchema } from "../../contracts/events/event-name.schema.js";
 import { envelopeSchema } from "../../contracts/common/envelope.schema.js";
@@ -32,6 +33,10 @@ import { discoverContractRoutes, type DiscoveredContractRoute } from "./discover
 const REQUEST_JSON_SCHEMA_OPTIONS = { target: "draft-2020-12", io: "input" } as const;
 const RESPONSE_JSON_SCHEMA_OPTIONS = { target: "draft-2020-12", io: "output" } as const;
 
+// api-specification.md §1/§2 — every error response is served as
+// `application/problem+json; charset=utf-8`.
+const PROBLEM_JSON_MEDIA_TYPE = "application/problem+json";
+
 interface JsonSchemaObject {
   type?: string;
   properties?: Record<string, Record<string, unknown>>;
@@ -51,9 +56,13 @@ export interface OpenApiResponseHeader {
   readonly schema: Record<string, unknown>;
 }
 
+// Keyed by media type rather than pinned to "application/json": a success
+// body is JSON, and every error body is `application/problem+json`
+// (api-specification.md §1/§2). A client that branches on content type has
+// to see the same one the server sends.
 export interface OpenApiResponse {
   readonly description: string;
-  readonly content?: { readonly "application/json": { readonly schema: Record<string, unknown> } };
+  readonly content?: Readonly<Record<string, { readonly schema: Record<string, unknown> }>>;
   headers?: Record<string, OpenApiResponseHeader>;
 }
 
@@ -301,6 +310,30 @@ function buildOperation(route: DiscoveredContractRoute): OpenApiOperation {
   if (contract.emitsEntityTag) {
     operation.responses[status]!.headers = {
       ETag: { required: true, schema: { type: "string" } },
+    };
+  }
+
+  // STORY-119 scenario 8 — the error BODY, not just the error-code union.
+  //
+  // Until this landed the document described success only, so
+  // openapi-typescript had nothing to render and `@nominara/client` shipped
+  // the code union with no body attached to any operation: a 500 was a
+  // response the client could not type, and every consumer's error handling
+  // was written against a shape the published document did not contain.
+  //
+  // WHY 500 EXPLICITLY, AND `default` FOR THE REST. A 500 is reachable on
+  // every route — an unexpected exception is not a per-endpoint condition —
+  // so naming it costs nothing and claims nothing false. Enumerating which
+  // OTHER statuses a given route's guard chain can produce would be a guess
+  // dressed as a contract; `default` says "any other error has this shape",
+  // which is exactly what ProblemFilter guarantees and no more.
+  for (const errorStatus of ["500", "default"]) {
+    operation.responses[errorStatus] = {
+      description:
+        errorStatus === "500"
+          ? "Unmodelled server-side failure — api-specification.md §2's `internal_error`."
+          : "Any other error, as RFC 9457 problem details.",
+      content: { [PROBLEM_JSON_MEDIA_TYPE]: { schema: toJsonSchema(problemDetailsSchema, RESPONSE_JSON_SCHEMA_OPTIONS) } },
     };
   }
 

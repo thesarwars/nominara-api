@@ -113,7 +113,7 @@ describe("STORY-023 · contracts:diff — semver derived from the specification 
     // `current` drops `name` — a consumer's existing code may still read it.
     const current = deepClone(previous);
     const responseSchema =
-      current.paths["/v1/workspaces"]!.post!.responses["201"]!.content!["application/json"].schema;
+      current.paths["/v1/workspaces"]!.post!.responses["201"]!.content!["application/json"]!.schema;
     delete responseSchema.properties!.name;
     responseSchema.required = (responseSchema.required as string[]).filter((field) => field !== "name");
 
@@ -162,7 +162,7 @@ describe("STORY-023 · contracts:diff — semver derived from the specification 
     // the correct answer is unconditionally "major".
     requestSchema.properties!.note = { type: "string" }; // addition (patch-shaped)
     const responseSchema =
-      current.paths["/v1/workspaces"]!.post!.responses["201"]!.content!["application/json"].schema;
+      current.paths["/v1/workspaces"]!.post!.responses["201"]!.content!["application/json"]!.schema;
     delete responseSchema.properties!.name; // removal (major-shaped)
     responseSchema.required = (responseSchema.required as string[]).filter((field) => field !== "name");
 
