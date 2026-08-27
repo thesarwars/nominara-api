@@ -108,13 +108,6 @@ describe("STORY-026 · the budget is per key, not global", () => {
     expect(h.emitted).toHaveLength(2);
   });
 
-  it("does not coalesce two projects' findings against each other", () => {
-    const h = harness();
-    h.coalescer.submit("aux.finding_created", "project-1", { id: "a" });
-    h.coalescer.submit("aux.finding_created", "project-2", { id: "b" });
-    expect(h.emitted).toHaveLength(2);
-  });
-
   it("does not coalesce a run's progress against the same run's completion", () => {
     const h = harness();
     h.coalescer.submit("run.progress", "run-1", { pct: 99 });
@@ -124,7 +117,20 @@ describe("STORY-026 · the budget is per key, not global", () => {
 });
 
 describe("STORY-026 · an event §11 does not coalesce is never throttled", () => {
-  it.each(["run.completed", "run.failed", "member.changed", "credits.debited"] as const)(
+  // `aux.finding_created` is in this list rather than in the per-key tests
+  // above, and that move is the point. It used to be coalesced at 200 ms, and
+  // a test asserted two projects' findings did not coalesce against each
+  // other. Once STORY-026 made the "≤ 5 / s" rows RATE-LIMITED instead — a
+  // real budget with a resync, because replace-latest on a creation event
+  // loses rows silently — that test could no longer fail: the event takes
+  // `Coalescer`'s "no window, emit immediately" branch, so submitting the
+  // SAME key twice also yields two emits. It asserted nothing.
+  //
+  // Its real subject moved to the rate-limit path, which is exercised
+  // end-to-end in test/integration/realtime-fanout-coalescing.spec.ts. What
+  // belongs here is the property that survives: the Coalescer must not
+  // invent a window for it. Found by the second-engineer review.
+  it.each(["run.completed", "run.failed", "member.changed", "credits.debited", "aux.finding_created"] as const)(
     "%s passes straight through",
     (event) => {
       const h = harness();

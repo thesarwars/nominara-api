@@ -24,6 +24,8 @@ import {
 import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
 import { SOCKET_MESSAGE_CAP_PER_SECOND, RESYNC_DIRECTIVE } from "../../src/gateway/backpressure.js";
 import { startValkey, type StartedValkey } from "../support/valkey-fixture.js";
+import { Redis } from "ioredis";
+import { SOCKET_MESSAGE_CAP_PER_SECOND as SOCKET_CAP } from "../../src/gateway/backpressure.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 
 // STORY-026 AC6 and AC7, over the path events ACTUALLY take.
@@ -144,7 +146,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
   }
 
   /** A joined, authorised socket in a workspace room — the only thing events are delivered to. */
-  async function joinedSocket(): Promise<{ workspaceId: string; client: ClientSocket }> {
+  async function joinedSocket(): Promise<{ workspaceId: string; ownerId: string; client: ClientSocket }> {
     const ownerId = await createUser();
     const workspace = await workspaces.create(ownerId, { name: `RT ${randomUUID()}` }, meta);
     const session = await sessions.createSession(ownerId);
@@ -158,7 +160,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
         resolve();
       });
     });
-    return { workspaceId: workspace.id, client };
+    return { workspaceId: workspace.id, ownerId, client };
   }
 
   function collect(client: ClientSocket, event: string): unknown[] {
@@ -181,6 +183,110 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
       eta_ms: null,
     };
   }
+
+  // THE TENANCY TEST, and the reason this file exists at all.
+  //
+  // Delivery used to be the socket.io adapter's room broadcast — a library's
+  // filter, and not in doubt. It is now ELEVEN LINES OF HAND-WRITTEN CODE in
+  // deliverFanout, and the only test that covered tenant scoping
+  // (realtime-cross-instance.spec.ts "row 4") drives
+  // `namespace.to(room).emit()` — the adapter path client events no longer
+  // travel. So it went on proving the library while the thing production
+  // actually runs had no test at all: removing the room check left the whole
+  // suite green while every workspace's events reached every socket.
+  //
+  // Found by the STORY-026 second-engineer review. The recurring shape of
+  // this epic, for the fifth time: a check that passes whether or not the
+  // thing works.
+  it("delivers a workspace's events ONLY to that workspace's sockets", async () => {
+    const mine = await joinedSocket();
+    const theirs = await joinedSocket();
+
+    const runId = randomUUID();
+    // A deadline the other tenant's socket must lose to. Asserting "nothing
+    // arrived" without racing a clock is the vacuity this epic keeps
+    // producing — it resolves before any frame could have been parsed.
+    const leaked = new Promise<"leaked">((resolve) => {
+      theirs.client.on("run.progress", () => resolve("leaked"));
+    });
+    const quiet = new Promise<"quiet">((resolve) => {
+      setTimeout(() => resolve("quiet"), 1_000);
+    });
+    const arrived = new Promise<"arrived">((resolve) => {
+      mine.client.on("run.progress", () => resolve("arrived"));
+    });
+
+    publisher.toWorkspace(mine.workspaceId, "run.progress", progress(runId, 7) as never);
+
+    // The intended recipient must actually receive it, or "nothing leaked"
+    // would pass against a gateway that delivers nothing to anyone.
+    await expect(arrived, "the intended workspace must receive its own event").resolves.toBe("arrived");
+    await expect(
+      Promise.race([leaked, quiet]),
+      "another workspace's socket must receive nothing",
+    ).resolves.toBe("quiet");
+  }, 30_000);
+
+  // AC4 — "the gateway requires NO sticky sessions" — for the path client
+  // events now actually take.
+  //
+  // realtime-cross-instance.spec.ts proves that property about
+  // `namespace.to(room).emit()`, the socket.io adapter path. Client events no
+  // longer travel it: they arrive on the fan-out channel and each instance
+  // delivers to its own local sockets. So the criterion was being proven
+  // about a mechanism that, for this traffic, does nothing. Found by the
+  // second-engineer review.
+  //
+  // Two independent gateways, one publish, both clients receive.
+  it("reaches a client on a gateway instance that did not publish, with no sticky session", async () => {
+    const first = await joinedSocket();
+
+    const secondRef = await Test.createTestingModule({ imports: [RealtimeModule] }).compile();
+    const secondApp = secondRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await secondApp.init();
+    await secondApp.listen({ port: 0, host: "127.0.0.1" });
+    const secondPort = (secondApp.getHttpServer().address() as { port: number }).port;
+    secondApp.get(RealtimeGateway).attachFanoutChannel(valkey.url, realtimeFanoutChannel(cacheKeyNamespace()));
+    await settle(250);
+
+    try {
+      // A second socket for the SAME workspace, connected to the other
+      // instance — the arrangement a load balancer with no affinity produces.
+      // The SAME member, a second session — one person with two tabs, landing
+      // on different replicas. No new membership: workspaces.create() already
+      // made this user the owner.
+      const session = await sessions.createSession(first.ownerId);
+      const pinned = await sessions.switchWorkspace(session.sid, first.ownerId, first.workspaceId, "owner", null, 1);
+
+      const other = io(`http://127.0.0.1:${String(secondPort)}/rt`, {
+        transports: ["websocket"],
+        extraHeaders: {
+          cookie: `${ACCESS_COOKIE_NAME}=${pinned.accessToken}; ${CSRF_COOKIE_NAME}=${pinned.csrfToken}`,
+        },
+        auth: { csrf: pinned.csrfToken },
+        reconnection: false,
+      });
+      clients.push(other);
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("no reply to join on the second instance")), 5_000);
+        other.emit(JOIN_WORKSPACE_MESSAGE, { workspace_id: first.workspaceId }, () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+
+      const here = collect(first.client, "run.progress");
+      const there = collect(other, "run.progress");
+
+      publisher.toWorkspace(first.workspaceId, "run.progress", progress(randomUUID(), 11) as never);
+      await settle(700);
+
+      expect(here, "the publishing instance's client").toHaveLength(1);
+      expect(there, "a client on the OTHER instance must receive it too").toHaveLength(1);
+    } finally {
+      await secondApp.close();
+    }
+  }, 45_000);
 
   // The guard on everything below: if nothing arrives at all, every
   // "at most N" assertion passes vacuously.
@@ -287,6 +393,86 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
       delivered.some((event) => event.project_id === quiet),
       "the quiet project's single event must survive the busy one's flood",
     ).toBe(true);
+  }, 30_000);
+
+  // The resync notice must not become the flood it reports.
+  //
+  // The budget is per (socket, PROJECT) and nothing bounds how many project
+  // ids a publisher can name, so an unbounded resync emitted outside §9's cap
+  // sent 201 frames to one socket against a cap of 20 — ten times the limit,
+  // in control traffic, to the client already established as unable to keep
+  // up. Found by the second-engineer review; AC7's own words are "a SINGLE
+  // resynchronise directive rather than a backlog".
+  it("keeps total frames to one socket within §9's cap even across many projects", async () => {
+    const { workspaceId, client } = await joinedSocket();
+    let frames = 0;
+    client.onAny(() => {
+      frames += 1;
+    });
+
+    for (let project = 0; project < 40; project += 1) {
+      const projectId = randomUUID();
+      for (let i = 0; i < 7; i += 1) {
+        publisher.toWorkspace(workspaceId, "aux.finding_created", finding(projectId) as never);
+      }
+    }
+    await settle(900);
+
+    // §9's cap governs DATA. The resync is the notice, and a notice that
+    // could itself be capped away would be useless — so it is allowed beyond
+    // the cap, but bounded: at most one naming a project and at most one
+    // widening to the socket. Two, not the 201 the review measured.
+    expect(frames, "the notice must not become the flood it reports").toBeLessThanOrEqual(SOCKET_CAP + 2);
+  }, 30_000);
+
+  // ...and suppression must not become silence. A second project overflowing
+  // in the same window is told BROADLY rather than not at all.
+  it("upgrades a second project's overflow to a socket-wide resync instead of dropping the notice", async () => {
+    const { workspaceId, client } = await joinedSocket();
+    const resyncs = collect(client, RESYNC_DIRECTIVE) as { scope: string; project_id: string | null }[];
+    const first = randomUUID();
+    const second = randomUUID();
+
+    for (let i = 0; i < 12; i += 1) publisher.toWorkspace(workspaceId, "aux.finding_created", finding(first) as never);
+    for (let i = 0; i < 12; i += 1) publisher.toWorkspace(workspaceId, "aux.finding_created", finding(second) as never);
+    await settle(900);
+
+    expect(resyncs.map((r) => r.scope), "the first names its project; the second widens to the socket").toEqual([
+      "project",
+      "socket",
+    ]);
+    expect(resyncs[0]!.project_id).toBe(first);
+    expect(resyncs[1]!.project_id, "a socket-wide resync names no single project").toBeNull();
+  }, 30_000);
+
+  // A malformed message on the fan-out channel must not take the gateway
+  // down. Every replica subscribes to the same channel, so one bad publish
+  // would kill the whole fleet at once, with no request to trace it back to.
+  it("survives malformed fan-out messages and keeps delivering afterwards", async () => {
+    const { workspaceId, client } = await joinedSocket();
+    const seen = collect(client, "run.progress");
+
+    const raw = new Redis(valkey.url);
+    const channel = realtimeFanoutChannel(cacheKeyNamespace());
+    try {
+      await raw.publish(channel, "not json at all");
+      await raw.publish(channel, JSON.stringify(null));
+      // socket.io reserves this name and THROWS when it is emitted — the
+      // event name was previously forwarded to socket.emit unvalidated.
+      await raw.publish(channel, JSON.stringify({ workspaceId, event: "disconnect", payload: {} }));
+      await raw.publish(channel, JSON.stringify({ workspaceId: "not-a-uuid", event: "run.progress", payload: {} }));
+      // A catalogued name whose payload does not match its schema.
+      await raw.publish(channel, JSON.stringify({ workspaceId, event: "run.progress", payload: { nonsense: true } }));
+      await settle(300);
+
+      publisher.toWorkspace(workspaceId, "run.progress", progress(randomUUID(), 3) as never);
+      await settle(600);
+
+      expect(seen, "the gateway must still be alive and delivering").toHaveLength(1);
+      expect(client.connected, "and the socket must not have been torn down").toBe(true);
+    } finally {
+      raw.disconnect();
+    }
   }, 30_000);
 
   // AC7. §9 caps one socket at 20 messages per second: beyond that it is told

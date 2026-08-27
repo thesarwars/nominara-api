@@ -31,6 +31,12 @@ const REAL_TIMERS: CoalescerTimers = {
   },
 };
 
+/** Only sweep when there is something to sweep — the common case is a handful of live runs. */
+const PRUNE_ABOVE = 256;
+
+/** Comfortably past the longest window §11 gives any event (engine.degraded, 60s). */
+const PRUNE_OLDER_THAN_MS = 300_000;
+
 interface Pending {
   payload: unknown;
   handle: unknown;
@@ -82,6 +88,7 @@ export class Coalescer {
         this.pending.delete(slot);
       }
       this.lastEmittedAt.set(slot, now);
+      this.prune(now);
       this.emit(event, payload);
       return;
     }
@@ -104,6 +111,24 @@ export class Coalescer {
     }, windowMs - (now - last));
 
     this.pending.set(slot, { payload, handle });
+  }
+
+  /**
+   * Forgets slots whose window has long since passed.
+   *
+   * `lastEmittedAt` is one entry per `${event}:${key}`, and before STORY-026
+   * gave this class production callers it never ran long enough to matter. It
+   * does now: one entry per run id a dashboard has ever seen, for the life of
+   * the socket. Dropping an entry older than its own window is behaviourally
+   * identical to keeping it — an absent entry means "emit immediately", which
+   * is exactly what an expired one already produces — so this is bookkeeping,
+   * not a policy change. Found by the second-engineer review.
+   */
+  private prune(now: number): void {
+    if (this.lastEmittedAt.size < PRUNE_ABOVE) return;
+    for (const [slot, at] of this.lastEmittedAt) {
+      if (now - at >= PRUNE_OLDER_THAN_MS && !this.pending.has(slot)) this.lastEmittedAt.delete(slot);
+    }
   }
 
   /** Drops everything held. Called when a socket goes away, so a flush cannot fire into a closed connection. */

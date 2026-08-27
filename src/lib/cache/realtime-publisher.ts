@@ -26,9 +26,13 @@ import { incrementCounter } from "../telemetry/metrics.js";
 //   connections and a second place where room authorisation could be got
 //   wrong — for the sake of sending a message.
 //
-// `@socket.io/redis-emitter` is the supported way to publish into a socket.io
-// deployment from a process that is not part of it, and it is the one the
-// adapter's own maintainers keep in step with the channel format.
+// `@socket.io/redis-emitter` WAS the answer, and is no longer used here.
+// Publishing into the adapter's channels means the adapter does the delivery,
+// and a room broadcast can honour neither §11's per-run coalescing nor §9's
+// per-socket cap — see realtimeFanoutChannel() below. Events go on a plain
+// channel the gateway reads itself. This paragraph is kept rather than
+// deleted because "why not the obvious library" is a question the next reader
+// will have.
 
 const logger = new Logger("realtime-publisher");
 
