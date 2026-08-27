@@ -1,10 +1,9 @@
 import { Injectable, Logger, type OnModuleDestroy } from "@nestjs/common";
-import { Emitter } from "@socket.io/redis-emitter";
 import { Redis } from "ioredis";
 import type { RealtimeEventPayloads } from "../../../contracts/events/catalog.schema.js";
 import type { RealtimeEventName } from "../../../contracts/events/event-name.schema.js";
 import { loadEnv } from "../../config/env.js";
-import { cacheKeyNamespace, socketIoChannelPrefix } from "./key-namespace.js";
+import { cacheKeyNamespace } from "./key-namespace.js";
 import { globalKey } from "./valkey-keys.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 
@@ -53,6 +52,36 @@ export function realtimeControlChannel(namespace: string): string {
   return globalKey(namespace, "rt", "control");
 }
 
+/**
+ * The channel client events travel on, so the gateway can deliver them ITSELF.
+ *
+ * WHY NOT THE ADAPTER. §11's coalescing budget and §9's "at most 20 messages
+ * per second to one socket" are both PER-SOCKET decisions, and a room
+ * broadcast makes none. `Adapter.broadcast` encodes the packet once and calls
+ * `socket.client.writeToEngine(...)` for every matching socket
+ * (socket.io-adapter/dist/in-memory-adapter.js): the only per-socket hook it
+ * offers is `notifyOutgoingListeners`, which backs `onAnyOutgoing` and is
+ * purely observational — it cannot drop, delay or replace a packet. AC7 is
+ * therefore unimplementable on a room broadcast, and AC6 done at this end
+ * would multiply §11's rate by the number of API replicas.
+ *
+ * So the API publishes the event here, every gateway instance receives it, and
+ * each one emits to its OWN sockets after coalescing and backpressure. That
+ * still requires no sticky sessions — which is the actual requirement behind
+ * "broadcast goes through the Valkey adapter" — and it puts the two budgets
+ * where the socket is.
+ */
+export function realtimeFanoutChannel(namespace: string): string {
+  return globalKey(namespace, "rt", "fanout");
+}
+
+/** What travels on the fan-out channel. Parsed by the gateway before anything is emitted. */
+export interface RealtimeFanoutMessage {
+  readonly workspaceId: string;
+  readonly event: RealtimeEventName;
+  readonly payload: unknown;
+}
+
 export interface RealtimePublisher {
   /** Publishes to every socket in a workspace's room, across every gateway instance. */
   toWorkspace<Name extends RealtimeEventName>(
@@ -77,28 +106,20 @@ export interface RealtimePublisher {
 @Injectable()
 export class ValkeyRealtimePublisher implements RealtimePublisher, OnModuleDestroy {
   private readonly client: Redis;
-  private readonly emitter: Emitter;
 
   constructor(url: string = loadEnv().VALKEY_CACHE_URL) {
     this.client = new Redis(url, { maxRetriesPerRequest: 2 });
     this.client.on("error", (error: Error) => {
       logger.error({ message: "realtime publisher connection error", error: error.name });
     });
-    // The emitter is handed a PUBLISH-ONLY WRAPPER rather than the client
-    // itself. `@socket.io/redis-emitter@5.1.0` calls exactly one method on
-    // whatever it is given — `publish` — and discards the promise, so an
-    // unreachable Valkey turns every emit into an unhandled rejection, which
-    // Node 24 answers by terminating the process. Wrapping is the whole fix
-    // and needs no patching: same connection underneath, same single failure
-    // mode, but nothing is left dangling.
-    this.emitter = new Emitter(
-      { publish: (channel: string, message: string | Buffer) => { this.publish(channel, message); } } as never,
-      // The same namespaced prefix the gateway's adapter uses. These two must
-      // agree exactly or the api process publishes into channels no gateway is
-      // listening on, and `member.changed` reaches nobody.
-      { key: socketIoChannelPrefix(cacheKeyNamespace()) },
-      "/rt",
-    );
+    // THE socket.io EMITTER IS GONE, and its absence is deliberate.
+    //
+    // It published into the adapter's channels so the adapter would broadcast
+    // to a room. That path cannot honour AC6 or AC7 (see
+    // realtimeFanoutChannel above), so client events no longer travel it.
+    // Keeping the emitter wired up while nothing used it would leave a
+    // component that LOOKS like the delivery path and is not — worse than
+    // absent, because the next reader would reason from it.
   }
 
   /**
@@ -131,7 +152,12 @@ export class ValkeyRealtimePublisher implements RealtimePublisher, OnModuleDestr
     // Awaiting delivery would make a workspace mutation fail because a cache
     // was briefly unreachable — trading a durable, committed change for a
     // notification.
-    this.emitter.to(workspaceRoomName(workspaceId)).emit(event, payload);
+    //
+    // Published to the FAN-OUT CHANNEL rather than through the socket.io
+    // emitter: the gateway delivers it per socket so §11's coalescing and §9's
+    // per-socket cap can apply at all. See realtimeFanoutChannel().
+    const message: RealtimeFanoutMessage = { workspaceId, event, payload };
+    this.publish(realtimeFanoutChannel(cacheKeyNamespace()), JSON.stringify(message));
     incrementCounter("nominara_realtime_published_total", { event });
   }
 

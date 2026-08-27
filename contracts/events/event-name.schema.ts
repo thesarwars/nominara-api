@@ -96,3 +96,24 @@ export const REALTIME_COALESCING_MS = {
 } as const;
 
 export type CoalescedEventName = keyof typeof REALTIME_COALESCING_MS;
+
+/**
+ * WHAT each budget is PER — the payload field carrying the coalescing key.
+ *
+ * §11 does not give one shared budget: `run.progress` is per RUN, the
+ * "≤ 5 / s" rows are per PROJECT, and `engine.degraded` is per ENGINE. Sharing
+ * one budget across projects would coalesce two tenants' findings against each
+ * other, which is a correctness failure wearing a performance optimisation's
+ * clothes.
+ *
+ * Declared here, next to the windows, rather than in the gateway: both halves
+ * are read off the same reference table, and splitting them across a contract
+ * and a service is how the two drift.
+ */
+export const REALTIME_COALESCE_KEY_FIELD = {
+  "run.progress": "run_id",
+  "aux.finding_created": "project_id",
+  "task.created": "project_id",
+  "displacement.detected": "project_id",
+  "engine.degraded": "engine_key",
+} as const satisfies Record<CoalescedEventName, string>;

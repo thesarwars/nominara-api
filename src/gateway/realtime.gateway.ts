@@ -4,6 +4,9 @@ import type { Server, Socket } from "socket.io";
 import { Logger } from "@nestjs/common";
 import { incrementCounter } from "../lib/telemetry/metrics.js";
 import { RESYNC_DIRECTIVE, SocketBackpressure, drainReconnectAfterMs } from "./backpressure.js";
+import { Coalescer } from "./coalescer.js";
+import { REALTIME_COALESCE_KEY_FIELD, type CoalescedEventName } from "../../contracts/events/event-name.schema.js";
+import type { RealtimeFanoutMessage } from "../lib/cache/realtime-publisher.js";
 import {
   ROOM_FORBIDDEN_CLOSE_CODE,
   RoomAuthorizationService,
@@ -46,6 +49,21 @@ export const JOIN_PROJECT_MESSAGE = "join:project";
 // STORY-026 T21 adds room authorisation through the SAME guard chain the HTTP
 // path uses (system-architecture.md §9), and nothing else: the Valkey adapter,
 // coalescing, backpressure and the typed emitters are T22.
+/**
+ * The value this event's budget is counted per, read from its own payload.
+ *
+ * `undefined` means "do not coalesce this" — either §11 gives the event no
+ * budget, or it gives it one and the payload is missing the field that budget
+ * is counted per. The caller sends those straight through; see there for why
+ * a fallback key would be worse than none.
+ */
+function coalesceKeyFor(event: string, payload: unknown): string | undefined {
+  const field = REALTIME_COALESCE_KEY_FIELD[event as CoalescedEventName] as string | undefined;
+  if (field === undefined) return undefined;
+  const value = (payload as Record<string, unknown> | null | undefined)?.[field];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 @WebSocketGateway({ namespace: "/rt" })
 export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
   @WebSocketServer()
@@ -53,7 +71,18 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
 
   private adapter: ValkeyAdapterHandle | undefined;
   private control: Redis | undefined;
+  private fanout: Redis | undefined;
   private readonly pressure = new Map<string, SocketBackpressure>();
+
+  /**
+   * One coalescer per SOCKET, not one per gateway.
+   *
+   * §11's budget is a promise about what a client receives, so it has to be
+   * counted where the client is. A single shared coalescer would let two
+   * sockets' events consume one budget, so a busy workspace would starve a
+   * quiet client of its own updates.
+   */
+  private readonly coalescers = new Map<string, Coalescer>();
 
   /**
    * Who is on each socket, recorded at join.
@@ -136,6 +165,90 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
    * channel every gateway process subscribes to, and each process closes the
    * sockets it owns.
    */
+  /**
+   * Subscribes to the channel client events travel on, and delivers them
+   * HERE rather than letting the adapter broadcast them.
+   *
+   * This is what makes AC6 and AC7 possible at all. `Adapter.broadcast`
+   * encodes a packet once and writes it straight to every matching socket's
+   * engine; its only per-socket hook, `notifyOutgoingListeners`, is
+   * observational and cannot drop or delay anything. So a room broadcast can
+   * honour neither §11's per-run coalescing nor §9's per-socket cap. Every
+   * gateway instance receives every event on this channel and emits to its own
+   * local sockets, which needs no sticky sessions — the actual requirement
+   * behind "broadcast goes through the Valkey adapter" — and puts both budgets
+   * where the socket is.
+   */
+  attachFanoutChannel(url: string, channel: string): void {
+    const subscriber = new Redis(url, { maxRetriesPerRequest: 2 });
+    this.fanout = subscriber;
+    subscriber.on("error", (error: Error) => {
+      logger.error({ message: "fanout channel error", error: error.name });
+    });
+    // Never an unhandled rejection: subscribing can fail while Valkey is still
+    // coming up, and in a gateway process that is a crash rather than a
+    // degraded subscription.
+    subscriber.subscribe(channel).catch((error: unknown) => {
+      logger.error({
+        message: "fanout channel subscribe failed; this instance will deliver no client events",
+        error: error instanceof Error ? error.name : "unknown",
+      });
+    });
+    subscriber.on("message", (_channel: string, raw: string) => {
+      this.deliverFanout(raw);
+    });
+  }
+
+  /** Exposed for tests: delivers one fan-out message without a Valkey in the middle. */
+  deliverFanout(raw: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const message = parsed as Partial<RealtimeFanoutMessage>;
+    if (typeof message.workspaceId !== "string" || typeof message.event !== "string") return;
+
+    const room = workspaceRoom(message.workspaceId);
+    // `@WebSocketServer()` on a NAMESPACED gateway injects the Namespace, not
+    // the io Server — the same mismatch attachAdapter() works around at the
+    // other end. `Namespace.sockets` is the Map of sockets connected to THIS
+    // instance, which is exactly the set this instance is responsible for.
+    const local = (this.server as unknown as { sockets: Map<string, Socket> }).sockets;
+    for (const socket of local.values()) {
+      // LOCAL sockets only. Every instance subscribes, so asking the adapter
+      // for the room's cluster-wide membership would deliver each event once
+      // per instance to every client.
+      if (!socket.rooms.has(room)) continue;
+
+      const key = coalesceKeyFor(message.event, message.payload);
+      if (key === undefined) {
+        // Either §11 gives this event no budget, or it gives it one and the
+        // payload is missing the field that budget is counted per. Both are
+        // sent straight through: substituting a constant key would put every
+        // run — or every project — into ONE budget and coalesce them against
+        // each other, losing one tenant's events to another's. Better one
+        // event too many than the wrong client's.
+        this.sendTo(socket, message.event, message.payload);
+        continue;
+      }
+      this.coalescerFor(socket).submit(message.event, key, message.payload);
+    }
+  }
+
+  /** This socket's coalescer, whose emit is the backpressure-honouring send. */
+  private coalescerFor(socket: Socket): Coalescer {
+    let coalescer = this.coalescers.get(socket.id);
+    if (coalescer === undefined) {
+      coalescer = new Coalescer((event, payload) => {
+        this.sendTo(socket, event, payload);
+      });
+      this.coalescers.set(socket.id, coalescer);
+    }
+    return coalescer;
+  }
+
   attachControlChannel(url: string, channel: string): void {
     const subscriber = new Redis(url, { maxRetriesPerRequest: 2 });
     this.control = subscriber;
@@ -209,6 +322,10 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
 
   private forget(socketId: string): void {
     this.pressure.delete(socketId);
+    // Drop what is held BEFORE forgetting the socket: a scheduled flush would
+    // otherwise fire into a closed connection.
+    this.coalescers.get(socketId)?.discard();
+    this.coalescers.delete(socketId);
     this.joined.delete(socketId);
     this.joinedProjects.delete(socketId);
     const timer = this.revalidations.get(socketId);
