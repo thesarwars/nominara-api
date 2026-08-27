@@ -23,7 +23,12 @@ import {
   scanEngineResultEventSchema,
 } from "./capture-events.schema.js";
 import { realtimeEventNameSchema, type RealtimeEventName } from "./event-name.schema.js";
-import { memberChangedEventSchema, serverDrainingEventSchema } from "./platform-events.schema.js";
+import {
+  memberChangedEventSchema,
+  resyncEventSchema,
+  serverDrainingEventSchema,
+  socketErrorEventSchema,
+} from "./platform-events.schema.js";
 
 // STORY-026 T19 — the catalog: every §11 event name bound to its payload.
 //
@@ -53,6 +58,8 @@ export const REALTIME_EVENT_PAYLOADS = {
   "engine.degraded": engineDegradedEventSchema,
   "member.changed": memberChangedEventSchema,
   "server.draining": serverDrainingEventSchema,
+  "resync": resyncEventSchema,
+  "error": socketErrorEventSchema,
 } as const satisfies Record<RealtimeEventName, z.ZodType>;
 
 export type RealtimeEventPayloads = {

@@ -9,6 +9,7 @@ import {
 } from "../../contracts/events/catalog.schema.js";
 import {
   REALTIME_COALESCING_MS,
+  REALTIME_DELIVERY_BUDGET,
   REALTIME_EVENT_COUNT,
   REALTIME_EVENT_PRODUCER,
   realtimeEventNameSchema,
@@ -66,11 +67,22 @@ function eventNamesInSpec(): string[] {
 }
 
 describe("STORY-026 · the realtime event catalog matches §11", () => {
-  it("carries exactly the events §11 names — nineteen, across eighteen table rows", () => {
+  // STORY-026 — `resync` and the `4403` `error` frame are NOT §11 table rows:
+  // they describe the delivery channel's own state, not the workspace's, and
+  // only the gateway can produce them. They were nonetheless already on the
+  // wire while the catalog called itself a closed union and contained
+  // neither, so clients had to handle two events nothing typed.
+  //
+  // Named explicitly rather than allowed as slack in the count: a third
+  // addition must be a deliberate edit here, not something that slips in
+  // because the number happened to move.
+  const GATEWAY_CONTROL_FRAMES = ["resync", "error"];
+
+  it("carries exactly the events §11 names, plus the two gateway control frames", () => {
     const fromSpec = eventNamesInSpec().sort();
-    expect(fromSpec).toHaveLength(19);
-    expect(realtimeEventNameSchema.options.slice().sort()).toEqual(fromSpec);
-    expect(REALTIME_EVENT_COUNT).toBe(19);
+    expect(fromSpec, "§11's own table").toHaveLength(19);
+    expect(realtimeEventNameSchema.options.slice().sort()).toEqual([...fromSpec, ...GATEWAY_CONTROL_FRAMES].sort());
+    expect(REALTIME_EVENT_COUNT).toBe(19 + GATEWAY_CONTROL_FRAMES.length);
   });
 
   it("binds a payload schema to every event, and no payload to an event §11 does not name", () => {
@@ -93,10 +105,28 @@ describe("STORY-026 · the realtime event catalog matches §11", () => {
     expect(REALTIME_COALESCING_MS["engine.degraded"]).toBe(60_000);
   });
 
-  it("coalesces only the events §11 marks — an uncoalesced event must not acquire a budget by accident", () => {
-    expect(Object.keys(REALTIME_COALESCING_MS).sort()).toEqual(
+  it("budgets only the events §11 marks — an unbudgeted event must not acquire one by accident", () => {
+    expect(Object.keys(REALTIME_DELIVERY_BUDGET).sort()).toEqual(
       ["aux.finding_created", "displacement.detected", "engine.degraded", "run.progress", "task.created"].sort(),
     );
+  });
+
+  // The distinction this story exists to draw. Replace-latest is right for a
+  // percentage and wrong for a creation event carrying a distinct id: under
+  // one shared throttle, twenty findings in a second delivered about five and
+  // the client never learned of the other fifteen.
+  it("the ≤ 5 / s rows are RATE-LIMITED per project, not replace-latest", () => {
+    for (const name of ["aux.finding_created", "task.created", "displacement.detected"] as const) {
+      expect(REALTIME_DELIVERY_BUDGET[name], name).toEqual({
+        kind: "rate_limit",
+        perSecond: 5,
+        keyField: "project_id",
+      });
+    }
+  });
+
+  it("the derived coalescing table holds the replace-latest events and nothing else", () => {
+    expect(Object.keys(REALTIME_COALESCING_MS).sort()).toEqual(["engine.degraded", "run.progress"]);
   });
 });
 

@@ -40,5 +40,52 @@ export const serverDrainingEventSchema = z
   })
   .strict();
 
+/**
+ * `resync` — "you have missed things; refetch."
+ *
+ * The gateway sends this instead of a backlog. Buffering a client that cannot
+ * keep up moves its problem into the gateway's memory, where it becomes every
+ * client's, and eventually delivers a flood of stale state that must be
+ * applied in order. One directive costs the client one query and the gateway
+ * nothing.
+ *
+ * `scope` says what to refetch, and it matters: a socket that blew §9's
+ * per-socket cap has missed events across the whole workspace, while a project
+ * that blew §11's "≤ 5 / s" has missed only its own rows. Refetching
+ * everything for the second case is wasteful; refetching one project for the
+ * first would leave real gaps.
+ *
+ * `project_id` is NULLABLE rather than optional — always on the wire, null
+ * when the scope is the socket. A field that is sometimes absent is a field
+ * every client must remember to check for.
+ */
+export const resyncEventSchema = z
+  .object({
+    reason: z.literal("rate_limited"),
+    scope: z.enum(["socket", "project"]),
+    project_id: z.uuid().nullable(),
+  })
+  .strict();
+
+/**
+ * The `4403` frame — system-architecture.md §9's refusal.
+ *
+ * socket.io's `disconnect()` carries no application close code, so the code
+ * travels as a terminal frame before the socket is closed. A client reading it
+ * gets the signal §9 specifies; one that ignores it is disconnected anyway.
+ *
+ * `reason` is deliberately coarse and nullable. Distinguishing "not a member"
+ * from "workspace suspended" over a channel that has just failed
+ * authorisation would answer a question the caller has not earned.
+ */
+export const socketErrorEventSchema = z
+  .object({
+    close_code: z.literal(4403),
+    reason: z.string().min(1).nullable(),
+  })
+  .strict();
+
 export type MemberChangedEvent = z.infer<typeof memberChangedEventSchema>;
+export type ResyncEvent = z.infer<typeof resyncEventSchema>;
+export type SocketErrorEvent = z.infer<typeof socketErrorEventSchema>;
 export type ServerDrainingEvent = z.infer<typeof serverDrainingEventSchema>;
