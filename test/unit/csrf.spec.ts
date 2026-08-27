@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { computeCsrfToken, isMutatingMethod, verifyDoubleSubmit } from "../../src/lib/auth/csrf.js";
+import {
+  computeCsrfToken,
+  isMutatingMethod,
+  requiresCsrfProtection,
+  verifyDoubleSubmit,
+} from "../../src/lib/auth/csrf.js";
 
 const SID = "0192f1a0-0000-7000-8000-000000000001";
 const SECRET = "test-csrf-secret";
@@ -10,6 +15,18 @@ describe("STORY-017 · csrf double-submit", () => {
     const second = computeCsrfToken(SID, SECRET);
     expect(first).toBe(second);
     expect(computeCsrfToken("some-other-sid", SECRET)).not.toBe(first);
+  });
+
+  // STORY-026 — a WebSocket handshake is not "mutating" in the HTTP sense and
+  // IS CSRF-relevant, which is why these are two questions rather than one.
+  // While they were one, verifyDoubleSubmit short-circuited on "WS" and the
+  // handshake was the only cookie-authenticated transport with no CSRF check.
+  it("requiresCsrfProtection covers the WebSocket handshake, which isMutatingMethod does not", () => {
+    expect(isMutatingMethod("WS")).toBe(false);
+    expect(requiresCsrfProtection("WS")).toBe(true);
+    expect(requiresCsrfProtection("ws")).toBe(true);
+    expect(requiresCsrfProtection("POST")).toBe(true);
+    expect(requiresCsrfProtection("GET")).toBe(false);
   });
 
   it("isMutatingMethod is true for POST/PUT/PATCH/DELETE and false for GET/HEAD/OPTIONS", () => {

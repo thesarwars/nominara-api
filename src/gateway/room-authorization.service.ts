@@ -6,6 +6,7 @@ import { RbacGuard } from "../api/guards/rbac.guard.js";
 import { WorkspaceGuard } from "../api/guards/workspace.guard.js";
 import { incrementCounter } from "../lib/telemetry/metrics.js";
 import { PG_POOL } from "../db/pg-pool.js";
+import { REALTIME_ALLOWED_ORIGINS } from "./gateway.tokens.js";
 import {
   executionContextForSocket,
   requestFromHandshake,
@@ -58,7 +59,31 @@ export class RoomAuthorizationService {
     private readonly workspaceGuard: WorkspaceGuard,
     private readonly rbacGuard: RbacGuard,
     @Inject(PG_POOL) private readonly pool: Pool,
+    @Inject(REALTIME_ALLOWED_ORIGINS) private readonly allowedOrigins: readonly string[],
   ) {}
+
+  /**
+   * The Origin allow-list — the half of handshake protection a CSRF token
+   * cannot provide.
+   *
+   * A same-site page (a white-label or marketing subdomain) carries the
+   * user's cookies AND can read the CSRF cookie, so its double-submit token
+   * is genuinely valid. `SameSite=Lax` does not stop it, because it blocks
+   * cross-SITE only, and no same-origin policy protects a WebSocket the way
+   * CORS protects a fetch. Only an allow-list distinguishes the app's own
+   * origin from a sibling.
+   *
+   * A handshake with NO Origin is permitted, deliberately. It is not a
+   * browser, so it is not the threat this addresses: it had to present the
+   * cookie itself, which means it already holds the credential. Refusing it
+   * would break every server-to-server consumer while closing nothing.
+   */
+  private originAllowed(headers: Record<string, string | string[] | undefined>): boolean {
+    const raw = headers["origin"];
+    const origin = Array.isArray(raw) ? raw[0] : raw;
+    if (origin === undefined || origin === "") return true;
+    return this.allowedOrigins.includes(origin);
+  }
 
   /**
    * The guards, in the order the HTTP chain runs them.
@@ -98,6 +123,14 @@ export class RoomAuthorizationService {
       return { refusal: this.refuse(subject, undefined, "malformed_handshake") };
     }
     if (params !== undefined) request.params = params;
+
+    // Checked BEFORE the guards run: a handshake from an origin that may not
+    // open a socket should cost a string comparison, not a session read and
+    // two database round trips.
+    if (!this.originAllowed(request.headers)) {
+      return { refusal: this.refuse(subject, undefined, "origin_not_allowed") };
+    }
+
     const context = executionContextForSocket(request, metadata);
 
     for (const guard of this.chain) {

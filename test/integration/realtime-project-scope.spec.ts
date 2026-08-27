@@ -9,7 +9,7 @@ import { RealtimeModule } from "../../src/gateway/gateway.module.js";
 import { JOIN_PROJECT_MESSAGE, JOIN_WORKSPACE_MESSAGE } from "../../src/gateway/realtime.gateway.js";
 import { ROOM_FORBIDDEN_CLOSE_CODE, projectRoom } from "../../src/gateway/room-authorization.service.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { ACCESS_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
+import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
@@ -156,10 +156,18 @@ describe("STORY-026 · project rooms enforce workspace_members.project_scope", (
     });
   }
 
-  function connect(accessToken: string): ClientSocket {
+  function connect(accessToken: string, csrfToken: string): ClientSocket {
     const client = io(`http://127.0.0.1:${String(port)}/rt`, {
       transports: ["websocket"],
-      extraHeaders: { cookie: `${ACCESS_COOKIE_NAME}=${accessToken}` },
+      extraHeaders: {
+        cookie: `${ACCESS_COOKIE_NAME}=${accessToken}; ${CSRF_COOKIE_NAME}=${csrfToken}`,
+      },
+      // STORY-026 — the handshake now carries the double-submit token, the
+      // same as any other cookie-authenticated request. socket.io puts it in
+      // `auth` because a browser cannot set a header on a WebSocket
+      // handshake; the server copies it into the header slot AuthGuard
+      // already reads.
+      auth: { csrf: csrfToken },
       reconnection: false,
     });
     clients.push(client);
@@ -203,7 +211,7 @@ describe("STORY-026 · project rooms enforce workspace_members.project_scope", (
 
     const session = await sessions.createSession(memberId);
     const pinned = await sessions.switchWorkspace(session.sid, memberId, workspace.id, role, scope ?? null, 1);
-    return { workspace, mine, theirs, client: connect(pinned.accessToken) };
+    return { workspace, mine, theirs, client: connect(pinned.accessToken, pinned.csrfToken) };
   }
 
   // The setup guard. If project_scope is not actually persisted, every

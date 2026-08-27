@@ -1,6 +1,8 @@
 import type { ExecutionContext } from "@nestjs/common";
 import { PROJECT_PARAM_KEY } from "../api/decorators/project-param.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../api/decorators/require-permission.decorator.js";
+import { CSRF_HEADER_NAME } from "../lib/auth/cookies.js";
+import { WEBSOCKET_HANDSHAKE_METHOD } from "../lib/auth/csrf.js";
 import type { Permission } from "../tenancy/permission-matrix.js";
 
 // STORY-026 T21 — an ExecutionContext synthesised from a socket handshake.
@@ -108,12 +110,25 @@ function decodeValue(value: string): string {
  * something.
  */
 export function requestFromHandshake(handshake: HandshakeLike): WsScopedRequest {
-  const headers = handshake.headers ?? {};
+  const headers = { ...(handshake.headers ?? {}) };
   const cookieHeader = Array.isArray(headers.cookie) ? headers.cookie[0] : headers.cookie;
+
+  // THE CSRF TOKEN'S HEADER SLOT.
+  //
+  // A browser cannot set request headers on a WebSocket handshake, so
+  // socket.io carries them in `auth` instead — `io(url, { auth: { csrf } })`.
+  // Copying it into the header AuthGuard already reads means the socket goes
+  // through exactly the same double-submit check as a mutating HTTP request,
+  // rather than a second CSRF implementation on the side. The client-supplied
+  // value is never trusted: it is one half of a comparison against the
+  // HMAC-of-sid the server recomputes.
+  const handshakeCsrf = handshake.auth?.["csrf"];
+  if (typeof handshakeCsrf === "string") headers[CSRF_HEADER_NAME] = handshakeCsrf;
+
   return {
     headers,
     cookies: parseCookieHeader(cookieHeader),
-    method: "WS",
+    method: WEBSOCKET_HANDSHAKE_METHOD,
     url: "/rt",
   };
 }

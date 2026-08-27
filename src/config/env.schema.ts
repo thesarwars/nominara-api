@@ -87,6 +87,21 @@ export const envSchema = z
     // STORY-017 — HMAC-SHA256(sid, secret) double-submit CSRF token secret.
     CSRF_SECRET: requiredString,
 
+    // STORY-026 — the socket handshake's Origin allow-list, comma-separated.
+    //
+    // Optional HERE and mandatory in the gateway, which is the only process
+    // that opens sockets. Making it globally required forced the API, the
+    // worker and the one-shot migrate container to carry a key none of them
+    // reads, and would fail a deployment for omitting configuration
+    // irrelevant to it.
+    //
+    // That is NOT a soft default. src/gateway/gateway.module.ts's provider
+    // throws when it is missing or empty, so the gateway does not start
+    // without an allow-list — the check cannot quietly become a no-op, which
+    // is the failure this codebase keeps finding. The requirement lives with
+    // the thing that needs it.
+    REALTIME_ALLOWED_ORIGINS: requiredString.optional(),
+
     // STORY-021-E-10 — LocalDekProvisioner's wrapping key (AES-256-GCM,
     // node:crypto only, no KMS). Base64-encoded, exactly 32 bytes so it is
     // usable directly as an AES-256 key.
