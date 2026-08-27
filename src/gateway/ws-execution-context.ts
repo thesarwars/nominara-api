@@ -1,4 +1,7 @@
 import type { ExecutionContext } from "@nestjs/common";
+import { PROJECT_PARAM_KEY } from "../api/decorators/project-param.decorator.js";
+import { REQUIRE_PERMISSION_KEY } from "../api/decorators/require-permission.decorator.js";
+import type { Permission } from "../tenancy/permission-matrix.js";
 
 // STORY-026 T21 — an ExecutionContext synthesised from a socket handshake.
 //
@@ -40,6 +43,13 @@ export interface WsScopedRequest {
   auth?: unknown;
   tenant?: unknown;
   membership?: unknown;
+  /**
+   * What `RbacGuard.assertInScope` reads the project id out of, through the
+   * `@ProjectParam()` name the synthesised handler declares — the same shape
+   * a controller's path parameters arrive in, so the guard needs no socket
+   * special case.
+   */
+  params?: Record<string, string | undefined>;
 }
 
 /**
@@ -108,19 +118,47 @@ export function requestFromHandshake(handshake: HandshakeLike): WsScopedRequest 
   };
 }
 
+/** What the synthesised handler declares to the guards that read metadata. */
+export interface SocketJoinMetadata {
+  /** The `@RequirePermission()` this join must satisfy. */
+  readonly permission: Permission;
+  /** The `@ProjectParam()` name, for a join whose permission is project-scoped. */
+  readonly projectParam?: string;
+}
+
 /**
  * Wraps a request in an ExecutionContext the existing guards accept.
  *
- * `getHandler()` and `getClass()` return objects carrying NO metadata, so
- * `reflector.getAllAndOverride` finds nothing for every key it looks up. That
- * is the correct answer rather than a convenient one: a socket join is not
- * `@Public()`, so AuthGuard runs in full; and it carries no
- * `@RequirePermission()`, so RbacGuard applies no permission requirement —
- * membership itself is what room authorisation checks, immediately after.
+ * THE METADATA IS THE POINT, and its absence was a defect.
+ *
+ * This used to return a handler and class carrying NO metadata, with a
+ * comment calling that "the correct answer rather than a convenient one" on
+ * the grounds that membership is what room authorisation checks. It was
+ * neither. `RbacGuard` looks up `@RequirePermission()` FIRST and returns
+ * `true` before it ever reads the request when it finds none — so the guard
+ * ran, cost a call, and could not refuse. `assertInScope` never executed, and
+ * `workspace_members.project_scope` had no effect on realtime at all: a
+ * manager scoped to one project received every project's events.
+ *
+ * The metadata is defined the same way `@RequirePermission()`/`@ProjectParam()`
+ * define it — `SetMetadata` is `Reflect.defineMetadata` — so the guard reads
+ * it through exactly the path it reads a decorated controller's, with no
+ * special case on the socket side.
+ *
+ * A socket join is still not `@Public()`, so AuthGuard continues to run in
+ * full.
  */
-export function executionContextForSocket(request: WsScopedRequest): ExecutionContext {
+export function executionContextForSocket(
+  request: WsScopedRequest,
+  metadata: SocketJoinMetadata,
+): ExecutionContext {
   class SocketJoin {}
   function socketJoinHandler(): void {}
+
+  Reflect.defineMetadata(REQUIRE_PERMISSION_KEY, metadata.permission, socketJoinHandler);
+  if (metadata.projectParam !== undefined) {
+    Reflect.defineMetadata(PROJECT_PARAM_KEY, metadata.projectParam, socketJoinHandler);
+  }
 
   const http = {
     getRequest: <T>(): T => request as T,
