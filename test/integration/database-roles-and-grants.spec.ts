@@ -490,7 +490,18 @@ describe("STORY-010 · database roles, grants & connection limits", () => {
     expect(mismatches).toEqual([]);
   });
 
-  it("no runtime role has any privilege on the _migrations schema", async () => {
+  // SCOPE, and it matters: this file applies 0001-0005 ONLY (see the
+  // isolated migrationsDir in beforeAll), so this asserts the state 0005
+  // leaves behind — not a standing invariant of the deployed database.
+  //
+  // STORY-120 later grants nominara_app exactly USAGE + SELECT here, in
+  // migration 0015, because readiness reads the ledger over the pooled
+  // connection and could never succeed without it. The decided end-state
+  // matrix for the FULL chain lives in
+  // test/integration/readiness-as-runtime-role.spec.ts; this assertion stays
+  // as the proof that the grant arrives in 0015 deliberately and is not
+  // something 0005 quietly handed out.
+  it("after 0005, no runtime role has any privilege on the _migrations schema (STORY-120's grant arrives later, in 0015)", async () => {
     for (const role of RUNTIME_ROLES) {
       const usage = await client.query<{ has_usage: boolean }>(
         "SELECT has_schema_privilege($1, '_migrations', 'USAGE') AS has_usage",

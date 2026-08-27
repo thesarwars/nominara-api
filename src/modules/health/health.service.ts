@@ -51,6 +51,12 @@ export const QUEUE_KEY_PREFIX_TOKEN = Symbol("HEALTH_QUEUE_KEY_PREFIX");
 // state only — HealthService never opens/closes a breaker itself).
 export const CACHE_CONNECTION_TOKEN = Symbol("HEALTH_CACHE_CONNECTION");
 
+// STORY-120 review — the ceiling on how long readiness may spend reading
+// queue depth before reporting it as unavailable. Deliberately short: this
+// is observability inside a probe an orchestrator polls, so being late is a
+// worse answer than being empty.
+const QUEUE_DEPTH_READ_TIMEOUT_MS = 2_000;
+
 @Injectable()
 export class HealthService implements OnModuleDestroy {
   private readonly logger = new Logger(HealthService.name);
@@ -192,18 +198,47 @@ export class HealthService implements OnModuleDestroy {
    * here, or an unprocessed backlog would silently read as depth 0.
    * A Valkey read failure is logged and reported as an empty list — never a
    * thrown error, since queue depth is observability, not a readiness gate.
+   *
+   * STORY-120 review — that posture was documented but not implemented. An
+   * UNREACHABLE queue instance produces no error to catch: BullMQ requires
+   * `maxRetriesPerRequest: null` (src/lib/queue/connection.ts), so ioredis
+   * retries forever and `getJobCounts()` never settles. Readiness then
+   * never answered at all — worse than a 503, because nothing can report
+   * it. Confirmed in real docker compose, where the api container stayed
+   * unhealthy with no response. The deadline below is what makes the
+   * sentence above true: an unreachable instance degrades this to an empty
+   * list, exactly like a failing one, and never blocks the probe.
+   *
+   * The deeper cause — an unbounded read reachable from anywhere that uses
+   * createQueueConnection — is STORY-030's, and is being filed separately.
    */
   private async queueDepths(): Promise<QueueDepth[]> {
-    try {
-      return await Promise.all(
-        Array.from(this.queues().entries()).map(async ([name, queue]) => {
-          const counts = await queue.getJobCounts("waiting", "active", "prioritized");
-          return { name, depth: (counts.waiting ?? 0) + (counts.active ?? 0) + (counts.prioritized ?? 0) };
-        }),
+    const reads = Promise.all(
+      Array.from(this.queues().entries()).map(async ([name, queue]) => {
+        const counts = await queue.getJobCounts("waiting", "active", "prioritized");
+        return { name, depth: (counts.waiting ?? 0) + (counts.active ?? 0) + (counts.prioritized ?? 0) };
+      }),
+    );
+    // The race below can ABANDON this promise, and Node 24 terminates the
+    // process on an unhandled rejection — so it carries its own handler
+    // before anything else touches it.
+    reads.catch(() => undefined);
+
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`queue depth read exceeded ${QUEUE_DEPTH_READ_TIMEOUT_MS}ms`)),
+        QUEUE_DEPTH_READ_TIMEOUT_MS,
       );
+    });
+
+    try {
+      return await Promise.race([reads, deadline]);
     } catch (error) {
       this.logger.error(`failed to read queue depth: ${(error as Error).message}`);
       return [];
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 
@@ -246,7 +281,15 @@ export class HealthService implements OnModuleDestroy {
       const appliedSet = await appliedMigrationNames(client);
       const appliedSorted = Array.from(appliedSet).sort();
       state.applied = appliedSorted.length > 0 ? appliedSorted[appliedSorted.length - 1]! : null;
-      state.matches = expectedNames.every((name) => appliedSet.has(name));
+      // STORY-120 review — `[].every(...)` is vacuously true, so a build
+      // that shipped no migration files at all would report `ready` against
+      // ANY database while expecting nothing: a probe that has stopped
+      // comparing. Not reachable through this repository's Dockerfile
+      // (which copies src/db/migrations/sql explicitly, with a comment
+      // saying it was learned the hard way), and guarded here so a change
+      // to that packaging cannot silently turn readiness into a rubber
+      // stamp. Asserted by readiness-as-runtime-role.spec.ts.
+      state.matches = expectedNames.length > 0 && expectedNames.every((name) => appliedSet.has(name));
     } finally {
       client.release();
     }
