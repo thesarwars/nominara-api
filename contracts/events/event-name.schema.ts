@@ -41,6 +41,12 @@ export const realtimeEventNameSchema = z.enum([
   "engine.degraded",
   // gateway
   "server.draining",
+  // STORY-026 — both were already on the wire and in neither the union nor
+  // the catalog, while this file called itself a closed set and clients had
+  // to act on both. An event that is typed nowhere is an event a client
+  // cannot handle.
+  "resync",
+  "error",
 ]);
 
 export type RealtimeEventName = z.infer<typeof realtimeEventNameSchema>;
@@ -76,44 +82,60 @@ export const REALTIME_EVENT_PRODUCER = {
   "engine.degraded": "worker-capture",
   "member.changed": "api",
   "server.draining": "gateway",
+  // Both are produced BY the gateway and only by it: they describe the
+  // delivery channel's own state, not the workspace's. Nothing upstream can
+  // know a socket is over budget.
+  "resync": "gateway",
+  "error": "gateway",
 } as const satisfies Record<RealtimeEventName, string>;
 
 /**
- * §11's "Coalescing" column, in milliseconds, for the events that carry one.
+ * §11's per-event delivery budgets — WHAT the budget is, not just how big.
  *
- * `run.progress` is the only per-RUN budget; the `≤ 5 / s / project` rows are
- * per-project, and `engine.degraded` is per-engine. The key an event is
- * coalesced ON therefore differs by event, which is why this is a table rather
- * than one number — collapsing them would coalesce two projects' findings
- * against each other.
+ * The reference gives two different guarantees and the code gave one. Every
+ * budgeted event was a 200 ms-to-750 ms REPLACE-LATEST throttle, which is
+ * right for `run.progress` (a client wants the current percentage, not every
+ * percentage) and wrong for the "≤ 5 / s" rows, which carry DISTINCT ids:
+ * twenty findings in a second delivered about five and the client never
+ * learned of the other fifteen. Silently. Last-write-wins on a creation event
+ * is data loss wearing a throttle's clothes.
+ *
+ * So the two are named apart:
+ *
+ *   replace_latest — at most one per window, and the one sent is the CURRENT
+ *   state. Superseded values are meant to be dropped.
+ *
+ *   rate_limit — a real per-second budget which PERMITS the burst §11 allows
+ *   (5/s means five at once; 200 ms spacing does not), and when it is spent
+ *   the client is told ONCE to resync rather than quietly missing rows.
+ *
+ * `keyField` is what the budget is counted per, read from the event's own
+ * payload: `run.progress` is per RUN, the "≤ 5 / s" rows are per PROJECT,
+ * `engine.degraded` per ENGINE. One shared budget would coalesce two projects'
+ * findings against each other — a correctness failure dressed as a
+ * performance optimisation.
  */
-export const REALTIME_COALESCING_MS = {
-  "run.progress": 750,
-  "aux.finding_created": 200,
-  "task.created": 200,
-  "displacement.detected": 200,
-  "engine.degraded": 60_000,
+export const REALTIME_DELIVERY_BUDGET = {
+  "run.progress": { kind: "replace_latest", windowMs: 750, keyField: "run_id" },
+  "engine.degraded": { kind: "replace_latest", windowMs: 60_000, keyField: "engine_key" },
+  "aux.finding_created": { kind: "rate_limit", perSecond: 5, keyField: "project_id" },
+  "task.created": { kind: "rate_limit", perSecond: 5, keyField: "project_id" },
+  "displacement.detected": { kind: "rate_limit", perSecond: 5, keyField: "project_id" },
 } as const;
 
-export type CoalescedEventName = keyof typeof REALTIME_COALESCING_MS;
+export type BudgetedEventName = keyof typeof REALTIME_DELIVERY_BUDGET;
 
 /**
- * WHAT each budget is PER — the payload field carrying the coalescing key.
+ * The replace-latest windows alone, DERIVED rather than restated.
  *
- * §11 does not give one shared budget: `run.progress` is per RUN, the
- * "≤ 5 / s" rows are per PROJECT, and `engine.degraded` is per ENGINE. Sharing
- * one budget across projects would coalesce two tenants' findings against each
- * other, which is a correctness failure wearing a performance optimisation's
- * clothes.
- *
- * Declared here, next to the windows, rather than in the gateway: both halves
- * are read off the same reference table, and splitting them across a contract
- * and a service is how the two drift.
+ * `Coalescer` only ever handled replace-latest and should only ever be asked
+ * to. Keeping a second hand-maintained list would let the two disagree about
+ * which events coalesce — and the disagreement would be silent.
  */
-export const REALTIME_COALESCE_KEY_FIELD = {
-  "run.progress": "run_id",
-  "aux.finding_created": "project_id",
-  "task.created": "project_id",
-  "displacement.detected": "project_id",
-  "engine.degraded": "engine_key",
-} as const satisfies Record<CoalescedEventName, string>;
+export const REALTIME_COALESCING_MS: Readonly<Record<string, number>> = Object.freeze(
+  Object.fromEntries(
+    Object.entries(REALTIME_DELIVERY_BUDGET)
+      .filter(([, budget]) => budget.kind === "replace_latest")
+      .map(([name, budget]) => [name, (budget as { windowMs: number }).windowMs]),
+  ),
+);

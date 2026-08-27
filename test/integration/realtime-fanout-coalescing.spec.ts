@@ -229,6 +229,66 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
     );
   }, 30_000);
 
+  function finding(projectId: string): Record<string, unknown> {
+    return {
+      finding_id: randomUUID(),
+      project_id: projectId,
+      rule_code: "AUX-001",
+      severity: "high",
+      url: "https://example.test/page",
+    };
+  }
+
+  // Decision #4. §11 says "≤ 5 / s / project"; it was implemented as a 200 ms
+  // replace-latest throttle. Both deliver about five of twenty — the
+  // difference, and the entire defect, is that the throttle delivered five and
+  // said NOTHING about the fifteen it dropped. The client could not know it
+  // was missing rows, so it never refetched them.
+  //
+  // The resync directive is therefore the discriminating assertion here, not
+  // the count: a replace-latest throttle passes every count-based check in
+  // this test and emits no resync at all.
+  it("spends a per-project budget and tells the client once that it missed rows", async () => {
+    const { workspaceId, client } = await joinedSocket();
+    const projectId = randomUUID();
+    const delivered = collect(client, "aux.finding_created");
+    const resyncs = collect(client, RESYNC_DIRECTIVE) as { scope: string; project_id: string | null }[];
+
+    for (let i = 0; i < 20; i += 1) {
+      publisher.toWorkspace(workspaceId, "aux.finding_created", finding(projectId) as never);
+    }
+    await settle(900);
+
+    expect(delivered.length, "§11 caps this at five per second per project").toBeLessThanOrEqual(5);
+    expect(delivered.length).toBeGreaterThan(0);
+    expect(resyncs, "silent loss is the defect; the client must be told it missed rows").toHaveLength(1);
+    expect(resyncs[0], "and told WHICH project to refetch, not to refetch everything").toEqual({
+      reason: "rate_limited",
+      scope: "project",
+      project_id: projectId,
+    });
+  }, 30_000);
+
+  // One budget per project, not one per socket. A workspace with a busy
+  // project would otherwise silence a quiet one.
+  it("gives each project its own budget", async () => {
+    const { workspaceId, client } = await joinedSocket();
+    const busy = randomUUID();
+    const quiet = randomUUID();
+    const delivered = collect(client, "aux.finding_created") as { project_id: string }[];
+
+    for (let i = 0; i < 20; i += 1) {
+      publisher.toWorkspace(workspaceId, "aux.finding_created", finding(busy) as never);
+    }
+    publisher.toWorkspace(workspaceId, "aux.finding_created", finding(quiet) as never);
+    await settle(900);
+
+    expect(
+      delivered.some((event) => event.project_id === quiet),
+      "the quiet project's single event must survive the busy one's flood",
+    ).toBe(true);
+  }, 30_000);
+
   // AC7. §9 caps one socket at 20 messages per second: beyond that it is told
   // ONCE to resync and further messages are DROPPED, never queued.
   it("caps a socket at the per-second budget and sends resync instead of a backlog", async () => {

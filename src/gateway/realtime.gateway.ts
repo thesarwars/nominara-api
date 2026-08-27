@@ -5,7 +5,7 @@ import { Logger } from "@nestjs/common";
 import { incrementCounter } from "../lib/telemetry/metrics.js";
 import { RESYNC_DIRECTIVE, SocketBackpressure, drainReconnectAfterMs } from "./backpressure.js";
 import { Coalescer } from "./coalescer.js";
-import { REALTIME_COALESCE_KEY_FIELD, type CoalescedEventName } from "../../contracts/events/event-name.schema.js";
+import { REALTIME_DELIVERY_BUDGET, type BudgetedEventName } from "../../contracts/events/event-name.schema.js";
 import type { RealtimeFanoutMessage } from "../lib/cache/realtime-publisher.js";
 import {
   ROOM_FORBIDDEN_CLOSE_CODE,
@@ -52,15 +52,17 @@ export const JOIN_PROJECT_MESSAGE = "join:project";
 /**
  * The value this event's budget is counted per, read from its own payload.
  *
- * `undefined` means "do not coalesce this" — either §11 gives the event no
- * budget, or it gives it one and the payload is missing the field that budget
- * is counted per. The caller sends those straight through; see there for why
- * a fallback key would be worse than none.
+ * `undefined` means "spend no budget on this" — either §11 gives the event
+ * none, or it gives it one and the payload is missing the field it is counted
+ * per. Both go straight through: substituting a constant would put every run —
+ * or every project — into ONE budget and coalesce them against each other,
+ * losing one tenant's events to another's. Better one event too many than the
+ * wrong client's.
  */
-function coalesceKeyFor(event: string, payload: unknown): string | undefined {
-  const field = REALTIME_COALESCE_KEY_FIELD[event as CoalescedEventName] as string | undefined;
-  if (field === undefined) return undefined;
-  const value = (payload as Record<string, unknown> | null | undefined)?.[field];
+function budgetKeyFor(event: string, payload: unknown): string | undefined {
+  const budget = REALTIME_DELIVERY_BUDGET[event as BudgetedEventName] as { keyField: string } | undefined;
+  if (budget === undefined) return undefined;
+  const value = (payload as Record<string, unknown> | null | undefined)?.[budget.keyField];
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
@@ -83,6 +85,9 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
    * quiet client of its own updates.
    */
   private readonly coalescers = new Map<string, Coalescer>();
+
+  /** §11's per-project budgets, one per (socket, project) — keyed together so one project cannot spend another's. */
+  private readonly projectBudgets = new Map<string, SocketBackpressure>();
 
   /**
    * Who is on each socket, recorded at join.
@@ -150,7 +155,7 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
     if (verdict.action === "resync") {
       logger.warn({ message: "socket throttled; resync directive sent", socket_id: socket.id, event });
       incrementCounter("nominara_gateway_resync_directive_total", { event });
-      socket.emit(RESYNC_DIRECTIVE, { reason: "rate_limited" });
+      socket.emit(RESYNC_DIRECTIVE, { reason: "rate_limited", scope: "socket", project_id: null });
       return;
     }
     incrementCounter("nominara_gateway_dropped_events_total", { event });
@@ -222,19 +227,72 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
       // per instance to every client.
       if (!socket.rooms.has(room)) continue;
 
-      const key = coalesceKeyFor(message.event, message.payload);
-      if (key === undefined) {
-        // Either §11 gives this event no budget, or it gives it one and the
-        // payload is missing the field that budget is counted per. Both are
-        // sent straight through: substituting a constant key would put every
-        // run — or every project — into ONE budget and coalesce them against
-        // each other, losing one tenant's events to another's. Better one
-        // event too many than the wrong client's.
+      const key = budgetKeyFor(message.event, message.payload);
+      const budget = REALTIME_DELIVERY_BUDGET[message.event as BudgetedEventName] as
+        | { kind: "replace_latest" }
+        | { kind: "rate_limit"; perSecond: number }
+        | undefined;
+
+      if (budget === undefined || key === undefined) {
         this.sendTo(socket, message.event, message.payload);
         continue;
       }
-      this.coalescerFor(socket).submit(message.event, key, message.payload);
+
+      if (budget.kind === "replace_latest") {
+        // A client wants the CURRENT percentage, not every percentage —
+        // superseded values are meant to be dropped.
+        this.coalescerFor(socket).submit(message.event, key, message.payload);
+        continue;
+      }
+
+      this.deliverRateLimited(socket, message.event, key, message.payload, budget.perSecond);
     }
+  }
+
+  /**
+   * §11's "≤ 5 / s / project" — a real budget, not a throttle.
+   *
+   * These events carry DISTINCT ids: a finding, a task, a displacement. Under
+   * the replace-latest throttle they used to share, twenty findings in a
+   * second delivered about five and the client never learned of the other
+   * fifteen — silently. Last-write-wins on a CREATION event is data loss
+   * wearing a throttle's clothes. A per-second budget also permits the burst
+   * §11 allows: "5 / s" means five at once, which 200 ms spacing never did.
+   *
+   * When the budget is spent the client is told ONCE, scoped to the project it
+   * missed rows in, and the rest are dropped rather than queued. A backlog
+   * would move the problem into this process's memory and eventually deliver a
+   * flood of stale rows the client must apply in order.
+   */
+  private deliverRateLimited(
+    socket: Socket,
+    event: string,
+    projectId: string,
+    payload: unknown,
+    perSecond: number,
+  ): void {
+    const slot = `${socket.id}:${projectId}`;
+    let budget = this.projectBudgets.get(slot);
+    if (budget === undefined) {
+      budget = new SocketBackpressure(undefined, perSecond);
+      this.projectBudgets.set(slot, budget);
+    }
+
+    const verdict = budget.admit();
+    if (verdict.action === "send") {
+      this.sendTo(socket, event, payload);
+      return;
+    }
+    if (verdict.action === "resync") {
+      incrementCounter("nominara_gateway_resync_directive_total", { event, scope: "project" });
+      // Emitted DIRECTLY rather than through sendTo. A resync is one message
+      // whose whole purpose is to survive the overload that provoked it;
+      // spending it against §9's socket budget could see the one notice a
+      // client needs dropped by the very cap it is reporting.
+      socket.emit(RESYNC_DIRECTIVE, { reason: "rate_limited", scope: "project", project_id: projectId });
+      return;
+    }
+    incrementCounter("nominara_gateway_dropped_events_total", { event, scope: "project" });
   }
 
   /** This socket's coalescer, whose emit is the backpressure-honouring send. */
@@ -326,6 +384,9 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
     // otherwise fire into a closed connection.
     this.coalescers.get(socketId)?.discard();
     this.coalescers.delete(socketId);
+    for (const slot of this.projectBudgets.keys()) {
+      if (slot.startsWith(`${socketId}:`)) this.projectBudgets.delete(slot);
+    }
     this.joined.delete(socketId);
     this.joinedProjects.delete(socketId);
     const timer = this.revalidations.get(socketId);
@@ -369,7 +430,7 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
       // socket.io has no application close code on disconnect(), so the code is
       // sent as a terminal frame first. A client reading `4403` gets the same
       // signal §9 specifies; a client that ignores it is disconnected anyway.
-      socket.emit("error", { close_code: decision.closeCode ?? ROOM_FORBIDDEN_CLOSE_CODE });
+      socket.emit("error", { close_code: decision.closeCode ?? ROOM_FORBIDDEN_CLOSE_CODE, reason: null });
       socket.disconnect(true);
       return { joined: false };
     }
@@ -406,7 +467,7 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
 
     const decision = await this.rooms.authorizeProjectRoom(socket.handshake, projectId);
     if (!decision.allowed) {
-      socket.emit("error", { close_code: decision.closeCode ?? ROOM_FORBIDDEN_CLOSE_CODE });
+      socket.emit("error", { close_code: decision.closeCode ?? ROOM_FORBIDDEN_CLOSE_CODE, reason: null });
       socket.disconnect(true);
       return { joined: false };
     }
