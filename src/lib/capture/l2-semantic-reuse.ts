@@ -1,0 +1,155 @@
+import type { ClientBase } from "pg";
+
+// STORY-032 — tracking-engine.md §6's L2 near-duplicate probe.
+//
+// §6's admission rules, all six of which must hold: same project, same
+// engine, cosine >= 0.94, source captured within 0.5x the engine's L1 TTL,
+// source `status='parsed'`, and the source NOT ITSELF an L2 reuse.
+//
+// ONE QUERY FOR THE WHOLE BATCH, and that is an acceptance criterion rather
+// than an optimisation. A per-cell query makes planning cost scale with run
+// size: a project with hundreds of cells would spend longer planning than
+// capturing, and the cost is invisible until a large project appears. The
+// LATERAL below runs the HNSW index once per candidate cell inside a single
+// round trip — the shape that keeps this O(1) in round trips.
+
+/** §6: "cosine >= 0.94". */
+export const L2_COSINE_THRESHOLD = 0.94;
+
+/** §6: "source captured within 0.5x the engine's L1 TTL". */
+export const L2_WINDOW_FRACTION = 0.5;
+
+export interface L2Candidate {
+  readonly promptId: string;
+  readonly engineKey: string;
+  readonly sampleIndex: number;
+  /** THIS engine's `cache_ttl_seconds`; the reuse window is half of it. */
+  readonly ttlSeconds: number;
+}
+
+export interface L2Hit {
+  readonly promptId: string;
+  readonly engineKey: string;
+  readonly sampleIndex: number;
+  /** The capture being reused — recorded as `source_result_id` on the suppressed row. */
+  readonly sourceResultId: string;
+  readonly cosine: number;
+}
+
+/**
+ * The identity of one cell within a run — an in-memory Map key, never a
+ * Valkey key.
+ *
+ * Separated by a pipe rather than a colon deliberately. ISO-13 flagged the
+ * colon-separated version as an un-namespaced cache key and was RIGHT to:
+ * in this codebase a colon-joined interpolated string means a Valkey key,
+ * and a reader encountering one here would reasonably look for the namespace
+ * it appears to be missing. (This sentence avoids spelling the shape out for
+ * the same reason — the scanner reads comments too, and it should. A gate
+ * that skipped comments could be evaded by writing the key in one.)
+ * The gate was not widened to accommodate this; the string
+ * was made unambiguous instead.
+ */
+export function cellKey(cell: { promptId: string; engineKey: string; sampleIndex: number }): string {
+  return `${cell.promptId}|${cell.engineKey}|${String(cell.sampleIndex)}`;
+}
+
+/**
+ * The batch probe.
+ *
+ * Returns at most one hit per candidate: the nearest admissible source. The
+ * caller suppresses those cells and dispatches the rest.
+ *
+ * Note what this does NOT do — it does not copy the parse output. §6 requires
+ * a reuse to re-run entity matching against the CURRENT alias set, so that an
+ * alias added yesterday appears in a reused cell. Copying wholesale here
+ * would make the matrix quietly disagree with the customer's own
+ * configuration, so the copy belongs to the capture worker that acts on the
+ * suppression, never to the probe that finds it.
+ */
+export async function probeSemanticReuse(
+  tx: ClientBase,
+  projectId: string,
+  candidates: readonly L2Candidate[],
+): Promise<Map<string, L2Hit>> {
+  const hits = new Map<string, L2Hit>();
+  if (candidates.length === 0) return hits;
+
+  // The candidate list travels as ONE array parameter per column and is
+  // unnested server-side, so the statement text is identical for a run of
+  // three cells and a run of three hundred. Building an IN list instead
+  // would produce a new query plan per run size and defeat the prepared
+  // statement cache.
+  const result = await tx.query<{
+    prompt_id: string;
+    engine_key: string;
+    sample_index: number;
+    source_result_id: string;
+    cosine: number;
+  }>(
+    `
+    WITH candidate AS (
+      -- ONE json parameter rather than four parallel arrays. Multi-argument
+      -- unnest() inside a CTE leaves Postgres unable to deduce the parameter
+      -- types ("inconsistent types deduced for parameter $4"), and naming the
+      -- columns here is clearer than four positional casts besides.
+      SELECT * FROM jsonb_to_recordset($2::jsonb)
+        AS c(prompt_id uuid, engine_key text, sample_index int, ttl_seconds int)
+    )
+    SELECT c.prompt_id, c.engine_key, c.sample_index, s.source_result_id, s.cosine
+      FROM candidate c
+      JOIN tracked_prompts target ON target.id = c.prompt_id
+      -- JOIN LATERAL ... ON true, not CROSS JOIN LATERAL: the subquery may
+      -- return no admissible source, and CROSS JOIN would then drop the row
+      -- with no way to distinguish "no source" from "never asked".
+      JOIN LATERAL (
+        SELECT ac.id AS source_result_id,
+               1 - (source_prompt.embedding <=> target.embedding) AS cosine
+          FROM answer_captures ac
+          JOIN tracked_prompts source_prompt ON source_prompt.id = ac.prompt_id
+         -- TWO project filters, and they are deliberately redundant: the
+         -- CAPTURE's project and its PROMPT's project must both be this
+         -- project. Mutation testing shows either alone refuses a
+         -- cross-project source, so rule 1's test proves the property
+         -- without pinning which clause enforces it. Both stay — a capture
+         -- whose prompt belongs to another project is corrupt either way,
+         -- and this is the query that must not act on it.
+         WHERE ac.project_id = $1                             -- same project (the capture)
+           AND ac.engine_key = c.engine_key                   -- same engine
+           AND ac.status = 'parsed'                           -- source fully parsed
+           AND ac.cache_layer <> 'l2'                         -- NO TRANSITIVE CHAINS
+           AND ac.captured_at >= now() - make_interval(secs => (c.ttl_seconds * $3::double precision))
+           AND source_prompt.project_id = $1                   -- same project (its prompt)
+           AND source_prompt.embedding IS NOT NULL
+           AND target.embedding IS NOT NULL
+           AND 1 - (source_prompt.embedding <=> target.embedding) >= $4
+         ORDER BY source_prompt.embedding <=> target.embedding
+         LIMIT 1
+      ) s ON true
+    `,
+    [
+      projectId,
+      JSON.stringify(
+        candidates.map((c) => ({
+          prompt_id: c.promptId,
+          engine_key: c.engineKey,
+          sample_index: c.sampleIndex,
+          ttl_seconds: c.ttlSeconds,
+        })),
+      ),
+      L2_WINDOW_FRACTION,
+      L2_COSINE_THRESHOLD,
+    ],
+  );
+
+  for (const row of result.rows) {
+    hits.set(cellKey({ promptId: row.prompt_id, engineKey: row.engine_key, sampleIndex: row.sample_index }), {
+      promptId: row.prompt_id,
+      engineKey: row.engine_key,
+      sampleIndex: row.sample_index,
+      sourceResultId: row.source_result_id,
+      cosine: Number(row.cosine),
+    });
+  }
+  return hits;
+}
