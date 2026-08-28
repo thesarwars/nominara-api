@@ -62,6 +62,22 @@ async function driveJobToDlq(options: {
     label: `${options.entry.name}.dlq to receive the terminally-failed job`,
   });
 
+  // CLOSED HERE, THE MOMENT ITS JOB IS DONE — this is the flake.
+  //
+  // This worker exists to fail a job into the DLQ, and nothing more. Left
+  // running it stays subscribed to the SAME queue under the SAME prefix, so
+  // when a test replays the entry and attaches its own worker to observe the
+  // result, the two compete: whichever polls first wins, and this one always
+  // throws. capture.plan retries at 2s/4s/8s, so a lost race burns 14s of
+  // backoff against a 15s deadline and then exhausts its four attempts and
+  // returns to the DLQ — at which point the observing worker never runs at
+  // all and the wait times out.
+  //
+  // It presented as flakiness (8 failures in 10 full runs) and was recorded
+  // as one. It is not: it is a race this helper creates, and the two tests
+  // that failed are exactly the two that attach a replacement worker.
+  await worker.close();
+
   const dlqJobs = await dlqQueue.getJobs(["waiting", "delayed", "active", "completed"]);
   const dlqJob = dlqJobs[0]!;
 
@@ -70,6 +86,8 @@ async function driveJobToDlq(options: {
     dlqQueue,
     dlqJob,
     async cleanup() {
+      // Idempotent in BullMQ, and already closed above on the happy path —
+      // repeated so a throw between here and there still releases it.
       await worker.close();
       await queue.close();
       await dlqQueue.close();
@@ -254,9 +272,23 @@ describe("STORY-030 · AdminService.replayDeadLetterJob — administrative DLQ r
       }),
     ).rejects.toBeInstanceOf(DlqReplayError);
 
-    const counts = await drive.queue.getJobCounts("waiting", "active", "delayed", "completed");
-    const total = (counts.waiting ?? 0) + (counts.active ?? 0) + (counts.delayed ?? 0) + (counts.completed ?? 0);
-    expect(total).toBe(1);
+    // `prioritized` is counted, and leaving it out was a latent bug this
+    // file's own race was hiding. Every QUEUE_TOPOLOGY entry carries a
+    // priority and `enqueueJob` always sets one, so a job no worker has
+    // picked up sits in BullMQ's separate `prioritized` state and NEVER in
+    // `waiting` — the same trap src/modules/health/health.service.ts
+    // documents for queue depth. This assertion passed only because the
+    // always-failing worker had already moved the job to `delayed`, which
+    // means it was counting a job in retry backoff rather than the enqueue
+    // it claims to check.
+    const counts = await drive.queue.getJobCounts("waiting", "prioritized", "active", "delayed", "completed");
+    const total =
+      (counts.waiting ?? 0) +
+      (counts.prioritized ?? 0) +
+      (counts.active ?? 0) +
+      (counts.delayed ?? 0) +
+      (counts.completed ?? 0);
+    expect(total, "exactly one replay reached the queue — the second was refused").toBe(1);
   }, 30_000);
 
   it("the replay is never deduplicated against the original job's now-consumed idempotency key", async () => {
