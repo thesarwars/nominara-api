@@ -168,6 +168,95 @@ describe("STORY-011 · withTenantContext — exact call order and bind parameter
   });
 });
 
+describe("STORY-026 · afterCommit — a side effect must not outlive a rolled-back transaction", () => {
+  const context: TenantContext = { workspaceId: "ws-1", actorId: "actor-1" };
+
+  // THE DEFECT THIS EXISTS FOR. `member.changed` was published from inside the
+  // request's transaction, before COMMIT. It closes the affected sockets and
+  // tells every client the membership changed — so a transaction that then
+  // failed left sockets closed and clients informed about a change that never
+  // happened, and the authoritative API they refetch would contradict it.
+  //
+  // Not fixable by moving the call after `withTenantContext` returns: the
+  // service method does not own the transaction, TenantContextInterceptor
+  // does, and a service cannot see the commit from inside it. Hence a seam.
+  it("runs registered tasks AFTER the commit, never before", async () => {
+    const { client, log } = createFakeClient();
+    const order: string[] = [];
+
+    await withTenantContext(client, context, async () => {
+      currentTenantStore()!.afterCommit(() => order.push("effect"));
+      order.push("body");
+    });
+
+    expect(order).toEqual(["body", "effect"]);
+    // Belt and braces: the effect must land after the COMMIT statement, not
+    // merely after the body — the body returning is not the commit.
+    expect(log[log.length - 1]!.text).toBe("COMMIT");
+  });
+
+  it("runs NOTHING when the transaction rolls back", async () => {
+    const { client } = createFakeClient({ failOn: (text) => text === "COMMIT" });
+    const effects: string[] = [];
+
+    await expect(
+      withTenantContext(client, context, async () => {
+        currentTenantStore()!.afterCommit(() => effects.push("published"));
+      }),
+    ).rejects.toThrow();
+
+    expect(effects, "a failed commit must leave no client told anything").toEqual([]);
+  });
+
+  it("runs nothing when the BODY throws, either", async () => {
+    const { client } = createFakeClient();
+    const effects: string[] = [];
+
+    await expect(
+      withTenantContext(client, context, async () => {
+        currentTenantStore()!.afterCommit(() => effects.push("published"));
+        throw new Error("handler failed");
+      }),
+    ).rejects.toThrow("handler failed");
+
+    expect(effects).toEqual([]);
+  });
+
+  // The mirror of the bug being fixed: the transaction has ALREADY committed,
+  // so a throwing side effect must not turn a successful, durable mutation
+  // into a failed request. The caller would retry a change that already
+  // happened.
+  it("a failing task neither fails the request nor stops the ones after it", async () => {
+    const { client } = createFakeClient();
+    const effects: string[] = [];
+
+    await expect(
+      withTenantContext(client, context, async () => {
+        const store = currentTenantStore()!;
+        store.afterCommit(() => {
+          throw new Error("valkey is down");
+        });
+        store.afterCommit(() => effects.push("second"));
+        return "committed";
+      }),
+    ).resolves.toBe("committed");
+
+    expect(effects, "one broken effect must not silence the next").toEqual(["second"]);
+  });
+
+  it("runs tasks in the order they were registered", async () => {
+    const { client } = createFakeClient();
+    const order: number[] = [];
+
+    await withTenantContext(client, context, async () => {
+      const store = currentTenantStore()!;
+      for (const n of [1, 2, 3]) store.afterCommit(() => order.push(n));
+    });
+
+    expect(order).toEqual([1, 2, 3]);
+  });
+});
+
 describe("STORY-021 · withActorContext — ADR-0001 actor-only context, exact call order", () => {
   it("BEGIN → READ ONLY → clear-workspace set_config → actor set_config → body → COMMIT, in that exact order", async () => {
     const { client, log } = createFakeClient();

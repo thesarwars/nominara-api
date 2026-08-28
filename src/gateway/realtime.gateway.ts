@@ -2,11 +2,14 @@ import { Inject, type OnApplicationShutdown, type OnModuleDestroy } from "@nestj
 import { MessageBody, ConnectedSocket, SubscribeMessage, WebSocketGateway, WebSocketServer } from "@nestjs/websockets";
 import type { Server, Socket } from "socket.io";
 import { Logger } from "@nestjs/common";
+import { z } from "zod";
 import { incrementCounter } from "../lib/telemetry/metrics.js";
 import { RESYNC_DIRECTIVE, SocketBackpressure, drainReconnectAfterMs } from "./backpressure.js";
 import { Coalescer } from "./coalescer.js";
 import { REALTIME_DELIVERY_BUDGET, type BudgetedEventName } from "../../contracts/events/event-name.schema.js";
-import type { RealtimeFanoutMessage } from "../lib/cache/realtime-publisher.js";
+import { REALTIME_EVENT_PAYLOADS } from "../../contracts/events/catalog.schema.js";
+import { realtimeEventNameSchema } from "../../contracts/events/event-name.schema.js";
+import type { ResyncEvent } from "../../contracts/events/platform-events.schema.js";
 import {
   ROOM_FORBIDDEN_CLOSE_CODE,
   RoomAuthorizationService,
@@ -50,6 +53,20 @@ export const JOIN_PROJECT_MESSAGE = "join:project";
 // path uses (system-architecture.md §9), and nothing else: the Valkey adapter,
 // coalescing, backpressure and the typed emitters are T22.
 /**
+ * The fan-out envelope, as it arrives off Valkey.
+ *
+ * `workspaceId` is a uuid because it selects a room by exact string match;
+ * `event` is the closed union because its value is handed to `socket.emit`.
+ */
+const fanoutMessageSchema = z
+  .object({
+    workspaceId: z.uuid(),
+    event: realtimeEventNameSchema,
+    payload: z.unknown(),
+  })
+  .strict();
+
+/**
  * The value this event's budget is counted per, read from its own payload.
  *
  * `undefined` means "spend no budget on this" — either §11 gives the event
@@ -88,6 +105,9 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
 
   /** §11's per-project budgets, one per (socket, project) — keyed together so one project cannot spend another's. */
   private readonly projectBudgets = new Map<string, SocketBackpressure>();
+
+  /** How many resync frames this socket has been sent in the current second, so the notice cannot become the flood. */
+  private readonly resyncWindows = new Map<string, { startedAt: number; sent: number; project: string | undefined }>();
 
   /**
    * Who is on each socket, recorded at join.
@@ -153,9 +173,18 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
       return;
     }
     if (verdict.action === "resync") {
+      // Through the SAME per-socket window the project-scoped directives use.
+      // Three independent sources of "send a resync outside the cap" added up
+      // to 23 frames against a cap of 20 — the notice becoming the flood it
+      // reports. One window bounds all of them together.
+      const frame = this.resyncFrameFor(socket.id, null);
+      if (frame === undefined) {
+        incrementCounter("nominara_gateway_dropped_events_total", { event, scope: "resync_suppressed" });
+        return;
+      }
       logger.warn({ message: "socket throttled; resync directive sent", socket_id: socket.id, event });
-      incrementCounter("nominara_gateway_resync_directive_total", { event });
-      socket.emit(RESYNC_DIRECTIVE, { reason: "rate_limited", scope: "socket", project_id: null });
+      incrementCounter("nominara_gateway_resync_directive_total", { event, scope: frame.scope });
+      socket.emit(RESYNC_DIRECTIVE, frame);
       return;
     }
     incrementCounter("nominara_gateway_dropped_events_total", { event });
@@ -200,7 +229,20 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
       });
     });
     subscriber.on("message", (_channel: string, raw: string) => {
-      this.deliverFanout(raw);
+      // NOTHING ON THIS WIRE MAY THROW PAST HERE. Every replica subscribes to
+      // the same channel, so one bad message would take the whole gateway
+      // FLEET down at once, with no request to trace it back to. Confirmed by
+      // the second-engineer review: publishing `null` threw a TypeError, and
+      // an event named `disconnect` threw socket.io's own reserved-name
+      // guard — both uncaught, both fatal.
+      try {
+        this.deliverFanout(raw);
+      } catch (error) {
+        logger.error({
+          message: "fanout delivery failed; the event was dropped",
+          error: error instanceof Error ? error.name : "unknown",
+        });
+      }
     });
   }
 
@@ -212,8 +254,32 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
     } catch {
       return;
     }
-    const message = parsed as Partial<RealtimeFanoutMessage>;
-    if (typeof message.workspaceId !== "string" || typeof message.event !== "string") return;
+    // VALIDATED AGAINST THE CATALOG, not two `typeof` checks.
+    //
+    // `onMemberChanged` a few lines down already parses its wire with
+    // `safeParse`, for the same reason, and this was written without it. The
+    // event NAME in particular was forwarded to clients unchecked while
+    // `realtimeEventNameSchema` calls itself a closed union — so a name
+    // socket.io reserves (`disconnect`, `connect`, …) reached `socket.emit`
+    // and threw. Validating the payload too is what guarantees the frames
+    // this gateway emits match the schemas it publishes: the `resync`
+    // directive's `project_id` is read straight off this payload, and an
+    // unvalidated one put a non-uuid on the wire that a client validating
+    // against the published schema would reject — reinstating the silent loss
+    // the directive exists to prevent.
+    const envelope = fanoutMessageSchema.safeParse(parsed);
+    if (!envelope.success) {
+      incrementCounter("nominara_gateway_fanout_rejected_total", { reason: "malformed_envelope" });
+      return;
+    }
+    const message = envelope.data;
+
+    const payloadSchema = REALTIME_EVENT_PAYLOADS[message.event];
+    if (!payloadSchema.safeParse(message.payload).success) {
+      incrementCounter("nominara_gateway_fanout_rejected_total", { reason: "payload", event: message.event });
+      logger.warn({ message: "fanout payload does not match its catalogued schema; dropped", event: message.event });
+      return;
+    }
 
     const room = workspaceRoom(message.workspaceId);
     // `@WebSocketServer()` on a NAMESPACED gateway injects the Namespace, not
@@ -226,6 +292,15 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
       // for the room's cluster-wide membership would deliver each event once
       // per instance to every client.
       if (!socket.rooms.has(room)) continue;
+
+      // ONLY the workspace room is consulted, and that is a known limit
+      // rather than an oversight. `proj:{project_id}` rooms exist and are
+      // authorised (join:project enforces workspace_members.project_scope),
+      // but nothing PUBLISHES to them: RealtimePublisher has toWorkspace and
+      // memberChanged and no toProject, so a project-scoped event still
+      // reaches every member of the workspace. Scoped DELIVERY needs the
+      // producers that arrive with EPIC-04, and belongs with them. Recorded
+      // in STORY-026 rather than left for a reader to infer from silence.
 
       const key = budgetKeyFor(message.event, message.payload);
       const budget = REALTIME_DELIVERY_BUDGET[message.event as BudgetedEventName] as
@@ -284,15 +359,71 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
       return;
     }
     if (verdict.action === "resync") {
-      incrementCounter("nominara_gateway_resync_directive_total", { event, scope: "project" });
-      // Emitted DIRECTLY rather than through sendTo. A resync is one message
-      // whose whole purpose is to survive the overload that provoked it;
-      // spending it against §9's socket budget could see the one notice a
-      // client needs dropped by the very cap it is reporting.
-      socket.emit(RESYNC_DIRECTIVE, { reason: "rate_limited", scope: "project", project_id: projectId });
+      const frame = this.resyncFrameFor(socket.id, projectId);
+      if (frame === undefined) {
+        incrementCounter("nominara_gateway_dropped_events_total", { event, scope: "resync_suppressed" });
+        return;
+      }
+      incrementCounter("nominara_gateway_resync_directive_total", { event, scope: frame.scope });
+      // Emitted DIRECTLY rather than through sendTo. A resync is the one
+      // message whose purpose is to survive the overload that provoked it;
+      // spending it against §9's budget could see the notice a client needs
+      // dropped by the very cap it is reporting. That is only defensible
+      // because resyncFrameFor bounds it — see there.
+      socket.emit(RESYNC_DIRECTIVE, frame);
       return;
     }
     incrementCounter("nominara_gateway_dropped_events_total", { event, scope: "project" });
+  }
+
+  /**
+   * The resync frame to send, or `undefined` to stay quiet — at most TWO per
+   * socket per second, whatever the traffic.
+   *
+   * WHY THIS EXISTS. The resync bypasses §9's per-socket cap, which is right
+   * for one frame and catastrophic for many: the budget is per (socket,
+   * PROJECT), and nothing bounds how many project ids a publisher can name.
+   * The second-engineer review drove 200 projects at one socket and measured
+   * 19 findings delivered against **201 resync frames** — ten times §9's cap,
+   * in control traffic, to the one client already established as unable to
+   * keep up. AC7's own words are "a SINGLE resynchronise directive rather
+   * than a backlog".
+   *
+   * The second distinct source inside a window is not simply suppressed,
+   * which would be the silent loss this whole story exists to remove. It
+   * upgrades the frame to `scope: "socket"` — "refetch everything" — which
+   * covers that project and every other one after it. So a client is never
+   * left unaware of rows it missed; it is only ever told more broadly.
+   *
+   * At most TWO frames per socket per second, therefore: one that names a
+   * project, and at most one that widens. §9's cap governs data; these two
+   * are the notice, and a notice that could itself be capped away would be
+   * useless.
+   */
+  private resyncFrameFor(socketId: string, projectId: string | null): ResyncEvent | undefined {
+    const now = Date.now();
+    let window = this.resyncWindows.get(socketId);
+    if (window === undefined || now - window.startedAt >= 1_000) {
+      window = { startedAt: now, sent: 0, project: undefined };
+      this.resyncWindows.set(socketId, window);
+    }
+
+    if (window.sent === 0) {
+      window.sent = 1;
+      window.project = projectId ?? undefined;
+      return projectId === null
+        ? { reason: "rate_limited", scope: "socket", project_id: null }
+        : { reason: "rate_limited", scope: "project", project_id: projectId };
+    }
+    // A SECOND, DIFFERENT source of loss in the same window. The first frame
+    // named one project; this says "more than that — refetch everything",
+    // which covers the second project and every one after it. No third frame
+    // is ever needed, because socket-wide is already the widest answer.
+    if (window.sent === 1 && window.project !== (projectId ?? undefined)) {
+      window.sent = 2;
+      return { reason: "rate_limited", scope: "socket", project_id: null };
+    }
+    return undefined;
   }
 
   /** This socket's coalescer, whose emit is the backpressure-honouring send. */
@@ -387,6 +518,7 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
     for (const slot of this.projectBudgets.keys()) {
       if (slot.startsWith(`${socketId}:`)) this.projectBudgets.delete(slot);
     }
+    this.resyncWindows.delete(socketId);
     this.joined.delete(socketId);
     this.joinedProjects.delete(socketId);
     const timer = this.revalidations.get(socketId);
@@ -564,6 +696,14 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
       socket.emit(SERVER_DRAINING_EVENT, { reconnect_after_ms: drainReconnectAfterMs() });
     }
     this.control?.disconnect();
+    // The fan-out subscriber holds the event loop open exactly as the control
+    // one does. Closing only `control` meant SIGTERM drained the sockets and
+    // then the process never exited, so `server.draining`'s carefully
+    // jittered reconnect advice was followed by a SIGKILL at the grace
+    // period. This file already documents the same class of bug making
+    // `pnpm test:integration` "exit 1 with 573 of 573 passing"; adding a
+    // second connection reintroduced it. Found by the second-engineer review.
+    this.fanout?.disconnect();
     for (const timer of this.revalidations.values()) clearInterval(timer);
   }
 

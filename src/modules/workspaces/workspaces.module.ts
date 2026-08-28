@@ -35,9 +35,11 @@ import { InvitationsService } from "./invitations.service.js";
   providers: [
     WorkspacesService,
     InvitationsService,
-    // STORY-026 T22 / D9 — the API process publishes realtime events through
-    // @socket.io/redis-emitter, never by standing up a socket.io server of its
-    // own. Chosen by environment exactly as the cache adapter is.
+    // STORY-026 T22 / D9 — the API process publishes realtime events onto a
+    // Valkey channel the gateway reads, never by standing up a socket.io
+    // server of its own. (It used @socket.io/redis-emitter until the delivery
+    // path moved per-socket; see realtimeFanoutChannel().) Chosen by
+    // environment exactly as the cache adapter is.
     {
       provide: REALTIME_PUBLISHER,
       useFactory: (): RealtimePublisher => RealtimePublisherProvider.create(),

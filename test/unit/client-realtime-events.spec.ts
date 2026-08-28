@@ -1,10 +1,16 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeAll, afterAll, describe, expect, it } from "vitest";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { beforeAll, afterAll, beforeEach, afterEach, describe, expect, it } from "vitest";
 import { REALTIME_EVENT_PAYLOADS } from "../../contracts/events/catalog.schema.js";
 import { realtimeEventNameSchema } from "../../contracts/events/event-name.schema.js";
-import { generateClient, generateOpenApiDocument } from "../../src/contracts/generate.js";
+import {
+  generateClient,
+  generateOpenApiDocument,
+  realtimeEventComponentName,
+} from "../../src/contracts/generate.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 
 // STORY-026 T24 — STORY-023 AC5 lists four things the published client must
@@ -16,6 +22,8 @@ import { applyFakeApiEnv } from "../support/fake-env.js";
 // `client/src`, so this checks the GENERATOR. A test reading the committed
 // output would pass on a stale file that nobody had regenerated — which is the
 // same class of defect as a drift check that compares a document to itself.
+
+const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
 let outDir: string;
 let events: string;
@@ -90,6 +98,68 @@ describe("STORY-026 · the published client carries §11's event catalog", () =>
       expect(readFileSync(join(second, "events.ts"), "utf8")).toBe(events);
     } finally {
       rmSync(second, { recursive: true, force: true });
+    }
+  });
+});
+
+// STORY-026 AC5 — "realtime event types", the half that was missing.
+//
+// The client shipped event NAMES and each payload's JSON Schema as DATA,
+// while this generator's own comment claimed the events were "typed per
+// event". A consumer could validate a frame at runtime and still had no
+// TypeScript type for it, so every handler took `unknown`. The payload
+// schemas now live in the document's `components.schemas`, which means the
+// same openapi-typescript pass that types every request and response types
+// these — one source, no second renderer, no new dependency.
+describe("STORY-026 · AC5 — the client carries a TYPE per event, not just a schema", () => {
+  const originalEnv = { ...process.env };
+  let dir: string | undefined;
+
+  beforeEach(() => {
+    applyFakeApiEnv();
+  });
+
+  afterEach(() => {
+    process.env = { ...originalEnv };
+    if (dir !== undefined) {
+      rmSync(dir, { recursive: true, force: true });
+      dir = undefined;
+    }
+  });
+
+  it("emits a payload type per event, sourced from the document's components", async () => {
+    const document = await generateOpenApiDocument();
+    dir = mkdtempSync(resolve(REPO_ROOT, "node_modules/.tmp-story026-ac5-"));
+    await generateClient(document, dir);
+
+    const events = readFileSync(join(dir, "events.ts"), "utf8");
+    expect(events, "the type map itself").toContain("export type RealtimeEventPayloads");
+
+    // Every event, not a sampled few — a map missing one entry is a handler
+    // silently typed `any` at exactly the call site that needed it.
+    const missing = realtimeEventNameSchema.options.filter(
+      (name) => !events.includes(`"${name}": components["schemas"]`),
+    );
+    expect(missing, `events with no payload type: ${JSON.stringify(missing)}`).toEqual([]);
+  });
+
+  // The discriminating half. A type map pointing at components that do not
+  // exist compiles to `any` under a loose config and would pass the check
+  // above while typing nothing.
+  it("the components those types point at are really in the document, with real fields", async () => {
+    const document = (await generateOpenApiDocument()) as unknown as {
+      components?: { schemas?: Record<string, { type?: string; properties?: Record<string, unknown> }> };
+    };
+    const schemas = document.components?.schemas ?? {};
+
+    for (const name of realtimeEventNameSchema.options) {
+      const schema = schemas[realtimeEventComponentName(name)];
+      expect(schema, `${name} has no component schema`).toBeDefined();
+      expect(schema!.type, `${name}'s component is not an object`).toBe("object");
+      expect(
+        Object.keys(schema!.properties ?? {}).length,
+        `${name}'s component has no properties — an empty type is not a type`,
+      ).toBeGreaterThan(0);
     }
   });
 });

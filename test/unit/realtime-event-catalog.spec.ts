@@ -9,6 +9,7 @@ import {
 } from "../../contracts/events/catalog.schema.js";
 import {
   REALTIME_COALESCING_MS,
+  PRODUCER_ENFORCED_EVENT_RULES,
   REALTIME_DELIVERY_BUDGET,
   REALTIME_EVENT_COUNT,
   REALTIME_EVENT_PRODUCER,
@@ -109,6 +110,29 @@ describe("STORY-026 · the realtime event catalog matches §11", () => {
     expect(Object.keys(REALTIME_DELIVERY_BUDGET).sort()).toEqual(
       ["aux.finding_created", "displacement.detected", "engine.degraded", "run.progress", "task.created"].sort(),
     );
+  });
+
+  // §11 has EIGHT rules, not five, and this file used to lock the five in as
+  // though that were the whole column. The other three are once-per-STATE —
+  // per threshold, per cycle — which the gateway cannot honour: its
+  // bookkeeping is per-socket and in-memory, so "once per cycle" enforced
+  // there is once per socket per process per month. They belong to the
+  // producers arriving with EPIC-04.
+  //
+  // Asserted as a DISJOINT, complete partition so neither list can quietly
+  // absorb the other's rows, and so a fourth producer-side rule has to be a
+  // deliberate edit here.
+  it("§11's other three rules are recorded as producer-enforced, not silently missing", () => {
+    expect(Object.keys(PRODUCER_ENFORCED_EVENT_RULES).sort()).toEqual([
+      "credits.depleted",
+      "credits.threshold",
+      "quota.threshold",
+    ]);
+
+    const budgeted = new Set<string>(Object.keys(REALTIME_DELIVERY_BUDGET));
+    for (const name of Object.keys(PRODUCER_ENFORCED_EVENT_RULES)) {
+      expect(budgeted.has(name), `${name} cannot be both gateway-budgeted and producer-enforced`).toBe(false);
+    }
   });
 
   // The distinction this story exists to draw. Replace-latest is right for a
