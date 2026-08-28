@@ -445,16 +445,28 @@ describe("STORY-120 · readiness as the runtime role", () => {
   // version comparison failing (which rolling any migration back would
   // cause anyway, and would therefore prove nothing about the grant).
   it("scenario 6 — rolling the grant migration back revokes the read and returns readiness to 503", async () => {
+    // ROLLS BACK UNTIL IT REACHES THE GRANT, rather than assuming the grant
+    // is the newest migration. It was when this was written, and STORY-032's
+    // 0016 displaced it — the assertion then failed for a reason that had
+    // nothing to do with what it tests. A test coupled to "my migration is
+    // last" breaks for the next person to add one, and the breakage looks
+    // like a readiness defect rather than like ordinary drift.
     const owner = await ownerClient();
-    let rolledBack: string | null;
+    const rolledBack: string[] = [];
     try {
-      rolledBack = await rollbackLast(owner);
+      for (let step = 0; step < 20; step += 1) {
+        const name = await rollbackLast(owner);
+        if (name === null) break;
+        rolledBack.push(name);
+        if (/migration_ledger/.test(name)) break;
+      }
     } finally {
       await owner.end();
     }
-    expect(rolledBack, "the ledger grant must be the newest migration for this rollback to target it").toMatch(
-      /migration_ledger/,
-    );
+    expect(
+      rolledBack.some((name) => /migration_ledger/.test(name)),
+      `the ledger grant must have been rolled back; reached ${JSON.stringify(rolledBack)}`,
+    ).toBe(true);
 
     const client = await runtimeRoleClient();
     try {
