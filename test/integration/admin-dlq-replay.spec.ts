@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Redis } from "ioredis";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue, dlqEntrySchema } from "../../src/lib/queue/dead-letter.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { buildWorker } from "../../src/lib/queue/worker-factory.js";
@@ -34,9 +34,9 @@ async function driveJobToDlq(options: {
   data: unknown;
   idempotencyKey: string;
 }) {
-  const producerConnection = createQueueConnection(options.connectionString);
-  const workerConnection = createQueueConnection(options.connectionString);
-  const dlqConnection = createQueueConnection(options.connectionString);
+  const producerConnection = createQueueWorkerConnection(options.connectionString);
+  const workerConnection = createQueueWorkerConnection(options.connectionString);
+  const dlqConnection = createQueueWorkerConnection(options.connectionString);
 
   const queue = buildQueue(options.entry, { connection: producerConnection, prefix: options.prefix });
   const dlqQueue = buildDlqQueue(options.entry, { connection: dlqConnection, prefix: options.prefix });
@@ -112,9 +112,9 @@ async function driveTamperedJobToDlq(options: {
   prefix: string;
   idempotencyKey: string;
 }) {
-  const producerConnection = createQueueConnection(options.connectionString);
-  const workerConnection = createQueueConnection(options.connectionString);
-  const dlqConnection = createQueueConnection(options.connectionString);
+  const producerConnection = createQueueWorkerConnection(options.connectionString);
+  const workerConnection = createQueueWorkerConnection(options.connectionString);
+  const dlqConnection = createQueueWorkerConnection(options.connectionString);
 
   const queue = buildQueue(options.entry, { connection: producerConnection, prefix: options.prefix });
   const dlqQueue = buildDlqQueue(options.entry, { connection: dlqConnection, prefix: options.prefix });
@@ -172,7 +172,7 @@ describe("STORY-030 · AdminService.replayDeadLetterJob — administrative DLQ r
 
   beforeAll(async () => {
     fixture = await startValkeyFixture();
-    lockConnection = createQueueConnection(fixture.connectionString);
+    lockConnection = createQueueWorkerConnection(fixture.connectionString);
   }, 60_000);
 
   afterAll(async () => {
@@ -203,7 +203,7 @@ describe("STORY-030 · AdminService.replayDeadLetterJob — administrative DLQ r
     // with its stale signature.
     let processedCount = 0;
     let processedKid: string | undefined;
-    const replayWorkerConnection = createQueueConnection(fixture.connectionString);
+    const replayWorkerConnection = createQueueWorkerConnection(fixture.connectionString);
     const replayWorker = buildWorker(ENTRY, {
       connection: replayWorkerConnection,
       prefix,
@@ -337,7 +337,7 @@ describe("STORY-030 · AdminService.replayDeadLetterJob — administrative DLQ r
 
     let processedCount = 0;
     let processedPayload: unknown;
-    const replayWorkerConnection = createQueueConnection(fixture.connectionString);
+    const replayWorkerConnection = createQueueWorkerConnection(fixture.connectionString);
     const replayWorker = buildWorker(NON_TENANT_ENTRY, {
       connection: replayWorkerConnection,
       prefix,
@@ -370,8 +370,8 @@ describe("STORY-030 · AdminService.replayDeadLetterJob — administrative DLQ r
 
   it("a jobId with no corresponding DLQ entry throws rather than silently no-op-ing", async () => {
     const prefix = queueKeyPrefix("admin-replay-missing");
-    const dlqConnection = createQueueConnection(fixture.connectionString);
-    const producerConnection = createQueueConnection(fixture.connectionString);
+    const dlqConnection = createQueueWorkerConnection(fixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(fixture.connectionString);
     const dlqQueue = buildDlqQueue(ENTRY, { connection: dlqConnection, prefix });
     const targetQueue = buildQueue(ENTRY, { connection: producerConnection, prefix });
     cleanups.push(async () => {

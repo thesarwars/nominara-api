@@ -3,7 +3,7 @@ import { TerminusModule } from "@nestjs/terminus";
 import { Redis } from "ioredis";
 import { loadEnv } from "../../config/env.js";
 import { MIGRATIONS_DIR } from "../../db/migrate-runner.js";
-import { createQueueConnection, queueKeyPrefix } from "../../lib/queue/connection.js";
+import { createQueueReaderConnection, queueKeyPrefix } from "../../lib/queue/connection.js";
 import { HealthController } from "./health.controller.js";
 import {
   CACHE_CONNECTION_TOKEN,
@@ -45,7 +45,7 @@ function createHealthCacheConnection(url: string): Redis {
   providers: [
     HealthService,
     { provide: MIGRATIONS_DIR_TOKEN, useValue: MIGRATIONS_DIR },
-    { provide: QUEUE_CONNECTION_TOKEN, useFactory: (): Redis => createQueueConnection(loadEnv().QUEUE_REDIS_URL) },
+    { provide: QUEUE_CONNECTION_TOKEN, useFactory: (): Redis => createQueueReaderConnection(loadEnv().QUEUE_REDIS_URL) },
     { provide: QUEUE_KEY_PREFIX_TOKEN, useFactory: (): string => queueKeyPrefix(loadEnv().NODE_ENV) },
     { provide: CACHE_CONNECTION_TOKEN, useFactory: (): Redis => createHealthCacheConnection(loadEnv().VALKEY_CACHE_URL) },
   ],

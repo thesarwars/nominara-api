@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue, type DlqEntry } from "../../src/lib/queue/dead-letter.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { buildWorker } from "../../src/lib/queue/worker-factory.js";
@@ -32,9 +32,9 @@ describe("STORY-030 · queue-deploy-single-attempt — deploy.cms fails once wit
   });
 
   it("deploy.cms: a failing job is invoked exactly once and lands directly in deploy.cms.dlq", async () => {
-    const producerConnection = createQueueConnection(fixture.connectionString);
-    const workerConnection = createQueueConnection(fixture.connectionString);
-    const dlqConnection = createQueueConnection(fixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const workerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const dlqConnection = createQueueWorkerConnection(fixture.connectionString);
     const prefix = queueKeyPrefix("deploy-single-attempt");
 
     const queue = buildQueue(deployEntry, { connection: producerConnection, prefix });
@@ -82,9 +82,9 @@ describe("STORY-030 · queue-deploy-single-attempt — deploy.cms fails once wit
   }, 20_000);
 
   it("negative control — capture.plan (documented 3x exp retry) DOES retry after a failure", async () => {
-    const producerConnection = createQueueConnection(fixture.connectionString);
-    const workerConnection = createQueueConnection(fixture.connectionString);
-    const dlqConnection = createQueueConnection(fixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const workerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const dlqConnection = createQueueWorkerConnection(fixture.connectionString);
     const prefix = queueKeyPrefix("deploy-single-attempt-negative-control");
 
     const queue = buildQueue(captureEntry, { connection: producerConnection, prefix });

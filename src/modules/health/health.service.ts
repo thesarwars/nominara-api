@@ -209,8 +209,12 @@ export class HealthService implements OnModuleDestroy {
    * sentence above true: an unreachable instance degrades this to an empty
    * list, exactly like a failing one, and never blocks the probe.
    *
-   * The deeper cause — an unbounded read reachable from anywhere that uses
-   * createQueueConnection — is STORY-030's, and is being filed separately.
+   * The deeper cause is fixed too, in STORY-121: the connection factory now
+   * has two named roles, and this service takes the READER — bounded retry,
+   * short connect timeout — so an unreachable instance produces an error to
+   * catch rather than silence. The deadline below stays as the second line of
+   * defence: the connection failing fast is the fix, and the deadline is what
+   * keeps the probe answering if a future read finds a new way to block.
    */
   private async queueDepths(): Promise<QueueDepth[]> {
     const reads = Promise.all(

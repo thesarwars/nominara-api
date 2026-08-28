@@ -1,6 +1,6 @@
 import type { Job } from "bullmq";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue, dlqQueueName, recordDeadLetter, type DlqEntry } from "../../src/lib/queue/dead-letter.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { buildWorker } from "../../src/lib/queue/worker-factory.js";
@@ -32,9 +32,9 @@ describe("STORY-030 · queue-dead-letter — a permanently-failed job lands in {
   });
 
   it.each(REPRESENTATIVE_QUEUES)("$name: exhausting the retry ladder lands the job in $name.dlq with payload + error + attempt count", async (entry) => {
-    const producerConnection = createQueueConnection(fixture.connectionString);
-    const workerConnection = createQueueConnection(fixture.connectionString);
-    const dlqConnection = createQueueConnection(fixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const workerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const dlqConnection = createQueueWorkerConnection(fixture.connectionString);
     const prefix = queueKeyPrefix(`dlq-${entry.name}`);
 
     const queue = buildQueue(entry, { connection: producerConnection, prefix });
@@ -84,7 +84,7 @@ describe("STORY-030 · queue-dead-letter — a permanently-failed job lands in {
   }, 30_000);
 
   it.each(REPRESENTATIVE_QUEUES)("$name.dlq: a DLQ entry is never itself retried", async (entry) => {
-    const dlqConnection = createQueueConnection(fixture.connectionString);
+    const dlqConnection = createQueueWorkerConnection(fixture.connectionString);
     const prefix = queueKeyPrefix(`dlq-noretry-${entry.name}`);
     const dlqQueue = buildDlqQueue(entry, { connection: dlqConnection, prefix });
 

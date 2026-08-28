@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { buildWorker } from "../../src/lib/queue/worker-factory.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
@@ -42,10 +42,10 @@ describe("STORY-030 · capture.execute saturation does not delay lookup.execute 
   it("a saturated capture.execute backlog does not block a concurrently-enqueued lookup.execute job", async () => {
     const prefix = queueKeyPrefix("interactive-pool-isolation");
 
-    const captureProducerConnection = createQueueConnection(fixture.connectionString);
-    const captureWorkerConnection = createQueueConnection(fixture.connectionString);
-    const lookupProducerConnection = createQueueConnection(fixture.connectionString);
-    const lookupWorkerConnection = createQueueConnection(fixture.connectionString);
+    const captureProducerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const captureWorkerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const lookupProducerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const lookupWorkerConnection = createQueueWorkerConnection(fixture.connectionString);
 
     const captureQueue = buildQueue(CAPTURE_EXECUTE, { connection: captureProducerConnection, prefix });
     const lookupQueue = buildQueue(LOOKUP_EXECUTE, { connection: lookupProducerConnection, prefix });
