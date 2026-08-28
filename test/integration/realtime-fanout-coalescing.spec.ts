@@ -19,6 +19,7 @@ import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import {
   NoopRealtimePublisher,
   ValkeyRealtimePublisher,
+  realtimeControlChannel,
   realtimeFanoutChannel,
 } from "../../src/lib/cache/realtime-publisher.js";
 import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
@@ -105,6 +106,10 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
     // The gateway subscribes to the fan-out channel, and the publisher writes
     // to it — the same two ends the deployed system wires together.
     app.get(RealtimeGateway).attachFanoutChannel(valkey.url, realtimeFanoutChannel(cacheKeyNamespace()));
+    // The CONTROL channel too — `member.changed` is what closes a revoked
+    // socket immediately instead of leaving it to the 60s timer, and until now
+    // nothing in the suite constructed both ends of it.
+    app.get(RealtimeGateway).attachControlChannel(valkey.url, realtimeControlChannel(cacheKeyNamespace()));
     publisher = new ValkeyRealtimePublisher(valkey.url);
     await new Promise((resolve) => setTimeout(resolve, 250));
   }, 180_000);
@@ -287,6 +292,52 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
       await secondApp.close();
     }
   }, 45_000);
+
+  // THE CROSS-PROCESS REVOCATION WIRE, which had no test at all.
+  //
+  // Nothing constructed ValkeyRealtimePublisher, called attachControlChannel
+  // and asserted the two ends meet. They compute the channel INDEPENDENTLY
+  // from process.env, so a CACHE_KEY_NAMESPACE mismatch between the api and
+  // gateway containers disables immediate revocation silently — a removed
+  // member keeps a live socket for the full 60 seconds §7 treats as the
+  // ceiling, not the mechanism, and nothing anywhere says so.
+  it("a member.changed published by the API closes the socket, cross-process", async () => {
+    const { workspaceId, ownerId, client } = await joinedSocket();
+
+    const closed = new Promise<"closed">((resolve) => {
+      client.on("disconnect", () => resolve("closed"));
+    });
+    const stayedOpen = new Promise<"open">((resolve) => {
+      setTimeout(() => resolve("open"), 3_000);
+    });
+
+    publisher.memberChanged(workspaceId, {
+      workspace_id: workspaceId,
+      user_id: ownerId,
+      role: "viewer",
+      status: "removed",
+    });
+
+    await expect(
+      Promise.race([closed, stayedOpen]),
+      "the control channel is what makes revocation immediate rather than a 60s wait",
+    ).resolves.toBe("closed");
+  }, 30_000);
+
+  // WHAT THIS FILE STILL CANNOT COVER, stated rather than left implied.
+  //
+  // The remaining risk is a CACHE_KEY_NAMESPACE mismatch between the api and
+  // gateway containers: both derive their channel from the environment, so
+  // they can disagree and revocation goes quiet with nothing to see. A test
+  // here cannot catch it — both ends call the same function in one process,
+  // so any assertion comparing them is trivially true. I wrote that assertion
+  // first, mutated the channel builder, and watched it pass; it was deleted
+  // rather than shipped, because a check that cannot fail is worse than none.
+  //
+  // Catching it needs a real mechanism — a startup handshake on the channel,
+  // or a deploy-time assertion that the two containers' configuration matches
+  // — and that is a decision, not an oversight. Recorded as open in
+  // STORY-026.
 
   // The guard on everything below: if nothing arrives at all, every
   // "at most N" assertion passes vacuously.

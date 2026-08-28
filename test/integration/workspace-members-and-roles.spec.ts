@@ -304,6 +304,45 @@ describe("STORY-021 · member listing, role changes, and removal within the matr
       expect(realtime.published[0]!.workspaceId).toBe(f.workspaceId);
     });
 
+    // THE COMMIT IS WHAT MAKES IT TRUE, and the event used to go out before
+    // it. `member.changed` closes the affected sockets and tells every client
+    // the membership changed — so a transaction that failed after the publish
+    // left sockets revoked and clients told about a change the database never
+    // kept, contradicted by the very API they refetch. Found by the STORY-026
+    // review; the seam is `afterCommit` in src/tenancy/tenant-context.ts.
+    //
+    // Driven by failing the COMMIT itself rather than the handler: a handler
+    // that throws never reaches the publish at all, so it would prove nothing
+    // about ordering. This fails at the one moment the work is done and the
+    // transaction is not yet durable.
+    it("emits NOTHING when the transaction fails to commit", async () => {
+      const f = await makeFixture();
+      const client = await pool.connect();
+      const realQuery = client.query.bind(client);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (client as any).query = (text: any, ...rest: any[]) => {
+        if (text === "COMMIT") throw new Error("simulated commit failure");
+        return realQuery(text, ...rest);
+      };
+
+      try {
+        await expect(
+          withTenantContext(client, { workspaceId: f.workspaceId, actorId: f.ownerId }, () =>
+            service.updateMemberRole(f.workspaceId, "owner", f.viewerMemberId, { role: "analyst" }),
+          ),
+        ).rejects.toThrow(/simulated commit failure/);
+      } finally {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (client as any).query = realQuery;
+        client.release();
+      }
+
+      expect(
+        realtime.published,
+        "a rolled-back membership change must leave no socket revoked and no client told",
+      ).toHaveLength(0);
+    });
+
     it("emits nothing when the mutation is REFUSED", async () => {
       // An event announcing a change that did not happen would make every
       // client refetch and see the old state — and, for a removal, would tell

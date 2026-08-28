@@ -126,6 +126,32 @@ export const REALTIME_DELIVERY_BUDGET = {
 export type BudgetedEventName = keyof typeof REALTIME_DELIVERY_BUDGET;
 
 /**
+ * §11's other three rules, and why they are NOT in the table above.
+ *
+ * `quota.threshold` is "once per threshold", `credits.threshold` "once per
+ * threshold per cycle", `credits.depleted` "once per cycle". None is a time
+ * window — they are once-per-STATE, and the state is a billing cycle that
+ * outlives any socket, any gateway process and any replica.
+ *
+ * The gateway cannot honour them. It has no idea which threshold was crossed
+ * or which cycle is current beyond what a payload asserts, and its bookkeeping
+ * is per-socket and in-memory: it resets on reconnect, and a second replica
+ * has its own. "Once per cycle" enforced that way is once per socket per
+ * process per month, which is not the same promise and is worse than none,
+ * because it looks like the promise.
+ *
+ * They belong to the PRODUCER, with durable state — the workers that arrive
+ * with EPIC-04+, which is also when these events first have a publisher.
+ * Listed here so the absence is a recorded decision rather than an oversight
+ * the next reader has to infer from an empty row.
+ */
+export const PRODUCER_ENFORCED_EVENT_RULES = {
+  "quota.threshold": "once per threshold",
+  "credits.threshold": "once per threshold per cycle",
+  "credits.depleted": "once per cycle",
+} as const;
+
+/**
  * The replace-latest windows alone, DERIVED rather than restated.
  *
  * `Coalescer` only ever handled replace-latest and should only ever be asked

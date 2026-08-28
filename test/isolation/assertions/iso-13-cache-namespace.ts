@@ -100,8 +100,72 @@ async function assertTenantKeyConstructors(): Promise<void> {
   }
 }
 
+/**
+ * The REALTIME channels, which this assertion could not see at all.
+ *
+ * STORY-026's review found the socket.io adapter and emitter using the
+ * library default channel prefix — the literal "socket.io", built INSIDE the
+ * libraries, so it never passed through valkey-keys.ts and carried no
+ * deployment segment. Two environments pointed at one Valkey cache instance
+ * cross-broadcast every event of every workspace, in both directions; room
+ * names are identical across deployments, so nothing downstream would notice.
+ * That is ISO-13's own subject — a channel is a key — and this gate, the one
+ * that exists to catch exactly this, was blind to it. The fix shipped guarded
+ * only by a unit test.
+ *
+ * These channels are GLOBAL rather than tenant-scoped, so the property is not
+ * "carries a workspace id" but "carries the deployment namespace, and two
+ * deployments never collide".
+ */
+async function assertRealtimeChannelNamespacing(): Promise<void> {
+  // Cache-busted for the same reason the constructor half is — see there.
+  const stamp = String(process.hrtime.bigint());
+  const namespaceModule = (await import(
+    `${new URL("../../../src/lib/cache/key-namespace.js", import.meta.url).href}?iso13=${stamp}`
+  )) as typeof import("../../../src/lib/cache/key-namespace.js");
+  const publisher = (await import(
+    `${new URL("../../../src/lib/cache/realtime-publisher.js", import.meta.url).href}?iso13=${stamp}`
+  )) as typeof import("../../../src/lib/cache/realtime-publisher.js");
+
+  const DEPLOY_A = "staging";
+  const DEPLOY_B = "production";
+
+  const forms: { name: string; build: (namespace: string) => string }[] = [
+    { name: "socketIoChannelPrefix", build: (ns) => namespaceModule.socketIoChannelPrefix(ns) },
+    { name: "realtimeControlChannel", build: (ns) => publisher.realtimeControlChannel(ns) },
+    { name: "realtimeFanoutChannel", build: (ns) => publisher.realtimeFanoutChannel(ns) },
+  ];
+
+  const seen = new Map<string, string>();
+  for (const form of forms) {
+    const a = form.build(DEPLOY_A);
+    const b = form.build(DEPLOY_B);
+
+    if (a === b) {
+      throw new Error(
+        `ISO-13 (realtime): ${form.name}() produces the SAME channel for two deployments — ` +
+          "staging and production sharing one Valkey would deliver each other's events",
+      );
+    }
+    if (!a.startsWith(`${DEPLOY_A}:`)) {
+      throw new Error(
+        `ISO-13 (realtime): ${form.name}() does not open with the deployment namespace (got "${a}")`,
+      );
+    }
+    // ...and the three must not collide with each other WITHIN a deployment:
+    // a control message parsed as a client event, or either as an adapter
+    // frame, would be a silent cross-wire.
+    const previous = seen.get(a);
+    if (previous !== undefined) {
+      throw new Error(`ISO-13 (realtime): ${form.name}() collides with ${previous}() — both build "${a}"`);
+    }
+    seen.set(a, form.name);
+  }
+}
+
 export async function assertIso13CacheNamespacing(): Promise<void> {
   await assertTenantKeyConstructors();
+  await assertRealtimeChannelNamespacing();
 
   const fixtureMatches = await scanFixturesForKeyLiterals(CACHE_KEY_PATTERN);
   const counts = { valid: 0, exception: 0, invalid: 0 } as Record<Classification, number>;
@@ -123,6 +187,14 @@ export async function assertIso13CacheNamespacing(): Promise<void> {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// ONE BREAKER PER ENTRY (test/isolation/meta/breaker-matrix.spec.ts enforces
+// it), and it stays on the tenant boundary rather than moving to the realtime
+// half added in STORY-026. Both properties are real, but a workspace id
+// missing from a cache key crosses TENANTS, while a deployment namespace
+// missing from a channel crosses ENVIRONMENTS — the first is the graver of the
+// two, and the one this suite exists for. The realtime half is verified
+// non-vacuous by mutation instead, recorded in the STORY-026 review notes.
+//
 // The breaker that used to live here planted an un-namespaced literal in src/
 // and therefore demonstrated the SCANNER failing. It is gone, and the reason is
 // worth stating: the scanner's own fixture self-test above already proves it is

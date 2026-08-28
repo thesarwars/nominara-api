@@ -17,7 +17,7 @@ import {
   WorkspaceLimitReachedException,
   WorkspaceSuspendedException,
 } from "../../tenancy/errors.js";
-import { currentTenantStore, withActorContext, withTenantContext } from "../../tenancy/tenant-context.js";
+import { afterCommit, currentTenantStore, withActorContext, withTenantContext } from "../../tenancy/tenant-context.js";
 import { SessionService } from "../identity/session.service.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { MembershipService } from "./membership.service.js";
@@ -590,11 +590,19 @@ export class WorkspacesService {
     // of the event: a role change can make an already-authorised socket
     // over-privileged, and without this the only thing closing that window is
     // the gateway's 60-second re-validation timer.
-    this.realtime.memberChanged(workspaceId, {
-      workspace_id: workspaceId,
-      user_id: targetRow.user_id,
-      role: response.role,
-      status: response.status,
+    //
+    // AFTER THE COMMIT, not here in the transaction. This event closes the
+    // affected sockets and tells every client the membership changed; running
+    // it inside meant a transaction that then failed left sockets closed and
+    // clients told about a change that never happened, contradicted by the
+    // very API they refetch. Found by the STORY-026 review.
+    afterCommit(() => {
+      this.realtime.memberChanged(workspaceId, {
+        workspace_id: workspaceId,
+        user_id: targetRow.user_id,
+        role: response.role,
+        status: response.status,
+      });
     });
 
     return response;
@@ -627,15 +635,21 @@ export class WorkspacesService {
     // revocation window from sixty seconds to immediate
     // (security-and-tenancy.md §7).
     //
-    // Emitted AFTER the mutation and never awaited. A realtime event is a hint;
+    // Emitted after the COMMIT and never awaited. A realtime event is a hint;
     // the authoritative answer is the API the client refetches. Failing the
     // removal because a cache was briefly unreachable would trade a committed,
     // security-relevant change for a notification.
-    this.realtime.memberChanged(workspaceId, {
-      workspace_id: workspaceId,
-      user_id: targetRow.user_id,
-      role: targetRow.role as MemberResponse["role"],
-      status: "removed",
+    //
+    // "After the mutation" is not the same as after the commit, and this said
+    // the former while doing neither — it ran inside the transaction, so a
+    // failed commit revoked a live socket for a removal that never happened.
+    afterCommit(() => {
+      this.realtime.memberChanged(workspaceId, {
+        workspace_id: workspaceId,
+        user_id: targetRow.user_id,
+        role: targetRow.role as MemberResponse["role"],
+        status: "removed",
+      });
     });
   }
 }
