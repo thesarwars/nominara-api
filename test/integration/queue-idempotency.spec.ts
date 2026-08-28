@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { buildWorker } from "../../src/lib/queue/worker-factory.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
@@ -26,8 +26,8 @@ describe("STORY-030 · queue-idempotency — a replay with the same key produces
   });
 
   it.each(QUEUE_TOPOLOGY)("$name: same idempotency key replayed twice → exactly one effect", async (entry) => {
-    const producerConnection = createQueueConnection(fixture.connectionString);
-    const workerConnection = createQueueConnection(fixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const workerConnection = createQueueWorkerConnection(fixture.connectionString);
     const prefix = queueKeyPrefix(`idem-same-${entry.name}`);
 
     const queue = buildQueue(entry, { connection: producerConnection, prefix });
@@ -65,8 +65,8 @@ describe("STORY-030 · queue-idempotency — a replay with the same key produces
   }, 30_000);
 
   it.each(QUEUE_TOPOLOGY)("$name: two DIFFERENT idempotency keys → two effects", async (entry) => {
-    const producerConnection = createQueueConnection(fixture.connectionString);
-    const workerConnection = createQueueConnection(fixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const workerConnection = createQueueWorkerConnection(fixture.connectionString);
     const prefix = queueKeyPrefix(`idem-diff-${entry.name}`);
 
     const queue = buildQueue(entry, { connection: producerConnection, prefix });

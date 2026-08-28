@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { withEngineLease } from "../../src/lib/engines/engine-lease.js";
 import { TokenBucket } from "../../src/lib/engines/token-bucket.js";
 import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixture.js";
@@ -36,9 +36,9 @@ describe("STORY-031 · engine-lease — no lease re-delays via BullMQ's DelayedE
   });
 
   it("a job denied a lease is moved to delayed (not failed), attemptsMade stays 0, and it processes once the bucket refills", async () => {
-    const producerConnection = createQueueConnection(queueFixture.connectionString);
-    const workerConnection = createQueueConnection(queueFixture.connectionString);
-    const cacheRedis = createQueueConnection(cacheFixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(queueFixture.connectionString);
+    const workerConnection = createQueueWorkerConnection(queueFixture.connectionString);
+    const cacheRedis = createQueueWorkerConnection(cacheFixture.connectionString);
     const prefix = queueKeyPrefix("engine-lease-test-1");
 
     const queue = buildQueue(ENTRY, { connection: producerConnection, prefix });

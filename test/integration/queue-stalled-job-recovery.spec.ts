@@ -1,6 +1,6 @@
 import { Queue, Worker, type Job } from "bullmq";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixture.js";
 import { waitFor } from "../support/queue-test-harness.js";
 
@@ -64,14 +64,14 @@ describe("STORY-030 Phase C · stalled-job recovery — a dropped connection mid
       const QUEUE_NAME = "test.stall-recovery";
       const prefix = queueKeyPrefix("stall-recovery");
 
-      const producerConnection = createQueueConnection(fixture.connectionString);
+      const producerConnection = createQueueWorkerConnection(fixture.connectionString);
       const queue = new Queue(QUEUE_NAME, { connection: producerConnection, prefix });
 
       const pickups: number[] = [];
       let workerACaughtJob = false;
       let completedCount = 0;
 
-      const connA = createQueueConnection(fixture.connectionString);
+      const connA = createQueueWorkerConnection(fixture.connectionString);
       const workerA = new Worker(
         QUEUE_NAME,
         async (job: Job) => {
@@ -91,7 +91,7 @@ describe("STORY-030 Phase C · stalled-job recovery — a dropped connection mid
       });
 
       let workerB: Worker | undefined;
-      let connB: ReturnType<typeof createQueueConnection> | undefined;
+      let connB: ReturnType<typeof createQueueWorkerConnection> | undefined;
 
       try {
         await queue.add(QUEUE_NAME, { probe: true }, { attempts: 2 });
@@ -102,7 +102,7 @@ describe("STORY-030 Phase C · stalled-job recovery — a dropped connection mid
         // deterministically exercising the recovery path.
         await waitFor(() => workerACaughtJob, { timeoutMs: 10_000, label: "worker A to pick up the job" });
 
-        connB = createQueueConnection(fixture.connectionString);
+        connB = createQueueWorkerConnection(fixture.connectionString);
         workerB = new Worker(
           QUEUE_NAME,
           async (job: Job) => {

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { buildWorker } from "../../src/lib/queue/worker-factory.js";
 import { QUEUE_TOPOLOGY, type QueueTopologyEntry } from "../../src/lib/queue/topology.js";
@@ -39,8 +39,8 @@ describe("STORY-030 · queue-signing-rotation — rotating keys and a tampered s
   });
 
   it.each(REPRESENTATIVE_QUEUES)("$name: a job signed under kid=K1 still verifies after rotating current to K2", async (entry) => {
-    const producerConnection = createQueueConnection(fixture.connectionString);
-    const workerConnection = createQueueConnection(fixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const workerConnection = createQueueWorkerConnection(fixture.connectionString);
     const prefix = queueKeyPrefix(`rotate-${entry.name}`);
 
     const queue = buildQueue(entry, { connection: producerConnection, prefix });
@@ -74,8 +74,8 @@ describe("STORY-030 · queue-signing-rotation — rotating keys and a tampered s
   }, 30_000);
 
   it.each(REPRESENTATIVE_QUEUES)("$name: a job signed under a kid outside the configured window is rejected", async (entry) => {
-    const producerConnection = createQueueConnection(fixture.connectionString);
-    const workerConnection = createQueueConnection(fixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const workerConnection = createQueueWorkerConnection(fixture.connectionString);
     const prefix = queueKeyPrefix(`outside-${entry.name}`);
 
     const queue = buildQueue(entry, { connection: producerConnection, prefix });

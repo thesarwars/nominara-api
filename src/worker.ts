@@ -10,7 +10,7 @@ import { createPgPool } from "./db/pg-pool.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
 import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
-import { createQueueConnection, queueKeyPrefix } from "./lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue } from "./lib/queue/dead-letter.js";
 import { queuesForGroup } from "./lib/queue/group.js";
 import { buildWorker, signingKeysFromEnv } from "./lib/queue/worker-factory.js";
@@ -106,11 +106,11 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
 
   try {
     for (const entry of entries) {
-      const dlqQueue = buildDlqQueue(entry, { connection: createQueueConnection(env.QUEUE_REDIS_URL), prefix });
+      const dlqQueue = buildDlqQueue(entry, { connection: createQueueWorkerConnection(env.QUEUE_REDIS_URL), prefix });
       dlqQueues.push(dlqQueue);
 
       const worker = buildWorker(entry, {
-        connection: createQueueConnection(env.QUEUE_REDIS_URL),
+        connection: createQueueWorkerConnection(env.QUEUE_REDIS_URL),
         prefix,
         keys,
         autorun: false,

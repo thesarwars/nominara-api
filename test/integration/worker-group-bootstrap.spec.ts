@@ -7,7 +7,7 @@ import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixtur
 // → one image, correct group." `bootstrapWorker()` must construct exactly
 // the invoked group's Worker instances and zero others, and an unknown
 // group must throw BEFORE any Redis connection is even attempted — asserted
-// here by spying on connection.ts's createQueueConnection and requiring it
+// here by spying on connection.ts's createQueueWorkerConnection and requiring it
 // is NEVER called on the invalid-group path. A real Valkey testcontainer
 // backs the valid-group path so `queuesForGroup`'s output is checked against
 // ACTUALLY constructed Worker instances, not merely against the topology
@@ -36,9 +36,9 @@ async function mockConnectionSpy() {
   vi.resetModules();
   vi.doMock("../../src/lib/queue/connection.js", async () => {
     const actual = await vi.importActual<typeof import("../../src/lib/queue/connection.js")>("../../src/lib/queue/connection.js");
-    return { ...actual, createQueueConnection: vi.fn(actual.createQueueConnection) };
+    return { ...actual, createQueueWorkerConnection: vi.fn(actual.createQueueWorkerConnection) };
   });
-  return (await import("../../src/lib/queue/connection.js")).createQueueConnection as unknown as ReturnType<typeof vi.fn>;
+  return (await import("../../src/lib/queue/connection.js")).createQueueWorkerConnection as unknown as ReturnType<typeof vi.fn>;
 }
 
 describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs exactly one group's queues/workers", () => {
@@ -61,7 +61,7 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
   it.each(Object.entries(EXPECTED_GROUP_MEMBERSHIP))(
     "WORKER_GROUP=%s constructs exactly that group's workers and zero others",
     async (group, expectedNames) => {
-      const createQueueConnectionSpy = await mockConnectionSpy();
+      const createQueueWorkerConnectionSpy = await mockConnectionSpy();
       process.env.WORKER_GROUP = group;
       const { bootstrapWorker, WORKER_GROUP_WORKERS } = await import("../../src/worker.js");
 
@@ -71,7 +71,7 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
         const names = runtime.workers.map((worker) => worker.name).sort();
         expect(names).toEqual([...expectedNames].sort());
         // One connection per worker + one per its DLQ queue.
-        expect(createQueueConnectionSpy).toHaveBeenCalledTimes(expectedNames.length * 2);
+        expect(createQueueWorkerConnectionSpy).toHaveBeenCalledTimes(expectedNames.length * 2);
       } finally {
         await app.close();
       }
@@ -80,19 +80,19 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
   );
 
   it("an unknown WORKER_GROUP throws before bootstrapWorker() opens any queue connection", async () => {
-    const createQueueConnectionSpy = await mockConnectionSpy();
+    const createQueueWorkerConnectionSpy = await mockConnectionSpy();
     process.env.WORKER_GROUP = "not-a-real-group";
 
     const { bootstrapWorker } = await import("../../src/worker.js");
 
     await expect(bootstrapWorker()).rejects.toThrow();
-    expect(createQueueConnectionSpy).not.toHaveBeenCalled();
+    expect(createQueueWorkerConnectionSpy).not.toHaveBeenCalled();
   });
 
   // Code-review fix (post Phase B) — a construction failure partway through a
   // group must not leak the queues/workers/connections already built for the
   // entries BEFORE the failing one. "crawl" has 4 queues (discover,
-  // fingerprint, audit, gsc.sync); the 3rd createQueueConnection() call is
+  // fingerprint, audit, gsc.sync); the 3rd createQueueWorkerConnection() call is
   // fingerprint's FIRST connection (its DLQ queue's) — so discover's worker
   // and DLQ queue must already exist and must be closed before the rethrow,
   // while fingerprint/audit/gsc.sync never get built at all.
@@ -104,12 +104,12 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
       const actual = await vi.importActual<typeof import("../../src/lib/queue/connection.js")>("../../src/lib/queue/connection.js");
       return {
         ...actual,
-        createQueueConnection: vi.fn((url: string) => {
+        createQueueWorkerConnection: vi.fn((url: string) => {
           callCount += 1;
           if (callCount === 3) {
             throw injectedError;
           }
-          return actual.createQueueConnection(url);
+          return actual.createQueueWorkerConnection(url);
         }),
       };
     });

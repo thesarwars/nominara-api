@@ -11,7 +11,7 @@ import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
 import { HealthModule } from "../../src/modules/health/health.module.js";
 import { HealthService, MIGRATIONS_DIR_TOKEN } from "../../src/modules/health/health.service.js";
 import { configureApp } from "../../src/api/configure-app.js";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixture.js";
@@ -140,7 +140,7 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
 
     const prefix = queueKeyPrefix(process.env.NODE_ENV ?? "development");
     const entry = QUEUE_TOPOLOGY.find((candidate) => candidate.name === "credit.reconcile")!; // non-tenant-scoped — no signing envelope needed
-    const producerConnection = createQueueConnection(valkeyFixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(valkeyFixture.connectionString);
     const queue = buildQueue(entry, { connection: producerConnection, prefix });
 
     try {
@@ -236,6 +236,42 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
 
     await app.close();
   });
+
+  // STORY-121 — the second of two independent layers, asserted here so each
+  // can be shown to work on its own.
+  //
+  // realtime-fanout's sibling test proves the DEADLINE keeps the probe
+  // answering. This proves the CONNECTION now fails fast, which is the actual
+  // fix: point the queue at an unreachable address and readiness still
+  // answers, degrading queue depth to the empty list its own documentation
+  // promises. Before STORY-121 this hung forever — no rejection, no
+  // resolution, nothing to time out — and the container sat unhealthy with no
+  // HTTP response at all.
+  it("STORY-121 · an unreachable QUEUE instance degrades readiness rather than hanging it", async () => {
+    process.env.QUEUE_REDIS_URL = "redis://127.0.0.1:1";
+
+    const moduleRef = await Test.createTestingModule({ imports: [DbModule, HealthModule] }).compile();
+    const service = moduleRef.get(HealthService);
+
+    const client = new Client({ connectionString: container.getConnectionUri() });
+    await client.connect();
+    await migrateUp(client);
+    await client.end();
+
+    try {
+      const startedAt = process.hrtime.bigint();
+      const result = await service.readiness();
+      const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+
+      expect(elapsedMs, "the probe must answer, not wait on an unreachable queue").toBeLessThan(10_000);
+      // Queue depth is observability, never a readiness gate — the database
+      // is fine, so the answer is ready with an empty queue list.
+      expect(result.status).toBe("ready");
+      expect(result.queues, "an unreachable queue reads as empty, exactly like a failing one").toEqual([]);
+    } finally {
+      await moduleRef.close();
+    }
+  }, 30_000);
 
   it("scenario 3 — an open circuit breaker is reported as an unhealthy, open postgres dependency", async () => {
     // A port nothing listens on — pool.connect() fails fast (ECONNREFUSED),

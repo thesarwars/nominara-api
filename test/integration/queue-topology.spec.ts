@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createQueueConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { buildWorker } from "../../src/lib/queue/worker-factory.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
@@ -27,8 +27,8 @@ describe("STORY-030 · queue-topology — every queue processes at exactly its d
   });
 
   it.each(QUEUE_TOPOLOGY)("$name processes at exactly its documented concurrency ($concurrency)", async (entry) => {
-    const producerConnection = createQueueConnection(fixture.connectionString);
-    const workerConnection = createQueueConnection(fixture.connectionString);
+    const producerConnection = createQueueWorkerConnection(fixture.connectionString);
+    const workerConnection = createQueueWorkerConnection(fixture.connectionString);
     const prefix = queueKeyPrefix(`topology-${entry.name}`);
 
     const queue = buildQueue(entry, { connection: producerConnection, prefix });
