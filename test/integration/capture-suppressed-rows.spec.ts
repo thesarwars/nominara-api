@@ -1,0 +1,214 @@
+import { randomUUID } from "node:crypto";
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import { Client } from "pg";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { migrateUp } from "../../src/db/migrate-runner.js";
+import {
+  recordRunCounts,
+  recordSuppressedCells,
+  type SuppressedCell,
+  type SuppressedRowContext,
+} from "../../src/lib/capture/record-suppressed.js";
+
+// STORY-032 AC9 and AC12 — the rows a run writes for cells it did NOT
+// capture, and the counters it records before dispatching the ones it did.
+//
+// §5: a suppressed cell "still produces an answer_captures row with
+// cache_layer and source_result_id, so the prompt matrix is never sparse.
+// They do NOT increment captured_cells."
+//
+// Both halves matter and they fail differently. WITHOUT the row, a cached
+// cell is indistinguishable from a failed one — both absent — and the
+// interface reads the gap as "this engine had nothing to say", which is a
+// claim about the engine rather than about our own cost optimisation.
+// WITHOUT the count discipline, suppressions inflate captured_cells, the
+// suppression rate computes against a denominator that already contains
+// them, and the cost lever appears to be working better than it is.
+describe("STORY-032 · suppressed cells produce rows without advancing the live count", () => {
+  let container: StartedPostgreSqlContainer;
+  let db: Client;
+  let workspaceId: string;
+  let projectId: string;
+  let runId: string;
+  let context: SuppressedRowContext;
+
+  beforeAll(async () => {
+    container = await new PostgreSqlContainer("pgvector/pgvector:pg18")
+      .withDatabase("nominara_test")
+      .withUsername("nominara")
+      .withPassword("nominara")
+      .start();
+    db = new Client({ connectionString: container.getConnectionUri() });
+    await db.connect();
+    await migrateUp(db);
+  }, 240_000);
+
+  afterAll(async () => {
+    await db.end();
+    await container.stop();
+  });
+
+  beforeEach(async () => {
+    await db.query("TRUNCATE answer_captures, tracked_prompts, capture_runs, projects, workspaces CASCADE");
+    workspaceId = randomUUID();
+    projectId = randomUUID();
+    runId = randomUUID();
+    await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'W', $2, 'growth')", [
+      workspaceId,
+      `w-${randomUUID().slice(0, 8)}`,
+    ]);
+    await db.query(
+      `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain)
+       VALUES ($1, $2, 'P', $3, 'https://e.test', 'e.test')`,
+      [projectId, workspaceId, `p-${randomUUID().slice(0, 8)}`],
+    );
+    await db.query(
+      `INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys)
+       VALUES ($1, $2, $3, 'scheduled', ARRAY['perplexity'])`,
+      [runId, workspaceId, projectId],
+    );
+    context = {
+      workspaceId,
+      projectId,
+      runId,
+      normalizerVersion: "v1",
+      captureMode: "api",
+    };
+  });
+
+  async function addPrompt(text: string): Promise<string> {
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO tracked_prompts (id, workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage)
+       VALUES ($1, $2, $3, $4, sha256($5::bytea), 'recommendation', 'consideration')`,
+      [id, workspaceId, projectId, text, Buffer.from(text, "utf8")],
+    );
+    return id;
+  }
+
+  async function addSourceCapture(promptId: string, contentHash: Buffer): Promise<string> {
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO answer_captures
+         (id, workspace_id, project_id, run_id, prompt_id, engine_key, captured_at,
+          capture_mode, adapter_version, normalizer_version, content_hash, status, cache_layer)
+       VALUES ($1, $2, $3, $4, $5, 'perplexity', now(), 'api', '1.0.0', 'v1', $6, 'parsed', 'live')`,
+      [id, workspaceId, projectId, randomUUID(), promptId, contentHash],
+    );
+    return id;
+  }
+
+  it("writes one row per suppressed cell, so the matrix is never sparse", async () => {
+    const promptA = await addPrompt("a");
+    const promptB = await addPrompt("b");
+    const cells: SuppressedCell[] = [
+      {
+        layer: "l1",
+        promptId: promptA,
+        engineKey: "perplexity",
+        sampleIndex: 0,
+        contentHash: Buffer.alloc(32, 7),
+        adapterVersion: "1.0.0",
+      },
+      {
+        layer: "l1",
+        promptId: promptB,
+        engineKey: "perplexity",
+        sampleIndex: 0,
+        contentHash: Buffer.alloc(32, 8),
+        adapterVersion: "1.0.0",
+      },
+    ];
+
+    expect(await recordSuppressedCells(db, context, cells)).toBe(2);
+
+    const rows = await db.query<{ cache_layer: string; status: string; source_result_id: string | null }>(
+      "SELECT cache_layer, status, source_result_id FROM answer_captures WHERE run_id = $1 ORDER BY prompt_id",
+      [runId],
+    );
+    expect(rows.rowCount).toBe(2);
+    for (const row of rows.rows) {
+      expect(row.cache_layer, "the row must say WHY it was not captured live").toBe("l1");
+      expect(row.status).toBe("skipped");
+      expect(row.source_result_id, "an L1 hit reuses the shared cache, not one of our own rows").toBeNull();
+    }
+  }, 30_000);
+
+  // An L2 row must point at the capture it reused, and carry that capture's
+  // own content hash — copied in SQL so the two cannot disagree about what
+  // was answered.
+  it("an L2 row records its source and copies that source's content hash", async () => {
+    const promptId = await addPrompt("reused");
+    const sourceHash = Buffer.alloc(32, 3);
+    const sourceId = await addSourceCapture(promptId, sourceHash);
+
+    await recordSuppressedCells(db, context, [
+      { layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: sourceId, adapterVersion: "1.0.0" },
+    ]);
+
+    const row = await db.query<{ cache_layer: string; source_result_id: string; content_hash: Buffer }>(
+      "SELECT cache_layer, source_result_id, content_hash FROM answer_captures WHERE run_id = $1",
+      [runId],
+    );
+    expect(row.rows[0]!.cache_layer).toBe("l2");
+    expect(row.rows[0]!.source_result_id, "the reuse must name what it reused").toBe(sourceId);
+    expect(row.rows[0]!.content_hash.equals(sourceHash), "copied from the source, never passed in").toBe(true);
+  }, 30_000);
+
+  // THE COUNT DISCIPLINE. captured_cells belongs to the workers, as real
+  // captures land. Pre-seeding it with suppressions reports work that never
+  // happened and makes the suppression rate compute against itself.
+  it("records planned and skipped, and leaves captured_cells at zero", async () => {
+    await recordRunCounts(db, runId, { planned: 10, skipped: 4 });
+
+    const run = await db.query<{ planned_cells: number; skipped_cells: number; captured_cells: number }>(
+      "SELECT planned_cells, skipped_cells, captured_cells FROM capture_runs WHERE id = $1",
+      [runId],
+    );
+    expect(run.rows[0]).toMatchObject({ planned_cells: 10, skipped_cells: 4, captured_cells: 0 });
+  }, 30_000);
+
+  // AC12's ordering, asserted as a property of the data rather than of the
+  // call order: at the moment the counters are durable, no capture has been
+  // recorded against the run yet.
+  it("the counters are durable before any live capture exists for the run", async () => {
+    const promptId = await addPrompt("q");
+    await recordSuppressedCells(db, context, [
+      {
+        layer: "l1",
+        promptId,
+        engineKey: "perplexity",
+        sampleIndex: 0,
+        contentHash: Buffer.alloc(32, 1),
+        adapterVersion: "1.0.0",
+      },
+    ]);
+    await recordRunCounts(db, runId, { planned: 3, skipped: 1 });
+
+    const live = await db.query<{ count: string }>(
+      "SELECT count(*) AS count FROM answer_captures WHERE run_id = $1 AND cache_layer = 'live'",
+      [runId],
+    );
+    expect(
+      Number(live.rows[0]!.count),
+      "a progress projection reading this run must not find live captures before the plan is durable",
+    ).toBe(0);
+  }, 30_000);
+
+  it("writes nothing, and asks nothing, for an empty suppression set", async () => {
+    expect(await recordSuppressedCells(db, context, [])).toBe(0);
+    const rows = await db.query("SELECT 1 FROM answer_captures WHERE run_id = $1", [runId]);
+    expect(rows.rowCount).toBe(0);
+  }, 30_000);
+
+  // A run with nothing cached is the normal case for a new project, and it
+  // must record a real plan rather than an empty one.
+  it("records a plan with zero suppressions when nothing was cached", async () => {
+    await recordRunCounts(db, runId, { planned: 6, skipped: 0 });
+    const run = await db.query<{ planned_cells: number; skipped_cells: number }>(
+      "SELECT planned_cells, skipped_cells FROM capture_runs WHERE id = $1",
+      [runId],
+    );
+    expect(run.rows[0]).toMatchObject({ planned_cells: 6, skipped_cells: 0 });
+  }, 30_000);
+});
