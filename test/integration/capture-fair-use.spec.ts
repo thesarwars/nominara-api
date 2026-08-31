@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import {
   FAIR_USE_METRIC,
+  UNLIMITED_LIMIT,
   assertFairUseCapacity,
   commitDeepScanCharge,
   reserveFairUseCapacity,
@@ -92,6 +93,32 @@ describe("STORY-032 · the fair-use ceiling and the charge hook", () => {
     await setCeiling(100, 90);
     expect(await reserveFairUseCapacity(db, workspaceId, PERIOD, 10)).toBe(true);
     expect(await counters()).toEqual({ used: 90, reserved: 10 });
+  }, 30_000);
+
+  // §9's reservation SQL carries an unlimited branch — `limit_value = -1 OR
+  // ...` — that this statement did not. Its absence does not merely fail to
+  // grant unlimited capacity; it INVERTS the sentinel, because
+  // `used + reserved + cells <= -1` is false for every positive request. An
+  // enterprise workspace whose ceiling is negotiated would be refused every
+  // capture, and `quota_exceeded` would name a ceiling that does not exist.
+  //
+  // The already-huge used and reserved values are the point: unlimited must
+  // not depend on the counter being small.
+  it("an unlimited ceiling never blocks, however much is already reserved", async () => {
+    await setCeiling(UNLIMITED_LIMIT, 10_000_000, 5_000_000);
+    expect(await reserveFairUseCapacity(db, workspaceId, PERIOD, 250)).toBe(true);
+    expect(
+      await counters(),
+      "unlimited still METERS — it is a ceiling that never binds, not a counter that stops counting",
+    ).toEqual({ used: 10_000_000, reserved: 5_000_250 });
+  }, 30_000);
+
+  // Unlimited must not become "any negative number means unlimited". A
+  // corrupt or mis-provisioned -2 is not a sentinel, and reading it as one
+  // would hand out unlimited capture on a typo.
+  it("only the documented sentinel is unlimited — a different negative still refuses", async () => {
+    await setCeiling(-2, 0, 0);
+    expect(await reserveFairUseCapacity(db, workspaceId, PERIOD, 1)).toBe(false);
   }, 30_000);
 
   // THE TEST THAT JUSTIFIES THE SINGLE STATEMENT. A read-then-write passes

@@ -24,6 +24,19 @@ export const CHARGED_TRIGGERS: readonly RunTrigger[] = ["manual"];
 export const FAIR_USE_METRIC = "fair_use_captures";
 
 /**
+ * The unlimited sentinel, from §9's reservation SQL.
+ *
+ * Named rather than written as a bare `-1` in the statement, because the
+ * literal is indistinguishable from a typo at the call site and the failure
+ * it guards against is silent: without the branch below, the comparison for
+ * an unlimited row reads `used + reserved + cells <= -1`, which is false for
+ * every positive request. The sentinel that must NEVER block would block
+ * ALWAYS — the exact inverse of its meaning, and invisible until an
+ * enterprise workspace on a negotiated ceiling is refused every capture.
+ */
+export const UNLIMITED_LIMIT = -1;
+
+/**
  * Reserves `cells` against this cycle's fair-use ceiling, ATOMICALLY.
  *
  * One statement, and that is the requirement rather than a style preference.
@@ -32,6 +45,12 @@ export const FAIR_USE_METRIC = "fair_use_captures";
  * the amount that made it worth having. The `WHERE` clause below is what
  * makes the check and the increment the same operation: it either matches a
  * row with room and increments it, or matches nothing.
+ *
+ * An UNLIMITED ceiling still takes this path and still increments: it is a
+ * ceiling that never binds, not a counter that stops counting. Skipping the
+ * write would leave an enterprise workspace with no usage signal at all,
+ * and the internal-cost view exists precisely for the accounts too large to
+ * cap.
  *
  * Reserved rather than used: the cells have not been captured yet. A worker
  * converts reserved into used as each lands, and a run that dies mid-flight
@@ -63,8 +82,8 @@ export async function reserveFairUseCapacity(
       WHERE workspace_id = $1
         AND metric = $2
         AND period_start = $3
-        AND used_value + reserved_value + $4 <= limit_value`,
-    [workspaceId, FAIR_USE_METRIC, periodStart, cells],
+        AND (limit_value = $5 OR used_value + reserved_value + $4 <= limit_value)`,
+    [workspaceId, FAIR_USE_METRIC, periodStart, cells, UNLIMITED_LIMIT],
   );
   return (result.rowCount ?? 0) === 1;
 }
