@@ -1,4 +1,12 @@
+import type { Job, Queue } from "bullmq";
 import type { ClientBase } from "pg";
+import type { Cache } from "../cache/cache.port.js";
+import type { QueueTopologyEntry } from "../queue/topology.js";
+import type { ProjectCadence } from "./dispatch-cells.js";
+import { resolveDueEngines, scopeForKind, CYCLE_DAYS, type RunKind } from "./engine-cadence.js";
+import type { RunTrigger } from "./fair-use.js";
+import type { PriorityVariant } from "../queue/queue-factory.js";
+import { dispatchPlannedRun, planRun, type PlannedRun } from "./plan-run.js";
 
 // STORY-033 — tracking-engine.md §5's scheduler: which projects are due, in
 // what order, and how two replicas run the same tick without colliding.
@@ -40,9 +48,13 @@ export const CAPTURABLE_WORKSPACE_STATUSES: readonly string[] = ["trialing", "ac
 export interface DueProject {
   readonly projectId: string;
   readonly workspaceId: string;
-  readonly cadence: string;
+  readonly cadence: ProjectCadence;
   readonly priorityPromptLimit: number;
   readonly nextRunAt: Date;
+  /** The workspace's plan — `cadence_by_plan` is keyed by it. */
+  readonly planKey: string;
+  /** The project's locale, which the L1 key is partitioned by. */
+  readonly locale: string;
 }
 
 /**
@@ -62,12 +74,15 @@ export async function claimDueProjects(
   const result = await tx.query<{
     id: string;
     workspace_id: string;
-    cadence: string;
+    cadence: ProjectCadence;
     priority_prompt_limit: number;
     next_run_at: Date;
+    locale: string;
+    plan_key: string;
   }>(
     `
-    SELECT p.id, p.workspace_id, p.cadence, p.priority_prompt_limit, p.next_run_at
+    SELECT p.id, p.workspace_id, p.cadence, p.priority_prompt_limit, p.next_run_at,
+           p.locale, w.plan_key
       FROM projects p
       JOIN workspaces w ON w.id = p.workspace_id
      WHERE p.status = 'active'
@@ -89,6 +104,8 @@ export async function claimDueProjects(
     cadence: row.cadence,
     priorityPromptLimit: row.priority_prompt_limit,
     nextRunAt: row.next_run_at,
+    planKey: row.plan_key,
+    locale: row.locale,
   }));
 }
 
@@ -116,4 +133,207 @@ export async function advanceNextRun(
     [project.projectId, project.nextRunAt, nextRunAt, ranAt],
   );
   return (result.rowCount ?? 0) === 1;
+}
+
+// ---------------------------------------------------------------------------
+// The tick — AC5, AC6 and AC9's seam.
+//
+// Every part above and in engine-cadence.ts is a piece: claim, resolve
+// due-ness, advance, plan, dispatch. This is the only place they meet, and
+// three ACs are about the MEETING rather than about any one piece:
+//
+//   AC5 — the run records exactly the engines it covered. True only if the
+//   set resolveDueEngines returned is the same set planRun was given and the
+//   same set the run row stores. One value flows through all three; there is
+//   no second engine set anywhere in this file.
+//
+//   AC6 — cells spread with per-cell jitter. dispatch-cells.ts already draws
+//   the jitter; what was missing was anything passing the project's cadence
+//   to it. `plan.cadence` carries it, so the scheduler cannot dispatch
+//   without one.
+//
+//   AC9 — a verification run goes through the same path. Enforced by there
+//   being one function and a trigger parameter, rather than a second
+//   scheduling path that would drift.
+//
+// ORDERING IS AC3, AND IT IS NOT NEGOTIABLE: `advanceNextRun` runs BEFORE
+// the enqueue and inside the same transaction, and the enqueue happens only
+// after that transaction commits. Dispatch is not transactional — a job
+// handed to Redis cannot be rolled back — so enqueueing first would leave a
+// crash window in which the jobs exist and the run row does not.
+// ---------------------------------------------------------------------------
+
+/**
+ * §5 states cadence as runs per 30-day cycle, so that is what the interval is
+ * derived from rather than from calendar weeks: `weekly` is 4 runs per cycle,
+ * which is 7.5 days, not 7. Deriving it from a calendar week would give 4.3
+ * runs in a 30-day cycle and quietly overrun every plan's stated figure.
+ *
+ * `manual` returns null: it is not scheduled at all, and a project on it
+ * should never have been claimed.
+ */
+export function nextRunAfter(cadence: ProjectCadence, from: Date): Date | null {
+  const cycleMs = CYCLE_DAYS * 24 * 60 * 60 * 1000;
+  const runsPerCycle: Record<Exclude<ProjectCadence, "manual">, number> = {
+    hourly: 720,
+    daily: 30,
+    twice_weekly: 8,
+    weekly: 4,
+  };
+  if (cadence === "manual") return null;
+  return new Date(from.getTime() + cycleMs / runsPerCycle[cadence]);
+}
+
+/** What the caller must supply that the project row cannot. */
+export interface ScheduleContext {
+  /** The billing cycle the fair-use counter belongs to. */
+  readonly periodStart: string;
+  readonly normalizerVersion: string;
+  readonly captureMode: "api" | "licensed_serp" | "headless";
+  /** `cacheKeyNamespace()`. */
+  readonly env: string;
+  /** False for a workspace whose plan carries `no_shared_cache`. */
+  readonly sharedCacheEnabled: boolean;
+  readonly personaHint?: string | null;
+}
+
+export interface ScheduledRun {
+  readonly projectId: string;
+  readonly runId: string;
+  readonly trigger: RunTrigger;
+  /** Exactly what the run row records — AC5. */
+  readonly engineKeys: readonly string[];
+  readonly plan: PlannedRun;
+}
+
+/**
+ * Plans one project's run inside the caller's transaction, and advances
+ * `next_run_at` before returning.
+ *
+ * Returns null, having advanced nothing, when there is nothing to run:
+ * either no engine is due, or another transaction advanced this project
+ * since it was claimed. Both are ordinary outcomes on a busy tick, not
+ * errors.
+ *
+ * DOES NOT DISPATCH. It has no queue, for the same reason `planRun` has
+ * none: the jobs must not exist until the transaction that wrote the run row
+ * has committed, and a function holding both a transaction and a queue is
+ * one refactor away from enqueueing inside it.
+ */
+export async function planScheduledRun(
+  tx: ClientBase,
+  cache: Cache,
+  project: DueProject,
+  context: ScheduleContext,
+  options: {
+    readonly runId: string;
+    readonly trigger: RunTrigger;
+    readonly kind: RunKind;
+    readonly now: Date;
+  },
+): Promise<ScheduledRun | null> {
+  const dueEngines = await resolveDueEngines(tx, {
+    projectId: project.projectId,
+    kind: options.kind,
+    now: options.now,
+  });
+
+  // No engine due. The project is still advanced, deliberately: leaving
+  // next_run_at in the past would re-claim it on every tick for the rest of
+  // the interval, and a project whose engines are all mid-interval would
+  // occupy a batch slot each time and starve the projects behind it.
+  const nextRunAt = nextRunAfter(project.cadence, options.now);
+  if (dueEngines.length === 0) {
+    if (nextRunAt !== null) await advanceNextRun(tx, project, nextRunAt, options.now);
+    return null;
+  }
+
+  const engineKeys = dueEngines.map((engine) => engine.engineKey);
+
+  // The run row. `planRun` UPDATES it with the counts; it does not create it,
+  // because the run's identity and trigger belong to whoever initiated it,
+  // not to planning.
+  //
+  // engine_keys is NOT AUTHORITATIVE HERE — `recordRunCounts` overwrites it
+  // moments later with the entitlement-filtered set, which is what AC5
+  // actually rests on. This writes the due set anyway because the column is
+  // NOT NULL and a placeholder would be a claim about coverage; passing the
+  // same array keeps the two writes from ever disagreeing. Verified by
+  // mutation: making this INSERT write the enabled set changes nothing, and
+  // making planRun resolve the enabled set fails AC5's test.
+  await tx.query(
+    `INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys, prompt_scope, status)
+     VALUES ($1, $2, $3, $4, $5::text[], $6, 'queued')`,
+    [
+      options.runId,
+      project.workspaceId,
+      project.projectId,
+      options.trigger,
+      engineKeys,
+      scopeForKind(options.kind),
+    ],
+  );
+
+  const plan = await planRun(tx, cache, {
+    workspaceId: project.workspaceId,
+    projectId: project.projectId,
+    runId: options.runId,
+    trigger: options.trigger,
+    cadence: project.cadence,
+    planKey: project.planKey,
+    scope: scopeForKind(options.kind),
+    // The due set NARROWS the engines planRun would otherwise resolve. It can
+    // never widen them past the entitlement — resolveEnabledEngines applies
+    // that filter again on its own side.
+    engineKeys,
+    periodStart: context.periodStart,
+    locale: project.locale,
+    personaHint: context.personaHint ?? null,
+    normalizerVersion: context.normalizerVersion,
+    captureMode: context.captureMode,
+    env: context.env,
+    sharedCacheEnabled: context.sharedCacheEnabled,
+    nowMs: options.now.getTime(),
+  });
+
+  // AC3 — BEFORE the enqueue, in this transaction. The compare-and-set can
+  // still lose: if it does, this run must not be dispatched, and returning
+  // null rather than the plan is what stops the caller.
+  if (nextRunAt !== null && !(await advanceNextRun(tx, project, nextRunAt, options.now))) {
+    return null;
+  }
+
+  return { projectId: project.projectId, runId: options.runId, trigger: options.trigger, engineKeys, plan };
+}
+
+/**
+ * The capture queue carries a dual priority, and the trigger decides it.
+ *
+ * `manual` is the only trigger with a person waiting on the answer, so it is
+ * the only interactive one. A verification run is platform-initiated
+ * re-measurement and a drift sample is background sampling; giving either the
+ * interactive lane would let automated work overtake the runs customers are
+ * actually watching.
+ */
+export function priorityVariantFor(trigger: RunTrigger): PriorityVariant {
+  return trigger === "manual" ? "interactive" : "scheduled";
+}
+
+/**
+ * Dispatches a planned run's cells. Call ONLY after the planning transaction
+ * has committed.
+ *
+ * Exists rather than having callers reach for `dispatchPlannedRun` so that
+ * the ordering rule above has somewhere to live at the call site the
+ * scheduler actually uses — and so the priority variant is chosen from the
+ * trigger every time, rather than at each call site.
+ */
+export async function dispatchScheduledRun(
+  queue: Queue,
+  entry: QueueTopologyEntry,
+  scheduled: ScheduledRun,
+): Promise<Job[]> {
+  return dispatchPlannedRun(queue, entry, scheduled.plan, {
+    priorityVariant: priorityVariantFor(scheduled.trigger),
+  });
 }

@@ -201,7 +201,7 @@ describe("STORY-033 · the scheduler claims due projects fairly and safely", () 
   // the caller must not enqueue.
   it("advancing twice from the same claim succeeds once and refuses the replay", async () => {
     const ws = await addWorkspace();
-    const projectId = await addProject(ws);
+    await addProject(ws);
     const [claim] = await inTransaction((tx) => claimDueProjects(tx, new Date()));
 
     const nextRun = new Date(Date.now() + 3_600_000);
