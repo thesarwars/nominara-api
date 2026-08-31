@@ -76,6 +76,52 @@ describe.each(adapters)("STORY-025 · the cache port, as implemented by %s", (na
     await expect(cache.get(key("k"))).resolves.toBeUndefined();
   });
 
+  describe("getMany — the batched read", () => {
+    it("returns the values POSITIONALLY, with a hole for each miss", async () => {
+      await cache.set(key("a"), "A", { ttlMs: 60_000 });
+      await cache.set(key("c"), "C", { ttlMs: 60_000 });
+
+      // Position is the entire contract: the caller maps results back to
+      // requests by index. An adapter that dropped misses instead of
+      // returning undefined would silently shift every later value onto the
+      // wrong key — in the L1 probe, onto the wrong prompt's answer.
+      await expect(cache.getMany([key("a"), key("b"), key("c")])).resolves.toEqual(["A", undefined, "C"]);
+    });
+
+    it("expires exactly as get does", async () => {
+      await cache.set(key("short"), "value", { ttlMs: 40 });
+      await new Promise((resolve) => setTimeout(resolve, 90));
+
+      // A batched read that ignored the TTL would be a cache that never
+      // expires — every L1 window assertion written against it would hold
+      // while production served answers past their sharing window.
+      await expect(cache.getMany([key("short")])).resolves.toEqual([undefined]);
+      await expect(cache.get(key("short"))).resolves.toBeUndefined();
+    });
+
+    it("agrees with get on every key", async () => {
+      await cache.set(key("x"), "X", { ttlMs: 60_000 });
+      const keys = [key("x"), key("never-written")];
+
+      const batched = await cache.getMany(keys);
+      const singly = await Promise.all(keys.map(async (k) => cache.get(k)));
+
+      expect(batched).toEqual(singly);
+    });
+
+    it("repeats a value for a repeated key rather than deduping behind the caller's back", async () => {
+      await cache.set(key("dup"), "D", { ttlMs: 60_000 });
+
+      await expect(cache.getMany([key("dup"), key("dup")])).resolves.toEqual(["D", "D"]);
+    });
+
+    it("returns an empty array for an empty request, without reaching the server", async () => {
+      // MGET with no arguments is a Valkey syntax error, so this is the one
+      // input where the two adapters would diverge by accident.
+      await expect(cache.getMany([])).resolves.toEqual([]);
+    });
+  });
+
   describe("onlyIfAbsent — the idempotency claim", () => {
     it("returns true for the winner and false for the loser", async () => {
       await expect(cache.set(key("c"), "first", { ttlMs: 10_000, onlyIfAbsent: true })).resolves.toBe(true);

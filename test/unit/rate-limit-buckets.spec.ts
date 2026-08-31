@@ -185,6 +185,7 @@ describe("STORY-025 · additive evaluation", () => {
     const inner = new InMemoryCacheAdapter(() => clock.ms);
     const counting: Cache = {
       get: (key) => inner.get(key),
+      getMany: (keys) => inner.getMany(keys),
       set: (key, value, options) => inner.set(key, value, options),
       delete: (key) => inner.delete(key),
       deleteIf: (key, expected) => inner.deleteIf(key, expected),
@@ -446,6 +447,7 @@ describe("STORY-025 · the three §12 rows whose callers have no workspace", () 
     const inner = new InMemoryCacheAdapter(() => clock.ms);
     const counting: Cache = {
       get: (key) => inner.get(key),
+      getMany: (keys) => inner.getMany(keys),
       set: (key, value, options) => inner.set(key, value, options),
       delete: (key) => inner.delete(key),
       deleteIf: (key, expected) => inner.deleteIf(key, expected),
@@ -469,6 +471,7 @@ describe("STORY-025 · the three §12 rows whose callers have no workspace", () 
     const inner = new InMemoryCacheAdapter();
     const counting: Cache = {
       get: (key) => inner.get(key),
+      getMany: (keys) => inner.getMany(keys),
       set: (key, value, options) => inner.set(key, value, options),
       delete: (key) => inner.delete(key),
       deleteIf: (key, expected) => inner.deleteIf(key, expected),
