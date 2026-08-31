@@ -163,8 +163,73 @@ async function assertRealtimeChannelNamespacing(): Promise<void> {
   }
 }
 
+/**
+ * THE ONE KEY THAT IS DELIBERATELY EXEMPT, asserted rather than assumed.
+ *
+ * §10 names the shared answer cache as the single documented exception to
+ * tenant scoping. Until STORY-032's review, this assertion could see neither
+ * half of it: `captureL1Key` was absent from the constructor list above, and
+ * the literal it builds opened with `global:` rather than with an
+ * interpolation, so `CACHE_KEY_PATTERN` never matched it either. The one key
+ * in this repository that is allowed to be tenant-free was covered by
+ * nothing — and it had drifted, shipping without the `{env}` segment three
+ * references require.
+ *
+ * An exception that nothing checks is not an exception; it is a hole with a
+ * comment next to it. So both halves of the exemption are pinned here: it
+ * MUST carry the deployment namespace, and it MUST NOT vary by tenant.
+ */
+async function assertSharedAnswerCacheExemption(): Promise<void> {
+  const keys = (await import(
+    `${new URL("../../../src/lib/capture/l1-cache-key.js", import.meta.url).href}?iso13=${String(process.hrtime.bigint())}`
+  )) as typeof import("../../../src/lib/capture/l1-cache-key.js");
+
+  const base = {
+    engineKey: "perplexity",
+    adapterMajor: 3,
+    promptText: "best crm for small business",
+    locale: "en-US",
+    personaHint: null,
+    ttlSeconds: 86_400,
+    nowMs: 1_700_000_000_000,
+  };
+
+  const staging = keys.captureL1Key({ ...base, env: "staging" });
+  const production = keys.captureL1Key({ ...base, env: "production" });
+
+  // Half one — it carries the deployment namespace. Without it two
+  // environments sharing a cache instance serve each other's answers, which
+  // is the leak STORY-026 already found once on the socket.io channels.
+  if (!staging.startsWith("staging:global:")) {
+    throw new Error(
+      `ISO-13 (shared answer cache): captureL1Key() must open with "{env}:global:" — got "${staging}"`,
+    );
+  }
+  if (staging === production) {
+    throw new Error(
+      "ISO-13 (shared answer cache): captureL1Key() produces the SAME key for two deployments — " +
+        "staging and production sharing one cache instance would serve each other's captured answers",
+    );
+  }
+
+  // Half two — it does NOT vary by tenant. This is what makes the exemption
+  // sound: §10 excepts this namespace from tenant scoping precisely because
+  // the value carries no tenant data. A key that varied per workspace would
+  // both break that premise and silently destroy the cross-tenant sharing
+  // that is the whole point of the cache.
+  const asA = keys.captureL1Key({ ...base, env: "test", workspaceId: "ws-a" } as never);
+  const asB = keys.captureL1Key({ ...base, env: "test", workspaceId: "ws-b" } as never);
+  if (asA !== asB) {
+    throw new Error(
+      "ISO-13 (shared answer cache): captureL1Key() varies by workspace — the exemption in §10 holds only " +
+        "while this value carries NO tenant data, and a per-tenant key also destroys the sharing it exists for",
+    );
+  }
+}
+
 export async function assertIso13CacheNamespacing(): Promise<void> {
   await assertTenantKeyConstructors();
+  await assertSharedAnswerCacheExemption();
   await assertRealtimeChannelNamespacing();
 
   const fixtureMatches = await scanFixturesForKeyLiterals(CACHE_KEY_PATTERN);

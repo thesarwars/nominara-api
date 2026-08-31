@@ -13,10 +13,17 @@ import type { ClientBase } from "pg";
 // LATERAL below runs the HNSW index once per candidate cell inside a single
 // round trip — the shape that keeps this O(1) in round trips.
 
-/** §6: "cosine >= 0.94". */
+/**
+ * §6: "cosine >= 0.94".
+ *
+ * Pinned by a test against the literal, not merely imported by one. An
+ * assertion that compares a fixture to this constant moves with it: the
+ * review set this to 0.80 and 0.5 below to 0.3, and all 1399 tests stayed
+ * green.
+ */
 export const L2_COSINE_THRESHOLD = 0.94;
 
-/** §6: "source captured within 0.5x the engine's L1 TTL". */
+/** §6: "source captured within 0.5x the engine's L1 TTL". Pinned the same way, for the same reason. */
 export const L2_WINDOW_FRACTION = 0.5;
 
 export interface L2Candidate {
@@ -98,7 +105,14 @@ export async function probeSemanticReuse(
     )
     SELECT c.prompt_id, c.engine_key, c.sample_index, s.source_result_id, s.cosine
       FROM candidate c
-      JOIN tracked_prompts target ON target.id = c.prompt_id
+      -- BOTH SIDES OF THE COMPARISON ARE PROJECT-SCOPED. The source filters
+      -- below were here from the start; the TARGET had none, so a cell whose
+      -- prompt belonged to another project could be matched against this
+      -- project's captures. RLS does not cover it: it holds the WORKSPACE
+      -- boundary and has nothing to say about a project boundary inside one.
+      -- Found by the STORY-032 second-engineer review, which reproduced it
+      -- under correct tenant context.
+      JOIN tracked_prompts target ON target.id = c.prompt_id AND target.project_id = $1
       -- JOIN LATERAL ... ON true, not CROSS JOIN LATERAL: the subquery may
       -- return no admissible source, and CROSS JOIN would then drop the row
       -- with no way to distinguish "no source" from "never asked".

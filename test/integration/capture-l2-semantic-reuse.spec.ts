@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import {
   L2_COSINE_THRESHOLD,
+  L2_WINDOW_FRACTION,
   cellKey,
   probeSemanticReuse,
   type L2Candidate,
@@ -34,6 +35,16 @@ function embedding(a: number, b: number, mix: number): string {
 }
 
 describe("STORY-032 · L2 semantic reuse — the six admission rules", () => {
+  // PINNED AGAINST THE LITERALS. Every other assertion in this file compares
+  // a fixture against the imported constant, so it MOVES with the constant:
+  // the review set the threshold to 0.80 and the window to 0.3 and all 1399
+  // tests stayed green. §6 gives both numbers; these two lines are what make
+  // the file notice if they change.
+  it("carries §6's two constants exactly", () => {
+    expect(L2_COSINE_THRESHOLD).toBe(0.94);
+    expect(L2_WINDOW_FRACTION).toBe(0.5);
+  });
+
   let container: StartedPostgreSqlContainer;
   let db: Client;
   let workspaceId: string;
@@ -119,9 +130,15 @@ describe("STORY-032 · L2 semantic reuse — the six admission rules", () => {
   }
 
   /** A near-duplicate pair: target and source almost parallel, cosine ~0.995. */
+  /**
+   * `ux_prompts_project_hash` makes prompt text unique per project, so each
+   * call needs its own text — a test that builds two pairs otherwise fails on
+   * the fixture rather than on the property.
+   */
   async function nearDuplicatePair(): Promise<{ target: string; source: string }> {
-    const source = await addPrompt("best crm for small business", embedding(0, 1, 0.0));
-    const target = await addPrompt("best crm for small businesses", embedding(0, 1, 0.1));
+    const tag = randomUUID().slice(0, 8);
+    const source = await addPrompt(`best crm for small business ${tag}`, embedding(0, 1, 0.0));
+    const target = await addPrompt(`best crm for small businesses ${tag}`, embedding(0, 1, 0.1));
     return { target, source };
   }
 
@@ -152,6 +169,28 @@ describe("STORY-032 · L2 semantic reuse — the six admission rules", () => {
     expect((await probeSemanticReuse(db, projectId, [candidate(target)])).size).toBe(0);
   }, 30_000);
 
+  // THE OTHER SIDE OF RULE 1, which had no filter at all. The source-side
+  // check was present twice; the TARGET prompt was joined on id alone, so a
+  // cell whose prompt belonged to another project matched against this
+  // project's captures. RLS does not cover it — it holds the WORKSPACE
+  // boundary and says nothing about a project boundary inside one. Found by
+  // the second-engineer review, reproduced under correct tenant context.
+  it("rule 1 — refuses a TARGET prompt from another project in the same workspace", async () => {
+    const otherProject = randomUUID();
+    await db.query(
+      `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain)
+       VALUES ($1, $2, 'Other', $3, 'https://other.test', 'other.test')`,
+      [otherProject, workspaceId, `o-${randomUUID().slice(0, 8)}`],
+    );
+    // The SOURCE is in this project and perfectly admissible; only the target
+    // is foreign, which is the case the original test could not see.
+    const source = await addPrompt("best crm for small business", embedding(0, 1, 0.0));
+    await addSourceCapture(source);
+    const foreignTarget = await addPrompt("best crm for small businesses", embedding(0, 1, 0.1), otherProject);
+
+    expect((await probeSemanticReuse(db, projectId, [candidate(foreignTarget)])).size).toBe(0);
+  }, 30_000);
+
   it("rule 2 — refuses a source captured from a DIFFERENT engine", async () => {
     const { target, source } = await nearDuplicatePair();
     await addSourceCapture(source, { engineKey: "chatgpt" });
@@ -161,23 +200,42 @@ describe("STORY-032 · L2 semantic reuse — the six admission rules", () => {
 
   // The boundary, from both sides. A threshold asserted only from the passing
   // side would hold for any value at or below 0.94.
-  it("rule 3 — refuses below the cosine threshold and admits at it", async () => {
+  // STRADDLES 0.94 rather than bracketing it loosely. The original fixtures
+  // were 0.707 and 0.98, which hold for ANY threshold between them — the
+  // review moved the constant to 0.80 and this test did not notice.
+  //
+  // cos(theta) for embedding(0,1,mix) against embedding(0,1,0) is
+  // 1/sqrt(1+mix^2), so mix = sqrt(1/c^2 - 1) puts the pair exactly at c.
+  it("rule 3 — refuses just below §6's threshold and admits just above it", async () => {
     const source = await addPrompt("best crm", embedding(0, 1, 0.0));
-    const farTarget = await addPrompt("weather tomorrow", embedding(0, 1, 1.0)); // cosine ~0.707
     await addSourceCapture(source);
 
-    expect((await probeSemanticReuse(db, projectId, [candidate(farTarget)])).size, "0.707 is below 0.94").toBe(0);
+    const justBelow = Math.sqrt(1 / 0.935 ** 2 - 1); // cosine ~0.935
+    const justAbove = Math.sqrt(1 / 0.945 ** 2 - 1); // cosine ~0.945
 
-    const nearTarget = await addPrompt("best crms", embedding(0, 1, 0.2)); // cosine ~0.98
-    expect((await probeSemanticReuse(db, projectId, [candidate(nearTarget)])).size, "0.98 is above 0.94").toBe(1);
+    const below = await addPrompt("below", embedding(0, 1, justBelow));
+    expect((await probeSemanticReuse(db, projectId, [candidate(below)])).size, "0.935 < 0.94").toBe(0);
+
+    const above = await addPrompt("above", embedding(0, 1, justAbove));
+    expect((await probeSemanticReuse(db, projectId, [candidate(above)])).size, "0.945 >= 0.94").toBe(1);
   }, 30_000);
 
-  it("rule 4 — refuses a source older than half the engine's TTL", async () => {
+  // Straddles 0.5x TTL. The original pair was 60s and 0.6x, which holds for
+  // any fraction in roughly (0.0007, 0.6).
+  it("rule 4 — straddles the half-TTL reuse window", async () => {
     const { target, source } = await nearDuplicatePair();
-    // 0.6 x TTL: inside the full TTL, outside the half-TTL reuse window.
-    await addSourceCapture(source, { ageSeconds: TTL_SECONDS * 0.6 });
+    await addSourceCapture(source, { ageSeconds: TTL_SECONDS * 0.55 });
+    expect(
+      (await probeSemanticReuse(db, projectId, [candidate(target)])).size,
+      "0.55x TTL is outside the 0.5x reuse window",
+    ).toBe(0);
 
-    expect((await probeSemanticReuse(db, projectId, [candidate(target)])).size).toBe(0);
+    const fresh = await nearDuplicatePair();
+    await addSourceCapture(fresh.source, { ageSeconds: TTL_SECONDS * 0.45 });
+    expect(
+      (await probeSemanticReuse(db, projectId, [candidate(fresh.target)])).size,
+      "0.45x TTL is inside it",
+    ).toBe(1);
   }, 30_000);
 
   it("rule 5 — refuses a source that is not fully parsed", async () => {
