@@ -148,6 +148,15 @@ describe("STORY-032 AC4 · the L1 exact-hash probe", () => {
     expect([...gets, ...batches.flat()], "and the shared namespace must not even be read").toEqual([]);
   });
 
+  // The bypass must not be a place where a broken adapter version hides.
+  it("still rejects a malformed adapter version for a bypassing workspace", async () => {
+    const { cache } = countingCache();
+
+    await expect(
+      probeExactHash(cache, { ...CONTEXT, sharedCacheEnabled: false }, [candidate({ adapterVersion: "v3" })]),
+    ).rejects.toThrow(/not semantic/u);
+  });
+
   it("costs nothing when the run planned nothing", async () => {
     const { cache, gets, batches } = countingCache();
     expect((await probeExactHash(cache, CONTEXT, [])).size).toBe(0);

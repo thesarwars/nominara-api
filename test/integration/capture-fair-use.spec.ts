@@ -98,28 +98,32 @@ describe("STORY-032 · the fair-use ceiling and the charge hook", () => {
   // every test above and fails here: both runs read 90, both see room for 10,
   // both write, and the ceiling is exceeded by exactly the amount that made
   // it worth having.
-  it("two runs planning CONCURRENTLY cannot both take the last capacity", async () => {
+  it("twenty runs planning CONCURRENTLY cannot take more than the last capacity", async () => {
+    // TWENTY, not two. Two claimants exercise the predicate but barely
+    // exercise the RACE: they can interleave in only a handful of ways, and
+    // a read-then-write can pass a two-way test by luck often enough to look
+    // green. Twenty contending for two slots makes the window this exists to
+    // close wide enough to fall into. The story doc claimed twenty before
+    // this test did; it now says what runs.
     await setCeiling(100, 90);
-    const pool = new Pool({ connectionString: container.getConnectionUri(), max: 4 });
+    const claimants = 20;
+    const each = 5;
+    const pool = new Pool({ connectionString: container.getConnectionUri(), max: 10 });
     try {
-      const [first, second] = await Promise.all([
-        pool.connect().then(async (c) => {
+      const outcomes = await Promise.all(
+        Array.from({ length: claimants }, async () => {
+          const c = await pool.connect();
           try {
-            return await reserveFairUseCapacity(c, workspaceId, PERIOD, 10);
+            return await reserveFairUseCapacity(c, workspaceId, PERIOD, each);
           } finally {
             c.release();
           }
         }),
-        pool.connect().then(async (c) => {
-          try {
-            return await reserveFairUseCapacity(c, workspaceId, PERIOD, 10);
-          } finally {
-            c.release();
-          }
-        }),
-      ]);
+      );
 
-      expect([first, second].filter(Boolean), "exactly one may win").toHaveLength(1);
+      // 10 of capacity left, 5 per claimant: exactly two may win, whichever
+      // two they are.
+      expect(outcomes.filter(Boolean), "exactly two may win").toHaveLength(2);
       expect((await counters()).reserved, "and the ceiling must not be exceeded").toBe(10);
     } finally {
       await pool.end();

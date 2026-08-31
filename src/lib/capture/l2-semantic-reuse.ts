@@ -106,7 +106,13 @@ export async function probeSemanticReuse(
   // have admitted, so it changes no result. Being scalar, it prunes. The
   // same measurement with it in place removes 10 of the 15 subplans and
   // turns `captured_at` into an index condition.
-  const maxWindowSeconds = Math.max(...candidates.map((c) => c.ttlSeconds)) * L2_WINDOW_FRACTION;
+  // Reduced rather than spread. `Math.max(...array)` passes every element as
+  // a call argument, and a project with enough prompts to overflow the
+  // engine's argument limit would fail here with a RangeError — on the
+  // planning path, for the largest tenants only, in code whose whole purpose
+  // is to make large batches cheap.
+  const maxWindowSeconds =
+    candidates.reduce((widest, c) => (c.ttlSeconds > widest ? c.ttlSeconds : widest), 0) * L2_WINDOW_FRACTION;
 
   // The candidate list travels as ONE array parameter per column and is
   // unnested server-side, so the statement text is identical for a run of

@@ -158,7 +158,15 @@ export async function probeExactHash(
   candidates: readonly L1Candidate[],
 ): Promise<Map<string, L1Hit>> {
   const hits = new Map<string, L1Hit>();
-  if (candidates.length === 0 || !context.sharedCacheEnabled) return hits;
+  if (candidates.length === 0) return hits;
+
+  // VALIDATED BEFORE THE BYPASS, not after. With the early return first, a
+  // malformed adapter version raised for an ordinary workspace and was
+  // silently tolerated for a `no_shared_cache` one — so the fleet's
+  // strictest-configured tenants were the only ones for whom a broken
+  // version never surfaced, and it would surface later, somewhere else.
+  for (const candidate of candidates) adapterMajorOf(candidate.adapterVersion);
+  if (!context.sharedCacheEnabled) return hits;
 
   // DEDUPED before the read, because the L1 key deliberately does not
   // include the sample index — §6 keys on the question, and the three

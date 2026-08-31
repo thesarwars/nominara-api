@@ -280,6 +280,20 @@ async function writePlan(
   });
 
   const cohortInput = { cadence: context.cadence, planKey: context.planKey };
+
+  // Hoisted out of the returned literal. The hook is a no-op until the
+  // wallet exists, and its own comment promises that adding the wallet is a
+  // change inside this function — which would not have held: an object
+  // literal cannot await, so EPIC-10 would have had to restructure the
+  // return rather than change one line.
+  const charge = commitDeepScanCharge({
+    workspaceId: context.workspaceId,
+    runId: context.runId,
+    trigger: context.trigger,
+    cellsPlanned: cells.length,
+    cellsCharged: liveCells.length,
+    cellsCached: suppressed.length,
+  });
   return {
     runId: context.runId,
     planned: cells.length,
@@ -289,14 +303,7 @@ async function writePlan(
     // MEASURED PER COHORT, not blended: a run belongs to every cohort it
     // qualifies for and is measured against each one's own target.
     cohorts: cohortsFor(cohortInput).map((cohort) => measureCohort(cohort, cells.length, suppressed.length)),
-    charge: commitDeepScanCharge({
-      workspaceId: context.workspaceId,
-      runId: context.runId,
-      trigger: context.trigger,
-      cellsPlanned: cells.length,
-      cellsCharged: liveCells.length,
-      cellsCached: suppressed.length,
-    }),
+    charge,
     cells: liveCells.map((cell) => ({
       promptId: cell.promptId,
       engineKey: cell.engineKey,
