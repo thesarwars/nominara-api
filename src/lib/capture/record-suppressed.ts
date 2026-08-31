@@ -157,11 +157,33 @@ export interface RunCounts {
  * suppressions would report work that never happened.
  */
 export async function recordRunCounts(tx: ClientBase, runId: string, counts: RunCounts): Promise<void> {
-  await tx.query(
+  const result = await tx.query(
     `UPDATE capture_runs
         SET planned_cells = $2,
             skipped_cells = $3
       WHERE id = $1`,
     [runId, counts.planned, counts.skipped],
   );
+
+  // AN UPDATE THAT MATCHED NOTHING IS NOT A RECORDED COUNT.
+  //
+  // `UPDATE ... WHERE id = $1` reports success having changed no rows, so
+  // without this check the one thing AC12 requires to happen BEFORE dispatch
+  // could silently not happen at all, and the caller would go on to enqueue.
+  // The run then reports `planned_cells = 0` while workers increment
+  // `captured_cells` against it — the exact zero denominator the ordering
+  // rule exists to prevent, reached by a different route.
+  //
+  // RLS is what makes this likely rather than theoretical. `capture_runs`
+  // carries FORCE ROW LEVEL SECURITY, so a missing or wrong
+  // `app.current_workspace_id` does not raise — the row simply becomes
+  // invisible and the UPDATE matches nothing. A tenant-context bug would
+  // present as runs that quietly never record a plan, which is close to the
+  // hardest failure to trace back to its cause.
+  if (result.rowCount !== 1) {
+    throw new Error(
+      `recordRunCounts: expected to update exactly 1 capture_runs row for ${runId}, updated ${String(result.rowCount ?? 0)} — ` +
+        "the run does not exist, or is invisible under the current tenant context",
+    );
+  }
 }

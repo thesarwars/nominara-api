@@ -52,11 +52,33 @@ export type L3RecomputeReason =
 /**
  * The alias set, hashed.
  *
- * Everything entity matching reads: the project's own aliases and owned
- * domains, and every competitor's name and aliases. A competitor added this
- * morning must invalidate a short-circuit, and competitors live in their own
- * table — a fingerprint over the project row alone would miss them entirely,
- * which is the most likely way for this cache to go quietly wrong.
+ * Everything entity matching reads: the project's own aliases, ROOT DOMAIN
+ * and owned domains, and every competitor's name, aliases and ROOT DOMAIN. A
+ * competitor added this morning must invalidate a short-circuit, and
+ * competitors live in their own table — a fingerprint over the project row
+ * alone would miss them entirely, which is the most likely way for this
+ * cache to go quietly wrong.
+ *
+ * THE TWO ROOT DOMAINS WERE MISSING, found by the second-engineer review.
+ * Both feed citation attribution rather than name matching, which is why
+ * they were easy to overlook and why the omission was serious:
+ *
+ *   `projects.root_domain` is NOT NULL and is the project's PRIMARY domain —
+ *   `owned_domains` is the secondary list beside it, not a superset. It was
+ *   the one column of the three the fingerprint did not read. A domain
+ *   migration or rebrand would leave every cached parse attributing
+ *   `owned_citation_count` against the old domain, indefinitely, because the
+ *   answer text had not changed and so nothing else would invalidate.
+ *
+ *   `competitors.root_domain` is how a citation is attributed to a
+ *   competitor at all. Setting it on a competitor that had none — the exact
+ *   shape of "finish configuring the competitor I added yesterday" — changed
+ *   what matching would produce while leaving this fingerprint identical.
+ *
+ * Adding inputs changes every fingerprint, so the first run after this ships
+ * recomputes rather than short-circuits. That is the safe direction and the
+ * one this module says it errs toward: recomputing costs money, copying a
+ * stale score costs trust.
  *
  * Order-independent by construction: the inputs are sorted before hashing, so
  * a database returning the same aliases in a different order does not look
@@ -64,16 +86,31 @@ export type L3RecomputeReason =
  * cannot hash alike.
  */
 export function aliasSetFingerprint(input: {
+  /** `projects.root_domain` — NOT NULL, and not a member of `ownedDomains`. */
+  readonly rootDomain: string;
   readonly brandAliases: readonly string[];
   readonly negativeAliases: readonly string[];
   readonly ownedDomains: readonly string[];
-  readonly competitors: readonly { readonly name: string; readonly aliases: readonly string[] }[];
+  readonly competitors: readonly {
+    readonly name: string;
+    readonly aliases: readonly string[];
+    /** `competitors.root_domain` — nullable, and how a citation is attributed to this competitor. */
+    readonly rootDomain: string | null;
+  }[];
 }): Buffer {
   const parts = [
+    `r:${input.rootDomain}`,
     ...input.brandAliases.map((a) => `b:${a}`),
     ...input.negativeAliases.map((a) => `n:${a}`),
     ...input.ownedDomains.map((d) => `d:${d}`),
-    ...input.competitors.flatMap((c) => [`c:${c.name}`, ...c.aliases.map((a) => `ca:${c.name}:${a}`)]),
+    ...input.competitors.flatMap((c) => [
+      `c:${c.name}`,
+      // Null and empty string must not hash alike: "no domain configured"
+      // and "domain cleared to empty" are different states of the row, and
+      // conflating them would let one become the other invisibly.
+      `cd:${c.name}:${c.rootDomain === null ? "\u0000null" : c.rootDomain}`,
+      ...c.aliases.map((a) => `ca:${c.name}:${a}`),
+    ]),
   ].sort();
 
   const hash = createHash("sha256");

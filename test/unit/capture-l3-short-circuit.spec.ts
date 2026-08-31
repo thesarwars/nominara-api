@@ -64,10 +64,11 @@ describe("STORY-032 · the L3 content-hash short-circuit", () => {
 
 describe("STORY-032 · the alias-set fingerprint", () => {
   const BASE = {
+    rootDomain: "acme.test",
     brandAliases: ["Acme", "Acme Corp"],
     negativeAliases: ["Acme Anvils"],
-    ownedDomains: ["acme.test"],
-    competitors: [{ name: "Globex", aliases: ["Globex Inc"] }],
+    ownedDomains: ["acme-shop.test"],
+    competitors: [{ name: "Globex", aliases: ["Globex Inc"], rootDomain: "globex.test" }],
   };
 
   it("is stable across repeated calls", () => {
@@ -80,7 +81,7 @@ describe("STORY-032 · the alias-set fingerprint", () => {
     const shuffled = {
       ...BASE,
       brandAliases: ["Acme Corp", "Acme"],
-      competitors: [{ name: "Globex", aliases: ["Globex Inc"] }],
+      competitors: [{ name: "Globex", aliases: ["Globex Inc"], rootDomain: "globex.test" }],
     };
     expect(aliasSetFingerprint(shuffled).equals(aliasSetFingerprint(BASE))).toBe(true);
   });
@@ -90,21 +91,92 @@ describe("STORY-032 · the alias-set fingerprint", () => {
   // competitor added this morning would never appear in a cell whose answer
   // had not changed.
   it("changes when a COMPETITOR is added, not just when the project's own aliases change", () => {
-    const withCompetitor = { ...BASE, competitors: [...BASE.competitors, { name: "Initech", aliases: [] }] };
+    const withCompetitor = {
+      ...BASE,
+      competitors: [...BASE.competitors, { name: "Initech", aliases: [], rootDomain: null }],
+    };
     expect(aliasSetFingerprint(withCompetitor).equals(aliasSetFingerprint(BASE))).toBe(false);
   });
 
   it("changes when a competitor gains an alias", () => {
-    const extended = { ...BASE, competitors: [{ name: "Globex", aliases: ["Globex Inc", "Globex Ltd"] }] };
+    const extended = {
+      ...BASE,
+      competitors: [{ name: "Globex", aliases: ["Globex Inc", "Globex Ltd"], rootDomain: "globex.test" }],
+    };
     expect(aliasSetFingerprint(extended).equals(aliasSetFingerprint(BASE))).toBe(false);
   });
 
   it.each([
     ["a brand alias", { brandAliases: ["Acme", "Acme Corp", "ACME Co"] }],
     ["a negative alias", { negativeAliases: ["Acme Anvils", "Acme Cartoons"] }],
-    ["an owned domain", { ownedDomains: ["acme.test", "acme.example"] }],
+    ["an owned domain", { ownedDomains: ["acme-shop.test", "acme.example"] }],
   ] as const)("changes when %s is added", (_label, patch) => {
     expect(aliasSetFingerprint({ ...BASE, ...patch }).equals(aliasSetFingerprint(BASE))).toBe(false);
+  });
+
+  // THE TWO ROOT DOMAINS, which the review found missing. Both drive
+  // CITATION attribution rather than name matching, so both change what a
+  // parse produces while leaving the answer text — and every other input
+  // here — identical.
+
+  it("changes when the project's ROOT DOMAIN changes, which owned_domains does not cover", () => {
+    // A domain migration. `root_domain` is NOT NULL and separate from
+    // `owned_domains`; fingerprinting only the latter left every cached
+    // parse attributing owned_citation_count against the old domain, with
+    // nothing to ever invalidate it.
+    const migrated = { ...BASE, rootDomain: "acme.example" };
+    expect(aliasSetFingerprint(migrated).equals(aliasSetFingerprint(BASE))).toBe(false);
+  });
+
+  it("does not confuse the project's root domain with one of its owned domains", () => {
+    // Swapping the two values must be a change. If both were hashed under
+    // the same tag, moving a domain from one column to the other would look
+    // like no change at all.
+    const swapped = { ...BASE, rootDomain: BASE.ownedDomains[0]!, ownedDomains: [BASE.rootDomain] };
+    expect(aliasSetFingerprint(swapped).equals(aliasSetFingerprint(BASE))).toBe(false);
+  });
+
+  it("changes when a COMPETITOR's root domain changes", () => {
+    const moved = { ...BASE, competitors: [{ ...BASE.competitors[0]!, rootDomain: "globex.example" }] };
+    expect(aliasSetFingerprint(moved).equals(aliasSetFingerprint(BASE))).toBe(false);
+  });
+
+  it("changes when a competitor that had NO root domain is given one", () => {
+    // "Finish configuring the competitor I added yesterday" — the most
+    // ordinary way this input changes, and the one the omission made silent.
+    const before = { ...BASE, competitors: [{ name: "Initech", aliases: [], rootDomain: null }] };
+    const after = { ...BASE, competitors: [{ name: "Initech", aliases: [], rootDomain: "initech.test" }] };
+    expect(aliasSetFingerprint(after).equals(aliasSetFingerprint(before))).toBe(false);
+  });
+
+  it("distinguishes a competitor with no root domain from one whose domain is empty", () => {
+    const absent = { ...BASE, competitors: [{ name: "Initech", aliases: [], rootDomain: null }] };
+    const empty = { ...BASE, competitors: [{ name: "Initech", aliases: [], rootDomain: "" }] };
+    expect(
+      aliasSetFingerprint(absent).equals(aliasSetFingerprint(empty)),
+      "unset and cleared are different states of the row and must not collapse into one",
+    ).toBe(false);
+  });
+
+  it("attributes a root domain to the RIGHT competitor", () => {
+    // Two competitors trading domains changes attribution for both while
+    // leaving the multiset of names and of domains identical — a fingerprint
+    // that hashed the two lists independently would miss it.
+    const forward = {
+      ...BASE,
+      competitors: [
+        { name: "Globex", aliases: [], rootDomain: "globex.test" },
+        { name: "Initech", aliases: [], rootDomain: "initech.test" },
+      ],
+    };
+    const traded = {
+      ...BASE,
+      competitors: [
+        { name: "Globex", aliases: [], rootDomain: "initech.test" },
+        { name: "Initech", aliases: [], rootDomain: "globex.test" },
+      ],
+    };
+    expect(aliasSetFingerprint(forward).equals(aliasSetFingerprint(traded))).toBe(false);
   });
 
   // LENGTH-PREFIXED, and this is the pair that proves it.
@@ -122,12 +194,14 @@ describe("STORY-032 · the alias-set fingerprint", () => {
   // against a configuration that had moved.
   it("distinguishes sets whose concatenations would otherwise be identical", () => {
     const withCompetitor = {
+      rootDomain: "x.test",
       brandAliases: ["a"],
       negativeAliases: [],
       ownedDomains: [],
-      competitors: [{ name: "b", aliases: [] }],
+      competitors: [{ name: "b", aliases: [], rootDomain: null }],
     };
     const withoutCompetitor = {
+      rootDomain: "x.test",
       brandAliases: ["ac:b"],
       negativeAliases: [],
       ownedDomains: [],
@@ -140,10 +214,21 @@ describe("STORY-032 · the alias-set fingerprint", () => {
   });
 
   // A project that has configured nothing yet still needs a stable answer
-  // rather than a throw or an empty buffer.
-  it("hashes an empty alias set to a stable value", () => {
-    const empty = { brandAliases: [], negativeAliases: [], ownedDomains: [], competitors: [] };
-    expect(aliasSetFingerprint(empty)).toHaveLength(32);
-    expect(aliasSetFingerprint(empty).equals(aliasSetFingerprint(empty))).toBe(true);
+  // rather than a throw or an empty buffer. `rootDomain` is NOT NULL in the
+  // schema, so it is always present even for a project with nothing else.
+  it("hashes an alias set with nothing but the root domain to a stable value", () => {
+    const bare = {
+      rootDomain: "acme.test",
+      brandAliases: [],
+      negativeAliases: [],
+      ownedDomains: [],
+      competitors: [],
+    };
+    expect(aliasSetFingerprint(bare)).toHaveLength(32);
+    expect(aliasSetFingerprint(bare).equals(aliasSetFingerprint(bare))).toBe(true);
+    expect(
+      aliasSetFingerprint(bare).equals(aliasSetFingerprint({ ...bare, rootDomain: "other.test" })),
+      "even a project that has configured nothing else is distinguished by its domain",
+    ).toBe(false);
   });
 });
