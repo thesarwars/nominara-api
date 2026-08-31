@@ -4,9 +4,16 @@ import type { Cache } from "../cache/cache.port.js";
 import type { QueueTopologyEntry } from "../queue/topology.js";
 import { dispatchCaptureCells, type DispatchCell, type DispatchOptions, type ProjectCadence } from "./dispatch-cells.js";
 import { assertFairUseCapacity, commitDeepScanCharge, type RunTrigger } from "./fair-use.js";
-import { probeExactHash } from "./l1-exact-hash.js";
-import { cellKey, probeSemanticReuse } from "./l2-semantic-reuse.js";
-import { fanOutCells, resolveEnabledEngines, selectPrompts, type PlannedCell, type PromptScope } from "./plan-cells.js";
+import { probeExactHash, type L1Hit } from "./l1-exact-hash.js";
+import { cellKey, probeSemanticReuse, type L2Hit } from "./l2-semantic-reuse.js";
+import {
+  fanOutCells,
+  resolveEnabledEngines,
+  selectPrompts,
+  type PlannedCell,
+  type PromptScope,
+  type ResolvedEngine,
+} from "./plan-cells.js";
 import { recordRunCounts, recordSuppressedCells, type SuppressedCell } from "./record-suppressed.js";
 import { cohortsFor, measureCohort, type SuppressionMeasurement } from "./suppression-cohorts.js";
 
@@ -84,9 +91,20 @@ function cellIdempotencyKey(runId: string, cell: PlannedCell): string {
 /**
  * Plan a run: resolve, fan out, suppress, reserve, and record.
  *
- * Everything here happens in the caller's transaction, and nothing here
- * enqueues. On refusal — a fair-use ceiling reached — this throws before
- * writing anything the caller would have to undo.
+ * Nothing here enqueues, and everything here happens in the caller's
+ * transaction — which this function now REQUIRES rather than assumes.
+ *
+ * The requirement was previously a sentence in this comment. It was also
+ * wrong in practice: no caller existed outside this directory, the tests
+ * passed a bare autocommit client, and `recordRunCounts` had just been made
+ * to throw. A run row deleted concurrently — a cancel racing a plan — left
+ * the suppressed rows written and the capacity reserved for a plan that
+ * threw. Reproduced by the second-engineer review.
+ *
+ * `SAVEPOINT` is the enforcement: Postgres refuses it outside a transaction
+ * block ("SAVEPOINT can only be used in transaction blocks"), so a caller in
+ * autocommit is told immediately rather than discovering it after a partial
+ * write. It is also the remedy — every write below is undone on the way out.
  */
 export async function planRun(tx: ClientBase, cache: Cache, context: PlanRunContext): Promise<PlannedRun> {
   const engines = await resolveEnabledEngines(tx, context.projectId, context.engineKeys);
@@ -149,6 +167,30 @@ export async function planRun(tx: ClientBase, cache: Cache, context: PlanRunCont
   // a second release path here would be the same mistake that put the
   // reservation in this module to begin with. Clamped at zero and recorded
   // rather than silently negative.
+  // THE WRITE LEG BEGINS HERE. See the note above: this both requires a
+  // transaction and scopes everything that follows, so a failure anywhere
+  // below leaves the reservation and the rows as they were.
+  await tx.query("SAVEPOINT nominara_plan_run");
+  try {
+    return await writePlan(tx, context, cells, liveCells, l1Hits, l2Hits, afterL1, engines);
+  } catch (error) {
+    await tx.query("ROLLBACK TO SAVEPOINT nominara_plan_run");
+    throw error;
+  } finally {
+    await tx.query("RELEASE SAVEPOINT nominara_plan_run").catch(() => undefined);
+  }
+}
+
+async function writePlan(
+  tx: ClientBase,
+  context: PlanRunContext,
+  cells: readonly PlannedCell[],
+  liveCells: readonly PlannedCell[],
+  l1Hits: Map<string, L1Hit>,
+  l2Hits: Map<string, L2Hit>,
+  afterL1: readonly PlannedCell[],
+  engines: readonly ResolvedEngine[],
+): Promise<PlannedRun> {
   const priorRun = await tx.query<{ planned_cells: number; skipped_cells: number }>(
     "SELECT planned_cells, skipped_cells FROM capture_runs WHERE id = $1",
     [context.runId],
@@ -193,6 +235,7 @@ export async function planRun(tx: ClientBase, cache: Cache, context: PlanRunCont
               engineKey: cell.engineKey,
               sampleIndex: cell.sampleIndex,
               sourceResultId: hit.sourceResultId,
+              sourceContentHash: hit.sourceContentHash,
               adapterVersion: cell.adapterVersion,
             },
           ];
@@ -215,7 +258,13 @@ export async function planRun(tx: ClientBase, cache: Cache, context: PlanRunCont
   // AC12 — durable before any job can exist. See the note at the top: what
   // makes this an ordering rather than a hope is that the return value of
   // this function is the only thing `dispatchPlannedRun` accepts.
-  await recordRunCounts(tx, context.runId, { planned: cells.length, skipped: suppressed.length });
+  await recordRunCounts(tx, context.runId, {
+    planned: cells.length,
+    skipped: suppressed.length,
+    // The engines that survived entitlement filtering, not the ones asked
+    // for. See RunCounts.engineKeys.
+    engineKeys: engines.map((engine) => engine.engineKey),
+  });
 
   const cohortInput = { cadence: context.cadence, planKey: context.planKey };
   return {

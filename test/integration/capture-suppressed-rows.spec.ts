@@ -177,7 +177,7 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
     const sourceId = await addSourceCapture(promptId, sourceHash);
 
     await recordSuppressedCells(db, context, [
-      { layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: sourceId, adapterVersion: "1.0.0" },
+      { layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: sourceId, sourceContentHash: sourceHash, adapterVersion: "1.0.0" },
     ]);
 
     const row = await db.query<{ cache_layer: string; source_result_id: string; content_hash: Buffer }>(
@@ -186,14 +186,17 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
     );
     expect(row.rows[0]!.cache_layer).toBe("l2");
     expect(row.rows[0]!.source_result_id, "the reuse must name what it reused").toBe(sourceId);
-    expect(row.rows[0]!.content_hash.equals(sourceHash), "copied from the source, never passed in").toBe(true);
+    expect(
+      row.rows[0]!.content_hash.equals(sourceHash),
+      "the row records the SOURCE's hash, so the two cannot disagree about what was answered",
+    ).toBe(true);
   }, 30_000);
 
   // THE COUNT DISCIPLINE. captured_cells belongs to the workers, as real
   // captures land. Pre-seeding it with suppressions reports work that never
   // happened and makes the suppression rate compute against itself.
   it("records planned and skipped, and leaves captured_cells at zero", async () => {
-    await recordRunCounts(db, runId, { planned: 10, skipped: 4 });
+    await recordRunCounts(db, runId, { planned: 10, skipped: 4, engineKeys: ["perplexity"] });
 
     const run = await db.query<{ planned_cells: number; skipped_cells: number; captured_cells: number }>(
       "SELECT planned_cells, skipped_cells, captured_cells FROM capture_runs WHERE id = $1",
@@ -224,7 +227,7 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
 
     // The failure this guards is not the missing run — it is the caller
     // going on to enqueue jobs against a plan that was never made durable.
-    await expect(recordRunCounts(db, absent, { planned: 3, skipped: 1 })).rejects.toThrow(/updated 0/u);
+    await expect(recordRunCounts(db, absent, { planned: 3, skipped: 1, engineKeys: ["perplexity"] })).rejects.toThrow(/updated 0/u);
   }, 30_000);
 
   it("throws for a run in ANOTHER workspace, which RLS makes invisible rather than forbidden", async () => {
@@ -253,7 +256,7 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
     await appDb.query("BEGIN");
     try {
       await appDb.query("SELECT set_config('app.current_workspace_id', $1, true)", [workspaceId]);
-      await expect(recordRunCounts(appDb, otherRun, { planned: 99, skipped: 99 })).rejects.toThrow(/updated 0/u);
+      await expect(recordRunCounts(appDb, otherRun, { planned: 99, skipped: 99, engineKeys: ["perplexity"] })).rejects.toThrow(/updated 0/u);
     } finally {
       await appDb.query("ROLLBACK");
     }
@@ -271,7 +274,7 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
     await appDb.query("BEGIN");
     try {
       await appDb.query("SELECT set_config('app.current_workspace_id', $1, true)", [workspaceId]);
-      await expect(recordRunCounts(appDb, runId, { planned: 7, skipped: 2 })).resolves.toBeUndefined();
+      await expect(recordRunCounts(appDb, runId, { planned: 7, skipped: 2, engineKeys: ["perplexity"] })).resolves.toBeUndefined();
       await appDb.query("COMMIT");
     } catch (error) {
       await appDb.query("ROLLBACK");
@@ -286,8 +289,8 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
   }, 30_000);
 
   it("records the counts it was given, not the counts it already had", async () => {
-    await recordRunCounts(db, runId, { planned: 3, skipped: 1 });
-    await recordRunCounts(db, runId, { planned: 8, skipped: 5 });
+    await recordRunCounts(db, runId, { planned: 3, skipped: 1, engineKeys: ["perplexity"] });
+    await recordRunCounts(db, runId, { planned: 8, skipped: 5, engineKeys: ["perplexity"] });
 
     // Re-planning must overwrite. An UPDATE that only ever set a zero row
     // would pass the first-write tests above and leave a replanned run
@@ -308,7 +311,8 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
   // for already-matched.
   it("a reused cell arrives UNSCORED — the source's scores are never copied", async () => {
     const promptId = await addPrompt("reused");
-    const sourceId = await addSourceCapture(promptId, Buffer.alloc(32, 3));
+    const sourceHash = Buffer.alloc(32, 3);
+    const sourceId = await addSourceCapture(promptId, sourceHash);
 
     // The source is fully scored, which is the whole temptation.
     const source = await db.query<{ brand_present: boolean; sov: number }>(
@@ -320,7 +324,7 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
     });
 
     await recordSuppressedCells(db, context, [
-      { layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: sourceId, adapterVersion: "1.0.0" },
+      { layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: sourceId, sourceContentHash: sourceHash, adapterVersion: "1.0.0" },
     ]);
 
     const reused = await db.query<{
@@ -358,10 +362,11 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
   // and the competitor added yesterday would never appear.
   it("a reused cell carries the CURRENT alias fingerprint, not the source's", async () => {
     const promptId = await addPrompt("reused");
-    const sourceId = await addSourceCapture(promptId, Buffer.alloc(32, 3));
+    const sourceHash = Buffer.alloc(32, 3);
+    const sourceId = await addSourceCapture(promptId, sourceHash);
 
     await recordSuppressedCells(db, context, [
-      { layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: sourceId, adapterVersion: "1.0.0" },
+      { layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: sourceId, sourceContentHash: sourceHash, adapterVersion: "1.0.0" },
     ]);
 
     const row = await db.query<{ alias_fingerprint: Buffer }>(
@@ -394,6 +399,59 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
     expect(row.rows[0]!.alias_fingerprint.equals(CURRENT_ALIASES)).toBe(true);
   }, 30_000);
 
+  // THE SAME DEFECT THE L2 PROBE HAD, in the sibling writer on the same code
+  // path. Reading the source's content hash here meant a LEFT JOIN on
+  // answer_captures.id, which is not indexed on its own — the primary key is
+  // (captured_at, id) — so every planning call that suppressed an L2 cell
+  // sequentially scanned every partition of the platform's largest table.
+  // The probe's own EXPLAIN test could not see it: it explains the probe.
+  it("reaches no partition of answer_captures at all when writing suppressed rows", async () => {
+    for (let monthsBack = 1; monthsBack <= 10; monthsBack += 1) {
+      const start = new Date(Date.UTC(2026, 7 - monthsBack, 1));
+      const end = new Date(Date.UTC(2026, 8 - monthsBack, 1));
+      await db.query(
+        `CREATE TABLE IF NOT EXISTS answer_captures_p${start.toISOString().slice(0, 7).replace("-", "")}
+           PARTITION OF answer_captures FOR VALUES FROM ('${start.toISOString()}') TO ('${end.toISOString()}')`,
+      );
+    }
+    const promptId = await addPrompt("q");
+    const sourceHash = Buffer.alloc(32, 3);
+    const sourceId = await addSourceCapture(promptId, sourceHash);
+
+    let plan = "";
+    const explaining = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "query") {
+          return async (sql: string, values?: unknown[]) => {
+            if (!sql.includes("INSERT INTO answer_captures")) {
+              return (target.query as (...a: unknown[]) => unknown)(sql, values);
+            }
+            const explained = await target.query<Record<string, string>>(`EXPLAIN (COSTS OFF) ${sql}`, values);
+            plan = explained.rows.map((row) => row["QUERY PLAN"] ?? "").join("\n");
+            return { rows: [], rowCount: 0 };
+          };
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+
+    await recordSuppressedCells(explaining, context, [
+      {
+        layer: "l2",
+        promptId,
+        engineKey: "perplexity",
+        sampleIndex: 0,
+        sourceResultId: sourceId,
+        sourceContentHash: sourceHash,
+        adapterVersion: "1.0.0",
+      },
+    ]);
+
+    // Only the NOT EXISTS guard may read the table, and it is bounded by
+    // run_id. Nothing may scan a partition to look a source row up by id.
+    expect(plan, `the writer still scans partitions. Plan:\n${plan}`).not.toMatch(/Seq Scan on answer_captures_p/u);
+  }, 60_000);
+
   it("writes nothing, and asks nothing, for an empty suppression set", async () => {
     expect(await recordSuppressedCells(db, context, [])).toBe(0);
     const rows = await db.query("SELECT 1 FROM answer_captures WHERE run_id = $1", [runId]);
@@ -403,7 +461,7 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
   // A run with nothing cached is the normal case for a new project, and it
   // must record a real plan rather than an empty one.
   it("records a plan with zero suppressions when nothing was cached", async () => {
-    await recordRunCounts(db, runId, { planned: 6, skipped: 0 });
+    await recordRunCounts(db, runId, { planned: 6, skipped: 0, engineKeys: ["perplexity"] });
     const run = await db.query<{ planned_cells: number; skipped_cells: number }>(
       "SELECT planned_cells, skipped_cells FROM capture_runs WHERE id = $1",
       [runId],

@@ -40,6 +40,16 @@ export interface L2Hit {
   readonly sampleIndex: number;
   /** The capture being reused — recorded as `source_result_id` on the suppressed row. */
   readonly sourceResultId: string;
+  /**
+   * The source's content hash, carried out with the hit.
+   *
+   * Returned here so the row writer does not have to go back for it. Its
+   * LEFT JOIN on `source.id` looked harmless and was not: `id` alone is not
+   * indexed — the primary key is (captured_at, id) — so it sequentially
+   * scanned every partition of answer_captures on every planning call that
+   * suppressed an L2 cell. The probe is already reading this row.
+   */
+  readonly sourceContentHash: Buffer;
   readonly cosine: number;
 }
 
@@ -108,6 +118,7 @@ export async function probeSemanticReuse(
     engine_key: string;
     sample_index: number;
     source_result_id: string;
+    source_content_hash: Buffer;
     cosine: number;
   }>(
     `
@@ -119,7 +130,7 @@ export async function probeSemanticReuse(
       SELECT * FROM jsonb_to_recordset($2::jsonb)
         AS c(prompt_id uuid, engine_key text, sample_index int, ttl_seconds int)
     )
-    SELECT c.prompt_id, c.engine_key, c.sample_index, s.source_result_id, s.cosine
+    SELECT c.prompt_id, c.engine_key, c.sample_index, s.source_result_id, s.source_content_hash, s.cosine
       FROM candidate c
       -- BOTH SIDES OF THE COMPARISON ARE PROJECT-SCOPED. The source filters
       -- below were here from the start; the TARGET had none, so a cell whose
@@ -134,6 +145,7 @@ export async function probeSemanticReuse(
       -- with no way to distinguish "no source" from "never asked".
       JOIN LATERAL (
         SELECT ac.id AS source_result_id,
+               ac.content_hash AS source_content_hash,
                1 - (source_prompt.embedding <=> target.embedding) AS cosine
           FROM answer_captures ac
           JOIN tracked_prompts source_prompt ON source_prompt.id = ac.prompt_id
@@ -189,6 +201,7 @@ export async function probeSemanticReuse(
       engineKey: row.engine_key,
       sampleIndex: row.sample_index,
       sourceResultId: row.source_result_id,
+      sourceContentHash: row.source_content_hash,
       cosine: Number(row.cosine),
     });
   }

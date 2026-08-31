@@ -52,6 +52,8 @@ export type SuppressedCell =
       readonly engineKey: string;
       readonly sampleIndex: number;
       readonly sourceResultId: string;
+      /** Copied from the source so the two cannot disagree about what was answered. */
+      readonly sourceContentHash: Buffer;
       readonly adapterVersion: string;
     };
 
@@ -103,7 +105,7 @@ export async function recordSuppressedCells(
     cache_layer: cell.layer,
     adapter_version: cell.adapterVersion,
     source_result_id: cell.layer === "l2" ? cell.sourceResultId : null,
-    content_hash: cell.layer === "l1" ? cell.contentHash.toString("hex") : null,
+    content_hash: (cell.layer === "l1" ? cell.contentHash : cell.sourceContentHash).toString("hex"),
     // L1 carries the answer inline; L2 leaves it where the source already
     // holds it, reachable through source_result_id inside this tenant.
     payload: cell.layer === "l1" ? cell.payload : null,
@@ -131,8 +133,14 @@ export async function recordSuppressedCells(
            -- An L2 row's hash is COPIED from the capture it reuses, so the
            -- two cannot disagree about what was answered. An L1 row's comes
            -- from the shared cache entry, which is the only thing that has it.
-           COALESCE(decode(c.content_hash, 'hex'), source.content_hash),
-           -- The CURRENT fingerprint, never source.alias_fingerprint. See
+           -- Both now arrive as parameters: reading the source's hash here
+           -- meant a LEFT JOIN on answer_captures.id, which is not indexed
+           -- on its own (the key is (captured_at, id)) and so scanned every
+           -- partition of the largest table on every planning call that
+           -- suppressed an L2 cell — the same defect fixed in the probe one
+           -- file over.
+           decode(c.content_hash, 'hex'),
+           -- The CURRENT fingerprint, never the source's. See
            -- SuppressedRowContext.aliasFingerprint.
            c.cache_layer, c.source_result_id, $7, 'skipped',
            -- THE ANSWER, for an L1 row. §6: "storage happens per tenant
@@ -144,7 +152,6 @@ export async function recordSuppressedCells(
         AS c(prompt_id uuid, engine_key text, sample_index int, cache_layer text,
              adapter_version text, source_result_id uuid, content_hash text,
              payload jsonb, excerpt text)
-      LEFT JOIN answer_captures source ON source.id = c.source_result_id
      -- IDEMPOTENT PER RUN. The ux_results_cell index cannot enforce it: it is
      -- (run_id, prompt_id, engine_key, sample_index, captured_at), and
      -- captured_at is now() — a fresh value on every attempt — so ON
@@ -182,6 +189,19 @@ export async function recordSuppressedCells(
 export interface RunCounts {
   readonly planned: number;
   readonly skipped: number;
+  /**
+   * The engines this run ACTUALLY covered, after entitlement filtering.
+   *
+   * §5: `capture_runs.engine_keys` "records exactly which engines a run
+   * covered, so a per-engine cadence is reconstructable from data and the
+   * freshness table cannot drift from reality (NFR-SIM-10)". The row is
+   * created before planning, with whatever set the caller intended; only the
+   * planner knows which of them survived the entitlement and status filters.
+   * Left unreconciled, a run on a plan entitled to one engine still claimed
+   * the two it asked for, and every per-engine cadence derived from the row
+   * would be derived from a set that never ran.
+   */
+  readonly engineKeys: readonly string[];
 }
 
 /**
@@ -203,9 +223,10 @@ export async function recordRunCounts(tx: ClientBase, runId: string, counts: Run
   const result = await tx.query(
     `UPDATE capture_runs
         SET planned_cells = $2,
-            skipped_cells = $3
+            skipped_cells = $3,
+            engine_keys = $4
       WHERE id = $1`,
-    [runId, counts.planned, counts.skipped],
+    [runId, counts.planned, counts.skipped, counts.engineKeys],
   );
 
   // AN UPDATE THAT MATCHED NOTHING IS NOT A RECORDED COUNT.

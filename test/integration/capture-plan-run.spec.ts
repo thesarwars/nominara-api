@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Redis } from "ioredis";
-import { Client } from "pg";
+import { Client, type ClientBase } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
@@ -174,6 +174,24 @@ describe("STORY-032 · planning a run end to end", () => {
     );
   }
 
+  /**
+   * planRun REQUIRES a transaction and says so by taking a savepoint, so
+   * every call here opens one. That is not test ceremony — it is the
+   * contract, and running these against an autocommit client is what let a
+   * partial write go unnoticed.
+   */
+  async function planInTransaction(client: ClientBase, ctx: PlanRunContext) {
+    await client.query("BEGIN");
+    try {
+      const planned = await planRun(client, cache, ctx);
+      await client.query("COMMIT");
+      return planned;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    }
+  }
+
   async function counts(): Promise<{ planned: number; skipped: number; captured: number }> {
     const row = await db.query<{ planned_cells: number; skipped_cells: number; captured_cells: number }>(
       "SELECT planned_cells, skipped_cells, captured_cells FROM capture_runs WHERE id = $1",
@@ -192,7 +210,7 @@ describe("STORY-032 · planning a run end to end", () => {
     await addPrompt("best crm");
     await addPrompt("best erp");
 
-    const plan = await planRun(db, cache, context());
+    const plan = await planInTransaction(db, context());
 
     expect(plan.planned).toBe(2);
     expect(plan.skipped).toBe(0);
@@ -209,7 +227,7 @@ describe("STORY-032 · planning a run end to end", () => {
     await addPrompt("best erp");
     const queue = newQueue();
 
-    const plan = await planRun(db, cache, context());
+    const plan = await planInTransaction(db, context());
 
     expect(await counts(), "the plan must be durable at this point").toMatchObject({ planned: 2, skipped: 0 });
     expect(await queue.getJobCountByTypes("waiting", "delayed", "prioritized", "active")).toBe(0);
@@ -226,7 +244,7 @@ describe("STORY-032 · planning a run end to end", () => {
     await seedL1(cached, "a".repeat(64));
     const queue = newQueue();
 
-    const plan = await planRun(db, cache, context());
+    const plan = await planInTransaction(db, context());
     await dispatchPlannedRun(queue, ENTRY, plan);
 
     expect(plan.skipped).toBe(1);
@@ -247,7 +265,7 @@ describe("STORY-032 · planning a run end to end", () => {
     await addPrompt("best crm");
     await seedL1("best crm", "a".repeat(64), "Acme is widely recommended.");
 
-    await planRun(db, cache, context());
+    await planInTransaction(db, context());
 
     const row = await db.query<{
       payload: { answer?: string };
@@ -297,7 +315,7 @@ describe("STORY-032 · planning a run end to end", () => {
       },
     });
 
-    const plan = await planRun(watching, cache, context());
+    const plan = await planInTransaction(watching, context());
 
     expect(l2Batch, "only the cells L1 could not answer").toHaveLength(1);
     expect(plan.suppressedByLayer).toEqual({ l1: 1, l2: 0 });
@@ -319,7 +337,7 @@ describe("STORY-032 · planning a run end to end", () => {
     await seedL1("best crm", "a".repeat(64));
     await seedL1("best erp", "b".repeat(64));
 
-    await planRun(db, cache, context());
+    await planInTransaction(db, context());
 
     const row = await db.query<{ reserved_value: string }>(
       "SELECT reserved_value FROM usage_counters WHERE workspace_id = $1 AND metric = $2",
@@ -337,7 +355,7 @@ describe("STORY-032 · planning a run end to end", () => {
     await setCeiling(1);
     const queue = newQueue();
 
-    await expect(planRun(db, cache, context())).rejects.toThrow(/fair-use|ceiling|quota/iu);
+    await expect(planInTransaction(db, context())).rejects.toThrow(/fair-use|ceiling|quota/iu);
 
     expect(await counts(), "no plan may be recorded for a refused run").toMatchObject({ planned: 0, skipped: 0 });
     const rows = await db.query("SELECT 1 FROM answer_captures WHERE run_id = $1", [runId]);
@@ -359,8 +377,8 @@ describe("STORY-032 · planning a run end to end", () => {
     await addPrompt("best erp");
     await seedL1("best crm", "a".repeat(64));
 
-    const first = await planRun(db, cache, context());
-    const second = await planRun(db, cache, context());
+    const first = await planInTransaction(db, context());
+    const second = await planInTransaction(db, context());
 
     expect(second.planned, "the plan itself is unchanged").toBe(first.planned);
     expect(second.skipped).toBe(first.skipped);
@@ -387,7 +405,7 @@ describe("STORY-032 · planning a run end to end", () => {
     await addPrompt("best erp");
     await seedL1("best crm", "a".repeat(64));
 
-    await planRun(db, cache, context());
+    await planInTransaction(db, context());
     await cache.delete(
       captureL1Key({
         env: "test",
@@ -400,7 +418,7 @@ describe("STORY-032 · planning a run end to end", () => {
         nowMs: NOW_MS,
       }),
     );
-    const second = await planRun(db, cache, context());
+    const second = await planInTransaction(db, context());
 
     expect(second.live, "the expired entry means both cells are live now").toBe(2);
     const reserved = await db.query<{ reserved_value: string }>(
@@ -410,12 +428,77 @@ describe("STORY-032 · planning a run end to end", () => {
     expect(Number(reserved.rows[0]!.reserved_value), "1 held from the first plan, 1 more now").toBe(2);
   }, 60_000);
 
+  // THE TRANSACTION IS A REQUIREMENT, NOT A CONVENTION.
+  it("refuses to plan on an autocommit connection rather than writing half a plan", async () => {
+    await addPrompt("best crm");
+
+    await expect(planRun(db, cache, context())).rejects.toThrow(/transaction blocks/u);
+
+    expect(await counts(), "and nothing was recorded").toMatchObject({ planned: 0, skipped: 0 });
+  }, 60_000);
+
+  // WHAT A FAILURE MID-WRITE LEAVES BEHIND: nothing.
+  //
+  // recordRunCounts throws when it matches no row, and it runs AFTER the
+  // reservation and after the suppressed rows. A run row deleted
+  // concurrently — a cancel racing a plan — used to leave the rows written
+  // and the capacity reserved for a plan that threw. Reproduced by the
+  // review: 1 orphan row, 1 reserved.
+  it("leaves no rows and no reservation when the plan fails after writing", async () => {
+    await addPrompt("best crm");
+    await addPrompt("best erp");
+    await seedL1("best crm", "a".repeat(64));
+
+    await db.query("BEGIN");
+    // Delete the run inside the same transaction, so recordRunCounts finds
+    // nothing to update and throws at the very end of the write leg.
+    await db.query("DELETE FROM capture_runs WHERE id = $1", [runId]);
+    await expect(planRun(db, cache, context())).rejects.toThrow(/updated 0/u);
+
+    const orphans = await db.query<{ n: string }>(
+      "SELECT count(*) AS n FROM answer_captures WHERE run_id = $1", [runId]);
+    const reserved = await db.query<{ reserved_value: string }>(
+      "SELECT reserved_value FROM usage_counters WHERE workspace_id = $1 AND metric = $2",
+      [workspaceId, FAIR_USE_METRIC]);
+
+    expect(Number(orphans.rows[0]!.n), "suppressed rows for a plan that threw").toBe(0);
+    expect(Number(reserved.rows[0]!.reserved_value), "capacity held for a run that will not happen").toBe(0);
+    await db.query("ROLLBACK");
+  }, 60_000);
+
+  // §5: the run row must record exactly which engines the run COVERED.
+  it("reconciles engine_keys with the engines entitlement actually allowed", async () => {
+    // A second engine the project enables but the plan does not entitle.
+    await db.query(
+      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
+                            cache_ttl_seconds, volatility_band, min_plan_key, status)
+       VALUES ('gemini', 'gemini', 'v', 'api', '1.0.0', $1, 'medium', 'business', 'active')`,
+      [TTL_SECONDS],
+    );
+    await db.query(
+      `INSERT INTO project_engines (workspace_id, project_id, engine_key, enabled, sample_count)
+       VALUES ($1, $2, 'gemini', true, 1)`,
+      [workspaceId, projectId],
+    );
+    await db.query("UPDATE capture_runs SET engine_keys = ARRAY['perplexity','gemini'] WHERE id = $1", [runId]);
+    await addPrompt("best crm");
+
+    await planInTransaction(db, context());
+
+    const row = await db.query<{ engine_keys: string[] }>(
+      "SELECT engine_keys FROM capture_runs WHERE id = $1", [runId]);
+    expect(
+      row.rows[0]!.engine_keys,
+      "the row must not claim an engine the workspace is not entitled to and which never ran",
+    ).toEqual(["perplexity"]);
+  }, 60_000);
+
   it("measures suppression per cohort, not blended", async () => {
     await addPrompt("best crm");
     await addPrompt("best erp");
     await seedL1("best crm", "a".repeat(64));
 
-    const plan = await planRun(db, cache, context({ cadence: "daily", planKey: "free" }));
+    const plan = await planInTransaction(db, context({ cadence: "daily", planKey: "free" }));
 
     // A free-plan daily project is in all three cohorts and is measured
     // against each one's own target — a blended number would report one.
@@ -428,8 +511,8 @@ describe("STORY-032 · planning a run end to end", () => {
   it("charges nothing for a scheduled run and hooks the charge for a manual one", async () => {
     await addPrompt("best crm");
 
-    expect((await planRun(db, cache, context())).charge.charged).toBe(false);
-    expect((await planRun(db, cache, context({ trigger: "manual" }))).charge.reason).toMatch(/wallet/iu);
+    expect((await planInTransaction(db, context())).charge.charged).toBe(false);
+    expect((await planInTransaction(db, context({ trigger: "manual" }))).charge.reason).toMatch(/wallet/iu);
   }, 60_000);
 
   // TWO CELLS, NOT ONE, and the count is asserted on both dispatches. With a
@@ -442,7 +525,7 @@ describe("STORY-032 · planning a run end to end", () => {
     await addPrompt("best erp");
     const queue = newQueue();
 
-    const plan = await planRun(db, cache, context());
+    const plan = await planInTransaction(db, context());
     expect(new Set(plan.cells.map((cell) => cell.idempotencyKey)).size, "one identity per cell").toBe(2);
 
     await dispatchPlannedRun(queue, ENTRY, plan);
@@ -459,7 +542,7 @@ describe("STORY-032 · planning a run end to end", () => {
     await addPrompt("best crm");
     await seedL1("best crm", "a".repeat(64));
 
-    const plan = await planRun(db, cache, context({ sharedCacheEnabled: false }));
+    const plan = await planInTransaction(db, context({ sharedCacheEnabled: false }));
 
     expect(plan.skipped, "a seeded answer must not be served to a bypassing workspace").toBe(0);
     expect(plan.live).toBe(1);

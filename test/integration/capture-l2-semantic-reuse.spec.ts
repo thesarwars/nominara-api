@@ -153,6 +153,21 @@ describe("STORY-032 · L2 semantic reuse — the six admission rules", () => {
     expect(hits.size, "the probe must be capable of admitting at all").toBe(1);
     expect(hits.get(cellKey(candidate(target)))?.sourceResultId).toBe(sourceId);
     expect(hits.get(cellKey(candidate(target)))!.cosine).toBeGreaterThanOrEqual(L2_COSINE_THRESHOLD);
+
+    // THE SOURCE'S OWN HASH, read from the source row.
+    //
+    // The row writer used to read this itself, with a LEFT JOIN on
+    // answer_captures.id — unindexed on its own, so it scanned every
+    // partition. It now trusts what the probe hands it, which puts the
+    // guarantee here: this is the assertion that the value actually comes
+    // from the source capture and is not, say, the target's or a default.
+    const sourceHash = await db.query<{ content_hash: Buffer }>(
+      "SELECT content_hash FROM answer_captures WHERE id = $1",
+      [sourceId],
+    );
+    expect(
+      hits.get(cellKey(candidate(target)))!.sourceContentHash.equals(sourceHash.rows[0]!.content_hash),
+    ).toBe(true);
   }, 30_000);
 
   it("rule 1 — refuses a source from ANOTHER project, even in the same workspace", async () => {
