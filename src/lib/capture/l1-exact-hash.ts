@@ -10,13 +10,37 @@ import { cellKey } from "./l2-semantic-reuse.js";
 // whether it can avoid work — the cache asked to justify itself in the
 // currency it exists to save. `Cache.getMany` is the operation added for it.
 //
-// WHAT AN ENTRY HOLDS, and why it is not a result id. L1 is cross-tenant, so
-// the value cannot point at a row: a `result_id` belongs to whichever tenant
-// happened to capture first, and handing it to a second tenant would be a
-// cross-tenant reference dressed up as a cache hit. It holds the answer's
-// CONTENT HASH instead, which is public information about a public answer.
-// The reader then resolves that hash against its OWN prior parses through
-// the L3 short-circuit, so nothing crosses the boundary.
+// WHAT AN ENTRY HOLDS: THE ANSWER ITSELF.
+//
+// §6 is explicit — "L1 entries store only an engine's public answer to a
+// public question and contain no tenant identifier. Entity matching,
+// scoring, and storage all happen per tenant AFTER the cache read." The
+// storage happens after the read because the read is what SUPPLIES the thing
+// stored.
+//
+// This module first shipped storing only the content HASH, on the reasoning
+// that a `result_id` would hand one tenant a reference to another tenant's
+// row. That half was right and still holds — no result id appears here. But
+// a hash alone is not an answer, and the reader was left with nothing to
+// store: the suppressed row carried a NULL `raw_object_key`, a NULL
+// `response_excerpt` and an empty `payload`, so no tenant that had not
+// ALREADY captured that exact answer could recover a word of it. The row was
+// not "unscored pending re-match"; it was unscoreable, permanently, while
+// `brand_present NOT NULL DEFAULT false` presented it to any future
+// aggregation as "the brand was absent". Found by the second-engineer
+// review, which reproduced the empty row.
+//
+// The remedy proposed there — admit an L1 hit only when the workspace can
+// already resolve the hash — was NOT taken: it would reduce L1 to a
+// per-tenant cache, since a tenant can only resolve a hash it already
+// captured. That is the opposite of §6's "all tenants asking the same
+// question in the same window share one capture", which the same section
+// calls the single largest cost lever. The defect was the missing answer,
+// not the sharing.
+//
+// A tenant identifier still cannot enter: the envelope carries the engine's
+// public response and nothing else, which is exactly what §10's exemption is
+// granted for.
 
 export interface L1Candidate {
   readonly promptId: string;
@@ -27,12 +51,60 @@ export interface L1Candidate {
   readonly adapterVersion: string;
 }
 
+/**
+ * What one shared entry holds — the engine's public answer, and nothing that
+ * identifies who asked.
+ *
+ * Versioned because the value outlives a deploy: an entry written by the
+ * previous build is still in the cache when the next one reads it, and an
+ * envelope it cannot read must be a MISS rather than a crash or, worse, a
+ * partially-populated row.
+ */
+export interface L1Envelope {
+  readonly v: 1;
+  /** Hex sha256 of the answer, as stored in `answer_captures.content_hash`. */
+  readonly contentHash: string;
+  /** The adapter's normalised response — what the parser reads. */
+  readonly payload: Record<string, unknown>;
+  /** The short human-readable excerpt shown in the UI. */
+  readonly excerpt: string | null;
+}
+
 export interface L1Hit {
   readonly promptId: string;
   readonly engineKey: string;
   readonly sampleIndex: number;
-  /** The shared answer's content hash — resolved against THIS tenant's own parses by L3. */
   readonly contentHash: Buffer;
+  /** The answer, so the suppressed row is a row the parser can actually read. */
+  readonly payload: Record<string, unknown>;
+  readonly excerpt: string | null;
+}
+
+/**
+ * Parse one stored entry, or return undefined for anything unreadable.
+ *
+ * Unreadable covers a corrupt value, a foreign key collision, and an
+ * envelope from a future build. All three are MISSES: a cell that falls
+ * through to a live capture costs a vendor call, while a cell suppressed
+ * against an entry we could not read costs a row that can never be scored.
+ */
+export function parseL1Envelope(raw: string): L1Envelope | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const candidate = parsed as Partial<L1Envelope>;
+  if (candidate.v !== 1) return undefined;
+  if (typeof candidate.contentHash !== "string" || !/^[0-9a-f]{64}$/u.test(candidate.contentHash)) return undefined;
+  if (typeof candidate.payload !== "object" || candidate.payload === null || Array.isArray(candidate.payload)) {
+    return undefined;
+  }
+  const excerpt = candidate.excerpt;
+  if (excerpt !== null && typeof excerpt !== "string") return undefined;
+  return { v: 1, contentHash: candidate.contentHash, payload: candidate.payload, excerpt: excerpt ?? null };
 }
 
 export interface L1ProbeContext {
@@ -116,17 +188,17 @@ export async function probeExactHash(
   keys.forEach((key, index) => {
     const value = values[index];
     if (value === undefined || value === "") return;
-    // A stored value that is not a hex digest is a corrupt or foreign entry,
-    // never a hit. Treating it as one would put arbitrary bytes into
-    // `content_hash` and send L3 looking for a parse that cannot exist.
-    if (!/^[0-9a-f]{64}$/u.test(value)) return;
-    const contentHash = Buffer.from(value, "hex");
+    const envelope = parseL1Envelope(value);
+    if (envelope === undefined) return;
+    const contentHash = Buffer.from(envelope.contentHash, "hex");
     for (const candidate of cellsByKey.get(key) ?? []) {
       hits.set(cellKey(candidate), {
         promptId: candidate.promptId,
         engineKey: candidate.engineKey,
         sampleIndex: candidate.sampleIndex,
         contentHash,
+        payload: envelope.payload,
+        excerpt: envelope.excerpt,
       });
     }
   });

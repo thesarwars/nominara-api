@@ -157,7 +157,7 @@ describe("STORY-032 · planning a run end to end", () => {
   }
 
   /** Seed the shared answer cache so the L1 probe finds `text`. */
-  async function seedL1(text: string, contentHash: string): Promise<void> {
+  async function seedL1(text: string, contentHash: string, answer = "the shared answer"): Promise<void> {
     await cache.set(
       captureL1Key({
         env: "test",
@@ -169,7 +169,7 @@ describe("STORY-032 · planning a run end to end", () => {
         ttlSeconds: TTL_SECONDS,
         nowMs: NOW_MS,
       }),
-      contentHash,
+      JSON.stringify({ v: 1, contentHash, payload: { answer }, excerpt: answer }),
       { ttlMs: 600_000 },
     );
   }
@@ -232,6 +232,40 @@ describe("STORY-032 · planning a run end to end", () => {
     expect(plan.skipped).toBe(1);
     expect(plan.live).toBe(1);
     expect(await queue.getJobCountByTypes("waiting", "delayed", "prioritized", "active")).toBe(1);
+  }, 60_000);
+
+  // THE SUPPRESSED ROW MUST BE A ROW SOMEONE CAN READ.
+  //
+  // The cross-tenant hit is the whole point of L1, so the tenant reading it
+  // has by definition never captured this answer. If the entry supplied only
+  // a hash, the row would carry no answer anywhere in this workspace: NULL
+  // raw_object_key, NULL excerpt, empty payload, nothing for EPIC-05 to
+  // match — and `brand_present NOT NULL DEFAULT false` would present it to
+  // any later aggregation as "the brand was absent". That row shipped, and
+  // the test above asserted `skipped === 1` and called it correct.
+  it("writes an L1 row carrying the answer, not an empty row nothing can score", async () => {
+    await addPrompt("best crm");
+    await seedL1("best crm", "a".repeat(64), "Acme is widely recommended.");
+
+    await planRun(db, cache, context());
+
+    const row = await db.query<{
+      payload: { answer?: string };
+      response_excerpt: string | null;
+      content_hash: Buffer;
+      source_result_id: string | null;
+    }>(
+      `SELECT payload, response_excerpt, content_hash, source_result_id
+         FROM answer_captures WHERE run_id = $1 AND cache_layer = 'l1'`,
+      [runId],
+    );
+
+    expect(row.rows[0]!.payload.answer, "the answer must be IN the row").toBe("Acme is widely recommended.");
+    expect(row.rows[0]!.response_excerpt).toBe("Acme is widely recommended.");
+    expect(row.rows[0]!.content_hash.toString("hex")).toBe("a".repeat(64));
+    // And no cross-tenant reference: the capture it shares belongs to
+    // someone else, so there is nothing in this workspace to point at.
+    expect(row.rows[0]!.source_result_id, "an L1 row may never reference another tenant's capture").toBeNull();
   }, 60_000);
 
   // EXACTLY ONE LAYER PER CELL. A cell answered by L1 must not be offered to
@@ -309,6 +343,71 @@ describe("STORY-032 · planning a run end to end", () => {
     const rows = await db.query("SELECT 1 FROM answer_captures WHERE run_id = $1", [runId]);
     expect(rows.rowCount).toBe(0);
     expect(await queue.getJobCountByTypes("waiting", "delayed", "prioritized", "active")).toBe(0);
+  }, 60_000);
+
+  // REPLANNING IS THE RECOVERY PATH, so it has to be idempotent.
+  //
+  // dispatchPlannedRun's own docstring names it: a crash between the plan
+  // committing and the jobs being enqueued is recovered by planning again.
+  // Nothing enforced that. `ux_results_cell` could not — it carries
+  // captured_at, which is now(), so ON CONFLICT never fired — and a second
+  // plan wrote a SECOND suppressed row for the same cell while
+  // `skipped_cells` still recorded one, and reserved the live cell a second
+  // time. Reproduced by the review: 2 rows, reserved_value 2, skipped 1.
+  it("replanning the same run writes no second row and reserves no second time", async () => {
+    await addPrompt("best crm");
+    await addPrompt("best erp");
+    await seedL1("best crm", "a".repeat(64));
+
+    const first = await planRun(db, cache, context());
+    const second = await planRun(db, cache, context());
+
+    expect(second.planned, "the plan itself is unchanged").toBe(first.planned);
+    expect(second.skipped).toBe(first.skipped);
+
+    const rows = await db.query<{ n: string }>(
+      "SELECT count(*) AS n FROM answer_captures WHERE run_id = $1 AND cache_layer = 'l1'",
+      [runId],
+    );
+    expect(Number(rows.rows[0]!.n), "one cached cell, one row — not two").toBe(1);
+
+    const reserved = await db.query<{ reserved_value: string }>(
+      "SELECT reserved_value FROM usage_counters WHERE workspace_id = $1 AND metric = $2",
+      [workspaceId, FAIR_USE_METRIC],
+    );
+    expect(Number(reserved.rows[0]!.reserved_value), "one live cell, one reservation").toBe(1);
+
+    expect(await counts(), "and the counters still describe one run").toMatchObject({ planned: 2, skipped: 1 });
+  }, 60_000);
+
+  // The other direction: a replan whose cache entry has since expired finds
+  // one MORE live cell, and must reserve exactly that one more.
+  it("reserves the difference when a replan finds more live cells than before", async () => {
+    await addPrompt("best crm");
+    await addPrompt("best erp");
+    await seedL1("best crm", "a".repeat(64));
+
+    await planRun(db, cache, context());
+    await cache.delete(
+      captureL1Key({
+        env: "test",
+        engineKey: "perplexity",
+        adapterMajor: adapterMajorOf("1.0.0"),
+        promptText: "best crm",
+        locale: "en-US",
+        personaHint: null,
+        ttlSeconds: TTL_SECONDS,
+        nowMs: NOW_MS,
+      }),
+    );
+    const second = await planRun(db, cache, context());
+
+    expect(second.live, "the expired entry means both cells are live now").toBe(2);
+    const reserved = await db.query<{ reserved_value: string }>(
+      "SELECT reserved_value FROM usage_counters WHERE workspace_id = $1 AND metric = $2",
+      [workspaceId, FAIR_USE_METRIC],
+    );
+    expect(Number(reserved.rows[0]!.reserved_value), "1 held from the first plan, 1 more now").toBe(2);
   }, 60_000);
 
   it("measures suppression per cohort, not blended", async () => {

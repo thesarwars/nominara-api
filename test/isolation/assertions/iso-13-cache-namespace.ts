@@ -212,17 +212,54 @@ async function assertSharedAnswerCacheExemption(): Promise<void> {
     );
   }
 
-  // Half two — it does NOT vary by tenant. This is what makes the exemption
-  // sound: §10 excepts this namespace from tenant scoping precisely because
-  // the value carries no tenant data. A key that varied per workspace would
-  // both break that premise and silently destroy the cross-tenant sharing
-  // that is the whole point of the cache.
-  const asA = keys.captureL1Key({ ...base, env: "test", workspaceId: "ws-a" } as never);
-  const asB = keys.captureL1Key({ ...base, env: "test", workspaceId: "ws-b" } as never);
-  if (asA !== asB) {
+  // Half two — it reads NOTHING but the eight declared inputs.
+  //
+  // The previous version of this check spread `workspaceId` into the input
+  // and asserted the key was unchanged. That tested one PROPERTY NAME, not
+  // the property. Adding `projectId?: string` and hashing it only when
+  // present left all 1417 unit and 51 isolation tests green — a tenant
+  // identifier inside the one key §10 excepts from tenant scoping, with
+  // every gate passing. The prior review had found the identical defect with
+  // `workspaceId`; the fix reproduced it one identifier over.
+  //
+  // `projectId` is also the likelier accident than `workspaceId`: §7 keys the
+  // compiled matcher on (project_id, alias_set_hash), and `PlanRunContext`
+  // carries `projectId` two frames above this call.
+  //
+  // So this reads the INPUT SET rather than guessing at names. A Proxy
+  // records every property the function touches, which catches an input
+  // whatever it is called and whether it is hashed conditionally or not —
+  // `input.projectId === undefined` is itself a read.
+  const declared = new Set([
+    "env",
+    "engineKey",
+    "adapterMajor",
+    "promptText",
+    "locale",
+    "personaHint",
+    "ttlSeconds",
+    "nowMs",
+  ]);
+  const touched = new Set<string>();
+  keys.captureL1Key(
+    new Proxy(
+      { ...base, env: "test" },
+      {
+        get(target, property, receiver) {
+          if (typeof property === "string") touched.add(property);
+          return Reflect.get(target, property, receiver) as unknown;
+        },
+      },
+    ) as Parameters<typeof keys.captureL1Key>[0],
+  );
+
+  const undeclared = [...touched].filter((name) => !declared.has(name));
+  if (undeclared.length > 0) {
     throw new Error(
-      "ISO-13 (shared answer cache): captureL1Key() varies by workspace — the exemption in §10 holds only " +
-        "while this value carries NO tenant data, and a per-tenant key also destroys the sharing it exists for",
+      `ISO-13 (shared answer cache): captureL1Key() reads ${undeclared.join(", ")}, which §6 does not declare — ` +
+        "the §10 exemption holds only while this value is built from the six public inputs and the deployment " +
+        "namespace, and ANY further input is either a tenant leak into an exempt namespace or a silent loss of " +
+        "the cross-tenant sharing the cache exists for",
     );
   }
 }

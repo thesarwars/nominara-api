@@ -31,6 +31,19 @@ export type SuppressedCell =
       readonly engineKey: string;
       readonly sampleIndex: number;
       readonly contentHash: Buffer;
+      /**
+       * The shared answer itself, from the L1 entry.
+       *
+       * REQUIRED, not optional. An L1 row cannot borrow its content from
+       * anywhere else: unlike an L2 row it has no `source_result_id`, because
+       * the capture it shares belongs to another tenant. If the answer does
+       * not arrive here it exists nowhere in this workspace, and the row is
+       * unscoreable forever while reading to any aggregation as "the brand
+       * was absent". Making it required is what stops that row being
+       * writable at all.
+       */
+      readonly payload: Record<string, unknown>;
+      readonly excerpt: string | null;
       readonly adapterVersion: string;
     }
   | {
@@ -91,6 +104,10 @@ export async function recordSuppressedCells(
     adapter_version: cell.adapterVersion,
     source_result_id: cell.layer === "l2" ? cell.sourceResultId : null,
     content_hash: cell.layer === "l1" ? cell.contentHash.toString("hex") : null,
+    // L1 carries the answer inline; L2 leaves it where the source already
+    // holds it, reachable through source_result_id inside this tenant.
+    payload: cell.layer === "l1" ? cell.payload : null,
+    excerpt: cell.layer === "l1" ? cell.excerpt : null,
   }));
 
   const result = await tx.query(
@@ -108,7 +125,7 @@ export async function recordSuppressedCells(
     INSERT INTO answer_captures
       (workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
        capture_mode, adapter_version, normalizer_version, content_hash,
-       cache_layer, source_result_id, alias_fingerprint, status)
+       cache_layer, source_result_id, alias_fingerprint, status, payload, response_excerpt)
     SELECT $1, $2, $3, c.prompt_id, c.engine_key, c.sample_index, now(),
            $4, c.adapter_version, $5,
            -- An L2 row's hash is COPIED from the capture it reuses, so the
@@ -117,11 +134,37 @@ export async function recordSuppressedCells(
            COALESCE(decode(c.content_hash, 'hex'), source.content_hash),
            -- The CURRENT fingerprint, never source.alias_fingerprint. See
            -- SuppressedRowContext.aliasFingerprint.
-           c.cache_layer, c.source_result_id, $7, 'skipped'
+           c.cache_layer, c.source_result_id, $7, 'skipped',
+           -- THE ANSWER, for an L1 row. §6: "storage happens per tenant
+           -- AFTER the cache read" — the read is what supplies the thing
+           -- stored. An L2 row leaves these at their defaults because
+           -- source_result_id already reaches the answer inside this tenant.
+           COALESCE(c.payload, '{}'::jsonb), c.excerpt
       FROM jsonb_to_recordset($6::jsonb)
         AS c(prompt_id uuid, engine_key text, sample_index int, cache_layer text,
-             adapter_version text, source_result_id uuid, content_hash text)
+             adapter_version text, source_result_id uuid, content_hash text,
+             payload jsonb, excerpt text)
       LEFT JOIN answer_captures source ON source.id = c.source_result_id
+     -- IDEMPOTENT PER RUN. The ux_results_cell index cannot enforce it: it is
+     -- (run_id, prompt_id, engine_key, sample_index, captured_at), and
+     -- captured_at is now() — a fresh value on every attempt — so ON
+     -- CONFLICT never fires and a replan wrote a SECOND row for the same
+     -- cell. The unique index cannot drop captured_at either, because
+     -- Postgres requires a partitioned table's unique index to include the
+     -- partition key. Hence the explicit guard.
+     --
+     -- Replanning is not an edge case: it is the documented recovery when a
+     -- crash lands between the plan committing and the jobs being enqueued.
+     -- Before this, that recovery doubled every suppressed row while
+     -- skipped_cells still said one, so the matrix counted a cached cell
+     -- twice against a denominator that counted it once.
+     WHERE NOT EXISTS (
+       SELECT 1 FROM answer_captures prior
+        WHERE prior.run_id = $3
+          AND prior.prompt_id = c.prompt_id
+          AND prior.engine_key = c.engine_key
+          AND prior.sample_index = c.sample_index
+     )
     `,
     [
       context.workspaceId,

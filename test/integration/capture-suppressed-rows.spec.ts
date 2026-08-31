@@ -138,6 +138,8 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
         engineKey: "perplexity",
         sampleIndex: 0,
         contentHash: Buffer.alloc(32, 7),
+        payload: { answer: "the shared answer" },
+        excerpt: "the shared answer",
         adapterVersion: "1.0.0",
       },
       {
@@ -146,6 +148,8 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
         engineKey: "perplexity",
         sampleIndex: 0,
         contentHash: Buffer.alloc(32, 8),
+        payload: { answer: "the shared answer" },
+        excerpt: "the shared answer",
         adapterVersion: "1.0.0",
       },
     ];
@@ -377,6 +381,8 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
         engineKey: "perplexity",
         sampleIndex: 0,
         contentHash: Buffer.alloc(32, 9),
+        payload: { answer: "the shared answer" },
+        excerpt: "the shared answer",
         adapterVersion: "1.0.0",
       },
     ]);

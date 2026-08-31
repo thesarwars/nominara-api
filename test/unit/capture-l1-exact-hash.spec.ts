@@ -3,7 +3,12 @@ import { describe, expect, it } from "vitest";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import type { Cache } from "../../src/lib/cache/cache.port.js";
 import { captureL1Key } from "../../src/lib/capture/l1-cache-key.js";
-import { adapterMajorOf, probeExactHash, type L1Candidate } from "../../src/lib/capture/l1-exact-hash.js";
+import {
+  adapterMajorOf,
+  parseL1Envelope,
+  probeExactHash,
+  type L1Candidate,
+} from "../../src/lib/capture/l1-exact-hash.js";
 import { cellKey } from "../../src/lib/capture/l2-semantic-reuse.js";
 
 const CONTEXT = {
@@ -53,7 +58,12 @@ function countingCache(): { cache: Cache; gets: string[]; batches: readonly stri
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 
-async function seed(cache: Cache, c: L1Candidate, hash: string): Promise<void> {
+/** One shared entry: the engine's public answer, exactly as §6 describes it. */
+function envelope(hash: string, answer = "the shared answer"): string {
+  return JSON.stringify({ v: 1, contentHash: hash, payload: { answer }, excerpt: answer });
+}
+
+async function seed(cache: Cache, c: L1Candidate, hash: string, answer?: string): Promise<void> {
   await cache.set(
     captureL1Key({
       env: CONTEXT.env,
@@ -65,7 +75,7 @@ async function seed(cache: Cache, c: L1Candidate, hash: string): Promise<void> {
       ttlSeconds: c.ttlSeconds,
       nowMs: CONTEXT.nowMs,
     }),
-    hash,
+    envelope(hash, answer),
     { ttlMs: 60_000 },
   );
 }
@@ -144,14 +154,60 @@ describe("STORY-032 AC4 · the L1 exact-hash probe", () => {
     expect([...gets, ...batches]).toEqual([]);
   });
 
-  it("refuses a stored value that is not a content hash", async () => {
+  // THE ANSWER, NOT JUST ITS HASH.
+  //
+  // §6: "L1 entries store only an engine's public answer to a public
+  // question... storage happens per tenant AFTER the cache read." This
+  // module first shipped storing the hash alone, and the row it produced
+  // carried no answer at all — nothing for the parser to read, and nothing
+  // any tenant could recover unless it had already captured that same answer
+  // itself. A hit must arrive with the content.
+  it("returns the ANSWER, so the suppressed row is one the parser can read", async () => {
     const { cache } = countingCache();
     const only = candidate();
-    await seed(cache, only, "not-a-digest");
+    await seed(cache, only, HASH_A, "Acme is widely recommended.");
 
-    const hits = await probeExactHash(cache, CONTEXT, [only]);
+    const hit = (await probeExactHash(cache, CONTEXT, [only])).get(cellKey(only));
 
-    expect(hits.size, "arbitrary bytes in content_hash would send L3 after a parse that cannot exist").toBe(0);
+    expect(hit?.payload, "an empty payload is an unscoreable row").toEqual({ answer: "Acme is widely recommended." });
+    expect(hit?.excerpt).toBe("Acme is widely recommended.");
+    expect(hit?.contentHash.toString("hex")).toBe(HASH_A);
+  });
+
+  it.each([
+    ["not JSON at all", "not-a-digest"],
+    ["a bare hash, which is the shape this module shipped with", "a".repeat(64)],
+    ["an envelope from a future build", JSON.stringify({ v: 2, contentHash: "a".repeat(64), payload: {} })],
+    ["an envelope whose hash is not a digest", JSON.stringify({ v: 1, contentHash: "nope", payload: {} })],
+    ["an envelope with no payload", JSON.stringify({ v: 1, contentHash: "a".repeat(64) })],
+    ["an envelope whose payload is an array", JSON.stringify({ v: 1, contentHash: "a".repeat(64), payload: [] })],
+  ])("treats %s as a MISS rather than a hit", async (_label, stored) => {
+    const { cache } = countingCache();
+    const only = candidate();
+    await cache.set(
+      captureL1Key({
+        env: CONTEXT.env,
+        engineKey: only.engineKey,
+        adapterMajor: adapterMajorOf(only.adapterVersion),
+        promptText: only.promptText,
+        locale: CONTEXT.locale,
+        personaHint: CONTEXT.personaHint,
+        ttlSeconds: only.ttlSeconds,
+        nowMs: CONTEXT.nowMs,
+      }),
+      stored,
+      { ttlMs: 60_000 },
+    );
+
+    // A miss costs a vendor call. A hit against an entry we could not read
+    // costs a row that can never be scored — so unreadable must mean miss.
+    expect((await probeExactHash(cache, CONTEXT, [only])).size).toBe(0);
+  });
+
+  it("round-trips an envelope it wrote itself", () => {
+    const parsed = parseL1Envelope(envelope(HASH_A));
+    expect(parsed?.contentHash).toBe(HASH_A);
+    expect(parsed?.payload).toEqual({ answer: "the shared answer" });
   });
 
   describe("adapterMajorOf", () => {

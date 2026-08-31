@@ -135,7 +135,34 @@ export async function planRun(tx: ClientBase, cache: Cache, context: PlanRunCont
   //
   // First, too: this throws, and a refusal must leave no suppressed rows and
   // no counters behind for a run that will not happen.
-  await assertFairUseCapacity(tx, context.workspaceId, context.periodStart, liveCells.length);
+  //
+  // AND ONLY THE DELTA, because replanning is the documented recovery from a
+  // crash between the plan committing and the jobs being enqueued. Reserving
+  // `liveCells.length` unconditionally charged the ceiling again on every
+  // replan, for cells already reserved — capacity consumed by a run that
+  // captures once. What this run has already reserved is derivable from the
+  // row it already wrote: `planned - skipped` is what it took last time.
+  //
+  // A replan that finds MORE cache hits than before reserves nothing and
+  // leaves the difference held. Releasing it is STORY-070's AC — "failure
+  // releases the reservation idempotently by job identifier" — and building
+  // a second release path here would be the same mistake that put the
+  // reservation in this module to begin with. Clamped at zero and recorded
+  // rather than silently negative.
+  const priorRun = await tx.query<{ planned_cells: number; skipped_cells: number }>(
+    "SELECT planned_cells, skipped_cells FROM capture_runs WHERE id = $1",
+    [context.runId],
+  );
+  const alreadyReserved = Math.max(
+    0,
+    (priorRun.rows[0]?.planned_cells ?? 0) - (priorRun.rows[0]?.skipped_cells ?? 0),
+  );
+  await assertFairUseCapacity(
+    tx,
+    context.workspaceId,
+    context.periodStart,
+    Math.max(0, liveCells.length - alreadyReserved),
+  );
 
   const suppressed: SuppressedCell[] = [
     ...cells.flatMap((cell): SuppressedCell[] => {
@@ -149,6 +176,8 @@ export async function planRun(tx: ClientBase, cache: Cache, context: PlanRunCont
               engineKey: cell.engineKey,
               sampleIndex: cell.sampleIndex,
               contentHash: hit.contentHash,
+              payload: hit.payload,
+              excerpt: hit.excerpt,
               adapterVersion: cell.adapterVersion,
             },
           ];
