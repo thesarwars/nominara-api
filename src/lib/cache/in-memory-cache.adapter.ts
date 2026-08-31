@@ -48,6 +48,14 @@ export class InMemoryCacheAdapter implements Cache {
     return Promise.resolve(this.live(key)?.value);
   }
 
+  getMany(keys: readonly string[]): Promise<readonly (string | undefined)[]> {
+    // Each key goes through `live()`, exactly as `get` does, so an entry that
+    // has expired reads as a miss here too. Reusing the same accessor is what
+    // keeps this an implementation rather than a second, subtly divergent
+    // copy of the read path.
+    return Promise.resolve(keys.map((key) => this.live(key)?.value));
+  }
+
   set(key: string, value: string, options: CacheSetOptions): Promise<boolean> {
     if (options.onlyIfAbsent === true && this.live(key) !== undefined) {
       return Promise.resolve(false);

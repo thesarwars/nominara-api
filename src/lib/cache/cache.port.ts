@@ -24,6 +24,27 @@ export interface Cache {
   get(key: string): Promise<string | undefined>;
 
   /**
+   * Reads many keys in ONE round trip, in the order given, with `undefined`
+   * for each miss.
+   *
+   * The seventh operation, added by STORY-032 for the same reason the sixth
+   * was: it cannot be built from the others *at the cost the caller needs*.
+   * A capture run plans hundreds of cells and probes L1 for every one of
+   * them. Served by a loop of `get`, that is hundreds of sequential round
+   * trips on the planning path — the cost the cache exists to avoid, paid to
+   * find out whether it can be avoided.
+   *
+   * Note this is `getMany`, NOT a general `pipeline()`. The comment above
+   * rejects pipelines because they would make the in-memory adapter a
+   * SIMULATION of Valkey. That argument does not reach here, and the
+   * distinction is the whole reason this shape was chosen: an in-memory map
+   * implements a multi-key read honestly — the same lookups, returned
+   * together — whereas it could only ever fake a pipeline's batching
+   * semantics. Both adapters implement this operation; neither pretends to.
+   */
+  getMany(keys: readonly string[]): Promise<readonly (string | undefined)[]>;
+
+  /**
    * Returns false when `onlyIfAbsent` was requested and the key already
    * existed — which is how a caller learns it LOST the race, rather than
    * discovering it by reading back a value someone else wrote.

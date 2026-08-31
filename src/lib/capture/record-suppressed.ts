@@ -31,6 +31,19 @@ export type SuppressedCell =
       readonly engineKey: string;
       readonly sampleIndex: number;
       readonly contentHash: Buffer;
+      /**
+       * The shared answer itself, from the L1 entry.
+       *
+       * REQUIRED, not optional. An L1 row cannot borrow its content from
+       * anywhere else: unlike an L2 row it has no `source_result_id`, because
+       * the capture it shares belongs to another tenant. If the answer does
+       * not arrive here it exists nowhere in this workspace, and the row is
+       * unscoreable forever while reading to any aggregation as "the brand
+       * was absent". Making it required is what stops that row being
+       * writable at all.
+       */
+      readonly payload: Record<string, unknown>;
+      readonly excerpt: string | null;
       readonly adapterVersion: string;
     }
   | {
@@ -39,6 +52,8 @@ export type SuppressedCell =
       readonly engineKey: string;
       readonly sampleIndex: number;
       readonly sourceResultId: string;
+      /** Copied from the source so the two cannot disagree about what was answered. */
+      readonly sourceContentHash: Buffer;
       readonly adapterVersion: string;
     };
 
@@ -90,7 +105,11 @@ export async function recordSuppressedCells(
     cache_layer: cell.layer,
     adapter_version: cell.adapterVersion,
     source_result_id: cell.layer === "l2" ? cell.sourceResultId : null,
-    content_hash: cell.layer === "l1" ? cell.contentHash.toString("hex") : null,
+    content_hash: (cell.layer === "l1" ? cell.contentHash : cell.sourceContentHash).toString("hex"),
+    // L1 carries the answer inline; L2 leaves it where the source already
+    // holds it, reachable through source_result_id inside this tenant.
+    payload: cell.layer === "l1" ? cell.payload : null,
+    excerpt: cell.layer === "l1" ? cell.excerpt : null,
   }));
 
   const result = await tx.query(
@@ -108,20 +127,51 @@ export async function recordSuppressedCells(
     INSERT INTO answer_captures
       (workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
        capture_mode, adapter_version, normalizer_version, content_hash,
-       cache_layer, source_result_id, alias_fingerprint, status)
+       cache_layer, source_result_id, alias_fingerprint, status, payload, response_excerpt)
     SELECT $1, $2, $3, c.prompt_id, c.engine_key, c.sample_index, now(),
            $4, c.adapter_version, $5,
            -- An L2 row's hash is COPIED from the capture it reuses, so the
            -- two cannot disagree about what was answered. An L1 row's comes
            -- from the shared cache entry, which is the only thing that has it.
-           COALESCE(decode(c.content_hash, 'hex'), source.content_hash),
-           -- The CURRENT fingerprint, never source.alias_fingerprint. See
+           -- Both now arrive as parameters: reading the source's hash here
+           -- meant a LEFT JOIN on answer_captures.id, which is not indexed
+           -- on its own (the key is (captured_at, id)) and so scanned every
+           -- partition of the largest table on every planning call that
+           -- suppressed an L2 cell — the same defect fixed in the probe one
+           -- file over.
+           decode(c.content_hash, 'hex'),
+           -- The CURRENT fingerprint, never the source's. See
            -- SuppressedRowContext.aliasFingerprint.
-           c.cache_layer, c.source_result_id, $7, 'skipped'
+           c.cache_layer, c.source_result_id, $7, 'skipped',
+           -- THE ANSWER, for an L1 row. §6: "storage happens per tenant
+           -- AFTER the cache read" — the read is what supplies the thing
+           -- stored. An L2 row leaves these at their defaults because
+           -- source_result_id already reaches the answer inside this tenant.
+           COALESCE(c.payload, '{}'::jsonb), c.excerpt
       FROM jsonb_to_recordset($6::jsonb)
         AS c(prompt_id uuid, engine_key text, sample_index int, cache_layer text,
-             adapter_version text, source_result_id uuid, content_hash text)
-      LEFT JOIN answer_captures source ON source.id = c.source_result_id
+             adapter_version text, source_result_id uuid, content_hash text,
+             payload jsonb, excerpt text)
+     -- IDEMPOTENT PER RUN. The ux_results_cell index cannot enforce it: it is
+     -- (run_id, prompt_id, engine_key, sample_index, captured_at), and
+     -- captured_at is now() — a fresh value on every attempt — so ON
+     -- CONFLICT never fires and a replan wrote a SECOND row for the same
+     -- cell. The unique index cannot drop captured_at either, because
+     -- Postgres requires a partitioned table's unique index to include the
+     -- partition key. Hence the explicit guard.
+     --
+     -- Replanning is not an edge case: it is the documented recovery when a
+     -- crash lands between the plan committing and the jobs being enqueued.
+     -- Before this, that recovery doubled every suppressed row while
+     -- skipped_cells still said one, so the matrix counted a cached cell
+     -- twice against a denominator that counted it once.
+     WHERE NOT EXISTS (
+       SELECT 1 FROM answer_captures prior
+        WHERE prior.run_id = $3
+          AND prior.prompt_id = c.prompt_id
+          AND prior.engine_key = c.engine_key
+          AND prior.sample_index = c.sample_index
+     )
     `,
     [
       context.workspaceId,
@@ -139,6 +189,19 @@ export async function recordSuppressedCells(
 export interface RunCounts {
   readonly planned: number;
   readonly skipped: number;
+  /**
+   * The engines this run ACTUALLY covered, after entitlement filtering.
+   *
+   * §5: `capture_runs.engine_keys` "records exactly which engines a run
+   * covered, so a per-engine cadence is reconstructable from data and the
+   * freshness table cannot drift from reality (NFR-SIM-10)". The row is
+   * created before planning, with whatever set the caller intended; only the
+   * planner knows which of them survived the entitlement and status filters.
+   * Left unreconciled, a run on a plan entitled to one engine still claimed
+   * the two it asked for, and every per-engine cadence derived from the row
+   * would be derived from a set that never ran.
+   */
+  readonly engineKeys: readonly string[];
 }
 
 /**
@@ -157,11 +220,34 @@ export interface RunCounts {
  * suppressions would report work that never happened.
  */
 export async function recordRunCounts(tx: ClientBase, runId: string, counts: RunCounts): Promise<void> {
-  await tx.query(
+  const result = await tx.query(
     `UPDATE capture_runs
         SET planned_cells = $2,
-            skipped_cells = $3
+            skipped_cells = $3,
+            engine_keys = $4
       WHERE id = $1`,
-    [runId, counts.planned, counts.skipped],
+    [runId, counts.planned, counts.skipped, counts.engineKeys],
   );
+
+  // AN UPDATE THAT MATCHED NOTHING IS NOT A RECORDED COUNT.
+  //
+  // `UPDATE ... WHERE id = $1` reports success having changed no rows, so
+  // without this check the one thing AC12 requires to happen BEFORE dispatch
+  // could silently not happen at all, and the caller would go on to enqueue.
+  // The run then reports `planned_cells = 0` while workers increment
+  // `captured_cells` against it — the exact zero denominator the ordering
+  // rule exists to prevent, reached by a different route.
+  //
+  // RLS is what makes this likely rather than theoretical. `capture_runs`
+  // carries FORCE ROW LEVEL SECURITY, so a missing or wrong
+  // `app.current_workspace_id` does not raise — the row simply becomes
+  // invisible and the UPDATE matches nothing. A tenant-context bug would
+  // present as runs that quietly never record a plan, which is close to the
+  // hardest failure to trace back to its cause.
+  if (result.rowCount !== 1) {
+    throw new Error(
+      `recordRunCounts: expected to update exactly 1 capture_runs row for ${runId}, updated ${String(result.rowCount ?? 0)} — ` +
+        "the run does not exist, or is invisible under the current tenant context",
+    );
+  }
 }

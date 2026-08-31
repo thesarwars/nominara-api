@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { globalKey } from "../cache/valkey-keys.js";
 
 // STORY-032 — tracking-engine.md §6's L1 exact-hash key.
 //
@@ -38,6 +39,19 @@ import { createHash } from "node:crypto";
 const L1_KEY_VERSION = "v3";
 
 export interface L1KeyInput {
+  /**
+   * The DEPLOYMENT namespace — `cacheKeyNamespace()`.
+   *
+   * This key shipped without one, on the reasoning that "the cache instance
+   * is already separate per environment". That is the exact assumption
+   * key-namespace.ts says in writing this repository refuses to rely on,
+   * because STORY-026 found a REALIZED cross-environment leak from it. Two
+   * deployments sharing a cache instance would share answers: a staging run
+   * with stubbed adapters writes a fixture answer, and a production run in
+   * the same TTL bucket hits it and stores it for a paying tenant. Nothing
+   * downstream could tell. Found by the second-engineer review.
+   */
+  readonly env: string;
   readonly engineKey: string;
   /** Major only: a patch release answers the same question, a major may not. §6's "an adapter upgrade invalidates the cache". */
   readonly adapterMajor: number;
@@ -95,10 +109,14 @@ export function captureL1Key(input: L1KeyInput): string {
   const material = parts.map((part) => `${String(part.length)}:${part}`).join("|");
   const digest = createHash("sha256").update(material).digest("hex");
 
-  // `global:capture:` is the prefix ISO-13's classifier excepts by name. Built
-  // here rather than through globalKey() because this value has no `{env}`
-  // segment ON PURPOSE: an environment segment would stop staging and
-  // production sharing a public answer, and sharing it is the entire point.
-  // The cache instance is already separate per environment.
-  return `global:capture:sim:${L1_KEY_VERSION}:${digest}`;
+  // Built through globalKey(), which is the designated constructor for
+  // "platform-wide, never tenant data" and takes `env` unconditionally. The
+  // result is `{env}:global:capture:sim:v3:{digest}` — the `{env}:global:`
+  // namespace three references name as the single documented ISO-13
+  // exception, with the `capture:` segment ISO-13's own classifier excepts
+  // by name.
+  //
+  // Sharing still spans TENANTS, which is the cost lever. It no longer spans
+  // DEPLOYMENTS, which was never the lever and only ever a hazard.
+  return globalKey(input.env, "capture", "sim", L1_KEY_VERSION, digest);
 }

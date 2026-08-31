@@ -163,8 +163,110 @@ async function assertRealtimeChannelNamespacing(): Promise<void> {
   }
 }
 
+/**
+ * THE ONE KEY THAT IS DELIBERATELY EXEMPT, asserted rather than assumed.
+ *
+ * §10 names the shared answer cache as the single documented exception to
+ * tenant scoping. Until STORY-032's review, this assertion could see neither
+ * half of it: `captureL1Key` was absent from the constructor list above, and
+ * the literal it builds opened with `global:` rather than with an
+ * interpolation, so `CACHE_KEY_PATTERN` never matched it either. The one key
+ * in this repository that is allowed to be tenant-free was covered by
+ * nothing — and it had drifted, shipping without the `{env}` segment three
+ * references require.
+ *
+ * An exception that nothing checks is not an exception; it is a hole with a
+ * comment next to it. So both halves of the exemption are pinned here: it
+ * MUST carry the deployment namespace, and it MUST NOT vary by tenant.
+ */
+async function assertSharedAnswerCacheExemption(): Promise<void> {
+  const keys = (await import(
+    `${new URL("../../../src/lib/capture/l1-cache-key.js", import.meta.url).href}?iso13=${String(process.hrtime.bigint())}`
+  )) as typeof import("../../../src/lib/capture/l1-cache-key.js");
+
+  const base = {
+    engineKey: "perplexity",
+    adapterMajor: 3,
+    promptText: "best crm for small business",
+    locale: "en-US",
+    personaHint: null,
+    ttlSeconds: 86_400,
+    nowMs: 1_700_000_000_000,
+  };
+
+  const staging = keys.captureL1Key({ ...base, env: "staging" });
+  const production = keys.captureL1Key({ ...base, env: "production" });
+
+  // Half one — it carries the deployment namespace. Without it two
+  // environments sharing a cache instance serve each other's answers, which
+  // is the leak STORY-026 already found once on the socket.io channels.
+  if (!staging.startsWith("staging:global:")) {
+    throw new Error(
+      `ISO-13 (shared answer cache): captureL1Key() must open with "{env}:global:" — got "${staging}"`,
+    );
+  }
+  if (staging === production) {
+    throw new Error(
+      "ISO-13 (shared answer cache): captureL1Key() produces the SAME key for two deployments — " +
+        "staging and production sharing one cache instance would serve each other's captured answers",
+    );
+  }
+
+  // Half two — it reads NOTHING but the eight declared inputs.
+  //
+  // The previous version of this check spread `workspaceId` into the input
+  // and asserted the key was unchanged. That tested one PROPERTY NAME, not
+  // the property. Adding `projectId?: string` and hashing it only when
+  // present left all 1417 unit and 51 isolation tests green — a tenant
+  // identifier inside the one key §10 excepts from tenant scoping, with
+  // every gate passing. The prior review had found the identical defect with
+  // `workspaceId`; the fix reproduced it one identifier over.
+  //
+  // `projectId` is also the likelier accident than `workspaceId`: §7 keys the
+  // compiled matcher on (project_id, alias_set_hash), and `PlanRunContext`
+  // carries `projectId` two frames above this call.
+  //
+  // So this reads the INPUT SET rather than guessing at names. A Proxy
+  // records every property the function touches, which catches an input
+  // whatever it is called and whether it is hashed conditionally or not —
+  // `input.projectId === undefined` is itself a read.
+  const declared = new Set([
+    "env",
+    "engineKey",
+    "adapterMajor",
+    "promptText",
+    "locale",
+    "personaHint",
+    "ttlSeconds",
+    "nowMs",
+  ]);
+  const touched = new Set<string>();
+  keys.captureL1Key(
+    new Proxy(
+      { ...base, env: "test" },
+      {
+        get(target, property, receiver) {
+          if (typeof property === "string") touched.add(property);
+          return Reflect.get(target, property, receiver) as unknown;
+        },
+      },
+    ) as Parameters<typeof keys.captureL1Key>[0],
+  );
+
+  const undeclared = [...touched].filter((name) => !declared.has(name));
+  if (undeclared.length > 0) {
+    throw new Error(
+      `ISO-13 (shared answer cache): captureL1Key() reads ${undeclared.join(", ")}, which §6 does not declare — ` +
+        "the §10 exemption holds only while this value is built from the six public inputs and the deployment " +
+        "namespace, and ANY further input is either a tenant leak into an exempt namespace or a silent loss of " +
+        "the cross-tenant sharing the cache exists for",
+    );
+  }
+}
+
 export async function assertIso13CacheNamespacing(): Promise<void> {
   await assertTenantKeyConstructors();
+  await assertSharedAnswerCacheExemption();
   await assertRealtimeChannelNamespacing();
 
   const fixtureMatches = await scanFixturesForKeyLiterals(CACHE_KEY_PATTERN);

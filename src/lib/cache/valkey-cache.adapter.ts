@@ -140,6 +140,14 @@ export class ValkeyCacheAdapter implements Cache, OnModuleDestroy {
     return value ?? undefined;
   }
 
+  async getMany(keys: readonly string[]): Promise<readonly (string | undefined)[]> {
+    // MGET with no arguments is a syntax error, so the empty batch never
+    // reaches the wire. A run that planned nothing must cost nothing.
+    if (keys.length === 0) return [];
+    const values = await this.client.mget(...keys);
+    return values.map((value) => value ?? undefined);
+  }
+
   async set(key: string, value: string, options: CacheSetOptions): Promise<boolean> {
     // `SET key value PX ttl NX` replies with null when NX prevented the write.
     // That reply IS the answer to "did I win the race", and it is why the

@@ -24,6 +24,7 @@ import { captureL1Key, l1TimeBucket, type L1KeyInput } from "../../src/lib/captu
 //   silently destroys the sharing. Nothing fails; the bill simply grows, and
 //   the suppression metric reports a rate nobody can explain.
 const BASE: L1KeyInput = {
+  env: "test",
   engineKey: "perplexity",
   adapterMajor: 3,
   promptText: "best crm for small business",
@@ -50,6 +51,26 @@ describe("STORY-032 · the L1 exact-hash key", () => {
   // extra input, tenant-derived or not, changes the hash and fails this. The
   // duplication is deliberate: a test that derives its expectation from the
   // implementation cannot detect a change in the implementation.
+  // THE PROPERTY, not the fixture. The digest comparison below catches an
+  // UNCONDITIONALLY hashed extra input; it does not catch a CONDITIONALLY
+  // hashed one, because the fixture never supplies it. The review added
+  // `workspaceId?: string`, hashed it only when present, and all 1399 tests
+  // stayed green — with the cross-tenant key carrying a tenant input.
+  //
+  // That is not a hypothetical edit: this module's own comment says
+  // `no_shared_cache` must BYPASS L1 rather than salt the key, and salting is
+  // exactly one optional field away. This assertion is the one an optional
+  // field cannot slip past.
+  it("produces the SAME key for two workspaces, so no tenant input can exist at all", () => {
+    const asWorkspaceA = { ...BASE, workspaceId: "ws-a" } as L1KeyInput;
+    const asWorkspaceB = { ...BASE, workspaceId: "ws-b" } as L1KeyInput;
+
+    expect(
+      captureL1Key(asWorkspaceA),
+      "a tenant-derived input would both leak into a global namespace and destroy the cross-tenant sharing",
+    ).toBe(captureL1Key(asWorkspaceB));
+  });
+
   it("hashes exactly §6's six inputs and nothing else — no tenant input can hide in it", () => {
     const bucket = Math.floor(BASE.nowMs / (BASE.ttlSeconds * 1_000));
     const parts = ["perplexity", "3", "best crm for small business", "en-US", "", String(bucket)];
@@ -60,11 +81,21 @@ describe("STORY-032 · the L1 exact-hash key", () => {
       captureL1Key(BASE),
       "an input this test does not know about would change the digest — including a workspace id, which would " +
         "both leak tenant-derived data into a global namespace and silently destroy the cross-tenant sharing",
-    ).toBe(`global:capture:sim:v3:${expected}`);
+    ).toBe(`test:global:capture:sim:v3:${expected}`);
   });
 
-  it("carries the documented global prefix, so ISO-13's exception applies to it and nothing else", () => {
-    expect(captureL1Key(BASE)).toMatch(/^global:capture:sim:v3:[0-9a-f]{64}$/);
+  it("carries the {env}:global: namespace the references name as ISO-13's exception", () => {
+    expect(captureL1Key(BASE)).toMatch(/^test:global:capture:sim:v3:[0-9a-f]{64}$/);
+  });
+
+  // THE HAZARD THE ENV SEGMENT CLOSES. Two deployments sharing one cache
+  // instance would otherwise share answers — a staging run with stubbed
+  // adapters writes a fixture answer, and a production run in the same TTL
+  // bucket hits it and stores it for a paying tenant. STORY-026 found a
+  // realized cross-environment leak from exactly the assumption this key
+  // originally made.
+  it("does NOT share across deployments, however identical the question", () => {
+    expect(captureL1Key({ ...BASE, env: "staging" })).not.toBe(captureL1Key({ ...BASE, env: "production" }));
   });
 
   // Each input that MUST change the key. An adapter upgrade invalidating the
