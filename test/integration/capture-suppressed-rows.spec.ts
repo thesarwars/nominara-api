@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -24,6 +24,10 @@ import {
 // WITHOUT the count discipline, suppressions inflate captured_cells, the
 // suppression rate computes against a denominator that already contains
 // them, and the cost lever appears to be working better than it is.
+/** The project's alias set as it stands now, and as it stood when the source was parsed. */
+const CURRENT_ALIASES = createHash("sha256").update("aliases-today").digest();
+const STALE_ALIASES = createHash("sha256").update("aliases-yesterday").digest();
+
 describe("STORY-032 · suppressed cells produce rows without advancing the live count", () => {
   let container: StartedPostgreSqlContainer;
   let db: Client;
@@ -73,6 +77,7 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
       runId,
       normalizerVersion: "v1",
       captureMode: "api",
+      aliasFingerprint: CURRENT_ALIASES,
     };
   });
 
@@ -86,14 +91,21 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
     return id;
   }
 
+  /**
+   * A fully SCORED source, parsed against yesterday's alias set — the exact
+   * row a reuse is tempted to copy wholesale.
+   */
   async function addSourceCapture(promptId: string, contentHash: Buffer): Promise<string> {
     const id = randomUUID();
     await db.query(
       `INSERT INTO answer_captures
          (id, workspace_id, project_id, run_id, prompt_id, engine_key, captured_at,
-          capture_mode, adapter_version, normalizer_version, content_hash, status, cache_layer)
-       VALUES ($1, $2, $3, $4, $5, 'perplexity', now(), 'api', '1.0.0', 'v1', $6, 'parsed', 'live')`,
-      [id, workspaceId, projectId, randomUUID(), promptId, contentHash],
+          capture_mode, adapter_version, normalizer_version, content_hash, status, cache_layer,
+          alias_fingerprint, brand_present, sov, sentiment_label, sentiment_score,
+          brand_rank_position, citation_count, owned_citation_count)
+       VALUES ($1, $2, $3, $4, $5, 'perplexity', now(), 'api', '1.0.0', 'v1', $6, 'parsed', 'live',
+               $7, true, 0.8, 'positive', 0.9, 2, 5, 3)`,
+      [id, workspaceId, projectId, randomUUID(), promptId, contentHash, STALE_ALIASES],
     );
     return id;
   }
@@ -193,6 +205,99 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
       Number(live.rows[0]!.count),
       "a progress projection reading this run must not find live captures before the plan is durable",
     ).toBe(0);
+  }, 30_000);
+
+  // AC7 — "a reuse re-runs entity matching against the current alias set, so
+  // an alias added yesterday is reflected in a reused cell."
+  //
+  // The matching itself is EPIC-05's parser. What THIS story owes is the
+  // contract that makes it possible: a reused cell arrives UNSCORED and
+  // stamped with the CURRENT alias set, so nothing downstream can mistake it
+  // for already-matched.
+  it("a reused cell arrives UNSCORED — the source's scores are never copied", async () => {
+    const promptId = await addPrompt("reused");
+    const sourceId = await addSourceCapture(promptId, Buffer.alloc(32, 3));
+
+    // The source is fully scored, which is the whole temptation.
+    const source = await db.query<{ brand_present: boolean; sov: number }>(
+      "SELECT brand_present, sov FROM answer_captures WHERE id = $1",
+      [sourceId],
+    );
+    expect(source.rows[0], "the fixture must actually be scored, or this test proves nothing").toMatchObject({
+      brand_present: true,
+    });
+
+    await recordSuppressedCells(db, context, [
+      { layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: sourceId, adapterVersion: "1.0.0" },
+    ]);
+
+    const reused = await db.query<{
+      brand_present: boolean;
+      sov: number | null;
+      sentiment_label: string | null;
+      sentiment_score: number | null;
+      brand_rank_position: number | null;
+      citation_count: number;
+      owned_citation_count: number;
+    }>(
+      `SELECT brand_present, sov, sentiment_label, sentiment_score, brand_rank_position,
+              citation_count, owned_citation_count
+         FROM answer_captures WHERE run_id = $1`,
+      [runId],
+    );
+
+    expect(
+      reused.rows[0],
+      "copying the source's scores would freeze yesterday's alias set into today's cell",
+    ).toMatchObject({
+      brand_present: false,
+      sov: null,
+      sentiment_label: null,
+      sentiment_score: null,
+      brand_rank_position: null,
+      citation_count: 0,
+      owned_citation_count: 0,
+    });
+  }, 30_000);
+
+  // The other half: the row must carry TODAY's alias fingerprint, not the
+  // one the source was matched against. A row stamped with the source's
+  // would look already-matched against an alias set that has since moved,
+  // and the competitor added yesterday would never appear.
+  it("a reused cell carries the CURRENT alias fingerprint, not the source's", async () => {
+    const promptId = await addPrompt("reused");
+    const sourceId = await addSourceCapture(promptId, Buffer.alloc(32, 3));
+
+    await recordSuppressedCells(db, context, [
+      { layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: sourceId, adapterVersion: "1.0.0" },
+    ]);
+
+    const row = await db.query<{ alias_fingerprint: Buffer }>(
+      "SELECT alias_fingerprint FROM answer_captures WHERE run_id = $1",
+      [runId],
+    );
+    expect(row.rows[0]!.alias_fingerprint.equals(CURRENT_ALIASES), "today's aliases").toBe(true);
+    expect(row.rows[0]!.alias_fingerprint.equals(STALE_ALIASES), "not the source's").toBe(false);
+  }, 30_000);
+
+  it("an L1 row is stamped with the current alias set too", async () => {
+    const promptId = await addPrompt("cached");
+    await recordSuppressedCells(db, context, [
+      {
+        layer: "l1",
+        promptId,
+        engineKey: "perplexity",
+        sampleIndex: 0,
+        contentHash: Buffer.alloc(32, 9),
+        adapterVersion: "1.0.0",
+      },
+    ]);
+
+    const row = await db.query<{ alias_fingerprint: Buffer }>(
+      "SELECT alias_fingerprint FROM answer_captures WHERE run_id = $1",
+      [runId],
+    );
+    expect(row.rows[0]!.alias_fingerprint.equals(CURRENT_ALIASES)).toBe(true);
   }, 30_000);
 
   it("writes nothing, and asks nothing, for an empty suppression set", async () => {

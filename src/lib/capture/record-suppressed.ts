@@ -48,6 +48,18 @@ export interface SuppressedRowContext {
   readonly runId: string;
   readonly normalizerVersion: string;
   readonly captureMode: "api" | "licensed_serp" | "headless";
+  /**
+   * The project's alias set AS IT IS NOW — never the source capture's.
+   *
+   * AC7: "A reuse re-runs entity matching against the current alias set, so
+   * an alias added yesterday is reflected in a reused cell." Stamping the
+   * CURRENT fingerprint is what makes that enforceable rather than merely
+   * intended: whatever parses this row later compares against this value, so
+   * a row carrying the source's fingerprint would look already-matched
+   * against an alias set that has since moved, and the competitor added
+   * yesterday would never appear.
+   */
+  readonly aliasFingerprint: Buffer;
 }
 
 /**
@@ -83,17 +95,29 @@ export async function recordSuppressedCells(
 
   const result = await tx.query(
     `
+    -- THE SCORED COLUMNS ARE DELIBERATELY ABSENT FROM THIS INSERT.
+    --
+    -- brand_present, sov, sentiment_label, sentiment_score,
+    -- brand_rank_position, citation_count and owned_citation_count are left
+    -- at their defaults, so a reused cell arrives UNSCORED. Copying them from
+    -- the source is the obvious shortcut and is what AC7 forbids: those
+    -- values were produced by matching against the alias set as it stood
+    -- then, and an alias added since would never appear. §6 requires a reuse
+    -- to "re-run entity matching against the current alias set", and a row
+    -- that already carries scores is a row nothing will re-match.
     INSERT INTO answer_captures
       (workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
        capture_mode, adapter_version, normalizer_version, content_hash,
-       cache_layer, source_result_id, status)
+       cache_layer, source_result_id, alias_fingerprint, status)
     SELECT $1, $2, $3, c.prompt_id, c.engine_key, c.sample_index, now(),
            $4, c.adapter_version, $5,
            -- An L2 row's hash is COPIED from the capture it reuses, so the
            -- two cannot disagree about what was answered. An L1 row's comes
            -- from the shared cache entry, which is the only thing that has it.
            COALESCE(decode(c.content_hash, 'hex'), source.content_hash),
-           c.cache_layer, c.source_result_id, 'skipped'
+           -- The CURRENT fingerprint, never source.alias_fingerprint. See
+           -- SuppressedRowContext.aliasFingerprint.
+           c.cache_layer, c.source_result_id, $7, 'skipped'
       FROM jsonb_to_recordset($6::jsonb)
         AS c(prompt_id uuid, engine_key text, sample_index int, cache_layer text,
              adapter_version text, source_result_id uuid, content_hash text)
@@ -106,6 +130,7 @@ export async function recordSuppressedCells(
       context.captureMode,
       context.normalizerVersion,
       JSON.stringify(payload),
+      context.aliasFingerprint,
     ],
   );
   return result.rowCount ?? 0;
