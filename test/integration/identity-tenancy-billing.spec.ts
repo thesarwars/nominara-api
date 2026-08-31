@@ -27,7 +27,18 @@ describe("STORY-007 · identity, tenancy & billing DDL", () => {
       .start();
 
     migrationsDir = await mkdtemp(path.join(tmpdir(), "nominara-story007-isolated-"));
-    for (const name of ["0001_extensions_and_conventions", "0002_identity_tenancy_billing"]) {
+    // 0018 joins the isolated set because `plans.entitlements` is now shaped
+    // by 0002 AND 0018 together: 0002 seeds the bare matrix, 0018 wraps every
+    // key with its live flag and adds §2's five deferred keys (STORY-069 AC1).
+    // The DB-matches-TS assertion below is about the seed's FINAL shape, so
+    // applying only 0002 would compare the TS source against a half-migrated
+    // column and fail for a reason that is not a defect. It touches data on
+    // one column, no DDL, so the isolation this fixture exists for is intact.
+    for (const name of [
+      "0001_extensions_and_conventions",
+      "0002_identity_tenancy_billing",
+      "0018_entitlement_live_flags",
+    ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");
         await writeFile(path.join(migrationsDir, `${name}.${ext}.sql`), content);
@@ -652,6 +663,11 @@ describe("STORY-007 · identity, tenancy & billing DDL", () => {
   // ---- scenario 11 -----------------------------------------------------
 
   it("scenario 11 — rolling the migration back is clean", async () => {
+    // 0018 sits on top of 0002 in this fixture (see beforeAll) and is
+    // data-only, so it comes off first. The assertion this scenario exists
+    // for is about 0002's rollback, not about what happens to be last.
+    expect(await rollbackLast(client, migrationsDir)).toBe("0018_entitlement_live_flags");
+
     const rolledBack = await rollbackLast(client, migrationsDir);
     expect(rolledBack).toBe("0002_identity_tenancy_billing");
 
