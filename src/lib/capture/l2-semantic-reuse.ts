@@ -76,11 +76,27 @@ export function cellKey(cell: { promptId: string; engineKey: string; sampleIndex
  */
 export async function probeSemanticReuse(
   tx: ClientBase,
-  projectId: string,
+  scope: { readonly workspaceId: string; readonly projectId: string },
   candidates: readonly L2Candidate[],
 ): Promise<Map<string, L2Hit>> {
   const hits = new Map<string, L2Hit>();
   if (candidates.length === 0) return hits;
+
+  // THE WIDEST WINDOW ANY CANDIDATE COULD ADMIT, as a scalar.
+  //
+  // The per-row bound below is derived from `c.ttl_seconds` and so varies
+  // per candidate, which leaves Postgres unable to prune partitions with it:
+  // measured on a 15-partition table, the planner scanned ALL FIFTEEN and
+  // demoted `captured_at` to a per-row Filter — every partition of the
+  // highest-volume table in the platform, touched once per candidate, on the
+  // planning path.
+  //
+  // This constant is deliberately REDUNDANT and deliberately LOOSER: taking
+  // the maximum means it can never exclude a row the per-row bound would
+  // have admitted, so it changes no result. Being scalar, it prunes. The
+  // same measurement with it in place removes 10 of the 15 subplans and
+  // turns `captured_at` into an index condition.
+  const maxWindowSeconds = Math.max(...candidates.map((c) => c.ttlSeconds)) * L2_WINDOW_FRACTION;
 
   // The candidate list travels as ONE array parameter per column and is
   // unnested server-side, so the statement text is identical for a run of
@@ -128,10 +144,19 @@ export async function probeSemanticReuse(
          -- without pinning which clause enforces it. Both stay — a capture
          -- whose prompt belongs to another project is corrupt either way,
          -- and this is the query that must not act on it.
-         WHERE ac.project_id = $1                             -- same project (the capture)
+         -- WORKSPACE FIRST, and not for tenancy — RLS already holds that
+         -- boundary. It is the LEADING COLUMN of every usable index on this
+         -- table, and omitting it left the planner on
+         -- the (run_id, status) index, scanning it for every parsed row
+         -- ever captured. Naming it here is what makes the project, engine
+         -- and time columns reachable.
+         WHERE ac.workspace_id = $5
+           AND ac.project_id = $1                             -- same project (the capture)
            AND ac.engine_key = c.engine_key                   -- same engine
            AND ac.status = 'parsed'                           -- source fully parsed
            AND ac.cache_layer <> 'l2'                         -- NO TRANSITIVE CHAINS
+           -- The prunable bound, then the exact one. See maxWindowSeconds.
+           AND ac.captured_at >= now() - make_interval(secs => $6::double precision)
            AND ac.captured_at >= now() - make_interval(secs => (c.ttl_seconds * $3::double precision))
            AND source_prompt.project_id = $1                   -- same project (its prompt)
            AND source_prompt.embedding IS NOT NULL
@@ -142,7 +167,7 @@ export async function probeSemanticReuse(
       ) s ON true
     `,
     [
-      projectId,
+      scope.projectId,
       JSON.stringify(
         candidates.map((c) => ({
           prompt_id: c.promptId,
@@ -153,6 +178,8 @@ export async function probeSemanticReuse(
       ),
       L2_WINDOW_FRACTION,
       L2_COSINE_THRESHOLD,
+      scope.workspaceId,
+      maxWindowSeconds,
     ],
   );
 
