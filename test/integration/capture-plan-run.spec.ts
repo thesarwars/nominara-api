@@ -148,7 +148,6 @@ describe("STORY-032 · planning a run end to end", () => {
       personaHint: null,
       normalizerVersion: "v1",
       captureMode: "api",
-      aliasFingerprint: Buffer.alloc(32, 7),
       env: "test",
       sharedCacheEnabled: true,
       nowMs: NOW_MS,
@@ -491,6 +490,39 @@ describe("STORY-032 · planning a run end to end", () => {
       row.rows[0]!.engine_keys,
       "the row must not claim an engine the workspace is not entitled to and which never ran",
     ).toEqual(["perplexity"]);
+  }, 60_000);
+
+  // THE STAMP MUST BE THE SET AS IT IS NOW, read at write time.
+  //
+  // aliasSetFingerprint had no caller in src/ at all — the planner took a
+  // Buffer from a context nobody built, so nothing connected the stamp to
+  // the project's actual configuration. A competitor added between one plan
+  // and the next has to change it, or a reuse short-circuits against an
+  // alias set the matcher no longer has.
+  it("stamps the alias set it reads from the database, not one it was handed", async () => {
+    await addPrompt("best crm");
+    await seedL1("best crm", "a".repeat(64));
+    await planInTransaction(db, context());
+
+    const before = await db.query<{ alias_fingerprint: Buffer }>(
+      "SELECT alias_fingerprint FROM answer_captures WHERE run_id = $1", [runId]);
+
+    await db.query(
+      `INSERT INTO competitors (workspace_id, project_id, name, aliases, root_domain)
+       VALUES ($1, $2, 'Initech', ARRAY['Initech Inc'], 'initech.test')`,
+      [workspaceId, projectId],
+    );
+    await db.query("DELETE FROM answer_captures WHERE run_id = $1", [runId]);
+    await db.query("UPDATE capture_runs SET planned_cells = 0, skipped_cells = 0 WHERE id = $1", [runId]);
+    await planInTransaction(db, context());
+
+    const after = await db.query<{ alias_fingerprint: Buffer }>(
+      "SELECT alias_fingerprint FROM answer_captures WHERE run_id = $1", [runId]);
+
+    expect(
+      after.rows[0]!.alias_fingerprint.equals(before.rows[0]!.alias_fingerprint),
+      "a competitor added between the two runs must change the stamp",
+    ).toBe(false);
   }, 60_000);
 
   it("measures suppression per cohort, not blended", async () => {

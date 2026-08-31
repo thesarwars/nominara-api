@@ -15,6 +15,7 @@ import {
   type ResolvedEngine,
 } from "./plan-cells.js";
 import { recordRunCounts, recordSuppressedCells, type SuppressedCell } from "./record-suppressed.js";
+import { projectAliasFingerprint } from "./l3-short-circuit.js";
 import { cohortsFor, measureCohort, type SuppressionMeasurement } from "./suppression-cohorts.js";
 
 // STORY-032 — run planning, end to end.
@@ -54,8 +55,17 @@ export interface PlanRunContext {
   readonly personaHint: string | null;
   readonly normalizerVersion: string;
   readonly captureMode: "api" | "licensed_serp" | "headless";
-  /** The project's alias set AS IT IS NOW — see record-suppressed.ts. */
-  readonly aliasFingerprint: Buffer;
+  /**
+   * The project's alias set AS IT IS NOW.
+   *
+   * Optional because the planner will read it itself when the caller does
+   * not supply one, which is the path that should normally be taken: a
+   * caller passing a fingerprint it computed earlier is passing a claim
+   * about a set that may have moved since, and a stamp that is even
+   * slightly stale is what makes a short-circuit copy a parse the current
+   * alias set would not produce. See record-suppressed.ts.
+   */
+  readonly aliasFingerprint?: Buffer;
   /** `cacheKeyNamespace()`, for the L1 key. */
   readonly env: string;
   /** False for a workspace whose plan carries `no_shared_cache`. */
@@ -191,6 +201,9 @@ async function writePlan(
   afterL1: readonly PlannedCell[],
   engines: readonly ResolvedEngine[],
 ): Promise<PlannedRun> {
+  // Read at write time from the database, unless the caller pinned one.
+  const aliasFingerprint = context.aliasFingerprint ?? (await projectAliasFingerprint(tx, context.projectId));
+
   const priorRun = await tx.query<{ planned_cells: number; skipped_cells: number }>(
     "SELECT planned_cells, skipped_cells FROM capture_runs WHERE id = $1",
     [context.runId],
@@ -250,7 +263,7 @@ async function writePlan(
       runId: context.runId,
       normalizerVersion: context.normalizerVersion,
       captureMode: context.captureMode,
-      aliasFingerprint: context.aliasFingerprint,
+      aliasFingerprint,
     },
     suppressed,
   );
