@@ -67,7 +67,7 @@ function quoteIdent(value: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Retention-window resolution — plans.entitlements->>'retention.*_days'.
+// Retention-window resolution — plans.entitlements->'retention.*_days'->'value'.
 // `null` and the literal string "unlimited" both mean "never purge" (this
 // story's own instruction); a numeric value is a day count.
 // ---------------------------------------------------------------------------
@@ -88,8 +88,11 @@ export interface WorkspaceRetention {
 
 export async function resolveWorkspaceRetention(client: ClientBase, workspaceId: string): Promise<WorkspaceRetention> {
   const result = await client.query<{ raw: unknown; rollups: unknown }>(
-    `SELECT p.entitlements->'retention.raw_captures_days' AS raw,
-            p.entitlements->'retention.rollups_days'       AS rollups
+    // ->'value' because STORY-069 wrapped every entitlement as
+    // {value, live}. Reading the key directly now yields the whole object,
+    // which resolveRetentionWindow would see as neither a number nor null.
+    `SELECT p.entitlements->'retention.raw_captures_days'->'value' AS raw,
+            p.entitlements->'retention.rollups_days'->'value'       AS rollups
        FROM workspaces w
        JOIN plans p ON p.key = w.plan_key
       WHERE w.id = $1`,

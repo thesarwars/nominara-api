@@ -14,7 +14,14 @@ import { MONEY_AMOUNT_USD_PATTERN } from "./money.schema.js";
 // commits to none: `unauthenticated`, `token_expired`, `token_revoked`,
 // `not_found`, `idempotency_conflict`, `workspace_mismatch`,
 // `project_out_of_scope`, `domain_not_verified`, `capture_mode_unavailable`,
-// `degraded`, `retention_exceeded`, and `quota_exceeded` (see below).
+// `degraded`, and `retention_exceeded`.
+//
+// `quota_exceeded` WAS in that list and no longer is. STORY-024's rule was to
+// model only what §2 states, and §2 states nothing for it — but STORY-070 AC6
+// does: "Exhaustion returns the quota failure with the metric, the limit, and
+// the reset time." A story asking for a shape is not the same as inventing
+// one, and `NFR-API-13` needs "wait for the cycle" to be actionable, which it
+// is not without saying when the cycle ends. See the 429 section.
 // `precondition_unmet` is also absent: §2 illustrates it with "e.g. a patch
 // whose `content_before_hash` no longer matches" — an example, not a
 // committed shape, and "e.g." is not something to freeze into a published
@@ -234,6 +241,34 @@ export const dailyLimitReachedDetailsSchema = z
   })
   .strict();
 
+// STORY-070 AC6 — "Exhaustion returns the quota failure with the metric, the
+// limit, and the reset time." Deliberately parallel to
+// `dailyLimitReachedDetailsSchema` above: the two are §9's third and fourth
+// enforcement mechanisms, and a client that can render one should not have to
+// learn a second shape to render the other.
+//
+// `resets_at` is a DATE, not a timestamp, and the difference is not cosmetic.
+// A daily cap resets at the next UTC midnight — a real instant. A tier cap
+// resets when the BILLING CYCLE rolls, and the cycle is bounded by
+// `credit_wallets.cycle_end` / `subscriptions.current_period_end`, both of
+// which this system holds as dates. `z.iso.datetime()` would demand a time
+// component nothing can supply, so it would be filled with a fabricated
+// midnight.
+//
+// `limit` IS OPTIONAL, AND THAT IS AC10. `FR-CRD-19`: the fair-use ceiling
+// "is not published — a limit nobody hits adds a dimension and reduces trust
+// at the same time". A 429 carrying `limit: 6000` publishes it to precisely
+// the customer who was about to ask what it is. So the figure is withheld for
+// the unpublished metrics and present for the rest, while the metric and the
+// reset date — the two things a customer needs to act — are always there.
+export const quotaExceededDetailsSchema = z
+  .object({
+    metric: z.string().min(1),
+    limit: z.number().int().nonnegative().optional(),
+    resets_at: z.iso.date(),
+  })
+  .strict();
+
 // NOTE — `quota_exceeded` has NO details schema, and that is a finding, not
 // an omission. It is the ONE spend-and-limit code the reference gives no
 // `details` for: §2's row says only "A non-credit tier cap is exhausted",
@@ -268,6 +303,7 @@ export const errorDetailsSchemaByCode = {
   forbidden: forbiddenDetailsSchema,
   entitlement_exceeded: entitlementExceededDetailsSchema,
   feature_not_in_plan: featureNotInPlanDetailsSchema,
+  quota_exceeded: quotaExceededDetailsSchema,
   conflict: conflictDetailsSchema,
   idempotency_conflict: idempotencyConflictDetailsSchema,
   workspace_limit_reached: workspaceLimitReachedDetailsSchema,
@@ -308,6 +344,7 @@ export type InsufficientCreditsDetails = z.infer<typeof insufficientCreditsDetai
 export type ForbiddenDetails = z.infer<typeof forbiddenDetailsSchema>;
 export type EntitlementExceededDetails = z.infer<typeof entitlementExceededDetailsSchema>;
 export type FeatureNotInPlanDetails = z.infer<typeof featureNotInPlanDetailsSchema>;
+export type QuotaExceededDetails = z.infer<typeof quotaExceededDetailsSchema>;
 export type ConflictDetails = z.infer<typeof conflictDetailsSchema>;
 export type WorkspaceLimitReachedDetails = z.infer<typeof workspaceLimitReachedDetailsSchema>;
 export type PriceChangedDetails = z.infer<typeof priceChangedDetailsSchema>;

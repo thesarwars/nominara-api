@@ -41,6 +41,13 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       // them. Without 0012 here, this fixture is a "0006-only" schema
       // that checkRls (correctly) flags as missing those two policies.
       "0012_actor_self_scoped_membership_policies",
+      // STORY-070 — `usage_reservations` is the FIRST tenant table created
+      // after 0006 was generated, so it is the first one this fixture's
+      // "every migration that creates a tenant table" set does not get for
+      // free from 0001-0004. Without it the shadow schema is missing a table
+      // that IS in the committed tenant-tables.generated.ts, and the drift
+      // assertion below fails for a reason that is not drift.
+      "0019_usage_reservations",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");

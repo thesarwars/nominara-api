@@ -3,6 +3,8 @@ import type { ClientBase } from "pg";
 import type { Cache } from "../cache/cache.port.js";
 import type { QueueTopologyEntry } from "../queue/topology.js";
 import { dispatchCaptureCells, type DispatchCell, type DispatchOptions, type ProjectCadence } from "./dispatch-cells.js";
+import { resolveEntitlements } from "../entitlements/resolution.js";
+import { provisionUsageCounters } from "../usage/tier-caps.js";
 import { assertFairUseCapacity, commitDeepScanCharge, type RunTrigger } from "./fair-use.js";
 import { probeExactHash, type L1Hit } from "./l1-exact-hash.js";
 import { cellKey, probeSemanticReuse, type L2Hit } from "./l2-semantic-reuse.js";
@@ -212,6 +214,25 @@ async function writePlan(
     0,
     (priorRun.rows[0]?.planned_cells ?? 0) - (priorRun.rows[0]?.skipped_cells ?? 0),
   );
+  // STORY-070 — PROVISION BEFORE RESERVING, and this call is what unblocked
+  // capture. The reservation below matches a row or it matches nothing, and
+  // until STORY-070 nothing created the row: every workspace's first run
+  // reserved against a counter that did not exist, matched zero rows, and was
+  // refused. EPIC-04's risk table called it "REALIZED as of 2026-08-31".
+  //
+  // Here rather than inside assertFairUseCapacity because the two are
+  // different jobs: this one derives the ceiling from the plan, that one tests
+  // a request against whatever ceiling is recorded. Folding them together
+  // would make every reservation rewrite `limit_value`, which is a second
+  // write and a wider lock on the planning path — and would leave the
+  // reservation with no independent behaviour to test.
+  //
+  // Resolved fresh rather than through EntitlementResolver's memo: planning
+  // runs once per run inside an already-open transaction, so there is no
+  // request-scoped version to key a memo by and no round trip worth saving.
+  const entitlements = await resolveEntitlements(tx, context.workspaceId);
+  await provisionUsageCounters(tx, context.workspaceId, context.periodStart, entitlements.entitlements);
+
   await assertFairUseCapacity(
     tx,
     context.workspaceId,

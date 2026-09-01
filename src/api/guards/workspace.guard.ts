@@ -44,6 +44,17 @@ export interface WorkspaceScopedRequest extends AuthenticatedRequest {
   tenant?: TenantContext;
   membership?: { role: string; projectScope: readonly string[] | null };
   apiKey?: ApiKeyContext;
+  /**
+   * The LIVE `workspaces.entitlement_version`, as read below.
+   *
+   * STORY-069 AC4 — EntitlementGuard memoises resolution under this version,
+   * and this guard has already paid for the read (it compares the live value
+   * against the token's `ent_v` and refuses when they differ). Handing it
+   * along means a memo hit costs no database round trip at all, and means the
+   * two guards cannot disagree about which version this request is being
+   * evaluated against.
+   */
+  entitlementVersion?: number;
 }
 
 function firstValue(value: string | string[] | undefined): string | undefined {
@@ -125,6 +136,9 @@ export class WorkspaceGuard implements CanActivate {
         ? { workspaceId, actorId: userId, scopeProjectIds: live.projectScope }
         : { workspaceId, actorId: userId };
     req.membership = { role: live.role, projectScope: live.projectScope };
+    // Only after the freshness check above, so what EntitlementGuard memoises
+    // under is a version this request has already been proven to be current for.
+    req.entitlementVersion = workspace.entitlementVersion;
     return true;
   }
 

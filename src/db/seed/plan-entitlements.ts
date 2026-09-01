@@ -16,7 +16,7 @@
 // semantics. This story's job is narrower — get the real matrix values into
 // the database so `workspaces.plan_key` has something to reference and the
 // property "a plan change is a data change" starts existing.
-type EntitlementValue = number | boolean | string | null;
+export type EntitlementValue = number | boolean | string | null;
 
 type Tier = "free" | "starter" | "growth" | "business" | "enterprise";
 
@@ -77,22 +77,71 @@ const MATRIX: ReadonlyArray<readonly [string, ...EntitlementValue[]]> = [
   ["support.response_target_hours", "community", 48, 24, "8_business_hours", "1_24_7"],
   ["fair_use.captures_per_cycle", 40, 1200, 6000, 22000, "negotiated"],
   ["no_shared_cache", false, false, false, false, "optional"],
+
+  // ---------------------------------------------------------------------
+  // §2's SECOND table — "Entitlement keys that are not live in v1".
+  //
+  // "These exist so the plan shape is settled before the features land.
+  // They are not launch claims and must render nowhere."
+  //
+  // They carry `null` at every tier rather than a value, because the
+  // reference gives them no per-tier row and inventing one would be
+  // inventing a claim. `null` already means "not applicable for that tier"
+  // in this file's encoding, which is exactly what an unbuilt feature is.
+  // The `live: false` flag below is what actually stops them rendering.
+  // ---------------------------------------------------------------------
+  ["integrations.slack", null, null, null, null, null],
+  ["integrations.mcp", null, null, null, null, null],
+  ["integrations.cms_connections_max", null, null, null, null, null],
+  ["exports.bi_ports", null, null, null, null, null],
+  ["sso.saml", null, null, null, null, null],
 ];
+
+/**
+ * §2: the keys that are NOT live in v1, and must render nowhere.
+ *
+ * `whitelabel.custom_domain` is the one that is easy to get wrong. It is a
+ * real matrix row with real per-tier values, and it is ALSO in the not-live
+ * table — "live at launch + 30 days". So a key can carry a genuine value and
+ * still not be live, which is precisely why the flag is per key rather than
+ * a separate list of unbuilt features.
+ */
+export const NOT_LIVE_KEYS: ReadonlySet<string> = new Set([
+  "integrations.slack",
+  "integrations.mcp",
+  "integrations.cms_connections_max",
+  "exports.bi_ports",
+  "sso.saml",
+  "whitelabel.custom_domain",
+]);
+
+/**
+ * One entitlement: what the plan grants, and whether the feature is live.
+ *
+ * THE FLAG IS NOT THE VALUE. A key can be `true` for a tier and still not be
+ * live — `whitelabel.custom_domain` on Business is exactly that — so a
+ * consumer that reads only the value would advertise a feature that does not
+ * exist. Resolution keeps both, and the surfaces gate on `live` first.
+ */
+export interface Entitlement {
+  readonly value: EntitlementValue;
+  readonly live: boolean;
+}
 
 export const ENTITLEMENT_KEYS: readonly string[] = MATRIX.map((row) => row[0]);
 
-function buildTierEntitlements(tierIndex: number): Record<string, EntitlementValue> {
-  const entitlements: Record<string, EntitlementValue> = {};
+function buildTierEntitlements(tierIndex: number): Record<string, Entitlement> {
+  const entitlements: Record<string, Entitlement> = {};
   for (const row of MATRIX) {
     const [key, ...values] = row;
-    entitlements[key] = values[tierIndex]!;
+    entitlements[key] = { value: values[tierIndex]!, live: !NOT_LIVE_KEYS.has(key) };
   }
   return entitlements;
 }
 
-export const PLAN_ENTITLEMENTS: Record<Tier, Record<string, EntitlementValue>> = Object.fromEntries(
+export const PLAN_ENTITLEMENTS: Record<Tier, Record<string, Entitlement>> = Object.fromEntries(
   TIERS.map((tier, index) => [tier, buildTierEntitlements(index)]),
-) as Record<Tier, Record<string, EntitlementValue>>;
+) as Record<Tier, Record<string, Entitlement>>;
 
 export const PLAN_CATALOG: ReadonlyArray<{
   key: Tier;

@@ -409,7 +409,8 @@ export function resolveMaxRetentionDays(values: readonly unknown[]): number | nu
 
 export async function resolveDetachDropCutoffDays(client: ClientBase): Promise<number | null> {
   const result = await client.query<{ value: unknown }>(
-    `SELECT DISTINCT p.entitlements->'retention.raw_captures_days' AS value
+    // ->'value': entitlements are {value, live} since STORY-069.
+    `SELECT DISTINCT p.entitlements->'retention.raw_captures_days'->'value' AS value
        FROM workspaces w
        JOIN plans p ON p.key = w.plan_key
       WHERE w.deleted_at IS NULL`,

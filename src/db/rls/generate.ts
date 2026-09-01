@@ -5,6 +5,7 @@ import {
   ACTOR_SELF_SCOPED_TABLES,
   GLOBAL_TABLES,
   PORTAL_READABLE_TABLES,
+  POLICY_IN_OWN_MIGRATION,
   PORTAL_SELF_SCOPED_TABLES,
   RLS_POLICY_ROLES,
   TENANT_SCOPE_COLUMN,
@@ -440,7 +441,17 @@ export function computeTenantTableNames(tables: readonly TableDescriptor[]): str
  * this throws (see resolveScopeColumn, via computeExpectedPolicies).
  */
 export function generateRlsSql(tables: readonly TableDescriptor[]): string {
-  const expectedPolicies = computeExpectedPolicies(tables);
+  // POLICY_IN_OWN_MIGRATION is filtered HERE rather than at the call site, so
+  // every consumer — the generator, `db:rls-check`, and the drift test that
+  // compares this output against the committed file — gets one answer. A table
+  // whose policy ships with its own CREATE TABLE must not also be written into
+  // 0006, which runs before that table exists.
+  //
+  // computeExpectedPolicies is NOT filtered anywhere: the table is a tenant
+  // table, it belongs in TENANT_TABLES, and `db:rls-check` must keep verifying
+  // its policy is really on the live schema.
+  const emitted = tables.filter((table) => !POLICY_IN_OWN_MIGRATION.includes(table.name));
+  const expectedPolicies = computeExpectedPolicies(emitted);
 
   const policiesByTable = new Map<string, ExpectedPolicy[]>();
   for (const policy of expectedPolicies) {
