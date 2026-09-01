@@ -345,6 +345,49 @@ describe("STORY-069 · EntitlementGuard: structural limits and feature flags nev
   });
 
   // -------------------------------------------------------------------------
+  // Scenario 11 — a plan edit changes behaviour with no redeploy (AC11)
+  // -------------------------------------------------------------------------
+  it("editing a plan limit in the database changes what the guard allows, in the same process", async () => {
+    // §2: "a plan change is a **data change with no redeploy**." The strongest
+    // form of that claim is this one: the SAME guard instance, holding the
+    // SAME memo, refuses and then allows — nothing reconstructed, nothing
+    // restarted, no constant edited.
+    await addProjects(3);
+
+    const before = await refusalFrom(() => guard.canActivate(makeContext(request(), CreateProjectRoute)));
+    expect(before.details).toEqual({ key: "projects.max", limit: 3, current: 3 });
+
+    await db.query(
+      `UPDATE plans SET entitlements = jsonb_set(entitlements, '{projects.max,value}', '10'::jsonb)
+        WHERE key = 'growth'`,
+    );
+    // The version bump is the other half of the mechanism, not an extra step:
+    // §8 says it bumps "on any plan, add-on, or override change", and without
+    // it the memo would keep answering from the old plan for up to its TTL.
+    await db.query("UPDATE workspaces SET entitlement_version = 2 WHERE id = $1", [workspaceId]);
+
+    const after = { ...request(), entitlementVersion: 2 };
+    await expect(guard.canActivate(makeContext(after, CreateProjectRoute))).resolves.toBe(true);
+  });
+
+  it("a plan edit WITHOUT a version bump is held off by the memo — which is what the version is for", async () => {
+    // The negative case, so the bump above is not mistaken for decoration. A
+    // plan edit that skipped the bump would take effect somewhere between
+    // immediately and the TTL, non-deterministically — §8's own reason for
+    // keying the memo by version, and unacceptable for a DOWNGRADE.
+    await addProjects(3);
+    await refusalFrom(() => guard.canActivate(makeContext(request(), CreateProjectRoute)));
+
+    await db.query(
+      `UPDATE plans SET entitlements = jsonb_set(entitlements, '{projects.max,value}', '10'::jsonb)
+        WHERE key = 'growth'`,
+    );
+
+    const stillRefused = await refusalFrom(() => guard.canActivate(makeContext(request(), CreateProjectRoute)));
+    expect(stillRefused.details).toEqual({ key: "projects.max", limit: 3, current: 3 });
+  });
+
+  // -------------------------------------------------------------------------
   // Fail closed
   // -------------------------------------------------------------------------
   it("refuses when no workspace is resolved rather than allowing the request", async () => {

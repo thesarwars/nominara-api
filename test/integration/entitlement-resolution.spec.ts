@@ -7,6 +7,10 @@ import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapte
 import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
 import { entitlementsKey } from "../../src/lib/cache/valkey-keys.js";
 import { EntitlementResolver, ENTITLEMENT_MEMO_TTL_MS } from "../../src/lib/entitlements/entitlement-resolver.js";
+import { EntitlementsController } from "../../src/modules/entitlements/entitlements.controller.js";
+import { EntitlementsService } from "../../src/modules/entitlements/entitlements.service.js";
+import { resolvedEntitlementsResponseSchema } from "../../contracts/entitlements/resolved-entitlements.schema.js";
+import type { WorkspaceScopedRequest } from "../../src/api/guards/workspace.guard.js";
 import {
   InvalidEntitlementOverridesError,
   UnknownWorkspaceError,
@@ -341,6 +345,47 @@ describe("STORY-069 · entitlement resolution: plan, then add-ons, then override
     // returning the version-2 payload under a version-1 key.
     const again = await resolver.resolve(workspaceId, 1);
     expect(again.entitlements["projects.max"]!.value).toBe(99);
+  });
+
+  // -------------------------------------------------------------------------
+  // AC5 — the one payload, through the actual handler
+  // AC12 — an override reaching a client as something it can explain
+  // -------------------------------------------------------------------------
+  it("GET /billing/entitlements returns every key, the version, and where each value came from", async () => {
+    await addAddon("extra_seat", 2);
+    await setOverrides({ "projects.max": 25 });
+
+    const controller = new EntitlementsController(new EntitlementsService(resolver));
+    const body = await controller.resolved({
+      tenant: { workspaceId, actorId: randomUUID() },
+      entitlementVersion: 1,
+    } as WorkspaceScopedRequest);
+
+    // The response is its own contract's shape, not merely close to it — a
+    // published client is generated from this schema.
+    expect(resolvedEntitlementsResponseSchema.parse(body)).toEqual(body);
+
+    expect(body.workspace_id).toBe(workspaceId);
+    expect(body.plan_key).toBe("growth");
+    expect(body.entitlement_version).toBe(1);
+    expect(Object.keys(body.entitlements)).toHaveLength(50);
+
+    // Three provenances in one payload, which is what makes the interface able
+    // to say "your plan includes 3; your agreement raises it to 25" rather
+    // than presenting an unexplained 25 for a Growth workspace.
+    expect(body.entitlements["projects.max"]).toEqual({
+      value: 25,
+      live: true,
+      source: "override",
+      plan_value: PLAN_GROWTH_PROJECTS_MAX,
+    });
+    expect(body.entitlements["seats.max"]).toEqual({
+      value: PLAN_GROWTH_SEATS_MAX + 2,
+      live: true,
+      source: "add_on",
+      plan_value: PLAN_GROWTH_SEATS_MAX,
+    });
+    expect(body.entitlements["exports.csv"]!.source).toBe("plan");
   });
 
   it("the memo entry expires on its own", async () => {
