@@ -167,3 +167,23 @@ export function requestBodyHash(canonicalBody: string): string {
 export function hashIdempotencyKey(key: string): string {
   return createHash("sha256").update(key).digest("hex");
 }
+
+/**
+ * `{env}:{workspace_id}:ent:{entitlement_version}` — resolved entitlements
+ * (STORY-069 AC4).
+ *
+ * plans-and-entitlements.md §8 writes it `ent:{workspace_id}:{entitlement_version}`;
+ * the `{env}` prefix and the workspace-first ordering are this file's, for the
+ * reasons at the top — the reference is naming the shape, not the full key, and
+ * §11 lists "entitlement memoisation" among what the CACHE instance holds.
+ *
+ * THE VERSION SEGMENT IS THE INVALIDATION. `workspaces.entitlement_version`
+ * bumps on any plan, add-on, or override change, so a bump moves every
+ * subsequent read to a key nothing has written. There is no invalidate() to
+ * call and therefore none to forget — which matters most for a DOWNGRADE,
+ * where an entry that outlived its plan is a customer using a tier they no
+ * longer pay for, for as long as the TTL happens to be.
+ */
+export function entitlementsKey(env: string, workspaceId: string, entitlementVersion: number): string {
+  return tenantKey(env, workspaceId, "ent", String(entitlementVersion));
+}

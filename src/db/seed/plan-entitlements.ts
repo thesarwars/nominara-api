@@ -16,7 +16,7 @@
 // semantics. This story's job is narrower — get the real matrix values into
 // the database so `workspaces.plan_key` has something to reference and the
 // property "a plan change is a data change" starts existing.
-type EntitlementValue = number | boolean | string | null;
+export type EntitlementValue = number | boolean | string | null;
 
 type Tier = "free" | "starter" | "growth" | "business" | "enterprise";
 

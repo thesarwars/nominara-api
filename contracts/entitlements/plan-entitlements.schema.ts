@@ -25,7 +25,7 @@ import { ENTITLEMENT_KEYS } from "../../src/db/seed/plan-entitlements.js";
 // anyway, and would encode today's tier values into the type, so a plan edit
 // — the thing AC11 requires to work with no redeploy — would stop type
 // checking. Pinning the KEY SET exactly is what this schema is for.
-const entitlementValueSchema = z.union([z.number(), z.boolean(), z.string(), z.null()]);
+export const entitlementValueSchema = z.union([z.number(), z.boolean(), z.string(), z.null()]);
 
 export const entitlementSchema = z
   .object({
