@@ -1,5 +1,7 @@
 import type { ClientBase } from "pg";
 import { QuotaExceededError } from "../../api/errors/domain-errors.js";
+import { resolveBillingPeriod } from "../usage/billing-period.js";
+import { reserveTierCap, UNLIMITED_LIMIT } from "../usage/tier-caps.js";
 
 // STORY-032 AC10 and AC11 — the fair-use ceiling, and the charge hook.
 //
@@ -21,45 +23,36 @@ export type RunTrigger = "scheduled" | "manual" | "verification" | "drift_sample
 
 export const CHARGED_TRIGGERS: readonly RunTrigger[] = ["manual"];
 
-export const FAIR_USE_METRIC = "fair_use_captures";
+export const FAIR_USE_METRIC = "fair_use_captures" as const;
 
 /**
- * The unlimited sentinel, from §9's reservation SQL.
- *
- * Named rather than written as a bare `-1` in the statement, because the
- * literal is indistinguishable from a typo at the call site and the failure
- * it guards against is silent: without the branch below, the comparison for
- * an unlimited row reads `used + reserved + cells <= -1`, which is false for
- * every positive request. The sentinel that must NEVER block would block
- * ALWAYS — the exact inverse of its meaning, and invisible until an
- * enterprise workspace on a negotiated ceiling is refused every capture.
+ * Re-exported so STORY-032's call sites and tests keep one name for it. The
+ * sentinel now lives in `src/lib/usage/metrics.ts`, with the counter lifecycle
+ * it belongs to — STORY-070 moved it there, as this story's own AC10 note
+ * said it should: one module owns `usage_counters`, rather than a second
+ * counter lifecycle growing inside `src/lib/capture/`.
  */
-export const UNLIMITED_LIMIT = -1;
+export { UNLIMITED_LIMIT };
 
 /**
  * Reserves `cells` against this cycle's fair-use ceiling, ATOMICALLY.
  *
- * One statement, and that is the requirement rather than a style preference.
- * A read-then-write would let two runs planning concurrently both observe
- * spare capacity and both reserve it, so the cap would be exceeded by exactly
- * the amount that made it worth having. The `WHERE` clause below is what
- * makes the check and the increment the same operation: it either matches a
- * row with room and increments it, or matches nothing.
+ * A thin wrapper over `reserveTierCap` since STORY-070. The atomicity
+ * argument, the unlimited branch and the reserved-rather-than-used reasoning
+ * all live there now; what stays here is capture's own vocabulary — cells, a
+ * run — so a reader of the planning path is not sent to a billing module to
+ * learn what is being reserved.
  *
- * An UNLIMITED ceiling still takes this path and still increments: it is a
- * ceiling that never binds, not a counter that stops counting. Skipping the
- * write would leave an enterprise workspace with no usage signal at all,
- * and the internal-cost view exists precisely for the accounts too large to
- * cap.
- *
- * Reserved rather than used: the cells have not been captured yet. A worker
- * converts reserved into used as each lands, and a run that dies mid-flight
- * leaves a reservation the cycle rollover clears — over-counting for the rest
- * of a cycle is the safe direction for a ceiling.
+ * NO JOB ID IS PASSED, and the consequence is stated rather than hidden:
+ * nothing can release a capture's reservation, so a run that dies mid-flight
+ * leaves it standing until the period rolls. Over-counting for the rest of a
+ * cycle is the safe direction for a ceiling. Threading `context.runId` through
+ * is what would make it releasable, and it belongs with the worker that
+ * converts reserved into used as cells land — which does not exist yet.
  *
  * Returns false rather than throwing, because the caller knows what it was
- * planning and this function does not. `assertFairUseCapacity` is the
- * throwing form for callers that just want the refusal.
+ * planning and this function does not. `assertFairUseCapacity` is the throwing
+ * form for callers that just want the refusal.
  */
 export async function reserveFairUseCapacity(
   tx: ClientBase,
@@ -67,33 +60,32 @@ export async function reserveFairUseCapacity(
   periodStart: string,
   cells: number,
 ): Promise<boolean> {
-  // Reserving nothing always succeeds, and must not touch the row: a run
-  // fully served from cache has nothing to reserve, and writing a no-op
-  // increment would still take the row lock and serialise planning across
-  // every project in the workspace for no reason.
-  if (cells === 0) return true;
   if (cells < 0) {
     throw new Error(`fair-use reservation: cells must not be negative (got ${String(cells)})`);
   }
-
-  const result = await tx.query(
-    `UPDATE usage_counters
-        SET reserved_value = reserved_value + $4
-      WHERE workspace_id = $1
-        AND metric = $2
-        AND period_start = $3
-        AND (limit_value = $5 OR used_value + reserved_value + $4 <= limit_value)`,
-    [workspaceId, FAIR_USE_METRIC, periodStart, cells, UNLIMITED_LIMIT],
-  );
-  return (result.rowCount ?? 0) === 1;
+  const outcome = await reserveTierCap(tx, {
+    workspaceId,
+    metric: FAIR_USE_METRIC,
+    periodStart,
+    quantity: cells,
+  });
+  return outcome.ok;
 }
 
 /**
- * The throwing form. `quota_exceeded` carries NO details, deliberately —
- * contracts/common/error-details.schema.ts records that as a finding rather
- * than an omission: it is the one spend-and-limit code the reference gives no
- * details shape for, and inventing `{limit, used}` here would publish a shape
- * no reference committed to.
+ * The throwing form.
+ *
+ * THE CEILING IS NOT IN THE DETAILS, and that is `FR-CRD-19` rather than an
+ * omission: the fair-use figure "is not published — a limit nobody hits adds a
+ * dimension and reduces trust at the same time", and a 429 carrying it would
+ * publish it to precisely the customer who was about to ask what it is.
+ * `METRIC_SPECS` is what decides that, per metric, so the decision lives in
+ * one place rather than at each throw site.
+ *
+ * The metric and the reset date ARE carried. STORY-070 AC6 asks for them, and
+ * without a reset date "wait for the cycle" is not an action anybody can take.
+ * The extra read to resolve the period end is on the refusal path only, which
+ * §11 says never happens on legitimate use.
  */
 export async function assertFairUseCapacity(
   tx: ClientBase,
@@ -101,11 +93,17 @@ export async function assertFairUseCapacity(
   periodStart: string,
   cells: number,
 ): Promise<void> {
-  if (!(await reserveFairUseCapacity(tx, workspaceId, periodStart, cells))) {
-    throw new QuotaExceededError({
-      message: "this cycle's fair-use capture ceiling is exhausted",
-    });
+  if (await reserveFairUseCapacity(tx, workspaceId, periodStart, cells)) {
+    return;
   }
+  const period = await resolveBillingPeriod(tx, workspaceId);
+  throw new QuotaExceededError({
+    message: "this cycle's fair-use capture ceiling is exhausted",
+    // No `limit`. METRIC_SPECS records fair use as unpublished, and this
+    // assertion is what makes that hold on the one path where the figure could
+    // otherwise escape.
+    details: { metric: FAIR_USE_METRIC, resets_at: period.end },
+  });
 }
 
 export interface DeepScanChargeInput {

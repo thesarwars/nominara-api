@@ -19,16 +19,22 @@ import { NOOP_REVERT, type Breaker } from "../support/breakers.js";
 // (both global — pre-tenant auth-path state, GRANT-protected the same way)
 // are the two new tables migration 0014 adds. Tenant count (59) is
 // unchanged.
+//
+// 77/60/17 as of STORY-070: `usage_reservations` (migration 0019) is the
+// first TENANT table added since 0004, and therefore the first entry here
+// that moves the tenant count rather than the global one. Its policy ships in
+// its own migration — see POLICY_IN_OWN_MIGRATION in src/db/conventions.ts
+// for why 0006 must not carry it.
 export async function assertIso06Census(ctx: AssertionContext): Promise<void> {
   const client = await connectSuperuser(ctx);
   try {
     const census = await computeCensus(client);
 
-    if (census.totalTables !== 76) {
-      throw new Error(`ISO-06: expected 76 total base tables, discovered ${census.totalTables}`);
+    if (census.totalTables !== 77) {
+      throw new Error(`ISO-06: expected 77 total base tables, discovered ${census.totalTables}`);
     }
-    if (census.tenantTables.length !== 59) {
-      throw new Error(`ISO-06: expected 59 tenant tables, discovered ${census.tenantTables.length}`);
+    if (census.tenantTables.length !== 60) {
+      throw new Error(`ISO-06: expected 60 tenant tables, discovered ${census.tenantTables.length}`);
     }
     if (census.globalTables.length !== 17) {
       throw new Error(`ISO-06: expected 17 global tables, discovered ${census.globalTables.length}`);

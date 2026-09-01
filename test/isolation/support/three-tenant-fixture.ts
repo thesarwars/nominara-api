@@ -206,6 +206,16 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
       [workspaceId, i],
     );
   }
+  // STORY-070 — one open reservation per counter row. The composite foreign
+  // key means a reservation can only exist against a counter that exists, so
+  // this loop follows the one above and reuses its period_start values.
+  for (let i = 0; i < R; i++) {
+    await client.query(
+      `INSERT INTO usage_reservations (workspace_id, metric, job_id, period_start, quantity)
+       VALUES ($1, 'pdf_exports', $2, CURRENT_DATE - $3::int, 1)`,
+      [workspaceId, `job_${label}_${i}`, i],
+    );
+  }
   for (let i = 0; i < R; i++) {
     await client.query("INSERT INTO usage_ledger (workspace_id, metric, quantity, source) VALUES ($1, 'pdf_exports', 1, 'system')", [
       workspaceId,

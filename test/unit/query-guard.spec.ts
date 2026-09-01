@@ -24,14 +24,26 @@ function createFakeClient() {
 }
 
 describe("STORY-011 · fix pass item 11 — TENANT_TABLES is a real, generated 59-member set", () => {
-  it("has EXACTLY 59 members and includes representative tables from every migration", () => {
+  it("has EXACTLY 60 members and includes representative tables from every migration", () => {
     // Fix pass (second pass) — tightened from toBeGreaterThanOrEqual(59):
     // a table silently added to the set in the future (e.g. a future
     // migration's table misclassified as tenant-scoped, or vice versa)
     // should fail THIS assertion specifically, not rely solely on other,
     // less direct checks elsewhere to catch it.
-    expect(TENANT_TABLES.size).toBe(59);
-    for (const name of ["workspaces", "projects", "competitors", "answer_captures", "tasks", "share_tokens"]) {
+    // 59 through STORY-069; 60 with STORY-070's `usage_reservations`, the
+    // first tenant table added after migration 0006 was generated. Its policy
+    // lives in its own migration (see POLICY_IN_OWN_MIGRATION) and it is still
+    // a tenant table, so query-guard must know about it.
+    expect(TENANT_TABLES.size).toBe(60);
+    for (const name of [
+      "workspaces",
+      "projects",
+      "competitors",
+      "answer_captures",
+      "tasks",
+      "share_tokens",
+      "usage_reservations",
+    ]) {
       expect(TENANT_TABLES.has(name), `expected TENANT_TABLES to contain ${name}`).toBe(true);
     }
   });

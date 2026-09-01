@@ -129,12 +129,33 @@ function occurrences(text: string, value: string): number[] {
   const lines = text.split("\n");
   const found: number[] = [];
   lines.forEach((line, index) => {
+    if (isCommentLine(line)) {
+      return;
+    }
     if (pattern.test(line)) {
       found.push(index + 1);
     }
     pattern.lastIndex = 0;
   });
   return found;
+}
+
+/**
+ * A line that is only a comment.
+ *
+ * Prose QUOTING a figure is not a hardcoded figure, and this file's own
+ * exemption is the proof: `metrics.ts` and `error-details.schema.ts` both
+ * explain the fair-use rule by naming the ceiling the refusal must not
+ * publish. Flagging those would push the next author to write the explanation
+ * without the number, which makes the codebase worse to read in exchange for
+ * nothing.
+ *
+ * Only WHOLE-line comments are skipped — `const LIMIT = 6000; // the growth
+ * ceiling` still has code on it and is still checked, which is asserted below.
+ */
+function isCommentLine(line: string): boolean {
+  const trimmed = line.trimStart();
+  return trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*") || trimmed.startsWith("--");
 }
 
 describe("STORY-069 AC10 · no plan limit, price, or credit cost is hardcoded", () => {
@@ -174,6 +195,14 @@ describe("STORY-069 AC10 · no plan limit, price, or credit cost is hardcoded", 
     expect(occurrences("const windowMs = 60_000;", "6000")).toEqual([]);
     expect(occurrences("const uptime = 99.95;", "99.9")).toEqual([]);
     expect(occurrences("const uptime = 99.9;", "99.9")).toEqual([1]);
+  });
+
+  it("prose naming a figure is not a hardcoded figure, but code with a trailing comment still is", () => {
+    expect(occurrences("// the growth ceiling is 6000 captures per cycle", "6000")).toEqual([]);
+    expect(occurrences(" * A 429 carrying `limit: 6000` publishes it", "6000")).toEqual([]);
+    expect(occurrences("-- seeded at 6000 for growth", "6000")).toEqual([]);
+    // The hole this could open, closed: code is still code with a comment on it.
+    expect(occurrences("const CEILING = 6000; // the growth ceiling", "6000")).toEqual([1]);
   });
 
   it("every allow-listed path still exists", () => {

@@ -254,6 +254,36 @@ export const PORTAL_SELF_SCOPED_TABLES = ["projects"] as const;
 // branches, and by src/tenancy/query-guard.ts's actor-only-mode allow-list.
 export const ACTOR_SELF_SCOPED_TABLES = ["workspaces", "workspace_members"] as const;
 
+// ---------------------------------------------------------------------------
+// STORY-070 — tenant tables whose RLS policy is created by the SAME migration
+// that creates the table, and must therefore NOT be emitted into
+// 0006_generated_rls_policies.
+// ---------------------------------------------------------------------------
+// 0006 was generated when every tenant table already existed. A tenant table
+// added AFTER it breaks that assumption in one direction only, and silently:
+// `pnpm db:rls-generate` introspects the fully-migrated schema, so it happily
+// writes `ALTER TABLE usage_reservations ENABLE ROW LEVEL SECURITY` into 0006
+// — a migration that runs THIRTEEN migrations before the table exists. A
+// fresh `pnpm db:migrate` then fails with
+//
+//     migration 0006_generated_rls_policies failed:
+//     relation "usage_reservations" does not exist
+//
+// which is not hypothetical: it is the exact error a regeneration produced
+// while STORY-070 was being written.
+//
+// A table listed here still appears in TENANT_TABLES and is still checked by
+// `pnpm db:rls-check` against the live schema — the classification and the
+// verification are unchanged. Only the FILE GENERATION skips it, because its
+// policy already lives in its own migration.
+//
+// The rule for a new tenant table from here on: create the table and its
+// `ws_isolation_<table>` policy in one migration, and add the name here.
+export const POLICY_IN_OWN_MIGRATION: readonly string[] = [
+  // 0019_usage_reservations.up.sql
+  "usage_reservations",
+];
+
 // STORY-011 — which runtime roles receive which generated policy. Every
 // FOR ALL ws_isolation_* policy is granted to `forAll`; every portal_scope_*
 // SELECT-only policy is granted to `portal`. Kept here as declared data

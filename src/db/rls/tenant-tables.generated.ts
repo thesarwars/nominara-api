@@ -74,6 +74,7 @@ export const TENANT_TABLES: ReadonlySet<string> = new Set([
   "tracked_prompts",
   "usage_counters",
   "usage_ledger",
+  "usage_reservations",
   "workspace_invitations",
   "workspace_keys",
   "workspace_members",
