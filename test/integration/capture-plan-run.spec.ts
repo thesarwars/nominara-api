@@ -112,6 +112,23 @@ describe("STORY-032 · planning a run end to end", () => {
     await setCeiling(1_000);
   });
 
+  /**
+   * STORY-070 — the ceiling as the CONTRACT sets it, not as a hand-written row.
+   *
+   * planRun provisions the counter from resolved entitlements before it
+   * reserves, so writing `limit_value` directly no longer holds: the next plan
+   * derives it again and overwrites whatever a test wrote. Setting the
+   * workspace override is the real mechanism and is what a negotiated ceiling
+   * actually is.
+   */
+  async function setCeilingByEntitlement(limit: number): Promise<void> {
+    await db.query(
+      `UPDATE workspaces SET entitlement_overrides = jsonb_build_object('fair_use.captures_per_cycle', $2::int)
+        WHERE id = $1`,
+      [workspaceId, limit],
+    );
+  }
+
   async function setCeiling(limit: number, used = 0, reserved = 0): Promise<void> {
     await db.query(
       `INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value, reserved_value)
@@ -345,13 +362,52 @@ describe("STORY-032 · planning a run end to end", () => {
     expect(Number(row.rows[0]!.reserved_value), "3 planned, 2 cached, 1 vendor call").toBe(1);
   }, 60_000);
 
+  // THE BLOCK EPIC-04's RISK TABLE CALLED "REALIZED as of 2026-08-31".
+  //
+  // "Capture refuses every workspace because nothing provisions the fair-use
+  // counter it reserves against." The reservation matches a row or it matches
+  // nothing, and nothing created the row — so a workspace's very first run was
+  // refused, every time, on every plan. This is the test that says it is over.
+  it("plans successfully for a workspace that has never had a counter row", async () => {
+    await db.query("DELETE FROM usage_counters WHERE workspace_id = $1", [workspaceId]);
+    await addPrompt("best crm");
+
+    const plan = await planInTransaction(db, context());
+
+    expect(plan.planned).toBe(1);
+    expect(plan.live).toBe(1);
+    // Provisioned from the plan, not from anything a test wrote: growth's
+    // fair_use.captures_per_cycle is 6000.
+    const row = await db.query<{ limit_value: string; reserved_value: string }>(
+      "SELECT limit_value, reserved_value FROM usage_counters WHERE workspace_id = $1 AND metric = $2",
+      [workspaceId, FAIR_USE_METRIC],
+    );
+    expect(row.rows[0]).toMatchObject({ limit_value: "6000", reserved_value: "1" });
+  }, 60_000);
+
+  it("a negotiated ceiling in the workspace's overrides is what gets provisioned", async () => {
+    await db.query("DELETE FROM usage_counters WHERE workspace_id = $1", [workspaceId]);
+    await setCeilingByEntitlement(99);
+    await addPrompt("best crm");
+
+    await planInTransaction(db, context());
+
+    const row = await db.query<{ limit_value: string }>(
+      "SELECT limit_value FROM usage_counters WHERE workspace_id = $1 AND metric = $2",
+      [workspaceId, FAIR_USE_METRIC],
+    );
+    expect(row.rows[0]!.limit_value).toBe("99");
+  }, 60_000);
+
   // A REFUSAL MUST LEAVE NOTHING BEHIND. Reserve is the first write for
   // exactly this reason: suppressed rows and counters for a run that will
   // not happen would make the matrix claim a plan that was refused.
   it("writes nothing at all when the fair-use ceiling refuses", async () => {
     await addPrompt("best crm");
     await addPrompt("best erp");
-    await setCeiling(1);
+    // Through the override, so the refusal happens for the reason it would in
+    // production: the plan's ceiling, resolved and provisioned by planRun.
+    await setCeilingByEntitlement(1);
     const queue = newQueue();
 
     await expect(planInTransaction(db, context())).rejects.toThrow(/fair-use|ceiling|quota/iu);
