@@ -4,6 +4,7 @@ import { Logger, Module, type INestApplicationContext, type OnModuleDestroy } fr
 import { NestFactory } from "@nestjs/core";
 import type { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
+import type { ClientBase, PoolClient } from "pg";
 import { engineSpendCeilingsSchema } from "./config/env.schema.js";
 import { loadEnv } from "./config/env.js";
 import { createPgPool } from "./db/pg-pool.js";
@@ -13,6 +14,7 @@ import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue } from "./lib/queue/dead-letter.js";
 import { queuesForGroup } from "./lib/queue/group.js";
+import { handlerFor } from "./lib/queue/handlers.js";
 import { buildWorker, signingKeysFromEnv } from "./lib/queue/worker-factory.js";
 
 // STORY-022 — worker bootstrap (project-structure.md §2: "src/worker.ts
@@ -29,12 +31,17 @@ import { buildWorker, signingKeysFromEnv } from "./lib/queue/worker-factory.js";
 // pool") is no different from any other queue in that respect, since BullMQ
 // never lets two queues share one Worker's concurrency slots anyway.
 //
-// Real per-queue handlers (the actual capture/parse/crawl/... business
-// logic) do not exist yet — later stories wire `getClient`/`process` for
-// each queue. Until then every worker is built with `autorun: false` (never
-// pulls a job) and placeholder handlers that throw if ever invoked, so
-// `bootstrapWorker()` proves the group→queue wiring itself without
-// pretending real job processing exists.
+// STORY-124 — per-queue handlers come from src/lib/queue/handlers.ts's
+// registry, and whether a worker autoruns is DERIVED from whether one is
+// registered rather than declared separately. A queue with a handler pulls
+// jobs and runs them on a pooled client; a queue without one keeps
+// `autorun: false` and the throwing placeholder, so it never pulls a job at
+// all.
+//
+// That asymmetry is the point. A worker that pulled a job it cannot process
+// would fail it down the retry ladder and into the dead-letter queue,
+// turning "not built yet" into "tried and failed" in the record an operator
+// reads during an incident. Inert is a better lie than broken.
 export class WorkerGroupError extends Error {
   constructor(message: string) {
     super(message);
@@ -52,11 +59,16 @@ class WorkerGroupRuntime implements OnModuleDestroy {
   constructor(
     public readonly workers: readonly Worker[],
     private readonly dlqQueues: readonly Queue[],
+    // STORY-124 — the pool every registered handler checks its client out
+    // of. Closed AFTER the workers, so a job still draining keeps the
+    // connection it is holding.
+    private readonly pool: ReturnType<typeof createPgPool>,
   ) {}
 
   async onModuleDestroy(): Promise<void> {
     await Promise.all(this.workers.map((worker) => worker.close()));
     await Promise.all(this.dlqQueues.map((queue) => queue.close()));
+    await this.pool.end().catch(() => undefined);
   }
 }
 
@@ -69,14 +81,14 @@ class WorkerGroupRuntime implements OnModuleDestroy {
 class CaptureCanaryRuntimeHolder implements OnModuleDestroy {
   constructor(
     public readonly runtime: CanaryRuntime,
-    private readonly pool: ReturnType<typeof createPgPool>,
     private readonly cacheRedis: Redis,
   ) {}
 
   async onModuleDestroy(): Promise<void> {
     this.runtime.stop();
-    await this.pool.end().catch(() => undefined);
     await this.cacheRedis.quit().catch(() => undefined);
+    // STORY-124 — the Postgres pool is WorkerGroupRuntime's now, shared
+    // with every registered queue handler, and closed there.
   }
 }
 
@@ -104,28 +116,47 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   const dlqQueues: Queue[] = [];
   const workers: Worker[] = [];
 
+  // STORY-124 — one pool per worker process, for every group rather than
+  // only `capture`. It is lazy (pg.Pool opens nothing until a client is
+  // checked out), so a group whose queues are all still inert pays nothing
+  // for holding one.
+  const pool = createPgPool(env.DATABASE_URL_POOLED);
+  const live: string[] = [];
+  const inert: string[] = [];
+
   try {
     for (const entry of entries) {
       const dlqQueue = buildDlqQueue(entry, { connection: createQueueWorkerConnection(env.QUEUE_REDIS_URL), prefix });
       dlqQueues.push(dlqQueue);
 
+      const handler = handlerFor(entry.name);
+      (handler ? live : inert).push(entry.name);
+
       const worker = buildWorker(entry, {
         connection: createQueueWorkerConnection(env.QUEUE_REDIS_URL),
         prefix,
         keys,
-        autorun: false,
-        getClient: () => notImplementedHandler(entry.name),
-        process: () => notImplementedHandler(entry.name),
+        // Derived, never declared twice: a registered handler is exactly
+        // what makes a queue safe to pull from.
+        autorun: handler !== undefined,
+        getClient: handler ? () => pool.connect() : () => notImplementedHandler(entry.name),
+        // Spread rather than a ternary to `undefined`: under
+        // exactOptionalPropertyTypes an absent option and one explicitly set
+        // to undefined are different things, and an unhandled queue has no
+        // client to give back — its getClient throws first.
+        ...(handler ? { releaseClient: (client: ClientBase) => (client as PoolClient).release() } : {}),
+        process: handler ? handler({ pool, env }) : () => notImplementedHandler(entry.name),
       });
       attachDeadLetterHandler(worker, dlqQueue, entry);
       workers.push(worker);
     }
   } catch (error) {
     await Promise.all([...workers.map((worker) => worker.close()), ...dlqQueues.map((queue) => queue.close())]);
+    await pool.end().catch(() => undefined);
     throw error;
   }
 
-  const runtime = new WorkerGroupRuntime(workers, dlqQueues);
+  const runtime = new WorkerGroupRuntime(workers, dlqQueues, pool);
 
   // STORY-031 Phase F — D2/EC-06: the 5-minute engine-health canary is a
   // capture-group concern only. Nothing else touches an engine at all.
@@ -140,7 +171,6 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       : {};
     warnMissingSpendCeilings(ceilingsUsd, ACTIVE_ENGINE_KEYS);
 
-    const pool = createPgPool(env.DATABASE_URL_POOLED);
     // lazyConnect: a fake/unreachable VALKEY_CACHE_URL (e.g. in a unit test)
     // must never attempt a connection merely from construction — only once
     // the canary's own poll interval actually fires a tick.
@@ -148,9 +178,11 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
     cacheRedis.on("error", (error) => {
       new Logger("bootstrap").warn(`capture canary: cache Valkey connection error: ${error.message}`);
     });
+    // STORY-124 — the canary shares the worker process's one pool rather
+    // than opening a second. WorkerGroupRuntime owns closing it.
     const canaryRuntime = new CanaryRuntime({ pool, cacheRedis });
     canaryRuntime.start();
-    providers.push({ provide: CAPTURE_CANARY_RUNTIME, useValue: new CaptureCanaryRuntimeHolder(canaryRuntime, pool, cacheRedis) });
+    providers.push({ provide: CAPTURE_CANARY_RUNTIME, useValue: new CaptureCanaryRuntimeHolder(canaryRuntime, cacheRedis) });
   }
 
   @Module({ providers })
@@ -158,8 +190,13 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
 
   const app = await NestFactory.createApplicationContext(WorkerRootModule, { bufferLogs: true });
   app.enableShutdownHooks();
+  // STORY-124 — an operator reading this needs to know which half of the
+  // spine is alive. A group that processes nothing must not look identical
+  // to one that processes everything.
   new Logger("bootstrap").log(
-    `worker group "${env.WORKER_GROUP}" started with ${workers.length} queue(s): ${entries.map((entry) => entry.name).join(", ")}`,
+    `worker group "${env.WORKER_GROUP}" started with ${workers.length} queue(s) — ` +
+      `${live.length} processing: ${live.length > 0 ? live.join(", ") : "none"}; ` +
+      `${inert.length} inert (no handler wired): ${inert.length > 0 ? inert.join(", ") : "none"}`,
   );
   return app;
 }
