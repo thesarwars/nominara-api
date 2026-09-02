@@ -406,7 +406,7 @@ describe("STORY-026 · room authorisation over a real socket", () => {
     await new Promise<void>((resolve) => client.on("connect", () => resolve()));
 
     const closure = disconnected(client);
-    client.emit(JOIN_PROJECT_MESSAGE, { project_id: theirProject.id });
+    client.emit(JOIN_PROJECT_MESSAGE, { project_id: theirProject });
 
     await closure;
     expect(client.connected, "a project outside the pinned workspace must not be joinable").toBe(false);
