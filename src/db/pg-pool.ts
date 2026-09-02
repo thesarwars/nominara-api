@@ -1,4 +1,6 @@
 import { Pool } from "pg";
+import { tenantAwarePool } from "../tenancy/query-guard.js";
+import { TENANT_TABLES } from "./rls/tenant-tables.generated.js";
 
 // STORY-022 — the DI token for the pooled Postgres connection (through
 // pgBouncer's transaction-mode pool, per docker-compose.yml/.env.example's
@@ -8,6 +10,26 @@ import { Pool } from "pg";
 // consumer defines its own competing token.
 export const PG_POOL = Symbol("PG_POOL");
 
+// STORY-118 — security-and-tenancy.md §4's NFR-SEC-01, in force.
+//
+// STORY-011 built the guard, the client-wrapping Proxy, the generated
+// tenant-table set and the actor-only allow-list, and unit-tested all of
+// it. Nothing called any of it. The pool was constructed bare on the line
+// below, so the guard had no production caller at all and the repository's
+// own disclosure ("we have a coarse guard") described an object rather than
+// an effect.
+//
+// This is the one place it belongs. Both callers of createPgPool — the API
+// (src/db/db.module.ts) and the worker (src/worker.ts) — get the same seam
+// from the same line, so there is no path that checks out an unwrapped
+// client and no worker exemption to write down.
+//
+// What this does NOT change is the isolation guarantee. RLS is the
+// boundary; the guard is a regex heuristic over SQL text (see
+// query-guard.ts's header, README gap G-6) and RLS is not fooled by the
+// cases it misses. What the guard buys is that "forgot the context"
+// surfaces as a loud failure in the first test that touches the path,
+// instead of as zero rows that look like an empty list.
 export function createPgPool(connectionString: string): Pool {
-  return new Pool({ connectionString });
+  return tenantAwarePool(new Pool({ connectionString }), TENANT_TABLES);
 }
