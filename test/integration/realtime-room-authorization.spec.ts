@@ -6,9 +6,10 @@ import { Client, Pool } from "pg";
 import { io, type Socket as ClientSocket } from "socket.io-client";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { RealtimeModule } from "../../src/gateway/gateway.module.js";
-import { JOIN_WORKSPACE_MESSAGE } from "../../src/gateway/realtime.gateway.js";
+import { JOIN_PROJECT_MESSAGE, JOIN_WORKSPACE_MESSAGE } from "../../src/gateway/realtime.gateway.js";
 import { ROOM_FORBIDDEN_CLOSE_CODE } from "../../src/gateway/room-authorization.service.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
@@ -53,10 +54,27 @@ describe("STORY-026 · room authorisation over a real socket", () => {
     await container.stop();
   });
 
+  /**
+   * STORY-118 — the pooled connection the GATEWAY checks out of, as
+   * deployed: nominara_app, never the migration owner.
+   *
+   * This file used to point DATABASE_URL_POOLED at the container superuser,
+   * which bypasses RLS entirely — so `SELECT 1 FROM projects` with no tenant
+   * context returned the row here and zero rows in every real deployment,
+   * and RoomAuthorizationService refused every project-room join in
+   * production while this suite stayed green. Same defect shape STORY-120
+   * found in readiness. The subject of the test is now the thing that runs.
+   */
+  function runtimeRoleUri(): string {
+    const password = encodeURIComponent(resolvePassword("nominara_app", {}));
+    return `postgres://nominara_app:${password}@${container.getHost()}:${container.getMappedPort(5432)}/${container.getDatabase()}`;
+  }
+
   beforeEach(async () => {
     applyFakeApiEnv();
+    // DATABASE_URL stays the OWNER — migrations are DDL and never run as a
+    // runtime role. Only the pooled connection becomes nominara_app.
     process.env.DATABASE_URL = container.getConnectionUri();
-    process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
@@ -65,7 +83,13 @@ describe("STORY-026 · room authorisation over a real socket", () => {
     await db.query("DROP SCHEMA public CASCADE");
     await db.query("CREATE SCHEMA public");
     await migrateUp(db);
+    // Migration 0005 deliberately sets no passwords (see its header).
+    await db.query(`ALTER ROLE nominara_app PASSWORD ${db.escapeLiteral(resolvePassword("nominara_app", {}))}`);
 
+    process.env.DATABASE_URL_POOLED = runtimeRoleUri();
+
+    // The FIXTURE pool stays the owner: seeding workspaces and sessions is
+    // setup, not the behaviour under test.
     pool = new Pool({ connectionString: container.getConnectionUri() });
     sessions = new SessionService(pool);
     workspaces = new WorkspacesService(
@@ -313,5 +337,78 @@ describe("STORY-026 · room authorisation over a real socket", () => {
 
     await closure;
     expect(client.connected, "a valid token must not outlive the membership it describes").toBe(false);
+  });
+  // ---- STORY-118 · the project room, which nothing here reached ----------
+  //
+  // Every test above joins a WORKSPACE room. The project-room path had no
+  // coverage at all, which is how RoomAuthorizationService.projectBelongsTo
+  // shipped running on the pool with no tenant context — refusing every
+  // project-room join as nominara_app while this file, on the superuser,
+  // never asked. Both halves are asserted now: the join that must succeed,
+  // and the one that must not.
+
+  async function createProject(workspaceId: string): Promise<string> {
+    const result = await db.query<{ id: string }>(
+      `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [workspaceId, `Project ${randomUUID()}`, `p-${randomUUID()}`, "https://example.com", "example.com"],
+    );
+    return result.rows[0]!.id;
+  }
+
+  function joinedProject(client: ClientSocket, projectId: string): Promise<{ joined: boolean; room?: string }> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error("no reply to the project join message within 5s"));
+      }, 5_000);
+      client.emit(JOIN_PROJECT_MESSAGE, { project_id: projectId }, (reply: { joined: boolean; room?: string }) => {
+        clearTimeout(timer);
+        resolve(reply);
+      });
+    });
+  }
+
+  it("STORY-118 — a member joins a project room in its own workspace", async () => {
+    const ownerId = await createUser();
+    const workspace = await workspaces.create(ownerId, { name: `Proj ${randomUUID()}` }, meta);
+    const projectId = await createProject(workspace.id);
+
+    const session = await sessions.createSession(ownerId);
+    const pinned = await sessions.switchWorkspace(session.sid, ownerId, workspace.id, "owner", null, 1);
+
+    const client = connect(pinned.accessToken, pinned.csrfToken);
+    await new Promise<void>((resolve) => client.on("connect", () => resolve()));
+
+    const reply = await joinedProject(client, projectId);
+
+    // Before STORY-118 this was `false` in every deployment: the pairing
+    // check ran with no tenant context, RLS matched nothing, and zero rows
+    // read as "that project is not in your workspace".
+    expect(reply.joined, "a member must be able to join a project room in its own workspace").toBe(true);
+    expect(reply.room).toBe(`proj:${projectId}`);
+    expect(client.connected).toBe(true);
+  });
+
+  it("STORY-118 — a project in ANOTHER workspace is still refused", async () => {
+    // The context the fix adds is the caller's own, never the project's, so
+    // a project outside it stays invisible. Without this the fix could have
+    // been "widen until it passes", which is the resolution the story bans.
+    const ownerId = await createUser();
+    const mine = await workspaces.create(ownerId, { name: `Mine ${randomUUID()}` }, meta);
+    const otherOwner = await createUser();
+    const theirs = await workspaces.create(otherOwner, { name: `Theirs ${randomUUID()}` }, meta);
+    const theirProject = await createProject(theirs.id);
+
+    const session = await sessions.createSession(ownerId);
+    const pinned = await sessions.switchWorkspace(session.sid, ownerId, mine.id, "owner", null, 1);
+
+    const client = connect(pinned.accessToken, pinned.csrfToken);
+    await new Promise<void>((resolve) => client.on("connect", () => resolve()));
+
+    const closure = disconnected(client);
+    client.emit(JOIN_PROJECT_MESSAGE, { project_id: theirProject.id });
+
+    await closure;
+    expect(client.connected, "a project outside the pinned workspace must not be joinable").toBe(false);
   });
 });

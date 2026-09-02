@@ -6,6 +6,8 @@ import { RbacGuard } from "../api/guards/rbac.guard.js";
 import { WorkspaceGuard } from "../api/guards/workspace.guard.js";
 import { incrementCounter } from "../lib/telemetry/metrics.js";
 import { PG_POOL } from "../db/pg-pool.js";
+import { TenantContextMissingError } from "../tenancy/errors.js";
+import { withTenantContext } from "../tenancy/tenant-context.js";
 import { REALTIME_ALLOWED_ORIGINS } from "./gateway.tokens.js";
 import {
   executionContextForSocket,
@@ -243,7 +245,7 @@ export class RoomAuthorizationService {
       return this.refuse(projectId, userId, "token_has_no_workspace");
     }
 
-    if (!(await this.projectBelongsTo(projectId, tokenWorkspaceId))) {
+    if (!(await this.projectBelongsTo(projectId, tokenWorkspaceId, userId))) {
       return this.refuse(projectId, userId, "project_outside_workspace");
     }
 
@@ -251,18 +253,50 @@ export class RoomAuthorizationService {
     return { allowed: true, workspaceId: tokenWorkspaceId, userId, projectId };
   }
 
-  /** Fail-closed: anything other than a row proving the pairing is a refusal. */
-  private async projectBelongsTo(projectId: string, workspaceId: string): Promise<boolean> {
+  /**
+   * Fail-closed: anything other than a row proving the pairing is a refusal.
+   *
+   * STORY-118 — this ran on the POOL, with no tenant context, until the
+   * query guard was installed and refused it. It is the one refusal the
+   * switch-on produced, and it was a genuine defect rather than a
+   * legitimately context-free path.
+   *
+   * `projects` is RLS-enforced and `nominara_app` is NOBYPASSRLS, so with no
+   * context `app.current_workspace()` is NULL, the policy matches nothing,
+   * and this returned zero rows for EVERY project — refusing every
+   * project-room join in every deployment, silently, since STORY-026. The
+   * suite stayed green because the integration test opened its pool as the
+   * container superuser, which bypasses RLS: the same defect shape STORY-120
+   * found in readiness, a check whose subject differs from the thing that
+   * runs in production. test/integration/realtime-room-authorization.spec.ts
+   * now connects as nominara_app so it cannot recur.
+   *
+   * The resolution is the context this query always needed, never a wider
+   * guard: the workspace is already proven by the chain above, so the read
+   * runs under it.
+   */
+  private async projectBelongsTo(projectId: string, workspaceId: string, actorId: string): Promise<boolean> {
+    const client = await this.pool.connect();
     try {
-      const result = await this.pool.query("SELECT 1 FROM projects WHERE id = $1 AND workspace_id = $2", [
-        projectId,
-        workspaceId,
-      ]);
-      return result.rowCount === 1;
-    } catch {
+      return await withTenantContext(client, { workspaceId, actorId }, async (tx) => {
+        const result = await tx.query("SELECT 1 FROM projects WHERE id = $1 AND workspace_id = $2", [
+          projectId,
+          workspaceId,
+        ]);
+        return result.rowCount === 1;
+      });
+    } catch (error) {
+      // A missing tenant context is never a refusal. Swallowing it would
+      // restore the exact silence this story exists to remove — every join
+      // denied, for a reason nothing reports.
+      if (error instanceof TenantContextMissingError) {
+        throw error;
+      }
       // A malformed id (not a uuid) reaches Postgres as a cast error, and a
       // database blip is not a licence to join. Both are refusals.
       return false;
+    } finally {
+      client.release();
     }
   }
 
