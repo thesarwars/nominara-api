@@ -177,10 +177,45 @@ never hand-edit the file. Full spec: `security-and-tenancy.md` §3–4.
   previously nothing generated one, despite `NFR-SEC-01` naming it). A regex
   heuristic over SQL text passed to `.query(...)`, **not** the security
   boundary (RLS is) — see gap G-6.
+- `src/db/pg-pool.ts` — **installs that guard**, at the one place the pool is
+  built (STORY-118). Every client `pool.connect()` hands out is wrapped, and
+  the pool's own `query()` refuses a tenant table outright: under
+  transaction-mode pooling its implicit per-query connection cannot carry
+  transaction-local context, so such a query is context-free by
+  construction. Both the API (`src/db/db.module.ts`) and the worker
+  (`src/worker.ts`) build their pool through `createPgPool`, so the request
+  path and the queue path are covered by the same seam and neither needs an
+  exemption. Before STORY-118 nothing called the guard at all — the pool was
+  constructed bare, so `NFR-SEC-01`'s effect was not in force and this
+  section described an object rather than an enforcement.
+  - **What the switch-on refused, classified.** Six pool-level `.query()`
+    call sites existed in `src/` when the guard was installed. **Five are
+    legitimately context-free** and the guard never touches them — they read
+    global tables (`sessions`, `oauth_authorization_requests`,
+    `email_otp_codes`, `engines`, `engine_health`), none of which is
+    RLS-scoped. **One was a genuine defect**:
+    `RoomAuthorizationService.projectBelongsTo` read `projects`, and as
+    `nominara_app` that returned zero rows for every project, refusing every
+    project-room socket join in every deployment since STORY-026. It was
+    resolved by giving the query the tenant context it always needed —
+    never by widening the guard, and `ACTOR_SELF_SCOPED_TABLES` remains
+    pinned to the two tables ADR-0001 names. **No checked-out-client path
+    was refused at all**: every tenant-table query in `src/` already runs
+    inside `withTenantContext`/`withTenantJob`/`withActorContext`, verified
+    across the unit, integration and isolation suites with the guard in
+    force.
 - `eslint-rules/no-session-scoped-config.js` — bans `set_config(..., false)`,
   a `set_config` call with fewer than 3 arguments, and any bare `SET`
   statement other than `SET LOCAL`/`SET ROLE` (`NFR-SEC-02`), wired in as a
   local flat-config plugin (`nominara/no-session-scoped-config`).
+- `eslint-rules/no-pool-level-tenant-query.js` — bans a query against an
+  RLS-enforced tenant table issued on a connection **pool** rather than on a
+  checked-out client (`NFR-SEC-01`, STORY-118), wired in as
+  `nominara/no-pool-level-tenant-query` over `src/**/*.ts`. The runtime guard
+  refuses one; this refuses it at the point it is written, because
+  `pool.query(...)` is reached from paths (a socket handshake, a health
+  probe) that no test necessarily covers. Reads its table set out of
+  `src/db/rls/tenant-tables.generated.ts` rather than restating it.
 
 ## Testing
 
@@ -370,16 +405,25 @@ pre-existed.
   EPIC-00" above), so there is no pipeline for it to run IN today. Not a new
   gap this story introduces, the same disclosed absence as every prior
   story's gates.
-- **G-6 — the query guard (`src/tenancy/query-guard.ts`) is a `pg` client
-  wrapper using regex-based table extraction, not a real Drizzle
-  `beforeQuery` hook.** `drizzle-orm` is a dependency of this repo but is
-  used **nowhere** for actual queries — every migration, seed script, and
-  integration test in this codebase issues SQL through the raw `pg` client
-  directly. Confirmed by inspection: no `src/` file imports a Drizzle query
-  builder. Wiring a real Drizzle hook (which would get exact table names
-  from the query builder's own AST instead of a heuristic) is a standing
-  observation for whichever future story actually introduces Drizzle-built
-  queries, not something this story fixes retroactively.
+- **G-6 — the query guard (`src/tenancy/query-guard.ts`) extracts table names
+  with a regex over SQL text, not from a query builder's AST.** `drizzle-orm`
+  is a dependency of this repo and Drizzle **is** the intended query path for
+  ordinary queries, but it is used **nowhere** for an actual query today —
+  every migration, seed script, and integration test issues SQL through the
+  raw `pg` client directly, and no `src/` file imports a Drizzle query
+  builder. Migrating those call sites is its own story.
+  - **What this gap is no longer.** Until STORY-118 the guard was also *not
+    installed*: the pool was built bare, nothing wrapped a client, and the
+    sentence above described a coarse guard when the accurate statement was
+    "a guard object". That half is closed — see `src/db/pg-pool.ts`. What
+    remains is precision, not absence.
+  - **The install survives the Drizzle migration.** `drizzle(pool)` issues
+    its statements through the same `pg` client `createPgPool` wraps, so the
+    guard sits *beneath* the query builder and Drizzle inherits it rather
+    than needing a second hook. `NFR-SEC-01` names the hook as the mechanism;
+    the property it asserts holds either way, and the exact-table-names
+    upgrade stays available to whichever story introduces Drizzle-built
+    queries.
 - **G-7 — no logger, metric, or span exists anywhere in this story's code**
   (consistent with no observability stack existing yet in this repo — see
   "Known gaps against EPIC-00" above). `pnpm db:rls-check`'s CLI output and

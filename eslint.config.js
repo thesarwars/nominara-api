@@ -1,5 +1,6 @@
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";
+import noPoolLevelTenantQuery from "./eslint-rules/no-pool-level-tenant-query.js";
 import noRepositoryLayer from "./eslint-rules/no-repository-layer.js";
 import noRequestHandlerNetworkCall from "./eslint-rules/no-request-handler-network-call.js";
 import noSessionScopedConfig from "./eslint-rules/no-session-scoped-config.js";
@@ -15,6 +16,7 @@ const nominaraLocalPlugin = {
     "no-request-handler-network-call": noRequestHandlerNetworkCall,
     "no-repository-layer": noRepositoryLayer,
     "no-spend-meter-postgres-access": noSpendMeterPostgresAccess,
+    "no-pool-level-tenant-query": noPoolLevelTenantQuery,
   },
 };
 
@@ -63,6 +65,18 @@ export default tseslint.config(
     files: ["src/modules/**/*.ts"],
     rules: {
       "nominara/no-repository-layer": "error",
+    },
+  },
+  {
+    // STORY-118 — NFR-SEC-01's other half. src/tenancy/query-guard.ts
+    // refuses a pool-level tenant-table query at runtime; this refuses it at
+    // the point it is written, so a path no test exercises (a socket
+    // handshake, a health probe) cannot ship one. Scoped to src/** only:
+    // test files connect as the migration owner and seed tenant tables
+    // through the pool deliberately.
+    files: ["src/**/*.ts"],
+    rules: {
+      "nominara/no-pool-level-tenant-query": "error",
     },
   },
   {
