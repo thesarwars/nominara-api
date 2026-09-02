@@ -185,7 +185,8 @@ export function assertPoolLevelQuery(sqlText: string, tenantTables: ReadonlySet<
  */
 export function tenantAwarePool<P extends Pool>(pool: P, tenantTables: ReadonlySet<string>): P {
   return new Proxy(pool, {
-    get(target, prop, receiver) {
+    // No `receiver` parameter, deliberately — see the Reflect.get below.
+    get(target, prop) {
       if (prop === "connect") {
         return (callback?: (err: Error | undefined, client: PoolClient, done: () => void) => void) => {
           // `pg` supports both a promise and a callback form. Nothing in

@@ -209,15 +209,25 @@ describe("STORY-118 · the tenant query guard, installed on the pool", () => {
     const a = await guardedPool.connect();
     const b = await guardedPool.connect();
     try {
-      await withTenantContext(a, { workspaceId: crypto.randomUUID(), actorId: crypto.randomUUID() }, async (txA) => {
-        await withTenantContext(b, { workspaceId: crypto.randomUUID(), actorId: crypto.randomUUID() }, async (txB) => {
-          // Each is fine on its own connection...
+      // CONCURRENT, not nested. Nesting would put both stores on one
+      // AsyncLocalStorage chain where the inner one simply shadows the
+      // outer — a different property, and not the one that matters. Two
+      // requests in flight at once each carry their own chain, which is
+      // what this reproduces.
+      await Promise.all([
+        withTenantContext(a, { workspaceId: crypto.randomUUID(), actorId: crypto.randomUUID() }, async (txA) => {
           await expect(txA.query("SELECT id FROM projects")).resolves.toBeDefined();
+          // B's context is open right now, on another connection. It
+          // authorises nothing here.
+          expect(() => b.query("SELECT id FROM projects")).toThrow(TenantContextMissingError);
+        }),
+        withTenantContext(b, { workspaceId: crypto.randomUUID(), actorId: crypto.randomUUID() }, async (txB) => {
           await expect(txB.query("SELECT id FROM projects")).resolves.toBeDefined();
-        });
-      });
+          expect(() => a.query("SELECT id FROM projects")).toThrow(TenantContextMissingError);
+        }),
+      ]);
 
-      // ...and neither survives its own context ending.
+      // And neither survives its own context ending.
       expect(() => a.query("SELECT id FROM projects")).toThrow(TenantContextMissingError);
       expect(() => b.query("SELECT id FROM projects")).toThrow(TenantContextMissingError);
     } finally {
