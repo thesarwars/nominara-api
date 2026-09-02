@@ -208,6 +208,27 @@ never hand-edit the file. Full spec: `security-and-tenancy.md` §3–4.
   a `set_config` call with fewer than 3 arguments, and any bare `SET`
   statement other than `SET LOCAL`/`SET ROLE` (`NFR-SEC-02`), wired in as a
   local flat-config plugin (`nominara/no-session-scoped-config`).
+- `src/db/schema/` — **the Drizzle pgTable definitions**
+  (`project-structure.md` §2), one file per subsystem, covering all 77 base
+  tables (STORY-122). **Generated** by `pnpm db:schema-generate` from a
+  freshly-migrated shadow database, like `0006_generated_rls_policies.up.sql`
+  and `tenant-tables.generated.ts` before them — never hand-edited. The
+  direction of truth runs migrations → schema files and never back:
+  migrations stay hand-authored SQL because `drizzle-kit` models no
+  extensions, functions, triggers, roles, grants, RLS policies or partitions,
+  which is migrations 0001, 0005, 0006 and 0007 in their entirety.
+  `pnpm db:schema-check` compares the committed definitions — read through
+  Drizzle's own `getTableConfig`, not by parsing source — against the
+  migrated database, and reports a missing definition, an orphaned one, a
+  column difference and a primary-key difference as **separate** buckets,
+  because the remedies differ.
+- `src/db/drizzle.service.ts` — the transaction helper a service calls.
+  `withTenantDb(pool, context, fn)` checks a client out, opens the context on
+  it, and hands the body a Drizzle handle bound to that transaction; there is
+  no exported overload that yields a pool-level handle. The AsyncLocalStorage
+  transaction and the query guard are inherited from
+  `src/tenancy/tenant-context.ts` and STORY-118 rather than rebuilt — a
+  second of either would be a second answer to the same question.
 - `eslint-rules/no-pool-level-tenant-query.js` — bans a query against an
   RLS-enforced tenant table issued on a connection **pool** rather than on a
   checked-out client (`NFR-SEC-01`, STORY-118), wired in as
@@ -423,7 +444,13 @@ pre-existed.
     than needing a second hook. `NFR-SEC-01` names the hook as the mechanism;
     the property it asserts holds either way, and the exact-table-names
     upgrade stays available to whichever story introduces Drizzle-built
-    queries.
+    queries. STORY-122 demonstrates this rather than assuming it — a Drizzle
+    query with the context removed throws, and one issued on the pool is
+    refused. **Note the wrapping**: Drizzle raises `DrizzleQueryError` with
+    the guard's error on `.cause`, so `instanceof TenantContextMissingError`
+    is false at the call site even though the refusal did happen. Nothing in
+    this repository branches on that type, and `ProblemFilter` maps both to
+    the same 500, but a future `catch` should read `.cause`.
 - **G-7 — no logger, metric, or span exists anywhere in this story's code**
   (consistent with no observability stack existing yet in this repo — see
   "Known gaps against EPIC-00" above). `pnpm db:rls-check`'s CLI output and
