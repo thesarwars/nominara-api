@@ -147,10 +147,15 @@ export function compareSchema(
         );
       }
       if (column.notNull !== definedColumn.notNull) {
-        result.columnMismatches.push(
-          `${table.name}.${column.name}: database ${column.notNull ? "NOT NULL" : "nullable"}, ` +
-            `schema ${definedColumn.notNull ? "NOT NULL" : "nullable"}`,
-        );
+        // Both readings are hoisted out of the template rather than written
+        // as inline ternaries. ISO-13's cache-key scanner is a regex over
+        // source text, and an interpolation-opening template carrying two
+        // colons — one from the "table.column:" prefix, one from a ternary —
+        // reads to it as an un-namespaced cache key. The gate is right to be
+        // coarse there; this is the call site's problem to avoid.
+        const inDatabase = column.notNull ? "NOT NULL" : "nullable";
+        const inSchema = definedColumn.notNull ? "NOT NULL" : "nullable";
+        result.columnMismatches.push(`${table.name}.${column.name}: database ${inDatabase}, schema ${inSchema}`);
       }
     }
     for (const name of definition.columns.keys()) {
