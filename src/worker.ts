@@ -193,10 +193,18 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   // STORY-124 — an operator reading this needs to know which half of the
   // spine is alive. A group that processes nothing must not look identical
   // to one that processes everything.
+  // The two lists are formatted into named locals rather than inline
+  // ternaries. ISO-13's cache-key scanner is a regex over source text, and a
+  // template opening with an interpolation and carrying two colons — one
+  // from the label, one from a ternary — reads to it as an un-namespaced
+  // cache key. The gate is right to be coarse; this is the call site's
+  // problem to avoid (same shape STORY-122 hit in schema-check.ts).
+  const processing = live.length > 0 ? live.join(", ") : "none";
+  const notWired = inert.length > 0 ? inert.join(", ") : "none";
   new Logger("bootstrap").log(
     `worker group "${env.WORKER_GROUP}" started with ${workers.length} queue(s) — ` +
-      `${live.length} processing: ${live.length > 0 ? live.join(", ") : "none"}; ` +
-      `${inert.length} inert (no handler wired): ${inert.length > 0 ? inert.join(", ") : "none"}`,
+      `${String(live.length)} processing (${processing}); ` +
+      `${String(inert.length)} inert, no handler wired (${notWired})`,
   );
   return app;
 }

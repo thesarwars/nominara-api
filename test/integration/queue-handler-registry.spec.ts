@@ -188,8 +188,8 @@ describe("STORY-124 · the queue-handler registry", () => {
     try {
       const line = logged.find((message) => message.includes('worker group "rollup"'));
       expect(line, "bootstrap must log a group summary").toBeDefined();
-      expect(line).toContain(`1 processing: ${HANDLED}`);
-      expect(line).toMatch(/inert \(no handler wired\): .*credit\.reconcile/);
+      expect(line).toContain(`1 processing (${HANDLED})`);
+      expect(line).toMatch(/inert, no handler wired \(.*credit\.reconcile/);
       // A group that processes nothing must not read the same as one that
       // processes everything.
       expect(line).not.toContain("0 inert");
