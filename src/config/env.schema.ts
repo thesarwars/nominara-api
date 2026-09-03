@@ -159,6 +159,20 @@ export const envSchema = z
     // read by the EMAIL_SENDER port's logging adapter — never hardcoded.
     OTP_EMAIL_FROM: requiredString,
 
+    // STORY-127 — opt in to DevEmailSenderAdapter, which logs the one-time
+    // code IN PLAINTEXT so email-OTP sign-in can be completed on a
+    // developer's machine. Without it the code is unrecoverable: an 8-digit
+    // CSPRNG draw, argon2id-hashed at rest, with no provider wired to
+    // deliver it.
+    //
+    // Off unless set to exactly "true" — a typo, "1", or "yes" leaves it
+    // off rather than guessing, because guessing wrong here prints a
+    // credential. It is ALSO refused outright under NODE_ENV=production, by
+    // this schema and again by the adapter's own constructor: two
+    // independent checks, because one that can be refactored away is the
+    // failure this codebase keeps finding.
+    OTP_DEV_LOG_CODES: z.literal("true").optional(),
+
     // STORY-025 — the Valkey CACHE instance. system-architecture.md §11
     // mandates two: this one (allkeys-lru, persistence off) for token
     // buckets, idempotency records, locks and memoisation, and a separate
@@ -270,6 +284,20 @@ export const envSchema = z
       })
       .optional(),
   })
-  .strict();
+  .strict()
+  // STORY-127 — the first of the two checks that keep plaintext one-time
+  // codes out of a production build. The adapter's constructor is the
+  // second; this one refuses at BOOT, so the process never starts rather
+  // than starting and printing a credential on the first sign-in attempt.
+  .superRefine((env, ctx) => {
+    if (env.NODE_ENV === "production" && env.OTP_DEV_LOG_CODES === "true") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["OTP_DEV_LOG_CODES"],
+        message:
+          "OTP_DEV_LOG_CODES logs one-time codes in plaintext and cannot be enabled under NODE_ENV=production.",
+      });
+    }
+  });
 
 export type Env = z.infer<typeof envSchema>;
