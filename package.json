@@ -21,6 +21,7 @@
     "db:rls-check": "tsx src/db/rls/rls-check.ts",
     "db:schema-generate": "tsx src/db/schema/generate.ts",
     "db:schema-check": "tsx src/db/schema/schema-check.ts",
+    "db:studio": "tsx src/db/studio.ts",
     "db:maintenance:run": "tsx src/workers/rollup/maintenance.ts",
     "db:maintenance:sweep": "tsx src/workers/rollup/retention.ts",
     "db:purge-check": "tsx src/db/purge-check.ts",
