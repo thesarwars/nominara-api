@@ -1,6 +1,8 @@
 import { Module } from "@nestjs/common";
 import { DbModule } from "../../db/db.module.js";
+import { DevEmailSenderAdapter } from "./adapters/dev-email-sender.adapter.js";
 import { LoggingEmailSenderAdapter } from "./adapters/logging-email-sender.adapter.js";
+import { loadEnv } from "../../config/env.js";
 import { OpenidClientAdapter } from "./adapters/openid-client.adapter.js";
 import { EmailOtpController } from "./email-otp.controller.js";
 import { EmailOtpService } from "./email-otp.service.js";
@@ -8,7 +10,7 @@ import { IdentityController } from "./identity.controller.js";
 import { IdentityService } from "./identity.service.js";
 import { OauthController } from "./oauth.controller.js";
 import { OauthService } from "./oauth.service.js";
-import { EMAIL_SENDER } from "./ports/email-sender.js";
+import { EMAIL_SENDER, type EmailSender } from "./ports/email-sender.js";
 import { OAUTH_CLIENT } from "./ports/oauth-client.js";
 import { SessionService } from "./session.service.js";
 
@@ -33,8 +35,30 @@ import { SessionService } from "./session.service.js";
     OauthService,
     EmailOtpService,
     { provide: OAUTH_CLIENT, useClass: OpenidClientAdapter },
-    { provide: EMAIL_SENDER, useClass: LoggingEmailSenderAdapter },
+    // STORY-127 — chosen at boot, not hardcoded. DevEmailSenderAdapter logs
+    // the one-time code in plaintext so local sign-in is possible at all;
+    // it is reachable ONLY with OTP_DEV_LOG_CODES set and NODE_ENV not
+    // "production", and its own constructor refuses production as well.
+    { provide: EMAIL_SENDER, useFactory: selectEmailSender },
   ],
   exports: [SessionService],
 })
 export class IdentityModule {}
+
+/**
+ * STORY-127 — which EmailSender this process runs with.
+ *
+ * The default is LoggingEmailSenderAdapter in every environment, including
+ * development: nothing prints a one-time code unless a developer explicitly
+ * asked for it. `env.schema.ts` already refuses OTP_DEV_LOG_CODES under
+ * NODE_ENV=production at boot, and DevEmailSenderAdapter's constructor
+ * refuses it again — this function is the third place the pair is checked,
+ * and deliberately so: it is the one a reader lands on first.
+ */
+export function selectEmailSender(): EmailSender {
+  const env = loadEnv();
+  if (env.OTP_DEV_LOG_CODES === "true" && env.NODE_ENV !== "production") {
+    return new DevEmailSenderAdapter();
+  }
+  return new LoggingEmailSenderAdapter();
+}

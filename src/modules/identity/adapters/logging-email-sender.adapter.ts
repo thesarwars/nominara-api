@@ -9,6 +9,11 @@ import type { EmailMessage, EmailSender } from "../ports/email-sender.js";
 // textBody, which is the only thing that ever carries the code. A real
 // provider (and its vendor credential) is a follow-up story, same as
 // OpenidClientAdapter's STORY-015 comment for OAUTH_CLIENT.
+//
+// STORY-127 — this stays the DEFAULT, including in development. Local
+// developers who need to complete an OTP sign-in opt in to
+// DevEmailSenderAdapter with OTP_DEV_LOG_CODES; nothing prints a code
+// unless someone asked for it.
 @Injectable()
 export class LoggingEmailSenderAdapter implements EmailSender {
   private readonly logger = new Logger(LoggingEmailSenderAdapter.name);

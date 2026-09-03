@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { EnvValidationError, loadEnv } from "../../src/config/env.js";
+import { KNOWN_KEYS } from "../../src/config/env.js";
 import { envSchema } from "../../src/config/env.schema.js";
 
 // STORY-022 scenario 6 — "Start with a required configuration value missing
@@ -231,5 +232,27 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
     // loadEnv (which would just silently drop an unpicked key).
     const result = envSchema.safeParse({ ...VALID, UNKNOWN_KEY: "x" });
     expect(result.success).toBe(false);
+  });
+});
+
+// STORY-127 — the loader's allow-list and the schema must agree.
+describe("STORY-127 · KNOWN_KEYS covers the schema", () => {
+  it("every key envSchema declares is picked from process.env", () => {
+    // A variable added to the schema but not to KNOWN_KEYS is dropped
+    // before parsing: the process boots, the setting silently does nothing,
+    // and there is no error to trace. This assertion is the only thing that
+    // notices.
+    const schemaKeys = Object.keys(envSchema._def.shape ?? envSchema.shape).sort();
+    const missing = schemaKeys.filter((key) => !(KNOWN_KEYS as readonly string[]).includes(key));
+    expect(missing, "in envSchema but missing from KNOWN_KEYS").toEqual([]);
+  });
+
+  it("every key KNOWN_KEYS picks is one the schema declares", () => {
+    // The other direction: a stale entry left behind after a rename. The
+    // schema is `.strict()`, so this would fail every boot — but naming it
+    // here says WHICH key rather than "unrecognized_keys".
+    const schemaKeys = new Set(Object.keys(envSchema._def.shape ?? envSchema.shape));
+    const stale = (KNOWN_KEYS as readonly string[]).filter((key) => !schemaKeys.has(key));
+    expect(stale, "in KNOWN_KEYS but not declared by envSchema").toEqual([]);
   });
 });
