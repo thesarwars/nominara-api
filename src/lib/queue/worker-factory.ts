@@ -26,6 +26,16 @@ export interface JobProcessorOptions {
   readonly keys: RotatingSigningKeys;
   /** Acquires the client this job's transaction runs on. Called AFTER signature verification for a tenant-scoped queue — never before. */
   readonly getClient: () => Promise<ClientBase> | ClientBase;
+  /**
+   * STORY-124 — returns the client `getClient` acquired.
+   *
+   * Optional, and absent everywhere a test hands over a fake client that
+   * has nothing to return. The production wiring (src/worker.ts) supplies
+   * it, because there a client comes from a pool and a job that does not
+   * give it back leaks a connection per job — a defect that could not
+   * exist before this story, since nothing had ever acquired one.
+   */
+  readonly releaseClient?: (client: ClientBase) => void;
   readonly process: JobProcessor;
 }
 
@@ -40,21 +50,37 @@ export interface JobProcessorOptions {
 export function createJobProcessor(entry: QueueTopologyEntry, options: JobProcessorOptions): (job: Job) => Promise<unknown> {
   const verify = rotatingHmacJobVerifier(options.keys);
 
+  // STORY-124 — release on EVERY exit path, including a throwing handler.
+  // A job that fails is exactly the job most likely to be retried, so a
+  // connection lost here is lost once per attempt, not once per job.
+  const release = (client: ClientBase): void => options.releaseClient?.(client);
+
   return async (job: Job): Promise<unknown> => {
     if (!entry.tenantScoped) {
       const client = await options.getClient();
-      return options.process(client, job);
+      try {
+        return await options.process(client, job);
+      } finally {
+        release(client);
+      }
     }
 
     const envelope = job.data as QueueJobEnvelope<TenantScopedPayload>;
     const tenantJob = toTenantJob(envelope);
 
     // Rejects a tampered/poisoned envelope here — before any client is even
-    // acquired, let alone any context set on one.
+    // acquired, let alone any context set on one. The try/finally below
+    // starts AFTER this line, deliberately: there is nothing to release
+    // when nothing was acquired, and moving acquisition up to simplify the
+    // shape is the one change ISO-11 exists to prevent.
     verify(tenantJob);
 
     const client = await options.getClient();
-    return withTenantJob(client, tenantJob, verify, (tx) => options.process(tx, job));
+    try {
+      return await withTenantJob(client, tenantJob, verify, (tx) => options.process(tx, job));
+    } finally {
+      release(client);
+    }
   };
 }
 
