@@ -11,7 +11,12 @@ export class EnvValidationError extends Error {
   }
 }
 
-const KNOWN_KEYS = [
+// STORY-127 — exported so test/unit/env.spec.ts can pin it against the
+// schema's own shape. A variable added to envSchema but forgotten here is
+// silently dropped before parsing: the process boots, the setting appears to
+// have no effect, and nothing says why. That happened to OTP_DEV_LOG_CODES
+// while it was being written.
+export const KNOWN_KEYS = [
   "NODE_ENV",
   "PORT",
   "GATEWAY_PORT",
@@ -43,6 +48,7 @@ const KNOWN_KEYS = [
   "CACHE_KEY_NAMESPACE",
   "TRUST_PROXY_HOPS",
   "OTP_EMAIL_FROM",
+  "OTP_DEV_LOG_CODES",
   "QUEUE_REDIS_URL",
   "QUEUE_JOB_SIGNING_KEY",
   "QUEUE_JOB_SIGNING_KID",
