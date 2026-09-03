@@ -510,6 +510,17 @@ pre-existed.
   vendored copy, or a fetch step. Which of those is a decision, not something
   the test can make. The failure names the problem rather than reading as a
   broken assertion.
+- **G-11 — 21 queues, 0 handlers.** `src/lib/queue/handlers.ts`
+  (STORY-124) is the registry a story registers its handler in, and
+  `src/worker.ts` derives each worker's `autorun` from whether one is
+  present: a handled queue pulls jobs and runs them on a pooled client, an
+  unhandled one keeps `autorun: false` and never pulls at all. **Every queue
+  is still unhandled**, deliberately — a story that produces work lands its
+  handler in the same commit. The inert default is the safe one: a worker
+  that pulled a job it could not process would fail it down the retry ladder
+  and into the dead-letter queue, turning "not built yet" into "tried and
+  failed" in the operational record. The boot line names the live and inert
+  sets separately, so a worker group that processes nothing says so.
 - **G-10 — no cron registration or queue-scheduler wiring for the
   partition-maintenance/retention jobs.** `src/workers/rollup/maintenance.ts`
   and `src/workers/rollup/retention.ts` are plain, exported, dependency-free
@@ -521,6 +532,12 @@ pre-existed.
   gaps (G-5/G-9). STORY-030's BullMQ processor for the `rollup` worker group
   imports these same exported functions unchanged as its handler body when
   it lands — no rewrite, no move, just a new caller.
+  - **STORY-124 built the socket that caller plugs into**, so what remains
+    of G-10 is one entry in `src/lib/queue/handlers.ts` plus the decision to
+    start running partition maintenance on the rollup worker. That is a
+    behaviour change and belongs to its own story; `maintenance.partition`
+    is non-tenant-scoped, which makes it the least entangled first handler
+    the registry could take.
 - **The orphan scan pages by throwing (a non-zero exit from `pnpm
   db:maintenance:sweep`), not by log line — but no real PagerDuty/alerting
   integration exists anywhere in this repo yet**, the same disclosed absence
