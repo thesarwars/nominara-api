@@ -200,12 +200,45 @@ export class IdentityService {
     // one environment unusable in another — STORY-014 test scenario 7).
     // Never let its raw message reach the client; rewrap as the same
     // uniform 400 as an explicit `verified: false`.
+    // STORY-127 — the reason is LOGGED before it is discarded.
+    //
+    // Swallowing it entirely is right for the response and wrong for the
+    // server: "passkey registration could not be verified" is the same
+    // sentence whether the origin is misconfigured, the RP ID is wrong, or
+    // the attestation is genuinely bad, and an operator had no way to tell
+    // which. Diagnosing one such failure took reading the database's
+    // challenge rows to rule out everything else. The expected values are
+    // logged alongside it because a mismatch is the common cause and the
+    // message alone does not name what was expected.
     const verification = await verifyRegistrationResponse({
       response: input.response as unknown as RegistrationResponseJSON,
       expectedChallenge,
       expectedOrigin: env.WEBAUTHN_ORIGIN,
       expectedRPID: env.WEBAUTHN_RP_ID,
-    }).catch(() => ({ verified: false as const, registrationInfo: undefined }));
+      // STORY-127 — must MATCH the options this ceremony was created with.
+      //
+      // createRegistrationOptions asks for `userVerification: "preferred"`,
+      // which is what security-and-tenancy.md §11's auth-methods table and
+      // STORY-014's own AC both specify. @simplewebauthn/server defaults
+      // `requireUserVerification` to TRUE, so the ceremony was told UV was
+      // optional and the verification then demanded it: every authenticator
+      // that did not perform UV — which "preferred" explicitly permits —
+      // was rejected with "User verification was required, but user could
+      // not be verified", after the browser had already saved the passkey.
+      //
+      // A registration that cannot complete on a conformant authenticator is
+      // not a stricter policy, it is a broken one. Tightening this to
+      // "required" is a real option, but it is a SPEC change: it would make
+      // the table above wrong and lock out authenticators the product
+      // promises to support.
+      requireUserVerification: false,
+    }).catch((error: unknown) => {
+      this.logger.warn(
+        `passkey registration verification failed: ${error instanceof Error ? error.message : String(error)} ` +
+          `(expected_origin=${env.WEBAUTHN_ORIGIN} expected_rp_id=${env.WEBAUTHN_RP_ID})`,
+      );
+      return { verified: false as const, registrationInfo: undefined };
+    });
 
     if (!verification.verified || !verification.registrationInfo) {
       throw new BadRequestException("passkey registration could not be verified");
@@ -288,6 +321,11 @@ export class IdentityService {
       expectedChallenge,
       expectedOrigin: env.WEBAUTHN_ORIGIN,
       expectedRPID: env.WEBAUTHN_RP_ID,
+      // STORY-127 — same reasoning as finishRegistration: the assertion
+      // options are also created with `userVerification: "preferred"`, so
+      // demanding UV here would refuse sign-ins with credentials this
+      // service itself registered.
+      requireUserVerification: false,
       credential: {
         id: row.credential_id.toString("base64url"),
         publicKey: new Uint8Array(row.public_key),
@@ -302,7 +340,15 @@ export class IdentityService {
         counter: 0,
         ...transportsField(row.transports),
       },
-    }).catch(() => ({ verified: false as const, authenticationInfo: undefined }));
+    }).catch((error: unknown) => {
+      // STORY-127 — same reasoning as finishRegistration's: uniform to the
+      // client, diagnosable on the server.
+      this.logger.warn(
+        `passkey assertion verification failed: ${error instanceof Error ? error.message : String(error)} ` +
+          `(expected_origin=${env.WEBAUTHN_ORIGIN} expected_rp_id=${env.WEBAUTHN_RP_ID})`,
+      );
+      return { verified: false as const, authenticationInfo: undefined };
+    });
 
     if (!verification.verified || !verification.authenticationInfo) {
       throw new BadRequestException("passkey assertion could not be verified");
