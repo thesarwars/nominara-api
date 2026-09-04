@@ -222,6 +222,16 @@ never hand-edit the file. Full spec: `security-and-tenancy.md` §3–4.
   migrated database, and reports a missing definition, an orphaned one, a
   column difference and a primary-key difference as **separate** buckets,
   because the remedies differ.
+- `pnpm db:studio` — **Drizzle Studio**, a browser table explorer over the
+  generated schema (STORY-128). LOCAL DEVELOPMENT ONLY, and enforced:
+  `src/db/studio.ts` refuses to launch unless `DATABASE_URL` names a local
+  host. Studio connects as the database **owner**, which RLS does not
+  constrain, and it **writes** — pointed anywhere real it would expose and
+  edit every tenant's rows at once, with no confirmation between editing a
+  cell and committing the `UPDATE`. It also binds `127.0.0.1` rather than
+  drizzle-kit's `0.0.0.0` default, so it is not reachable from the network.
+  Same posture as `pnpm db:dev-credentials`: a tool with no production path,
+  that says so.
 - `src/db/drizzle.service.ts` — the transaction helper a service calls.
   `withTenantDb(pool, context, fn)` checks a client out, opens the context on
   it, and hands the body a Drizzle handle bound to that transaction; there is
