@@ -231,6 +231,96 @@ describe("STORY-043 · ProjectsService.create", () => {
     expect(result.fields_supplied).toEqual([]);
   });
 
+  // THE 500. `ux_projects_ws_slug` is unique on (workspace_id, slug) and the
+  // slug was the bare domain, so a SECOND project on the same site died with a
+  // raw Postgres 23505. Two projects on one domain is not a mistake:
+  // kind='product_line' exists so a brand and its product lines can share a
+  // site, and they necessarily share a root_domain.
+  it("suffixes the slug when the domain is already taken in this workspace", async () => {
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          if (sql.includes("SELECT slug FROM projects")) return { rows: [{ slug: "hubspot.com" }] };
+          return { rows: [] };
+        }),
+      },
+    } as never);
+    const svc = new ProjectsService(queues, resolverReturning(GENEROUS), urlGuard);
+
+    await svc.create(WS, ACTOR, { root_url: "https://hubspot.com" }, 1);
+
+    const insert = calls.find((c) => c.sql.includes("INSERT INTO projects"))!;
+    expect(insert.params).toContain("hubspot.com-2");
+  });
+
+  it("skips over every taken suffix rather than reusing one", async () => {
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          if (sql.includes("SELECT slug FROM projects")) {
+            return { rows: [{ slug: "hubspot.com" }, { slug: "hubspot.com-2" }, { slug: "hubspot.com-3" }] };
+          }
+          return { rows: [] };
+        }),
+      },
+    } as never);
+    const svc = new ProjectsService(queues, resolverReturning(GENEROUS), urlGuard);
+
+    await svc.create(WS, ACTOR, { root_url: "https://hubspot.com" }, 1);
+
+    const insert = calls.find((c) => c.sql.includes("INSERT INTO projects"))!;
+    expect(insert.params).toContain("hubspot.com-4");
+  });
+
+  it("reports a racing duplicate as a conflict, not a 500", async () => {
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          if (sql.includes("SELECT slug FROM projects")) return { rows: [] };
+          if (sql.includes("INSERT INTO projects")) {
+            // What a concurrent create looks like: the slug was free when we
+            // checked and taken by the time we wrote.
+            throw Object.assign(new Error("duplicate key"), { code: "23505", constraint: "ux_projects_ws_slug" });
+          }
+          return { rows: [] };
+        }),
+      },
+    } as never);
+    const svc = new ProjectsService(queues, resolverReturning(GENEROUS), urlGuard);
+
+    const error = await svc.create(WS, ACTOR, { root_url: "https://hubspot.com" }, 1).catch((e: unknown) => e);
+    expect((error as DomainError).code).toBe("conflict");
+    expect((error as DomainError).getStatus()).toBe(409);
+  });
+
+  it("does not swallow a DIFFERENT unique violation as a slug conflict", async () => {
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          if (sql.includes("SELECT slug FROM projects")) return { rows: [] };
+          if (sql.includes("INSERT INTO projects")) {
+            throw Object.assign(new Error("duplicate key"), { code: "23505", constraint: "some_other_index" });
+          }
+          return { rows: [] };
+        }),
+      },
+    } as never);
+    const svc = new ProjectsService(queues, resolverReturning(GENEROUS), urlGuard);
+
+    const error = await svc.create(WS, ACTOR, { root_url: "https://hubspot.com" }, 1).catch((e: unknown) => e);
+    // Mislabelling an unrelated constraint as "try again" would send a caller
+    // into a retry loop over something retrying cannot fix.
+    expect((error as { code?: string }).code).toBe("23505");
+  });
+
   it("uses the registrable domain as the placeholder name when none is supplied", async () => {
     await service().create(WS, ACTOR, { root_url: "https://hubspot.com" }, 1);
     const insert = calls.find((c) => c.sql.includes("INSERT INTO projects"))!;
