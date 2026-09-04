@@ -10,7 +10,7 @@ import type {
 } from "../../../contracts/projects/index.js";
 import { COLUMN_FOR_FIELD, LIST_VALUED_FIELDS } from "../../../contracts/projects/index.js";
 import { OPTIONAL_PROJECT_FIELDS } from "../../../contracts/projects/index.js";
-import { EntitlementExceededError, NotFoundError, UnsafeTargetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { ConflictError, EntitlementExceededError, NotFoundError, UnsafeTargetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { GuardedFetchRefusal } from "../../lib/net/guarded-fetch.js";
 import { UrlGuard } from "../../lib/net/url-guard.service.js";
 import { UnparsableHostError } from "../../lib/net/registrable-domain.js";
@@ -98,6 +98,7 @@ export class ProjectsService {
     }
 
     const projectId = uuidV7();
+    const slug = await nextFreeSlug(client, rootDomain);
     await client.query(
       `INSERT INTO projects
          (id, workspace_id, name, slug, kind, parent_project_id, root_url, root_domain,
@@ -111,7 +112,7 @@ export class ProjectsService {
         // discovery runs, the domain is the only honest placeholder — a blank
         // name would render as an empty row in the sidebar.
         input.name ?? rootDomain,
-        rootDomain,
+        slug,
         input.kind ?? "brand",
         input.parent_project_id ?? null,
         input.root_url,
@@ -126,7 +127,22 @@ export class ProjectsService {
         promptsCap,
         actorId,
       ],
-    );
+    ).catch((error: unknown) => {
+      // `nextFreeSlug` picked a free one a moment ago, so reaching here means
+      // a CONCURRENT create took it in between. The unique index is the real
+      // guarantee and this is the honest report of it — a 409 the caller can
+      // retry, rather than the 500 this used to be.
+      if (isUniqueViolation(error, "ux_projects_ws_slug")) {
+        // `current_state` is the only key §2 gives a conflict's details, and
+        // widening the schema to carry a prettier shape would be changing the
+        // contract to suit one call site.
+        throw new ConflictError({
+          message: "a project for this domain was just created — try again",
+          details: { current_state: `slug_taken:${slug}` },
+        });
+      }
+      throw error;
+    });
 
     await this.insertSuppliedSeeds(client, workspaceId, projectId, input);
 
@@ -413,6 +429,52 @@ function assertShape(field: ConfirmableField, value: unknown): void {
       details: { issues: [{ path: ["fields", field, "value"], message: wantsList ? "expected an array" : "expected a string" }] },
     });
   }
+}
+
+/**
+ * A workspace-unique slug for this domain.
+ *
+ * `ux_projects_ws_slug` is UNIQUE on (workspace_id, slug) where not deleted,
+ * and the slug was the bare registrable domain — so a SECOND project on the
+ * same site collided and the request answered 500 from a raw Postgres 23505,
+ * after the row had already been attempted. Two projects on one domain is not
+ * a mistake: `kind='product_line'` exists precisely so a brand and its product
+ * lines can share a site (§4.1), and they necessarily share a root_domain.
+ *
+ * Suffixes rather than refuses, because the caller supplied no slug and has
+ * nothing to correct — the field is server-derived by design.
+ *
+ * No workspace predicate: RLS scopes the read (NFR-SEC-01), and the index it
+ * has to agree with is per-workspace for the same reason.
+ */
+async function nextFreeSlug(
+  client: { query: (sql: string, params: unknown[]) => Promise<{ rows: { slug: string }[] }> },
+  base: string,
+): Promise<string> {
+  const taken = await client.query(
+    "SELECT slug FROM projects WHERE deleted_at IS NULL AND (slug = $1 OR slug LIKE $2)",
+    [base, `${base}-%`],
+  );
+  const used = new Set(taken.rows.map((row) => row.slug));
+  if (!used.has(base)) return base;
+  // Bounded: a workspace with 999 projects on one domain has a different
+  // problem, and an unbounded loop here would be a denial-of-service on
+  // ourselves rather than a feature.
+  for (let n = 2; n < 1000; n += 1) {
+    const candidate = `${base}-${String(n)}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  throw new ConflictError({
+    message: "too many projects already use this domain",
+    details: { current_state: `slug_exhausted:${base}` },
+  });
+}
+
+/** A Postgres 23505 on one named constraint. */
+function isUniqueViolation(error: unknown, constraint: string): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const pgError = error as { code?: unknown; constraint?: unknown };
+  return pgError.code === "23505" && pgError.constraint === constraint;
 }
 
 /** A `discovery` column that the handler has actually written. */
