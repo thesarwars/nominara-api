@@ -197,6 +197,22 @@ export class ProblemFilter implements ExceptionFilter {
       code: wireCode,
       workspace_id: (request as AuthenticatedRequest).auth?.ws ?? null,
       ...(isServerError ? {} : { detail: message }),
+      // THE STACK, SERVER-SIDE ONLY, AND ONLY FOR A 5xx.
+      //
+      // The rule above is about the RESPONSE: an unexpected exception's
+      // message is the one string most likely to carry a connection string or
+      // a row, so it never reaches the client. But it was not reaching the LOG
+      // either, and that made a 500 undiagnosable — an operator saw
+      // `code: internal_error` and nothing else, with no way to tell a bad
+      // query from a failed interceptor. Found the hard way: a real 500 on
+      // POST /v1/projects took a manual bisect through the service to locate,
+      // because the log said only that a request had been refused.
+      //
+      // A 4xx is already fully described by its own `detail`, so this adds
+      // nothing there and would only make the ordinary case noisy.
+      ...(isServerError && exception instanceof Error
+        ? { error_name: exception.name, error_message: exception.message, stack: exception.stack }
+        : {}),
     });
 
     // A representation tag may already be on the reply: WorkspacesController

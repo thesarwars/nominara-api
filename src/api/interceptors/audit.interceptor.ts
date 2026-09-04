@@ -53,10 +53,26 @@ function firstHeaderValue(value: string | string[] | undefined): string | null {
 // fail-closed error regardless of which mode resolved the value.
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function resourceIdFromResponse(body: unknown): string | null {
-  if (body !== null && typeof body === "object" && "id" in body) {
-    const id = (body as { id?: unknown }).id;
-    return typeof id === "string" ? id : null;
+/**
+ * The created resource's id, from either `id` or `<resourceType>_id`.
+ *
+ * `id` alone was not enough, and the gap was live: `POST /v1/projects` returns
+ * `project_id` — api-specification.md §4.4 names the field, so the contract
+ * generates it and the client reads it — and this returned null, so the
+ * interceptor threw and the request answered 500 AFTER the project row had
+ * already been written. A caller saw a failure for a project that exists.
+ *
+ * `resourceType` is already declared on the decorator, so the second name is
+ * derived rather than configured: a route that says it audits a "project" is
+ * saying its identifier is a project id, and a third spelling would be a new
+ * convention rather than a new option.
+ */
+function resourceIdFromResponse(body: unknown, resourceType: string): string | null {
+  if (body === null || typeof body !== "object") return null;
+  const record = body as Record<string, unknown>;
+  for (const key of ["id", `${resourceType}_id`]) {
+    const value = record[key];
+    if (typeof value === "string") return value;
   }
   return null;
 }
@@ -73,10 +89,10 @@ function resolveResourceId(req: AuditableRequest, options: AuditOptions, respons
   const routeLabel = `action "${options.action}" (resourceType "${options.resourceType}")`;
 
   if (options.resourceIdFrom === "response") {
-    const raw = resourceIdFromResponse(responseBody);
+    const raw = resourceIdFromResponse(responseBody, options.resourceType);
     if (raw === null) {
       throw new AuditResourceIdUnresolvedError(
-        `AuditInterceptor: ${routeLabel} declares resourceIdFrom: "response" but the handler's response body had no usable string "id" field`,
+        `AuditInterceptor: ${routeLabel} declares resourceIdFrom: "response" but the handler's response body had no usable string "id" or "${options.resourceType}_id" field`,
       );
     }
     if (!UUID_PATTERN.test(raw)) {
