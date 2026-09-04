@@ -1,7 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
-import type { CreateProjectRequest, CreateProjectResponse, OptionalProjectField } from "../../../contracts/projects/index.js";
+import type { CreateProjectRequest, CreateProjectResponse, DiscoveryResponse, OptionalProjectField } from "../../../contracts/projects/index.js";
 import { OPTIONAL_PROJECT_FIELDS } from "../../../contracts/projects/index.js";
-import { EntitlementExceededError, UnsafeTargetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { EntitlementExceededError, NotFoundError, UnsafeTargetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { GuardedFetchRefusal } from "../../lib/net/guarded-fetch.js";
 import { UrlGuard } from "../../lib/net/url-guard.service.js";
 import { UnparsableHostError } from "../../lib/net/registrable-domain.js";
@@ -9,6 +9,7 @@ import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
+import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
 
 // STORY-043 — URL-only project creation. api-specification.md §4.
 //
@@ -148,6 +149,44 @@ export class ProjectsService {
   }
 
   /**
+   * `GET /v1/projects/{id}/discovery` — api-specification.md §4.5.
+   *
+   * Scenario 2: readable the moment creation returns, and BEFORE discovery
+   * finishes. Until the handler writes anything, `projects.discovery` is its
+   * `{}` default and `discovery_status` is `pending` — so this synthesises the
+   * empty-but-honest payload rather than 404ing. A 404 here would be wrong
+   * twice over: the project exists, and the client is polling exactly because
+   * it expects the answer to arrive later.
+   */
+  async discoveryFor(projectId: string): Promise<DiscoveryResponse> {
+    const client = currentTenantStore()!.client;
+    const result = await client.query<{ discovery: unknown; discovery_status: string }>(
+      "SELECT discovery, discovery_status FROM projects WHERE id = $1 AND deleted_at IS NULL",
+      [projectId],
+    );
+    // No workspace predicate: RLS scopes the transaction, so another tenant's
+    // project is simply not here (NFR-SEC-01).
+    if (result.rows.length === 0) throw new NotFoundError({ message: "no such project" });
+
+    const row = result.rows[0]!;
+    const stored = row.discovery;
+    // A written payload carries its own status; an unwritten one is the `{}`
+    // default and takes the column's.
+    if (isDiscoveryPayload(stored)) return stored;
+
+    return {
+      discovery_status: row.discovery_status as DiscoveryResponse["discovery_status"],
+      duration_ms: null,
+      fields: {},
+      competitors_proposed: [],
+      prompts_generated: [],
+      prompts_free_remaining: FREE_PROMPT_ALLOWANCE,
+      credits_charged: 0,
+      low_confidence_fields: [],
+    };
+  }
+
+  /**
    * AC5 — supplied competitors are `user_authored`, supplied prompts `manual`,
    * and neither charges anything. There is no wallet call anywhere in this
    * method, which is what makes scenario 15's "wallet unchanged" true by
@@ -174,6 +213,11 @@ export class ProjectsService {
       );
     }
   }
+}
+
+/** A `discovery` column that the handler has actually written. */
+function isDiscoveryPayload(value: unknown): value is DiscoveryResponse {
+  return typeof value === "object" && value !== null && "discovery_status" in value && "fields" in value;
 }
 
 /** AC4 — exactly the optional keys the caller sent, in the order §4.1 documents them. */

@@ -40,13 +40,27 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
     }
   });
 
-  // The count is deliberately asserted rather than left open. STORY-124
-  // ships the seam and no handlers; the first story to add one updates this
-  // line in the same commit, which is the point — a handler appearing
-  // without anyone noticing is exactly what this makes impossible.
-  it("ships zero handlers — the seam, not the business logic", () => {
-    expect(Object.keys(QUEUE_HANDLERS)).toEqual([]);
-    expect(inertQueueNames()).toHaveLength(21);
+  // The set is deliberately asserted rather than left open, so a handler
+  // cannot appear without anyone noticing. STORY-124 shipped the seam with
+  // none; STORY-043 lands the first, exactly as that story's comment said it
+  // would ("crawl.discover with STORY-043"). Every later story updates this
+  // line in its own commit.
+  it("ships exactly the handlers the stories that landed them declared", () => {
+    expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual(["crawl.discover"]);
+    expect(liveQueueNames()).toEqual(["crawl.discover"]);
+  });
+
+  // The half that keeps mattering as handlers accumulate: an unwired queue
+  // must stay INERT rather than pull a job it cannot process and fail it down
+  // the retry ladder into the dead-letter queue — turning "not built yet" into
+  // "tried and failed" in the record an operator reads during an incident.
+  it("every queue without a handler is still inert", () => {
+    const live = new Set(liveQueueNames());
+    const expectedInert = QUEUE_TOPOLOGY.map((entry) => entry.name).filter((name) => !live.has(name));
+
+    expect(inertQueueNames()).toEqual(expectedInert);
+    expect(inertQueueNames()).toHaveLength(QUEUE_TOPOLOGY.length - live.size);
+    expect(live.size + inertQueueNames().length).toBe(QUEUE_TOPOLOGY.length);
   });
 
   it("liveQueueNames and inertQueueNames answer for a subset too — inertness is per worker group", () => {

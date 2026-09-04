@@ -250,3 +250,66 @@ describe("STORY-043 · ProjectsService.create", () => {
     ).resolves.toBeDefined();
   });
 });
+
+// STORY-043 scenario 2 — "read the project before discovery finishes:
+// usable, initialising, discovery running."
+describe("STORY-043 · ProjectsService.discoveryFor", () => {
+  let calls: Recorded[];
+
+  function serviceReading(rows: unknown[]) {
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: tenantClientRecording(calls, rows),
+    } as never);
+    return new ProjectsService(
+      { enqueueTenantJob: vi.fn() } as unknown as QueueProducer,
+      resolverReturning(GENEROUS),
+      urlGuard,
+    );
+  }
+
+  it("scenario 2 — before discovery has written anything, reports pending and is not a 404", async () => {
+    const result = await serviceReading([{ discovery: {}, discovery_status: "pending" }]).discoveryFor("p1");
+
+    expect(result.discovery_status).toBe("pending");
+    expect(result.fields).toEqual({});
+    expect(result.duration_ms).toBeNull();
+    expect(result.credits_charged).toBe(0);
+  });
+
+  it("scenario 2 — reports running while the handler is mid-flight", async () => {
+    const result = await serviceReading([{ discovery: {}, discovery_status: "running" }]).discoveryFor("p1");
+    expect(result.discovery_status).toBe("running");
+  });
+
+  it("returns the written payload once discovery has completed", async () => {
+    const written = {
+      discovery_status: "completed",
+      duration_ms: 17420,
+      fields: { brand_name: { value: "HubSpot", confidence: 0.96, source: "Organization schema", user_edited: false } },
+      competitors_proposed: [],
+      prompts_generated: [],
+      prompts_free_remaining: 10,
+      credits_charged: 0,
+      low_confidence_fields: [],
+    };
+    const result = await serviceReading([{ discovery: written, discovery_status: "completed" }]).discoveryFor("p1");
+
+    expect(result).toEqual(written);
+  });
+
+  it("404s for a project that does not exist, or belongs to another tenant", async () => {
+    // RLS makes the two indistinguishable here, which is the intent — a 404
+    // that differed from a 403 would confirm the row exists.
+    const error = await serviceReading([]).discoveryFor("p1").catch((e: unknown) => e);
+    expect((error as DomainError).code).toBe("not_found");
+    expect((error as DomainError).getStatus()).toBe(404);
+  });
+
+  it("takes no workspace_id predicate — RLS scopes the read (NFR-SEC-01)", async () => {
+    await serviceReading([{ discovery: {}, discovery_status: "pending" }]).discoveryFor("p1");
+    for (const call of calls) {
+      expect(call.sql).not.toContain("workspace_id");
+    }
+  });
+});

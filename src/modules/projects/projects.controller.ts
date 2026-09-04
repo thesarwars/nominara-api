@@ -1,5 +1,12 @@
-import { Body, Controller, HttpCode, Post, Req } from "@nestjs/common";
-import { createProjectRequestSchema, createProjectResponseSchema, type CreateProjectRequest, type CreateProjectResponse } from "../../../contracts/projects/index.js";
+import { Body, Controller, Get, HttpCode, Param, Post, Req } from "@nestjs/common";
+import {
+  createProjectRequestSchema,
+  createProjectResponseSchema,
+  discoveryResponseSchema,
+  type CreateProjectRequest,
+  type CreateProjectResponse,
+  type DiscoveryResponse,
+} from "../../../contracts/projects/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequireEntitlement } from "../../api/decorators/require-entitlement.decorator.js";
@@ -36,5 +43,15 @@ export class ProjectsController {
     @Body(new ZodValidationPipe(createProjectRequestSchema)) body: CreateProjectRequest,
   ): Promise<CreateProjectResponse> {
     return this.service.create(req.tenant!.workspaceId, req.tenant!.actorId, body, req.entitlementVersion);
+  }
+
+  // §4.5 — polled after creation. A plain read: no @Idempotent (nothing is
+  // created), and `project:read` rather than `project:create`, because a
+  // viewer watching onboarding must be able to see discovery arrive.
+  @Get(":id/discovery")
+  @RequirePermission("project:read")
+  @ApiContract({ operationId: "getProjectDiscovery", responseSchema: discoveryResponseSchema })
+  discovery(@Param("id") id: string): Promise<DiscoveryResponse> {
+    return this.service.discoveryFor(id);
   }
 }
