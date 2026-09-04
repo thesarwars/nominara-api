@@ -1,5 +1,6 @@
 import type { Pool } from "pg";
 import type { Env } from "../../config/env.schema.js";
+import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { QUEUE_TOPOLOGY } from "./topology.js";
 import type { JobProcessor } from "./worker-factory.js";
 
@@ -51,7 +52,9 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * invoked today only by a hand-run script (README gap G-10). Wiring it is a
  * behaviour change and belongs to its own story.
  */
-export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {};
+export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
+  "crawl.discover": (context) => createCrawlDiscoverHandler(context),
+};
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */
 export function handlerFor(name: string): QueueHandlerFactory | undefined {
