@@ -26,19 +26,54 @@
 // Regex over a whole document to find arbitrary content would be the wrong
 // tool; regex to find <head>'s meta tags is the right size of hammer.
 
-/** Confidence attached to each source, highest first. §4.5 renders these to the customer. */
+/**
+ * Confidence attached to each source, highest first. §4.5 renders these to the
+ * customer, and anything under LOW_CONFIDENCE_THRESHOLD (0.60) is flagged for
+ * confirmation rather than quietly applied.
+ *
+ * THE SPLIT AT 0.60 IS THE POINT, and these numbers were originally all above
+ * it — every one of the six, so `low_confidence_fields` was structurally always
+ * empty and FR-ONB-02b's confirm affordance was unreachable dead code. The
+ * threshold was not wrong; the confidences were. The line to hold is:
+ *
+ *   ABOVE — the site TOLD us. A publisher who writes `Organization.name` or
+ *   `og:site_name` is making a machine-readable assertion about themselves,
+ *   and second-guessing it would flag almost every field on a well-marked-up
+ *   site, which trains the customer to click through the confirmations
+ *   without reading them.
+ *
+ *   BELOW — we INFERRED it. A title split on a separator, or a brand name
+ *   guessed from a domain label, is our reading of something that was not
+ *   written for us. It is often right and cannot be trusted to be, which is
+ *   exactly the condition "flagged, not applied" exists for.
+ */
 export const CONFIDENCE = {
   /** Publisher-declared structured data. The strongest signal a page carries. */
   jsonLd: 0.96,
-  /** Publisher-declared, but for social preview rather than machine consumption. */
+  /** `og:site_name` — publisher-declared, and specifically the name of the site. */
   openGraph: 0.88,
-  /** Present on essentially every page, and frequently decorated with taglines. */
-  title: 0.72,
-  metaDescription: 0.8,
   /** Declared by the document, occasionally wrong, never absent in practice. */
   htmlLang: 0.85,
-  /** Derived by us from the domain rather than stated by the site. */
-  derived: 0.7,
+  /** Publisher-written prose about themselves, aimed at search rather than at us. */
+  metaDescription: 0.8,
+  /**
+   * A page title, ours only after guessing where the brand ends.
+   *
+   * `titleLeader` splits on the first separator, which reads "HubSpot |
+   * Customer Platform" correctly and "The best CRM software - HubSpot"
+   * exactly backwards. That failure is silent and produces a project named
+   * after a marketing sentence, so it belongs below the line.
+   */
+  pageTitle: 0.55,
+  /**
+   * Inferred by us from the domain, with nothing from the page behind it.
+   *
+   * `hubspot.com` -> "Hubspot" is a guess with the wrong capitalisation more
+   * often than not, and the negative aliases proposed from it can SUPPRESS
+   * real mentions — the one discovery error that destroys data rather than
+   * merely being wrong. The lowest tier, and the most important one to flag.
+   */
+  derived: 0.45,
 } as const;
 
 export interface Extracted {
@@ -126,13 +161,20 @@ export function extractFromHtml(html: string): Extracted {
   const out: Record<string, { value: unknown; confidence: number; source: string }> = {};
 
   const ldName = stringField(organization, "name");
-  const ogTitle = metaContent(html, "og:site_name") ?? metaContent(html, "og:title");
+  // `og:site_name` and `og:title` are NOT the same signal and no longer share a
+  // confidence. site_name is the publisher naming their site; og:title is the
+  // page's title, decorated with a tagline exactly as often as <title> is — so
+  // it earns <title>'s confidence, and goes through the same titleLeader split
+  // rather than being stored whole.
+  const ogSiteName = metaContent(html, "og:site_name");
+  const ogTitle = metaContent(html, "og:title");
   const titleMatch = TITLE_RE.exec(html);
   const title = titleMatch?.[1] ? decodeEntities(titleMatch[1]).trim() : undefined;
 
   if (ldName) out.brandName = { value: ldName, confidence: CONFIDENCE.jsonLd, source: "Organization schema" };
-  else if (ogTitle) out.brandName = { value: ogTitle, confidence: CONFIDENCE.openGraph, source: "Open Graph" };
-  else if (title) out.brandName = { value: titleLeader(title), confidence: CONFIDENCE.title, source: "<title>" };
+  else if (ogSiteName) out.brandName = { value: ogSiteName, confidence: CONFIDENCE.openGraph, source: "og:site_name" };
+  else if (ogTitle) out.brandName = { value: titleLeader(ogTitle), confidence: CONFIDENCE.pageTitle, source: "og:title" };
+  else if (title) out.brandName = { value: titleLeader(title), confidence: CONFIDENCE.pageTitle, source: "<title>" };
 
   const ldDescription = stringField(organization, "description");
   const metaDescription = metaContent(html, "description") ?? metaContent(html, "og:description");
