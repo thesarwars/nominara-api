@@ -39,8 +39,8 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
     // A job payload is a snapshot from enqueue time; the row is the truth, and
     // reading it also confirms the project still exists — it may have been
     // deleted between creation and this job being picked up.
-    const project = await tx.query<{ root_domain: string }>(
-      "SELECT root_domain FROM projects WHERE id = $1 AND deleted_at IS NULL",
+    const project = await tx.query<{ root_domain: string; discovery: unknown }>(
+      "SELECT root_domain, discovery FROM projects WHERE id = $1 AND deleted_at IS NULL",
       [payload.projectId],
     );
     if (project.rows.length === 0) {
@@ -57,14 +57,27 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
     // `discover` does not throw for a site-side problem — it returns `partial`
     // or `failed` with whatever it obtained (AC13). A throw here would be OUR
     // bug, and should reach the retry ladder.
+    // STORY-044 AC4/scenario 5 — a field a human overrode is NEVER overwritten
+    // by a later pass. Folded into the same `fieldsSupplied` skip list that
+    // makes "supplied wins" work, rather than added as a second mechanism:
+    // both mean "a person decided this, do not derive it", and one code path
+    // cannot drift out of step with itself. Without this a re-crawl silently
+    // reverts the customer's correction and they have no way to tell.
+    const humanDecided = userEditedFields(project.rows[0]!.discovery);
     const result = await discover(
       {
         rootUrl: payload.rootUrl,
         rootDomain: project.rows[0]!.root_domain,
-        fieldsSupplied: payload.fieldsSupplied,
+        fieldsSupplied: [...payload.fieldsSupplied, ...humanDecided],
       },
       deps,
     );
+
+    // The overridden entries are carried forward verbatim. `discover` skipped
+    // them, so without this they would simply vanish from the payload — the
+    // value would survive on the project column but the record that a human
+    // set it would not, and the NEXT pass would happily re-derive it.
+    const merged = { ...result, fields: { ...result.fields, ...preservedFields(project.rows[0]!.discovery) } };
 
     // The whole review payload into `discovery`, and only the STATUS onto its
     // own column. Nothing here writes name, description, category or aliases:
@@ -73,14 +86,37 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
     // code path from this handler to those columns.
     await tx.query("UPDATE projects SET discovery = $2, discovery_status = $3, updated_at = now() WHERE id = $1", [
       payload.projectId,
-      JSON.stringify(result),
-      result.discovery_status,
+      JSON.stringify(merged),
+      merged.discovery_status,
     ]);
 
     logger.log(
-      `project ${payload.projectId}: ${result.discovery_status} in ${String(result.duration_ms ?? 0)}ms, ` +
-        `${String(Object.keys(result.fields).length)} field(s), ` +
-        `${String(result.low_confidence_fields.length)} low-confidence`,
+      `project ${payload.projectId}: ${merged.discovery_status} in ${String(merged.duration_ms ?? 0)}ms, ` +
+        `${String(Object.keys(merged.fields).length)} field(s), ` +
+        `${String(merged.low_confidence_fields.length)} low-confidence, ` +
+        `${String(humanDecided.length)} preserved from a human decision`,
     );
   };
+}
+
+interface StoredDiscovery {
+  readonly fields?: Record<string, { user_edited?: boolean } | undefined>;
+}
+
+function storedDiscovery(value: unknown): StoredDiscovery | undefined {
+  return typeof value === "object" && value !== null ? (value as StoredDiscovery) : undefined;
+}
+
+/** The field names a human has overridden, in the shape `discover` skips. */
+function userEditedFields(stored: unknown): string[] {
+  const fields = storedDiscovery(stored)?.fields ?? {};
+  return Object.entries(fields)
+    .filter(([, field]) => field?.user_edited === true)
+    .map(([name]) => name);
+}
+
+/** Those same entries, to merge back over a fresh pass's result. */
+function preservedFields(stored: unknown): Record<string, unknown> {
+  const fields = storedDiscovery(stored)?.fields ?? {};
+  return Object.fromEntries(Object.entries(fields).filter(([, field]) => field?.user_edited === true));
 }

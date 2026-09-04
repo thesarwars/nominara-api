@@ -1,5 +1,14 @@
 import { Injectable, Logger } from "@nestjs/common";
-import type { CreateProjectRequest, CreateProjectResponse, DiscoveryResponse, OptionalProjectField } from "../../../contracts/projects/index.js";
+import type {
+  ConfirmDiscoveryRequest,
+  ConfirmableField,
+  CreateProjectRequest,
+  CreateProjectResponse,
+  DiscoveredField,
+  DiscoveryResponse,
+  OptionalProjectField,
+} from "../../../contracts/projects/index.js";
+import { COLUMN_FOR_FIELD, LIST_VALUED_FIELDS } from "../../../contracts/projects/index.js";
 import { OPTIONAL_PROJECT_FIELDS } from "../../../contracts/projects/index.js";
 import { EntitlementExceededError, NotFoundError, UnsafeTargetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { GuardedFetchRefusal } from "../../lib/net/guarded-fetch.js";
@@ -10,6 +19,7 @@ import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
+import { handlerFor } from "../../lib/queue/handlers.js";
 
 // STORY-043 — URL-only project creation. api-specification.md §4.
 //
@@ -174,16 +184,172 @@ export class ProjectsService {
     // default and takes the column's.
     if (isDiscoveryPayload(stored)) return stored;
 
-    return {
-      discovery_status: row.discovery_status as DiscoveryResponse["discovery_status"],
-      duration_ms: null,
-      fields: {},
-      competitors_proposed: [],
-      prompts_generated: [],
-      prompts_free_remaining: FREE_PROMPT_ALLOWANCE,
-      credits_charged: 0,
-      low_confidence_fields: [],
+    return emptyDiscovery(row.discovery_status as DiscoveryResponse["discovery_status"]);
+  }
+
+  /**
+   * `POST /v1/projects/{id}/discovery/confirm` — STORY-044.
+   *
+   * THE `user_edited` FLAG IS THE DURABLE PART OF THIS STORY. Without it a
+   * re-discovery — a re-crawl, a schema change on the customer's site, a
+   * manual refresh — silently reverts the customer's correction and they have
+   * no way to tell it happened. Recording the human decision makes discovery
+   * permanently deferential to it (AC4, scenario 5).
+   *
+   * Idempotent by construction (AC7): every write is an assignment, not an
+   * increment or an append, so confirming twice lands the same state. The
+   * competitor insert is the one exception and is deduped explicitly.
+   */
+  async confirmDiscovery(
+    workspaceId: string,
+    projectId: string,
+    input: ConfirmDiscoveryRequest,
+    entitlementVersion: number | undefined,
+  ): Promise<DiscoveryResponse> {
+    const client = currentTenantStore()!.client;
+
+    const existing = await client.query<{ discovery: unknown; category_slug: string | null }>(
+      "SELECT discovery, category_slug FROM projects WHERE id = $1 AND deleted_at IS NULL",
+      [projectId],
+    );
+    if (existing.rows.length === 0) throw new NotFoundError({ message: "no such project" });
+
+    const stored = existing.rows[0]!.discovery;
+    const payload: DiscoveryResponse = isDiscoveryPayload(stored) ? stored : emptyDiscovery("pending");
+    const fields: Record<string, DiscoveredField> = { ...payload.fields };
+
+    const assignments: string[] = [];
+    const params: unknown[] = [projectId];
+    let categoryChanged = false;
+
+    for (const [name, decision] of Object.entries(input.fields ?? {})) {
+      const field = name as ConfirmableField;
+      const discovered = fields[field];
+
+      // Accepting a field nothing discovered has no value to apply. Refused
+      // rather than ignored: a client that thinks it accepted something should
+      // hear that it did not.
+      if (decision.decision === "accept" && discovered === undefined) {
+        throw new ValidationFailedError({
+          message: `nothing was discovered for ${field}`,
+          details: { issues: [{ path: ["fields", field], message: "no discovered value to accept" }] },
+        });
+      }
+
+      const value = decision.decision === "accept" ? discovered!.value : decision.value;
+      assertShape(field, value);
+
+      assignments.push(`${COLUMN_FOR_FIELD[field]} = $${String(params.length + 1)}`);
+      params.push(value);
+
+      if (field === "category" && value !== existing.rows[0]!.category_slug) categoryChanged = true;
+
+      // AC3/AC4 — accepting records that it was applied; overriding also
+      // records that a HUMAN decided, which is what re-discovery reads.
+      fields[field] = {
+        value,
+        confidence: decision.decision === "override" ? 1 : (discovered?.confidence ?? 1),
+        ...(discovered?.source !== undefined ? { source: discovered.source } : {}),
+        user_edited: decision.decision === "override",
+      };
+    }
+
+    if (input.competitors !== undefined) {
+      await this.confirmCompetitors(client, workspaceId, projectId, input.competitors, entitlementVersion);
+    }
+
+    const nextPayload: DiscoveryResponse = {
+      ...payload,
+      fields,
+      // A confirmed field is no longer awaiting confirmation, however
+      // uncertain the machine was about it.
+      low_confidence_fields: payload.low_confidence_fields.filter((name) => !(name in (input.fields ?? {}))),
     };
+
+    assignments.push(`discovery = $${String(params.length + 1)}`);
+    params.push(JSON.stringify(nextPayload));
+
+    await client.query(
+      `UPDATE projects SET ${assignments.join(", ")}, updated_at = now() WHERE id = $1`,
+      params,
+    );
+
+    // AC9 — overriding the category must not leave everything derived from it
+    // stale. `rollup.metric_daily` is the job that recomputes it.
+    if (categoryChanged) this.requestRecompute(workspaceId, projectId);
+
+    return nextPayload;
+  }
+
+  /**
+   * AC5 — "confirming competitors creates the tracked rows up to the
+   * entitlement, refusing beyond it with the structural-limit failure".
+   *
+   * The cap is checked against the count AFTER this confirmation, including
+   * rows already present, so confirming five twice cannot creep past a cap of
+   * five.
+   */
+  private async confirmCompetitors(
+    client: { query: (sql: string, params: unknown[]) => Promise<{ rows: { name: string }[] }> },
+    workspaceId: string,
+    projectId: string,
+    competitors: NonNullable<ConfirmDiscoveryRequest["competitors"]>,
+    entitlementVersion: number | undefined,
+  ): Promise<void> {
+    const resolved =
+      entitlementVersion === undefined
+        ? await this.entitlements.resolveForWorkspace(workspaceId)
+        : await this.entitlements.resolve(workspaceId, entitlementVersion);
+    const cap = numericEntitlement(resolved.entitlements["competitors.max_per_project"]?.value);
+
+    const existing = await client.query(
+      "SELECT name FROM competitors WHERE project_id = $1 AND deleted_at IS NULL",
+      [projectId],
+    );
+    const present = new Set(existing.rows.map((row) => row.name.toLowerCase()));
+    // AC7 — re-confirming a competitor already tracked is a no-op, not a
+    // duplicate row and not a cap violation.
+    const toInsert = competitors.filter((c) => !present.has(c.name.toLowerCase()));
+
+    assertWithinCap("competitors.max_per_project", present.size + toInsert.length, cap);
+
+    for (const competitor of toInsert) {
+      await client.query(
+        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, origin)
+         VALUES ($1,$2,$3,$4,$5,$6,'user_authored')`,
+        [uuidV7(), workspaceId, projectId, competitor.name, competitor.root_domain ?? null, competitor.aliases ?? []],
+      );
+    }
+  }
+
+  /**
+   * Asks for the category-relative rollups to be recomputed.
+   *
+   * Guarded on the queue actually having a handler. `rollup.metric_daily` is
+   * still inert (STORY-124's registry lists it among the unwired), and
+   * enqueueing into a queue nothing consumes would pile jobs into Redis for
+   * as long as it stays that way. Checking `handlerFor` means this starts
+   * working the day that handler lands, with no edit here — and says out loud,
+   * in the log, that the recomputation was skipped rather than silently
+   * dropping the requirement.
+   */
+  private requestRecompute(workspaceId: string, projectId: string): void {
+    if (handlerFor("rollup.metric_daily") === undefined) {
+      this.logger.warn(
+        `project ${projectId}: category changed but rollup.metric_daily has no handler yet — ` +
+          "category-relative values will be correct from the first rollup after it is wired (STORY-044 AC9)",
+      );
+      return;
+    }
+    afterCommit(() => {
+      void this.queues
+        .enqueueTenantJob("rollup.metric_daily", workspaceId, { projectId, reason: "category_override" }, {
+          idempotencyKey: `rollup:${projectId}:category-override`,
+        })
+        .catch((error: unknown) => {
+          this.logger.error(`failed to enqueue recompute for project ${projectId}: ${String(error)}`);
+        });
+    });
   }
 
   /**
@@ -212,6 +378,38 @@ export class ProjectsService {
         [uuidV7(), workspaceId, projectId, prompt.text],
       );
     }
+  }
+}
+
+/** The honest empty payload for a project whose discovery has written nothing yet. */
+function emptyDiscovery(status: DiscoveryResponse["discovery_status"]): DiscoveryResponse {
+  return {
+    discovery_status: status,
+    duration_ms: null,
+    fields: {},
+    competitors_proposed: [],
+    prompts_generated: [],
+    prompts_free_remaining: FREE_PROMPT_ALLOWANCE,
+    credits_charged: 0,
+    low_confidence_fields: [],
+  };
+}
+
+/**
+ * A list-valued field must be given a list, and a scalar one a string.
+ *
+ * The request schema accepts either shape for any field, because a union
+ * keyed on the field NAME would need one branch per field and would drift
+ * from CONFIRMABLE_FIELDS the moment one was added. The pairing is checked
+ * here instead, against the same list the columns are derived from.
+ */
+function assertShape(field: ConfirmableField, value: unknown): void {
+  const wantsList = LIST_VALUED_FIELDS.includes(field);
+  if (wantsList !== Array.isArray(value)) {
+    throw new ValidationFailedError({
+      message: `${field} takes ${wantsList ? "a list of strings" : "a string"}`,
+      details: { issues: [{ path: ["fields", field, "value"], message: wantsList ? "expected an array" : "expected a string" }] },
+    });
   }
 }
 

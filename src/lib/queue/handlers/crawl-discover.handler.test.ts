@@ -15,7 +15,10 @@ function jobWith(payload: Record<string, unknown>): Job {
   return { data: { payload: { workspaceId: WORKSPACE, kid: "k1", ...payload } } } as unknown as Job;
 }
 
-function txRecording(calls: { sql: string; params: unknown[] }[], projectRows: unknown[] = [{ root_domain: "hubspot.com" }]) {
+function txRecording(
+  calls: { sql: string; params: unknown[] }[],
+  projectRows: unknown[] = [{ root_domain: "hubspot.com", discovery: {} }],
+) {
   return {
     query: vi.fn(async (sql: string, params: unknown[]) => {
       calls.push({ sql, params });
@@ -98,7 +101,7 @@ describe("STORY-043 · crawl.discover handler", () => {
     const handler = createCrawlDiscoverHandler(CONTEXT, depsServing("<html></html>"));
 
     await handler(
-      txRecording(calls, [{ root_domain: "notion.so" }]),
+      txRecording(calls, [{ root_domain: "notion.so", discovery: {} }]),
       jobWith({ projectId: PROJECT, rootUrl: "https://notion.so", fieldsSupplied: [] }),
     );
 
@@ -137,5 +140,72 @@ describe("STORY-043 · crawl.discover handler", () => {
   it("rejects a payload of the wrong shape at the boundary", async () => {
     const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
     await expect(handler(txRecording([]), jobWith({ projectId: "not-a-uuid" }))).rejects.toThrow();
+  });
+
+  // STORY-044 AC4 / scenario 5 — the durable half of the confirm story.
+  it("scenario 5 — a human-overridden field survives re-discovery untouched", async () => {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const overridden = {
+      fields: {
+        brand_name: { value: "HubSpot, Inc.", confidence: 1, source: "Organization schema", user_edited: true },
+      },
+    };
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
+
+    await handler(
+      txRecording(calls, [{ root_domain: "hubspot.com", discovery: overridden }]),
+      jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }),
+    );
+
+    const write = calls.find((c) => c.sql.includes("SET discovery = $2"))!;
+    const payload = JSON.parse(write.params[1] as string) as {
+      fields: Record<string, { value: unknown; user_edited?: boolean }>;
+    };
+    // The page says "HubSpot"; the human said "HubSpot, Inc.". The human wins,
+    // and the record that a human decided survives too — without the second
+    // half the NEXT pass would happily re-derive it.
+    expect(payload.fields.brand_name?.value).toBe("HubSpot, Inc.");
+    expect(payload.fields.brand_name?.user_edited).toBe(true);
+  });
+
+  it("scenario 5 — fields NOT overridden are still re-derived normally", async () => {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const overridden = {
+      fields: { brand_name: { value: "Held", confidence: 1, user_edited: true } },
+    };
+    const handler = createCrawlDiscoverHandler(
+      CONTEXT,
+      depsServing(`<html lang="fr-FR"><head>
+        <script type="application/ld+json">{"@type":"Organization","name":"Fresh","description":"New copy."}</script>
+      </head></html>`),
+    );
+
+    await handler(
+      txRecording(calls, [{ root_domain: "hubspot.com", discovery: overridden }]),
+      jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }),
+    );
+
+    const write = calls.find((c) => c.sql.includes("SET discovery = $2"))!;
+    const payload = JSON.parse(write.params[1] as string) as { fields: Record<string, { value: unknown }> };
+    expect(payload.fields.brand_name?.value).toBe("Held");
+    expect(payload.fields.description?.value).toBe("New copy.");
+    expect(payload.fields.locale?.value).toBe("fr-FR");
+  });
+
+  it("a field merely ACCEPTED (not overridden) is re-derived — only a human override is sticky", async () => {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const accepted = {
+      fields: { brand_name: { value: "Old", confidence: 0.96, user_edited: false } },
+    };
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
+
+    await handler(
+      txRecording(calls, [{ root_domain: "hubspot.com", discovery: accepted }]),
+      jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }),
+    );
+
+    const write = calls.find((c) => c.sql.includes("SET discovery = $2"))!;
+    const payload = JSON.parse(write.params[1] as string) as { fields: Record<string, { value: unknown }> };
+    expect(payload.fields.brand_name?.value).toBe("HubSpot");
   });
 });
