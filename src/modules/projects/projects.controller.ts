@@ -1,9 +1,11 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Req } from "@nestjs/common";
 import {
+  confirmDiscoveryRequestSchema,
   createProjectRequestSchema,
   createProjectResponseSchema,
   discoveryResponseSchema,
   type CreateProjectRequest,
+  type ConfirmDiscoveryRequest,
   type CreateProjectResponse,
   type DiscoveryResponse,
 } from "../../../contracts/projects/index.js";
@@ -53,5 +55,25 @@ export class ProjectsController {
   @ApiContract({ operationId: "getProjectDiscovery", responseSchema: discoveryResponseSchema })
   discovery(@Param("id") id: string): Promise<DiscoveryResponse> {
     return this.service.discoveryFor(id);
+  }
+
+  // §3's route table: `project:update`, "accept or override discovered fields
+  // and proposed competitors". Audited because it changes what counts as a
+  // mention, and therefore the meaning of every subsequent number (AC8).
+  @Post(":id/discovery/confirm")
+  @HttpCode(200)
+  @RequirePermission("project:update")
+  @Audit({ action: "project.discovery_confirmed", resourceType: "project" })
+  @ApiContract({
+    operationId: "confirmProjectDiscovery",
+    requestSchema: confirmDiscoveryRequestSchema,
+    responseSchema: discoveryResponseSchema,
+  })
+  confirmDiscovery(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(confirmDiscoveryRequestSchema)) body: ConfirmDiscoveryRequest,
+  ): Promise<DiscoveryResponse> {
+    return this.service.confirmDiscovery(req.tenant!.workspaceId, id, body, req.entitlementVersion);
   }
 }

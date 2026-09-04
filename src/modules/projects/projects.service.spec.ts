@@ -313,3 +313,219 @@ describe("STORY-043 · ProjectsService.discoveryFor", () => {
     }
   });
 });
+
+// STORY-044 — confirm and override.
+describe("STORY-044 · ProjectsService.confirmDiscovery", () => {
+  let calls: Recorded[];
+
+  const DISCOVERED = {
+    discovery_status: "completed",
+    duration_ms: 1200,
+    fields: {
+      brand_name: { value: "HubSpot", confidence: 0.96, source: "Organization schema", user_edited: false },
+      category: { value: "crm", confidence: 0.55, source: "text classification", user_edited: false },
+      aliases: { value: ["HubSpot"], confidence: 0.7, source: "domain stem", user_edited: false },
+    },
+    competitors_proposed: [],
+    prompts_generated: [],
+    prompts_free_remaining: 10,
+    credits_charged: 0,
+    low_confidence_fields: ["category"],
+  };
+
+  function serviceReading(rows: unknown[], entitlements: Record<string, { value: unknown }> = GENEROUS) {
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          if (sql.includes("SELECT discovery")) return { rows };
+          if (sql.includes("SELECT name FROM competitors")) return { rows: [] };
+          return { rows: [] };
+        }),
+      },
+    } as never);
+    return new ProjectsService(
+      { enqueueTenantJob: vi.fn() } as unknown as QueueProducer,
+      resolverReturning(entitlements),
+      urlGuard,
+    );
+  }
+
+  const stored = (extra: Record<string, unknown> = {}) => [{ discovery: DISCOVERED, category_slug: null, ...extra }];
+
+  // AC3 — applied, NOT marked edited.
+  it("scenario 3 — accepting a discovered field applies it and does not mark it edited", async () => {
+    const result = await serviceReading(stored()).confirmDiscovery(WS, "p1", {
+      fields: { brand_name: { decision: "accept" } },
+    }, 1);
+
+    expect(result.fields.brand_name?.value).toBe("HubSpot");
+    expect(result.fields.brand_name?.user_edited).toBe(false);
+    const update = calls.find((c) => c.sql.includes("UPDATE projects"))!;
+    expect(update.sql).toContain("name = $2");
+    expect(update.params).toContain("HubSpot");
+  });
+
+  // AC4 — applied AND marked edited. This flag is what re-discovery reads.
+  it("scenario 4 — overriding a field applies the new value and marks it edited", async () => {
+    const result = await serviceReading(stored()).confirmDiscovery(WS, "p1", {
+      fields: { brand_name: { decision: "override", value: "HubSpot, Inc." } },
+    }, 1);
+
+    expect(result.fields.brand_name?.value).toBe("HubSpot, Inc.");
+    expect(result.fields.brand_name?.user_edited).toBe(true);
+    // A human's decision is certain by definition; the machine's confidence in
+    // its own guess is no longer the relevant number.
+    expect(result.fields.brand_name?.confidence).toBe(1);
+  });
+
+  it("writes the override to its mapped column, not to a column of the same name", async () => {
+    await serviceReading(stored()).confirmDiscovery(WS, "p1", {
+      fields: { category: { decision: "override", value: "marketing-automation" } },
+    }, 1);
+
+    const update = calls.find((c) => c.sql.includes("UPDATE projects"))!;
+    expect(update.sql).toContain("category_slug = $2");
+    expect(update.params).toContain("marketing-automation");
+  });
+
+  it("confirming a field clears it from low_confidence_fields", async () => {
+    const result = await serviceReading(stored()).confirmDiscovery(WS, "p1", {
+      fields: { category: { decision: "accept" } },
+    }, 1);
+    expect(result.low_confidence_fields).not.toContain("category");
+  });
+
+  // AC7 — idempotent.
+  it("scenario 9 — confirming twice produces the same state", async () => {
+    const body = { fields: { brand_name: { decision: "override" as const, value: "HubSpot, Inc." } } };
+    const first = await serviceReading(stored()).confirmDiscovery(WS, "p1", body, 1);
+    const second = await serviceReading([{ discovery: first, category_slug: null }]).confirmDiscovery(WS, "p1", body, 1);
+    expect(second).toEqual(first);
+  });
+
+  it("refuses to accept a field nothing was discovered for, rather than silently ignoring it", async () => {
+    const error = await serviceReading(stored())
+      .confirmDiscovery(WS, "p1", { fields: { description: { decision: "accept" } } }, 1)
+      .catch((e: unknown) => e);
+    expect((error as DomainError).code).toBe("validation_failed");
+  });
+
+  it("refuses a list value for a scalar field, and a scalar for a list field", async () => {
+    const scalarGivenList = await serviceReading(stored())
+      .confirmDiscovery(WS, "p1", { fields: { brand_name: { decision: "override", value: ["a", "b"] } } }, 1)
+      .catch((e: unknown) => e);
+    expect((scalarGivenList as DomainError).code).toBe("validation_failed");
+
+    const listGivenScalar = await serviceReading(stored())
+      .confirmDiscovery(WS, "p1", { fields: { aliases: { decision: "override", value: "one" } } }, 1)
+      .catch((e: unknown) => e);
+    expect((listGivenScalar as DomainError).code).toBe("validation_failed");
+  });
+
+  // AC5 — competitors up to the entitlement.
+  it("scenario 6 — confirming competitors within the cap creates the tracked rows", async () => {
+    await serviceReading(stored()).confirmDiscovery(WS, "p1", {
+      competitors: [{ name: "Salesforce", root_domain: "salesforce.com" }, { name: "Pipedrive" }],
+    }, 1);
+
+    const inserts = calls.filter((c) => c.sql.includes("INSERT INTO competitors"));
+    expect(inserts).toHaveLength(2);
+    expect(inserts[0]!.sql).toContain("user_authored");
+  });
+
+  it("scenario 7 — confirming beyond the cap fails with the structural limit, naming it", async () => {
+    const error = await serviceReading(stored(), { "competitors.max_per_project": { value: 1 } })
+      .confirmDiscovery(WS, "p1", { competitors: [{ name: "A" }, { name: "B" }] }, 1)
+      .catch((e: unknown) => e);
+
+    expect((error as DomainError).code).toBe("entitlement_exceeded");
+    expect((error as DomainError).details).toMatchObject({ key: "competitors.max_per_project", limit: 1, current: 2 });
+  });
+
+  // AC6 — the flag is a prompt, not a gate.
+  it("scenario 8 — an empty confirmation is valid; nothing is required", async () => {
+    const result = await serviceReading(stored()).confirmDiscovery(WS, "p1", {}, 1);
+    expect(result.fields.category?.value).toBe("crm");
+    expect(calls.some((c) => c.sql.includes("INSERT INTO competitors"))).toBe(false);
+  });
+
+  it("404s for a project that does not exist or is another tenant's", async () => {
+    const error = await serviceReading([]).confirmDiscovery(WS, "p1", {}, 1).catch((e: unknown) => e);
+    expect((error as DomainError).code).toBe("not_found");
+  });
+
+  it("takes no workspace_id predicate — RLS scopes it (NFR-SEC-01)", async () => {
+    await serviceReading(stored()).confirmDiscovery(WS, "p1", {
+      fields: { brand_name: { decision: "accept" } },
+    }, 1);
+    for (const call of calls) {
+      if (call.sql.includes("INSERT INTO")) continue; // an insert names the column it fills
+      expect(call.sql).not.toContain("workspace_id");
+    }
+  });
+
+  // AC9 / scenario 10 — "overriding the category triggers recomputation of
+  // anything category-relative rather than leaving stale derived values".
+  //
+  // The trigger is built and correct; the JOB it asks for is inert.
+  // rollup.metric_daily has no handler yet (STORY-124's registry lists it
+  // among the unwired), so enqueueing would pile jobs into Redis for as long
+  // as that stays true. The guard makes this start working the day the handler
+  // lands, with no edit here.
+  it("scenario 10 — a category override asks for recomputation and does not throw while the queue is inert", async () => {
+    const queues = { enqueueTenantJob: vi.fn() } as unknown as QueueProducer;
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          return { rows: sql.includes("SELECT discovery") ? [{ discovery: DISCOVERED, category_slug: "crm" }] : [] };
+        }),
+      },
+    } as never);
+    const service = new ProjectsService(queues, resolverReturning(GENEROUS), urlGuard);
+
+    await expect(
+      service.confirmDiscovery(WS, "p1", { fields: { category: { decision: "override", value: "cdp" } } }, 1),
+    ).resolves.toBeDefined();
+
+    // Nothing enqueued, because nothing would consume it.
+    expect(queues.enqueueTenantJob).not.toHaveBeenCalled();
+  });
+
+  it("a NON-category override never asks for recomputation", async () => {
+    const queues = { enqueueTenantJob: vi.fn() } as unknown as QueueProducer;
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          return { rows: sql.includes("SELECT discovery") ? [{ discovery: DISCOVERED, category_slug: "crm" }] : [] };
+        }),
+      },
+    } as never);
+    const service = new ProjectsService(queues, resolverReturning(GENEROUS), urlGuard);
+
+    await service.confirmDiscovery(WS, "p1", { fields: { brand_name: { decision: "override", value: "X" } } }, 1);
+    expect(queues.enqueueTenantJob).not.toHaveBeenCalled();
+  });
+
+  it("re-confirming the SAME category is not a change and asks for nothing", async () => {
+    const queues = { enqueueTenantJob: vi.fn() } as unknown as QueueProducer;
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          return { rows: sql.includes("SELECT discovery") ? [{ discovery: DISCOVERED, category_slug: "crm" }] : [] };
+        }),
+      },
+    } as never);
+    const service = new ProjectsService(queues, resolverReturning(GENEROUS), urlGuard);
+
+    await service.confirmDiscovery(WS, "p1", { fields: { category: { decision: "accept" } } }, 1);
+    expect(queues.enqueueTenantJob).not.toHaveBeenCalled();
+  });
+});
