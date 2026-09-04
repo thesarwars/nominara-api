@@ -194,6 +194,26 @@ describe("STORY-131 · guardedFetch — the loop, against a real server", () => 
     await expect(guardedFetch(at("/never"), {}, permitTestOrigin)).rejects.toThrow(/timeout/);
   }, 30_000);
 
+  // THE LOOKUP REGRESSION. Every test above connects to the literal
+  // `127.0.0.1`, and net.connect skips the lookup function ENTIRELY for a
+  // literal address — so the pinned-address lookup, the single most important
+  // line in the module, was never executed by any of them. It was broken for
+  // every real hostname (Node's autoSelectFamily path calls lookup with
+  // `{all: true}` and expects an array; it got `undefined` and failed with
+  // "Invalid IP address") and the suite stayed green.
+  //
+  // `localhost` is a NAME, so this exercises the lookup for real.
+  it("connects through the pinned lookup when the host is a name, not a literal", async () => {
+    const port = (server.address() as { port: number }).port;
+    const permitLocalhost = {
+      assertSafe: async (rawUrl: string) => ({ url: new URL(rawUrl), addresses: ["127.0.0.1"] }),
+    };
+
+    const response = await guardedFetch(`http://localhost:${String(port)}/`, {}, permitLocalhost);
+    expect(response.status).toBe(200);
+    expect(response.body.toString()).toBe("ok");
+  });
+
   it("the default deps are the strict validator — the seam is not a bypass", () => {
     expect(defaultDepsAreStrict()).toBe(true);
   });

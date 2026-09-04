@@ -209,10 +209,27 @@ function requestOnce(target: SafeTarget, method: string, deadline: number): Prom
     // The whole point of the file. `lookup` is called by the connector INSTEAD
     // of a real DNS query, and hands back the address assertSafeUrl already
     // approved — so there is no second resolution to disagree with the first.
-    const lookup: LookupFunction = (_hostname, _options, callback) => {
-      // family 0 lets Node infer from the literal; passing the wrong family
-      // for the address makes the connection fail rather than go somewhere else.
-      (callback as (err: null, address: string, family: number) => void)(null, pinned, pinned.includes(":") ? 6 : 4);
+    //
+    // TWO CALLING CONVENTIONS, AND BOTH ARE REACHED. Node's `net` module has
+    // `autoSelectFamily` on by default since v20, and that path calls lookup
+    // with `{ all: true }` and expects an ARRAY of `{address, family}`; the
+    // older path expects `(err, address, family)`. Answering only the second
+    // hands the first `undefined` and fails every connection with
+    // "Invalid IP address: undefined".
+    //
+    // This was live, and the unit tests could not have caught it: they connect
+    // to `127.0.0.1`, and `net.connect` skips lookup ENTIRELY for a literal
+    // address — so the function under test was never called. Found by fetching
+    // a real hostname, which is what the regression test now does.
+    const family = pinned.includes(":") ? 6 : 4;
+    const lookup: LookupFunction = (_hostname, options, callback) => {
+      if (typeof options === "object" && options !== null && options.all === true) {
+        (callback as unknown as (err: null, addresses: { address: string; family: number }[]) => void)(null, [
+          { address: pinned, family },
+        ]);
+        return;
+      }
+      (callback as (err: null, address: string, family: number) => void)(null, pinned, family);
     };
 
     const options: RequestOptions = {

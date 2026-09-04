@@ -96,6 +96,78 @@ describe("STORY-020 · AuditInterceptor", () => {
     });
   });
 
+  // THE LIVE GAP. POST /v1/projects returns `project_id` — §4.4 names the
+  // field, so the contract generates it — and this used to resolve null,
+  // throw, and answer 500 AFTER the project row had been written. A caller
+  // saw a failure for a project that exists.
+  it("resolves <resourceType>_id from the response when there is no bare 'id'", async () => {
+    const projectId = "0195e5b7-0000-7000-8000-000000000001";
+    const auditChain = fakeAuditChain();
+    const interceptor = new AuditInterceptor(new Reflector(), auditChain);
+    const { client } = fakePoolClient();
+    const req: Partial<AuditableRequest> = {
+      method: "POST",
+      id: "req-1",
+      headers: { "user-agent": "vitest-ua" },
+      params: {},
+      ip: "203.0.113.9",
+      authMethod: "session",
+    };
+    const next: CallHandler = { handle: () => of({ project_id: projectId, root_url: "https://hubspot.com" }) };
+
+    await withTenantContext(client, { workspaceId: "ws-1", actorId: "user-1" }, async () => {
+      await firstValueFrom(interceptor.intercept(makeContext("create", req), next));
+    });
+
+    const [, input] = (auditChain.append as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(input).toMatchObject({ action: "project.create", resourceId: projectId });
+  });
+
+  it("prefers a bare 'id' when a response carries both", async () => {
+    const bare = "0195e5b7-0000-7000-8000-0000000000aa";
+    const auditChain = fakeAuditChain();
+    const interceptor = new AuditInterceptor(new Reflector(), auditChain);
+    const { client } = fakePoolClient();
+    const req: Partial<AuditableRequest> = {
+      method: "POST",
+      id: "req-1",
+      headers: { "user-agent": "vitest-ua" },
+      params: {},
+      ip: "203.0.113.9",
+      authMethod: "session",
+    };
+    const next: CallHandler = { handle: () => of({ id: bare, project_id: "0195e5b7-0000-7000-8000-0000000000bb" }) };
+
+    await withTenantContext(client, { workspaceId: "ws-1", actorId: "user-1" }, async () => {
+      await firstValueFrom(interceptor.intercept(makeContext("create", req), next));
+    });
+
+    const [, input] = (auditChain.append as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(input).toMatchObject({ resourceId: bare });
+  });
+
+  it("does not accept some OTHER resource's id field", async () => {
+    // `invitation_id` on a route auditing a project is not this project's id,
+    // and treating any *_id as the subject would attribute an audit row to the
+    // wrong resource — worse than failing.
+    const auditChain = fakeAuditChain();
+    const interceptor = new AuditInterceptor(new Reflector(), auditChain);
+    const { client } = fakePoolClient();
+    const req: Partial<AuditableRequest> = {
+      method: "POST",
+      id: "req-1",
+      headers: { "user-agent": "vitest-ua" },
+      params: {},
+      ip: "203.0.113.9",
+      authMethod: "session",
+    };
+    const next: CallHandler = { handle: () => of({ invitation_id: "0195e5b7-0000-7000-8000-0000000000cc" }) };
+
+    await withTenantContext(client, { workspaceId: "ws-1", actorId: "user-1" }, async () => {
+      await expect(firstValueFrom(interceptor.intercept(makeContext("create", req), next))).rejects.toThrow();
+    });
+  });
+
   it("resourceIdFrom: 'response' reads resource_id from the handler's returned body, not the route params", async () => {
     const auditChain = fakeAuditChain();
     const interceptor = new AuditInterceptor(new Reflector(), auditChain);
