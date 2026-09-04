@@ -243,11 +243,58 @@ describe("STORY-043 · ProjectsService.create", () => {
     expect(insert.params).toContain("HubSpot CRM");
   });
 
-  it("treats a null (unlimited) cap as unlimited rather than zero", async () => {
+  // This test previously asserted the OPPOSITE — that null means unlimited —
+  // and passed, because it was written against the implementation rather than
+  // against the specification. plans-and-entitlements.md and
+  // classification.ts:133-137 both say null is "no allowance at all", naming
+  // this exact key: "free carries null for prompts.max_per_project because it
+  // has no projects to put prompts in."
+  it("treats a null cap as NO allowance, not as unlimited", async () => {
     const svc = new ProjectsService(queues, resolverReturning({ "prompts.max_per_project": { value: null } }), urlGuard);
-    await expect(
-      svc.create(WS, ACTOR, { root_url: "https://hubspot.com", prompts: [{ text: "a" }] }, 1),
-    ).resolves.toBeDefined();
+    const error = await svc
+      .create(WS, ACTOR, { root_url: "https://hubspot.com", prompts: [{ text: "a" }] }, 1)
+      .catch((e: unknown) => e);
+
+    expect((error as DomainError).code).toBe("entitlement_exceeded");
+    expect((error as DomainError).details).toMatchObject({ limit: 0, current: 1 });
+  });
+
+  it("a null cap still allows a project with no prompts — the cap binds prompts, not creation", async () => {
+    const svc = new ProjectsService(queues, resolverReturning({ "prompts.max_per_project": { value: null } }), urlGuard);
+    await expect(svc.create(WS, ACTOR, { root_url: "https://hubspot.com" }, 1)).resolves.toBeDefined();
+  });
+
+  // THE 500. `structuralLimitFrom` resolves "custom" to unlimited, so an
+  // enterprise workspace passes the projects.max guard and reaches the service
+  // — where the old hand-rolled resolver returned MAX_SAFE_INTEGER and bound
+  // it into `prompts_cap`, a smallint. Postgres refused with 22003 AFTER the
+  // URL guard and both cap checks had passed, so every enterprise project
+  // creation answered 500 on an otherwise valid request.
+  it("does not overflow the smallint column on an enterprise 'custom' cap", async () => {
+    const svc = new ProjectsService(
+      queues,
+      resolverReturning({
+        "prompts.max_per_project": { value: "custom" },
+        "competitors.max_per_project": { value: "custom" },
+      }),
+      urlGuard,
+    );
+    const result = await svc.create(WS, ACTOR, { root_url: "https://hubspot.com", prompts: [{ text: "a" }] }, 1);
+
+    expect(result.prompts_cap).toBe(32767);
+    expect(result.prompts_cap).toBeLessThanOrEqual(32767); // smallint's own ceiling
+    const insert = calls.find((c) => c.sql.includes("INSERT INTO projects"))!;
+    expect(insert.params).not.toContain(Number.MAX_SAFE_INTEGER);
+  });
+
+  it("an unrecognised entitlement value fails closed at zero, not open at unlimited", async () => {
+    // A value nobody classified is a configuration defect, and the safe
+    // reading of a defect is "grant nothing".
+    const svc = new ProjectsService(queues, resolverReturning({ "prompts.max_per_project": { value: "???" } }), urlGuard);
+    const error = await svc
+      .create(WS, ACTOR, { root_url: "https://hubspot.com", prompts: [{ text: "a" }] }, 1)
+      .catch((e: unknown) => e);
+    expect((error as DomainError).code).toBe("entitlement_exceeded");
   });
 });
 

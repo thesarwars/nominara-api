@@ -133,6 +133,71 @@ describe("STORY-043 · discover", () => {
     expect(Object.keys(result.fields).length).toBeGreaterThan(0);
   });
 
+  // THE REGRESSION GUARD. Every confidence was once above the 0.60 threshold,
+  // so `low_confidence_fields` was structurally always empty and FR-ONB-02b's
+  // confirm affordance was unreachable dead code — while the scenario-14 test
+  // above still passed, because it only checks the list against a derivation
+  // of the same data and both sides were empty. This asserts the affordance
+  // actually FIRES, which is the property that was silently missing.
+  it("FR-ONB-02b — a realistic page produces at least one flagged field", async () => {
+    const result = await discover(BASE, depsServing(PAGE));
+    expect(result.low_confidence_fields.length).toBeGreaterThan(0);
+    // Aliases are inferred from the domain with nothing from the page behind
+    // them, so they are always below the line.
+    expect(result.low_confidence_fields).toContain("aliases");
+  });
+
+  // The line the recalibration draws: the site TOLD us vs we INFERRED it.
+  it("flags what we inferred and trusts what the publisher declared", async () => {
+    const result = await discover(BASE, depsServing(PAGE));
+
+    // Declared — a machine-readable assertion the publisher made about
+    // themselves. Flagging these would flag almost every field on a
+    // well-marked-up site and train the customer to click through.
+    expect(result.fields.brand_name!.confidence).toBeGreaterThanOrEqual(LOW_CONFIDENCE_THRESHOLD);
+    expect(result.fields.description!.confidence).toBeGreaterThanOrEqual(LOW_CONFIDENCE_THRESHOLD);
+    expect(result.fields.locale!.confidence).toBeGreaterThanOrEqual(LOW_CONFIDENCE_THRESHOLD);
+
+    // Inferred — our reading of something not written for us.
+    expect(result.fields.aliases!.confidence).toBeLessThan(LOW_CONFIDENCE_THRESHOLD);
+  });
+
+  it("a brand name taken from <title> is flagged — the split is a guess", async () => {
+    // titleLeader reads "HubSpot | Customer Platform" correctly and "The best
+    // CRM software - HubSpot" exactly backwards, silently. This page has no
+    // structured data, so the name comes from the title and must be confirmed.
+    const titleOnly = `<html lang="en-US"><head><title>The best CRM software - HubSpot</title></head></html>`;
+    const result = await discover(BASE, depsServing(titleOnly));
+
+    expect(result.fields.brand_name?.value).toBe("The best CRM software"); // wrong, and visibly so
+    expect(result.low_confidence_fields).toContain("brand_name");
+  });
+
+  it("a proposed negative alias is always flagged — a wrong one suppresses real mentions", async () => {
+    const page = `<html><head><script type="application/ld+json">{"@type":"Organization","name":"Notion"}</script></head></html>`;
+    const result = await discover({ ...BASE, rootDomain: "notion.so" }, depsServing(page));
+
+    expect(result.fields.negative_aliases).toBeDefined();
+    expect(result.low_confidence_fields).toContain("negative_aliases");
+  });
+
+  // og:site_name and og:title are different signals and no longer share a
+  // confidence — site_name is the publisher naming their site, og:title is a
+  // page title with the same tagline weakness as <title>.
+  it("trusts og:site_name but flags an og:title fallback, and splits its tagline", async () => {
+    const siteName = `<html><head><meta property="og:site_name" content="Acme"></head></html>`;
+    const bySiteName = await discover(BASE, depsServing(siteName));
+    expect(bySiteName.fields.brand_name?.value).toBe("Acme");
+    expect(bySiteName.low_confidence_fields).not.toContain("brand_name");
+
+    const ogTitleOnly = `<html><head><meta property="og:title" content="Acme | The best widgets"></head></html>`;
+    const byOgTitle = await discover(BASE, depsServing(ogTitleOnly));
+    // Split, not stored whole — it used to inherit og:site_name's confidence
+    // AND skip titleLeader, so the tagline became the project's name.
+    expect(byOgTitle.fields.brand_name?.value).toBe("Acme");
+    expect(byOgTitle.low_confidence_fields).toContain("brand_name");
+  });
+
   // AC12 / scenario 15.
   it("AC12 — charges nothing and reports the full free allowance", async () => {
     const result = await discover(BASE, depsServing(PAGE));
