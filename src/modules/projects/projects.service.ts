@@ -20,6 +20,8 @@ import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
 import { handlerFor } from "../../lib/queue/handlers.js";
+import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
+import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 
 // STORY-043 — URL-only project creation. api-specification.md §4.
 //
@@ -81,8 +83,8 @@ export class ProjectsService {
         ? await this.entitlements.resolveForWorkspace(workspaceId)
         : await this.entitlements.resolve(workspaceId, entitlementVersion);
 
-    const promptsCap = numericEntitlement(resolved.entitlements["prompts.max_per_project"]?.value);
-    const competitorsCap = numericEntitlement(resolved.entitlements["competitors.max_per_project"]?.value);
+    const promptsCap = resolveCap(resolved.entitlements["prompts.max_per_project"]?.value);
+    const competitorsCap = resolveCap(resolved.entitlements["competitors.max_per_project"]?.value);
 
     // AC5 — "exceeding a cap refuses the whole request and creates no
     // project". Checked BEFORE the insert, not after, so there is nothing to
@@ -300,7 +302,7 @@ export class ProjectsService {
       entitlementVersion === undefined
         ? await this.entitlements.resolveForWorkspace(workspaceId)
         : await this.entitlements.resolve(workspaceId, entitlementVersion);
-    const cap = numericEntitlement(resolved.entitlements["competitors.max_per_project"]?.value);
+    const cap = resolveCap(resolved.entitlements["competitors.max_per_project"]?.value);
 
     const existing = await client.query(
       "SELECT name FROM competitors WHERE project_id = $1 AND deleted_at IS NULL",
@@ -423,9 +425,54 @@ function suppliedFields(input: CreateProjectRequest): OptionalProjectField[] {
   return OPTIONAL_PROJECT_FIELDS.filter((field) => input[field] !== undefined);
 }
 
-/** `null` means unlimited (plans-and-entitlements.md); a number is a hard cap. */
-function numericEntitlement(value: unknown): number {
-  return typeof value === "number" ? value : Number.MAX_SAFE_INTEGER;
+/**
+ * `projects.prompts_cap` is a `smallint`, so 32767 is the largest value it can
+ * hold. An unlimited entitlement is stored as that maximum: no project will
+ * ever carry 32k prompts, so "as many as the column can express" and "no cap"
+ * are the same thing in practice.
+ *
+ * This is NOT the sentinel that caused the bug below. MAX_SAFE_INTEGER was
+ * unrepresentable in the column; this is the column's own ceiling.
+ *
+ * The properly-typed fix is a nullable column with NULL meaning unlimited —
+ * the convention `structuralLimitFrom` already uses for the entitlement, and
+ * the one the client's own pass arithmetic draws deliberately. That is a
+ * migration plus a contract change (`prompts_cap` is `z.number()` on the
+ * wire), so it belongs in its own story rather than in a crash fix.
+ */
+const PROMPTS_CAP_COLUMN_MAX = 32767;
+
+/**
+ * Resolves an entitlement value to the numeric cap this request must enforce.
+ *
+ * Delegates to `structuralLimitFrom`, which is the ONE place that knows what
+ * a resolved entitlement value means. The hand-rolled version this replaces
+ * got two of its four cases wrong, and both were live:
+ *
+ *   `"custom"` (enterprise, every structural key) — returned
+ *   MAX_SAFE_INTEGER, which was then bound into `prompts_cap`, a `smallint`.
+ *   Postgres refused it with 22003 numeric-value-out-of-range AFTER the URL
+ *   guard and the cap checks had passed, so **every project creation on an
+ *   enterprise plan answered 500** on an otherwise valid request. Enterprise
+ *   reaches the service because `structuralLimitFrom` resolves "custom" to
+ *   unlimited, so `projects.max` does not refuse it at the guard.
+ *
+ *   `null` — returned MAX_SAFE_INTEGER, i.e. UNLIMITED, when
+ *   plans-and-entitlements.md means the opposite: "no allowance at all"
+ *   (classification.ts's own comment says so, naming this exact key). Not
+ *   currently reachable, because the only plan carrying null for a prompt cap
+ *   is `free`, whose `projects.max` is 0 and is refused at the guard — but it
+ *   was one plan-table edit away from silently granting an unlimited cap to
+ *   the tier that is meant to have none.
+ *
+ * An unrecognised value fails closed at 0 rather than open at unlimited: a
+ * value nobody classified is a configuration defect, and the safe reading of
+ * a defect is "grant nothing", not "grant everything".
+ */
+function resolveCap(value: unknown): number {
+  const limit = structuralLimitFrom(value as EntitlementValue);
+  if (limit === undefined) return 0;
+  return limit.kind === "unlimited" ? PROMPTS_CAP_COLUMN_MAX : limit.limit;
 }
 
 function assertWithinCap(key: string, requested: number, limit: number): void {

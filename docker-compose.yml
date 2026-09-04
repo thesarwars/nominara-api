@@ -224,6 +224,60 @@ services:
       start_period: 30s
       retries: 6
 
+  # STORY-043 review — src/worker.ts is the ONLY thing that executes queue
+  # handlers, and until now nothing ran it: there was no npm script and no
+  # compose service. That was invisible while the registry was empty (STORY-124
+  # shipped the seam with zero handlers, so there was nothing to consume), and
+  # it stopped being invisible the moment `crawl.discover` became real.
+  #
+  # Without this service a project is created, the job is enqueued, and
+  # `discovery_status` stays `pending` forever — the wired flow would look MORE
+  # broken than the fixture it replaced, and would look broken in a way that
+  # points at the API rather than at the missing consumer.
+  # ONE PROCESS PER WORKER GROUP, which is why this is `worker-crawl` and not
+  # `worker`. src/worker.ts refuses to boot without WORKER_GROUP, and it is
+  # right to: a group is the unit of concurrency and of blast radius, so a
+  # single process draining all seven would let a slow crawl starve a rollup.
+  #
+  # Only `crawl` has a handler today (`crawl.discover`, STORY-043). The other
+  # six groups get their own service in the story that lands their first
+  # handler — adding six idle services now would only make six things to
+  # misread during an incident.
+  worker-crawl:
+    build: .
+    image: nominara-api
+    depends_on:
+      dev-credentials:
+        condition: service_completed_successfully
+      valkey-cache:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      valkey:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
+      DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
+      VALKEY_CACHE_URL: redis://valkey-cache:6379
+      QUEUE_REDIS_URL: redis://valkey:6379
+      WORKER_GROUP: crawl
+    # No ports, and the image's healthcheck DISABLED rather than merely
+    # omitted. The Dockerfile bakes in `HEALTHCHECK ... /health/live`, which a
+    # worker does not serve — so it inherits a probe that can only ever fail,
+    # and the container sits permanently `unhealthy` while working perfectly.
+    # An always-red health signal is worse than none: it trains an operator to
+    # ignore the column.
+    #
+    # Real worker liveness is whether it is draining its queues, which needs a
+    # queue-depth metric rather than a socket, and that belongs with the
+    # deployment manifests (KAD-10) — not here.
+    healthcheck:
+      disable: true
+    command: ["node", "dist/src/worker.js"]
+
   gateway:
     build: .
     image: nominara-api

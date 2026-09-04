@@ -190,6 +190,14 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
 
   const app = await NestFactory.createApplicationContext(WorkerRootModule, { bufferLogs: true });
   app.enableShutdownHooks();
+  // STORY-043 review — WITHOUT THIS THE WORKER LOGS NOTHING, EVER. `bufferLogs`
+  // holds every log line until something flushes it, and main.ts and
+  // gateway.ts both flush implicitly via `app.listen()`. A worker never
+  // listens, so nothing ever flushed: `docker logs` on the worker container
+  // was completely empty, including the boot line below that exists to tell
+  // an operator which queues are live. Found by running the container rather
+  // than by reading it.
+  app.flushLogs();
   // STORY-124 — an operator reading this needs to know which half of the
   // spine is alive. A group that processes nothing must not look identical
   // to one that processes everything.
