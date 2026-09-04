@@ -4,6 +4,9 @@ import { ProjectsService } from "./projects.service.js";
 import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
 import { EntitlementsModule } from "../entitlements/entitlements.module.js";
 import { UrlGuard } from "../../lib/net/url-guard.service.js";
+import { DomainVerificationService } from "./domain-verification.service.js";
+import { CHECK_DEPS } from "./domain-verification.service.js";
+import { defaultCheckDeps } from "../../lib/verification/checkers.js";
 
 // STORY-022 — system-architecture.md §5 module inventory. Registration only —
 // no logic here (coding-standards.md §1's module layout).
@@ -16,6 +19,14 @@ import { UrlGuard } from "../../lib/net/url-guard.service.js";
 @Module({
   imports: [QueueProducerModule, EntitlementsModule],
   controllers: [ProjectsController],
-  providers: [ProjectsService, UrlGuard],
+  providers: [
+    ProjectsService,
+    UrlGuard,
+    DomainVerificationService,
+    // A factory, so a test supplies its own resolver and fetcher and the
+    // production one builds a Resolver we chose rather than reading whatever
+    // is in the container's /etc/resolv.conf (STORY-048 AC4).
+    { provide: CHECK_DEPS, useFactory: () => defaultCheckDeps() },
+  ],
 })
 export class ProjectsModule {}
