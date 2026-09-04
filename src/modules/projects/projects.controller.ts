@@ -2,13 +2,20 @@ import { Body, Controller, Get, HttpCode, Param, Post, Req } from "@nestjs/commo
 import {
   confirmDiscoveryRequestSchema,
   createProjectRequestSchema,
+  startVerificationRequestSchema,
+  verificationStateSchema,
+  verificationStatusResponseSchema,
   createProjectResponseSchema,
   discoveryResponseSchema,
   type CreateProjectRequest,
   type ConfirmDiscoveryRequest,
   type CreateProjectResponse,
   type DiscoveryResponse,
+  type StartVerificationRequest,
+  type VerificationState,
+  type VerificationStatusResponse,
 } from "../../../contracts/projects/index.js";
+import { DomainVerificationService } from "./domain-verification.service.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequireEntitlement } from "../../api/decorators/require-entitlement.decorator.js";
@@ -22,7 +29,10 @@ import { ProjectsService } from "./projects.service.js";
 // calls one service method, and returns (coding-standards.md §1).
 @Controller("projects")
 export class ProjectsController {
-  constructor(private readonly service: ProjectsService) {}
+  constructor(
+    private readonly service: ProjectsService,
+    private readonly verification: DomainVerificationService,
+  ) {}
 
   // 202, not 201 (§4.4): the row exists and is readable, but the resource is
   // not in its final state — discovery is still running behind it.
@@ -75,5 +85,50 @@ export class ProjectsController {
     @Body(new ZodValidationPipe(confirmDiscoveryRequestSchema)) body: ConfirmDiscoveryRequest,
   ): Promise<DiscoveryResponse> {
     return this.service.confirmDiscovery(req.tenant!.workspaceId, id, body, req.entitlementVersion);
+  }
+
+  // §3's route table: `POST /projects/{id}/domain-verification` · `/check`,
+  // both `project:update`. AC10 — every state change is audited, because
+  // verification decides how much of a site we may look at.
+  @Post(":id/domain-verification")
+  @HttpCode(200)
+  @RequirePermission("project:update")
+  @Audit({ action: "project.domain_verification_started", resourceType: "project" })
+  @ApiContract({
+    operationId: "startDomainVerification",
+    requestSchema: startVerificationRequestSchema,
+    responseSchema: verificationStateSchema,
+  })
+  startVerification(
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(startVerificationRequestSchema)) body: StartVerificationRequest,
+  ): Promise<VerificationState> {
+    return this.verification.start(id, body.method);
+  }
+
+  @Post(":id/domain-verification/check")
+  @HttpCode(200)
+  @RequirePermission("project:update")
+  @Audit({ action: "project.domain_verification_checked", resourceType: "project" })
+  @ApiContract({
+    operationId: "checkDomainVerification",
+    requestSchema: startVerificationRequestSchema,
+    responseSchema: verificationStateSchema,
+  })
+  checkVerification(
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(startVerificationRequestSchema)) body: StartVerificationRequest,
+  ): Promise<VerificationState> {
+    return this.verification.check(id, body.method);
+  }
+
+  // Not in §3's table, and needed: without it a client that has started two
+  // methods has no way to ask which of them currently holds, and no way to
+  // render the audit scope it implies.
+  @Get(":id/domain-verification")
+  @RequirePermission("project:read")
+  @ApiContract({ operationId: "getDomainVerification", responseSchema: verificationStatusResponseSchema })
+  verificationStatus(@Param("id") id: string): Promise<VerificationStatusResponse> {
+    return this.verification.status(id);
   }
 }
