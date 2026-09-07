@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ARCHETYPES, ARCHETYPE_BY_KEY } from "./archetypes.js";
-import { emitCandidates } from "./emit.js";
+import { emitCandidates, minimumAnonymous } from "./emit.js";
 import { resolveSlots, type SlotContext } from "./slots.js";
 
 // STORY-045 — §4 step 3 TEMPLATE EMIT, with step 6 CLASSIFY folded in
@@ -154,13 +154,73 @@ describe("STORY-045 · emitCandidates — scenario 7, the anonymous minimum", ()
     expect(anonymous.length).toBeGreaterThanOrEqual(6);
   });
 
-  it("reaches it on a THIN context too, where the fallbacks do the work", () => {
-    // The case that matters: thin context is when branded surfaces go
-    // unfillable and the anonymous siblings carry coverage. If the minimum
-    // only held for a rich project, it would fail exactly for the customers
-    // most likely to hit it.
-    const anonymous = emitFor({ categorySlug: "crm" }).candidates.filter((c) => c.brandAnonymous);
-    expect(anonymous.length).toBeGreaterThanOrEqual(6);
+  it("holds the minimum as a SHARE on a thin context, where a full fifteen is impossible", () => {
+    // FR-FAN-01c reads "at least 6 of the 15 variants". A context that can
+    // only fill four surfaces has no fifteen for the ratio to be taken of,
+    // so the requirement is applied as the share it expresses — 6/15 — and
+    // this is where the first draft of this test was simply wrong: it
+    // demanded six anonymous variants out of a four-candidate pass.
+    const thin = emitFor({ categorySlug: "crm" });
+    expect(thin.candidates.length).toBeLessThan(15);
+    expect(thin.candidates.filter((c) => c.brandAnonymous).length).toBeGreaterThanOrEqual(minimumAnonymous(thin.candidates.length));
+  });
+
+  it("holds the share across every context between thin and full", () => {
+    const contexts: SlotContext[] = [
+      { categorySlug: "crm" },
+      { categorySlug: "crm", competitors: ["Salesforce"] },
+      { categorySlug: "crm", brandName: "HubSpot CRM", competitors: ["Salesforce"] },
+      { categorySlug: "crm", brandName: "HubSpot CRM", competitors: ["Salesforce"], verticals: ["b2b_saas"] },
+      FULL,
+    ];
+    for (const context of contexts) {
+      const result = emitFor(context);
+      const anonymous = result.candidates.filter((c) => c.brandAnonymous).length;
+      expect(anonymous, JSON.stringify(context)).toBeGreaterThanOrEqual(minimumAnonymous(result.candidates.length));
+    }
+  });
+
+  it("gives exactly the documented six at a full fifteen", () => {
+    expect(minimumAnonymous(15)).toBe(6);
+  });
+
+  it("keeps a branded `.a1` when the pass is already above the floor", () => {
+    // The preference yields to the guarantee, not the other way round: on a
+    // full context there is anonymous headroom, so every documented surface
+    // stays.
+    const substituted = emitFor(FULL).candidates.filter((c) => c.anonymousSubstitution);
+    expect(substituted).toHaveLength(0);
+  });
+
+  it("substitutes rather than reporting a false fallback when the floor binds", () => {
+    // A swap for the quota is NOT thin context, and the two must not be
+    // conflated: a customer reading a coverage row should not be told their
+    // context was insufficient when the real reason was the anonymous floor.
+    const result = emitFor({ categorySlug: "crm", brandName: "HubSpot CRM", competitors: ["Salesforce"] });
+    const swapped = result.candidates.filter((c) => c.anonymousSubstitution);
+    expect(swapped.length).toBeGreaterThan(0);
+    for (const candidate of swapped) expect(candidate.usedAnonymousFallback).toBe(false);
+  });
+
+  // *** A REAL GAP, PINNED SO IT CANNOT BE REDISCOVERED BY A CUSTOMER. ***
+  //
+  // `category` is load-bearing for FR-FAN-01c: EVERY brand-anonymous surface
+  // in the grammar interpolates it, because asking a category-free anonymous
+  // question ("what should I look at instead?") carries no measurable
+  // subject. So a project with a brand and competitors but NO category emits
+  // an entirely brand-named prompt set — precisely the "systematically
+  // overstate visibility" failure the requirement exists to prevent.
+  //
+  // Not worked around here. `category_slug` is set at creation or by
+  // discovery and is almost always present, and the 180-category taxonomy is
+  // itself an unowned gap in dev-plan.md. The pipeline reports the anonymous
+  // share so this is visible rather than silent; making category mandatory
+  // for a generation pass is a product decision.
+  it("documents that a context with no category cannot produce an anonymous variant", () => {
+    const noCategory = emitFor({ brandName: "HubSpot CRM", competitors: ["Salesforce"], personas: ["marketing_director"] });
+    expect(noCategory.candidates.length).toBeGreaterThan(0);
+    expect(noCategory.candidates.every((c) => c.brandNamed || c.competitorNamed)).toBe(true);
+    expect(noCategory.candidates.filter((c) => c.brandAnonymous)).toHaveLength(0);
   });
 });
 
