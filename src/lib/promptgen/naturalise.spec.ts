@@ -166,9 +166,18 @@ describe("STORY-045 · scenario 11 — FR-FAN-01e, what the naturaliser may see"
     expect(request.lines).toHaveLength(candidates.length);
   });
 
-  it("sanitises control characters and collapses whitespace", () => {
-    expect(sanitiseForModel("a b")).toBe("ab");
+  it("replaces a control character with a space rather than deleting it", () => {
+    // Deleting JOINS two words into one that was never written: "a\u0000b"
+    // is two tokens and "ab" invents a third, which for a brand name is a
+    // silent corruption of the thing we are measuring. A space removes the
+    // character's power to split a line without inventing a word.
+    //
+    // Written as an escape, not as the raw byte. The first draft of this test
+    // contained a literal NUL — invisible in a diff and in review, and it
+    // took a hex dump to see why an edit to the line kept missing.
+    expect(sanitiseForModel("a\u0000b")).toBe("a b");
     expect(sanitiseForModel("a\tb\nc")).toBe("a b c");
+    expect(sanitiseForModel("a\u200Bb")).toBe("a b");
     expect(sanitiseForModel("  spaced   out  ")).toBe("spaced out");
   });
 

@@ -33,6 +33,12 @@ export interface Candidate {
   readonly brandNamed: boolean;
   readonly competitorNamed: boolean;
   readonly brandAnonymous: boolean;
+  /**
+   * False here always — emit produces TEMPLATE text. §4 step 4's naturaliser
+   * sets it, and `generator_meta` records it, so a stored prompt says which
+   * path actually produced its wording rather than which path was requested.
+   */
+  readonly naturalized: boolean;
   /** True when a preferred surface was skipped as UNFILLABLE and an anonymous one took its place. */
   readonly usedAnonymousFallback: boolean;
   /**
@@ -102,6 +108,7 @@ function fill(
     brandNamed,
     competitorNamed,
     brandAnonymous: !brandNamed && !competitorNamed,
+    naturalized: false,
     usedAnonymousFallback,
     anonymousSubstitution,
     weight: archetype.weight,
