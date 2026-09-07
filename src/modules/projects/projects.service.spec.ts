@@ -198,7 +198,24 @@ describe("STORY-043 · ProjectsService.create", () => {
     );
 
     expect(calls.some((c) => c.sql.includes("INSERT INTO competitors") && c.sql.includes("user_authored"))).toBe(true);
-    expect(calls.some((c) => c.sql.includes("INSERT INTO tracked_prompts") && c.sql.includes("'manual'"))).toBe(true);
+
+    // *** THIS ASSERTION USED TO READ `c.sql.includes("'manual'")`, AND THAT
+    //     IS WHY A BROKEN INSERT SHIPPED. ***
+    //
+    // The statement supplied three columns and `tracked_prompts` has three
+    // more that are NOT NULL with no default, so it could never execute — and
+    // a substring check against a stubbed client passed anyway. The
+    // executable proof now lives in
+    // test/integration/promptgen-persist.spec.ts; what is checkable HERE is
+    // that the row carries the right provenance, which is a value in the
+    // parameters rather than a literal in the SQL.
+    const promptInsert = calls.find((c) => c.sql.includes("INSERT INTO tracked_prompts"));
+    expect(promptInsert).toBeDefined();
+    expect(promptInsert?.params).toContain("manual");
+    expect(promptInsert?.params).toContain("custom");
+    for (const column of ["text_hash", "intent_archetype", "funnel_stage"]) {
+      expect(promptInsert?.sql, column).toContain(column);
+    }
   });
 
   it("scenario 15 — creation touches no wallet or ledger table", async () => {

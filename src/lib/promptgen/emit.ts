@@ -62,6 +62,18 @@ export interface EmitInput {
   readonly archetypes: readonly Archetype[];
   /** Variants per archetype — the contract's `batch_size`. */
   readonly batchSize: number;
+  /**
+   * Surfaces already known to produce a duplicate, so they are not chosen again.
+   *
+   * `FR-FAN-01a`'s backfill mechanism: "the engine backfills from secondary
+   * templates until 15 are accepted or all templates are exhausted". The
+   * pipeline discovers a collision only after hashing, so it re-emits with
+   * the offending template ids skipped rather than emit trying to predict
+   * them. Re-running the whole selection is deliberate — the anonymous floor
+   * is a property of the SET, so it has to be re-evaluated once the set
+   * changes.
+   */
+  readonly skipTemplateIds?: ReadonlySet<string>;
 }
 
 export interface EmitResult {
@@ -72,6 +84,11 @@ export interface EmitResult {
 /** A template is usable only when EVERY declared slot has a value. */
 function fillable(template: SurfaceTemplate, bag: SlotBag): boolean {
   return template.requiredSlots.every((slot) => slotValue(bag, slot) !== undefined);
+}
+
+/** Usable, and not already known to collide with an existing prompt. */
+function available(template: SurfaceTemplate, input: EmitInput): boolean {
+  return fillable(template, input.bag) && input.skipTemplateIds?.has(template.id) !== true;
 }
 
 function fill(
@@ -133,7 +150,7 @@ export function emitCandidates(input: EmitInput): EmitResult {
   const chosenByArchetype = new Map<GeneratableArchetype, SurfaceTemplate[]>();
 
   for (const archetype of input.archetypes) {
-    const usable = archetype.templates.filter((template) => fillable(template, input.bag));
+    const usable = archetype.templates.filter((template) => available(template, input));
     chosenByArchetype.set(archetype.key, usable.slice(0, input.batchSize));
   }
 
@@ -151,6 +168,10 @@ export function emitCandidates(input: EmitInput): EmitResult {
     // `.a1` is already anonymous has not fallen back to anything — marking
     // it so would make thin context look like the normal case and turn the
     // coverage chip row into noise.
+    // UNFILLABLE, not merely unavailable. A preferred surface skipped because
+    // it collided with an existing prompt is not evidence of thin context, and
+    // reporting it as a fallback would tell the customer their project is
+    // underspecified when the real cause was a duplicate.
     const preferred = archetype.templates[0];
     const skippedPreferred = preferred !== undefined && !fillable(preferred, input.bag);
 
@@ -233,7 +254,7 @@ function enforceAnonymousMinimum(
       if (current === undefined || current.brandAnonymous) continue;
 
       const replacement = archetype.templates.find(
-        (template) => template.brandAnonymous && fillable(template, input.bag) && !chosen.includes(template),
+        (template) => template.brandAnonymous && available(template, input) && !chosen.includes(template),
       );
       if (replacement === undefined) continue;
 
