@@ -88,8 +88,17 @@ export function l1TimeBucket(nowMs: number, ttlSeconds: number): number {
  * Two tenants who independently wrote the same question should share, and
  * "Best CRM" versus "best crm" is the same question to an engine. Lowercased
  * and whitespace-collapsed only — nothing that could change meaning.
+ *
+ * EXPORTED for STORY-045's `promptTextHash`, which computes
+ * `tracked_prompts.text_hash`. `schemas/projects-and-prompts.md` documents
+ * that column as both the dedupe key and part of THIS key, so the two must
+ * normalise identically: a second, more aggressive normalisation there would
+ * dedupe two prompts that this key then treats as different questions —
+ * reporting a duplicate that never shares a capture, with the cost lever
+ * quietly degraded and no test going red. Exported rather than duplicated
+ * for exactly the reason this file's header gives about fragmentation.
  */
-function normalizePromptText(text: string): string {
+export function normalizePromptText(text: string): string {
   return text.trim().toLowerCase().replace(/\s+/u, " ").replace(/\s+/gu, " ");
 }
 
