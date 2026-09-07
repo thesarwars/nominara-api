@@ -54,15 +54,17 @@ describe("STORY-045 · prioritise — scenario 8, selected by weight and intent"
   });
 
   it("breaks a weight tie on slot specificity, not on nothing", () => {
-    // Seven archetypes are decision-stage and only six slots are asked for,
-    // so the tie is real and something has to resolve it. Within the stage,
-    // the candidate grounded in more REAL context outranks one leaning on a
-    // derived slot.
+    // EIGHT archetypes are decision-stage and the documented subset size is
+    // six, so the tie is real and something has to resolve it. Within the
+    // stage, the candidate grounded in more REAL context outranks one leaning
+    // on a derived slot.
     const flagged = prioritise(candidatesFor(), 6).filter((c) => c.isPriority);
     const unflaggedDecision = prioritise(candidatesFor(), 6).filter((c) => !c.isPriority && c.funnelStage === "decision");
-    expect(unflaggedDecision).toHaveLength(1);
-    const lowest = Math.min(...flagged.map((c) => c.contextSlotCount));
-    expect(unflaggedDecision[0]?.contextSlotCount).toBeLessThanOrEqual(lowest);
+    expect(unflaggedDecision).toHaveLength(2);
+    const lowestFlagged = Math.min(...flagged.map((c) => c.contextSlotCount));
+    for (const passedOver of unflaggedDecision) {
+      expect(passedOver.contextSlotCount, passedOver.archetype).toBeLessThanOrEqual(lowestFlagged);
+    }
   });
 
   it("falls back to §4's table order for a total tie, so the result is never arbitrary", () => {
@@ -73,10 +75,12 @@ describe("STORY-045 · prioritise — scenario 8, selected by weight and intent"
   });
 
   it("reaches into consideration stage once the decision archetypes run out", () => {
+    // §4's table is 8 decision and 7 consideration — worth stating, because
+    // the first draft of these tests had that split backwards.
     const flagged = prioritise(candidatesFor(), 10).filter((c) => c.isPriority);
     expect(flagged).toHaveLength(10);
-    expect(flagged.filter((c) => c.funnelStage === "decision")).toHaveLength(7);
-    expect(flagged.filter((c) => c.funnelStage === "consideration")).toHaveLength(3);
+    expect(flagged.filter((c) => c.funnelStage === "decision")).toHaveLength(8);
+    expect(flagged.filter((c) => c.funnelStage === "consideration")).toHaveLength(2);
   });
 });
 
@@ -112,16 +116,21 @@ describe("STORY-045 · prioritise — ordering and edge cases", () => {
   });
 });
 
-describe("STORY-045 · prioritise — the weight factor is the documented scale", () => {
-  it("ranks a decision archetype above a consideration one at equal specificity", () => {
+describe("STORY-045 · prioritise — weight dominates specificity", () => {
+  it("ranks a decision archetype above a MORE specific consideration one", () => {
+    // The precedence, proven where the two factors disagree rather than
+    // where they happen to agree. `vertical_fit.a1` interpolates two real
+    // context slots and `support_quality.a1` only one — so specificity
+    // favours vertical_fit and weight favours support_quality. Weight is
+    // primary, so support_quality wins: §4 step 7 multiplies, and the stage
+    // is the factor with a documented scale behind it.
     const decision = ARCHETYPE_BY_KEY.support_quality;
     const consideration = ARCHETYPE_BY_KEY.vertical_fit;
     expect(decision.weight).toBeGreaterThan(consideration.weight);
 
-    const bag = resolveSlots(FULL);
-    const both = emitCandidates({ bag, archetypes: [consideration, decision], batchSize: 1 }).candidates;
-    // Both interpolate one context slot, so weight alone decides.
-    expect(both[0]?.contextSlotCount).toBe(both[1]?.contextSlotCount);
+    const both = emitCandidates({ bag: resolveSlots(FULL), archetypes: [consideration, decision], batchSize: 1 }).candidates;
+    expect(both[0]?.contextSlotCount).toBeGreaterThan(both[1]?.contextSlotCount ?? 0);
+
     const result = prioritise(both, 1);
     expect(result.find((c) => c.isPriority)?.archetype).toBe("support_quality");
   });
