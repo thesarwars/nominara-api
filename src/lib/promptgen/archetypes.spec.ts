@@ -53,6 +53,8 @@ describe("STORY-045 · the archetype grammar", () => {
     expect(ARCHETYPE_BY_KEY.recommendation.templates[0]?.surface).toBe("Which {category} do you recommend for {segment}?");
     expect(ARCHETYPE_BY_KEY.head_to_head.templates[0]?.surface).toBe("Is {brand} or {competitor} better for {persona}?");
     expect(ARCHETYPE_BY_KEY.support_quality.templates[0]?.surface).toBe("Which {category} vendor has the most responsive support?");
+    expect(ARCHETYPE_BY_KEY.scale_fit.templates[0]?.surface).toBe("Best {category} for a team of {headcount}?");
+    expect(ARCHETYPE_BY_KEY.compliance_security.templates[0]?.surface).toBe("Which {category} tools are {compliance_term} compliant?");
     expect(ARCHETYPE_BY_KEY.buyer_shortlist.templates[0]?.surface).toBe(
       "Shortlist 3 {category} options for {segment} and explain the trade-offs.",
     );

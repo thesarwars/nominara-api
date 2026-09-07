@@ -178,9 +178,15 @@ export const ARCHETYPES: readonly Archetype[] = [
     "Which {category} can I use in a {compliance_term} environment?",
   ]),
   archetype("scale_fit", "consideration", [
+    // §4's documented surface needs a NUMERIC headcount, and no document
+    // enumerates size bands or maps one to a head count — so `.a1` fires only
+    // when the caller supplies a numeric band, and `.a2`/`.a3` keep the
+    // archetype coverable on the qualitative band alone. Inventing a
+    // band-to-range table (mid_market -> "200-1000") would put a number we
+    // cannot derive into customer-visible prompt text.
     "Best {category} for a team of {headcount}?",
-    "Which {category} holds up at {headcount} users?",
-    "What {category} do teams of {headcount} settle on?",
+    "Which {category} holds up at {size_band} scale?",
+    "What {category} do {size_band} teams settle on?",
   ]),
   archetype("vertical_fit", "consideration", [
     "Best {category} for {vertical} companies?",
