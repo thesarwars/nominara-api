@@ -111,7 +111,7 @@ describe("STORY-046 · preselectForActivation — ranking within a round", () =>
     // happened to yield first, and a customer who re-opens the dialog sees a
     // different pre-selection over the same data.
     const tied = [candidate("recommendation", 1), candidate("head_to_head", 1), candidate("alternatives", 1)];
-    expect(preselectForActivation(tied, 2).map((c) => c.promptId)).toEqual(["p-recommendation-0", "p-head_to_head-0"]);
+    expect(preselectForActivation(tied, 2).map((c) => c.promptId)).toEqual(["p-recommendation-1", "p-head_to_head-1"]);
   });
 });
 
