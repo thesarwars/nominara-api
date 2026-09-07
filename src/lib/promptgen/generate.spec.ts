@@ -155,7 +155,7 @@ describe("STORY-045 · generatePass — scenario 5, determinism (FR-FAN-01d)", (
     const b = await generatePass(input());
     // Ids are UUIDv7 and differ by design; everything else must match.
     const strip = (pass: Awaited<ReturnType<typeof generatePass>>) =>
-      pass.rows.map(({ id, ...rest }) => ({ ...rest, textHash: rest.textHash.toString("hex") }));
+      pass.rows.map(({ id: _id, ...rest }) => ({ ...rest, textHash: rest.textHash.toString("hex") }));
     expect(strip(a)).toEqual(strip(b));
     expect(a.summary).toEqual(b.summary);
     expect(a.coverage).toEqual(b.coverage);
