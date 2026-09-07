@@ -10744,6 +10744,855 @@
         }
       }
     },
+    "/v1/projects/{id}/prompts/generate": {
+      "post": {
+        "operationId": "generatePrompts",
+        "responses": {
+          "200": {
+            "description": "generatePrompts response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "generation_batch_id": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "variants": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "prompt_id": {
+                                "type": "string",
+                                "format": "uuid",
+                                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                              },
+                              "text": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500
+                              },
+                              "text_hash": {
+                                "type": "string",
+                                "pattern": "^sha256:[0-9a-f]{64}$"
+                              },
+                              "intent_archetype": {
+                                "type": "string",
+                                "enum": [
+                                  "recommendation",
+                                  "head_to_head",
+                                  "alternatives",
+                                  "use_case_fit",
+                                  "pricing_value",
+                                  "integration_capability",
+                                  "objection_risk",
+                                  "migration_switching",
+                                  "compliance_security",
+                                  "scale_fit",
+                                  "vertical_fit",
+                                  "feature_specific",
+                                  "implementation_effort",
+                                  "support_quality",
+                                  "buyer_shortlist"
+                                ]
+                              },
+                              "funnel_stage": {
+                                "type": "string",
+                                "enum": [
+                                  "awareness",
+                                  "consideration",
+                                  "decision"
+                                ]
+                              },
+                              "template_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 100
+                              },
+                              "naturalized": {
+                                "type": "boolean"
+                              },
+                              "brand_named": {
+                                "type": "boolean"
+                              },
+                              "competitor_named": {
+                                "type": "boolean"
+                              },
+                              "slots": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string"
+                                },
+                                "additionalProperties": {
+                                  "type": "string"
+                                }
+                              },
+                              "novelty": {
+                                "type": "object",
+                                "properties": {
+                                  "max_cosine_to_existing": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number",
+                                        "minimum": 0,
+                                        "maximum": 1
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "nearest_prompt_id": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string",
+                                        "format": "uuid",
+                                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "max_cosine_to_existing",
+                                  "nearest_prompt_id"
+                                ],
+                                "additionalProperties": false
+                              },
+                              "is_priority": {
+                                "type": "boolean"
+                              },
+                              "status": {
+                                "type": "string",
+                                "enum": [
+                                  "active",
+                                  "paused",
+                                  "archived"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "prompt_id",
+                              "text",
+                              "text_hash",
+                              "intent_archetype",
+                              "funnel_stage",
+                              "template_id",
+                              "naturalized",
+                              "brand_named",
+                              "competitor_named",
+                              "slots",
+                              "novelty",
+                              "is_priority",
+                              "status"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "rejected": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "text": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500
+                              },
+                              "text_hash": {
+                                "type": "string",
+                                "pattern": "^sha256:[0-9a-f]{64}$"
+                              },
+                              "intent_archetype": {
+                                "type": "string",
+                                "enum": [
+                                  "recommendation",
+                                  "head_to_head",
+                                  "alternatives",
+                                  "use_case_fit",
+                                  "pricing_value",
+                                  "integration_capability",
+                                  "objection_risk",
+                                  "migration_switching",
+                                  "compliance_security",
+                                  "scale_fit",
+                                  "vertical_fit",
+                                  "feature_specific",
+                                  "implementation_effort",
+                                  "support_quality",
+                                  "buyer_shortlist"
+                                ]
+                              },
+                              "template_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 100
+                              },
+                              "reason": {
+                                "type": "string",
+                                "enum": [
+                                  "rejected_duplicate",
+                                  "templates_exhausted"
+                                ]
+                              },
+                              "conflicting_prompt_id": {
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "text",
+                              "text_hash",
+                              "intent_archetype",
+                              "template_id",
+                              "reason",
+                              "conflicting_prompt_id"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "coverage": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "intent_archetype": {
+                                "type": "string",
+                                "enum": [
+                                  "recommendation",
+                                  "head_to_head",
+                                  "alternatives",
+                                  "use_case_fit",
+                                  "pricing_value",
+                                  "integration_capability",
+                                  "objection_risk",
+                                  "migration_switching",
+                                  "compliance_security",
+                                  "scale_fit",
+                                  "vertical_fit",
+                                  "feature_specific",
+                                  "implementation_effort",
+                                  "support_quality",
+                                  "buyer_shortlist"
+                                ]
+                              },
+                              "represented": {
+                                "type": "boolean"
+                              },
+                              "variant_count": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "used_anonymous_fallback": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "intent_archetype",
+                              "represented",
+                              "variant_count",
+                              "used_anonymous_fallback"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "summary": {
+                          "type": "object",
+                          "properties": {
+                            "requested": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "generated": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "accepted": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "rejected_duplicate": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "activated": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "priority_flagged": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            }
+                          },
+                          "required": [
+                            "requested",
+                            "generated",
+                            "accepted",
+                            "rejected_duplicate",
+                            "activated",
+                            "priority_flagged"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "cached": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "generation_batch_id",
+                        "variants",
+                        "rejected",
+                        "coverage",
+                        "summary",
+                        "cached"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "scoring_version": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "computed_at": {
+                          "type": "string",
+                          "format": "date-time",
+                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                        }
+                      },
+                      "required": [
+                        "request_id",
+                        "scoring_version",
+                        "computed_at"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "batch_size": {
+                    "default": 1,
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4
+                  },
+                  "topic_hint": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "brand_context": {
+                    "type": "object",
+                    "properties": {
+                      "brand_name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "brand_aliases": {
+                        "maxItems": 50,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        }
+                      },
+                      "root_domain": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 253
+                      },
+                      "category_slug": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 100
+                      },
+                      "verticals": {
+                        "maxItems": 20,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 100
+                        }
+                      },
+                      "competitors": {
+                        "maxItems": 200,
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "name": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "aliases": {
+                              "maxItems": 50,
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              }
+                            }
+                          },
+                          "required": [
+                            "name"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "personas": {
+                        "maxItems": 20,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 100
+                        }
+                      },
+                      "size_bands": {
+                        "maxItems": 20,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 100
+                        }
+                      },
+                      "integrations": {
+                        "maxItems": 50,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 100
+                        }
+                      },
+                      "compliance_terms": {
+                        "maxItems": 50,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 100
+                        }
+                      },
+                      "capabilities": {
+                        "maxItems": 50,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 100
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "archetype_plan": {
+                    "type": "object",
+                    "properties": {
+                      "mode": {
+                        "default": "full_coverage",
+                        "type": "string",
+                        "enum": [
+                          "full_coverage"
+                        ]
+                      },
+                      "include": {
+                        "minItems": 1,
+                        "maxItems": 15,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "recommendation",
+                            "head_to_head",
+                            "alternatives",
+                            "use_case_fit",
+                            "pricing_value",
+                            "integration_capability",
+                            "objection_risk",
+                            "migration_switching",
+                            "compliance_security",
+                            "scale_fit",
+                            "vertical_fit",
+                            "feature_specific",
+                            "implementation_effort",
+                            "support_quality",
+                            "buyer_shortlist"
+                          ]
+                        }
+                      },
+                      "exclude": {
+                        "maxItems": 15,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "recommendation",
+                            "head_to_head",
+                            "alternatives",
+                            "use_case_fit",
+                            "pricing_value",
+                            "integration_capability",
+                            "objection_risk",
+                            "migration_switching",
+                            "compliance_security",
+                            "scale_fit",
+                            "vertical_fit",
+                            "feature_specific",
+                            "implementation_effort",
+                            "support_quality",
+                            "buyer_shortlist"
+                          ]
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "generation": {
+                    "type": "object",
+                    "properties": {
+                      "strategy": {
+                        "default": "template_first",
+                        "type": "string",
+                        "enum": [
+                          "template_first",
+                          "template_only",
+                          "model_first"
+                        ]
+                      },
+                      "naturalizer_enabled": {
+                        "default": true,
+                        "type": "boolean"
+                      },
+                      "temperature": {
+                        "default": 0.35,
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2
+                      },
+                      "single_batched_call": {
+                        "default": true,
+                        "type": "boolean"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "dedupe": {
+                    "type": "object",
+                    "properties": {
+                      "method": {
+                        "default": "pgvector_cosine",
+                        "type": "string",
+                        "enum": [
+                          "pgvector_cosine"
+                        ]
+                      },
+                      "similarity_threshold": {
+                        "default": 0.92,
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "maximum": 1
+                      },
+                      "scope": {
+                        "default": "project",
+                        "type": "string",
+                        "enum": [
+                          "project"
+                        ]
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "options": {
+                    "type": "object",
+                    "properties": {
+                      "auto_activate": {
+                        "default": false,
+                        "type": "boolean"
+                      },
+                      "priority_subset_size": {
+                        "default": 6,
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 15
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/workspaces": {
       "post": {
         "operationId": "createWorkspace",
