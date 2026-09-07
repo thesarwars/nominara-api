@@ -3,3 +3,4 @@ export * from "./create-project-response.schema.js";
 export * from "./discovery-response.schema.js";
 export * from "./confirm-discovery-request.schema.js";
 export * from "./domain-verification.schema.js";
+export * from "./project-list-response.schema.js";

@@ -1,7 +1,8 @@
-import { Body, Controller, Get, HttpCode, Param, Post, Req } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Post, Query, Req } from "@nestjs/common";
 import {
   confirmDiscoveryRequestSchema,
   createProjectRequestSchema,
+  projectListResponseSchema,
   startVerificationRequestSchema,
   verificationStateSchema,
   verificationStatusResponseSchema,
@@ -10,12 +11,15 @@ import {
   type CreateProjectRequest,
   type ConfirmDiscoveryRequest,
   type CreateProjectResponse,
+  type ProjectListItem,
   type DiscoveryResponse,
   type StartVerificationRequest,
   type VerificationState,
   type VerificationStatusResponse,
 } from "../../../contracts/projects/index.js";
 import { DomainVerificationService } from "./domain-verification.service.js";
+import { paginationRequestSchema, type PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequireEntitlement } from "../../api/decorators/require-entitlement.decorator.js";
@@ -130,5 +134,21 @@ export class ProjectsController {
   @ApiContract({ operationId: "getDomainVerification", responseSchema: verificationStatusResponseSchema })
   verificationStatus(@Param("id") id: string): Promise<VerificationStatusResponse> {
     return this.verification.status(id);
+  }
+
+  // §3: `GET /projects` — "workspace matrix". `project:read`, not
+  // `project:create`: a viewer must be able to see the list.
+  @Get()
+  @RequirePermission("project:read")
+  @ApiContract({
+    operationId: "listProjects",
+    querySchema: paginationRequestSchema,
+    responseSchema: projectListResponseSchema,
+    listOf: true,
+  })
+  list(
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<ProjectListItem>> {
+    return this.service.list(pagination);
   }
 }
