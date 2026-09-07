@@ -11,6 +11,19 @@ import { promptTextHash } from "./text-hash.js";
 
 const BATCH = "01a06ccd-0000-7000-8000-0000000000ff";
 
+/** The L5 port over a Map, so a test can look at what was stored. */
+function memoryCache() {
+  const store = new Map<string, readonly string[]>();
+  return {
+    store,
+    get: (key: string) => Promise.resolve(store.get(key)),
+    set: (key: string, lines: readonly string[]) => {
+      store.set(key, lines);
+      return Promise.resolve();
+    },
+  };
+}
+
 const FULL_CONTEXT = {
   brandName: "HubSpot CRM",
   categorySlug: "crm",
@@ -173,7 +186,7 @@ describe("STORY-045 · generatePass — the naturaliser and the L5 cache", () =>
 
   it("scenario 9 — a cached naturalised array costs no model call", async () => {
     const naturaliser = { naturalise: vi.fn(async (r: { lines: readonly string[] }) => r.lines.map((l) => `rewritten: ${l}`)) };
-    const cache = new Map<string, readonly string[]>();
+    const cache = memoryCache();
 
     const first = await generatePass(input({ naturaliser, cache }));
     expect(first.cached).toBe(false);
@@ -189,21 +202,21 @@ describe("STORY-045 · generatePass — the naturaliser and the L5 cache", () =>
     // Caching the template text under the naturalised key would make a
     // transient model outage look like the permanent answer for thirty days.
     const naturaliser = { naturalise: vi.fn(async () => Promise.reject(new Error("503"))) };
-    const cache = new Map<string, readonly string[]>();
+    const cache = memoryCache();
 
     await generatePass(input({ naturaliser, cache }));
-    expect(cache.size).toBe(0);
+    expect(cache.store.size).toBe(0);
   });
 
   it("keys the cache on the normalised topic, so two phrasings share one entry", async () => {
     const naturaliser = { naturalise: vi.fn(async (r: { lines: readonly string[] }) => [...r.lines]) };
-    const cache = new Map<string, readonly string[]>();
+    const cache = memoryCache();
 
     await generatePass(input({ naturaliser, cache, topicHint: "Lead Management Platforms!" }));
     await generatePass(input({ naturaliser, cache, topicHint: "lead management platform" }));
 
     expect(naturaliser.naturalise).toHaveBeenCalledTimes(1);
-    expect(cache.size).toBe(1);
+    expect(cache.store.size).toBe(1);
   });
 });
 

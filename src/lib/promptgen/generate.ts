@@ -20,8 +20,8 @@ import { promptTextHash } from "./text-hash.js";
 //   5. DEDUPE     6. CLASSIFY       7. PRIORITISE     8. PERSIST
 //
 // PURE APART FROM THE INJECTED PORTS. `existingHashes` arrives as a value
-// rather than being queried for here, and the L5 cache is a plain Map
-// interface. So the whole pipeline — including the backfill loop, which is
+// rather than being queried for here, and the L5 cache is a two-method port.
+// So the whole pipeline — including the backfill loop, which is
 // the part most likely to spin or to drop a variant — is exercised without a
 // database, and the service above stays a thin wrapper over one query, one
 // call and one transaction.
@@ -61,14 +61,23 @@ export interface GeneratePassInput {
   readonly includeArchetypes?: readonly GeneratableArchetype[];
   readonly excludeArchetypes?: readonly GeneratableArchetype[];
   /**
-   * §8's L5 template cache, keyed by the caller.
+   * §8's L5 template cache.
    *
-   * A Map rather than a Valkey client so the pipeline stays pure; the service
-   * passes an adapter over `l5TemplateCacheKey`. Absent means "do not cache",
-   * which is what a `template_only` pass wants — there is nothing to cache
-   * when no model ran.
+   * A narrow two-method port, not the `Cache` interface itself: this file
+   * takes no view on Valkey, namespacing or TTL. The service's adapter
+   * applies `l5TemplateCacheKey`'s tenant scoping and §8's thirty days, so
+   * the SUFFIX built here stays the one logical key and there is no second
+   * key format to keep in step.
+   *
+   * Absent means "do not cache", which is what a `template_only` pass wants —
+   * there is nothing worth caching when no model ran.
    */
-  readonly cache?: Map<string, readonly string[]>;
+  readonly cache?: TemplateCache;
+}
+
+export interface TemplateCache {
+  get(key: string): Promise<readonly string[] | undefined>;
+  set(key: string, lines: readonly string[]): Promise<void>;
 }
 
 export interface GeneratePass {
@@ -209,7 +218,7 @@ export async function generatePass(input: GeneratePassInput): Promise<GeneratePa
   // topic, so "Lead Management Platforms!" and "lead management platform"
   // share one entry — which is the whole point of step 1 feeding this.
   const cacheKey = `${topicNorm}|${input.locale ?? ""}|${GRAMMAR_VERSION}|${String(input.batchSize)}`;
-  const cachedLines = input.cache?.get(cacheKey);
+  const cachedLines = await input.cache?.get(cacheKey);
 
   let naturalised: readonly Candidate[];
   let cached = false;
@@ -224,7 +233,7 @@ export async function generatePass(input: GeneratePassInput): Promise<GeneratePa
     // this key would make a transient model outage the permanent answer for
     // the cache's thirty days.
     if (result.naturalized && input.cache !== undefined) {
-      input.cache.set(cacheKey, result.candidates.map((candidate) => candidate.text));
+      await input.cache.set(cacheKey, result.candidates.map((candidate) => candidate.text));
     }
   }
 
