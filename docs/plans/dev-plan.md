@@ -88,7 +88,7 @@ There is no `INSERT INTO engines` anywhere in `src/`. `engines.cadence_by_plan` 
 
 ### G3 · Nothing computes an embedding
 
-`prompt_embedding` and the `vector` columns exist and are indexed. L2 semantic suppression reads them, L3 reads them, `embed_tokens` is a metered metric. **No embedding provider client exists** — no HTTP call to any embedding API anywhere in `src/`. Until one does, L2 suppression can never fire, topic clustering ([STORY-047](./stories/projects/STORY-047-topic-clustering.md)) cannot run, and every [EPIC-08](./epics/EPIC-08-displacement-and-geo-insights.md) centroid is unreachable. See §12, `NEW-B`.
+`prompt_embedding` and the `vector` columns exist and are indexed. L2 semantic suppression reads them, L3 reads them, `embed_tokens` is a metered metric. **No embedding provider client exists** — no HTTP call to any embedding API anywhere in `src/`. Until one does, L2 suppression can never fire, topic clustering ([STORY-047](./stories/projects/STORY-047-topic-clustering.md)) cannot run, and every [EPIC-08](./epics/EPIC-08-displacement-and-geo-insights.md) centroid is unreachable. **`embed.batch` and `topic.cluster` are declared in the live topology with no handler registered for either, and `worker-embed` is deployed with nothing to run.** See §12, `NEW-B` — **drafted as [STORY-133](./stories/capture/STORY-133-embedding-client.md)**.
 
 ### G4 · There is no CI in either repository
 
@@ -252,7 +252,7 @@ Wire onboarding's project step ([STORY-088](./stories/frontend/STORY-088-onboard
 
 | Story | What | Est. |
 |---|---|---|
-| `NEW-B` | Embedding client (§12) | 1.0d |
+| [STORY-133](./stories/capture/STORY-133-embedding-client.md) | **Embedding client (G3)** — `NEW-B`, drafted; **four decisions need sign-off**, one of them a dependency choice | 1.0d |
 | [STORY-045](./stories/projects/STORY-045-prompt-generation-engine.md) | Prompt generation — archetype grammar, naturaliser, dedupe | 2.5d |
 | [STORY-046](./stories/projects/STORY-046-prompt-lifecycle-and-activation.md) | Prompt lifecycle and activation against caps | 1.5d |
 | [STORY-047](./stories/projects/STORY-047-topic-clustering.md) | Topic clustering with editable labels | 1.5d |
@@ -505,7 +505,7 @@ The twelve items in [`development-workflow.md` §8](./references/development-wor
 ## 11. Decisions that need you
 
 1. **The engine catalog seed.** Drafted as [STORY-130](./stories/capture/STORY-130-seed-the-engine-catalog.md); **six decisions in it need you** before a migration is written. Most of the catalog transcribed cleanly from the references — `tracking-engine.md` §3's closing line resolves the "ten engines" question (four are seeded `status='disabled'`), and it also settles mode, volatility and TTL for all six active engines. What did not transcribe: §11 states the business and enterprise cadences in prose ("daily on the priority subset", "hourly priority") and `cadence_by_plan` needs integers, and **`schemas/captures-and-facts.md`:31's worked example says `priority: 26` where daily over a 30-day cycle is 30**. That number is unexplained anywhere and I will not seed a figure I cannot derive. **Blocks Slice 3, not Slice 1** — discovery does not capture.
-2. **The embedding provider (`NEW-B`).** Adding one is adding a dependency, and [`development-workflow.md`](./references/development-workflow.md) §6 puts that outside what an agent may decide. Which provider, which model, and does it need its own credential in the same conversation as [STORY-001](./stories/preflight/STORY-001-vendor-accounts-and-engine-smoke.md)?
+2. **The embedding provider (`NEW-B`).** Drafted as [STORY-133](./stories/capture/STORY-133-embedding-client.md); **four decisions in it need you.** Adding a provider is adding a dependency, and [`development-workflow.md`](./references/development-workflow.md) §6 puts that outside what an agent may decide: which provider, which model, and does it need its own credential in the same conversation as [STORY-001](./stories/preflight/STORY-001-vendor-accounts-and-engine-smoke.md)? **The schema has already narrowed it** — `1536` is hard-coded in six vector columns and two HNSW index definitions, so a 1536-dimension model is a config change and anything else is an expand/contract migration plus a reindex. The story also surfaces a genuine specification defect: `EC-23` says `embedding_model` is stored on **every** vector row, and three of the six tables — including `tracked_prompts`, the one carrying all three similarity thresholds — do not have the column. **Blocks Slice 2.**
 3. **[STORY-001](./stories/preflight/STORY-001-vendor-accounts-and-engine-smoke.md) itself.** Seven stories sit behind it (§4) and the wait is external, not engineering. Every week it is not started is a week added to the end.
 4. **`share_tokens.max_active` is a spec defect.** §9 of [`plans-and-entitlements.md`](./references/plans-and-entitlements.md) names it a structural limit; §2's matrix — which the seed reads — has only `share_links.enabled` with `"10_active"`/`"50_active"` strings. [EPIC-09](./epics/EPIC-09-action-plan-growth-map-alerts.md) must either add the key to §2 or rule that those strings are the cap.
 5. **The realtime socket cannot authenticate.** `nominara-app` connects its socket directly to the API host, and the `__Host-`-prefixed session cookie does not travel there — recorded as an unresolved finding in the app's README and never escalated. Slice 3 is the first screen that genuinely needs it, and every realtime surface after it. It is a cross-repo design question (CORS and cookie scope, or a token handshake), not a bug either repo can fix alone, and it should be settled **before** [STORY-091](./stories/frontend/STORY-091-prompts-matrix-and-answer-drawer.md) wires live run progress.
@@ -515,12 +515,12 @@ The twelve items in [`development-workflow.md` §8](./references/development-wor
 
 ## 12. Stories this plan requires that do not exist yet
 
-Both need drafting into `stories/` and signing off before implementation. Neither is scope creep — both are gaps that existing `Done` stories depend on.
+Both are now drafted into `stories/` and need signing off before implementation. Neither is scope creep — both are gaps that existing `Done` stories depend on.
 
 **`NEW-A` — Seed the engine catalog** · ~0.5d · [EPIC-04](./epics/EPIC-04-capture-and-tracking-engine.md) · closes **G2** — **drafted as [STORY-130](./stories/capture/STORY-130-seed-the-engine-catalog.md)**
 Ten rows: six active with the cadence from [`plans-and-entitlements.md`](./references/plans-and-entitlements.md) §11, four (`grok`, `copilot`, `meta_ai`, `deepseek`) seeded `status='disabled'` per [`tracking-engine.md`](./references/tracking-engine.md) §3. Acceptance as drafted, plus two the first draft of this plan missed: **a disabled engine is never scheduled even when a project enables it**, and `min_plan_key` is enforced independently of the cadence map. Six decisions in the story need sign-off — see §11.1.
 
-**`NEW-B` — Embedding client** · ~1.0d · [EPIC-04](./epics/EPIC-04-capture-and-tracking-engine.md) or [EPIC-06](./epics/EPIC-06-projects-prompts-onboarding.md) · closes **G3**
+**`NEW-B` — Embedding client** · ~1.0d · [EPIC-04](./epics/EPIC-04-capture-and-tracking-engine.md) · closes **G3** — **drafted as [STORY-133](./stories/capture/STORY-133-embedding-client.md)**
 One provider client behind a port, called only from a queue handler — never from a request path (`NFR-ARCH-01`). Acceptance: `prompt_embedding` is populated on prompt activation; L2 semantic suppression fires against a real embedding in an integration test; `embed_tokens` metering records actual spend through the internal-cost path, which must never gate a customer request.
 
 ---
