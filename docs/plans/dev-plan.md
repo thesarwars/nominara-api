@@ -250,12 +250,12 @@ Wire onboarding's project step ([STORY-088](./stories/frontend/STORY-088-onboard
 
 **Backend first**
 
-| Story | What | Est. |
-|---|---|---|
-| [STORY-133](./stories/capture/STORY-133-embedding-client.md) | **Embedding client (G3)** — `NEW-B`, drafted; **four decisions need sign-off**, one of them a dependency choice | 1.0d |
-| [STORY-045](./stories/projects/STORY-045-prompt-generation-engine.md) | Prompt generation — archetype grammar, naturaliser, dedupe | 2.5d |
-| [STORY-046](./stories/projects/STORY-046-prompt-lifecycle-and-activation.md) | Prompt lifecycle and activation against caps | 1.5d |
-| [STORY-047](./stories/projects/STORY-047-topic-clustering.md) | Topic clustering with editable labels | 1.5d |
+| Story | What | Est. | Status |
+|---|---|---|---|
+| [STORY-133](./stories/capture/STORY-133-embedding-client.md) | **Embedding client (G3)** — `NEW-B`, drafted; **four decisions need sign-off**, one of them a dependency choice | 1.0d | blocked on you |
+| [STORY-045](./stories/projects/STORY-045-prompt-generation-engine.md) | Prompt generation — archetype grammar, naturaliser, dedupe | 2.5d | **done** — nine of twelve ACs met, endpoint live, six gates green. Naturaliser model, vector dedupe and site-mined slots blocked on their own dependencies; six derivations need sign-off. Found and fixed STORY-043's supplied-prompt insert, a live 500. |
+| [STORY-046](./stories/projects/STORY-046-prompt-lifecycle-and-activation.md) | Prompt lifecycle and activation against caps | 1.5d | next — the keystone |
+| [STORY-047](./stories/projects/STORY-047-topic-clustering.md) | Topic clustering with editable labels | 1.5d | hard-blocked on STORY-133 |
 
 [STORY-046](./stories/projects/STORY-046-prompt-lifecycle-and-activation.md) is the keystone of the whole plan, not just this slice: [STORY-032](./stories/capture/STORY-032-run-planning-and-cache-suppression.md) names it upstream — *"planning has nothing to plan without activated prompts"* — so until it lands, the shipped run planner has an empty input for every project that exists.
 
