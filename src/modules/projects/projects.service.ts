@@ -17,6 +17,7 @@ import { UrlGuard } from "../../lib/net/url-guard.service.js";
 import { UnparsableHostError } from "../../lib/net/registrable-domain.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import { insertPromptStatement, manualPromptRow } from "../../lib/promptgen/persist.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -442,12 +443,39 @@ export class ProjectsService {
         [uuidV7(), workspaceId, projectId, competitor.name, competitor.root_domain ?? null, competitor.aliases ?? []],
       );
     }
+    // *** THIS LOOP COULD NOT RUN BEFORE STORY-045. ***
+    //
+    // The statement here supplied `text`, `generation_source` and `status`
+    // and nothing else, while `tracked_prompts` has three more NOT NULL
+    // columns with no default — `text_hash`, `intent_archetype`,
+    // `funnel_stage`. So `POST /v1/projects` with any `prompts` in the body
+    // answered 500 on `null value in column "text_hash" violates not-null
+    // constraint`, from the day it shipped, reachable from onboarding's
+    // project step.
+    //
+    // Two suites covered it and neither could catch it: this file's own unit
+    // test asserts the SQL STRING contains `'manual'` against a stubbed
+    // client, and the integration test writes its own correct insert rather
+    // than calling this method. A statement that can never execute satisfies
+    // both. `test/integration/promptgen-persist.spec.ts` now EXECUTES it.
+    //
+    // The row is built by src/lib/promptgen/persist.ts, which is the single
+    // place that knows the column set — so the generation path and this one
+    // cannot drift, and neither can omit a column again.
+    //
+    // DEDUPED BY HASH FIRST. `ux_prompts_project_hash` is unique on
+    // (project_id, text_hash), so two supplied prompts differing only in
+    // casing or spacing would collide and fail the whole creation. The
+    // project is brand new here, so there is nothing else to collide with and
+    // an in-memory dedupe is complete — no ON CONFLICT needed.
+    const seen = new Set<string>();
     for (const prompt of input.prompts ?? []) {
-      await client.query(
-        `INSERT INTO tracked_prompts (id, workspace_id, project_id, text, generation_source, status)
-         VALUES ($1,$2,$3,$4,'manual','active')`,
-        [uuidV7(), workspaceId, projectId, prompt.text],
-      );
+      const row = manualPromptRow({ workspaceId, projectId, text: prompt.text });
+      const key = row.textHash.toString("hex");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const { sql, params } = insertPromptStatement(row);
+      await client.query(sql, [...params]);
     }
   }
 }
