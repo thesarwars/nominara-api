@@ -2,6 +2,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import type {
   ConfirmDiscoveryRequest,
   ConfirmableField,
+  ProjectListItem,
   CreateProjectRequest,
   CreateProjectResponse,
   DiscoveredField,
@@ -17,6 +18,9 @@ import { UnparsableHostError } from "../../lib/net/registrable-domain.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { Page, pageFrom } from "../../api/pagination/page.js";
+import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
 import { handlerFor } from "../../lib/queue/handlers.js";
@@ -174,6 +178,55 @@ export class ProjectsService {
       fields_supplied: fieldsSupplied,
       poll: { discovery: `/v1/projects/${projectId}/discovery`, expected_ms: DISCOVERY_EXPECTED_MS },
     };
+  }
+
+  /**
+   * `GET /v1/projects` — the workspace matrix. STORY-132.
+   *
+   * TWO THINGS DO THE SCOPING, AND ONLY ONE OF THEM IS RLS.
+   *
+   * The tenant boundary is RLS's: `ws_isolation_projects` filters by
+   * `app.current_workspace()`, which is why there is no `workspace_id`
+   * predicate below (NFR-SEC-01 — a filter in application SQL implies the
+   * boundary lives there).
+   *
+   * The PROJECT scope is not. For `nominara_app` the only policy on this
+   * table is that workspace one; `portal_scope_projects` binds
+   * `nominara_portal` alone. So an analyst restricted to two of five projects
+   * is NOT restricted by RLS here, and the query has to do it. STORY-089 is
+   * explicit that this is a tenancy assertion rather than a filter: counts
+   * that include out-of-scope projects leak the existence of work the caller
+   * may not know about, often a competitor managed by the same agency.
+   *
+   * `app.current_scope_projects()` is read in SQL rather than threaded from
+   * the request, because it is the same source the portal policy reads and a
+   * second copy of the tenant's scope can disagree with the first. An empty
+   * array means UNSCOPED, which is safe because tenant-context.ts sets the
+   * GUC only when the member's scope is non-empty — a scoped member always
+   * has one. Worth saying out loud: the expression reads fail-open at a
+   * glance and is not.
+   */
+  async list(pagination: PaginationRequest): Promise<Page<ProjectListItem>> {
+    const client = currentTenantStore()!.client;
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
+
+    const result = await client.query<ProjectRow>(
+      `SELECT id, name, slug::text AS slug, root_domain, kind, status, discovery_status,
+              prompts_active, prompts_cap, open_task_count,
+              domain_verified_at, created_at,
+              visibility_blended, visibility_delta_30d, aux_score_current, sparkline_30d,
+              created_at::text AS created_at_key
+         FROM projects
+        WHERE deleted_at IS NULL
+          AND (cardinality(app.current_scope_projects()) = 0
+               OR id = ANY(app.current_scope_projects()))
+          AND ($1::timestamptz IS NULL OR (created_at, id) > ($1::timestamptz, $2::uuid))
+        ORDER BY created_at ASC, id ASC
+        LIMIT $3`,
+      [after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
+    );
+
+    return pageFrom(result.rows, pagination.limit, toProjectListItem, (row) => [row.created_at_key, row.id]);
   }
 
   /**
@@ -397,6 +450,60 @@ export class ProjectsService {
       );
     }
   }
+}
+
+interface ProjectRow {
+  id: string;
+  name: string;
+  slug: string;
+  root_domain: string;
+  kind: string;
+  status: string;
+  discovery_status: string;
+  prompts_active: number;
+  prompts_cap: number;
+  open_task_count: number;
+  domain_verified_at: Date | null;
+  created_at: Date;
+  visibility_blended: string | null;
+  visibility_delta_30d: string | null;
+  aux_score_current: string | null;
+  sparkline_30d: unknown;
+  created_at_key: string;
+}
+
+/**
+ * `numeric` arrives from pg as a STRING, not a number — the driver refuses to
+ * narrow it because a numeric can exceed what a double represents exactly.
+ * Parsing here rather than letting it reach the wire as `"88.200"`, which the
+ * response schema would reject and a client would render verbatim.
+ *
+ * Null stays null. A project with no rollup has no score, which is not a score
+ * of zero.
+ */
+function numericOrNull(value: string | null): number | null {
+  return value === null ? null : Number(value);
+}
+
+function toProjectListItem(row: ProjectRow): ProjectListItem {
+  return {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    root_domain: row.root_domain,
+    kind: row.kind as ProjectListItem["kind"],
+    status: row.status,
+    discovery_status: row.discovery_status as ProjectListItem["discovery_status"],
+    prompts_active: row.prompts_active,
+    prompts_cap: row.prompts_cap,
+    open_task_count: row.open_task_count,
+    domain_verified_at: row.domain_verified_at?.toISOString() ?? null,
+    created_at: row.created_at.toISOString(),
+    visibility_blended: numericOrNull(row.visibility_blended),
+    visibility_delta_30d: numericOrNull(row.visibility_delta_30d),
+    aux_score_current: numericOrNull(row.aux_score_current),
+    sparkline_30d: row.sparkline_30d ?? null,
+  };
 }
 
 /** The honest empty payload for a project whose discovery has written nothing yet. */

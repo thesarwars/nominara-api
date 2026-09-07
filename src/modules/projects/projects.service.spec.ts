@@ -666,3 +666,131 @@ describe("STORY-044 · ProjectsService.confirmDiscovery", () => {
     expect(queues.enqueueTenantJob).not.toHaveBeenCalled();
   });
 });
+
+// STORY-132 — the workspace matrix read. Specified in api-specification.md §3,
+// referenced by STORY-089's central AC, and owned by no story until this one.
+describe("STORY-132 · ProjectsService.list", () => {
+  let calls: Recorded[];
+
+  function serviceReading(rows: unknown[]) {
+    calls = [];
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          return { rows };
+        }),
+      },
+    } as never);
+    return new ProjectsService(
+      { enqueueTenantJob: vi.fn() } as unknown as QueueProducer,
+      resolverReturning(GENEROUS),
+      urlGuard,
+    );
+  }
+
+  function row(over: Record<string, unknown> = {}) {
+    return {
+      id: "0195e5b7-0000-7000-8000-000000000001",
+      name: "HubSpot",
+      slug: "hubspot.com",
+      root_domain: "hubspot.com",
+      kind: "brand",
+      status: "active",
+      discovery_status: "completed",
+      prompts_active: 0,
+      prompts_cap: 40,
+      open_task_count: 0,
+      domain_verified_at: null,
+      created_at: new Date("2026-09-01T00:00:00Z"),
+      visibility_blended: null,
+      visibility_delta_30d: null,
+      aux_score_current: null,
+      sparkline_30d: null,
+      created_at_key: "2026-09-01 00:00:00+00",
+      ...over,
+    };
+  }
+
+  it("scenario 1 — returns the workspace's projects", async () => {
+    const page = await serviceReading([row(), row({ id: "0195e5b7-0000-7000-8000-000000000002", name: "Stripe" })]).list({
+      limit: 50,
+    } as never);
+
+    expect(page.items).toHaveLength(2);
+    expect(page.items[0]!.name).toBe("HubSpot");
+  });
+
+  it("scenario 2 — an empty workspace is an empty array, not an error", async () => {
+    await expect(serviceReading([]).list({ limit: 50 } as never)).resolves.toMatchObject({ items: [] });
+  });
+
+  it("scenario 3 — excludes soft-deleted projects", async () => {
+    await serviceReading([]).list({ limit: 50 } as never);
+    expect(calls[0]!.sql).toContain("deleted_at IS NULL");
+  });
+
+  // NFR-SEC-01 — the tenant boundary lives in the policy, not in this SQL.
+  it("scenario 4 — takes no workspace_id predicate; RLS scopes the tenant", async () => {
+    await serviceReading([]).list({ limit: 50 } as never);
+    expect(calls[0]!.sql).not.toContain("workspace_id");
+  });
+
+  // THE SECURITY-RELEVANT ONE. For nominara_app the only policy on `projects`
+  // is the workspace one — portal_scope_projects binds nominara_portal alone —
+  // so an analyst restricted to two of five projects is NOT restricted by RLS
+  // here. A client-side filter over a wider payload would leak the existence
+  // of projects the caller may not know about.
+  it("scenario 5 — the QUERY applies the project scope, not the caller", async () => {
+    await serviceReading([]).list({ limit: 50 } as never);
+    expect(calls[0]!.sql).toContain("app.current_scope_projects()");
+    expect(calls[0]!.sql).toContain("id = ANY(app.current_scope_projects())");
+  });
+
+  it("scenario 6 — an empty scope array means unscoped, not nothing", async () => {
+    await serviceReading([]).list({ limit: 50 } as never);
+    // Safe only because tenant-context sets the GUC exclusively for a member
+    // whose scope is non-empty; the expression reads fail-open at a glance.
+    expect(calls[0]!.sql).toContain("cardinality(app.current_scope_projects()) = 0");
+  });
+
+  // Absence is not zero. A project with no rollup has NO score.
+  it("scenario 7 — score fields are null before any rollup, never 0", async () => {
+    const page = await serviceReading([row()]).list({ limit: 50 } as never);
+
+    expect(page.items[0]!.visibility_blended).toBeNull();
+    expect(page.items[0]!.visibility_delta_30d).toBeNull();
+    expect(page.items[0]!.aux_score_current).toBeNull();
+    expect(page.items[0]!.sparkline_30d).toBeNull();
+  });
+
+  // pg returns `numeric` as a STRING — it refuses to narrow, because a numeric
+  // can exceed what a double represents exactly. Unparsed it reaches the wire
+  // as "88.200" and the response schema rejects it.
+  it("parses a numeric score from pg's string form", async () => {
+    const page = await serviceReading([row({ visibility_blended: "88.200", aux_score_current: "74.500" })]).list({
+      limit: 50,
+    } as never);
+
+    expect(page.items[0]!.visibility_blended).toBe(88.2);
+    expect(page.items[0]!.aux_score_current).toBe(74.5);
+  });
+
+  it("scenario 8 — orders stably and asks for one more than the limit, so has_more is knowable", async () => {
+    await serviceReading([]).list({ limit: 2 } as never);
+
+    expect(calls[0]!.sql).toContain("ORDER BY created_at ASC, id ASC");
+    // limit + 1: the extra row is how a cursor page knows there is a next one
+    // without a second count query.
+    expect(calls[0]!.params).toContain(3);
+  });
+
+  it("serialises timestamps as ISO strings, and a null verification stays null", async () => {
+    const page = await serviceReading([row({ domain_verified_at: new Date("2026-09-02T10:00:00Z") })]).list({
+      limit: 50,
+    } as never);
+
+    expect(page.items[0]!.domain_verified_at).toBe("2026-09-02T10:00:00.000Z");
+    expect(page.items[0]!.created_at).toBe("2026-09-01T00:00:00.000Z");
+  });
+});
