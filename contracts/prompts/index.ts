@@ -4,3 +4,5 @@ export * from "./generate-prompts-response.schema.js";
 export * from "./activate-prompts-request.schema.js";
 export * from "./activate-prompts-response.schema.js";
 export * from "./update-prompt-request.schema.js";
+export * from "./prompt-list-response.schema.js";
+export * from "./create-prompt-request.schema.js";

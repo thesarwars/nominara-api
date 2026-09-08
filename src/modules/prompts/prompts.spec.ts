@@ -5,6 +5,7 @@ import { PROMPT_NATURALISER } from "./ports/naturaliser.js";
 import { PromptActivationService } from "./activation.service.js";
 import { PromptLifecycleController } from "./lifecycle.controller.js";
 import { PromptLifecycleService } from "./lifecycle.service.js";
+import { PromptListService } from "./prompt-list.service.js";
 import { PromptsController } from "./prompts.controller.js";
 import { PromptsModule } from "./prompts.module.js";
 import { PromptsService } from "./prompts.service.js";
@@ -43,7 +44,7 @@ describe("STORY-022 · PromptsModule compiles", () => {
     await moduleRef.close();
   });
 
-  it("resolves both controllers and all three services", async () => {
+  it("resolves both controllers and every service", async () => {
     // STORY-046 added the activation and lifecycle halves. Asserted here
     // because a service that compiles but is not PROVIDED fails only at the
     // first request, and this module's spec is the cheapest place to find it.
@@ -52,6 +53,9 @@ describe("STORY-022 · PromptsModule compiles", () => {
     expect(moduleRef.get(PromptLifecycleController)).toBeInstanceOf(PromptLifecycleController);
     expect(moduleRef.get(PromptActivationService)).toBeInstanceOf(PromptActivationService);
     expect(moduleRef.get(PromptLifecycleService)).toBeInstanceOf(PromptLifecycleService);
+    // STORY-134's list/create half. A service that compiles but is not
+    // PROVIDED fails only at the first request.
+    expect(moduleRef.get(PromptListService)).toBeInstanceOf(PromptListService);
     await moduleRef.close();
   });
 });
