@@ -425,10 +425,33 @@ export class ProjectsService {
   }
 
   /**
-   * AC5 — supplied competitors are `user_authored`, supplied prompts `manual`,
+   * AC5 — supplied competitors are user-authored, supplied prompts `manual`,
    * and neither charges anything. There is no wallet call anywhere in this
    * method, which is what makes scenario 15's "wallet unchanged" true by
    * construction rather than by a test that happens to pass.
+   *
+   * *** BOTH INSERTS HERE HAVE NOW SHIPPED BROKEN, FOR THE SAME REASON. ***
+   *
+   * The prompts one omitted three NOT NULL columns (fixed with STORY-045).
+   * The competitors one named a column that does not exist — `origin`, where
+   * the table has `source` — and a value its CHECK forbids: `'user_authored'`
+   * against `CHECK (source IN ('user','auto_detected'))`. So supplying ANY
+   * competitor at creation answered 500 with `column "origin" of relation
+   * "competitors" does not exist`, from the day it shipped, on the onboarding
+   * step that offers "Up to 10".
+   *
+   * `user_authored` came from AC5's prose. `schemas/projects-and-prompts.md`
+   * is the authority on a table and says `'user'` — a schema beats prose
+   * about a table, and this is what that rule is for.
+   *
+   * WHY NEITHER SUITE CAUGHT EITHER. The unit test asserts
+   * `c.sql.includes("user_authored")` against a STUBBED client: a statement
+   * that can never execute satisfies a substring check perfectly, and the
+   * substring it checked for was itself the bug. The integration test writes
+   * its own correct insert rather than calling this method. Both statements
+   * are now executed against real migrations by
+   * `test/integration/project-seeds.spec.ts`, and the assertions here check
+   * bound PARAMETERS rather than SQL text.
    */
   private async insertSuppliedSeeds(
     client: { query: (sql: string, params: unknown[]) => Promise<unknown> },
@@ -436,11 +459,19 @@ export class ProjectsService {
     projectId: string,
     input: CreateProjectRequest,
   ): Promise<void> {
+    // DEDUPED BY LOWERCASED NAME FIRST, for the reason the prompts loop below
+    // records about hashes: `ux_competitors_project_name` is unique on
+    // `(project_id, lower(name))`, so "Google" and "google" in the same
+    // submission would collide and fail the whole creation.
+    const seenCompetitors = new Set<string>();
     for (const competitor of input.competitors ?? []) {
+      const key = competitor.name.toLowerCase();
+      if (seenCompetitors.has(key)) continue;
+      seenCompetitors.add(key);
       await client.query(
-        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, origin)
-         VALUES ($1,$2,$3,$4,$5,$6,'user_authored')`,
-        [uuidV7(), workspaceId, projectId, competitor.name, competitor.root_domain ?? null, competitor.aliases ?? []],
+        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [uuidV7(), workspaceId, projectId, competitor.name, competitor.root_domain ?? null, competitor.aliases ?? [], "user"],
       );
     }
     // *** THIS LOOP COULD NOT RUN BEFORE STORY-045. ***

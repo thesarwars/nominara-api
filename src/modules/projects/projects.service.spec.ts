@@ -189,7 +189,7 @@ describe("STORY-043 · ProjectsService.create", () => {
 
   // AC5 — "stored as user-authored and manual respectively", and charging
   // nothing. The absence of any wallet call is the assertion that matters.
-  it("scenario 8 — supplied competitors are user_authored and prompts manual", async () => {
+  it("scenario 8 — supplied competitors are user-authored and prompts manual", async () => {
     await service().create(
       WS,
       ACTOR,
@@ -197,7 +197,23 @@ describe("STORY-043 · ProjectsService.create", () => {
       1,
     );
 
-    expect(calls.some((c) => c.sql.includes("INSERT INTO competitors") && c.sql.includes("user_authored"))).toBe(true);
+    // *** THIS ASSERTION USED TO READ `c.sql.includes("user_authored")`, AND
+    //     THE SUBSTRING IT CHECKED FOR WAS ITSELF THE BUG. ***
+    //
+    // The statement named a column that does not exist (`origin`, where the
+    // table has `source`) and a value its CHECK forbids (`'user_authored'`
+    // against `CHECK (source IN ('user','auto_detected'))`) — so supplying
+    // any competitor at creation answered 500 from the day it shipped. A
+    // substring check against a stubbed client passed anyway, and passed
+    // BECAUSE the wrong value was present.
+    //
+    // What is checkable here is the bound PARAMETERS. The executable proof is
+    // in test/integration/project-seeds.spec.ts.
+    const competitorInsert = calls.find((c) => c.sql.includes("INSERT INTO competitors"));
+    expect(competitorInsert).toBeDefined();
+    expect(competitorInsert?.params).toContain("user");
+    expect(competitorInsert?.sql).toContain("source");
+    expect(competitorInsert?.sql).not.toContain("origin");
 
     // *** THIS ASSERTION USED TO READ `c.sql.includes("'manual'")`, AND THAT
     //     IS WHY A BROKEN INSERT SHIPPED. ***
