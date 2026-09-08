@@ -4,6 +4,7 @@ import { EntitlementsModule } from "../entitlements/entitlements.module.js";
 import { PromptActivationService } from "./activation.service.js";
 import { PromptLifecycleController } from "./lifecycle.controller.js";
 import { PromptLifecycleService } from "./lifecycle.service.js";
+import { PromptListService } from "./prompt-list.service.js";
 import { PromptsController } from "./prompts.controller.js";
 import { PromptsService } from "./prompts.service.js";
 
@@ -30,6 +31,6 @@ import { PromptsService } from "./prompts.service.js";
 @Module({
   imports: [CacheModule, EntitlementsModule],
   controllers: [PromptsController, PromptLifecycleController],
-  providers: [PromptsService, PromptActivationService, PromptLifecycleService],
+  providers: [PromptsService, PromptActivationService, PromptLifecycleService, PromptListService],
 })
 export class PromptsModule {}
