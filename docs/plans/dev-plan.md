@@ -90,6 +90,12 @@ There is no `INSERT INTO engines` anywhere in `src/`. `engines.cadence_by_plan` 
 
 `prompt_embedding` and the `vector` columns exist and are indexed. L2 semantic suppression reads them, L3 reads them, `embed_tokens` is a metered metric. **No embedding provider client exists** — no HTTP call to any embedding API anywhere in `src/`. Until one does, L2 suppression can never fire, topic clustering ([STORY-047](./stories/projects/STORY-047-topic-clustering.md)) cannot run, and every [EPIC-08](./epics/EPIC-08-displacement-and-geo-insights.md) centroid is unreachable. **`embed.batch` and `topic.cluster` are declared in the live topology with no handler registered for either, and `worker-embed` is deployed with nothing to run.** See §12, `NEW-B` — **drafted as [STORY-133](./stories/capture/STORY-133-embedding-client.md)**.
 
+### G9 · The prompt list and manual creation are unowned
+
+`api-specification.md` §3 documents five prompt routes. Three shipped with [STORY-045](./stories/projects/STORY-045-prompt-generation-engine.md) and [STORY-046](./stories/projects/STORY-046-prompt-lifecycle-and-activation.md); **`GET /projects/{id}/prompts` and `POST /projects/{id}/prompts` are built by nobody.** So generation writes fifteen rows, activation turns them on, and **there is no way to read them back** — a customer who finishes onboarding has fifteen tracked prompts and no surface that can list one. "Add manually", the only 0-credit way to add a prompt, has no endpoint at all.
+
+The same inversion as `G7` and `G8`, for the third time: [STORY-091](./stories/frontend/STORY-091-prompts-matrix-and-answer-drawer.md) is the consumer and names five upstreams, none of which is the endpoint it reads every row from. **Drafted as [STORY-134](./stories/projects/STORY-134-list-and-create-prompts.md).**
+
 ### G4 · There is no CI in either repository
 
 `api/.github` is absent. `nominara-app` has no workflow either. **Every gate in [`testing-strategy.md`](./references/testing-strategy.md) §10 — including the four that "cannot be talked past" — is run by hand today.** The gates themselves are real and they pass; nothing enforces that they were run. This is [STORY-002](./stories/preflight/STORY-002-repositories-and-shared-ci.md)'s job and [STORY-002](./stories/preflight/STORY-002-repositories-and-shared-ci.md) has not started.
