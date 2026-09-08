@@ -2,6 +2,9 @@ import { Test } from "@nestjs/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
 import { PROMPT_NATURALISER } from "./ports/naturaliser.js";
+import { PromptActivationService } from "./activation.service.js";
+import { PromptLifecycleController } from "./lifecycle.controller.js";
+import { PromptLifecycleService } from "./lifecycle.service.js";
 import { PromptsController } from "./prompts.controller.js";
 import { PromptsModule } from "./prompts.module.js";
 import { PromptsService } from "./prompts.service.js";
@@ -37,6 +40,18 @@ describe("STORY-022 · PromptsModule compiles", () => {
     const moduleRef = await Test.createTestingModule({ imports: [PromptsModule] }).compile();
     expect(moduleRef.get(PromptsService)).toBeInstanceOf(PromptsService);
     expect(() => moduleRef.get(PROMPT_NATURALISER)).toThrow();
+    await moduleRef.close();
+  });
+
+  it("resolves both controllers and all three services", async () => {
+    // STORY-046 added the activation and lifecycle halves. Asserted here
+    // because a service that compiles but is not PROVIDED fails only at the
+    // first request, and this module's spec is the cheapest place to find it.
+    const moduleRef = await Test.createTestingModule({ imports: [PromptsModule] }).compile();
+    expect(moduleRef.get(PromptsController)).toBeInstanceOf(PromptsController);
+    expect(moduleRef.get(PromptLifecycleController)).toBeInstanceOf(PromptLifecycleController);
+    expect(moduleRef.get(PromptActivationService)).toBeInstanceOf(PromptActivationService);
+    expect(moduleRef.get(PromptLifecycleService)).toBeInstanceOf(PromptLifecycleService);
     await moduleRef.close();
   });
 });

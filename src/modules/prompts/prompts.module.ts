@@ -1,5 +1,9 @@
 import { Module } from "@nestjs/common";
 import { CacheModule } from "../../lib/cache/cache.module.js";
+import { EntitlementsModule } from "../entitlements/entitlements.module.js";
+import { PromptActivationService } from "./activation.service.js";
+import { PromptLifecycleController } from "./lifecycle.controller.js";
+import { PromptLifecycleService } from "./lifecycle.service.js";
 import { PromptsController } from "./prompts.controller.js";
 import { PromptsService } from "./prompts.service.js";
 
@@ -19,9 +23,13 @@ import { PromptsService } from "./prompts.service.js";
 // global module is only global once something has loaded it into the graph,
 // so this module compiled on its own — as its own spec does — would have
 // nothing to resolve CACHE from.
+// EntitlementsModule is imported for its EntitlementResolver, which is what
+// binds the prompt cap at activation. STORY-046's whole point is that "caps
+// bind at activation, not at generation", so this module cannot resolve one
+// without it.
 @Module({
-  imports: [CacheModule],
-  controllers: [PromptsController],
-  providers: [PromptsService],
+  imports: [CacheModule, EntitlementsModule],
+  controllers: [PromptsController, PromptLifecycleController],
+  providers: [PromptsService, PromptActivationService, PromptLifecycleService],
 })
 export class PromptsModule {}
