@@ -167,13 +167,13 @@ export async function planManualRun(
   cache: Cache,
   project: ManualRunProject,
   options: { readonly runId: string; readonly triggeredBy: string | null; readonly now: Date },
-): Promise<PlannedRun> {
+): Promise<{ readonly plan: PlannedRun; readonly credits: number }> {
   // Re-resolved INSIDE the caller's transaction. The route priced the run
   // against the header before opening one; a plan changed in between would
   // otherwise be planned at yesterday's price, and this is the read that
   // shares a snapshot with the rows about to be written.
   const resolved = await resolveEntitlements(tx, project.workspaceId);
-  await deepScanPriceOrThrow(tx, resolved.entitlements);
+  const credits = await deepScanPriceOrThrow(tx, resolved.entitlements);
 
   await tx.query(
     `INSERT INTO capture_runs (id, workspace_id, project_id, trigger, triggered_by, engine_keys, prompt_scope, status)
@@ -181,7 +181,7 @@ export async function planManualRun(
     [options.runId, project.workspaceId, project.projectId, options.triggeredBy],
   );
 
-  return planRun(tx, cache, {
+  const plan = await planRun(tx, cache, {
     workspaceId: project.workspaceId,
     projectId: project.projectId,
     runId: options.runId,
@@ -200,4 +200,9 @@ export async function planManualRun(
     sharedCacheEnabled: sharedCacheEnabled(resolved.entitlements),
     nowMs: options.now.getTime(),
   });
+
+  // The price travels back with the plan so the response can state it
+  // WITHOUT a second resolution — the two would then be two readings of a
+  // schedule that a plan change could move between them.
+  return { plan, credits };
 }
