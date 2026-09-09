@@ -9,6 +9,7 @@ import { deepScanPriceOrThrow } from "./deep-scan-price.js";
 import type { ProjectCadence } from "./dispatch-cells.js";
 import { planRun, type PlannedRun } from "./plan-run.js";
 import { probeRunCells } from "./probe-run.js";
+import { NORMALIZER_VERSION } from "../parser/normalize.js";
 
 // STORY-034 — the manual deep scan.
 //
@@ -30,9 +31,6 @@ import { probeRunCells } from "./probe-run.js";
 //   IT IS PRICED. §5's table charges `manual`; every other trigger is inside
 //   the subscription envelope. The charge itself is still `commitDeepScanCharge`,
 //   which records its own inaction until EPIC-10 builds the wallet.
-
-/** `v1` everywhere in this codebase; there is no second normaliser yet. */
-export const NORMALIZER_VERSION = "v1";
 
 /**
  * The mode a manual scan captures in.
