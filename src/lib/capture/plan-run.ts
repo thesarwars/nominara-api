@@ -6,16 +6,10 @@ import { dispatchCaptureCells, type DispatchCell, type DispatchOptions, type Pro
 import { resolveEntitlements } from "../entitlements/resolution.js";
 import { provisionUsageCounters } from "../usage/tier-caps.js";
 import { assertFairUseCapacity, commitDeepScanCharge, type RunTrigger } from "./fair-use.js";
-import { probeExactHash, type L1Hit } from "./l1-exact-hash.js";
-import { cellKey, probeSemanticReuse, type L2Hit } from "./l2-semantic-reuse.js";
-import {
-  fanOutCells,
-  resolveEnabledEngines,
-  selectPrompts,
-  type PlannedCell,
-  type PromptScope,
-  type ResolvedEngine,
-} from "./plan-cells.js";
+import { type L1Hit } from "./l1-exact-hash.js";
+import { cellKey, type L2Hit } from "./l2-semantic-reuse.js";
+import { probeRunCells } from "./probe-run.js";
+import { type PlannedCell, type PromptScope, type ResolvedEngine } from "./plan-cells.js";
 import { recordRunCounts, recordSuppressedCells, type SuppressedCell } from "./record-suppressed.js";
 import { projectAliasFingerprint } from "./l3-short-circuit.js";
 import { cohortsFor, measureCohort, type SuppressionMeasurement } from "./suppression-cohorts.js";
@@ -119,44 +113,10 @@ function cellIdempotencyKey(runId: string, cell: PlannedCell): string {
  * write. It is also the remedy — every write below is undone on the way out.
  */
 export async function planRun(tx: ClientBase, cache: Cache, context: PlanRunContext): Promise<PlannedRun> {
-  const engines = await resolveEnabledEngines(tx, context.projectId, context.engineKeys);
-  const prompts = await selectPrompts(tx, context.projectId, context.scope);
-  const cells = fanOutCells(prompts, engines);
-
-  // L1 FIRST, AND ONLY THEN L2. Not interchangeable:
-  //
-  //   L1 costs one cache round trip for the whole batch; L2 costs a vector
-  //   query against the largest table in the platform. Asking the expensive
-  //   layer about cells the cheap one already answered is pure waste.
-  //
-  //   More importantly, a cell suppressed twice would produce TWO
-  //   answer_captures rows for one cell and count as two skips, inflating
-  //   the suppression rate with duplicates. Passing only the survivors on is
-  //   what makes each cell belong to exactly one layer.
-  const l1Hits = await probeExactHash(
-    cache,
-    {
-      env: context.env,
-      locale: context.locale,
-      personaHint: context.personaHint,
-      nowMs: context.nowMs,
-      sharedCacheEnabled: context.sharedCacheEnabled,
-    },
-    cells,
-  );
-  const afterL1 = cells.filter((cell) => !l1Hits.has(cellKey(cell)));
-
-  const l2Hits = await probeSemanticReuse(
-    tx,
-    { workspaceId: context.workspaceId, projectId: context.projectId },
-    afterL1.map((cell) => ({
-      promptId: cell.promptId,
-      engineKey: cell.engineKey,
-      sampleIndex: cell.sampleIndex,
-      ttlSeconds: cell.ttlSeconds,
-    })),
-  );
-  const liveCells = afterL1.filter((cell) => !l2Hits.has(cellKey(cell)));
+  // The READ leg lives in probe-run.ts, so the free estimate and the run it
+  // estimates ask the cache layers in one order rather than two. Nothing
+  // below this line is reachable without the SAVEPOINT.
+  const { engines, cells, afterL1, liveCells, l1Hits, l2Hits } = await probeRunCells(tx, cache, context);
 
   // THE CEILING IS RESERVED FOR THE LIVE CELLS ONLY, and before anything is
   // written. A cell served from cache makes no vendor call and must not

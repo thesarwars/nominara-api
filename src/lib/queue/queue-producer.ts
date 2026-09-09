@@ -1,6 +1,8 @@
 import { Inject, Injectable, Logger, type OnModuleDestroy } from "@nestjs/common";
 import type { Job, Queue } from "bullmq";
 import type { Redis } from "ioredis";
+import { dispatchCaptureCells } from "../capture/dispatch-cells.js";
+import type { PlannedRun } from "../capture/plan-run.js";
 import { signQueueJobPayload, type TenantScopedPayload } from "./envelope.js";
 import { buildQueue, enqueueJob, type PriorityVariant } from "./queue-factory.js";
 import { QUEUE_TOPOLOGY, type QueueTopologyEntry } from "./topology.js";
@@ -74,6 +76,76 @@ export class QueueProducer implements OnModuleDestroy {
       idempotencyKey: options.idempotencyKey,
       ...(options.priorityVariant !== undefined ? { priorityVariant: options.priorityVariant } : {}),
     });
+  }
+
+  /**
+   * STORY-034 — the BATCH producer, and the place a planned run gets SIGNED.
+   *
+   * `dispatchCaptureCells` builds one `addBulk` with per-cell jitter and the
+   * deduplication identity `enqueueJob` would have given each job, and it
+   * takes a raw `Queue` because STORY-032 had no producer to hand. It
+   * therefore enqueued `cell.payload` VERBATIM — unsigned — and
+   * `createJobProcessor` runs `verify(tenantJob)` as its first executable
+   * statement. Every one of those cells would have been rejected by the first
+   * capture handler to exist. Nothing caught it because no handler existed.
+   *
+   * Signing here rather than in `plan-run.ts` keeps the key where the other
+   * producer already holds it: planning happens inside a database
+   * transaction and has no business holding an HMAC key.
+   */
+  async dispatchPlannedCells(name: QueueName, plan: PlannedRun): Promise<Job[]> {
+    const entry = TOPOLOGY_BY_NAME.get(name);
+    if (entry === undefined) throw new UnknownQueueError(name);
+
+    return dispatchCaptureCells(
+      this.queueFor(entry),
+      entry,
+      plan.cells.map((cell) => ({
+        ...cell,
+        payload: signQueueJobPayload(
+          { ...(cell.payload as Record<string, unknown>), kid: this.keys.current.kid } as TenantScopedPayload,
+          this.keys.current.key,
+        ),
+      })),
+      { cadence: plan.cadence },
+    );
+  }
+
+  /**
+   * STORY-034 AC5 — remove the jobs a cancelled run left waiting.
+   *
+   * "Cancellation DRAINS QUEUED CELLS and marks the run cancelled; IN-FLIGHT
+   * CELLS COMPLETE rather than being abandoned mid-write." That distinction
+   * is the whole method: only `waiting` and `delayed` jobs are removed.
+   * BullMQ's own `job.remove()` refuses a job that is active, and this does
+   * not try to force one — the story's note says why. "Draining rather than
+   * killing in-flight cells avoids a half-written fact set, which the
+   * application-enforced integrity would then report as an orphan."
+   *
+   * Returns how many were removed, so a caller can report a drain that found
+   * nothing differently from one it never ran.
+   */
+  async drainWaiting(name: QueueName, matches: (data: unknown) => boolean): Promise<number> {
+    const entry = TOPOLOGY_BY_NAME.get(name);
+    if (entry === undefined) throw new UnknownQueueError(name);
+
+    const queue = this.queueFor(entry);
+    const jobs = await queue.getJobs(["waiting", "delayed", "prioritized", "wait"]);
+    let removed = 0;
+    for (const job of jobs) {
+      if (!matches(job.data)) continue;
+      // Best-effort per job. A job that became active between the read above
+      // and this call throws, and that is the CORRECT outcome — it is now
+      // in-flight and must be allowed to finish. Failing the whole cancel
+      // because one cell started would leave the run marked running.
+      try {
+        await job.remove();
+        removed += 1;
+      } catch (error) {
+        this.logger.debug(`drain skipped job ${String(job.id)} on ${name}: ${String(error)}`);
+      }
+    }
+    return removed;
   }
 
   private queueFor(entry: QueueTopologyEntry): Queue {
