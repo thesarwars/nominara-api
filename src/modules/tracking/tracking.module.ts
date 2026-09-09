@@ -1,6 +1,8 @@
 import { Module } from "@nestjs/common";
 import { CacheModule } from "../../lib/cache/cache.module.js";
 import { EntitlementsModule } from "../entitlements/entitlements.module.js";
+import { MatrixController } from "./matrix.controller.js";
+import { MatrixService } from "./matrix.service.js";
 import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
 import { RunEstimateService } from "./run-estimate.service.js";
 import { RunLifecycleService } from "./run-lifecycle.service.js";
@@ -22,7 +24,7 @@ import { TrackingService } from "./tracking.service.js";
 // worker process that is not running.
 @Module({
   imports: [CacheModule, EntitlementsModule, QueueProducerModule],
-  controllers: [TrackingController, RunsController],
-  providers: [TrackingService, RunEstimateService, RunLifecycleService],
+  controllers: [TrackingController, RunsController, MatrixController],
+  providers: [TrackingService, RunEstimateService, RunLifecycleService, MatrixService],
 })
 export class TrackingModule {}
