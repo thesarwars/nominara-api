@@ -9,6 +9,7 @@ import { ValkeyRealtimePublisher } from "../../cache/realtime-publisher.js";
 import { captureCell } from "../../capture/execute-cell.js";
 import { readRunProgress } from "../../capture/run-progress.js";
 import { resolveRunOutcome } from "../../engines/run-outcome.js";
+import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 
@@ -36,9 +37,6 @@ const payloadSchema = z
     personaHint: z.string().nullable(),
   })
   .strict();
-
-/** `v1` — the same constant manual-run.ts stamps onto the plan. */
-const NORMALIZER_VERSION = "v1";
 
 /** §11: `run.progress` is coalesced at ≤ 1 / 750 ms / run. */
 const PROGRESS_COALESCE_MS = 750;
