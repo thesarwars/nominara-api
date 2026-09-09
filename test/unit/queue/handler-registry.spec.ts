@@ -43,11 +43,26 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   // The set is deliberately asserted rather than left open, so a handler
   // cannot appear without anyone noticing. STORY-124 shipped the seam with
   // none; STORY-043 lands the first, exactly as that story's comment said it
-  // would ("crawl.discover with STORY-043"). Every later story updates this
-  // line in its own commit.
+  // would ("crawl.discover with STORY-043"), and STORY-034 lands the second,
+  // exactly as the same comment said ("the capture queues with STORY-034").
+  // Every later story updates this line in its own commit.
   it("ships exactly the handlers the stories that landed them declared", () => {
-    expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual(["crawl.discover"]);
-    expect(liveQueueNames()).toEqual(["crawl.discover"]);
+    expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual(["capture.execute", "crawl.discover"]);
+    // Topology order, not alphabetical — `liveQueueNames` filters
+    // QUEUE_TOPOLOGY, and the capture queues are declared before the crawl
+    // ones.
+    expect(liveQueueNames()).toEqual(["capture.execute", "crawl.discover"]);
+  });
+
+  // `capture.plan`, `capture.parse` and `capture.arbitrate` STAY INERT, and
+  // each for its own reason rather than by oversight: planning happens on the
+  // request path inside the trigger's transaction rather than as a job, and
+  // parsing and arbitration are EPIC-05's. A parse worker pulling a job with
+  // no parser behind it would fail it into the dead-letter queue.
+  it("leaves the rest of the capture queues inert", () => {
+    for (const name of ["capture.plan", "capture.parse", "capture.arbitrate"]) {
+      expect(handlerFor(name), `${name} should still be inert`).toBeUndefined();
+    }
   });
 
   // The half that keeps mattering as handlers accumulate: an unwired queue
