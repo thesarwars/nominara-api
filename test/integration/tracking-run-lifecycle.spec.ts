@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import type { Redis } from "ioredis";
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
@@ -11,6 +12,9 @@ import { adapterMajorOf } from "../../src/lib/capture/l1-exact-hash.js";
 import { loadManualRunProject, planManualRun } from "../../src/lib/capture/manual-run.js";
 import { etaMsFrom, pctFrom, readRunProgress } from "../../src/lib/capture/run-progress.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
+import { QueueProducer } from "../../src/lib/queue/queue-producer.js";
+import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixture.js";
 
 // STORY-034 AC2–AC5 — the run row a manual trigger writes, and the projection
 // read back off it.
@@ -213,6 +217,78 @@ describe("STORY-034 · the manual run lifecycle", () => {
 
   it("refuses to read a run that does not exist", async () => {
     await expect(readRunProgress(db, uuidV7(), NOW)).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  // THROUGH THE REAL PRODUCER, because the handler test builds its jobs by
+  // hand and therefore proved nothing about the enqueue.
+  //
+  // `capture.execute` carries a dual priority — `{ scheduled: 5,
+  // interactive: 1 }` — and `resolvePriority` REFUSES to guess. A dispatch
+  // with no variant throws, which is what a live trigger did: the run row
+  // committed, the cells never reached the queue, and the run sat at `queued`
+  // reporting 0 of 4 forever. Nothing in the suite touched the producer.
+  describe("dispatching a planned run", () => {
+    let valkey: ValkeyFixture;
+    const connections: Redis[] = [];
+
+    beforeAll(async () => {
+      valkey = await startValkeyFixture();
+    }, 300_000);
+
+    afterAll(async () => {
+      for (const connection of connections) await connection.quit().catch(() => undefined);
+      await valkey.stop();
+    });
+
+    function producer(): QueueProducer {
+      const connection = createQueueWorkerConnection(valkey.connectionString);
+      connections.push(connection);
+      return new QueueProducer(connection, queueKeyPrefix(`dispatch-${randomUUID().slice(0, 8)}`), {
+        current: { kid: "test-kid", key: Buffer.alloc(32, 3) },
+      });
+    }
+
+    it("enqueues every live cell, signed and at interactive priority", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      await addPrompt("crm with the best hubspot migration path");
+      const project = await loadManualRunProject(db, projectId);
+      await db.query("BEGIN");
+      const { plan } = await planManualRun(db, cache, project, { runId: uuidV7(), triggeredBy: null, now: NOW });
+      await db.query("COMMIT");
+
+      const jobs = await producer().dispatchPlannedCells("capture.execute", plan, {
+        priorityVariant: "interactive",
+        cadence: "manual",
+      });
+
+      expect(jobs).toHaveLength(2);
+      for (const job of jobs) {
+        // The envelope the worker verifies FIRST. An unsigned payload is
+        // rejected before the handler is ever reached.
+        expect(job.data).toMatchObject({ signature: expect.any(String) });
+        expect((job.data as { payload: { kid: string } }).payload.kid).toBe("test-kid");
+        expect(job.opts.priority).toBe(1);
+        // NO JITTER. `CADENCE_JITTER_MAX_MS.manual` is 0 — a manual scan is
+        // someone waiting for an answer, and the project's own cadence
+        // (`weekly` here) would have delayed it by up to an hour. Found by
+        // triggering one live and watching it sit at `queued`.
+        expect(job.opts.delay).toBe(0);
+      }
+    });
+
+    it("REFUSES to dispatch without a variant — the queue has two priorities", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      const project = await loadManualRunProject(db, projectId);
+      await db.query("BEGIN");
+      const { plan } = await planManualRun(db, cache, project, { runId: uuidV7(), triggeredBy: null, now: NOW });
+      await db.query("COMMIT");
+
+      await expect(
+        // @ts-expect-error — the variant is required, and this asserts the
+        // runtime refusal a JavaScript caller would still hit.
+        producer().dispatchPlannedCells("capture.execute", plan, { cadence: "manual" }),
+      ).rejects.toThrow(/priorityVariant/);
+    });
   });
 });
 

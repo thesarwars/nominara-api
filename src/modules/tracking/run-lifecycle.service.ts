@@ -53,7 +53,15 @@ export class RunLifecycleService {
     });
 
     afterCommit(() => {
-      void this.queues.dispatchPlannedCells(CAPTURE_EXECUTE.name, plan).catch(
+      // INTERACTIVE AND IMMEDIATE, and both halves are about the same fact:
+      // a manual deep scan is someone waiting for an answer. It must not
+      // queue behind a nightly sweep, and it must not be jittered across the
+      // project's cadence window — `CADENCE_JITTER_MAX_MS.manual` is 0 for
+      // exactly this case, while `plan.cadence` is the PROJECT's cadence and
+      // would have delayed a weekly project's manual scan by up to an hour.
+      void this.queues
+        .dispatchPlannedCells(CAPTURE_EXECUTE.name, plan, { priorityVariant: "interactive", cadence: "manual" })
+        .catch(
         (error: unknown) => {
           // The run row EXISTS and its cells are planned. Failing the response
           // here would tell the customer their scan did not start when the
