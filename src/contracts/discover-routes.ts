@@ -3,7 +3,10 @@ import { readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { API_CONTRACT_KEY, type ApiContractOptions } from "../api/decorators/api-contract.decorator.js";
+import { AUDIT_METADATA_KEY } from "../api/decorators/audit.decorator.js";
 import { NO_ENVELOPE_KEY } from "../api/decorators/no-envelope.decorator.js";
+import { IS_PUBLIC_KEY } from "../api/decorators/public.decorator.js";
+import { SKIP_TENANT_CONTEXT_KEY } from "../api/decorators/skip-tenant-context.decorator.js";
 
 // STORY-023 T3 — ADR-0002 says `contracts:generate` "must either boot the
 // Nest container or walk route metadata via DiscoveryService". Empirically
@@ -79,6 +82,19 @@ export interface DiscoveredContractRoute {
    * describes the unwrapped body describes something the server never sends.
    */
   readonly envelopeExempt: boolean;
+  /**
+   * STORY-034 — whether this handler declares `@Audit()`, and whether it is
+   * exempt from needing one, read exactly as AuditInterceptor reads them.
+   *
+   * Here rather than in a spec of its own because this is the only place that
+   * already walks every controller in the graph. The interceptor fails CLOSED
+   * at request time — "refusing to run it unaudited" — which means a mutating
+   * route that forgot the decorator is a 500 on its first live call and green
+   * in every test that exercises the service instead of the route. That is
+   * exactly how `POST /projects/{id}/runs/estimate` shipped.
+   */
+  readonly audited: boolean;
+  readonly auditExempt: boolean;
 }
 
 function normalizeSegment(segment: string | undefined): string {
@@ -159,6 +175,14 @@ export async function discoverContractRoutes(): Promise<DiscoveredContractRoute[
           envelopeExempt:
             (Reflect.getMetadata(NO_ENVELOPE_KEY, handler) as boolean | undefined) === true ||
             (Reflect.getMetadata(NO_ENVELOPE_KEY, exported) as boolean | undefined) === true,
+          audited:
+            Reflect.getMetadata(AUDIT_METADATA_KEY, handler) !== undefined ||
+            Reflect.getMetadata(AUDIT_METADATA_KEY, exported) !== undefined,
+          auditExempt: [IS_PUBLIC_KEY, SKIP_TENANT_CONTEXT_KEY].some(
+            (key) =>
+              (Reflect.getMetadata(key, handler) as boolean | undefined) === true ||
+              (Reflect.getMetadata(key, exported) as boolean | undefined) === true,
+          ),
         });
       }
     }

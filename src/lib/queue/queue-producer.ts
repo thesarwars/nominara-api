@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger, type OnModuleDestroy } from "@nestjs/common
 import type { Job, Queue } from "bullmq";
 import type { Redis } from "ioredis";
 import { dispatchCaptureCells } from "../capture/dispatch-cells.js";
+import type { ProjectCadence } from "../capture/dispatch-cells.js";
 import type { PlannedRun } from "../capture/plan-run.js";
 import { signQueueJobPayload, type TenantScopedPayload } from "./envelope.js";
 import { buildQueue, enqueueJob, type PriorityVariant } from "./queue-factory.js";
@@ -92,8 +93,28 @@ export class QueueProducer implements OnModuleDestroy {
    * Signing here rather than in `plan-run.ts` keeps the key where the other
    * producer already holds it: planning happens inside a database
    * transaction and has no business holding an HMAC key.
+   *
+   * BOTH DISPATCH FIELDS ARE REQUIRED, and neither is derivable from the plan.
+   *
+   * `priorityVariant` — `capture.execute` carries a dual priority
+   * (`{ scheduled: 5, interactive: 1 }`) and `resolvePriority` refuses to
+   * guess, which is right: a manual deep scan is someone waiting for an
+   * answer and must not queue behind a nightly sweep.
+   *
+   * `cadence` — the JITTER class, which is NOT `plan.cadence`. That field is
+   * the PROJECT's cadence and is what `cohortsFor` measures suppression
+   * against; the jitter table is about how urgent THIS RUN is, and its own
+   * entry for `manual` is 0 ("A manual run is someone waiting for an answer,
+   * and spreading it across an hour to protect a diurnal sample nobody is
+   * measuring would trade a real user's time for nothing"). Passing the
+   * project's cadence through delayed a manual scan on a weekly project by up
+   * to an hour — found by triggering one and watching it sit at `queued`.
    */
-  async dispatchPlannedCells(name: QueueName, plan: PlannedRun): Promise<Job[]> {
+  async dispatchPlannedCells(
+    name: QueueName,
+    plan: PlannedRun,
+    dispatch: { readonly priorityVariant: PriorityVariant; readonly cadence: ProjectCadence },
+  ): Promise<Job[]> {
     const entry = TOPOLOGY_BY_NAME.get(name);
     if (entry === undefined) throw new UnknownQueueError(name);
 
@@ -107,7 +128,7 @@ export class QueueProducer implements OnModuleDestroy {
           this.keys.current.key,
         ),
       })),
-      { cadence: plan.cadence },
+      dispatch,
     );
   }
 

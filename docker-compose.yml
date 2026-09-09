@@ -239,10 +239,11 @@ services:
   # right to: a group is the unit of concurrency and of blast radius, so a
   # single process draining all seven would let a slow crawl starve a rollup.
   #
-  # Only `crawl` has a handler today (`crawl.discover`, STORY-043). The other
-  # six groups get their own service in the story that lands their first
-  # handler — adding six idle services now would only make six things to
-  # misread during an incident.
+  # Only the groups with a handler get a service. `crawl` has
+  # `crawl.discover` (STORY-043) and `capture` has `capture.execute`
+  # (STORY-034); the other five get theirs in the story that lands their
+  # first handler — adding five idle services now would only make five things
+  # to misread during an incident.
   worker-crawl:
     build: .
     image: nominara-api
@@ -274,6 +275,41 @@ services:
     # Real worker liveness is whether it is draining its queues, which needs a
     # queue-depth metric rather than a socket, and that belongs with the
     # deployment manifests (KAD-10) — not here.
+    healthcheck:
+      disable: true
+    command: ["node", "dist/src/worker.js"]
+
+  # STORY-034 — the group that drains `capture.execute`.
+  #
+  # WITHOUT THIS, A TRIGGERED RUN SITS AT `queued` FOREVER. The trigger plans
+  # the cells and enqueues them; nothing local consumed them, so the whole
+  # run-lifecycle surface looked broken in a way that points at the API rather
+  # than at the missing consumer — the exact failure the comment above this
+  # block describes for the crawl group.
+  worker-capture:
+    build: .
+    image: nominara-api
+    depends_on:
+      dev-credentials:
+        condition: service_completed_successfully
+      valkey-cache:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      valkey:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
+      DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
+      VALKEY_CACHE_URL: redis://valkey-cache:6379
+      QUEUE_REDIS_URL: redis://valkey:6379
+      WORKER_GROUP: capture
+    # Disabled for the same reason as worker-crawl's: the image bakes in a
+    # `/health/live` probe that a worker does not serve, so it would sit
+    # permanently `unhealthy` while working perfectly.
     healthcheck:
       disable: true
     command: ["node", "dist/src/worker.js"]

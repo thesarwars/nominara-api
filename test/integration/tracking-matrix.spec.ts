@@ -108,7 +108,7 @@ describe("STORY-034 · the prompt × engine matrix", () => {
   function matrix(query: Partial<MatrixQuery> = {}): Promise<MatrixResponse> {
     return withTenantContext(
       db,
-      { workspaceId, actorId: randomUUID(), role: "owner" },
+      { workspaceId, actorId: randomUUID() },
       () => service.matrix(projectId, { timeframe: "30d", ...query }),
     ) as Promise<MatrixResponse>;
   }
@@ -216,7 +216,7 @@ describe("STORY-034 · the prompt × engine matrix", () => {
     expect((await matrix()).prompts).toEqual([]);
 
     await expect(
-      withTenantContext(db, { workspaceId, actorId: randomUUID(), role: "owner" }, () =>
+      withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
         service.matrix(randomUUID(), { timeframe: "30d" }),
       ),
     ).rejects.toMatchObject({ code: "not_found" });

@@ -41,6 +41,19 @@ export class TrackingController {
   @Post("estimate")
   @HttpCode(200)
   @RequirePermission("tracking:trigger")
+  // AUDITED EVEN THOUGH IT WRITES NOTHING, and not merely to satisfy the
+  // interceptor's fail-closed rule for POSTs.
+  //
+  // §5's two-step guard rail makes the QUOTE the thing a customer acts on:
+  // they are shown a figure, they echo it back in
+  // `X-Nominara-Confirmed-Credits`, and the trigger refuses if the two
+  // disagree. When a charge is later disputed, "what were they quoted, and
+  // when" is the question, and without this row the only record is the
+  // charge itself — which is the half nobody is disputing.
+  //
+  // Found by running it: the interceptor refuses any mutating method with no
+  // `@Audit()`, and a POST that happens to be a read is still a POST to it.
+  @Audit({ action: "run.estimated", resourceType: "project" })
   @ApiContract({
     operationId: "estimateRun",
     requestSchema: triggerRunRequestSchema,

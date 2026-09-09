@@ -66,9 +66,53 @@ class WorkerGroupRuntime implements OnModuleDestroy {
   ) {}
 
   async onModuleDestroy(): Promise<void> {
-    await Promise.all(this.workers.map((worker) => worker.close()));
-    await Promise.all(this.dlqQueues.map((queue) => queue.close()));
+    await Promise.all(this.workers.map((worker) => closeWithinDeadline(worker)));
+    await Promise.all(this.dlqQueues.map((queue) => queue.close().catch(() => undefined)));
     await this.pool.end().catch(() => undefined);
+  }
+}
+
+/** How long a graceful close may take before it is forced. */
+const WORKER_CLOSE_DEADLINE_MS = 2_000;
+
+/**
+ * Close a worker gracefully, but never indefinitely.
+ *
+ * A bare `worker.close()` waits for the worker to drain, and a worker whose
+ * Redis is unreachable NEVER DRAINS — it sits in ioredis's reconnect loop
+ * while the process refuses to exit. That is a pod that will not terminate
+ * during exactly the incident you most want it to restart in, and a
+ * shutdown-during-a-Valkey-outage is not a hypothetical.
+ *
+ * Graceful first, because that is what lets an in-flight job finish rather
+ * than being retried. Forced after the deadline, because a shutdown that
+ * cannot complete is worse than one that interrupts a job the retry ladder
+ * will pick up again.
+ *
+ * Surfaced by wiring `capture.execute`: the worker boot test had never
+ * booted a group with a live queue in it, so nothing had ever closed a real
+ * worker against a Valkey that was not there.
+ */
+async function closeWithinDeadline(worker: Worker): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), WORKER_CLOSE_DEADLINE_MS);
+    timer.unref();
+  });
+
+  try {
+    const outcome = await Promise.race([worker.close().then(() => "closed" as const), deadline]);
+    if (outcome !== "timeout") return;
+    // The FORCED close is raced too. BullMQ's `close()` awaits its own
+    // `waitUntilReady` on the way in, so a worker whose Redis never comes up
+    // hangs on the forced path exactly as it did on the graceful one — and a
+    // shutdown that waits forever for the escape hatch has no escape hatch.
+    // The connection is torn down with the process either way.
+    await Promise.race([worker.close(true).catch(() => undefined), deadline]);
+  } catch {
+    await Promise.race([worker.close(true).catch(() => undefined), deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

@@ -1,5 +1,6 @@
 import type { Pool } from "pg";
 import type { Env } from "../../config/env.schema.js";
+import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { QUEUE_TOPOLOGY } from "./topology.js";
 import type { JobProcessor } from "./worker-factory.js";
@@ -44,8 +45,15 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * operator reads during an incident.
  *
  * A story that produces work lands its handler here in the same commit:
- * `crawl.discover` with STORY-043, the capture queues with STORY-034, and
- * so on. One line each.
+ * `crawl.discover` with STORY-043, `capture.execute` with STORY-034, and so
+ * on. One line each.
+ *
+ * `capture.plan`, `capture.parse` and `capture.arbitrate` are STILL INERT and
+ * that is deliberate. Planning happens on the request path inside the
+ * trigger's transaction rather than as a job; parsing and arbitration are
+ * EPIC-05's, and a worker pulling a parse job with no parser behind it would
+ * fail it into the dead-letter queue — turning "not built yet" into "tried
+ * and failed" in the record an operator reads during an incident.
  *
  * `maintenance.partition` is the obvious first real entry — non-tenant-
  * scoped, and its logic already exists in src/workers/rollup/maintenance.ts,
@@ -54,6 +62,7 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  */
 export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "crawl.discover": (context) => createCrawlDiscoverHandler(context),
+  "capture.execute": (context) => createCaptureExecuteHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */
