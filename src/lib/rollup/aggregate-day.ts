@@ -136,16 +136,37 @@ export async function aggregateRange(
           AND c.status NOT IN ('failed', 'blocked')
      ),
      entities AS (
-       -- Every (engine, entity) pair that appears on the day, so a competitor
-       -- mentioned on one engine and not another gets a row for each — the
-       -- absent one carrying cells_total and a zero share, which is §2.3's
-       -- rule and the reason it cannot be a join over mentions alone.
+       -- Every (engine, entity) pair that appears in the range, so a
+       -- competitor mentioned on one engine and not another gets a row for
+       -- each — the absent one carrying cells_total and a zero share, which
+       -- is §2.3's rule and the reason it cannot be a join over mentions
+       -- alone.
        SELECT DISTINCT m.engine_key,
               m.entity_type,
               COALESCE(m.entity_id, $1::uuid) AS entity_id
          FROM mention_facts m
          JOIN day_cells dc ON dc.id = m.result_id
         WHERE m.entity_type IN ('brand', 'competitor')
+       UNION
+       -- ⚠ THE BRAND ALWAYS HAS A ROW WHEREVER THERE ARE CELLS, mentioned or
+       -- not. Found by STORY-136.
+       --
+       -- Derived from mentions alone, a day on which the engine answered a
+       -- hundred times and named the brand in none of them produced NO BRAND
+       -- ROW — so the day vanished from metric_daily entirely, and the
+       -- overview would show "no data" for the single most important finding
+       -- the product can report: presence rate 0.
+       --
+       -- That is the same conflation as the matrix's absent-versus-failed
+       -- rule, one level up. "The engine answered and did not name you" is a
+       -- measurement; the absence of a row says nobody asked.
+       --
+       -- Competitors are NOT unioned in: a competitor with no mention
+       -- anywhere in the range is not being tracked in it, and inventing a
+       -- zero row for every competitor on every engine would multiply the
+       -- table by the competitor count for no finding.
+       SELECT DISTINCT dc.engine_key, 'brand'::text AS entity_type, $1::uuid AS entity_id
+         FROM day_cells dc
      ),
      per_engine AS (
        SELECT dc.engine_key,

@@ -59,15 +59,30 @@ export const scorecardEntrySchema = z
   .object({
     /** An engine key, or `all` for the blended entry. */
     engine_key: z.string().min(1),
-    /** Null for the blend; the engine's own cadence otherwise. */
+    /** Null on the blended entry, which is not an engine. */
     display_name: z.string().nullable(),
     /**
-     * AC2 — RESOLVED FROM `project_engines`, the same row the scheduler
-     * reads. A static label here is the drift STORY-090's notes call "the
-     * most embarrassing kind": a screen claiming daily while the scheduler
-     * runs weekly.
+     * AC2 — THE CADENCE, RESOLVED THE WAY THE SCHEDULER RESOLVES IT.
+     *
+     * `engines.cadence_by_plan -> {plan} ->> 'full'`, runs per 30-day cycle
+     * — the same expression `resolveDueEngines` evaluates.
+     * `schemas/captures-and-facts.md` is explicit that this is the only
+     * source: "`cadence_by_plan` x `project_engines.enabled` is the only
+     * source the scheduler reads and the only source the per-engine
+     * freshness row renders, which is why the customer-visible cadence
+     * cannot drift from what actually runs."
+     *
+     * A NUMBER, NOT A LABEL. "Daily" is a rendering of `30`; storing the
+     * rendering is how a screen ends up claiming daily while the scheduler
+     * runs weekly, which STORY-090's notes call the most embarrassing kind
+     * of drift.
+     *
+     * NULL MEANS THIS PLAN DOES NOT SCHEDULE THIS ENGINE — the scheduler's
+     * own fail-closed rule, not a missing value. It is also what every
+     * engine reports today, because `engines.cadence_by_plan` defaults to
+     * `{}` and nothing seeds the catalog (STORY-130).
      */
-    cadence: z.string().nullable(),
+    cadence_runs_per_cycle: z.number().int().positive().nullable(),
     /** §3's 0–100 composite. Null when no component was measurable. */
     visibility_score: z.number().nullable(),
     /**

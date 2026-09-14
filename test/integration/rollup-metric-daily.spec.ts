@@ -293,13 +293,29 @@ describe("STORY-042 · rollup.metric_daily", () => {
     // §6 already forbids.
     const at = "2026-09-10T12:00:00Z";
     const cell = await addCell({ capturedAt: at, brandPresent: false, sov: 0 });
-    // A competitor mention, so the day has a row at all but the BRAND has no
-    // mentions of its own.
+    // A competitor mention, so the day has a competitor row too and the two
+    // can be told apart.
     await addMention(cell, at, { entityType: "competitor", prominence: 0.5 });
 
     await roll("2026-09-10");
-    const brand = await metricRow("google_ai_mode", "brand");
-    expect(brand).toBeUndefined();
+
+    // THE BRAND ROW EXISTS, and it used to not — found by STORY-136.
+    //
+    // This test previously asserted `toBeUndefined()` here, which was an
+    // artefact of the entity set being derived from `mention_facts` alone
+    // rather than a property anyone wanted: a day on which the engine
+    // answered and named the brand in none of its answers produced no brand
+    // row, so the day vanished from the rollup and presence rate 0 — the
+    // single most important finding the product can report — was
+    // indistinguishable from never having asked.
+    const brand = (await metricRow("google_ai_mode", "brand"))!;
+    expect(brand).toBeDefined();
+    expect(Number(brand.cells_total)).toBe(1);
+    expect(Number(brand.cells_present)).toBe(0);
+    expect(Number(brand.presence_rate)).toBe(0);
+    // And the title's own property, now testable on the brand at all:
+    expect(brand.sentiment_score).toBeNull();
+    expect(brand.rendering_quality).toBeNull();
 
     const competitor = await metricRow("google_ai_mode", "competitor");
     expect(competitor).toBeDefined();
