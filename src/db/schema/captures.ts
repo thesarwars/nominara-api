@@ -32,7 +32,7 @@ export const answerCaptures = pgTable("answer_captures", {
   contentHash: bytea("content_hash").notNull(),
   responseExcerpt: text("response_excerpt"),
   payload: jsonb("payload").notNull().default(sql`'{}'::jsonb`),
-  brandPresent: boolean("brand_present").notNull().default(sql`false`),
+  brandPresent: boolean("brand_present"),
   brandRankPosition: smallint("brand_rank_position"),
   sov: real("sov"),
   sentimentLabel: text("sentiment_label"),

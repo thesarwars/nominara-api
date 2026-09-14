@@ -36,6 +36,10 @@ interface CellRow {
   captured_at: Date | null;
   cache_layer: string | null;
   last_success_at: Date | null;
+  brand_present: boolean | null;
+  brand_rank_position: number | null;
+  sov: number | null;
+  sentiment_label: string | null;
 }
 
 @Injectable()
@@ -62,6 +66,10 @@ export class MatrixService {
               latest.error_code  AS error_code,
               latest.captured_at AS captured_at,
               latest.cache_layer AS cache_layer,
+              latest.brand_present AS brand_present,
+              latest.brand_rank_position AS brand_rank_position,
+              latest.sov AS sov,
+              latest.sentiment_label AS sentiment_label,
               success.captured_at AS last_success_at
          FROM tracked_prompts p
          CROSS JOIN (
@@ -70,7 +78,8 @@ export class MatrixService {
               AND ($3::text[] IS NULL OR engine_key = ANY($3::text[]))
          ) e
          LEFT JOIN LATERAL (
-           SELECT c.id, c.status, c.error_code, c.captured_at, c.cache_layer
+           SELECT c.id, c.status, c.error_code, c.captured_at, c.cache_layer,
+                  c.brand_present, c.brand_rank_position, c.sov, c.sentiment_label
              FROM answer_captures c
             WHERE c.project_id = p.project_id
               AND c.prompt_id = p.id
@@ -106,7 +115,7 @@ export class MatrixService {
       project_id: projectId,
       timeframe: query.timeframe,
       engine_keys: [...new Set(result.rows.map((row) => row.engine_key))],
-      prompts: this.group(result.rows),
+      prompts: this.group(result.rows, new Date()),
     };
   }
 
@@ -123,7 +132,7 @@ export class MatrixService {
     if (rows.rowCount === 0) throw new NotFoundError({ message: "no such project" });
   }
 
-  private group(rows: readonly CellRow[]): MatrixRow[] {
+  private group(rows: readonly CellRow[], now: Date): MatrixRow[] {
     const byPrompt = new Map<string, MatrixRow>();
     for (const row of rows) {
       let entry = byPrompt.get(row.prompt_id);
@@ -138,12 +147,12 @@ export class MatrixService {
         };
         byPrompt.set(row.prompt_id, entry);
       }
-      entry.cells.push(this.cell(row));
+      entry.cells.push(this.cell(row, now));
     }
     return [...byPrompt.values()];
   }
 
-  private cell(row: CellRow): MatrixCell {
+  private cell(row: CellRow, now: Date): MatrixCell {
     return {
       engine_key: row.engine_key,
       result_id: row.result_id,
@@ -154,6 +163,18 @@ export class MatrixService {
       captured_at: row.captured_at?.toISOString() ?? null,
       last_success_at: row.last_success_at?.toISOString() ?? null,
       cache_layer: row.cache_layer as MatrixCell["cache_layer"],
+      brand_present: row.brand_present,
+      brand_rank_position: row.brand_rank_position,
+      sov: row.sov,
+      sentiment_label: row.sentiment_label as MatrixCell["sentiment_label"],
+      // AC3 — the TRUE capture age of a reused answer. A cached cell
+      // stamped with today's date would claim a freshness it does not have.
+      // Null on a live cell: it has no age to report, and 0 would say it was
+      // captured this instant.
+      cache_age_ms:
+        row.cache_layer !== null && row.cache_layer !== "live" && row.captured_at !== null
+          ? Math.max(0, now.getTime() - row.captured_at.getTime())
+          : null,
     };
   }
 }

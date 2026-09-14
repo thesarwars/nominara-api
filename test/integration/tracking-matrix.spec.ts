@@ -79,18 +79,32 @@ describe("STORY-034 · the prompt × engine matrix", () => {
     return id;
   }
 
+  interface CaptureOptions {
+    errorCode?: string;
+    agoDays?: number;
+    agoHours?: number;
+    cacheLayer?: string;
+    /** STORY-091's scores. Left undefined they stay NULL — a captured but unparsed cell. */
+    brandPresent?: boolean;
+    rank?: number;
+    sov?: number;
+    sentiment?: string;
+  }
+
   async function addCapture(
     promptId: string,
     engineKey: string,
     status: string,
-    options: { errorCode?: string; agoDays?: number; cacheLayer?: string } = {},
+    options: CaptureOptions = {},
   ): Promise<void> {
     await db.query(
       `INSERT INTO answer_captures (workspace_id, project_id, run_id, prompt_id, engine_key, captured_at,
                                     capture_mode, adapter_version, normalizer_version, content_hash,
-                                    status, error_code, cache_layer)
-       VALUES ($1, $2, $3, $4, $5, now() - make_interval(days => $6::int),
-               'api', '1.0.0', 'v1', sha256(random()::text::bytea), $7, $8, $9)`,
+                                    status, error_code, cache_layer,
+                                    brand_present, brand_rank_position, sov, sentiment_label)
+       VALUES ($1, $2, $3, $4, $5, now() - make_interval(days => $6::int, hours => $10::int),
+               'api', '1.0.0', 'v1', sha256(random()::text::bytea), $7, $8, $9,
+               $11, $12, $13, $14)`,
       [
         workspaceId,
         projectId,
@@ -101,6 +115,11 @@ describe("STORY-034 · the prompt × engine matrix", () => {
         status,
         options.errorCode ?? null,
         options.cacheLayer ?? "live",
+        options.agoHours ?? 0,
+        options.brandPresent ?? null,
+        options.rank ?? null,
+        options.sov ?? null,
+        options.sentiment ?? null,
       ],
     );
   }
@@ -220,5 +239,59 @@ describe("STORY-034 · the prompt × engine matrix", () => {
         service.matrix(randomUUID(), { timeframe: "30d" }),
       ),
     ).rejects.toMatchObject({ code: "not_found" });
+  });
+  // ── STORY-091 · the scores the grid renders ──────────────────────────────
+  //
+  // §6's cell reads `①44%🟢`. Every one of these fields is NULLABLE, and null
+  // is not zero in any of them: the whole reason STORY-034 shipped the cell
+  // without them was that a default would put a measurement nobody made on
+  // the wire.
+
+  it("carries rank, share of voice and sentiment on a parsed cell", async () => {
+    const promptId = await addPrompt("crm");
+    await addCapture(promptId, "chatgpt", "parsed", {
+      brandPresent: true,
+      rank: 1,
+      sov: 0.62,
+      sentiment: "positive",
+    });
+
+    const cell = (await matrix()).prompts[0]!.cells.find((c) => c.engine_key === "chatgpt")!;
+    expect(cell).toMatchObject({ brand_present: true, brand_rank_position: 1, sentiment_label: "positive" });
+    expect(Number(cell.sov)).toBeCloseTo(0.62, 5);
+  });
+
+  it("distinguishes ABSENT from NEVER PARSED — the same honesty rule, one level down", async () => {
+    // `brand_present: false` on a parsed cell is a real finding: the engine
+    // answered and did not name the brand. Null on a pending cell is the
+    // absence of a measurement. Rendering both as a dash would make an
+    // outage look like a visibility collapse.
+    const promptId = await addPrompt("crm");
+    await addCapture(promptId, "chatgpt", "parsed", { brandPresent: false, sov: 0 });
+
+    const cells = (await matrix()).prompts[0]!.cells;
+    const absent = cells.find((c) => c.engine_key === "chatgpt")!;
+    expect(absent).toMatchObject({ status: "parsed", brand_present: false });
+    expect(Number(absent.sov)).toBe(0);
+
+    // The other engine was never attempted at all.
+    expect(cells.find((c) => c.engine_key === "perplexity")).toMatchObject({
+      status: "pending",
+      brand_present: null,
+      sov: null,
+      sentiment_label: null,
+    });
+  });
+
+  it("AC3 — a cached cell reports its TRUE age, and a live one reports none", async () => {
+    // A cached cell stamped with today's date would claim a freshness it does
+    // not have. Null on a live cell: 0 would say it was captured this instant.
+    const promptId = await addPrompt("crm");
+    await addCapture(promptId, "chatgpt", "parsed", { cacheLayer: "l1", agoHours: 30 });
+    await addCapture(promptId, "perplexity", "parsed", { cacheLayer: "live" });
+
+    const cells = (await matrix()).prompts[0]!.cells;
+    expect(cells.find((c) => c.engine_key === "chatgpt")!.cache_age_ms).toBeGreaterThan(29 * 3_600_000);
+    expect(cells.find((c) => c.engine_key === "perplexity")!.cache_age_ms).toBeNull();
   });
 });

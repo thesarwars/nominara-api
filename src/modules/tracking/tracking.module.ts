@@ -6,6 +6,8 @@ import { MatrixService } from "./matrix.service.js";
 import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
 import { RunEstimateService } from "./run-estimate.service.js";
 import { RunLifecycleService } from "./run-lifecycle.service.js";
+import { ResultDocumentService } from "./result-document.service.js";
+import { ResultsController } from "./results.controller.js";
 import { RunsController } from "./runs.controller.js";
 import { TrackingController } from "./tracking.controller.js";
 import { TrackingService } from "./tracking.service.js";
@@ -24,7 +26,7 @@ import { TrackingService } from "./tracking.service.js";
 // worker process that is not running.
 @Module({
   imports: [CacheModule, EntitlementsModule, QueueProducerModule],
-  controllers: [TrackingController, RunsController, MatrixController],
-  providers: [TrackingService, RunEstimateService, RunLifecycleService, MatrixService],
+  controllers: [TrackingController, RunsController, MatrixController, ResultsController],
+  providers: [TrackingService, RunEstimateService, RunLifecycleService, MatrixService, ResultDocumentService],
 })
 export class TrackingModule {}

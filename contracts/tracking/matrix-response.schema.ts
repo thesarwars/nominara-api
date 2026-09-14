@@ -58,20 +58,44 @@ export const matrixCellSchema = z
     last_success_at: z.string().datetime({ offset: true }).nullable(),
     /** `live`, `l1` or `l2` — null when nothing was captured. */
     cache_layer: z.enum(["live", "l1", "l2"]).nullable(),
+    /**
+     * §6's rendered cell: `①44%🟢`. Added by STORY-091 — the parse stage
+     * (STORY-135) now writes the facts these read, which is why the original
+     * contract shipped without them.
+     *
+     * EVERY ONE IS NULLABLE, and null means a different thing from zero in
+     * each case. A `pending` cell has no measurement at all; a `captured`
+     * cell where the brand was absent has `brand_present: false` with a
+     * `sov` of 0 — which IS a measurement, and the finding the matrix exists
+     * to show.
+     */
+    brand_present: z.boolean().nullable(),
+    /** Null outside a ranked list. Never 0 — rank 0 does not exist. */
+    brand_rank_position: z.number().int().positive().nullable(),
+    /** Share of voice in [0,1]. 0 with `brand_present: false` is a real result. */
+    sov: z.number().nullable(),
+    sentiment_label: z.enum(["positive", "neutral", "negative", "absent"]).nullable(),
+    /**
+     * How old the reused answer is, in milliseconds — AC3's "true capture
+     * age". A cached cell showing today's date would claim a freshness it
+     * does not have; this is what lets the cell say how stale it really is.
+     * Null on a live cell, which has no age to report.
+     */
+    cache_age_ms: z.number().int().nonnegative().nullable(),
   })
   .strict();
 
 /**
- * NO SCORES IN THIS CONTRACT, AND THAT IS THE HONEST VERSION.
+ * THE SCORES LIVE ON THE CELL, added by STORY-091 — and the reason they were
+ * omitted originally is what makes adding them safe now.
  *
- * §6's rendered matrix carries rank, share of voice and sentiment per cell.
- * Every one of those is produced by the parser and the scoring core —
- * EPIC-05, Slice 4 — and `answer_captures` carries their columns at
- * defaults: `brand_present false`, `sov null`, `citation_count 0`. Publishing
- * those defaults would put `brand_present: false` on the wire for a cell
- * nothing has ever parsed, which reads as "the engine did not mention you"
- * and is a measurement nobody made. They land in this schema with the parser
- * that fills them.
+ * The first version of this contract said: "Publishing those defaults would
+ * put `brand_present: false` on the wire for a cell nothing has ever parsed,
+ * which reads as 'the engine did not mention you' and is a measurement nobody
+ * made." STORY-135's parse stage now fills them, so they are real — and the
+ * nullability that avoided the problem then still avoids it: a `pending` cell
+ * has never been parsed and carries null on every score, which stays
+ * distinguishable from a parsed cell reporting `brand_present: false`.
  */
 export const matrixRowSchema = z
   .object({
