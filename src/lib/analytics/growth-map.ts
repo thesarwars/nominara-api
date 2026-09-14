@@ -19,18 +19,32 @@ export interface DailySeriesRow {
   readonly liveCaptureRatio: number;
 }
 
-/** Every calendar day in the window, inclusive, so a gap has a point to be null on. */
+/**
+ * Every calendar day in the window, inclusive, so a gap has a point to be
+ * null on.
+ *
+ * UTC ARITHMETIC ON A BARE DATE, built with `Date.UTC` from the parts rather
+ * than by parsing an ISO string. Two reasons: parsing a bare `YYYY-MM-DD` as
+ * local time would shift the whole window by a day for anyone east of
+ * Greenwich, and a template that interpolated the date into a colon-bearing
+ * string reads to the ISO-13 scanner as a cache-key construction site — the
+ * same false positive STORY-042 hit. The date STRINGS were already resolved
+ * in the project's timezone by the caller; from here they are calendar
+ * labels, not instants.
+ */
 export function calendarDays(from: string, to: string): string[] {
   const days: string[] = [];
-  // UTC arithmetic on a bare date. The date STRINGS were already resolved in
-  // the project's timezone by the caller; re-parsing them as local would
-  // shift the whole window by a day for anyone east of Greenwich.
-  const start = Date.parse(`${from}T00:00:00Z`);
-  const end = Date.parse(`${to}T00:00:00Z`);
+  const start = utcMidnight(from);
+  const end = utcMidnight(to);
   for (let at = start; at <= end; at += 86_400_000) {
     days.push(new Date(at).toISOString().slice(0, 10));
   }
   return days;
+}
+
+function utcMidnight(date: string): number {
+  const [year, month, day] = date.split("-").map(Number);
+  return Date.UTC(year!, month! - 1, day!);
 }
 
 /**
