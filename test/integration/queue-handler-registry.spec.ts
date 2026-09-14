@@ -88,7 +88,13 @@ describe("STORY-124 · the queue-handler registry", () => {
     const { app, runtime } = await boot("rollup");
     try {
       expect(runtime.workers.length).toBeGreaterThan(0);
-      for (const worker of runtime.workers) {
+      // Queues the REAL registry wires are excluded, not the test's own —
+      // STORY-042 gave `rollup.metric_daily` a handler and this scenario is
+      // about queues with NONE. Filtering by the registry rather than by a
+      // hardcoded name means the next story to wire one does not have to
+      // touch this line, and cannot accidentally weaken it: a queue that
+      // stops being registered comes straight back into the assertion.
+      for (const worker of runtime.workers.filter((w) => QUEUE_HANDLERS[w.name as QueueName] === undefined)) {
         // Inert is a better lie than broken: a worker that pulled a job it
         // cannot process would fail it down the retry ladder and into the
         // DLQ, turning "not built yet" into "tried and failed".
@@ -110,9 +116,13 @@ describe("STORY-124 · the queue-handler registry", () => {
       expect(handled, `${HANDLED} must be in the rollup group`).toBeDefined();
       expect(handled!.opts.autorun).toBe(true);
 
-      for (const worker of runtime.workers.filter((w) => w.name !== HANDLED)) {
+      for (const worker of runtime.workers.filter(
+        (w) => w.name !== HANDLED && QUEUE_HANDLERS[w.name as QueueName] === undefined,
+      )) {
         expect(worker.opts.autorun, `${worker.name} has no handler and must stay inert`).toBe(false);
       }
+      // And the group is not vacuously inert — something in it does autorun.
+      expect(runtime.workers.some((w) => w.opts.autorun)).toBe(true);
     } finally {
       await app.close();
     }
@@ -188,7 +198,15 @@ describe("STORY-124 · the queue-handler registry", () => {
     try {
       const line = logged.find((message) => message.includes('worker group "rollup"'));
       expect(line, "bootstrap must log a group summary").toBeDefined();
-      expect(line).toContain(`1 processing (${HANDLED})`);
+      // The COUNT is derived rather than written down: the rollup group has
+      // had one live queue since STORY-042 wired `rollup.metric_daily`, and
+      // this scenario is about the line's SHAPE — a live list, an inert list,
+      // and the two not reading alike — not about how many are wired today.
+      const live = QUEUE_TOPOLOGY.filter(
+        (entry) => entry.workerGroup === "rollup" && QUEUE_HANDLERS[entry.name] !== undefined,
+      ).map((entry) => entry.name);
+      expect(line).toContain(`${String(live.length)} processing (${live.join(", ")})`);
+      expect(line).toContain(HANDLED);
       expect(line).toMatch(/inert, no handler wired \(.*credit\.reconcile/);
       // A group that processes nothing must not read the same as one that
       // processes everything.
