@@ -333,6 +333,50 @@ describe("STORY-136 · project scorecards", () => {
   // go on passing after someone removed the policy. `pnpm test:isolation`
   // runs as the application role and is where that claim is actually proven.
 
+  it("STORY-090 — reports the last capture per engine, from OUTSIDE the window if that is where it is", async () => {
+    // Not windowed: the engine that has been silent longest is exactly the
+    // one the header exists to surface.
+    await addCell({ capturedAt: daysAgo(200), engineKey: "chatgpt", brandPresent: true });
+    const document = await read("7d");
+    const engine = document.engines.find((e) => e.engine_key === "chatgpt")!;
+    expect(engine.last_captured_at).not.toBeNull();
+    expect(engine.measured_cells).toBe(0);
+  });
+
+  it("STORY-090 — projects the next run from the cadence, and null without one", async () => {
+    await setUp({ cadence: { growth: { full: 30 } } });
+    await addCell({ capturedAt: daysAgo(1), engineKey: "chatgpt", brandPresent: true });
+
+    const engine = (await read()).engines.find((e) => e.engine_key === "chatgpt")!;
+    // 30 runs per 30-day cycle is a daily interval.
+    const expected = Date.parse(engine.last_captured_at!) + 86_400_000;
+    expect(Date.parse(engine.next_run_at!)).toBe(expected);
+
+    // The other engine never ran, so there is nothing to project from.
+    expect((await read()).engines.find((e) => e.engine_key === "google_ai_mode")!.next_run_at).toBeNull();
+  });
+
+  it("STORY-090 — a plan that does not schedule the engine has no next run", async () => {
+    await setUp({ cadence: { starter: { full: 4 } } });
+    await addCell({ capturedAt: daysAgo(1), engineKey: "chatgpt", brandPresent: true });
+    expect((await read()).engines.find((e) => e.engine_key === "chatgpt")!.next_run_at).toBeNull();
+  });
+
+  it("STORY-090 — the blended entry carries no last scan and no next run", async () => {
+    // They are per-engine facts; a "blended last scan" would be the max of a
+    // set the reader cannot see.
+    await addCell({ capturedAt: daysAgo(1), brandPresent: true });
+    const document = await read();
+    expect(document.blended.last_captured_at).toBeNull();
+    expect(document.blended.next_run_at).toBeNull();
+  });
+
+  it("STORY-090 — every metric delta is suppressed while a window is under-sampled", async () => {
+    for (let i = 0; i < 5; i += 1) await addCell({ capturedAt: daysAgo(1), brandPresent: true });
+    const engine = (await read()).engines.find((e) => e.engine_key === "google_ai_mode")!;
+    expect(Object.values(engine.metrics_delta)).toEqual([null, null, null, null, null]);
+  });
+
   it("404s for a project that does not exist at all", async () => {
     await expect(
       withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
