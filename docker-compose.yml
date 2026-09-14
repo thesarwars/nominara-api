@@ -240,10 +240,10 @@ services:
   # single process draining all seven would let a slow crawl starve a rollup.
   #
   # Only the groups with a handler get a service. `crawl` has
-  # `crawl.discover` (STORY-043) and `capture` has `capture.execute`
-  # (STORY-034); the other five get theirs in the story that lands their
-  # first handler — adding five idle services now would only make five things
-  # to misread during an incident.
+  # `crawl.discover` (STORY-043), `capture` has `capture.execute`
+  # (STORY-034), and `parse` has `capture.parse` (STORY-135); the other four
+  # get theirs in the story that lands their first handler — adding four idle
+  # services now would only make four things to misread during an incident.
   worker-crawl:
     build: .
     image: nominara-api
@@ -310,6 +310,38 @@ services:
     # Disabled for the same reason as worker-crawl's: the image bakes in a
     # `/health/live` probe that a worker does not serve, so it would sit
     # permanently `unhealthy` while working perfectly.
+    healthcheck:
+      disable: true
+    command: ["node", "dist/src/worker.js"]
+
+  # STORY-135 — the group that drains `capture.parse`.
+  #
+  # ITS OWN PROCESS, not folded into worker-capture, because a group is the
+  # unit of concurrency and of blast radius. A parse resolves every citation
+  # in an answer through the guarded fetcher, so it is network-bound and slow
+  # in a way a capture is not; sharing a worker would let a run of
+  # redirect-heavy answers starve the captures behind them.
+  worker-parse:
+    build: .
+    image: nominara-api
+    depends_on:
+      dev-credentials:
+        condition: service_completed_successfully
+      valkey-cache:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      valkey:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
+      DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
+      VALKEY_CACHE_URL: redis://valkey-cache:6379
+      QUEUE_REDIS_URL: redis://valkey:6379
+      WORKER_GROUP: parse
     healthcheck:
       disable: true
     command: ["node", "dist/src/worker.js"]

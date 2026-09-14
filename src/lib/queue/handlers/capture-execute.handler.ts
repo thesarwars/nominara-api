@@ -10,6 +10,9 @@ import { captureCell } from "../../capture/execute-cell.js";
 import { readRunProgress } from "../../capture/run-progress.js";
 import { resolveRunOutcome } from "../../engines/run-outcome.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
+import { QueueProducer } from "../queue-producer.js";
+import { signingKeysFromEnv } from "../worker-factory.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 
@@ -44,6 +47,18 @@ const PROGRESS_COALESCE_MS = 750;
 export interface CaptureExecuteDeps {
   readonly cache: Cache;
   readonly realtime: RealtimePublisher;
+  /** Injected in tests; production builds a producer from env on first use. */
+  readonly enqueueParse?: (payload: ParseJobPayload) => Promise<unknown>;
+}
+
+/** What `capture.parse` needs to find and re-read the row this handler wrote. */
+export interface ParseJobPayload {
+  readonly workspaceId: string;
+  readonly resultId: string;
+  readonly projectId: string;
+  readonly promptId: string;
+  readonly engineKey: string;
+  readonly capturedAt: string;
 }
 
 export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?: CaptureExecuteDeps): JobProcessor {
@@ -56,11 +71,35 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
   // worker boot test caught it by hanging.
   let cache: Cache | undefined = deps?.cache;
   let realtime: RealtimePublisher | undefined = deps?.realtime;
+  let producer: QueueProducer | undefined;
   const connections = (): { cache: Cache; realtime: RealtimePublisher } => {
     cache ??= new ValkeyCacheAdapter(context.env.VALKEY_CACHE_URL);
     realtime ??= new ValkeyRealtimePublisher(context.env.VALKEY_CACHE_URL);
     return { cache, realtime };
   };
+
+  // `async`, so that BUILDING the producer is inside the promise too.
+  //
+  // It was a plain arrow returning `enqueueTenantJob(...)`, and the
+  // construction above it threw SYNCHRONOUSLY — past the caller's `.catch`
+  // and out of the handler. An unreachable queue would then have failed the
+  // whole capture and discarded an engine call already made and paid for,
+  // which is the exact outcome the caller's comment says must not happen.
+  // Found by the STORY-034 tests, which pass an env with no queue in it.
+  const enqueueParse =
+    deps?.enqueueParse ??
+    (async (payload: ParseJobPayload): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob("capture.parse", payload.workspaceId, { ...payload }, {
+        // One parse per capture. A replayed capture job re-parses the same
+        // row rather than queueing a second pass over it.
+        idempotencyKey: `parse:${payload.resultId}`,
+      });
+    });
 
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const { cache: liveCache, realtime: livePublisher } = connections();
@@ -111,6 +150,42 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       personaHint: payload.personaHint,
       normalizerVersion: NORMALIZER_VERSION,
     });
+
+    // STORY-135 — hand the capture to the parser.
+    //
+    // ENQUEUED INSIDE THE JOB'S TRANSACTION, and that is a deliberate
+    // exception rather than an oversight. `withTenantJob` has no
+    // `afterCommit`, so there is nowhere else to put it — and unlike the run
+    // trigger's dispatch, the failure mode here is benign and
+    // self-correcting: if this transaction rolls back, the capture row does
+    // not exist, and `capture.parse` reads it by id, finds nothing, logs and
+    // returns. An orphaned parse job cancels itself. An orphaned CAPTURE job
+    // would have captured against a run that never existed, which is why
+    // that one waits for a commit and this one does not.
+    if (outcome.kind === "captured") {
+      const parseTarget = await tx.query<{ id: string; captured_at: Date }>(
+        `SELECT id, captured_at FROM answer_captures
+          WHERE run_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = $4
+          ORDER BY captured_at DESC LIMIT 1`,
+        [payload.runId, payload.promptId, payload.engineKey, payload.sampleIndex],
+      );
+      const target = parseTarget.rows[0];
+      if (target !== undefined) {
+        await enqueueParse({
+          workspaceId: payload.workspaceId,
+          resultId: target.id,
+          projectId: payload.projectId,
+          promptId: payload.promptId,
+          engineKey: payload.engineKey,
+          capturedAt: target.captured_at.toISOString(),
+        }).catch((error: unknown) => {
+          // The ANSWER IS STORED. A parse that did not start is recoverable by
+          // re-parsing; failing the capture here would discard an engine call
+          // that has already been paid for and made.
+          logger.error(`failed to enqueue parse for capture ${target.id}: ${String(error)}`);
+        });
+      }
+    }
 
     const progress = await readRunProgress(tx, payload.runId);
     const finished = progress.captured + progress.failed + progress.skipped >= progress.planned;
