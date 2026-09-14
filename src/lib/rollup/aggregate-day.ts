@@ -91,6 +91,36 @@ export async function aggregateDay(
   metricDate: string,
   timezone: string,
 ): Promise<DayAggregate[]> {
+  return aggregateRange(tx, projectId, metricDate, metricDate, timezone);
+}
+
+/**
+ * The same aggregation over a DATE RANGE, inclusive at both ends.
+ *
+ * STORY-136 needs it, and needs it to be THIS function rather than a
+ * re-aggregation of `metric_daily`. `scoring-models.md` §3 defines every
+ * component over `C(T)` — the set of cells in the timeframe — not over daily
+ * rollup rows, and the two are not the same number: `PresenceRate(30d)` is
+ * `Σ present / Σ total` over the window, never the mean of thirty daily
+ * rates, and they differ whenever the daily cell counts differ.
+ *
+ * Re-deriving from `metric_daily` would also have to pass through `real`
+ * columns — `avg_prominence` is the only route back to the prominence sum
+ * the sentiment weighting needs — and float4 carries about seven significant
+ * digits. Slice 4's success metric is a Visibility Score a customer can
+ * recompute by hand from an exported cell list and match **exactly to
+ * 1e-9**, which a lossy intermediate cannot deliver.
+ *
+ * `metric_daily` keeps its job: the per-day series a chart plots. This is the
+ * window aggregate, and the facts are the only honest source for it.
+ */
+export async function aggregateRange(
+  tx: ClientBase,
+  projectId: string,
+  fromDate: string,
+  toDate: string,
+  timezone: string,
+): Promise<DayAggregate[]> {
   const result = await tx.query<Record<string, string | null>>(
     `WITH day_cells AS (
        SELECT c.id, c.engine_key, c.status, c.cache_layer, c.brand_present, c.sov,
@@ -99,23 +129,44 @@ export async function aggregateDay(
          LEFT JOIN project_engines pe
                 ON pe.project_id = c.project_id AND pe.engine_key = c.engine_key
         WHERE c.project_id = $1
-          AND (c.captured_at AT TIME ZONE $3)::date = $2::date
+          AND (c.captured_at AT TIME ZONE $3)::date BETWEEN $2::date AND $4::date
           -- A FAILED CELL IS NOT A MEASUREMENT. §2.5 excludes it from both
           -- numerator and denominator; a refusal ('parsed' with the flag) is
           -- data and stays in.
           AND c.status NOT IN ('failed', 'blocked')
      ),
      entities AS (
-       -- Every (engine, entity) pair that appears on the day, so a competitor
-       -- mentioned on one engine and not another gets a row for each — the
-       -- absent one carrying cells_total and a zero share, which is §2.3's
-       -- rule and the reason it cannot be a join over mentions alone.
+       -- Every (engine, entity) pair that appears in the range, so a
+       -- competitor mentioned on one engine and not another gets a row for
+       -- each — the absent one carrying cells_total and a zero share, which
+       -- is §2.3's rule and the reason it cannot be a join over mentions
+       -- alone.
        SELECT DISTINCT m.engine_key,
               m.entity_type,
               COALESCE(m.entity_id, $1::uuid) AS entity_id
          FROM mention_facts m
          JOIN day_cells dc ON dc.id = m.result_id
         WHERE m.entity_type IN ('brand', 'competitor')
+       UNION
+       -- ⚠ THE BRAND ALWAYS HAS A ROW WHEREVER THERE ARE CELLS, mentioned or
+       -- not. Found by STORY-136.
+       --
+       -- Derived from mentions alone, a day on which the engine answered a
+       -- hundred times and named the brand in none of them produced NO BRAND
+       -- ROW — so the day vanished from metric_daily entirely, and the
+       -- overview would show "no data" for the single most important finding
+       -- the product can report: presence rate 0.
+       --
+       -- That is the same conflation as the matrix's absent-versus-failed
+       -- rule, one level up. "The engine answered and did not name you" is a
+       -- measurement; the absence of a row says nobody asked.
+       --
+       -- Competitors are NOT unioned in: a competitor with no mention
+       -- anywhere in the range is not being tracked in it, and inventing a
+       -- zero row for every competitor on every engine would multiply the
+       -- table by the competitor count for no finding.
+       SELECT DISTINCT dc.engine_key, 'brand'::text AS entity_type, $1::uuid AS entity_id
+         FROM day_cells dc
      ),
      per_engine AS (
        SELECT dc.engine_key,
@@ -186,7 +237,7 @@ export async function aggregateDay(
             -- neither owned nor foreign.
             AND f.http_status IS NOT NULL
        ) cit`,
-    [projectId, metricDate, timezone],
+    [projectId, fromDate, timezone, toDate],
   );
 
   return result.rows.map((row) => ({
