@@ -91,6 +91,36 @@ export async function aggregateDay(
   metricDate: string,
   timezone: string,
 ): Promise<DayAggregate[]> {
+  return aggregateRange(tx, projectId, metricDate, metricDate, timezone);
+}
+
+/**
+ * The same aggregation over a DATE RANGE, inclusive at both ends.
+ *
+ * STORY-136 needs it, and needs it to be THIS function rather than a
+ * re-aggregation of `metric_daily`. `scoring-models.md` §3 defines every
+ * component over `C(T)` — the set of cells in the timeframe — not over daily
+ * rollup rows, and the two are not the same number: `PresenceRate(30d)` is
+ * `Σ present / Σ total` over the window, never the mean of thirty daily
+ * rates, and they differ whenever the daily cell counts differ.
+ *
+ * Re-deriving from `metric_daily` would also have to pass through `real`
+ * columns — `avg_prominence` is the only route back to the prominence sum
+ * the sentiment weighting needs — and float4 carries about seven significant
+ * digits. Slice 4's success metric is a Visibility Score a customer can
+ * recompute by hand from an exported cell list and match **exactly to
+ * 1e-9**, which a lossy intermediate cannot deliver.
+ *
+ * `metric_daily` keeps its job: the per-day series a chart plots. This is the
+ * window aggregate, and the facts are the only honest source for it.
+ */
+export async function aggregateRange(
+  tx: ClientBase,
+  projectId: string,
+  fromDate: string,
+  toDate: string,
+  timezone: string,
+): Promise<DayAggregate[]> {
   const result = await tx.query<Record<string, string | null>>(
     `WITH day_cells AS (
        SELECT c.id, c.engine_key, c.status, c.cache_layer, c.brand_present, c.sov,
@@ -99,7 +129,7 @@ export async function aggregateDay(
          LEFT JOIN project_engines pe
                 ON pe.project_id = c.project_id AND pe.engine_key = c.engine_key
         WHERE c.project_id = $1
-          AND (c.captured_at AT TIME ZONE $3)::date = $2::date
+          AND (c.captured_at AT TIME ZONE $3)::date BETWEEN $2::date AND $4::date
           -- A FAILED CELL IS NOT A MEASUREMENT. §2.5 excludes it from both
           -- numerator and denominator; a refusal ('parsed' with the flag) is
           -- data and stays in.
@@ -186,7 +216,7 @@ export async function aggregateDay(
             -- neither owned nor foreign.
             AND f.http_status IS NOT NULL
        ) cit`,
-    [projectId, metricDate, timezone],
+    [projectId, fromDate, timezone, toDate],
   );
 
   return result.rows.map((row) => ({
