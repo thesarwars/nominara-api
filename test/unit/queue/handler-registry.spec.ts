@@ -44,14 +44,19 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   // cannot appear without anyone noticing. STORY-124 shipped the seam with
   // none; STORY-043 lands the first, exactly as that story's comment said it
   // would ("crawl.discover with STORY-043"), STORY-034 lands the second and
-  // STORY-135 the third — both named by the same comment ("the capture queues
-  // with STORY-034"). Every later story updates this line in its own commit.
+  // STORY-135 the third, and STORY-042 the fourth. Every later story updates
+  // this line in its own commit.
   it("ships exactly the handlers the stories that landed them declared", () => {
-    expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual(["capture.execute", "capture.parse", "crawl.discover"]);
+    expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual([
+      "capture.execute",
+      "capture.parse",
+      "crawl.discover",
+      "rollup.metric_daily",
+    ]);
     // Topology order, not alphabetical — `liveQueueNames` filters
     // QUEUE_TOPOLOGY, and the capture queues are declared before the crawl
     // ones.
-    expect(liveQueueNames()).toEqual(["capture.execute", "capture.parse", "crawl.discover"]);
+    expect(liveQueueNames()).toEqual(["capture.execute", "capture.parse", "crawl.discover", "rollup.metric_daily"]);
   });
 
   // `capture.plan` and `capture.arbitrate` STAY INERT, each for its own
@@ -80,12 +85,24 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   });
 
   it("liveQueueNames and inertQueueNames answer for a subset too — inertness is per worker group", () => {
-    // A rollup worker with no handlers is inert even when capture is fully
-    // wired, so the boot line has to be able to ask about one group's set.
-    const rollup = QUEUE_TOPOLOGY.filter((entry) => entry.workerGroup === "rollup").map((entry) => entry.name);
-    expect(rollup.length).toBeGreaterThan(0);
-    expect(inertQueueNames(rollup)).toEqual(rollup);
-    expect(liveQueueNames(rollup)).toEqual([]);
+    // A report worker with no handlers is inert even when capture and rollup
+    // are wired, so the boot line has to be able to ask about one group's set.
+    //
+    // This used the ROLLUP group until STORY-042 gave it a handler. The
+    // property under test is "inertness is per group", not "rollup is inert",
+    // so it moves to a group that is still empty rather than being deleted —
+    // and the assertion below covers the other half, which the old version
+    // could not.
+    const report = QUEUE_TOPOLOGY.filter((entry) => entry.workerGroup === "report").map((entry) => entry.name);
+    expect(report.length).toBeGreaterThan(0);
+    expect(inertQueueNames(report)).toEqual(report);
+    expect(liveQueueNames(report)).toEqual([]);
+  });
+
+  it("a group with SOME handlers reports both halves", () => {
+    const capture = QUEUE_TOPOLOGY.filter((entry) => entry.workerGroup === "capture").map((entry) => entry.name);
+    expect(liveQueueNames(capture)).toEqual(["capture.execute"]);
+    expect(inertQueueNames(capture).length).toBeGreaterThan(0);
   });
 
   it("a factory is called once per queue at boot, not once per job", () => {

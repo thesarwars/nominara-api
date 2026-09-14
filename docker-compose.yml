@@ -241,9 +241,10 @@ services:
   #
   # Only the groups with a handler get a service. `crawl` has
   # `crawl.discover` (STORY-043), `capture` has `capture.execute`
-  # (STORY-034), and `parse` has `capture.parse` (STORY-135); the other four
-  # get theirs in the story that lands their first handler — adding four idle
-  # services now would only make four things to misread during an incident.
+  # (STORY-034), `parse` has `capture.parse` (STORY-135) and `rollup` has
+  # `rollup.metric_daily` (STORY-042); the other three get theirs in the story
+  # that lands their first handler — adding three idle services now would only
+  # make three things to misread during an incident.
   worker-crawl:
     build: .
     image: nominara-api
@@ -342,6 +343,37 @@ services:
       VALKEY_CACHE_URL: redis://valkey-cache:6379
       QUEUE_REDIS_URL: redis://valkey:6379
       WORKER_GROUP: parse
+    healthcheck:
+      disable: true
+    command: ["node", "dist/src/worker.js"]
+
+  # STORY-042 — the group that drains `rollup.metric_daily`.
+  #
+  # Its own process for the same reason the others are: a rollup takes a
+  # per-project advisory lock and holds it for the whole aggregation, so a
+  # slow project blocks nothing but itself — but only if the group is not
+  # also competing for the workers a capture needs.
+  worker-rollup:
+    build: .
+    image: nominara-api
+    depends_on:
+      dev-credentials:
+        condition: service_completed_successfully
+      valkey-cache:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      valkey:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
+      DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
+      VALKEY_CACHE_URL: redis://valkey-cache:6379
+      QUEUE_REDIS_URL: redis://valkey:6379
+      WORKER_GROUP: rollup
     healthcheck:
       disable: true
     command: ["node", "dist/src/worker.js"]

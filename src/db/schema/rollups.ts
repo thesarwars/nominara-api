@@ -27,7 +27,7 @@ export const metricDaily = pgTable("metric_daily", {
   mentionsPositive: integer("mentions_positive").notNull().default(sql`0`),
   mentionsNeutral: integer("mentions_neutral").notNull().default(sql`0`),
   mentionsNegative: integer("mentions_negative").notNull().default(sql`0`),
-  sentimentScore: real("sentiment_score").notNull().default(sql`0`),
+  sentimentScore: real("sentiment_score"),
   citationsTotal: integer("citations_total").notNull().default(sql`0`),
   citationsOwned: integer("citations_owned").notNull().default(sql`0`),
   citationShare: real("citation_share").notNull().default(sql`0`),

@@ -3,6 +3,7 @@ import type { Env } from "../../config/env.schema.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCaptureParseHandler } from "./handlers/capture-parse.handler.js";
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
+import { createRollupMetricDailyHandler } from "./handlers/rollup-metric-daily.handler.js";
 import { QUEUE_TOPOLOGY } from "./topology.js";
 import type { JobProcessor } from "./worker-factory.js";
 
@@ -47,7 +48,8 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  *
  * A story that produces work lands its handler here in the same commit:
  * `crawl.discover` with STORY-043, `capture.execute` with STORY-034,
- * `capture.parse` with STORY-135. One line each.
+ * `capture.parse` with STORY-135, `rollup.metric_daily` with STORY-042.
+ * One line each.
  *
  * `capture.plan` and `capture.arbitrate` are STILL INERT and that is
  * deliberate. Planning happens on the request path inside the trigger's
@@ -66,6 +68,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "crawl.discover": (context) => createCrawlDiscoverHandler(context),
   "capture.execute": (context) => createCaptureExecuteHandler(context),
   "capture.parse": (context) => createCaptureParseHandler(context),
+  "rollup.metric_daily": (context) => createRollupMetricDailyHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */
