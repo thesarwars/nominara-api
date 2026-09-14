@@ -328,7 +328,7 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
     ]);
 
     const reused = await db.query<{
-      brand_present: boolean;
+      brand_present: boolean | null;
       sov: number | null;
       sentiment_label: string | null;
       sentiment_score: number | null;
@@ -346,7 +346,12 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
       reused.rows[0],
       "copying the source's scores would freeze yesterday's alias set into today's cell",
     ).toMatchObject({
-      brand_present: false,
+      // NULL, not `false`, since migration 0021 — and null is the stronger
+      // form of the same property this test protects. `false` was the
+      // column's old default and read as "the brand was absent from this
+      // answer", which is a score, and a copied one at that. Null says what
+      // is actually true of a suppressed row: nothing has parsed it.
+      brand_present: null,
       sov: null,
       sentiment_label: null,
       sentiment_score: null,

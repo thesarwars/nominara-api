@@ -118,7 +118,9 @@ export async function recordSuppressedCells(
     --
     -- brand_present, sov, sentiment_label, sentiment_score,
     -- brand_rank_position, citation_count and owned_citation_count are left
-    -- at their defaults, so a reused cell arrives UNSCORED. Copying them from
+    -- alone, so a reused cell arrives UNSCORED — brand_present as NULL since
+    -- migration 0021, which is what "unscored" should always have looked
+    -- like on the wire. Copying them from
     -- the source is the obvious shortcut and is what AC7 forbids: those
     -- values were produced by matching against the alias set as it stood
     -- then, and an alias added since would never appear. §6 requires a reuse

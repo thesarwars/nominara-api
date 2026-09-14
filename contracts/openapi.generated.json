@@ -10883,6 +10883,66 @@
                                           "type": "null"
                                         }
                                       ]
+                                    },
+                                    "brand_present": {
+                                      "anyOf": [
+                                        {
+                                          "type": "boolean"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "brand_rank_position": {
+                                      "anyOf": [
+                                        {
+                                          "type": "integer",
+                                          "exclusiveMinimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "sov": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "sentiment_label": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string",
+                                          "enum": [
+                                            "positive",
+                                            "neutral",
+                                            "negative",
+                                            "absent"
+                                          ]
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "cache_age_ms": {
+                                      "anyOf": [
+                                        {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
                                     }
                                   },
                                   "required": [
@@ -10892,7 +10952,12 @@
                                     "error_code",
                                     "captured_at",
                                     "last_success_at",
-                                    "cache_layer"
+                                    "cache_layer",
+                                    "brand_present",
+                                    "brand_rank_position",
+                                    "sov",
+                                    "sentiment_label",
+                                    "cache_age_ms"
                                   ],
                                   "additionalProperties": false
                                 }
@@ -15095,7 +15160,14 @@
                               "type": "string"
                             },
                             "brand_present": {
-                              "type": "boolean"
+                              "anyOf": [
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
                             },
                             "brand_rank_position": {
                               "anyOf": [

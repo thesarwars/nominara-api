@@ -221,4 +221,32 @@ describe("STORY-034 AC7 · the parser document", () => {
     // worse than one reading `chatgpt`.
     expect((await get()).engine.display_name).toBe("chatgpt");
   });
+  it("reports brand_present as NULL on a capture the parse stage has not reached", async () => {
+    // Migration 0021. The capture stage writes the row; STORY-135's parse
+    // stage fills the scores afterwards. `NOT NULL DEFAULT false` used to
+    // report "the brand was absent" for that whole window — a measurement
+    // nobody made, and the finding `l1-exact-hash.ts` already records from a
+    // second-engineer review.
+    await db.query("DELETE FROM answer_captures");
+    await db.query(
+      `INSERT INTO answer_captures
+         (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,
+          normalizer_version,content_hash,payload,flags,cache_layer,status)
+       VALUES ($1,$2,$3,$4,$5,'chatgpt', now(),'api','1.0.0','n1',$6,$7::jsonb,'{}','live','captured')`,
+      [
+        resultId,
+        workspaceId,
+        projectId,
+        uuidV7(),
+        promptId,
+        createHash("sha256").update(ANSWER).digest(),
+        JSON.stringify({ format: "markdown", text: ANSWER }),
+      ],
+    );
+
+    const document = await get();
+    expect(document.metrics.brand_present).toBeNull();
+    expect(document.highlight_map).toEqual([]);
+    expect(resultDocumentSchema.safeParse(document).success).toBe(true);
+  });
 });

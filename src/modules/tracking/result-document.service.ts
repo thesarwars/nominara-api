@@ -45,7 +45,7 @@ interface CaptureRow {
   error_code: string | null;
   cache_layer: "live" | "l1" | "l2";
   source_result_id: string | null;
-  brand_present: boolean;
+  brand_present: boolean | null;
   brand_rank_position: number | null;
   sov: number | null;
   sentiment_label: "positive" | "neutral" | "negative" | "absent" | null;

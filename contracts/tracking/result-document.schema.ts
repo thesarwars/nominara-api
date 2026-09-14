@@ -183,7 +183,13 @@ export const resultDocumentSchema = z
     metrics: z
       .object({
         scoring_version: z.string(),
-        brand_present: z.boolean(),
+        /**
+         * NULLABLE since migration 0021. The capture stage writes the row and
+         * the parse stage fills the scores afterwards; between the two there
+         * is no measurement, and the column's old `NOT NULL DEFAULT false`
+         * reported one — "the brand was absent" — that nobody had made.
+         */
+        brand_present: z.boolean().nullable(),
         brand_rank_position: z.number().int().positive().nullable(),
         /** Null when nothing was measurable — never 0. */
         share_of_voice: z.number().nullable(),
