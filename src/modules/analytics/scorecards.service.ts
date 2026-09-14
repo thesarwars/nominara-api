@@ -31,7 +31,19 @@ interface EngineConfig {
   display_name: string | null;
   cadenceRunsPerCycle: number | null;
   weight: number;
+  /** Not windowed — see the contract. */
+  lastCapturedAt: Date | null;
 }
+
+/**
+ * §5's cadence is stated in runs per 30-day cycle, so the interval between
+ * two runs is `30 days / runs` — the same arithmetic `resolveDueEngines`
+ * does. Duplicated as a constant rather than imported so this read does not
+ * pull the scheduler's query into an analytics request; the value is §5's,
+ * not either module's, and `engine-cadence.ts` asserts it against the same
+ * section.
+ */
+const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
 
 interface ResolvedWindow {
   from: string;
@@ -143,15 +155,28 @@ export class ScorecardsService {
       display_name: string | null;
       runs_per_cycle: number | null;
       weight: string;
+      last_captured_at: Date | null;
     }>(
       `SELECT pe.engine_key,
               e.display_name,
               (e.cadence_by_plan -> w.plan_key ->> 'full')::int AS runs_per_cycle,
-              pe.weight::text AS weight
+              pe.weight::text AS weight,
+              last_capture.captured_at AS last_captured_at
          FROM project_engines pe
          JOIN projects p   ON p.id = pe.project_id
          JOIN workspaces w ON w.id = p.workspace_id
          LEFT JOIN engines e ON e.key = pe.engine_key
+         -- NOT WINDOWED, deliberately. An engine that last answered before
+         -- the window is exactly the one worth surfacing, and clamping this
+         -- to the window would report null for the engine that has been
+         -- silent longest. Same rule as the matrix cell's last_success_at.
+         LEFT JOIN LATERAL (
+           SELECT max(c.captured_at) AS captured_at
+             FROM answer_captures c
+            WHERE c.project_id = pe.project_id
+              AND c.engine_key = pe.engine_key
+              AND c.status IN ('captured', 'parsed', 'skipped')
+         ) last_capture ON true
         WHERE pe.project_id = $1 AND pe.enabled = true
           AND ($2::text[] IS NULL OR pe.engine_key = ANY($2::text[]))
         ORDER BY pe.engine_key ASC`,
@@ -168,6 +193,7 @@ export class ScorecardsService {
       // "0 runs per cycle" the screen would have to special-case anyway.
       cadenceRunsPerCycle: row.runs_per_cycle !== null && row.runs_per_cycle > 0 ? row.runs_per_cycle : null,
       weight: Number(row.weight),
+      lastCapturedAt: row.last_captured_at,
     }));
   }
 
@@ -202,12 +228,30 @@ export class ScorecardsService {
   }
 }
 
+/**
+ * The next scheduled run for an engine.
+ *
+ * NULL WHEN THERE IS NOTHING TO PROJECT FROM. A plan that does not schedule
+ * this engine has no interval; an engine that has never run has no last
+ * capture to add one to. Inventing "now" for either would put a scan on the
+ * header that nothing will start.
+ */
+function nextRunAt(engine: EngineConfig): string | null {
+  if (engine.cadenceRunsPerCycle === null || engine.lastCapturedAt === null) return null;
+  return new Date(engine.lastCapturedAt.getTime() + CYCLE_MS / engine.cadenceRunsPerCycle).toISOString();
+}
+
 /** `null` config marks the blended entry — it has no engine to name or schedule. */
 function toEntry(scorecard: Scorecard, engine: EngineConfig | null): ScorecardEntry {
   return {
     engine_key: scorecard.engineKey,
     display_name: engine?.display_name ?? null,
     cadence_runs_per_cycle: engine?.cadenceRunsPerCycle ?? null,
+    // The blended entry has no last scan and no next run: they are per-engine
+    // facts, and a "blended last scan" would be the max of a set the reader
+    // cannot see.
+    last_captured_at: engine?.lastCapturedAt?.toISOString() ?? null,
+    next_run_at: engine === null ? null : nextRunAt(engine),
     visibility_score: scorecard.visibilityScore,
     visibility_delta: scorecard.visibilityDelta,
     confidence: scorecard.confidence,
@@ -224,6 +268,13 @@ function toEntry(scorecard: Scorecard, engine: EngineConfig | null): ScorecardEn
       mentions_total: scorecard.metrics.mentionsTotal,
       citations_total: scorecard.metrics.citationsTotal,
       citations_owned: scorecard.metrics.citationsOwned,
+    },
+    metrics_delta: {
+      presence_rate: scorecard.metricsDelta.presenceRate,
+      share_of_voice: scorecard.metricsDelta.shareOfVoice,
+      sentiment_score: scorecard.metricsDelta.sentimentScore,
+      citation_share: scorecard.metricsDelta.citationShare,
+      rendering_quality: scorecard.metricsDelta.renderingQuality,
     },
   };
 }

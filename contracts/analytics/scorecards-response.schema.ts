@@ -55,6 +55,30 @@ export const scorecardMetricsSchema = z
   })
   .strict();
 
+/**
+ * STORY-090 AC4 — "each with a period delta SUPPRESSED BELOW THE CONFIDENCE
+ * THRESHOLD".
+ *
+ * Computed server-side, under the same `n < 30` rule as the Visibility
+ * Score's own delta, so the suppression lives in one place. A client
+ * subtracting two windows itself would have to re-implement `NFR-ANL-03`,
+ * and the first screen that forgot would publish a trend arrow on four
+ * cells.
+ *
+ * Every field is nullable twice over: null when the windows are
+ * under-sampled, and null when the metric itself was never measured in
+ * either window. Neither is zero.
+ */
+export const scorecardMetricsDeltaSchema = z
+  .object({
+    presence_rate: z.number().nullable(),
+    share_of_voice: z.number().nullable(),
+    sentiment_score: z.number().nullable(),
+    citation_share: z.number().nullable(),
+    rendering_quality: z.number().nullable(),
+  })
+  .strict();
+
 export const scorecardEntrySchema = z
   .object({
     /** An engine key, or `all` for the blended entry. */
@@ -100,6 +124,27 @@ export const scorecardEntrySchema = z
     /** The denominator behind everything above. `0` on an engine with no rows. */
     measured_cells: z.number().int().nonnegative(),
     metrics: scorecardMetricsSchema,
+    metrics_delta: scorecardMetricsDeltaSchema,
+    /**
+     * STORY-090 AC — "the header shows LAST SCAN TIME PER ENGINE".
+     *
+     * The last capture that actually produced an answer on this engine, from
+     * `answer_captures`, and NOT WINDOWED: an engine that last answered
+     * before the window is exactly the one worth surfacing, and clamping it
+     * would report null for the engine that has been silent longest. Same
+     * rule as the matrix cell's `last_success_at`.
+     */
+    last_captured_at: z.string().datetime({ offset: true }).nullable(),
+    /**
+     * STORY-090 AC — "the NEXT SCHEDULED RUNS, each marked included and
+     * zero-credit".
+     *
+     * `last_captured_at + 30 days / cadence_runs_per_cycle`, the same
+     * arithmetic `resolveDueEngines` uses to decide due-ness. Null when the
+     * plan does not schedule this engine, or when it has never run — there
+     * is no "next" to compute from a cadence that does not exist.
+     */
+    next_run_at: z.string().datetime({ offset: true }).nullable(),
   })
   .strict();
 
@@ -130,5 +175,6 @@ export const scorecardsResponseSchema = z
 
 export type ScorecardsQuery = z.infer<typeof scorecardsQuerySchema>;
 export type ScorecardMetrics = z.infer<typeof scorecardMetricsSchema>;
+export type ScorecardMetricsDelta = z.infer<typeof scorecardMetricsDeltaSchema>;
 export type ScorecardEntry = z.infer<typeof scorecardEntrySchema>;
 export type ScorecardsResponse = z.infer<typeof scorecardsResponseSchema>;

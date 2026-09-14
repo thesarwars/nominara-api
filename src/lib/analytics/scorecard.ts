@@ -3,6 +3,7 @@ import {
   blendAcrossEngines,
   confidenceFor,
   confidenceHalfWidth,
+  CONFIDENCE_THRESHOLDS,
   visibilityDelta,
   visibilityScore,
   type Confidence,
@@ -89,6 +90,47 @@ export const EMPTY_WINDOW_METRICS: WindowMetrics = Object.freeze({
   citationsOwned: 0,
 });
 
+/** STORY-090 AC4 — the five metric deltas, under the same suppression rule. */
+export interface WindowMetricsDelta {
+  readonly presenceRate: number | null;
+  readonly shareOfVoice: number | null;
+  readonly sentimentScore: number | null;
+  readonly citationShare: number | null;
+  readonly renderingQuality: number | null;
+}
+
+/**
+ * A metric's period delta.
+ *
+ * NULL WHEN EITHER WINDOW IS UNDER-SAMPLED, exactly as `visibilityDelta`
+ * suppresses the headline one — `NFR-ANL-03` does not carve out the
+ * components. And null when either side never measured the metric: a
+ * project that gained its first citations this month has no citation-share
+ * delta, because there is no prior number to subtract.
+ */
+function metricDelta(
+  current: number | null,
+  prior: number | null,
+  currentCells: number,
+  priorCells: number,
+): number | null {
+  if (current === null || prior === null) return null;
+  if (currentCells < CONFIDENCE_THRESHOLDS.medium || priorCells < CONFIDENCE_THRESHOLDS.medium) return null;
+  return current - prior;
+}
+
+export function toMetricsDelta(current: WindowMetrics, prior: WindowMetrics): WindowMetricsDelta {
+  const of = (pick: (m: WindowMetrics) => number | null): number | null =>
+    metricDelta(pick(current), pick(prior), current.cellsTotal, prior.cellsTotal);
+  return {
+    presenceRate: of((m) => m.presenceRate),
+    shareOfVoice: of((m) => m.shareOfVoice),
+    sentimentScore: of((m) => m.sentimentScore),
+    citationShare: of((m) => m.citationShare),
+    renderingQuality: of((m) => m.renderingQuality),
+  };
+}
+
 export interface Scorecard {
   readonly engineKey: string;
   readonly visibilityScore: number | null;
@@ -97,6 +139,7 @@ export interface Scorecard {
   readonly confidenceHalfWidth: number | null;
   readonly measuredCells: number;
   readonly metrics: WindowMetrics;
+  readonly metricsDelta: WindowMetricsDelta;
 }
 
 /**
@@ -132,6 +175,7 @@ export function toScorecard(engineKey: string, current: WindowMetrics, prior: Wi
     confidenceHalfWidth: confidenceHalfWidth(current.presenceRate, current.cellsTotal),
     measuredCells: current.cellsTotal,
     metrics: current,
+    metricsDelta: toMetricsDelta(current, prior),
   };
 }
 
@@ -156,14 +200,8 @@ export function blendScorecards(
   entries: readonly { readonly scorecard: Scorecard; readonly weight: number }[],
   priorEntries: readonly { readonly scorecard: Scorecard; readonly weight: number }[],
 ): Scorecard {
-  const sum = (of: (m: WindowMetrics) => number): number =>
-    entries.reduce((total, entry) => total + of(entry.scorecard.metrics), 0);
-
-  const cellsTotal = sum((m) => m.cellsTotal);
-  const cellsPresent = sum((m) => m.cellsPresent);
-  const citationsTotal = sum((m) => m.citationsTotal);
-  const citationsOwned = sum((m) => m.citationsOwned);
-  const priorCells = priorEntries.reduce((total, entry) => total + entry.scorecard.metrics.cellsTotal, 0);
+  const metrics = blendMetrics(entries);
+  const priorMetrics = blendMetrics(priorEntries);
 
   const score = blendAcrossEngines(
     entries.map((entry) => ({ score: entry.scorecard.visibilityScore, engineWeight: entry.weight })),
@@ -172,10 +210,42 @@ export function blendScorecards(
     priorEntries.map((entry) => ({ score: entry.scorecard.visibilityScore, engineWeight: entry.weight })),
   );
 
-  // The blend's own components are weighted the same way as its score, over
-  // the engines that HAVE each one. Averaging a null in at zero would drag
-  // the blended figure toward "measured, and terrible" — the rollup's
-  // second pass makes the same choice for the same reason.
+  return {
+    engineKey: BLENDED_KEY,
+    visibilityScore: score,
+    visibilityDelta: visibilityDelta(
+      { score, measuredCells: metrics.cellsTotal },
+      { score: priorScore, measuredCells: priorMetrics.cellsTotal },
+    ),
+    confidence: confidenceFor(metrics.cellsTotal),
+    confidenceHalfWidth: confidenceHalfWidth(metrics.presenceRate, metrics.cellsTotal),
+    measuredCells: metrics.cellsTotal,
+    metrics,
+    // The blend's own metric deltas come from the two BLENDED windows, not
+    // from averaging the per-engine deltas: a per-engine delta is already
+    // suppressed on that engine's own cell count, and averaging suppressed
+    // nulls would either drop the blend's delta whenever one engine is thin
+    // or, worse, compute it from the engines that happen to have survived.
+    metricsDelta: toMetricsDelta(metrics, priorMetrics),
+  };
+}
+
+/**
+ * The blended window's own components.
+ *
+ * COUNTS ARE SUMMED, ratios are weighted. The blend's `measured_cells` is how
+ * many cells stand behind it — STORY-090 AC3's "the cell count behind it" —
+ * and a weighted mean of counts is not a count of anything. The ratios are
+ * weighted over the engines that HAVE each one: averaging a null in at zero
+ * would drag the blended figure toward "measured, and terrible", which is the
+ * choice the rollup's second pass makes for the same reason.
+ */
+function blendMetrics(
+  entries: readonly { readonly scorecard: Scorecard; readonly weight: number }[],
+): WindowMetrics {
+  const sum = (of: (m: WindowMetrics) => number): number =>
+    entries.reduce((total, entry) => total + of(entry.scorecard.metrics), 0);
+
   const weightedMean = (of: (m: WindowMetrics) => number | null): number | null => {
     const present = entries.filter((entry) => of(entry.scorecard.metrics) !== null);
     const weightTotal = present.reduce((total, entry) => total + entry.weight, 0);
@@ -183,29 +253,19 @@ export function blendScorecards(
     return present.reduce((total, entry) => total + entry.weight * of(entry.scorecard.metrics)!, 0) / weightTotal;
   };
 
-  const presenceRate = ratio(cellsPresent, cellsTotal);
+  const cellsTotal = sum((m) => m.cellsTotal);
+  const cellsPresent = sum((m) => m.cellsPresent);
 
   return {
-    engineKey: BLENDED_KEY,
-    visibilityScore: score,
-    visibilityDelta: visibilityDelta(
-      { score, measuredCells: cellsTotal },
-      { score: priorScore, measuredCells: priorCells },
-    ),
-    confidence: confidenceFor(cellsTotal),
-    confidenceHalfWidth: confidenceHalfWidth(presenceRate, cellsTotal),
-    measuredCells: cellsTotal,
-    metrics: {
-      presenceRate,
-      shareOfVoice: weightedMean((m) => m.shareOfVoice),
-      sentimentScore: weightedMean((m) => m.sentimentScore),
-      citationShare: weightedMean((m) => m.citationShare),
-      renderingQuality: weightedMean((m) => m.renderingQuality),
-      cellsTotal,
-      cellsPresent,
-      mentionsTotal: sum((m) => m.mentionsTotal),
-      citationsTotal,
-      citationsOwned,
-    },
+    presenceRate: ratio(cellsPresent, cellsTotal),
+    shareOfVoice: weightedMean((m) => m.shareOfVoice),
+    sentimentScore: weightedMean((m) => m.sentimentScore),
+    citationShare: weightedMean((m) => m.citationShare),
+    renderingQuality: weightedMean((m) => m.renderingQuality),
+    cellsTotal,
+    cellsPresent,
+    mentionsTotal: sum((m) => m.mentionsTotal),
+    citationsTotal: sum((m) => m.citationsTotal),
+    citationsOwned: sum((m) => m.citationsOwned),
   };
 }

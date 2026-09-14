@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   blendScorecards,
   BLENDED_KEY,
+  toMetricsDelta,
   EMPTY_WINDOW_METRICS,
   toScorecard,
   toWindowMetrics,
@@ -241,5 +242,64 @@ describe("STORY-136 · blendScorecards", () => {
   it("returns a null score and a low band for a project with no engines at all", () => {
     const blended: Scorecard = blendScorecards([], []);
     expect(blended).toMatchObject({ visibilityScore: null, measuredCells: 0, confidence: "low" });
+  });
+});
+
+
+describe("STORY-090 · per-metric deltas", () => {
+  it("subtracts each metric against the prior window", () => {
+    const current = metrics({ presenceRate: 0.8, citationShare: 0.5 });
+    const prior = metrics({ presenceRate: 0.6, citationShare: 0.2 });
+    const delta = toMetricsDelta(current, prior);
+    expect(delta.presenceRate).toBeCloseTo(0.2, 12);
+    expect(delta.citationShare).toBeCloseTo(0.3, 12);
+  });
+
+  it("SUPPRESSES every metric delta when either window is under-sampled", () => {
+    // NFR-ANL-03 does not carve out the components. Suppressing the headline
+    // score's delta while publishing five component arrows beside it would
+    // defeat the rule entirely — the arrows are the part a reader looks at.
+    const thin = metrics({ cellsTotal: 29 });
+    expect(Object.values(toMetricsDelta(thin, metrics()))).toEqual([null, null, null, null, null]);
+    expect(Object.values(toMetricsDelta(metrics(), thin))).toEqual([null, null, null, null, null]);
+  });
+
+  it("reports null for a metric neither window measured, and for one only this window has", () => {
+    // A project that gained its first citations this month has no
+    // citation-share delta: there is no prior number to subtract.
+    const current = metrics({ citationShare: 0.4 });
+    const prior = metrics({ citationShare: null });
+    expect(toMetricsDelta(current, prior).citationShare).toBeNull();
+    expect(toMetricsDelta(metrics({ citationShare: null }), prior).citationShare).toBeNull();
+  });
+
+  it("keeps a real zero delta as zero", () => {
+    // "Nothing changed" is a finding when both windows are well sampled.
+    expect(toMetricsDelta(metrics(), metrics()).presenceRate).toBe(0);
+  });
+
+  it("puts the deltas on the scorecard and on the blend", () => {
+    // Built from the COUNTS, not by patching the ratio: `blendMetrics`
+    // re-derives presence from `cellsPresent / cellsTotal`, so a fixture that
+    // patched only the ratio would blend two identical windows and assert a
+    // delta of zero against itself.
+    const card = toScorecard("chatgpt", windowFrom({ cellsPresent: 80 }), windowFrom({ cellsPresent: 60 }));
+    expect(card.metricsDelta.presenceRate).toBeCloseTo(0.2, 12);
+
+    const blended = blendScorecards(
+      [{ scorecard: card, weight: 1 }],
+      [
+        {
+          scorecard: toScorecard("chatgpt", windowFrom({ cellsPresent: 60 }), EMPTY_WINDOW_METRICS),
+          weight: 1,
+        },
+      ],
+    );
+    expect(blended.metricsDelta.presenceRate).toBeCloseTo(0.2, 12);
+  });
+
+  it("gives an unmeasured engine a delta of all nulls, never zeros", () => {
+    const card = toScorecard("gemini", EMPTY_WINDOW_METRICS, EMPTY_WINDOW_METRICS);
+    expect(Object.values(card.metricsDelta)).toEqual([null, null, null, null, null]);
   });
 });
