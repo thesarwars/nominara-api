@@ -54,6 +54,7 @@ describe("STORY-034 · capture.execute moves a cell", () => {
   let db: Client;
   let cache: Cache;
   let emissions: Emission[];
+  let parseJobs: { resultId: string }[];
   let workspaceId: string;
   let projectId: string;
 
@@ -79,6 +80,7 @@ describe("STORY-034 · capture.execute moves a cell", () => {
     );
     cache = new InMemoryCacheAdapter();
     emissions = [];
+    parseJobs = [];
     workspaceId = randomUUID();
     projectId = randomUUID();
     await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'W', $2, 'growth')", [
@@ -104,7 +106,18 @@ describe("STORY-034 · capture.execute moves a cell", () => {
 
   function handler() {
     const context = { pool: undefined, env: { VALKEY_CACHE_URL: "unused" } } as unknown as QueueHandlerContext;
-    return createCaptureExecuteHandler(context, { cache, realtime: recordingPublisher(emissions) });
+    // STORY-135 — the parse enqueue is stubbed and RECORDED. This suite is
+    // about the capture handler, and the env above has no queue in it; what
+    // matters here is that a captured cell hands its row on, which
+    // `parseJobs` below asserts.
+    return createCaptureExecuteHandler(context, {
+      cache,
+      realtime: recordingPublisher(emissions),
+      enqueueParse: (payload) => {
+        parseJobs.push(payload);
+        return Promise.resolve();
+      },
+    });
   }
 
   async function addPrompt(text: string): Promise<string> {
@@ -242,6 +255,27 @@ describe("STORY-034 · capture.execute moves a cell", () => {
     await process(db, jobs[1]!);
 
     expect(emissions.filter((entry) => entry.event === "run.progress")).toHaveLength(1);
+  });
+
+  it("STORY-135 — hands each captured cell to the parser, once", async () => {
+    await addPrompt("normal");
+    const { jobs } = await planRun();
+    await handler()(db, jobs[0]!);
+
+    expect(parseJobs).toHaveLength(1);
+    const written = await db.query<{ id: string }>("SELECT id FROM answer_captures WHERE status = 'captured'");
+    expect(parseJobs[0]!.resultId).toBe(written.rows[0]!.id);
+  });
+
+  it("does NOT enqueue a parse for a cell that failed to capture", async () => {
+    // A blocked or failed cell has no text. Handing it to the parser would
+    // put a job on the queue whose only possible outcome is to return.
+    await addPrompt("normal");
+    const { runId, jobs } = await planRun();
+    await db.query("UPDATE capture_runs SET status = 'canceled' WHERE id = $1", [runId]);
+    await handler()(db, jobs[0]!);
+
+    expect(parseJobs).toEqual([]);
   });
 
   it("seeds the shared cache so a later run can reuse the answer", async () => {
