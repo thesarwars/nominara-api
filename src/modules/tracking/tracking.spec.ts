@@ -2,6 +2,7 @@ import { Test } from "@nestjs/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
 import { MatrixController } from "./matrix.controller.js";
+import { ResultsController } from "./results.controller.js";
 import { RunEstimateService } from "./run-estimate.service.js";
 import { RunLifecycleService } from "./run-lifecycle.service.js";
 import { RunsController } from "./runs.controller.js";
@@ -28,6 +29,7 @@ describe("STORY-022 · TrackingModule compiles", () => {
     expect(moduleRef.get(TrackingController)).toBeInstanceOf(TrackingController);
     expect(moduleRef.get(RunsController)).toBeInstanceOf(RunsController);
     expect(moduleRef.get(MatrixController)).toBeInstanceOf(MatrixController);
+    expect(moduleRef.get(ResultsController)).toBeInstanceOf(ResultsController);
     expect(moduleRef.get(RunEstimateService)).toBeInstanceOf(RunEstimateService);
     expect(moduleRef.get(RunLifecycleService)).toBeInstanceOf(RunLifecycleService);
     await moduleRef.close();
