@@ -12,6 +12,7 @@ import { RbacGuard } from "./guards/rbac.guard.js";
 import { EntitlementGuard } from "./guards/entitlement.guard.js";
 import { QuotaGuard } from "./guards/quota.guard.js";
 import { DailyCapGuard } from "./guards/daily-cap.guard.js";
+import { RateLimitedError } from "./errors/domain-errors.js";
 import { RateLimitGuard } from "./guards/rate-limit.guard.js";
 import { CreditGuard } from "./guards/credit.guard.js";
 import { IdempotencyInterceptor } from "./interceptors/idempotency.interceptor.js";
@@ -119,13 +120,14 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
   // STORY-019 — QA finding: the guard-order test above only ever observes
   // RbacGuard returning true (every guard here is a no-op except AuthGuard,
   // /health/live is @Public()). It never proves a refusal SHORT-CIRCUITS
-  // the chain. EntitlementGuard/QuotaGuard/DailyCapGuard/RateLimitGuard/
-  // CreditGuard are still no-ops today, so there is no side effect (e.g. a
-  // credit reservation) for this test to prove was skipped yet — once any
-  // of them stops being a no-op, a test asserting that side effect never
-  // ran on a 403 must be added alongside it. What this test pins now: a
-  // thrown PermissionDeniedException stops NestJS's guard pipeline before
-  // any guard registered after RbacGuard is even invoked.
+  // the chain. What this test pins: a thrown PermissionDeniedException stops
+  // NestJS's guard pipeline before any guard registered after RbacGuard is
+  // even invoked.
+  //
+  // STORY-072 — that finding's own follow-up has now come due. It asked for
+  // "a test asserting that side effect never ran on a 403" once any of the
+  // later guards stopped being a no-op, and CreditGuard now reserves credits.
+  // The sibling test below is that test.
   it("an RbacGuard refusal short-circuits the chain before any later guard runs", async () => {
     const calls: string[] = [];
     for (const Guard of GUARD_ORDER) {
@@ -154,6 +156,50 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
 
     expect(response.statusCode).toBe(403);
     expect(calls).toEqual([AuthGuard.name, WorkspaceGuard.name, RbacGuard.name]);
+
+    await app.close();
+  });
+
+  // STORY-072 AC8 — "A RATE-LIMITED REQUEST NEVER REACHES THIS GUARD, so no
+  // reservation is created under load. Asserted."
+  //
+  // This is why `api.module.ts` corrected the reference documents' own
+  // diagrammed order: both say in prose that "a rate-limited request must
+  // never reach CreditGuard", and both diagram the opposite. Under a burst
+  // the wallet would otherwise be reserved against on every request that the
+  // rate limiter was about to refuse — reservations that nothing settles,
+  // because no handler ever runs.
+  it("a rate-limit refusal short-circuits before CreditGuard can reserve anything", async () => {
+    const calls: string[] = [];
+    for (const Guard of GUARD_ORDER) {
+      const proto = Guard.prototype as unknown as { canActivate: (...args: unknown[]) => boolean | Promise<boolean> };
+      const original = proto.canActivate;
+      if (Guard === RateLimitGuard) {
+        vi.spyOn(proto, "canActivate").mockImplementation(function (this: unknown) {
+          calls.push(Guard.name);
+          throw new RateLimitedError({ message: "slow down", details: { retry_after_ms: 1000 } });
+        });
+        continue;
+      }
+      vi.spyOn(proto, "canActivate").mockImplementation(function (this: unknown, ...args: unknown[]) {
+        calls.push(Guard.name);
+        return original.apply(this, args as never);
+      });
+    }
+
+    const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
+    const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await configureApp(app);
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+
+    const response = await app.inject({ method: "GET", url: "/health/live" });
+
+    expect(response.statusCode).toBe(429);
+    // CreditGuard is absent from the list, which is the assertion: it was
+    // never invoked, so it cannot have reserved.
+    expect(calls).not.toContain(CreditGuard.name);
+    expect(calls[calls.length - 1]).toBe(RateLimitGuard.name);
 
     await app.close();
   });

@@ -30,6 +30,20 @@ export const PG_POOL = Symbol("PG_POOL");
 // cases it misses. What the guard buys is that "forgot the context"
 // surfaces as a loud failure in the first test that touches the path,
 // instead of as zero rows that look like an empty list.
-export function createPgPool(connectionString: string): Pool {
-  return tenantAwarePool(new Pool({ connectionString }), TENANT_TABLES);
+export function createPgPool(connectionString: string, options: PoolTuning = {}): Pool {
+  return tenantAwarePool(new Pool({ connectionString, ...options }), TENANT_TABLES);
+}
+
+/**
+ * The knobs a SECOND pool needs, and nothing more.
+ *
+ * STORY-072's settlement pool is small and bounded on purpose, and the
+ * second-engineer review caught it being built as a bare `new Pool(...)` —
+ * which made the sentence above ("no path that checks out an unwrapped
+ * client") false the moment it landed. Tuning goes through here so a caller
+ * that needs different limits still gets the guard.
+ */
+export interface PoolTuning {
+  readonly max?: number;
+  readonly connectionTimeoutMillis?: number;
 }
