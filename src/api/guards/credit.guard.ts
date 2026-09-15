@@ -1,8 +1,22 @@
-import { CanActivate, ExecutionContext, Injectable } from "@nestjs/common";
+import { CanActivate, ExecutionContext, Inject, Injectable, Logger } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
+import type { ClientBase, Pool } from "pg";
+import { PG_POOL } from "../../db/pg-pool.js";
+import { appendLedgerEntry, inspectReservations, type LedgerActionCode } from "../../lib/credits/ledger.js";
+import { provisionWallet, purchasableOptions, reserveCredits, readWallet } from "../../lib/credits/wallet.js";
+import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
+import { compensateDailyCounter } from "../../lib/usage/daily-cap.js";
+import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
+import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { CREDITS_KEY, CREDIT_PRICE_KEY, type CreditAction } from "../decorators/credits.decorator.js";
-import { PriceChangedError, ValidationFailedError } from "../errors/domain-errors.js";
+import {
+  ConflictError,
+  InsufficientCreditsError,
+  PriceChangedError,
+  ValidationFailedError,
+} from "../errors/domain-errors.js";
+import type { DailyCapScopedRequest } from "./daily-cap.guard.js";
 import type { WorkspaceScopedRequest } from "./workspace.guard.js";
 
 // STORY-022-E-2 composed this slot as a pass-through; STORY-034 fills in the
@@ -16,13 +30,48 @@ import type { WorkspaceScopedRequest } from "./workspace.guard.js";
 //   CONFIRM  → 409 price_changed. Needs the PRICE, which is a plan
 //              entitlement and has been readable since STORY-069.
 //
-// Shipping the confirm half now is what makes the two-step guard rail real
-// rather than decorative: without it, `POST /projects/{id}/runs` would
-// happily execute against a figure the operator never saw. A route that
-// cannot yet debit can still refuse to act on a stale quote.
+// STORY-072 FILLS IN THE RESERVE HALF. `credit_wallets` now exists, so the
+// order is: confirm the quote, then reserve against it. Confirming first is
+// deliberate — a stale quote should be refused without touching the wallet
+// at all, and a reservation made before the price check would have to be
+// released on the very next line.
 
-interface CreditScopedRequest extends WorkspaceScopedRequest {
+const logger = new Logger("credit-guard");
+
+interface CreditScopedRequest extends WorkspaceScopedRequest, DailyCapScopedRequest {
   headers?: Record<string, string | string[] | undefined>;
+  /**
+   * AC10 — what the interceptor settles.
+   *
+   * Set only when this guard actually reserved. The interceptor commits it on
+   * success and releases it on failure; an absent value means there is
+   * nothing to settle, which is the correct state for an unpriced route.
+   */
+  creditReservation?: CreditReservation;
+}
+
+export interface CreditReservation {
+  readonly workspaceId: string;
+  readonly action: CreditAction;
+  /** What was reserved. A flat-priced action commits exactly this. */
+  readonly amount: number;
+  /**
+   * The request's `Idempotency-Key`, and it is REQUIRED — the guard refuses a
+   * priced route without one. It is what `ux_credit_ledger_idem` dedupes on,
+   * so a reservation that had no key could be opened twice by a redelivery,
+   * which is the leak the second-engineer review reproduced.
+   */
+  readonly idempotencyKey: string;
+  /** `credit_ledger.action_code` for this action, resolved once by the guard. */
+  readonly ledgerAction: LedgerActionCode;
+  /**
+   * Which attempt under that key this reservation is.
+   *
+   * A COLUMN, NOT A SUFFIX. Settlement closes this exact attempt, and the
+   * client cannot write it — see migration 0022 for what the string version
+   * let a second seat in a workspace do to someone else's reservation.
+   */
+  readonly attempt: number;
 }
 
 /** §1's header, verbatim. Lowercased because Node normalises incoming header names. */
@@ -33,6 +82,7 @@ export class CreditGuard implements CanActivate {
   constructor(
     private readonly reflector: Reflector,
     private readonly resolver: EntitlementResolver,
+    @Inject(PG_POOL) private readonly pool: Pool,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -82,8 +132,214 @@ export class CreditGuard implements CanActivate {
         },
       });
     }
+
+    await this.reserve(request, workspaceId, action, price, resolved.entitlements);
     return true;
   }
+
+  /**
+   * §6 STEP 1, made IDEMPOTENT, and the refusal that follows from zero rows.
+   *
+   * ⚠ THE LEDGER ENTRY IS THE PERMISSION TO MOVE THE BALANCE. The
+   * second-engineer review reproduced a 600-credit wallet drained to zero by
+   * three retries of one action: guards run before ALL interceptors, so
+   * anything that short-circuits in `IdempotencyInterceptor` — a replay, an
+   * `in_flight` conflict, a body mismatch — leaves the reservation this guard
+   * made with nothing to settle it. Each retry opened another.
+   *
+   * `ux_credit_ledger_idem` closes it. The `reserve` entry is written FIRST,
+   * under the request's `Idempotency-Key`; a redelivery conflicts, the insert
+   * reports `false`, and the wallet is never touched a second time. The
+   * caller re-attaches to the reservation that already exists.
+   *
+   * ⚠ AND A PRICED ROUTE WITHOUT A KEY IS REFUSED BEFORE ANY OF THIS. Without
+   * one there is nothing to dedupe on, so the leak would be reachable again
+   * by simply omitting a header — which is how the review reached it. §1
+   * requires the header on every billable POST and `IdempotencyInterceptor`
+   * would 400 the request moments later anyway; refusing here means it does
+   * so without a reservation behind it.
+   */
+  private async reserve(
+    request: CreditScopedRequest,
+    workspaceId: string,
+    action: CreditAction,
+    price: number,
+    entitlements: Readonly<Record<string, { readonly value: unknown }>>,
+  ): Promise<void> {
+    // A zero-priced action has nothing to reserve. Reserving 0 would write a
+    // row for a spend that cannot fail and would leave the interceptor with
+    // a settlement to make for no credits.
+    if (price === 0) return;
+
+    const idempotencyKey = idempotencyKeyOf(request);
+    if (idempotencyKey === undefined) {
+      throw new ValidationFailedError({
+        message: "a credit-spending route requires an Idempotency-Key",
+        details: {
+          issues: [{ path: ["idempotency-key"], message: "required on a credit-priced route" }],
+        },
+      });
+    }
+
+    let refusal: InstanceType<typeof InsufficientCreditsError> | null = null;
+    let alreadyCommitted = false;
+    let attempt = 1;
+
+    const client = await this.pool.connect();
+    try {
+      await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx: ClientBase) => {
+        // Nothing else in the product creates a wallet row — see
+        // `provisionWallet`. On the request path so there is no window in
+        // which a cycle has begun and the row does not exist.
+        const period = await resolveBillingPeriod(tx, workspaceId);
+        await provisionWallet(tx, workspaceId, includedGrantOf(entitlements), period);
+
+        // ⚠ "IS ONE OF THIS KEY'S RESERVATIONS STILL OPEN", not "has this key
+        // reserved before". A ledger entry is permanent; a reservation is
+        // not. Testing the entry's mere existence re-attached a retry to a
+        // reservation that had already been released, and the commit then
+        // matched no row — 500, nothing charged, key poisoned forever.
+        const claim = await inspectReservations(tx, workspaceId, idempotencyKey);
+
+        if (claim.committed) {
+          // THE ACTION ALREADY RAN AND WAS PAID FOR. Reaching here means
+          // `IdempotencyInterceptor` lost its stored response — it says it
+          // degrades to executing rather than refusing — and executing a
+          // paid action a second time would spend at the engine again.
+          // Refusing at the GUARD is what stops the handler running at all.
+          alreadyCommitted = true;
+          return;
+        }
+
+        if (claim.openAttempt !== null) {
+          // A redelivery of a request whose reservation is still standing.
+          // Re-attach: the credits are already held.
+          attempt = claim.openAttempt;
+          return;
+        }
+
+        // Every prior attempt was released, so this is a genuine retry and
+        // needs credits of its own.
+        attempt = claim.attempts + 1;
+
+        const outcome = await reserveCredits(tx, workspaceId, price);
+        if (!outcome.ok) {
+          const wallet = await readWallet(tx, workspaceId);
+          if (wallet === null) {
+            throw new Error(`workspace ${workspaceId} has no credit wallet after provisioning`);
+          }
+          // COLLECTED, NOT THROWN. Throwing from inside `withTenantContext`
+          // rolls the transaction back — which is correct for the failed
+          // reservation, and fatal for the daily-cap compensation that has to
+          // follow it. The review caught exactly that: the compensation was
+          // written inside the doomed transaction and died with it.
+          refusal = new InsufficientCreditsError({
+            message:
+              "Your scheduled tracking is unaffected and keeps running. This on-demand action needs more credits than the wallet has.",
+            details: {
+              required: price,
+              available: wallet.available,
+              wallet: {
+                included_balance: wallet.includedBalance,
+                purchased_balance: wallet.purchasedBalance,
+                reserved: wallet.reserved,
+                cycle_end: wallet.cycleEnd,
+              },
+              packs: (await purchasableOptions(tx, workspaceId)).map((pack) => ({
+                key: pack.key,
+                credits: pack.credits,
+                price_usd: pack.priceUsd,
+              })),
+            },
+          });
+          return;
+        }
+
+        // The entry goes in the SAME transaction as the wallet movement, so a
+        // reservation without its ledger row is unrepresentable. A conflict
+        // means this key already reserved: undo this transaction's own
+        // increment by rolling back, and re-attach below.
+        const first = await appendLedgerEntry(tx, {
+          workspaceId,
+          entryType: "reserve",
+          actionCode: LEDGER_ACTION[action],
+          credits: price,
+          idempotencyKey,
+          attempt,
+          after: outcome.wallet!,
+          actorId: null,
+          actorType: "system",
+        });
+        // A concurrent delivery computed the same attempt number and won.
+        // Roll this one back and let the caller re-attach to theirs.
+        if (!first) throw new AlreadyReservedError();
+      });
+    } catch (error) {
+      if (!(error instanceof AlreadyReservedError)) throw error;
+      // A concurrent delivery got there first. The rollback undid this
+      // attempt's increment; re-read to find the reservation it opened.
+      const found = await this.openAttemptFor(workspaceId, idempotencyKey);
+      if (found === null) {
+        // `conflict`, NOT `idempotency_conflict`. That code means "same key,
+        // different body" and its details name the two request hashes; this
+        // is a lost race between two identical deliveries.
+        //
+        // The wording does not claim a reservation is still being held: the
+        // race winner may have settled in the window between our conflict
+        // and this re-read, in which case nothing is in flight any more. A
+        // plain retry resolves it either way.
+        throw new ConflictError({
+          message: "another delivery of this request is being processed; retry with the same Idempotency-Key",
+        });
+      }
+      attempt = found;
+    } finally {
+      client.release();
+    }
+
+    if (alreadyCommitted) {
+      // ⚠ NEVER "retry with a new Idempotency-Key". The review caught that
+      // wording telling a client which lost its acknowledgement to run the
+      // action again under a fresh key — which reserves, executes and
+      // charges a SECOND time. A lost acknowledgement must not become a
+      // double charge for one customer intent.
+      //
+      // ⚠ AND THIS DEVIATES FROM §1 AND `NFR-API-07`, deliberately and
+      // visibly. Both say a replayed request returns the cached response and
+      // debits nothing more. Reaching here means `IdempotencyInterceptor`
+      // lost that response — it degrades to executing rather than refusing —
+      // and the guard has no stored result to replay. The available choices
+      // are refuse, or execute a paid action a second time. Refusing is the
+      // one that does not spend the customer's money twice. Recorded in
+      // STORY-072 rather than left as a discovery.
+      throw new ConflictError({
+        message:
+          "This request already completed and the credits were charged. Check the run history before retrying — " +
+          "repeating it would charge again.",
+      });
+    }
+
+    if (refusal !== null) {
+      // ⚠ OUTSIDE the transaction that failed, and on its own connection.
+      // STORY-071 AC6: "a wallet failure compensates the increment.
+      // Otherwise a user with no credits burns their allowance discovering
+      // they have none." The compensation must OUTLIVE the rollback, which
+      // is the whole reason it is here and not three lines above.
+      await this.compensateDaily(request);
+      throw refusal;
+    }
+
+    request.creditReservation = {
+      workspaceId,
+      action,
+      amount: price,
+      idempotencyKey,
+      // Settlement must close the attempt it actually attached to.
+      attempt,
+      ledgerAction: LEDGER_ACTION[action],
+    };
+  }
+
 
   /**
    * MISSING IS A 400, NOT A ZERO.
@@ -114,4 +370,67 @@ export class CreditGuard implements CanActivate {
     }
     return parsed;
   }
+
+  /** Re-read which of a key's attempts is open, after losing a race to open one. */
+  private async openAttemptFor(workspaceId: string, idempotencyKey: string): Promise<number | null> {
+    const client = await this.pool.connect();
+    try {
+      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx: ClientBase) => {
+        const claim = await inspectReservations(tx, workspaceId, idempotencyKey);
+        return claim.openAttempt;
+      });
+    } finally {
+      client.release();
+    }
+  }
+
+  /** STORY-071 AC6's compensating decrement, committed on a connection of its own. */
+  private async compensateDaily(request: CreditScopedRequest): Promise<void> {
+    const compensation = request.dailyCapCompensation;
+    if (compensation === undefined) return;
+
+    const client = await this.pool.connect();
+    try {
+      await withTenantContext(
+        client,
+        { workspaceId: compensation.workspaceId, actorId: SYSTEM_ACTOR_ID },
+        (tx: ClientBase) => compensateDailyCounter(tx, compensation.workspaceId, compensation.action),
+      );
+    } catch (error) {
+      // A failed compensation costs the customer one of the day's actions.
+      // Worth a loud log; not worth replacing their `402` with a `500`, which
+      // would tell them nothing about the actual problem.
+      logger.error(
+        `failed to compensate the daily counter for workspace ${compensation.workspaceId}: ${String(error)}`,
+      );
+    } finally {
+      client.release();
+    }
+  }
+}
+
+/** Raised and swallowed inside `reserve` to roll back a duplicate attempt. */
+class AlreadyReservedError extends Error {}
+
+/** `@Credits` actions onto `credit_ledger.action_code`'s own CHECK. */
+const LEDGER_ACTION: Readonly<Record<CreditAction, LedgerActionCode>> = Object.freeze({
+  deep_scan: "manual_scan",
+});
+
+/**
+ * The plan's included grant, for a wallet that does not exist yet.
+ *
+ * Zero when the plan does not publish one: a wallet provisioned at zero
+ * refuses correctly, where guessing a figure would hand out credits.
+ */
+function includedGrantOf(entitlements: Readonly<Record<string, { readonly value: unknown }>>): number {
+  const value = entitlements["credits.included_per_cycle"]?.value;
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : 0;
+}
+
+/** The request's `Idempotency-Key`, so a redelivery settles the same reservation. */
+function idempotencyKeyOf(request: CreditScopedRequest): string | undefined {
+  const raw = request.headers?.["idempotency-key"];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === "string" && value.length > 0 && value.length <= 255 ? value : undefined;
 }

@@ -39,6 +39,7 @@ export const creditLedger = pgTable("credit_ledger", {
   internalCostUsd: numeric("internal_cost_usd", { precision: 10, scale: 6 }),
   reason: text("reason"),
   occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().default(sql`now()`),
+  attempt: smallint("attempt").notNull().default(sql`1`),
 });
 
 export const creditPacks = pgTable("credit_packs", {
