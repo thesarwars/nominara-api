@@ -57,6 +57,17 @@ export const creditLedgerEntrySchema = z
      * did not take.
      */
     actor_id: z.string().uuid().nullable(),
+    /**
+     * Set only once the person has been erased, and then `actor_id` is null —
+     * `ck_credit_ledger_actor_exclusive` makes the two mutually exclusive.
+     *
+     * ⚠ IT IS RETURNED RATHER THAN HIDDEN, because the whole reason it
+     * survives erasure is that somebody disputing an invoice can still group
+     * one person's charges together. A field kept for that purpose and then
+     * withheld from the only screen that would use it keeps the data without
+     * the justification for keeping it.
+     */
+    actor_pseudonym: z.string().uuid().nullable(),
     actor_type: z.enum(["user", "api_key", "system"]),
     project_id: z.string().uuid().nullable(),
     reference_type: z.string().nullable(),

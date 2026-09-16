@@ -3,7 +3,7 @@ import type { ClientBase } from "pg";
 import type { PurgeFailureDetail } from "../../../contracts/ops/purge-failure-detail.schema.js";
 import { connect, requireDatabaseUrl } from "../../db/client.js";
 import { RECHAINED_MARKER_ACTION } from "../../lib/crypto/audit-chain.js";
-import { pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
+import { pseudonymiseActorId, pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -348,7 +348,23 @@ export async function requestIndividualErasure(privilegedClient: ClientBase, use
     await privilegedClient.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
     await privilegedClient.query("UPDATE audit_log SET actor_id = $2 WHERE actor_id = $1", [userId, SYSTEM_ACTOR_ID]);
-    await privilegedClient.query("UPDATE credit_ledger SET actor_id = $2 WHERE actor_id = $1", [userId, SYSTEM_ACTOR_ID]);
+    // ⚠ PSEUDONYMISED, NOT REASSIGNED, and `credit_ledger` differs from
+    // `audit_log` above for a reason worth stating. Both retain their rows;
+    // only this one is an ACCOUNTING record, kept for the invoice-dispute
+    // window (data-model.md §7), and a dispute asks who authorised a charge.
+    // Collapsing every erased person onto the system actor answers "the
+    // system", which is not an answer — after two erasures their spend is
+    // indistinguishable, and from entries the system genuinely caused too.
+    //
+    // `actor_id` goes NULL because it carries an FK to `users` and a
+    // pseudonym has no row to point at; `ck_credit_ledger_actor_exclusive`
+    // is what keeps the two from ever both being set. The pseudonym is
+    // deterministic, so one person's entries still group together, and
+    // one-way, so the grouping identifies nobody.
+    await privilegedClient.query(
+      "UPDATE credit_ledger SET actor_id = NULL, actor_pseudonym = $2 WHERE actor_id = $1",
+      [userId, pseudonymiseActorId(userId)],
+    );
     await privilegedClient.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
 

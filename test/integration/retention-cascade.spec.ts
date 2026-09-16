@@ -3,7 +3,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RECHAINED_MARKER_ACTION } from "../../src/lib/crypto/audit-chain.js";
-import { pseudonymiseWorkspaceId } from "../../src/lib/crypto/pseudonymise.js";
+import { pseudonymiseActorId, pseudonymiseWorkspaceId } from "../../src/lib/crypto/pseudonymise.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
@@ -399,10 +399,20 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     );
     expect(audit.rows[0]!.actor_id).toBe(SYSTEM_ACTOR_ID);
 
-    const ledger = await client.query<{ actor_id: string }>("SELECT actor_id FROM credit_ledger WHERE workspace_id = $1", [
-      workspaceId,
-    ]);
-    expect(ledger.rows[0]!.actor_id).toBe(SYSTEM_ACTOR_ID);
+    // ⚠ PSEUDONYMISED, NOT REASSIGNED TO THE SYSTEM ACTOR. This used to
+    // assert `SYSTEM_ACTOR_ID`, which is erasure of the actor rather than
+    // pseudonymisation of it: after two people are erased their spend is
+    // indistinguishable, and indistinguishable from entries the system
+    // genuinely caused. `credit_ledger` is an ACCOUNTING record kept for the
+    // invoice-dispute window (data-model.md §7), and a dispute asks who
+    // authorised a charge — "the system" is not an answer to that.
+    const ledger = await client.query<{ actor_id: string | null; actor_pseudonym: string | null }>(
+      "SELECT actor_id, actor_pseudonym FROM credit_ledger WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    expect(ledger.rows[0]!.actor_id).toBeNull();
+    expect(ledger.rows[0]!.actor_pseudonym).toBe(pseudonymiseActorId(userId));
+    expect(ledger.rows[0]!.actor_pseudonym).not.toBe(userId);
 
     // The append-only trigger still protects every OTHER workspace's rows.
     const otherWorkspace = await createWorkspace();
@@ -414,6 +424,61 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
   });
 
   // -- STORY-020 D-4 — erasure appends a re-chain marker per affected workspace
+
+  it("STORY-073 AC13 · two erased people stay distinguishable in the ledger, and neither is identifiable", async () => {
+    // ⚠ THE PROPERTY THE SYSTEM-ACTOR VERSION DESTROYED. A dispute over an
+    // invoice asks which person authorised which charge. Collapsing every
+    // erased actor onto one id answers "the same one" for all of them.
+    const workspaceId = await createWorkspace();
+    const first = await createUser();
+    const second = await createUser();
+    for (const member of [first, second]) {
+      await client.query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1, $2, 'analyst', 'active')",
+        [workspaceId, member],
+      );
+    }
+    await insertCreditLedger(workspaceId, first);
+    await insertCreditLedger(workspaceId, first);
+    await insertCreditLedger(workspaceId, second);
+
+    expect(await requestIndividualErasure(client, first)).toEqual({ blocked: false });
+    expect(await requestIndividualErasure(client, second)).toEqual({ blocked: false });
+
+    const rows = await client.query<{ actor_pseudonym: string | null; actor_id: string | null }>(
+      "SELECT actor_id, actor_pseudonym FROM credit_ledger WHERE workspace_id = $1",
+      [workspaceId],
+    );
+
+    const pseudonyms = rows.rows.map((row) => row.actor_pseudonym);
+    // Nobody is named any more...
+    expect(rows.rows.every((row) => row.actor_id === null)).toBe(true);
+    expect(pseudonyms).not.toContain(first);
+    expect(pseudonyms).not.toContain(second);
+    // ...and the two people are still two people: 2 rows and 1 row.
+    expect(new Set(pseudonyms).size).toBe(2);
+    expect(pseudonyms.filter((p) => p === pseudonymiseActorId(first))).toHaveLength(2);
+  });
+
+  it("STORY-073 AC13 · a row cannot name a person and carry a pseudonym at once", async () => {
+    // The constraint is what makes "pseudonymised" a state the database can
+    // express rather than a convention the erasure function happens to follow.
+    const workspaceId = await createWorkspace();
+    const actorId = await createUser();
+    await insertCreditLedger(workspaceId, actorId);
+
+    await client.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
+    try {
+      await expect(
+        client.query("UPDATE credit_ledger SET actor_pseudonym = $1 WHERE workspace_id = $2", [
+          pseudonymiseActorId(actorId),
+          workspaceId,
+        ]),
+      ).rejects.toThrow(/ck_credit_ledger_actor_exclusive/u);
+    } finally {
+      await client.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
+    }
+  });
 
   it("STORY-020 · individual erasure appends one audit.chain.rechained marker row to each workspace whose audit_log rows had this actor", async () => {
     const userId = await createUser();

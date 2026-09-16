@@ -18,6 +18,7 @@ function entry(over: Partial<CreditLedgerEntry> = {}): CreditLedgerEntry {
     purchased_after: 0,
     reserved_after: 0,
     actor_id: "22222222-2222-7222-8222-222222222222",
+    actor_pseudonym: null,
     actor_type: "user",
     project_id: "33333333-3333-7333-8333-333333333333",
     reference_type: "run",

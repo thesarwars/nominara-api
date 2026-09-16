@@ -29,6 +29,7 @@ interface LedgerRow {
   purchased_after: string;
   reserved_after: string;
   actor_id: string | null;
+  actor_pseudonym: string | null;
   actor_type: CreditLedgerEntry["actor_type"];
   project_id: string | null;
   reference_type: string | null;
@@ -50,6 +51,7 @@ function toEntry(row: LedgerRow): CreditLedgerEntry {
     purchased_after: Number(row.purchased_after),
     reserved_after: Number(row.reserved_after),
     actor_id: row.actor_id,
+    actor_pseudonym: row.actor_pseudonym,
     actor_type: row.actor_type,
     project_id: row.project_id,
     reference_type: row.reference_type,
@@ -95,7 +97,7 @@ export async function readLedgerPage(
   const result = await tx.query<LedgerRow>(
     `SELECT id, entry_type, action_code, credits::text, bucket,
             included_after::text, purchased_after::text, reserved_after::text,
-            actor_id, actor_type, project_id, reference_type, reference_id,
+            actor_id, actor_pseudonym, actor_type, project_id, reference_type, reference_id,
             unit_detail, reason,
             to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS occurred_at_key,
             seq::text AS seq_key
@@ -159,6 +161,7 @@ export function toLedgerCsv(entries: readonly CreditLedgerEntry[]): string {
     "reserved_after",
     "actor_type",
     "actor_id",
+    "actor_pseudonym",
     "project_id",
     "reference_type",
     "reference_id",
@@ -180,6 +183,7 @@ export function toLedgerCsv(entries: readonly CreditLedgerEntry[]): string {
     String(entry.reserved_after),
     entry.actor_type,
     entry.actor_id ?? "",
+    entry.actor_pseudonym ?? "",
     entry.project_id ?? "",
     entry.reference_type ?? "",
     entry.reference_id ?? "",
