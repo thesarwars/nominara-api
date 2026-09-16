@@ -190,6 +190,44 @@ describe("STORY-073 · reading the credit ledger", () => {
     expect(page.items.map((entry) => entry.credits)).toEqual([30, 20, 10]);
   });
 
+  it("⚠ pages across entries that differ only in MICROSECONDS without dropping one", async () => {
+    // ⚠ THE SECOND ROW-SKIPPING BUG IN THIS CURSOR. `occurred_at` is
+    // published at millisecond precision — that is what a person reads — and
+    // the query orders on the full timestamptz. Keying the cursor on the
+    // truncated value made the keyset predicate exclude every row sharing a
+    // millisecond with the page boundary: four entries in one millisecond at
+    // limit 2 returned three of them, `has_more` went false, and the missing
+    // debit appeared on NO page.
+    //
+    // Two settlements landing in the same millisecond is ordinary. Every
+    // earlier paging test here seeds whole seconds or one identical
+    // timestamp for all rows, so none of them could see it.
+    const base = "2026-09-12T10:00:00";
+    for (const micros of ["000000", "000100", "000200", "000300"]) {
+      await seed({ occurredAt: `${base}.${micros}Z`, credits: 10 + Number(micros) });
+    }
+
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 6; page += 1) {
+      const result = await read(cursor === undefined ? { limit: 2 } : { limit: 2, cursor });
+      seen.push(...result.items.map((entry) => entry.id));
+      if (result.pagination.cursor_next === null) break;
+      cursor = result.pagination.cursor_next;
+    }
+
+    expect(seen).toHaveLength(4);
+    expect(new Set(seen).size).toBe(4);
+  });
+
+  it("still publishes occurred_at at millisecond precision, whatever the cursor keys on", async () => {
+    // The cursor's extra precision is internal. A person reading a statement
+    // does not want six decimal places, and the contract does not change.
+    await seed({ occurredAt: "2026-09-12T10:00:00.000123Z" });
+    const page = await read();
+    expect(page.items[0]!.occurred_at).toBe("2026-09-12T10:00:00.000Z");
+  });
+
   it("⚠ pages across a digit boundary without skipping a row", async () => {
     // ⚠ THE BUG THIS CAUGHT. `seq::text` aliases back onto `seq`, PostgreSQL
     // lets ORDER BY bind to that output alias, and WHERE cannot — so the
@@ -228,6 +266,45 @@ describe("STORY-073 · reading the credit ledger", () => {
     const seen = [...first.items, ...second.items, ...third.items].map((entry) => entry.id);
     expect(new Set(seen).size).toBe(5);
     expect(third.pagination.has_more).toBe(false);
+  });
+
+  // ───────────────────── a cursor is untrusted input ─────────────────────
+
+  describe("⚠ a forged cursor is refused, not honoured", () => {
+    // ⚠ A CURSOR LEAVES THE SERVER, SITS IN A URL A PERSON CAN EDIT, AND
+    // COMES BACK. `decodeCursor` pins the arity and not the element types,
+    // and `cursorPayloadSchema` permits nulls and integers — so a two-element
+    // cursor of the wrong shape used to decode cleanly and then either rewind
+    // to page one forever, or reach Postgres and 500.
+    const forge = (key: unknown[]): string =>
+      Buffer.from(JSON.stringify({ v: 1, k: key }), "utf8").toString("base64url");
+
+    for (const [name, key] of [
+      ["nulls", [null, null]],
+      ["a null timestamp", [null, "3"]],
+      ["integers", [5, 3]],
+      ["a non-timestamp string", ["not-a-timestamp", "3"]],
+      ["a non-numeric seq", ["2026-09-12T10:00:00.000000Z", "abc"]],
+      ["a millisecond timestamp this list no longer keys on", ["2026-09-12T10:00:00.000Z", "3"]],
+    ] as const) {
+      it(`refuses a cursor built from ${name}`, async () => {
+        await seed({ credits: 10 });
+        await seed({ credits: 20 });
+        await expect(read({ limit: 1, cursor: forge([...key]) })).rejects.toThrow(/invalid pagination cursor/u);
+      });
+    }
+
+    it("refuses a cursor of the wrong arity", async () => {
+      await seed();
+      await expect(read({ cursor: forge(["2026-09-12T10:00:00.000000Z"]) })).rejects.toThrow(
+        /invalid pagination cursor/u,
+      );
+    });
+
+    it("refuses something that is not a cursor at all", async () => {
+      await seed();
+      await expect(read({ cursor: "not-a-cursor" })).rejects.toThrow(/invalid pagination cursor/u);
+    });
   });
 
   // ─────────────────────────── filters ───────────────────────────

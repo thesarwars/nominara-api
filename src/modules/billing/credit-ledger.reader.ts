@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import type { CreditLedgerEntry, CreditLedgerQuery } from "../../../contracts/billing/index.js";
+import { ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
 
@@ -36,6 +37,26 @@ interface LedgerRow {
   reference_id: string | null;
   unit_detail: CreditLedgerEntry["unit_detail"];
   reason: string | null;
+  /** What the contract publishes — millisecond precision, which is what a person reads. */
+  occurred_at: string;
+  /**
+   * ⚠ MICROSECONDS, AND IT IS A DIFFERENT COLUMN FROM `occurred_at` FOR A
+   * REASON THAT COST ROWS. `pageFrom`'s contract is that the cursor key is
+   * the tuple the query ORDERED BY. `occurred_at` is `timestamptz` — `now()`
+   * routinely lands on a microsecond like `...525873` — and the published
+   * value truncates to milliseconds. Keying the cursor on the truncated
+   * value made the keyset predicate exclude every row whose real timestamp
+   * sat between the truncated cursor and the row it was taken from: with
+   * four entries in one millisecond and a page boundary between them, one
+   * debit was returned by NO page and `has_more` still went false. A
+   * customer paging to completion got a history whose total was wrong, with
+   * no error.
+   *
+   * Two ledger writes land in the same millisecond whenever two requests
+   * settle together, which is ordinary rather than contrived — and the
+   * previous paging tests could not see it, because they seed whole seconds
+   * or one identical timestamp for every row.
+   */
   occurred_at_key: string;
   seq_key: string;
 }
@@ -58,7 +79,7 @@ function toEntry(row: LedgerRow): CreditLedgerEntry {
     reference_id: row.reference_id,
     unit_detail: row.unit_detail,
     reason: row.reason,
-    occurred_at: row.occurred_at_key,
+    occurred_at: row.occurred_at,
   };
 }
 
@@ -72,14 +93,25 @@ function toEntry(row: LedgerRow): CreditLedgerEntry {
  * the habit that produces a cross-tenant read the first time someone copies
  * it somewhere the context is missing.
  *
- * ⚠ THE `_key` ALIASES BELOW ARE LOAD-BEARING. PostgreSQL lets ORDER BY
- * resolve to an OUTPUT COLUMN ALIAS, and WHERE never does. Spelling the
- * casts as "seq::text" aliases them straight back onto their own column
- * names, so ORDER BY sorted the TEXT while the keyset predicate compared the
- * BIGINT. Text ordering puts "9" above "10": the tenth entry was skipped
- * outright and the page after it came back short — rows silently missing
- * from a customer's billing history, which is the precise failure
- * NFR-API-03 exists to prevent. Found by the paging test, not by reading.
+ * ⚠ THE `_key` COLUMNS ARE THE CURSOR'S, AND THEY ARE NOT THE PUBLISHED
+ * ONES. Two separate defects taught this, both of them rows silently missing
+ * from a customer's billing history — the precise failure NFR-API-03 exists
+ * to prevent, and neither visible as an error:
+ *
+ *   ORDER BY resolves to an OUTPUT COLUMN ALIAS and WHERE never does. Written
+ *   as "seq::text", the cast aliases straight back onto `seq`, so the
+ *   ordering compared TEXT while the keyset compared BIGINT — and text puts
+ *   "9" above "10", so the tenth entry was skipped outright.
+ *
+ *   The cursor key must be the value the query ORDERED BY, at the SAME
+ *   resolution. `occurred_at` is published at millisecond precision because
+ *   that is what a person reads; ordering happens on the full timestamptz.
+ *   Keying the cursor on the truncated value dropped every row sharing a
+ *   millisecond with the page boundary.
+ *
+ * So the cursor gets its own full-precision columns, and the published
+ * `occurred_at` stays readable. Both were found by tests rather than by
+ * reading this query.
  *
  * ⚠ AND THE DATE FILTERS ARE HALF-OPEN IN SQL THOUGH THE CONTRACT IS
  * INCLUSIVE. `to = '2026-09-16'` means "the whole of the 16th", so the
@@ -92,14 +124,15 @@ export async function readLedgerPage(
   tx: ClientBase,
   query: CreditLedgerQuery,
 ): Promise<Page<CreditLedgerEntry>> {
-  const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, 2);
+  const after = query.cursor === undefined ? undefined : cursorKeyOf(query.cursor);
 
   const result = await tx.query<LedgerRow>(
     `SELECT id, entry_type, action_code, credits::text, bucket,
             included_after::text, purchased_after::text, reserved_after::text,
             actor_id, actor_pseudonym, actor_type, project_id, reference_type, reference_id,
             unit_detail, reason,
-            to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS occurred_at_key,
+            to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS occurred_at,
+            to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS occurred_at_key,
             seq::text AS seq_key
        FROM credit_ledger
       WHERE ($1::text IS NULL OR action_code = $1)
@@ -145,9 +178,20 @@ export async function readLedgerPage(
  *
  * ⚠ EVERY FIELD IS QUOTED AND EVERY QUOTE IS DOUBLED, including the ones
  * that "cannot" contain a comma. `reason` is free text a human wrote, so it
- * certainly can; and a formula-shaped value in a spreadsheet is a known
- * injection path, which is why a leading `=`, `+`, `-` or `@` is prefixed
- * with a tab. A billing export is exactly the file somebody opens in Excel.
+ * certainly can.
+ *
+ * ⚠ AND THE FORMULA GUARD IS ON THE TEXT FIELDS ONLY, WHICH IT WAS NOT. A
+ * leading `=`, `+`, `-` or `@` makes Excel treat a cell as a formula, so
+ * those are tab-prefixed — but the first version applied that to EVERY
+ * column including `credits`, which is a signed integer. `"\t-40"` imports
+ * as TEXT, so a SUM over the credits column silently omitted every clawback
+ * and negative adjustment while including every positive one: a billing
+ * export that does not add up, which is the one thing a billing export has
+ * to do. The test even asserted that output while its comment claimed the
+ * opposite.
+ *
+ * The server generates the numeric columns, so none of them can carry a
+ * formula in the first place. Only what a person typed needs defusing.
  */
 export function toLedgerCsv(entries: readonly CreditLedgerEntry[]): string {
   const header = [
@@ -171,6 +215,11 @@ export function toLedgerCsv(entries: readonly CreditLedgerEntry[]): string {
     "cells_cached",
     "reason",
   ];
+
+  // Which columns hold something a person wrote, or an identifier that could
+  // begin with one of the formula characters. Everything else is a
+  // server-generated number or a closed enum.
+  const guarded = new Set(["action_code", "entry_type", "bucket", "actor_type", "reference_type", "reason"]);
 
   const rows = entries.map((entry) => [
     entry.occurred_at,
@@ -196,12 +245,44 @@ export function toLedgerCsv(entries: readonly CreditLedgerEntry[]): string {
 
   // CRLF, because RFC 4180 says so and because Excel on Windows treats a
   // bare LF file as one long row.
-  return [header, ...rows].map((row) => row.map(csvField).join(",")).join("\r\n") + "\r\n";
+  const render = (row: readonly string[]): string =>
+    row.map((value, column) => csvField(value, guarded.has(header[column]!))).join(",");
+
+  return [header.map((name) => csvField(name, false)).join(","), ...rows.map(render)].join("\r\n") + "\r\n";
 }
+
+/**
+ * Decode the cursor AND check that its elements are the two things this
+ * list is keyed on.
+ *
+ * ⚠ `decodeCursor` PINS ARITY, NOT TYPES, and the gap is reachable from a
+ * URL a person can edit. `cursorPayloadSchema` permits null and integer
+ * elements, so a two-element cursor of the wrong shape decoded cleanly and
+ * then either rewound the page — `(occurred_at, seq) < (NULL, NULL)` is
+ * NULL, the predicate drops out, and page one comes back forever, so a
+ * paging loop never terminates — or reached Postgres as `invalid input
+ * syntax for type timestamp with time zone`, which is a 500 from a query
+ * string. `decodeCursor`'s own comment says it exists to prevent exactly the
+ * first of those.
+ */
+function cursorKeyOf(cursor: string): [string, string] {
+  const key = decodeCursor(cursor, 2);
+  const [occurredAt, seq] = key;
+  if (typeof occurredAt !== "string" || !ISO_MICROS.test(occurredAt) || typeof seq !== "string" || !DIGITS.test(seq)) {
+    throw new ValidationFailedError({
+      message: "invalid pagination cursor",
+      details: { issues: [{ path: ["cursor"], message: "cursor was not issued for this list" }] },
+    });
+  }
+  return [occurredAt, seq];
+}
+
+const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
+const DIGITS = /^\d{1,19}$/u;
 
 const FORMULA_PREFIXES = new Set(["=", "+", "-", "@"]);
 
-function csvField(value: string): string {
-  const guarded = FORMULA_PREFIXES.has(value.slice(0, 1)) ? `\t${value}` : value;
-  return `"${guarded.replaceAll('"', '""')}"`;
+function csvField(value: string, defuse: boolean): string {
+  const safe = defuse && FORMULA_PREFIXES.has(value.slice(0, 1)) ? `\t${value}` : value;
+  return `"${safe.replaceAll('"', '""')}"`;
 }

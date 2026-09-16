@@ -90,7 +90,7 @@ describe("STORY-073 · the ledger CSV export", () => {
   });
 
   for (const prefix of ["=", "+", "-", "@"]) {
-    it(`⚠ defuses a ${prefix}-prefixed value, which Excel would execute as a formula`, () => {
+    it(`⚠ defuses a ${prefix}-prefixed REASON, which Excel would execute as a formula`, () => {
       // A billing export is exactly the file somebody opens in Excel, and a
       // reason field is free text somebody else wrote. `=HYPERLINK(...)` in a
       // cell is a known exfiltration path.
@@ -107,12 +107,37 @@ describe("STORY-073 · the ledger CSV export", () => {
     expect(csv).not.toContain("\tcredit");
   });
 
-  it("⚠ carries a NEGATIVE adjustment through as a negative number", () => {
-    // `-40` starts with `-`, so the formula guard fires — and the value must
-    // still be readable as a number by whoever opens the file. The tab is the
-    // reason this is a separate assertion from the one above.
+  it("⚠ carries a NEGATIVE adjustment through as a NUMBER, not as tab-prefixed text", () => {
+    // ⚠ THIS TEST USED TO ASSERT THE BUG. It expected `"\t-40"` while its own
+    // comment claimed the value "must still be readable as a number by
+    // whoever opens the file" — and `\t-40` imports into Excel as TEXT, so a
+    // SUM over the credits column silently omitted every clawback and every
+    // negative adjustment while including every positive one. A billing
+    // export that does not add up is worse than no export.
+    //
+    // The guard belongs on what a PERSON typed. The server generates
+    // `credits`, so it cannot carry a formula in the first place.
     const csv = toLedgerCsv([entry({ entry_type: "adjustment", credits: -40, bucket: "included", reason: "clawback" })]);
-    expect(csv).toContain('"\t-40"');
+    expect(csv).toContain('"-40"');
+    expect(csv).not.toContain("\t-40");
+  });
+
+  it("still defuses a formula in the field a person actually types", () => {
+    const csv = toLedgerCsv([entry({ entry_type: "adjustment", credits: -40, bucket: "included", reason: "=SUM(A1)" })]);
+    expect(csv).toContain('"\t=SUM(A1)"');
+    // ...and the number beside it is still a number.
+    expect(csv).toContain('"-40"');
+  });
+
+  it("leaves every server-generated numeric column summable", () => {
+    const [header, row] = rows(toLedgerCsv([entry({ credits: -40, entry_type: "adjustment", bucket: "included", reason: "r" })]));
+    const columns = header!.split(",").map((c) => c.replaceAll('"', ""));
+    const values = row!.split(",").map((c) => c.replaceAll('"', ""));
+
+    for (const column of ["credits", "included_after", "purchased_after", "reserved_after", "cells_charged", "cells_cached"]) {
+      const value = values[columns.indexOf(column)]!;
+      expect(value.startsWith("\t"), `${column} was tab-prefixed and will import as text`).toBe(false);
+    }
   });
 
   it("ends every record with CRLF, which is what RFC 4180 and Excel expect", () => {
