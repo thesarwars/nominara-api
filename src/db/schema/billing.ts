@@ -41,6 +41,7 @@ export const creditLedger = pgTable("credit_ledger", {
   occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().default(sql`now()`),
   attempt: smallint("attempt").notNull().default(sql`1`),
   seq: bigint("seq", { mode: "bigint" }).notNull(),
+  actorPseudonym: uuid("actor_pseudonym"),
 });
 
 export const creditPacks = pgTable("credit_packs", {

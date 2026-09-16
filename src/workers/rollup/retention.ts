@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ClientBase } from "pg";
 import type { PurgeFailureDetail } from "../../../contracts/ops/purge-failure-detail.schema.js";
@@ -348,7 +349,51 @@ export async function requestIndividualErasure(privilegedClient: ClientBase, use
     await privilegedClient.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
     await privilegedClient.query("UPDATE audit_log SET actor_id = $2 WHERE actor_id = $1", [userId, SYSTEM_ACTOR_ID]);
-    await privilegedClient.query("UPDATE credit_ledger SET actor_id = $2 WHERE actor_id = $1", [userId, SYSTEM_ACTOR_ID]);
+    // ⚠ PSEUDONYMISED, NOT REASSIGNED, and `credit_ledger` differs from
+    // `audit_log` above for a reason worth stating. Both retain their rows;
+    // only this one is an ACCOUNTING record, kept for the invoice-dispute
+    // window (data-model.md §7), and a dispute asks who authorised a charge.
+    // Collapsing every erased person onto the system actor answers "the
+    // system", which is not an answer — after two erasures their spend is
+    // indistinguishable, and from entries the system genuinely caused too.
+    //
+    // `actor_id` goes NULL because it carries an FK to `users` and a
+    // pseudonym has no row to point at; `ck_credit_ledger_actor_exclusive`
+    // is what keeps the two from ever both being set. The pseudonym is
+    // deterministic, so one person's entries still group together, and
+    // one-way, so the grouping identifies nobody.
+    // ⚠ RANDOM, NOT DERIVED FROM THE USER ID. The first version hashed the
+    // id, and the second-engineer review inverted it in one query: this
+    // function ANONYMISES the `users` row rather than deleting it — every FK
+    // in the product points at that id — so the brute-force candidate space
+    // is `SELECT id FROM users`. Worse, the anonymised email above is
+    // 'deleted+' || id || '@nominara.invalid', so the raw UUID survives in
+    // plaintext in the very row that was meant to remove it.
+    //
+    // One random UUID, generated here and stored, groups this person's rows
+    // exactly as well as a digest did and cannot be inverted because nothing
+    // derives it. It is also a REAL v4 UUID, which the digest was not — 87%
+    // of hashed pseudonyms failed the route's own published `uuid` contract,
+    // written immutably into an append-only table.
+    //
+    // Generated once per erasure and reused for the whole UPDATE, so every
+    // row of one person carries the same value.
+    await privilegedClient.query(
+      "UPDATE credit_ledger SET actor_id = NULL, actor_pseudonym = $2 WHERE actor_id = $1",
+      [userId, randomUUID()],
+    );
+
+    // ⚠ AND THE LEDGER'S OWN REFERENCES ARE A ROUTE BACK TO THE PERSON.
+    // STORY-073B started recording `reference_id` on every debit — the
+    // capture run — and `capture_runs.triggered_by` holds the raw user id.
+    // So a pseudonymised ledger row joined one hop re-identified the person
+    // it had just been scrubbed of, a path this story created. Reassigned to
+    // the system actor exactly as `milestones.created_by` and `task_events`
+    // already are, and for the same reason.
+    await privilegedClient.query("UPDATE capture_runs SET triggered_by = $2 WHERE triggered_by = $1", [
+      userId,
+      SYSTEM_ACTOR_ID,
+    ]);
     await privilegedClient.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
 

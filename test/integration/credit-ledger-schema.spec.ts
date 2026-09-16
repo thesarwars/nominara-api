@@ -117,13 +117,27 @@ describe("STORY-072 · rolling 0022 back", () => {
   });
 
   /**
-   * 0022 is no longer the head — STORY-073's 0023 sits on top of it, and a
-   * rollback is a stack. Taking the later one off here rather than inside
-   * each assertion keeps these tests about 0022, and makes the next
-   * migration's arrival a one-line change instead of a puzzling failure.
+   * 0022 is not the head any more and will not be again — a rollback is a
+   * stack, so every later migration comes off first.
+   *
+   * ⚠ IT POPS UNTIL IT REACHES 0022 RATHER THAN NAMING THE ONE ABOVE IT. The
+   * first version named 0023 explicitly and broke the moment 0024 landed,
+   * with a failure ("expected 0024… to be 0022…") that says nothing about
+   * what these tests are actually for. The loop makes the next migration a
+   * non-event here, which is the right amount of attention for a file that
+   * is about the `attempt` column.
    */
+  const TARGET = "0022_credit_ledger_attempt";
+
   async function rollBackToTwentyTwo(): Promise<void> {
-    expect(await rollbackLast(db)).toBe("0023_credit_ledger_replay_integrity");
+    for (let popped = 0; popped < 20; popped += 1) {
+      const head = await db.query<{ name: string }>(
+        "SELECT name FROM _migrations.applied ORDER BY name DESC LIMIT 1",
+      );
+      if (head.rows[0]?.name === TARGET) return;
+      await rollbackLast(db);
+    }
+    throw new Error(`rolled back twenty migrations without reaching ${TARGET}`);
   }
 
   it("rolls back cleanly when no request key has more than one attempt", async () => {

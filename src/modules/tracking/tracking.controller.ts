@@ -13,6 +13,7 @@ import { Credits } from "../../api/decorators/credits.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
+import type { CreditUsage } from "../../api/interceptors/credit.interceptor.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { RunEstimateService } from "./run-estimate.service.js";
 import { RunLifecycleService } from "./run-lifecycle.service.js";
@@ -89,12 +90,19 @@ export class TrackingController {
     requestSchema: triggerRunRequestSchema,
     responseSchema: runProgressResponseSchema,
   })
-  trigger(
-    @Req() req: RbacScopedRequest,
+  async trigger(
+    @Req() req: RbacScopedRequest & { creditUsage?: CreditUsage },
     @Param("id") projectId: string,
     @Body(new ZodValidationPipe(triggerRunRequestSchema)) _body: TriggerRunRequest,
   ): Promise<RunProgressResponse> {
-    return this.lifecycle.trigger(projectId, req.auth?.sub ?? null);
+    const { progress, usage } = await this.lifecycle.trigger(projectId, req.auth?.sub ?? null);
+    // STORY-073 AC10/AC11 — what `CreditInterceptor` records on the debit.
+    // Stamped here because this is the layer that holds both the request and
+    // the result; the interceptor reads it on the way out, beside
+    // `creditsConsumed`, and an absent value records nothing rather than a
+    // guess.
+    req.creditUsage = usage;
+    return progress;
   }
 
 }

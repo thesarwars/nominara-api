@@ -8,7 +8,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { CreditGuard } from "../../src/api/guards/credit.guard.js";
-import { CreditInterceptor } from "../../src/api/interceptors/credit.interceptor.js";
+import { CreditInterceptor, type CreditUsage } from "../../src/api/interceptors/credit.interceptor.js";
 import { CONFIRMED_CREDITS_HEADER } from "../../src/api/guards/credit.guard.js";
 import type { EntitlementResolver } from "../../src/lib/entitlements/entitlement-resolver.js";
 import { incrementDailyCounter } from "../../src/lib/usage/daily-cap.js";
@@ -85,6 +85,9 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     headers: Record<string, string>;
     creditReservation?: unknown;
     dailyCapCompensation?: { workspaceId: string; action: "lookup" };
+    auth?: { sub: string };
+    authMethod?: "session" | "apiKey";
+    creditUsage?: CreditUsage;
   }
 
   function request(key: string, over: Partial<Req> = {}): Req {
@@ -119,6 +122,173 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     expect(await wallet()).toBeNull();
     await guard().canActivate(contextFor(request("k-1")));
     expect(await wallet()).toMatchObject({ includedBalance: 300, reserved: PRICE });
+  });
+
+  describe("STORY-073 AC10 — every debit answers what spent my credits", () => {
+    let userId: string;
+
+    beforeEach(async () => {
+      const row = await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [
+        `a-${randomUUID().slice(0, 8)}@nominara.test`,
+      ]);
+      userId = row.rows[0]!.id;
+    });
+
+    /** Run the real interceptor's success path with the usage a handler would have reported. */
+    async function settle(req: Req, usage: CreditUsage | undefined): Promise<void> {
+      await runInterceptor({ ...req, creditUsage: usage } as Req, () => ({ ok: true }));
+    }
+
+    /** A real project row — the commit drops a `project_id` this workspace cannot see. */
+    async function project(owner: string): Promise<string> {
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, kind)
+         VALUES ($1,$2,'P',$3,'https://example.com','example.com','brand')`,
+        [id, owner, `p-${randomUUID().slice(0, 8)}`],
+      );
+      return id;
+    }
+
+    async function entry(entryType: string): Promise<Record<string, unknown> | undefined> {
+      const rows = await db.query<Record<string, unknown>>(
+        `SELECT actor_id, actor_type, actor_pseudonym, project_id, reference_type, reference_id, unit_detail
+           FROM credit_ledger WHERE workspace_id = $1 AND entry_type = $2`,
+        [workspaceId, entryType],
+      );
+      return rows.rows[0];
+    }
+
+    it("⚠ names the PERSON on the reserve, not the system", async () => {
+      // ⚠ EVERY ENTRY SAID `system` BEFORE STORY-073B. The request has always
+      // known who it was; nothing carried it the twelve lines from the guard
+      // to the ledger, so a workspace reading its own history saw a column of
+      // identical system rows.
+      await guard().canActivate(contextFor(request("k-1", { auth: { sub: userId }, authMethod: "session" })));
+
+      expect(await entry("reserve")).toMatchObject({ actor_id: userId, actor_type: "user" });
+    });
+
+    it("carries that same person onto the commit, and the handler's work with it", async () => {
+      const req = request("k-1", { auth: { sub: userId }, authMethod: "session" });
+      await guard().canActivate(contextFor(req));
+
+      const projectId = await project(workspaceId);
+      const runId = randomUUID();
+      await settle(req, {
+        projectId,
+        referenceType: "run",
+        referenceId: runId,
+        unitDetail: { prompts: 15, engines: 2, cells_charged: 22, cells_cached: 8 },
+      });
+
+      expect(await entry("commit")).toMatchObject({
+        actor_id: userId,
+        actor_type: "user",
+        project_id: projectId,
+        reference_type: "run",
+        reference_id: runId,
+        // FR-CRD-03 — work done, not billing arithmetic. 22 live and 8 from
+        // cache is what the money bought; the price was flat either way.
+        unit_detail: { prompts: 15, engines: 2, cells_charged: 22, cells_cached: 8 },
+      });
+    });
+
+    it("⚠ DROPS a project the workspace cannot see rather than writing it into the ledger", async () => {
+      // ⚠ `project_id` HAS NO FOREIGN KEY AND THE HANDLER SUPPLIES IT. Nothing
+      // stopped a debit naming another workspace's project. RLS scopes the
+      // lookup, so someone else's project simply is not visible.
+      //
+      // Dropped rather than refused: the work was done and the customer is
+      // being charged for it, so failing here would leave a completed action
+      // that never settles. One attribution field is lost, loudly.
+      const other = randomUUID();
+      await db.query("INSERT INTO workspaces (id,name,slug,plan_key) VALUES ($1,'O',$2,'free')", [
+        other,
+        `o-${randomUUID().slice(0, 8)}`,
+      ]);
+      const theirProject = await project(other);
+
+      const req = request("k-1", { auth: { sub: userId }, authMethod: "session" });
+      await guard().canActivate(contextFor(req));
+      await settle(req, { projectId: theirProject, referenceType: "run", referenceId: randomUUID() });
+
+      const commit = await entry("commit");
+      expect(commit).toMatchObject({ project_id: null, reference_type: "run" });
+    });
+
+    it("⚠ records an API key as api_key with NO user id against it", async () => {
+      // An API key is a workspace credential. Attributing its spend to
+      // whoever created it puts a name against actions that person did not
+      // take, in a record kept for the invoice-dispute window.
+      await guard().canActivate(
+        contextFor(request("k-1", { auth: { sub: userId }, authMethod: "apiKey" })),
+      );
+
+      expect(await entry("reserve")).toMatchObject({ actor_id: null, actor_type: "api_key" });
+    });
+
+    it("falls back to system for an unauthenticated caller rather than inventing an actor", async () => {
+      await guard().canActivate(contextFor(request("k-1")));
+      expect(await entry("reserve")).toMatchObject({ actor_id: null, actor_type: "system" });
+    });
+
+    it("⚠ attributes the RELEASE to the person whose request failed, not to the system", async () => {
+      // ⚠ NO TEST COVERED THIS LINE. The second-engineer review reverted both
+      // `settle.ts` and the interceptor to `actorType: "system"` and 116
+      // tests stayed green — the release half of AC10 was enforced by
+      // nothing. Money a person held and got back is their history; the
+      // system's own releases are the reconciler's.
+      const req = request("k-fail", { auth: { sub: userId }, authMethod: "session" });
+      await guard().canActivate(contextFor(req));
+      await expect(
+        runInterceptor(req, () => {
+          throw new Error("handler blew up");
+        }),
+      ).rejects.toThrow(/handler blew up/u);
+
+      // Scheduled off the critical path, like the existing release test.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await entry("release")).toMatchObject({ actor_id: userId, actor_type: "user" });
+    });
+
+    it("⚠ inherits the commit's actor from the RESERVE, so an erasure mid-request cannot re-name the person", async () => {
+      // ⚠ THE RACE THE REVIEW REPRODUCED. The guard captures the actor; the
+      // commit writes it minutes later; `requestIndividualErasure` only
+      // touches rows that exist when it runs. So the reserve came out
+      // pseudonymised and the commit wrote the erased person's id back in
+      // full, into an append-only table, unrepairable without disabling the
+      // trigger. Nothing revokes an in-flight request on erasure.
+      const req = request("k-erased", { auth: { sub: userId }, authMethod: "session" });
+      await guard().canActivate(contextFor(req));
+
+      // The erasure lands between the reserve and the commit.
+      const pseudonym = randomUUID();
+      await db.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
+      await db.query("UPDATE credit_ledger SET actor_id = NULL, actor_pseudonym = $2 WHERE actor_id = $1", [
+        userId,
+        pseudonym,
+      ]);
+      await db.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
+
+      await settle(req, undefined);
+
+      const commit = await entry("commit");
+      expect(commit).toMatchObject({ actor_id: null, actor_pseudonym: pseudonym });
+    });
+
+    it("records nothing rather than a guess when the handler reports no usage", async () => {
+      const req = request("k-1", { auth: { sub: userId }, authMethod: "session" });
+      await guard().canActivate(contextFor(req));
+      await settle(req, undefined);
+
+      expect(await entry("commit")).toMatchObject({
+        actor_id: userId,
+        project_id: null,
+        reference_type: null,
+        unit_detail: null,
+      });
+    });
   });
 
   it("⚠ ACCOUNTS FOR THE PROVISIONING GRANT IN THE LEDGER, not just in the balance", async () => {

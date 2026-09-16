@@ -72,6 +72,19 @@ export interface PlanRunContext {
 export interface PlannedRun {
   readonly runId: string;
   readonly planned: number;
+  /**
+   * How many DISTINCT PROMPTS this run covers.
+   *
+   * ⚠ IT IS NOT `planned / engines.length`. `plan-cells.ts` fans out prompt ×
+   * engine × `sampleIndex`, so `planned` is `prompts × Σ(engine.sampleCount)`
+   * — and dividing by the engine count is wrong for every run with sampling
+   * on, not merely rounded. STORY-073B's `unit_detail` computed it that way
+   * and recorded a prompt count that was never true, in a field the product
+   * describes as "a statement of work done".
+   *
+   * Counted from the cells, which is the only place it is actually known.
+   */
+  readonly prompts: number;
   readonly skipped: number;
   /** What will actually be captured — `planned - skipped`. */
   readonly live: number;
@@ -278,6 +291,7 @@ async function writePlan(
   return {
     runId: context.runId,
     planned: cells.length,
+    prompts: new Set(cells.map((cell) => cell.promptId)).size,
     skipped: suppressed.length,
     live: liveCells.length,
     suppressedByLayer: { l1: l1Hits.size, l2: l2Hits.size },

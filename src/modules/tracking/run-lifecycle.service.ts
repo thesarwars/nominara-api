@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { RunProgressResponse } from "../../../contracts/tracking/index.js";
 import { ConflictError } from "../../api/errors/domain-errors.js";
+import type { CreditUsage } from "../../api/interceptors/credit.interceptor.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { commitDeepScanCharge } from "../../lib/capture/fair-use.js";
 import { deepScanPrice } from "../../lib/capture/deep-scan-price.js";
@@ -39,7 +40,21 @@ export class RunLifecycleService {
    * would leave jobs for a run that does not exist." A lost job is
    * recoverable; a job for a run that was rolled back is not.
    */
-  async trigger(projectId: string, actorId: string | null): Promise<RunProgressResponse> {
+  /**
+   * AC2 — plan the run inside the request's transaction, enqueue after it
+   * commits. Returns the progress AND what the debit should record about
+   * itself.
+   *
+   * ⚠ THE USAGE IS RETURNED RATHER THAN STAMPED, because this service has no
+   * request to stamp. The controller has one, and one explicit line there
+   * beats an AsyncLocalStorage channel nobody can see at the call site — a
+   * billing record that appears by ambient magic is a billing record nobody
+   * can trace when it is wrong.
+   */
+  async trigger(
+    projectId: string,
+    actorId: string | null,
+  ): Promise<{ readonly progress: RunProgressResponse; readonly usage: CreditUsage }> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("RunLifecycleService requires an active tenant context");
 
@@ -74,7 +89,39 @@ export class RunLifecycleService {
     });
 
     const progress = await readRunProgress(store.client, runId, now);
-    return this.present(progress, plan.charge, credits);
+    return {
+      progress: this.present(progress, plan.charge, credits),
+      // STORY-073 AC10/AC11 — what the debit records about itself.
+      //
+      // ⚠ BUILT HERE, WHERE `plan` IS IN SCOPE, and not from the response.
+      // `prompts` cannot be derived from `planned` and the engine count:
+      // `plan-cells.ts` fans out prompt × engine × sampleIndex, so any run
+      // with sampling on would have recorded a prompt count that was never
+      // true — in a field FR-CRD-03 calls "a statement of work done, never
+      // billing arithmetic". The planner counts the distinct prompts because
+      // it is the only place they are known.
+      //
+      // None of these derive the price: a flat-priced scan costs the same
+      // whether the cache served two cells or two hundred. They are here to
+      // say what the money bought.
+      usage: {
+        projectId,
+        referenceType: "run",
+        referenceId: runId,
+        unitDetail: {
+          prompts: plan.prompts,
+          // ⚠ THE RUN'S ENGINES, NOT THE LIVE CELLS' ENGINES. `plan.cells`
+          // is what survived suppression, so an engine whose every cell came
+          // from cache would vanish from the count — understating the work
+          // for exactly the runs the cache served best. `engineKeys` is the
+          // set that survived entitlement filtering, which is what the run
+          // actually covers.
+          engines: progress.engineKeys.length,
+          cells_charged: plan.live,
+          cells_cached: plan.skipped,
+        },
+      },
+    };
   }
 
   /** AC3 and AC4 — the projection, and on a manual run the charge beside it. */

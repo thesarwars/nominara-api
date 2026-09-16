@@ -57,22 +57,53 @@ describe("STORY-007 · jsonb column schemas flagged by review", () => {
   });
 
   describe("ledgerUnitDetailSchema", () => {
-    it("accepts null — not every ledger entry carries unit-of-work detail", () => {
+    it("accepts null — most entries carry no unit-of-work detail", () => {
       expect(ledgerUnitDetailSchema.safeParse(null).success).toBe(true);
     });
 
-    it("accepts the documented shape", () => {
+    it("accepts the full shape the reference documents", () => {
       const result = ledgerUnitDetailSchema.safeParse({
-        prompts: 30,
-        engines: ["chatgpt", "claude"],
-        cellsCharged: 12,
-        cellsCached: 18,
+        prompts: 15,
+        engines: 2,
+        cells_charged: 22,
+        cells_cached: 8,
       });
       expect(result.success).toBe(true);
     });
 
+    it("⚠ rejects the camelCase spelling this schema used to declare", () => {
+      // The first version quoted `{prompts, engines, cells_charged,
+      // cells_cached}` in its own header and then declared `cellsCharged`,
+      // agreeing with neither the reference nor the rest of the wire format.
+      // It had no route and no writer, so nothing surfaced it. STORY-073B
+      // both writes the column and returns it, so the casing now matters.
+      expect(
+        ledgerUnitDetailSchema.safeParse({ prompts: 1, engines: 1, cellsCharged: 1, cellsCached: 1 }).success,
+      ).toBe(false);
+    });
+
+    it("requires every member, because a partial split explains nothing", () => {
+      // "22 cells charged" without "8 cached" is not a statement of work
+      // done; it is half of one, and the reader cannot tell which half.
+      expect(ledgerUnitDetailSchema.safeParse({ prompts: 15, engines: 2, cells_charged: 22 }).success).toBe(false);
+    });
+
     it("rejects a negative count", () => {
-      expect(ledgerUnitDetailSchema.safeParse({ cellsCharged: -1 }).success).toBe(false);
+      expect(
+        ledgerUnitDetailSchema.safeParse({ prompts: 1, engines: 1, cells_charged: -1, cells_cached: 0 }).success,
+      ).toBe(false);
+    });
+
+    it("rejects an unknown member rather than carrying it into a financial record", () => {
+      expect(
+        ledgerUnitDetailSchema.safeParse({
+          prompts: 1,
+          engines: 1,
+          cells_charged: 1,
+          cells_cached: 0,
+          cost_usd: "0.40",
+        }).success,
+      ).toBe(false);
     });
   });
 });

@@ -10,12 +10,51 @@ import {
 import { catchError, from, mergeMap, type Observable } from "rxjs";
 import type { ClientBase, Pool } from "pg";
 import { createPgPool, PG_POOL } from "../../db/pg-pool.js";
-import { appendLedgerEntry, ledgerEntryExists, settlementOf } from "../../lib/credits/ledger.js";
+import {
+  appendLedgerEntry,
+  ledgerEntryExists,
+  reservationActor,
+  settlementOf,
+} from "../../lib/credits/ledger.js";
 import { releaseReservation } from "../../lib/credits/settle.js";
 import { commitCredits, lockWallet, readWallet } from "../../lib/credits/wallet.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 import type { CreditReservation } from "../guards/credit.guard.js";
+
+/**
+ * The work a debit paid for, as the handler reports it.
+ *
+ * `unitDetail` is `billing-and-credits.md`'s `{prompts, engines,
+ * cells_charged, cells_cached}` and is rendered — FR-CRD-03 — "as a
+ * statement of work done, never as billing arithmetic". It does not derive
+ * the price and the price does not derive it: a flat-priced deep scan costs
+ * the same whether the cache served two cells or two hundred, and the split
+ * is there to tell the customer what their money actually bought.
+ */
+export interface CreditUsage {
+  readonly projectId?: string;
+  readonly referenceType?: string;
+  readonly referenceId?: string;
+  readonly unitDetail?: {
+    readonly prompts: number;
+    readonly engines: number;
+    readonly cells_charged: number;
+    readonly cells_cached: number;
+  };
+  /**
+   * What serving this action cost US, in USD.
+   *
+   * ⚠ NOTHING SUPPLIES A NON-ZERO VALUE YET, and the reason is upstream:
+   * `execute-cell.ts`'s `recordCost` is a no-op and every fixture adapter
+   * reports `costUsd: 0`, because the real engine adapters are STORY-028 and
+   * STORY-029 and both are deferred. The column and the path exist now so
+   * that the story which lands a real adapter fills a field rather than
+   * inventing the accounting for it — "realised operating cost is measurable
+   * from data rather than modelled" is only true once something measures.
+   */
+  readonly internalCostUsd?: string;
+}
 
 // STORY-022-E-2 composed this slot as a pass-through; STORY-072 fills it.
 //
@@ -92,6 +131,19 @@ interface CreditSettlingRequest {
    * Unset is NOT zero — zero would mean the action ran and cost nothing.
    */
   creditsConsumed?: number;
+  /**
+   * What the handler did, for the debit's own record.
+   *
+   * ⚠ SET BY THE HANDLER, BECAUSE ONLY THE HANDLER KNOWS. The guard reserves
+   * before anything has run, so it can name the person but not the project,
+   * the run, or how much of the work was actually done live. AC10's "every
+   * debit answers what spent my credits" needs all four, and the commit is
+   * where they are all finally known.
+   *
+   * Absent is a legitimate state — a priced route that names nothing records
+   * nothing, rather than recording a guess.
+   */
+  creditUsage?: CreditUsage;
 }
 
 /**
@@ -285,6 +337,20 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
     // `?? amount` is what makes the flat case the default, so a route that
     // declares nothing cannot under-charge.
     const consumed = request.creditsConsumed ?? reservation.amount;
+    const usage = await settleableUsage(store.client, reservation, request.creditUsage);
+
+    // ⚠ INHERITED FROM THE RESERVE, NOT RE-RESOLVED FROM THE REQUEST. An
+    // erasure landing between the two would otherwise write the erased
+    // person's id back into an append-only table, and a re-attached retry
+    // could name a different member of the workspace than the reserve did.
+    // See `reservationActor`.
+    const actor =
+      (await reservationActor(
+        store.client,
+        reservation.workspaceId,
+        reservation.idempotencyKey,
+        reservation.attempt,
+      )) ?? reservation.actor;
     const committed = await commitCredits(store.client, reservation.workspaceId, consumed, reservation.amount);
 
     if (committed === null) {
@@ -308,8 +374,10 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
       idempotencyKey: reservation.idempotencyKey,
       attempt: reservation.attempt,
       after: committed,
-      actorId: null,
-      actorType: "system",
+      // AC10 — the action, the actor, the project and the reference, which
+      // together are the whole of "what spent my credits?".
+      ...actor,
+      ...usage,
     });
 
     clearReservation(request);
@@ -374,6 +442,11 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
               attempt: reservation.attempt,
               credits: reservation.amount,
               actionCode: reservation.ledgerAction,
+              // The release belongs to the person whose request failed, not
+              // to the system — money they held and got back is their
+              // history. The reconciler's own releases are the system's,
+              // and it passes no actor at all.
+              actor: reservation.actor,
             }),
         );
       } finally {
@@ -427,4 +500,48 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
       logger.warn(`could not stamp wallet headers for workspace ${workspaceId}: ${String(error)}`);
     }
   }
+}
+
+/**
+ * The handler's reported usage, with the project checked before it is
+ * written.
+ *
+ * ⚠ `project_id` HAS NO FOREIGN KEY AND THE HANDLER SUPPLIES IT, so nothing
+ * stopped a debit naming another workspace's project — a guard-rail gap the
+ * second-engineer review found, with no live exploit because the only caller
+ * writes its own route's project. A composite FK would be the structural fix
+ * and would also block hard-deleting a project that has ledger history,
+ * because the append-only trigger fires on the cascade's UPDATE.
+ *
+ * So it is checked here instead — and the predicate NAMES THE WORKSPACE
+ * rather than leaning on RLS to hide the row. RLS would do it in production,
+ * but a check that only holds on some connections is a check no test running
+ * as the owner can prove, which is precisely the false confidence that let
+ * three other defects through this story. One indexed primary key read, on a
+ * path that already does several, correct on any role.
+ *
+ * A project that does not resolve is DROPPED rather than refused — the work
+ * was done and the customer is being charged for it, and failing the request
+ * here would mean a completed action that never settles. The debit loses one
+ * attribution field and says so in the log.
+ */
+async function settleableUsage(
+  tx: ClientBase,
+  reservation: CreditReservation,
+  reported: CreditUsage | undefined,
+): Promise<CreditUsage> {
+  if (reported?.projectId === undefined) return reported ?? {};
+
+  const visible = await tx.query(`SELECT 1 FROM projects WHERE id = $1 AND workspace_id = $2`, [
+    reported.projectId,
+    reservation.workspaceId,
+  ]);
+  if ((visible.rowCount ?? 0) > 0) return reported;
+
+  logger.error(
+    `credit debit for workspace ${reservation.workspaceId} reported project ${reported.projectId}, ` +
+      "which this workspace cannot see; recording the debit without it",
+  );
+  const { projectId: _dropped, ...rest } = reported;
+  return rest;
 }

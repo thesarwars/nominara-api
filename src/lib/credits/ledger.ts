@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { ledgerUnitDetailSchema, type LedgerUnitDetail } from "../../../contracts/billing/ledger-unit-detail.schema.js";
 import type { CreditBucket, WalletState } from "./wallet.js";
 
 // STORY-072 — the append-only credit ledger.
@@ -56,6 +57,39 @@ interface LedgerEntryCommon {
   readonly actorType: "user" | "api_key" | "system";
   readonly referenceType?: string;
   readonly referenceId?: string;
+  /**
+   * The project this entry is about, where there is one.
+   *
+   * ⚠ NOT EVERY ENTRY HAS ONE, and that is why it is optional rather than
+   * nullable-required: a grant, a purchase and an expiry are workspace
+   * facts, and forcing a project onto them would make `ix_credit_ledger_
+   * project` describe a relationship that does not exist. A debit usually
+   * does have one, and AC10 wants it.
+   */
+  readonly projectId?: string;
+  /**
+   * `{prompts, engines, cells_charged, cells_cached}` — what the debit paid
+   * for, as work done.
+   *
+   * ⚠ PARSED THROUGH `ledgerUnitDetailSchema` BEFORE IT IS WRITTEN, not
+   * merely typed. The value comes from a request handler and lands in an
+   * append-only financial record, so `Record<string, number>` was not a
+   * check at all — the second-engineer review wrote `{}` and a payload
+   * carrying invented keys straight through `appendLedgerEntry` and back out
+   * of the read endpoint, both violating the route's own published contract.
+   * The schema's unit test asserts it "rejects an unknown member rather than
+   * carrying it into a financial record"; nothing on the write path had ever
+   * run it.
+   */
+  readonly unitDetail?: LedgerUnitDetail;
+  /** What serving it cost us, in USD. A string so the numeric survives the round trip un-rounded. */
+  readonly internalCostUsd?: string;
+  /**
+   * Set only when the entry inherits an already-erased actor from its
+   * reserve row. Mutually exclusive with `actorId` —
+   * `ck_credit_ledger_actor_exclusive`.
+   */
+  readonly actorPseudonym?: string | null;
 }
 
 export interface LedgerMovementEntry extends LedgerEntryCommon {
@@ -90,6 +124,23 @@ export interface LedgerAdjustmentEntry extends LedgerEntryCommon {
 }
 
 export type LedgerEntry = LedgerMovementEntry | LedgerBalanceEntry | LedgerAdjustmentEntry;
+
+/**
+ * ⚠ THROWS RATHER THAN COERCING. A debit whose unit detail is malformed
+ * should fail loudly at the point of writing, where the request can still be
+ * refused, rather than be quietly stored as `null` — the ledger would then
+ * carry a debit that claims no work was done, in the one table where a
+ * missing explanation is the whole failure mode.
+ */
+function parseUnitDetail(detail: NonNullable<LedgerUnitDetail>): NonNullable<LedgerUnitDetail> {
+  const parsed = ledgerUnitDetailSchema.safeParse(detail);
+  if (!parsed.success || parsed.data === null) {
+    throw new Error(
+      `credit ledger unit_detail does not match its contract: ${parsed.success ? "null" : parsed.error.issues[0]?.message ?? "invalid"}`,
+    );
+  }
+  return parsed.data;
+}
 
 /** Only a reservation retries; every other type is attempt 1 — `ck_credit_ledger_attempt_scope`. */
 function attemptOf(entry: LedgerEntry): number {
@@ -134,8 +185,8 @@ export async function appendLedgerEntry(tx: ClientBase, entry: LedgerEntry): Pro
     `INSERT INTO credit_ledger
        (workspace_id, actor_id, actor_type, entry_type, action_code, credits, bucket,
         included_after, purchased_after, reserved_after, reference_type, reference_id,
-        idempotency_key, attempt, reason)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        idempotency_key, attempt, reason, project_id, unit_detail, internal_cost_usd, actor_pseudonym)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
      ON CONFLICT (workspace_id, entry_type, idempotency_key, attempt) DO NOTHING`,
     [
       entry.workspaceId,
@@ -153,6 +204,12 @@ export async function appendLedgerEntry(tx: ClientBase, entry: LedgerEntry): Pro
       entry.idempotencyKey,
       attemptOf(entry),
       reasonOf(entry),
+      entry.projectId ?? null,
+      entry.unitDetail === undefined || entry.unitDetail === null
+        ? null
+        : JSON.stringify(parseUnitDetail(entry.unitDetail)),
+      entry.internalCostUsd ?? null,
+      entry.actorPseudonym ?? null,
     ],
   );
   return (result.rowCount ?? 0) > 0;
@@ -202,6 +259,49 @@ export async function settlementOf(
     [workspaceId, idempotencyKey, attempt],
   );
   return result.rows[0]?.entry_type ?? null;
+}
+
+/**
+ * Who the RESERVE row says is spending — the authority the commit inherits.
+ *
+ * ⚠ THE COMMIT MUST NOT RE-RESOLVE THE ACTOR FROM THE REQUEST, for two
+ * reasons the second-engineer review reproduced against a real database:
+ *
+ *   AN ERASURE CAN LAND BETWEEN THE RESERVE AND THE COMMIT. The guard
+ *   captures the actor, the handler runs for as long as a manual scan takes,
+ *   and `requestIndividualErasure` only touches rows that exist when it runs.
+ *   So the reserve came out pseudonymised and the commit wrote the erased
+ *   person's id back — in full, into an append-only table, minutes after
+ *   they asked to be forgotten, and unrepairable without disabling the
+ *   trigger. Nothing revokes an in-flight request on erasure.
+ *
+ *   AND A RE-ATTACHED RETRY CAN BE A DIFFERENT PERSON. `inspectReservations`
+ *   is keyed on (workspace, key) and not on the user, so two members of one
+ *   workspace replaying one Idempotency-Key produced a settlement whose two
+ *   halves named two different people.
+ *
+ * Reading it back off the reserve makes both unrepresentable: the pair
+ * always agrees, because there is only one source.
+ */
+export async function reservationActor(
+  tx: ClientBase,
+  workspaceId: string,
+  idempotencyKey: string,
+  attempt: number,
+): Promise<{ actorId: string | null; actorType: "user" | "api_key" | "system"; actorPseudonym: string | null } | null> {
+  const result = await tx.query<{
+    actor_id: string | null;
+    actor_type: "user" | "api_key" | "system";
+    actor_pseudonym: string | null;
+  }>(
+    `SELECT actor_id, actor_type, actor_pseudonym FROM credit_ledger
+      WHERE workspace_id = $1 AND entry_type = 'reserve' AND idempotency_key = $2 AND attempt = $3`,
+    [workspaceId, idempotencyKey, attempt],
+  );
+  const row = result.rows[0];
+  return row === undefined
+    ? null
+    : { actorId: row.actor_id, actorType: row.actor_type, actorPseudonym: row.actor_pseudonym };
 }
 
 // ─────────────────────── the key family ───────────────────────

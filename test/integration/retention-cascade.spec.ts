@@ -1,6 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
+import { z } from "zod";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RECHAINED_MARKER_ACTION } from "../../src/lib/crypto/audit-chain.js";
 import { pseudonymiseWorkspaceId } from "../../src/lib/crypto/pseudonymise.js";
@@ -399,10 +400,20 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     );
     expect(audit.rows[0]!.actor_id).toBe(SYSTEM_ACTOR_ID);
 
-    const ledger = await client.query<{ actor_id: string }>("SELECT actor_id FROM credit_ledger WHERE workspace_id = $1", [
-      workspaceId,
-    ]);
-    expect(ledger.rows[0]!.actor_id).toBe(SYSTEM_ACTOR_ID);
+    // ⚠ PSEUDONYMISED, NOT REASSIGNED TO THE SYSTEM ACTOR. This used to
+    // assert `SYSTEM_ACTOR_ID`, which is erasure of the actor rather than
+    // pseudonymisation of it: after two people are erased their spend is
+    // indistinguishable, and indistinguishable from entries the system
+    // genuinely caused. `credit_ledger` is an ACCOUNTING record kept for the
+    // invoice-dispute window (data-model.md §7), and a dispute asks who
+    // authorised a charge — "the system" is not an answer to that.
+    const ledger = await client.query<{ actor_id: string | null; actor_pseudonym: string | null }>(
+      "SELECT actor_id, actor_pseudonym FROM credit_ledger WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    expect(ledger.rows[0]!.actor_id).toBeNull();
+    expect(ledger.rows[0]!.actor_pseudonym).not.toBeNull();
+    expect(ledger.rows[0]!.actor_pseudonym).not.toBe(userId);
 
     // The append-only trigger still protects every OTHER workspace's rows.
     const otherWorkspace = await createWorkspace();
@@ -414,6 +425,162 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
   });
 
   // -- STORY-020 D-4 — erasure appends a re-chain marker per affected workspace
+
+  it("STORY-073 AC13 · two erased people stay distinguishable in the ledger, and neither is identifiable", async () => {
+    // ⚠ THE FIRST VERSION OF THIS TEST NAMED A PROPERTY IT DID NOT CHECK —
+    // it asserted only `pseudonym !== rawUserId`, which a plain hash of the
+    // user id also satisfies. It did, and the second-engineer review
+    // inverted that hash in one query. This one ATTEMPTS the
+    // re-identification, the same way an attacker holding the database
+    // would.
+    const workspaceId = await createWorkspace();
+    const first = await createUser();
+    const second = await createUser();
+    for (const member of [first, second]) {
+      await client.query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1, $2, 'analyst', 'active')",
+        [workspaceId, member],
+      );
+    }
+    await insertCreditLedger(workspaceId, first);
+    await insertCreditLedger(workspaceId, first);
+    await insertCreditLedger(workspaceId, second);
+
+    expect(await requestIndividualErasure(client, first)).toEqual({ blocked: false });
+    expect(await requestIndividualErasure(client, second)).toEqual({ blocked: false });
+
+    const rows = await client.query<{ actor_pseudonym: string | null; actor_id: string | null }>(
+      "SELECT actor_id, actor_pseudonym FROM credit_ledger WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    const pseudonyms = rows.rows.map((row) => row.actor_pseudonym!);
+
+    // Nobody is named...
+    expect(rows.rows.every((row) => row.actor_id === null)).toBe(true);
+    expect(pseudonyms).not.toContain(first);
+    expect(pseudonyms).not.toContain(second);
+
+    // ...and the two people are still two people: 2 rows and 1 row.
+    expect(new Set(pseudonyms).size).toBe(2);
+    const counts = [...new Set(pseudonyms)].map((p) => pseudonyms.filter((q) => q === p).length).sort();
+    expect(counts).toEqual([1, 2]);
+  });
+
+  it("⚠ STORY-073 AC13 · the pseudonym cannot be inverted by anyone holding the database", async () => {
+    // ⚠ THE ATTACK THE REVIEW RAN. `requestIndividualErasure` ANONYMISES the
+    // `users` row rather than deleting it, because every FK in the product
+    // points at that id — so a pseudonym DERIVED from the id has a candidate
+    // space of `SELECT id FROM users`, sitting in the same database. A hash
+    // was inverted in one query. A stored random value cannot be.
+    const workspaceId = await createWorkspace();
+    const userId = await createUser();
+    await client.query(
+      "INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1, $2, 'analyst', 'active')",
+      [workspaceId, userId],
+    );
+    await insertCreditLedger(workspaceId, userId);
+
+    // ⚠ THE JOIN TARGET HAS TO EXIST FOR ATTACK 3 TO MEAN ANYTHING. Without
+    // this row the assertion below counts zero either way and passes against
+    // a version that leaves the id in place — which it did, until a mutant
+    // showed it.
+    const projectId = await createProject(workspaceId);
+    await client.query(
+      `INSERT INTO capture_runs
+         (workspace_id, project_id, trigger, engine_keys, prompt_scope, planned_cells, skipped_cells,
+          captured_cells, failed_cells, scoring_version, status, triggered_by)
+       VALUES ($1, $2, 'manual', ARRAY['chatgpt'], 'all', 1, 0, 1, 0, 'v1', 'completed', $3)`,
+      [workspaceId, projectId, userId],
+    );
+
+    await requestIndividualErasure(client, userId);
+
+    const row = await client.query<{ actor_pseudonym: string }>(
+      "SELECT actor_pseudonym FROM credit_ledger WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    const pseudonym = row.rows[0]!.actor_pseudonym;
+
+    // ATTACK 1 — hash every id that survived erasure and look for a match.
+    // This is what killed the digest version.
+    const survivors = await client.query<{ id: string }>("SELECT id FROM users");
+    for (const prefix of ["credit-ledger-actor-pseudonym:", "audit-log-workspace-pseudonym:", ""]) {
+      const matched = survivors.rows.some((candidate) => {
+        const digest = createHash("sha256").update(prefix).update(candidate.id).digest("hex");
+        const shaped = [
+          digest.slice(0, 8),
+          digest.slice(8, 12),
+          digest.slice(12, 16),
+          digest.slice(16, 20),
+          digest.slice(20, 32),
+        ].join("-");
+        return shaped === pseudonym;
+      });
+      expect(matched, `the pseudonym is a sha256 of a surviving id under prefix "${prefix}"`).toBe(false);
+    }
+
+    // ATTACK 2 — the pseudonym is not the id, nor anything trivially derived.
+    expect(pseudonym).not.toBe(userId);
+    expect(survivors.rows.map((candidate) => candidate.id)).not.toContain(pseudonym);
+
+    // ATTACK 3 — follow the ledger's own references back to a person.
+    // STORY-073B began recording `reference_id` (the capture run) on every
+    // debit, and `capture_runs.triggered_by` held the raw user id, so a
+    // scrubbed row re-identified its person one hop away. This story opened
+    // that path, so this story closes it.
+    const leaks = await client.query<{ triggered_by: string | null }>(
+      "SELECT triggered_by FROM capture_runs WHERE triggered_by = $1",
+      [userId],
+    );
+    expect(leaks.rowCount, "capture_runs still names the erased user").toBe(0);
+  });
+
+  it("⚠ STORY-073 AC13 · the pseudonym satisfies the contract the route publishes for it", async () => {
+    // ⚠ 87% OF THE DIGEST VERSION DID NOT. `actor_pseudonym` is published as
+    // `z.string().uuid()`, and a sha256 slice has arbitrary version and
+    // variant nibbles — so most erased actors would have been written, into
+    // an APPEND-ONLY table, as a value the route's own contract rejects and
+    // `@nominara/client` would refuse to parse. It cannot be corrected
+    // afterwards without disabling the append-only trigger.
+    //
+    // The contract test in `credit-ledger-read.spec.ts` passed vacuously: it
+    // never seeded a pseudonymised row, which is the only state this column
+    // exists for.
+    const workspaceId = await createWorkspace();
+    const userId = await createUser();
+    await client.query(
+      "INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1, $2, 'analyst', 'active')",
+      [workspaceId, userId],
+    );
+    await insertCreditLedger(workspaceId, userId);
+    await requestIndividualErasure(client, userId);
+
+    const row = await client.query<{ actor_pseudonym: string }>(
+      "SELECT actor_pseudonym FROM credit_ledger WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    expect(z.string().uuid().safeParse(row.rows[0]!.actor_pseudonym).success).toBe(true);
+  });
+
+  it("STORY-073 AC13 · a row cannot name a person and carry a pseudonym at once", async () => {
+    // The constraint is what makes "pseudonymised" a state the database can
+    // express rather than a convention the erasure function happens to follow.
+    const workspaceId = await createWorkspace();
+    const actorId = await createUser();
+    await insertCreditLedger(workspaceId, actorId);
+
+    await client.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
+    try {
+      await expect(
+        client.query("UPDATE credit_ledger SET actor_pseudonym = $1 WHERE workspace_id = $2", [
+          randomUUID(),
+          workspaceId,
+        ]),
+      ).rejects.toThrow(/ck_credit_ledger_actor_exclusive/u);
+    } finally {
+      await client.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
+    }
+  });
 
   it("STORY-020 · individual erasure appends one audit.chain.rechained marker row to each workspace whose audit_log rows had this actor", async () => {
     const userId = await createUser();

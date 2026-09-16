@@ -226,6 +226,57 @@ describe("STORY-073 · ledger, reconciliation and replay", () => {
     });
   });
 
+  describe("⚠ unit_detail is parsed on the way in, not merely typed", () => {
+    // ⚠ THE TYPE WAS NOT A CHECK. `unitDetail` was `Record<string, number>`
+    // and went straight to `JSON.stringify`, so a handler could write `{}` or
+    // invented keys into an APPEND-ONLY financial record, and the read
+    // endpoint returned them — both violating the route's own published
+    // contract. `ledgerUnitDetailSchema`'s unit test asserts it "rejects an
+    // unknown member rather than carrying it into a financial record";
+    // nothing on the write path had ever run it.
+    //
+    // The casts below are the point rather than a convenience: the compiler
+    // stops a TypeScript caller, and the runtime has to stop everyone else —
+    // a JS consumer, a future refactor, a handler built from request data.
+    beforeEach(async () => {
+      await provision(600);
+    });
+
+    async function write(unitDetail: unknown): Promise<void> {
+      const after = (await readWallet(db, workspaceId))!;
+      await inTx((tx) =>
+        appendLedgerEntry(tx, {
+          workspaceId,
+          entryType: "commit",
+          actionCode: "manual_scan",
+          credits: 1,
+          idempotencyKey: `u-${randomUUID().slice(0, 8)}`,
+          attempt: 1,
+          after,
+          actorId: null,
+          actorType: "system",
+          unitDetail: unitDetail as never,
+        }),
+      );
+    }
+
+    for (const [name, detail] of [
+      ["an empty object", {}],
+      ["a partial split", { prompts: 1, engines: 1, cells_charged: 2 }],
+      ["an invented key", { prompts: 1, engines: 1, cells_charged: 2, cells_cached: 0, internal_cost_cents: 4237 }],
+      ["the camelCase spelling", { prompts: 1, engines: 1, cellsCharged: 2, cellsCached: 0 }],
+      ["a negative count", { prompts: 1, engines: 1, cells_charged: -2, cells_cached: 0 }],
+    ] as const) {
+      it(`refuses ${name}`, async () => {
+        await expect(write(detail)).rejects.toThrow(/unit_detail does not match its contract/u);
+      });
+    }
+
+    it("accepts the shape the contract publishes", async () => {
+      await expect(write({ prompts: 15, engines: 2, cells_charged: 22, cells_cached: 8 })).resolves.toBeUndefined();
+    });
+  });
+
   // ───────────────────────── scenario 2 ─────────────────────────
 
   describe("scenario 2 — the ledger is append-only, trigger-enforced", () => {
