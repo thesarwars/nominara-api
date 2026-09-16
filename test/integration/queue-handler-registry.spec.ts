@@ -27,7 +27,15 @@ const HANDLED: QueueName = "notify.dispatch";
 // Non-tenant-scoped, so its processor reaches getClient() immediately —
 // which is what makes the not-wired error observable. On a tenant-scoped
 // queue the signature is verified first, and correctly so.
-const UNHANDLED_UNSIGNED: QueueName = "credit.reconcile";
+//
+// Was `credit.reconcile` until STORY-073 wired it. `maintenance.partition`
+// is the rollup group's other non-tenant-scoped queue and is still inert
+// (its logic exists in `src/workers/rollup/maintenance.ts` and is invoked
+// only by a hand-run script — README gap G-10), so it carries this scenario
+// now. If it is ever wired, this constant moves again rather than the
+// scenario being dropped: "an unregistered queue is not reached by a job" is
+// the half that keeps mattering as handlers accumulate.
+const UNHANDLED_UNSIGNED: QueueName = "maintenance.partition";
 const WORKSPACE_ID = "018bcfe5-0000-7000-8000-0000000000aa";
 
 describe("STORY-124 · the queue-handler registry", () => {
@@ -207,7 +215,7 @@ describe("STORY-124 · the queue-handler registry", () => {
       ).map((entry) => entry.name);
       expect(line).toContain(`${String(live.length)} processing (${live.join(", ")})`);
       expect(line).toContain(HANDLED);
-      expect(line).toMatch(/inert, no handler wired \(.*credit\.reconcile/);
+      expect(line).toMatch(/inert, no handler wired \(.*maintenance\.partition/);
       // A group that processes nothing must not read the same as one that
       // processes everything.
       expect(line).not.toContain("0 inert");

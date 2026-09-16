@@ -40,13 +40,21 @@ describe("STORY-072 · credit_ledger.attempt", () => {
     ]);
   });
 
+  /**
+   * `bucket` and `reason` are supplied for the types that require them since
+   * STORY-073's migration 0023 — a balance entry has to name the balance it
+   * moved, and an adjustment has to carry its reason. They are incidental to
+   * what this file is about (the attempt column and the unique index), so
+   * they are derived here rather than pushed out to every call site.
+   */
   async function entry(entryType: string, key: string, attempt: number): Promise<void> {
+    const movement = ["reserve", "commit", "release"].includes(entryType);
     await db.query(
       `INSERT INTO credit_ledger
-         (workspace_id, actor_type, entry_type, credits, included_after, purchased_after, reserved_after,
-          idempotency_key, attempt)
-       VALUES ($1,'system',$2,100,0,0,0,$3,$4)`,
-      [workspaceId, entryType, key, attempt],
+         (workspace_id, actor_type, entry_type, credits, bucket, reason, included_after, purchased_after,
+          reserved_after, idempotency_key, attempt)
+       VALUES ($1,'system',$2,100,$5,$6,0,0,0,$3,$4)`,
+      [workspaceId, entryType, key, attempt, movement ? null : "included", entryType === "adjustment" ? "test" : null],
     );
   }
 
@@ -108,7 +116,18 @@ describe("STORY-072 · rolling 0022 back", () => {
     await container.stop();
   });
 
+  /**
+   * 0022 is no longer the head — STORY-073's 0023 sits on top of it, and a
+   * rollback is a stack. Taking the later one off here rather than inside
+   * each assertion keeps these tests about 0022, and makes the next
+   * migration's arrival a one-line change instead of a puzzling failure.
+   */
+  async function rollBackToTwentyTwo(): Promise<void> {
+    expect(await rollbackLast(db)).toBe("0023_credit_ledger_replay_integrity");
+  }
+
   it("rolls back cleanly when no request key has more than one attempt", async () => {
+    await rollBackToTwentyTwo();
     const rolled = await rollbackLast(db);
     expect(rolled).toBe("0022_credit_ledger_attempt");
 
@@ -129,6 +148,7 @@ describe("STORY-072 · rolling 0022 back", () => {
     //
     // Disabling the trigger would authorise a migration to rewrite a ledger
     // silently, which §6 rule 4 says the system must never do.
+    await rollBackToTwentyTwo();
     const workspaceId = randomUUID();
     await db.query("INSERT INTO workspaces (id,name,slug,plan_key) VALUES ($1,'W',$2,'growth')", [
       workspaceId,

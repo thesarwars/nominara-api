@@ -6,6 +6,7 @@ import { Client, Pool } from "pg";
 import { firstValueFrom, of, throwError } from "rxjs";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { CreditGuard } from "../../src/api/guards/credit.guard.js";
 import { CreditInterceptor } from "../../src/api/interceptors/credit.interceptor.js";
 import { CONFIRMED_CREDITS_HEADER } from "../../src/api/guards/credit.guard.js";
@@ -118,6 +119,23 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     expect(await wallet()).toBeNull();
     await guard().canActivate(contextFor(request("k-1")));
     expect(await wallet()).toMatchObject({ includedBalance: 300, reserved: PRICE });
+  });
+
+  it("⚠ ACCOUNTS FOR THE PROVISIONING GRANT IN THE LEDGER, not just in the balance", async () => {
+    // ⚠ STORY-073: `provisionWallet` inserted `included_balance = 300` and
+    // wrote no entry, so the very first workspace to touch a priced route
+    // held credits its ledger could not explain — and the nightly verifier
+    // would have paged on every new workspace.
+    //
+    // The assertion is here, on the GUARD, because that is the only caller.
+    // The second-engineer review reverted this call site to `provisionWallet`
+    // — reinstating the exact defect the change exists to fix — and 2,286
+    // unit and 1,238 integration tests stayed green, because the coverage
+    // lived on the library function rather than on the path that uses it.
+    await guard().canActivate(contextFor(request("k-1")));
+
+    expect(await ledger("grant")).toBe(1);
+    expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
   });
 
   it("BLOCKER 1 — a REDELIVERED request does not open a second reservation", async () => {
