@@ -108,7 +108,7 @@ describe("STORY-074 · estimates, confirmation and price-changed", () => {
   }
 
   function estimateService(): RunEstimateService {
-    return new RunEstimateService(new InMemoryCacheAdapter(), new EntitlementResolver(new InMemoryCacheAdapter(), pool));
+    return new RunEstimateService(new InMemoryCacheAdapter());
   }
 
   async function estimate() {
@@ -148,7 +148,7 @@ describe("STORY-074 · estimates, confirmation and price-changed", () => {
 
     // growth's `deep_scan.credits` is 200.
     expect(result.credits).toBe(200);
-    expect(result.wallet).toMatchObject({ available: 2_400, after: 2_200 });
+    expect(result.wallet).toMatchObject({ available: 2_400, after: 2_200, shortfall: null });
     expect(result.credits_charged).toBe(0);
   });
 
@@ -197,9 +197,116 @@ describe("STORY-074 · estimates, confirmation and price-changed", () => {
 
     expect(result.wallet.available).toBe(1_200); // growth's included grant
     expect(result.wallet.after).toBe(1_000);
+    expect(result.wallet.shortfall).toBeNull();
     // And the thresholds are evaluated against that, not against zero: a
     // wallet read as empty would have fired `balance_after_below_floor` too.
     expect(result.confirmation.reasons).not.toContain("balance_after_below_floor");
+  });
+
+  it("⚠ does not take a SECOND pool connection while the request already holds one", async () => {
+    // ⚠ THE DEADLOCK THIS CAUGHT. `TenantContextInterceptor` checks a
+    // connection out of `PG_POOL` and holds it in an open transaction for the
+    // life of the request. The first version of this service then called
+    // `EntitlementResolver.resolveForWorkspace`, which takes its own
+    // connection from that same pool — the resolver's header says plainly it
+    // is built to run in the guard chain "before TenantContextInterceptor has
+    // opened anything".
+    //
+    // `createPgPool` sets no `connectionTimeoutMillis` and pg's default is
+    // wait-forever, so at `max` concurrent estimates the pool deadlocks
+    // PERMANENTLY — and `PG_POOL` serves every route, so the blast radius is
+    // the whole API rather than this endpoint.
+    //
+    // A pool of ONE and two concurrent requests is the smallest shape that
+    // reproduces it: if the estimate needs a second connection, the first
+    // request can never get one and neither can finish.
+    const tiny = new Pool({ connectionString: container.getConnectionUri(), max: 1 });
+    try {
+      await fundWallet(2_400);
+      const service = new RunEstimateService(new InMemoryCacheAdapter());
+
+      const run = async (): Promise<number> => {
+        const client = await tiny.connect();
+        try {
+          const result = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () =>
+            service.estimate(projectId),
+          );
+          return result.credits;
+        } finally {
+          client.release();
+        }
+      };
+
+      // Sequential on a pool of one, because that is what a single connection
+      // permits — the point is that ONE request completes without needing a
+      // second connection. A version that did would hang here forever.
+      const outcome = await Promise.race([
+        (async () => [await run(), await run()])(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("pool deadlock")), 10_000)),
+      ]);
+
+      expect(outcome).toEqual([200, 200]);
+    } finally {
+      await tiny.end();
+    }
+  }, 30_000);
+
+  it("⚠ names the shortfall rather than leaving a component to read it off a minus sign", async () => {
+    // AC9 / FR-CST-04 — "the modal becomes a purchase step in place: the
+    // shortfall and the tier-filtered options, never a dead end." `after`
+    // goes negative here, which is honest for "what you would be left with"
+    // and is NOT a balance; `shortfall` is that figure made explicit.
+    await fundWallet(50);
+    const result = await estimate();
+
+    expect(result.wallet).toMatchObject({ available: 50, after: -150, shortfall: 150 });
+    expect(result.scans_affordable).toBe(0);
+  });
+
+  it("⚠ refuses rather than reporting an enterprise workspace as broke", async () => {
+    // ⚠ THE FAILURE THE SUBSTITUTION WAS SUPPOSED TO PREVENT, CAUSED BY IT.
+    // `credits.included_per_cycle` is "custom" on enterprise — negotiated per
+    // contract, not a number. Reading it as 0 rendered "0 available → −400
+    // after · 0 more scans" and a purchase step to the largest account in the
+    // product, on its very first estimate. An unknown grant is not zero.
+    await setPlan("enterprise");
+    await db.query("UPDATE workspaces SET entitlement_overrides = $2 WHERE id = $1", [
+      workspaceId,
+      JSON.stringify({ "deep_scan.credits": 400 }),
+    ]);
+
+    await expect(estimate()).rejects.toMatchObject({
+      code: "feature_not_in_plan",
+      details: { key: "credits.included_per_cycle" },
+    });
+  });
+
+  it("serves an enterprise workspace normally once its wallet exists", async () => {
+    // The refusal above is about the SUBSTITUTION, not about enterprise. With
+    // a real wallet row there is nothing to substitute.
+    await setPlan("enterprise");
+    await db.query("UPDATE workspaces SET entitlement_overrides = $2 WHERE id = $1", [
+      workspaceId,
+      JSON.stringify({ "deep_scan.credits": 400 }),
+    ]);
+    await fundWallet(10_000);
+
+    const result = await estimate();
+    expect(result.credits).toBe(400);
+    expect(result.wallet).toMatchObject({ available: 10_000, after: 9_600, shortfall: null });
+  });
+
+  it("⚠ does NOT disclose the wallet's bucket breakdown on a tracking:trigger route", async () => {
+    // ⚠ PERMISSION BOUNDARY. This route is `tracking:trigger`, which a
+    // MANAGER holds; `billing:read` is owner/admin only, and there is no
+    // `GET /billing/wallet` at all. Shipping included/purchased/reserved here
+    // would have made the estimate the one success-path route in the product
+    // disclosing a wallet's internals a rank below the permission gating
+    // them. §7's modal renders `available` and `after`; never the split.
+    await fundWallet(2_400);
+    const result = await estimate();
+
+    expect(Object.keys(result.wallet).sort()).toEqual(["after", "available", "cycle_end", "shortfall"]);
   });
 
   // ───────────────────── scenarios 6 and 7 ─────────────────────
@@ -287,6 +394,92 @@ describe("STORY-074 · estimates, confirmation and price-changed", () => {
       const { req, context } = guardContext(requoted);
       await expect(guard().canActivate(context)).resolves.toBe(true);
       expect(req).toHaveProperty("creditReservation");
+    });
+
+    it("⚠ refuses a fresh quote that does not match a STILL-OPEN reservation", async () => {
+      // ⚠ THE HOLE IN AC6 THE REVIEW FOUND. The price check compared the
+      // confirmed figure against TODAY's price; the re-attach path then
+      // settles against what the standing reservation HOLDS. So a customer
+      // whose first delivery reserved 500, who re-quoted after the price
+      // dropped to 200 and echoed 200, passed the check and would have been
+      // debited 500 — charged a figure they never saw, which is the one
+      // thing AC6 forbids.
+      await fundWallet(10_000);
+      await setPlan("business");
+
+      const key = `k-${randomUUID().slice(0, 8)}`;
+      const deliver = (confirmed: number) => {
+        const req = {
+          tenant: { workspaceId },
+          headers: { [CONFIRMED_CREDITS_HEADER]: String(confirmed), "idempotency-key": key },
+        };
+        return {
+          req,
+          context: {
+            getHandler: () => undefined,
+            getClass: () => undefined,
+            switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({ header: () => undefined }) }),
+          } as unknown as ExecutionContext,
+        };
+      };
+
+      // Delivery 1 reserves business's 500 and nothing settles it.
+      await expect(guard().canActivate(deliver(500).context)).resolves.toBe(true);
+      const held = await db.query<{ reserved: string }>(
+        "SELECT reserved::text FROM credit_wallets WHERE workspace_id = $1",
+        [workspaceId],
+      );
+      expect(held.rows[0]!.reserved).toBe("500");
+
+      // The contracted price is renegotiated downwards, and the customer
+      // re-quotes honestly.
+      await setPlan("growth");
+      expect((await estimate()).credits).toBe(200);
+
+      // Re-delivering under the same key must refuse, naming the held amount.
+      await expect(guard().canActivate(deliver(200).context)).rejects.toMatchObject({
+        code: "price_changed",
+        details: { shown: 200, recomputed: 500 },
+      });
+
+      // And nothing moved: the original hold is intact, not doubled.
+      const after = await db.query<{ reserved: string }>(
+        "SELECT reserved::text FROM credit_wallets WHERE workspace_id = $1",
+        [workspaceId],
+      );
+      expect(after.rows[0]!.reserved).toBe("500");
+    });
+
+    it("re-attaches silently when the confirmed figure DOES match the held amount", async () => {
+      // The ordinary redelivery — same key, same figure, nothing changed.
+      // It must not be turned into a conflict by the check above.
+      await fundWallet(10_000);
+      const key = `k-${randomUUID().slice(0, 8)}`;
+      const deliver = () => {
+        const req = {
+          tenant: { workspaceId },
+          headers: { [CONFIRMED_CREDITS_HEADER]: "200", "idempotency-key": key },
+        };
+        return {
+          req,
+          context: {
+            getHandler: () => undefined,
+            getClass: () => undefined,
+            switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({ header: () => undefined }) }),
+          } as unknown as ExecutionContext,
+        };
+      };
+
+      await expect(guard().canActivate(deliver().context)).resolves.toBe(true);
+      const second = deliver();
+      await expect(guard().canActivate(second.context)).resolves.toBe(true);
+
+      // One hold, not two.
+      const wallet = await db.query<{ reserved: string }>(
+        "SELECT reserved::text FROM credit_wallets WHERE workspace_id = $1",
+        [workspaceId],
+      );
+      expect(wallet.rows[0]!.reserved).toBe("200");
     });
 
     it("scenario 3 — execution without the header is refused", async () => {
