@@ -177,7 +177,7 @@ export class CreditGuard implements CanActivate {
       });
     }
 
-    await this.reserve(request, workspaceId, action, price, resolved.entitlements);
+    await this.reserve(request, workspaceId, action, price, confirmed, resolved.entitlements);
     return true;
   }
 
@@ -208,6 +208,7 @@ export class CreditGuard implements CanActivate {
     workspaceId: string,
     action: CreditAction,
     price: number,
+    confirmed: number,
     entitlements: Readonly<Record<string, { readonly value: unknown }>>,
   ): Promise<void> {
     // A zero-priced action has nothing to reserve. Reserving 0 would write a
@@ -230,6 +231,8 @@ export class CreditGuard implements CanActivate {
     let attempt = 1;
     /** Set only when re-attaching: what the standing reservation actually holds. */
     let heldCredits: number | null = null;
+    /** Collected, not thrown: throwing here would roll back the transaction that read the claim. */
+    let reattachMismatch: InstanceType<typeof PriceChangedError> | null = null;
 
     const client = await this.pool.connect();
     try {
@@ -269,6 +272,29 @@ export class CreditGuard implements CanActivate {
           // stays reserved until the cycle ends with nothing to release it.
           attempt = claim.openAttempt;
           heldCredits = claim.openCredits;
+
+          // ⚠ AND THE CONFIRMED FIGURE HAS TO BE CHECKED AGAINST THAT SAME
+          // HELD AMOUNT. The check at the top of `canActivate` compared it
+          // against today's price, which is the number this delivery will
+          // NOT be charged — so a customer who re-quoted after a price drop
+          // echoed the new figure, passed the check, and was debited the old
+          // reservation's larger amount. Reproduced by the second-engineer
+          // review: confirmed 200, settled 500.
+          //
+          // AC6 is "a customer is never charged a figure they did not see",
+          // and the figure they will be charged here is the held one.
+          if (heldCredits !== null && confirmed !== heldCredits) {
+            reattachMismatch = new PriceChangedError({
+              message: "the confirmed price does not match the reservation this request is settling",
+              details: {
+                shown: confirmed,
+                recomputed: heldCredits,
+                reason:
+                  "a reservation for this Idempotency-Key is still open and holds a different amount; " +
+                  "re-quote before retrying",
+              },
+            });
+          }
           return;
         }
 
@@ -353,6 +379,21 @@ export class CreditGuard implements CanActivate {
       }
       attempt = found.openAttempt;
       heldCredits = found.openCredits;
+      // Same rule as the re-attach branch above: settlement will debit what
+      // the winning delivery reserved, so that is the figure the customer
+      // must have confirmed.
+      if (heldCredits !== null && confirmed !== heldCredits) {
+        reattachMismatch = new PriceChangedError({
+          message: "the confirmed price does not match the reservation this request is settling",
+          details: {
+            shown: confirmed,
+            recomputed: heldCredits,
+            reason:
+              "a concurrent delivery of this Idempotency-Key opened a reservation for a different amount; " +
+              "re-quote before retrying",
+          },
+        });
+      }
     } finally {
       client.release();
     }
@@ -378,6 +419,8 @@ export class CreditGuard implements CanActivate {
           "repeating it would charge again.",
       });
     }
+
+    if (reattachMismatch !== null) throw reattachMismatch;
 
     if (refusal !== null) {
       // ⚠ OUTSIDE the transaction that failed, and on its own connection.
