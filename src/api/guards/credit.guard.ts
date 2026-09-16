@@ -2,8 +2,14 @@ import { CanActivate, ExecutionContext, Inject, Injectable, Logger } from "@nest
 import { Reflector } from "@nestjs/core";
 import type { ClientBase, Pool } from "pg";
 import { PG_POOL } from "../../db/pg-pool.js";
-import { appendLedgerEntry, inspectReservations, type LedgerActionCode } from "../../lib/credits/ledger.js";
-import { provisionWallet, purchasableOptions, reserveCredits, readWallet } from "../../lib/credits/wallet.js";
+import {
+  appendLedgerEntry,
+  inspectReservations,
+  type LedgerActionCode,
+  type ReservationClaim,
+} from "../../lib/credits/ledger.js";
+import { provisionWalletWithGrant } from "../../lib/credits/balance.js";
+import { purchasableOptions, reserveCredits, readWallet } from "../../lib/credits/wallet.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { compensateDailyCounter } from "../../lib/usage/daily-cap.js";
@@ -184,6 +190,8 @@ export class CreditGuard implements CanActivate {
     let refusal: InstanceType<typeof InsufficientCreditsError> | null = null;
     let alreadyCommitted = false;
     let attempt = 1;
+    /** Set only when re-attaching: what the standing reservation actually holds. */
+    let heldCredits: number | null = null;
 
     const client = await this.pool.connect();
     try {
@@ -192,7 +200,7 @@ export class CreditGuard implements CanActivate {
         // `provisionWallet`. On the request path so there is no window in
         // which a cycle has begun and the row does not exist.
         const period = await resolveBillingPeriod(tx, workspaceId);
-        await provisionWallet(tx, workspaceId, includedGrantOf(entitlements), period);
+        await provisionWalletWithGrant(tx, workspaceId, includedGrantOf(entitlements), period);
 
         // ⚠ "IS ONE OF THIS KEY'S RESERVATIONS STILL OPEN", not "has this key
         // reserved before". A ledger entry is permanent; a reservation is
@@ -214,7 +222,15 @@ export class CreditGuard implements CanActivate {
         if (claim.openAttempt !== null) {
           // A redelivery of a request whose reservation is still standing.
           // Re-attach: the credits are already held.
+          //
+          // ⚠ AND SETTLE AGAINST WHAT IS HELD, NOT AGAINST TODAY'S PRICE.
+          // `price` is recomputed on every delivery, so a redelivery arriving
+          // after the schedule moved would hand settlement a figure this
+          // reservation never held — too high and the commit matches no row
+          // (a 500 for work that was performed), too low and the difference
+          // stays reserved until the cycle ends with nothing to release it.
           attempt = claim.openAttempt;
+          heldCredits = claim.openCredits;
           return;
         }
 
@@ -278,8 +294,8 @@ export class CreditGuard implements CanActivate {
       if (!(error instanceof AlreadyReservedError)) throw error;
       // A concurrent delivery got there first. The rollback undid this
       // attempt's increment; re-read to find the reservation it opened.
-      const found = await this.openAttemptFor(workspaceId, idempotencyKey);
-      if (found === null) {
+      const found = await this.openClaimFor(workspaceId, idempotencyKey);
+      if (found.openAttempt === null) {
         // `conflict`, NOT `idempotency_conflict`. That code means "same key,
         // different body" and its details name the two request hashes; this
         // is a lost race between two identical deliveries.
@@ -292,7 +308,8 @@ export class CreditGuard implements CanActivate {
           message: "another delivery of this request is being processed; retry with the same Idempotency-Key",
         });
       }
-      attempt = found;
+      attempt = found.openAttempt;
+      heldCredits = found.openCredits;
     } finally {
       client.release();
     }
@@ -332,7 +349,10 @@ export class CreditGuard implements CanActivate {
     request.creditReservation = {
       workspaceId,
       action,
-      amount: price,
+      // `heldCredits` is set only on the re-attach paths, where the
+      // reservation predates this delivery and its amount is the ledger's to
+      // state rather than this request's to recompute.
+      amount: heldCredits ?? price,
       idempotencyKey,
       // Settlement must close the attempt it actually attached to.
       attempt,
@@ -372,13 +392,12 @@ export class CreditGuard implements CanActivate {
   }
 
   /** Re-read which of a key's attempts is open, after losing a race to open one. */
-  private async openAttemptFor(workspaceId: string, idempotencyKey: string): Promise<number | null> {
+  private async openClaimFor(workspaceId: string, idempotencyKey: string): Promise<ReservationClaim> {
     const client = await this.pool.connect();
     try {
-      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx: ClientBase) => {
-        const claim = await inspectReservations(tx, workspaceId, idempotencyKey);
-        return claim.openAttempt;
-      });
+      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx: ClientBase) =>
+        inspectReservations(tx, workspaceId, idempotencyKey),
+      );
     } finally {
       client.release();
     }
