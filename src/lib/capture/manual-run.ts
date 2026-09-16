@@ -86,6 +86,14 @@ export interface ManualRunForecast {
 }
 
 export interface ManualRunEstimate {
+  /**
+   * The merged entitlement set this estimate was computed from.
+   *
+   * Exposed so the caller can answer §7's threshold questions from THE SAME
+   * SNAPSHOT that produced the price, on the same connection. See the note at
+   * `estimateManualRun`.
+   */
+  readonly entitlements: ResolvedEntitlementsResponse["entitlements"];
   readonly credits: number;
   readonly forecast: ManualRunForecast;
   readonly promptCount: number;
@@ -112,9 +120,17 @@ export async function estimateManualRun(
   project: ManualRunProject,
   now: Date = new Date(),
 ): Promise<ManualRunEstimate> {
-  // ONE resolution, two questions asked of it. `deep_scan.credits` and
+  // ONE resolution, several questions asked of it. `deep_scan.credits` and
   // `no_shared_cache` both come from the merged entitlement set, and reading
   // it twice on a route that answers in a modal is a round trip for nothing.
+  //
+  // ⚠ IT IS RETURNED, so the caller does not resolve a second time.
+  // STORY-074 needed `projects.max` and `credits.included_per_cycle` for the
+  // confirmation verdict and reached for `EntitlementResolver` — which takes
+  // its OWN pool connection while the request already holds one, deadlocking
+  // `PG_POOL` at ten concurrent estimates. It also read a different snapshot
+  // through a Valkey memo, so one response could quote plan A's price beside
+  // plan B's thresholds. Handing this one back closes both.
   const resolved = await resolveEntitlements(tx, project.workspaceId);
   const credits = await deepScanPriceOrThrow(tx, resolved.entitlements);
   const probe = await probeRunCells(tx, cache, {
@@ -129,6 +145,7 @@ export async function estimateManualRun(
   });
 
   return {
+    entitlements: resolved.entitlements,
     credits,
     forecast: {
       plannedCells: probe.cells.length,
