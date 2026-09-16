@@ -1,45 +1,49 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { pseudonymiseActorId, pseudonymiseWorkspaceId } from "../../src/lib/crypto/pseudonymise.js";
+import { pseudonymiseWorkspaceId } from "../../src/lib/crypto/pseudonymise.js";
 
-// STORY-073 AC13 — the properties the credit ledger's erased actor depends
-// on. Two are checked by the retention integration suite (an erased person's
-// rows still group; two erased people stay apart); these are the ones a
-// behavioural test cannot reach.
+// STORY-020 — the workspace pseudonym used by the audit export.
+//
+// ⚠ THIS FILE USED TO TEST A `pseudonymiseActorId` TOO, and that function has
+// been deleted. It hashed a user id for the credit ledger's erased actor, and
+// the second-engineer review inverted it: `requestIndividualErasure`
+// anonymises the `users` row rather than deleting it, so the brute-force
+// candidate space is `SELECT id FROM users`. The erased actor's pseudonym is
+// a stored random UUID now — see `retention.ts` — so there is no function
+// left to unit-test, and the property that matters is asserted where it
+// happens, in `retention-cascade.spec.ts`.
+//
+// The workspace pseudonym is a different case and is left alone: it is
+// written only into the IMMUTABLE EXPORT, never into a table alongside the
+// data it de-identifies, so a reader holding the export does not also hold
+// the `workspaces` row to hash against.
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const UUID_SHAPED = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
-describe("STORY-073 · pseudonymiseActorId", () => {
-  it("is deterministic, which is what lets one person's charges group", () => {
+describe("STORY-020 · pseudonymiseWorkspaceId", () => {
+  it("is deterministic, so one workspace's export rows still group", () => {
     const id = randomUUID();
-    expect(pseudonymiseActorId(id)).toBe(pseudonymiseActorId(id));
+    expect(pseudonymiseWorkspaceId(id)).toBe(pseudonymiseWorkspaceId(id));
   });
 
-  it("separates two people", () => {
-    expect(pseudonymiseActorId(randomUUID())).not.toBe(pseudonymiseActorId(randomUUID()));
-  });
-
-  it("is UUID-shaped, because the column it lands in is a uuid", () => {
-    expect(pseudonymiseActorId(randomUUID())).toMatch(UUID);
+  it("separates two workspaces", () => {
+    expect(pseudonymiseWorkspaceId(randomUUID())).not.toBe(pseudonymiseWorkspaceId(randomUUID()));
   });
 
   it("does not return the input", () => {
     const id = randomUUID();
-    expect(pseudonymiseActorId(id)).not.toBe(id);
+    expect(pseudonymiseWorkspaceId(id)).not.toBe(id);
   });
 
-  it("⚠ does NOT collide with the workspace pseudonym for the same input", () => {
-    // ⚠ THE PROPERTY NO BEHAVIOURAL TEST REACHES, and the reason the two
-    // functions carry different domain prefixes rather than sharing one
-    // helper. A workspace id and a user id are both UUIDs from the same
-    // space, so they CAN be equal — and a shared prefix would make an
-    // erased person's ledger pseudonym equal to some workspace's export
-    // pseudonym, grouping two unrelated things together in a record kept
-    // for disputes.
-    //
-    // Nothing observable breaks until the day those two UUIDs coincide,
-    // which is exactly the kind of defect that ships.
-    const id = randomUUID();
-    expect(pseudonymiseActorId(id)).not.toBe(pseudonymiseWorkspaceId(id));
+  it("⚠ is UUID-SHAPED but is NOT a valid v4 UUID, which is why it never goes in a uuid column", () => {
+    // A sha256 slice has arbitrary version and variant nibbles. It survives
+    // `/^[0-9a-f-]+$/` and fails `z.string().uuid()` most of the time — 87%,
+    // measured. That is harmless here because this value only ever lands in
+    // an export file. It was NOT harmless when the same construction was
+    // used for `credit_ledger.actor_pseudonym`, whose published contract
+    // declares `uuid`; that is one of the reasons the ledger's version is
+    // now a real random UUID rather than a digest.
+    const value = pseudonymiseWorkspaceId(randomUUID());
+    expect(value).toMatch(UUID_SHAPED);
   });
 });

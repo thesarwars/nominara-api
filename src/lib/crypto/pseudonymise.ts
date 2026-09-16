@@ -14,23 +14,32 @@ export function pseudonymiseWorkspaceId(workspaceId: string): string {
 }
 
 
+
 /**
- * Deterministically pseudonymises a USER id, for the credit ledger's
- * accounting record.
+ * ⚠ `pseudonymiseActorId` WAS HERE AND HAS BEEN REMOVED. It hashed the user
+ * id, and a hash of a surviving identifier is not a pseudonym.
  *
- * ⚠ A SEPARATE DOMAIN PREFIX FROM THE WORKSPACE ONE, and not for tidiness.
- * Sharing a prefix would make `pseudonymise(x)` collide across two different
- * kinds of identifier that happen to hold the same UUID — a workspace and a
- * user can, since both are v4/v7 UUIDs from the same space — and two
- * unrelated things would group together in a record kept for disputes.
+ * The second-engineer review re-identified an erased person three ways
+ * against a real database, and the first two were the digest itself:
  *
- * One-way, so an erasure cannot be undone by anyone holding the database:
- * the `users` row is anonymised in the same transaction, so there is no
- * surviving id to brute-force the digest against.
+ *   1. `requestIndividualErasure` ANONYMISES the `users` row, it does not
+ *      delete it — every FK in the product points at that id. So the
+ *      candidate space for a brute force is not 2^122, it is
+ *      `SELECT id FROM users`, which is small and sitting in the same
+ *      database as the pseudonym.
+ *   2. The anonymised email is `'deleted+' || id || '@nominara.invalid'`
+ *      (data-model.md §7's own spelling), so the raw UUID survives in
+ *      PLAINTEXT in the row that was supposed to have removed it.
+ *
+ * The docstring that used to sit here claimed "an erasure cannot be undone
+ * by anyone holding the database". It was wrong, and it was wrong in the
+ * direction that matters.
+ *
+ * An HMAC under an external key would fix the brute force and add key
+ * management, rotation, and a grouping that breaks when the key rotates —
+ * for a value that never needs to be recomputed. The erased actor's
+ * pseudonym is now simply RANDOM, assigned once at erasure time and stored:
+ * nothing derives it, so there is nothing to invert, and one random UUID per
+ * erased person groups their rows exactly as well as a digest did. See
+ * `retention.ts`.
  */
-export function pseudonymiseActorId(userId: string): string {
-  const digest = createHash("sha256").update("credit-ledger-actor-pseudonym:").update(userId).digest("hex");
-  return [digest.slice(0, 8), digest.slice(8, 12), digest.slice(12, 16), digest.slice(16, 20), digest.slice(20, 32)].join(
-    "-",
-  );
-}
