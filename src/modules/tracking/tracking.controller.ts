@@ -95,7 +95,7 @@ export class TrackingController {
     @Param("id") projectId: string,
     @Body(new ZodValidationPipe(triggerRunRequestSchema)) _body: TriggerRunRequest,
   ): Promise<RunProgressResponse> {
-    const { progress, usage } = await this.lifecycle.triggerWithUsage(projectId, req.auth?.sub ?? null);
+    const { progress, usage } = await this.lifecycle.trigger(projectId, req.auth?.sub ?? null);
     // STORY-073 AC10/AC11 — what `CreditInterceptor` records on the debit.
     // Stamped here because this is the layer that holds both the request and
     // the result; the interceptor reads it on the way out, beside
