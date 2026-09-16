@@ -33,6 +33,14 @@ export interface SettleableReservation {
   readonly attempt: number;
   readonly credits: number;
   readonly actionCode: LedgerActionCode;
+  /**
+   * Whose release this is.
+   *
+   * Absent means the system's — which is the reconciler, and is the truth
+   * there: nobody asked for that release, a sweep noticed an abandoned hold.
+   * A failed request's release belongs to the person who made it.
+   */
+  readonly actor?: { readonly actorId: string | null; readonly actorType: "user" | "api_key" | "system" };
 }
 
 export type ReleaseOutcome = "released" | "already_settled";
@@ -93,8 +101,8 @@ export async function releaseReservation(
     idempotencyKey: reservation.idempotencyKey,
     attempt: reservation.attempt,
     after,
-    actorId: null,
-    actorType: "system",
+    actorId: reservation.actor?.actorId ?? null,
+    actorType: reservation.actor?.actorType ?? "system",
     ...(referenceType === undefined ? {} : { referenceType }),
   });
 

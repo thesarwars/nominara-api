@@ -23,6 +23,7 @@ import {
   ValidationFailedError,
 } from "../errors/domain-errors.js";
 import type { DailyCapScopedRequest } from "./daily-cap.guard.js";
+import type { AuthenticatedRequest } from "./auth.guard.js";
 import type { WorkspaceScopedRequest } from "./workspace.guard.js";
 
 // STORY-022-E-2 composed this slot as a pass-through; STORY-034 fills in the
@@ -56,9 +57,46 @@ interface CreditScopedRequest extends WorkspaceScopedRequest, DailyCapScopedRequ
   creditReservation?: CreditReservation;
 }
 
+/**
+ * Who is spending, in the two facts `credit_ledger` records.
+ *
+ * ⚠ EVERY ENTRY SAID `system` BEFORE THIS. STORY-072 wrote `actorId: null,
+ * actorType: "system"` on the reserve and the commit alike, so a workspace
+ * looking at its own history saw a column of identical system rows and the
+ * story's own question — "what spent my credits?" — had no answer in the
+ * data. The request has always known; nothing carried it the twelve lines
+ * from the guard to the ledger.
+ *
+ * `system` remains a real value, for the entries a person did not cause: the
+ * reconciler's releases, and a grant applied at provisioning.
+ */
+export interface CreditActor {
+  readonly actorId: string | null;
+  readonly actorType: "user" | "api_key" | "system";
+}
+
+/**
+ * Resolve the actor from the request.
+ *
+ * ⚠ THE API-KEY BRANCH RECORDS THE KEY'S ID, NOT A USER'S. An API key is a
+ * workspace credential; attributing its spend to whichever person created it
+ * would put a name against actions they did not take, in a financial record
+ * kept for the invoice-dispute window. `actor_id` has an FK to `users`, so
+ * the id is deliberately NOT written there — `actor_type` says `api_key` and
+ * `actor_id` stays null, which is the honest shape until `credit_ledger`
+ * grows a column that can hold a key.
+ */
+export function creditActorOf(request: AuthenticatedRequest & { apiKey?: { id: string } }): CreditActor {
+  if (request.authMethod === "apiKey") return { actorId: null, actorType: "api_key" };
+  const sub = request.auth?.sub;
+  return sub === undefined ? { actorId: null, actorType: "system" } : { actorId: sub, actorType: "user" };
+}
+
 export interface CreditReservation {
   readonly workspaceId: string;
   readonly action: CreditAction;
+  /** Who is spending. Carried from the guard so the commit attributes the same person the reserve did. */
+  readonly actor: CreditActor;
   /** What was reserved. A flat-priced action commits exactly this. */
   readonly amount: number;
   /**
@@ -283,8 +321,13 @@ export class CreditGuard implements CanActivate {
           idempotencyKey,
           attempt,
           after: outcome.wallet!,
-          actorId: null,
-          actorType: "system",
+          // ⚠ THE RESERVE CARRIES THE ACTOR AND NOT THE PROJECT, and the
+          // asymmetry is real rather than an omission. The person is known
+          // before the handler runs; what they are about to operate on is
+          // not — the handler resolves that, and the COMMIT is the debit
+          // AC10 is about. A reserve that guessed at a project would be
+          // wrong on every route whose body names it.
+          ...creditActorOf(request),
         });
         // A concurrent delivery computed the same attempt number and won.
         // Roll this one back and let the caller re-attach to theirs.
@@ -349,6 +392,7 @@ export class CreditGuard implements CanActivate {
     request.creditReservation = {
       workspaceId,
       action,
+      actor: creditActorOf(request),
       // `heldCredits` is set only on the re-attach paths, where the
       // reservation predates this delivery and its amount is the ledger's to
       // state rather than this request's to recompute.

@@ -17,6 +17,40 @@ import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 import type { CreditReservation } from "../guards/credit.guard.js";
 
+/**
+ * The work a debit paid for, as the handler reports it.
+ *
+ * `unitDetail` is `billing-and-credits.md`'s `{prompts, engines,
+ * cells_charged, cells_cached}` and is rendered — FR-CRD-03 — "as a
+ * statement of work done, never as billing arithmetic". It does not derive
+ * the price and the price does not derive it: a flat-priced deep scan costs
+ * the same whether the cache served two cells or two hundred, and the split
+ * is there to tell the customer what their money actually bought.
+ */
+export interface CreditUsage {
+  readonly projectId?: string;
+  readonly referenceType?: string;
+  readonly referenceId?: string;
+  readonly unitDetail?: {
+    readonly prompts: number;
+    readonly engines: number;
+    readonly cells_charged: number;
+    readonly cells_cached: number;
+  };
+  /**
+   * What serving this action cost US, in USD.
+   *
+   * ⚠ NOTHING SUPPLIES A NON-ZERO VALUE YET, and the reason is upstream:
+   * `execute-cell.ts`'s `recordCost` is a no-op and every fixture adapter
+   * reports `costUsd: 0`, because the real engine adapters are STORY-028 and
+   * STORY-029 and both are deferred. The column and the path exist now so
+   * that the story which lands a real adapter fills a field rather than
+   * inventing the accounting for it — "realised operating cost is measurable
+   * from data rather than modelled" is only true once something measures.
+   */
+  readonly internalCostUsd?: string;
+}
+
 // STORY-022-E-2 composed this slot as a pass-through; STORY-072 fills it.
 //
 // §6's settlement: COMMIT the actual amount on success, RELEASE the whole
@@ -92,6 +126,19 @@ interface CreditSettlingRequest {
    * Unset is NOT zero — zero would mean the action ran and cost nothing.
    */
   creditsConsumed?: number;
+  /**
+   * What the handler did, for the debit's own record.
+   *
+   * ⚠ SET BY THE HANDLER, BECAUSE ONLY THE HANDLER KNOWS. The guard reserves
+   * before anything has run, so it can name the person but not the project,
+   * the run, or how much of the work was actually done live. AC10's "every
+   * debit answers what spent my credits" needs all four, and the commit is
+   * where they are all finally known.
+   *
+   * Absent is a legitimate state — a priced route that names nothing records
+   * nothing, rather than recording a guess.
+   */
+  creditUsage?: CreditUsage;
 }
 
 /**
@@ -285,6 +332,7 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
     // `?? amount` is what makes the flat case the default, so a route that
     // declares nothing cannot under-charge.
     const consumed = request.creditsConsumed ?? reservation.amount;
+    const usage = request.creditUsage ?? {};
     const committed = await commitCredits(store.client, reservation.workspaceId, consumed, reservation.amount);
 
     if (committed === null) {
@@ -308,8 +356,11 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
       idempotencyKey: reservation.idempotencyKey,
       attempt: reservation.attempt,
       after: committed,
-      actorId: null,
-      actorType: "system",
+      // AC10 — the action, the actor, the project and the reference, which
+      // together are the whole of "what spent my credits?". The actor came
+      // from the guard; the rest the handler reported.
+      ...reservation.actor,
+      ...usage,
     });
 
     clearReservation(request);
@@ -374,6 +425,11 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
               attempt: reservation.attempt,
               credits: reservation.amount,
               actionCode: reservation.ledgerAction,
+              // The release belongs to the person whose request failed, not
+              // to the system — money they held and got back is their
+              // history. The reconciler's own releases are the system's,
+              // and it passes no actor at all.
+              actor: reservation.actor,
             }),
         );
       } finally {

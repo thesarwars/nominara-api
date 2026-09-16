@@ -56,6 +56,20 @@ interface LedgerEntryCommon {
   readonly actorType: "user" | "api_key" | "system";
   readonly referenceType?: string;
   readonly referenceId?: string;
+  /**
+   * The project this entry is about, where there is one.
+   *
+   * ⚠ NOT EVERY ENTRY HAS ONE, and that is why it is optional rather than
+   * nullable-required: a grant, a purchase and an expiry are workspace
+   * facts, and forcing a project onto them would make `ix_credit_ledger_
+   * project` describe a relationship that does not exist. A debit usually
+   * does have one, and AC10 wants it.
+   */
+  readonly projectId?: string;
+  /** `{prompts, engines, cells_charged, cells_cached}` — what the debit paid for, as work done. */
+  readonly unitDetail?: Readonly<Record<string, number>>;
+  /** What serving it cost us, in USD. A string so the numeric survives the round trip un-rounded. */
+  readonly internalCostUsd?: string;
 }
 
 export interface LedgerMovementEntry extends LedgerEntryCommon {
@@ -134,8 +148,8 @@ export async function appendLedgerEntry(tx: ClientBase, entry: LedgerEntry): Pro
     `INSERT INTO credit_ledger
        (workspace_id, actor_id, actor_type, entry_type, action_code, credits, bucket,
         included_after, purchased_after, reserved_after, reference_type, reference_id,
-        idempotency_key, attempt, reason)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        idempotency_key, attempt, reason, project_id, unit_detail, internal_cost_usd)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
      ON CONFLICT (workspace_id, entry_type, idempotency_key, attempt) DO NOTHING`,
     [
       entry.workspaceId,
@@ -153,6 +167,9 @@ export async function appendLedgerEntry(tx: ClientBase, entry: LedgerEntry): Pro
       entry.idempotencyKey,
       attemptOf(entry),
       reasonOf(entry),
+      entry.projectId ?? null,
+      entry.unitDetail === undefined ? null : JSON.stringify(entry.unitDetail),
+      entry.internalCostUsd ?? null,
     ],
   );
   return (result.rowCount ?? 0) > 0;

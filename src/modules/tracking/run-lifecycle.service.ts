@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { RunProgressResponse } from "../../../contracts/tracking/index.js";
 import { ConflictError } from "../../api/errors/domain-errors.js";
+import type { CreditUsage } from "../../api/interceptors/credit.interceptor.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { commitDeepScanCharge } from "../../lib/capture/fair-use.js";
 import { deepScanPrice } from "../../lib/capture/deep-scan-price.js";
@@ -39,6 +40,42 @@ export class RunLifecycleService {
    * would leave jobs for a run that does not exist." A lost job is
    * recoverable; a job for a run that was rolled back is not.
    */
+  /**
+   * What the run's debit should record about itself.
+   *
+   * ⚠ RETURNED RATHER THAN STAMPED, because this service has no request to
+   * stamp. The controller has one, and one explicit line there beats an
+   * AsyncLocalStorage channel nobody can see at the call site — a billing
+   * record that appears by ambient magic is a billing record nobody can
+   * trace when it is wrong.
+   */
+  async triggerWithUsage(
+    projectId: string,
+    actorId: string | null,
+  ): Promise<{ readonly progress: RunProgressResponse; readonly usage: CreditUsage }> {
+    const progress = await this.trigger(projectId, actorId);
+    return {
+      progress,
+      usage: {
+        projectId: progress.project_id,
+        referenceType: "run",
+        referenceId: progress.run_id,
+        // FR-CRD-03 — "as a statement of work done, never as billing
+        // arithmetic". `planned` is every cell the run covers and `skipped`
+        // is the part the cache already had, so the difference is what an
+        // engine actually had to be asked for. None of it derives the price:
+        // a flat-priced scan costs the same either way, and this is here to
+        // say what the money bought.
+        unitDetail: {
+          prompts: progress.engine_keys.length === 0 ? 0 : Math.round(progress.planned / progress.engine_keys.length),
+          engines: progress.engine_keys.length,
+          cells_charged: progress.planned - progress.skipped,
+          cells_cached: progress.skipped,
+        },
+      },
+    };
+  }
+
   async trigger(projectId: string, actorId: string | null): Promise<RunProgressResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("RunLifecycleService requires an active tenant context");

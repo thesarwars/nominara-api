@@ -8,7 +8,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { CreditGuard } from "../../src/api/guards/credit.guard.js";
-import { CreditInterceptor } from "../../src/api/interceptors/credit.interceptor.js";
+import { CreditInterceptor, type CreditUsage } from "../../src/api/interceptors/credit.interceptor.js";
 import { CONFIRMED_CREDITS_HEADER } from "../../src/api/guards/credit.guard.js";
 import type { EntitlementResolver } from "../../src/lib/entitlements/entitlement-resolver.js";
 import { incrementDailyCounter } from "../../src/lib/usage/daily-cap.js";
@@ -85,6 +85,9 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     headers: Record<string, string>;
     creditReservation?: unknown;
     dailyCapCompensation?: { workspaceId: string; action: "lookup" };
+    auth?: { sub: string };
+    authMethod?: "session" | "apiKey";
+    creditUsage?: CreditUsage;
   }
 
   function request(key: string, over: Partial<Req> = {}): Req {
@@ -119,6 +122,95 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     expect(await wallet()).toBeNull();
     await guard().canActivate(contextFor(request("k-1")));
     expect(await wallet()).toMatchObject({ includedBalance: 300, reserved: PRICE });
+  });
+
+  describe("STORY-073 AC10 — every debit answers what spent my credits", () => {
+    let userId: string;
+
+    beforeEach(async () => {
+      const row = await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [
+        `a-${randomUUID().slice(0, 8)}@nominara.test`,
+      ]);
+      userId = row.rows[0]!.id;
+    });
+
+    /** Run the real interceptor's success path with the usage a handler would have reported. */
+    async function settle(req: Req, usage: CreditUsage | undefined): Promise<void> {
+      await runInterceptor({ ...req, creditUsage: usage } as Req, () => ({ ok: true }));
+    }
+
+    async function entry(entryType: string): Promise<Record<string, unknown> | undefined> {
+      const rows = await db.query<Record<string, unknown>>(
+        `SELECT actor_id, actor_type, project_id, reference_type, reference_id, unit_detail
+           FROM credit_ledger WHERE workspace_id = $1 AND entry_type = $2`,
+        [workspaceId, entryType],
+      );
+      return rows.rows[0];
+    }
+
+    it("⚠ names the PERSON on the reserve, not the system", async () => {
+      // ⚠ EVERY ENTRY SAID `system` BEFORE STORY-073B. The request has always
+      // known who it was; nothing carried it the twelve lines from the guard
+      // to the ledger, so a workspace reading its own history saw a column of
+      // identical system rows.
+      await guard().canActivate(contextFor(request("k-1", { auth: { sub: userId }, authMethod: "session" })));
+
+      expect(await entry("reserve")).toMatchObject({ actor_id: userId, actor_type: "user" });
+    });
+
+    it("carries that same person onto the commit, and the handler's work with it", async () => {
+      const req = request("k-1", { auth: { sub: userId }, authMethod: "session" });
+      await guard().canActivate(contextFor(req));
+
+      const projectId = randomUUID();
+      const runId = randomUUID();
+      await settle(req, {
+        projectId,
+        referenceType: "run",
+        referenceId: runId,
+        unitDetail: { prompts: 15, engines: 2, cells_charged: 22, cells_cached: 8 },
+      });
+
+      expect(await entry("commit")).toMatchObject({
+        actor_id: userId,
+        actor_type: "user",
+        project_id: projectId,
+        reference_type: "run",
+        reference_id: runId,
+        // FR-CRD-03 — work done, not billing arithmetic. 22 live and 8 from
+        // cache is what the money bought; the price was flat either way.
+        unit_detail: { prompts: 15, engines: 2, cells_charged: 22, cells_cached: 8 },
+      });
+    });
+
+    it("⚠ records an API key as api_key with NO user id against it", async () => {
+      // An API key is a workspace credential. Attributing its spend to
+      // whoever created it puts a name against actions that person did not
+      // take, in a record kept for the invoice-dispute window.
+      await guard().canActivate(
+        contextFor(request("k-1", { auth: { sub: userId }, authMethod: "apiKey" })),
+      );
+
+      expect(await entry("reserve")).toMatchObject({ actor_id: null, actor_type: "api_key" });
+    });
+
+    it("falls back to system for an unauthenticated caller rather than inventing an actor", async () => {
+      await guard().canActivate(contextFor(request("k-1")));
+      expect(await entry("reserve")).toMatchObject({ actor_id: null, actor_type: "system" });
+    });
+
+    it("records nothing rather than a guess when the handler reports no usage", async () => {
+      const req = request("k-1", { auth: { sub: userId }, authMethod: "session" });
+      await guard().canActivate(contextFor(req));
+      await settle(req, undefined);
+
+      expect(await entry("commit")).toMatchObject({
+        actor_id: userId,
+        project_id: null,
+        reference_type: null,
+        unit_detail: null,
+      });
+    });
   });
 
   it("⚠ ACCOUNTS FOR THE PROVISIONING GRANT IN THE LEDGER, not just in the balance", async () => {
