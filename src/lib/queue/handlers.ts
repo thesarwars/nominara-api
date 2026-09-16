@@ -2,6 +2,7 @@ import type { Pool } from "pg";
 import type { Env } from "../../config/env.schema.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCaptureParseHandler } from "./handlers/capture-parse.handler.js";
+import { createCreditReconcileHandler } from "./handlers/credit-reconcile.handler.js";
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { createRollupMetricDailyHandler } from "./handlers/rollup-metric-daily.handler.js";
 import { QUEUE_TOPOLOGY } from "./topology.js";
@@ -51,6 +52,14 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * `capture.parse` with STORY-135, `rollup.metric_daily` with STORY-042.
  * One line each.
  *
+ * `credit.reconcile` lands with STORY-073 and is the first handler here
+ * whose PRODUCER does not exist. Nothing in this repo registers a BullMQ
+ * repeatable job — not for the reconciler, not for `capture.plan`'s
+ * "scheduler cron" — so it is wired and will simply never be handed a job
+ * until a scheduler does. That is a better state than inert: an inert queue
+ * would need this file edited under whatever incident first made someone
+ * want the reconciler running, and the handler is correct and tested now.
+ *
  * `capture.plan` and `capture.arbitrate` are STILL INERT and that is
  * deliberate. Planning happens on the request path inside the trigger's
  * transaction rather than as a job, so nothing enqueues it; arbitration has
@@ -69,6 +78,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "capture.execute": (context) => createCaptureExecuteHandler(context),
   "capture.parse": (context) => createCaptureParseHandler(context),
   "rollup.metric_daily": (context) => createRollupMetricDailyHandler(context),
+  "credit.reconcile": (context) => createCreditReconcileHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */

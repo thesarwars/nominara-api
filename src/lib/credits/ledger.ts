@@ -1,5 +1,5 @@
 import type { ClientBase } from "pg";
-import type { WalletState } from "./wallet.js";
+import type { CreditBucket, WalletState } from "./wallet.js";
 
 // STORY-072 — the append-only credit ledger.
 //
@@ -20,19 +20,36 @@ import type { WalletState } from "./wallet.js";
 // deletes; a correction is a new `adjustment` entry with a reason, which is
 // §6 rule 4's "the system never silently rewrites a balance".
 
-export type LedgerEntryType = "reserve" | "commit" | "release";
+/**
+ * The three types that move `reserved`, and the five that move a balance.
+ *
+ * Split rather than one flat union because they carry different obligations
+ * and the compiler should say so: a movement has an `attempt` and an action
+ * it is charging for; a balance entry has to name the bucket it moved; an
+ * adjustment has to carry a reason. `LedgerEntry` below is the discriminated
+ * union of the three, so "an adjustment without a reason" is a type error
+ * before it is a constraint violation.
+ */
+export type LedgerMovementType = "reserve" | "commit" | "release";
+export type LedgerBalanceType = "grant" | "purchase" | "expire" | "refund";
+export type LedgerEntryType = LedgerMovementType | LedgerBalanceType | "adjustment";
+
+/** `credit_ledger.bucket` and `credit_wallets`' two balance columns are the same two names, so the type is declared once, in `wallet.ts`. */
+export type { CreditBucket };
 
 /** `credit_ledger.action_code`'s own CHECK. `@Credits` actions map onto it. */
 export type LedgerActionCode = "lookup" | "manual_scan" | "nlp_command" | "aux_manual" | "prompt_activate" | "other";
 
-export interface LedgerEntry {
+interface LedgerEntryCommon {
   readonly workspaceId: string;
-  readonly entryType: LedgerEntryType;
-  readonly actionCode: LedgerActionCode;
+  /**
+   * A POSITIVE MAGNITUDE for every type but `adjustment`, whose direction is
+   * carried by the sign — `ck_credit_ledger_credits_sign` in migration 0023.
+   * A `commit` may be 0: a priced action that consumed nothing still settles
+   * through the commit path.
+   */
   readonly credits: number;
   readonly idempotencyKey: string;
-  /** Which attempt under that key. 1 for everything that has no retries. */
-  readonly attempt: number;
   /** The wallet as it stands AFTER this entry — §6 rule 4's reconciliation reads these. */
   readonly after: WalletState;
   readonly actorId: string | null;
@@ -41,39 +58,101 @@ export interface LedgerEntry {
   readonly referenceId?: string;
 }
 
+export interface LedgerMovementEntry extends LedgerEntryCommon {
+  readonly entryType: LedgerMovementType;
+  readonly actionCode: LedgerActionCode;
+  /** Which attempt under that key. 1 for everything that has no retries. */
+  readonly attempt: number;
+}
+
+export interface LedgerBalanceEntry extends LedgerEntryCommon {
+  readonly entryType: LedgerBalanceType;
+  /**
+   * Which balance moved. Required, because `included` and `purchased` have
+   * different lifetimes and an entry that does not say cannot be replayed —
+   * `ck_credit_ledger_bucket_scope`.
+   */
+  readonly bucket: CreditBucket;
+}
+
+export interface LedgerAdjustmentEntry extends LedgerEntryCommon {
+  readonly entryType: "adjustment";
+  readonly bucket: CreditBucket;
+  /**
+   * ⚠ WHY A HUMAN DECIDED THIS. §6 rule 4's whole point: a balance that
+   * changed for a reason nobody wrote down is the failure, not the change.
+   * Required here and by `ck_credit_ledger_adjustment_reason`.
+   */
+  readonly reason: string;
+  /** An adjustment is authored, so it is never `system`. */
+  readonly actorType: "user" | "api_key";
+  readonly actorId: string;
+}
+
+export type LedgerEntry = LedgerMovementEntry | LedgerBalanceEntry | LedgerAdjustmentEntry;
+
+/** Only a reservation retries; every other type is attempt 1 — `ck_credit_ledger_attempt_scope`. */
+function attemptOf(entry: LedgerEntry): number {
+  return entry.entryType === "reserve" || entry.entryType === "commit" || entry.entryType === "release"
+    ? entry.attempt
+    : 1;
+}
+
+function actionCodeOf(entry: LedgerEntry): LedgerActionCode | null {
+  return "actionCode" in entry ? entry.actionCode : null;
+}
+
+function bucketOf(entry: LedgerEntry): CreditBucket | null {
+  return "bucket" in entry ? entry.bucket : null;
+}
+
+function reasonOf(entry: LedgerEntry): string | null {
+  return "reason" in entry ? entry.reason : null;
+}
+
 /**
  * Append one entry, or report that it was already there.
  *
  * `ON CONFLICT DO NOTHING` over `ux_credit_ledger_idem`. `false` means this
- * exact (workspace, type, key) is already recorded — a redelivery — and the
- * caller must NOT repeat whatever wallet movement the entry describes.
+ * exact (workspace, type, key, attempt) is already recorded — a redelivery —
+ * and the caller must NOT repeat whatever wallet movement the entry
+ * describes.
  *
- * ⚠ THIS IS THE DEDUPE, not a log line. Calling the wallet statement and then
- * writing the entry would leave the window the review exploited; the entry
- * goes first and its success is the permission to move the balance.
+ * ⚠ THIS IS THE DEDUPE, not a log line. The entry and the wallet statement
+ * share one transaction, so a movement without its ledger row is
+ * unrepresentable; a conflict here rolls the movement back with it.
+ *
+ * ⚠ AND IT GOES AFTER THE WALLET STATEMENT, ALWAYS. `seq` is drawn here, and
+ * replay's ordering is only sound because the row lock on `credit_wallets`
+ * is already held when it is drawn — see migration 0023. Appending first and
+ * moving the balance second would still be atomic and would silently break
+ * every replay. `test/unit/credits/replay.spec.ts` states the invariant;
+ * nothing but review enforces it at the call site.
  */
 export async function appendLedgerEntry(tx: ClientBase, entry: LedgerEntry): Promise<boolean> {
   const result = await tx.query(
     `INSERT INTO credit_ledger
-       (workspace_id, actor_id, actor_type, entry_type, action_code, credits,
+       (workspace_id, actor_id, actor_type, entry_type, action_code, credits, bucket,
         included_after, purchased_after, reserved_after, reference_type, reference_id,
-        idempotency_key, attempt)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        idempotency_key, attempt, reason)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
      ON CONFLICT (workspace_id, entry_type, idempotency_key, attempt) DO NOTHING`,
     [
       entry.workspaceId,
       entry.actorId,
       entry.actorType,
       entry.entryType,
-      entry.actionCode,
+      actionCodeOf(entry),
       entry.credits,
+      bucketOf(entry),
       entry.after.includedBalance,
       entry.after.purchasedBalance,
       entry.after.reserved,
       entry.referenceType ?? null,
       entry.referenceId ?? null,
       entry.idempotencyKey,
-      entry.attempt,
+      attemptOf(entry),
+      reasonOf(entry),
     ],
   );
   return (result.rowCount ?? 0) > 0;
@@ -99,6 +178,30 @@ export async function ledgerEntryExists(
     [workspaceId, entryType, idempotencyKey, attempt],
   );
   return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * How ONE attempt under a key was settled, or null if it is still open.
+ *
+ * Narrower than `inspectReservations`, which answers "does this key have an
+ * open reservation anywhere in its family". Both settlement paths need the
+ * per-attempt question, asked with the wallet row lock already held — see
+ * `lockWallet`.
+ */
+export async function settlementOf(
+  tx: ClientBase,
+  workspaceId: string,
+  idempotencyKey: string,
+  attempt: number,
+): Promise<"commit" | "release" | null> {
+  const result = await tx.query<{ entry_type: "commit" | "release" }>(
+    `SELECT entry_type FROM credit_ledger
+      WHERE workspace_id = $1 AND idempotency_key = $2 AND attempt = $3
+        AND entry_type IN ('commit', 'release')
+      LIMIT 1`,
+    [workspaceId, idempotencyKey, attempt],
+  );
+  return result.rows[0]?.entry_type ?? null;
 }
 
 // ─────────────────────── the key family ───────────────────────
@@ -132,6 +235,18 @@ export async function ledgerEntryExists(
 export interface ReservationClaim {
   /** The attempt number still open, or null when none is. Re-attach to it. */
   readonly openAttempt: number | null;
+  /**
+   * How many credits that open attempt actually holds.
+   *
+   * ⚠ RE-ATTACHING MUST USE THIS, NOT THE CURRENT PRICE. A redelivery
+   * arriving after the price schedule moved would otherwise settle against a
+   * figure the reservation never held: too high and the commit matches no
+   * row (a 500 for work that was done), too low and the difference stays
+   * reserved for the rest of the cycle with nothing to release it. The
+   * second-engineer review flagged it; STORY-073's replay is what would
+   * eventually page about it.
+   */
+  readonly openCredits: number | null;
   /** A settled attempt that COMMITTED. The action already happened and was paid for. */
   readonly committed: boolean;
   /** How many reserve entries this key already has, open or settled. */
@@ -150,8 +265,8 @@ export async function inspectReservations(
   workspaceId: string,
   idempotencyKey: string,
 ): Promise<ReservationClaim> {
-  const result = await tx.query<{ attempt: number; settlement: string | null }>(
-    `SELECT r.attempt,
+  const result = await tx.query<{ attempt: number; credits: string; settlement: string | null }>(
+    `SELECT r.attempt, r.credits::text,
             (SELECT s.entry_type FROM credit_ledger s
               WHERE s.workspace_id = r.workspace_id
                 AND s.idempotency_key = r.idempotency_key
@@ -169,6 +284,7 @@ export async function inspectReservations(
   const open = result.rows.find((row) => row.settlement === null);
   return {
     openAttempt: open?.attempt ?? null,
+    openCredits: open === undefined ? null : Number(open.credits),
     committed: result.rows.some((row) => row.settlement === "commit"),
     attempts: result.rows.length,
   };
@@ -177,6 +293,23 @@ export async function inspectReservations(
 /**
  * §6 rule 4's reconciliation input — reservations with no matching commit or
  * release.
+ *
+ * ⚠ CROSS-TENANT BY DESIGN, so it needs a privileged connection. There is
+ * no `workspace_id` filter — an orphan scan that could only see one
+ * workspace would need something to tell it which workspaces to look at,
+ * and that list is the thing being scanned for. Same contract as
+ * `retention.ts`'s own cross-tenant discovery functions; see that file's
+ * PRIVILEGE CONTRACT comment.
+ *
+ * ⚠ THE GRACE WINDOW IS COMPUTED IN THE DATABASE, not handed in as a
+ * timestamp the application worked out. `occurred_at` is written by the
+ * database's clock, and comparing it against the app server's is a silent
+ * dependency on two machines agreeing — which they do not, especially under
+ * a VM. Skew in one direction under-releases, which is merely untidy; skew
+ * in the other releases reservations YOUNGER than the grace period, which is
+ * the reconciler racing a request that is still running. Found by the
+ * integration suite finding zero orphans against a container whose clock ran
+ * ahead of the host's.
  *
  * STORY-073 owns the reconciler itself; this is the query it needs and the
  * reason the settlement paths can honestly call an unsettled reservation
@@ -189,21 +322,24 @@ export interface OpenReservation {
   readonly idempotencyKey: string;
   readonly attempt: number;
   readonly credits: number;
+  /** Carried through onto the release, so the entry that closes a hold names the action it was held for. */
+  readonly actionCode: LedgerActionCode;
   readonly occurredAt: Date;
 }
 
-export async function openReservations(tx: ClientBase, olderThan: Date): Promise<OpenReservation[]> {
+export async function openReservations(tx: ClientBase, graceSeconds: number): Promise<OpenReservation[]> {
   const result = await tx.query<{
     workspace_id: string;
     idempotency_key: string;
     attempt: number;
     credits: string;
+    action_code: LedgerActionCode | null;
     occurred_at: Date;
   }>(
-    `SELECT r.workspace_id, r.idempotency_key, r.attempt, r.credits::text, r.occurred_at
+    `SELECT r.workspace_id, r.idempotency_key, r.attempt, r.credits::text, r.action_code, r.occurred_at
        FROM credit_ledger r
       WHERE r.entry_type = 'reserve'
-        AND r.occurred_at < $1
+        AND r.occurred_at < now() - make_interval(secs => $1)
         AND NOT EXISTS (
           SELECT 1 FROM credit_ledger s
            WHERE s.workspace_id = r.workspace_id
@@ -212,13 +348,17 @@ export async function openReservations(tx: ClientBase, olderThan: Date): Promise
              AND s.entry_type IN ('commit', 'release')
         )
       ORDER BY r.occurred_at ASC`,
-    [olderThan],
+    [graceSeconds],
   );
   return result.rows.map((row) => ({
     workspaceId: row.workspace_id,
     idempotencyKey: row.idempotency_key,
     attempt: row.attempt,
     credits: Number(row.credits),
+    // `action_code` is nullable on the table because the balance types have
+    // none; a `reserve` always has one, and `other` is the honest fallback
+    // rather than a cast that pretends the column cannot be null.
+    actionCode: row.action_code ?? "other",
     occurredAt: row.occurred_at,
   }));
 }

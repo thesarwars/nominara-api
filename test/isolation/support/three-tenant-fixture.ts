@@ -174,8 +174,11 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
   }
   for (let i = 0; i < R; i++) {
     await client.query(
-      `INSERT INTO credit_ledger (workspace_id, entry_type, credits, included_after, purchased_after, reserved_after, idempotency_key)
-       VALUES ($1, 'grant', 10, 10, 0, 0, $2)`,
+      // `bucket` since STORY-073's migration 0023 — a `grant` that does not
+      // name the balance it moved cannot be replayed, and
+      // `ck_credit_ledger_bucket_scope` refuses it.
+      `INSERT INTO credit_ledger (workspace_id, entry_type, credits, bucket, included_after, purchased_after, reserved_after, idempotency_key)
+       VALUES ($1, 'grant', 10, 'included', 10, 0, 0, $2)`,
       [workspaceId, `idem-${label}-${i}`],
     );
   }

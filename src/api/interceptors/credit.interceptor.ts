@@ -10,8 +10,9 @@ import {
 import { catchError, from, mergeMap, type Observable } from "rxjs";
 import type { ClientBase, Pool } from "pg";
 import { createPgPool, PG_POOL } from "../../db/pg-pool.js";
-import { appendLedgerEntry, ledgerEntryExists } from "../../lib/credits/ledger.js";
-import { commitCredits, readWallet, releaseCredits } from "../../lib/credits/wallet.js";
+import { appendLedgerEntry, ledgerEntryExists, settlementOf } from "../../lib/credits/ledger.js";
+import { releaseReservation } from "../../lib/credits/settle.js";
+import { commitCredits, lockWallet, readWallet } from "../../lib/credits/wallet.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 import type { CreditReservation } from "../guards/credit.guard.js";
@@ -218,6 +219,45 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
       );
     }
 
+    // ⚠ THE LOCK COMES FIRST, BEFORE ANY QUESTION IS ASKED ABOUT THIS
+    // RESERVATION. `commitCredits` tests the workspace's AGGREGATE
+    // `reserved`, which cannot tell whose hold it is spending — and since
+    // STORY-073 there is a reconciler that releases holds. The
+    // second-engineer review reproduced the consequence end to end:
+    //
+    //   both held:  included 600, reserved 90  (slow-A 40, live-B 50)
+    //   reconciler: sweeps A's 40             -> reserved 50
+    //   A commits:  SUCCEEDS against a released reservation, eating B's hold
+    //   B commits:  matches no row -> 500, work performed, nothing charged
+    //   verifier:   CLEAN, because the ledger replays to exactly that
+    //
+    // So the customer whose hold was eaten pays nothing for work that was
+    // done, another is charged against a reservation that no longer existed,
+    // and the nightly replay says the wallet is fine. Reading the ledger
+    // without the row lock would only narrow the window; taking it first
+    // closes it, because every releaser serialises behind the same row.
+    await lockWallet(store.client, reservation.workspaceId);
+
+    if (
+      (await settlementOf(
+        store.client,
+        reservation.workspaceId,
+        reservation.idempotencyKey,
+        reservation.attempt,
+      )) === "release"
+    ) {
+      // The hold is gone — swept by the reconciler, or released by a
+      // concurrent failure path. Committing now would spend someone else's
+      // reservation. Failing the request is the honest answer: the work
+      // happened and was not paid for, which is a thing to investigate, not
+      // to paper over with a 200.
+      throw new Error(
+        `credit commit for workspace ${reservation.workspaceId} ` +
+          `(idempotency key ${reservation.idempotencyKey}) found its reservation already released; ` +
+          "the hold was swept before the handler returned and nothing may be charged against it",
+      );
+    }
+
     // ⚠ UNREACHABLE BY DESIGN, AND LOUD IF IT IS NOT.
     //
     // The first version skipped the debit silently when a `commit` entry
@@ -317,36 +357,24 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
     try {
       const client = await pool.connect();
       try {
+        // ⚠ SHARED WITH THE RECONCILER, deliberately. This used to check for
+        // an existing release entry and then act, with no wallet row lock
+        // between the two — so two releasers could both read "not settled"
+        // and both proceed, and the second one's balance movement committed
+        // even though the ledger refused its entry. `releaseReservation`
+        // takes the lock first and treats a refused entry as impossible
+        // rather than as an outcome.
         await withTenantContext(
           client,
           { workspaceId: reservation.workspaceId, actorId: SYSTEM_ACTOR_ID },
-          async (tx: ClientBase) => {
-            if (
-              await ledgerEntryExists(
-                tx,
-                reservation.workspaceId,
-                "release",
-                reservation.idempotencyKey,
-                reservation.attempt,
-              )
-            ) {
-              return;
-            }
-            await releaseCredits(tx, reservation.workspaceId, reservation.amount);
-            const after = await readWallet(tx, reservation.workspaceId);
-            if (after === null) return;
-            await appendLedgerEntry(tx, {
+          (tx: ClientBase) =>
+            releaseReservation(tx, {
               workspaceId: reservation.workspaceId,
-              entryType: "release",
-              actionCode: reservation.ledgerAction,
-              credits: reservation.amount,
               idempotencyKey: reservation.idempotencyKey,
               attempt: reservation.attempt,
-              after,
-              actorId: null,
-              actorType: "system",
-            });
-          },
+              credits: reservation.amount,
+              actionCode: reservation.ledgerAction,
+            }),
         );
       } finally {
         client.release();

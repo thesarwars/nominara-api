@@ -206,9 +206,13 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
   async function insertCreditLedger(workspaceId: string, actorId: string): Promise<void> {
     seq += 1;
     await client.query(
+      // `bucket` since STORY-073's migration 0023: a `grant` that does not
+      // say which of the two balances it moved cannot be replayed, and
+      // `ck_credit_ledger_bucket_scope` refuses it.
       `INSERT INTO credit_ledger
-         (workspace_id, actor_id, entry_type, credits, included_after, purchased_after, reserved_after, idempotency_key)
-       VALUES ($1, $2, 'grant', 10, 10, 0, 0, $3)`,
+         (workspace_id, actor_id, entry_type, credits, bucket, included_after, purchased_after, reserved_after,
+          idempotency_key)
+       VALUES ($1, $2, 'grant', 10, 'included', 10, 0, 0, $3)`,
       [workspaceId, actorId, `idem-${seq}`],
     );
   }

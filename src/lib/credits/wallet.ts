@@ -22,6 +22,35 @@ export interface WalletState {
   readonly cycleEnd: string;
 }
 
+/** Which of the two balances a movement touches. Mirrors `credit_ledger.bucket`. */
+export type CreditBucket = "included" | "purchased";
+
+/** The running totals a movement may also count itself into. */
+export type LifetimeCounter = "granted" | "purchased" | null;
+
+const BUCKET_COLUMN: Readonly<Record<CreditBucket, string>> = Object.freeze({
+  included: "included_balance",
+  purchased: "purchased_balance",
+});
+
+const LIFETIME_COLUMN: Readonly<Record<"granted" | "purchased", string>> = Object.freeze({
+  granted: "lifetime_granted",
+  purchased: "lifetime_purchased",
+});
+
+export interface ProvisionOutcome {
+  /**
+   * The wallet as this call created it, or null when one was already there.
+   *
+   * ⚠ NULL MEANS "ALREADY EXISTED", not "absent" — the opposite of
+   * `readWallet`'s null, which is why it is spelled out here. An earlier
+   * version carried a separate `created` boolean beside it; the two could
+   * only ever agree, so a caller checking the wrong one was an equivalent
+   * mutant no test could kill. One field, one meaning.
+   */
+  readonly created: WalletState | null;
+}
+
 export interface ReserveOutcome {
   readonly ok: boolean;
   /** Present only on success — the state after the reservation. */
@@ -201,9 +230,9 @@ export async function provisionWallet(
   workspaceId: string,
   grant: number,
   cycle: { readonly start: string; readonly end: string },
-): Promise<void> {
+): Promise<ProvisionOutcome> {
   assertNonNegativeInteger(grant, "grant");
-  await tx.query(
+  const result = await tx.query<WalletRow>(
     `INSERT INTO credit_wallets
        (workspace_id, included_balance, purchased_balance, reserved, lifetime_granted, cycle_start, cycle_end)
      -- BOTH USES OF $2 ARE CAST. included_balance is integer and
@@ -211,9 +240,87 @@ export async function provisionWallet(
      -- for a parameter used as both: "inconsistent types deduced for
      -- parameter $2".
      VALUES ($1, $2::int, 0, 0, $2::bigint, $3::date, $4::date)
-     ON CONFLICT (workspace_id) DO NOTHING`,
+     ON CONFLICT (workspace_id) DO NOTHING
+     RETURNING ${WALLET_COLUMNS}`,
     [workspaceId, grant, cycle.start, cycle.end],
   );
+
+  // ⚠ RETURNING IS EMPTY ON A CONFLICT, which is exactly the signal the
+  // caller needs: it distinguishes "this call minted the grant" from "a
+  // wallet was already here". STORY-073 needs it because the grant has to be
+  // accounted for in the ledger, and accounting for it twice is minting
+  // credits — see `provisionWalletWithGrant`.
+  const row = result.rows[0];
+  return { created: row === undefined ? null : toWalletState(row) };
+}
+
+/**
+ * Move ONE balance by a signed delta, optionally counting it into a lifetime
+ * total — the statement behind `grant`, `purchase`, `expire`, `refund` and
+ * `adjustment`.
+ *
+ * ⚠ THE COLUMN NAMES COME FROM A CLOSED LOOKUP, NEVER FROM THE ARGUMENT.
+ * `bucket` and `lifetime` are unions, and the SQL is assembled from constants
+ * indexed by them. A template that interpolated the caller's string would be
+ * an injection site in the one table where it would be least visible.
+ *
+ * ⚠ IT CAN FAIL, AND THAT IS THE POINT. `ck_wallet_nonneg` refuses a balance
+ * below zero and `ck_wallet_reserved` refuses one that drops under what is
+ * currently reserved — so expiring credits out from under a live reservation
+ * raises rather than quietly succeeding at the wrong number. The caller sees
+ * a constraint violation, which is the honest answer to "take away credits
+ * that are already spoken for".
+ *
+ * Returns null when the workspace has no wallet row.
+ */
+export async function applyBucketDelta(
+  tx: ClientBase,
+  workspaceId: string,
+  bucket: CreditBucket,
+  delta: number,
+  lifetime: LifetimeCounter = null,
+): Promise<WalletState | null> {
+  if (!Number.isInteger(delta) || delta === 0) {
+    throw new Error(`bucket delta must be a non-zero integer, received ${String(delta)}`);
+  }
+
+  const column = BUCKET_COLUMN[bucket];
+  const lifetimeClause = lifetime === null ? "" : `, ${LIFETIME_COLUMN[lifetime]} = ${LIFETIME_COLUMN[lifetime]} + $2`;
+
+  const result = await tx.query<WalletRow>(
+    `UPDATE credit_wallets
+        SET ${column} = ${column} + $2${lifetimeClause}, updated_at = now()
+      WHERE workspace_id = $1
+     RETURNING ${WALLET_COLUMNS}`,
+    [workspaceId, delta],
+  );
+
+  const row = result.rows[0];
+  return row === undefined ? null : toWalletState(row);
+}
+
+/**
+ * Take the workspace's wallet row lock, and nothing else.
+ *
+ * ⚠ THIS IS HOW TWO SETTLEMENT PATHS AGREE ON WHAT IS STILL HELD. Every
+ * statement in this file already locks the row on its way to moving a
+ * balance, which serialises the MOVEMENTS — but a path that reads the ledger
+ * to decide whether to move at all is a check-then-act, and the window
+ * between them is where a reservation gets released twice, or committed
+ * after the reconciler already swept it.
+ *
+ * The second-engineer review reproduced both: the reconciler and the
+ * interceptor each released the same hold, destroying 40 credits of an
+ * unrelated live reservation; and a swept reservation was committed anyway,
+ * because `commitCredits` tests the workspace's AGGREGATE `reserved` and
+ * could not tell whose hold it was eating.
+ *
+ * Taking the lock BEFORE the ledger read closes both. Returns false when the
+ * workspace has no wallet row.
+ */
+export async function lockWallet(tx: ClientBase, workspaceId: string): Promise<boolean> {
+  const result = await tx.query(`SELECT 1 FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE`, [workspaceId]);
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function readWallet(tx: ClientBase, workspaceId: string): Promise<WalletState | null> {
