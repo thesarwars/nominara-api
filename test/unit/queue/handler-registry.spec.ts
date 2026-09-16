@@ -46,17 +46,31 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   // would ("crawl.discover with STORY-043"), STORY-034 lands the second and
   // STORY-135 the third, and STORY-042 the fourth. Every later story updates
   // this line in its own commit.
+  //
+  // STORY-073 lands `credit.reconcile`, and it is the first entry here whose
+  // PRODUCER does not exist: nothing in this repo registers a BullMQ
+  // repeatable job, so the queue is live and will simply never be handed one
+  // until a scheduler does. Wired rather than inert on purpose — see
+  // `handlers.ts` — because the alternative is editing this file under
+  // whatever incident first makes someone want the reconciler running.
   it("ships exactly the handlers the stories that landed them declared", () => {
     expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual([
       "capture.execute",
       "capture.parse",
       "crawl.discover",
+      "credit.reconcile",
       "rollup.metric_daily",
     ]);
     // Topology order, not alphabetical — `liveQueueNames` filters
     // QUEUE_TOPOLOGY, and the capture queues are declared before the crawl
-    // ones.
-    expect(liveQueueNames()).toEqual(["capture.execute", "capture.parse", "crawl.discover", "rollup.metric_daily"]);
+    // ones, which come before the rollup group's.
+    expect(liveQueueNames()).toEqual([
+      "capture.execute",
+      "capture.parse",
+      "crawl.discover",
+      "rollup.metric_daily",
+      "credit.reconcile",
+    ]);
   });
 
   // `capture.plan` and `capture.arbitrate` STAY INERT, each for its own
