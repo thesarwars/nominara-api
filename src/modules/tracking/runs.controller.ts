@@ -1,8 +1,14 @@
-import { Controller, Get, HttpCode, Param, Post } from "@nestjs/common";
-import { runProgressResponseSchema, type RunProgressResponse } from "../../../contracts/tracking/index.js";
+import { Controller, Get, HttpCode, Param, Post, Req } from "@nestjs/common";
+import {
+  runProgressResponseSchema,
+  runUndoResponseSchema,
+  type RunProgressResponse,
+  type RunUndoResponse,
+} from "../../../contracts/tracking/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import { RunLifecycleService } from "./run-lifecycle.service.js";
 
 // STORY-034 — §3's Tracking table, the run-scoped half.
@@ -40,5 +46,27 @@ export class RunsController {
   @ApiContract({ operationId: "cancelRun", responseSchema: runProgressResponseSchema })
   cancel(@Param("id") runId: string): Promise<RunProgressResponse> {
     return this.lifecycle.cancel(runId);
+  }
+
+  // STORY-074 AC8 — the five-second undo.
+  //
+  // ⚠ IT REFUNDS RATHER THAN RELEASING, because there is nothing left to
+  // release: `CreditInterceptor` commits when the handler returns and the 202
+  // arrives with cells already dispatched. See `lib/credits/undo.ts`.
+  //
+  // 200 EVEN WHEN IT REFUSES. "Disabled with an explanation" needs the
+  // explanation and the run's state to render it; a 409 carrying neither
+  // would send the client back for another round trip to find out what
+  // happened. Nothing went wrong — the answer is no.
+  //
+  // `tracking:trigger` rather than a billing permission: undoing your own
+  // scan is part of running one, and anyone who could start it can stop it.
+  @Post(":id/undo")
+  @HttpCode(200)
+  @RequirePermission("tracking:trigger")
+  @Audit({ action: "run.undone", resourceType: "capture_run" })
+  @ApiContract({ operationId: "undoRun", responseSchema: runUndoResponseSchema })
+  undo(@Req() req: RbacScopedRequest, @Param("id") runId: string): Promise<RunUndoResponse> {
+    return this.lifecycle.undo(runId, req.auth?.sub ?? null);
   }
 }

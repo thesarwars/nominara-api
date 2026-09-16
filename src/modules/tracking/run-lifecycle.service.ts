@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
-import type { RunProgressResponse } from "../../../contracts/tracking/index.js";
+import type { RunProgressResponse, RunUndoResponse } from "../../../contracts/tracking/index.js";
 import { ConflictError } from "../../api/errors/domain-errors.js";
 import type { CreditUsage } from "../../api/interceptors/credit.interceptor.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
@@ -10,6 +10,7 @@ import { readRunProgress, type RunProgress } from "../../lib/capture/run-progres
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { QUEUE_TOPOLOGY } from "../../lib/queue/topology.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import { undoRunCharge } from "../../lib/credits/undo.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
 
 // STORY-034 AC2–AC5 — trigger, observe, cancel.
@@ -204,6 +205,52 @@ export class RunLifecycleService {
     });
 
     return this.present({ ...current, status: "canceled" }, null, null);
+  }
+
+  /**
+   * AC8 — take it back, if it is still allowed.
+   *
+   * ⚠ CANCEL FIRST, REFUND SECOND, IN ONE TRANSACTION. The reverse order
+   * would refund a run that then failed to cancel, handing back credits for
+   * work that goes on to happen. Both statements are on the request's
+   * transaction, so either both land or neither does.
+   *
+   * ⚠ AND A REFUSAL IS A 200, NOT AN ERROR. "Undo after the job starts is
+   * disabled with an explanation" — the interface needs the explanation and
+   * the run's current state to render that, and a 409 carrying neither would
+   * make the client fetch again to find out what happened. Nothing went
+   * wrong; the answer is no.
+   */
+  async undo(runId: string, actorId: string | null): Promise<RunUndoResponse> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("RunLifecycleService requires an active tenant context");
+
+    const current = await readRunProgress(store.client, runId);
+
+    // ⚠ `captured + failed`, NOT `status`. A run is `running` from the moment
+    // a worker picks up its first cell, which is milliseconds after the 202 —
+    // refusing on status would refuse essentially every undo. What §7 means
+    // by "the job has not started" is that no work has been DONE, and a cell
+    // that has produced a result is work done whether it succeeded or not.
+    const settledCells = current.captured + current.failed;
+
+    const outcome = await undoRunCharge(store.client, {
+      workspaceId: store.context.workspaceId,
+      runId,
+      actorId,
+      actorType: actorId === null ? "system" : "user",
+      settledCells,
+    });
+
+    if (outcome.refusal !== null) {
+      return { run: this.present(current, null, null), credits_refunded: 0, refusal: outcome.refusal };
+    }
+
+    const cancelled = CANCELLABLE.has(current.status)
+      ? await this.cancel(runId)
+      : this.present(current, null, null);
+
+    return { run: cancelled, credits_refunded: outcome.refunded, refusal: null };
   }
 
   private present(
