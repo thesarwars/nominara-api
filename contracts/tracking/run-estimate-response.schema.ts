@@ -42,6 +42,60 @@ export const cacheForecastSchema = z
   })
   .strict();
 
+/**
+ * STORY-074 AC2 — the wallet the modal renders, before and after.
+ *
+ * ⚠ `after` IS SERVER-COMPUTED, NOT `available - credits` IN THE COMPONENT.
+ * The two are the same subtraction, and that is exactly why: a figure the
+ * client derives is a figure the client can derive differently, and AC10's
+ * "no hardcoded number in any component or modal" is only worth having if
+ * the component is not doing the arithmetic either.
+ */
+export const estimateWalletSchema = z
+  .object({
+    available: z.number().int(),
+    /** What `available` becomes if this action is confirmed. */
+    after: z.number().int(),
+    included_balance: z.number().int().nonnegative(),
+    purchased_balance: z.number().int().nonnegative(),
+    reserved: z.number().int().nonnegative(),
+    /** `YYYY-MM-DD`, formatted by Postgres — never through a local `Date`. */
+    cycle_end: z.string(),
+  })
+  .strict();
+
+/** Why §7's cost modal is mandatory. Empty when it is not. */
+export const escalationReasonSchema = z.enum([
+  "zero_project_tier",
+  "credits_above_threshold",
+  "large_share_of_balance",
+  "multiple_projects",
+  "balance_after_below_floor",
+]);
+
+/**
+ * STORY-074 AC7 — whether the two-step guard rail's modal is required, and
+ * why.
+ *
+ * ⚠ DECIDED HERE AND NOT IN THE MODAL. The thresholds are comparisons
+ * against the wallet, the price and the plan; a client evaluating them would
+ * need its own copy of all three and its own copy of the numbers. Two
+ * implementations of "is this big enough to need a click" drift, and the
+ * drift is silent in the direction that matters — a stale client stops
+ * confirming debits the product promised would always be confirmed.
+ *
+ * REASONS RATHER THAN A BARE BOOLEAN, because the modal has something to
+ * say: "this would leave you under 50 credits" and "this is more than a
+ * tenth of your balance" are different warnings, and a client given only
+ * `true` has to invent copy for a condition it cannot see.
+ */
+export const confirmationSchema = z
+  .object({
+    required: z.boolean(),
+    reasons: z.array(escalationReasonSchema),
+  })
+  .strict();
+
 export const runEstimateResponseSchema = z
   .object({
     /**
@@ -59,8 +113,25 @@ export const runEstimateResponseSchema = z
      * could not ship without changing this contract.
      */
     credits_charged: z.literal(0),
+    wallet: estimateWalletSchema,
+    /**
+     * How many more scans this balance affords at this price.
+     *
+     * ⚠ COMPUTED ON THE CURRENT BALANCE, NOT THE ONE AFTER. §7's wireframe
+     * shows "2,400 available → 1,900 after · 4 more scans this cycle", and
+     * 2400/500 is 4 while 1900/500 is 3 — so it is the former. The two differ
+     * by one on every render and a customer counting scans would notice, so
+     * the reading is recorded rather than silently chosen. There is no
+     * per-cycle scan CAP to report: no entitlement limits deep scans by
+     * count, only by what the wallet holds.
+     */
+    scans_affordable: z.number().int().nonnegative(),
+    confirmation: confirmationSchema,
   })
   .strict();
 
 export type CacheForecast = z.infer<typeof cacheForecastSchema>;
+export type EstimateWallet = z.infer<typeof estimateWalletSchema>;
+export type EscalationReasonCode = z.infer<typeof escalationReasonSchema>;
+export type EstimateConfirmation = z.infer<typeof confirmationSchema>;
 export type RunEstimateResponse = z.infer<typeof runEstimateResponseSchema>;
