@@ -12,7 +12,20 @@ import { runProgressResponseSchema } from "./run-progress-response.schema.js";
 // charged — and leaves the ledger explaining the money in both directions.
 
 export const undoRefusalSchema = z.enum([
-  /** Cells have produced results. §7: "undo after job start is disabled with an explanation." */
+  /**
+   * ⚠ §7 GIVES THE UNDO TO SUB-THRESHOLD ACTIONS ONLY — "BELOW ALL
+   * THRESHOLDS the action executes with a toast showing the debit and a
+   * 5-second undo." An action above a threshold takes the other path: a
+   * mandatory cost modal showing the exact figure, echoed back in
+   * `X-Nominara-Confirmed-Credits`. Something a customer explicitly approved
+   * at a stated price does not also need taking back.
+   *
+   * Every seeded `deep_scan.credits` is 100 or more against a threshold of
+   * 25, so every deep scan is confirmed and this is what the route answers
+   * for one today.
+   */
+  "action_was_confirmed",
+  /** Cells have delivered answers — captured, failed, or served from cache. */
   "work_started",
   /** The five seconds are up. */
   "window_closed",

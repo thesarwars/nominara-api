@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
+import type { ClientBase } from "pg";
 import type { RunProgressResponse, RunUndoResponse } from "../../../contracts/tracking/index.js";
 import { ConflictError } from "../../api/errors/domain-errors.js";
 import type { CreditUsage } from "../../api/interceptors/credit.interceptor.js";
@@ -10,6 +11,9 @@ import { readRunProgress, type RunProgress } from "../../lib/capture/run-progres
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { QUEUE_TOPOLOGY } from "../../lib/queue/topology.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import { maxProjectsFrom } from "../../lib/credits/confirmation.js";
+import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
+import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { undoRunCharge } from "../../lib/credits/undo.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
 
@@ -210,10 +214,17 @@ export class RunLifecycleService {
   /**
    * AC8 — take it back, if it is still allowed.
    *
-   * ⚠ CANCEL FIRST, REFUND SECOND, IN ONE TRANSACTION. The reverse order
-   * would refund a run that then failed to cancel, handing back credits for
-   * work that goes on to happen. Both statements are on the request's
-   * transaction, so either both land or neither does.
+   * ⚠ CANCEL FIRST, REFUND SECOND, IN ONE TRANSACTION — and the first
+   * version said exactly that while doing the reverse. The second-engineer
+   * review found the comment and the code disagreeing, and then found what
+   * the disagreement cost: with the last cell landing between this method's
+   * read and `cancel`'s own re-read, the refund was written, `cancel` threw
+   * `ConflictError`, and the rollback took the refund with it. The MONEY was
+   * right by accident; the client got a 409 carrying no reason from an
+   * endpoint whose whole design is that a refusal is a 200 with one.
+   *
+   * Cancelling first means a run that cannot be stopped never reaches the
+   * refund, and the reason it could not be stopped is the answer.
    *
    * ⚠ AND A REFUSAL IS A 200, NOT AN ERROR. "Undo after the job starts is
    * disabled with an explanation" — the interface needs the explanation and
@@ -227,30 +238,72 @@ export class RunLifecycleService {
 
     const current = await readRunProgress(store.client, runId);
 
-    // ⚠ `captured + failed`, NOT `status`. A run is `running` from the moment
-    // a worker picks up its first cell, which is milliseconds after the 202 —
-    // refusing on status would refuse essentially every undo. What §7 means
-    // by "the job has not started" is that no work has been DONE, and a cell
-    // that has produced a result is work done whether it succeeded or not.
-    const settledCells = current.captured + current.failed;
+    try {
+      return await this.attemptUndo(store.client, current, runId, actorId);
+    } catch (error) {
+      // A run that could not be stopped is a refusal, not a 500: a 409
+      // carrying no reason is the round trip this endpoint exists to avoid.
+      if (!(error instanceof ConflictError)) throw error;
+      return { run: this.present(current, null, null), credits_refunded: 0, refusal: "work_started" };
+    }
+  }
 
-    const outcome = await undoRunCharge(store.client, {
+  private async attemptUndo(
+    client: ClientBase,
+    current: RunProgress,
+    runId: string,
+    actorId: string | null,
+  ): Promise<RunUndoResponse> {
+    const store = currentTenantStore()!;
+
+    // ⚠ NOT `status`, AND NOT `captured + failed` EITHER. A run is `running`
+    // milliseconds after the 202, so refusing on status would refuse every
+    // undo. And `captured + failed` excludes cache-served cells, which
+    // `run-progress.ts` says in its own comment is wrong — "A SUPPRESSED CELL
+    // IS DONE" — so a re-triggered scan served entirely from L1 delivered
+    // every answer and refunded every credit. What §7 means by "the job has
+    // not started" is that nothing has been DELIVERED, and a cell whose
+    // answer the customer can read is delivered whoever served it.
+    const deliveredCells = current.captured + current.failed + current.skipped;
+
+    // ⚠ HANDED IN, NOT CALLED HERE. `undoRunCharge` invokes it only once
+    // every check has passed and before any credit moves — the ordering is
+    // enforced by the module that knows both ways of getting it wrong. A run
+    // that finished in the meantime cannot be cancelled, and that IS the
+    // refusal: work was delivered.
+    // A ConflictError from `cancel` propagates out of `undoRunCharge` with
+    // nothing moved, and `undo` turns it into the refusal.
+    const stopWork = async (): Promise<void> => {
+      if (!CANCELLABLE.has(current.status)) return;
+      cancelled = await this.cancel(runId);
+    };
+
+    let cancelled: RunProgressResponse | null = null;
+    const outcome = await undoRunCharge(client, {
+      stopWork,
       workspaceId: store.context.workspaceId,
       runId,
+      // ⚠ §7 GIVES THE UNDO TO ACTIONS BELOW ALL THRESHOLDS ONLY, and
+      // `undoRunCharge` re-derives that from the ledger rather than being
+      // told. This is the one threshold input the ledger cannot supply.
+      //
+      // For a seeded deep scan the verdict is always "confirmed" — the
+      // cheapest price is 100 against a `creditsAbove` of 25 — so this route
+      // refuses every real undo today and goes live if a workspace's
+      // contracted price ever falls below the thresholds, or when a cheap
+      // priced action arrives.
+      maxProjects: maxProjectsFrom(
+        structuralLimitFrom((await resolveEntitlements(client, store.context.workspaceId)).entitlements["projects.max"]?.value ?? null),
+      ),
       actorId,
       actorType: actorId === null ? "system" : "user",
-      settledCells,
+      deliveredCells,
     });
 
-    if (outcome.refusal !== null) {
-      return { run: this.present(current, null, null), credits_refunded: 0, refusal: outcome.refusal };
-    }
-
-    const cancelled = CANCELLABLE.has(current.status)
-      ? await this.cancel(runId)
-      : this.present(current, null, null);
-
-    return { run: cancelled, credits_refunded: outcome.refunded, refusal: null };
+    const run = cancelled ?? this.present(current, null, null);
+    return outcome.refusal !== null
+      ? { run, credits_refunded: 0, refusal: outcome.refusal }
+      : { run, credits_refunded: outcome.refunded, refusal: null };
   }
 
   private present(

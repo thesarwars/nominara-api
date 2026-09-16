@@ -18945,6 +18945,7 @@
                             {
                               "type": "string",
                               "enum": [
+                                "action_was_confirmed",
                                 "work_started",
                                 "window_closed"
                               ]
