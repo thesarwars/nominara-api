@@ -42,7 +42,17 @@ export type EscalationReason =
   | "large_share_of_balance"
   | "multiple_projects"
   | "balance_after_below_floor"
-  | "zero_project_tier";
+  | "zero_project_tier"
+  /**
+   * The plan's `projects.max` could not be read.
+   *
+   * ⚠ ITS OWN CODE, NOT `zero_project_tier`. An unreadable cap used to
+   * resolve to 0 and emit that — telling a Business workspace whose
+   * `projects.max` override had been hand-typed as the string `"5"` that they
+   * were on a zero-project tier. The safe DIRECTION is still an extra click;
+   * the client renders remediation from the code, so the code has to be true.
+   */
+  | "project_cap_unreadable";
 
 export interface ConfirmationInput {
   /** What the action would debit. */
@@ -52,14 +62,15 @@ export interface ConfirmationInput {
   /** How many projects the action touches. One for a deep scan. */
   readonly projectCount: number;
   /**
-   * `projects.max` for the caller's plan.
+   * `projects.max` for the caller's plan — a number, `null` for unlimited, or
+   * `"unreadable"` when the entitlement did not parse.
    *
    * ⚠ ZERO IS THE POINT, and `null` means unlimited rather than none —
    * enterprise carries a custom figure that resolves to no numeric cap. A
    * plan that permits no projects has no billing relationship, so §7 makes
    * confirmation unconditional there: "such a user must never be surprised."
    */
-  readonly maxProjects: number | null;
+  readonly maxProjects: number | null | "unreadable";
 }
 
 export interface ConfirmationVerdict {
@@ -81,6 +92,8 @@ export function confirmationFor(input: ConfirmationInput): ConfirmationVerdict {
   // figures say — including for an action of zero credits, which is why this
   // is not folded into the comparisons below.
   if (input.maxProjects === 0) reasons.push("zero_project_tier");
+  // Same direction, different reason: we do not know the cap, so we ask.
+  else if (input.maxProjects === "unreadable") reasons.push("project_cap_unreadable");
 
   if (input.credits > ESCALATION.creditsAbove) reasons.push("credits_above_threshold");
 
@@ -144,12 +157,17 @@ export function actionsAffordable(available: number, credits: number): number {
  * ALWAYS confirm. Read `"custom"` as 0 and the most expensive plan confirms
  * every action.
  *
- * An unparseable value resolves to 0, because the safe direction is an extra
- * click. Not reachable with the seeded matrix — every plan's `projects.max`
- * parses — which is exactly why it is pinned by a test rather than left to
- * be right by accident.
+ * An unparseable value resolves to `"unreadable"`, which still confirms —
+ * the safe direction is an extra click — but under its own reason code. It
+ * used to resolve to 0 and claim `zero_project_tier`, which is a remediation
+ * lie: `entitlementValueSchema` accepts strings, so a hand-typed override of
+ * `{"projects.max": "5"}` told a Business workspace they were on a
+ * zero-project tier. Not reachable from the seeded matrix, which is exactly
+ * why it is pinned by a test rather than left to be right by accident.
  */
-export function maxProjectsFrom(limit: { kind: "finite"; limit: number } | { kind: "unlimited" } | undefined): number | null {
-  if (limit === undefined) return 0;
+export function maxProjectsFrom(
+  limit: { kind: "finite"; limit: number } | { kind: "unlimited" } | undefined,
+): number | null | "unreadable" {
+  if (limit === undefined) return "unreadable";
   return limit.kind === "unlimited" ? null : limit.limit;
 }

@@ -26,17 +26,40 @@ const CALM: ConfirmationInput = {
 };
 
 describe("STORY-074 · the escalation thresholds", () => {
+  it("⚠ pins §7's numbers as LITERALS, because every other test here is written against the constant", () => {
+    // ⚠ WITHOUT THIS THE NUMBERS ARE UNTESTED. The boundary cases below read
+    // `ESCALATION.creditsAbove` and assert around it, which is true for ANY
+    // value of it — a threshold of 100 passed all 2,337 tests in this
+    // repository, meaning a server that stopped confirming every debit
+    // between 26 and 99 credits would have shipped green. AC7 is "the
+    // escalation thresholds are implemented exactly", and exactly is a claim
+    // about the operands, not only the comparisons.
+    //
+    // Transcribed by hand from plans-and-entitlements.md §7's table:
+    //   Estimated debit > 25 credits
+    //   Estimated debit > 10% of available balance
+    //   The action fans out to more than one project
+    //   The balance after the action would fall below 50
+    expect(ESCALATION).toEqual({
+      creditsAbove: 25,
+      fractionOfAvailableAbove: 0.1,
+      projectsAbove: 1,
+      balanceAfterBelow: 50,
+    });
+  });
+
   it("asks for nothing when every threshold is clear", () => {
     expect(confirmationFor(CALM)).toEqual({ required: false, reasons: [] });
   });
 
-  it("fires on a debit above the absolute threshold, and not at it", () => {
-    // "> 25", not ">= 25". A small action should not need a click, and 25 is
-    // still small.
-    expect(confirmationFor({ ...CALM, credits: ESCALATION.creditsAbove }).reasons).toEqual([]);
-    expect(confirmationFor({ ...CALM, credits: ESCALATION.creditsAbove + 1 }).reasons).toEqual([
-      "credits_above_threshold",
-    ]);
+  it("fires on a debit above 25, and not at it", () => {
+    // ⚠ LITERALS, NOT `ESCALATION.creditsAbove`. Written against the constant
+    // this asserted nothing about the constant — see the pin above. "> 25",
+    // not ">= 25": a small action should not need a click, and 25 is still
+    // small.
+    expect(confirmationFor({ ...CALM, credits: 24 }).reasons).toEqual([]);
+    expect(confirmationFor({ ...CALM, credits: 25 }).reasons).toEqual([]);
+    expect(confirmationFor({ ...CALM, credits: 26 }).reasons).toEqual(["credits_above_threshold"]);
   });
 
   it("fires on more than a tenth of the balance, whatever the absolute size", () => {
@@ -47,8 +70,17 @@ describe("STORY-074 · the escalation thresholds", () => {
     expect(verdict.reasons).not.toContain("credits_above_threshold");
   });
 
-  it("does not fire at exactly a tenth", () => {
+  it("does not fire at exactly a tenth, and does one credit past it", () => {
+    // Literal: a tenth of 200 is 20. 20 is clear, 21 is not.
     expect(confirmationFor({ ...CALM, credits: 20, available: 200 }).reasons).not.toContain("large_share_of_balance");
+    expect(confirmationFor({ ...CALM, credits: 21, available: 200 }).reasons).toContain("large_share_of_balance");
+  });
+
+  it("⚠ holds the tenth at a size where a wrong fraction would be invisible", () => {
+    // A threshold of 0.13 instead of 0.1 passed every other test here. At
+    // 1,000 available, a tenth is 100 and a thirteenth-and-a-bit is 130 — so
+    // 110 separates them and nothing else in this file does.
+    expect(confirmationFor({ ...CALM, credits: 110, available: 1_000 }).reasons).toContain("large_share_of_balance");
   });
 
   it("⚠ treats any debit against an EMPTY wallet as a large share", () => {
@@ -74,14 +106,15 @@ describe("STORY-074 · the escalation thresholds", () => {
     expect(confirmationFor({ ...CALM, projectCount: 2 }).reasons).toContain("multiple_projects");
   });
 
-  it("fires when the balance afterwards would fall under the floor, and not at it", () => {
-    // 5,000 − 4,951 = 49, under the floor. 5,000 − 4,950 = 50, at it.
-    expect(confirmationFor({ ...CALM, credits: 4_950, available: 5_000 }).reasons).not.toContain(
-      "balance_after_below_floor",
-    );
-    expect(confirmationFor({ ...CALM, credits: 4_951, available: 5_000 }).reasons).toContain(
-      "balance_after_below_floor",
-    );
+  it("fires when the balance afterwards would fall under 50, and not at it", () => {
+    // Literal boundaries: 51 left is clear, 50 is the floor itself and clear,
+    // 49 fires.
+    const leaving = (remaining: number) =>
+      confirmationFor({ ...CALM, credits: 5_000 - remaining, available: 5_000 }).reasons;
+
+    expect(leaving(51)).not.toContain("balance_after_below_floor");
+    expect(leaving(50)).not.toContain("balance_after_below_floor");
+    expect(leaving(49)).toContain("balance_after_below_floor");
   });
 
   it("⚠ scenario 7 — a zero-project tier confirms a SMALL action too", () => {
@@ -135,11 +168,24 @@ describe("STORY-074 · maxProjectsFrom", () => {
     expect(maxProjectsFrom({ kind: "unlimited" })).toBeNull();
   });
 
-  it("⚠ falls to zero on an unparseable entitlement, because the safe direction is an extra click", () => {
-    // Not reachable with the seeded matrix — which is why it is pinned here
-    // rather than left to be right by accident. The alternative reading
-    // (unknown = unlimited) silently stops the free tier confirming.
-    expect(maxProjectsFrom(undefined)).toBe(0);
+  it("⚠ reports an unparseable entitlement as UNREADABLE, not as zero", () => {
+    // Not reachable from the seeded matrix — which is why it is pinned here
+    // rather than left to be right by accident. `entitlementValueSchema`
+    // accepts strings, so a hand-typed override of {"projects.max": "5"} gets
+    // here.
+    //
+    // The safe DIRECTION is still an extra click, and the first version got
+    // that right by returning 0 — but 0 emits `zero_project_tier`, which told
+    // a Business workspace they were on a tier with no projects. The client
+    // renders remediation from the code, so the code has to be true.
+    expect(maxProjectsFrom(undefined)).toBe("unreadable");
+  });
+
+  it("⚠ still confirms on an unreadable cap, under its own reason", () => {
+    const verdict = confirmationFor({ ...CALM, maxProjects: "unreadable" });
+    expect(verdict.required).toBe(true);
+    expect(verdict.reasons).toEqual(["project_cap_unreadable"]);
+    expect(verdict.reasons).not.toContain("zero_project_tier");
   });
 });
 

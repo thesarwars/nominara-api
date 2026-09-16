@@ -50,15 +50,29 @@ export const cacheForecastSchema = z
  * client derives is a figure the client can derive differently, and AC10's
  * "no hardcoded number in any component or modal" is only worth having if
  * the component is not doing the arithmetic either.
+ *
+ * ⚠ `available`, `after` AND `cycle_end` ONLY — the included/purchased/
+ * reserved breakdown was here and has been removed. This route is
+ * `tracking:trigger`, which a MANAGER holds; the breakdown is billing
+ * information and `billing:read` is owner/admin only. There is no
+ * `GET /billing/wallet` at all, so shipping it here would have made the
+ * estimate the one success-path route in the product disclosing a wallet's
+ * internals one permission rank below the one that gates them. §7's modal
+ * renders `available` and `after`; it never renders the split.
+ *
+ * ⚠ AND `after` CAN BE NEGATIVE, which §5 calls unrepresentable FOR A
+ * BALANCE. This is not a balance — it is "what you would be left with", and
+ * for someone who cannot afford the action the honest answer is a negative
+ * number the modal turns into a shortfall. `shortfall` beside it is that
+ * figure made explicit, so no component has to derive it from a sign.
  */
 export const estimateWalletSchema = z
   .object({
-    available: z.number().int(),
-    /** What `available` becomes if this action is confirmed. */
+    available: z.number().int().nonnegative(),
+    /** What `available` becomes if this action is confirmed. Negative when it cannot be afforded. */
     after: z.number().int(),
-    included_balance: z.number().int().nonnegative(),
-    purchased_balance: z.number().int().nonnegative(),
-    reserved: z.number().int().nonnegative(),
+    /** How far short the wallet is, or null when it covers the action. AC9's purchase-in-place figure. */
+    shortfall: z.number().int().positive().nullable(),
     /** `YYYY-MM-DD`, formatted by Postgres — never through a local `Date`. */
     cycle_end: z.string(),
   })
@@ -71,6 +85,8 @@ export const escalationReasonSchema = z.enum([
   "large_share_of_balance",
   "multiple_projects",
   "balance_after_below_floor",
+  /** The plan's project cap could not be read. Confirm anyway — but say THAT, not that the tier has no projects. */
+  "project_cap_unreadable",
 ]);
 
 /**
