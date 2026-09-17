@@ -98,11 +98,16 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     };
   }
 
-  function contextFor(req: Req): ExecutionContext {
+  function contextFor(req: Req, stamped?: Map<string, string>): ExecutionContext {
+    const response = {
+      header: (name: string, value: string) => {
+        stamped?.set(name.toLowerCase(), value);
+      },
+    };
     return {
       getHandler: () => undefined,
       getClass: () => undefined,
-      switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({ header: () => undefined }) }),
+      switchToHttp: () => ({ getRequest: () => req, getResponse: () => response }),
     } as unknown as ExecutionContext;
   }
 
@@ -390,7 +395,7 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
 
   // ── The interceptor ─────────────────────────────────────────────────────
 
-  async function runInterceptor(req: Req, handler: () => unknown): Promise<unknown> {
+  async function runInterceptor(req: Req, handler: () => unknown, stamped?: Map<string, string>): Promise<unknown> {
     const interceptor = new CreditInterceptor(pool);
     const next: CallHandler = {
       handle: () => {
@@ -403,7 +408,7 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     };
     // Inside a tenant transaction, exactly as TenantContextInterceptor puts it.
     return withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () =>
-      firstValueFrom(interceptor.intercept(contextFor(req), next)),
+      firstValueFrom(interceptor.intercept(contextFor(req, stamped), next)),
     );
   }
 
@@ -595,5 +600,61 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
 
     expect(await wallet()).toMatchObject({ reserved: PRICE });
     expect(await ledger("reserve")).toBe(1);
+  });
+
+  // ── The wallet headers, which the credit chip is built on ───────────────
+  //
+  // ⚠ NOTHING ASSERTED THESE UNTIL NOW. `NFR-UI-09` says the chip "updates
+  // from response headers and realtime events — never by polling the wallet
+  // endpoint", so `x-nominara-credits-available` is the entire supply side of
+  // a surface in the top bar of every authenticated page. `stampWallet` could
+  // have been deleted and every gate stayed green.
+
+  it("⚠ stamps the wallet headers on a successful priced response", async () => {
+    const req = request("k-stamp");
+    await guard().canActivate(contextFor(req));
+    const stamped = new Map<string, string>();
+
+    await runInterceptor(req, () => ({ ok: true }), stamped);
+
+    const after = await wallet();
+    expect(stamped.get("x-nominara-credits-available")).toBe(String(after!.available));
+    expect(stamped.get("x-nominara-credits-reserved")).toBe(String(after!.reserved));
+    expect(stamped.get("x-nominara-credits-cycle-end")).toBe(after!.cycleEnd);
+  });
+
+  it("⚠ the stamped balance is the one AFTER the commit, not before it", async () => {
+    // A chip showing the pre-charge balance is worse than one showing nothing:
+    // it tells the customer the action was free.
+    const req = request("k-stamp-after");
+    await guard().canActivate(contextFor(req));
+    const before = (await wallet())!.available;
+    const stamped = new Map<string, string>();
+
+    await runInterceptor(req, () => ({ ok: true }), stamped);
+
+    const after = (await wallet())!.available;
+    expect(after).toBeLessThan(before + PRICE); // the reservation settled
+    expect(stamped.get("x-nominara-credits-available")).toBe(String(after));
+  });
+
+  it("⚠ stamps NOTHING on the error path, where the transaction is rolling back", async () => {
+    // Reading a balance out of a doomed transaction and publishing it as
+    // current would put a figure on screen that never existed.
+    const req = request("k-stamp-error");
+    await guard().canActivate(contextFor(req));
+    const stamped = new Map<string, string>();
+
+    await expect(
+      runInterceptor(
+        req,
+        () => {
+          throw new Error("handler blew up");
+        },
+        stamped,
+      ),
+    ).rejects.toThrow();
+
+    expect(stamped.has("x-nominara-credits-available")).toBe(false);
   });
 });
