@@ -351,6 +351,26 @@ function tripleOf(wallet: WalletState): BalanceTriple {
  * resolved by a human-authored `adjustment` with a reason. This reports and
  * stops.
  */
+/**
+ * Whether the workspace has ANY ledger entry.
+ *
+ * ⚠ THE ONLY THING THAT SEPARATES "never provisioned" FROM "wallet lost".
+ * `provisionWalletWithGrant` writes the wallet row before the first entry and
+ * `credit_ledger` refuses DELETE by trigger, so a workspace with entries and
+ * no wallet is not a state the code can reach — `verifyWorkspaceWallet` below
+ * already reports it as a discrepancy. Any route that answers a missing
+ * wallet with a substituted figure has to ask this first, or it answers a
+ * data incident with a confident number.
+ *
+ * The predicate is explicit ON TOP OF RLS, as `settleableUsage` is: the
+ * question is "does this workspace have history", and a route that answers it
+ * from an unset context would read zero and call a lost wallet a new one.
+ */
+export async function hasLedgerHistory(tx: ClientBase, workspaceId: string): Promise<boolean> {
+  const result = await tx.query(`SELECT 1 FROM credit_ledger WHERE workspace_id = $1 LIMIT 1`, [workspaceId]);
+  return (result.rowCount ?? 0) > 0;
+}
+
 export async function verifyWorkspaceWallet(tx: ClientBase, workspaceId: string): Promise<WalletMismatch | null> {
   const wallet = await readWallet(tx, workspaceId);
   const rows = await readLedgerForReplay(tx, workspaceId);
