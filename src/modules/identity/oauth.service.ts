@@ -11,7 +11,10 @@ import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { OAUTH_CLIENT, type OauthClient, type OauthIdentity } from "./ports/oauth-client.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
-import type { OauthCallbackQuery, OauthCallbackResponse, OauthProvider } from "./dto/index.js";
+import type { OauthCallbackQuery, OauthCallbackResponse, OauthLinkItem, OauthProvider } from "./dto/index.js";
+import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { pageFrom, type Page } from "../../api/pagination/page.js";
 
 // STORY-015 — dangerous area: state-signing/session-binding and the
 // provider-subject-as-join-key account-resolution logic (second-engineer
@@ -60,6 +63,30 @@ export interface OauthStartResult {
 export interface OauthCallbackResult {
   readonly tokens: SessionTokens;
   readonly body: OauthCallbackResponse;
+}
+
+interface OauthLinkRow {
+  id: string;
+  provider: string;
+  last_used_at: Date | null;
+  created_at: Date;
+  created_at_key: string;
+}
+
+/**
+ * ⚠ `.toISOString()`, NOT THE ROW AS IT COMES BACK. `pg` hands a `timestamptz`
+ * over as a JS `Date`, and the published contract says `z.iso.datetime()` — a
+ * string. Returning the row directly type-checks (the field is declared
+ * `string`) and then fails its own schema at runtime, which is how a route
+ * ships publishing a shape its contract does not describe. Same explicit
+ * mapper `toMemberResponse` uses, and for the same reason.
+ */
+function toOauthLinkItem(row: OauthLinkRow): OauthLinkItem {
+  return {
+    provider: row.provider as OauthLinkItem["provider"],
+    last_used_at: row.last_used_at === null ? null : row.last_used_at.toISOString(),
+    created_at: row.created_at.toISOString(),
+  };
 }
 
 @Injectable()
@@ -469,6 +496,57 @@ export class OauthService {
   }
 
   /**
+   * STORY-096 slice C — `GET /me/oauth`, the providers this caller has linked.
+   *
+   * ⚠ REVOKED CREDENTIALS ARE NOT LINKS. `unlink` revokes by setting
+   * `revoked_at` rather than deleting the row, so a history of every provider
+   * the caller has ever connected sits in this table. Reading it without the
+   * filter would offer "Disconnect" for an account they already disconnected,
+   * and `unlink` would answer 403.
+   *
+   * ⚠ `kind = 'oauth'` ONLY. `ux_credentials_oauth` also covers `saml` and
+   * `oidc`, which are enterprise SSO bindings rather than personal connected
+   * accounts — they are not something an individual connects or disconnects
+   * here, and listing them under "Connected accounts" would offer a Disconnect
+   * for their organisation's sign-in.
+   *
+   * ⚠ SCOPED BY `user_id`, AND NOTHING ELSE. A credential belongs to a PERSON,
+   * not to a workspace, so the route carries `@SkipTenantContext()` for the
+   * same reason `GET /me/passkeys` does.
+   *
+   * ⚠ AND NO RLS POLICY BACKS THAT UP — I claimed ISO-18..22 covered this and
+   * it does not. `ACTOR_SELF_SCOPED_TABLES` is `["workspaces",
+   * "workspace_members"]`; `user_credentials` has `relrowsecurity = false` and
+   * zero policies. The two real controls are:
+   *
+   *   1. THE GRANT. Migration 0005 revokes the table from `nominara_worker`,
+   *      `nominara_report` and `nominara_portal` outright, leaving only
+   *      `nominara_app`. Its own comment says why this is stronger than a
+   *      policy: "RLS would be the weaker control here because it would imply
+   *      the table was reachable and merely filtered."
+   *   2. THE PREDICATE BELOW, which is hand-written and therefore deletable.
+   *
+   * So deleting `AND user_id = $1` fails no isolation assertion anywhere —
+   * only `identity-oauth-links.spec.ts`'s cross-user test stands between that
+   * and a cross-account credential listing. Said plainly here because the
+   * route-permission EXEMPT list carries a written reason, and a reason that
+   * names a safety net that does not exist is worse than no reason at all.
+   */
+  async listLinks(userId: string, pagination: PaginationRequest): Promise<Page<OauthLinkItem>> {
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
+    const result = await this.pool.query<OauthLinkRow>(
+      `SELECT id, provider, last_used_at, created_at, created_at::text AS created_at_key
+         FROM user_credentials
+        WHERE user_id = $1 AND kind = 'oauth' AND revoked_at IS NULL AND provider IS NOT NULL
+          AND ($2::timestamptz IS NULL OR (created_at, id) > ($2::timestamptz, $3::uuid))
+        ORDER BY created_at ASC, id ASC
+        LIMIT $4`,
+      [userId, after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
+    );
+    return pageFrom(result.rows, pagination.limit, toOauthLinkItem, (row) => [row.created_at_key, row.id]);
+  }
+
+  /**
    * DELETE /me/oauth/:provider. Mirrors IdentityService.revokePasskey's
    * exact pattern (identity.service.ts): locks the user's WHOLE active
    * credential set before counting, not just the target row — see that
@@ -480,8 +558,20 @@ export class OauthService {
     try {
       await client.query("BEGIN");
 
+      // ⚠ ORDERED, BECAUSE `find` BELOW TAKES THE FIRST MATCH. One person can
+      // hold two accounts on the same provider — `ux_credentials_oauth` is
+      // unique on (provider, external_subject), not (user_id, provider) — and
+      // this route is keyed on the PROVIDER, so with two Google accounts it
+      // revokes one of them. Unordered, which of the two was undefined: the
+      // same click could take the work account on one call and the personal
+      // one on the next. Oldest-first at least makes it a rule the screen can
+      // state. Addressing a SPECIFIC link needs an id-keyed route, which is
+      // a contract change and is filed rather than smuggled in here.
       const active = await client.query<{ id: string; kind: string; provider: string | null }>(
-        `SELECT id, kind, provider FROM user_credentials WHERE user_id = $1 AND revoked_at IS NULL FOR UPDATE`,
+        `SELECT id, kind, provider FROM user_credentials
+          WHERE user_id = $1 AND revoked_at IS NULL
+          ORDER BY created_at ASC, id ASC
+          FOR UPDATE`,
         [userId],
       );
       const target = active.rows.find((row) => row.kind === "oauth" && row.provider === provider);

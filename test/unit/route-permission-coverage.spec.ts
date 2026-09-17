@@ -43,6 +43,7 @@ const EXEMPT: Readonly<Record<string, string>> = Object.freeze({
   "IdentityController.rename": "PATCH /me/passkeys/:id — the caller's own credential",
   "IdentityController.revoke": "DELETE /me/passkeys/:id — the caller's own credential",
   "OauthController.linkStart": "links a provider to the CALLER's identity, not to a workspace",
+  "OauthController.listLinks": "GET /me/oauth — which providers can sign the CALLER in; a credential belongs to a person",
   "OauthController.unlink": "DELETE /me/oauth/:provider — the caller's own identity link",
   "WorkspacesController.create": "creates the workspace whose roles a permission would be read from",
   "WorkspacesController.list": "lists the caller's OWN memberships; runs before a workspace is chosen",
