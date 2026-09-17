@@ -333,6 +333,28 @@ export async function readWallet(tx: ClientBase, workspaceId: string): Promise<W
   return row === undefined ? null : toWalletState(row);
 }
 
+/**
+ * Whether the wallet's cycle has ALREADY ENDED without being rolled.
+ *
+ * ⚠ NOTHING IN `src/` WRITES `cycle_end` AFTER `provisionWallet`. The roll is
+ * STORY-075/076's, so every wallet still carries the date it was provisioned
+ * against, and a workspace provisioned in August reports a cycle ending in
+ * August. Read straight through, that turns a date six weeks in the past into
+ * a future expiry deadline on the billing screen.
+ *
+ * ⚠ COMPARED IN POSTGRES, NEVER AGAINST A JS `Date`. The reconciler's grace
+ * window was written the other way first and found zero orphans, because the
+ * two clocks are not the same clock. `CURRENT_DATE` is the database's own
+ * day, which is the day `cycle_end` was written against.
+ */
+export async function cycleHasLapsed(tx: ClientBase, workspaceId: string): Promise<boolean> {
+  const result = await tx.query<{ lapsed: boolean }>(
+    `SELECT cycle_end < CURRENT_DATE AS lapsed FROM credit_wallets WHERE workspace_id = $1`,
+    [workspaceId],
+  );
+  return result.rows[0]?.lapsed ?? false;
+}
+
 export interface PurchasableOption {
   readonly key: string;
   readonly displayName: string;

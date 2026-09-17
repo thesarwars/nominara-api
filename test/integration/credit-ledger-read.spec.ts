@@ -9,6 +9,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { connectAsRole } from "../isolation/support/runtime-roles.js";
 import { BillingService } from "../../src/modules/billing/billing.service.js";
 import { readLedgerPage } from "../../src/modules/billing/credit-ledger.reader.js";
+import { readWallet } from "../../src/lib/credits/wallet.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
@@ -151,11 +152,36 @@ describe("STORY-073 · reading the credit ledger", () => {
     const wallet = () =>
       withTenantContext(appClient, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => new BillingService().wallet());
 
+    // ⚠ EVERY CYCLE DATE BELOW IS RELATIVE TO `CURRENT_DATE`, never a literal.
+    // `expiring_soon` now depends on whether the cycle has lapsed, so a
+    // hardcoded '2026-10-01' would pass today and start failing on the 1st —
+    // a test that expires is worse than no test, because it fails for a
+    // reason that has nothing to do with the code.
+    const seedWallet = (
+      cols: { included?: number; purchased?: number; reserved?: number; endsInDays?: number },
+      target = workspaceId,
+    ) =>
+      db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved,
+                                     cycle_start, cycle_end)
+         VALUES ($1, $2, $3, $4, CURRENT_DATE - INTERVAL '1 month', CURRENT_DATE + make_interval(days => $5))`,
+        [target, cols.included ?? 0, cols.purchased ?? 0, cols.reserved ?? 0, cols.endsInDays ?? 14],
+      );
+
+    /** `cycle_end` as the route will report it, read back from Postgres. */
+    const cycleEndOf = async (target = workspaceId): Promise<string> => {
+      const r = await db.query<{ e: string }>(
+        `SELECT to_char(cycle_end, 'YYYY-MM-DD') AS e FROM credit_wallets WHERE workspace_id = $1`,
+        [target],
+      );
+      return r.rows[0]!.e;
+    };
+
     it("reports the standing position, buckets and all", async () => {
       await db.query(
         `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved,
                                      lifetime_granted, lifetime_purchased, lifetime_spent, cycle_start, cycle_end)
-         VALUES ($1, 600, 1000, 40, 1200, 1000, 600, '2026-09-01', '2026-10-01')`,
+         VALUES ($1, 600, 1000, 40, 1200, 1000, 600, CURRENT_DATE - INTERVAL '1 month', CURRENT_DATE + INTERVAL '14 days')`,
         [workspaceId],
       );
 
@@ -164,8 +190,8 @@ describe("STORY-073 · reading the credit ledger", () => {
         included_balance: 600,
         purchased_balance: 1_000,
         reserved: 40,
-        expiring_soon: { credits: 600, expires_at: "2026-10-01" },
-        cycle_end: "2026-10-01",
+        expiring_soon: { credits: 560, expires_at: await cycleEndOf() }, // 600 included − 40 already reserved
+        cycle_end: await cycleEndOf(),
         lifetime_granted: 1_200,
         lifetime_purchased: 1_000,
         lifetime_spent: 600,
@@ -173,15 +199,42 @@ describe("STORY-073 · reading the credit ledger", () => {
     });
 
     it("⚠ reports NOTHING expiring rather than zero when the included balance is spent", async () => {
-      // "0 credits expiring on 2026-10-01" invites the reader to wonder what
+      // "0 credits expiring on the 1st" invites the reader to wonder what
       // they did wrong. Absence is the honest shape.
-      await db.query(
-        `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
-         VALUES ($1, 0, 1000, 0, '2026-09-01', '2026-10-01')`,
-        [workspaceId],
-      );
+      await seedWallet({ included: 0, purchased: 1_000 });
 
       expect((await wallet()).expiring_soon).toBeNull();
+    });
+
+    it("⚠ does not warn about included credits a running action has already spoken for", async () => {
+      // §5 settles included first, so a reservation consumes the expiring
+      // bucket before the durable one. A wallet whose whole included balance
+      // is reserved will expire NOTHING at cycle end, and telling the
+      // customer 600 credits are about to lapse sends them to buy what they
+      // already have committed.
+      await seedWallet({ included: 600, purchased: 1_000, reserved: 600 });
+
+      expect((await wallet()).expiring_soon).toBeNull();
+    });
+
+    it("counts only the unreserved part of the included bucket as at risk", async () => {
+      await seedWallet({ included: 600, reserved: 200 });
+
+      expect((await wallet()).expiring_soon).toEqual({ credits: 400, expires_at: await cycleEndOf() });
+    });
+
+    it("⚠ names no expiry once the cycle has lapsed and nothing rolled it", async () => {
+      // NOTHING in src/ writes `cycle_end` after provisioning — the roll is
+      // STORY-075/076 — so a wallet provisioned before its own cycle_end
+      // still carries that date. The credits did NOT expire, because no
+      // writer took them, so `available` stays true; but a date in the past
+      // presented as a future deadline is a statement about their money that
+      // is not true.
+      await seedWallet({ included: 600, purchased: 400, endsInDays: -47 });
+
+      const result = await wallet();
+      expect(result.expiring_soon).toBeNull();
+      expect(result.available).toBe(1_000); // the balance itself is untouched
     });
 
     it("⚠ does not report a wallet-less workspace as broke", async () => {
@@ -189,12 +242,39 @@ describe("STORY-073 · reading the credit ledger", () => {
       // customer who has never triggered a paid action has no row. Rendering
       // "0 available" on a billing screen is a claim about their money that
       // is not true.
-      const result = await wallet();
+      //
+      // ⚠ ASSERTED WHOLE. Naming only `available` left `included_balance`,
+      // `purchased_balance` and `reserved` free: a mutant swapping the grant
+      // into `purchased_balance` survived the entire suite, and it would have
+      // told a customer who has bought nothing that they bought 1,200 credits.
+      const period = await db.query<{ e: string }>(
+        `SELECT to_char(date_trunc('month', CURRENT_DATE) + INTERVAL '1 month', 'YYYY-MM-DD') AS e`,
+      );
 
-      expect(result.available).toBe(1_200); // growth's included grant
-      expect(result.expiring_soon).toMatchObject({ credits: 1_200 });
-      // And it does not invent lifetime figures for a wallet that has no history.
-      expect(result).toMatchObject({ lifetime_granted: 0, lifetime_spent: 0 });
+      expect(await wallet()).toEqual({
+        available: 1_200, // growth's included grant
+        included_balance: 1_200,
+        purchased_balance: 0,
+        reserved: 0,
+        expiring_soon: { credits: 1_200, expires_at: period.rows[0]!.e },
+        cycle_end: period.rows[0]!.e,
+        lifetime_granted: 0,
+        lifetime_purchased: 0,
+        lifetime_spent: 0,
+      });
+    });
+
+    it("⚠ refuses rather than substituting a grant over a workspace that HAS history", async () => {
+      // A wallet row is written before the first ledger entry and
+      // `credit_ledger` refuses DELETE by trigger, so entries without a
+      // wallet is not a state the code can reach — `verifyWorkspaceWallet`
+      // reports it as a discrepancy. Answering it with the plan's full grant
+      // would put "1,200 available" directly above a ledger, on the same
+      // screen, showing what they actually spent.
+      await seed();
+      await db.query("DELETE FROM credit_wallets WHERE workspace_id = $1", [workspaceId]);
+
+      await expect(wallet()).rejects.toMatchObject({ code: "internal_error" });
     });
 
     it("⚠ refuses rather than guessing when the plan's grant is negotiated", async () => {
@@ -210,23 +290,35 @@ describe("STORY-073 · reading the credit ledger", () => {
 
     it("serves an enterprise workspace normally once its wallet exists", async () => {
       await db.query("UPDATE workspaces SET plan_key = 'enterprise' WHERE id = $1", [workspaceId]);
-      await db.query(
-        `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
-         VALUES ($1, 5000, 0, 0, '2026-09-01', '2026-10-01')`,
-        [workspaceId],
-      );
+      await seedWallet({ included: 5_000 });
 
       expect((await wallet()).available).toBe(5_000);
     });
 
     it("⚠ sees only its OWN workspace's wallet", async () => {
-      // Same RLS control as the ledger, asserted on the runtime role rather
-      // than the superuser that bypasses it.
-      await db.query(
-        `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
-         VALUES ($1, 600, 0, 0, '2026-09-01', '2026-10-01'), ($2, 9999, 0, 0, '2026-09-01', '2026-10-01')`,
-        [workspaceId, otherWorkspaceId],
-      );
+      // ⚠ WHAT THIS CAN AND CANNOT PROVE. Unlike `readLedgerPage`, `readWallet`
+      // carries its OWN `WHERE workspace_id = $1` and is handed the context's
+      // own id — so asserting "A's balance is A's" is satisfied by the
+      // predicate alone and stays green with the policy replaced by
+      // `USING (true)`. That assertion was here first and proved nothing
+      // (ISO-00, vacuity).
+      //
+      // The POLICY on `credit_wallets` is proven where it can fail: it is one
+      // of the 60 tenant tables ISO-02 discovers, seeded for three tenants,
+      // asserted positively and negatively on `nominara_app`, with a breaker.
+      //
+      // What is worth asserting HERE is the pair this route depends on — the
+      // raw count under A's context, which RLS alone decides, and the reader
+      // refusing to fetch a workspace it was not given.
+      await seedWallet({ included: 600 });
+      await seedWallet({ included: 9_999 }, otherWorkspaceId);
+
+      await withTenantContext(appClient, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        const visible = await tx.query<{ count: string }>("SELECT count(*) FROM credit_wallets");
+        expect(Number(visible.rows[0]!.count)).toBe(1);
+
+        expect(await readWallet(tx, otherWorkspaceId)).toBeNull();
+      });
 
       expect((await wallet()).available).toBe(600);
     });
