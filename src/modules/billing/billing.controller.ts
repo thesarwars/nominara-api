@@ -2,8 +2,10 @@ import { Controller, Get, Query } from "@nestjs/common";
 import {
   creditLedgerListResponseSchema,
   creditLedgerQuerySchema,
+  walletResponseSchema,
   type CreditLedgerEntry,
   type CreditLedgerQuery,
+  type WalletResponse,
 } from "../../../contracts/billing/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
@@ -38,6 +40,16 @@ import { BillingService } from "./billing.service.js";
 @Controller("billing/wallet")
 export class BillingController {
   constructor(private readonly service: BillingService) {}
+
+  // §3's `GET /billing/wallet` — `billing:read`, owner and admin only. The
+  // estimate's project-scoped wallet is a different question at a different
+  // permission; see `wallet-response.schema.ts`.
+  @Get()
+  @RequirePermission("billing:read")
+  @ApiContract({ operationId: "getWallet", responseSchema: walletResponseSchema })
+  wallet(): Promise<WalletResponse> {
+    return this.service.wallet();
+  }
 
   @Get("ledger")
   @RequirePermission("billing:read")

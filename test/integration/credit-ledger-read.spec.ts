@@ -7,6 +7,7 @@ import { creditLedgerEntrySchema } from "../../contracts/billing/index.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { connectAsRole } from "../isolation/support/runtime-roles.js";
+import { BillingService } from "../../src/modules/billing/billing.service.js";
 import { readLedgerPage } from "../../src/modules/billing/credit-ledger.reader.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
@@ -142,6 +143,93 @@ describe("STORY-073 · reading the credit ledger", () => {
        VALUES ($1,$2,'P',$3,'https://example.com','example.com','brand')`,
       [projectId, workspaceId, `p-${randomUUID().slice(0, 8)}`],
     );
+  });
+
+  // ─────────────────────── the wallet endpoint ───────────────────────
+
+  describe("STORY-096 · GET /billing/wallet", () => {
+    const wallet = () =>
+      withTenantContext(appClient, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => new BillingService().wallet());
+
+    it("reports the standing position, buckets and all", async () => {
+      await db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved,
+                                     lifetime_granted, lifetime_purchased, lifetime_spent, cycle_start, cycle_end)
+         VALUES ($1, 600, 1000, 40, 1200, 1000, 600, '2026-09-01', '2026-10-01')`,
+        [workspaceId],
+      );
+
+      expect(await wallet()).toEqual({
+        available: 1_560, // 600 + 1000 − 40
+        included_balance: 600,
+        purchased_balance: 1_000,
+        reserved: 40,
+        expiring_soon: { credits: 600, expires_at: "2026-10-01" },
+        cycle_end: "2026-10-01",
+        lifetime_granted: 1_200,
+        lifetime_purchased: 1_000,
+        lifetime_spent: 600,
+      });
+    });
+
+    it("⚠ reports NOTHING expiring rather than zero when the included balance is spent", async () => {
+      // "0 credits expiring on 2026-10-01" invites the reader to wonder what
+      // they did wrong. Absence is the honest shape.
+      await db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
+         VALUES ($1, 0, 1000, 0, '2026-09-01', '2026-10-01')`,
+        [workspaceId],
+      );
+
+      expect((await wallet()).expiring_soon).toBeNull();
+    });
+
+    it("⚠ does not report a wallet-less workspace as broke", async () => {
+      // `provisionWalletWithGrant` runs on the first PRICED request, so a
+      // customer who has never triggered a paid action has no row. Rendering
+      // "0 available" on a billing screen is a claim about their money that
+      // is not true.
+      const result = await wallet();
+
+      expect(result.available).toBe(1_200); // growth's included grant
+      expect(result.expiring_soon).toMatchObject({ credits: 1_200 });
+      // And it does not invent lifetime figures for a wallet that has no history.
+      expect(result).toMatchObject({ lifetime_granted: 0, lifetime_spent: 0 });
+    });
+
+    it("⚠ refuses rather than guessing when the plan's grant is negotiated", async () => {
+      // Enterprise carries `"custom"`. An unknown grant is unknown, and
+      // inventing a figure for a billing screen is worse than failing.
+      await db.query("UPDATE workspaces SET plan_key = 'enterprise' WHERE id = $1", [workspaceId]);
+
+      await expect(wallet()).rejects.toMatchObject({
+        code: "feature_not_in_plan",
+        details: { key: "credits.included_per_cycle" },
+      });
+    });
+
+    it("serves an enterprise workspace normally once its wallet exists", async () => {
+      await db.query("UPDATE workspaces SET plan_key = 'enterprise' WHERE id = $1", [workspaceId]);
+      await db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
+         VALUES ($1, 5000, 0, 0, '2026-09-01', '2026-10-01')`,
+        [workspaceId],
+      );
+
+      expect((await wallet()).available).toBe(5_000);
+    });
+
+    it("⚠ sees only its OWN workspace's wallet", async () => {
+      // Same RLS control as the ledger, asserted on the runtime role rather
+      // than the superuser that bypasses it.
+      await db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
+         VALUES ($1, 600, 0, 0, '2026-09-01', '2026-10-01'), ($2, 9999, 0, 0, '2026-09-01', '2026-10-01')`,
+        [workspaceId, otherWorkspaceId],
+      );
+
+      expect((await wallet()).available).toBe(600);
+    });
   });
 
   // ─────────────────────────── isolation ───────────────────────────
