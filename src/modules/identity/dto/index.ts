@@ -47,6 +47,12 @@ export {
   type OauthProvider,
 } from "../../../../contracts/identity/oauth-provider.schema.js";
 export {
+  oauthLinkItemSchema,
+  oauthLinkResponseSchema,
+  type OauthLinkItem,
+  type OauthLinkResponse,
+} from "../../../../contracts/identity/oauth-link-response.schema.js";
+export {
   oauthStartResponseSchema,
   type OauthStartResponse,
 } from "../../../../contracts/identity/oauth-start-response.schema.js";

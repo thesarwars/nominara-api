@@ -1,4 +1,6 @@
 import { Controller, Delete, Param, Post, Query, Get, Req, Res } from "@nestjs/common";
+import { paginationRequestSchema, type PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import type { Page } from "../../api/pagination/page.js";
 import type { FastifyReply } from "fastify";
 import type { AuthenticatedRequest } from "../../api/guards/auth.guard.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
@@ -9,10 +11,12 @@ import { OAUTH_BINDING_COOKIE_NAME, ACCESS_COOKIE_NAME, setAuthCookies, setOauth
 import {
   oauthCallbackQuerySchema,
   oauthCallbackResponseSchema,
+  oauthLinkResponseSchema,
   oauthProviderSchema,
   oauthStartResponseSchema,
   type OauthCallbackQuery,
   type OauthCallbackResponse,
+  type OauthLinkItem,
   type OauthProvider,
   type OauthStartResponse,
 } from "./dto/index.js";
@@ -82,6 +86,39 @@ export class OauthController {
     );
     setAuthCookies(reply, result.tokens);
     return result.body;
+  }
+
+  /**
+   * STORY-096 slice C — the state BETWEEN link and unlink, which nothing could
+   * read. `unlink` answers 403 for a provider that is not linked, so without
+   * this a security screen's Disconnect is a button whose only outcome is an
+   * error.
+   *
+   * ⚠ CURSOR-PAGINATED, though the realistic row count is 0–3. It is tempting
+   * to call a set bounded by a three-value provider enum "not a list" and skip
+   * `NFR-API-03` — but `ux_credentials_oauth` is unique on
+   * `(provider, external_subject)`, NOT on `(user_id, provider)`, so one
+   * person can link two different Google accounts. The set is bounded by
+   * nothing the schema enforces.
+   *
+   * No `@RequirePermission`: a credential belongs to a PERSON, not a
+   * workspace, so there is no role to check — the same reason
+   * `GET /me/passkeys` carries none. `route-permission-coverage.spec.ts`
+   * records it with that reason rather than letting it pass silently.
+   */
+  @Get("me/oauth")
+  @SkipTenantContext()
+  @ApiContract({
+    operationId: "listOauthLinks",
+    querySchema: paginationRequestSchema,
+    responseSchema: oauthLinkResponseSchema,
+    listOf: true,
+  })
+  listLinks(
+    @Req() req: AuthenticatedRequest,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<OauthLinkItem>> {
+    return this.service.listLinks(req.auth!.sub, pagination);
   }
 
   @Delete("me/oauth/:provider")

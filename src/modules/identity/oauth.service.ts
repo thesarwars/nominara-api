@@ -11,7 +11,10 @@ import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { OAUTH_CLIENT, type OauthClient, type OauthIdentity } from "./ports/oauth-client.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
-import type { OauthCallbackQuery, OauthCallbackResponse, OauthProvider } from "./dto/index.js";
+import type { OauthCallbackQuery, OauthCallbackResponse, OauthLinkItem, OauthProvider } from "./dto/index.js";
+import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { pageFrom, type Page } from "../../api/pagination/page.js";
 
 // STORY-015 — dangerous area: state-signing/session-binding and the
 // provider-subject-as-join-key account-resolution logic (second-engineer
@@ -60,6 +63,30 @@ export interface OauthStartResult {
 export interface OauthCallbackResult {
   readonly tokens: SessionTokens;
   readonly body: OauthCallbackResponse;
+}
+
+interface OauthLinkRow {
+  id: string;
+  provider: string;
+  last_used_at: Date | null;
+  created_at: Date;
+  created_at_key: string;
+}
+
+/**
+ * ⚠ `.toISOString()`, NOT THE ROW AS IT COMES BACK. `pg` hands a `timestamptz`
+ * over as a JS `Date`, and the published contract says `z.iso.datetime()` — a
+ * string. Returning the row directly type-checks (the field is declared
+ * `string`) and then fails its own schema at runtime, which is how a route
+ * ships publishing a shape its contract does not describe. Same explicit
+ * mapper `toMemberResponse` uses, and for the same reason.
+ */
+function toOauthLinkItem(row: OauthLinkRow): OauthLinkItem {
+  return {
+    provider: row.provider as OauthLinkItem["provider"],
+    last_used_at: row.last_used_at === null ? null : row.last_used_at.toISOString(),
+    created_at: row.created_at.toISOString(),
+  };
 }
 
 @Injectable()
@@ -475,6 +502,40 @@ export class OauthService {
    * method's comment for why locking only the target row races two
    * concurrent last-two-credential revokes into a double self-lockout.
    */
+/**
+   * STORY-096 slice C — `GET /me/oauth`, the providers this caller has linked.
+   *
+   * ⚠ REVOKED CREDENTIALS ARE NOT LINKS. `unlink` revokes by setting
+   * `revoked_at` rather than deleting the row, so a history of every provider
+   * the caller has ever connected sits in this table. Reading it without the
+   * filter would offer "Disconnect" for an account they already disconnected,
+   * and `unlink` would answer 403.
+   *
+   * ⚠ `kind = 'oauth'` ONLY. `ux_credentials_oauth` also covers `saml` and
+   * `oidc`, which are enterprise SSO bindings rather than personal connected
+   * accounts — they are not something an individual connects or disconnects
+   * here, and listing them under "Connected accounts" would offer a Disconnect
+   * for their organisation's sign-in.
+   *
+   * ⚠ SCOPED BY `user_id`, NOT BY TENANT. A credential belongs to a PERSON,
+   * not to a workspace — this is the actor-self-scoped class ISO-18..22
+   * covers, and the route carries `@SkipTenantContext()` for the same reason
+   * `GET /me/passkeys` does.
+   */
+  async listLinks(userId: string, pagination: PaginationRequest): Promise<Page<OauthLinkItem>> {
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
+    const result = await this.pool.query<OauthLinkRow>(
+      `SELECT id, provider, last_used_at, created_at, created_at::text AS created_at_key
+         FROM user_credentials
+        WHERE user_id = $1 AND kind = 'oauth' AND revoked_at IS NULL AND provider IS NOT NULL
+          AND ($2::timestamptz IS NULL OR (created_at, id) > ($2::timestamptz, $3::uuid))
+        ORDER BY created_at ASC, id ASC
+        LIMIT $4`,
+      [userId, after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
+    );
+    return pageFrom(result.rows, pagination.limit, toOauthLinkItem, (row) => [row.created_at_key, row.id]);
+  }
+
   async unlink(userId: string, provider: OauthProvider): Promise<void> {
     const client = await this.pool.connect();
     try {
