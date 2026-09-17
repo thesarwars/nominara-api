@@ -4,6 +4,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { oauthLinkItemSchema } from "../../contracts/identity/oauth-link-response.schema.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { IdentityService } from "../../src/modules/identity/identity.service.js";
 import { OauthService } from "../../src/modules/identity/oauth.service.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 
@@ -166,4 +167,151 @@ describe("STORY-096C · GET /me/oauth", () => {
   it("says plainly that nothing is connected", async () => {
     expect((await page()).items).toEqual([]);
   });
+
+  it("⚠ excludes an oauth row with no provider, which no constraint forbids", () => {
+    // The guard exists and had no test: nothing in the schema stops a
+    // `kind='oauth'` row with a NULL provider, and `responseSchema` is used
+    // only for OpenAPI generation — there is no runtime response validation —
+    // so `{"provider": null}` would reach the wire against a strict enum.
+    return (async () => {
+      await credential({ provider: null, subject: "no-provider" });
+      expect((await page()).items).toEqual([]);
+    })();
+  });
+
+  it("⚠ the CURSOR publishes the row id, which the item deliberately omits", () => {
+    // The cursor is unsigned base64url of the sort tuple, so `id` is readable
+    // by anyone holding one. That is a deliberate consequence of cursor
+    // pagination and not a leak of `external_subject` — asserted here so it
+    // stays a decision rather than a surprise. The assertion that the ITEM
+    // omits it lives above; this one covers the half that inspection misses.
+    return (async () => {
+      await credential({ provider: "google", subject: "one" });
+      await credential({ provider: "github", subject: "two" });
+
+      const first = await service.listLinks(userId, { limit: 1 });
+      const decoded = Buffer.from(first.pagination.cursor_next!, "base64url").toString("utf8");
+
+      expect(decoded).not.toContain("one");
+      expect(decoded).not.toContain("two");
+      expect(decoded).toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-/); // the row id, by design
+    })();
+  });
+});
+
+// ⚠ THE LOCKOUT HAZARD THIS SCREEN NEWLY CREATES, and it had no test.
+//
+// `/settings/security` is the first surface to put "remove a passkey" and
+// "disconnect an account" side by side. The existing race test in
+// identity-passkey-webauthn.spec.ts is passkey-versus-passkey; nothing raced
+// `IdentityService.revokePasskey` against `OauthService.unlink`. Both count
+// the caller's whole active credential set under `FOR UPDATE` before deciding,
+// so the second transaction must block and re-evaluate — but a future
+// narrowing of either lock to the target row would ship green without this.
+describe("STORY-096C · a person cannot be locked out by removing their last two credentials at once", () => {
+  let container: StartedPostgreSqlContainer;
+  let pool: Pool;
+  let oauth: OauthService;
+  let identity: IdentityService;
+
+  beforeAll(async () => {
+    applyFakeApiEnv();
+    container = await new PostgreSqlContainer("pgvector/pgvector:pg18")
+      .withDatabase("nominara_test")
+      .withUsername("nominara")
+      .withPassword("nominara")
+      .start();
+    pool = new Pool({ connectionString: container.getConnectionUri() });
+    const client = await pool.connect();
+    try {
+      await migrateUp(client);
+    } finally {
+      client.release();
+    }
+    oauth = new OauthService(pool, {} as never, {} as never);
+    identity = new IdentityService(pool, {} as never);
+  }, 300_000);
+
+  afterAll(async () => {
+    await pool.end();
+    await container.stop();
+  });
+
+  it("⚠ the rule counts BOTH KINDS — an oauth link is removable while a passkey remains", async () => {
+    // The mirror of the lockout assertion, and the one that catches
+    // OVER-refusal. Narrowing `unlink`'s lock/count to `kind = 'oauth'` still
+    // passes the concurrent test — it refuses, which is what that test wants —
+    // but it refuses a person who has a perfectly good passkey to fall back
+    // on. The last-credential rule is about the whole credential set, not
+    // about the set of one kind.
+    const id = randomUUID();
+    await pool.query(`INSERT INTO users (id, email, status) VALUES ($1, $2, 'active')`, [id, `${id}@nominara.test`]);
+    await pool.query(
+      `INSERT INTO user_credentials (user_id, kind, credential_id, public_key, sign_count)
+       VALUES ($1, 'passkey', $2, '\\x00'::bytea, 0)`,
+      [id, Buffer.from(randomUUID())],
+    );
+    await pool.query(
+      `INSERT INTO user_credentials (user_id, kind, provider, external_subject) VALUES ($1, 'oauth', 'google', $2)`,
+      [id, randomUUID()],
+    );
+
+    await expect(oauth.unlink(id, "google")).resolves.toBeUndefined();
+
+    const left = await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM user_credentials WHERE user_id = $1 AND revoked_at IS NULL`,
+      [id],
+    );
+    expect(Number(left.rows[0]!.n)).toBe(1);
+  });
+
+  it("⚠ and refuses once that passkey is the only thing left", async () => {
+    const id = randomUUID();
+    await pool.query(`INSERT INTO users (id, email, status) VALUES ($1, $2, 'active')`, [id, `${id}@nominara.test`]);
+    await pool.query(
+      `INSERT INTO user_credentials (user_id, kind, provider, external_subject) VALUES ($1, 'oauth', 'github', $2)`,
+      [id, randomUUID()],
+    );
+
+    await expect(oauth.unlink(id, "github")).rejects.toThrow(/last remaining credential/i);
+  });
+
+  it("⚠ one of the two concurrent removals is refused, every time", async () => {
+    const ROUNDS = 8;
+    const outcomes: string[] = [];
+
+    for (let round = 0; round < ROUNDS; round += 1) {
+      const id = randomUUID();
+      await pool.query(`INSERT INTO users (id, email, status) VALUES ($1, $2, 'active')`, [id, `${id}@nominara.test`]);
+      const passkey = await pool.query<{ id: string }>(
+        `INSERT INTO user_credentials (user_id, kind, credential_id, public_key, sign_count)
+         VALUES ($1, 'passkey', $2, '\\x00'::bytea, 0) RETURNING id`,
+        [id, Buffer.from(randomUUID())],
+      );
+      await pool.query(
+        `INSERT INTO user_credentials (user_id, kind, provider, external_subject) VALUES ($1, 'oauth', 'google', $2)`,
+        [id, randomUUID()],
+      );
+
+      // Fired together: one removes the last passkey, the other the last link.
+      const [a, b] = await Promise.allSettled([
+        identity.revokePasskey(id, passkey.rows[0]!.id),
+        oauth.unlink(id, "google"),
+      ]);
+
+      const left = await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM user_credentials WHERE user_id = $1 AND revoked_at IS NULL`,
+        [id],
+      );
+      outcomes.push(`${a.status}/${b.status}:${left.rows[0]!.n}`);
+
+      // ⚠ NEVER ZERO. That is the whole assertion — a person with two ways in
+      // who removes both at once must keep one, not lose both to a race.
+      expect(Number(left.rows[0]!.n)).toBeGreaterThanOrEqual(1);
+      // And exactly one of the two was refused, rather than both succeeding.
+      expect([a.status, b.status].filter((s) => s === "rejected")).toHaveLength(1);
+    }
+
+    expect(outcomes).toHaveLength(ROUNDS);
+  }, 120_000);
 });

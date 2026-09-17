@@ -19,6 +19,15 @@ import { oauthProviderSchema } from "./oauth-provider.schema.js";
 // Google", and the identifier is a cross-service correlator this product has
 // no reason to publish back to a browser. Same rule
 // `passkey-list-response.schema.ts` states for `credential_id`.
+// ⚠ NO IDENTIFIER, AND THAT IS A LIMITATION RATHER THAN A DECISION.
+// `DELETE /me/oauth/{provider}` is keyed on the PROVIDER, so publishing a row
+// id here would hand a caller something they cannot act on. The consequence is
+// that two accounts on one provider are visible but not individually
+// addressable: `unlink` revokes the OLDEST (ordered explicitly in
+// `oauth.service.ts` so it is at least a rule rather than whichever row the
+// planner returned first), and the screen states which one it will take.
+// Making a specific link addressable needs an id-keyed route — a change to a
+// shipped contract, filed rather than folded into this one.
 export const oauthLinkItemSchema = z
   .object({
     provider: oauthProviderSchema,

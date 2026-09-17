@@ -496,13 +496,6 @@ export class OauthService {
   }
 
   /**
-   * DELETE /me/oauth/:provider. Mirrors IdentityService.revokePasskey's
-   * exact pattern (identity.service.ts): locks the user's WHOLE active
-   * credential set before counting, not just the target row — see that
-   * method's comment for why locking only the target row races two
-   * concurrent last-two-credential revokes into a double self-lockout.
-   */
-/**
    * STORY-096 slice C — `GET /me/oauth`, the providers this caller has linked.
    *
    * ⚠ REVOKED CREDENTIALS ARE NOT LINKS. `unlink` revokes by setting
@@ -517,10 +510,27 @@ export class OauthService {
    * here, and listing them under "Connected accounts" would offer a Disconnect
    * for their organisation's sign-in.
    *
-   * ⚠ SCOPED BY `user_id`, NOT BY TENANT. A credential belongs to a PERSON,
-   * not to a workspace — this is the actor-self-scoped class ISO-18..22
-   * covers, and the route carries `@SkipTenantContext()` for the same reason
-   * `GET /me/passkeys` does.
+   * ⚠ SCOPED BY `user_id`, AND NOTHING ELSE. A credential belongs to a PERSON,
+   * not to a workspace, so the route carries `@SkipTenantContext()` for the
+   * same reason `GET /me/passkeys` does.
+   *
+   * ⚠ AND NO RLS POLICY BACKS THAT UP — I claimed ISO-18..22 covered this and
+   * it does not. `ACTOR_SELF_SCOPED_TABLES` is `["workspaces",
+   * "workspace_members"]`; `user_credentials` has `relrowsecurity = false` and
+   * zero policies. The two real controls are:
+   *
+   *   1. THE GRANT. Migration 0005 revokes the table from `nominara_worker`,
+   *      `nominara_report` and `nominara_portal` outright, leaving only
+   *      `nominara_app`. Its own comment says why this is stronger than a
+   *      policy: "RLS would be the weaker control here because it would imply
+   *      the table was reachable and merely filtered."
+   *   2. THE PREDICATE BELOW, which is hand-written and therefore deletable.
+   *
+   * So deleting `AND user_id = $1` fails no isolation assertion anywhere —
+   * only `identity-oauth-links.spec.ts`'s cross-user test stands between that
+   * and a cross-account credential listing. Said plainly here because the
+   * route-permission EXEMPT list carries a written reason, and a reason that
+   * names a safety net that does not exist is worse than no reason at all.
    */
   async listLinks(userId: string, pagination: PaginationRequest): Promise<Page<OauthLinkItem>> {
     const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
@@ -536,13 +546,32 @@ export class OauthService {
     return pageFrom(result.rows, pagination.limit, toOauthLinkItem, (row) => [row.created_at_key, row.id]);
   }
 
+  /**
+   * DELETE /me/oauth/:provider. Mirrors IdentityService.revokePasskey's
+   * exact pattern (identity.service.ts): locks the user's WHOLE active
+   * credential set before counting, not just the target row — see that
+   * method's comment for why locking only the target row races two
+   * concurrent last-two-credential revokes into a double self-lockout.
+   */
   async unlink(userId: string, provider: OauthProvider): Promise<void> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
 
+      // ⚠ ORDERED, BECAUSE `find` BELOW TAKES THE FIRST MATCH. One person can
+      // hold two accounts on the same provider — `ux_credentials_oauth` is
+      // unique on (provider, external_subject), not (user_id, provider) — and
+      // this route is keyed on the PROVIDER, so with two Google accounts it
+      // revokes one of them. Unordered, which of the two was undefined: the
+      // same click could take the work account on one call and the personal
+      // one on the next. Oldest-first at least makes it a rule the screen can
+      // state. Addressing a SPECIFIC link needs an id-keyed route, which is
+      // a contract change and is filed rather than smuggled in here.
       const active = await client.query<{ id: string; kind: string; provider: string | null }>(
-        `SELECT id, kind, provider FROM user_credentials WHERE user_id = $1 AND revoked_at IS NULL FOR UPDATE`,
+        `SELECT id, kind, provider FROM user_credentials
+          WHERE user_id = $1 AND revoked_at IS NULL
+          ORDER BY created_at ASC, id ASC
+          FOR UPDATE`,
         [userId],
       );
       const target = active.rows.find((row) => row.kind === "oauth" && row.provider === provider);
