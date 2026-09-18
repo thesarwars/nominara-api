@@ -153,6 +153,12 @@ function refusalFor(queue: string): "inert" | "tenant-scoped" | null {
  * reachable. `getJobSchedulers` then `upsert`/`remove` is a read-then-write on
  * shared Redis state with no lock, so a scheduler registered under a
  * different key inside the window survives and both fire at the same instant.
+ * STORY-141 has since made the handler take `credit.reconcile`'s advisory
+ * lock, so the overlap this paragraph worried about is now excluded at the
+ * source and what follows is the second line of defence rather than the
+ * first. It is still exactly true of the hand-run ops path, and still the
+ * thing that holds if the lock is ever removed.
+ *
  * Two concurrent `credit.reconcile` runs are safe, and not by accident:
  * `releaseReservation` takes the wallet row lock FIRST, reads the ledger under
  * it, and treats a refused append as a throw rather than an outcome. The test

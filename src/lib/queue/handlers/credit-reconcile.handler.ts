@@ -5,6 +5,7 @@ import { z } from "zod";
 import { connect } from "../../../db/client.js";
 import { reconcileOrphanedReservations } from "../../credits/reconcile.js";
 import { globalQueueLockKey, releaseAdvisorySessionLock, tryAdvisorySessionLock } from "../locks.js";
+import { incrementCounter } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 
@@ -66,13 +67,58 @@ const payloadSchema = z
  * connection, and the alternative — a second pool for a job that runs every
  * ten minutes — costs more than it saves.
  */
+/**
+ * ⚠ BOUNDS HOW LONG A DEAD PROCESS CAN HOLD THE LOCK, and without it this
+ * handler's lock is strictly more dangerous than no lock at all.
+ *
+ * The case is a replica that is PARTITIONED rather than killed. Killed is
+ * already safe — the backend dies and Postgres drops its session locks, which
+ * is the argument `locks.ts` makes. Partitioned is not: the client is gone,
+ * the backend is alive and idle holding the lock, and because
+ * `pg_try_advisory_lock` is fleet-wide, every other replica's tick now yields.
+ * No orphaned reservation in any workspace is returned to anyone until that
+ * backend notices — and nothing in this repository sets any timeout, so it
+ * notices at the OS TCP keepalive default, which is TWO HOURS on Linux.
+ *
+ * Worse, it is silent: a yielded tick completes successfully, so the
+ * dead-letter queue stays empty and every alarm reads green while the one
+ * path that hands credits back to customers who were never charged is dead.
+ *
+ * These are SERVER-side settings for this session, so the backend probes its
+ * own peer and terminates itself in roughly 90 seconds instead of two hours —
+ * and Postgres releases the session locks of a terminated backend.
+ *
+ * ⚠ DELIBERATELY NOT AN `idle_session_timeout`. That would also fire during a
+ * perfectly healthy long scan: this connection is legitimately idle for most
+ * of a run, because the releases happen on the `work` pool. It would then
+ * terminate the holder MID-RUN, dropping the lock while the remaining
+ * releases carried on unprotected — turning a bounded wait into the exact
+ * concurrency this lock exists to prevent. Keepalives distinguish "idle" from
+ * "gone"; a timeout cannot.
+ *
+ * ⚠ PASSED AS STARTUP OPTIONS RATHER THAN `SET`, and not to dodge anything.
+ * `eslint-rules/no-session-scoped-config.js` bans a bare `SET` because
+ * session-scoped config leaks across pooled connections under pgBouncer
+ * transaction pooling (NFR-SEC-02) — a real hazard, and the rule is right.
+ * It cannot apply here: this is `DATABASE_URL`, the DIRECT connection, opened
+ * by `connect()` per job and never returned to a pool. Startup options are
+ * also simply the better mechanism — the GUCs are in force from the moment
+ * the backend starts, rather than after three round-trips during which the
+ * window this closes is still open.
+ */
+export function withKeepalives(databaseUrl: string): string {
+  const url = new URL(databaseUrl);
+  url.searchParams.set("options", "-c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3");
+  return url.toString();
+}
+
 export function createCreditReconcileHandler(context: QueueHandlerContext): JobProcessor {
   const logger = new Logger("credit.reconcile");
 
   return async (_client: ClientBase, job: Job): Promise<void> => {
     const payload = payloadSchema.parse((job.data as { payload?: unknown }).payload ?? {});
 
-    const discovery = await connect(context.env.DATABASE_URL);
+    const discovery = await connect(withKeepalives(context.env.DATABASE_URL));
     const lockKey = globalQueueLockKey("credit.reconcile");
     let outcome;
     let held = false;
@@ -88,27 +134,41 @@ export function createCreditReconcileHandler(context: QueueHandlerContext): JobP
       // per-reservation transactions the scan opens. See `locks.ts`.
       held = await tryAdvisorySessionLock(discovery, lockKey);
       if (!held) {
-        logger.log("another replica holds the reconcile lock; yielding this tick");
+        // ⚠ COUNTED, NOT JUST LOGGED, AND AT WARN. In steady state there is
+        // ONE scheduler across the fleet producing ONE job per cadence, so a
+        // yield is already anomalous rather than routine — it means a scan
+        // has outrun its ten-minute cadence, or a holder is wedged. The
+        // failure this guards is silent by construction: a yielded tick
+        // COMPLETES, so the DLQ stays empty and every existing alarm reads
+        // green while no orphaned reservation in any workspace is being
+        // returned to anyone. An INFO line nobody greps is not a signal.
+        incrementCounter("credit_reconcile_yielded_total");
+        logger.warn("another replica holds the reconcile lock; yielding this tick");
         return;
       }
       outcome = await reconcileOrphanedReservations({ discovery, work: context.pool });
     } finally {
-      // ⚠ THESE TWO LINES ARE REDUNDANT AND BOTH ARE HERE ON PURPOSE. Ending
-      // the connection releases the lock by itself — Postgres drops every
-      // session-level advisory lock when the backend terminates — so the
-      // explicit unlock changes nothing observable today, and a mutation
-      // removing EITHER one passes the whole suite. Removing BOTH fails six
-      // of seven tests, which is what is actually pinned: after this handler
-      // returns, by any path, the lock is not held.
+      // ⚠ `end()` IS THE GUARANTEE; THE EXPLICIT UNLOCK IS THE DOCUMENTATION.
+      // An earlier version of this comment called the two redundant, and a
+      // review proved that backwards in two directions.
       //
-      // The explicit unlock earns its place against a change that has not
-      // happened yet. If `discovery` ever becomes a pooled client, `end()`
-      // turns into `release()` and hands the connection back to the pool
-      // STILL HOLDING the lock — which would wedge the reconciler for the
-      // life of the process and, because the reconciler is the path that
-      // returns credits to people who were never charged, would do it
-      // silently. Do not read this line as load-bearing today; read it as the
-      // thing that keeps the failure loud if that refactor arrives.
+      // `end()` is load-bearing on its own. Remove it and the seven tests
+      // below still pass, but every yielded tick LEAKS an owner-role,
+      // non-pooled backend — one every ten minutes per replica until
+      // `max_connections` is gone, at which point `connect()` above starts
+      // failing and reconciliation stops entirely. That is pinned now.
+      //
+      // And the explicit unlock cannot cover the case that most needs it.
+      // Session advisory locks survive ROLLBACK and a failed statement, so if
+      // `pg_try_advisory_lock` is executed server-side and the client call
+      // then rejects — a cancel, a socket error after the server processed
+      // it — the SERVER holds the lock while `held` is false, and the
+      // conditional below is skipped. `end()` is the only thing that releases
+      // it on that path.
+      //
+      // The unlock still earns its place, for a change that has not happened
+      // yet: if `discovery` ever becomes pooled, `end()` turns into
+      // `release()` and hands the connection back STILL HOLDING the lock.
       if (held && !(await releaseAdvisorySessionLock(discovery, lockKey))) {
         logger.error("reconcile lock was not held at release — the lock key or the connection changed under us");
       }

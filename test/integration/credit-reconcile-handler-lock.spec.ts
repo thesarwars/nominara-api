@@ -1,13 +1,31 @@
 import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool, type ClientBase } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { Logger } from "@nestjs/common";
+
+// ⚠ A PASSTHROUGH SPY ON `connect`, so the URL the handler ACTUALLY opens is
+// observable. Asserting `withKeepalives()` builds the right string proves the
+// function; it does not prove the handler calls it, and a mutation dropping
+// the call passed the whole spec until this was added. Postgres exposes no way
+// to read another backend's GUCs, so the connection string is the seam.
+const connectedUrls: string[] = [];
+vi.mock("../../src/db/client.js", async () => {
+  const actual = await vi.importActual<typeof import("../../src/db/client.js")>("../../src/db/client.js");
+  return {
+    ...actual,
+    connect: async (url: string) => {
+      connectedUrls.push(url);
+      return actual.connect(url);
+    },
+  };
+});
 import type { Job } from "bullmq";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { provisionWalletWithGrant } from "../../src/lib/credits/balance.js";
 import { readWallet, reserveCredits } from "../../src/lib/credits/wallet.js";
-import { createCreditReconcileHandler } from "../../src/lib/queue/handlers/credit-reconcile.handler.js";
+import { createCreditReconcileHandler, withKeepalives } from "../../src/lib/queue/handlers/credit-reconcile.handler.js";
 import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
 import type { Env } from "../../src/config/env.schema.js";
 
@@ -110,6 +128,15 @@ describe("STORY-141 · credit.reconcile holds §4's advisory lock", () => {
     return result.rowCount ?? 0;
   }
 
+  async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error("waitUntil timed out");
+  }
+
   /** A granted privilege makes the role undroppable, so it goes first. */
   async function dropBlindRole(): Promise<void> {
     await db.query("REVOKE ALL ON DATABASE nominara_test FROM lock_but_blind").catch(() => undefined);
@@ -165,24 +192,62 @@ describe("STORY-141 · credit.reconcile holds §4's advisory lock", () => {
     });
   });
 
-  it("⚠ RELEASES the lock when the run finishes, so the next tick is not locked out forever", async () => {
-    // A session-scoped lock that is never released is the failure `locks.ts`'s
-    // header warns about. Proven by taking it afterwards rather than by
-    // reading the code.
+  it("⚠ HOLDS the lock ACROSS the per-reservation transactions, and frees it after", async () => {
+    // ⚠ THE ONE TEST THAT PINS THE WHOLE PREMISE, and the first version of
+    // this spec did not have it. Probing after the handler returns cannot
+    // distinguish "released" from "never taken" — a handler that ignores the
+    // lock entirely passes that. A review proved it: five of the original
+    // seven tests passed unchanged against the pre-change handler.
+    //
+    // The reason a SESSION lock was introduced at all is that it must outlive
+    // the per-reservation transactions, which run on a DIFFERENT connection
+    // (the `work` pool). So the assertion has to happen while the scan is
+    // genuinely in flight. This stalls it there: an outside transaction holds
+    // the wallet row with `FOR UPDATE`, so the reconciler blocks INSIDE a
+    // release transaction, and only then is the lock probed.
     await orphan("dead-pod", 40);
 
-    await createCreditReconcileHandler({ pool: appPool, env })(db, tick());
-
+    const blocker = new Client({ connectionString: container.getConnectionUri() });
+    await blocker.connect();
     const probe = new Client({ connectionString: container.getConnectionUri() });
     await probe.connect();
     try {
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT 1 FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE", [workspaceId]);
+
+      const running = createCreditReconcileHandler({ pool: appPool, env })(db, tick());
+
+      // Wait until the reconciler is genuinely blocked on that row rather
+      // than merely started — otherwise this races the scan's own startup and
+      // would pass for the wrong reason.
+      await waitUntil(async () => {
+        const waiting = await probe.query(
+          `SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query ILIKE '%credit_wallets%'`,
+        );
+        return (waiting.rowCount ?? 0) > 0;
+      });
+
+      // MID-SCAN: the lock is held, across a transaction on another connection.
+      expect(await tryAdvisorySessionLock(probe, LOCK_KEY)).toBe(false);
+
+      await blocker.query("ROLLBACK");
+      await running;
+
+      // AFTER: free again.
       expect(await tryAdvisorySessionLock(probe, LOCK_KEY)).toBe(true);
     } finally {
+      await blocker.end();
       await probe.end();
     }
-  });
+  }, 30_000);
 
-  it("⚠ RELEASES the lock even when the scan THROWS, not merely when it fails a row", async () => {
+  it("⚠ does not leave the lock held when the scan THROWS, not merely when it fails a row", async () => {
+    // ⚠ WHAT THIS PINS AND WHAT IT DOES NOT. It proves the error path leaves
+    // no lock behind; it CANNOT distinguish that from never taking one, and a
+    // review measured it passing against the pre-change handler. The test
+    // above is what establishes the lock is taken at all. This one covers the
+    // `finally` on the throw path, which is a narrower but real claim.
+    //
     // The `finally` is what makes this true. Without it, one failed run wedges
     // the reconciler for the life of the process — and the reconciler is the
     // path that hands credits back to people who were never charged, so it
@@ -219,21 +284,122 @@ describe("STORY-141 · credit.reconcile holds §4's advisory lock", () => {
     }
   });
 
-  it("⚠ two genuinely concurrent ticks sweep the orphan exactly once between them", async () => {
-    // The production shape: two replicas, same instant. One wins the lock and
-    // sweeps; the other yields. `credit-ledger-reconciliation.spec.ts` already
-    // proves the ledger survives an overlap WITHOUT the lock — this proves the
-    // overlap no longer happens.
+  it("⚠ of two genuinely concurrent ticks, exactly ONE scans and the other yields", async () => {
+    // ⚠ ASSERTED ON THE LOGS, NOT THE LEDGER, AND THAT IS THE POINT. The first
+    // version checked `releaseCount() === 2` — which holds WITHOUT any lock,
+    // because `releaseReservation` is already idempotent and the loser's
+    // releases come back `already_settled`. So it re-proved
+    // `credit-ledger-reconciliation.spec.ts`'s invariant and said nothing
+    // about this change; a review measured it passing pre-change.
+    //
+    // What distinguishes locked from merely-safe is how many runs SCANNED.
     await orphan("dead-pod", 40);
     await orphan("dead-pod-2", 50);
 
-    await Promise.all([
-      createCreditReconcileHandler({ pool: appPool, env })(db, tick()),
-      createCreditReconcileHandler({ pool: appPool, env })(db, tick()),
-    ]);
+    const scans: string[] = [];
+    const yields: string[] = [];
+    const logSpy = vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
+      if (String(message).startsWith("orphan scan")) scans.push(String(message));
+    });
+    const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation((message: unknown) => {
+      if (String(message).includes("yielding")) yields.push(String(message));
+    });
 
+    try {
+      await Promise.all([
+        createCreditReconcileHandler({ pool: appPool, env })(db, tick()),
+        createCreditReconcileHandler({ pool: appPool, env })(db, tick()),
+      ]);
+    } finally {
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+
+    expect(scans).toHaveLength(1);
+    expect(yields).toHaveLength(1);
+    // And the ledger is still correct, which was never in doubt.
     expect(await releaseCount()).toBe(2);
     expect(await readWallet(db, workspaceId)).toMatchObject({ reserved: 0, available: 600 });
+  }, 30_000);
+
+  it("⚠ LEAKS NO BACKEND, which is what makes `discovery.end()` load-bearing", async () => {
+    // ⚠ THE MUTANT THAT USED TO SURVIVE. An earlier comment called `end()` and
+    // the explicit unlock redundant; a review proved that backwards. Remove
+    // `end()` and every one of these ticks leaks an OWNER-ROLE, non-pooled
+    // backend — one every ten minutes per replica in production, until
+    // `max_connections` is exhausted and `connect()` starts failing, at which
+    // point reconciliation stops entirely. Nothing pinned it.
+    //
+    // Yielded ticks are used because they are the cheapest path through the
+    // whole function, and they still open and must close a connection.
+    const owner = async (): Promise<number> => {
+      const result = await db.query(
+        `SELECT count(*)::int AS n FROM pg_stat_activity WHERE usename = 'nominara' AND datname = current_database()`,
+      );
+      return result.rows[0]!.n as number;
+    };
+
+    await orphan("dead-pod", 40);
+    const before = await owner();
+
+    await asAnotherReplica(async () => {
+      for (let i = 0; i < 5; i += 1) {
+        await createCreditReconcileHandler({ pool: appPool, env })(db, tick());
+      }
+    });
+
+    expect(await owner()).toBe(before);
+  }, 30_000);
+
+  it("⚠ BOUNDS how long a dead process can hold the lock, via server-side keepalives", async () => {
+    // ⚠ WITHOUT THIS THE LOCK IS WORSE THAN NO LOCK. A replica that is
+    // PARTITIONED rather than killed leaves a live backend holding a
+    // fleet-wide lock, and nothing in this repository sets any timeout — so
+    // every other replica's tick yields until the OS TCP keepalive default
+    // notices, which is TWO HOURS on Linux. For that whole window no orphaned
+    // reservation in any workspace is returned to anyone, and because a
+    // yielded tick COMPLETES, the dead-letter queue stays empty and every
+    // alarm reads green.
+    //
+    // Asserted against `pg_settings` on a connection built the same way the
+    // handler builds its own, because a URL that merely looks right proves
+    // nothing — the option has to actually reach the backend.
+    const probe = new Client({ connectionString: withKeepalives(container.getConnectionUri()) });
+    await probe.connect();
+    try {
+      const settings = await probe.query<{ name: string; setting: string }>(
+        "SELECT name, setting FROM pg_settings WHERE name LIKE 'tcp_keepalives%' ORDER BY name",
+      );
+      expect(settings.rows).toEqual([
+        { name: "tcp_keepalives_count", setting: "3" },
+        { name: "tcp_keepalives_idle", setting: "60" },
+        { name: "tcp_keepalives_interval", setting: "10" },
+      ]);
+    } finally {
+      await probe.end();
+    }
+  });
+
+  it("⚠ the HANDLER opens its discovery connection with those keepalives", async () => {
+    // The wiring, not the helper. Dropping `withKeepalives(...)` from the
+    // handler's own `connect()` call passed every other test in this file.
+    connectedUrls.length = 0;
+    await orphan("dead-pod", 40);
+
+    await createCreditReconcileHandler({ pool: appPool, env })(db, tick());
+
+    expect(connectedUrls).toHaveLength(1);
+    expect(connectedUrls[0]).toContain("tcp_keepalives_idle%3D60");
+  });
+
+  it("⚠ preserves whatever the database URL already carried", async () => {
+    // Appending options by string concatenation would corrupt a URL that
+    // already has a query, and the reconciler's connection is the privileged
+    // one — a malformed url here fails the run, not a request.
+    const built = new URL(withKeepalives("postgres://u:p@h:5432/db?sslmode=require"));
+    expect(built.searchParams.get("sslmode")).toBe("require");
+    expect(built.searchParams.get("options")).toContain("tcp_keepalives_idle=60");
+    expect(built.pathname).toBe("/db");
   });
 
   it("⚠ locks on the key locks.ts already names for this queue, not a new one", async () => {
