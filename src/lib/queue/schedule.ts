@@ -67,8 +67,17 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // ⚠ DAILY, WHERE §4 SAYS MONTHLY — A DECISION, NOT A TRANSCRIPTION, and the
   // one place in this table where the cron does not follow the reference.
   //
-  // The job is idempotent and costs almost nothing when there is nothing to
-  // do: `computePartitionMonths` creates only the months that are missing.
+  // ⚠ AND THE TICK RUNS ONLY THE RUNWAY HALF. `maintenance-partition.handler.ts`
+  // calls `runPartitionRunwayMaintenance`, not `runMonthlyMaintenance`: the
+  // destructive parts (cold-tier moves, detach/drop past retention, vector
+  // index rebuilds) stay operator-invoked. The drop cutoff is the MINIMUM
+  // retention across ACTIVE workspaces, so one reversible soft-delete
+  // collapses it platform-wide — at monthly there was up to a month to notice
+  // and revert; at daily the next tick drops, and a dropped partition does not
+  // come back. The two halves were never one cadence, only one function.
+  //
+  // The runway half is idempotent and costs almost nothing when there is
+  // nothing to do: `computePartitionMonths` creates only the missing months.
   // Monthly gives it ONE attempt per month, so a single failed run is not
   // discovered until rows are already in the default partition — and by then
   // the fix is no longer "create a partition", it is "move rows out from under
