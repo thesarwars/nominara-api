@@ -55,9 +55,10 @@ const DELIBERATE_DIVERGENCE: Record<string, { cron: string; because: string }> =
  * separate for the same reason the topology keeps its additions separate: the
  * §4 transcription above must stay quotable.
  */
-const FROM_OTHER_REFERENCES: Record<string, { cron: string; source: string }> = {
+const FROM_OTHER_REFERENCES: Record<string, { cron: string; section: string; source: string }> = {
   "audit.verify": {
     cron: "40 2 * * *",
+    section: "§12",
     source: "security-and-tenancy.md §12 — a verifier job re-walks each chain daily and pages on the first mismatch",
   },
 };
@@ -74,7 +75,7 @@ describe("G12 · the schedule table matches the reference", () => {
       expect(scheduleFor(queue)?.cron, queue).toBe(entry.cron);
       // The table's own `statedAs` must carry the provenance, so a reader of
       // the source is not left assuming §4 said something it does not.
-      expect(scheduleFor(queue)?.statedAs, queue).toContain("§12");
+      expect(scheduleFor(queue)?.statedAs, queue).toContain(entry.section);
       expect(entry.source.length).toBeGreaterThan(40);
     }
   });

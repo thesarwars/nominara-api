@@ -1,5 +1,5 @@
 import { Logger } from "@nestjs/common";
-import type { Job } from "bullmq";
+import { UnrecoverableError, type Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
 import { LoggingPagingNotifier } from "../../../modules/audit/adapters/logging-paging-notifier.js";
@@ -31,6 +31,32 @@ import type { JobProcessor } from "../worker-factory.js";
 // queue is declared in `topology.ts` as an explicit addition — see
 // ADDED_BEYOND_REFERENCE in `test/unit/queue/topology.spec.ts`.
 
+// ⚠ WHAT A "no mismatch" LINE DOES NOT MEAN. Three tampers pass this walk
+// clean, all inherited from STORY-020 and all reproduced by review. They are
+// listed here because this story is what turns the walk into a nightly
+// assurance, and an assurance whose limits are not written down is read as
+// covering everything:
+//
+//   1. TAIL TRUNCATION. Delete the last k rows of a chain and the remainder
+//      verifies from genesis with no complaint — there is no expected head,
+//      no expected length, and nothing persists a high-water mark between
+//      runs. This is the tamper an attacker actually performs, because the
+//      newest rows are the ones recording what they just did.
+//   2. WHOLE-CHAIN DELETION. Discovery is `SELECT DISTINCT workspace_id FROM
+//      audit_log`, so a workspace whose rows are ALL deleted stops existing
+//      for the verifier rather than becoming a finding.
+//   3. ANYTHING BEFORE A RECHAINING MARKER. `verifyChain` trusts on-disk
+//      hashes before the last marker (STORY-020-E-9, deliberate — erasure
+//      rewrites content), so one forged marker moves the whole history into
+//      the lenient zone permanently.
+//
+// A missing GENESIS row IS caught, for contrast: the surviving first row's
+// prev_hash will not equal GENESIS_HASH. It is the tail that is invisible.
+//
+// `audit-verify-handler.spec.ts` pins all three as KNOWN GAPS so they cannot
+// widen unnoticed, and closing them needs a stored per-workspace high-water
+// mark — its own story, not a comment here.
+
 /**
  * ⚠ THE OWNER CONNECTION, because the verifier is cross-tenant by definition.
  * `listAuditedWorkspaceIds` has no workspace filter — it cannot, or it would
@@ -59,29 +85,51 @@ export function createAuditVerifyHandler(context: QueueHandlerContext): JobProce
       // skipped run loses nothing because the next one asks the same question.
       held = await tryAdvisorySessionLock(client, lockKey);
       if (!held) {
-        incrementCounter("audit_verify_yielded_total");
+        incrementCounter("nominara_audit_verify_yielded_total");
         logger.warn("another replica holds the audit-verify lock; yielding this tick");
         return;
       }
 
       const result = await verifyAllChains(client, new LoggingPagingNotifier());
 
-      if (result.mismatch === null) {
-        logger.log("audit chains verified: no mismatch");
+      if (result.mismatches.length === 0) {
+        logger.log(`audit chains verified: no mismatch across ${String(result.walked)} workspace(s)`);
         return;
       }
 
-      // ⚠ PAGED, COUNTED, AND THE JOB STILL SUCCEEDS. `verifyAllChains` has
-      // already paged through the notifier — that is the §12 requirement and
-      // it has happened by the time we get here. Throwing would ALSO send the
-      // tick down the retry ladder to re-walk every chain and page again,
-      // identically, on every attempt, and then park in the dead-letter queue
-      // looking like a broken verifier rather than a detected mismatch. A
-      // mismatch is a finding, not a failure to find.
-      incrementCounter("audit_chain_mismatch_detected", { workspace_id: result.mismatch.workspaceId });
-      logger.error(
-        `audit chain mismatch in workspace ${result.mismatch.workspaceId} at seq ${String(result.mismatch.seq)}: ` +
-          result.mismatch.reason,
+      for (const mismatch of result.mismatches) {
+        incrementCounter("nominara_audit_chain_mismatch_total", { workspace_id: mismatch.workspaceId });
+        logger.error(
+          `audit chain mismatch in workspace ${mismatch.workspaceId} at seq ${String(mismatch.seq)}: ${mismatch.reason}`,
+        );
+      }
+
+      // ⚠ THE JOB FAILS, AND AN EARLIER VERSION OF THIS COMMENT WAS WRONG
+      // ABOUT WHY IT NEED NOT. It claimed `verifyAllChains` "has already paged
+      // — that is the §12 requirement and it has happened". It has not.
+      // `LoggingPagingNotifier` says so in its own header: a stub, because no
+      // paging client exists in this repo (STORY-020-E-4), and
+      // `incrementCounter` is a `Logger.log` for the same reason — no metrics
+      // backend exists either. So on the old path the complete output of a
+      // detected tamper was three log lines and a GREEN job: no failed job, no
+      // dead-letter entry, no alert, nothing a machine watches. The audit
+      // log's tamper detection would have run nightly and told nobody.
+      //
+      // That notifier's own comment names what used to close the gap: "the
+      // calling worker script decides process.exitCode, not this class." The
+      // script's non-zero exit WAS the escalation, and moving the job onto a
+      // queue removed it. Failing the job is what puts it back — the
+      // dead-letter queue is the one channel here that an operator actually
+      // reads.
+      //
+      // `UnrecoverableError` rather than a plain throw, which answers the
+      // objection the old comment was reaching for: it skips the retry ladder
+      // entirely, so this is ONE walk, ONE page and ONE dead-letter entry per
+      // day, never a re-walk of the estate and never a repeated page.
+      throw new UnrecoverableError(
+        `audit chain mismatch in ${String(result.mismatches.length)} workspace(s); ` +
+          `first: ${result.mismatches[0]!.workspaceId} at seq ${String(result.mismatches[0]!.seq)} ` +
+          `(${result.mismatches[0]!.reason})`,
       );
     } finally {
       // ⚠ `client.end()` IS WHAT GUARANTEES THE RELEASE; this call is the

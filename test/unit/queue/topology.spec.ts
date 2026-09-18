@@ -268,8 +268,9 @@ const EXPECTED_GROUP_COUNTS: Record<string, number> = {
  * a list with a reason rather than silently inside a table that claims to be a
  * copy of §4.
  */
-const ADDED_BEYOND_REFERENCE: Record<string, { because: string }> = {
+const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: string }> = {
   "audit.verify": {
+    workerGroup: "rollup",
     because:
       "security-and-tenancy.md §12 requires a verifier job that re-walks each audit chain daily and pages on the first mismatch. " +
       "§4's table never allocated it a queue, so STORY-020 wrote the job (workers/rollup/audit-verify.ts) with nowhere to run it — " +
@@ -323,13 +324,15 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     for (const entry of QUEUE_TOPOLOGY) {
       actualCounts[entry.workerGroup] = (actualCounts[entry.workerGroup] ?? 0) + 1;
     }
-    // §4's counts, plus the additions, attributed to the group each one
-    // actually declares — so an addition dropped into the wrong group fails
-    // here rather than quietly inflating a number somebody once wrote down.
+    // ⚠ THE GROUP COMES FROM THE RECORD, NOT FROM THE TOPOLOGY. The first
+    // version read `QUEUE_TOPOLOGY.find(name)!.workerGroup` — the actual value
+    // — which made the expectation self-satisfying, while its comment claimed
+    // it caught a misplaced addition. A review moved `audit.verify` to the
+    // capture group and this test stayed green. Declaring the group alongside
+    // the reason is what makes it an assertion.
     const expectedCounts = { ...EXPECTED_GROUP_COUNTS };
-    for (const name of Object.keys(ADDED_BEYOND_REFERENCE)) {
-      const group = QUEUE_TOPOLOGY.find((entry) => entry.name === name)!.workerGroup;
-      expectedCounts[group] = (expectedCounts[group] ?? 0) + 1;
+    for (const added of Object.values(ADDED_BEYOND_REFERENCE)) {
+      expectedCounts[added.workerGroup] = (expectedCounts[added.workerGroup] ?? 0) + 1;
     }
     expect(actualCounts).toEqual(expectedCounts);
   });
