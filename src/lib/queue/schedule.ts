@@ -20,6 +20,25 @@ import { QUEUE_TOPOLOGY } from "./topology.js";
 // whoever is awake). Only the cadences §4 states unambiguously are here. The
 // rest are listed with what the reference actually says, so the gap is
 // visible in this table rather than discovered later.
+//
+// ⚠ A ROW HERE IS NOT A PROMISE THAT THE QUEUE TICKS. This table records what
+// §4 SAYS; `schedule-registrar.ts` decides what can actually be driven by a
+// bare repeatable, and refuses two whole categories — a queue with no handler,
+// and a queue that is `tenantScoped`. For a tenant-scoped queue, "cron hourly"
+// in §4 describes a SWEEP that enqueues one signed job per project (what
+// `src/lib/capture/scheduler.ts` is for `capture.plan`), not a repeatable on
+// the queue itself: a job scheduler has no workspace to name and no key to
+// sign with, and the tenant processor rejects the empty envelope before the
+// handler is reached. Of the four dated rows below, only `credit.reconcile`
+// is schedulable today. The other three are cadences waiting on a producer.
+//
+// ⚠ AND "HOURLY" INVENTS A MINUTE, by the same argument this header makes
+// about inventing an hour. `0 * * * *` picks minute 0, the most contended
+// minute of the hour on any box, and the two hourly rows below would collide
+// on it exactly. §6.1's explicit `:05` for `capture.plan` shows the reference
+// choosing minutes deliberately when it cares. Neither hourly row is
+// schedulable yet, so nothing turns on it today — but when a sweep arrives
+// for them, the minute is a decision to make and not a transcription to copy.
 export interface QueueSchedule {
   readonly queue: string;
   /** A cron expression, or null when the reference states a period without a time. */

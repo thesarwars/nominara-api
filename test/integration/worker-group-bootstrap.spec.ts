@@ -2,6 +2,7 @@ import { Queue, Worker } from "bullmq";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixture.js";
+import { queueKeyPrefix } from "../../src/lib/queue/connection.js";
 
 // STORY-030 Phase B / Test scenario 10 — "Run a worker with each queue group
 // → one image, correct group." `bootstrapWorker()` must construct exactly
@@ -36,9 +37,17 @@ async function mockConnectionSpy() {
   vi.resetModules();
   vi.doMock("../../src/lib/queue/connection.js", async () => {
     const actual = await vi.importActual<typeof import("../../src/lib/queue/connection.js")>("../../src/lib/queue/connection.js");
-    return { ...actual, createQueueWorkerConnection: vi.fn(actual.createQueueWorkerConnection) };
+    return {
+      ...actual,
+      createQueueWorkerConnection: vi.fn(actual.createQueueWorkerConnection),
+      createQueueReaderConnection: vi.fn(actual.createQueueReaderConnection),
+    };
   });
-  return (await import("../../src/lib/queue/connection.js")).createQueueWorkerConnection as unknown as ReturnType<typeof vi.fn>;
+  const mod = await import("../../src/lib/queue/connection.js");
+  return {
+    worker: mod.createQueueWorkerConnection as unknown as ReturnType<typeof vi.fn>,
+    reader: mod.createQueueReaderConnection as unknown as ReturnType<typeof vi.fn>,
+  };
 }
 
 describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs exactly one group's queues/workers", () => {
@@ -61,7 +70,7 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
   it.each(Object.entries(EXPECTED_GROUP_MEMBERSHIP))(
     "WORKER_GROUP=%s constructs exactly that group's workers and zero others",
     async (group, expectedNames) => {
-      const createQueueWorkerConnectionSpy = await mockConnectionSpy();
+      const spies = await mockConnectionSpy();
       process.env.WORKER_GROUP = group;
       const { bootstrapWorker, WORKER_GROUP_WORKERS } = await import("../../src/worker.js");
 
@@ -70,15 +79,24 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
         const runtime = app.get<{ workers: readonly { name: string }[] }>(WORKER_GROUP_WORKERS);
         const names = runtime.workers.map((worker) => worker.name).sort();
         expect(names).toEqual([...expectedNames].sort());
-        // One connection per worker + one per its DLQ queue, plus exactly ONE
-        // shared by every schedule Queue in the group (G12).
+        // One connection per worker + one per its DLQ queue. Nothing else may
+        // take a WORKER connection.
+        expect(spies.worker).toHaveBeenCalledTimes(expectedNames.length * 2);
+        // ⚠ EXACTLY ONE READER CONNECTION, SHARED BY EVERY SCHEDULE QUEUE, and
+        // it must be the READER factory (G12). Two assertions in one:
         //
-        // ⚠ THE `+ 1` IS THE ASSERTION, not an allowance. A Worker blocks on
-        // Redis and needs its own connection; a producer-side Queue does not,
-        // and giving each of these one would have tripled every worker
-        // process's connection count to Valkey for schedulers upserted once at
-        // boot. If that ever becomes `* 3`, someone has stopped sharing it.
-        expect(createQueueWorkerConnectionSpy).toHaveBeenCalledTimes(expectedNames.length * 2 + 1);
+        // The COUNT — a Worker blocks on Redis and needs its own connection; a
+        // producer-side Queue does not, and giving each of these one would
+        // have multiplied every worker process's connection count to Valkey
+        // for schedulers upserted once at boot. If this ever grows with the
+        // group size, someone has stopped sharing it.
+        //
+        // The FACTORY — the worker factory sets `maxRetriesPerRequest: null`,
+        // so a read through it against an unreachable Valkey never rejects and
+        // never resolves. These Queues ask questions and must answer. An
+        // earlier cut used the worker factory here and needed a bespoke
+        // timeout to escape the hang it caused.
+        expect(spies.reader).toHaveBeenCalledTimes(1);
       } finally {
         await app.close();
       }
@@ -86,14 +104,108 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
     20_000,
   );
 
+  // ⚠ G12 — THE ONLY TESTS THAT PROVE THE SCHEDULER IS WIRED AT ALL.
+  //
+  // Everything else in this file is satisfied by construction. A review
+  // mutated the reconcile call out of `src/worker.ts` entirely — keeping the
+  // connection and the Queues — and all nine tests passed, boot log reading
+  // "scheduled: none". The whole feature could have been a no-op in
+  // production with the suite green. These read the REAL Valkey the boot just
+  // wrote to, which is the only place the truth lives.
+  async function schedulersIn(group: string): Promise<{ key: string; pattern: string; next: number }[]> {
+    process.env.WORKER_GROUP = group;
+    const { bootstrapWorker } = await import("../../src/worker.js");
+    const app = await bootstrapWorker();
+    try {
+      const probe = new Queue("credit.reconcile", {
+        connection: { url: fixture.connectionString },
+        prefix: queueKeyPrefix(process.env.NODE_ENV ?? "test"),
+      });
+      try {
+        const found = await probe.getJobSchedulers();
+        return found.map((entry) => ({
+          key: String(entry.key),
+          pattern: String(entry.pattern),
+          next: Number(entry.next),
+        }));
+      } finally {
+        await probe.close();
+      }
+    } finally {
+      await app.close();
+    }
+  }
+
+  it("⚠ WORKER_GROUP=rollup actually writes credit.reconcile's scheduler to Valkey", async () => {
+    await mockConnectionSpy();
+
+    const found = await schedulersIn("rollup");
+
+    expect(found).toHaveLength(1);
+    expect(found[0]!.key).toBe("cron:credit.reconcile");
+    expect(found[0]!.pattern).toBe("*/10 * * * *");
+  }, 20_000);
+
+  it("⚠ and the cron PARSES to the cadence §4 states, not merely to the string we wrote twice", async () => {
+    // Both `schedule.ts` and `schedule.spec.ts` are hand transcriptions from
+    // the same head, so a typo that survives one survives both. A dropped
+    // field is not a syntax error — cron-parser accepts `*/10 * * *` and
+    // reads it as every minute during one hour of the day. Asserting the
+    // PARSED fire time is what catches that, and it goes through BullMQ's own
+    // parser, which is the one that will actually run.
+    await mockConnectionSpy();
+
+    const found = await schedulersIn("rollup");
+
+    const next = new Date(found[0]!.next);
+    expect(next.getUTCSeconds()).toBe(0);
+    expect(next.getUTCMinutes() % 10).toBe(0);
+    // Within the next ten minutes — a four-field misread fires within one.
+    expect(found[0]!.next - Date.now()).toBeLessThanOrEqual(10 * 60_000);
+  }, 20_000);
+
+  it("⚠ WORKER_GROUP=parse writes NOTHING — the reconcile is scoped to the group that owns the queue", async () => {
+    // The scoping decision, asserted against Redis rather than against a
+    // one-entry map that could not have failed.
+    await mockConnectionSpy();
+
+    const found = await schedulersIn("parse");
+
+    expect(found).toEqual([]);
+  }, 20_000);
+
+  it("⚠ rollup does NOT schedule its tenant-scoped queues, however wired their handlers", async () => {
+    // `rollup.metric_daily` has a cron in §4 AND a handler, and a bare tick
+    // cannot drive it: the tenant processor throws on the empty envelope
+    // before the handler is reached, once an hour, into the DLQ forever.
+    await mockConnectionSpy();
+    process.env.WORKER_GROUP = "rollup";
+    const { bootstrapWorker } = await import("../../src/worker.js");
+    const app = await bootstrapWorker();
+    try {
+      const probe = new Queue("rollup.metric_daily", {
+        connection: { url: fixture.connectionString },
+        prefix: queueKeyPrefix(process.env.NODE_ENV ?? "test"),
+      });
+      try {
+        expect(await probe.getJobSchedulers()).toEqual([]);
+      } finally {
+        await probe.close();
+      }
+    } finally {
+      await app.close();
+    }
+  }, 20_000);
+
   it("an unknown WORKER_GROUP throws before bootstrapWorker() opens any queue connection", async () => {
-    const createQueueWorkerConnectionSpy = await mockConnectionSpy();
+    const spies = await mockConnectionSpy();
     process.env.WORKER_GROUP = "not-a-real-group";
 
     const { bootstrapWorker } = await import("../../src/worker.js");
 
     await expect(bootstrapWorker()).rejects.toThrow();
-    expect(createQueueWorkerConnectionSpy).not.toHaveBeenCalled();
+    expect(spies.worker).not.toHaveBeenCalled();
+    expect(spies.reader).not.toHaveBeenCalled();
   });
 
   // Code-review fix (post Phase B) — a construction failure partway through a

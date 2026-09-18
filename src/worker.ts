@@ -11,7 +11,7 @@ import { createPgPool } from "./db/pg-pool.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
 import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
-import { createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
+import { createQueueReaderConnection, createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue } from "./lib/queue/dead-letter.js";
 import { queuesForGroup } from "./lib/queue/group.js";
 import { handlerFor } from "./lib/queue/handlers.js";
@@ -239,7 +239,20 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       attachDeadLetterHandler(worker, dlqQueue, entry);
       workers.push(worker);
     }
-    scheduleConnection = createQueueWorkerConnection(env.QUEUE_REDIS_URL);
+    // ⚠ THE READER FACTORY, NOT THE WORKER ONE. These Queues ASK Valkey
+    // questions (`getJobSchedulers`) and must answer someone, which is
+    // exactly the role `createQueueReaderConnection` exists to serve —
+    // bounded connect, one retry, then a real error. The worker factory sets
+    // `maxRetriesPerRequest: null` on purpose, so that a worker never invents
+    // a job failure out of a connection problem; inherited here it means the
+    // read never rejects and never resolves, which is precisely the hang the
+    // deadline below was added to paper over. connection.ts's own comment
+    // describes this failure and names the mistake: the bounded factory
+    // "mirrors createHealthCacheConnection, which got this right for the
+    // cache instance and was never carried across to the queue one". It has
+    // now been carried across. The deadline stays as a second line of
+    // defence, but a failure here now arrives with a cause attached.
+    scheduleConnection = createQueueReaderConnection(env.QUEUE_REDIS_URL);
     for (const entry of entries) {
       scheduleQueues.set(entry.name, buildQueue(entry, { connection: scheduleConnection, prefix }));
     }

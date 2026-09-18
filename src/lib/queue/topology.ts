@@ -291,3 +291,18 @@ export const QUEUE_TOPOLOGY: readonly QueueTopologyEntry[] = RAW_QUEUE_TOPOLOGY.
     removeOnFail: GLOBAL_REMOVE_ON_FAIL,
   }),
 );
+
+const BY_NAME = new Map(QUEUE_TOPOLOGY.map((entry) => [entry.name, entry]));
+
+/**
+ * The topology entry for `name`, or a throw. Callers that reach here with a
+ * name are working from the topology already — `QUEUE_TOPOLOGY.find(...)!`
+ * spelled once, with the non-null assertion replaced by a real error.
+ */
+export function topologyFor(name: string): QueueTopologyEntry {
+  const entry = BY_NAME.get(name);
+  if (entry === undefined) {
+    throw new Error(`no queue topology entry named "${name}"`);
+  }
+  return entry;
+}
