@@ -24,6 +24,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "credit.reconcile",
     "notify.dispatch",
     "maintenance.partition",
+    // STORY-143 — not in §4; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "audit.verify",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],
@@ -39,13 +41,13 @@ describe("STORY-030 · queuesForGroup — the worker entry point's queue-group s
     expect(() => queuesForGroup("not-a-real-group" as never)).toThrow(UnknownWorkerGroupError);
   });
 
-  it("partitions all 21 queues across the 7 groups with no overlap and no gap", () => {
+  it("partitions every queue across the 7 groups with no overlap and no gap", () => {
     const allNames = Object.values(EXPECTED_GROUP_MEMBERSHIP)
       .flat()
       .sort();
     const fromTopology = QUEUE_TOPOLOGY.map((entry) => entry.name).sort();
     expect(allNames).toEqual(fromTopology);
-    expect(allNames).toHaveLength(21);
+    expect(allNames).toHaveLength(QUEUE_TOPOLOGY.length);
   });
 
   it("one worker image serves every group — WORKER_GROUP config accepts exactly the set of groups that own queues, including deploy", () => {

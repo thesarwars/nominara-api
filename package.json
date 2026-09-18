@@ -27,6 +27,8 @@
     "db:maintenance:sweep": "tsx src/workers/rollup/retention.ts",
     "credits:verify": "tsx src/workers/rollup/credit-verify.ts",
     "credits:reconcile": "tsx src/workers/rollup/credit-reconcile.ts",
+    "audit:verify": "tsx src/workers/rollup/audit-verify.ts",
+    "audit:export": "tsx src/workers/rollup/audit-export.ts",
     "db:purge-check": "tsx src/db/purge-check.ts",
     "contracts:generate": "tsx src/contracts/generate.ts",
     "contracts:check": "tsx src/contracts/check.ts",

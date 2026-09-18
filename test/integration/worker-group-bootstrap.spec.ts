@@ -28,6 +28,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "credit.reconcile",
     "notify.dispatch",
     "maintenance.partition",
+    // STORY-143 — not in §4; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "audit.verify",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],
@@ -208,6 +210,38 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
         const next = new Date(Number(found[0]!.next));
         expect(next.getUTCHours()).toBe(3);
         expect(next.getUTCMinutes()).toBe(20);
+      } finally {
+        await probe.close();
+      }
+    } finally {
+      await app.close();
+    }
+  }, 20_000);
+
+  it("⚠ WORKER_GROUP=rollup schedules audit.verify daily at 02:40 UTC", async () => {
+    // STORY-143. §12 requires the verifier daily; §4's table never gave it a
+    // queue, so it had no handler, no schedule, and not even a pnpm script.
+    // Asserted against the real Valkey, because a handler and a cron are worth
+    // nothing if the boot does not register the repeatable — the gap a review
+    // found in STORY-140.
+    await mockConnectionSpy();
+    process.env.WORKER_GROUP = "rollup";
+    const { bootstrapWorker } = await import("../../src/worker.js");
+    const app = await bootstrapWorker();
+    try {
+      const probe = new Queue("audit.verify", {
+        connection: { url: fixture.connectionString },
+        prefix: queueKeyPrefix(process.env.NODE_ENV ?? "test"),
+      });
+      try {
+        const found = await probe.getJobSchedulers();
+        expect(found).toHaveLength(1);
+        expect(found[0]!.key).toBe("cron:audit.verify");
+        expect(found[0]!.pattern).toBe("40 2 * * *");
+        expect((found[0] as { tz?: string }).tz).toBe("UTC");
+        const next = new Date(Number(found[0]!.next));
+        expect(next.getUTCHours()).toBe(2);
+        expect(next.getUTCMinutes()).toBe(40);
       } finally {
         await probe.close();
       }

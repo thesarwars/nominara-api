@@ -60,6 +60,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   // ran on partitions nobody was extending.
   it("ships exactly the handlers the stories that landed them declared", () => {
     expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual([
+      "audit.verify",
       "capture.execute",
       "capture.parse",
       "crawl.discover",
@@ -77,6 +78,9 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "rollup.metric_daily",
       "credit.reconcile",
       "maintenance.partition",
+      // Declared after maintenance.partition in topology.ts — STORY-143's
+      // addition sits at the end of the rollup group's entries.
+      "audit.verify",
     ]);
   });
 

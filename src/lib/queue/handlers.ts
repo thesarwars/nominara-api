@@ -3,6 +3,7 @@ import type { Env } from "../../config/env.schema.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCaptureParseHandler } from "./handlers/capture-parse.handler.js";
 import { createCreditReconcileHandler } from "./handlers/credit-reconcile.handler.js";
+import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
 import { createMaintenancePartitionHandler } from "./handlers/maintenance-partition.handler.js";
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { createRollupMetricDailyHandler } from "./handlers/rollup-metric-daily.handler.js";
@@ -81,6 +82,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "rollup.metric_daily": (context) => createRollupMetricDailyHandler(context),
   "credit.reconcile": (context) => createCreditReconcileHandler(context),
   "maintenance.partition": (context) => createMaintenancePartitionHandler(context),
+  "audit.verify": (context) => createAuditVerifyHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */

@@ -56,6 +56,14 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   { queue: "attribution.rollup", cron: "0 * * * *", statedAs: "cron hourly, ingest watermark" },
   { queue: "credit.reconcile", cron: "*/10 * * * *", statedAs: "cron every 10 min" },
 
+  // ⚠ NOT FROM §4 AT ALL — from `security-and-tenancy.md` §12, "a verifier job
+  // re-walks each chain daily and pages on the first mismatch". §4's table has
+  // no audit queue, so this cadence comes from the security reference and the
+  // queue is an explicit addition (see `topology.ts`). 02:40 UTC: the same
+  // quiet window as the partition tick, forty minutes earlier so the two
+  // estate-wide walks do not contend for the same connections.
+  { queue: "audit.verify", cron: "40 2 * * *", statedAs: "security-and-tenancy.md §12: verifier re-walks each chain daily" },
+
   // ⚠ PERIOD STATED, TIME NOT. Scheduling these needs an hour of the day (and
   // for weekly, a day) that no reference gives. Left null deliberately — see
   // this file's header. `maintenance.partition` was here until STORY-142; it

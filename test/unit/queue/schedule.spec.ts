@@ -50,9 +50,33 @@ const DELIBERATE_DIVERGENCE: Record<string, { cron: string; because: string }> =
   },
 };
 
+/**
+ * ⚠ SCHEDULES WHOSE CADENCE COMES FROM A DIFFERENT REFERENCE THAN §4, kept
+ * separate for the same reason the topology keeps its additions separate: the
+ * §4 transcription above must stay quotable.
+ */
+const FROM_OTHER_REFERENCES: Record<string, { cron: string; source: string }> = {
+  "audit.verify": {
+    cron: "40 2 * * *",
+    source: "security-and-tenancy.md §12 — a verifier job re-walks each chain daily and pages on the first mismatch",
+  },
+};
+
 describe("G12 · the schedule table matches the reference", () => {
-  it("covers exactly the queues whose producer names a cron, and no others", () => {
-    expect(QUEUE_SCHEDULES.map((s) => s.queue).sort()).toEqual(Object.keys(REFERENCE).sort());
+  it("covers §4's cron queues exactly, plus the ones another reference asks for", () => {
+    expect(QUEUE_SCHEDULES.map((s) => s.queue).sort()).toEqual(
+      [...Object.keys(REFERENCE), ...Object.keys(FROM_OTHER_REFERENCES)].sort(),
+    );
+  });
+
+  it("⚠ every schedule not from §4 names the reference it IS from", () => {
+    for (const [queue, entry] of Object.entries(FROM_OTHER_REFERENCES)) {
+      expect(scheduleFor(queue)?.cron, queue).toBe(entry.cron);
+      // The table's own `statedAs` must carry the provenance, so a reader of
+      // the source is not left assuming §4 said something it does not.
+      expect(scheduleFor(queue)?.statedAs, queue).toContain("§12");
+      expect(entry.source.length).toBeGreaterThan(40);
+    }
   });
 
   it("carries the cron expression the reference states, or null where it states none", () => {
@@ -80,12 +104,12 @@ describe("G12 · the schedule table matches the reference", () => {
     for (const schedule of QUEUE_SCHEDULES) expect(names.has(schedule.queue), schedule.queue).toBe(true);
   });
 
-  it("⚠ states a time for exactly five of the ten, and says so rather than guessing", () => {
+  it("⚠ five cron queues still state no time, and say so rather than being guessed at", () => {
     // The count is the point: five cron queues cannot be scheduled from the
     // references as written, and that gap belongs in a test rather than in
     // somebody's memory. It was six until STORY-142 chose an hour for
     // `maintenance.partition` — chose, and wrote down why.
-    expect(datedSchedules()).toHaveLength(5);
+    expect(datedSchedules()).toHaveLength(6);
     expect(undatedSchedules()).toHaveLength(5);
   });
 
@@ -125,7 +149,7 @@ describe("G12 · the schedule table matches the reference", () => {
     // has BOTH a cron and a handler, so a gate on those two alone scheduled
     // it, and a bare tick on a tenant-scoped queue throws in the signature
     // path before the handler is reached — once an hour, into the DLQ,
-    // forever. This test is the arithmetic written down: 10 − 5 − 2 − 1 = 2.
+    // forever. This test is the arithmetic written down: 11 − 5 − 2 − 1 = 3.
     const dated = datedSchedules().map((s) => s.queue);
     const inert = dated.filter((queue) => handlerFor(queue) === undefined);
     const tenantScoped = dated.filter((queue) => handlerFor(queue) !== undefined && topologyFor(queue).tenantScoped);
@@ -133,7 +157,7 @@ describe("G12 · the schedule table matches the reference", () => {
 
     expect(inert.sort()).toEqual(["attribution.rollup", "capture.plan"]);
     expect(tenantScoped.sort()).toEqual(["rollup.metric_daily"]);
-    expect(schedulable.sort()).toEqual(["credit.reconcile", "maintenance.partition"]);
+    expect(schedulable.sort()).toEqual(["audit.verify", "credit.reconcile", "maintenance.partition"]);
     // The three reasons partition the dated rows — no queue is refused twice
     // and none falls through unaccounted for.
     expect(inert.length + tenantScoped.length + schedulable.length).toBe(dated.length);
@@ -173,6 +197,6 @@ describe("G12 · describeSchedules — the one line a boot log gets", () => {
   });
 
   it("reports the cadence gap so an operator need not go and read the table", () => {
-    expect(describeSchedules(empty)).toContain("5 of 10 cron queues state a time");
+    expect(describeSchedules(empty)).toContain("6 of 11 cron queues state a time");
   });
 });
