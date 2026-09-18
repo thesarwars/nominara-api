@@ -47,18 +47,24 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   // STORY-135 the third, and STORY-042 the fourth. Every later story updates
   // this line in its own commit.
   //
-  // STORY-073 lands `credit.reconcile`, and it is the first entry here whose
-  // PRODUCER does not exist: nothing in this repo registers a BullMQ
-  // repeatable job, so the queue is live and will simply never be handed one
-  // until a scheduler does. Wired rather than inert on purpose — see
-  // `handlers.ts` — because the alternative is editing this file under
-  // whatever incident first makes someone want the reconciler running.
+  // STORY-073 lands `credit.reconcile`, and it was the first entry here whose
+  // PRODUCER did not exist: nothing registered a BullMQ repeatable job, so the
+  // queue was live and simply never handed one. Wired rather than inert on
+  // purpose — see `handlers.ts` — because the alternative is editing this file
+  // under whatever incident first makes someone want the reconciler running.
+  // STORY-140 finally gave it one.
+  //
+  // STORY-142 lands `maintenance.partition`, and it is the reverse case: the
+  // WORK existed (`runMonthlyMaintenance`, complete and tested under
+  // STORY-013) and only the handler and the tick were missing, so the estate
+  // ran on partitions nobody was extending.
   it("ships exactly the handlers the stories that landed them declared", () => {
     expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual([
       "capture.execute",
       "capture.parse",
       "crawl.discover",
       "credit.reconcile",
+      "maintenance.partition",
       "rollup.metric_daily",
     ]);
     // Topology order, not alphabetical — `liveQueueNames` filters
@@ -70,6 +76,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "crawl.discover",
       "rollup.metric_daily",
       "credit.reconcile",
+      "maintenance.partition",
     ]);
   });
 

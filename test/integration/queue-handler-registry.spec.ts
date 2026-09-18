@@ -28,13 +28,21 @@ const HANDLED: QueueName = "notify.dispatch";
 // which is what makes the not-wired error observable. On a tenant-scoped
 // queue the signature is verified first, and correctly so.
 //
-// Was `credit.reconcile` until STORY-073 wired it. `maintenance.partition`
-// is the rollup group's other non-tenant-scoped queue and is still inert
-// (its logic exists in `src/workers/rollup/maintenance.ts` and is invoked
-// only by a hand-run script — README gap G-10), so it carries this scenario
-// now. If it is ever wired, this constant moves again rather than the
-// scenario being dropped: "an unregistered queue is not reached by a job" is
-// the half that keeps mattering as handlers accumulate.
+// ⚠ THIS CONSTANT HAS RUN OUT OF CANDIDATES, and that is a fact about the
+// topology rather than a problem with the scenario. It was `credit.reconcile`
+// until STORY-073 wired it, then `maintenance.partition` — and STORY-142 wired
+// that one too. Those are the ONLY two `tenantScoped: false` queues in all
+// twenty-one: every other queue verifies a signature before the handler is
+// reached, so an unsigned probe never gets far enough to observe the
+// not-wired error.
+//
+// The previous comment said the constant should move rather than the scenario
+// be dropped. There is nowhere left to move it, so the scenario now
+// UNREGISTERS a handler for its duration instead of borrowing a queue that
+// happens to lack one. That is strictly better: the property under test is
+// "a queue with no handler throws not-wired when forced", which was never
+// really about `maintenance.partition`, and the test stops being a hostage to
+// whichever queue is wired next.
 const UNHANDLED_UNSIGNED: QueueName = "maintenance.partition";
 const WORKSPACE_ID = "018bcfe5-0000-7000-8000-0000000000aa";
 
@@ -182,6 +190,11 @@ describe("STORY-124 · the queue-handler registry", () => {
   // ---- scenario 7 --------------------------------------------------------
 
   it("scenario 7 — an unhandled queue's processor still throws the not-wired error if forced", async () => {
+    // Removed for this scenario and restored in the `finally`, because the
+    // topology no longer contains an unwired non-tenant-scoped queue to
+    // borrow. See the note on UNHANDLED_UNSIGNED.
+    const restore = QUEUE_HANDLERS[UNHANDLED_UNSIGNED];
+    delete QUEUE_HANDLERS[UNHANDLED_UNSIGNED];
     const { app, runtime } = await boot("rollup");
     try {
       const inert = runtime.workers.find((worker) => worker.name === UNHANDLED_UNSIGNED)!;
@@ -190,6 +203,7 @@ describe("STORY-124 · the queue-handler registry", () => {
       await expect(processor({ data: {} })).rejects.toThrow(UNHANDLED_UNSIGNED);
     } finally {
       await app.close();
+      QUEUE_HANDLERS[UNHANDLED_UNSIGNED] = restore;
     }
   });
 
@@ -215,7 +229,15 @@ describe("STORY-124 · the queue-handler registry", () => {
       ).map((entry) => entry.name);
       expect(line).toContain(`${String(live.length)} processing (${live.join(", ")})`);
       expect(line).toContain(HANDLED);
-      expect(line).toMatch(/inert, no handler wired \(.*maintenance\.partition/);
+      // ⚠ DERIVED, LIKE `live` ABOVE. This named `maintenance.partition` until
+      // STORY-142 wired it — the same brittleness the `live` count was written
+      // to avoid, one line below the comment explaining why. The scenario is
+      // about the SHAPE of the line, so the example comes from the topology.
+      const inert = QUEUE_TOPOLOGY.filter(
+        (entry) => entry.workerGroup === "rollup" && QUEUE_HANDLERS[entry.name] === undefined,
+      ).map((entry) => entry.name);
+      expect(inert.length, "this scenario needs at least one inert queue in the group").toBeGreaterThan(0);
+      expect(line).toContain(`${String(inert.length)} inert, no handler wired (${inert.join(", ")})`);
       // A group that processes nothing must not read the same as one that
       // processes everything.
       expect(line).not.toContain("0 inert");

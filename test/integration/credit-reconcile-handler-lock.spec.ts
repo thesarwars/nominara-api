@@ -21,11 +21,12 @@ vi.mock("../../src/db/client.js", async () => {
   };
 });
 import type { Job } from "bullmq";
+import { withKeepalives } from "../../src/db/client.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { provisionWalletWithGrant } from "../../src/lib/credits/balance.js";
 import { readWallet, reserveCredits } from "../../src/lib/credits/wallet.js";
-import { createCreditReconcileHandler, withKeepalives } from "../../src/lib/queue/handlers/credit-reconcile.handler.js";
+import { createCreditReconcileHandler } from "../../src/lib/queue/handlers/credit-reconcile.handler.js";
 import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
 import type { Env } from "../../src/config/env.schema.js";
 

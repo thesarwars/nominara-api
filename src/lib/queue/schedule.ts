@@ -57,12 +57,39 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   { queue: "credit.reconcile", cron: "*/10 * * * *", statedAs: "cron every 10 min" },
 
   // ⚠ PERIOD STATED, TIME NOT. Scheduling these needs an hour of the day (and
-  // for weekly, a day; for monthly, a date) that no reference gives. Left
-  // null deliberately — see this file's header.
+  // for weekly, a day) that no reference gives. Left null deliberately — see
+  // this file's header. `maintenance.partition` was here until STORY-142; it
+  // left because the cost of NOT running it is dated and rising, which is a
+  // reason to choose an hour rather than to keep waiting for one.
   { queue: "geo.analyze", cron: null, statedAs: "cron daily, API" },
   { queue: "gsc.sync", cron: null, statedAs: "cron daily, API" },
   { queue: "topic.cluster", cron: null, statedAs: "prompt-set change >= 10%, cron weekly" },
-  { queue: "maintenance.partition", cron: null, statedAs: "cron monthly" },
+  // ⚠ DAILY, WHERE §4 SAYS MONTHLY — A DECISION, NOT A TRANSCRIPTION, and the
+  // one place in this table where the cron does not follow the reference.
+  //
+  // ⚠ AND THE TICK RUNS ONLY THE RUNWAY HALF. `maintenance-partition.handler.ts`
+  // calls `runPartitionRunwayMaintenance`, not `runMonthlyMaintenance`: the
+  // destructive parts (cold-tier moves, detach/drop past retention, vector
+  // index rebuilds) stay operator-invoked. The drop cutoff is the MINIMUM
+  // retention across ACTIVE workspaces, so one reversible soft-delete
+  // collapses it platform-wide — at monthly there was up to a month to notice
+  // and revert; at daily the next tick drops, and a dropped partition does not
+  // come back. The two halves were never one cadence, only one function.
+  //
+  // The runway half is idempotent and costs almost nothing when there is
+  // nothing to do: `computePartitionMonths` creates only the missing months.
+  // Monthly gives it ONE attempt per month, so a single failed run is not
+  // discovered until rows are already in the default partition — and by then
+  // the fix is no longer "create a partition", it is "move rows out from under
+  // a lock first", which is strictly worse and grows daily. Daily means a
+  // failure costs nothing because tomorrow retries and the lead window absorbs
+  // the gap. The cadence §4 names is the RESOLUTION of the work (a month's
+  // partition), not the frequency at which it is safe to check.
+  //
+  // 03:20 UTC: a low-traffic window for DDL that takes locks, and :20 rather
+  // than :00 for the reason §6.1 gives `capture.plan` :05 — the top of the
+  // hour is where everything else lands.
+  { queue: "maintenance.partition", cron: "20 3 * * *", statedAs: "cron monthly (scheduled daily — see above)" },
 
   // ⚠ NO CADENCE AT ALL. §4 says "cron" without a period; both are also
   // API-triggered, so the cron half may not be a fixed schedule so much as a

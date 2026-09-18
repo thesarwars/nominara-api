@@ -183,16 +183,89 @@ export async function ensurePartitionsForTable(
   return created;
 }
 
+/**
+ * ⚠ ONE UNCREATABLE MONTH MUST NOT SILENCE THE WHOLE ESTATE, which is what
+ * this used to do. STORY-142's review reproduced it: a single row sitting in
+ * a DEFAULT partition whose month falls INSIDE the lead window makes
+ * `CREATE ... ATTACH` fail with "updated partition constraint for default
+ * partition would be violated by some row" — and because the loop simply
+ * propagated, nothing at all was created. Not that month, not the months
+ * after it, and not the other two fact tables, which were never reached.
+ *
+ * Under the hand-run script that was an operator reading an error. On a daily
+ * tick it is the job that guards the runway refusing to run, identically,
+ * every day, while the runway expires — the exact outcome the schedule was
+ * added to prevent, now self-inflicted.
+ *
+ * So a failure is RECORDED AND STEPPED OVER. Every other month and every
+ * other table still gets its partition, and the months that could not be
+ * created come back as `failures` for the caller to surface. The remedy for
+ * them is `catchUpDefaultPartition`, which moves the stranded rows out.
+ */
+export interface EnsurePartitionsOutcome {
+  readonly created: readonly string[];
+  readonly failures: readonly { partition: string; reason: string }[];
+}
+
 export async function ensureAllPartitions(
   client: ClientBase,
   referenceDate: Date = new Date(),
   monthsAhead: number = PARTITION_LEAD_MONTHS,
-): Promise<string[]> {
+): Promise<EnsurePartitionsOutcome> {
   const created: string[] = [];
+  const failures: { partition: string; reason: string }[] = [];
   for (const table of PARTITIONED_FACT_TABLES) {
-    created.push(...(await ensurePartitionsForTable(client, table, referenceDate, monthsAhead)));
+    for (const { start, end, suffix } of computePartitionMonths(referenceDate, monthsAhead)) {
+      const name = `${table}_${suffix}`;
+      if (await tableExists(client, name)) continue;
+      try {
+        await createPartition(client, table, name, start, end);
+        created.push(name);
+      } catch (error) {
+        failures.push({ partition: name, reason: error instanceof Error ? error.message : String(error) });
+      }
+    }
   }
-  return created;
+  return { created, failures };
+}
+
+/**
+ * The half of maintenance that is safe to run often: find out what is
+ * stranded, then extend the runway.
+ *
+ * ⚠ DETECTION RUNS FIRST, AND IT IS NOT THE LOAD-BEARING HALF OF THAT FIX —
+ * say so here rather than let the next reader assume it. `runMonthlyMaintenance`
+ * detects AFTER creating, so a creation failure used to take the alert down
+ * with it: the one signal that would have explained the failure never reached
+ * anyone. What actually fixes that is `ensureAllPartitions` recording failures
+ * instead of throwing, and with that in place detection would still run in
+ * either order. A mutation swapping these two lines back passes all seven
+ * tests; the mutation that removes record-and-continue fails two.
+ *
+ * The order stays because it is free and because it is the right shape — find
+ * out what is stranded before acting on it, not after — and it is insurance
+ * against any statement added between the two later that CAN throw. It is not
+ * pinned by a test, and nothing here pretends otherwise.
+ *
+ * Deliberately does NOT move cold partitions, detach, drop, reindex or
+ * analyse. See `runMonthlyMaintenance` and STORY-142's cadence note.
+ */
+export interface RunwayMaintenanceResult {
+  readonly defaultPartitionAlerts: readonly DefaultPartitionAlert[];
+  readonly partitionsCreated: readonly string[];
+  readonly partitionFailures: readonly { partition: string; reason: string }[];
+}
+
+export async function runPartitionRunwayMaintenance(
+  client: Client,
+  options: { readonly referenceDate?: Date } = {},
+): Promise<RunwayMaintenanceResult> {
+  return withAdvisoryLock(client, MAINTENANCE_LOCK_KEY, async () => {
+    const referenceDate = options.referenceDate ?? new Date();
+    const defaultPartitionAlerts = await detectDefaultPartitionRows(client);
+    const { created, failures } = await ensureAllPartitions(client, referenceDate);
+    return { defaultPartitionAlerts, partitionsCreated: created, partitionFailures: failures };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +412,11 @@ async function isOnColdTablespace(client: ClientBase, relname: string): Promise<
   return result.rows[0]?.spcname === COLD_TABLESPACE;
 }
 
+async function tablespaceExists(client: ClientBase, name: string): Promise<boolean> {
+  const result = await client.query("SELECT 1 FROM pg_tablespace WHERE spcname = $1", [name]);
+  return (result.rowCount ?? 0) > 0;
+}
+
 export async function moveColdPartitions(
   client: ClientBase,
   referenceDate: Date = new Date(),
@@ -346,6 +424,18 @@ export async function moveColdPartitions(
 ): Promise<string[]> {
   const cutoff = new Date(referenceDate.getTime() - hotWindowDays * 86_400_000);
   const moved: string[] = [];
+  // ⚠ THE TABLESPACE IS PROVISIONED OUTSIDE MIGRATIONS AND USUALLY IS NOT.
+  // `grep -rn cold_tier docker docker-compose.yml scripts src/db/migrations`
+  // finds nothing, and a freshly migrated database has no `cold_tier`. Before
+  // STORY-142 that surfaced as an error on an operator's terminal the first
+  // time a partition aged past the hot window; once this runs unattended it
+  // would be a throw, every run, forever — and a throw here would take
+  // everything after it down too. A missing cold tier means "no cold tier to
+  // move to", which is a fact about the deployment, not a failure of the run.
+  const coldTierExists = await tablespaceExists(client, COLD_TABLESPACE);
+  if (!coldTierExists) {
+    return moved;
+  }
   for (const table of PARTITIONED_FACT_TABLES) {
     for (const partition of await listPartitions(client, table)) {
       if (partition.isDefault || !partition.to || partition.to > cutoff) {
@@ -625,18 +715,20 @@ export interface MaintenanceResult {
   readonly dropped: readonly DroppedPartitionGroup[];
   readonly recallChecks: readonly RecallCheckResult[];
   readonly analyzed: readonly string[];
+  /** Months that could not be created, with the reason — see `ensureAllPartitions`. */
+  readonly partitionFailures: readonly { partition: string; reason: string }[];
 }
 
 export async function runMonthlyMaintenance(client: Client, options: MaintenanceOptions = {}): Promise<MaintenanceResult> {
   return withAdvisoryLock(client, MAINTENANCE_LOCK_KEY, async () => {
     const referenceDate = options.referenceDate ?? new Date();
-    const partitionsCreated = await ensureAllPartitions(client, referenceDate);
+    const { created: partitionsCreated, failures: partitionFailures } = await ensureAllPartitions(client, referenceDate);
     const defaultPartitionAlerts = await detectDefaultPartitionRows(client);
     const coldTierMoved = await moveColdPartitions(client, referenceDate);
     const dropped = await detachAndDropPartitions(client, referenceDate);
     const recallChecks = await checkAndRebuildVectorIndexes(client);
     const analyzed = await analyzeActivePartitions(client, referenceDate);
-    return { partitionsCreated, defaultPartitionAlerts, coldTierMoved, dropped, recallChecks, analyzed };
+    return { partitionsCreated, partitionFailures, defaultPartitionAlerts, coldTierMoved, dropped, recallChecks, analyzed };
   });
 }
 

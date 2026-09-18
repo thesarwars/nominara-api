@@ -174,6 +174,48 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
     expect(found).toEqual([]);
   }, 20_000);
 
+  it("⚠ WORKER_GROUP=rollup also schedules maintenance.partition, daily", async () => {
+    // STORY-142. The queue had a handler and a cadence the moment that story
+    // landed, and neither is worth anything if the boot does not register the
+    // repeatable — which is exactly the gap a review found in STORY-140, where
+    // the whole feature could be deleted from `src/worker.ts` with the suite
+    // green. Asserted against the real Valkey the boot wrote to.
+    await mockConnectionSpy();
+    process.env.WORKER_GROUP = "rollup";
+    const { bootstrapWorker } = await import("../../src/worker.js");
+    const app = await bootstrapWorker();
+    try {
+      const probe = new Queue("maintenance.partition", {
+        connection: { url: fixture.connectionString },
+        prefix: queueKeyPrefix(process.env.NODE_ENV ?? "test"),
+      });
+      try {
+        const found = await probe.getJobSchedulers();
+        expect(found).toHaveLength(1);
+        expect(found[0]!.key).toBe("cron:maintenance.partition");
+        expect(found[0]!.pattern).toBe("20 3 * * *");
+        // ⚠ THE TIMEZONE IS THE ASSERTION, and it must be asserted DIRECTLY
+        // rather than inferred from the next fire time. BullMQ resolves a cron
+        // in the process's local zone unless told, so `20 3 * * *` means 03:20
+        // wherever the container thinks it is — found here on a UTC+6 machine,
+        // where the boot produced a 21:20 UTC fire. A next-fire-time check
+        // alone would pass on a UTC runner no matter what, which is precisely
+        // how this would have reached production and then behaved differently
+        // there than in CI.
+        expect((found[0] as { tz?: string }).tz).toBe("UTC");
+        // And the parsed instant agrees, which also catches a dropped cron
+        // field — accepted silently by the parser and meaning something else.
+        const next = new Date(Number(found[0]!.next));
+        expect(next.getUTCHours()).toBe(3);
+        expect(next.getUTCMinutes()).toBe(20);
+      } finally {
+        await probe.close();
+      }
+    } finally {
+      await app.close();
+    }
+  }, 20_000);
+
   it("⚠ rollup does NOT schedule its tenant-scoped queues, however wired their handlers", async () => {
     // `rollup.metric_daily` has a cron in §4 AND a handler, and a bare tick
     // cannot drive it: the tenant processor throws on the empty envelope
