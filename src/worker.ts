@@ -11,10 +11,12 @@ import { createPgPool } from "./db/pg-pool.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
 import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
-import { createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
+import { createQueueReaderConnection, createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue } from "./lib/queue/dead-letter.js";
 import { queuesForGroup } from "./lib/queue/group.js";
 import { handlerFor } from "./lib/queue/handlers.js";
+import { buildQueue } from "./lib/queue/queue-factory.js";
+import { describeSchedules, reconcileSchedules } from "./lib/queue/schedule-registrar.js";
 import { buildWorker, signingKeysFromEnv } from "./lib/queue/worker-factory.js";
 
 // STORY-022 — worker bootstrap (project-structure.md §2: "src/worker.ts
@@ -59,6 +61,10 @@ class WorkerGroupRuntime implements OnModuleDestroy {
   constructor(
     public readonly workers: readonly Worker[],
     private readonly dlqQueues: readonly Queue[],
+    // G12 — the producer-side Queue handles the schedule registrar upserts
+    // through, and the one connection they share. Closed with the DLQ queues.
+    private readonly scheduleQueues: readonly Queue[],
+    private readonly scheduleConnection: Redis | undefined,
     // STORY-124 — the pool every registered handler checks its client out
     // of. Closed AFTER the workers, so a job still draining keeps the
     // connection it is holding.
@@ -68,12 +74,33 @@ class WorkerGroupRuntime implements OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     await Promise.all(this.workers.map((worker) => closeWithinDeadline(worker)));
     await Promise.all(this.dlqQueues.map((queue) => queue.close().catch(() => undefined)));
+    await Promise.all(this.scheduleQueues.map((queue) => queue.close().catch(() => undefined)));
+    // The one connection every schedule Queue shares. Closing a Queue does
+    // not close a connection it was handed rather than asked to create.
+    await this.scheduleConnection?.quit().catch(() => undefined);
     await this.pool.end().catch(() => undefined);
   }
 }
 
 /** How long a graceful close may take before it is forced. */
 const WORKER_CLOSE_DEADLINE_MS = 2_000;
+
+/** How long the boot will wait for Valkey to accept the schedule reconcile. */
+const SCHEDULE_RECONCILE_DEADLINE_MS = 5_000;
+
+/** Reject rather than hang. See the schedule reconcile's own comment for why. */
+async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${String(ms)}ms`)), ms);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 /**
  * Close a worker gracefully, but never indefinitely.
@@ -159,6 +186,24 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   // before rethrowing, instead of leaking their connections.
   const dlqQueues: Queue[] = [];
   const workers: Worker[] = [];
+  // G12 — one producer-side Queue per entry in THIS group, used only to
+  // reconcile job schedulers. Scoped to the group because a scheduler is
+  // removed when it should not run, and a group that could see another
+  // group's queues would remove its schedulers on every boot.
+  //
+  // ⚠ ONE SHARED CONNECTION FOR ALL OF THEM, unlike the Workers above, and
+  // built AFTER the worker loop. The comment at the top of this file records
+  // why each Worker gets a dedicated ioredis connection: a Worker blocks on
+  // Redis, so two sharing one starve each other. A producer-side Queue issues
+  // ordinary commands and does not block, so a connection each would have
+  // tripled every worker process's connection count to Valkey for schedulers
+  // upserted once at boot. Built after the loop so the connection ORDER
+  // inside it is unchanged — `worker-group-bootstrap.spec.ts` injects a
+  // failure at a specific call index to prove partial construction cleans up,
+  // and a connection taken before the loop would have shifted that index and
+  // quietly changed what that test proves.
+  let scheduleConnection: Redis | undefined;
+  const scheduleQueues = new Map<string, Queue>();
 
   // STORY-124 — one pool per worker process, for every group rather than
   // only `capture`. It is lazy (pg.Pool opens nothing until a client is
@@ -194,13 +239,35 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       attachDeadLetterHandler(worker, dlqQueue, entry);
       workers.push(worker);
     }
+    // ⚠ THE READER FACTORY, NOT THE WORKER ONE. These Queues ASK Valkey
+    // questions (`getJobSchedulers`) and must answer someone, which is
+    // exactly the role `createQueueReaderConnection` exists to serve —
+    // bounded connect, one retry, then a real error. The worker factory sets
+    // `maxRetriesPerRequest: null` on purpose, so that a worker never invents
+    // a job failure out of a connection problem; inherited here it means the
+    // read never rejects and never resolves, which is precisely the hang the
+    // deadline below was added to paper over. connection.ts's own comment
+    // describes this failure and names the mistake: the bounded factory
+    // "mirrors createHealthCacheConnection, which got this right for the
+    // cache instance and was never carried across to the queue one". It has
+    // now been carried across. The deadline stays as a second line of
+    // defence, but a failure here now arrives with a cause attached.
+    scheduleConnection = createQueueReaderConnection(env.QUEUE_REDIS_URL);
+    for (const entry of entries) {
+      scheduleQueues.set(entry.name, buildQueue(entry, { connection: scheduleConnection, prefix }));
+    }
   } catch (error) {
-    await Promise.all([...workers.map((worker) => worker.close()), ...dlqQueues.map((queue) => queue.close())]);
+    await Promise.all([
+      ...workers.map((worker) => worker.close()),
+      ...dlqQueues.map((queue) => queue.close()),
+      ...[...scheduleQueues.values()].map((queue) => queue.close()),
+      ...(scheduleConnection ? [scheduleConnection.quit().catch(() => undefined)] : []),
+    ]);
     await pool.end().catch(() => undefined);
     throw error;
   }
 
-  const runtime = new WorkerGroupRuntime(workers, dlqQueues, pool);
+  const runtime = new WorkerGroupRuntime(workers, dlqQueues, [...scheduleQueues.values()], scheduleConnection, pool);
 
   // STORY-031 Phase F — D2/EC-06: the 5-minute engine-health canary is a
   // capture-group concern only. Nothing else touches an engine at all.
@@ -251,6 +318,31 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   // from the label, one from a ternary — reads to it as an un-namespaced
   // cache key. The gate is right to be coarse; this is the call site's
   // problem to avoid (same shape STORY-122 hit in schema-check.ts).
+  // G12 — the timer. `producer:` in the topology was a declaration of intent
+  // nothing had ever read, so ten queues declared a cron and none had a job
+  // scheduler. Reconciled AFTER the workers are built, so a boot that fails
+  // partway has not left a repeatable firing into a process that never came
+  // up.
+  //
+  // ⚠ A FAILURE HERE MUST NOT TAKE THE WORKER DOWN, AND NEITHER MAY A HANG.
+  // The group's whole job is processing what is already queued, and it can do
+  // that with no schedule at all — so a Valkey that refuses the upsert is a
+  // degraded tick, not a dead worker.
+  //
+  // The DEADLINE is the half that matters. ioredis does not fail fast against
+  // an unreachable Valkey; it sits in its reconnect loop, so `await
+  // queue.getJobSchedulers()` never settles and the boot never finishes. That
+  // is the same trap `closeWithinDeadline` above documents for shutdown, at
+  // the other end of the process's life — and the worker boot test found it
+  // here by timing out at 15s.
+  let scheduleLine: string;
+  try {
+    scheduleLine = describeSchedules(await withDeadline(reconcileSchedules(scheduleQueues), SCHEDULE_RECONCILE_DEADLINE_MS));
+  } catch (error) {
+    scheduleLine = `schedules: FAILED to reconcile — ${error instanceof Error ? error.message : String(error)}`;
+    new Logger("bootstrap").error(scheduleLine);
+  }
+
   const processing = live.length > 0 ? live.join(", ") : "none";
   const notWired = inert.length > 0 ? inert.join(", ") : "none";
   new Logger("bootstrap").log(
@@ -258,6 +350,7 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       `${String(live.length)} processing (${processing}); ` +
       `${String(inert.length)} inert, no handler wired (${notWired})`,
   );
+  new Logger("bootstrap").log(`worker group "${env.WORKER_GROUP}" ${scheduleLine}`);
   return app;
 }
 
