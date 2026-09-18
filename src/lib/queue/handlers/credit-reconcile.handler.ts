@@ -4,6 +4,7 @@ import type { ClientBase } from "pg";
 import { z } from "zod";
 import { connect } from "../../../db/client.js";
 import { reconcileOrphanedReservations } from "../../credits/reconcile.js";
+import { globalQueueLockKey, releaseAdvisorySessionLock, tryAdvisorySessionLock } from "../locks.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 
@@ -11,15 +12,16 @@ import type { JobProcessor } from "../worker-factory.js";
 // "cron every 10 min", worker group `rollup`, concurrency 1, not tenant
 // scoped.
 //
-// ⚠ NOTHING ENQUEUES THIS YET, and that is the repo's oldest structural gap
-// rather than an oversight in this story. No process anywhere registers a
-// BullMQ repeatable job — `capture.plan`'s "scheduler cron" producer does
-// not exist either, which is why no scheduled tracking run has ever
-// happened. The handler is wired here so that the day a scheduler lands, the
-// reconciler is already correct and tested rather than being written under
-// the deadline of whatever incident prompted it; until then it is reachable
-// by enqueueing the job by hand, exactly as `audit-verify.ts` and
-// `retention.ts` are reachable by running them.
+// ⚠ STORY-140 GAVE THIS A TIMER, AND THAT CHANGED WHAT "concurrency: 1"
+// BUYS. Until then nothing enqueued this job at all — it ran when an
+// operator ran it — so the fact that §4 also specifies "advisory-locked"
+// beside the concurrency was moot. It is not moot now: a job scheduler fires
+// this every ten minutes in EVERY worker-rollup replica, and BullMQ's
+// `concurrency` bounds one Worker instance, not the queue. Two replicas at
+// concurrency 1 each can run two reconcilers at the same instant — see
+// `locks.ts`, whose header made exactly this argument for exactly this
+// queue, and whose `globalQueueLockKey` names it. The lock below is §4's
+// second half, finally called.
 
 const payloadSchema = z
   .object({
@@ -71,10 +73,45 @@ export function createCreditReconcileHandler(context: QueueHandlerContext): JobP
     const payload = payloadSchema.parse((job.data as { payload?: unknown }).payload ?? {});
 
     const discovery = await connect(context.env.DATABASE_URL);
+    const lockKey = globalQueueLockKey("credit.reconcile");
     let outcome;
+    let held = false;
     try {
+      // ⚠ TRY, NOT WAIT, and the tick that loses does NOTHING. Waiting would
+      // queue the ticks behind a slow scan, each holding a privileged
+      // connection to arrive at an estate the winner has already swept. A
+      // skipped run costs nothing: "what is still open now" is not a question
+      // about a window, so the next tick ten minutes later asks the same one.
+      //
+      // The lock lives on `discovery` — a dedicated, non-pooled connection
+      // ended in this same `finally` — because it must outlive the
+      // per-reservation transactions the scan opens. See `locks.ts`.
+      held = await tryAdvisorySessionLock(discovery, lockKey);
+      if (!held) {
+        logger.log("another replica holds the reconcile lock; yielding this tick");
+        return;
+      }
       outcome = await reconcileOrphanedReservations({ discovery, work: context.pool });
     } finally {
+      // ⚠ THESE TWO LINES ARE REDUNDANT AND BOTH ARE HERE ON PURPOSE. Ending
+      // the connection releases the lock by itself — Postgres drops every
+      // session-level advisory lock when the backend terminates — so the
+      // explicit unlock changes nothing observable today, and a mutation
+      // removing EITHER one passes the whole suite. Removing BOTH fails six
+      // of seven tests, which is what is actually pinned: after this handler
+      // returns, by any path, the lock is not held.
+      //
+      // The explicit unlock earns its place against a change that has not
+      // happened yet. If `discovery` ever becomes a pooled client, `end()`
+      // turns into `release()` and hands the connection back to the pool
+      // STILL HOLDING the lock — which would wedge the reconciler for the
+      // life of the process and, because the reconciler is the path that
+      // returns credits to people who were never charged, would do it
+      // silently. Do not read this line as load-bearing today; read it as the
+      // thing that keeps the failure loud if that refactor arrives.
+      if (held && !(await releaseAdvisorySessionLock(discovery, lockKey))) {
+        logger.error("reconcile lock was not held at release — the lock key or the connection changed under us");
+      }
       await discovery.end();
     }
 
