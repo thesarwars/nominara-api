@@ -260,10 +260,37 @@ const EXPECTED_GROUP_COUNTS: Record<string, number> = {
   deploy: 1,
 };
 
-describe("STORY-030 · queue topology declares all 21 queues per architecture reference §4", () => {
-  it("declares exactly 21 queues, matching the transcribed reference table entry-for-entry", () => {
+
+/**
+ * ⚠ QUEUES THIS REPOSITORY DECLARES THAT §4 DOES NOT, kept apart from the
+ * transcription above so the reference stays quotable and the additions stay
+ * countable. Adding a queue is a change to the architecture, and it belongs in
+ * a list with a reason rather than silently inside a table that claims to be a
+ * copy of §4.
+ */
+const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: string }> = {
+  "audit.verify": {
+    workerGroup: "rollup",
+    because:
+      "security-and-tenancy.md §12 requires a verifier job that re-walks each audit chain daily and pages on the first mismatch. " +
+      "§4's table never allocated it a queue, so STORY-020 wrote the job (workers/rollup/audit-verify.ts) with nowhere to run it — " +
+      "no handler, no schedule, and not even a pnpm script, while two comments in this repo claimed it ran daily. STORY-143.",
+  },
+};
+
+describe("STORY-030 · queue topology declares §4's 21 queues, plus what we have added on purpose", () => {
+  it("transcribes §4's twenty-one entry-for-entry, and adds exactly the queues named as additions", () => {
     expect(EXPECTED_QUEUE_TOPOLOGY).toHaveLength(21);
-    expect(QUEUE_TOPOLOGY).toHaveLength(21);
+    // ⚠ THE COUNT IS DERIVED, so a 23rd queue cannot appear without either a
+    // line in ADDED_BEYOND_REFERENCE or this failing.
+    expect(QUEUE_TOPOLOGY).toHaveLength(21 + Object.keys(ADDED_BEYOND_REFERENCE).length);
+
+    const referenceNames = new Set(EXPECTED_QUEUE_TOPOLOGY.map((entry) => entry.name));
+    const extra = QUEUE_TOPOLOGY.map((entry) => entry.name).filter((name) => !referenceNames.has(name));
+    expect(extra.sort()).toEqual(Object.keys(ADDED_BEYOND_REFERENCE).sort());
+    for (const entry of Object.values(ADDED_BEYOND_REFERENCE)) {
+      expect(entry.because.length).toBeGreaterThan(60);
+    }
 
     const byName = new Map(QUEUE_TOPOLOGY.map((entry) => [entry.name, entry]));
     for (const expected of EXPECTED_QUEUE_TOPOLOGY) {
@@ -292,12 +319,22 @@ describe("STORY-030 · queue topology declares all 21 queues per architecture re
     }
   });
 
-  it("has the documented per-worker-group queue counts (capture 3 / parse 2 / crawl 4 / embed 2 / rollup 8 / report 1 / deploy 1)", () => {
+  it("has the documented per-worker-group queue counts (rollup carries the one added queue)", () => {
     const actualCounts: Record<string, number> = {};
     for (const entry of QUEUE_TOPOLOGY) {
       actualCounts[entry.workerGroup] = (actualCounts[entry.workerGroup] ?? 0) + 1;
     }
-    expect(actualCounts).toEqual(EXPECTED_GROUP_COUNTS);
+    // ⚠ THE GROUP COMES FROM THE RECORD, NOT FROM THE TOPOLOGY. The first
+    // version read `QUEUE_TOPOLOGY.find(name)!.workerGroup` — the actual value
+    // — which made the expectation self-satisfying, while its comment claimed
+    // it caught a misplaced addition. A review moved `audit.verify` to the
+    // capture group and this test stayed green. Declaring the group alongside
+    // the reason is what makes it an assertion.
+    const expectedCounts = { ...EXPECTED_GROUP_COUNTS };
+    for (const added of Object.values(ADDED_BEYOND_REFERENCE)) {
+      expectedCounts[added.workerGroup] = (expectedCounts[added.workerGroup] ?? 0) + 1;
+    }
+    expect(actualCounts).toEqual(expectedCounts);
   });
 
   it("uses a .strict() zod schema, and every one of the 21 entries parses against it", () => {
@@ -322,9 +359,15 @@ describe("STORY-030 · queue topology declares all 21 queues per architecture re
     }
   });
 
-  it("marks tenantScoped=false only for credit.reconcile and maintenance.partition; true for every other queue", () => {
+  it("marks tenantScoped=false only for the three cross-tenant system jobs; true for every other queue", () => {
+    // ⚠ THE SHORT LIST IS THE ASSERTION. A tenant-scoped queue cannot be
+    // driven by a bare cron tick — `createJobProcessor` verifies a signature
+    // before the handler is reached — so this set is exactly the set of
+    // queues a scheduler can produce for, and `schedule-registrar.ts` refuses
+    // the rest. `audit.verify` joins it because a verifier that could only see
+    // one workspace would not be a verifier.
     const systemScoped = QUEUE_TOPOLOGY.filter((entry) => !entry.tenantScoped).map((entry) => entry.name).sort();
-    expect(systemScoped).toEqual(["credit.reconcile", "maintenance.partition"]);
+    expect(systemScoped).toEqual(["audit.verify", "credit.reconcile", "maintenance.partition"]);
   });
 
   it("configures deploy.cms with an empty retry ladder — a single attempt, no automatic retry", () => {

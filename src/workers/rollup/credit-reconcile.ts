@@ -13,6 +13,10 @@ import { globalQueueLockKey, tryAdvisorySessionLock } from "../../lib/queue/lock
 // operator runs it OUT of cadence — during an incident, or to confirm a fix —
 // exactly as `retention.ts` and `audit-verify.ts` are run.
 //
+// ⚠ That last clause was false when written: `audit-verify.ts` had no pnpm
+// script at all and was reachable only from its own tests. STORY-143 gave it
+// one (`pnpm audit:verify`) and a daily tick, so the sentence is true now.
+//
 // ⚠ WHICH MEANS IT CAN NOW COLLIDE WITH A SCHEDULED TICK, and that is exactly
 // when an operator is most likely to run it. So it takes the SAME advisory
 // lock the handler takes (STORY-141). Without this the "single-flight across

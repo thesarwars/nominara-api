@@ -271,6 +271,34 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "part:{yyyy_mm}",
     tenantScoped: false,
   },
+  // ⚠ THE ONE QUEUE §4 DOES NOT CONTAIN, and the divergence is deliberate.
+  // `security-and-tenancy.md` §12 requires it — "A verifier job re-walks each
+  // chain daily and pages on the first mismatch" — and §4's table simply never
+  // allocated it a home, so the job was written (`workers/rollup/audit-verify.ts`,
+  // STORY-020, complete with a paging notifier) and had nowhere to run. It had
+  // no pnpm script either, so it was reachable ONLY from its own tests, while
+  // two comments in this repo claimed it ran daily.
+  //
+  // Added rather than folded into `maintenance.partition` so that each queue
+  // keeps meaning one thing: an operator reading a DLQ entry or a boot line can
+  // tell which job failed. `test/unit/queue/topology.spec.ts` keeps §4's
+  // twenty-one transcribed exactly and lists this separately with its reason,
+  // so the reference and the addition never blur together.
+  //
+  // Not tenant-scoped: `listAuditedWorkspaceIds` walks every workspace, which
+  // is the whole point of a verifier. Advisory-locked for the reason
+  // `locks.ts` gives for `credit.reconcile` — concurrency 1 bounds one Worker
+  // instance, not the queue, so two replicas would both walk every chain.
+  {
+    name: "audit.verify",
+    producer: "cron daily (security-and-tenancy.md §12; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "auditver:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",
