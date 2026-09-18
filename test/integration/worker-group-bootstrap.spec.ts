@@ -70,8 +70,15 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
         const runtime = app.get<{ workers: readonly { name: string }[] }>(WORKER_GROUP_WORKERS);
         const names = runtime.workers.map((worker) => worker.name).sort();
         expect(names).toEqual([...expectedNames].sort());
-        // One connection per worker + one per its DLQ queue.
-        expect(createQueueWorkerConnectionSpy).toHaveBeenCalledTimes(expectedNames.length * 2);
+        // One connection per worker + one per its DLQ queue, plus exactly ONE
+        // shared by every schedule Queue in the group (G12).
+        //
+        // ⚠ THE `+ 1` IS THE ASSERTION, not an allowance. A Worker blocks on
+        // Redis and needs its own connection; a producer-side Queue does not,
+        // and giving each of these one would have tripled every worker
+        // process's connection count to Valkey for schedulers upserted once at
+        // boot. If that ever becomes `* 3`, someone has stopped sharing it.
+        expect(createQueueWorkerConnectionSpy).toHaveBeenCalledTimes(expectedNames.length * 2 + 1);
       } finally {
         await app.close();
       }
