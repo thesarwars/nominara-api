@@ -21,10 +21,28 @@ const REFERENCE: Record<string, { cron: string | null }> = {
   "geo.analyze": { cron: null }, // "cron daily, API"
   "gsc.sync": { cron: null }, // "cron daily, API"
   "topic.cluster": { cron: null }, // "cron weekly"
-  "maintenance.partition": { cron: null }, // "cron monthly"
+  "maintenance.partition": { cron: null }, // "cron monthly" — see DELIBERATE_DIVERGENCE
   // No period at all.
   "crawl.audit": { cron: null }, // "API, cron"
   "report.build": { cron: null }, // "API, cron"
+};
+
+/**
+ * ⚠ THE ONE PLACE THE TABLE DOES NOT FOLLOW §4, named here so it stays one
+ * place. §4 says "cron monthly" for `maintenance.partition`, which states a
+ * RESOLUTION (a month's partition) rather than a safe checking frequency.
+ * STORY-142 schedules it daily because the job is idempotent and nearly free
+ * when there is nothing to do, while a missed monthly run is not discovered
+ * until rows are already in the default partition — at which point the remedy
+ * stops being "create a partition" and becomes "move rows out under a lock".
+ *
+ * A divergence belongs in a list with a reason, not in a diff nobody reads.
+ */
+const DELIBERATE_DIVERGENCE: Record<string, { cron: string; because: string }> = {
+  "maintenance.partition": {
+    cron: "20 3 * * *",
+    because: "§4's monthly is the work's resolution, not a safe check frequency; a missed run is only found once rows are in DEFAULT",
+  },
 };
 
 describe("G12 · the schedule table matches the reference", () => {
@@ -34,8 +52,22 @@ describe("G12 · the schedule table matches the reference", () => {
 
   it("carries the cron expression the reference states, or null where it states none", () => {
     for (const [queue, expected] of Object.entries(REFERENCE)) {
-      expect(scheduleFor(queue)?.cron, queue).toBe(expected.cron);
+      const divergence = DELIBERATE_DIVERGENCE[queue];
+      expect(scheduleFor(queue)?.cron, queue).toBe(divergence?.cron ?? expected.cron);
     }
+  });
+
+  it("⚠ diverges from the reference in exactly one place, and that place carries a reason", () => {
+    // The count is the assertion. A second divergence appearing without a line
+    // in `DELIBERATE_DIVERGENCE` means somebody edited a cron rather than
+    // deciding one.
+    const diverging = Object.keys(REFERENCE).filter((queue) => scheduleFor(queue)?.cron !== REFERENCE[queue]!.cron);
+    expect(diverging).toEqual(Object.keys(DELIBERATE_DIVERGENCE));
+    for (const entry of Object.values(DELIBERATE_DIVERGENCE)) {
+      expect(entry.because.length).toBeGreaterThan(40);
+    }
+    // And the table itself records that it is not quoting §4 here.
+    expect(scheduleFor("maintenance.partition")?.statedAs).toContain("scheduled daily");
   });
 
   it("⚠ every scheduled queue exists in the topology", () => {
@@ -43,12 +75,13 @@ describe("G12 · the schedule table matches the reference", () => {
     for (const schedule of QUEUE_SCHEDULES) expect(names.has(schedule.queue), schedule.queue).toBe(true);
   });
 
-  it("⚠ states a time for exactly four of the ten, and says so rather than guessing", () => {
-    // The count is the point: six cron queues cannot be scheduled from the
+  it("⚠ states a time for exactly five of the ten, and says so rather than guessing", () => {
+    // The count is the point: five cron queues cannot be scheduled from the
     // references as written, and that gap belongs in a test rather than in
-    // somebody's memory.
-    expect(datedSchedules()).toHaveLength(4);
-    expect(undatedSchedules()).toHaveLength(6);
+    // somebody's memory. It was six until STORY-142 chose an hour for
+    // `maintenance.partition` — chose, and wrote down why.
+    expect(datedSchedules()).toHaveLength(5);
+    expect(undatedSchedules()).toHaveLength(5);
   });
 
   it("⚠ never invents an hour — no undated schedule carries a cron", () => {
@@ -87,7 +120,7 @@ describe("G12 · the schedule table matches the reference", () => {
     // has BOTH a cron and a handler, so a gate on those two alone scheduled
     // it, and a bare tick on a tenant-scoped queue throws in the signature
     // path before the handler is reached — once an hour, into the DLQ,
-    // forever. This test is the arithmetic written down: 10 − 6 − 2 − 1 = 1.
+    // forever. This test is the arithmetic written down: 10 − 5 − 2 − 1 = 2.
     const dated = datedSchedules().map((s) => s.queue);
     const inert = dated.filter((queue) => handlerFor(queue) === undefined);
     const tenantScoped = dated.filter((queue) => handlerFor(queue) !== undefined && topologyFor(queue).tenantScoped);
@@ -95,7 +128,7 @@ describe("G12 · the schedule table matches the reference", () => {
 
     expect(inert.sort()).toEqual(["attribution.rollup", "capture.plan"]);
     expect(tenantScoped.sort()).toEqual(["rollup.metric_daily"]);
-    expect(schedulable).toEqual(["credit.reconcile"]);
+    expect(schedulable.sort()).toEqual(["credit.reconcile", "maintenance.partition"]);
     // The three reasons partition the dated rows — no queue is refused twice
     // and none falls through unaccounted for.
     expect(inert.length + tenantScoped.length + schedulable.length).toBe(dated.length);
@@ -135,6 +168,6 @@ describe("G12 · describeSchedules — the one line a boot log gets", () => {
   });
 
   it("reports the cadence gap so an operator need not go and read the table", () => {
-    expect(describeSchedules(empty)).toContain("4 of 10 cron queues state a time");
+    expect(describeSchedules(empty)).toContain("5 of 10 cron queues state a time");
   });
 });

@@ -39,7 +39,10 @@ describe("G12 · reconcileSchedules", () => {
 
     expect(queue.upsertJobScheduler).toHaveBeenCalledWith(
       schedulerIdFor("credit.reconcile"),
-      { pattern: "*/10 * * * *" },
+      // ⚠ `tz` IS PART OF THE CONTRACT, not decoration. BullMQ resolves a cron
+      // in the process's local zone unless told, so without this every
+      // time-of-day schedule means something different per container.
+      { pattern: "*/10 * * * *", tz: "UTC" },
       { name: "scheduled", data: {}, opts: RECONCILE_OPTS },
     );
     expect(result.scheduled).toEqual([{ queue: "credit.reconcile", cron: "*/10 * * * *" }]);
@@ -99,11 +102,13 @@ describe("G12 · reconcileSchedules", () => {
   });
 
   it("⚠ schedules nothing for a queue whose cadence states no time", async () => {
-    // `maintenance.partition` says "cron monthly" and no date. Scheduling it
-    // would mean inventing one.
+    // `topic.cluster` says "cron weekly" and names neither a day nor an hour.
+    // Scheduling it would mean inventing both. (`maintenance.partition` stood
+    // here until STORY-142 chose an hour for it — deliberately, and for a
+    // reason recorded in `schedule.spec.ts`'s divergence list.)
     const queue = fakeQueue();
 
-    const result = await reconcileSchedules(new Map([["maintenance.partition", asQueue(queue)]]));
+    const result = await reconcileSchedules(new Map([["topic.cluster", asQueue(queue)]]));
 
     expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
     expect(result.scheduled).toEqual([]);

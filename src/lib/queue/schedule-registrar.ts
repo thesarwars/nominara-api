@@ -47,6 +47,28 @@ import { incrementCounter } from "../telemetry/metrics.js";
 // it — and nothing in the code would show it. Every boot reconciles: what
 // should run is upserted, what should not is removed.
 
+/**
+ * ⚠ EVERY CRON IN THIS TABLE IS UTC, STATED RATHER THAN ASSUMED.
+ *
+ * BullMQ resolves a cron in the PROCESS's local timezone unless told
+ * otherwise, so `20 3 * * *` means 03:20 wherever the container happens to
+ * think it is. Found by STORY-142's own boot test on a UTC+6 machine, which
+ * asserted a 03:20 fire and got 21:20 UTC.
+ *
+ * Nothing caught it earlier because nothing could: every schedule before
+ * `maintenance.partition` is timezone-INDEPENDENT — a every-ten-minutes, an
+ * on-the-hour and a five-past all fire at the same instants in any zone. The
+ * first entry with a time of day is the first that can be wrong, and it would
+ * have been wrong SILENTLY and DIFFERENTLY between a developer's machine and
+ * production — the maintenance window landing in the middle of someone's
+ * afternoon with nothing in the source to explain it.
+ *
+ * The references state their cadences against UTC (`data-model.md`'s
+ * partitions are UTC month boundaries, and `utc_date` is the daily-counter
+ * key), so UTC is the reading, not a preference.
+ */
+const SCHEDULE_TZ = "UTC";
+
 /** The prefix every scheduler id this table owns begins with. */
 const OWNED_PREFIX = "cron:";
 
@@ -199,7 +221,7 @@ export async function reconcileSchedules(
       if (shouldRun) {
         await queue.upsertJobScheduler(
           schedulerIdFor(name),
-          { pattern: wanted },
+          { pattern: wanted, tz: SCHEDULE_TZ },
           { name: jobName, data: {}, opts: scheduledJobOptions(name) },
         );
         scheduled.push({ queue: name, cron: wanted });
