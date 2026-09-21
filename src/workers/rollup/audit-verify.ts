@@ -121,6 +121,44 @@ export async function verifyWorkspaceChain(
    */
   chunkRows: number = CHAIN_CHUNK_ROWS,
 ): Promise<ChainMismatch | null> {
+  // ⚠ `LIMIT 0` WOULD READ AN EMPTY CHUNK AND CALL THE CHAIN CLEAN. The loop
+  // below treats an empty chunk as "end of chain", which is right for a walk
+  // that has reached the end and wrong for one that was never allowed to
+  // start. Conflating "found nothing" with "nothing is wrong" is the exact
+  // mistake STORY-143 paid for once already, on this same control.
+  if (!Number.isInteger(chunkRows) || chunkRows < 1) {
+    throw new RangeError(`chain walk chunk size must be a positive integer, got ${String(chunkRows)}`);
+  }
+
+  // ⚠ ONE SNAPSHOT, BECAUSE THE OLD WALK HAD ONE AND THE EQUIVALENCE ARGUMENT
+  // DEPENDS ON IT. `readWorkspaceChain` was a single statement, so it saw one
+  // consistent state; this walk is 2 + N statements, and on a bare connection
+  // every one of them takes its own READ COMMITTED snapshot. A review
+  // reproduced the consequence: let a legitimate GDPR erasure commit between
+  // the marker lookup and the first chunk — `retention.ts` rewrites content
+  // without rehashing and appends a rechaining marker, atomically — and this
+  // walk reports `hash_mismatch` on a chain that `verifyChain` calls clean.
+  //
+  // The handler turns that into an `UnrecoverableError`, a dead-letter entry
+  // and the estate's "tamper detected" signal, for an ordinary erasure that
+  // happened to overlap the nightly window. Alarm fatigue on the one control
+  // whose failure mode is silence.
+  //
+  // REPEATABLE READ rather than a lock: the walk is read-only, so the only
+  // cost is holding xmin for one workspace's read, which is what the single
+  // query cost anyway. The false-CLEAN direction was checked separately and is
+  // not reachable — `AuditChainService.append` holds an advisory xact lock per
+  // workspace, so `seq` order is commit order and keyset cannot skip a row
+  // that commits late.
+  await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+  try {
+    return await walkChain(client, workspaceId, chunkRows);
+  } finally {
+    await client.query("COMMIT");
+  }
+}
+
+async function walkChain(client: ClientBase, workspaceId: string, chunkRows: number): Promise<ChainMismatch | null> {
   const markerSeq = await lastRechainSeq(client, workspaceId, RECHAINED_MARKER_ACTION);
 
   // Where strict verification begins, and what it begins from.

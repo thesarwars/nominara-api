@@ -90,23 +90,6 @@ export interface ChainMismatch {
 export const RECHAINED_MARKER_ACTION = "audit.chain.rechained";
 
 /**
- * Walks `rows` (already fetched in ascending seq order, already scoped to
- * ONE workspace by the caller) and returns the FIRST mismatch, or null if
- * the chain verifies clean.
- *
- * STORY-020-E-9 / D-4: rows strictly BEFORE the most recent
- * `audit.chain.rechained` marker are exempted from strict content-hash
- * verification — `requestIndividualErasure` pseudonymises actor_id on
- * already-appended rows without recomputing their row_hash (recomputing
- * would mean rewriting the hash of every row that ever followed it, an
- * unbounded operation repeated on every future erasure). The marker
- * documents exactly when this happened; verification is strict again from
- * the marker row itself onward, so genuine tampering after a legitimate
- * rechaining event still pages on the first mismatch. A gap this leaves
- * open, disclosed as STORY-020-E-9: tampering that happens to land strictly
- * BEFORE a rechaining marker is not caught by this walk.
- */
-/**
  * The strict check for ONE row, given what its `prev_hash` should be.
  *
  * Extracted so the in-memory walk and STORY-144's chunked walk cannot drift
@@ -127,6 +110,23 @@ export function verifyChainStep(
   return { ok: true, nextExpected: row.row_hash };
 }
 
+/**
+ * Walks `rows` (already fetched in ascending seq order, already scoped to
+ * ONE workspace by the caller) and returns the FIRST mismatch, or null if
+ * the chain verifies clean.
+ *
+ * STORY-020-E-9 / D-4: rows strictly BEFORE the most recent
+ * `audit.chain.rechained` marker are exempted from strict content-hash
+ * verification — `requestIndividualErasure` pseudonymises actor_id on
+ * already-appended rows without recomputing their row_hash (recomputing
+ * would mean rewriting the hash of every row that ever followed it, an
+ * unbounded operation repeated on every future erasure). The marker
+ * documents exactly when this happened; verification is strict again from
+ * the marker row itself onward, so genuine tampering after a legitimate
+ * rechaining event still pages on the first mismatch. A gap this leaves
+ * open, disclosed as STORY-020-E-9: tampering that happens to land strictly
+ * BEFORE a rechaining marker is not caught by this walk.
+ */
 export function verifyChain(rows: readonly AuditChainRow[]): ChainMismatch | null {
   let lastRechainedIndex = -1;
   for (let i = 0; i < rows.length; i++) {

@@ -106,6 +106,19 @@ export async function chainAnchorBefore(client: ClientBase, workspaceId: string,
  * which turns a linear walk quadratic — and on a table whose whole point is
  * that it only ever grows, that is the wrong shape. The `(workspace_id, seq)`
  * index added by migration 0025 is what makes this one index scan per chunk.
+ *
+ * ⚠ TWO QUERY TEXTS, NOT ONE WITH AN `OR`, and that is not a style choice.
+ * The first version was `($2::int8 IS NULL OR audit_log.seq > $2::int8)`,
+ * which plans as a keyset scan ONLY because node-pg sends unnamed statements
+ * and Postgres therefore builds a custom plan with the parameter values in
+ * hand. Under a GENERIC plan — reachable by naming the statement, by any
+ * statement-caching pool layer, or by `plan_cache_mode` set at role or
+ * database level — the planner cannot know `$2` is non-null, so the bound
+ * collapses out of the `Index Cond` into a `Filter`. A review measured the
+ * result: the scan restarts at the workspace's FIRST row on every chunk and
+ * discards everything already walked, which is precisely the quadratic shape
+ * this comment claims keyset avoids. Splitting the text makes the bound
+ * structural instead of contingent on how the driver happens to send it.
  */
 export async function readChainChunk(
   client: ClientBase,
@@ -113,12 +126,29 @@ export async function readChainChunk(
   afterSeq: string | null,
   limit: number = CHAIN_CHUNK_ROWS,
 ): Promise<AuditChainRow[]> {
-  const result = await client.query<RawAuditRow>(
-    `SELECT ${ROW_COLUMNS} FROM audit_log
-      WHERE workspace_id = $1 AND ($2::int8 IS NULL OR audit_log.seq > $2::int8)
-      ORDER BY audit_log.seq ASC
-      LIMIT $3`,
-    [workspaceId, afterSeq, limit],
-  );
+  const result =
+    afterSeq === null
+      ? await client.query<RawAuditRow>(
+          `SELECT ${ROW_COLUMNS} FROM audit_log
+            WHERE workspace_id = $1
+            ORDER BY audit_log.seq ASC
+            LIMIT $2`,
+          [workspaceId, limit],
+        )
+      : await client.query<RawAuditRow>(
+          `SELECT ${ROW_COLUMNS} FROM audit_log
+            WHERE workspace_id = $1 AND audit_log.seq > $2::int8
+            ORDER BY audit_log.seq ASC
+            LIMIT $3`,
+          [workspaceId, afterSeq, limit],
+        );
   return result.rows.map(toAuditChainRow);
+}
+
+/** The exact text `readChainChunk` runs for a continuing chunk — so a plan test can EXPLAIN the real thing. */
+export function chainChunkQueryText(): string {
+  return `SELECT ${ROW_COLUMNS} FROM audit_log
+            WHERE workspace_id = $1 AND audit_log.seq > $2::int8
+            ORDER BY audit_log.seq ASC
+            LIMIT $3`;
 }
