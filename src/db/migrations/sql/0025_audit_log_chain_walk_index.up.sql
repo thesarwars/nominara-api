@@ -1,0 +1,33 @@
+-- ============================================================================
+-- STORY-144 — the index the daily chain verifier walks on.
+--
+-- ⚠ THE VERIFIER SORTS EVERY CHAIN ON EVERY RUN, and it has done since
+-- STORY-020. `readWorkspaceChain` asks for one workspace's rows in `seq`
+-- order, and `audit_log`'s three indexes are all on `occurred_at DESC` or on
+-- `(resource_type, resource_id)` — none of them orders by `seq`. So the plan
+-- is `Bitmap Index Scan → Bitmap Heap Scan → Sort (Sort Key: seq)`, measured
+-- by the STORY-143 review, with the sort spilling to disk once a chain
+-- outgrows `work_mem`.
+--
+-- That cost nothing while the job was unreachable. STORY-143 put it on a
+-- nightly timer, so it is now paid every night, per workspace, forever, and
+-- it grows monotonically — `audit_log` is pruned only by workspace hard
+-- delete.
+--
+-- ⚠ AND THE CHUNKED WALK REQUIRES IT, not merely benefits from it. STORY-144
+-- replaces the read-it-all-into-memory walk with keyset pagination on
+-- `(workspace_id, seq)`; without a matching index every chunk re-scans and
+-- re-sorts the workspace's rows, which would make the fix slower than the
+-- thing it fixes.
+--
+-- `seq` ASC rather than DESC: the chain is verified oldest-first, because
+-- each row's hash is computed over the one before it.
+--
+-- Deliberately NOT `CONCURRENTLY` — this repository's migration runner wraps
+-- each file in a transaction and `CREATE INDEX CONCURRENTLY` cannot run in
+-- one. `audit_log` is small today; if that stops being true, building this
+-- one out of band before deploying is the operator's call, and the `IF NOT
+-- EXISTS` below makes doing so safe.
+-- ============================================================================
+
+CREATE INDEX IF NOT EXISTS ix_audit_ws_seq ON audit_log (workspace_id, seq);

@@ -106,6 +106,27 @@ export const RECHAINED_MARKER_ACTION = "audit.chain.rechained";
  * open, disclosed as STORY-020-E-9: tampering that happens to land strictly
  * BEFORE a rechaining marker is not caught by this walk.
  */
+/**
+ * The strict check for ONE row, given what its `prev_hash` should be.
+ *
+ * Extracted so the in-memory walk and STORY-144's chunked walk cannot drift
+ * on the rules — two implementations of "is this row's hash right" is exactly
+ * the kind of duplication that ends with one of them being quietly wrong.
+ */
+export function verifyChainStep(
+  expectedPrevHash: Buffer,
+  row: AuditChainRow,
+): { ok: true; nextExpected: Buffer } | { ok: false; mismatch: ChainMismatch } {
+  if (!row.prev_hash.equals(expectedPrevHash)) {
+    return { ok: false, mismatch: { seq: row.seq, reason: "prev_hash_mismatch" } };
+  }
+  const recomputed = computeRowHash(expectedPrevHash, contentOf(row));
+  if (!recomputed.equals(row.row_hash)) {
+    return { ok: false, mismatch: { seq: row.seq, reason: "hash_mismatch" } };
+  }
+  return { ok: true, nextExpected: row.row_hash };
+}
+
 export function verifyChain(rows: readonly AuditChainRow[]): ChainMismatch | null {
   let lastRechainedIndex = -1;
   for (let i = 0; i < rows.length; i++) {
@@ -125,14 +146,11 @@ export function verifyChain(rows: readonly AuditChainRow[]): ChainMismatch | nul
       expectedPrevHash = row.row_hash;
       continue;
     }
-    if (!row.prev_hash.equals(expectedPrevHash)) {
-      return { seq: row.seq, reason: "prev_hash_mismatch" };
+    const step = verifyChainStep(expectedPrevHash, row);
+    if (!step.ok) {
+      return step.mismatch;
     }
-    const recomputed = computeRowHash(expectedPrevHash, contentOf(row));
-    if (!recomputed.equals(row.row_hash)) {
-      return { seq: row.seq, reason: "hash_mismatch" };
-    }
-    expectedPrevHash = row.row_hash;
+    expectedPrevHash = step.nextExpected;
   }
   return null;
 }
