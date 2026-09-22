@@ -19,8 +19,17 @@ import { loadEnv } from "../config/env.js";
  * Bare `trustProxy: true` is not the fix. It trusts the entire
  * `X-Forwarded-For` chain, so any caller can prepend a forged address and land
  * in an untouched bucket — evasion instead of denial of service, which is
- * worse because it is silent and free. A HOP COUNT trusts exactly the proxies
- * the operator says are theirs and treats everything beyond as caller input.
+ * worse because it is silent and free. A HOP COUNT trusts exactly that many
+ * entries at the right-hand end of the chain and treats everything beyond as
+ * caller input.
+ *
+ * ⚠ THE COUNT IS OF **APPENDING** HOPS. A hop that relays the chain verbatim
+ * — nominara-app does — writes no entry and consumes no count, because
+ * `proxy-addr` begins at the socket peer and that peer is the relaying hop.
+ * `browser → ingress → nominara-app → api` is ONE. The counting rule and why
+ * an off-by-one here is invisible under honest traffic are in
+ * src/config/env.schema.ts; the arithmetic is pinned in
+ * test/unit/trust-proxy.spec.ts.
  *
  * Absent means no proxy. That is the honest default: with nothing in front,
  * the peer address IS the client, and a wrong guess in the other direction
