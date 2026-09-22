@@ -40,10 +40,23 @@ import { isIP } from "node:net";
 // whole request and writes no audit row at all — availability, not integrity,
 // and repeatable by whoever controls the value.
 //
-// ⚠ AND THE MASK SUFFIX STAYS REJECTED THOUGH `host()` WOULD NOW SURVIVE IT.
-// `host('10.0.0.0/8')` is '10.0.0.0', which would record a NETWORK as though
-// it were a host that acted. A CIDR block is not an address, and quietly
-// reinterpreting one as one is a worse answer than `null`.
+// ⚠ AND THE MASK SUFFIX STAYS REJECTED, THOUGH THE STATED REASON WAS TOO
+// BROAD. "A CIDR block is not an address" is true of `/8` and false of `/32`
+// and `/128` — which are the masks a caller would actually append, and for
+// which `host()` loses nothing. The honest accounting is that rejecting them
+// trades an integrity problem `host()` already solves for a small attribution
+// one: append `/32` to your own address and your rows read "unknown address"
+// while every other field still names you.
+//
+// Kept anyway, and narrowly: no caller sends a mask, `@fastify/proxy-addr`
+// will not produce one, and a value we cannot explain the provenance of is
+// better refused than reinterpreted. If a real mask-bearing source ever
+// appears, accept a full-length prefix (`/32`, `/128`) and nothing shorter —
+// do not widen this to `host()` generally, which would silently record
+// `10.0.0.0/8` as a host that acted.
+
+/** The longest possible IPv6 text form: `ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255`. */
+const MAX_IP_TEXT_LENGTH = 45;
 
 /**
  * The value safe to CAST as an actor's address, or `null`.
@@ -57,5 +70,24 @@ import { isIP } from "node:net";
  */
 export function safeActorIp(raw: string | null | undefined): string | null {
   if (raw === null || raw === undefined) return null;
+  // A stated ceiling, and REDUNDANT WITH THE NEXT CHECK TODAY — said plainly
+  // rather than dressed up as load-bearing. Measured: with no zone index,
+  // `isIP` accepts nothing longer than 45, so the `%` rejection below is what
+  // actually bounds this value. It stays because Node does not DOCUMENT a
+  // maximum length for `isIP` — today's 45 is an implementation detail, and
+  // this value is a bind parameter on every audited mutation. Making the
+  // ceiling explicit means a future Node change cannot silently unbound it.
+  // Neither guard is individually falsifiable by a unit test, which is what
+  // redundancy means; the invariant they jointly hold is what is asserted.
+  if (raw.length > MAX_IP_TEXT_LENGTH) return null;
+  // ⚠ ZONE INDEX: `isIP` SAYS YES AND `inet` SAYS 22P02.
+  // `isIP('fe80::1%eth0')` is 6, `'fe80::1%eth0'::inet` raises, and
+  // `@fastify/proxy-addr` passes a zone id through verbatim — so one header
+  // was a reliable kill switch on every mutating request a caller made,
+  // leaving no audit row, which is exactly the failure this guard exists to
+  // prevent. A scope id is meaningful only on the interface that owns it and
+  // is meaningless in a record of who called us, so there is nothing to
+  // preserve by stripping it rather than refusing it.
+  if (raw.includes("%")) return null;
   return isIP(raw) === 0 ? null : raw;
 }

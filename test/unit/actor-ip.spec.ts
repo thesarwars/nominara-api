@@ -38,6 +38,53 @@ describe("STORY-148 · safeActorIp — what may be hashed into the audit chain",
     expect(safeActorIp("'; DROP TABLE audit_log; --")).toBeNull();
   });
 
+  // ⚠ EVERY NEGATIVE ABOVE IS COLON-FREE, AND THAT WAS A HOLE THE REVIEW
+  // WALKED THROUGH. With no IPv6 rejection case anywhere in the suite, the
+  // one-line "simplification"
+  //
+  //     return isIP(raw) === 0 && !raw.includes(":") ? null : raw;
+  //
+  // passed all sixteen assertions while admitting networks and uncastable
+  // garbage — the exact two failures this function exists to prevent.
+  it("REJECTS an IPv6 network, an IPv6 that does not parse, and an IPv6 mask", () => {
+    expect(safeActorIp("2001:db8::/64"), "a network is not a host that acted").toBeNull();
+    expect(safeActorIp("2001:db8::1/128")).toBeNull();
+    expect(safeActorIp(":::::::"), "casts to 22P02 and aborts the mutation").toBeNull();
+    expect(safeActorIp("not:an:ip")).toBeNull();
+  });
+
+  // ⚠ `isIP` SAYS 6 AND `inet` SAYS 22P02. The one input where the two
+  // disagree, and the whole remaining job of this function is that they do
+  // not. `@fastify/proxy-addr` passes a zone id through verbatim, so one
+  // header was a reliable kill switch on every mutating request a caller
+  // made — the transaction the audit append shares with the MUTATION aborts,
+  // the request fails, and no audit row records the attempt.
+  it("REJECTS an IPv6 zone index, which Node validates and Postgres refuses", () => {
+    expect(safeActorIp("fe80::1%eth0")).toBeNull();
+    expect(safeActorIp("fe80::1%25eth0")).toBeNull();
+    expect(safeActorIp("::ffff:192.168.0.1%1")).toBeNull();
+  });
+
+  // ⚠ THE INVARIANT, NOT EITHER GUARD. `isIP`'s only unbounded acceptance is
+  // the zone suffix — `isIP('fe80::1%' + 'a'.repeat(100000))` is 6 — and that
+  // is already rejected above, so the explicit 45-character ceiling is
+  // redundant TODAY and neither check is individually falsifiable here. That
+  // is what redundancy means, and it is worth saying rather than writing two
+  // assertions that each look load-bearing and are not. What this pins is the
+  // property both exist to hold: nothing over-long reaches the bind parameter
+  // by any route. Removing BOTH fails it.
+  //
+  // The `"A"*4000` case above pins nothing about length — that string is
+  // colon-free and is rejected for not being an address at all.
+  it("admits nothing longer than the longest possible IPv6 text form, by any route", () => {
+    for (const long of [`fe80::1%${"a".repeat(100_000)}`, "0".repeat(50), `${"1".repeat(46)}.1.1.1`]) {
+      expect(safeActorIp(long)).toBeNull();
+    }
+    expect(safeActorIp("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255"), "45 chars, and valid").toBe(
+      "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255",
+    );
+  });
+
   // ⚠ THESE ARE THE CHAIN POISONERS. Each casts cleanly, so nothing fails at
   // write time; each comes back from host() as a DIFFERENT string, so the row
   // can never verify again.
