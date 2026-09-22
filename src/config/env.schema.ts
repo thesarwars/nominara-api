@@ -238,6 +238,18 @@ export const envSchema = z
     // which is total forgery of every ip bucket and of every audit row's
     // `actorIp`.
     //
+    // ⚠ AND TODAY IT MUST STAY UNSET EVERYWHERE REGARDLESS, FOR ONE MORE
+    // REASON. `audit_log.actor_ip` is `inet`, the row hash is computed over
+    // the string we send, and the verifier reads the row back with
+    // `host(actor_ip)` — so a caller who controls `request.ip` can send a
+    // valid but non-canonical IPv6 literal, have Postgres rewrite it, and
+    // leave THAT TENANT'S chain reporting `hash_mismatch` forever.
+    // `src/lib/crypto/actor-ip.ts` closes the castable and mask-suffixed
+    // cases; the IPv6 spelling is not closed yet, and
+    // test/integration/audit-chain-service.spec.ts demonstrates the break
+    // rather than describing it. Setting this variable before that lands
+    // hands a caller a permanent, unrepairable mark on a tenant's audit trail.
+    //
     // UNSET MEANS NO PROXY, and that is the safe default rather than a
     // convenient one: with no value the peer address is used, which is correct
     // when nothing sits in front and merely coarse when something does.

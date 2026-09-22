@@ -164,6 +164,83 @@ describe("STORY-020 · AuditChainService", () => {
     }
   });
 
+  // ⚠ STORY-148 review — A CALLER-SUPPLIED ADDRESS MUST NOT BE ABLE TO BREAK
+  // THIS CHAIN, and until now nothing stopped one.
+  //
+  // `actor_ip` is `inet`; the row hash is computed over the string we send and
+  // the verifier reads the row back with `host(actor_ip)`. Any spelling
+  // Postgres rewrites yields a row that can never be recomputed — a permanent
+  // `hash_mismatch` the daily verifier reports as tampering against that
+  // TENANT. It became reachable the moment nominara-app started relaying the
+  // caller's X-Forwarded-For chain.
+  //
+  // This asserts against the real database and the real verifier, which is the
+  // only place the round-trip is observable: the unit test in
+  // test/unit/actor-ip.spec.ts knows which spellings to reject, and THIS knows
+  // whether rejecting them was enough.
+  it("STORY-148 — a mask suffix in actor_ip does not poison the chain", async () => {
+    const ws = "beeff00d-0000-4000-8000-000000000001";
+    await service.append(db, input({ workspaceId: ws, actorIp: "203.0.113.9/32", action: "project.update" }));
+
+    const rows = await fetchChain(db, ws);
+    // Dropped rather than stored wrong: `host()` would return '203.0.113.9'
+    // for it, so hashing '203.0.113.9/32' would be hashing a string this row
+    // can never present again.
+    expect(rows[0]!.actor_ip).toBeNull();
+    expect(verifyChain(rows), "the tenant's chain must still verify").toBeNull();
+  });
+
+  it("STORY-148 — an uncastable actor_ip does not abort the mutation's transaction", async () => {
+    // `'not-an-ip'::inet` raises 22P02, and the append runs inside the
+    // MUTATION's transaction — so without this the request itself fails and
+    // no audit row is written for it, repeatably, at the caller's choosing.
+    const ws = "beeff00d-0000-4000-8000-000000000002";
+    await expect(
+      service.append(db, input({ workspaceId: ws, actorIp: "not-an-ip", action: "project.update" })),
+    ).resolves.toBeUndefined();
+
+    const rows = await fetchChain(db, ws);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.actor_ip).toBeNull();
+    expect(verifyChain(rows), "a null mismatch is a chain that verifies").toBeNull();
+  });
+
+  it("STORY-148 — a real address still round-trips and still verifies", async () => {
+    // The guard must not be a blanket null: an audit row with no actor address
+    // is the failure this column exists to prevent.
+    const ws = "beeff00d-0000-4000-8000-000000000003";
+    await service.append(db, input({ workspaceId: ws, actorIp: "203.0.113.9", action: "project.update" }));
+
+    const rows = await fetchChain(db, ws);
+    expect(rows[0]!.actor_ip).toBe("203.0.113.9");
+    expect(verifyChain(rows), "a null mismatch is a chain that verifies").toBeNull();
+  });
+
+  // ⚠ STORY-148 review — THE HALF THAT IS NOT FIXED YET, DEMONSTRATED RATHER
+  // THAN DESCRIBED.
+  //
+  // `2001:0DB8::0001` is a VALID IPv6 literal, so `safeActorIp` lets it
+  // through; Postgres stores it and `host()` returns `2001:db8::1`. This test
+  // exists to show that the consequence is real and permanent, because a
+  // comment saying "this would break the chain" is a claim and this is
+  // evidence. It is also the regression test for the fix: when the survivors
+  // are normalised through `SELECT host($1::inet)` in the same transaction,
+  // this test fails and is rewritten to assert the chain verifies.
+  //
+  // Until then, `TRUST_PROXY_HOPS` must stay unset in every environment — it
+  // is the only thing standing between a caller and this row.
+  it("⚠ KNOWN GAP — a non-canonical IPv6 literal DOES break the chain, permanently", async () => {
+    const ws = "beeff00d-0000-4000-8000-000000000004";
+    await service.append(db, input({ workspaceId: ws, actorIp: "2001:0DB8::0001", action: "project.update" }));
+
+    const rows = await fetchChain(db, ws);
+    expect(rows[0]!.actor_ip, "Postgres rewrote what we hashed").toBe("2001:db8::1");
+
+    const mismatch = verifyChain(rows);
+    expect(mismatch, "this tenant's chain now reports as tampered, and nothing can repair it").not.toBeNull();
+    expect(mismatch!.reason).toBe("hash_mismatch");
+  });
+
   it("support action records the grant reference alongside the support actor type (scenario 11)", async () => {
     const ws = "99999999-9999-9999-9999-999999999999";
     const grantId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";

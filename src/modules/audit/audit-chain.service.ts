@@ -7,6 +7,7 @@ import {
   type AuditRowContent,
   type AuditSeverity,
 } from "../../lib/crypto/audit-chain.js";
+import { safeActorIp } from "../../lib/crypto/actor-ip.js";
 import { redactState } from "../../lib/crypto/redact.js";
 
 // STORY-020 — security-and-tenancy.md §12. Runs on the SAME context-carrying
@@ -61,7 +62,11 @@ export class AuditChainService {
       occurred_at: new Date().toISOString(),
       actor_type: input.actorType,
       actor_id: input.actorId,
-      actor_ip: input.actorIp,
+      // Validated BEFORE the hash, for the same reason redactState runs before
+      // it: the verifier recomputes from the stored content, so anything that
+      // changes on the way into the column must change before the hash sees
+      // it. See lib/crypto/actor-ip.ts.
+      actor_ip: safeActorIp(input.actorIp),
       actor_ua: input.actorUa,
       action: input.action,
       resource_type: input.resourceType,
