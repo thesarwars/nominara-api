@@ -88,13 +88,22 @@ export class RoomAuthorizationService {
   }
 
   /**
-   * The guards, in the order the HTTP chain runs them.
+   * The guards this chain runs, in order — a SUBSET of the HTTP chain's; see
+   * the note on `chain` below.
    *
    * Exposed so `test/unit/gateway-structure.spec.ts` can assert these are the SAME
    * INSTANCES the container provides, rather than trusting a comment saying
    * they are. "We reuse the guards" is exactly the kind of claim that quietly
    * stops being true.
    */
+  // ⚠ THREE GUARDS, AND THE HTTP CHAIN NOW RUNS NINE. STORY-150 added
+  // `CanonicalParamsGuard` at the front of the HTTP chain; it is deliberately
+  // NOT here, because a ws context is not an http one and because the room
+  // name — which is not a param — would still need canonicalising separately.
+  // `realtime.gateway.ts`'s `joinProject` canonicalises the project id once,
+  // at the entry, so both this chain's `params` and the room name derive from
+  // the same value. The comment above used to say "the order the HTTP chain
+  // runs them", which stopped being true.
   get chain(): readonly CanActivate[] {
     return [this.authGuard, this.workspaceGuard, this.rbacGuard];
   }

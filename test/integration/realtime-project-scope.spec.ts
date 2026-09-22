@@ -237,6 +237,30 @@ describe("STORY-026 · project rooms enforce workspace_members.project_scope", (
   // THE DEFECT. Before project rooms and the permission metadata existed,
   // there was no join to refuse and no scope check to run — this member
   // received every project's events through the workspace room.
+  // ⚠ STORY-150 review — THE ONLY PRODUCTION PATH WHERE `assertInScope` READS
+  // A PARAM, AND THE ONE STORY-150 ORIGINALLY EXCLUDED.
+  //
+  // `@ProjectParam` appears on ZERO controllers, so the HTTP guard added by
+  // that story never reaches this check in production; this join does. The
+  // client sends `project_id` verbatim, and it is used TWICE — as the param
+  // `RbacGuard` compares against a scope list read from Postgres (lowercase),
+  // and as the room name a publisher will later address.
+  //
+  // So an uppercase id refused a scoped manager THEIR OWN project's room with
+  // a 4403. And for an unrestricted member it did something quieter and worse:
+  // `assertInScope` returns early, the ownership read casts to `uuid` and
+  // passes, and the socket joins `proj:A0EE…` — a room no publisher will ever
+  // match. Latent only while nothing publishes to project rooms.
+  it("STORY-150 — an UPPERCASE project id joins the same room a lowercase one does", async () => {
+    const { mine, client } = await scenario("manager", "first");
+    const reply = await joinProject(client, mine.toUpperCase());
+
+    expect(reply.joined, "a scoped manager must not be refused their own project for typing it in capitals").toBe(true);
+    // The room name is the sharp half: a room named from the uppercase id is
+    // one no publisher addresses.
+    expect(reply.room).toBe(projectRoom(mine));
+  });
+
   it("a manager scoped to one project is REFUSED another project's room, and disconnected", async () => {
     const { theirs, client } = await scenario("manager", "first");
     const closed = refused(client);

@@ -20,6 +20,7 @@ import { Redis } from "ioredis";
 import { memberChangedEventSchema } from "../../contracts/events/platform-events.schema.js";
 import { attachValkeyAdapter, type ValkeyAdapterHandle } from "./valkey-adapter.js";
 import { MembershipCacheService } from "../tenancy/membership-cache.js";
+import { canonicalUuid } from "../api/canonical-uuid.js";
 
 const logger = new Logger("realtime-gateway");
 
@@ -591,7 +592,32 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
     @ConnectedSocket() socket: Socket,
     @MessageBody() body: { project_id?: unknown },
   ): Promise<{ joined: boolean; room?: string }> {
-    const projectId = typeof body?.project_id === "string" ? body.project_id : "";
+    // ⚠ CANONICALISED HERE, BECAUSE THIS IS THE ONLY PLACE IT CAN BE.
+    // STORY-150, added by that story's review.
+    //
+    // This one value is used TWICE and both uses need the canonical form:
+    // `authorizeProjectRoom` puts it in `params` for `RbacGuard.assertInScope`,
+    // which compares it against a scope list read from Postgres and therefore
+    // lowercase; and `projectRoom()` below names the room a publisher will
+    // later address. So an uppercase `project_id` refused a scoped manager
+    // their OWN project's room with a 4403 — and for an unrestricted member
+    // (`project_scope IS NULL`) `assertInScope` returns early, the ownership
+    // read casts to `uuid` and passes, and the socket joins `proj:A0EE…`: a
+    // room NO PUBLISHER WILL EVER MATCH. Silent event loss rather than a
+    // refusal, latent only while nothing publishes to project rooms yet.
+    //
+    // ⚠ NOT FIXED BY `CanonicalParamsGuard`, and it cannot be. That guard runs
+    // in the HTTP chain; `RoomAuthorizationService.chain` is three guards over
+    // a synthesised ws context. Adding it there would fix the scope check and
+    // still leave the room name wrong, because the room is named from this
+    // value and not from `params`. One canonicalisation at the entry fixes
+    // both, which is the same "decide it once, before anything reads it" shape
+    // the HTTP guard has.
+    //
+    // ⚠ AND THE REVIEW FOUND THIS IS THE ONLY PRODUCTION PATH WHERE
+    // `assertInScope` READS A PARAM AT ALL — `@ProjectParam` appears on zero
+    // controllers. The surface STORY-150 led with was the one it excluded.
+    const projectId = typeof body?.project_id === "string" ? canonicalUuid(body.project_id) : "";
     if (projectId.length === 0) {
       socket.disconnect(true);
       return { joined: false };

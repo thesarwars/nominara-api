@@ -5,6 +5,7 @@ import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { canonicalUuid } from "../../api/canonical-uuid.js";
 
 // STORY-046 — `POST /v1/projects/{id}/prompts/activate`.
 // plans-and-entitlements.md §10, api-specification.md §3.
@@ -59,12 +60,33 @@ export class PromptActivationService {
     if (store === undefined) throw new Error("PromptActivationService.activate requires an active tenant context");
     const client = store.client as TenantClient;
 
+    // ⚠ CANONICALISED BEFORE ANYTHING COMPARES THEM. STORY-150's review found
+    // this one live: `prompt_ids` is a BODY field, so `CanonicalParamsGuard`
+    // never sees it, and `z.string().uuid()` accepts an uppercase uuid (zod's
+    // check is case-insensitive — verified, not assumed). Postgres then
+    // matched the row anyway, because `$1::uuid[]` casts — so `loadPrompts`
+    // got the row back, `found.get(UPPERCASE)` missed the lowercase key it was
+    // stored under, and the caller was told "no such prompt in this project"
+    // about a prompt in their own project.
+    //
+    // It also made the duplicate check below miss `[lower, UPPER]` of one
+    // prompt, which is the same id twice. That failed closed at `loadPrompts`
+    // instead, so the refusal was right for the wrong reason.
+    //
+    // ⚠ BODY AND QUERY UUIDS ARE NOT SYSTEMATICALLY HANDLED, and this fixes
+    // one instance rather than the class. There are 67 uuid fields across
+    // `contracts/`; the boundary for them is a shared schema with a lowercase
+    // transform, which changes the generated OpenAPI and belongs in its own
+    // story. This one is fixed here because it is live and it is the defect
+    // STORY-150 is named for.
+    const promptIds = request.prompt_ids.map((id) => canonicalUuid(id));
+
     // A DUPLICATE ID IS A REFUSAL, not something to quietly collapse. With
     // one slot left, `[P1, P1]` either passes the cap check as two and
     // activates one, or passes as one and is reported as two — both of which
     // lie in the summary. Refusing names the mistake instead.
-    const unique = new Set(request.prompt_ids);
-    if (unique.size !== request.prompt_ids.length) {
+    const unique = new Set(promptIds);
+    if (unique.size !== promptIds.length) {
       throw new ValidationFailedError({
         message: "prompt_ids contains a duplicate",
         details: { issues: [{ path: ["prompt_ids"], message: "each prompt may appear at most once" }] },
@@ -75,7 +97,7 @@ export class PromptActivationService {
 
     const cap = await this.resolveCap(store.context.workspaceId);
     const activeBefore = await this.countOccupyingSlots(client, projectId);
-    const prompts = await this.loadPrompts(client, projectId, request.prompt_ids);
+    const prompts = await this.loadPrompts(client, projectId, promptIds);
 
     // Already-active prompts are counted against NEITHER the cap nor the
     // charge. This is what makes a replay at the cap succeed: counting them
@@ -134,7 +156,7 @@ export class PromptActivationService {
     return {
       activated_prompt_ids: toActivate.map((prompt) => prompt.id),
       summary: {
-        requested: request.prompt_ids.length,
+        requested: promptIds.length,
         activated: toActivate.length,
         already_active: alreadyActive.length,
         slots_remaining: Math.max(0, cap - activeAfter),
