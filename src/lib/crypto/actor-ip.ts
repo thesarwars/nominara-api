@@ -27,22 +27,29 @@ import { isIP } from "node:net";
 // moment `TRUST_PROXY_HOPS` is set, a caller inside the trusted span chooses
 // this string.
 //
-// ⚠ THIS IS THE FIRST OF TWO HALVES, DELIBERATELY. `isIP` rejects the mask
-// suffix, the leading zero and the garbage — three of the four rows above and
-// the transaction abort with them. What survives is a VALID but non-canonical
-// IPv6 literal, which Postgres still rewrites. Node has no canonicaliser that
-// agrees with `host()` (WHATWG's URL parser turns '::ffff:127.0.0.1' into
-// '::ffff:7f00:1', which would break the common case rather than fix the rare
-// one), so the honest fix is to normalise the survivors through the database
-// itself — `SELECT host($1::inet)` inside the same transaction, which is
-// correct by construction because it is the very function the verifier uses.
-// That is its own story; it needs an integration test against real Postgres.
+// ⚠ THIS IS ONE OF TWO HALVES, AND IT IS NOT THE ONE THAT MAKES THE HASH
+// AGREE. STORY-149 folded `host($2::inet)` into the tail read in
+// AuditChainService.append, so the value hashed and stored is the one the
+// verifier will read back — correct by construction, because it is the same
+// function, rather than a Node canonicaliser that would have to be kept in
+// step with Postgres forever.
 //
-// Until it lands, `TRUST_PROXY_HOPS` must stay unset in every environment —
-// see src/config/env.schema.ts.
+// What this still does, and why removing it would reintroduce the worse bug:
+// `$2::inet` on a non-address raises 22P02, and that statement runs inside the
+// MUTATION's transaction. Without this guard an uncastable value fails the
+// whole request and writes no audit row at all — availability, not integrity,
+// and repeatable by whoever controls the value.
+//
+// ⚠ AND THE MASK SUFFIX STAYS REJECTED THOUGH `host()` WOULD NOW SURVIVE IT.
+// `host('10.0.0.0/8')` is '10.0.0.0', which would record a NETWORK as though
+// it were a host that acted. A CIDR block is not an address, and quietly
+// reinterpreting one as one is a worse answer than `null`.
 
 /**
- * The value safe to hash and store as an actor's address, or `null`.
+ * The value safe to CAST as an actor's address, or `null`.
+ *
+ * Not the value finally stored — `AuditChainService.append` canonicalises what
+ * this admits through `host()`. This decides only what may reach the cast.
  *
  * `null` rather than a placeholder: "we do not know where this came from" is
  * a true statement an incident review can act on, and a stand-in address is a

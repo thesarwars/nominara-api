@@ -216,29 +216,47 @@ describe("STORY-020 · AuditChainService", () => {
     expect(verifyChain(rows), "a null mismatch is a chain that verifies").toBeNull();
   });
 
-  // ⚠ STORY-148 review — THE HALF THAT IS NOT FIXED YET, DEMONSTRATED RATHER
-  // THAN DESCRIBED.
+  // ⚠ STORY-149 — THE ROUND-TRIP ITSELF, which is the only thing that proves
+  // this fix and the only place it is observable.
   //
-  // `2001:0DB8::0001` is a VALID IPv6 literal, so `safeActorIp` lets it
-  // through; Postgres stores it and `host()` returns `2001:db8::1`. This test
-  // exists to show that the consequence is real and permanent, because a
-  // comment saying "this would break the chain" is a claim and this is
-  // evidence. It is also the regression test for the fix: when the survivors
-  // are normalised through `SELECT host($1::inet)` in the same transaction,
-  // this test fails and is rewritten to assert the chain verifies.
+  // This test previously asserted the OPPOSITE: `2001:0DB8::0001` came back
+  // `2001:db8::1` and the chain reported `hash_mismatch`, permanently.
+  // `append` now canonicalises through `host()` before hashing, so the value
+  // stored and the value the verifier reads are the same string by
+  // construction.
   //
-  // Until then, `TRUST_PROXY_HOPS` must stay unset in every environment — it
-  // is the only thing standing between a caller and this row.
-  it("⚠ KNOWN GAP — a non-canonical IPv6 literal DOES break the chain, permanently", async () => {
-    const ws = "beeff00d-0000-4000-8000-000000000004";
-    await service.append(db, input({ workspaceId: ws, actorIp: "2001:0DB8::0001", action: "project.update" }));
+  // A table, because one spelling proves one spelling. Each of these is a way
+  // Postgres rewrites an address, measured against the real database — and any
+  // one of them is a tenant's chain permanently reporting as tampered.
+  const REWRITTEN: ReadonlyArray<{ sent: string; stored: string; why: string }> = [
+    { sent: "2001:0DB8::0001", stored: "2001:db8::1", why: "uppercase hex and leading zeros in a group" },
+    { sent: "2001:DB8:0:0:0:0:0:1", stored: "2001:db8::1", why: "an uncompressed zero run" },
+    { sent: "::FFFF:127.0.0.1", stored: "::ffff:127.0.0.1", why: "the dual-stack form fastify produces, in capitals" },
+  ];
+
+  for (const [index, spelling] of REWRITTEN.entries()) {
+    it(`STORY-149 — '${spelling.sent}' (${spelling.why}) is canonicalised before hashing, and the chain verifies`, async () => {
+      const ws = `beeff00d-0000-4000-8000-00000000001${String(index)}`;
+      await service.append(db, input({ workspaceId: ws, actorIp: spelling.sent, action: "project.update" }));
+
+      const rows = await fetchChain(db, ws);
+      expect(rows[0]!.actor_ip, "what the verifier reads back").toBe(spelling.stored);
+      expect(verifyChain(rows), "hashing the sent spelling would leave this unrepairable").toBeNull();
+    });
+  }
+
+  it("STORY-149 — a chain of mixed spellings verifies end to end, not just one row at a time", async () => {
+    // A single-row chain cannot fail on `prev_hash`, so it is the weakest
+    // possible shape for this claim. Five linked rows is the real one.
+    const ws = "beeff00d-0000-4000-8000-000000000020";
+    for (const ip of ["203.0.113.9", "2001:0DB8::0001", "::FFFF:127.0.0.1", "not-an-ip", "203.0.113.9/32"]) {
+      await service.append(db, input({ workspaceId: ws, actorIp: ip, action: "project.update" }));
+    }
 
     const rows = await fetchChain(db, ws);
-    expect(rows[0]!.actor_ip, "Postgres rewrote what we hashed").toBe("2001:db8::1");
-
-    const mismatch = verifyChain(rows);
-    expect(mismatch, "this tenant's chain now reports as tampered, and nothing can repair it").not.toBeNull();
-    expect(mismatch!.reason).toBe("hash_mismatch");
+    expect(rows).toHaveLength(5);
+    expect(rows.map((r) => r.actor_ip)).toEqual(["203.0.113.9", "2001:db8::1", "::ffff:127.0.0.1", null, null]);
+    expect(verifyChain(rows)).toBeNull();
   });
 
   it("support action records the grant reference alongside the support actor type (scenario 11)", async () => {

@@ -49,15 +49,21 @@ describe("STORY-148 · safeActorIp — what may be hashed into the audit chain",
     expect(safeActorIp("0203.0.113.9")).toBeNull();
   });
 
-  // ⚠ AND THE ONE THIS HALF DOES NOT CLOSE, STATED RATHER THAN HIDDEN.
-  // host('2001:0DB8::0001') is '2001:db8::1', so this still poisons a chain.
-  // Node has no canonicaliser that agrees with Postgres — WHATWG's URL parser
-  // turns '::ffff:127.0.0.1' into '::ffff:7f00:1', breaking the common case to
-  // fix the rare one — so the fix is to normalise through the database, which
-  // needs an integration test and is its own story. The assertion is written
-  // the way the code actually behaves, so the day it changes this test fails
-  // and someone reads this comment.
-  it("⚠ KNOWN GAP — a non-canonical IPv6 literal still passes, and still poisons the chain", () => {
-    expect(safeActorIp("2001:0DB8::0001"), "TRUST_PROXY_HOPS must stay unset until this is closed").toBe("2001:0DB8::0001");
+  // ⚠ A NON-CANONICAL IPv6 LITERAL PASSES HERE, AND THAT IS NOW CORRECT.
+  // STORY-149.
+  //
+  // This function decides what may reach `$2::inet`, not what is stored.
+  // `AuditChainService.append` canonicalises what it admits through `host()`,
+  // so '2001:0DB8::0001' becomes '2001:db8::1' BEFORE the hash is computed and
+  // the row verifies. Rejecting it here would discard a real address for a
+  // problem solved one layer down — the actor of that request would be
+  // recorded as unknown because they wrote their own address in capitals.
+  //
+  // test/integration/audit-chain-service.spec.ts is where the round-trip is
+  // observable and where that claim is actually proved; this only pins that
+  // the value is not dropped on the way.
+  it("admits a valid but non-canonical spelling — append canonicalises it, so dropping it would lose a real actor", () => {
+    expect(safeActorIp("2001:0DB8::0001")).toBe("2001:0DB8::0001");
+    expect(safeActorIp("2001:DB8::1")).toBe("2001:DB8::1");
   });
 });

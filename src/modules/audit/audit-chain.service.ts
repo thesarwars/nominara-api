@@ -47,11 +47,40 @@ export class AuditChainService {
   async append(client: ClientBase, input: AppendAuditRowInput): Promise<void> {
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [input.workspaceId]);
 
-    const tail = await client.query<{ row_hash: Buffer }>(
-      "SELECT row_hash FROM audit_log WHERE workspace_id = $1 ORDER BY seq DESC LIMIT 1",
-      [input.workspaceId],
+    // The chain tail AND the actor's address, in one statement.
+    //
+    // ⚠ `host()` IS WHY THIS IS CORRECT RATHER THAN CAREFUL. STORY-149.
+    //
+    // `actor_ip` is `inet`, so Postgres rewrites what it stores — and the
+    // verifier reads the row back with `host(actor_ip)`
+    // (src/modules/audit/audit-log-reader.ts). Hashing the string a CALLER
+    // sent therefore hashes something the row can never present again:
+    // '2001:0DB8::0001' comes back '2001:db8::1' and that workspace's chain
+    // reports `hash_mismatch` from then on, permanently, with no way to
+    // repair it. STORY-148 made that reachable by relaying the caller's
+    // X-Forwarded-For chain.
+    //
+    // Normalising in Node was the obvious reach and the wrong one: no Node
+    // API agrees with `host()` — WHATWG's URL parser turns '::ffff:127.0.0.1'
+    // into '::ffff:7f00:1', breaking the common case to fix the rare one — so
+    // any hand-rolled canonicaliser is a second implementation that must be
+    // kept in step with Postgres forever. Asking Postgres is not a
+    // round-trip we pay for: it folds into the tail read that was already
+    // here, and it is the SAME FUNCTION the verifier uses, which is the whole
+    // property. `host()` is idempotent and strict, so a null stays null and a
+    // canonical address is returned unchanged.
+    //
+    // `safeActorIp` still runs first and still matters: `$2::inet` on a
+    // non-address raises 22P02, and this statement is inside the MUTATION's
+    // transaction, so an uncastable value would fail the request rather than
+    // the audit row. The two halves compose — one makes the cast safe, the
+    // other makes the hash agree with the read.
+    const head = await client.query<{ row_hash: Buffer | null; actor_ip: string | null }>(
+      `SELECT (SELECT row_hash FROM audit_log WHERE workspace_id = $1 ORDER BY seq DESC LIMIT 1) AS row_hash,
+              host($2::inet) AS actor_ip`,
+      [input.workspaceId, safeActorIp(input.actorIp)],
     );
-    const prevHash: Buffer = tail.rows[0]?.row_hash ?? GENESIS_HASH;
+    const prevHash: Buffer = head.rows[0]?.row_hash ?? GENESIS_HASH;
 
     // Redacted BEFORE the hash is computed — redaction covers content, so a
     // verifier re-walking the chain later recomputes the SAME hash from the
@@ -62,11 +91,11 @@ export class AuditChainService {
       occurred_at: new Date().toISOString(),
       actor_type: input.actorType,
       actor_id: input.actorId,
-      // Validated BEFORE the hash, for the same reason redactState runs before
-      // it: the verifier recomputes from the stored content, so anything that
+      // Canonical BEFORE the hash, for the same reason redactState runs before
+      // it: the verifier recomputes from the STORED content, so anything that
       // changes on the way into the column must change before the hash sees
-      // it. See lib/crypto/actor-ip.ts.
-      actor_ip: safeActorIp(input.actorIp),
+      // it. See the `host()` note above and lib/crypto/actor-ip.ts.
+      actor_ip: head.rows[0]?.actor_ip ?? null,
       actor_ua: input.actorUa,
       action: input.action,
       resource_type: input.resourceType,
