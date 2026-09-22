@@ -216,9 +216,39 @@ export const envSchema = z
     // A HOP COUNT, never `trustProxy: true`. Bare `true` trusts the whole
     // X-Forwarded-For chain, so any caller can forge a header and land in a
     // fresh bucket — which turns a denial-of-service bug into a trivial
-    // evasion, strictly worse than what it replaced. The count says how many
-    // proxies YOU operate; everything beyond them is caller-supplied and
-    // ignored.
+    // evasion, strictly worse than what it replaced.
+    //
+    // ⚠ COUNT THE HOPS THAT **APPEND** TO X-FORWARDED-FOR, AND DO NOT COUNT
+    // A HOP THAT MERELY RELAYS ONE. Read literally this is "how many entries
+    // at the right-hand end of the chain did equipment I operate write". A
+    // relaying hop — nominara-app, which forwards the chain it received
+    // verbatim (lib/api/forwarded-for.ts) — writes no entry and consumes no
+    // count, because `proxy-addr` starts from the socket peer and that peer
+    // IS the relaying hop. So `browser → ingress → nominara-app → api` is
+    // ONE, not two.
+    //
+    // ⚠ AND AN OFF-BY-ONE HERE IS INVISIBLE IN TESTING. With honest traffic
+    // through one appending ingress, 1 and 2 return the same address; 2 only
+    // diverges once someone prepends a forged entry, and then it returns
+    // theirs. Verified in test/unit/trust-proxy.spec.ts against the real
+    // proxy-addr rather than reasoned about.
+    //
+    // ⚠ NOTHING APPENDING IN FRONT? THEN THIS MUST STAY UNSET. Any value at
+    // all makes the rightmost entry of a caller-authored header authoritative,
+    // which is total forgery of every ip bucket and of every audit row's
+    // `actorIp`.
+    //
+    // ⚠ AND TODAY IT MUST STAY UNSET EVERYWHERE REGARDLESS, FOR ONE MORE
+    // REASON. `audit_log.actor_ip` is `inet`, the row hash is computed over
+    // the string we send, and the verifier reads the row back with
+    // `host(actor_ip)` — so a caller who controls `request.ip` can send a
+    // valid but non-canonical IPv6 literal, have Postgres rewrite it, and
+    // leave THAT TENANT'S chain reporting `hash_mismatch` forever.
+    // `src/lib/crypto/actor-ip.ts` closes the castable and mask-suffixed
+    // cases; the IPv6 spelling is not closed yet, and
+    // test/integration/audit-chain-service.spec.ts demonstrates the break
+    // rather than describing it. Setting this variable before that lands
+    // hands a caller a permanent, unrepairable mark on a tenant's audit trail.
     //
     // UNSET MEANS NO PROXY, and that is the safe default rather than a
     // convenient one: with no value the peer address is used, which is correct
