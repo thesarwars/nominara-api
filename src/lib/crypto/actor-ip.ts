@@ -27,22 +27,42 @@ import { isIP } from "node:net";
 // moment `TRUST_PROXY_HOPS` is set, a caller inside the trusted span chooses
 // this string.
 //
-// ⚠ THIS IS THE FIRST OF TWO HALVES, DELIBERATELY. `isIP` rejects the mask
-// suffix, the leading zero and the garbage — three of the four rows above and
-// the transaction abort with them. What survives is a VALID but non-canonical
-// IPv6 literal, which Postgres still rewrites. Node has no canonicaliser that
-// agrees with `host()` (WHATWG's URL parser turns '::ffff:127.0.0.1' into
-// '::ffff:7f00:1', which would break the common case rather than fix the rare
-// one), so the honest fix is to normalise the survivors through the database
-// itself — `SELECT host($1::inet)` inside the same transaction, which is
-// correct by construction because it is the very function the verifier uses.
-// That is its own story; it needs an integration test against real Postgres.
+// ⚠ THIS IS ONE OF TWO HALVES, AND IT IS NOT THE ONE THAT MAKES THE HASH
+// AGREE. STORY-149 folded `host($2::inet)` into the tail read in
+// AuditChainService.append, so the value hashed and stored is the one the
+// verifier will read back — correct by construction, because it is the same
+// function, rather than a Node canonicaliser that would have to be kept in
+// step with Postgres forever.
 //
-// Until it lands, `TRUST_PROXY_HOPS` must stay unset in every environment —
-// see src/config/env.schema.ts.
+// What this still does, and why removing it would reintroduce the worse bug:
+// `$2::inet` on a non-address raises 22P02, and that statement runs inside the
+// MUTATION's transaction. Without this guard an uncastable value fails the
+// whole request and writes no audit row at all — availability, not integrity,
+// and repeatable by whoever controls the value.
+//
+// ⚠ AND THE MASK SUFFIX STAYS REJECTED, THOUGH THE STATED REASON WAS TOO
+// BROAD. "A CIDR block is not an address" is true of `/8` and false of `/32`
+// and `/128` — which are the masks a caller would actually append, and for
+// which `host()` loses nothing. The honest accounting is that rejecting them
+// trades an integrity problem `host()` already solves for a small attribution
+// one: append `/32` to your own address and your rows read "unknown address"
+// while every other field still names you.
+//
+// Kept anyway, and narrowly: no caller sends a mask, `@fastify/proxy-addr`
+// will not produce one, and a value we cannot explain the provenance of is
+// better refused than reinterpreted. If a real mask-bearing source ever
+// appears, accept a full-length prefix (`/32`, `/128`) and nothing shorter —
+// do not widen this to `host()` generally, which would silently record
+// `10.0.0.0/8` as a host that acted.
+
+/** The longest possible IPv6 text form: `ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255`. */
+const MAX_IP_TEXT_LENGTH = 45;
 
 /**
- * The value safe to hash and store as an actor's address, or `null`.
+ * The value safe to CAST as an actor's address, or `null`.
+ *
+ * Not the value finally stored — `AuditChainService.append` canonicalises what
+ * this admits through `host()`. This decides only what may reach the cast.
  *
  * `null` rather than a placeholder: "we do not know where this came from" is
  * a true statement an incident review can act on, and a stand-in address is a
@@ -50,5 +70,24 @@ import { isIP } from "node:net";
  */
 export function safeActorIp(raw: string | null | undefined): string | null {
   if (raw === null || raw === undefined) return null;
+  // A stated ceiling, and REDUNDANT WITH THE NEXT CHECK TODAY — said plainly
+  // rather than dressed up as load-bearing. Measured: with no zone index,
+  // `isIP` accepts nothing longer than 45, so the `%` rejection below is what
+  // actually bounds this value. It stays because Node does not DOCUMENT a
+  // maximum length for `isIP` — today's 45 is an implementation detail, and
+  // this value is a bind parameter on every audited mutation. Making the
+  // ceiling explicit means a future Node change cannot silently unbound it.
+  // Neither guard is individually falsifiable by a unit test, which is what
+  // redundancy means; the invariant they jointly hold is what is asserted.
+  if (raw.length > MAX_IP_TEXT_LENGTH) return null;
+  // ⚠ ZONE INDEX: `isIP` SAYS YES AND `inet` SAYS 22P02.
+  // `isIP('fe80::1%eth0')` is 6, `'fe80::1%eth0'::inet` raises, and
+  // `@fastify/proxy-addr` passes a zone id through verbatim — so one header
+  // was a reliable kill switch on every mutating request a caller made,
+  // leaving no audit row, which is exactly the failure this guard exists to
+  // prevent. A scope id is meaningful only on the interface that owns it and
+  // is meaningless in a record of who called us, so there is nothing to
+  // preserve by stripping it rather than refusing it.
+  if (raw.includes("%")) return null;
   return isIP(raw) === 0 ? null : raw;
 }
