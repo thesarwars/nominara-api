@@ -22,6 +22,9 @@ import { TenantContextInterceptor } from "./interceptors/tenant-context.intercep
 import { AuditInterceptor } from "./interceptors/audit.interceptor.js";
 import { CreditInterceptor } from "./interceptors/credit.interceptor.js";
 import { PermissionDeniedException } from "../tenancy/errors.js";
+import { Controller, Get } from "@nestjs/common";
+import { Public } from "./decorators/public.decorator.js";
+import { applyFakeApiEnv } from "../../test/support/fake-env.js";
 
 // STORY-022 — locks the composition root's global guard/interceptor order
 // against a silent regression (this story's "critical implementation
@@ -295,5 +298,111 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
       envelope,
       "the envelope must be applied BEFORE IdempotencyInterceptor exits — STORY-025 requires the store to hold the response envelope, not just a marker, so a replay returns a byte-identical body",
     ).toBeLessThan(idempotency);
+  });
+});
+
+
+// ⚠ STORY-150 — THE CONJUNCTION, WHICH NOTHING ASSERTED.
+//
+// The order test above compares `calls` against `GUARD_ORDER`, and that array
+// lives in this file and is edited alongside api.module.ts. It is a MIRROR,
+// not an oracle: the review moved `CanonicalParamsGuard` from first to LAST in
+// both places and the entire suite stayed green — 2357 passing — while
+// production was broken in precisely the way both files describe at length.
+//
+// The unit tests assert what the guard does to a hand-built context. The order
+// test asserts that it is invoked. Neither asserts the property, which is the
+// CONJUNCTION of the two: that a guard running AFTER it sees a canonical value
+// on a real request to a route that HAS a param. `/health/live` has none, so
+// the order test could never have caught this.
+//
+// This fails when the guard moves, when it is deleted, and when its body is
+// gutted — because it observes the effect, at the place that consumes it.
+describe("STORY-150 · a later guard sees the canonical param on a real request", () => {
+  const originalEnv = { ...process.env };
+  const UPPER = "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11";
+  const LOWER = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+
+  @Controller("story150")
+  class ParamProbeController {
+    @Public()
+    @Get(":id")
+    read(): { ok: true } {
+      return { ok: true };
+    }
+  }
+
+  beforeEach(() => {
+    applyFakeApiEnv();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    process.env = { ...originalEnv };
+  });
+
+  async function paramsSeenBy(guard: { prototype: { canActivate: unknown } }, url: string): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const proto = guard.prototype as unknown as { canActivate: (...args: unknown[]) => boolean | Promise<boolean> };
+    const original = proto.canActivate;
+    vi.spyOn(proto, "canActivate").mockImplementation(function (this: unknown, ...args: unknown[]) {
+      const context = args[0] as ExecutionContext;
+      seen.push({ ...(context.switchToHttp().getRequest<{ params?: unknown }>().params as object) });
+      return original.apply(this, args as never);
+    });
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [ApiModule],
+      controllers: [ParamProbeController],
+    }).compile();
+    const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await configureApp(app);
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+
+    await app.inject({ method: "GET", url });
+    await app.close();
+    return seen;
+  }
+
+  it("WorkspaceGuard — which runs after CanonicalParamsGuard — receives the lowercase id", async () => {
+    const seen = await paramsSeenBy(WorkspaceGuard, `/v1/story150/${UPPER}`);
+
+    expect(seen, "the probe route must actually be reached, or this proves nothing").toHaveLength(1);
+    expect(seen[0]).toEqual({ id: LOWER });
+  });
+
+  // ⚠ AND THE PERCENT-ENCODED FORM, which is the one that fooled the first
+  // attempt: Fastify DECODES params and does not decode `request.url`, so this
+  // request is byte-different in the url and identical in the params.
+  it("a percent-encoded id arrives decoded and canonical, exactly like the plain one", async () => {
+    const seen = await paramsSeenBy(WorkspaceGuard, "/v1/story150/%410eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toEqual({ id: LOWER });
+  });
+
+  // ⚠ A SPELLING POSTGRES WOULD ACCEPT AND WE WILL NOT. Rejected rather than
+  // normalised — see the note on isNonCanonicalUuidSpelling — so two strings
+  // can never name one row.
+  it("refuses a braced uuid with 400 rather than passing a second spelling downstream", async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [ApiModule],
+      controllers: [ParamProbeController],
+    }).compile();
+    const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await configureApp(app);
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+
+    const braced = await app.inject({ method: "GET", url: `/v1/story150/%7B${LOWER}%7D` });
+    const unhyphenated = await app.inject({ method: "GET", url: "/v1/story150/a0eebc999c0b4ef8bb6d6bb9bd380a11" });
+    const canonical = await app.inject({ method: "GET", url: `/v1/story150/${LOWER}` });
+
+    expect(braced.statusCode).toBe(400);
+    expect(unhyphenated.statusCode).toBe(400);
+    expect(canonical.statusCode, "the one accepted spelling must still work").toBe(200);
+
+    await app.close();
   });
 });

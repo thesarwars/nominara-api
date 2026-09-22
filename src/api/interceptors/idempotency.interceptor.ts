@@ -45,6 +45,10 @@ const IDEMPOTENCY_KEY_HEADER = "idempotency-key";
 
 interface IdempotentRequest extends AuthenticatedRequest {
   url?: string;
+  /** Fastify's matched route pattern — `/v1/projects/:id/runs`, not the caller's url. */
+  routeOptions?: { url?: string };
+  /** Fastify's extracted, percent-DECODED path params. */
+  params?: Record<string, unknown>;
   body?: unknown;
 }
 
@@ -114,6 +118,13 @@ export class IdempotencyInterceptor implements NestInterceptor {
         userId,
         method: request.method ?? "POST",
         url: request.url ?? "",
+        // ⚠ STORY-150 — the fingerprint keys on what the ROUTER resolved, not
+        // on the url. `request.url` is percent-encoded as the caller wrote it;
+        // `params` is decoded. Keying on the url let two encodings of one
+        // request claim two records and execute twice on a credit-spending
+        // route. See routeIdentity.
+        routePattern: request.routeOptions?.url,
+        params: request.params,
         body: request.body,
       },
       parsedKey.data,
