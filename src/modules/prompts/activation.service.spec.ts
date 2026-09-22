@@ -94,6 +94,38 @@ describe("STORY-046 · PromptActivationService.activate", () => {
     expect(result.prompts_cap).toBe(40);
   });
 
+  // ⚠ STORY-150 review — A BODY UUID, WHICH NO GUARD CANONICALISES.
+  //
+  // `prompt_ids` arrives in the body, so `CanonicalParamsGuard` never sees it,
+  // and zod's `.uuid()` accepts an uppercase one. Postgres then matched the
+  // row anyway (`$1::uuid[]` casts), so the row came BACK from `loadPrompts`
+  // — keyed lowercase, as the column stores it — while `found.get(UPPERCASE)`
+  // missed it. The caller was told "no such prompt in this project" about a
+  // prompt in their own project. The stub below answers with the LOWERCASE id
+  // precisely because that is what the database returns.
+  it("STORY-150 — an uppercase prompt id names the same prompt, not a missing one", async () => {
+    const service = setup({ activeCount: 32, prompts: [{ id: P1, status: "archived" }] });
+
+    const result = await service.activate(PROJECT, { prompt_ids: [P1.toUpperCase()] });
+
+    expect(result.activated_prompt_ids).toEqual([P1]);
+    expect(result.summary.activated).toBe(1);
+  });
+
+  it("STORY-150 — one prompt sent twice in two cases is a duplicate, and is named as one", async () => {
+    // It failed closed before — at loadPrompts, as "no such prompt" — so the
+    // refusal was right for the wrong reason and said the wrong thing.
+    const service = setup({ activeCount: 32, prompts: [{ id: P1, status: "archived" }] });
+
+    const error = await service
+      .activate(PROJECT, { prompt_ids: [P1, P1.toUpperCase()] })
+      .catch((e: unknown) => e as DomainError);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as DomainError).code).toBe("validation_failed");
+    expect(String((error as DomainError).message)).toContain("duplicate");
+  });
+
   it("scenario 10 — the active count is written in the SAME statement sequence, not deferred", async () => {
     // AC10: "maintained in the same transaction as any activation or
     // archival, so it can never drift". The ambient tenant transaction is

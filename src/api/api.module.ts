@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from "@nestjs/core";
+import { CanonicalParamsGuard } from "./guards/canonical-params.guard.js";
 import { DbModule } from "../db/db.module.js";
 import { CacheModule } from "../lib/cache/cache.module.js";
 import { HealthModule } from "../modules/health/health.module.js";
@@ -91,6 +92,10 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
       useFactory: (cache: Cache): RateLimitBuckets => new RateLimitBuckets(cache),
       inject: [CACHE],
     },
+    // ⚠ FIRST, AND api.module.spec.ts ASSERTS IT. Every guard below reads
+    // `req.params`, and this is what makes the value they read the same value
+    // the database will store. Second place would make it silently useless.
+    { provide: APP_GUARD, useClass: CanonicalParamsGuard },
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_GUARD, useClass: WorkspaceGuard },
     { provide: APP_GUARD, useClass: RbacGuard },

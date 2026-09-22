@@ -6,6 +6,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { WorkspaceGuard, type WorkspaceScopedRequest } from "../../src/api/guards/workspace.guard.js";
 import { AuthGuard, type AuthenticatedRequest } from "../../src/api/guards/auth.guard.js";
 import { RbacGuard, type RbacScopedRequest } from "../../src/api/guards/rbac.guard.js";
+import { CanonicalParamsGuard } from "../../src/api/guards/canonical-params.guard.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
@@ -52,6 +53,11 @@ function makeContext(req: WorkspaceScopedRequest | RbacScopedRequest, ctor: new 
   return {
     getHandler: () => proto.handler ?? (() => undefined),
     getClass: () => ctor,
+    // Every real ExecutionContext carries this; the stand-in did not, and
+    // CanonicalParamsGuard reads it to stay off the realtime gateway's
+    // differently-shaped requests. A fake missing a member of the interface
+    // it stands in for is a fake that can fail for the wrong reason.
+    getType: () => "http",
     switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
   } as unknown as Parameters<WorkspaceGuard["canActivate"]>[0];
 }
@@ -282,6 +288,47 @@ describe("STORY-019 · RbacGuard + step-up, against real Postgres", () => {
     };
 
     await expect(runChain(req, ProjectReadController)).resolves.toBe(true);
+  });
+
+  // ⚠ STORY-150 — THE SAME MEMBERSHIP ROW, WITH THE PATH TYPED IN CAPITALS.
+  //
+  // `scope.includes(projectId)` compares a raw path param against a scope list
+  // read from Postgres, which is canonical because the column is `uuid`. So an
+  // uppercase uuid in the URL missed the member's OWN project and RbacGuard
+  // refused them. Fail-closed, so never a hole — but a 403 on a legitimate
+  // request, and an unexplainable one.
+  //
+  // Both halves are asserted against a REAL `workspace_members` row: the
+  // refusal without canonicalisation, so the bug is shown to be real rather
+  // than described, and the permit with it. `api.module.spec.ts` is what
+  // proves CanonicalParamsGuard actually runs first over a real HTTP request;
+  // this proves what that position buys.
+  it("STORY-150 — an uppercase project id in the path is refused WITHOUT canonicalisation and permitted WITH it", async () => {
+    const userId = await createUser();
+    const workspaceId = await createWorkspace();
+    const projectId = uuidV7();
+    await addMember(workspaceId, userId, "manager", [projectId]);
+
+    const tokens = await sessions.createSession(userId);
+    const { accessToken } = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "manager", null, 1);
+
+    const upperCased = projectId.toUpperCase();
+    expect(upperCased, "uuidV7 must produce something with letters to shift").not.toBe(projectId);
+
+    const makeReq = (): AuthenticatedRequest & WorkspaceScopedRequest & RbacScopedRequest => ({
+      cookies: { [ACCESS_COOKIE_NAME]: accessToken },
+      method: "GET",
+      params: { projectId: upperCased },
+    });
+
+    // RED, against the real row: this is the 403 a member got for their own project.
+    await expect(runChain(makeReq(), ProjectReadController)).rejects.toThrow(ProjectOutOfScopeException);
+
+    // GREEN, with the guard that production runs first in the chain.
+    const canonicalised = makeReq();
+    expect(new CanonicalParamsGuard().canActivate(makeContext(canonicalised, ProjectReadController))).toBe(true);
+    expect(canonicalised.params, "the guard rewrites the object the later guards read").toEqual({ projectId });
+    await expect(runChain(canonicalised, ProjectReadController)).resolves.toBe(true);
   });
 
   // ---- STORY-019-E-2 — API-key requests never get req.membership ----------
