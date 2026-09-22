@@ -6,6 +6,7 @@ import { tap } from "rxjs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiModule } from "./api.module.js";
 import { configureApp } from "./configure-app.js";
+import { CanonicalParamsGuard } from "./guards/canonical-params.guard.js";
 import { AuthGuard } from "./guards/auth.guard.js";
 import { WorkspaceGuard } from "./guards/workspace.guard.js";
 import { RbacGuard } from "./guards/rbac.guard.js";
@@ -29,6 +30,16 @@ import { PermissionDeniedException } from "../tenancy/errors.js";
 // to the (@Public()) /health/live route — not stand-ins.
 
 const GUARD_ORDER = [
+  // ⚠ STORY-150 — FIRST, AND THAT IS THE WHOLE PROPERTY. Every guard below
+  // reads `req.params`; this is what makes the value they read the same value
+  // Postgres will store. Second place makes it silently useless — RbacGuard
+  // would still compare an uppercase path param against a canonical scope
+  // list and refuse a member their own project.
+  //
+  // Named here for the same reason the interceptor list gives below: a guard
+  // missing from this array is not merely unasserted, it is INVISIBLE, because
+  // this list is also what the test instruments.
+  CanonicalParamsGuard,
   AuthGuard,
   WorkspaceGuard,
   RbacGuard,
@@ -155,7 +166,14 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
     const response = await app.inject({ method: "GET", url: "/health/live" });
 
     expect(response.statusCode).toBe(403);
-    expect(calls).toEqual([AuthGuard.name, WorkspaceGuard.name, RbacGuard.name]);
+    // ⚠ DERIVED FROM GUARD_ORDER, not re-typed. A hard-coded prefix here went
+    // stale the moment a guard was added at the front (STORY-150) — it failed
+    // loudly, which is the good outcome, but the next one might be appended
+    // where it fails silently. The claim is "everything up to and including
+    // RbacGuard, and nothing after it".
+    const upToRbac = GUARD_ORDER.slice(0, GUARD_ORDER.indexOf(RbacGuard) + 1).map((Guard) => Guard.name);
+    expect(upToRbac.at(-1), "the slice must actually end at the refusing guard").toBe(RbacGuard.name);
+    expect(calls).toEqual(upToRbac);
 
     await app.close();
   });

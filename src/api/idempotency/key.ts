@@ -1,3 +1,4 @@
+import { canonicalUuid } from "../canonical-uuid.js";
 import {
   hashIdempotencyKey,
   idempotencyRecordKey,
@@ -47,8 +48,36 @@ export interface IdempotencyIdentity {
  * request are one request, and deciding otherwise would make the safety of a
  * retry depend on how the other end serialises a URL.
  */
+/**
+ * ⚠ THE PATH IS CANONICALISED HERE TOO, SEPARATELY FROM THE PARAMS.
+ * STORY-150.
+ *
+ * `CanonicalParamsGuard` fixes `req.params` for everything that reads them.
+ * This function does not read them — it reads the raw URL — so it would have
+ * gone on keying the idempotency record on whatever case the caller typed:
+ *
+ *     POST /v1/projects/A0EEBC99-.../runs   Idempotency-Key: k
+ *     POST /v1/projects/a0eebc99-.../runs   Idempotency-Key: k
+ *
+ * are one operation and produced two scope fingerprints, two records, and two
+ * executions — on a route that spends credits. §1's guarantee is "identical
+ * key + identical body returns the original response"; it was escapable by
+ * shifting a letter.
+ *
+ * The url is normalised rather than rewritten upstream on purpose: `req.url`
+ * is what the access log and the request id are threaded through, and a
+ * request should be greppable by the path the caller actually sent.
+ */
+function canonicalPath(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => canonicalUuid(segment))
+    .join("/");
+}
+
 export function routeIdentity(method: string, url: string): string {
-  const [path, query] = url.split("?");
+  const [rawPath, query] = url.split("?");
+  const path = rawPath === undefined ? undefined : canonicalPath(rawPath);
   const canonicalQuery =
     query === undefined || query.length === 0
       ? ""
@@ -56,7 +85,7 @@ export function routeIdentity(method: string, url: string): string {
           .sort(([a, av], [b, bv]) => (a === b ? (av < bv ? -1 : av > bv ? 1 : 0) : a < b ? -1 : 1))
           .map(([name, value]) => `${name}=${value}`)
           .join("&")}`;
-  return `${method.toUpperCase()} ${path ?? url}${canonicalQuery}`;
+  return `${method.toUpperCase()} ${path ?? canonicalPath(url)}${canonicalQuery}`;
 }
 
 /**
