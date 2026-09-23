@@ -30,7 +30,15 @@ describe("STORY-151 · applyPlanChange", () => {
     await db.connect();
     await migrateUp(db);
     await db.query(`ALTER ROLE nominara_app PASSWORD ${db.escapeLiteral(resolvePassword("nominara_app", {}))}`);
-    pool = new Pool({ connectionString: container.getConnectionUri(), max: 8 });
+    // ⚠ AS `nominara_app`, NOT AS THE CONTAINER SUPERUSER. The first version
+    // pointed this pool at the container's own `nominara` role, which is
+    // `rolsuper` and `rolbypassrls` — so FORCE RLS was never exercised by any
+    // of these tests, while the `ALTER ROLE` above sat there reading as though
+    // it were. The production path runs as `nominara_app`; so does this.
+    const appUri = new URL(container.getConnectionUri());
+    appUri.username = "nominara_app";
+    appUri.password = resolvePassword("nominara_app", {});
+    pool = new Pool({ connectionString: appUri.toString(), max: 8 });
   }, 180_000);
 
   afterAll(async () => {
@@ -67,6 +75,31 @@ describe("STORY-151 · applyPlanChange", () => {
     return id;
   }
 
+  /**
+   * ⚠ THE FIXTURE THAT WAS MISSING, AND ITS ABSENCE HID EVERY LEDGER DEFECT.
+   *
+   * `WorkspacesService.create` does NOT create a wallet — they are provisioned
+   * lazily on first credit use — so every test in this story took
+   * `applyPlanChange`'s `cycle === undefined` branch and `grantCredits` was
+   * never called ONCE across 33 tests. A second-engineer review proved it by
+   * mutation: deleting the entire §5 top-up, breaking its idempotency key, and
+   * removing the advisory lock ALL left every test green.
+   *
+   * Two real defects were hiding behind that: a free-text `--ticket` written
+   * into `credit_ledger.reference_id`, which is `uuid` and raised 22P02 and
+   * rolled the whole plan change back; and `date` columns read as
+   * local-midnight `Date`s, which over-granted credits in `us-east-1`.
+   *
+   * The dangerous area is the ledger. It needs a wallet.
+   */
+  async function provisionWallet(ws: string, cycleStart: string, cycleEnd: string, included = 0): Promise<void> {
+    await db.query(
+      `INSERT INTO credit_wallets (workspace_id, included_balance, cycle_start, cycle_end)
+       VALUES ($1, $2, $3, $4)`,
+      [ws, included, cycleStart, cycleEnd],
+    );
+  }
+
   async function change(
     ws: string,
     plan: string,
@@ -82,6 +115,19 @@ describe("STORY-151 · applyPlanChange", () => {
           { requestId: "TICKET-1", operator: "op@example.test", reason: "test" },
           opts.allowNegotiatedTier === undefined ? {} : { allowNegotiatedTier: opts.allowNegotiatedTier },
         ),
+      );
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Same as change(), with the clock pinned so a pro-rata boundary is assertable. */
+  async function changeAt(ws: string, plan: string, now: Date) {
+    const client = await pool.connect();
+    try {
+      return await withTenantContext(client, { workspaceId: ws, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+        applyPlanChange(tx, ws, planKeyOnly(plan),
+          { requestId: "TICKET-1", operator: "op@example.test", reason: "test" }, { now }),
       );
     } finally {
       client.release();
@@ -272,5 +318,110 @@ describe("STORY-151 · applyPlanChange", () => {
     const named = await db.query<{ workspace_id: string }>(
       "SELECT workspace_id FROM subscriptions WHERE plan_key <> 'free' AND provider = 'none'");
     expect(named.rows[0]!.workspace_id).toBe(rogue);
+  });
+
+  // ---- THE LEDGER. The dangerous area, and it had no coverage at all. ------
+
+  it("grants §5's pro-rata top-up through the real ledger, and the wallet still replays", async () => {
+    // Half-way through a 30-day cycle, free(60) → growth(1200): 1140 × 15/30.
+    await provisionWallet(workspaceId, "2026-09-01", "2026-10-01", 60);
+    const outcome = await changeAt(workspaceId, "growth", new Date("2026-09-16T00:00:00.000Z"));
+
+    expect(outcome.creditsToppedUp).toBe(570);
+
+    const wallet = await db.query<{ included_balance: number; lifetime_granted: string }>(
+      "SELECT included_balance, lifetime_granted FROM credit_wallets WHERE workspace_id = $1", [workspaceId]);
+    expect(wallet.rows[0]!.included_balance, "added, never replaced").toBe(630);
+    expect(wallet.rows[0]!.lifetime_granted).toBe("570");
+
+    const ledger = await db.query<{ entry_type: string; credits: number; reference_type: string; reference_id: string | null }>(
+      "SELECT entry_type, credits, reference_type, reference_id FROM credit_ledger WHERE workspace_id = $1", [workspaceId]);
+    expect(ledger.rows).toHaveLength(1);
+    expect(ledger.rows[0]).toMatchObject({ entry_type: "grant", credits: 570, reference_type: "plan_change" });
+    // ⚠ NULL, NOT THE TICKET. `reference_id` is `uuid`; a free-text ticket
+    // there raised 22P02 and rolled the entire plan change back, on every
+    // workspace that had ever spent a credit. The ticket lives on the audit
+    // row, whose `request_id` is text.
+    expect(ledger.rows[0]!.reference_id).toBeNull();
+  });
+
+  // ⚠ THE OPERATOR'S TICKET IS FREE TEXT AND MUST NOT ABORT THE CHANGE.
+  it("accepts a non-UUID ticket on a workspace that HAS a wallet", async () => {
+    await provisionWallet(workspaceId, "2026-09-01", "2026-10-01", 60);
+    const client = await pool.connect();
+    try {
+      const outcome = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+        applyPlanChange(tx, workspaceId, planKeyOnly("growth"),
+          { requestId: "OPS-1234", operator: "op@example.test", reason: "a real ticket ref" },
+          { now: new Date("2026-09-16T00:00:00.000Z") }),
+      );
+      expect(outcome.changed).toBe(true);
+      expect(outcome.creditsToppedUp).toBeGreaterThan(0);
+    } finally {
+      client.release();
+    }
+    const ws = await db.query<{ plan_key: string }>("SELECT plan_key FROM workspaces WHERE id = $1", [workspaceId]);
+    expect(ws.rows[0]!.plan_key, "the change must have COMMITTED, not rolled back").toBe("growth");
+  });
+
+  // ⚠ THE CYCLE BOUNDARY MEANS THE SAME THING IN EVERY TIMEZONE. `cycle_start`
+  // and `cycle_end` are `date`, and node-postgres parses `date` at LOCAL
+  // midnight — so reading them raw over-granted by ~6 credits per upgrade in
+  // us-east-1 (the default region) and minted credits into an ALREADY ENDED
+  // cycle. wallet.ts:83 documents this trap and answers it with `to_char`.
+  it("grants the same amount whatever timezone the process runs in", async () => {
+    const original = process.env.TZ;
+    const results: number[] = [];
+    try {
+      for (const tz of ["UTC", "America/New_York", "Asia/Dhaka"]) {
+        process.env.TZ = tz;
+        const ws = await createFreeWorkspace();
+        await provisionWallet(ws, "2026-09-01", "2026-10-01", 60);
+        const outcome = await changeAt(ws, "growth", new Date("2026-09-16T00:00:00.000Z"));
+        results.push(outcome.creditsToppedUp);
+      }
+    } finally {
+      process.env.TZ = original;
+    }
+    expect(results, "570 in every timezone, not 570/576/560").toEqual([570, 570, 570]);
+  });
+
+  it("grants NOTHING for a cycle that has already ended, in any timezone", async () => {
+    const original = process.env.TZ;
+    try {
+      process.env.TZ = "America/New_York";
+      await provisionWallet(workspaceId, "2026-08-01", "2026-09-01", 60);
+      const outcome = await changeAt(workspaceId, "growth", new Date("2026-09-01T03:00:00.000Z"));
+      expect(outcome.creditsToppedUp, "minting into an ended cycle is minting").toBe(0);
+    } finally {
+      process.env.TZ = original;
+    }
+  });
+
+  // ⚠ THE IDEMPOTENCY KEY CARRIES THE VERSION, SO A SECOND UPGRADE IN ONE
+  // CYCLE GRANTS ITS OWN UPLIFT. Keying on the workspace alone would make the
+  // second upgrade silently grant nothing.
+  it("a second upgrade in the same cycle grants its own uplift, and does not double-count", async () => {
+    await provisionWallet(workspaceId, "2026-09-01", "2026-10-01", 60);
+    const first = await changeAt(workspaceId, "starter", new Date("2026-09-11T00:00:00.000Z"));
+    const second = await changeAt(workspaceId, "growth", new Date("2026-09-21T00:00:00.000Z"));
+
+    // free(60)→starter(450): 390 × 20/30 = 260. starter(450)→growth(1200): 750 × 10/30 = 250.
+    expect(first.creditsToppedUp).toBe(260);
+    expect(second.creditsToppedUp).toBe(250);
+
+    const ledger = await db.query<{ count: string }>(
+      "SELECT count(*) AS count FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'grant'", [workspaceId]);
+    expect(ledger.rows[0]!.count, "two grants, one per version").toBe("2");
+  });
+
+  it("the no-wallet path skips cleanly and says so, rather than failing", async () => {
+    const outcome = await change(workspaceId, "growth");
+    expect(outcome.changed).toBe(true);
+    expect(outcome.creditsToppedUp).toBe(0);
+    expect(outcome.creditsNote).toMatch(/no credit wallet/u);
+    const ledger = await db.query<{ count: string }>(
+      "SELECT count(*) AS count FROM credit_ledger WHERE workspace_id = $1", [workspaceId]);
+    expect(ledger.rows[0]!.count).toBe("0");
   });
 });

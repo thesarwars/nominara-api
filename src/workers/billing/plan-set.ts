@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import type { PoolClient } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { createPgPool } from "../../db/pg-pool.js";
 import { applyPlanChange, planKeyOnly, type BillingInterval } from "../../lib/billing/apply-plan.js";
@@ -109,6 +110,17 @@ export function parsePlanSetArgs(argv: readonly string[]): PlanSetArgs {
   };
 }
 
+/** Its own context-carrying transaction: `workspace_members` is a tenant table. */
+async function activeMemberCount(client: PoolClient, workspaceId: string): Promise<string> {
+  const rows = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+    tx.query<{ count: string }>(
+      "SELECT count(*) AS count FROM workspace_members WHERE workspace_id = $1 AND status = 'active'",
+      [workspaceId],
+    ),
+  );
+  return rows.rows[0]?.count ?? "?";
+}
+
 export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void = console.log): Promise<void> {
   const env = loadEnv();
   // The same role and the same tenant context an ordinary request uses. The
@@ -147,11 +159,15 @@ export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void 
       // ⚠ SAID OUT LOUD, BECAUSE IT SURPRISES PEOPLE. The version bump is a
       // workspace-wide soft logout: every member's live token now fails
       // `entitlement_stale` until their client re-enters the workspace.
-      const members = await client.query<{ count: string }>(
-        "SELECT count(*) AS count FROM workspace_members WHERE workspace_id = $1 AND status = 'active'",
-        [args.workspaceId],
-      );
-      log(`${members.rows[0]?.count ?? "?"} active member(s) must re-enter the workspace; their live tokens are now stale.`);
+      //
+      // ⚠ AND IT NEEDS ITS OWN TENANT CONTEXT. The first version ran this on
+      // `client` AFTER `withTenantContext` had returned — and `createPgPool`
+      // wraps the pool in `tenantAwarePool` while `workspace_members` is a
+      // TENANT_TABLE, so every single invocation printed success, then threw
+      // `TenantContextMissingError`, then exited 1. The plan change had
+      // already committed, so an operator reasonably re-running it got a
+      // no-op — correct by luck rather than by design.
+      log(`${await activeMemberCount(client, args.workspaceId)} active member(s) must re-enter the workspace; their live tokens are now stale.`);
     } finally {
       client.release();
     }

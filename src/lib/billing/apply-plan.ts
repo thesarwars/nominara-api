@@ -9,7 +9,7 @@ import {
   PlanChangeTargetMissingError,
   UnknownPlanError,
 } from "./errors.js";
-import { proRataTopUp } from "./plan-grant.js";
+import { proRataTopUp, utcMidnight } from "./plan-grant.js";
 
 // STORY-151 — a workspace's plan can change. Nothing in this product could do
 // that before, and that single absence made the whole product unreachable:
@@ -35,8 +35,9 @@ import { proRataTopUp } from "./plan-grant.js";
 // ⚠ RLS IS NOT THE CONTROL HERE AND THIS COMMENT WILL NOT PRETEND IT IS.
 // `ws_isolation_workspaces` is `USING (id = app.current_workspace())`, so a
 // workspace updating its OWN plan_key under its own tenant context PASSES.
-// test/isolation asserts that it succeeds, by name, so that no future reader
-// rests a safety argument on a mechanism that does not provide one.
+// (An earlier draft of this comment claimed test/isolation asserted that by
+// name. It did not — the test was never written. A comment that invents a
+// control is worse than no comment, so the claim is gone and the fact stays.)
 // `subscriptions.provider` (migration 0026) is the detective control for what
 // prevention cannot reach.
 //
@@ -172,12 +173,26 @@ export async function applyPlanChange(
   provenance: ChangeProvenance,
   options: ApplyPlanOptions = {},
 ): Promise<PlanChangeOutcome> {
-  // 1. The chain lock FIRST, in the exact key shape AuditChainService.append
-  //    takes, so the whole read-modify-write serialises against a concurrent
-  //    append and no lock-order inversion is possible at step 8.
-  await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 0))", [workspaceId]);
+  // ⚠ NO ADVISORY LOCK IS TAKEN HERE, AND TAKING ONE CAUSED A DEADLOCK.
+  //
+  // The first version opened with `pg_advisory_xact_lock(hashtextextended(ws))`
+  // to serialise the read-modify-write. That inverts the lock order the whole
+  // request pipeline uses: `CreditInterceptor` takes the `credit_wallets` ROW
+  // lock first (credit.interceptor.ts:291 → wallet.ts's `FOR UPDATE`) and the
+  // advisory chain lock second, when `AuditInterceptor` appends — an ordering
+  // api.module.ts:107-123 states explicitly and calls load-bearing. Taking the
+  // advisory lock first here and the wallet row lock at step 8 reversed it, and
+  // a second-engineer review reproduced `40P01 deadlock detected` with the
+  // CUSTOMER'S request as the victim: the reservation already committed, the
+  // engine already spent, and the settle transaction killed.
+  //
+  // It also bought nothing. `workspaces … FOR UPDATE` below already serialises
+  // two concurrent plan changes — verified with four simultaneous calls — and
+  // `AuditChainService.append` takes the same advisory lock itself at step 9,
+  // so the chain is still serialised where it matters. Rows first, advisory
+  // second: the canonical order every other writer uses.
 
-  // 2. The workspace, locked. Its pre-image is the audit row's before_state —
+  // 1. The workspace, locked. Its pre-image is the audit row's before_state —
   //    the first populated one in this repo: `auditBeforeState` is declared on
   //    the interceptor and read by it, and set by nothing.
   const workspace = await tx.query<WorkspaceRow>(
@@ -191,7 +206,7 @@ export async function applyPlanChange(
     throw new PlanChangeTargetMissingError(workspaceId, "it is pending deletion");
   }
 
-  // 3. Both plans. `plans` is a GLOBAL table — no RLS — so tenant context does
+  // 2. Both plans. `plans` is a GLOBAL table — no RLS — so tenant context does
   //    not hide it. This is also where the cycle grants come from for step 7.
   //
   //    ⚠ NOT GATED ON `is_public`. The seed INSERT lists only
@@ -204,7 +219,7 @@ export async function applyPlanChange(
   );
   const byKey = new Map(plans.rows.map((row) => [row.key, row]));
 
-  // 4. The live subscription, locked. NEVER inserted — see NoActiveSubscriptionError.
+  // 3. The live subscription, locked. NEVER inserted — see NoActiveSubscriptionError.
   const subscription = await tx.query<SubscriptionRow>(
     `SELECT id, plan_key, billing_interval, stripe_customer_id, stripe_subscription_id, status,
             current_period_start, current_period_end, trial_ends_at, cancel_at_period_end,
@@ -225,7 +240,7 @@ export async function applyPlanChange(
   const currentPlan = byKey.get(before.plan_key);
   if (currentPlan === undefined) throw new UnknownPlanError(before.plan_key, [...byKey.keys()]);
 
-  // 5. NO-OP GATE, and it is not tidiness. A version bump is a workspace-wide
+  // 4. NO-OP GATE, and it is not tidiness. A version bump is a workspace-wide
   //    soft logout — every member's live token 401s `entitlement_stale` — so
   //    re-running a grant that already holds must not log everyone out twice.
   const planUnchanged = before.plan_key === desired.planKey && currentRow.plan_key === desired.planKey;
@@ -240,7 +255,7 @@ export async function applyPlanChange(
     };
   }
 
-  // 6. DIRECTION, then the negotiated tier by name — the order matters,
+  // 5. DIRECTION, then the negotiated tier by name — the order matters,
   //    because `sort_order` can never refuse enterprise (it is the maximum).
   if (targetPlan.sort_order < currentPlan.sort_order) {
     throw new DowngradeNotSupportedError(before.plan_key, desired.planKey);
@@ -249,7 +264,7 @@ export async function applyPlanChange(
     throw new NegotiatedTierRefusedError(desired.planKey);
   }
 
-  // 7. The subscription, WHOLESALE — every reconciled column from a complete
+  // 6. The subscription, WHOLESALE — every reconciled column from a complete
   //    record. This is STORY-075's "reconciled from a fresh fetch, never
   //    applied as a delta" with the fetch removed, and it is the statement its
   //    webhook will execute unchanged.
@@ -278,7 +293,7 @@ export async function applyPlanChange(
     ],
   );
 
-  // 8. ⚠ ONE STATEMENT, AND THIS IS THE ONLY CORRECTNESS-CRITICAL CO-CHANGE.
+  // 7. ⚠ ONE STATEMENT, AND THIS IS THE ONLY CORRECTNESS-CRITICAL CO-CHANGE.
   //    `entitlementsKey(env, ws, version)` puts the version IN the cache key,
   //    so the bump IS the invalidation — there is no invalidate() to call or
   //    forget. Two statements would let a reader observe (new plan, old
@@ -293,12 +308,31 @@ export async function applyPlanChange(
   );
   const after = bumped.rows[0]!;
 
-  // 9. §5's pro-rata top-up. See plan-grant.ts for why this is arithmetic and
+  // 8. §5's pro-rata top-up. See plan-grant.ts for why this is arithmetic and
   //    not a question for a human.
   let creditsToppedUp = 0;
   let creditsNote: string | undefined;
-  const wallet = await tx.query<{ cycle_start: Date; cycle_end: Date }>(
-    "SELECT cycle_start, cycle_end FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE",
+  // ⚠ `to_char`, NOT THE RAW COLUMNS, AND THIS IS A BUG THE CODEBASE HAD
+  // ALREADY FIXED ONCE. `credit_wallets.cycle_start/cycle_end` are `date`, and
+  // node-postgres parses `date` into a JS Date at LOCAL midnight. wallet.ts:83
+  // documents exactly this trap — "Every query below asks for `to_char` so
+  // there is no Date to..." — after a previous second-engineer review caught
+  // the production read keeping it. This write path reintroduced it, and here
+  // it MINTS CREDITS rather than rendering a date a day early:
+  //
+  //   TZ=UTC              half-way through a cycle → 570  (correct)
+  //   TZ=America/New_York                          → 576  (+6 free credits)
+  //   TZ=America/New_York  three hours PAST the end → 1    (into an ended cycle)
+  //
+  // `us-east-1` is the default and only region for free/starter/growth, so the
+  // realistic deployment is the one that over-grants — and `credits:verify`
+  // can never see it, because the wallet and the ledger agree. Only the AMOUNT
+  // is wrong, which is the kind of defect that is found by an auditor or not
+  // at all.
+  const wallet = await tx.query<{ cycle_start: string; cycle_end: string }>(
+    `SELECT to_char(cycle_start, 'YYYY-MM-DD') AS cycle_start,
+            to_char(cycle_end,   'YYYY-MM-DD') AS cycle_end
+       FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE`,
     [workspaceId],
   );
   const cycle = wallet.rows[0];
@@ -311,8 +345,10 @@ export async function applyPlanChange(
     const topUp = proRataTopUp(
       currentPlan.credits_per_cycle,
       targetPlan.credits_per_cycle,
-      cycle.cycle_start,
-      cycle.cycle_end,
+      // UTC instants, so the boundary means the same thing wherever the
+      // process runs. See utcMidnight for why it is built rather than parsed.
+      utcMidnight(cycle.cycle_start),
+      utcMidnight(cycle.cycle_end),
       options.now ?? new Date(),
     );
     if (topUp > 0) {
@@ -329,7 +365,15 @@ export async function applyPlanChange(
           actorId: null,
           actorType: "system",
           referenceType: "plan_change",
-          referenceId: provenance.requestId,
+          // ⚠ NO `referenceId`. `credit_ledger.reference_id` is `uuid`
+          // (migration 0002:394) and `provenance.requestId` is an operator's
+          // free-text `--ticket` or a provider event id like `evt_1abc…` —
+          // neither is a UUID, and passing one raised `22P02` which ABORTED
+          // THE WHOLE PLAN CHANGE. It only ever succeeded on a workspace with
+          // no wallet, because that path never reaches grantCredits, and every
+          // test in this story took exactly that path. The ticket is on the
+          // audit row, whose `request_id` is `text` and which is the record
+          // that is supposed to carry provenance.
         },
         topUp,
       );
@@ -337,7 +381,7 @@ export async function applyPlanChange(
     }
   }
 
-  // 10. The audit row, INSIDE the transaction. A commit that changed the plan
+  // 9. The audit row, INSIDE the transaction. A commit that changed the plan
   //     and bumped the version with no audit row is the worst outcome
   //     available here, so an audit failure must roll the plan change back.
   await new AuditChainService().append(tx, {

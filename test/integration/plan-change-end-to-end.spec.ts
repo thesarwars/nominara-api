@@ -133,7 +133,18 @@ describe("STORY-151 · a workspace can change plan, and that is what makes the p
       payload: { root_url: "https://acme-two.test" },
     });
     expect(stale.statusCode, "a token minted before the change must not survive it").toBe(401);
-    expect(stale.body).toContain("entitlement_stale");
+
+    // ⚠ THE EXACT ENVELOPE, PINNED, BECAUSE nominara-app DEPENDS ON ITS SHAPE.
+    // `entitlement_stale` is not in §2's taxonomy, so `ProblemFilter` maps it
+    // onto `unauthenticated` and demotes the original into `details.reason`.
+    // The client's recovery matched `error.code` and could therefore never
+    // fire — it shipped a blocking call on every dashboard render for no
+    // effect, with a test that asserted the broken behaviour was correct.
+    // This assertion is the cross-repo contract that stops that recurring: if
+    // the shape moves, this fails here rather than silently in the browser.
+    const envelope = stale.json() as { error: { code: string; details?: { reason?: string } } };
+    expect(envelope.error.code).toBe("unauthenticated");
+    expect(envelope.error.details?.reason, "nominara-app matches on this").toBe("entitlement_stale");
 
     // 6. Re-enter — the recovery a client performs on `entitlement_stale`.
     const reentered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, 2);

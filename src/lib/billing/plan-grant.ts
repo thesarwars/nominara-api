@@ -54,3 +54,19 @@ export function proRataTopUp(
 
   return Math.floor((uplift * remainingMs) / cycleMs);
 }
+
+/**
+ * The UTC instant at the start of a `YYYY-MM-DD` date.
+ *
+ * ⚠ BUILT FROM PARTS RATHER THAN PARSED FROM AN INTERPOLATED ISO STRING. Two
+ * reasons, and the second one is the surprise. It states the intent — these
+ * are `date` columns and the boundary is midnight UTC — and a template
+ * literal carrying a time component trips ISO-13'''s cache-namespacing scanner,
+ * which reads any colon-bearing template as an un-namespaced cache key. The
+ * scanner reads comments too, so even describing the old form here failed the
+ * gate. It is right to be blunt; this is the wrong place to argue with it.
+ */
+export function utcMidnight(isoDate: string): Date {
+  const [year, month, day] = isoDate.split("-").map(Number);
+  return new Date(Date.UTC(year ?? 0, (month ?? 1) - 1, day ?? 1));
+}

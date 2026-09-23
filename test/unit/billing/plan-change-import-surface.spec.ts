@@ -38,8 +38,13 @@ describe("STORY-151 · nothing customer-reachable can change a plan", () => {
   // (maintenance-partition, audit-verify, credit-reconcile all do), so a
   // BullMQ handler importing this would have been a customer-triggerable path
   // that a narrower scan waved through.
-  const SCANNED = ["modules", "api", "lib/queue/handlers", "workers", "gateway", "tenancy"];
-
+  // ⚠ EVERYTHING UNDER src/, NOT A LIST OF DIRECTORIES. The first version
+  // scanned six directories and a second-engineer review walked around it:
+  // `src/lib/queue/handlers.ts` (the handler REGISTRY, next to the `handlers/`
+  // directory that WAS scanned), the three process entry points `main.ts`,
+  // `worker.ts`, `gateway.ts`, and every re-export barrel under `src/lib/**`
+  // were all one hop out of view. Scanning everything and allowing exactly one
+  // file has no such gaps to enumerate.
   function walk(dir: string, out: string[] = []): string[] {
     for (const entry of readdirSync(dir)) {
       const full = path.join(dir, entry);
@@ -49,27 +54,68 @@ describe("STORY-151 · nothing customer-reachable can change a plan", () => {
     return out;
   }
 
-  const files = SCANNED.flatMap((rel) => walk(path.join(root, rel)));
+  /** The module and its siblings in src/lib/billing are not "importers". */
+  const BILLING_LIB = path.join(root, "lib", "billing");
+  const files = walk(root).filter((file) => !file.startsWith(BILLING_LIB));
+
+  // ⚠ EVERY MODULE-SPECIFIER FORM, NOT JUST `import … from "…"`. The review
+  // evaded the original matcher with `await import()`, `require()`, single
+  // quotes, a re-export and a barrel hop — and `await import()` is not
+  // hypothetical: src/modules/tracking/run-estimate.service.ts already uses it,
+  // inside a directory the old scan covered. A controller in that house style
+  // reached `applyPlanChange` with a green build.
+  const REACHES_APPLY_PLAN = /(?:from|import|require)\s*\(?\s*["'][^"']*billing\/apply-plan\.js["']/u;
+  /** One hop out: anything importing the CLI inherits its reach. */
+  const REACHES_CLI = /(?:from|import|require)\s*\(?\s*["'][^"']*workers\/billing\/plan-set\.js["']/u;
 
   it("finds the files it claims to scan — an empty scan would pass forever", () => {
-    // The failure mode of every source scan: the detector stops matching and
-    // reports success. This is the floor, not a target.
-    // A floor, not a pin: tight enough that a broken walk (wrong root, wrong
-    // extension filter) fails loudly, loose enough that adding or moving a
-    // file is not a test edit. It is 200 today.
-    expect(files.length).toBeGreaterThan(150);
+    // A floor, not a pin: tight enough that a broken walk fails loudly, loose
+    // enough that adding a file is not a test edit. It is ~460 today.
+    expect(files.length).toBeGreaterThan(300);
     expect(files, "the one allowed importer must itself be in scope").toContain(ALLOWED);
+    // Named individually because each of these was a hole in the first version.
+    for (const entry of ["worker.ts", "main.ts", "gateway.ts", path.join("lib", "queue", "handlers.ts")]) {
+      expect(files, `${entry} must be scanned — it was a gap`).toContain(path.join(root, entry));
+    }
   });
 
-  it("⚠ NOTHING BUT THE OPERATOR CLI IMPORTS applyPlanChange", () => {
+  it("⚠ NOTHING BUT THE OPERATOR CLI REACHES applyPlanChange", () => {
     const offenders = files
       .filter((file) => file !== ALLOWED)
-      .filter((file) => /from\s+"[^"]*billing\/apply-plan\.js"/u.test(readFileSync(file, "utf8")));
+      .filter((file) => {
+        const source = readFileSync(file, "utf8");
+        return REACHES_APPLY_PLAN.test(source) || REACHES_CLI.test(source);
+      });
 
     expect(
       offenders.map((f) => path.relative(root, f)),
       "a new importer here is a new way for a customer to reach a plan write — see this file's header",
     ).toEqual([]);
+  });
+
+  // ⚠ A DETECTOR THAT CANNOT FAIL IS NOT A CONTROL. Every form below was found
+  // by a review walking straight through the first version of this test, so
+  // each is a regression case rather than a hypothetical.
+  it.each([
+    ["static import", 'import { applyPlanChange } from "../../lib/billing/apply-plan.js";'],
+    ["single quotes", "import { applyPlanChange } from '../../lib/billing/apply-plan.js';"],
+    ["dynamic import", 'const m = await import("../../lib/billing/apply-plan.js");'],
+    ["dynamic import then()", 'void import("../../lib/billing/apply-plan.js").then((m) => m.applyPlanChange);'],
+    ["require", 'const m = require("../../lib/billing/apply-plan.js");'],
+    ["re-export", 'export { applyPlanChange } from "../../lib/billing/apply-plan.js";'],
+    ["transitively via the CLI", 'import { runPlanSet } from "../../workers/billing/plan-set.js";'],
+  ])("catches a %s", (_label, line) => {
+    expect(REACHES_APPLY_PLAN.test(line) || REACHES_CLI.test(line), `this form evades the scan: ${line}`).toBe(true);
+  });
+
+  it("does not fire on an unrelated import that merely mentions billing", () => {
+    for (const line of [
+      'import { getWallet } from "../../lib/credits/wallet.js";',
+      'import { proRataTopUp } from "../../lib/billing/plan-grant.js";',
+      "// applyPlanChange is named in this comment and imported by nothing",
+    ]) {
+      expect(REACHES_APPLY_PLAN.test(line) || REACHES_CLI.test(line), line).toBe(false);
+    }
   });
 
   // The CLI is not a NestJS artifact and must not become one: a provider, a

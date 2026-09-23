@@ -10,8 +10,9 @@
 -- RLS is NOT the control here and this comment will not pretend it is:
 -- `ws_isolation_workspaces` is `USING (id = app.current_workspace())`, so a
 -- workspace updating its OWN plan_key under its own tenant context passes.
--- test/isolation asserts that it succeeds, by name, so no future reader rests
--- a safety argument on a mechanism that does not provide one.
+-- (An earlier draft claimed test/isolation asserted that by name. It did not —
+-- the test was never written, and a comment that invents a control is worse
+-- than no comment.)
 --
 -- `applyPlanChange` is the only writer of this column and always sets it. So
 -- the invariant below holds by construction, and any paid row that did not come

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { proRataTopUp } from "../../../src/lib/billing/plan-grant.js";
+import { proRataTopUp, utcMidnight } from "../../../src/lib/billing/plan-grant.js";
 
 // STORY-151 — §5's mid-cycle upgrade rule, as arithmetic.
 //
@@ -103,5 +103,31 @@ describe("STORY-151 · proRataTopUp", () => {
   it("returns 0 for a cycle of zero or negative length rather than dividing by it", () => {
     expect(proRataTopUp(60, 1200, CYCLE_START, CYCLE_START, CYCLE_START)).toBe(0);
     expect(proRataTopUp(60, 1200, CYCLE_END, CYCLE_START, CYCLE_START)).toBe(0);
+  });
+});
+
+// STORY-151 review — the cycle columns are `date`, and node-postgres parses
+// `date` at LOCAL midnight. wallet.ts documents that trap; apply-plan.ts
+// reintroduced it and a review measured it over-granting ~6 credits per
+// upgrade in us-east-1 and minting into an already-ended cycle.
+describe("STORY-151 · utcMidnight", () => {
+  it("is the same instant whatever timezone the process runs in", () => {
+    const original = process.env.TZ;
+    try {
+      const seen = new Set<number>();
+      for (const tz of ["UTC", "America/New_York", "Asia/Dhaka", "Pacific/Kiritimati"]) {
+        process.env.TZ = tz;
+        seen.add(utcMidnight("2026-10-01").getTime());
+      }
+      expect(seen.size, "one instant, not four").toBe(1);
+      expect([...seen][0]).toBe(Date.parse("2026-10-01T00:00:00.000Z"));
+    } finally {
+      process.env.TZ = original;
+    }
+  });
+
+  it("handles a leap day and a year boundary", () => {
+    expect(utcMidnight("2028-02-29").toISOString()).toBe("2028-02-29T00:00:00.000Z");
+    expect(utcMidnight("2027-01-01").toISOString()).toBe("2027-01-01T00:00:00.000Z");
   });
 });
