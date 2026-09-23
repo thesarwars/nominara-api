@@ -33,6 +33,11 @@ describe("STORY-033 · per-engine cadence, and the run that records it", () => {
   let db: Client;
   let cache: InMemoryCacheAdapter;
   let workspaceId: string;
+  /**
+   * The engines THIS test seeded, appended by `addEngine` and reset with the
+   * TRUNCATE below. Read by `scheduleContext()` — see the note there.
+   */
+  let seededEngineKeys: string[] = [];
   let projectId: string;
 
   beforeAll(async () => {
@@ -53,6 +58,9 @@ describe("STORY-033 · per-engine cadence, and the run that records it", () => {
 
   beforeEach(async () => {
     await db.query("TRUNCATE workspaces, engines, usage_counters CASCADE");
+    // Reset WITH the truncate: a key surviving into the next test would name
+    // an engine whose row no longer exists.
+    seededEngineKeys = [];
     cache = new InMemoryCacheAdapter();
     workspaceId = randomUUID();
     projectId = randomUUID();
@@ -79,6 +87,7 @@ describe("STORY-033 · per-engine cadence, and the run that records it", () => {
     cadence: Record<string, Record<string, number>>,
     options: { enabled?: boolean; minPlan?: string; status?: string } = {},
   ): Promise<void> {
+    if (!seededEngineKeys.includes(key)) seededEngineKeys.push(key);
     await db.query(
       `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
                             cache_ttl_seconds, volatility_band, min_plan_key, status, cadence_by_plan)
@@ -112,13 +121,32 @@ describe("STORY-033 · per-engine cadence, and the run that records it", () => {
     );
   }
 
-  const scheduleContext: ScheduleContext = {
-    periodStart: PERIOD,
-    normalizerVersion: "v1",
-    captureMode: "api",
-    env: "test",
-    sharedCacheEnabled: true,
-  };
+  /**
+   * A FUNCTION, not a constant, because `captureReadyEngineKeys` has to be
+   * whatever THIS test seeded — and `addEngine` runs inside the test, after a
+   * constant would have been evaluated.
+   *
+   * ⚠ THE SEAM. STORY-152 made `resolveEnabledEngines` return ENTITLEMENT ∩
+   * CAPTURE-READY, and production's capture-ready set is EMPTY: every
+   * registry entry is fixture-backed and cannot answer a real prompt, so a
+   * scheduled tick plans nothing. AC5's covered set and AC6's jitter window
+   * are both statements about a run's cells, so they need cells to exist.
+   *
+   * It passes the keys the test seeded rather than a literal, so the seam
+   * cannot name an engine with no catalog row — which would resolve nothing
+   * and be indistinguishable from the bug these tests are here to catch.
+   * `engine-catalog-entitlement.spec.ts` asserts the production default.
+   */
+  function scheduleContext(): ScheduleContext {
+    return {
+      periodStart: PERIOD,
+      normalizerVersion: "v1",
+      captureMode: "api",
+      env: "test",
+      sharedCacheEnabled: true,
+      captureReadyEngineKeys: [...seededEngineKeys],
+    };
+  }
 
   async function dueKeys(kind: "full" | "priority" = "full", now = NOW): Promise<string[]> {
     const due = await resolveDueEngines(db, { projectId, kind, now });
@@ -232,7 +260,7 @@ describe("STORY-033 · per-engine cadence, and the run that records it", () => {
     await db.query("BEGIN");
     try {
       const [project] = await claimDueProjects(db, options.now ?? NOW);
-      const scheduled = await planScheduledRun(db, cache, project!, scheduleContext, {
+      const scheduled = await planScheduledRun(db, cache, project!, scheduleContext(), {
         runId: randomUUID(),
         trigger: options.trigger ?? "scheduled",
         kind: options.kind ?? "full",

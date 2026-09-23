@@ -105,37 +105,41 @@ export async function resolveDueEngines(
     last_covered_at: Date | null;
   }>(
     `
-    SELECT pe.engine_key,
-           (e.cadence_by_plan -> w.plan_key ->> $2)::int AS runs_per_cycle,
-           last_run.covered_at                           AS last_covered_at
-      FROM project_engines pe
-      JOIN projects p            ON p.id = pe.project_id
-      JOIN workspaces w          ON w.id = p.workspace_id
-      JOIN engines e             ON e.key = pe.engine_key
-      JOIN plans engine_plan     ON engine_plan.key = e.min_plan_key
-      JOIN plans workspace_plan  ON workspace_plan.key = w.plan_key
+    -- THE VIEW, NOT project_engines. STORY-152 — see plan-cells.ts.
+    -- pes.cadence is already cadence_by_plan -> this workspace's plan, so the
+    -- scheduler and the customer-visible freshness row read the SAME
+    -- expression from the same place, which is what FR-CRD-09's "it cannot
+    -- drift from the scheduler" actually asks for.
+    SELECT pes.engine_key,
+           (pes.cadence ->> $2)::int AS runs_per_cycle,
+           last_run.covered_at       AS last_covered_at
+      FROM project_entitled_engines pes
       -- When this engine was last actually covered for this project. AC5's
       -- engine_keys is the only record of it; a run's created_at cannot
       -- answer it, because each run covers a different set.
       LEFT JOIN LATERAL (
         SELECT max(r.created_at) AS covered_at
           FROM capture_runs r
-         WHERE r.project_id = pe.project_id
-           AND r.engine_keys @> ARRAY[pe.engine_key]
+         WHERE r.project_id = pes.project_id
+           AND r.engine_keys @> ARRAY[pes.engine_key]
            -- A run that failed or was canceled did not cover the engine, and
            -- treating it as coverage would push the next capture a whole
            -- interval away on the strength of work that never happened.
            AND r.status <> ALL (ARRAY['failed', 'canceled'])
       ) last_run ON true
-     WHERE pe.project_id = $1
-       AND pe.enabled
-       AND e.status = 'active'
-       AND engine_plan.sort_order <= workspace_plan.sort_order
-       -- Fail closed: no cadence entry for this plan means this plan does not
-       -- schedule this engine. The > 0 test also rejects a seeded 0, which
-       -- would otherwise divide by zero below.
-       AND (e.cadence_by_plan -> w.plan_key ->> $2)::int > 0
-     ORDER BY pe.engine_key
+     WHERE pes.project_id = $1
+       AND pes.enabled
+       -- status active and the plan floor are in the view now. THE CADENCE
+       -- TEST IS NOT, AND MUST STAY HERE: the view lists every engine the
+       -- plan ENTITLES, including the ones it entitles on demand and never
+       -- schedules (STORY-130 §57's "tools only" free tier). This line is the
+       -- whole of FAIL CLOSED above -- pes.cadence is NULL when the plan has
+       -- no entry, NULL ->> $2 is NULL, and NULL::int > 0 is not true, so an
+       -- entitled-but-uncadenced engine is never due. It also covers the
+       -- KIND-specific case (a plan with full and no priority schedules no
+       -- priority run) and rejects a seeded 0, which would divide by zero.
+       AND (pes.cadence ->> $2)::int > 0
+     ORDER BY pes.engine_key
     `,
     [input.projectId, input.kind],
   );

@@ -35,11 +35,32 @@ describe("STORY-032 · engine resolution, prompt selection and cell fan-out", ()
     await container.stop();
   });
 
-  /** The engines table ships unseeded, so each test declares the engines it means. */
+  /**
+   * The capture-ready seam. STORY-152.
+   *
+   * `resolveEnabledEngines` returns ENTITLEMENT ∩ CAPTURE-READY, and in
+   * production the capture-ready half is EMPTY — every engine in the registry
+   * is fixture-backed, so nothing here can answer a real prompt until
+   * STORY-001 opens the vendor accounts. These tests are about entitlement
+   * resolution, not about which adapters exist, so they pass the keys THEY
+   * seeded and let the entitlement filter be the only thing under test.
+   */
+  let seededEngineKeys: string[];
+
+  /**
+   * Each test declares the engines it means, rather than leaning on 0027's catalog.
+   *
+   * NO `cadence_by_plan`, and that is the point: entitlement is the plan
+   * FLOOR (`min_plan_key`) and nothing else. An engine the plan never
+   * schedules is still an engine the project may capture on — STORY-130 §57's
+   * "tools only" free tier is exactly that — so these fixtures resolve on the
+   * floor alone, which is what every exclusion below claims to test.
+   */
   async function addEngine(
     key: string,
     options: { minPlan?: string; status?: string; ttl?: number; adapter?: string } = {},
   ): Promise<void> {
+    if (!seededEngineKeys.includes(key)) seededEngineKeys.push(key);
     await db.query(
       `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
                             cache_ttl_seconds, volatility_band, min_plan_key, status)
@@ -77,6 +98,7 @@ describe("STORY-032 · engine resolution, prompt selection and cell fan-out", ()
 
   beforeEach(async () => {
     await db.query("TRUNCATE project_engines, tracked_prompts, projects, workspaces, engines CASCADE");
+    seededEngineKeys = [];
     workspaceId = randomUUID();
     projectId = randomUUID();
     await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'W', $2, 'growth')", [
@@ -96,7 +118,7 @@ describe("STORY-032 · engine resolution, prompt selection and cell fan-out", ()
     await addEngine("perplexity");
     await enableForProject("perplexity");
 
-    const engines = await resolveEnabledEngines(db, projectId);
+    const engines = await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys);
 
     expect(engines).toHaveLength(1);
     expect(engines[0]).toMatchObject({ engineKey: "perplexity", sampleCount: 1, ttlSeconds: 86_400 });
@@ -106,14 +128,14 @@ describe("STORY-032 · engine resolution, prompt selection and cell fan-out", ()
     await addEngine("perplexity");
     await enableForProject("perplexity", { enabled: false });
 
-    expect(await resolveEnabledEngines(db, projectId)).toHaveLength(0);
+    expect(await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys)).toHaveLength(0);
   }, 30_000);
 
   it("excludes an engine WE have disabled, whatever the project asked for", async () => {
     await addEngine("perplexity", { status: "disabled" });
     await enableForProject("perplexity");
 
-    expect(await resolveEnabledEngines(db, projectId)).toHaveLength(0);
+    expect(await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys)).toHaveLength(0);
   }, 30_000);
 
   // AC1, and the reason the filter reads plan ORDER from the database rather
@@ -123,11 +145,14 @@ describe("STORY-032 · engine resolution, prompt selection and cell fan-out", ()
     await enableForProject("claude");
     await setPlan("starter");
 
-    expect(await resolveEnabledEngines(db, projectId), "starter is below business").toHaveLength(0);
+    expect(
+      await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys),
+      "starter is below business",
+    ).toHaveLength(0);
 
     await setPlan("business");
     expect(
-      await resolveEnabledEngines(db, projectId),
+      await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys),
       "the ONLY thing that changed is a row in the database",
     ).toHaveLength(1);
   }, 30_000);
@@ -140,9 +165,9 @@ describe("STORY-032 · engine resolution, prompt selection and cell fan-out", ()
     await enableForProject("perplexity");
     await enableForProject("claude");
 
-    expect(await resolveEnabledEngines(db, projectId, ["perplexity"])).toHaveLength(1);
+    expect(await resolveEnabledEngines(db, projectId, ["perplexity"], seededEngineKeys)).toHaveLength(1);
     expect(
-      await resolveEnabledEngines(db, projectId, ["claude"]),
+      await resolveEnabledEngines(db, projectId, ["claude"], seededEngineKeys),
       "asking for an unentitled engine returns nothing, never an error that confirms it exists",
     ).toHaveLength(0);
   }, 30_000);

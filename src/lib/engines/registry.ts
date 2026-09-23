@@ -29,18 +29,49 @@ export class EngineRefusalError extends Error {
   }
 }
 
-type EngineRegistration = { readonly status: "active"; readonly adapter: CaptureAdapter } | { readonly status: "disabled" };
+type EngineRegistration =
+  | { readonly status: "active"; readonly adapter: CaptureAdapter; readonly captureReady: boolean }
+  | { readonly status: "disabled" };
 
 // Wired to the fixture adapters (STORY-027 T14) — every active key's
 // adapter is stamped with its own engineKey (never inferred from a
 // payload), read straight off FIXTURE_ADAPTERS.
+//
+// ⚠ `captureReady: false` ON ALL SIX, AND IT IS NOT DECORATION. STORY-152.
+//
+// A fixture adapter matches `input.promptText` against six hard-coded strings
+// by EXACT equality and throws otherwise. Every prompt a real project
+// generates misses. So the moment STORY-152 seeded the catalog and the
+// scheduler began resolving engines, a fixture-backed engine would have been
+// planned, attempted, and thrown on — unwinding the transaction so that no
+// capture row of any status survived, burning all five retry attempts, and
+// landing every cell in the dead-letter queue behind a `healthProbe()` that
+// returns ok unconditionally.
+//
+// The alternative considered was a new `adapter_unsupported` failure code, so
+// the attempt would at least be RECORDED. It was rejected on two counts. It
+// needs a ninth entry in tracking-engine.md §2's taxonomy, which says in terms
+// "Fixed, because the circuit breaker and retry ladder branch on it" and which
+// `failure-taxonomy.spec.ts` pins at length 8. And it would have been a lie to
+// the customer anyway: the matrix renders a failed cell as "We asked and no
+// answer came back", and we would not have asked anyone — there is no vendor
+// adapter in this repository and there cannot be until STORY-001 opens the
+// accounts.
+//
+// So the honest state is that these engines are entitled but not capturable,
+// and the place to say so is BEFORE a cell is planned. `plan-cells.ts` reads
+// this flag; nothing is attempted, so nothing fails.
+//
+// Each engine's own adapter story flips its flag to `true` in the same commit
+// that binds a real adapter. The flag is not `adapter !== FIXTURE_ADAPTERS[k]`
+// because a declared fact survives a refactor that an `instanceof` does not.
 const REGISTRY: Record<EngineKey, EngineRegistration> = {
-  google_aio: { status: "active", adapter: FIXTURE_ADAPTERS.google_aio },
-  google_ai_mode: { status: "active", adapter: FIXTURE_ADAPTERS.google_ai_mode },
-  perplexity: { status: "active", adapter: FIXTURE_ADAPTERS.perplexity },
-  chatgpt: { status: "active", adapter: FIXTURE_ADAPTERS.chatgpt },
-  gemini: { status: "active", adapter: FIXTURE_ADAPTERS.gemini },
-  claude: { status: "active", adapter: FIXTURE_ADAPTERS.claude },
+  google_aio: { status: "active", adapter: FIXTURE_ADAPTERS.google_aio, captureReady: false },
+  google_ai_mode: { status: "active", adapter: FIXTURE_ADAPTERS.google_ai_mode, captureReady: false },
+  perplexity: { status: "active", adapter: FIXTURE_ADAPTERS.perplexity, captureReady: false },
+  chatgpt: { status: "active", adapter: FIXTURE_ADAPTERS.chatgpt, captureReady: false },
+  gemini: { status: "active", adapter: FIXTURE_ADAPTERS.gemini, captureReady: false },
+  claude: { status: "active", adapter: FIXTURE_ADAPTERS.claude, captureReady: false },
   grok: { status: "disabled" },
   copilot: { status: "disabled" },
   meta_ai: { status: "disabled" },
@@ -68,4 +99,21 @@ export function resolveEngine(engineKey: string): CaptureAdapter {
 
 export async function healthProbeEngine(engineKey: string): Promise<{ ok: boolean; latencyMs: number; detail?: string }> {
   return resolveEngine(engineKey).healthProbe();
+}
+
+/**
+ * The engine keys a capture may actually be attempted on.
+ *
+ * ⚠ EMPTY TODAY, DELIBERATELY, AND THAT IS THE PRODUCT'S TRUE STATE. Every
+ * active engine is fixture-backed; none can answer a real prompt. Planning a
+ * cell for one would manufacture a failure out of a thing we never tried.
+ *
+ * Derived from REGISTRY rather than listed, so an adapter story cannot bind a
+ * real adapter and forget to make it reachable, or the reverse.
+ */
+export function captureReadyEngineKeys(): readonly EngineKey[] {
+  return (Object.keys(REGISTRY) as EngineKey[]).filter((key) => {
+    const entry = REGISTRY[key];
+    return entry.status === "active" && entry.captureReady;
+  });
 }

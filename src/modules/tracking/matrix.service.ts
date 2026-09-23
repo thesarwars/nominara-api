@@ -72,8 +72,17 @@ export class MatrixService {
               latest.sentiment_label AS sentiment_label,
               success.captured_at AS last_success_at
          FROM tracked_prompts p
+         -- THE VIEW, NOT project_engines. STORY-152.
+         --
+         -- This read had no plan floor at all: it listed whatever rows
+         -- existed, so a row for an engine the workspace does not pay for
+         -- would have put a column on the customer's matrix. It never did,
+         -- only because nothing ever wrote a row — the matrix showed ZERO
+         -- engine columns for every real project. The view carries the floor
+         -- and the cadence key, so the columns are the plan's engines by
+         -- construction rather than by whoever wrote the rows.
          CROSS JOIN (
-           SELECT engine_key FROM project_engines
+           SELECT engine_key FROM project_entitled_engines
             WHERE project_id = $1 AND enabled = true
               AND ($3::text[] IS NULL OR engine_key = ANY($3::text[]))
          ) e

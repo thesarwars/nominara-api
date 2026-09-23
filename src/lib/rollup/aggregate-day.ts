@@ -126,6 +126,13 @@ export async function aggregateRange(
        SELECT c.id, c.engine_key, c.status, c.cache_layer, c.brand_present, c.sov,
               COALESCE(pe.weight, 1.0)::real AS engine_weight
          FROM answer_captures c
+         -- ⚠ project_engines, NOT the entitled view, AND THAT IS DELIBERATE.
+         -- STORY-152 moved the entitlement reads onto project_entitled_engines;
+         -- this one stays because it is not an entitlement read. It is the
+         -- WEIGHT applied to a capture that already happened, and a historical
+         -- measurement must not be re-weighted — or dropped — because the plan
+         -- changed afterwards. Joining the view here would silently rewrite
+         -- yesterday's score on a downgrade.
          LEFT JOIN project_engines pe
                 ON pe.project_id = c.project_id AND pe.engine_key = c.engine_key
         WHERE c.project_id = $1

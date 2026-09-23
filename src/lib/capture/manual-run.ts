@@ -119,6 +119,16 @@ export async function estimateManualRun(
   cache: Cache,
   project: ManualRunProject,
   now: Date = new Date(),
+  /**
+   * ⚠ A TEST SEAM, AND PRODUCTION NEVER SETS IT. STORY-152.
+   *
+   * Forwarded to `ProbeRunContext.captureReadyEngineKeys`, which documents
+   * it. Needed here because this function builds the probe context itself, so
+   * a spec asking what a scan would cost cannot otherwise reach it — and the
+   * forecast tests are about the cache split and the prompt-times-engine
+   * fan-out, neither of which exists over an empty engine set.
+   */
+  captureReadyEngineKeys?: readonly string[],
 ): Promise<ManualRunEstimate> {
   // ONE resolution, several questions asked of it. `deep_scan.credits` and
   // `no_shared_cache` both come from the merged entitlement set, and reading
@@ -142,6 +152,10 @@ export async function estimateManualRun(
     env: cacheKeyNamespace(),
     sharedCacheEnabled: sharedCacheEnabled(resolved.entitlements),
     nowMs: now.getTime(),
+    // Spread, not assigned — `exactOptionalPropertyTypes` distinguishes an
+    // explicit `undefined` from an absent key, and only the absent key takes
+    // the registry default.
+    ...(captureReadyEngineKeys === undefined ? {} : { captureReadyEngineKeys }),
   });
 
   return {
@@ -181,7 +195,19 @@ export async function planManualRun(
   tx: ClientBase,
   cache: Cache,
   project: ManualRunProject,
-  options: { readonly runId: string; readonly triggeredBy: string | null; readonly now: Date },
+  options: {
+    readonly runId: string;
+    readonly triggeredBy: string | null;
+    readonly now: Date;
+    /**
+     * ⚠ A TEST SEAM, AND PRODUCTION NEVER SETS IT. STORY-152 — see
+     * `PlanRunContext.captureReadyEngineKeys`, which documents it. The
+     * run-lifecycle specs plan a run and then assert dispatch, progress,
+     * suppression and failure over its cells; none of that exists when the
+     * capture-ready set is empty, which it is in production.
+     */
+    readonly captureReadyEngineKeys?: readonly string[];
+  },
 ): Promise<{ readonly plan: PlannedRun; readonly credits: number }> {
   // Re-resolved INSIDE the caller's transaction. The route priced the run
   // against the header before opening one; a plan changed in between would
@@ -214,6 +240,10 @@ export async function planManualRun(
     env: cacheKeyNamespace(),
     sharedCacheEnabled: sharedCacheEnabled(resolved.entitlements),
     nowMs: options.now.getTime(),
+    // Spread, not assigned — see the same note in `estimateManualRun`.
+    ...(options.captureReadyEngineKeys === undefined
+      ? {}
+      : { captureReadyEngineKeys: options.captureReadyEngineKeys }),
   });
 
   // The price travels back with the plan so the response can state it

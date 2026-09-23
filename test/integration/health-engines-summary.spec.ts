@@ -31,15 +31,11 @@ describe("STORY-031 · readiness engines[] — real per-engine status + circuit 
     const client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();
     await migrateUp(client);
-    await client.query(
-      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version, cache_ttl_seconds, volatility_band, min_plan_key) VALUES
-       ('google_aio', 'google_aio', 'v', 'api', 'v1', 3600, 'medium', 'free'),
-       ('google_ai_mode', 'google_ai_mode', 'v', 'api', 'v1', 3600, 'medium', 'free'),
-       ('perplexity', 'perplexity', 'v', 'api', 'v1', 3600, 'medium', 'free'),
-       ('chatgpt', 'chatgpt', 'v', 'api', 'v1', 3600, 'medium', 'free'),
-       ('gemini', 'gemini', 'v', 'api', 'v1', 3600, 'medium', 'free'),
-       ('claude', 'claude', 'v', 'api', 'v1', 3600, 'medium', 'free')`,
-    );
+    // No `INSERT INTO engines`: these six ARE the catalog's active engines,
+    // and migration 0027 seeds them. This file used to hand-write the same
+    // six, which meant the readiness surface was asserted against a world the
+    // product did not have. The `status` UPDATE below still belongs here —
+    // that is this test's own scenario, not catalog data.
     await client.query("UPDATE engines SET status = 'degraded' WHERE key = 'gemini'");
     await client.end();
 

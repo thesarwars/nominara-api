@@ -33,6 +33,8 @@ export interface ProbeRunContext {
   readonly scope: PromptScope;
   /** Narrows the engine set; can never widen it past the entitlement. */
   readonly engineKeys?: readonly string[];
+  /** Test seam — production leaves it undefined. See PlanRunContext. */
+  readonly captureReadyEngineKeys?: readonly string[];
   readonly locale: string;
   readonly personaHint: string | null;
   /** `cacheKeyNamespace()`, for the L1 key. */
@@ -61,7 +63,7 @@ export interface ProbedRun {
  * has no transaction to offer and must not open one to answer a question.
  */
 export async function probeRunCells(tx: ClientBase, cache: Cache, context: ProbeRunContext): Promise<ProbedRun> {
-  const engines = await resolveEnabledEngines(tx, context.projectId, context.engineKeys);
+  const engines = await resolveEnabledEngines(tx, context.projectId, context.engineKeys, context.captureReadyEngineKeys);
   const prompts = await selectPrompts(tx, context.projectId, context.scope);
   const cells = fanOutCells(prompts, engines);
 

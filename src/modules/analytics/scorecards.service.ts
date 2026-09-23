@@ -157,15 +157,21 @@ export class ScorecardsService {
       weight: string;
       last_captured_at: Date | null;
     }>(
-      `SELECT pe.engine_key,
-              e.display_name,
-              (e.cadence_by_plan -> w.plan_key ->> 'full')::int AS runs_per_cycle,
-              pe.weight::text AS weight,
+      // THE VIEW, NOT project_engines. STORY-152.
+      //
+      // Three joins collapse into it. This read had no plan floor either, and
+      // it re-derived the cadence with its own copy of
+      // `cadence_by_plan -> plan_key ->> 'full'` — the same expression the
+      // scheduler uses, written out a second time. FR-CRD-09 asks that the
+      // customer-visible freshness figure cannot drift from the scheduler, and
+      // two copies of an expression is precisely how it would. `pes.cadence`
+      // IS the scheduler's object.
+      `SELECT pes.engine_key,
+              pes.display_name,
+              (pes.cadence ->> 'full')::int AS runs_per_cycle,
+              pes.weight::text AS weight,
               last_capture.captured_at AS last_captured_at
-         FROM project_engines pe
-         JOIN projects p   ON p.id = pe.project_id
-         JOIN workspaces w ON w.id = p.workspace_id
-         LEFT JOIN engines e ON e.key = pe.engine_key
+         FROM project_entitled_engines pes
          -- NOT WINDOWED, deliberately. An engine that last answered before
          -- the window is exactly the one worth surfacing, and clamping this
          -- to the window would report null for the engine that has been
@@ -173,13 +179,13 @@ export class ScorecardsService {
          LEFT JOIN LATERAL (
            SELECT max(c.captured_at) AS captured_at
              FROM answer_captures c
-            WHERE c.project_id = pe.project_id
-              AND c.engine_key = pe.engine_key
+            WHERE c.project_id = pes.project_id
+              AND c.engine_key = pes.engine_key
               AND c.status IN ('captured', 'parsed', 'skipped')
          ) last_capture ON true
-        WHERE pe.project_id = $1 AND pe.enabled = true
-          AND ($2::text[] IS NULL OR pe.engine_key = ANY($2::text[]))
-        ORDER BY pe.engine_key ASC`,
+        WHERE pes.project_id = $1 AND pes.enabled = true
+          AND ($2::text[] IS NULL OR pes.engine_key = ANY($2::text[]))
+        ORDER BY pes.engine_key ASC`,
       [projectId, requested],
     );
 

@@ -39,6 +39,18 @@ describe("STORY-032 · planning a run end to end", () => {
   let workspaceId: string;
   let projectId: string;
   let runId: string;
+  /**
+   * STORY-152 — the engines THIS spec seeds, and the reason it has to say so.
+   *
+   * `resolveEnabledEngines` returns ENTITLEMENT ∩ CAPTURE-READY, and in
+   * production the capture-ready half is EMPTY: every engine in the registry is
+   * fixture-backed and cannot answer a real prompt until STORY-001 opens the
+   * vendor accounts. This spec is about the RUN LIFECYCLE — dispatch, progress,
+   * suppression, refusal — none of which can be exercised with an empty set, so
+   * it declares capture-ready exactly the keys `addEngine` seeded and nothing
+   * more. The entitlement filter stays the only thing under test.
+   */
+  let seededEngineKeys: string[];
   const connections: Redis[] = [];
   const cleanups: (() => Promise<void>)[] = [];
 
@@ -84,6 +96,7 @@ describe("STORY-032 · planning a run end to end", () => {
     workspaceId = randomUUID();
     projectId = randomUUID();
     runId = randomUUID();
+    seededEngineKeys = [];
     await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'W', $2, 'growth')", [
       workspaceId,
       `w-${randomUUID().slice(0, 8)}`,
@@ -98,12 +111,7 @@ describe("STORY-032 · planning a run end to end", () => {
        VALUES ($1, $2, $3, 'scheduled', ARRAY['perplexity'])`,
       [runId, workspaceId, projectId],
     );
-    await db.query(
-      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
-                            cache_ttl_seconds, volatility_band, min_plan_key, status)
-       VALUES ('perplexity', 'perplexity', 'v', 'api', '1.0.0', $1, 'medium', 'free', 'active')`,
-      [TTL_SECONDS],
-    );
+    await addEngine("perplexity");
     await db.query(
       `INSERT INTO project_engines (workspace_id, project_id, engine_key, enabled, sample_count)
        VALUES ($1, $2, 'perplexity', true, 1)`,
@@ -111,6 +119,25 @@ describe("STORY-032 · planning a run end to end", () => {
     );
     await setCeiling(1_000);
   });
+
+  /**
+   * Seed a catalog engine and record it as capture-ready for this spec.
+   *
+   * NO `cadence_by_plan`. `project_entitled_engines` gates on the plan FLOOR
+   * alone — a cadence entry governs whether the SCHEDULER runs an engine, not
+   * whether the project may capture on it (STORY-130 §57). The floor stays
+   * the caller's to state, which is what the entitlement reconciliation test
+   * below turns on.
+   */
+  async function addEngine(key: string, minPlan = "free"): Promise<void> {
+    if (!seededEngineKeys.includes(key)) seededEngineKeys.push(key);
+    await db.query(
+      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
+                            cache_ttl_seconds, volatility_band, min_plan_key, status)
+       VALUES ($1, $1, 'v', 'api', '1.0.0', $2, 'medium', $3, 'active')`,
+      [key, TTL_SECONDS, minPlan],
+    );
+  }
 
   /**
    * STORY-070 — the ceiling as the CONTRACT sets it, not as a hand-written row.
@@ -165,6 +192,10 @@ describe("STORY-032 · planning a run end to end", () => {
       personaHint: null,
       normalizerVersion: "v1",
       captureMode: "api",
+      // The seam. See `seededEngineKeys` above: production's capture-ready set
+      // is empty because no adapter can capture yet, and this spec tests the
+      // run lifecycle rather than the registry.
+      captureReadyEngineKeys: [...seededEngineKeys],
       env: "test",
       sharedCacheEnabled: true,
       nowMs: NOW_MS,
@@ -524,12 +555,7 @@ describe("STORY-032 · planning a run end to end", () => {
   // §5: the run row must record exactly which engines the run COVERED.
   it("reconciles engine_keys with the engines entitlement actually allowed", async () => {
     // A second engine the project enables but the plan does not entitle.
-    await db.query(
-      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
-                            cache_ttl_seconds, volatility_band, min_plan_key, status)
-       VALUES ('gemini', 'gemini', 'v', 'api', '1.0.0', $1, 'medium', 'business', 'active')`,
-      [TTL_SECONDS],
-    );
+    await addEngine("gemini", "business");
     await db.query(
       `INSERT INTO project_engines (workspace_id, project_id, engine_key, enabled, sample_count)
        VALUES ($1, $2, 'gemini', true, 1)`,

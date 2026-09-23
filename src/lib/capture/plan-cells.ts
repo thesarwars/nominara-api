@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { captureReadyEngineKeys } from "../engines/registry.js";
 
 // STORY-032 — tracking-engine.md §5's cell planning: engine resolution,
 // prompt selection, and the fan-out across prompts x engines x samples.
@@ -51,10 +52,37 @@ export interface ResolvedEngine {
  * asking for an engine the workspace is not entitled to gets nothing back,
  * rather than an error that would let it probe the entitlement set.
  */
+/**
+ * ⚠ ENTITLED AND CAPTURE-READY ARE TWO DIFFERENT THINGS, and this returns the
+ * intersection. STORY-152.
+ *
+ * The catalog says what a plan BUYS; `registry.ts` says what this build can
+ * actually ask. Today those disagree completely — every active engine is
+ * fixture-backed, so `captureReadyEngineKeys()` is empty and this returns []
+ * for every project on every plan.
+ *
+ * That is not the same "[]" this function returned before STORY-152, and the
+ * difference is the whole point. It used to be empty because `project_engines`
+ * had no production writer — the product silently believed no project was
+ * entitled to anything. It is empty now because nothing in this repository can
+ * capture yet, which is true and is fixed by STORY-001 opening vendor accounts.
+ */
 export async function resolveEnabledEngines(
   tx: ClientBase,
   projectId: string,
   engineKeys?: readonly string[],
+  /**
+   * ⚠ A SEAM, NOT A CONVENIENCE. Production never passes this: the default is
+   * the registry's own derived list, so the honest empty set is what the
+   * scheduler and every handler actually get.
+   *
+   * It exists because the capture-path integration specs are about the RUN
+   * LIFECYCLE — dispatch, progress, suppression, failure — and cannot exercise
+   * any of it while no engine is capture-ready. They pass the keys they seeded.
+   * The one test that asserts what PRODUCTION resolves omits it, which is what
+   * keeps the default from being an unfalsifiable one.
+   */
+  captureReady: readonly string[] = captureReadyEngineKeys(),
 ): Promise<ResolvedEngine[]> {
   const result = await tx.query<{
     engine_key: string;
@@ -63,21 +91,29 @@ export async function resolveEnabledEngines(
     adapter_version: string;
   }>(
     `
-    SELECT pe.engine_key, pe.sample_count, e.cache_ttl_seconds, e.adapter_version
-      FROM project_engines pe
-      JOIN projects p            ON p.id = pe.project_id
-      JOIN workspaces w          ON w.id = p.workspace_id
-      JOIN engines e             ON e.key = pe.engine_key
-      JOIN plans engine_plan     ON engine_plan.key = e.min_plan_key
-      JOIN plans workspace_plan  ON workspace_plan.key = w.plan_key
-     WHERE pe.project_id = $1
-       AND pe.enabled
-       AND e.status = 'active'
-       AND engine_plan.sort_order <= workspace_plan.sort_order
-       AND ($2::text[] IS NULL OR pe.engine_key = ANY($2::text[]))
-     ORDER BY pe.engine_key
+    -- THE VIEW, NOT project_engines. STORY-152.
+    --
+    -- This query used to be driven by project_engines — which has never had a
+    -- production writer, so it resolved ZERO cells for every real project and
+    -- a run was planned with nothing in it. The entitled set is DERIVED now:
+    -- the view's driving table is engines, and an override enters through a
+    -- LEFT JOIN, so it can only narrow.
+    --
+    -- The plan floor and the cadence predicate live in the view rather than
+    -- here, which is the point: they were correct in this file and in
+    -- engine-cadence.ts, and absent from the four other readers.
+    SELECT pes.engine_key, pes.sample_count, pes.cache_ttl_seconds, pes.adapter_version
+      FROM project_entitled_engines pes
+     WHERE pes.project_id = $1
+       AND pes.enabled
+       -- CAPTURE-READY ONLY. An engine can be entitled and still have no
+       -- adapter that could answer; planning a cell for one manufactures a
+       -- failure out of something we never attempted. See registry.ts.
+       AND pes.engine_key = ANY($3::text[])
+       AND ($2::text[] IS NULL OR pes.engine_key = ANY($2::text[]))
+     ORDER BY pes.engine_key
     `,
-    [projectId, engineKeys === undefined ? null : [...engineKeys]],
+    [projectId, engineKeys === undefined ? null : [...engineKeys], [...captureReady]],
   );
 
   return result.rows.map((row) => ({
