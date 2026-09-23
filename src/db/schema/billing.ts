@@ -160,6 +160,7 @@ export const subscriptions = pgTable("subscriptions", {
   projectsPurchased: integer("projects_purchased").notNull().default(sql`0`),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  provider: text("provider").notNull().default(sql`'none'::text`),
 });
 
 export const usageCounters = pgTable("usage_counters", {
