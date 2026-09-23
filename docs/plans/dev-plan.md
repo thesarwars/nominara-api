@@ -748,6 +748,20 @@ One provider client behind a port, called only from a queue handler — never fr
 
 **Still owed:** capture-readiness is `false` for all six engines until an adapter story flips it — **the catalog is seeded and nothing can capture on it yet**, which is STORY-001's dependency, not a defect in this one.
 
+**⚠ ITS REVIEW RETURNED CHANGES REQUIRED WITH A LIVE REPRODUCTION, AND THE FIRST FINDING WAS A HOLE IN THE GATE ITSELF.** `db:rls-check` reported `isClean: true` on a database containing `CREATE VIEW leaky AS SELECT * FROM projects`, granted to all four runtime roles, that served **every tenant's rows** to a caller pinned to one workspace. The census filters `relkind IN ('r','p')`; the isolation suite's discovery uses the same filter; ISO-16 inspects `pg_matviews`. **A plain view was outside every gate's universe** — and this story shipped the first one, whose entire tenant safety is one reloption that `ALTER VIEW … SET (security_invoker = false)` removes silently. Closed with a seventh `checkRls` bucket and **ISO-23**, registered with a breaker so ISO-00's anti-vacuity covers it; extension views are excluded by `pg_depend`, not by name, because an allow-list of two names admits the next extension's.
+
+**⚠ AND "FAIL CLOSED" FAILED OPEN, WITH A 500.** `(cadence ->> kind)::int` does not fail closed on a non-integer — it RAISES, and the raise reaches the customer as a 500 on the whole Project Overview screen. `cadence_by_plan` is edited by hand-written operator migrations, and **seeding the catalog is what armed a cast that was dormant while the table was empty.** A CHECK constraint now rejects exactly the values that raise; zero and negative stay legal, because they cast cleanly and the readers' own `> 0` is the actual fail-closed rule.
+
+**⚠ AND THE "IDEMPOTENT" RE-SEED WAS AN OVERWRITE.** Reproduced against the real rollback/migrate sequence: an incident responder's `status='degraded'` reverted to `active`, resuming scheduling against a vendor that was down, and `adapter_version` 2.3.1 reverted to 0.1.0 — **rewriting the catalog side of the very provenance pair the down migration keeps the rows to preserve.** Both dropped from the SET list.
+
+**⚠ AND SWITCHING THE SCORECARD ONTO THE VIEW SILENTLY REDEFINED THE HEADLINE SCORE.** The header blended plan-entitled engines only; the stored `engine_key='all'` row that Growth Map and the trend series read blends every engine holding a `metric_daily` row with no floor at all. Before this story both were unfiltered and agreed — after it they differed by **17.75 points**, with `SCORING_VERSION` still `v1` and no dual-compute window, reachable the moment a workspace downgrades. **Decided: a blend is a statement about what was MEASURED.** Entitlement governs what may be captured next and cannot retroactively un-measure something, because a past day's score has to stay reproducible from an export.
+
+**⚠ AND THE SCHEDULER WOULD HAVE MANUFACTURED EMPTY RUNS FOREVER.** `resolveDueEngines` had no capture-ready filter, so a tick would write a run row, resolve zero cells, record `engine_keys = '{}'` — which the coverage LATERAL cannot match, leaving `last_covered_at` NULL and the engine **permanently due**. Latent only because no capture worker exists; the next story to wire one would have inherited it.
+
+**⚠ AND THE PLAN FLOOR WAS INERT IN BOTH SPECS THAT COVER THE SURFACES IT NEWLY GOVERNS.** `tracking-matrix.spec.ts` and `scorecards.spec.ts` truncate `engines` and rebuild it with `min_plan_key='free'` on everything, so the floor could have been deleted and neither would have noticed — every one of the ten tests the mutation note cites lives in a third file. **A mutation result is scoped to the files that ran.**
+
+**⚠ AND ONE OF MY OWN TESTS LOST ITS PRECISION WHILE I FIXED ANOTHER FINDING.** Adding the capture-ready filter made the free-tier "due nothing" assertion pass for TWO reasons — no cadence, and nothing capture-ready — so the cadence mutation stopped failing it. Fixing a finding can silently disarm the test that guards a different one; re-run the old mutations after every fix, not just the new ones.
+
 
 ## 13. What "done" looks like for this plan
 
