@@ -127,8 +127,14 @@ export async function estimateManualRun(
    * a spec asking what a scan would cost cannot otherwise reach it — and the
    * forecast tests are about the cache split and the prompt-times-engine
    * fan-out, neither of which exists over an empty engine set.
+   *
+   * AN OBJECT RATHER THAN A FIFTH POSITIONAL `readonly string[]`. It sits
+   * behind `now: Date = new Date()`, and a caller that miscounted arguments
+   * could otherwise reach a capture-readiness override by accident — a
+   * reviewer of STORY-152 flagged exactly that. A named field cannot be
+   * passed by miscounting.
    */
-  captureReadyEngineKeys?: readonly string[],
+  options: { readonly captureReadyEngineKeys?: readonly string[] } = {},
 ): Promise<ManualRunEstimate> {
   // ONE resolution, several questions asked of it. `deep_scan.credits` and
   // `no_shared_cache` both come from the merged entitlement set, and reading
@@ -155,7 +161,9 @@ export async function estimateManualRun(
     // Spread, not assigned — `exactOptionalPropertyTypes` distinguishes an
     // explicit `undefined` from an absent key, and only the absent key takes
     // the registry default.
-    ...(captureReadyEngineKeys === undefined ? {} : { captureReadyEngineKeys }),
+    ...(options.captureReadyEngineKeys === undefined
+      ? {}
+      : { captureReadyEngineKeys: options.captureReadyEngineKeys }),
   });
 
   return {

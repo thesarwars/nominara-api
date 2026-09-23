@@ -18,6 +18,7 @@ import { assertIso13CacheNamespacing, iso13ConstructorBreaker } from "./iso-13-c
 import { assertIso14ObjectNamespacing, iso14Breaker } from "./iso-14-object-namespace.js";
 import { assertIso15AggregateAnonymity, iso15Breaker } from "./iso-15-aggregate-anonymity.js";
 import { assertIso16NoMaterializedViews, iso16Breaker } from "./iso-16-no-matviews.js";
+import { assertIso23ViewsSecurityInvoker, iso23Breaker } from "./iso-23-views-security-invoker.js";
 import { assertIso17AgainstMissingApplyTenantRls, assertIso17PartitionRlsApplied, iso17Breaker } from "./iso-17-partition-rls-applied.js";
 import { assertIso18ActorSelfScopedMultiActor, iso18Breaker } from "./iso-18-actor-self-scoped-multi-actor.js";
 import { assertIso19NoGucsZeroRows, iso19Breaker } from "./iso-19-actor-scoped-no-context-zero-rows.js";
@@ -129,6 +130,9 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
   },
   { id: "ISO-15", needsDatabase: true, readOnly: false, needsFixture: true, assert: assertIso15AggregateAnonymity, assertUnderBreaker: assertIso15AggregateAnonymity, breaker: iso15Breaker },
   { id: "ISO-16", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso16NoMaterializedViews, assertUnderBreaker: assertIso16NoMaterializedViews, breaker: iso16Breaker },
+  // STORY-152 — the plain-view sibling of ISO-16. Read-only and fixture-free
+  // for the same reason: it inspects the SCHEMA, not any tenant's rows.
+  { id: "ISO-23", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso23ViewsSecurityInvoker, assertUnderBreaker: assertIso23ViewsSecurityInvoker, breaker: iso23Breaker },
   // readOnly: false — creates a partition and inserts a probe row (DDL + a
   // write), so it is excluded from the staging read-only subset like ISO-10.
   {

@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { captureReadyEngineKeys } from "../engines/registry.js";
 
 // STORY-033 AC4 and AC5 — per-engine due-ness, and the record that makes it
 // reconstructable.
@@ -16,8 +17,15 @@ import type { ClientBase } from "pg";
 // "`cadence_by_plan` x `project_engines.enabled` is the only source the
 // scheduler reads and the only source the per-engine freshness row renders,
 // which is why the customer-visible cadence cannot drift from what actually
-// runs." So there is deliberately no fallback here — see UNSEEDED CATALOG
-// below for what that costs today.
+// runs." So there is deliberately no fallback here.
+//
+// STORY-152 — that sentence still holds, through one more hop: this reads
+// `project_entitled_engines`, and the view's `cadence` column IS
+// `cadence_by_plan -> <this workspace's plan>`. The scheduler and the
+// customer-visible freshness row now read the same expression from the same
+// relation, which is what FR-CRD-09's "it cannot drift from the scheduler"
+// actually asks for. `project_engines.enabled` reaches this query through
+// the view's LEFT JOIN, as `pes.enabled`.
 
 /**
  * §5's cadence table is stated in runs per 30-day cycle, so the interval
@@ -66,23 +74,39 @@ export interface DueEngine {
  * due-ness for the project and applying it to every engine would produce a
  * uniform run that the freshness row would then misreport.
  *
- * FOUR CONDITIONS, and each excludes something different:
+ * FOUR CONDITIONS, and each excludes something different. STORY-152 moved
+ * three of them into `project_entitled_engines`; they are still four, and
+ * the view is where three now live:
  *
- *   `pe.enabled` — the customer's choice.
- *   `e.status = 'active'` — ours; a degraded or beta engine is not scheduled
- *   into merely because a project enabled it.
- *   plan order — the entitlement, compared IN THE DATABASE for the same
- *   reason `resolveEnabledEngines` does it: a compiled-in mapping would need
- *   a redeploy for a plan change.
- *   the cadence entry — whether this plan schedules this engine at all.
+ *   `pes.enabled` — the customer's choice, via the view's LEFT JOIN to
+ *   `project_engines`. An override narrows; it can never widen.
+ *   `e.status = 'active'` — ours, now IN THE VIEW; a degraded or beta engine
+ *   is not scheduled into merely because a project enabled it.
+ *   plan order — the entitlement, now IN THE VIEW, compared in the database
+ *   for the same reason `resolveEnabledEngines` does it: a compiled-in
+ *   mapping would need a redeploy for a plan change.
+ *   the cadence entry — whether this plan schedules this engine at all. THIS
+ *   ONE STAYS HERE, and deliberately: see FAIL CLOSED.
  *
- * UNSEEDED CATALOG. `engines.cadence_by_plan` defaults to `{}` and NOTHING
- * SEEDS IT — there is no `INSERT INTO engines` anywhere in `src/`, and no
- * story owns one. So in production this returns an empty set for every
- * project and the scheduler covers no engines. That is the correct behaviour
- * for the data as it stands (see FAIL CLOSED), not a bug in this function,
- * but it means AC4 is inert until the catalog is seeded. Recorded in the
- * story rather than papered over with a fallback.
+ * ⚠ THE CATALOG IS SEEDED NOW — migration 0027, STORY-152. This comment used
+ * to say the opposite ("NOTHING SEEDS IT ... the scheduler covers no engines"),
+ * and a reader who believed it would conclude this function is inert and ship
+ * a worker on that basis. It is not inert: it returns real due engines for a
+ * real project the moment a caller exists.
+ *
+ * ⚠ CAPTURE-READINESS IS A FIFTH CONDITION, AND IT IS APPLIED HERE RATHER
+ * THAN LEFT TO THE PLANNER. `captureReadyEngineKeys()` is `[]` today because
+ * every engine is fixture-backed. Without this filter, a scheduled tick would
+ * find engines due, write a `capture_runs` row, resolve ZERO cells, and
+ * record `engine_keys = '{}'` — which the `last_run` LATERAL below cannot
+ * match, so `last_covered_at` would stay NULL and the same engine would be
+ * due again on every tick, forever, accumulating permanently-`queued` runs
+ * that nothing can complete.
+ *
+ * Filtering here instead makes the due set empty, and `planScheduledRun`'s
+ * existing "nothing is due" path returns before it inserts anything. That
+ * path is older than this story and already tested; the alternative was to
+ * delete a row we had just written, which is a second mechanism to get right.
  *
  * FAIL CLOSED. An engine whose plan has no cadence entry is NOT due, rather
  * than due by default. The two mistakes are not symmetric: scheduling an
@@ -98,6 +122,11 @@ export async function resolveDueEngines(
     readonly kind: RunKind;
     readonly now: Date;
   },
+  /**
+   * ⚠ A TEST SEAM, AND PRODUCTION NEVER PASSES IT. STORY-152 — the default
+   * IS the production value, and it is empty. See the fifth condition above.
+   */
+  captureReady: readonly string[] = captureReadyEngineKeys(),
 ): Promise<DueEngine[]> {
   const result = await tx.query<{
     engine_key: string;
@@ -129,6 +158,10 @@ export async function resolveDueEngines(
       ) last_run ON true
      WHERE pes.project_id = $1
        AND pes.enabled
+       -- Capture-readiness, the fifth condition. Empty in production, so this
+       -- excludes everything and no scheduled run is planned at all -- which
+       -- is the honest state until an adapter story binds a real adapter.
+       AND pes.engine_key = ANY($3::text[])
        -- status active and the plan floor are in the view now. THE CADENCE
        -- TEST IS NOT, AND MUST STAY HERE: the view lists every engine the
        -- plan ENTITLES, including the ones it entitles on demand and never
@@ -141,7 +174,7 @@ export async function resolveDueEngines(
        AND (pes.cadence ->> $2)::int > 0
      ORDER BY pes.engine_key
     `,
-    [input.projectId, input.kind],
+    [input.projectId, input.kind, [...captureReady]],
   );
 
   const due: DueEngine[] = [];

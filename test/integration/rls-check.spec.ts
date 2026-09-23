@@ -75,8 +75,10 @@ describe("STORY-011 · pnpm db:rls-check", () => {
     await client.end();
   });
 
-  it("a freshly-migrated database is clean — all five buckets empty", async () => {
+  it("a freshly-migrated database is clean — all SEVEN buckets empty", async () => {
     const result = await checkRls(client);
+    // Whole-object equality on purpose: a new bucket that nobody adds here
+    // fails this test, which is how the seventh one got noticed at all.
     expect(result).toEqual({
       unclassifiedTables: [],
       missingRls: [],
@@ -84,6 +86,7 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       unexpectedPolicies: [],
       policiesWithoutWithCheck: [],
       globalTablesWithPolicies: [],
+      viewsWithoutSecurityInvoker: [],
     });
     expect(isClean(result)).toBe(true);
   });
@@ -307,6 +310,97 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       const sql = await readFile(path.join(migrationsDir, "0006_generated_rls_policies.up.sql"), "utf8");
       await client.query("DROP POLICY IF EXISTS ws_isolation_competitors ON competitors");
       await client.query(sql);
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // STORY-152 — the seventh bucket, and the only one about a relation this
+  // check could not previously SEE.
+  //
+  // ⚠ THIS IS A REAL LEAK THAT THE OTHER SIX CALLED CLEAN. `CENSUS_TABLES_SQL`
+  // filters `relkind IN ('r','p')`, `test/isolation/support/discovery.ts` uses
+  // the same filter, and ISO-16 inspects `pg_matviews` — so before this bucket
+  // existed, a plain view was outside every gate's universe. A view without
+  // `security_invoker` executes as its OWNER, the migration role, which
+  // bypasses RLS on every base table it reads.
+  //
+  // The breaker below is the exact reproduction from STORY-152's review: it
+  // returned `isClean: true` on a database containing this view granted to all
+  // four runtime roles, while the view served every tenant's rows to a caller
+  // pinned to one workspace.
+  // --------------------------------------------------------------------------
+
+  it("bucket: viewsWithoutSecurityInvoker — a view that bypasses RLS on its base tables", async () => {
+    await client.query("CREATE VIEW leaky_probe_view AS SELECT * FROM projects");
+    try {
+      const result = await checkRls(client);
+      expect(
+        result.viewsWithoutSecurityInvoker,
+        "a view with no reloptions at all must FAIL — unset is the dangerous default, not a pass",
+      ).toContain("leaky_probe_view: security_invoker=unset");
+      expect(isClean(result), "and it must make the whole check dirty, or the gate still passes").toBe(false);
+    } finally {
+      await client.query("DROP VIEW IF EXISTS leaky_probe_view");
+    }
+  });
+
+  it("bucket: viewsWithoutSecurityInvoker — explicitly FALSE is caught too, not just absent", async () => {
+    // The one-edit path back to a leak on a view that was created correctly:
+    // `ALTER VIEW ... SET (security_invoker = false)` leaves reloptions
+    // populated, so a check that merely tested for a non-empty array would
+    // pass this.
+    await client.query("CREATE VIEW invoker_off_view WITH (security_invoker = false) AS SELECT * FROM projects");
+    try {
+      const result = await checkRls(client);
+      expect(result.viewsWithoutSecurityInvoker).toContain("invoker_off_view: security_invoker=security_invoker=false");
+      expect(isClean(result)).toBe(false);
+    } finally {
+      await client.query("DROP VIEW IF EXISTS invoker_off_view");
+    }
+  });
+
+  it("⚠ a CORRECT view passes, so the bucket discriminates rather than failing everything", async () => {
+    // The anti-vacuity half. Without this, a bucket that reported every view
+    // unconditionally would pass both breakers above and be indistinguishable
+    // from a working one.
+    //
+    // A view built here rather than `project_entitled_engines`: this fixture
+    // applies a hand-picked migration SUBSET (see beforeAll) and the story's
+    // own view is not in it. Building the shape locally tests the property
+    // instead of the fixture's migration list, and does not silently start
+    // passing for a different reason if that list changes.
+    await client.query("CREATE VIEW correct_probe_view WITH (security_invoker = true) AS SELECT * FROM projects");
+    try {
+      const result = await checkRls(client);
+      expect(
+        result.viewsWithoutSecurityInvoker,
+        "a view carrying security_invoker=true must NOT be reported",
+      ).toEqual([]);
+      expect(isClean(result)).toBe(true);
+    } finally {
+      await client.query("DROP VIEW IF EXISTS correct_probe_view");
+    }
+  });
+
+  it("extension-owned views are excluded by dependency, not by name", async () => {
+    // pg_stat_statements installs two views into `public` with no
+    // security_invoker. They are excluded via pg_depend deptype='e' — and if
+    // that exclusion ever became a two-name allow-list, this asserts the
+    // mechanism that makes the NEXT extension safe too.
+    const extensionViews = await client.query<{ relname: string }>(
+      `SELECT c.relname
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_depend d ON d.objid = c.oid AND d.classid = 'pg_class'::regclass AND d.deptype = 'e'
+        WHERE n.nspname = 'public' AND c.relkind = 'v'`,
+    );
+    expect(
+      extensionViews.rowCount,
+      "if no extension view exists here, the exclusion below is proving nothing",
+    ).toBeGreaterThan(0);
+    const result = await checkRls(client);
+    for (const row of extensionViews.rows) {
+      expect(result.viewsWithoutSecurityInvoker.join(",")).not.toContain(row.relname);
     }
   });
 });

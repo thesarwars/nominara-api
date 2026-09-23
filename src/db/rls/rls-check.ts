@@ -31,6 +31,27 @@ export interface RlsCheckResult {
   policiesWithoutWithCheck: string[];
   /** "<table>.<policy>" — a policy found on a GLOBAL_TABLES entry (the inverse mistake — GLOBAL_TABLES are GRANT-secured, never RLS). */
   globalTablesWithPolicies: string[];
+  /**
+   * "<view>: security_invoker=<value>" — a view in `public` that does not
+   * carry `security_invoker=true`.
+   *
+   * ⚠ EVERY OTHER BUCKET IS BLIND TO VIEWS, WHICH IS WHY THIS ONE EXISTS.
+   * `CENSUS_TABLES_SQL` selects `relkind IN ('r','p')`, so a view is examined
+   * by none of the six above — and a view without `security_invoker` runs as
+   * its OWNER, which is the migration role, which bypasses RLS on every base
+   * table it reads. Demonstrated rather than assumed: a review of STORY-152
+   * created `CREATE VIEW leaky AS SELECT * FROM projects`, granted it to all
+   * four runtime roles, and this function returned `isClean: true` while the
+   * view returned every tenant's rows to a caller pinned to one workspace.
+   *
+   * The sibling rule for MATERIALIZED views is ISO-16, which forbids them
+   * outright for exactly this reason. A plain view is permitted because it
+   * has no stored copy to go stale — but only with `security_invoker`, which
+   * one `ALTER VIEW ... SET (security_invoker = false)` removes silently.
+   *
+   * STORY-152 introduced the first plain view (`project_entitled_engines`).
+   */
+  viewsWithoutSecurityInvoker: string[];
 }
 
 export function isClean(result: RlsCheckResult): boolean {
@@ -40,7 +61,8 @@ export function isClean(result: RlsCheckResult): boolean {
     result.missingPolicies.length === 0 &&
     result.unexpectedPolicies.length === 0 &&
     result.policiesWithoutWithCheck.length === 0 &&
-    result.globalTablesWithPolicies.length === 0
+    result.globalTablesWithPolicies.length === 0 &&
+    result.viewsWithoutSecurityInvoker.length === 0
   );
 }
 
@@ -281,6 +303,39 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
   );
   const globalTablesWithPolicies = globalPoliciesResult.rows.map((row) => describe(row.tablename, row.policyname));
 
+  // ⚠ READ FROM pg_class DIRECTLY, NOT FROM THE CENSUS. `CENSUS_TABLES_SQL`
+  // filters `relkind IN ('r','p')` and would return nothing here — which is
+  // the blind spot this bucket exists to close, so reusing it would rebuild
+  // the blind spot inside its own fix.
+  //
+  // `reloptions` is NULL on a view created without options, and that is the
+  // dangerous case (PostgreSQL's default is security DEFINER semantics), so a
+  // missing array must fail rather than pass. Matched on the exact token
+  // `security_invoker=true`; Postgres normalises the stored spelling, which
+  // this is verified against in rls-check.spec.ts.
+  // ⚠ EXTENSION-OWNED VIEWS ARE EXCLUDED, BY DEPENDENCY AND NOT BY NAME.
+  // `pg_stat_statements` installs `pg_stat_statements` and
+  // `pg_stat_statements_info` into `public`, and they are neither ours to
+  // alter nor capable of leaking tenant data — they read shared memory, not
+  // our tables. `pg_depend.deptype = 'e'` is what "belongs to an extension"
+  // actually means; an allow-list of two names would quietly admit the next
+  // extension's views, which is the same class of gap this bucket closes.
+  const viewsResult = await client.query<{ relname: string; reloptions: string[] | null }>(
+    `SELECT c.relname, c.reloptions
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relkind = 'v'
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+           WHERE d.classid = 'pg_class'::regclass
+             AND d.objid = c.oid
+             AND d.deptype = 'e'
+        )`,
+  );
+  const viewsWithoutSecurityInvoker = viewsResult.rows
+    .filter((row) => !(row.reloptions ?? []).includes("security_invoker=true"))
+    .map((row) => `${row.relname}: security_invoker=${(row.reloptions ?? []).join(",") || "unset"}`);
+
   return {
     unclassifiedTables,
     missingRls,
@@ -288,6 +343,7 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
     unexpectedPolicies,
     policiesWithoutWithCheck,
     globalTablesWithPolicies,
+    viewsWithoutSecurityInvoker,
   };
 }
 

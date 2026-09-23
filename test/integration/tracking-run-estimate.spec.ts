@@ -142,7 +142,7 @@ describe("STORY-034 · estimating a manual deep scan", () => {
   // without this argument, which is what keeps the default falsifiable.
   async function estimate() {
     const project = await loadManualRunProject(db, projectId);
-    return estimateManualRun(db, cache, project, NOW, [SEEDED_ENGINE_KEY]);
+    return estimateManualRun(db, cache, project, NOW, { captureReadyEngineKeys: [SEEDED_ENGINE_KEY] });
   }
 
   it("prices the scan from the plan, not from the cell count", async () => {

@@ -149,7 +149,10 @@ describe("STORY-033 · per-engine cadence, and the run that records it", () => {
   }
 
   async function dueKeys(kind: "full" | "priority" = "full", now = NOW): Promise<string[]> {
-    const due = await resolveDueEngines(db, { projectId, kind, now });
+    // Same seam as scheduleContext(): the keys THIS test seeded. Without it
+    // the production default (empty) makes every due-ness assertion below
+    // read [] and pass for a reason that has nothing to do with cadence.
+    const due = await resolveDueEngines(db, { projectId, kind, now }, [...seededEngineKeys]);
     return due.map((engine) => engine.engineKey);
   }
 

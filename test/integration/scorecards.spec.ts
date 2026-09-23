@@ -62,18 +62,21 @@ describe("STORY-136 · project scorecards", () => {
        VALUES ($1,$2,$3,'q',sha256('q'::bytea),'recommendation','consideration',false,'active')`,
       [promptId, workspaceId, projectId],
     );
-    // The catalog is unseeded (STORY-130), so the rows are created here —
-    // including `cadence_by_plan`, which is what the cadence field reads.
-    for (const [engine, weight] of [
-      ["google_ai_mode", 3],
-      ["chatgpt", 1],
+    // ⚠ EACH ENGINE CARRIES ITS OWN REAL PLAN FLOOR, NOT 'free' FOR EVERYTHING.
+    // This fixture used to seed min_plan_key='free' on every engine, which
+    // made STORY-152's plan floor INERT in the one spec that covers this
+    // surface — the floor could have been deleted from the view and nothing
+    // here would have noticed. These are the floors migration 0027 seeds.
+    for (const [engine, weight, minPlan] of [
+      ["google_ai_mode", 3, "growth"],
+      ["chatgpt", 1, "free"],
     ] as const) {
       await db.query(
         `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
                               cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
-         VALUES ($1,$1,'v','api','1.0.0',86400,'medium','free','active',$2::jsonb)
+         VALUES ($1,$1,'v','api','1.0.0',86400,'medium',$3,'active',$2::jsonb)
          ON CONFLICT (key) DO NOTHING`,
-        [engine, JSON.stringify(options.cadence ?? {})],
+        [engine, JSON.stringify(options.cadence ?? {}), minPlan],
       );
       await db.query(
         `INSERT INTO project_engines (workspace_id,project_id,engine_key,enabled,sample_count,weight)
@@ -383,5 +386,91 @@ describe("STORY-136 · project scorecards", () => {
         new ScorecardsService().scorecards(randomUUID(), { timeframe: "30d" }),
       ),
     ).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  // ==========================================================================
+  // STORY-152 — WHAT A BLEND IS A STATEMENT ABOUT.
+  //
+  // ⚠ THIS PAIR EXISTS BECAUSE THE FIRST VERSION OF STORY-152 SILENTLY
+  // REDEFINED THE HEADLINE VISIBILITY SCORE.
+  //
+  // Switching this service onto `project_entitled_engines` made the blend run
+  // over "the engines you are entitled to TODAY". The stored cross-engine row
+  // that Growth Map and the trend series read (roll-up-day.ts's
+  // upsertCrossEngineRows) blends every engine holding a `metric_daily` row
+  // and applies no floor at all. Before the change both were unfiltered and
+  // agreed; after it, a project holding a measurement from an engine its plan
+  // no longer sells showed one number in its header and another on its chart.
+  // Reachable the moment a workspace downgrades, which STORY-151 made
+  // possible.
+  //
+  // The settled rule: ENTITLEMENT GOVERNS WHAT MAY BE CAPTURED NEXT. It
+  // cannot retroactively un-measure something already measured, because a
+  // past day's score has to stay reproducible from an export.
+  // ==========================================================================
+  describe("STORY-152 · blend membership is what was MEASURED, not what is entitled", () => {
+    /** `claude` is a business engine; this workspace is on `growth`. */
+    async function seedBelowFloorEngineWithData(): Promise<void> {
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active','{}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+      await addCell({ capturedAt: daysAgo(2), engineKey: "claude", brandPresent: true });
+    }
+
+    it("⚠ an engine BELOW the plan floor still counts if it was measured in the window", async () => {
+      await seedBelowFloorEngineWithData();
+
+      const document = await read();
+      const keys = document.engines.map((engine) => engine.engine_key);
+
+      expect(keys, "claude is not entitled at growth, but it was measured — dropping it rewrites a past score").toContain(
+        "claude",
+      );
+    });
+
+    it("and it is genuinely NOT entitled — so the floor is doing its job, not simply absent", async () => {
+      await seedBelowFloorEngineWithData();
+
+      // The view is the entitlement answer, and it must exclude claude. If
+      // this passed too, the test above would be proving nothing: both would
+      // just mean "the floor is not applied anywhere".
+      const entitled = await db.query<{ engine_key: string }>(
+        "SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 ORDER BY engine_key",
+        [projectId],
+      );
+      expect(entitled.rows.map((r) => r.engine_key)).not.toContain("claude");
+
+      // And the consequence of not being entitled: no cadence is claimed for
+      // it, because the plan schedules no runs of an engine it does not sell.
+      const claude = (await read()).engines.find((engine) => engine.engine_key === "claude")!;
+      expect(claude.cadence_runs_per_cycle, "an unentitled engine is scheduled zero times").toBeNull();
+    });
+
+    it("an entitled engine with NO measurement is still listed, and changes no number", async () => {
+      // The other direction of the union. `blendMetrics` filters nulls before
+      // summing the denominator, so an empty engine is in neither numerator
+      // nor denominator — it must be visible without moving the score.
+      await addCell({ capturedAt: daysAgo(1), engineKey: "google_ai_mode", brandPresent: true });
+      const withoutChatgptData = await read();
+
+      const chatgpt = withoutChatgptData.engines.find((engine) => engine.engine_key === "chatgpt");
+      expect(chatgpt, "entitled and never measured is a state the screen must be able to show").toBeDefined();
+      expect(chatgpt!.last_captured_at).toBeNull();
+
+      // ⚠ brandPresent FALSE, and it has to be. A second engine measured
+      // IDENTICALLY blends to the same number, so seeding another present
+      // cell would leave the score unchanged for a reason that has nothing to
+      // do with membership — and this guard would fail while everything
+      // worked. A measured ABSENCE is what moves the blend.
+      await addCell({ capturedAt: daysAgo(1), engineKey: "chatgpt", brandPresent: false });
+      const withChatgptData = await read();
+      expect(
+        withChatgptData.blended.visibility_score === withoutChatgptData.blended.visibility_score,
+        "a measured absence on a second engine SHOULD lower the blend — if this is equal, the fixture measured nothing and the assertions above are vacuous",
+      ).toBe(false);
+    });
   });
 });

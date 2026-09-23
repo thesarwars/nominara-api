@@ -136,13 +136,182 @@ describe("STORY-152 · a project resolves its engines from the catalog", () => {
     try {
       for (const kind of ["full", "priority"] as const) {
         const due = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
-          resolveDueEngines(tx, { projectId, kind, now: new Date() }),
+          // ⚠ THE TWO ENTITLED KEYS ARE PASSED AS CAPTURE-READY ON PURPOSE.
+          // `resolveDueEngines` now also filters on capture-readiness, whose
+          // production value is EMPTY — so leaving this out would make the
+          // assertion below pass because nothing is capture-ready, whether or
+          // not the cadence rule works at all. Declaring them ready leaves
+          // the MISSING FREE CADENCE as the only thing that can empty this.
+          resolveDueEngines(tx, { projectId, kind, now: new Date() }, ["perplexity", "chatgpt"]),
         );
         expect(due, `free has no ${kind} cadence, so the scheduler must pick up nothing`).toEqual([]);
       }
     } finally {
       client.release();
     }
+  });
+
+  // ==========================================================================
+  // ⚠ THE CATALOG IS DATA, AND DATA THAT NOTHING PINS IS DATA THAT DRIFTS.
+  //
+  // Everything else in this file tests the RULES over the catalog — the floor,
+  // the override, the cadence. All of it would keep passing if somebody
+  // changed a TTL from 28800 to 3600, or "corrected" a cadence back to a
+  // figure the references state in a different vocabulary. These are
+  // customer-visible and money-adjacent: `cache_ttl_seconds` decides whether a
+  // cell is served from cache (and a cached cell is not charged), and
+  // `cadence_by_plan` is the interval divisor the scheduler runs on.
+  //
+  // Each row cites the reference it was transcribed from. A future editor who
+  // disagrees has to change a test that names its source, which is a decision,
+  // instead of editing a migration nobody re-reads.
+  // ==========================================================================
+  describe("the seeded catalog matches the references, field for field", () => {
+    // tracking-engine.md §3 (mode, TTL, fidelity) and plans-and-entitlements.md
+    // §11 (the floor). TTLs there are stated in hours: 8/4/4/12/8/24.
+    const ACTIVE = [
+      ["perplexity", "Perplexity", "Perplexity", "api", 28800, "high", "free"],
+      ["google_aio", "AI Overviews", "Google", "licensed_serp", 14400, "very_high", "starter"],
+      ["google_ai_mode", "AI Mode", "Google", "licensed_serp", 14400, "very_high", "growth"],
+      ["chatgpt", "ChatGPT", "OpenAI", "api", 43200, "high", "free"],
+      ["gemini", "Gemini", "Google", "api", 28800, "high", "business"],
+      ["claude", "Claude", "Anthropic", "api", 86400, "medium", "business"],
+    ] as const;
+
+    it.each(ACTIVE)(
+      "%s is %s by %s — %s, ttl %i, %s volatility, sold from %s",
+      async (key, displayName, vendor, captureMode, ttl, band, floor) => {
+        const row = await db.query(
+          `SELECT display_name, vendor, capture_mode, cache_ttl_seconds,
+                  volatility_band, min_plan_key, status, adapter_version, model_fingerprint
+             FROM engines WHERE key = $1`,
+          [key],
+        );
+        expect(row.rows[0]).toMatchObject({
+          display_name: displayName,
+          vendor,
+          capture_mode: captureMode,
+          cache_ttl_seconds: ttl,
+          volatility_band: band,
+          min_plan_key: floor,
+          status: "active",
+          // Provenance, not a guess: each adapter story bumps its own version
+          // in the commit that binds a real adapter, and the fingerprint is
+          // vendor-reported at capture time.
+          adapter_version: "0.1.0",
+          model_fingerprint: null,
+        });
+      },
+    );
+
+    it("the four reserved keys exist and are disabled — status is the enabling mechanism", async () => {
+      const rows = await db.query<{ key: string; status: string; cadence_by_plan: unknown }>(
+        "SELECT key, status, cadence_by_plan FROM engines WHERE key = ANY($1::text[]) ORDER BY key",
+        [["copilot", "deepseek", "grok", "meta_ai"]],
+      );
+      expect(rows.rows.map((r) => r.key)).toEqual(["copilot", "deepseek", "grok", "meta_ai"]);
+      for (const row of rows.rows) {
+        expect(row.status, `${row.key} must ship disabled`).toBe("disabled");
+        expect(row.cadence_by_plan, `${row.key} is not scheduled by any plan`).toEqual({});
+      }
+    });
+
+    // ⚠ NO ENGINE HAS A `free` KEY, AND THAT IS THE "TOOLS ONLY" TIER.
+    // STORY-130 §57. Asserted over the whole table rather than per engine,
+    // because the claim is about the catalog, not about any one row.
+    it("no engine carries a free cadence — free schedules nothing at all", async () => {
+      const withFree = await db.query<{ key: string }>(
+        "SELECT key FROM engines WHERE cadence_by_plan ? 'free'",
+      );
+      expect(withFree.rows.map((r) => r.key)).toEqual([]);
+    });
+
+    // ⚠ THE ONE FIGURE THAT DEVIATES FROM A NUMBER PRINTED IN THE REFERENCES,
+    // AND THE REASON IS ARITHMETIC RATHER THAN PREFERENCE.
+    //
+    // `schemas/captures-and-facts.md`:31's worked example shows
+    // `"business":{"full":4,"priority":26}`. This column is a DIVISOR:
+    // engine-cadence.ts computes `intervalMs = CYCLE_MS / runs_per_cycle`, so
+    // 26 over a 30-day cycle is a 27.7-hour interval that slides ~4 hours a
+    // day through the diurnal cycle that §5's jitter budget exists to protect.
+    // 30 is one run a day, which is what §5's prose ("daily on the priority
+    // subset") actually says.
+    //
+    // The two numbers are different vocabularies, not a contradiction, and
+    // `plans.entitlements."scan.runs_per_cycle"` is deliberately left as
+    // "4_full_plus_26_priority": 4 full-set days plus 26 priority-only days
+    // IS 30 run-days. Nothing needs correcting there.
+    it("business priority cadence is 30 — a divisor, not a run-day count", async () => {
+      const row = await db.query<{ priority: string | null }>(
+        "SELECT cadence_by_plan -> 'business' ->> 'priority' AS priority FROM engines WHERE key = 'perplexity'",
+      );
+      expect(row.rows[0]?.priority).toBe("30");
+    });
+
+    it("enterprise is 720 priority and 30 full-set, per §5", async () => {
+      const row = await db.query<{ cadence: { full: number; priority: number } }>(
+        "SELECT cadence_by_plan -> 'enterprise' AS cadence FROM engines WHERE key = 'perplexity'",
+      );
+      // STORY-130's draft proposed {"full":4,"priority":720}; §5 says
+      // "720 priority + 30 full-set". Transcription error, caught and seeded
+      // as 30.
+      expect(row.rows[0]?.cadence).toEqual({ full: 30, priority: 720 });
+    });
+
+    // ⚠ AND THE DATABASE REFUSES TO STORE ONE THAT WOULD NOT. Seeding the
+    // catalog armed a cast that was dormant while `engines` was empty:
+    // `(cadence ->> kind)::int` does not fail closed on a non-integer, it
+    // RAISES, and the raise reaches the customer as a 500 on the whole
+    // Project Overview — not merely a missing cadence. `cadence_by_plan` is
+    // edited by hand-written operator migrations, which is exactly where a
+    // "4.5" comes from.
+    it.each([
+      ["a fraction", '{"business":{"full":4.5}}'],
+      ["a string", '{"business":{"full":"daily"}}'],
+      ["a scalar where an object belongs", '{"business":4}'],
+    ])("refuses %s in cadence_by_plan at write time", async (_label, value) => {
+      await expect(
+        db.query("UPDATE engines SET cadence_by_plan = $1::jsonb WHERE key = 'perplexity'", [value]),
+      ).rejects.toThrow(/engines_cadence_by_plan_castable/u);
+    });
+
+    // ⚠ ZERO AND NEGATIVE STAY LEGAL, DELIBERATELY. They cast cleanly, and the
+    // readers' own `> 0` is what excludes them — that IS the fail-closed rule
+    // (capture-engine-cadence.spec.ts seeds {"growth":{"full":0}} to prove
+    // it). A constraint that forbade them would take over a scheduling
+    // decision it has no business making.
+    it.each([
+      ["zero", '{"business":{"full":0}}'],
+      ["a negative", '{"business":{"full":-1}}'],
+    ])("still accepts %s — the readers exclude it, not the constraint", async (_label, value) => {
+      const original = await db.query<{ c: unknown }>(
+        "SELECT cadence_by_plan AS c FROM engines WHERE key = 'perplexity'",
+      );
+      try {
+        await expect(
+          db.query("UPDATE engines SET cadence_by_plan = $1::jsonb WHERE key = 'perplexity'", [value]),
+        ).resolves.toBeDefined();
+      } finally {
+        await db.query("UPDATE engines SET cadence_by_plan = $1 WHERE key = 'perplexity'", [
+          JSON.stringify(original.rows[0]!.c),
+        ]);
+      }
+    });
+
+    it("every cadence leaf survives the ::int cast the readers apply", async () => {
+      // The shape the CHECK constraint enforces, asserted from the reader's
+      // side as well: if a leaf were 4.5 or "daily", this query raises rather
+      // than returning a row, and both the scheduler and the scorecard read
+      // would 500 on it.
+      const rows = await db.query<{ key: string }>(
+        `SELECT e.key
+           FROM engines e,
+                LATERAL jsonb_each(e.cadence_by_plan) AS per_plan(plan_key, plan_value),
+                LATERAL jsonb_each(per_plan.plan_value) AS per_kind(kind_key, kind_value)
+          WHERE (per_kind.kind_value #>> '{}')::int IS NULL`,
+      );
+      expect(rows.rows).toEqual([]);
+    });
   });
 
   // ⚠ THE COUNT MATCHES THE PUBLISHED CLAIM, TIER BY TIER. `engines.enabled`

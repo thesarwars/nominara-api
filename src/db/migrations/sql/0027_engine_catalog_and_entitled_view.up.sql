@@ -83,18 +83,87 @@ VALUES
 -- THIS ONE: `projects.cadence` carries a trigger recording changes for chart
 -- annotation (STORY-033 AC10), and a silently edited seed would leave that
 -- annotation unexplained.
+-- ⚠ `adapter_version` AND `status` ARE DELIBERATELY NOT IN THIS LIST, AND
+-- LEAVING THEM OUT IS THE WHOLE POINT OF READING THIS BLOCK.
+--
+-- A re-run of this seed is a CORRECTION of transcribed reference data, never
+-- a reset of operator state. The two excluded columns are operator state:
+--
+--   `status`          -- an incident responder sets 'degraded' when a vendor
+--                        is down. Re-seeding it back to 'active' resumes
+--                        scheduling against a broken vendor, silently, as a
+--                        side effect of a deploy that was about a cadence.
+--   `adapter_version` -- the catalog side of a provenance pair. Every
+--                        `answer_captures` row records the adapter_version
+--                        that produced it, and the down migration keeps the
+--                        catalog rows precisely BECAUSE captures point at
+--                        them. Rewriting 2.3.1 back to 0.1.0 makes the
+--                        catalog contradict every capture already recorded.
+--
+-- `model_fingerprint` is excluded for the same reason and always was.
+--
+-- Reproduced, not theorised: a review of this story ran the real
+-- rollback/migrate sequence against operator edits and watched a 'degraded'
+-- status, a deliberate cadence throttle and adapter_version 2.3.1 all revert.
+-- The cadence throttle is intended to revert -- that is transcribed data. The
+-- other two were not.
 ON CONFLICT (key) DO UPDATE SET
   display_name      = EXCLUDED.display_name,
   vendor            = EXCLUDED.vendor,
   capture_mode      = EXCLUDED.capture_mode,
-  adapter_version   = EXCLUDED.adapter_version,
   supports_citations= EXCLUDED.supports_citations,
   cache_ttl_seconds = EXCLUDED.cache_ttl_seconds,
   volatility_band   = EXCLUDED.volatility_band,
   min_plan_key      = EXCLUDED.min_plan_key,
   cadence_by_plan   = EXCLUDED.cadence_by_plan,
-  status            = EXCLUDED.status,
   updated_at        = now();
+
+-- ---------------------------------------------------------------------------
+-- A SHAPE CONSTRAINT ON cadence_by_plan, BECAUSE SEEDING THE CATALOG ARMS A
+-- CAST THAT WAS DORMANT WHILE THE TABLE WAS EMPTY.
+--
+-- Two readers cast a cadence leaf to int:
+--   engine-cadence.ts  (pes.cadence ->> $2)::int > 0     -- the scheduler
+--   scorecards.service (pes.cadence ->> 'full')::int     -- the customer read
+--
+-- `::int` does not fail closed on a non-integer, it RAISES. A hand-written
+-- operator migration setting a leaf to 4.5 or "daily" -- and the header of
+-- this file invites exactly such a migration -- turns
+-- GET /v1/projects/{id}/scorecards into a 500 for every tenant entitled to
+-- that engine. Not their cadence: the whole Project Overview screen.
+--
+-- ⚠ ZERO AND NEGATIVE ARE DELIBERATELY STILL LEGAL. They cast cleanly and the
+-- readers' own `> 0` already excludes them -- that IS the fail-closed rule,
+-- and capture-engine-cadence.spec.ts seeds `{"growth":{"full":0}}` to prove
+-- it. This constraint is scoped to exactly the values that RAISE, so it
+-- closes the crash without taking over the scheduling decision.
+--
+-- A FUNCTION because a CHECK constraint may not contain a subquery, and
+-- walking two levels of jsonb needs one. IMMUTABLE so it is usable in a CHECK.
+CREATE FUNCTION app.cadence_by_plan_is_castable(value jsonb) RETURNS boolean
+  LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $fn$
+  SELECT value IS NOT NULL
+     AND jsonb_typeof(value) = 'object'
+     AND NOT EXISTS (
+       SELECT 1
+         FROM jsonb_each(value) AS per_plan(plan_key, plan_value)
+        WHERE jsonb_typeof(per_plan.plan_value) <> 'object'
+           OR EXISTS (
+                SELECT 1
+                  FROM jsonb_each(per_plan.plan_value) AS per_kind(kind_key, kind_value)
+                 WHERE jsonb_typeof(per_kind.kind_value) <> 'number'
+                    OR (per_kind.kind_value #>> '{}')::numeric
+                       <> trunc((per_kind.kind_value #>> '{}')::numeric)
+              )
+     );
+$fn$;
+
+COMMENT ON FUNCTION app.cadence_by_plan_is_castable(jsonb) IS
+  'True when every cadence leaf survives ::int. Zero and negative are legal -- the readers exclude them with > 0.';
+
+ALTER TABLE engines
+  ADD CONSTRAINT engines_cadence_by_plan_castable
+  CHECK (app.cadence_by_plan_is_castable(cadence_by_plan));
 
 -- ---------------------------------------------------------------------------
 -- How a project resolves its engines: it does not GET them, it DERIVES them.
@@ -174,6 +243,20 @@ SELECT p.workspace_id,
 -- rows for every Free workspace -- the same unenterable product STORY-151
 -- had just fixed one layer up.
 --
+-- ⚠ WHAT STOPS A FREE WORKSPACE CAPTURING AT ALL IS A DIFFERENT MECHANISM,
+-- AND IT IS WORTH KNOWING WHICH. This view gives a free project perplexity
+-- and chatgpt, correctly: plans.entitlements."tools.engine_set" is 2 and
+-- §57 calls them reachable on demand. Nothing on the CAPTURE path
+-- distinguishes free from the rest -- `resolveEnabledEngines` reads this same
+-- view for the manual-run path too. The thing that actually prevents a free
+-- workspace planning cells is `projects.max = 0`: it cannot create a project
+-- to capture for.
+--
+-- That is a STRUCTURAL LIMIT doing a tier cap's job, which the four-separate-
+-- mechanisms rule says should not be load-bearing. It holds today and is not
+-- this story's to change; recorded so that whoever gives free a project finds
+-- this sentence rather than discovering it from a bill.
+
 -- The scheduler still fails closed on a missing cadence, on its own, one
 -- layer down: engine-cadence.ts tests (pes.cadence ->> kind)::int > 0, and
 -- NULL ->> anything is NULL, so an entitled-but-uncadenced engine is listed
@@ -190,7 +273,27 @@ COMMENT ON TABLE project_engines IS
   'reweights an already-entitled engine; it can never add one. Empty is the correct state today: '
   'tools.engines_selectable is false on every plan, so no customer chooses. STORY-152.';
 
+-- ⚠ REVOKE FIRST, BECAUSE ALTER DEFAULT PRIVILEGES ALREADY GRANTED MORE THAN
+-- THIS STATEMENT ASKS FOR.
+--
 -- 0005's lesson is that an implicit grant is how a new object silently becomes
--- unreadable. ALTER DEFAULT PRIVILEGES does cover views and this runs as the
--- same role, so this is belt and braces rather than strictly required.
+-- unreadable, and its ALTER DEFAULT PRIVILEGES does cover views. The effect is
+-- that the moment this view is created it carries SELECT/INSERT/UPDATE/DELETE
+-- for nominara_app and nominara_worker, and SELECT for nominara_portal --
+-- none of which is written anywhere. A review of this story read them out of
+-- information_schema.role_table_grants and found exactly that.
+--
+-- Inert today: the view joins four relations, so it is not auto-updatable
+-- ("cannot insert into view ... not automatically updatable") and the write
+-- privileges cannot be exercised; nominara_portal reads zero rows because
+-- `workspaces` carries no portal policy. Inert is not the same as intended,
+-- and no gate covers view privileges -- role-check.ts only asserts "not the
+-- migration owner", and the ACL census in database-roles-and-grants.spec.ts
+-- is relkind IN ('r','p') and stops at 0005.
+--
+-- So the grant is stated in full: revoke everything, then grant exactly the
+-- three reads. The statement and the catalog now say the same thing, and a
+-- future reader comparing them finds no gap to interpret.
+REVOKE ALL ON project_entitled_engines FROM PUBLIC;
+REVOKE ALL ON project_entitled_engines FROM nominara_app, nominara_worker, nominara_report, nominara_portal;
 GRANT SELECT ON project_entitled_engines TO nominara_app, nominara_worker, nominara_report;
