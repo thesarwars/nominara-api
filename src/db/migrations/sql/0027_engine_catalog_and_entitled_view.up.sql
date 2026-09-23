@@ -138,6 +138,28 @@ ON CONFLICT (key) DO UPDATE SET
 -- it. This constraint is scoped to exactly the values that RAISE, so it
 -- closes the crash without taking over the scheduling decision.
 --
+-- ⚠ IT TESTS THE TEXT `->>` PRODUCES, NOT THE JSON VALUE'S TYPE, AND THE
+-- DIFFERENCE IS THE WHOLE CONSTRAINT.
+--
+-- The first version of this asked "is it an integral JSON number". That is a
+-- DIFFERENT SET from "does ::int accept it", and a review found two members of
+-- the gap by trying them:
+--
+--   {"full": 4.0}          jsonb_typeof is 'number' and 4.0 = trunc(4.0), so
+--                          it passed -- and '4.0'::int still raises. This is
+--                          the most natural way an operator writes a cadence
+--                          in JSON.
+--   {"full": 99999999999}  integral, so it passed -- and it is out of range
+--                          for int4, which raises too.
+--
+-- Both still 500'd the Project Overview. A guard that is most of the way
+-- closed while reading as fully closed is worse than no guard, because the
+-- next person stops checking.
+--
+-- So: take the text, require it to be an optionally-signed run of digits, and
+-- require it to fit in int4. That is `::int`'s own contract, expressed the
+-- only way that cannot drift from it -- over the same string the readers cast.
+--
 -- A FUNCTION because a CHECK constraint may not contain a subquery, and
 -- walking two levels of jsonb needs one. IMMUTABLE so it is usable in a CHECK.
 CREATE FUNCTION app.cadence_by_plan_is_castable(value jsonb) RETURNS boolean
@@ -152,14 +174,19 @@ CREATE FUNCTION app.cadence_by_plan_is_castable(value jsonb) RETURNS boolean
                 SELECT 1
                   FROM jsonb_each(per_plan.plan_value) AS per_kind(kind_key, kind_value)
                  WHERE jsonb_typeof(per_kind.kind_value) <> 'number'
+                    -- The text form, which is what the readers cast. '4.0' is
+                    -- a number and is not a run of digits.
+                    OR (per_kind.kind_value #>> '{}') !~ '^-?[0-9]+$'
+                    -- int4's range. Checked as numeric, because casting to
+                    -- int here to find out whether it casts would raise.
                     OR (per_kind.kind_value #>> '{}')::numeric
-                       <> trunc((per_kind.kind_value #>> '{}')::numeric)
+                         NOT BETWEEN -2147483648 AND 2147483647
               )
      );
 $fn$;
 
 COMMENT ON FUNCTION app.cadence_by_plan_is_castable(jsonb) IS
-  'True when every cadence leaf survives ::int. Zero and negative are legal -- the readers exclude them with > 0.';
+  'True when every cadence leaf survives ::int -- tested on the TEXT ->> produces, so 4.0 and out-of-int4 values are refused. Zero and negative are legal: the readers exclude them with > 0.';
 
 ALTER TABLE engines
   ADD CONSTRAINT engines_cadence_by_plan_castable

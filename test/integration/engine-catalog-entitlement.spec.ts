@@ -265,15 +265,69 @@ describe("STORY-152 · a project resolves its engines from the catalog", () => {
     // Project Overview — not merely a missing cadence. `cadence_by_plan` is
     // edited by hand-written operator migrations, which is exactly where a
     // "4.5" comes from.
+    // ⚠ THE FIRST VERSION OF THIS LIST WAS WRITTEN FROM THE IMPLEMENTATION
+    // AND SO REPRODUCED ITS BLIND SPOT. It asserted exactly the three inputs
+    // the constraint caught, and the constraint tested "is an integral JSON
+    // number" rather than "does ::int accept this text". A review found two
+    // values in the gap by trying them, and both still 500'd the Project
+    // Overview: `4.0`, which is how an operator most naturally writes a
+    // cadence in JSON, and an integer too large for int4.
+    //
+    // The list is now written from the CAST's contract — the cases are the
+    // ways `'<text>'::int` can fail — rather than from what the function
+    // happens to check. The last two are the regression cases.
     it.each([
       ["a fraction", '{"business":{"full":4.5}}'],
       ["a string", '{"business":{"full":"daily"}}'],
       ["a scalar where an object belongs", '{"business":4}'],
+      ["⚠ a whole number written with a decimal point", '{"business":{"full":4.0}}'],
+      ["⚠ an integer beyond int4", '{"business":{"full":99999999999}}'],
+      ["⚠ a negative beyond int4", '{"business":{"full":-99999999999}}'],
+      ["a trailing-zero fraction", '{"business":{"full":4.50}}'],
+      ["null where a number belongs", '{"business":{"full":null}}'],
     ])("refuses %s in cadence_by_plan at write time", async (_label, value) => {
       await expect(
         db.query("UPDATE engines SET cadence_by_plan = $1::jsonb WHERE key = 'perplexity'", [value]),
       ).rejects.toThrow(/engines_cadence_by_plan_castable/u);
     });
+
+    // ⚠ AND THE CONSTRAINT IS CHECKED AGAINST THE CAST ITSELF, NOT AGAINST MY
+    // READING OF IT. Postgres decides what `::int` accepts; this asserts the
+    // two agree over the exact strings above, so the constraint cannot drift
+    // from the thing it is protecting.
+    //
+    // ⚠ THE LITERAL IS NOT THE STORED TEXT, AND `4e2` IS WHY THIS TEST EXISTS
+    // IN THIS FORM. jsonb normalises some numeric literals and preserves
+    // others: `4e2` is stored as `400` and casts cleanly, while `4.0` and
+    // `4.50` are stored verbatim and do not. I had `4e2` in the refusal list
+    // above on the assumption that it looked un-castable; the database
+    // disagreed. So the comparison below asks POSTGRES what `::int` does with
+    // the text jsonb actually stored, and requires the constraint to give the
+    // same answer — rather than encoding my reading of either one.
+    it.each(["4.0", "4.50", "99999999999", "-99999999999", "4e2", "4", "0", "-1", "2147483647", "2147483648"])(
+      "the constraint agrees with ::int about %s",
+      async (literal) => {
+        const stored = await db
+          .query<{ t: string }>("SELECT ($1::jsonb) #>> '{}' AS t", [literal])
+          .then((r) => r.rows[0]!.t);
+
+        const actuallyCasts = await db
+          .query("SELECT ($1::text)::int", [stored])
+          .then(() => true)
+          .catch(() => false);
+
+        const accepted = await db
+          .query<{ ok: boolean }>("SELECT app.cadence_by_plan_is_castable($1::jsonb) AS ok", [
+            `{"business":{"full":${literal}}}`,
+          ])
+          .then((r) => r.rows[0]!.ok);
+
+        expect(
+          accepted,
+          `literal ${literal} stores as "${stored}", which ::int ${actuallyCasts ? "accepts" : "rejects"} — the constraint must say the same`,
+        ).toBe(actuallyCasts);
+      },
+    );
 
     // ⚠ ZERO AND NEGATIVE STAY LEGAL, DELIBERATELY. They cast cleanly, and the
     // readers' own `> 0` is what excludes them — that IS the fail-closed rule
@@ -298,11 +352,16 @@ describe("STORY-152 · a project resolves its engines from the catalog", () => {
       }
     });
 
-    it("every cadence leaf survives the ::int cast the readers apply", async () => {
-      // The shape the CHECK constraint enforces, asserted from the reader's
-      // side as well: if a leaf were 4.5 or "daily", this query raises rather
-      // than returning a row, and both the scheduler and the scorecard read
-      // would 500 on it.
+    // ⚠ A REGRESSION GUARD ON THE SEED, NOT A PROBE FOR BAD INPUT. It queries
+    // the catalog 0027 itself produced, so it can only ever fail if a future
+    // edit to the SEED introduces an uncastable value — it structurally cannot
+    // encounter a `4.0` an operator writes later, and an earlier version of
+    // this file leaned on it as though it could. The constraint tests above
+    // are what cover operator input.
+    it("every cadence leaf in the seeded catalog survives the ::int cast", async () => {
+      // If a seeded leaf were 4.5 or "daily", this query raises rather than
+      // returning a row, and both the scheduler and the scorecard read would
+      // 500 on it.
       const rows = await db.query<{ key: string }>(
         `SELECT e.key
            FROM engines e,

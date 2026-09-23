@@ -36,6 +36,13 @@ export const REQUIRED_INTERNAL_FUNCTIONS = [
   // job is the next consumer: exactly one call per new partition, or the
   // partition reopens the RLS bypass this story found and fixed.
   "apply_tenant_rls",
+  // STORY-152 — the CHECK constraint on `engines.cadence_by_plan` calls this,
+  // and the thing it guards is a customer-facing 500: `(cadence ->> kind)::int`
+  // RAISES on a non-integer rather than failing closed, taking out the whole
+  // Project Overview for every tenant entitled to a mis-seeded engine. If the
+  // function disappears the constraint goes with it, silently, and the crash
+  // comes back — which is the same reason `breakglass_login_alert` is listed.
+  "cadence_by_plan_is_castable",
 ] as const;
 
 // STORY-009 — data-model.md §2 "Table census", verbatim (STORY-017 update:

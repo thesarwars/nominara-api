@@ -62,7 +62,7 @@ export class ScorecardsService {
 
     const window = await this.resolveWindow(tx, projectId, TIMEFRAME_DAYS[query.timeframe]);
     const requested = query.engines?.split(",").map((key) => key.trim()).filter((key) => key.length > 0) ?? null;
-    const engines = await this.engineConfig(tx, projectId, requested, window.from, window.to);
+    const engines = await this.engineConfig(tx, projectId, requested, window.from, window.to, window.timezone);
 
     // TWO RANGE AGGREGATIONS, not 2 × N. `aggregateRange` groups by engine, so
     // the whole window costs one scan per period however many engines the
@@ -155,6 +155,7 @@ export class ScorecardsService {
     requested: string[] | null,
     windowFrom: string,
     windowTo: string,
+    timezone: string,
   ): Promise<EngineConfig[]> {
     const result = await tx.query<{
       engine_key: string;
@@ -206,13 +207,36 @@ export class ScorecardsService {
       //
       // `measured` is scoped to the window because the blend is; an engine
       // last measured before it would add a row with nothing in it.
+      //
+      // ⚠ AND IT USES `aggregateRange`'s OWN PREDICATE, CHARACTER FOR
+      // CHARACTER — `(captured_at AT TIME ZONE tz)::date BETWEEN from AND to`
+      // (aggregate-day.ts:139). The first version of this CTE wrote a
+      // plausible equivalent instead, `captured_at >= from AND < to`, and it
+      // was wrong in two independent ways:
+      //
+      //   `to` IS INCLUSIVE THERE AND WAS EXCLUSIVE HERE, so this discarded
+      //   the window's entire final day. An engine whose only capture is
+      //   TODAY carried metrics that `aggregateRange` returned and that this
+      //   CTE could not see — dropping it from the blend while the stored
+      //   rollup counted it. That is the exact divergence this CTE exists to
+      //   close, reopened and narrowed to "the captures are from today",
+      //   which is the day a customer opens their dashboard after a scan.
+      //
+      //   AND IT DID NOT CONVERT THE TIMEZONE. `aggregateRange` buckets in
+      //   the WORKSPACE's zone; a bare 'YYYY-MM-DD' cast to timestamptz is
+      //   parsed in the SESSION's. For Australia/Sydney that is a ten-hour
+      //   skew, and combined with the above a Sydney workspace lost about the
+      //   last 34 hours of its window.
+      //
+      // Two spellings of one boundary is the same defect this file already
+      // avoids for the cadence expression. There is one spelling now, and it
+      // is the aggregation's.
       `WITH measured AS (
          SELECT DISTINCT c.engine_key
            FROM answer_captures c
           WHERE c.project_id = $1
             AND c.status IN ('captured', 'parsed', 'skipped')
-            AND c.captured_at >= $3::timestamptz
-            AND c.captured_at <  $4::timestamptz
+            AND (c.captured_at AT TIME ZONE $5)::date BETWEEN $3::date AND $4::date
        ),
        engine_keys AS (
          SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 AND enabled = true
@@ -248,7 +272,7 @@ export class ScorecardsService {
          ) last_capture ON true
         WHERE ($2::text[] IS NULL OR k.engine_key = ANY($2::text[]))
         ORDER BY k.engine_key ASC`,
-      [projectId, requested, windowFrom, windowTo],
+      [projectId, requested, windowFrom, windowTo, timezone],
     );
 
     if (result.rows.length === 0) await this.assertProjectExists(tx, projectId);

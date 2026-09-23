@@ -87,6 +87,7 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       policiesWithoutWithCheck: [],
       globalTablesWithPolicies: [],
       viewsWithoutSecurityInvoker: [],
+      unclassifiedRelations: [],
     });
     expect(isClean(result)).toBe(true);
   });
@@ -379,6 +380,66 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       expect(isClean(result)).toBe(true);
     } finally {
       await client.query("DROP VIEW IF EXISTS correct_probe_view");
+    }
+  });
+
+  // ⚠ `WITH (security_invoker = on)` IS CORRECT AND MUST NOT BE REPORTED.
+  // Postgres stores the author's spelling, so a string match on "=true" flags
+  // a view that is properly protected. Fail-safe, but a gate that cries wolf
+  // is a gate people stop reading.
+  it("accepts every spelling Postgres accepts for security_invoker", async () => {
+    await client.query("CREATE VIEW v_on WITH (security_invoker = on) AS SELECT * FROM projects");
+    await client.query("CREATE VIEW v_bare WITH (security_invoker) AS SELECT * FROM projects");
+    await client.query(
+      "CREATE VIEW v_barrier WITH (security_barrier = true, security_invoker = true) AS SELECT * FROM projects",
+    );
+    try {
+      const result = await checkRls(client);
+      expect(result.viewsWithoutSecurityInvoker, "all three spellings mean true").toEqual([]);
+      expect(isClean(result)).toBe(true);
+    } finally {
+      for (const name of ["v_on", "v_bare", "v_barrier"]) {
+        await client.query(`DROP VIEW IF EXISTS ${name}`);
+      }
+    }
+  });
+
+  // ==========================================================================
+  // ⚠ THE CLASS, NOT THE INSTANCE.
+  //
+  // The view hole existed because this module enumerated an allow-list of
+  // relkinds and everything else was invisible. Adding views to the list fixed
+  // one entry and left the shape — a review then walked ONE RELKIND OVER and
+  // did it again with a foreign table, to which RLS does not apply at all.
+  // The census is inverted now, and these are its breakers.
+  // ==========================================================================
+  it("bucket: unclassifiedRelations — a MATERIALIZED view, which has no bucket of its own", async () => {
+    await client.query("CREATE MATERIALIZED VIEW mv_probe AS SELECT id, workspace_id FROM projects");
+    try {
+      const result = await checkRls(client);
+      expect(result.unclassifiedRelations).toContain("mv_probe (relkind=m)");
+      expect(isClean(result), "ISO-16 forbids these; rls-check must not call one clean").toBe(false);
+    } finally {
+      await client.query("DROP MATERIALIZED VIEW IF EXISTS mv_probe");
+    }
+  });
+
+  it("bucket: unclassifiedRelations — a FOREIGN TABLE, which RLS does not apply to at all", async () => {
+    // The exact shape a review used to walk around the seventh bucket. There
+    // is no policy to be missing and no flag to be unset, so every other
+    // bucket is silent by construction.
+    await client.query("CREATE EXTENSION IF NOT EXISTS file_fdw");
+    await client.query("CREATE SERVER IF NOT EXISTS probe_srv FOREIGN DATA WRAPPER file_fdw");
+    await client.query(
+      "CREATE FOREIGN TABLE projects_shadow (id uuid, workspace_id uuid) SERVER probe_srv OPTIONS (filename '/dev/null', format 'csv')",
+    );
+    try {
+      const result = await checkRls(client);
+      expect(result.unclassifiedRelations).toContain("projects_shadow (relkind=f)");
+      expect(isClean(result)).toBe(false);
+    } finally {
+      await client.query("DROP FOREIGN TABLE IF EXISTS projects_shadow");
+      await client.query("DROP SERVER IF EXISTS probe_srv");
     }
   });
 

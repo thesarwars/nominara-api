@@ -34,11 +34,20 @@ export async function assertIso23ViewsSecurityInvoker(ctx: AssertionContext): Pr
     // pg_stat_statements installs two views into `public` that read shared
     // memory rather than our tables. An allow-list of their names would admit
     // the next extension's views silently.
-    const views = await client.query<{ relname: string; reloptions: string[] | null }>(
-      `SELECT c.relname, c.reloptions
+    // ⚠ EVERY NON-SYSTEM SCHEMA, NOT JUST `public`. The first version scoped
+    // to public, and its empty-collection guard could not protect that choice:
+    // `project_entitled_engines` guarantees public is never empty, so the
+    // guard fires only if the RELKIND filter drifts, never if the SCHEMA does.
+    // A view created in `app` — where this codebase already puts functions —
+    // would have been invisible while the guard reported everything healthy.
+    const views = await client.query<{ nspname: string; relname: string; reloptions: string[] | null }>(
+      `SELECT n.nspname, c.relname, c.reloptions
          FROM pg_class c
          JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relkind = 'v'
+        WHERE c.relkind = 'v'
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg_toast%'
+          AND n.nspname NOT LIKE 'pg_temp%'
           AND NOT EXISTS (
             SELECT 1 FROM pg_depend d
              WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
@@ -51,14 +60,33 @@ export async function assertIso23ViewsSecurityInvoker(ctx: AssertionContext): Pr
     // STORY-152 shipped `project_entitled_engines`, so there is at least one.
     if (views.rowCount === 0) {
       throw new Error(
-        "ISO-23: zero views found in `public` — expected at least project_entitled_engines. " +
+        "ISO-23: zero views found in any non-system schema — expected at least public.project_entitled_engines. " +
           "A view census that matches nothing cannot fail, so this is a broken assertion, not a clean schema.",
       );
     }
+    // And the guard names the view it expects, so a census that drifts to some
+    // OTHER schema and happens to find something there still fails.
+    if (!views.rows.some((row) => row.nspname === "public" && row.relname === "project_entitled_engines")) {
+      throw new Error(
+        "ISO-23: public.project_entitled_engines was not in the census — the scope has drifted, " +
+          `saw: ${views.rows.map((r) => `${r.nspname}.${r.relname}`).join(", ")}`,
+      );
+    }
+
+    // Parsed rather than string-matched: `WITH (security_invoker = on)` and
+    // `WITH (security_invoker)` are both correct and store `on` and `true`.
+    const enabled = (reloptions: string[] | null): boolean => {
+      for (const option of reloptions ?? []) {
+        const [name, value] = option.split("=", 2);
+        if (name?.trim() !== "security_invoker") continue;
+        return ["true", "on", "1", "yes"].includes((value ?? "true").trim().toLowerCase());
+      }
+      return false;
+    };
 
     const offenders = views.rows
-      .filter((row) => !(row.reloptions ?? []).includes("security_invoker=true"))
-      .map((row) => `${row.relname} (reloptions=${(row.reloptions ?? []).join(",") || "unset"})`);
+      .filter((row) => !enabled(row.reloptions))
+      .map((row) => `${row.nspname}.${row.relname} (reloptions=${(row.reloptions ?? []).join(",") || "unset"})`);
 
     if (offenders.length > 0) {
       throw new Error(

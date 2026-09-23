@@ -52,6 +52,49 @@ export interface RlsCheckResult {
    * STORY-152 introduced the first plain view (`project_entitled_engines`).
    */
   viewsWithoutSecurityInvoker: string[];
+  /**
+   * "<relation> (relkind=<k>)" — a relation in `public` of a kind NO bucket
+   * examines.
+   *
+   * ⚠ THIS CLOSES THE CLASS, NOT ONE MORE INSTANCE OF IT. The view blind spot
+   * existed because this module enumerates an allow-list of relkinds and
+   * everything outside it is invisible. Adding views to that list fixed one
+   * entry and left the shape intact — a review then walked one relkind over
+   * and did it again with a FOREIGN TABLE:
+   *
+   *   CREATE FOREIGN TABLE projects_shadow (...) SERVER probe_srv;
+   *   GRANT SELECT ON projects_shadow TO nominara_app, ...;
+   *
+   * RLS does not apply to foreign tables AT ALL, so there is no policy to be
+   * missing and no flag to be unset. It is invisible by construction to all
+   * seven buckets above, and `isClean` returned true with it present.
+   *
+   * So the rule is inverted here: every relkind is either handled by a bucket
+   * or reported by this one. `f` (foreign table) and `m` (materialized view,
+   * which ISO-16 forbids outright) are the two that can expose rows;
+   * indexes, sequences, composite types and TOAST tables cannot and are
+   * listed as handled. An unfamiliar EIGHTH relkind fails loudly instead of
+   * silently, which is the property the previous two rounds did not have.
+   */
+  unclassifiedRelations: string[];
+}
+
+/**
+ * Whether a view's reloptions enable `security_invoker`.
+ *
+ * Postgres stores the spelling the author used — `WITH (security_invoker)`
+ * and `WITH (security_invoker = on)` both mean true and store `true` and `on`
+ * respectively — so this parses the value rather than matching a string. A
+ * gate that reports a correct view as a violation gets distrusted, and a
+ * distrusted gate is the one nobody reads on the day it matters.
+ */
+function securityInvokerEnabled(reloptions: string[] | null): boolean {
+  for (const option of reloptions ?? []) {
+    const [name, value] = option.split("=", 2);
+    if (name?.trim() !== "security_invoker") continue;
+    return ["true", "on", "1", "yes"].includes((value ?? "true").trim().toLowerCase());
+  }
+  return false;
 }
 
 export function isClean(result: RlsCheckResult): boolean {
@@ -62,7 +105,8 @@ export function isClean(result: RlsCheckResult): boolean {
     result.unexpectedPolicies.length === 0 &&
     result.policiesWithoutWithCheck.length === 0 &&
     result.globalTablesWithPolicies.length === 0 &&
-    result.viewsWithoutSecurityInvoker.length === 0
+    result.viewsWithoutSecurityInvoker.length === 0 &&
+    result.unclassifiedRelations.length === 0
   );
 }
 
@@ -332,9 +376,41 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
              AND d.deptype = 'e'
         )`,
   );
+  // ⚠ PARSED, NOT STRING-MATCHED. `WITH (security_invoker = on)` stores
+  // `security_invoker=on`, which is correct and which an `includes("...=true")`
+  // test reports as a violation. The direction is fail-safe, but a gate that
+  // cries wolf on a correct view costs someone an hour and teaches them to
+  // distrust it. Postgres's own boolean parse accepts on/true/1/yes.
   const viewsWithoutSecurityInvoker = viewsResult.rows
-    .filter((row) => !(row.reloptions ?? []).includes("security_invoker=true"))
+    .filter((row) => !securityInvokerEnabled(row.reloptions))
     .map((row) => `${row.relname}: security_invoker=${(row.reloptions ?? []).join(",") || "unset"}`);
+
+  // ⚠ THE INVERTED CENSUS. Every other query here names the relkinds it wants;
+  // this one names the relkinds that are ACCOUNTED FOR and reports the rest.
+  //
+  //   r, p  tables and partitioned tables   -> the six buckets above
+  //   v     views                           -> viewsWithoutSecurityInvoker
+  //   i, I  indexes                         -> hold no rows of their own
+  //   S     sequences                       -> no tenant data
+  //   c     composite types                 -> not a relation with rows
+  //   t     TOAST                           -> inaccessible, follows its table
+  //
+  // `m` (materialized view) and `f` (foreign table) are deliberately ABSENT
+  // from that list, so both land here. A matview is forbidden by ISO-16 and a
+  // foreign table is outside RLS entirely — neither has a bucket, and before
+  // this they had no report either.
+  const unhandledResult = await client.query<{ relname: string; relkind: string }>(
+    `SELECT c.relname, c.relkind::text
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public'
+        AND c.relkind NOT IN ('r', 'p', 'v', 'i', 'I', 'S', 'c', 't')
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+           WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+        )`,
+  );
+  const unclassifiedRelations = unhandledResult.rows.map((row) => `${row.relname} (relkind=${row.relkind})`);
 
   return {
     unclassifiedTables,
@@ -344,6 +420,7 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
     policiesWithoutWithCheck,
     globalTablesWithPolicies,
     viewsWithoutSecurityInvoker,
+    unclassifiedRelations,
   };
 }
 
@@ -394,6 +471,35 @@ async function main() {
     }
     if (result.globalTablesWithPolicies.length > 0) {
       console.error(`  policies on GLOBAL_TABLES entries: ${result.globalTablesWithPolicies.join(", ")}`);
+    }
+    if (result.viewsWithoutSecurityInvoker.length > 0) {
+      console.error(`  views without security_invoker (they run as OWNER and bypass RLS): ${result.viewsWithoutSecurityInvoker.join(", ")}`);
+    }
+    if (result.unclassifiedRelations.length > 0) {
+      console.error(`  relations of an unhandled kind — no bucket examines these: ${result.unclassifiedRelations.join(", ")}`);
+    }
+    // ⚠ A BUCKET WITH NO LINE HERE PRINTS NOTHING AND EXITS 1, which reads as
+    // a broken tool on the one invariant nobody was looking for. The seventh
+    // bucket shipped in exactly that state: `isClean` consulted it and this
+    // block did not, so `pnpm db:rls-check` failed with a bare header.
+    //
+    // This is the backstop rather than a reason to relax: it names any bucket
+    // that is non-empty and unprinted, so the NEXT one is merely ugly instead
+    // of silent. The per-bucket lines above are still what a reviewer reads.
+    const printed = new Set([
+      "unclassifiedTables",
+      "missingRls",
+      "missingPolicies",
+      "unexpectedPolicies",
+      "policiesWithoutWithCheck",
+      "globalTablesWithPolicies",
+      "viewsWithoutSecurityInvoker",
+      "unclassifiedRelations",
+    ]);
+    for (const [bucket, entries] of Object.entries(result)) {
+      if (!printed.has(bucket) && Array.isArray(entries) && entries.length > 0) {
+        console.error(`  ${bucket} (no dedicated message — add one): ${entries.join(", ")}`);
+      }
     }
     process.exit(1);
   }

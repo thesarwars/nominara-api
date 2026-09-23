@@ -313,7 +313,14 @@ describe("STORY-136 · project scorecards", () => {
     expect(document.window.from < document.window.to).toBe(true);
   });
 
-  it("narrows to the requested engines, and never widens past what is enabled", async () => {
+  // ⚠ THE TITLE USED TO SAY "never widens past what is ENABLED", and STORY-152
+  // made that overstate the invariant: a measured engine is in the response
+  // whether or not the plan entitles it (see the blend-membership block at the
+  // bottom of this file). `gemini` returns nothing here because it is BOTH
+  // unentitled and unmeasured in this fixture — which is what the narrower
+  // title now claims, and what the next person adding a gemini cell needs to
+  // know before they read this as a promise it no longer makes.
+  it("narrows to the requested engines, and cannot summon one with no data and no entitlement", async () => {
     expect((await read("30d", "chatgpt")).engines.map((e) => e.engine_key)).toEqual(["chatgpt"]);
     expect((await read("30d", "gemini")).engines).toEqual([]);
   });
@@ -414,10 +421,11 @@ describe("STORY-136 · project scorecards", () => {
       await db.query(
         `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
                               cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
-         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active','{}'::jsonb)
+         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active',
+                 '{"business":{"full":4}}'::jsonb)
          ON CONFLICT (key) DO NOTHING`,
       );
-      await addCell({ capturedAt: daysAgo(2), engineKey: "claude", brandPresent: true });
+      await addCell({ capturedAt: daysAgo(0), engineKey: "claude", brandPresent: true });
     }
 
     it("⚠ an engine BELOW the plan floor still counts if it was measured in the window", async () => {
@@ -445,8 +453,95 @@ describe("STORY-136 · project scorecards", () => {
 
       // And the consequence of not being entitled: no cadence is claimed for
       // it, because the plan schedules no runs of an engine it does not sell.
+      //
+      // ⚠ CLAUDE CARRIES A REAL business CADENCE IN THE FIXTURE, AND THAT IS
+      // WHAT MAKES THIS ASSERTION MEAN ANYTHING. The first version seeded
+      // `cadence_by_plan = '{}'`, so the null came from an empty map and this
+      // line would have passed with the plan floor deleted from the view — a
+      // comment claiming a discrimination the assertion did not have. Now the
+      // cadence EXISTS and is withheld because the project is not entitled to
+      // it, which the upgrade below proves by making the same row report 4.
       const claude = (await read()).engines.find((engine) => engine.engine_key === "claude")!;
       expect(claude.cadence_runs_per_cycle, "an unentitled engine is scheduled zero times").toBeNull();
+
+      await db.query("UPDATE workspaces SET plan_key = 'business' WHERE id = $1", [workspaceId]);
+      const upgraded = (await read()).engines.find((engine) => engine.engine_key === "claude")!;
+      expect(upgraded.cadence_runs_per_cycle, "on business the very same row reports its cadence").toBe(4);
+    });
+
+    // ⚠ THE ONE THING THE FLOOR STILL DECIDES IN THIS SERVICE, AND NOTHING
+    // TESTED IT. Under the union rule a MEASURED engine is present whether or
+    // not it is entitled, so the floor is unobservable for any engine with
+    // data — which means every assertion above would survive deleting it.
+    // What remains observable is: unentitled AND unmeasured must be ABSENT.
+    it("an engine that is neither entitled nor measured does not appear at all", async () => {
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('gemini','gemini','v','api','1.0.0',86400,'medium','business','active',
+                 '{"business":{"full":4}}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+      await addCell({ capturedAt: daysAgo(1), engineKey: "google_ai_mode", brandPresent: true });
+
+      const keys = (await read()).engines.map((engine) => engine.engine_key);
+      expect(keys, "growth does not buy gemini and nothing measured it").not.toContain("gemini");
+      // Anti-vacuity: the entitled engines are present, so this is not an
+      // empty response.
+      expect(keys).toContain("google_ai_mode");
+      expect(keys).toContain("chatgpt");
+    });
+
+    // ⚠ daysAgo(0) IN THE FIXTURE ABOVE IS LOad-BEARING. With daysAgo(2) both
+    // tests here pass against a `measured` CTE whose upper bound is EXCLUSIVE
+    // and whose timezone is the session's — which is what the first version
+    // of this change shipped. Today's captures are the ones that expose it.
+    // ⚠ THIS TEST IS PLACED AT THE WINDOW'S FIRST INSTANT ON PURPOSE, AND A
+    // LOOSER PLACEMENT PROVED NOTHING.
+    //
+    // The first version used `daysAgo(0)` and a Sydney workspace, on the
+    // reasoning that a ten-hour skew must show up somewhere. It does not:
+    // both bounds are DATES compared with an inclusive BETWEEN, so a skew
+    // only changes the answer for a capture within hours of a boundary.
+    // Forcing the conversion to UTC left all 27 tests green — the mutation
+    // survived, and the test was decorative.
+    //
+    // `from` is `today - 29` in the WORKSPACE's zone. A capture at 00:30 on
+    // that date in Sydney is 14:30 the PREVIOUS day in UTC, so its UTC date
+    // is `from - 1` and a UTC-converted predicate excludes it while a
+    // Sydney-converted one includes it. That is the only shape that can tell
+    // the two apart.
+    it("⚠ the window's own timezone decides, at the boundary where that differs", async () => {
+      await setUp({ timezone: "Australia/Sydney" });
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active','{}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+
+      // Derived in SQL from the same clock and zone the service uses, so it
+      // cannot drift from `resolveWindow`'s arithmetic or from the test
+      // machine's zone.
+      const boundary = await db.query<{ at: string; syd: string; utc: string }>(
+        `SELECT ts AS at,
+                to_char((ts AT TIME ZONE 'Australia/Sydney')::date, 'YYYY-MM-DD') AS syd,
+                to_char((ts AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD')              AS utc
+           FROM (SELECT ((date_trunc('day', (now() AT TIME ZONE 'Australia/Sydney')) - interval '29 days')
+                         + interval '30 minutes') AT TIME ZONE 'Australia/Sydney' AS ts) t`,
+      );
+      const { at, syd, utc } = boundary.rows[0]!;
+      // The fixture only discriminates if the two zones genuinely disagree
+      // about the date. If they ever stop disagreeing, fail loudly rather
+      // than pass silently.
+      expect(utc, "the two zones must land on different dates, or this proves nothing").not.toBe(syd);
+
+      await addCell({ capturedAt: at, engineKey: "claude", brandPresent: true });
+
+      expect(
+        (await read()).engines.map((engine) => engine.engine_key),
+        "the capture is inside the window in Sydney and outside it in UTC — the workspace's zone decides",
+      ).toContain("claude");
     });
 
     it("an entitled engine with NO measurement is still listed, and changes no number", async () => {
