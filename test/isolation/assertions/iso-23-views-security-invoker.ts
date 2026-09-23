@@ -1,5 +1,11 @@
 import { connectSuperuser, type AssertionContext } from "../support/assertion-context.js";
 import { NOOP_REVERT, type Breaker } from "../support/breakers.js";
+// ⚠ IMPORTED, NOT RE-IMPLEMENTED. This suite OBSERVES src/db, never edits it
+// (ISO-16 says the same about additive-guard.ts), and the alternative here was
+// a second copy of the security_invoker parse — which a review found had
+// already drifted once: the module accepted `on` and this file's inline copy
+// would have had to learn it separately.
+import { NON_SYSTEM_SCHEMA_SQL, SECURITY_INVOKER_ENABLED_SQL } from "../../../src/db/rls/rls-check.js";
 
 // STORY-152 — ISO-23. Every plain view in `public` carries
 // `security_invoker = true`.
@@ -40,14 +46,17 @@ export async function assertIso23ViewsSecurityInvoker(ctx: AssertionContext): Pr
     // guard fires only if the RELKIND filter drifts, never if the SCHEMA does.
     // A view created in `app` — where this codebase already puts functions —
     // would have been invisible while the guard reported everything healthy.
-    const views = await client.query<{ nspname: string; relname: string; reloptions: string[] | null }>(
-      `SELECT n.nspname, c.relname, c.reloptions
+    const views = await client.query<{
+      nspname: string;
+      relname: string;
+      reloptions: string[] | null;
+      enabled: boolean;
+    }>(
+      `SELECT n.nspname, c.relname, c.reloptions, ${SECURITY_INVOKER_ENABLED_SQL} AS enabled
          FROM pg_class c
          JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relkind = 'v'
-          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-          AND n.nspname NOT LIKE 'pg_toast%'
-          AND n.nspname NOT LIKE 'pg_temp%'
+          AND ${NON_SYSTEM_SCHEMA_SQL}
           AND NOT EXISTS (
             SELECT 1 FROM pg_depend d
              WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
@@ -73,19 +82,8 @@ export async function assertIso23ViewsSecurityInvoker(ctx: AssertionContext): Pr
       );
     }
 
-    // Parsed rather than string-matched: `WITH (security_invoker = on)` and
-    // `WITH (security_invoker)` are both correct and store `on` and `true`.
-    const enabled = (reloptions: string[] | null): boolean => {
-      for (const option of reloptions ?? []) {
-        const [name, value] = option.split("=", 2);
-        if (name?.trim() !== "security_invoker") continue;
-        return ["true", "on", "1", "yes"].includes((value ?? "true").trim().toLowerCase());
-      }
-      return false;
-    };
-
     const offenders = views.rows
-      .filter((row) => !enabled(row.reloptions))
+      .filter((row) => !row.enabled)
       .map((row) => `${row.nspname}.${row.relname} (reloptions=${(row.reloptions ?? []).join(",") || "unset"})`);
 
     if (offenders.length > 0) {

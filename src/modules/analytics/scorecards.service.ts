@@ -11,7 +11,7 @@ import {
   type Scorecard,
   type WindowMetrics,
 } from "../../lib/analytics/scorecard.js";
-import { aggregateRange } from "../../lib/rollup/aggregate-day.js";
+import { aggregateRange, MEASUREMENT_STATUS_SQL } from "../../lib/rollup/aggregate-day.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`.
@@ -62,7 +62,28 @@ export class ScorecardsService {
 
     const window = await this.resolveWindow(tx, projectId, TIMEFRAME_DAYS[query.timeframe]);
     const requested = query.engines?.split(",").map((key) => key.trim()).filter((key) => key.length > 0) ?? null;
-    const engines = await this.engineConfig(tx, projectId, requested, window.from, window.to, window.timezone);
+    // ⚠ `priorFrom`, NOT `from` — THE MEMBERSHIP SPAN COVERS BOTH LEGS.
+    //
+    // `blendScorecards` builds the current AND prior blends from this one
+    // list, so a list scoped to the current window gives the prior leg a
+    // membership rule of "engines measured in the CURRENT window". An engine
+    // measured in the prior window and silent since — the exact shape of a
+    // downgrade — was then missing from `priorMetrics` while the stored
+    // cross-engine rows counted it over those days, so `visibility_delta`,
+    // the number the measured-membership rule exists to protect, was computed
+    // over a set the rule does not describe.
+    //
+    // `priorTo` is `from - 1 day` (see resolveWindow), so `priorFrom … to` is
+    // contiguous and one span covers both windows with no gap.
+    //
+    // Widening membership cannot move the CURRENT blend: an engine with no
+    // current metrics carries `EMPTY_WINDOW_METRICS`, and `blendMetrics`
+    // filters nulls before summing the denominator, so it is in neither
+    // numerator nor denominator. It does make such an engine VISIBLE in the
+    // response for up to one further window, which is correct — an engine
+    // that stopped being measured is a thing the screen should show, not
+    // hide.
+    const engines = await this.engineConfig(tx, projectId, requested, window.priorFrom, window.to, window.timezone);
 
     // TWO RANGE AGGREGATIONS, not 2 × N. `aggregateRange` groups by engine, so
     // the whole window costs one scan per period however many engines the
@@ -153,8 +174,10 @@ export class ScorecardsService {
     tx: ClientBase,
     projectId: string,
     requested: string[] | null,
-    windowFrom: string,
-    windowTo: string,
+    /** The lower bound of the MEMBERSHIP span — the PRIOR window's start. */
+    measuredFrom: string,
+    /** The current window's end. `measuredFrom … measuredTo` covers both legs. */
+    measuredTo: string,
     timezone: string,
   ): Promise<EngineConfig[]> {
     const result = await tx.query<{
@@ -196,7 +219,7 @@ export class ScorecardsService {
       // day's score has to stay reproducible from an export, which is what
       // the 1e-9 reproducibility claim rests on.
       //
-      // So the key set is ENTITLED ∪ MEASURED-IN-WINDOW. The union is
+      // So the key set is ENTITLED ∪ MEASURED-IN-EITHER-WINDOW. The union is
       // deliberate in both directions:
       //   entitled-but-unmeasured — carries no metrics, so it changes no
       //   number (blendMetrics filters nulls before summing the denominator),
@@ -206,7 +229,9 @@ export class ScorecardsService {
       //   rollup already counted, so the header now agrees with the chart.
       //
       // `measured` is scoped to the window because the blend is; an engine
-      // last measured before it would add a row with nothing in it.
+      // last measured before it would add a row with nothing in it. The span
+      // is the PRIOR window's start to the CURRENT window's end, because both
+      // blend legs are built from this one list — see the call site.
       //
       // ⚠ AND IT USES `aggregateRange`'s OWN PREDICATE, CHARACTER FOR
       // CHARACTER — `(captured_at AT TIME ZONE tz)::date BETWEEN from AND to`
@@ -235,7 +260,20 @@ export class ScorecardsService {
          SELECT DISTINCT c.engine_key
            FROM answer_captures c
           WHERE c.project_id = $1
-            AND c.status IN ('captured', 'parsed', 'skipped')
+            -- ⚠ THE AGGREGATION'S OWN CONSTANT, NOT A COPY OF IT. This read
+            -- IN ('captured','parsed','skipped') for a round: the same SET
+            -- as the aggregation's rule and the opposite KIND of rule, an
+            -- allow-list against a deny-list. Equal over today's five
+            -- statuses, and divergent the moment a sixth is added -- the new
+            -- value would count as a measurement in the stored rollup and
+            -- not here, dropping the engine from the header's blend while
+            -- the chart counted it. That is this story's round-2 divergence
+            -- exactly, arriving by the last predicate that was still written
+            -- out twice.
+            --
+            -- Interpolated from one definition so there is nothing to keep
+            -- in step. The alias c is what the constant expects.
+            AND ${MEASUREMENT_STATUS_SQL}
             AND (c.captured_at AT TIME ZONE $5)::date BETWEEN $3::date AND $4::date
        ),
        engine_keys AS (
@@ -272,7 +310,7 @@ export class ScorecardsService {
          ) last_capture ON true
         WHERE ($2::text[] IS NULL OR k.engine_key = ANY($2::text[]))
         ORDER BY k.engine_key ASC`,
-      [projectId, requested, windowFrom, windowTo, timezone],
+      [projectId, requested, measuredFrom, measuredTo, timezone],
     );
 
     if (result.rows.length === 0) await this.assertProjectExists(tx, projectId);

@@ -3,6 +3,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { CONFIDENCE_THRESHOLDS } from "../../src/lib/scoring/visibility.js";
 import { scorecardsResponseSchema } from "../../contracts/analytics/index.js";
 import { ScorecardsService } from "../../src/modules/analytics/scorecards.service.js";
 import { rollUpDay } from "../../src/lib/rollup/roll-up-day.js";
@@ -416,6 +417,10 @@ describe("STORY-136 · project scorecards", () => {
   // past day's score has to stay reproducible from an export.
   // ==========================================================================
   describe("STORY-152 · blend membership is what was MEASURED, not what is entitled", () => {
+    // The span is `priorFrom … to` — BOTH windows — because
+    // `blendScorecards` builds the current and prior legs from one engine
+    // list. See the note at the `engineConfig` call site.
+
     /** `claude` is a business engine; this workspace is on `growth`. */
     async function seedBelowFloorEngineWithData(): Promise<void> {
       await db.query(
@@ -542,6 +547,96 @@ describe("STORY-136 · project scorecards", () => {
         (await read()).engines.map((engine) => engine.engine_key),
         "the capture is inside the window in Sydney and outside it in UTC — the workspace's zone decides",
       ).toContain("claude");
+    });
+
+    // ⚠ THE OTHER EDGE. Every membership test above asserts that something IS
+    // present, so they pin under-inclusion only — a review showed that
+    // deleting the window predicate outright survives the whole suite. An
+    // engine the customer neither buys nor used in either window would then
+    // render as a row with empty metrics and a stale `last_captured_at`,
+    // which is the screen's "entitled and never measured" state. That is the
+    // absent-versus-unmeasured conflation this codebase treats as a top
+    // correctness risk, one level up.
+    //
+    // 70 days back is outside BOTH windows: a 30d read spans `today-29 …
+    // today` and its prior leg `today-59 … today-30`.
+    it("⚠ an engine measured outside BOTH windows does not appear", async () => {
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active','{}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+      await addCell({ capturedAt: daysAgo(70), engineKey: "claude", brandPresent: true });
+      await addCell({ capturedAt: daysAgo(1), engineKey: "google_ai_mode", brandPresent: true });
+
+      const keys = (await read()).engines.map((engine) => engine.engine_key);
+      expect(keys, "unentitled, and measured in neither window").not.toContain("claude");
+      // Anti-vacuity: the response is not simply empty.
+      expect(keys).toContain("google_ai_mode");
+    });
+
+    // ⚠ THE PRIOR LEG'S MEMBERSHIP, WHICH WAS THE CURRENT WINDOW'S.
+    //
+    // `blendScorecards` builds BOTH blends from one engine list. While that
+    // list was scoped to the current window, an engine measured in the prior
+    // window and silent since — the shape a downgrade makes — was missing
+    // from `priorMetrics` while the stored cross-engine rows counted it over
+    // those days. `visibility_delta`, the number the measured-membership rule
+    // exists to protect, was computed over a set the rule does not describe.
+    //
+    // The membership span is `priorFrom … to` now. This asserts the
+    // CONSEQUENCE, not membership: with identical current-window data, the
+    // blended delta MOVES once the prior-only engine is counted.
+    //
+    // ⚠ THIRTY CELLS PER WINDOW IS NOT PADDING. `visibilityDelta` returns
+    // null below CONFIDENCE_THRESHOLDS.medium (30) in EITHER window, so a
+    // smaller fixture makes both deltas null and the comparison vacuous.
+    it("⚠ an engine measured only in the PRIOR window still counts toward the delta", async () => {
+      // The real constant, so a change to the threshold cannot quietly make
+      // this fixture too small and the comparison vacuous.
+      const CELLS = CONFIDENCE_THRESHOLDS.medium;
+      async function seedCommon(): Promise<void> {
+        for (let i = 0; i < CELLS; i++) {
+          await addCell({ capturedAt: daysAgo(5), engineKey: "google_ai_mode", brandPresent: true });
+          await addCell({ capturedAt: daysAgo(40), engineKey: "google_ai_mode", brandPresent: true });
+        }
+      }
+
+      await setUp();
+      await seedCommon();
+      const withoutClaude = await read();
+
+      await setUp();
+      await seedCommon();
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active','{}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+      // PRIOR window only (the 30d prior leg is days 30..59 back), and a
+      // measured ABSENCE so it moves the prior blend instead of matching it.
+      for (let i = 0; i < CELLS; i++) {
+        await addCell({ capturedAt: daysAgo(40), engineKey: "claude", brandPresent: false });
+      }
+      const withClaude = await read();
+
+      expect(
+        withClaude.engines.map((engine) => engine.engine_key),
+        "measured in the prior window, so it is part of what the delta compares against",
+      ).toContain("claude");
+
+      // Both must be real numbers, or the comparison below compares nulls.
+      expect(withoutClaude.blended.visibility_delta).not.toBeNull();
+      expect(withClaude.blended.visibility_delta).not.toBeNull();
+
+      // Claude was absent from every prior-window answer, so counting it
+      // LOWERS the prior blend, which RAISES current-minus-prior.
+      expect(
+        withClaude.blended.visibility_delta!,
+        "the prior leg must count claude's cells — identical current data, different delta",
+      ).toBeGreaterThan(withoutClaude.blended.visibility_delta!);
     });
 
     it("an entitled engine with NO measurement is still listed, and changes no number", async () => {

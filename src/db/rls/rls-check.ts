@@ -80,22 +80,46 @@ export interface RlsCheckResult {
 }
 
 /**
- * Whether a view's reloptions enable `security_invoker`.
+ * Whether a view's reloptions enable `security_invoker`, decided BY POSTGRES.
  *
- * Postgres stores the spelling the author used — `WITH (security_invoker)`
- * and `WITH (security_invoker = on)` both mean true and store `true` and `on`
- * respectively — so this parses the value rather than matching a string. A
- * gate that reports a correct view as a violation gets distrusted, and a
- * distrusted gate is the one nobody reads on the day it matters.
+ * ⚠ AN ENUMERATION OF SPELLINGS IS THE WRONG SHAPE HERE, AND IT WAS WRONG
+ * TWICE. The first version matched the string `security_invoker=true` and
+ * reported `WITH (security_invoker = on)` — which is correct — as a
+ * violation. The second version enumerated `true|on|1|yes` and still reported
+ * `t`, because Postgres's boolean input also accepts `t`, `tr`, `tru`, `y`,
+ * `ye` and every case variant of each. A gate that cries wolf on a correct
+ * view gets distrusted, and a distrusted gate is the one nobody reads on the
+ * day it matters.
+ *
+ * `pg_options_to_table` plus `::boolean` hands the question to the component
+ * that owns the answer, so there is no list to keep in step with anything.
+ * `COALESCE(..., 'false')` makes an ABSENT option false — the dangerous
+ * default, which must fail rather than pass.
+ *
+ * EXPORTED because ISO-23 asks the same question of the same catalog, and two
+ * copies of this predicate is exactly the defect this story's own comments
+ * warn about three times over (the cadence expression, the window boundary,
+ * the status set). It is a SQL fragment rather than a TS function so that
+ * both callers put the work in the same place: the database.
  */
-function securityInvokerEnabled(reloptions: string[] | null): boolean {
-  for (const option of reloptions ?? []) {
-    const [name, value] = option.split("=", 2);
-    if (name?.trim() !== "security_invoker") continue;
-    return ["true", "on", "1", "yes"].includes((value ?? "true").trim().toLowerCase());
-  }
-  return false;
-}
+export const SECURITY_INVOKER_ENABLED_SQL = `
+  COALESCE(
+    (SELECT option_value FROM pg_options_to_table(c.reloptions) WHERE option_name = 'security_invoker'),
+    'false'
+  )::boolean`;
+
+/**
+ * The schemas a tenant-bearing relation could hide in.
+ *
+ * ⚠ NOT `= 'public'`. This codebase already puts functions in `app`, and a
+ * review planted a foreign table there that every control missed — the
+ * relkind census was public-only while ISO-23 had already been widened, so
+ * the reasoning existed and had simply not been carried across.
+ */
+export const NON_SYSTEM_SCHEMA_SQL = `
+  n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%'
+  AND n.nspname NOT LIKE 'pg_temp%'`;
 
 export function isClean(result: RlsCheckResult): boolean {
   return (
@@ -364,11 +388,12 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
   // our tables. `pg_depend.deptype = 'e'` is what "belongs to an extension"
   // actually means; an allow-list of two names would quietly admit the next
   // extension's views, which is the same class of gap this bucket closes.
-  const viewsResult = await client.query<{ relname: string; reloptions: string[] | null }>(
-    `SELECT c.relname, c.reloptions
+  const viewsResult = await client.query<{ nspname: string; relname: string; reloptions: string[] | null; enabled: boolean }>(
+    `SELECT n.nspname, c.relname, c.reloptions, ${SECURITY_INVOKER_ENABLED_SQL} AS enabled
        FROM pg_class c
        JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = 'public' AND c.relkind = 'v'
+      WHERE c.relkind = 'v'
+        AND ${NON_SYSTEM_SCHEMA_SQL}
         AND NOT EXISTS (
           SELECT 1 FROM pg_depend d
            WHERE d.classid = 'pg_class'::regclass
@@ -382,7 +407,7 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
   // cries wolf on a correct view costs someone an hour and teaches them to
   // distrust it. Postgres's own boolean parse accepts on/true/1/yes.
   const viewsWithoutSecurityInvoker = viewsResult.rows
-    .filter((row) => !securityInvokerEnabled(row.reloptions))
+    .filter((row) => !row.enabled)
     .map((row) => `${row.relname}: security_invoker=${(row.reloptions ?? []).join(",") || "unset"}`);
 
   // ⚠ THE INVERTED CENSUS. Every other query here names the relkinds it wants;
@@ -399,18 +424,29 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
   // from that list, so both land here. A matview is forbidden by ISO-16 and a
   // foreign table is outside RLS entirely — neither has a bucket, and before
   // this they had no report either.
-  const unhandledResult = await client.query<{ relname: string; relkind: string }>(
-    `SELECT c.relname, c.relkind::text
+  //
+  // ⚠ EVERY NON-SYSTEM SCHEMA, NOT `public`. This was public-only for one
+  // round, while ISO-23 had already been widened — so the reasoning existed
+  // in this repository and had simply not been carried across. A review
+  // planted `app.projects_shadow`, a FOREIGN TABLE granted to all three
+  // runtime roles, and it fell through every control: this bucket did not see
+  // the schema, ISO-23 only looks at views, and ISO-16 only at matviews. RLS
+  // does not apply to foreign tables at all, so nothing else was going to
+  // catch it either. The name is schema-qualified for the same reason.
+  const unhandledResult = await client.query<{ nspname: string; relname: string; relkind: string }>(
+    `SELECT n.nspname, c.relname, c.relkind::text
        FROM pg_class c
        JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = 'public'
+      WHERE ${NON_SYSTEM_SCHEMA_SQL}
         AND c.relkind NOT IN ('r', 'p', 'v', 'i', 'I', 'S', 'c', 't')
         AND NOT EXISTS (
           SELECT 1 FROM pg_depend d
            WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
         )`,
   );
-  const unclassifiedRelations = unhandledResult.rows.map((row) => `${row.relname} (relkind=${row.relkind})`);
+  const unclassifiedRelations = unhandledResult.rows.map(
+    (row) => `${row.nspname === "public" ? row.relname : `${row.nspname}.${row.relname}`} (relkind=${row.relkind})`,
+  );
 
   return {
     unclassifiedTables,

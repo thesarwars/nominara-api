@@ -114,6 +114,31 @@ export async function aggregateDay(
  * `metric_daily` keeps its job: the per-day series a chart plots. This is the
  * window aggregate, and the facts are the only honest source for it.
  */
+/**
+ * What counts as a MEASUREMENT, as a SQL fragment over an alias `c`.
+ *
+ * ⚠ EXPORTED, AND A DENY-LIST, AND BOTH MATTER.
+ *
+ * Exported because `scorecards.service.ts` asks the same question when it
+ * decides which engines are in the blend, and the two must agree exactly: if
+ * a status counts as a measurement in the stored cross-engine rollup and not
+ * in the scorecard's membership, the engine drops out of the header's blend
+ * while the chart still counts it. That is a live divergence this story
+ * already shipped once by a different route (the window boundary), found in
+ * review, and it came back the moment two spellings of one boundary existed.
+ * A review then found this one: an allow-list here and a deny-list there,
+ * equal over today's five statuses and opposite in kind.
+ *
+ * A DENY-LIST, so a status added by a later migration counts as a measurement
+ * until someone decides otherwise. That direction is deliberate: the
+ * alternative silently drops real data from a published score, where this
+ * one surfaces it and is visible.
+ *
+ * `answer_captures_status_check` permits exactly captured/parsed/skipped/
+ * failed/blocked today. A sixth value is a decision about this constant.
+ */
+export const MEASUREMENT_STATUS_SQL = "c.status NOT IN ('failed', 'blocked')";
+
 export async function aggregateRange(
   tx: ClientBase,
   projectId: string,
@@ -139,8 +164,9 @@ export async function aggregateRange(
           AND (c.captured_at AT TIME ZONE $3)::date BETWEEN $2::date AND $4::date
           -- A FAILED CELL IS NOT A MEASUREMENT. §2.5 excludes it from both
           -- numerator and denominator; a refusal ('parsed' with the flag) is
-          -- data and stays in.
-          AND c.status NOT IN ('failed', 'blocked')
+          -- data and stays in. The predicate is MEASUREMENT_STATUS_SQL, declared
+          -- above -- see there for why it is not written out here.
+          AND ${MEASUREMENT_STATUS_SQL}
      ),
      entities AS (
        -- Every (engine, entity) pair that appears in the range, so a

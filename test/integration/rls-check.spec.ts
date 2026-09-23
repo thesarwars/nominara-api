@@ -443,6 +443,51 @@ describe("STORY-011 · pnpm db:rls-check", () => {
     }
   });
 
+  // ⚠ THE SAME RELATION, IN THE SCHEMA THE FIRST FIX FORGOT. The relkind
+  // census was `public`-only for a round while ISO-23 had already been
+  // widened — so the reasoning was written down in this repository and simply
+  // not carried across. A review planted this in `app`, where the codebase
+  // already keeps functions, and it fell through every control: this bucket
+  // did not see the schema, ISO-23 looks only at views, ISO-16 only at
+  // matviews, and RLS does not apply to foreign tables at all.
+  it("bucket: unclassifiedRelations — a foreign table in a NON-public schema", async () => {
+    await client.query("CREATE EXTENSION IF NOT EXISTS file_fdw");
+    await client.query("CREATE SERVER IF NOT EXISTS probe_srv2 FOREIGN DATA WRAPPER file_fdw");
+    await client.query("CREATE SCHEMA IF NOT EXISTS app");
+    await client.query(
+      "CREATE FOREIGN TABLE app.projects_shadow (id uuid, workspace_id uuid) SERVER probe_srv2 OPTIONS (filename '/dev/null', format 'csv')",
+    );
+    try {
+      const result = await checkRls(client);
+      expect(result.unclassifiedRelations, "schema-qualified, because `public` is no longer assumed").toContain(
+        "app.projects_shadow (relkind=f)",
+      );
+      expect(isClean(result)).toBe(false);
+    } finally {
+      await client.query("DROP FOREIGN TABLE IF EXISTS app.projects_shadow");
+      await client.query("DROP SERVER IF EXISTS probe_srv2");
+    }
+  });
+
+  // `security_invoker = t` was reported as a violation by the second version
+  // of this check, which enumerated `true|on|1|yes`. Postgres's boolean input
+  // also takes `t`, `tr`, `tru`, `y`, `ye` and every case variant, so the
+  // enumeration was always going to be one spelling short. The parse is
+  // Postgres's own now, and this asserts the awkward spellings rather than
+  // the obvious ones.
+  it.each(["t", "T", "TRUE", "yes", "1", "on"])(
+    "accepts security_invoker = %s, because Postgres does",
+    async (spelling) => {
+      await client.query(`CREATE VIEW v_spell WITH (security_invoker = ${spelling}) AS SELECT * FROM projects`);
+      try {
+        const result = await checkRls(client);
+        expect(result.viewsWithoutSecurityInvoker).toEqual([]);
+      } finally {
+        await client.query("DROP VIEW IF EXISTS v_spell");
+      }
+    },
+  );
+
   it("extension-owned views are excluded by dependency, not by name", async () => {
     // pg_stat_statements installs two views into `public` with no
     // security_invoker. They are excluded via pg_depend deptype='e' — and if

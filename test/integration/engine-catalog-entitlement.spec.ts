@@ -304,8 +304,38 @@ describe("STORY-152 · a project resolves its engines from the catalog", () => {
     // disagreed. So the comparison below asks POSTGRES what `::int` does with
     // the text jsonb actually stored, and requires the constraint to give the
     // same answer — rather than encoding my reading of either one.
-    it.each(["4.0", "4.50", "99999999999", "-99999999999", "4e2", "4", "0", "-1", "2147483647", "2147483648"])(
-      "the constraint agrees with ::int about %s",
+    //
+    // ⚠ ONE-DIRECTIONAL: ACCEPTED ⇒ CASTS. The first version asserted
+    // equality, and equality is FALSE in general — the constraint is
+    // deliberately stricter for JSON strings and JSON null, which `::int`
+    // would happily take:
+    //
+    //   '"4"'   stores as `4`   -> constraint refuses, ::int accepts
+    //   '" 4 "' stores as ` 4 ` -> constraint refuses, ::int accepts
+    //   'null'  stores as NULL  -> constraint refuses, ::int accepts
+    //
+    // It passed only because no JSON string was in the list. A reviewer
+    // adding `'"4"'` — an entirely reasonable "cover strings too" — would get
+    // a red whose obvious fix is to LOOSEN the constraint, which is the exact
+    // move this whole guard exists to prevent. The implication is the real
+    // safety property, it is true for every input, and it catches `4.0` just
+    // as well.
+    it.each([
+      "4.0",
+      "4.50",
+      "99999999999",
+      "-99999999999",
+      "4e2",
+      "4",
+      "0",
+      "-1",
+      "2147483647",
+      "2147483648",
+      '"4"',
+      '" 4 "',
+      "null",
+    ])(
+      "nothing the constraint accepts can raise in the reader: %s",
       async (literal) => {
         const stored = await db
           .query<{ t: string }>("SELECT ($1::jsonb) #>> '{}' AS t", [literal])
@@ -322,12 +352,30 @@ describe("STORY-152 · a project resolves its engines from the catalog", () => {
           ])
           .then((r) => r.rows[0]!.ok);
 
-        expect(
-          accepted,
-          `literal ${literal} stores as "${stored}", which ::int ${actuallyCasts ? "accepts" : "rejects"} — the constraint must say the same`,
-        ).toBe(actuallyCasts);
+        // The implication, not the equivalence. Stricter is safe; the
+        // forbidden combination is accepted-and-raises.
+        if (accepted) {
+          expect(
+            actuallyCasts,
+            `the constraint ACCEPTED ${literal} (stored as "${stored}"), which ::int rejects — this is a 500 in the reader`,
+          ).toBe(true);
+        }
       },
     );
+
+    // And the implication must not be vacuous: if the constraint refused
+    // everything, every case above would pass. These are the values it is
+    // REQUIRED to accept, because the readers' `> 0` depends on them being
+    // storable (capture-engine-cadence.spec.ts seeds a 0 to prove the
+    // fail-closed rule).
+    it.each(["4", "0", "-1", "2147483647", "-2147483648", "4e2"])("still accepts %s", async (literal) => {
+      const accepted = await db
+        .query<{ ok: boolean }>("SELECT app.cadence_by_plan_is_castable($1::jsonb) AS ok", [
+          `{"business":{"full":${literal}}}`,
+        ])
+        .then((r) => r.rows[0]!.ok);
+      expect(accepted, `${literal} casts cleanly and must remain storable`).toBe(true);
+    });
 
     // ⚠ ZERO AND NEGATIVE STAY LEGAL, DELIBERATELY. They cast cleanly, and the
     // readers' own `> 0` is what excludes them — that IS the fail-closed rule
