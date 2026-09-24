@@ -3,6 +3,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { CONFIDENCE_THRESHOLDS } from "../../src/lib/scoring/visibility.js";
 import { scorecardsResponseSchema } from "../../contracts/analytics/index.js";
 import { ScorecardsService } from "../../src/modules/analytics/scorecards.service.js";
 import { rollUpDay } from "../../src/lib/rollup/roll-up-day.js";
@@ -62,18 +63,21 @@ describe("STORY-136 · project scorecards", () => {
        VALUES ($1,$2,$3,'q',sha256('q'::bytea),'recommendation','consideration',false,'active')`,
       [promptId, workspaceId, projectId],
     );
-    // The catalog is unseeded (STORY-130), so the rows are created here —
-    // including `cadence_by_plan`, which is what the cadence field reads.
-    for (const [engine, weight] of [
-      ["google_ai_mode", 3],
-      ["chatgpt", 1],
+    // ⚠ EACH ENGINE CARRIES ITS OWN REAL PLAN FLOOR, NOT 'free' FOR EVERYTHING.
+    // This fixture used to seed min_plan_key='free' on every engine, which
+    // made STORY-152's plan floor INERT in the one spec that covers this
+    // surface — the floor could have been deleted from the view and nothing
+    // here would have noticed. These are the floors migration 0027 seeds.
+    for (const [engine, weight, minPlan] of [
+      ["google_ai_mode", 3, "growth"],
+      ["chatgpt", 1, "free"],
     ] as const) {
       await db.query(
         `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
                               cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
-         VALUES ($1,$1,'v','api','1.0.0',86400,'medium','free','active',$2::jsonb)
+         VALUES ($1,$1,'v','api','1.0.0',86400,'medium',$3,'active',$2::jsonb)
          ON CONFLICT (key) DO NOTHING`,
-        [engine, JSON.stringify(options.cadence ?? {})],
+        [engine, JSON.stringify(options.cadence ?? {}), minPlan],
       );
       await db.query(
         `INSERT INTO project_engines (workspace_id,project_id,engine_key,enabled,sample_count,weight)
@@ -310,7 +314,14 @@ describe("STORY-136 · project scorecards", () => {
     expect(document.window.from < document.window.to).toBe(true);
   });
 
-  it("narrows to the requested engines, and never widens past what is enabled", async () => {
+  // ⚠ THE TITLE USED TO SAY "never widens past what is ENABLED", and STORY-152
+  // made that overstate the invariant: a measured engine is in the response
+  // whether or not the plan entitles it (see the blend-membership block at the
+  // bottom of this file). `gemini` returns nothing here because it is BOTH
+  // unentitled and unmeasured in this fixture — which is what the narrower
+  // title now claims, and what the next person adding a gemini cell needs to
+  // know before they read this as a promise it no longer makes.
+  it("narrows to the requested engines, and cannot summon one with no data and no entitlement", async () => {
     expect((await read("30d", "chatgpt")).engines.map((e) => e.engine_key)).toEqual(["chatgpt"]);
     expect((await read("30d", "gemini")).engines).toEqual([]);
   });
@@ -383,5 +394,290 @@ describe("STORY-136 · project scorecards", () => {
         new ScorecardsService().scorecards(randomUUID(), { timeframe: "30d" }),
       ),
     ).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  // ==========================================================================
+  // STORY-152 — WHAT A BLEND IS A STATEMENT ABOUT.
+  //
+  // ⚠ THIS PAIR EXISTS BECAUSE THE FIRST VERSION OF STORY-152 SILENTLY
+  // REDEFINED THE HEADLINE VISIBILITY SCORE.
+  //
+  // Switching this service onto `project_entitled_engines` made the blend run
+  // over "the engines you are entitled to TODAY". The stored cross-engine row
+  // that Growth Map and the trend series read (roll-up-day.ts's
+  // upsertCrossEngineRows) blends every engine holding a `metric_daily` row
+  // and applies no floor at all. Before the change both were unfiltered and
+  // agreed; after it, a project holding a measurement from an engine its plan
+  // no longer sells showed one number in its header and another on its chart.
+  // Reachable the moment a workspace downgrades, which STORY-151 made
+  // possible.
+  //
+  // The settled rule: ENTITLEMENT GOVERNS WHAT MAY BE CAPTURED NEXT. It
+  // cannot retroactively un-measure something already measured, because a
+  // past day's score has to stay reproducible from an export.
+  // ==========================================================================
+  describe("STORY-152 · blend membership is what was MEASURED, not what is entitled", () => {
+    // The span is `priorFrom … to` — BOTH windows — because
+    // `blendScorecards` builds the current and prior legs from one engine
+    // list. See the note at the `engineConfig` call site.
+
+    /** `claude` is a business engine; this workspace is on `growth`. */
+    async function seedBelowFloorEngineWithData(): Promise<void> {
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active',
+                 '{"business":{"full":4}}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+      await addCell({ capturedAt: daysAgo(0), engineKey: "claude", brandPresent: true });
+    }
+
+    it("⚠ an engine BELOW the plan floor still counts if it was measured in the window", async () => {
+      await seedBelowFloorEngineWithData();
+
+      const document = await read();
+      const keys = document.engines.map((engine) => engine.engine_key);
+
+      expect(keys, "claude is not entitled at growth, but it was measured — dropping it rewrites a past score").toContain(
+        "claude",
+      );
+    });
+
+    it("and it is genuinely NOT entitled — so the floor is doing its job, not simply absent", async () => {
+      await seedBelowFloorEngineWithData();
+
+      // The view is the entitlement answer, and it must exclude claude. If
+      // this passed too, the test above would be proving nothing: both would
+      // just mean "the floor is not applied anywhere".
+      const entitled = await db.query<{ engine_key: string }>(
+        "SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 ORDER BY engine_key",
+        [projectId],
+      );
+      expect(entitled.rows.map((r) => r.engine_key)).not.toContain("claude");
+
+      // And the consequence of not being entitled: no cadence is claimed for
+      // it, because the plan schedules no runs of an engine it does not sell.
+      //
+      // ⚠ CLAUDE CARRIES A REAL business CADENCE IN THE FIXTURE, AND THAT IS
+      // WHAT MAKES THIS ASSERTION MEAN ANYTHING. The first version seeded
+      // `cadence_by_plan = '{}'`, so the null came from an empty map and this
+      // line would have passed with the plan floor deleted from the view — a
+      // comment claiming a discrimination the assertion did not have. Now the
+      // cadence EXISTS and is withheld because the project is not entitled to
+      // it, which the upgrade below proves by making the same row report 4.
+      const claude = (await read()).engines.find((engine) => engine.engine_key === "claude")!;
+      expect(claude.cadence_runs_per_cycle, "an unentitled engine is scheduled zero times").toBeNull();
+
+      await db.query("UPDATE workspaces SET plan_key = 'business' WHERE id = $1", [workspaceId]);
+      const upgraded = (await read()).engines.find((engine) => engine.engine_key === "claude")!;
+      expect(upgraded.cadence_runs_per_cycle, "on business the very same row reports its cadence").toBe(4);
+    });
+
+    // ⚠ THE ONE THING THE FLOOR STILL DECIDES IN THIS SERVICE, AND NOTHING
+    // TESTED IT. Under the union rule a MEASURED engine is present whether or
+    // not it is entitled, so the floor is unobservable for any engine with
+    // data — which means every assertion above would survive deleting it.
+    // What remains observable is: unentitled AND unmeasured must be ABSENT.
+    it("an engine that is neither entitled nor measured does not appear at all", async () => {
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('gemini','gemini','v','api','1.0.0',86400,'medium','business','active',
+                 '{"business":{"full":4}}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+      await addCell({ capturedAt: daysAgo(1), engineKey: "google_ai_mode", brandPresent: true });
+
+      const keys = (await read()).engines.map((engine) => engine.engine_key);
+      expect(keys, "growth does not buy gemini and nothing measured it").not.toContain("gemini");
+      // Anti-vacuity: the entitled engines are present, so this is not an
+      // empty response.
+      expect(keys).toContain("google_ai_mode");
+      expect(keys).toContain("chatgpt");
+    });
+
+    // ⚠ daysAgo(0) IN THE FIXTURE ABOVE IS LOad-BEARING. With daysAgo(2) both
+    // tests here pass against a `measured` CTE whose upper bound is EXCLUSIVE
+    // and whose timezone is the session's — which is what the first version
+    // of this change shipped. Today's captures are the ones that expose it.
+    // ⚠ THIS TEST IS PLACED AT THE WINDOW'S FIRST INSTANT ON PURPOSE, AND A
+    // LOOSER PLACEMENT PROVED NOTHING.
+    //
+    // The first version used `daysAgo(0)` and a Sydney workspace, on the
+    // reasoning that a ten-hour skew must show up somewhere. It does not:
+    // both bounds are DATES compared with an inclusive BETWEEN, so a skew
+    // only changes the answer for a capture within hours of a boundary.
+    // Forcing the conversion to UTC left all 27 tests green — the mutation
+    // survived, and the test was decorative.
+    //
+    // `from` is `today - 29` in the WORKSPACE's zone. A capture at 00:30 on
+    // that date in Sydney is 14:30 the PREVIOUS day in UTC, so its UTC date
+    // is `from - 1` and a UTC-converted predicate excludes it while a
+    // Sydney-converted one includes it. That is the only shape that can tell
+    // the two apart.
+    it("⚠ the window's own timezone decides, at the boundary where that differs", async () => {
+      await setUp({ timezone: "Australia/Sydney" });
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active','{}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+
+      // Derived in SQL from the same clock and zone the service uses, so it
+      // cannot drift from `resolveWindow`'s arithmetic or from the test
+      // machine's zone.
+      const boundary = await db.query<{ at: string; syd: string; utc: string }>(
+        `SELECT ts AS at,
+                to_char((ts AT TIME ZONE 'Australia/Sydney')::date, 'YYYY-MM-DD') AS syd,
+                to_char((ts AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD')              AS utc
+           FROM (SELECT ((date_trunc('day', (now() AT TIME ZONE 'Australia/Sydney')) - interval '29 days')
+                         + interval '30 minutes') AT TIME ZONE 'Australia/Sydney' AS ts) t`,
+      );
+      const { at, syd, utc } = boundary.rows[0]!;
+      // The fixture only discriminates if the two zones genuinely disagree
+      // about the date. If they ever stop disagreeing, fail loudly rather
+      // than pass silently.
+      expect(utc, "the two zones must land on different dates, or this proves nothing").not.toBe(syd);
+
+      await addCell({ capturedAt: at, engineKey: "claude", brandPresent: true });
+
+      expect(
+        (await read()).engines.map((engine) => engine.engine_key),
+        "the capture is inside the window in Sydney and outside it in UTC — the workspace's zone decides",
+      ).toContain("claude");
+    });
+
+    // ⚠ THE OTHER EDGE. Every membership test above asserts that something IS
+    // present, so they pin under-inclusion only — a review showed that
+    // deleting the window predicate outright survives the whole suite. An
+    // engine the customer neither buys nor used in either window would then
+    // render as a row with empty metrics and a stale `last_captured_at`,
+    // which is the screen's "entitled and never measured" state. That is the
+    // absent-versus-unmeasured conflation this codebase treats as a top
+    // correctness risk, one level up.
+    //
+    // 70 days back is outside BOTH windows: a 30d read spans `today-29 …
+    // today` and its prior leg `today-59 … today-30`.
+    it("⚠ an engine measured outside BOTH windows does not appear", async () => {
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active','{}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+      await addCell({ capturedAt: daysAgo(70), engineKey: "claude", brandPresent: true });
+      await addCell({ capturedAt: daysAgo(1), engineKey: "google_ai_mode", brandPresent: true });
+
+      const keys = (await read()).engines.map((engine) => engine.engine_key);
+      expect(keys, "unentitled, and measured in neither window").not.toContain("claude");
+      // Anti-vacuity: the response is not simply empty.
+      expect(keys).toContain("google_ai_mode");
+    });
+
+    // ⚠ THE PRIOR LEG'S MEMBERSHIP, WHICH WAS THE CURRENT WINDOW'S.
+    //
+    // `blendScorecards` builds BOTH blends from one engine list. While that
+    // list was scoped to the current window, an engine measured in the prior
+    // window and silent since — the shape a downgrade makes — was missing
+    // from `priorMetrics` while the stored cross-engine rows counted it over
+    // those days. `visibility_delta`, the number the measured-membership rule
+    // exists to protect, was computed over a set the rule does not describe.
+    //
+    // The membership span is `priorFrom … to` now. This asserts the
+    // CONSEQUENCE, not membership: with identical current-window data, the
+    // blended delta MOVES once the prior-only engine is counted.
+    //
+    // ⚠ THIRTY CELLS PER WINDOW IS NOT PADDING. `visibilityDelta` returns
+    // null below CONFIDENCE_THRESHOLDS.medium (30) in EITHER window, so a
+    // smaller fixture makes both deltas null and the comparison vacuous.
+    it("⚠ an engine measured only in the PRIOR window still counts toward the delta", async () => {
+      // The real constant, so a change to the threshold cannot quietly make
+      // this fixture too small and the comparison vacuous.
+      const CELLS = CONFIDENCE_THRESHOLDS.medium;
+      async function seedCommon(): Promise<void> {
+        for (let i = 0; i < CELLS; i++) {
+          await addCell({ capturedAt: daysAgo(5), engineKey: "google_ai_mode", brandPresent: true });
+          await addCell({ capturedAt: daysAgo(40), engineKey: "google_ai_mode", brandPresent: true });
+        }
+      }
+
+      await setUp();
+      await seedCommon();
+      const withoutClaude = await read();
+
+      await setUp();
+      await seedCommon();
+      await db.query(
+        `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                              cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+         VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active','{}'::jsonb)
+         ON CONFLICT (key) DO NOTHING`,
+      );
+      // PRIOR window only (the 30d prior leg is days 30..59 back), and a
+      // measured ABSENCE so it moves the prior blend instead of matching it.
+      for (let i = 0; i < CELLS; i++) {
+        await addCell({ capturedAt: daysAgo(40), engineKey: "claude", brandPresent: false });
+      }
+      const withClaude = await read();
+
+      expect(
+        withClaude.engines.map((engine) => engine.engine_key),
+        "measured in the prior window, so it is part of what the delta compares against",
+      ).toContain("claude");
+
+      // ⚠ THE CLAIM "IDENTICAL CURRENT-WINDOW DATA" IS ASSERTED, NOT REASONED.
+      // The whole argument is that only the PRIOR leg moved; if claude's cells
+      // had leaked into the current window this test would still go green for
+      // the wrong reason.
+      expect(
+        withClaude.blended.visibility_score,
+        "claude has no current-window cells, so the current blend must be untouched",
+      ).toBe(withoutClaude.blended.visibility_score);
+
+      // ⚠ BOTH MUST BE REAL NUMBERS, AND SITTING ON THE THRESHOLD IS
+      // DELIBERATE. `visibilityDelta` returns null when EITHER window is below
+      // CONFIDENCE_THRESHOLDS.medium, and the fixture puts the prior leg at
+      // exactly 30 without claude and 60 with it. The trap that would make
+      // this vacuous is the CROSSING case — one delta null, the other a
+      // number, differing because of the threshold rather than because of
+      // membership. These two assertions are what exclude it. If the
+      // comparison in `visibilityDelta` ever became `<=`, this fails loudly
+      // instead of quietly proving nothing.
+      expect(withoutClaude.blended.visibility_delta).not.toBeNull();
+      expect(withClaude.blended.visibility_delta).not.toBeNull();
+
+      // Claude was absent from every prior-window answer, so counting it
+      // LOWERS the prior blend, which RAISES current-minus-prior.
+      expect(
+        withClaude.blended.visibility_delta!,
+        "the prior leg must count claude's cells — identical current data, different delta",
+      ).toBeGreaterThan(withoutClaude.blended.visibility_delta!);
+    });
+
+    it("an entitled engine with NO measurement is still listed, and changes no number", async () => {
+      // The other direction of the union. `blendMetrics` filters nulls before
+      // summing the denominator, so an empty engine is in neither numerator
+      // nor denominator — it must be visible without moving the score.
+      await addCell({ capturedAt: daysAgo(1), engineKey: "google_ai_mode", brandPresent: true });
+      const withoutChatgptData = await read();
+
+      const chatgpt = withoutChatgptData.engines.find((engine) => engine.engine_key === "chatgpt");
+      expect(chatgpt, "entitled and never measured is a state the screen must be able to show").toBeDefined();
+      expect(chatgpt!.last_captured_at).toBeNull();
+
+      // ⚠ brandPresent FALSE, and it has to be. A second engine measured
+      // IDENTICALLY blends to the same number, so seeding another present
+      // cell would leave the score unchanged for a reason that has nothing to
+      // do with membership — and this guard would fail while everything
+      // worked. A measured ABSENCE is what moves the blend.
+      await addCell({ capturedAt: daysAgo(1), engineKey: "chatgpt", brandPresent: false });
+      const withChatgptData = await read();
+      expect(
+        withChatgptData.blended.visibility_score === withoutChatgptData.blended.visibility_score,
+        "a measured absence on a second engine SHOULD lower the blend — if this is equal, the fixture measured nothing and the assertions above are vacuous",
+      ).toBe(false);
+    });
   });
 });

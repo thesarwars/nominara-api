@@ -21,6 +21,15 @@ import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
 // the assertion is that the tables it could have touched are untouched.
 
 const TTL_SECONDS = 86_400;
+/**
+ * The one engine this spec seeds, named once.
+ *
+ * Used both for the `INSERT INTO engines` row and for the capture-ready seam
+ * the calls below pass, so the two cannot drift — a seam naming an engine
+ * with no catalog row would resolve nothing and look exactly like a bug in
+ * the code under test.
+ */
+const SEEDED_ENGINE_KEY = "perplexity";
 const NOW = new Date(Date.UTC(2026, 7, 20, 12, 0, 0));
 
 describe("STORY-034 · estimating a manual deep scan", () => {
@@ -59,16 +68,21 @@ describe("STORY-034 · estimating a manual deep scan", () => {
        VALUES ($1, $2, 'P', $3, 'https://e.test', 'e.test', 10)`,
       [projectId, workspaceId, `p-${randomUUID().slice(0, 8)}`],
     );
+    // NO `cadence_by_plan`: an estimate PRICES a manual scan, and a manual
+    // scan is on-demand, so what the plan schedules is irrelevant to it.
+    // `project_entitled_engines` gates on the plan floor alone (STORY-130
+    // §57), so this engine resolves for the estimate while the scheduler
+    // would never pick it up — which is the free tier's "tools only" shape.
     await db.query(
       `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
                             cache_ttl_seconds, volatility_band, min_plan_key, status)
-       VALUES ('perplexity', 'perplexity', 'v', 'api', '1.0.0', $1, 'medium', 'free', 'active')`,
-      [TTL_SECONDS],
+       VALUES ($2, $2, 'v', 'api', '1.0.0', $1, 'medium', 'free', 'active')`,
+      [TTL_SECONDS, SEEDED_ENGINE_KEY],
     );
     await db.query(
       `INSERT INTO project_engines (workspace_id, project_id, engine_key, enabled, sample_count)
-       VALUES ($1, $2, 'perplexity', true, 1)`,
-      [workspaceId, projectId],
+       VALUES ($1, $2, $3, true, 1)`,
+      [workspaceId, projectId, SEEDED_ENGINE_KEY],
     );
   });
 
@@ -115,9 +129,20 @@ describe("STORY-034 · estimating a manual deep scan", () => {
     );
   }
 
+  // ⚠ THE SEAM, AND WHY THESE TESTS NEED ONE. STORY-152 made
+  // `resolveEnabledEngines` return ENTITLEMENT ∩ CAPTURE-READY, and the
+  // capture-ready set is EMPTY in production — every registry entry is
+  // fixture-backed and cannot answer a real prompt. The forecast below is
+  // about the cache split and the prompt-times-engine fan-out, and neither
+  // exists over an empty engine set, so this passes the one key it seeded.
+  //
+  // It is the SEEDED key rather than a literal list, so the fixture and the
+  // seam cannot drift into testing an engine that no row exists for.
+  // `engine-catalog-entitlement.spec.ts` asserts what production resolves
+  // without this argument, which is what keeps the default falsifiable.
   async function estimate() {
     const project = await loadManualRunProject(db, projectId);
-    return estimateManualRun(db, cache, project, NOW);
+    return estimateManualRun(db, cache, project, NOW, { captureReadyEngineKeys: [SEEDED_ENGINE_KEY] });
   }
 
   it("prices the scan from the plan, not from the cell count", async () => {

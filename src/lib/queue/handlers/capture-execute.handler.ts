@@ -1,4 +1,5 @@
 import { Logger } from "@nestjs/common";
+import { nonMeasurementStatusSql } from "../../rollup/aggregate-day.js";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
@@ -294,7 +295,7 @@ async function emitProgress(
 /** Which engines contributed to a failed run — §11's `failed_engines[]`. */
 async function failedEngines(tx: ClientBase, runId: string): Promise<string[]> {
   const rows = await tx.query<{ engine_key: string }>(
-    "SELECT DISTINCT engine_key FROM answer_captures WHERE run_id = $1 AND status IN ('failed','blocked')",
+    `SELECT DISTINCT engine_key FROM answer_captures WHERE run_id = $1 AND ${nonMeasurementStatusSql("status")}`,
     [runId],
   );
   return rows.rows.map((row) => row.engine_key);

@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { capturedInRunStatusSql, nonMeasurementStatusSql } from "../rollup/aggregate-day.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
 import type { RunStatus } from "../../../contracts/tracking/index.js";
 
@@ -87,8 +88,8 @@ export async function readRunProgress(tx: ClientBase, runId: string, now: Date =
             c.captured, c.failed, c.l1, c.l2
        FROM capture_runs r
        LEFT JOIN LATERAL (
-         SELECT count(*) FILTER (WHERE status IN ('captured','parsed'))          AS captured,
-                count(*) FILTER (WHERE status IN ('failed','blocked'))           AS failed,
+         SELECT count(*) FILTER (WHERE ${capturedInRunStatusSql("status")})          AS captured,
+                count(*) FILTER (WHERE ${nonMeasurementStatusSql("status")})           AS failed,
                 count(*) FILTER (WHERE cache_layer = 'l1')                       AS l1,
                 count(*) FILTER (WHERE cache_layer = 'l2')                       AS l2
            FROM answer_captures

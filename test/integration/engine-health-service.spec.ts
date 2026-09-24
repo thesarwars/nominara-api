@@ -31,16 +31,11 @@ describe("STORY-031 · EngineHealthService — real-Postgres concurrent upserts"
     pool = new Pool({ connectionString: container.getConnectionUri() });
     service = new EngineHealthService(pool);
 
-    // engine_health.engine_key FK-references engines(key) — seed the
-    // engines this file exercises (mirrors
-    // test/integration/projects-prompts-captures.spec.ts's createEngine()).
-    for (const key of ["chatgpt", "claude", "gemini", "perplexity"]) {
-      await pool.query(
-        `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version, cache_ttl_seconds, volatility_band, min_plan_key)
-         VALUES ($1, $1, 'vendor', 'api', 'v1', 3600, 'medium', 'free')`,
-        [key],
-      );
-    }
+    // ⚠ NO `INSERT INTO engines` HERE ANY MORE. `engine_health.engine_key`
+    // FK-references `engines(key)`, and migration 0027 seeds the catalog, so
+    // the rows this needs already exist by the time `migrateUp` returns.
+    // Re-inserting them is a duplicate-key error, and hand-seeding a row the
+    // product ships is how the empty catalog stayed invisible for so long.
   }, 120_000);
 
   afterAll(async () => {
@@ -135,10 +130,8 @@ describe("STORY-031 · EngineHealthService.perEngineStatus — D16 per-engine st
     const client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();
     await migrateUp(client);
-    await client.query(
-      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version, cache_ttl_seconds, volatility_band, min_plan_key)
-       VALUES ('chatgpt', 'chatgpt', 'v', 'api', 'v1', 3600, 'medium', 'free')`,
-    );
+    // No `INSERT INTO engines`: migration 0027 seeds the catalog, so the row
+    // the `engine_health` FK needs is already there.
     await client.end();
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
@@ -258,10 +251,8 @@ describe("STORY-031 fix round · EXPLAIN-budget — perEngineStatus() queries us
     client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();
     await migrateUp(client);
-    await client.query(
-      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version, cache_ttl_seconds, volatility_band, min_plan_key)
-       VALUES ('chatgpt', 'chatgpt', 'v', 'api', 'v1', 3600, 'medium', 'free')`,
-    );
+    // No `INSERT INTO engines`: migration 0027 seeds the catalog, so the row
+    // the `engine_health` FK needs is already there.
     for (let i = 0; i < 20; i++) {
       await client.query("INSERT INTO engine_health (engine_key, bucket_start, attempts) VALUES ('chatgpt', $1, 1)", [
         new Date(Date.UTC(2026, 0, 1, 0, i * 5, 0, 0)).toISOString(),

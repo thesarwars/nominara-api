@@ -195,6 +195,20 @@ export interface ScheduleContext {
   /** False for a workspace whose plan carries `no_shared_cache`. */
   readonly sharedCacheEnabled: boolean;
   readonly personaHint?: string | null;
+  /**
+   * ⚠ A TEST SEAM, AND PRODUCTION NEVER SETS IT. STORY-152.
+   *
+   * Forwarded verbatim to `PlanRunContext.captureReadyEngineKeys`, which
+   * documents it — the short version is that it defaults to the registry's
+   * capture-ready list, that list is EMPTY, and so a scheduled tick plans no
+   * cells until STORY-001 binds a real adapter.
+   *
+   * Carried here because `planScheduledRun` builds the plan context itself,
+   * so a spec exercising due-ness, AC5's covered set or AC6's jitter has no
+   * other way to reach it. `engine-catalog-entitlement.spec.ts` is what
+   * asserts the production default, so this cannot hide it.
+   */
+  readonly captureReadyEngineKeys?: readonly string[];
 }
 
 export interface ScheduledRun {
@@ -232,11 +246,20 @@ export async function planScheduledRun(
     readonly now: Date;
   },
 ): Promise<ScheduledRun | null> {
-  const dueEngines = await resolveDueEngines(tx, {
-    projectId: project.projectId,
-    kind: options.kind,
-    now: options.now,
-  });
+  const dueEngines = await resolveDueEngines(
+    tx,
+    {
+      projectId: project.projectId,
+      kind: options.kind,
+      now: options.now,
+    },
+    // Forwarded so the due set and the planned cells agree on what is
+    // capturable. If they disagreed, this would write a run row that planRun
+    // then filled with nothing — see engine-cadence.ts's fifth condition.
+    // `undefined` means "use the production default", which is what every
+    // real caller does, because nothing sets this field.
+    context.captureReadyEngineKeys,
+  );
 
   // No engine due. The project is still advanced, deliberately: leaving
   // next_run_at in the past would re-claim it on every tick for the rest of
@@ -294,6 +317,12 @@ export async function planScheduledRun(
     env: context.env,
     sharedCacheEnabled: context.sharedCacheEnabled,
     nowMs: options.now.getTime(),
+    // Spread rather than assigned, because `exactOptionalPropertyTypes` makes
+    // an explicit `undefined` a different thing from an absent key — and the
+    // default only applies when the key is absent.
+    ...(context.captureReadyEngineKeys === undefined
+      ? {}
+      : { captureReadyEngineKeys: context.captureReadyEngineKeys }),
   });
 
   // AC3 — BEFORE the enqueue, in this transaction. The compare-and-set can

@@ -75,8 +75,10 @@ describe("STORY-011 · pnpm db:rls-check", () => {
     await client.end();
   });
 
-  it("a freshly-migrated database is clean — all five buckets empty", async () => {
+  it("a freshly-migrated database is clean — all SEVEN buckets empty", async () => {
     const result = await checkRls(client);
+    // Whole-object equality on purpose: a new bucket that nobody adds here
+    // fails this test, which is how the seventh one got noticed at all.
     expect(result).toEqual({
       unclassifiedTables: [],
       missingRls: [],
@@ -84,6 +86,9 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       unexpectedPolicies: [],
       policiesWithoutWithCheck: [],
       globalTablesWithPolicies: [],
+      viewsWithoutSecurityInvoker: [],
+      unclassifiedRelations: [],
+      unmanagedTables: [],
     });
     expect(isClean(result)).toBe(true);
   });
@@ -307,6 +312,256 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       const sql = await readFile(path.join(migrationsDir, "0006_generated_rls_policies.up.sql"), "utf8");
       await client.query("DROP POLICY IF EXISTS ws_isolation_competitors ON competitors");
       await client.query(sql);
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // STORY-152 — the seventh bucket, and the only one about a relation this
+  // check could not previously SEE.
+  //
+  // ⚠ THIS IS A REAL LEAK THAT THE OTHER SIX CALLED CLEAN. `CENSUS_TABLES_SQL`
+  // filters `relkind IN ('r','p')`, `test/isolation/support/discovery.ts` uses
+  // the same filter, and ISO-16 inspects `pg_matviews` — so before this bucket
+  // existed, a plain view was outside every gate's universe. A view without
+  // `security_invoker` executes as its OWNER, the migration role, which
+  // bypasses RLS on every base table it reads.
+  //
+  // The breaker below is the exact reproduction from STORY-152's review: it
+  // returned `isClean: true` on a database containing this view granted to all
+  // four runtime roles, while the view served every tenant's rows to a caller
+  // pinned to one workspace.
+  // --------------------------------------------------------------------------
+
+  it("bucket: viewsWithoutSecurityInvoker — a view that bypasses RLS on its base tables", async () => {
+    await client.query("CREATE VIEW leaky_probe_view AS SELECT * FROM projects");
+    try {
+      const result = await checkRls(client);
+      expect(
+        result.viewsWithoutSecurityInvoker,
+        "a view with no reloptions at all must FAIL — unset is the dangerous default, not a pass",
+      ).toContain("leaky_probe_view: security_invoker=unset");
+      expect(isClean(result), "and it must make the whole check dirty, or the gate still passes").toBe(false);
+    } finally {
+      await client.query("DROP VIEW IF EXISTS leaky_probe_view");
+    }
+  });
+
+  it("bucket: viewsWithoutSecurityInvoker — explicitly FALSE is caught too, not just absent", async () => {
+    // The one-edit path back to a leak on a view that was created correctly:
+    // `ALTER VIEW ... SET (security_invoker = false)` leaves reloptions
+    // populated, so a check that merely tested for a non-empty array would
+    // pass this.
+    await client.query("CREATE VIEW invoker_off_view WITH (security_invoker = false) AS SELECT * FROM projects");
+    try {
+      const result = await checkRls(client);
+      expect(result.viewsWithoutSecurityInvoker).toContain("invoker_off_view: security_invoker=security_invoker=false");
+      expect(isClean(result)).toBe(false);
+    } finally {
+      await client.query("DROP VIEW IF EXISTS invoker_off_view");
+    }
+  });
+
+  it("⚠ a CORRECT view passes, so the bucket discriminates rather than failing everything", async () => {
+    // The anti-vacuity half. Without this, a bucket that reported every view
+    // unconditionally would pass both breakers above and be indistinguishable
+    // from a working one.
+    //
+    // A view built here rather than `project_entitled_engines`: this fixture
+    // applies a hand-picked migration SUBSET (see beforeAll) and the story's
+    // own view is not in it. Building the shape locally tests the property
+    // instead of the fixture's migration list, and does not silently start
+    // passing for a different reason if that list changes.
+    await client.query("CREATE VIEW correct_probe_view WITH (security_invoker = true) AS SELECT * FROM projects");
+    try {
+      const result = await checkRls(client);
+      expect(
+        result.viewsWithoutSecurityInvoker,
+        "a view carrying security_invoker=true must NOT be reported",
+      ).toEqual([]);
+      expect(isClean(result)).toBe(true);
+    } finally {
+      await client.query("DROP VIEW IF EXISTS correct_probe_view");
+    }
+  });
+
+  // ⚠ `WITH (security_invoker = on)` IS CORRECT AND MUST NOT BE REPORTED.
+  // Postgres stores the author's spelling, so a string match on "=true" flags
+  // a view that is properly protected. Fail-safe, but a gate that cries wolf
+  // is a gate people stop reading.
+  it("accepts every spelling Postgres accepts for security_invoker", async () => {
+    await client.query("CREATE VIEW v_on WITH (security_invoker = on) AS SELECT * FROM projects");
+    await client.query("CREATE VIEW v_bare WITH (security_invoker) AS SELECT * FROM projects");
+    await client.query(
+      "CREATE VIEW v_barrier WITH (security_barrier = true, security_invoker = true) AS SELECT * FROM projects",
+    );
+    try {
+      const result = await checkRls(client);
+      expect(result.viewsWithoutSecurityInvoker, "all three spellings mean true").toEqual([]);
+      expect(isClean(result)).toBe(true);
+    } finally {
+      for (const name of ["v_on", "v_bare", "v_barrier"]) {
+        await client.query(`DROP VIEW IF EXISTS ${name}`);
+      }
+    }
+  });
+
+  // ==========================================================================
+  // ⚠ THE CLASS, NOT THE INSTANCE.
+  //
+  // The view hole existed because this module enumerated an allow-list of
+  // relkinds and everything else was invisible. Adding views to the list fixed
+  // one entry and left the shape — a review then walked ONE RELKIND OVER and
+  // did it again with a foreign table, to which RLS does not apply at all.
+  // The census is inverted now, and these are its breakers.
+  // ==========================================================================
+  it("bucket: unclassifiedRelations — a MATERIALIZED view, which has no bucket of its own", async () => {
+    await client.query("CREATE MATERIALIZED VIEW mv_probe AS SELECT id, workspace_id FROM projects");
+    try {
+      const result = await checkRls(client);
+      expect(result.unclassifiedRelations).toContain("mv_probe (relkind=m)");
+      expect(isClean(result), "ISO-16 forbids these; rls-check must not call one clean").toBe(false);
+    } finally {
+      await client.query("DROP MATERIALIZED VIEW IF EXISTS mv_probe");
+    }
+  });
+
+  it("bucket: unclassifiedRelations — a FOREIGN TABLE, which RLS does not apply to at all", async () => {
+    // The exact shape a review used to walk around the seventh bucket. There
+    // is no policy to be missing and no flag to be unset, so every other
+    // bucket is silent by construction.
+    await client.query("CREATE EXTENSION IF NOT EXISTS file_fdw");
+    await client.query("CREATE SERVER IF NOT EXISTS probe_srv FOREIGN DATA WRAPPER file_fdw");
+    await client.query(
+      "CREATE FOREIGN TABLE projects_shadow (id uuid, workspace_id uuid) SERVER probe_srv OPTIONS (filename '/dev/null', format 'csv')",
+    );
+    try {
+      const result = await checkRls(client);
+      expect(result.unclassifiedRelations).toContain("projects_shadow (relkind=f)");
+      expect(isClean(result)).toBe(false);
+    } finally {
+      await client.query("DROP FOREIGN TABLE IF EXISTS projects_shadow");
+      await client.query("DROP SERVER IF EXISTS probe_srv");
+    }
+  });
+
+  // ⚠ THE SAME RELATION, IN THE SCHEMA THE FIRST FIX FORGOT. The relkind
+  // census was `public`-only for a round while ISO-23 had already been
+  // widened — so the reasoning was written down in this repository and simply
+  // not carried across. A review planted this in `app`, where the codebase
+  // already keeps functions, and it fell through every control: this bucket
+  // did not see the schema, ISO-23 looks only at views, ISO-16 only at
+  // matviews, and RLS does not apply to foreign tables at all.
+  it("bucket: unclassifiedRelations — a foreign table in a NON-public schema", async () => {
+    await client.query("CREATE EXTENSION IF NOT EXISTS file_fdw");
+    await client.query("CREATE SERVER IF NOT EXISTS probe_srv2 FOREIGN DATA WRAPPER file_fdw");
+    await client.query("CREATE SCHEMA IF NOT EXISTS app");
+    await client.query(
+      "CREATE FOREIGN TABLE app.projects_shadow (id uuid, workspace_id uuid) SERVER probe_srv2 OPTIONS (filename '/dev/null', format 'csv')",
+    );
+    try {
+      const result = await checkRls(client);
+      expect(result.unclassifiedRelations, "schema-qualified, because `public` is no longer assumed").toContain(
+        "app.projects_shadow (relkind=f)",
+      );
+      expect(isClean(result)).toBe(false);
+    } finally {
+      await client.query("DROP FOREIGN TABLE IF EXISTS app.projects_shadow");
+      await client.query("DROP SERVER IF EXISTS probe_srv2");
+    }
+  });
+
+  // `security_invoker = t` was reported as a violation by the second version
+  // of this check, which enumerated `true|on|1|yes`. Postgres's boolean input
+  // also takes `t`, `tr`, `tru`, `y`, `ye` and every case variant, so the
+  // enumeration was always going to be one spelling short. The parse is
+  // Postgres's own now, and this asserts the awkward spellings rather than
+  // the obvious ones.
+  it.each(["t", "T", "TRUE", "yes", "1", "on"])(
+    "accepts security_invoker = %s, because Postgres does",
+    async (spelling) => {
+      await client.query(`CREATE VIEW v_spell WITH (security_invoker = ${spelling}) AS SELECT * FROM projects`);
+      try {
+        const result = await checkRls(client);
+        expect(result.viewsWithoutSecurityInvoker).toEqual([]);
+      } finally {
+        await client.query("DROP VIEW IF EXISTS v_spell");
+      }
+    },
+  );
+
+  // ==========================================================================
+  // ⚠ THE FOURTH INSTANCE OF THE CLASS, AND THE MOST ORDINARY RELATION OF ALL.
+  //
+  // STORY-152 widened two queries to every schema — the two a review had
+  // planted objects in — and left the census feeding the other six buckets on
+  // `public`. A review then planted an ORDINARY TABLE with a `workspace_id`,
+  // granted to every runtime role, RLS not even enabled, and all eight buckets
+  // reported clean.
+  //
+  // `unclassifiedRelations` cannot catch it and should not: `r` is correctly
+  // in its handled list. The generator's census is rightly `public`-only
+  // because it emits unqualified DDL. So the gap is closed by refusing to let
+  // a base table sit OUTSIDE that scope unnoticed.
+  // ==========================================================================
+  it("bucket: unmanagedTables — a tenant-bearing table in another schema", async () => {
+    await client.query("CREATE SCHEMA IF NOT EXISTS tenantdata");
+    await client.query(
+      "CREATE TABLE tenantdata.leaked_captures (id uuid primary key, workspace_id uuid not null, secret text)",
+    );
+    try {
+      const result = await checkRls(client);
+      expect(result.unmanagedTables).toContain("tenantdata.leaked_captures");
+      expect(isClean(result), "RLS is not even enabled on it — this must not read as clean").toBe(false);
+      // The other buckets genuinely cannot see it, which is why this one
+      // exists. Asserted so that a future change making them see it is a
+      // deliberate decision rather than a silent overlap.
+      expect(result.unclassifiedTables).toEqual([]);
+      expect(result.missingRls).toEqual([]);
+      expect(result.unclassifiedRelations).toEqual([]);
+    } finally {
+      await client.query("DROP TABLE IF EXISTS tenantdata.leaked_captures");
+      await client.query("DROP SCHEMA IF EXISTS tenantdata");
+    }
+  });
+
+  it("the migration ledger is the one declared exception, and only it", async () => {
+    // `_migrations.applied` must NOT be reported — it is created before any
+    // migration runs and holds file names. Asserting it is ABSENT is what
+    // stops someone widening the exception into "the whole _migrations schema".
+    const clean = await checkRls(client);
+    expect(clean.unmanagedTables).toEqual([]);
+
+    await client.query("CREATE TABLE _migrations.sneaky (id uuid primary key, workspace_id uuid)");
+    try {
+      const result = await checkRls(client);
+      expect(
+        result.unmanagedTables,
+        "a SECOND table in _migrations is not covered by the exception",
+      ).toContain("_migrations.sneaky");
+    } finally {
+      await client.query("DROP TABLE IF EXISTS _migrations.sneaky");
+    }
+  });
+
+  it("extension-owned views are excluded by dependency, not by name", async () => {
+    // pg_stat_statements installs two views into `public` with no
+    // security_invoker. They are excluded via pg_depend deptype='e' — and if
+    // that exclusion ever became a two-name allow-list, this asserts the
+    // mechanism that makes the NEXT extension safe too.
+    const extensionViews = await client.query<{ relname: string }>(
+      `SELECT c.relname
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_depend d ON d.objid = c.oid AND d.classid = 'pg_class'::regclass AND d.deptype = 'e'
+        WHERE n.nspname = 'public' AND c.relkind = 'v'`,
+    );
+    expect(
+      extensionViews.rowCount,
+      "if no extension view exists here, the exclusion below is proving nothing",
+    ).toBeGreaterThan(0);
+    const result = await checkRls(client);
+    for (const row of extensionViews.rows) {
+      expect(result.viewsWithoutSecurityInvoker.join(",")).not.toContain(row.relname);
     }
   });
 });

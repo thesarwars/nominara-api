@@ -20,6 +20,15 @@ import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixtur
 // read back off it.
 
 const TTL_SECONDS = 86_400;
+/**
+ * The one engine this spec seeds, named once.
+ *
+ * Used both for the `INSERT INTO engines` row and for the capture-ready seam
+ * the calls below pass, so the two cannot drift — a seam naming an engine
+ * with no catalog row would resolve nothing and look exactly like a bug in
+ * the code under test.
+ */
+const SEEDED_ENGINE_KEY = "perplexity";
 const NOW = new Date(Date.UTC(2026, 7, 20, 12, 0, 0));
 
 describe("STORY-034 · the manual run lifecycle", () => {
@@ -64,8 +73,8 @@ describe("STORY-034 · the manual run lifecycle", () => {
     await db.query(
       `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
                             cache_ttl_seconds, volatility_band, min_plan_key, status)
-       VALUES ('perplexity', 'perplexity', 'v', 'api', '1.0.0', $1, 'medium', 'free', 'active')`,
-      [TTL_SECONDS],
+       VALUES ($2, $2, 'v', 'api', '1.0.0', $1, 'medium', 'free', 'active')`,
+      [TTL_SECONDS, SEEDED_ENGINE_KEY],
     );
     await db.query(
       `INSERT INTO project_engines (workspace_id, project_id, engine_key, enabled, sample_count)
@@ -112,7 +121,12 @@ describe("STORY-034 · the manual run lifecycle", () => {
     const project = await loadManualRunProject(db, projectId);
     await db.query("BEGIN");
     try {
-      await planManualRun(db, cache, project, { runId, triggeredBy: null, now: NOW });
+      await planManualRun(db, cache, project, {
+        runId,
+        triggeredBy: null,
+        now: NOW,
+        captureReadyEngineKeys: [SEEDED_ENGINE_KEY],
+      });
       await db.query("COMMIT");
     } catch (error) {
       await db.query("ROLLBACK");
@@ -151,6 +165,7 @@ describe("STORY-034 · the manual run lifecycle", () => {
       runId: uuidV7(),
       triggeredBy: null,
       now: NOW,
+      captureReadyEngineKeys: [SEEDED_ENGINE_KEY],
     });
     await db.query("COMMIT");
 
@@ -253,7 +268,12 @@ describe("STORY-034 · the manual run lifecycle", () => {
       await addPrompt("crm with the best hubspot migration path");
       const project = await loadManualRunProject(db, projectId);
       await db.query("BEGIN");
-      const { plan } = await planManualRun(db, cache, project, { runId: uuidV7(), triggeredBy: null, now: NOW });
+      const { plan } = await planManualRun(db, cache, project, {
+        runId: uuidV7(),
+        triggeredBy: null,
+        now: NOW,
+        captureReadyEngineKeys: [SEEDED_ENGINE_KEY],
+      });
       await db.query("COMMIT");
 
       const jobs = await producer().dispatchPlannedCells("capture.execute", plan, {
@@ -280,7 +300,12 @@ describe("STORY-034 · the manual run lifecycle", () => {
       await addPrompt("best crm for a 50-rep sales team");
       const project = await loadManualRunProject(db, projectId);
       await db.query("BEGIN");
-      const { plan } = await planManualRun(db, cache, project, { runId: uuidV7(), triggeredBy: null, now: NOW });
+      const { plan } = await planManualRun(db, cache, project, {
+        runId: uuidV7(),
+        triggeredBy: null,
+        now: NOW,
+        captureReadyEngineKeys: [SEEDED_ENGINE_KEY],
+      });
       await db.query("COMMIT");
 
       await expect(

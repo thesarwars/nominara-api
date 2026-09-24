@@ -45,6 +45,21 @@ export interface PlanRunContext {
   readonly scope: PromptScope;
   /** Narrows the engine set; can never widen it past the entitlement. */
   readonly engineKeys?: readonly string[];
+  /**
+   * ⚠ A TEST SEAM, AND PRODUCTION NEVER SETS IT. STORY-152.
+   *
+   * Defaults to the registry's derived capture-ready list, which is EMPTY —
+   * every active engine is fixture-backed and cannot answer a real prompt, so
+   * production plans no cells at all until STORY-001 opens vendor accounts and
+   * an adapter story flips its own flag.
+   *
+   * The run-lifecycle specs are about dispatch, progress, suppression and
+   * failure, none of which can be exercised with an empty set, so they pass
+   * the keys they seeded. `engine-catalog-entitlement.spec.ts` asserts what
+   * production resolves WITHOUT this, which is what stops the default being an
+   * unfalsifiable one.
+   */
+  readonly captureReadyEngineKeys?: readonly string[];
   /** The billing cycle the fair-use counter belongs to. */
   readonly periodStart: string;
   readonly locale: string;

@@ -7,6 +7,24 @@ import type { TableDescriptor } from "./generate.js";
 // (`relkind IN ('r','p') AND NOT relispartition`) — so the generator's own
 // notion of "which tables exist" and that test's notion can never silently
 // diverge from one another.
+//
+// ⚠ `public` HERE IS CORRECT, AND IT IS NOT THE SAME DECISION AS THE ONE
+// STORY-152 GOT WRONG TWICE ELSEWHERE.
+//
+// This census feeds the GENERATOR (`pnpm db:rls-generate`), which emits
+// `ALTER TABLE <name> ENABLE ROW LEVEL SECURITY` and `CREATE POLICY ... ON
+// <name>` with UNQUALIFIED names. Widening it would make the generator write
+// statements that resolve by `search_path` — correct for public and wrong
+// for anything else. The generator manages `public`; that is a real boundary,
+// not an oversight.
+//
+// What was missing is the other half of the same sentence: NOTHING said so,
+// and nothing reported a table outside `public`. A review planted
+// `tenantdata.leaked_captures` and `app.leaked_workspaces` — both carrying
+// `workspace_id`, both granted to every runtime role, RLS not even enabled —
+// and all eight buckets were empty. `checkRls`'s `unmanagedTables` bucket is
+// where that is answered now: this function scopes the generator, and that
+// bucket refuses to let anything sit silently outside its scope.
 const CENSUS_TABLES_SQL = `
   SELECT c.relname AS table_name
     FROM pg_class c

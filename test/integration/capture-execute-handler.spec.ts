@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import type { Cache } from "../../src/lib/cache/cache.port.js";
@@ -32,6 +32,36 @@ import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 // through fixture adapters" — assumes a fallback the adapter does not have.
 // Recorded rather than fixed here: loosening a test double's matching is a
 // decision about what the demo proves, not a detail of this handler.
+
+// STORY-152 — the capture-ready seam, and the only reason this spec sets it.
+//
+// `resolveEnabledEngines` returns ENTITLEMENT ∩ CAPTURE-READY, and production's
+// capture-ready set is EMPTY: every active engine in `registry.ts` is bound to
+// a fixture adapter that cannot answer a real prompt, so planning a cell for
+// one would manufacture a failure out of a request we never made. This suite is
+// about the RUN LIFECYCLE — dispatch, progress, coalescing, cancellation, the
+// parse hand-off — none of which exists without a cell, so it declares
+// capture-ready exactly the one engine it seeds below and nothing else.
+//
+// Hoisted because the `vi.mock` factory beneath runs before module-level
+// initialisation.
+const { SEEDED_ENGINE_KEY, SEEDED_CAPTURE_READY_ENGINE_KEYS } = vi.hoisted(() => {
+  const key = "perplexity";
+  return { SEEDED_ENGINE_KEY: key, SEEDED_CAPTURE_READY_ENGINE_KEYS: [key] as readonly string[] };
+});
+
+// The seam is on `PlanRunContext`, but this suite plans through
+// `planManualRun`, which builds that context itself and — correctly — never
+// sets it. So the real `planRun` is called with the seam added and everything
+// else untouched, rather than rebuilding the manual-run planner's context here:
+// a hand-rolled context would make the reuse test assert against the spec's own
+// key namespace, TTL and shared-cache flag instead of the ones production picks.
+vi.mock("../../src/lib/capture/plan-run.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/lib/capture/plan-run.js")>();
+  const planRunWithCaptureReadySeam: typeof actual.planRun = (tx, cache, context) =>
+    actual.planRun(tx, cache, { ...context, captureReadyEngineKeys: SEEDED_CAPTURE_READY_ENGINE_KEYS });
+  return { ...actual, planRun: planRunWithCaptureReadySeam };
+});
 
 const NOW = new Date(Date.UTC(2026, 7, 20, 12, 0, 0));
 
@@ -92,15 +122,23 @@ describe("STORY-034 · capture.execute moves a cell", () => {
        VALUES ($1, $2, 'P', $3, 'https://e.test', 'e.test', 10)`,
       [projectId, workspaceId, `p-${randomUUID().slice(0, 8)}`],
     );
+    // NO `cadence_by_plan`, DELIBERATELY. `project_entitled_engines` gates on
+    // the plan FLOOR only; a cadence entry decides whether the SCHEDULER runs
+    // the engine, not whether the project may capture on it (STORY-130 §57).
+    // This spec executes a cell that is already planned, so an engine with no
+    // cadence at all is the honest fixture — and it pins that distinction.
     await db.query(
       `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
                             cache_ttl_seconds, volatility_band, min_plan_key, status)
-       VALUES ('perplexity', 'perplexity', 'v', 'api', '1.0.0', 86400, 'medium', 'free', 'active')`,
+       VALUES ($1, 'perplexity', 'v', 'api', '1.0.0', 86400, 'medium', 'free', 'active')`,
+      [SEEDED_ENGINE_KEY],
     );
+    // The override row: it narrows, it cannot widen. Same key the seam above
+    // declares capture-ready, read from one constant so the two cannot drift.
     await db.query(
       `INSERT INTO project_engines (workspace_id, project_id, engine_key, enabled, sample_count)
-       VALUES ($1, $2, 'perplexity', true, 1)`,
-      [workspaceId, projectId],
+       VALUES ($1, $2, $3, true, 1)`,
+      [workspaceId, projectId, SEEDED_ENGINE_KEY],
     );
   });
 

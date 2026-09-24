@@ -28,10 +28,11 @@ describe("STORY-031 · CanaryRuntime — real Postgres + real cache Valkey, end 
     const client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();
     await migrateUp(client);
-    await client.query(
-      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version, cache_ttl_seconds, volatility_band, min_plan_key)
-       VALUES ('chatgpt', 'chatgpt', 'vendor', 'api', 'v1', 3600, 'medium', 'free')`,
-    );
+    // ⚠ NO `INSERT INTO engines` HERE ANY MORE. `engine_health.engine_key`
+    // FK-references `engines(key)`, and migration 0027 seeds the catalog, so
+    // the rows this needs already exist by the time `migrateUp` returns.
+    // Re-inserting them is a duplicate-key error, and hand-seeding a row the
+    // product ships is how the empty catalog stayed invisible for so long.
     await client.end();
 
     pool = new Pool({ connectionString: container.getConnectionUri() });

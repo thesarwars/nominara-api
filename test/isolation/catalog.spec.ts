@@ -3,6 +3,7 @@ import { assertIso06Census } from "./assertions/iso-06-census.js";
 import { assertIso05PolicyShape } from "./assertions/iso-05-policy-shape.js";
 import { assertIso07NoBypassRls } from "./assertions/iso-07-no-bypassrls.js";
 import { assertIso16NoMaterializedViews } from "./assertions/iso-16-no-matviews.js";
+import { assertIso23ViewsSecurityInvoker } from "./assertions/iso-23-views-security-invoker.js";
 import { assertIso17PartitionRlsApplied } from "./assertions/iso-17-partition-rls-applied.js";
 import { getAssertionContext } from "./support/context.js";
 
@@ -29,6 +30,15 @@ describe("ISO-07 · no runtime role holds BYPASSRLS except nominara_breakglass",
 describe("ISO-16 · no materialized view exists; migration lint enforces it", () => {
   it("holds against the live schema and every committed migration file", async () => {
     await expect(assertIso16NoMaterializedViews(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+// STORY-152 — next to ISO-16 deliberately: same hazard, different relkind. A
+// plain view without security_invoker executes as its OWNER and bypasses RLS
+// exactly as a matview does.
+describe("ISO-23 · every view in `public` carries security_invoker=true", () => {
+  it("holds against the live schema, and finds at least one view to check", async () => {
+    await expect(assertIso23ViewsSecurityInvoker(getAssertionContext())).resolves.toBeUndefined();
   });
 });
 

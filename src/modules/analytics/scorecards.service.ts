@@ -11,7 +11,7 @@ import {
   type Scorecard,
   type WindowMetrics,
 } from "../../lib/analytics/scorecard.js";
-import { aggregateRange } from "../../lib/rollup/aggregate-day.js";
+import { aggregateRange, answeredStatusSql, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`.
@@ -62,7 +62,28 @@ export class ScorecardsService {
 
     const window = await this.resolveWindow(tx, projectId, TIMEFRAME_DAYS[query.timeframe]);
     const requested = query.engines?.split(",").map((key) => key.trim()).filter((key) => key.length > 0) ?? null;
-    const engines = await this.engineConfig(tx, projectId, requested);
+    // ⚠ `priorFrom`, NOT `from` — THE MEMBERSHIP SPAN COVERS BOTH LEGS.
+    //
+    // `blendScorecards` builds the current AND prior blends from this one
+    // list, so a list scoped to the current window gives the prior leg a
+    // membership rule of "engines measured in the CURRENT window". An engine
+    // measured in the prior window and silent since — the exact shape of a
+    // downgrade — was then missing from `priorMetrics` while the stored
+    // cross-engine rows counted it over those days, so `visibility_delta`,
+    // the number the measured-membership rule exists to protect, was computed
+    // over a set the rule does not describe.
+    //
+    // `priorTo` is `from - 1 day` (see resolveWindow), so `priorFrom … to` is
+    // contiguous and one span covers both windows with no gap.
+    //
+    // Widening membership cannot move the CURRENT blend: an engine with no
+    // current metrics carries `EMPTY_WINDOW_METRICS`, and `blendMetrics`
+    // filters nulls before summing the denominator, so it is in neither
+    // numerator nor denominator. It does make such an engine VISIBLE in the
+    // response for up to one further window, which is correct — an engine
+    // that stopped being measured is a thing the screen should show, not
+    // hide.
+    const engines = await this.engineConfig(tx, projectId, requested, window.priorFrom, window.to, window.timezone);
 
     // TWO RANGE AGGREGATIONS, not 2 × N. `aggregateRange` groups by engine, so
     // the whole window costs one scan per period however many engines the
@@ -149,7 +170,16 @@ export class ScorecardsService {
    * silently shrink the screen rather than showing an engine with no
    * configuration behind it.
    */
-  private async engineConfig(tx: ClientBase, projectId: string, requested: string[] | null): Promise<EngineConfig[]> {
+  private async engineConfig(
+    tx: ClientBase,
+    projectId: string,
+    requested: string[] | null,
+    /** The lower bound of the MEMBERSHIP span — the PRIOR window's start. */
+    measuredFrom: string,
+    /** The current window's end. `measuredFrom … measuredTo` covers both legs. */
+    measuredTo: string,
+    timezone: string,
+  ): Promise<EngineConfig[]> {
     const result = await tx.query<{
       engine_key: string;
       display_name: string | null;
@@ -157,15 +187,116 @@ export class ScorecardsService {
       weight: string;
       last_captured_at: Date | null;
     }>(
-      `SELECT pe.engine_key,
-              e.display_name,
-              (e.cadence_by_plan -> w.plan_key ->> 'full')::int AS runs_per_cycle,
-              pe.weight::text AS weight,
+      // THE VIEW, NOT project_engines — plus everything the window MEASURED.
+      // STORY-152.
+      //
+      // Three joins collapse into the view, and it supplies the plan floor
+      // this read never had, the display name, and the cadence. The cadence
+      // matters most: this used to re-derive it with its own copy of
+      // `cadence_by_plan -> plan_key ->> 'full'`, the same expression the
+      // scheduler uses, written out a second time. FR-CRD-09 asks that the
+      // customer-visible freshness figure cannot drift from the scheduler,
+      // and two copies of an expression is exactly how it would. `pes.cadence`
+      // IS the scheduler's object.
+      //
+      // ⚠ BUT ENTITLEMENT DOES NOT DECIDE MEMBERSHIP OF THE BLEND, AND THAT
+      // DISTINCTION IS THE WHOLE `measured` CTE.
+      //
+      // Driving this query from the view alone — which is what the first
+      // version of this change did — silently redefined the blended
+      // visibility score as "over the engines you are entitled to TODAY".
+      // The stored cross-engine row (`roll-up-day.ts`'s upsertCrossEngineRows,
+      // which Growth Map and the trend series read) blends every engine with
+      // a `metric_daily` row and applies no floor at all. Before this story
+      // both were unfiltered and agreed; after it they disagreed by 17.75
+      // points on a project holding an override for an engine its plan no
+      // longer buys — reachable the moment a workspace downgrades, which
+      // STORY-151 made possible.
+      //
+      // The rule, decided rather than inherited: A BLEND IS A STATEMENT ABOUT
+      // WHAT WAS MEASURED. Entitlement governs what may be captured NEXT, so
+      // it cannot retroactively remove a measurement that was taken — a past
+      // day's score has to stay reproducible from an export, which is what
+      // the 1e-9 reproducibility claim rests on.
+      //
+      // So the key set is ENTITLED ∪ MEASURED-IN-EITHER-WINDOW. The union is
+      // deliberate in both directions:
+      //   entitled-but-unmeasured — carries no metrics, so it changes no
+      //   number (blendMetrics filters nulls before summing the denominator),
+      //   and it renders as "enabled and never measured", which is the
+      //   distinction the matrix draws too.
+      //   measured-but-unentitled — carries the metrics that the stored
+      //   rollup already counted, so the header now agrees with the chart.
+      //
+      // `measured` is scoped to the window because the blend is; an engine
+      // last measured before it would add a row with nothing in it. The span
+      // is the PRIOR window's start to the CURRENT window's end, because both
+      // blend legs are built from this one list — see the call site.
+      //
+      // ⚠ AND IT USES `aggregateRange`'s OWN PREDICATE, CHARACTER FOR
+      // CHARACTER — `(captured_at AT TIME ZONE tz)::date BETWEEN from AND to`
+      // (aggregate-day.ts:139). The first version of this CTE wrote a
+      // plausible equivalent instead, `captured_at >= from AND < to`, and it
+      // was wrong in two independent ways:
+      //
+      //   `to` IS INCLUSIVE THERE AND WAS EXCLUSIVE HERE, so this discarded
+      //   the window's entire final day. An engine whose only capture is
+      //   TODAY carried metrics that `aggregateRange` returned and that this
+      //   CTE could not see — dropping it from the blend while the stored
+      //   rollup counted it. That is the exact divergence this CTE exists to
+      //   close, reopened and narrowed to "the captures are from today",
+      //   which is the day a customer opens their dashboard after a scan.
+      //
+      //   AND IT DID NOT CONVERT THE TIMEZONE. `aggregateRange` buckets in
+      //   the WORKSPACE's zone; a bare 'YYYY-MM-DD' cast to timestamptz is
+      //   parsed in the SESSION's. For Australia/Sydney that is a ten-hour
+      //   skew, and combined with the above a Sydney workspace lost about the
+      //   last 34 hours of its window.
+      //
+      // Two spellings of one boundary is the same defect this file already
+      // avoids for the cadence expression. There is one spelling now, and it
+      // is the aggregation's.
+      `WITH measured AS (
+         SELECT DISTINCT c.engine_key
+           FROM answer_captures c
+          WHERE c.project_id = $1
+            -- ⚠ THE AGGREGATION'S OWN CONSTANT, NOT A COPY OF IT. This read
+            -- IN ('captured','parsed','skipped') for a round: the same SET
+            -- as the aggregation's rule and the opposite KIND of rule, an
+            -- allow-list against a deny-list. Equal over today's five
+            -- statuses, and divergent the moment a sixth is added -- the new
+            -- value would count as a measurement in the stored rollup and
+            -- not here, dropping the engine from the header's blend while
+            -- the chart counted it. That is this story's round-2 divergence
+            -- exactly, arriving by the last predicate that was still written
+            -- out twice.
+            --
+            -- Interpolated from one definition so there is nothing to keep
+            -- in step. The alias c is what the constant expects.
+            AND ${measurementStatusSql()}
+            AND (c.captured_at AT TIME ZONE $5)::date BETWEEN $3::date AND $4::date
+       ),
+       engine_keys AS (
+         SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 AND enabled = true
+         UNION
+         SELECT engine_key FROM measured
+       )
+       SELECT k.engine_key,
+              COALESCE(pes.display_name, cat.display_name) AS display_name,
+              -- NULL for an unentitled engine, and correctly so: a plan that
+              -- does not sell the engine schedules no runs of it. The screen
+              -- already renders a null cadence.
+              (pes.cadence ->> 'full')::int AS runs_per_cycle,
+              -- Matches roll-up-day.ts's COALESCE(pe.weight, 1.0) exactly, so
+              -- the two blends weight an engine identically. pes.weight
+              -- already folds the override in for entitled engines.
+              COALESCE(pes.weight, ov.weight, 1.0::real)::text AS weight,
               last_capture.captured_at AS last_captured_at
-         FROM project_engines pe
-         JOIN projects p   ON p.id = pe.project_id
-         JOIN workspaces w ON w.id = p.workspace_id
-         LEFT JOIN engines e ON e.key = pe.engine_key
+         FROM engine_keys k
+         LEFT JOIN project_entitled_engines pes
+                ON pes.project_id = $1 AND pes.engine_key = k.engine_key AND pes.enabled = true
+         LEFT JOIN engines cat ON cat.key = k.engine_key
+         LEFT JOIN project_engines ov ON ov.project_id = $1 AND ov.engine_key = k.engine_key
          -- NOT WINDOWED, deliberately. An engine that last answered before
          -- the window is exactly the one worth surfacing, and clamping this
          -- to the window would report null for the engine that has been
@@ -173,14 +304,13 @@ export class ScorecardsService {
          LEFT JOIN LATERAL (
            SELECT max(c.captured_at) AS captured_at
              FROM answer_captures c
-            WHERE c.project_id = pe.project_id
-              AND c.engine_key = pe.engine_key
-              AND c.status IN ('captured', 'parsed', 'skipped')
+            WHERE c.project_id = $1
+              AND c.engine_key = k.engine_key
+              AND ${answeredStatusSql()}
          ) last_capture ON true
-        WHERE pe.project_id = $1 AND pe.enabled = true
-          AND ($2::text[] IS NULL OR pe.engine_key = ANY($2::text[]))
-        ORDER BY pe.engine_key ASC`,
-      [projectId, requested],
+        WHERE ($2::text[] IS NULL OR k.engine_key = ANY($2::text[]))
+        ORDER BY k.engine_key ASC`,
+      [projectId, requested, measuredFrom, measuredTo, timezone],
     );
 
     if (result.rows.length === 0) await this.assertProjectExists(tx, projectId);

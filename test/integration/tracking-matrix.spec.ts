@@ -294,4 +294,46 @@ describe("STORY-034 · the prompt × engine matrix", () => {
     expect(cells.find((c) => c.engine_key === "chatgpt")!.cache_age_ms).toBeGreaterThan(29 * 3_600_000);
     expect(cells.find((c) => c.engine_key === "perplexity")!.cache_age_ms).toBeNull();
   });
+
+  // ⚠ STORY-152 — THE PLAN FLOOR, WHICH THIS SPEC COULD NOT PREVIOUSLY SEE.
+  //
+  // The matrix's columns now come from `project_entitled_engines`, and the
+  // comment in matrix.service.ts claims "the columns are the plan's engines by
+  // construction". Nothing here tested that claim: every engine this file
+  // seeds carries min_plan_key='free', so the floor could have been deleted
+  // from the view and all fourteen tests above would still pass.
+  //
+  // `claude` is a business engine and this workspace is on growth. The
+  // project_engines row is the strongest form of the test — it is the row
+  // that, under a design where the entitled set is WRITTEN rather than
+  // derived, would have granted the engine.
+  it("⚠ an engine above the plan floor is not a column, even with an enabled override row", async () => {
+    await addPrompt("best crm for a 50-rep sales team");
+    await db.query(
+      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version,
+                            cache_ttl_seconds, volatility_band, min_plan_key, status)
+       VALUES ('claude', 'claude', 'v', 'api', '1.0.0', 86400, 'medium', 'business', 'active')
+       ON CONFLICT (key) DO NOTHING`,
+    );
+    await db.query(
+      `INSERT INTO project_engines (workspace_id, project_id, engine_key, enabled, sample_count)
+       VALUES ($1, $2, 'claude', true, 1)`,
+      [workspaceId, projectId],
+    );
+
+    const grid = await matrix({});
+    expect(grid.engine_keys, "growth does not buy claude, and an override cannot widen the set").not.toContain("claude");
+    // Anti-vacuity: the two engines this project DOES buy are still columns,
+    // so the assertion above is not passing because the grid is empty.
+    expect(grid.engine_keys).toEqual(["chatgpt", "perplexity"]);
+
+    // And asking for it by name does not add it either — the request
+    // parameter narrows the entitled set, it does not bypass it.
+    expect((await matrix({ engines: "claude" })).engine_keys).toEqual([]);
+
+    // The floor is what excludes it, not its absence from project_engines:
+    // upgrading the workspace makes the same row resolve.
+    await db.query("UPDATE workspaces SET plan_key = 'business' WHERE id = $1", [workspaceId]);
+    expect((await matrix({})).engine_keys, "on business, the very same row is entitled").toContain("claude");
+  });
 });
