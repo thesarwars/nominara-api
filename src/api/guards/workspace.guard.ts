@@ -137,9 +137,32 @@ export class WorkspaceGuard implements CanActivate {
     // real order by observing runtime canActivate calls rather than reading
     // this file's text.
     //
-    // What actually holds: a route may skip tenant context only if it needs
-    // NOTHING derived from a validated workspace. That is decidable here and
-    // is asserted over Nest's own metadata in
+    // ⚠ WHAT ACTUALLY HOLDS, STATED AS AN ALLOW-LIST BECAUSE THREE ATTEMPTS AT
+    // A FORBIDDEN-LIST WERE EACH INCOMPLETE:
+    //
+    //   ON A TENANT-LESS ROUTE, NO CLAIM IN THE ACCESS TOKEN EXCEPT `sub` AND
+    //   `sid` MAY BECOME AUTHORITY.
+    //
+    // Those two are what AuthGuard validated — signature, kid, and a session
+    // row that is not revoked. `ws`, `role`, `ent_v` and the project scope
+    // were validated by THIS guard, and on these routes now are not.
+    //
+    // That one sentence closes what three enumerations did not. The earlier
+    // forms named paths — a forbidden decorator, then also a self-opened
+    // tenant context — and a review found a third each time, most recently a
+    // handler simply writing `this.service.doThing(req.auth!.ws)`: no
+    // decorator, no context opened, just the claim passed as an identity, and
+    // nothing in the repo would catch it. Naming what is ALLOWED is closed
+    // under "what else could carry an unvalidated workspace"; naming what is
+    // forbidden is not. Same inversion as `isWorkspaceUsable`.
+    //
+    // The mechanical half of this is now enforced by construction rather than
+    // asserted: the `?? request.auth?.ws` fallback is deleted from all five
+    // guards that had it, so a tenant-less route cannot reach a workspace
+    // through them even if someone pairs the decorators. The test below is
+    // defence in depth.
+    //
+    // The rest is decidable here and asserted over Nest's own metadata in
     // test/unit/api/skip-tenant-context-routes.spec.ts — no tenant-less route
     // may carry @RequirePermission, @RequireEntitlement, @RequireFeature,
     // @Meter, @DailyCap or @Credits, because each of those is read by a guard

@@ -7,6 +7,7 @@ import { METER_KEY } from "../../../src/api/decorators/meter.decorator.js";
 import { REQUIRE_ENTITLEMENT_KEY, REQUIRE_FEATURE_KEY } from "../../../src/api/decorators/require-entitlement.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../../../src/api/decorators/require-permission.decorator.js";
 import { SKIP_TENANT_CONTEXT_KEY } from "../../../src/api/decorators/skip-tenant-context.decorator.js";
+import { executionContextForSocket } from "../../../src/gateway/ws-execution-context.js";
 import { discoverRealRoutes, type DiscoveredRoute } from "../../support/discover-contract-routes.js";
 import { applyFakeApiEnv } from "../../support/fake-env.js";
 
@@ -183,19 +184,50 @@ describe("STORY-153 · a tenant-less route needs nothing derived from a validate
   // OPEN on (`rbac.guard.ts:45-50` returns true for want of metadata). Such a
   // route has no workspace-derived authority to lose, and must therefore be
   // tenant-less — otherwise it is gated on a `ws` claim it never uses.
+  /**
+   * Routes that state no permission and are deliberately NOT tenant-less.
+   *
+   * ⚠ THIS ESCAPE HATCH EXISTS BECAUSE THE RULE WITHOUT ONE STEERS YOU INTO A
+   * REMEDY THAT BREAKS THE ROUTE. A review reproduced it: drop
+   * `@RequirePermission` from a tenant-scoped route — a plausible shape for
+   * one whose authority is RLS alone — and TWO gates fire, this one and
+   * `route-permission-coverage`. Both are satisfied by adding
+   * `@SkipTenantContext()` plus an EXEMPT entry, which passes 2419 tests while
+   * the route 500s on EVERY call, because its service opens with
+   * `currentTenantStore()` and the interceptor never set one.
+   *
+   * The two gates beside this one each let you write down a reason. This one
+   * did not, so the next engineer had to choose between two red tests with no
+   * way to say "neither, and here is why". Now they can — and the entry is a
+   * decision a reviewer sees, which is the whole point of the pattern.
+   */
+  const NOT_TENANT_LESS: Readonly<Record<string, string>> = Object.freeze({});
+
   it("⚠ a non-public route that states no permission MUST be tenant-less", async () => {
     const all = await routes();
     const offenders = all
       .filter((r) => meta(IS_PUBLIC_KEY, r) !== true)
       .filter((r) => meta(REQUIRE_PERMISSION_KEY, r) === undefined)
       .filter((r) => meta(SKIP_TENANT_CONTEXT_KEY, r) !== true)
-      .map(name);
+      .map(name)
+      .filter((route) => !(route in NOT_TENANT_LESS));
 
     expect(
       offenders,
       "this route is gated on a `ws` claim it never uses — after a plan change its caller is locked out of it " +
-        "for a staleness that cannot matter to it. Either state a permission, or mark it @SkipTenantContext()",
+        "for a staleness that cannot matter to it. THREE options, not two: state a permission; mark it " +
+        "@SkipTenantContext() (only if it needs nothing from a validated workspace — check its service does not " +
+        "call currentTenantStore()); or add it to NOT_TENANT_LESS above with what gates it instead",
     ).toEqual([]);
+  });
+
+  it("the escape hatch stays honest — every entry names a live route", async () => {
+    // A stale entry would silently exempt nothing while looking like it
+    // exempts something, and the next reader would trust it.
+    const live = new Set((await routes()).map(name));
+    for (const route of Object.keys(NOT_TENANT_LESS)) {
+      expect(live, `NOT_TENANT_LESS names ${route}, which is not a live route`).toContain(route);
+    }
   });
 
   it("⚠ the recovery routes are tenant-less, or the plan-change deadlock returns", async () => {
@@ -212,6 +244,41 @@ describe("STORY-153 · a tenant-less route needs nothing derived from a validate
     ] as const) {
       expect(tenantless, `${route} must stay @SkipTenantContext — ${why}`).toContain(route);
     }
+  });
+
+  // ⚠ THE SECOND CALLER OF THIS GUARD, WHICH THE ROUTE WALK CANNOT SEE.
+  //
+  // `room-authorization.service.ts:149` invokes `WorkspaceGuard.canActivate`
+  // on a synthetic context built by `executionContextForSocket`, for
+  // `join:project`. It is not a Nest HTTP controller, so `discoverRealRoutes()`
+  // does not return it and every assertion above is silent about it.
+  //
+  // That matters more here than anywhere else in this file. The gateway
+  // DELIBERATELY DELETED its own `getLiveMembership` call
+  // (`room-authorization.service.ts:203-212`) on the grounds that
+  // "WorkspaceGuard, which ran three lines above, already re-reads live
+  // membership" — so this guard is the ONLY thing enforcing socket
+  // revocation. STORY-153's early return is one `Reflect.defineMetadata` away
+  // from disabling it, and the failure would not be a 500: it would be a
+  // revoked member keeping a live socket.
+  it("⚠ the socket join context is NOT tenant-less — it is the only revocation check on a live socket", () => {
+    const context = executionContextForSocket({ auth: { ws: "w", sub: "u" } } as never, {
+      permission: "workspace:read",
+    } as never);
+
+    for (const target of [context.getHandler(), context.getClass()]) {
+      expect(
+        Reflect.getMetadata(SKIP_TENANT_CONTEXT_KEY, target),
+        "a tenant-less socket join would skip the live-membership re-read the gateway relies on",
+      ).not.toBe(true);
+    }
+
+    // Anti-vacuity: the context must carry the metadata it is SUPPOSED to, or
+    // this is asserting the absence of a key on an empty object.
+    expect(
+      Reflect.getMetadata(REQUIRE_PERMISSION_KEY, context.getHandler()),
+      "the socket context should carry its permission — otherwise this probe is inspecting nothing",
+    ).toBe("workspace:read");
   });
 
   // ⚠ THE CLASS-LEVEL CASE, ASSERTED DIRECTLY. The metadata read above handles
