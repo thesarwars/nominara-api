@@ -60,7 +60,7 @@ describe("STORY-152 · answer_captures.status has named rules and no hand-writte
    * check decides what is ours.
    */
   const STATUS_PREDICATE =
-    /(?:\b[a-z_]+\.)?status\s*(?:(?:NOT\s+)?IN\s*\(([^)]*)\)|(?:=|<>|!=)\s*('[a-z_]+'))/giu;
+    /(?:\b[a-z_]+\.)?\bstatus\s*(?:(?:NOT\s+)?IN\s*\(([^)]*)\)|(?:=|<>|!=)\s*('[a-z_]+'))/giu;
 
   /** The declaration sites, anchored on the string LITERAL rather than to the next `;`. */
   const DECLARATIONS = /return `\$\{statusColumn\}[^`]*`;/gu;
@@ -140,18 +140,36 @@ describe("STORY-152 · answer_captures.status has named rules and no hand-writte
   }
 
   /**
-   * An assignment is not a predicate.
+   * An assignment is not a predicate — recognised NARROWLY, so that anything
+   * unfamiliar is flagged rather than skipped.
    *
-   * `UPDATE answer_captures SET status = 'parsed'` WRITES a status; it does
-   * not ask a question about one, and there is nothing for a named rule to
-   * say about it. Decided by the nearest preceding SQL keyword, so
-   * `SET a = 1, status = 'x'` reads as assignment and
-   * `WHERE a = 1 AND status = 'x'` reads as predicate.
+   * `UPDATE answer_captures SET status = 'parsed'` WRITES a status; it asks
+   * nothing, and there is nothing for a named rule to say about it.
+   *
+   * ⚠ THE FIRST VERSION SEARCHED BACKWARDS FOR THE NEAREST OF
+   * (SET|WHERE|AND|OR|ON|HAVING) AND CALLED IT AN ASSIGNMENT IF IT FOUND
+   * `SET`. That is an ENUMERATION OF PREDICATE INTRODUCERS — the exact shape
+   * five review rounds punished — and it was one member short. A review
+   * demonstrated it with ordinary SQL:
+   *
+   *   UPDATE t SET flag = CASE WHEN status = 'parsed' THEN 1 ELSE 0 END
+   *
+   * `status = 'parsed'` there is a genuine predicate, the nearest listed
+   * keyword is `SET`, and the scan skipped it SILENTLY — the direction I had
+   * argued was safe and was not.
+   *
+   * Adding `WHEN` would have closed those two cases and left the shape. So
+   * this asks the narrow POSITIVE question instead: is the column sitting
+   * directly in a SET list, i.e. immediately after `SET` or after a comma
+   * continuing one? Everything else — `CASE WHEN`, `HAVING`, `FILTER
+   * (WHERE …)`, a subquery, or any construct nobody has thought of — falls
+   * through to "not an assignment" and gets FLAGGED.
+   *
+   * That inverts the failure: an unrecognised context now costs a false
+   * positive somebody has to look at, instead of a real copy nobody sees.
    */
   function isAssignment(source: string, index: number): boolean {
-    const before = source.slice(Math.max(0, index - 200), index);
-    const keyword = [...before.matchAll(/\b(SET|WHERE|AND|OR|ON|HAVING)\b/giu)].pop();
-    return keyword?.[1]?.toUpperCase() === "SET";
+    return /(?:\bSET\b|,)\s*$/iu.test(source.slice(Math.max(0, index - 80), index));
   }
 
   /**
@@ -298,6 +316,31 @@ describe("STORY-152 · answer_captures.status has named rules and no hand-writte
     // ...and a predicate after a SET-bearing statement does not.
     const both = "UPDATE t SET a = 1 WHERE id = $1 AND status = 'parsed'";
     expect(isAssignment(both, both.indexOf("status = 'parsed'"))).toBe(false);
+
+    // ⚠ THE REGRESSION CASES. The first version searched backwards for the
+    // nearest of (SET|WHERE|AND|OR|ON|HAVING); in all four of these the
+    // nearest listed keyword is `SET` while the column is a genuine
+    // PREDICATE, so it skipped them silently. A reviewer found the first two
+    // with ordinary SQL. They must all read as NOT-an-assignment.
+    for (const sql of [
+      "UPDATE answer_captures SET flag = CASE WHEN status = 'parsed' THEN 1 ELSE 0 END",
+      "UPDATE t SET a = 1, b = CASE WHEN c.status = 'parsed' THEN 2 END",
+      "UPDATE t SET a = (SELECT 1 FROM x GROUP BY y HAVING ac2.status = 'parsed')",
+      "UPDATE t SET a = (SELECT count(*) FILTER (WHERE status = 'parsed') FROM x)",
+    ]) {
+      const at = sql.indexOf("status = 'parsed'");
+      expect(isAssignment(sql, at), `a predicate inside a SET clause must still be flagged: ${sql}`).toBe(false);
+    }
+
+    // And the inversion's own property: an UNRECOGNISED context falls through
+    // to "not an assignment", so a construct nobody anticipated costs noise
+    // rather than silence. This is the whole reason the test is a narrow
+    // positive rather than a keyword list.
+    const invented = "UPDATE t SET a = SOMETHING_NOBODY_HAS_WRITTEN_YET status = 'parsed'";
+    expect(isAssignment(invented, invented.indexOf("status = 'parsed'"))).toBe(false);
+
+    // A column whose NAME merely ends in `status` is not this column.
+    expect("x_status = 'parsed'".match(STATUS_PREDICATE), "x_status must not match").toBeNull();
   });
 
   it("⚠ the stripper removes the declarations and nothing else", () => {

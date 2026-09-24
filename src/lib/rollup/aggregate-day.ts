@@ -200,18 +200,6 @@ export function answeredStatusSql(statusColumn = "c.status"): string {
 }
 
 /**
- * "This cell produced a FRESH capture in this run" — run progress only.
- *
- * ⚠ DELIBERATELY EXCLUDES `skipped`, WHICH IS WHY IT IS NOT
- * `answeredStatusSql`. A suppressed cell HAS an answer (that is the point of
- * the cache) and counts toward freshness, but `capture_runs.skipped_cells`
- * accounts for it separately — so counting it here too would double-count it
- * in the progress bar.
- *
- * Named rather than left inline because a scan cannot tell a third question
- * from a third spelling of the same one, and the next reader cannot either.
- */
-/**
  * "This capture's FACTS EXIST" — the only status with parsed output.
  *
  * ⚠ THE FIFTH QUESTION, AND IT USES A DIFFERENT OPERATOR, WHICH IS HOW IT
@@ -232,6 +220,18 @@ export function hasFactsStatusSql(statusColumn = "c.status"): string {
   return `${statusColumn} = 'parsed'`;
 }
 
+/**
+ * "This cell produced a FRESH capture in this run" — run progress only.
+ *
+ * ⚠ DELIBERATELY EXCLUDES `skipped`, WHICH IS WHY IT IS NOT
+ * `answeredStatusSql`. A suppressed cell HAS an answer (that is the point of
+ * the cache) and counts toward freshness, but `capture_runs.skipped_cells`
+ * accounts for it separately — so counting it here too would double-count it
+ * in the progress bar.
+ *
+ * Named rather than left inline because a scan cannot tell a third question
+ * from a third spelling of the same one, and the next reader cannot either.
+ */
 export function capturedInRunStatusSql(statusColumn = "c.status"): string {
   return `${statusColumn} IN ('captured', 'parsed')`;
 }
