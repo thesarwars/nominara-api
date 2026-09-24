@@ -211,6 +211,27 @@ export function answeredStatusSql(statusColumn = "c.status"): string {
  * Named rather than left inline because a scan cannot tell a third question
  * from a third spelling of the same one, and the next reader cannot either.
  */
+/**
+ * "This capture's FACTS EXIST" — the only status with parsed output.
+ *
+ * ⚠ THE FIFTH QUESTION, AND IT USES A DIFFERENT OPERATOR, WHICH IS HOW IT
+ * HID. The guard that keeps these rules from being copied scanned for `IN`
+ * and `NOT IN`; `l2-semantic-reuse.ts` says `ac.status = 'parsed'`. Round
+ * four's finding escaped on the alias prefix, this one on the operator — the
+ * same class one dimension over, and the guard's title claimed a coverage it
+ * did not have.
+ *
+ * It is an EQUALITY rather than an allow-list on purpose, and that is the
+ * distinction worth keeping: L2 semantic reuse copies `mention_facts` from a
+ * source capture, and only `parsed` has any. A sixth status would not belong
+ * here even if it were a measurement and even if it had answered — it would
+ * need its own facts first. So unlike the four rules above, this one does not
+ * widen when the domain does.
+ */
+export function hasFactsStatusSql(statusColumn = "c.status"): string {
+  return `${statusColumn} = 'parsed'`;
+}
+
 export function capturedInRunStatusSql(statusColumn = "c.status"): string {
   return `${statusColumn} IN ('captured', 'parsed')`;
 }

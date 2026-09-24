@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { hasFactsStatusSql } from "../rollup/aggregate-day.js";
 
 // STORY-032 — tracking-engine.md §6's L2 near-duplicate probe.
 //
@@ -171,7 +172,7 @@ export async function probeSemanticReuse(
          WHERE ac.workspace_id = $5
            AND ac.project_id = $1                             -- same project (the capture)
            AND ac.engine_key = c.engine_key                   -- same engine
-           AND ac.status = 'parsed'                           -- source fully parsed
+           AND ${hasFactsStatusSql("ac.status")}                 -- source fully parsed
            AND ac.cache_layer <> 'l2'                         -- NO TRANSITIVE CHAINS
            -- The prunable bound, then the exact one. See maxWindowSeconds.
            AND ac.captured_at >= now() - make_interval(secs => $6::double precision)
