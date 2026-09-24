@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { Client, Pool } from "pg";
@@ -706,31 +705,6 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
       ).rejects.toThrow();
     });
 
-    // ⚠ THE DEPENDENCY THIS FIX INTRODUCES, ASSERTED WHERE IT IS CREATED.
-    //
-    // Returning early means WorkspaceGuard no longer refuses an
-    // unauthenticated caller on these routes. That is correct — the
-    // decorator's comment says "AuthGuard still runs and requires a valid
-    // access token (this is NOT @Public())" — but it is only correct BECAUSE
-    // AuthGuard runs first. Nest executes APP_GUARDs in registration order.
-    //
-    // A first draft of this test asserted that the guard itself rejects an
-    // unauthenticated request, which it does not and should not; it resolved
-    // `true` and the test was wrong, not the fix. The property that actually
-    // holds the safety is the ORDER, so that is what is pinned.
-    it("⚠ AuthGuard is registered BEFORE WorkspaceGuard, which is why the early return is safe", async () => {
-      const source = await readFile(new URL("../../src/api/api.module.ts", import.meta.url), "utf8");
-      const order = [...source.matchAll(/provide: APP_GUARD, useClass: (\w+)/gu)].map((m) => m[1]!);
-
-      expect(order, "no APP_GUARD registrations found — the scan is vacuous").not.toEqual([]);
-      const auth = order.indexOf("AuthGuard");
-      const workspace = order.indexOf("WorkspaceGuard");
-      expect(auth, "AuthGuard must be registered").toBeGreaterThanOrEqual(0);
-      expect(workspace, "WorkspaceGuard must be registered").toBeGreaterThanOrEqual(0);
-      expect(auth, "AuthGuard must run BEFORE WorkspaceGuard, or a tenant-less route is unauthenticated").toBeLessThan(
-        workspace,
-      );
-    });
   });
 
 });

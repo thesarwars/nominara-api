@@ -20,7 +20,7 @@ import {
 import { afterCommit, currentTenantStore, withActorContext, withTenantContext } from "../../tenancy/tenant-context.js";
 import { SessionService } from "../identity/session.service.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
-import { MembershipService } from "./membership.service.js";
+import { isWorkspaceUsable, MembershipService } from "./membership.service.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import type {
   CreateWorkspaceRequest,
@@ -450,13 +450,10 @@ export class WorkspacesService {
     // token minted for a suspended/pending-deletion/deleted workspace would
     // be refused on the very next request anyway; refusing it here too means
     // switching never hands back a token good for zero requests.
-    const isUnusable =
-      !workspaceStatus ||
-      workspaceStatus.status === "suspended" ||
-      workspaceStatus.status === "pending_deletion" ||
-      workspaceStatus.status === "deleted" ||
-      workspaceStatus.deletedAt !== null;
-    if (isUnusable) {
+    // ⚠ THE SAME PREDICATE THE GUARD USES, NOT A COPY OF IT. STORY-153 stopped
+    // WorkspaceGuard running on this route, so this is now the ONLY usability
+    // check on the switch path — see isWorkspaceUsable's own comment.
+    if (!isWorkspaceUsable(workspaceStatus)) {
       throw new WorkspaceSuspendedException();
     }
 

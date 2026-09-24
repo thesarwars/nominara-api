@@ -2,7 +2,7 @@ import { CanActivate, ExecutionContext, Inject, Injectable, Logger } from "@nest
 import { Reflector } from "@nestjs/core";
 import type { Pool } from "pg";
 import { PG_POOL } from "../../db/pg-pool.js";
-import { MembershipService } from "../../modules/workspaces/membership.service.js";
+import { isWorkspaceUsable, MembershipService } from "../../modules/workspaces/membership.service.js";
 import { WORKSPACE_HEADER_NAME } from "../../tenancy/constants.js";
 import {
   EntitlementStaleException,
@@ -126,6 +126,28 @@ export class WorkspaceGuard implements CanActivate {
     // Note the shape of the original error: the guard gated these on the
     // token's CURRENT workspace, which is not the workspace any of them is
     // about.
+    //
+    // ⚠ AND THE SAFETY ARGUMENT IS *NOT* GUARD ORDERING. A first draft of
+    // this comment said the early return is safe "because AuthGuard runs
+    // first". A review refuted it: both are APP_GUARDs and both run on every
+    // non-@Public route whatever the order, so reversing them changes which
+    // status code surfaces, not whether the caller is authenticated. The
+    // argument was pinned by a test that therefore proved nothing about it,
+    // and that test is gone — src/api/api.module.spec.ts already pins the
+    // real order by observing runtime canActivate calls rather than reading
+    // this file's text.
+    //
+    // What actually holds: a route may skip tenant context only if it needs
+    // NOTHING derived from a validated workspace. That is decidable here and
+    // is asserted over Nest's own metadata in
+    // test/unit/api/skip-tenant-context-routes.spec.ts — no tenant-less route
+    // may carry @RequirePermission, @RequireEntitlement, @RequireFeature,
+    // @Meter, @DailyCap or @Credits, because each of those is read by a guard
+    // that falls back to the RAW `auth.ws` claim when `req.tenant` is absent
+    // (entitlement.guard.ts:82, quota.guard.ts:94, daily-cap.guard.ts:72,
+    // credit.guard.ts:140, credit.interceptor.ts:481). That fallback was dead
+    // before this change — the guard always set `tenant` — and this early
+    // return makes it live, so the decorator pairing is what must not happen.
     const skipsTenantContext = this.reflector.getAllAndOverride<boolean>(SKIP_TENANT_CONTEXT_KEY, [
       context.getHandler(),
       context.getClass(),
@@ -205,14 +227,12 @@ export class WorkspaceGuard implements CanActivate {
     // `workspaces` only filters by id, not by status/deleted_at, so this
     // guard is the only thing standing between a deleted workspace id and a
     // request that still names it.
-    const isUnusable =
-      !workspace ||
-      workspace.status === "suspended" ||
-      workspace.status === "pending_deletion" ||
-      workspace.status === "deleted" ||
-      workspace.deletedAt !== null;
-    if (isUnusable) {
-      this.logger.warn({ msg: "workspace access refused", workspace_id: workspaceId, status: workspace?.status ?? "unknown" });
+    // Read before the narrowing check: `isWorkspaceUsable` is a type
+    // predicate, so in the false branch `workspace` is `never` and its status
+    // — the one thing the operator needs to see — is unreadable.
+    const observedStatus = workspace?.status ?? "unknown";
+    if (!isWorkspaceUsable(workspace)) {
+      this.logger.warn({ msg: "workspace access refused", workspace_id: workspaceId, status: observedStatus });
       throw new WorkspaceSuspendedException();
     }
     return workspace;
