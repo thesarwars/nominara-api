@@ -11,7 +11,7 @@ import {
   type Scorecard,
   type WindowMetrics,
 } from "../../lib/analytics/scorecard.js";
-import { aggregateRange, MEASUREMENT_STATUS_SQL } from "../../lib/rollup/aggregate-day.js";
+import { aggregateRange, answeredStatusSql, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`.
@@ -273,7 +273,7 @@ export class ScorecardsService {
             --
             -- Interpolated from one definition so there is nothing to keep
             -- in step. The alias c is what the constant expects.
-            AND ${MEASUREMENT_STATUS_SQL}
+            AND ${measurementStatusSql()}
             AND (c.captured_at AT TIME ZONE $5)::date BETWEEN $3::date AND $4::date
        ),
        engine_keys AS (
@@ -306,7 +306,7 @@ export class ScorecardsService {
              FROM answer_captures c
             WHERE c.project_id = $1
               AND c.engine_key = k.engine_key
-              AND c.status IN ('captured', 'parsed', 'skipped')
+              AND ${answeredStatusSql()}
          ) last_capture ON true
         WHERE ($2::text[] IS NULL OR k.engine_key = ANY($2::text[]))
         ORDER BY k.engine_key ASC`,

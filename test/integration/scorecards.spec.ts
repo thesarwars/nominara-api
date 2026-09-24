@@ -627,7 +627,24 @@ describe("STORY-136 · project scorecards", () => {
         "measured in the prior window, so it is part of what the delta compares against",
       ).toContain("claude");
 
-      // Both must be real numbers, or the comparison below compares nulls.
+      // ⚠ THE CLAIM "IDENTICAL CURRENT-WINDOW DATA" IS ASSERTED, NOT REASONED.
+      // The whole argument is that only the PRIOR leg moved; if claude's cells
+      // had leaked into the current window this test would still go green for
+      // the wrong reason.
+      expect(
+        withClaude.blended.visibility_score,
+        "claude has no current-window cells, so the current blend must be untouched",
+      ).toBe(withoutClaude.blended.visibility_score);
+
+      // ⚠ BOTH MUST BE REAL NUMBERS, AND SITTING ON THE THRESHOLD IS
+      // DELIBERATE. `visibilityDelta` returns null when EITHER window is below
+      // CONFIDENCE_THRESHOLDS.medium, and the fixture puts the prior leg at
+      // exactly 30 without claude and 60 with it. The trap that would make
+      // this vacuous is the CROSSING case — one delta null, the other a
+      // number, differing because of the threshold rather than because of
+      // membership. These two assertions are what exclude it. If the
+      // comparison in `visibilityDelta` ever became `<=`, this fails loudly
+      // instead of quietly proving nothing.
       expect(withoutClaude.blended.visibility_delta).not.toBeNull();
       expect(withClaude.blended.visibility_delta).not.toBeNull();
 

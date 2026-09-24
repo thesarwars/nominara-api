@@ -115,7 +115,13 @@ export async function aggregateDay(
  * window aggregate, and the facts are the only honest source for it.
  */
 /**
- * What counts as a MEASUREMENT, as a SQL fragment over an alias `c`.
+ * What counts as a MEASUREMENT, as a SQL fragment.
+ *
+ * Takes the status COLUMN rather than assuming an alias, because one of the
+ * two readers in this file queries `answer_captures` unaliased — and the
+ * first version of the guard that was supposed to keep these in step missed
+ * that copy for exactly that reason, requiring a `c.` prefix the line did not
+ * have.
  *
  * ⚠ EXPORTED, AND A DENY-LIST, AND BOTH MATTER.
  *
@@ -137,7 +143,77 @@ export async function aggregateDay(
  * `answer_captures_status_check` permits exactly captured/parsed/skipped/
  * failed/blocked today. A sixth value is a decision about this constant.
  */
-export const MEASUREMENT_STATUS_SQL = "c.status NOT IN ('failed', 'blocked')";
+const NON_MEASUREMENT_STATUSES = ["failed", "blocked"] as const;
+
+function statusList(): string {
+  return NON_MEASUREMENT_STATUSES.map((status) => `'${status}'`).join(", ");
+}
+
+export function measurementStatusSql(statusColumn = "c.status"): string {
+  return `${statusColumn} NOT IN (${statusList()})`;
+}
+
+/**
+ * The complement — "this cell is NOT a measurement".
+ *
+ * ⚠ DERIVED FROM THE SAME ARRAY, because three places were asking this
+ * question with the set written out by hand: `run-progress.ts`'s failed-cell
+ * count, `capture-execute.handler.ts`'s `failedEngines`, and
+ * `growth-map.service.ts`'s failure days. A review found the first copy of the
+ * POSITIVE form; widening the scan that found it turned up these three of the
+ * negative form.
+ *
+ * They are one boundary, not two: if a sixth `answer_captures.status` is ever
+ * classed as a non-measurement, every one of these has to move together or a
+ * cell counts as failed on the progress bar and as data in the score.
+ */
+export function nonMeasurementStatusSql(statusColumn = "c.status"): string {
+  return `${statusColumn} IN (${statusList()})`;
+}
+
+/**
+ * What counts as HAVING ANSWERED, as a SQL fragment. Takes the status column
+ * for the same reason as above.
+ *
+ * ⚠ A DIFFERENT QUESTION FROM measurementStatusSql, AND AN ALLOW-LIST ON
+ * PURPOSE — the one place in this story where an allow-list is the right
+ * shape, so the reason is written down rather than assumed.
+ *
+ * This answers "when did this engine last produce an answer", which feeds
+ * `last_captured_at`, the next-run projection and FR-CRD-09's freshness
+ * claim. A status nobody has thought about must NOT silently become a "last
+ * answered at": that would make a stale engine look fresh and push its next
+ * run further out. Failing toward STALE is the correct bias here, and it is
+ * the opposite of the bias measurementStatusSql wants — where dropping a
+ * real capture out of a published score is the worse mistake.
+ *
+ * ⚠ A SECOND NAMED CONSTANT RATHER THAN AN EXEMPTION IN A SCANNER'S ALLOW
+ * LIST. A review pointed out that an exemption leaves ONE rule plus a hole,
+ * and that on a hypothetical sixth status the two predicates inside a single
+ * scorecards query would disagree — the engine counted as measured for
+ * scoring and never-measured for freshness, in one response. Two named rules
+ * cannot drift into that; one rule plus an exemption can. It is also what
+ * `matrix.service.ts` had been spelling out by hand.
+ */
+export function answeredStatusSql(statusColumn = "c.status"): string {
+  return `${statusColumn} IN ('captured', 'parsed', 'skipped')`;
+}
+
+/**
+ * "This cell produced a FRESH capture in this run" — run progress only.
+ *
+ * ⚠ DELIBERATELY EXCLUDES `skipped`, WHICH IS WHY IT IS NOT
+ * `answeredStatusSql`. A suppressed cell HAS an answer (that is the point of
+ * the cache) and counts toward freshness, but `capture_runs.skipped_cells`
+ * accounts for it separately — so counting it here too would double-count it
+ * in the progress bar.
+ *
+ * Named rather than left inline because a scan cannot tell a third question
+ * from a third spelling of the same one, and the next reader cannot either.
+ */
+export function capturedInRunStatusSql(statusColumn = "c.status"): string {
+  return `${statusColumn} IN ('captured', 'parsed')`;
+}
 
 export async function aggregateRange(
   tx: ClientBase,
@@ -164,9 +240,9 @@ export async function aggregateRange(
           AND (c.captured_at AT TIME ZONE $3)::date BETWEEN $2::date AND $4::date
           -- A FAILED CELL IS NOT A MEASUREMENT. §2.5 excludes it from both
           -- numerator and denominator; a refusal ('parsed' with the flag) is
-          -- data and stays in. The predicate is MEASUREMENT_STATUS_SQL, declared
+          -- data and stays in. The predicate is measurementStatusSql(), declared
           -- above -- see there for why it is not written out here.
-          AND ${MEASUREMENT_STATUS_SQL}
+          AND ${measurementStatusSql()}
      ),
      entities AS (
        -- Every (engine, entity) pair that appears in the range, so a
@@ -322,7 +398,13 @@ export async function datesWithFacts(
        FROM answer_captures
       WHERE project_id = $1
         AND (captured_at AT TIME ZONE $2)::date BETWEEN $3::date AND $4::date
-        AND status NOT IN ('failed', 'blocked')
+        -- ⚠ THE COPY THE FIRST VERSION OF THE GUARD MISSED. It sat 185 lines
+        -- below the constant, in a file the scanner already read, and escaped
+        -- on the alias prefix alone: the scan required a c. prefix and this
+        -- line has none. Same question, same deny-list, and the rebuild path
+        -- uses it to decide which days to re-roll -- so a divergence here
+        -- rebuilds a different set of days than the aggregation measures.
+        AND ${measurementStatusSql("status")}
       ORDER BY metric_date`,
     [projectId, timezone, fromDate, toDate],
   );

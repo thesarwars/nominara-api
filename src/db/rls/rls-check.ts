@@ -77,7 +77,47 @@ export interface RlsCheckResult {
    * silently, which is the property the previous two rounds did not have.
    */
   unclassifiedRelations: string[];
+  /**
+   * "<schema>.<table>" — a BASE TABLE outside `public`, which nothing in this
+   * system manages.
+   *
+   * ⚠ THE FOURTH INSTANCE OF THE CLASS THIS STORY KEPT GETTING WRONG, AND THE
+   * WORST OF THEM, BECAUSE THE RELATION IS THE MOST ORDINARY ONE THERE IS.
+   *
+   * STORY-152 widened two queries to every schema — the two a review had
+   * planted objects in — and left the census that feeds the other six
+   * buckets scoped to `public`. A review then planted this:
+   *
+   *   CREATE TABLE tenantdata.leaked_captures (id uuid, workspace_id uuid, secret text);
+   *   GRANT SELECT ON tenantdata.leaked_captures TO nominara_app, ...;
+   *
+   * A tenant-bearing table, granted to every runtime role, with RLS not even
+   * enabled — and all eight buckets empty. `unclassifiedRelations` cannot
+   * catch it and should not: `r` is correctly in its handled list.
+   *
+   * The generator's census is rightly `public`-only (see introspect.ts: it
+   * emits unqualified DDL). So the answer is not to widen that — it is to
+   * refuse to let anything sit outside its scope unnoticed. THE DEFAULT HERE
+   * IS TO REPORT. That is the difference between this list and the three
+   * allow-lists that failed earlier in this story: an entry has to be
+   * declared, and anything undeclared fails.
+   */
+  unmanagedTables: string[];
 }
+
+/**
+ * The only base table outside `public` that is expected to exist.
+ *
+ * `_migrations.applied` is the migration runner's own ledger. It is created
+ * by `migrate-runner.ts` BEFORE any migration has run — so before the schema,
+ * the roles or the policy machinery exist — and it holds file names, not
+ * tenant data. It cannot live in `public` under the generator's management
+ * because it is what records that the generator's migrations ran.
+ *
+ * Schema-qualified and exact. A second table appearing in `_migrations`, or
+ * anything at all in another schema, is reported.
+ */
+const EXPECTED_NON_PUBLIC_TABLES: readonly string[] = ["_migrations.applied"];
 
 /**
  * Whether a view's reloptions enable `security_invoker`, decided BY POSTGRES.
@@ -130,7 +170,8 @@ export function isClean(result: RlsCheckResult): boolean {
     result.policiesWithoutWithCheck.length === 0 &&
     result.globalTablesWithPolicies.length === 0 &&
     result.viewsWithoutSecurityInvoker.length === 0 &&
-    result.unclassifiedRelations.length === 0
+    result.unclassifiedRelations.length === 0 &&
+    result.unmanagedTables.length === 0
   );
 }
 
@@ -360,10 +401,19 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
   // Independent, blanket catalog checks — not scoped to the expected/actual
   // comparison above, so a mistake here is caught even if it happens to
   // coincide with an otherwise-correct classification.
-  const forAllNullCheckResult = await client.query<{ tablename: string; policyname: string }>(
-    "SELECT tablename, policyname FROM pg_policies WHERE schemaname = 'public' AND cmd = 'ALL' AND with_check IS NULL",
+  // ⚠ EVERY NON-SYSTEM SCHEMA. A FOR ALL policy with a NULL with_check is a
+  // write that escapes its own read filter, and that is no less true in `app`
+  // than in `public`. Scoped to public, this bucket would have reported clean
+  // on one.
+  const forAllNullCheckResult = await client.query<{ schemaname: string; tablename: string; policyname: string }>(
+    `SELECT schemaname, tablename, policyname
+       FROM pg_policies
+      WHERE cmd = 'ALL' AND with_check IS NULL
+        AND schemaname NOT IN ('pg_catalog', 'information_schema')`,
   );
-  const policiesWithoutWithCheck = forAllNullCheckResult.rows.map((row) => describe(row.tablename, row.policyname));
+  const policiesWithoutWithCheck = forAllNullCheckResult.rows.map((row) =>
+    describe(row.schemaname === "public" ? row.tablename : `${row.schemaname}.${row.tablename}`, row.policyname),
+  );
 
   const globalPoliciesResult = await client.query<{ tablename: string; policyname: string }>(
     "SELECT tablename, policyname FROM pg_policies WHERE schemaname = 'public' AND tablename = ANY($1::text[])",
@@ -406,9 +456,17 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
   // test reports as a violation. The direction is fail-safe, but a gate that
   // cries wolf on a correct view costs someone an hour and teaches them to
   // distrust it. Postgres's own boolean parse accepts on/true/1/yes.
+  // Schema-qualified outside `public`, because the bucket below already does
+  // and a review pointed out that an unqualified message names an object that
+  // may also exist in `public` and be fine — sending the operator to the
+  // wrong relation first.
   const viewsWithoutSecurityInvoker = viewsResult.rows
     .filter((row) => !row.enabled)
-    .map((row) => `${row.relname}: security_invoker=${(row.reloptions ?? []).join(",") || "unset"}`);
+    .map(
+      (row) =>
+        `${row.nspname === "public" ? row.relname : `${row.nspname}.${row.relname}`}: ` +
+        `security_invoker=${(row.reloptions ?? []).join(",") || "unset"}`,
+    );
 
   // ⚠ THE INVERTED CENSUS. Every other query here names the relkinds it wants;
   // this one names the relkinds that are ACCOUNTED FOR and reports the rest.
@@ -448,6 +506,27 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
     (row) => `${row.nspname === "public" ? row.relname : `${row.nspname}.${row.relname}`} (relkind=${row.relkind})`,
   );
 
+  // Base tables outside the generator's scope. Partition children are
+  // excluded the same way the generator's census excludes them, so a
+  // partitioned table in another schema reports once rather than once per
+  // child.
+  const unmanagedResult = await client.query<{ qualified: string }>(
+    `SELECT n.nspname || '.' || c.relname AS qualified
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE ${NON_SYSTEM_SCHEMA_SQL}
+        AND n.nspname <> 'public'
+        AND c.relkind IN ('r', 'p')
+        AND NOT c.relispartition
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+           WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+        )`,
+  );
+  const unmanagedTables = unmanagedResult.rows
+    .map((row) => row.qualified)
+    .filter((qualified) => !EXPECTED_NON_PUBLIC_TABLES.includes(qualified));
+
   return {
     unclassifiedTables,
     missingRls,
@@ -457,6 +536,7 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
     globalTablesWithPolicies,
     viewsWithoutSecurityInvoker,
     unclassifiedRelations,
+    unmanagedTables,
   };
 }
 
@@ -514,6 +594,9 @@ async function main() {
     if (result.unclassifiedRelations.length > 0) {
       console.error(`  relations of an unhandled kind — no bucket examines these: ${result.unclassifiedRelations.join(", ")}`);
     }
+    if (result.unmanagedTables.length > 0) {
+      console.error(`  base tables outside \`public\` — the RLS generator does not manage these: ${result.unmanagedTables.join(", ")}`);
+    }
     // ⚠ A BUCKET WITH NO LINE HERE PRINTS NOTHING AND EXITS 1, which reads as
     // a broken tool on the one invariant nobody was looking for. The seventh
     // bucket shipped in exactly that state: `isClean` consulted it and this
@@ -531,6 +614,7 @@ async function main() {
       "globalTablesWithPolicies",
       "viewsWithoutSecurityInvoker",
       "unclassifiedRelations",
+      "unmanagedTables",
     ]);
     for (const [bucket, entries] of Object.entries(result)) {
       if (!printed.has(bucket) && Array.isArray(entries) && entries.length > 0) {

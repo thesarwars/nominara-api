@@ -88,6 +88,7 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       globalTablesWithPolicies: [],
       viewsWithoutSecurityInvoker: [],
       unclassifiedRelations: [],
+      unmanagedTables: [],
     });
     expect(isClean(result)).toBe(true);
   });
@@ -487,6 +488,60 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       }
     },
   );
+
+  // ==========================================================================
+  // ⚠ THE FOURTH INSTANCE OF THE CLASS, AND THE MOST ORDINARY RELATION OF ALL.
+  //
+  // STORY-152 widened two queries to every schema — the two a review had
+  // planted objects in — and left the census feeding the other six buckets on
+  // `public`. A review then planted an ORDINARY TABLE with a `workspace_id`,
+  // granted to every runtime role, RLS not even enabled, and all eight buckets
+  // reported clean.
+  //
+  // `unclassifiedRelations` cannot catch it and should not: `r` is correctly
+  // in its handled list. The generator's census is rightly `public`-only
+  // because it emits unqualified DDL. So the gap is closed by refusing to let
+  // a base table sit OUTSIDE that scope unnoticed.
+  // ==========================================================================
+  it("bucket: unmanagedTables — a tenant-bearing table in another schema", async () => {
+    await client.query("CREATE SCHEMA IF NOT EXISTS tenantdata");
+    await client.query(
+      "CREATE TABLE tenantdata.leaked_captures (id uuid primary key, workspace_id uuid not null, secret text)",
+    );
+    try {
+      const result = await checkRls(client);
+      expect(result.unmanagedTables).toContain("tenantdata.leaked_captures");
+      expect(isClean(result), "RLS is not even enabled on it — this must not read as clean").toBe(false);
+      // The other buckets genuinely cannot see it, which is why this one
+      // exists. Asserted so that a future change making them see it is a
+      // deliberate decision rather than a silent overlap.
+      expect(result.unclassifiedTables).toEqual([]);
+      expect(result.missingRls).toEqual([]);
+      expect(result.unclassifiedRelations).toEqual([]);
+    } finally {
+      await client.query("DROP TABLE IF EXISTS tenantdata.leaked_captures");
+      await client.query("DROP SCHEMA IF EXISTS tenantdata");
+    }
+  });
+
+  it("the migration ledger is the one declared exception, and only it", async () => {
+    // `_migrations.applied` must NOT be reported — it is created before any
+    // migration runs and holds file names. Asserting it is ABSENT is what
+    // stops someone widening the exception into "the whole _migrations schema".
+    const clean = await checkRls(client);
+    expect(clean.unmanagedTables).toEqual([]);
+
+    await client.query("CREATE TABLE _migrations.sneaky (id uuid primary key, workspace_id uuid)");
+    try {
+      const result = await checkRls(client);
+      expect(
+        result.unmanagedTables,
+        "a SECOND table in _migrations is not covered by the exception",
+      ).toContain("_migrations.sneaky");
+    } finally {
+      await client.query("DROP TABLE IF EXISTS _migrations.sneaky");
+    }
+  });
 
   it("extension-owned views are excluded by dependency, not by name", async () => {
     // pg_stat_statements installs two views into `public` with no

@@ -1,4 +1,5 @@
 import { Injectable } from "@nestjs/common";
+import { nonMeasurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import type { ClientBase } from "pg";
 import type {
   GrowthMapQuery,
@@ -230,7 +231,7 @@ export class GrowthMapService {
          FROM answer_captures
         WHERE project_id = $1
           AND (captured_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
-          AND status IN ('failed', 'blocked')`,
+          AND ${nonMeasurementStatusSql("status")}`,
       [projectId, from, to, timezone],
     );
     return result.rows.map((row) => ({ metricDate: row.metric_date, engineKey: row.engine_key }));

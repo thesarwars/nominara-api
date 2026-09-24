@@ -1,6 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import type { MatrixCell, MatrixQuery, MatrixResponse, MatrixRow } from "../../../contracts/tracking/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { answeredStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
 // STORY-034 AC8 — the prompt × engine grid.
@@ -107,7 +108,7 @@ export class MatrixService {
             WHERE c.project_id = p.project_id
               AND c.prompt_id = p.id
               AND c.engine_key = e.engine_key
-              AND c.status IN ('captured', 'parsed', 'skipped')
+              AND ${answeredStatusSql()}
             ORDER BY c.captured_at DESC
             LIMIT 1
          ) success ON true
