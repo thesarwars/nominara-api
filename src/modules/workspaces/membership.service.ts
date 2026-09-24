@@ -43,15 +43,25 @@ export interface WorkspaceStatus {
  * precedent in workers/rollup/retention.ts: RLS on `workspaces` filters by id
  * only, never by status or deleted_at, so this predicate is the only thing
  * standing between a deleted workspace id and a request that still names it.
+ *
+ * ⚠ AN ALLOW-LIST, AND THE FIRST VERSION WAS A DENY-LIST. It listed the three
+ * unusable statuses, so an EIGHTH status added to the 7-value CHECK would have
+ * been classified USABLE by default — and the spec would have stayed green,
+ * because its expected-classification list is retyped and would not have
+ * mentioned the new value either. Both sides would have agreed, about nothing.
+ * A review demonstrated it by adding `fraud_hold` to the migration: fully
+ * actionable, four tests passing, including through `POST /workspaces/{id}/switch`,
+ * which STORY-153 made the only place this check happens at all.
+ *
+ * Inverted, a status nobody has classified REFUSES, and the spec fails loudly
+ * naming it. That is the right default for a predicate the switch path now
+ * depends on alone: a new workspace state should not become actionable
+ * because nobody remembered this function existed.
  */
+const USABLE_STATUSES: ReadonlySet<string> = new Set(["trialing", "active", "past_due", "soft_capped"]);
+
 export function isWorkspaceUsable(workspace: WorkspaceStatus | null): workspace is WorkspaceStatus {
-  return (
-    workspace !== null &&
-    workspace.status !== "suspended" &&
-    workspace.status !== "pending_deletion" &&
-    workspace.status !== "deleted" &&
-    workspace.deletedAt === null
-  );
+  return workspace !== null && USABLE_STATUSES.has(workspace.status) && workspace.deletedAt === null;
 }
 
 

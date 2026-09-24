@@ -148,6 +148,27 @@ export class WorkspaceGuard implements CanActivate {
     // credit.guard.ts:140, credit.interceptor.ts:481). That fallback was dead
     // before this change — the guard always set `tenant` — and this early
     // return makes it live, so the decorator pairing is what must not happen.
+    //
+    // ⚠ AND A SECOND HALF, TRUE TODAY BUT UNASSERTED. If a tenant-less route
+    // opens its OWN tenant context, the workspace id must come from something
+    // it validated — not from the token claim and not from an unvalidated
+    // path param. Two do. `WorkspacesService.create` uses a freshly minted
+    // uuid. `InvitationsService.accept` opens one on the URL's caller-supplied
+    // `:id` BEFORE validating anything, and holds only because the first
+    // statement inside is the token-gated
+    // `UPDATE ... WHERE workspace_id = $2 AND token_hash = $3` — every later
+    // read is reached only if that claimed a row. That is a property of the
+    // route's internals, not of this guard, and nothing pins it.
+    //
+    // Note also what is NOT the net here: `RbacGuard` fails closed on a
+    // missing `req.membership`, but the invariant above forbids
+    // @RequirePermission on these routes, so RbacGuard is structurally a
+    // no-op on them. It is the REASON for the prohibition, not a backstop
+    // under it. What actually catches a tenant-less route that reaches tenant
+    // state is `TenantContextInterceptor` never opening a transaction, so
+    // `currentTenantStore()` is undefined and every service dereferences it
+    // as `currentTenantStore()!.client` — a TypeError, loud, no leak — then
+    // src/tenancy/query-guard.ts, then RLS.
     const skipsTenantContext = this.reflector.getAllAndOverride<boolean>(SKIP_TENANT_CONTEXT_KEY, [
       context.getHandler(),
       context.getClass(),

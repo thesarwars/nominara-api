@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { IDEMPOTENT_KEY } from "../../../src/api/decorators/idempotent.decorator.js";
 import { IS_PUBLIC_KEY } from "../../../src/api/decorators/public.decorator.js";
 import { CREDITS_KEY } from "../../../src/api/decorators/credits.decorator.js";
 import { DAILY_CAP_KEY } from "../../../src/api/decorators/daily-cap.decorator.js";
@@ -100,6 +101,21 @@ describe("STORY-153 · a tenant-less route needs nothing derived from a validate
       ["a meter", METER_KEY],
       ["a daily cap", DAILY_CAP_KEY],
       ["credits", CREDITS_KEY],
+      // ⚠ A SEVENTH, FOUND BY REVIEW AGAINST THIS LIST'S OWN CRITERION.
+      // `idempotency.interceptor.ts:100` resolves `request.auth?.ws` — the raw
+      // claim, never `req.tenant` — and writes the record under a
+      // tenant-scoped cache key. Before this story that claim had been
+      // validated by WorkspaceGuard before any interceptor ran. A tenant-less
+      // @Idempotent() route would let a caller removed from W read and write
+      // idempotency records in W's namespace. Lower severity than a wallet
+      // debit, but `idempotency/key.ts:69` records that @Idempotent() and
+      // @Credits("deep_scan") travel together on POST /v1/projects/:id/runs,
+      // so they arrive as a pair.
+      //
+      // RATE_LIMIT_CLASS_KEY also reaches `auth.ws` and is deliberately NOT
+      // here: it always used the raw claim, its default class applies with or
+      // without the decorator, and it refuses rather than grants.
+      ["idempotency", IDEMPOTENT_KEY],
     ] as const;
 
     // Anti-vacuity: the keys must actually match something somewhere, or this
@@ -141,6 +157,45 @@ describe("STORY-153 · a tenant-less route needs nothing derived from a validate
     // side — kept because the two fail with different messages, and the one
     // that fires tells the next reader which decision they got wrong.
     expect(offenders, "a tenant-less route that states a permission is a contradiction").toEqual([]);
+  });
+
+  // ⚠ THE REVERSE DIRECTION, WHICH WAS COMPLETELY UNPINNED.
+  //
+  // Everything above says "tenant-less ⇒ no forbidden decorator". Nothing said
+  // "this route must STAY tenant-less", beyond the two recovery routes named
+  // below. A review removed `@SkipTenantContext()` from `GET /me/passkeys` and
+  // ran the whole unit suite: 2418 passed.
+  //
+  // That regression is STORY-153's own lockout shape one notch narrower. A user
+  // with a stale `ent_v` after any plan change — or whose sole workspace is
+  // suspended — could no longer list or manage their own passkeys or OAuth
+  // links. Those are credentials belonging to a PERSON, not a workspace, and
+  // they are exactly what an account-recovery flow reaches for.
+  //
+  // The nine mutating tenant-less routes are protected only INCIDENTALLY:
+  // `audit-coverage.spec.ts` keys its audit exemption on
+  // `@Public()`/`@SkipTenantContext()`, so dropping the decorator makes them
+  // demand `@Audit()`. That is an accident of a different gate and it covers
+  // no GET — which is why both routes the review broke are GETs.
+  //
+  // THE RULE, over metadata rather than another spec's hand-written list: a
+  // route that is not public and states no permission is one `RbacGuard` fails
+  // OPEN on (`rbac.guard.ts:45-50` returns true for want of metadata). Such a
+  // route has no workspace-derived authority to lose, and must therefore be
+  // tenant-less — otherwise it is gated on a `ws` claim it never uses.
+  it("⚠ a non-public route that states no permission MUST be tenant-less", async () => {
+    const all = await routes();
+    const offenders = all
+      .filter((r) => meta(IS_PUBLIC_KEY, r) !== true)
+      .filter((r) => meta(REQUIRE_PERMISSION_KEY, r) === undefined)
+      .filter((r) => meta(SKIP_TENANT_CONTEXT_KEY, r) !== true)
+      .map(name);
+
+    expect(
+      offenders,
+      "this route is gated on a `ws` claim it never uses — after a plan change its caller is locked out of it " +
+        "for a staleness that cannot matter to it. Either state a permission, or mark it @SkipTenantContext()",
+    ).toEqual([]);
   });
 
   it("⚠ the recovery routes are tenant-less, or the plan-change deadlock returns", async () => {

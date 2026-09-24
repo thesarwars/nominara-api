@@ -40,7 +40,21 @@ describe("STORY-153 · isWorkspaceUsable, over the whole status domain", () => {
     return [...check[1]!.matchAll(/'([a-z_]+)'/gu)].map((m) => m[1]!);
   })();
 
-  /** The ones that must be refused. Everything else in the domain must be allowed. */
+  /**
+   * The ones that must be refused. Everything else in the domain must be allowed.
+   *
+   * ⚠ RETYPED ON PURPOSE, AND ONLY CORRECT BECAUSE THE PREDICATE IS AN
+   * ALLOW-LIST. While `isWorkspaceUsable` was a deny-list this list made the
+   * test vacuous in the worst way: an eighth status was absent from BOTH, so
+   * both said "usable", they agreed, and the test was silent — which is the
+   * failure this file's header says it exists to prevent. A review proved it
+   * with `fraud_hold`.
+   *
+   * Inverted, the two disagree about an unclassified status — the predicate
+   * refuses it, this list expects it allowed — so the test FAILS naming the
+   * value. That is the point: this is the ORACLE, and updating it is the
+   * deliberate act of classifying a new workspace state.
+   */
   const UNUSABLE = ["suspended", "pending_deletion", "deleted"];
 
   it("the domain was parsed, and it is the one the schema declares", () => {
