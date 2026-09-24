@@ -14,6 +14,7 @@ import {
 import type { TenantContext } from "../../tenancy/tenant-context.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
+import { SKIP_TENANT_CONTEXT_KEY } from "../decorators/skip-tenant-context.decorator.js";
 import type { AuthenticatedRequest } from "./auth.guard.js";
 
 // STORY-018 — security-and-tenancy.md §5/§7. Real logic replacing the
@@ -77,6 +78,59 @@ export class WorkspaceGuard implements CanActivate {
       context.getClass(),
     ]);
     if (isPublic) {
+      return true;
+    }
+
+    // ⚠ STORY-153 — A TENANT-LESS ROUTE IS NOT GATED ON THE TOKEN'S CURRENT
+    // WORKSPACE, AND LEAVING THAT OUT DEADLOCKED THE PRODUCT.
+    //
+    // `@SkipTenantContext()`'s own comment has always said "WorkspaceGuard
+    // never populates req.tenant for it (there is no workspace in scope)".
+    // That was half-implemented: `TenantContextInterceptor`, `AuditInterceptor`
+    // and `discover-routes.ts` all consult the metadata, and this guard —
+    // which injects `reflector` — consulted only IS_PUBLIC_KEY. So every
+    // tenant-less route still resolved the token's `ws` claim and enforced its
+    // `ent_v` against it.
+    //
+    // THE DEADLOCK. STORY-151 made plan changes possible, and a plan change
+    // bumps `workspaces.entitlement_version`. Every existing session for that
+    // workspace then carries a stale `ent_v` and gets `EntitlementStaleException`
+    // — CORRECTLY, on any route that reads entitlements. But it also fired on:
+    //
+    //   GET  /v1/workspaces            the client asks this FIRST, to decide
+    //                                  whether the user belongs anywhere at all
+    //   POST /v1/workspaces/{id}/switch  the ONLY route that re-mints a token
+    //                                  carrying the CURRENT ent_v
+    //
+    // So the recovery could not run and the thing that would have fixed the
+    // session was itself refused. Every member of a workspace whose plan
+    // changed was locked out, with the exit blocked by the condition it
+    // existed to clear. STORY-151's own acceptance criterion — "a plan change
+    // does not break every other member of the workspace" — did not hold.
+    //
+    // ⚠ THIS DOES NOT WEAKEN THE STALENESS CHECK. It still fires on every
+    // route that reads tenant data, including `GET /billing/entitlements`,
+    // which is NOT tenant-less and is the 401 the client recovers FROM.
+    //
+    // Safe because each tenant-less route establishes its own authority and
+    // none of them reads `req.tenant` (pinned by
+    // test/unit/api/skip-tenant-context-routes.spec.ts):
+    //   POST /workspaces              no workspace exists yet
+    //   GET  /workspaces              scoped by `req.auth.sub`, the caller's own memberships
+    //   POST /workspaces/{id}/switch  re-checks the TARGET workspace's status and the
+    //                                 caller's membership of it (workspaces.service.ts:448-465,
+    //                                 which says in terms that it mirrors assertWorkspaceIsUsable)
+    //   POST /workspaces/{id}/invitations/accept  the invitation token is the authority,
+    //                                 and the caller is by definition not yet a member
+    //
+    // Note the shape of the original error: the guard gated these on the
+    // token's CURRENT workspace, which is not the workspace any of them is
+    // about.
+    const skipsTenantContext = this.reflector.getAllAndOverride<boolean>(SKIP_TENANT_CONTEXT_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (skipsTenantContext) {
       return true;
     }
 
