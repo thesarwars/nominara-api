@@ -26,6 +26,22 @@ import { applyFakeApiEnv } from "../support/fake-env.js";
 
 let handlerCalls = 0;
 
+// ⚠ DO NOT COPY THIS DECORATOR PAIRING INTO A REAL CONTROLLER.
+//
+// `@Idempotent()` + `@SkipTenantContext()` is forbidden in production and
+// asserted against in test/unit/api/skip-tenant-context-routes.spec.ts.
+// `idempotency.interceptor.ts:100` resolves the workspace from
+// `request.auth?.ws` — the RAW token claim — and writes the idempotency record
+// under a tenant-scoped cache key. On a tenant-less route that claim has been
+// validated by nothing, so a caller removed from a workspace could read and
+// write records in its namespace.
+//
+// It is acceptable HERE, and only here, because this controller exists solely
+// to exercise the interceptor in isolation: the decorator is what lets the
+// test run without a real workspace, and this fixture is never mounted in
+// `ApiModule`. Which is also why the gate cannot see it — it is not a route
+// `discoverRealRoutes()` returns — so this comment is the only thing standing
+// between it and the next billable route somebody builds by copying it.
 @Controller("test-only")
 class BillableController {
   @Post("charge")

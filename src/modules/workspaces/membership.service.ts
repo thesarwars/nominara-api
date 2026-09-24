@@ -21,6 +21,50 @@ export interface WorkspaceStatus {
   readonly deletedAt: Date | null;
 }
 
+/**
+ * Whether a workspace may be acted on at all.
+ *
+ * ⚠ ONE DEFINITION, BECAUSE STORY-153 MADE THE DUPLICATE LOAD-BEARING.
+ *
+ * `WorkspaceGuard.assertWorkspaceIsUsable` and `WorkspacesService.switchTo`
+ * each carried a literal copy of these five conditions, and the service's
+ * copy even said in a comment that it "mirrors WorkspaceGuard
+ * .assertWorkspaceIsUsable exactly". That was true — verified condition for
+ * condition — but it was true by hand.
+ *
+ * STORY-153 stopped the guard running on `POST /workspaces/{id}/switch` at
+ * all, which makes the service's copy the ONLY check on that path. A sixth
+ * unusable status added to one copy and not the other would then let a
+ * session switch into a workspace the rest of the system refuses. `status` is
+ * a 7-value CHECK (0002_identity_tenancy_billing.up.sql), so there are values
+ * to add.
+ *
+ * `deletedAt` is checked as well as `status`, matching the terminal-state
+ * precedent in workers/rollup/retention.ts: RLS on `workspaces` filters by id
+ * only, never by status or deleted_at, so this predicate is the only thing
+ * standing between a deleted workspace id and a request that still names it.
+ *
+ * ⚠ AN ALLOW-LIST, AND THE FIRST VERSION WAS A DENY-LIST. It listed the three
+ * unusable statuses, so an EIGHTH status added to the 7-value CHECK would have
+ * been classified USABLE by default — and the spec would have stayed green,
+ * because its expected-classification list is retyped and would not have
+ * mentioned the new value either. Both sides would have agreed, about nothing.
+ * A review demonstrated it by adding `fraud_hold` to the migration: fully
+ * actionable, four tests passing, including through `POST /workspaces/{id}/switch`,
+ * which STORY-153 made the only place this check happens at all.
+ *
+ * Inverted, a status nobody has classified REFUSES, and the spec fails loudly
+ * naming it. That is the right default for a predicate the switch path now
+ * depends on alone: a new workspace state should not become actionable
+ * because nobody remembered this function existed.
+ */
+const USABLE_STATUSES: ReadonlySet<string> = new Set(["trialing", "active", "past_due", "soft_capped"]);
+
+export function isWorkspaceUsable(workspace: WorkspaceStatus | null): workspace is WorkspaceStatus {
+  return workspace !== null && USABLE_STATUSES.has(workspace.status) && workspace.deletedAt === null;
+}
+
+
 @Injectable()
 export class MembershipService {
   constructor(private readonly cache: MembershipCacheService) {}

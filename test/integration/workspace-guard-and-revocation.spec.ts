@@ -4,6 +4,7 @@ import { Client, Pool } from "pg";
 import { describe, expect, it, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { WorkspaceGuard, type WorkspaceScopedRequest } from "../../src/api/guards/workspace.guard.js";
+import { SkipTenantContext } from "../../src/api/decorators/skip-tenant-context.decorator.js";
 import { AuthGuard, type AuthenticatedRequest } from "../../src/api/guards/auth.guard.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
@@ -29,6 +30,25 @@ function makeContext(req: WorkspaceScopedRequest) {
   return {
     getHandler: () => (): void => {},
     getClass: () => class {},
+    switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
+  } as unknown as Parameters<WorkspaceGuard["canActivate"]>[0];
+}
+
+// STORY-153 — a context carrying the REAL `@SkipTenantContext()` decorator.
+//
+// The metadata is applied by the decorator itself rather than by a
+// hand-written `Reflect.defineMetadata`, so this test breaks if the
+// decorator's key or mechanism ever changes — which is the thing the guard
+// now depends on.
+class TenantlessRoute {
+  @SkipTenantContext()
+  handler(): void {}
+}
+
+function makeTenantlessContext(req: WorkspaceScopedRequest) {
+  return {
+    getHandler: () => TenantlessRoute.prototype.handler,
+    getClass: () => TenantlessRoute,
     switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
   } as unknown as Parameters<WorkspaceGuard["canActivate"]>[0];
 }
@@ -625,4 +645,66 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
 
     isPublicSpy.mockRestore();
   });
+
+  // =========================================================================
+  // STORY-153 — THE DEADLOCK A PLAN CHANGE CREATED.
+  //
+  // STORY-151 made plan changes possible and a plan change bumps
+  // `entitlement_version`. Every existing session for that workspace then
+  // carries a stale `ent_v`, and scenario 7 above is the CORRECT refusal for
+  // any route that reads entitlements.
+  //
+  // But the guard applied it to tenant-less routes too, and two of those are
+  // the recovery itself: `GET /v1/workspaces`, which the client asks first to
+  // decide whether the user belongs anywhere, and `POST /workspaces/{id}/switch`,
+  // the only route that re-mints a token carrying the CURRENT ent_v. The exit
+  // was blocked by the condition it existed to clear, so every member of a
+  // workspace whose plan changed was locked out with no way back.
+  // =========================================================================
+  describe("STORY-153 · a tenant-less route is not gated on the token's current workspace", () => {
+    it("⚠ a STALE ent_v does not refuse a @SkipTenantContext route — this is the deadlock", async () => {
+      const userId = await createUser();
+      const workspaceId = await createWorkspace();
+      await addMember(workspaceId, userId, "owner");
+
+      // Exactly the state a plan change leaves behind: the row moved on, the
+      // token did not.
+      await pool.query("UPDATE workspaces SET entitlement_version = entitlement_version + 1 WHERE id = $1", [
+        workspaceId,
+      ]);
+      const stale = sessionClaims({ sub: userId, ws: workspaceId, role: "owner", ent_v: 1 });
+
+      const req: WorkspaceScopedRequest = { authMethod: "session", auth: stale, headers: {} };
+      await expect(
+        guard.canActivate(makeTenantlessContext(req)),
+        "GET /v1/workspaces and POST /workspaces/{id}/switch must survive a stale ent_v",
+      ).resolves.toBe(true);
+
+      // And it honours the decorator's own documented contract: "WorkspaceGuard
+      // never populates req.tenant for it (there is no workspace in scope)".
+      expect(req.tenant, "a tenant-less route has no workspace in scope").toBeUndefined();
+    });
+
+    it("⚠ and the SAME stale token is still refused on a tenant-scoped route", async () => {
+      // The anti-vacuity half. Without this, deleting the ent_v check
+      // entirely would pass the test above, and the staleness guarantee —
+      // which is what stops a session acting on entitlements it no longer
+      // has — would be gone with nothing failing.
+      const userId = await createUser();
+      const workspaceId = await createWorkspace();
+      await addMember(workspaceId, userId, "owner");
+      await pool.query("UPDATE workspaces SET entitlement_version = entitlement_version + 1 WHERE id = $1", [
+        workspaceId,
+      ]);
+      const stale = sessionClaims({ sub: userId, ws: workspaceId, role: "owner", ent_v: 1 });
+
+      const req: WorkspaceScopedRequest = { authMethod: "session", auth: stale, headers: {} };
+      await expect(
+        guard.canActivate(makeContext(req)),
+        "GET /billing/entitlements is NOT tenant-less, and its 401 is what the client recovers from",
+      ).rejects.toThrow();
+    });
+
+  });
+
 });

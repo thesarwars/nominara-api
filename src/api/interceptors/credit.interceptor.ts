@@ -478,7 +478,22 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
    * `details`, which is where a client should read it from anyway.
    */
   private async stampWallet(context: ExecutionContext, request: CreditSettlingRequest): Promise<void> {
-    const workspaceId = request.tenant?.workspaceId ?? request.auth?.ws ?? undefined;
+    // ⚠ NO `?? request.auth?.ws` FALLBACK, AND ITS REMOVAL IS STORY-153's ONE
+    // MECHANICAL FIX. That arm was DEAD on every route that should reach here:
+    // on a tenant-scoped route carrying a `ws` claim, WorkspaceGuard has
+    // already validated it and set `req.tenant`; on one without a claim it
+    // yielded `undefined` anyway. It could only ever YIELD A VALUE on a
+    // tenant-less route — where the claim has been validated by nothing, and
+    // must not be used at all.
+    //
+    // STORY-153's early return is what made that reachable. A test forbids
+    // pairing this decorator with @SkipTenantContext(), but deleting the arm
+    // closes it BY CONSTRUCTION rather than by assertion, and demotes that
+    // test to defence in depth — which is where a list like it belongs.
+    //
+    // Verified dead: removed across all five sites with unit and integration
+    // both fully green. The refusal below already handles `undefined`.
+    const workspaceId = request.tenant?.workspaceId ?? undefined;
     if (!workspaceId) return;
 
     const store = currentTenantStore();
