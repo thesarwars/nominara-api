@@ -98,6 +98,7 @@ export class EntitlementGuard implements CanActivate {
     if (!workspaceId) {
       throw new EntitlementGuardMisconfiguredError(
         `route declares @RequireEntitlement/@RequireFeature but no workspace is resolved. ` +
+        "or the route is @SkipTenantContext(), in which case the workspace claim is deliberately unresolved and these decorators cannot be combined with it. " +
           "An entitlement cannot be evaluated without a plan, so the request is refused rather than allowed.",
       );
     }

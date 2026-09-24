@@ -158,7 +158,15 @@ export class CreditGuard implements CanActivate {
       // no plan. Refusing beats charging against a default.
       throw new ValidationFailedError({
         message: "a credit-priced route requires a workspace",
-        details: { issues: [{ path: ["workspace"], message: "no workspace is resolved for this request" }] },
+        details: {
+          issues: [
+            {
+              path: ["workspace"],
+              message:
+                "no workspace is resolved for this request, or the route is @SkipTenantContext() — a priced route cannot be tenant-less",
+            },
+          ],
+        },
       });
     }
 

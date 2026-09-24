@@ -109,7 +109,9 @@ export class QuotaGuard implements CanActivate {
     const workspaceId = request.tenant?.workspaceId ?? undefined;
     if (!workspaceId) {
       throw new Error(
-        "route declares @Meter() but no workspace is resolved. A tier cap cannot be evaluated without a plan, " +
+        "route declares @Meter() but no workspace is resolved. " +
+        "or the route is @SkipTenantContext(), in which case the workspace claim is deliberately unresolved and these decorators cannot be combined with it. " +
+        "A tier cap cannot be evaluated without a plan, " +
           "so the request is refused rather than allowed.",
       );
     }

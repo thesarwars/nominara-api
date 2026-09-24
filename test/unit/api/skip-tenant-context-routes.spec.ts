@@ -203,14 +203,17 @@ describe("STORY-153 · a tenant-less route needs nothing derived from a validate
    */
   const NOT_TENANT_LESS: Readonly<Record<string, string>> = Object.freeze({});
 
-  it("⚠ a non-public route that states no permission MUST be tenant-less", async () => {
-    const all = await routes();
-    const offenders = all
+  /** Routes the rule flags, BEFORE any suppression — the population the hatch draws from. */
+  async function unsuppressedOffenders(): Promise<string[]> {
+    return (await routes())
       .filter((r) => meta(IS_PUBLIC_KEY, r) !== true)
       .filter((r) => meta(REQUIRE_PERMISSION_KEY, r) === undefined)
       .filter((r) => meta(SKIP_TENANT_CONTEXT_KEY, r) !== true)
-      .map(name)
-      .filter((route) => !(route in NOT_TENANT_LESS));
+      .map(name);
+  }
+
+  it("⚠ a non-public route that states no permission MUST be tenant-less", async () => {
+    const offenders = (await unsuppressedOffenders()).filter((route) => !(route in NOT_TENANT_LESS));
 
     expect(
       offenders,
@@ -221,12 +224,30 @@ describe("STORY-153 · a tenant-less route needs nothing derived from a validate
     ).toEqual([]);
   });
 
-  it("the escape hatch stays honest — every entry names a live route", async () => {
-    // A stale entry would silently exempt nothing while looking like it
-    // exempts something, and the next reader would trust it.
+  it("⚠ the escape hatch stays honest — every entry is LIVE and still NEEDED", async () => {
     const live = new Set((await routes()).map(name));
     for (const route of Object.keys(NOT_TENANT_LESS)) {
       expect(live, `NOT_TENANT_LESS names ${route}, which is not a live route`).toContain(route);
+    }
+
+    // ⚠ AND STILL NEEDED, WHICH LIVENESS ALONE DOES NOT CATCH. A review
+    // reproduced the gap: add an entry for a route that carries a permission,
+    // and it is a live route so the check above is satisfied, while the rule
+    // never flagged it so nothing notices it is unused. It sits there looking
+    // like it exempts something.
+    //
+    // The damage comes later. When that route eventually LOSES its permission
+    // — the exact scenario this hatch exists for — the dead entry suppresses
+    // this gate silently. The engineer sees only `route-permission-coverage`
+    // fire, takes its remedy, and never learns a tenant-context decision was
+    // due. An exemption nobody re-decided is worse than no exemption.
+    const flagged = new Set(await unsuppressedOffenders());
+    for (const route of Object.keys(NOT_TENANT_LESS)) {
+      expect(
+        flagged,
+        `NOT_TENANT_LESS names ${route}, but the rule does not flag it — the entry is unused. ` +
+          "Remove it: a suppression that suppresses nothing today will suppress silently tomorrow",
+      ).toContain(route);
     }
   });
 
@@ -253,15 +274,33 @@ describe("STORY-153 · a tenant-less route needs nothing derived from a validate
   // `join:project`. It is not a Nest HTTP controller, so `discoverRealRoutes()`
   // does not return it and every assertion above is silent about it.
   //
-  // That matters more here than anywhere else in this file. The gateway
-  // DELIBERATELY DELETED its own `getLiveMembership` call
-  // (`room-authorization.service.ts:203-212`) on the grounds that
-  // "WorkspaceGuard, which ran three lines above, already re-reads live
-  // membership" — so this guard is the ONLY thing enforcing socket
-  // revocation. STORY-153's early return is one `Reflect.defineMetadata` away
-  // from disabling it, and the failure would not be a 500: it would be a
-  // revoked member keeping a live socket.
-  it("⚠ the socket join context is NOT tenant-less — it is the only revocation check on a live socket", () => {
+  // That matters here because the gateway DELIBERATELY DELETED its own
+  // `getLiveMembership` call (`room-authorization.service.ts:203-212`) on the
+  // grounds that "WorkspaceGuard, which ran three lines above, already
+  // re-reads live membership". So this guard is the only place that read
+  // happens on the socket path.
+  //
+  // ⚠ WHAT THE FAILURE ACTUALLY IS — CORRECTED. A first version of this
+  // comment said it would be "a revoked member keeping a live socket". That
+  // is wrong, and the mechanism disproves it: `executionContextForSocket`
+  // sets `REQUIRE_PERMISSION_KEY` unconditionally
+  // (`ws-execution-context.ts:173`), and if the early return fired
+  // `req.membership` would never be set, so `RbacGuard` fails closed on every
+  // join (`rbac.guard.ts:58-60`). NOBODY connects. It is a total realtime
+  // outage, not a revocation bypass — louder, and easier to notice.
+  //
+  // ⚠ AND THE TEST THAT LOOKS LIKE IT COVERS THIS DOES NOT.
+  // `realtime-room-authorization.spec.ts:309` — "refuses a member whose
+  // membership was revoked AFTER the token was minted" — STILL PASSES under
+  // that regression, because it expects a refusal and gets one for entirely
+  // the wrong reason. Its own comment claims "ONLY the live-membership
+  // re-read can refuse this", which would no longer be true. The tests that
+  // actually catch it are the two HAPPY-PATH joins in that file.
+  //
+  // This assertion is therefore a fast local signal, not the only net. It has
+  // a subject: injecting the metadata into `executionContextForSocket` fails
+  // it.
+  it("⚠ the socket join context is NOT tenant-less — it is where the live-membership re-read happens", () => {
     const context = executionContextForSocket({ auth: { ws: "w", sub: "u" } } as never, {
       permission: "workspace:read",
     } as never);

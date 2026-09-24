@@ -87,7 +87,9 @@ export class DailyCapGuard implements CanActivate {
     const workspaceId = request.tenant?.workspaceId ?? undefined;
     if (!workspaceId) {
       throw new Error(
-        "route declares @DailyCap() but no workspace is resolved. A daily allowance is a property of a plan, " +
+        "route declares @DailyCap() but no workspace is resolved. " +
+        "or the route is @SkipTenantContext(), in which case the workspace claim is deliberately unresolved and these decorators cannot be combined with it. " +
+        "A daily allowance is a property of a plan, " +
           "so the request is refused rather than allowed against a default.",
       );
     }
