@@ -1,0 +1,103 @@
+# STORY-155 — the merge-blocking gates from testing-strategy.md §10, run on
+# every push instead of by hand.
+#
+# Before this file, every gate below was real and passing, and NOTHING
+# enforced that it had been run. The first clean-room run proved why that
+# matters: `pnpm test:integration` had been exiting 1 on every run — an
+# unhandled error after all 1547 tests passed — and every report quoted the
+# "Tests" line, never the exit code. CI reads the exit code.
+#
+# ⚠ WHAT THIS DOES NOT RUN, because it does not exist yet (§10 "always"
+# gates this pipeline cannot honestly claim — see STORY-155):
+#   - scoring and parser golden sets        (no runner; test/golden/ absent)
+#   - migration forward + rollback, general  (per-migration specs only)
+#   - EXPLAIN budget regression, general     (one spec, not a gate)
+#   - accuracy gates at launch-set sizes     (parser/scoring not built)
+# test/unit/ci/gates-workflow.spec.ts fails if a new `test:*` or `*check`
+# script appears in package.json without being run here or declared exempt.
+#
+# Supply chain: exactly two actions, both GitHub-owned, each pinned to a full
+# commit SHA (a tag can be moved; a SHA cannot). pnpm comes from Node's own
+# corepack, pinned with its sha512 in package.json#packageManager, so the
+# version and its integrity have one source for local and CI alike — and
+# pnpm 11's default 24-hour minimumReleaseAge travels with it.
+
+name: gates
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gates-${{ github.ref }}
+  # A newer push to a branch supersedes the old run. Never on main: every
+  # merge there must be verified on its own.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  static-and-database:
+    name: static + database gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      # The three shadow-database gates each CREATE their own throwaway
+      # database from the migrations, so a bare server is all they need —
+      # the same image docker-compose.yml runs.
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: nominara
+          POSTGRES_PASSWORD: nominara
+          POSTGRES_DB: nominara
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nominara -d nominara"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://nominara:nominara@localhost:5432/nominara
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm contracts:check
+      - run: pnpm test:unit
+      - run: pnpm db:drift-check
+      - run: pnpm db:rls-check
+      - run: pnpm db:schema-check
+
+  containers:
+    name: integration + isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Testcontainers starts its own Postgres, Valkey and pgbouncer per spec
+    # against the runner's Docker daemon; no service block, no socket
+    # overrides — those are colima workarounds this runner does not need.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      # Includes the 200-way concurrent debit (credit-wallet.spec.ts).
+      - run: pnpm test:integration
+      - run: pnpm test:isolation
+      - run: pnpm test:isolation:breakers
