@@ -1,8 +1,8 @@
 import { createRequire } from "node:module";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { UnrecoverableError, type Job } from "bullmq";
+import { Job, UnrecoverableError } from "bullmq";
 import { describe, expect, it } from "vitest";
 import { willBullmqRetry } from "../../../src/lib/queue/dead-letter.js";
 
@@ -10,56 +10,68 @@ import { willBullmqRetry } from "../../../src/lib/queue/dead-letter.js";
 //
 // `attachDeadLetterHandler` used to ask `job.attemptsMade >= (opts.attempts ??
 // 1)`, and its comment called the other branch "will still be retried". That
-// was an INFERENCE about BullMQ, not a fact from it, and BullMQ has three ways
-// to stop retrying that never touch the attempt count. The most important of
-// them is the one this codebase uses ON PURPOSE:
-// `audit-verify.handler.ts:129` throws `UnrecoverableError` on a detected
+// was an INFERENCE about BullMQ, not a fact from it, and BullMQ has several
+// ways to stop retrying that never touch the attempt count. The most important
+// of them is the one this codebase uses ON PURPOSE:
+// the tamper throw in `audit-verify.handler.ts` raises `UnrecoverableError`
+// on a detected
 // audit-chain tamper, specifically to get exactly one dead-letter entry a day.
 // It got none. The nightly tamper alarm's only machine-readable output was
 // dropped by the listener meant to record it.
 //
-// So the cases below are NOT a list I wrote from reading our own code — that
-// list is what had the blind spot. They are derived from BullMQ's own
-// `shouldRetryJob`, and the first test fails if that function changes at all.
+// So the cases below are NOT a list written from reading our own code — that
+// reading is what had the blind spot. They are derived from BullMQ's own
+// retry decision, and the first test fails if that decision changes at all.
 describe("STORY-154 · willBullmqRetry, against BullMQ's real retry decision", () => {
-  const require_ = createRequire(import.meta.url);
-
-  /** BullMQ's own `shouldRetryJob`, read out of the installed package. */
-  const shouldRetryJobSource = (() => {
-    const jobPath = require_.resolve("bullmq/dist/cjs/classes/job.js");
-    const source = readFileSync(jobPath, "utf8");
-    const start = source.indexOf("async shouldRetryJob(err)");
-    if (start === -1) {
-      throw new Error("bullmq's shouldRetryJob was not found — this test cannot see the decision it exists to track");
+  /**
+   * The decision AS THE RUNTIME EXECUTES IT.
+   *
+   * ⚠ READ OFF THE LOADED PROTOTYPE, NOT OFF A FILE PATH, AND THE DIFFERENCE
+   * IS NOT PEDANTIC. The first version of this suite asserted against
+   * `bullmq/dist/cjs/commands/*.lua` — which is the BUILD INPUT, still carrying
+   * unexpanded `--- @include` directives. The executed artifact is
+   * `dist/cjs/scripts/*.js` (`redis-connection.js:8` does
+   * `require("../scripts")`). A review removed the guarantee from the executed
+   * script, left the .lua untouched, and the suite stayed green. Reading a
+   * package by path means guessing which of its builds is live; reading the
+   * function off the prototype is the thing itself.
+   */
+  const shouldRetryJobSource = ((): string => {
+    // `shouldRetryJob` is private in BullMQ's .d.ts. Reaching past that is the
+    // point: this suite's job is to notice when internals move, and a test that
+    // could only see the public surface could not see this decision at all.
+    const proto = Job.prototype as unknown as { shouldRetryJob?: () => unknown };
+    if (typeof proto.shouldRetryJob !== "function") {
+      throw new Error("bullmq's Job.prototype.shouldRetryJob is gone — the retry decision moved and must be re-found");
     }
-    // Bounded at whichever comes first of the next method and the docblock
-    // that introduces it — bounding on the method alone swept that docblock in,
-    // which the fingerprint test below caught on its first run.
-    const bounds = ["\n    async ", "\n    /**", "\n    get "]
-      .map((marker) => source.indexOf(marker, start + 1))
-      .filter((index) => index !== -1);
-    if (bounds.length === 0) {
-      throw new Error("bullmq's shouldRetryJob has no following member — the slice would run to end of file");
-    }
-    return source.slice(start, Math.min(...bounds));
+    return proto.shouldRetryJob.toString();
   })();
 
   /**
-   * The exact decision we enumerated the terminal paths from, whitespace-
-   * normalized.
+   * The exact decision the terminal paths were enumerated from,
+   * whitespace-normalized.
    *
-   * ⚠ THE DEFAULT HERE IS "REPORT", WHICH IS THE WHOLE DESIGN. Anything this
-   * function grows — a fourth terminal branch, a renamed sentinel, a new error
-   * class — changes this string and fails this test by construction. The
-   * alternative was a list of conditions to check for, and a list cannot
-   * mention a branch that does not exist yet: it would have gone on passing
-   * while the new branch silently dropped dead-letter entries, which is
-   * precisely the failure being repaired.
+   * ⚠ THE DEFAULT HERE IS "REPORT". Anything this function grows — a fourth
+   * branch, a renamed sentinel, a new error class — changes this string and
+   * fails by construction. A list of conditions to look for cannot mention a
+   * branch that does not exist yet: it would go on passing while the new branch
+   * silently dropped dead-letter entries, which is precisely the failure being
+   * repaired.
+   *
+   * ⚠ AND ITS SCOPE IS THIS FUNCTION ONLY — it is not a guarantee about every
+   * terminal path. BullMQ decides terminality elsewhere too: a job stalled past
+   * `maxStalledCount` is marked with a `defa` hash field by
+   * moveStalledJobsToWait, which `worker.js` later converts into an
+   * `UnrecoverableError`. `willBullmqRetry` handles that correctly — it reaches
+   * the same non-retry branch, so `finishedOn` is set, and it can arrive with
+   * `attemptsMade` as low as 0, which the OLD counter dropped outright — but it
+   * is the predicate's fail-terminal DIRECTION that covers it, not this
+   * fingerprint. Do not read a green test here as "every terminal path is
+   * watched".
    *
    * WHEN THIS FAILS: re-read `shouldRetryJob`, work out every way it can now
-   * return `[false, ...]`, make sure each one has a case in TERMINAL_PATHS
-   * below and in test/integration/queue-terminal-failures.spec.ts, and only
-   * then update this fingerprint.
+   * return `[false, ...]`, give each one a case below and in
+   * test/integration/queue-terminal-failures.spec.ts, and only then update it.
    */
   const KNOWN_DECISION =
     "async shouldRetryJob(err) { if (this.attemptsMade + 1 < this.opts.attempts && " +
@@ -106,11 +118,17 @@ describe("STORY-154 · willBullmqRetry, against BullMQ's real retry decision", (
   });
 
   it("⚠ a job BullMQ finished early is terminal even with the counter saying otherwise", () => {
-    // All three of UnrecoverableError-by-instance, UnrecoverableError-by-name
-    // and a backoff returning -1 reach the listener in exactly this shape:
-    // one event, attemptsMade 1 of 4, finishedOn set. The old counter read
-    // 1 < 4 and dropped the entry.
+    // All of UnrecoverableError-by-instance, UnrecoverableError-by-name and a
+    // backoff returning -1 reach the listener in exactly this shape: one event,
+    // attemptsMade 1 of 4, finishedOn set. The old counter read 1 < 4 and
+    // dropped the entry.
     expect(willBullmqRetry(jobAs(1, 4, 1_700_000_000_000))).toBe(false);
+  });
+
+  it("⚠ a stalled-past-the-limit job, which can arrive with attemptsMade 0, is terminal", () => {
+    // moveStalledJobsToWait marks the job and worker.js converts it into an
+    // UnrecoverableError on the next pass. The old counter read 0 < 4.
+    expect(willBullmqRetry(jobAs(0, 4, 1_700_000_000_000))).toBe(false);
   });
 
   it("⚠ a terminal job that removeOnFail already deleted is still terminal", () => {
@@ -118,12 +136,13 @@ describe("STORY-154 · willBullmqRetry, against BullMQ's real retry decision", (
     // failed SET and answers false once the job is gone. `finishedOn` comes
     // from a client-built timestamp on the non-retry branch, so removal cannot
     // erase it. Latent today (topology pins removeOnFail to {age}), and pinned
-    // by removeOnFail-is-never-overridden.spec.ts.
+    // by remove-on-fail-is-never-overridden.spec.ts.
     expect(willBullmqRetry(jobAs(2, 2, 1_700_000_000_000))).toBe(false);
   });
 
   it("a missing attempts option does not make a failure retryable", () => {
-    // `opts.attempts` is optional in BullMQ; undefined means one attempt.
+    // `opts.attempts` is optional in BullMQ; undefined means one attempt, and
+    // shouldRetryJob's `1 < undefined` is false, so both agree it is terminal.
     expect(willBullmqRetry({ attemptsMade: 1, finishedOn: undefined, opts: {} } as unknown as Job)).toBe(false);
   });
 
@@ -136,9 +155,6 @@ describe("STORY-154 · willBullmqRetry, against BullMQ's real retry decision", (
   });
 
   it("UnrecoverableError is a real BullMQ export, not a name we invented", () => {
-    // The duck-typed branch keys off this exact name; if the class were
-    // renamed upstream the fingerprint test fails, but this keeps the
-    // relationship visible from our side too.
     expect(new UnrecoverableError("x").name).toBe("UnrecoverableError");
   });
 });
@@ -147,57 +163,86 @@ describe("STORY-154 · willBullmqRetry, against BullMQ's real retry decision", (
 //
 // The predicate treats a set `finishedOn` as proof BullMQ declined a retry. A
 // Job is rehydrated from its Redis hash on every fetch, so the question that
-// decides whether the fix is safe is: can a job arrive at a worker ALREADY
-// carrying `finishedOn` from an earlier terminal failure? If it could, the
-// listener would write a dead-letter entry for a job that is about to run
-// again, and a second one when it really did fail.
+// decides whether the fix is safe is: can a job reach a worker ALREADY carrying
+// `finishedOn` from an earlier terminal failure? If it could, the listener
+// would write a dead-letter entry for a run the job is about to make, and a
+// second when it really failed — duplicates in `audit.verify.dlq`, the one
+// queue whose entries an operator reads as a tamper alarm.
 //
-// It cannot, for two independent reasons, and both are asserted here because
-// the whole fix rests on them.
+// It cannot, and the reason that actually protects us is the THIRD one below:
+// nothing here revives a finished job at all. The two BullMQ guarantees are a
+// second line of defence for a path we do not use, and they are asserted
+// against the EXECUTED scripts rather than the build inputs — the first version
+// of this file got that wrong and a review broke the executed artifact while
+// the suite stayed green.
 describe("STORY-154 · a rehydrated job cannot carry a stale finishedOn into a retry", () => {
   const require_ = createRequire(import.meta.url);
   const read = (specifier: string): string => readFileSync(require_.resolve(specifier), "utf8");
 
-  it("⚠ BullMQ deletes finishedOn from the hash when a finished job is requeued", () => {
-    // reprocessJob is what `Job.retry()` runs. Without this HDEL a replayed job
-    // would come back with finishedOn still set.
-    const lua = read("bullmq/dist/cjs/commands/reprocessJob-8.lua");
-    expect(lua).toMatch(/HDEL["\s,]+.*finishedOn/u);
+  it("⚠ the artifacts asserted below are the ones BullMQ actually loads", () => {
+    // The control that the previous version of this suite lacked. If BullMQ
+    // ever stops loading `../scripts`, every assertion in this block is about
+    // a dead file and must be re-pointed rather than trusted.
+    expect(read("bullmq/dist/cjs/classes/redis-connection.js")).toContain('require("../scripts")');
+    // And the build inputs are demonstrably NOT executable as-is, which is what
+    // makes asserting on them a silent no-op.
+    expect(read("bullmq/dist/cjs/commands/reprocessJob-8.lua")).toContain("@include");
   });
 
-  it("⚠ and Job.fromJSON only adopts finishedOn when the hash actually holds one", () => {
-    // `if (json.finishedOn)` — so absent, null and 0 all leave it undefined
-    // rather than assigning a falsy value the predicate would have to reason
-    // about separately.
-    const jobSource = read("bullmq/dist/cjs/classes/job.js");
-    expect(jobSource).toContain("if (json.finishedOn) {");
+  it.each([
+    ["reprocessJob-8", "Job.retry()"],
+    ["moveJobsToWait-8", "Queue.retryJobs() / Queue.promoteJobs()"],
+  ])("⚠ the executed %s script clears finishedOn when reviving a finished job (%s)", (script) => {
+    const executed = read(`bullmq/dist/cjs/scripts/${script}.js`);
+    expect(
+      executed,
+      `${script} no longer clears finishedOn. A revived job would reach the dead-letter listener already ` +
+        "looking terminal, producing an entry for a run it is about to make and a duplicate when it really fails.",
+    ).toMatch(/HDEL[^)]*finishedOn/u);
   });
 
-  it("⚠ and this codebase never requeues a finished job in the first place", () => {
+  it("⚠ and this codebase never revives a finished job in the first place", () => {
     // Admin DLQ replay enqueues a NEW job with a replay idempotency suffix
-    // (admin.service.ts, STORY-030 AC7) rather than reviving the original, so
-    // the path above is a second line of defence rather than the only one.
-    // Derived from src/ so a future `job.retry()` call has to come past this.
+    // (admin.service.ts, STORY-030 AC7) rather than reviving the original.
+    //
+    // ⚠ ANY RECEIVER, NOT A LIST OF NAMES. The first version matched
+    // `(?:job|dlqJob|replayedJob)\.retry\(` — a deny-list of three identifiers,
+    // in a change whose own sibling spec disavows exactly that shape. A review
+    // walked straight past it with `failedJob.retry()` and, worse,
+    // `q.retryJobs()` — the BULK revival of the entire failed set, which is
+    // precisely what an operator reaches for after a DLQ page, and which the
+    // old pattern did not even mention.
+    const REVIVAL = /\.(?:retry|retryJobs|promoteJobs)\s*\(/u;
     const src = fileURLToPath(new URL("../../../src", import.meta.url));
     const offenders: string[] = [];
+    let scanned = 0;
     const walk = (dir: string): void => {
       for (const name of readdirSync(dir)) {
         const full = join(dir, name);
         if (statSync(full).isDirectory()) walk(full);
-        else if (name.endsWith(".ts")) {
+        else if (/\.[cm]?tsx?$/u.test(name)) {
+          scanned++;
           readFileSync(full, "utf8")
             .split("\n")
             .forEach((line, index) => {
               const trimmed = line.trim();
               if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
-              if (/\b(?:job|dlqJob|replayedJob)\.retry\s*\(/u.test(trimmed)) {
-                offenders.push(`${relative(src, full)}:${String(index + 1)} — ${trimmed}`);
-              }
+              if (REVIVAL.test(trimmed)) offenders.push(`${relative(src, full)}:${String(index + 1)} — ${trimmed}`);
             });
         }
       }
     };
     walk(src);
+
+    // Anti-vacuity, in both directions: the walk must have read real files, and
+    // the pattern must actually match the forms it claims to. A broken regex
+    // would otherwise report clean forever.
+    expect(scanned, "the source walk found nothing — every assertion here would be vacuous").toBeGreaterThan(50);
+    for (const form of ["await failedJob.retry();", "await q.retryJobs({ state: 'failed' });", "job.retry()", "queue.promoteJobs()"]) {
+      expect(REVIVAL.test(form), `the scanner does not recognise ${form}`).toBe(true);
+    }
+    expect(REVIVAL.test("const r = retryCount(job);"), "the scanner matches a non-revival call").toBe(false);
+
     expect(
       offenders,
       "reviving a finished BullMQ job puts a stale finishedOn one HDEL away from the dead-letter predicate. " +
