@@ -103,10 +103,70 @@ export async function recordDeadLetter(dlqQueue: Queue, entry: QueueTopologyEntr
 }
 
 /**
+ * Answers the one question the dead-letter handler needs: will BullMQ run
+ * this job again?
+ *
+ * ⚠ PHRASED AS "WILL IT CERTAINLY COME BACK", NOT "IS IT TERMINAL", AND THE
+ * DIRECTION IS THE POINT. The two ways to be wrong here are not symmetric: a
+ * spurious DLQ entry is a duplicate an operator dismisses, while a missing one
+ * is silent data loss on the queue whose entire purpose is to not be silent.
+ * So this returns true only when two independent signals AGREE the job is
+ * coming back, and everything else — including whatever BullMQ grows next — is
+ * treated as terminal and recorded.
+ *
+ * ⚠ THE ATTEMPT COUNT ALONE IS NOT THE QUESTION, AND BELIEVING IT WAS COST THE
+ * AUDIT-CHAIN TAMPER ALARM ITS ONLY OUTPUT. `Job.shouldRetryJob` (bullmq
+ * 6.2.0, job.js:448) reads
+ *
+ *     this.attemptsMade + 1 < this.opts.attempts &&
+ *       !(err instanceof UnrecoverableError || err.name == 'UnrecoverableError')
+ *
+ * and then maps a backoff delay of `-1` to "do not retry". That is THREE ways
+ * to be terminal on the FIRST attempt, every one of them invisible to a
+ * counter:
+ *   1. `UnrecoverableError` by instance — what the tamper throw in
+ *      `audit-verify.handler.ts` raises, chosen deliberately to get ONE entry a
+ *      day. (Named by symbol, not line: this change moved that throw twice
+ *      while citing it, and a review caught the stale number both times.);
+ *   2. `UnrecoverableError` by NAME — duck-typed, and the only one of the two
+ *      that survives a serialization boundary;
+ *   3. a backoff strategy returning `-1` — which `worker-factory.ts`'s
+ *      `adaptBackoffStrategy` returns BY DESIGN once the retry ladder is spent.
+ * Measured against a real Valkey: each produces a single `failed` event with
+ * `attemptsMade = 1` of 4, and the old counter dropped all three.
+ *
+ * ⚠ AND `job.isFailed()` IS NOT THE QUESTION EITHER, THOUGH IT READS LIKE IT.
+ * It is `isInState('failed')` — a Redis read of the failed SET — so it answers
+ * false for a genuinely terminal job that `removeOnFail` has already deleted.
+ * Measured: with `removeOnFail: true` or `{ count: 0 }`, a terminal job reports
+ * `isFailed() === false`, so a fix built on it would have closed the three
+ * paths above and opened a fourth. `topology.ts:55` pins `removeOnFail` to
+ * `{ age: … }` for every queue and all three enqueue sites pass
+ * `entry.removeOnFail`, so nothing reaches that shape today — which is what
+ * makes it a hazard that is latent rather than absent.
+ *
+ * `finishedOn` is neither proxy. `moveToFailed` declares it fresh and assigns
+ * it ONLY in the non-retry branch (job.js:485-503), from a client-built
+ * timestamp rather than the Lua script's return value — so it is set if and
+ * only if BullMQ decided against a retry, and it is set whether or not the job
+ * was then removed. It is also already in memory, costing no round trip on a
+ * hot path. (`Job.retry()` assigns `this.finishedOn = null`, against its own
+ * `finishedOn?: number` declaration — unreachable from a worker's failed
+ * listener, whose Job is always a fresh `fromJSON`, and safe in any case since
+ * `null !== undefined` reports rather than drops.) The attempt count is kept alongside it as a second, independent
+ * witness: if either signal ever regresses, the other still reports the
+ * failure rather than losing it.
+ */
+export function willBullmqRetry(job: Pick<Job, "attemptsMade" | "finishedOn" | "opts">): boolean {
+  return job.finishedOn === undefined && job.attemptsMade < (job.opts.attempts ?? 1);
+}
+
+/**
  * Attaches the terminal-failure handler to `worker`: every time a job on
- * `entry`'s queue fails with no retries left (`attemptsMade >= attempts`),
- * its full payload and error land in `entry`'s DLQ. Jobs that will still be
- * retried are left alone — the DLQ is for TERMINAL failures only.
+ * `entry`'s queue fails and BullMQ will not run it again, its full payload and
+ * error land in `entry`'s DLQ. Only jobs that will certainly be retried are
+ * left alone — see `willBullmqRetry` for why that is the question asked, and
+ * why the obvious two ways of asking it both lose entries.
  */
 export function attachDeadLetterHandler(
   worker: { on(event: "failed", listener: (job: Job | undefined, error: unknown) => void): void },
@@ -115,8 +175,7 @@ export function attachDeadLetterHandler(
 ): void {
   worker.on("failed", (job, error) => {
     if (!job) return;
-    const attempts = job.opts.attempts ?? 1;
-    if (job.attemptsMade < attempts) return; // will still be retried — not a terminal failure
+    if (willBullmqRetry(job)) return; // certainly coming back — not a terminal failure
 
     // Code-review fix: recordDeadLetter() is fire-and-forget from the
     // "failed" listener's point of view (the listener itself cannot be
