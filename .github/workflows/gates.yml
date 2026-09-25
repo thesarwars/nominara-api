@@ -72,13 +72,25 @@ jobs:
           package-manager-cache: false
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
+        id: install
+      # ⚠ EVERY GATE REPORTS ON ITS OWN. Without the `if:` below, the first
+      # failing gate skips every step after it — the first CI run failed
+      # test:unit and left all three database gates unrun and unknown. The
+      # job still fails if any gate fails; it just says which ones did.
       - run: pnpm lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm typecheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm contracts:check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm test:unit
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm db:drift-check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm db:rls-check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm db:schema-check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
 
   containers:
     name: integration + isolation
@@ -97,7 +109,11 @@ jobs:
           package-manager-cache: false
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
+        id: install
       # Includes the 200-way concurrent debit (credit-wallet.spec.ts).
       - run: pnpm test:integration
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm test:isolation
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm test:isolation:breakers
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}

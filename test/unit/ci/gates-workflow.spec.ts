@@ -62,6 +62,23 @@ describe("STORY-155 · the CI workflow runs every gate package.json declares", (
     ).toEqual([]);
   });
 
+  it("⚠ every gate step still runs when an earlier gate failed", () => {
+    // The first CI run failed test:unit and SKIPPED all three database gates,
+    // so it proved nothing about them. A gate that only runs when every gate
+    // before it passed reports on the first failure and hides the rest. Each
+    // gate step therefore carries a guard that runs it whenever install
+    // succeeded; the job still fails if any of them does.
+    const GUARD = "if: ${{ !cancelled() && steps.install.outcome == 'success' }}";
+    const unguarded = [...workflow.matchAll(/^\s*-\s*run:\s*pnpm\s+([a-z][\w:.-]*)\s*\n(.*)$/gmu)]
+      .filter((m) => GATE.test(m[1]!) && m[2]!.trim() !== GUARD)
+      .map((m) => m[1]!);
+    expect(unguarded, "these gate steps are skipped whenever an earlier gate fails").toEqual([]);
+    // The guard is only meaningful if the step it names exists.
+    expect(workflow.match(/^\s*id:\s*install\s*$/gmu)?.length, "every job needs an `install` step id").toBe(
+      (workflow.match(/^\s*-\s*run:\s*pnpm install --frozen-lockfile\s*$/gmu) ?? []).length,
+    );
+  });
+
   it("every step names a script that exists", () => {
     // A renamed script would otherwise surface only as a red run on GitHub.
     expect([...invoked].filter((name) => !(name in scripts))).toEqual([]);
