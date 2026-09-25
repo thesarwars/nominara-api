@@ -15,7 +15,18 @@ import { MIGRATION_OWNER_ROLE, RUNTIME_ROLES } from "../../../src/db/conventions
 // flow-style `- { uses: x@v1 }` and a renamed install step straight past it,
 // and it classified scripts by a naming convention that missed half the
 // plausible gate names. It also never looked at test FILES, and five contract
-// test files (62 tests) had never run in CI.
+// test files (70 tests — an earlier count of 62 was a grep that missed it.each
+// expansions) had never run in CI.
+//
+// ⚠ AND A SECOND REVIEW FOUND THE SAME SHAPE ONE LEVEL UP. The parsed version
+// closed every step-level bypass and left the levels above open: a
+// workflow-level `env` or `defaults.run.shell`, a job `env` line setting
+// pnpm's script shell to `true`, an action input, or a gate script's BODY in
+// package.json (`--shard=1/2`, `-t`, `|| true`) each turned gates into no-ops
+// with this spec green. So now every level is pinned by VALUE, not by shape:
+// the workflow's top-level keys, each job's settings, each action's inputs,
+// and each gate script's exact body. A change to any of them is a change to
+// what a gate runs, and has to change this file in the same diff.
 //
 // So everything here works on the PARSED workflow, and the default is to
 // REPORT: an unrecognised step, an unrecognised job setting, an unclassified
@@ -99,7 +110,72 @@ const EXEMPT_GATE: Readonly<Record<string, string>> = {
     "their own), so the table does not exist and it would ERROR; it only means something against production.",
 };
 
+/**
+ * Each gate script's EXACT body. Pinned because the census below asks vitest
+ * which files a body COLLECTS, and `vitest list` ignores `--shard` and `-t` —
+ * so a narrowed body looked complete — and because `|| true` or an extra flag
+ * on any gate excuses or narrows it.
+ *
+ * The one edit this cannot catch is one that stops THIS file running (an
+ * `--exclude` of test/unit/ci on test:unit): nothing checks a check that does
+ * not run. That edit has to change the body pinned here too, so it cannot be
+ * made without the diff saying so.
+ */
+const GATE_BODIES: Readonly<Record<string, string>> = {
+  lint: "eslint .",
+  typecheck: "tsc --noEmit",
+  "contracts:check": "tsx src/contracts/check.ts",
+  "test:unit": "vitest run test/unit src contracts",
+  "db:drift-check": "tsx src/db/drift-check.ts",
+  "db:rls-check": "tsx src/db/rls/rls-check.ts",
+  "db:schema-check": "tsx src/db/schema/schema-check.ts",
+  "test:integration": "vitest run --config vitest.integration.config.ts",
+  "test:isolation": 'vitest run --config vitest.isolation.config.ts --exclude "test/isolation/breakers/**"',
+  "test:isolation:breakers": "vitest run --config vitest.isolation.config.ts test/isolation/breakers",
+};
+
+/** The only actions this workflow may use, with the exact inputs each may take. */
+const ACTION_INPUTS: Readonly<Record<string, Record<string, unknown>>> = {
+  "actions/checkout": { "persist-credentials": false },
+  "actions/setup-node": { "node-version-file": ".nvmrc", "package-manager-cache": false },
+};
+
 describe("STORY-155 · the CI workflow, parsed, runs every gate this repository declares", () => {
+  it("⚠ the workflow has exactly the top-level keys this spec knows — no `env`, no `defaults`", () => {
+    // Workflow-level `defaults.run.shell: "true {0}"` or `env` carrying
+    // pnpm_config_script_shell made every gate a no-op, one level above
+    // everything the previous version checked.
+    expect(Object.keys(workflow).sort()).toEqual(["concurrency", "jobs", "name", "on", "permissions"]);
+  });
+
+  it("⚠ each job's settings are pinned by VALUE, not just by key", () => {
+    const [staticJob, containers] = [workflow.jobs["static-and-database"], workflow.jobs.containers];
+    expect(Object.keys(workflow.jobs).sort()).toEqual(["containers", "static-and-database"]);
+    // One env line is enough to neutralise every step in a job, so the job env
+    // is exactly the database URL — a plain URL, no query string, no options.
+    expect(staticJob!.env).toEqual({ DATABASE_URL: "postgres://nominara:nominara@localhost:5432/nominara" });
+    expect(containers!.env).toBeUndefined();
+    expect(staticJob!.services).toEqual({
+      postgres: {
+        image: "pgvector/pgvector:pg18",
+        env: { POSTGRES_USER: "nominara", POSTGRES_PASSWORD: "nominara", POSTGRES_DB: "nominara" },
+        ports: ["5432:5432"],
+        options: '--health-cmd "pg_isready -U nominara -d nominara" --health-interval 5s --health-timeout 3s --health-retries 20',
+      },
+    });
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      expect(job["runs-on"], name).toBe("ubuntu-24.04");
+      expect(typeof job["timeout-minutes"], name).toBe("number");
+    }
+  });
+
+  it("⚠ every gate script's body is exactly the pinned one — no flag, operator or narrowing", () => {
+    // `vitest list --filesOnly` ignores --shard and -t, so a narrowed body
+    // passed the census; `|| true` excused a gate outright.
+    const bodies = Object.fromEntries([...invoked].map((name) => [name, scripts[name]]));
+    expect(bodies).toEqual(GATE_BODIES);
+  });
+
   it("the parse found what it should — the checks below are not running over nothing", () => {
     expect(Object.keys(workflow.jobs).length).toBeGreaterThanOrEqual(2);
     expect(gateSteps.length, "no gate steps parsed").toBeGreaterThanOrEqual(10);
@@ -184,13 +260,17 @@ describe("STORY-155 · the CI workflow, parsed, runs every gate this repository 
     // db:role-check passes vacuously: CI's role is neither the owner it looks for nor a runtime role.
     expect(url.username).not.toBe(MIGRATION_OWNER_ROLE);
     expect(RUNTIME_ROLES as readonly string[]).not.toContain(url.username);
-    // db:purge-check would error: nothing migrates CI's service database.
+    // db:purge-check would error: nothing migrates CI's service database — no
+    // step, and (the review's case) no gate script BODY either.
     expect(invoked.has("db:migrate")).toBe(false);
-    expect(allSteps.some((step) => typeof step.run === "string" && step.run.includes("db:migrate"))).toBe(false);
+    expect(allSteps.some((step) => typeof step.run === "string" && step.run.includes("migrat"))).toBe(false);
+    expect([...invoked].filter((name) => /migrat/iu.test(scripts[name]!))).toEqual([]);
+    // And the role is fixed by the URL alone — no query string, no options.
+    expect(url.search).toBe("");
   });
 
   it("⚠ every tracked test file is collected by a test script CI runs", { timeout: 120_000 }, () => {
-    // The census that found five contract test files (62 tests) CI never ran:
+    // The census that found five contract test files (70 tests) CI never ran:
     // `test:unit`'s positional filters were `test/unit src`, and nothing else
     // collected `contracts/`. Asked of vitest itself, not re-implemented.
     const tracked = execFileSync("git", ["ls-files"], { cwd: ROOT, encoding: "utf8" })
@@ -221,7 +301,12 @@ describe("STORY-155 · the CI workflow, parsed, runs every gate this repository 
     expect(uses.length).toBeGreaterThanOrEqual(2);
     for (const step of uses) {
       expect(step.uses, "a tag can be re-pointed; a third-party action is a dependency (§6)").toMatch(PINNED_ACTION);
-      if (step.uses!.startsWith("actions/checkout@")) expect(step.with?.["persist-credentials"]).toBe(false);
+      // An allow-list of actions, each with EXACT inputs: a GitHub-owned action
+      // such as github-script can write GITHUB_ENV and neutralise every later
+      // step, and a checkout `ref: main` would test main instead of the push.
+      const action = step.uses!.split("@")[0]!;
+      expect(Object.keys(ACTION_INPUTS), `${action} is not an action this workflow may use`).toContain(action);
+      expect(step.with, action).toEqual(ACTION_INPUTS[action]);
     }
     expect(workflow.permissions).toEqual({ contents: "read" });
   });

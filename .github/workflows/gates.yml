@@ -4,9 +4,10 @@
 # Before this file, every gate below EXISTED and nothing enforced that it had
 # been run — and two of them were not passing on a clean checkout. A local
 # clean-room run that read exit codes found `pnpm test:integration` exiting 1
-# after all 1547 tests passed (an unhandled error), and `test:unit` failing on
-# gap G-12. Every earlier report had quoted the "Tests" line, which a pipe
-# strips of its exit status.
+# after all 1547 tests passed (an unhandled error); every earlier report had
+# quoted the "Tests" line, which a pipe strips of its exit status. The FIRST CI
+# run then found `test:unit` failing on gap G-12 — the local run could not,
+# because it ran beside the docs snapshot the failing test read.
 #
 # ⚠ §10 GATES THIS PIPELINE CANNOT CLAIM, because nothing exists to run:
 #   always:                        scoring and parser golden sets (no runner;
@@ -19,8 +20,11 @@
 # test/unit/ci/gates-workflow.spec.ts holds this file to package.json and to
 # the repository's test files, on the PARSED workflow: every script is either
 # run here or classified with a reason, every tracked test file is collected
-# by a script that runs here, and a gate step cannot be neutralised by a job
-# or step setting without that spec failing.
+# by a script that runs here, and the top-level keys, each job's settings,
+# each action's inputs and each gate script's body are pinned by VALUE — so
+# changing what a gate runs means changing that spec in the same diff. The one
+# change it cannot see is one that stops the spec itself running; that edit
+# has to touch a pinned body too, so the diff shows it.
 #
 # Supply chain: exactly two actions, both GitHub-owned, each pinned to a full
 # commit SHA (a tag can be moved; a SHA cannot). pnpm comes from Node's own
