@@ -26,28 +26,30 @@ import {
 
 const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
-// READS THE REFERENCE ITSELF, WHICH LIVES OUTSIDE THIS REPOSITORY.
+// READS THE REFERENCE ITSELF — FROM ITS COMMITTED MIRROR.
 //
-// `Nominara-Dev-Docs-main/` is a sibling snapshot with no git history of its
-// own, so this file is the first test here that depends on something a fresh
-// clone does not have. That is deliberate: an event list transcribed into the
-// test would only prove the transcription matches itself, and the whole point
-// is fidelity to §11.
+// An event list transcribed into the test would only prove the transcription
+// matches itself; the whole point is fidelity to §11. So this reads
+// api-specification.md, the document, not a copy of our own array.
 //
-// The consequence is stated rather than discovered: when CI exists it must be
-// given the reference — a submodule, a vendored copy, or a fetch step — and
-// that is a decision, not something this test can make. Until then the failure
-// says so instead of reading as a broken assertion. Disclosed as gap G-12.
-const SPEC_PATH = resolve(REPO_ROOT, "../Nominara-Dev-Docs-main/references/api-specification.md");
+// It used to read `../Nominara-Dev-Docs-main/` beside the repository, which a
+// fresh clone does not have — gap G-12, and the one failure in the first CI
+// run. STORY-155 settled G-12 as a vendored mirror, the same arrangement as
+// docs/plans/dev-plan.md: `docs/references/api-specification.md` is a
+// byte-identical copy of the snapshot's file, and
+// test/unit/docs-reference-mirror.spec.ts fails wherever the snapshot is
+// present and the two differ. The mirror is a copy of the DOCUMENT, not a
+// transcription of its contents, so the test still checks the code against
+// the specification rather than against itself.
+const SPEC_PATH = resolve(REPO_ROOT, "docs/references/api-specification.md");
 
 function readSpec(): string {
   try {
     return readFileSync(SPEC_PATH, "utf8");
   } catch {
     throw new Error(
-      `realtime-event-catalog.spec: the reference is not at ${SPEC_PATH}. This suite checks the catalog ` +
-        "against api-specification.md §11 itself rather than against a copy, so it needs the docs snapshot " +
-        "beside the repository. See README gap G-12 — CI must be given the reference before this can run there.",
+      `realtime-event-catalog.spec: the mirrored reference is not at ${SPEC_PATH}. It is committed to this ` +
+        "repository (STORY-155, gap G-12); re-copy it from the docs snapshot's references/ directory.",
     );
   }
 }
