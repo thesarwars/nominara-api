@@ -36,17 +36,29 @@ describe("STORY-154 · removeOnFail is never overridden per job", () => {
       for (const name of readdirSync(dir)) {
         const full = join(dir, name);
         if (statSync(full).isDirectory()) walk(full);
-        else if (name.endsWith(".ts")) found.push(full);
+        // ⚠ EVERY TypeScript EXTENSION, NOT `.ts`. A review defeated both
+        // checks below with a single `.mts` file carrying both forbidden
+        // forms — on a spec whose stated premise is "the only way that
+        // survives a new file being added".
+        else if (/\.[cm]?tsx?$/u.test(name)) found.push(full);
       }
     };
     walk(SRC);
     return found;
   })();
 
-  it("the file census is non-empty and reaches the queue module", () => {
+  it("the file census is non-empty, reaches the queue module, and covers every TS extension", () => {
     // An empty walk would make every assertion below vacuous.
     expect(tsFiles.length).toBeGreaterThan(50);
     expect(tsFiles.some((f) => f.endsWith(join("lib", "queue", "queue-factory.ts")))).toBe(true);
+    // The matcher itself, pinned — a walk that silently stopped seeing .mts
+    // would report clean forever.
+    for (const name of ["a.ts", "a.mts", "a.cts", "a.tsx"]) {
+      expect(/\.[cm]?tsx?$/u.test(name), `${name} must be scanned`).toBe(true);
+    }
+    for (const name of ["a.js", "a.json", "a.ts.map", "a.d.ts.bak"]) {
+      expect(/\.[cm]?tsx?$/u.test(name), `${name} must not be scanned`).toBe(false);
+    }
   });
 
   it("⚠ every removeOnFail in src/ either DEFINES the topology value or passes it through unchanged", () => {
@@ -62,8 +74,16 @@ describe("STORY-154 · removeOnFail is never overridden per job", () => {
         // Prose is not a job option — but a comment mentioning it is also not
         // evidence of anything, so it is simply skipped rather than trusted.
         if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
-        // Form 1: the topology module defining the single permitted value.
-        if (rel === join("lib", "queue", "topology.ts")) return;
+        // Form 1: the topology module DEFINING the single permitted value —
+        // narrowed to the three declared forms. A whole-file exemption let any
+        // shape through in the one file whose job is to constrain the option.
+        if (rel === join("lib", "queue", "topology.ts")) {
+          if (/^removeOnFail:\s*z\./u.test(trimmed)) return;
+          if (/^removeOnFail:\s*GLOBAL_REMOVE_ON_FAIL,?$/u.test(trimmed)) return;
+          if (trimmed.includes("Omit<QueueTopologyEntry")) return;
+          offenders.push(`${rel}:${String(index + 1)} — ${trimmed}`);
+          return;
+        }
         // Form 2: a verbatim pass-through of that value.
         if (/^removeOnFail:\s*entry\.removeOnFail,?$/u.test(trimmed)) {
           passthroughs++;
@@ -93,6 +113,15 @@ describe("STORY-154 · removeOnFail is never overridden per job", () => {
           .filter(({ line }) => line.includes("defaultJobOptions") && !line.startsWith("//") && !line.startsWith("*"));
       })
       .map(({ rel, line, n }) => `${rel}:${String(n)} — ${line}`);
+
+    // ⚠ ITS OWN ANTI-VACUITY CONTROL. The sibling check above counts
+    // pass-throughs so a broken pattern fails; this one had nothing, so a
+    // mistyped literal would have reported clean forever. A review named that
+    // asymmetry, and the commit message had claimed both were covered.
+    const matches = (line: string): boolean =>
+      line.includes("defaultJobOptions") && !line.startsWith("//") && !line.startsWith("*");
+    expect(matches("defaultJobOptions: { attempts: 3 },"), "the matcher does not recognise a real use").toBe(true);
+    expect(matches("// defaultJobOptions is never set"), "the matcher reads a comment as code").toBe(false);
 
     expect(
       offenders,

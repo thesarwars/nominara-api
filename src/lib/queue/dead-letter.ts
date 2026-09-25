@@ -124,8 +124,10 @@ export async function recordDeadLetter(dlqQueue: Queue, entry: QueueTopologyEntr
  * and then maps a backoff delay of `-1` to "do not retry". That is THREE ways
  * to be terminal on the FIRST attempt, every one of them invisible to a
  * counter:
- *   1. `UnrecoverableError` by instance — what `audit-verify.handler.ts:129`
- *      throws on a detected tamper, chosen deliberately to get ONE entry a day;
+ *   1. `UnrecoverableError` by instance — what the tamper throw in
+ *      `audit-verify.handler.ts` raises, chosen deliberately to get ONE entry a
+ *      day. (Named by symbol, not line: this change moved that throw twice
+ *      while citing it, and a review caught the stale number both times.);
  *   2. `UnrecoverableError` by NAME — duck-typed, and the only one of the two
  *      that survives a serialization boundary;
  *   3. a backoff strategy returning `-1` — which `worker-factory.ts`'s
@@ -148,7 +150,10 @@ export async function recordDeadLetter(dlqQueue: Queue, entry: QueueTopologyEntr
  * timestamp rather than the Lua script's return value — so it is set if and
  * only if BullMQ decided against a retry, and it is set whether or not the job
  * was then removed. It is also already in memory, costing no round trip on a
- * hot path. The attempt count is kept alongside it as a second, independent
+ * hot path. (`Job.retry()` assigns `this.finishedOn = null`, against its own
+ * `finishedOn?: number` declaration — unreachable from a worker's failed
+ * listener, whose Job is always a fresh `fromJSON`, and safe in any case since
+ * `null !== undefined` reports rather than drops.) The attempt count is kept alongside it as a second, independent
  * witness: if either signal ever regresses, the other still reports the
  * failure rather than losing it.
  */

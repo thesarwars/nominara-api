@@ -16,7 +16,7 @@ import { TEST_SIGNING_KEYS, fakeClient, jobDataFor, waitFor } from "../support/q
 // for exactly that shape, so the suite was green while three other terminal
 // paths dropped their entries silently.
 //
-// The one that mattered: `audit-verify.handler.ts:129` throws
+// The one that mattered: the tamper throw in `audit-verify.handler.ts` raises
 // `UnrecoverableError` when the nightly walk detects an audit-chain tamper.
 // Its comment explains the choice — skip the retry ladder, so "ONE walk, ONE
 // page and ONE dead-letter entry per day". `UnrecoverableError` is precisely
@@ -37,7 +37,10 @@ describe("STORY-154 · a terminal failure reaches the DLQ however BullMQ decided
 
   afterAll(async () => {
     await Promise.all(cleanups.map((fn) => fn()));
-    await fixture.stop();
+    // Guarded: a beforeAll container failure otherwise surfaces as
+    // "Cannot read properties of undefined (reading 'stop')" alongside the real
+    // cause, on the only suite that guards the handler-rewiring regression.
+    if (fixture !== undefined) await fixture.stop();
   });
 
   const auditVerify = QUEUE_TOPOLOGY.find((entry) => entry.name === "audit.verify")!;
