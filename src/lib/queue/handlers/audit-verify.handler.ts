@@ -126,6 +126,18 @@ export function createAuditVerifyHandler(context: QueueHandlerContext): JobProce
       // objection the old comment was reaching for: it skips the retry ladder
       // entirely, so this is ONE walk, ONE page and ONE dead-letter entry per
       // day, never a re-walk of the estate and never a repeated page.
+      //
+      // ⚠ AND FOR MOST OF THIS FILE'S LIFE THAT COUNT WAS ZERO, NOT ONE.
+      // STORY-154: `attachDeadLetterHandler` decided a failure was terminal
+      // from `attemptsMade >= opts.attempts`, and skipping the ladder is
+      // exactly what leaves that count at 1 of 4. The mechanism chosen here to
+      // guarantee a single dead-letter entry was the mechanism that guaranteed
+      // none — landing this detector back in the state the paragraphs above
+      // describe as the bug: "no dead-letter entry, nothing a machine
+      // watches". The handler now asks `willBullmqRetry` instead, and
+      // test/integration/queue-terminal-failures.spec.ts drives this exact
+      // throw end to end. If that test is ever weakened, this comment is a
+      // promise again rather than a description.
       throw new UnrecoverableError(
         `audit chain mismatch in ${String(result.mismatches.length)} workspace(s); ` +
           `first: ${result.mismatches[0]!.workspaceId} at seq ${String(result.mismatches[0]!.seq)} ` +

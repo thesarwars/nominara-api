@@ -142,7 +142,10 @@ export async function verifyWorkspaceChain(
   // The handler turns that into an `UnrecoverableError`, a dead-letter entry
   // and the estate's "tamper detected" signal, for an ordinary erasure that
   // happened to overlap the nightly window. Alarm fatigue on the one control
-  // whose failure mode is silence.
+  // whose failure mode is silence. (That dead-letter entry was itself missing
+  // until STORY-154 — see `willBullmqRetry` in lib/queue/dead-letter.ts. The
+  // snapshot argument below is unaffected: it is about not raising a false
+  // alarm, and it held while the alarm could not be raised at all.)
   //
   // REPEATABLE READ rather than a lock: the walk is read-only, so the only
   // cost is holding xmin for one workspace's read, which is what the single
