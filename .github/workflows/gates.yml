@@ -1,20 +1,26 @@
 # STORY-155 — the merge-blocking gates from testing-strategy.md §10, run on
 # every push instead of by hand.
 #
-# Before this file, every gate below was real and passing, and NOTHING
-# enforced that it had been run. The first clean-room run proved why that
-# matters: `pnpm test:integration` had been exiting 1 on every run — an
-# unhandled error after all 1547 tests passed — and every report quoted the
-# "Tests" line, never the exit code. CI reads the exit code.
+# Before this file, every gate below EXISTED and nothing enforced that it had
+# been run — and two of them were not passing on a clean checkout. A local
+# clean-room run that read exit codes found `pnpm test:integration` exiting 1
+# after all 1547 tests passed (an unhandled error), and `test:unit` failing on
+# gap G-12. Every earlier report had quoted the "Tests" line, which a pipe
+# strips of its exit status.
 #
-# ⚠ WHAT THIS DOES NOT RUN, because it does not exist yet (§10 "always"
-# gates this pipeline cannot honestly claim — see STORY-155):
-#   - scoring and parser golden sets        (no runner; test/golden/ absent)
-#   - migration forward + rollback, general  (per-migration specs only)
-#   - EXPLAIN budget regression, general     (one spec, not a gate)
-#   - accuracy gates at launch-set sizes     (parser/scoring not built)
-# test/unit/ci/gates-workflow.spec.ts fails if a new `test:*` or `*check`
-# script appears in package.json without being run here or declared exempt.
+# ⚠ §10 GATES THIS PIPELINE CANNOT CLAIM, because nothing exists to run:
+#   always:                        scoring and parser golden sets (no runner;
+#                                  test/golden/ absent)
+#   when a migration is present:   migration forward + rollback, as a general
+#                                  gate (per-migration specs only)
+#   when a read path changes:      EXPLAIN budget regression (one spec, no gate)
+#   when parser/scoring changes:   accuracy gates at launch-set sizes
+#
+# test/unit/ci/gates-workflow.spec.ts holds this file to package.json and to
+# the repository's test files, on the PARSED workflow: every script is either
+# run here or classified with a reason, every tracked test file is collected
+# by a script that runs here, and a gate step cannot be neutralised by a job
+# or step setting without that spec failing.
 #
 # Supply chain: exactly two actions, both GitHub-owned, each pinned to a full
 # commit SHA (a tag can be moved; a SHA cannot). pnpm comes from Node's own
@@ -33,9 +39,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: gates-${{ github.ref }}
-  # A newer push to a branch supersedes the old run. Never on main: every
-  # merge there must be verified on its own.
+  # On a branch, a newer push supersedes the older run. On main, every commit
+  # gets a group of its OWN: `cancel-in-progress: false` alone protects only the
+  # run already in progress — GitHub keeps one PENDING run per group and cancels
+  # it when the next arrives, so a shared group on main silently dropped the
+  # middle of three quick merges.
+  group: ${{ github.ref == 'refs/heads/main' && format('gates-main-{0}', github.sha) || format('gates-{0}', github.ref) }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
