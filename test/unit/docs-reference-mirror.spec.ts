@@ -18,9 +18,10 @@ import { describe, expect, it } from "vitest";
 // honest. Two halves:
 //   1. wherever the snapshot IS present — every machine that edits the docs —
 //      every mirrored file must equal its original byte for byte;
-//   2. nothing in src/ or test/ may read the snapshot at runtime. Without this
-//      half, the next test to reach outside the repository reopens G-12 and
-//      nobody finds out until CI is red.
+//   2. nothing in src/ or test/ may reach OUTSIDE the repository — by the
+//      snapshot's name, by a path that climbs past the file's own depth, or by
+//      `..` resolved against a ROOT variable. Without this half, the next test
+//      to read a sibling reopens G-12 and nobody finds out until CI is red.
 describe("STORY-155 · docs/references is a faithful mirror of the docs snapshot", () => {
   const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
   const MIRROR = resolve(REPO_ROOT, "docs/references");
@@ -51,8 +52,24 @@ describe("STORY-155 · docs/references is a faithful mirror of the docs snapshot
     });
   });
 
-  it("⚠ nothing in src/ or test/ reads the docs snapshot at runtime", () => {
+  it("⚠ nothing in src/ or test/ reaches outside the repository", () => {
+    // ⚠ THE HAZARD, NOT A NAME. The first version searched for the literal
+    // "Nominara-Dev-Docs-main" and nothing else, so a test reading any OTHER
+    // sibling — this machine also has ../client and ../nominara-api — or one
+    // that assembled the snapshot's name from parts would pass locally, where
+    // the siblings exist, and break or go vacuous in CI. That is G-12 again.
+    //
+    // So this flags any path literal that climbs out of the repository:
+    //   - relative to its own FILE, when it has more leading `../` than the
+    //     file is deep (how `new URL("../..", import.meta.url)` paths escape);
+    //   - relative to a *ROOT* variable, when a `..` literal is the argument
+    //     right after one — `resolve(REPO_ROOT, "../x")` and
+    //     `resolve(REPO_ROOT, "..", "x")`. A ROOT *declaration* built from
+    //     `new URL("../..", import.meta.url)` is file-relative, not this.
+    // The snapshot's name is still flagged outright, however it is used.
     const THIS_FILE = relative(REPO_ROOT, fileURLToPath(import.meta.url));
+    const LITERAL = /(["'`])(\.\.(?:\/[^"'`$]*)?)\1/gu;
+    const AGAINST_ROOT = /\b[A-Za-z_]*ROOT\b\s*,\s*["'`]\.\.(?:["'`]|\/)/u;
     const offenders: string[] = [];
     let scanned = 0;
     const walk = (dir: string): void => {
@@ -65,15 +82,20 @@ describe("STORY-155 · docs/references is a faithful mirror of the docs snapshot
         if (!/\.[cm]?tsx?$/u.test(name)) continue;
         scanned++;
         const rel = relative(REPO_ROOT, full);
-        if (rel === THIS_FILE) continue; // the one file that reads it on purpose, to compare
+        if (rel === THIS_FILE) continue; // the one file that reads the snapshot on purpose, to compare
+        const depth = rel.split("/").length - 1;
         readFileSync(full, "utf8")
           .split("\n")
           .forEach((line, index) => {
             const trimmed = line.trim();
-            // Prose about the snapshot is fine — two comments in src/ cite it
-            // as the origin of what they encode.
             if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
-            if (trimmed.includes("Nominara-Dev-Docs-main")) offenders.push(`${rel}:${String(index + 1)} — ${trimmed}`);
+            const where = `${rel}:${String(index + 1)} — ${trimmed}`;
+            if (trimmed.includes("Nominara-Dev-Docs-main")) offenders.push(where);
+            for (const match of trimmed.matchAll(LITERAL)) {
+              const climbs = match[2]!.split("/").filter((segment) => segment === "..").length;
+              if (climbs > depth) offenders.push(`${where}   [climbs ${String(climbs)} from depth ${String(depth)}]`);
+            }
+            if (AGAINST_ROOT.test(trimmed)) offenders.push(`${where}   [.. resolved against a ROOT variable]`);
           });
       }
     };
@@ -81,6 +103,14 @@ describe("STORY-155 · docs/references is a faithful mirror of the docs snapshot
     walk(resolve(REPO_ROOT, "test"));
 
     expect(scanned, "the walk found nothing — this check would be vacuous").toBeGreaterThan(200);
+    // The matcher, pinned against the three forms it exists for.
+    const probe = (text: string): string[] => [...text.matchAll(LITERAL)].map((m) => m[2]!);
+    expect(probe('new URL("../../../../x", import.meta.url)')).toEqual(["../../../../x"]);
+    expect(probe("import { a } from \"./local.js\";")).toEqual([]);
+    expect(AGAINST_ROOT.test('resolve(REPO_ROOT, "../sibling/x.md")')).toBe(true);
+    expect(AGAINST_ROOT.test('resolve(REPO_ROOT, "..", "sibling")')).toBe(true);
+    expect(AGAINST_ROOT.test('const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));'), "a ROOT declaration is file-relative").toBe(false);
+    expect(AGAINST_ROOT.test('resolve(REPO_ROOT, "docs/references")')).toBe(false);
     expect(
       offenders,
       "code outside this repository is not in a fresh clone, so CI cannot see it (gap G-12). Mirror the file " +

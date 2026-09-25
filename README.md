@@ -523,8 +523,10 @@ pre-existed.
   keeps it honest: wherever the snapshot is present, every mirrored file must
   match its original byte for byte (the comparison shows as *skipped*, never
   silently passing, where the snapshot is absent — CI included); and nothing in
-  `src/` or `test/` may read the snapshot at runtime, so the next test to reach
-  outside the repository fails here instead of in CI. **When you edit
+  `src/` or `test/` may reach outside the repository at all — by the snapshot's
+  name, by a path that climbs past its own file's depth, or by `..` resolved
+  against a ROOT variable — so the next test to read a sibling fails here
+  instead of in CI. **When you edit
   `references/api-specification.md` in the docs snapshot, re-copy it** — the
   local unit run tells you if you forget.
 - **G-11 — 21 queues, 0 handlers.** `src/lib/queue/handlers.ts`
