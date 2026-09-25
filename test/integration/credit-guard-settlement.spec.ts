@@ -4,7 +4,7 @@ import type { Reflector } from "@nestjs/core";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { firstValueFrom, of, throwError } from "rxjs";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { CreditGuard } from "../../src/api/guards/credit.guard.js";
@@ -52,6 +52,37 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     await pool.end();
     await db.end();
     await container.stop();
+  });
+
+  // ⚠ EVERY INTERCEPTOR BUILT HERE IS SETTLED BEFORE ITS TEST ENDS — STORY-155.
+  //
+  // `CreditInterceptor` releases a failed request's reservation FIRE-AND-
+  // FORGET (`setImmediate(() => void this.release(...))`) on a settlement pool
+  // of its own. `runInterceptor` built one per call and never destroyed it, so
+  // releases outlived the test that caused them. Two consequences, both
+  // observed rather than inferred:
+  //
+  //   1. CROSS-TEST BLEED. `k-commit-fails`'s release ran AFTER the next
+  //      test's TRUNCATE and logged "has an open reservation and no wallet row
+  //      to release it against" — a release acting on the next test's world.
+  //   2. AN UNHANDLED ERROR ON EVERY RUN. The last in-flight release still held
+  //      a checked-out client when `container.stop()` ran. pg-pool detaches its
+  //      error listener at checkout, so the dying connection's "Connection
+  //      terminated unexpectedly" had no listener and Vitest recorded
+  //      `Errors 1 error` — exit code 1 on every run, 3 of 3, with all 28
+  //      tests green. Nobody saw it because every report quoted the Tests line.
+  //      CI reads the exit code, which is how this surfaced.
+  //
+  // `onModuleDestroy()` ends the settlement pool, and `pool.end()` waits for
+  // checked-out clients — so after one setImmediate turn (letting any release
+  // scheduled by the test reach `pool.connect()`) it waits for that release to
+  // finish. The interceptor's own comment on `onModuleDestroy` names this exact
+  // error from an earlier sighting; that fix covered the app's lifecycle, and
+  // this spec's hand-built interceptors never reached it.
+  const interceptors: CreditInterceptor[] = [];
+  afterEach(async () => {
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const interceptor of interceptors.splice(0)) await interceptor.onModuleDestroy();
   });
 
   beforeEach(async () => {
@@ -397,6 +428,7 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
 
   async function runInterceptor(req: Req, handler: () => unknown, stamped?: Map<string, string>): Promise<unknown> {
     const interceptor = new CreditInterceptor(pool);
+    interceptors.push(interceptor);
     const next: CallHandler = {
       handle: () => {
         try {
