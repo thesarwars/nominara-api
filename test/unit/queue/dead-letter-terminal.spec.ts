@@ -1,5 +1,7 @@
 import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
+import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { UnrecoverableError, type Job } from "bullmq";
 import { describe, expect, it } from "vitest";
 import { willBullmqRetry } from "../../../src/lib/queue/dead-letter.js";
@@ -138,5 +140,68 @@ describe("STORY-154 · willBullmqRetry, against BullMQ's real retry decision", (
     // renamed upstream the fingerprint test fails, but this keeps the
     // relationship visible from our side too.
     expect(new UnrecoverableError("x").name).toBe("UnrecoverableError");
+  });
+});
+
+// ⚠ STORY-154 — THE ONE WAY `finishedOn` COULD LIE, AND WHY IT CANNOT HERE.
+//
+// The predicate treats a set `finishedOn` as proof BullMQ declined a retry. A
+// Job is rehydrated from its Redis hash on every fetch, so the question that
+// decides whether the fix is safe is: can a job arrive at a worker ALREADY
+// carrying `finishedOn` from an earlier terminal failure? If it could, the
+// listener would write a dead-letter entry for a job that is about to run
+// again, and a second one when it really did fail.
+//
+// It cannot, for two independent reasons, and both are asserted here because
+// the whole fix rests on them.
+describe("STORY-154 · a rehydrated job cannot carry a stale finishedOn into a retry", () => {
+  const require_ = createRequire(import.meta.url);
+  const read = (specifier: string): string => readFileSync(require_.resolve(specifier), "utf8");
+
+  it("⚠ BullMQ deletes finishedOn from the hash when a finished job is requeued", () => {
+    // reprocessJob is what `Job.retry()` runs. Without this HDEL a replayed job
+    // would come back with finishedOn still set.
+    const lua = read("bullmq/dist/cjs/commands/reprocessJob-8.lua");
+    expect(lua).toMatch(/HDEL["\s,]+.*finishedOn/u);
+  });
+
+  it("⚠ and Job.fromJSON only adopts finishedOn when the hash actually holds one", () => {
+    // `if (json.finishedOn)` — so absent, null and 0 all leave it undefined
+    // rather than assigning a falsy value the predicate would have to reason
+    // about separately.
+    const jobSource = read("bullmq/dist/cjs/classes/job.js");
+    expect(jobSource).toContain("if (json.finishedOn) {");
+  });
+
+  it("⚠ and this codebase never requeues a finished job in the first place", () => {
+    // Admin DLQ replay enqueues a NEW job with a replay idempotency suffix
+    // (admin.service.ts, STORY-030 AC7) rather than reviving the original, so
+    // the path above is a second line of defence rather than the only one.
+    // Derived from src/ so a future `job.retry()` call has to come past this.
+    const src = fileURLToPath(new URL("../../../src", import.meta.url));
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const name of readdirSync(dir)) {
+        const full = join(dir, name);
+        if (statSync(full).isDirectory()) walk(full);
+        else if (name.endsWith(".ts")) {
+          readFileSync(full, "utf8")
+            .split("\n")
+            .forEach((line, index) => {
+              const trimmed = line.trim();
+              if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
+              if (/\b(?:job|dlqJob|replayedJob)\.retry\s*\(/u.test(trimmed)) {
+                offenders.push(`${relative(src, full)}:${String(index + 1)} — ${trimmed}`);
+              }
+            });
+        }
+      }
+    };
+    walk(src);
+    expect(
+      offenders,
+      "reviving a finished BullMQ job puts a stale finishedOn one HDEL away from the dead-letter predicate. " +
+        "Replay by enqueueing a new job with a replay idempotency suffix, as admin.service.ts does.",
+    ).toEqual([]);
   });
 });
