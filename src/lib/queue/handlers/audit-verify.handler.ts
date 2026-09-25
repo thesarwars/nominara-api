@@ -134,10 +134,18 @@ export function createAuditVerifyHandler(context: QueueHandlerContext): JobProce
       // guarantee a single dead-letter entry was the mechanism that guaranteed
       // none — landing this detector back in the state the paragraphs above
       // describe as the bug: "no dead-letter entry, nothing a machine
-      // watches". The handler now asks `willBullmqRetry` instead, and
-      // test/integration/queue-terminal-failures.spec.ts drives this exact
-      // throw end to end. If that test is ever weakened, this comment is a
-      // promise again rather than a description.
+      // watches". The handler now asks `willBullmqRetry` instead.
+      //
+      // Two tests hold this comment to its word, and it took a review to
+      // notice they are different tests. `audit-verify-handler.spec.ts` runs
+      // THIS handler against a tampered chain and asserts the thrown CLASS —
+      // without that, `UnrecoverableError` could quietly become a plain
+      // `Error` with every gate green, and the estate would re-walk and page
+      // four times a night instead of once. `queue-terminal-failures.spec.ts`
+      // proves an `UnrecoverableError` on attempt 1 of 4 reaches the DLQ at
+      // all; it builds its own error rather than calling this handler, so it
+      // covers the wiring, not this throw. Weaken either and this paragraph is
+      // a promise again rather than a description.
       throw new UnrecoverableError(
         `audit chain mismatch in ${String(result.mismatches.length)} workspace(s); ` +
           `first: ${result.mismatches[0]!.workspaceId} at seq ${String(result.mismatches[0]!.seq)} ` +

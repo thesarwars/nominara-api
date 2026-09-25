@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, type Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Job } from "bullmq";
+import { UnrecoverableError, type Job } from "bullmq";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { createAuditVerifyHandler } from "../../src/lib/queue/handlers/audit-verify.handler.js";
 import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
@@ -149,7 +149,24 @@ describe("STORY-143 · audit.verify handler", () => {
     const { Logger } = await import("@nestjs/common");
     const spy = vi.spyOn(Logger.prototype, "error").mockImplementation((m: unknown) => void errors.push(String(m)));
     try {
-      await expect(run()).rejects.toThrow(/audit chain mismatch/);
+      // ⚠ THE CLASS, NOT ONLY THE MESSAGE — STORY-154. The handler throws
+      // `UnrecoverableError` deliberately: it is what makes BullMQ skip the
+      // retry ladder, which is what makes this "ONE walk, ONE page and ONE
+      // dead-letter entry per day" rather than four of each on a tampered
+      // estate. A message-only assertion left that choice untested, so
+      // `new UnrecoverableError(...)` could quietly become `new Error(...)`
+      // with every gate still green — and the estate would re-walk itself four
+      // times per night and page four times, on the one control whose output an
+      // operator is meant to trust.
+      // ONE run — `run()` increments nominara_audit_chain_mismatch_total, and
+      // the assertion below requires exactly one detection.
+      const thrown: unknown = await run().then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(thrown, "the tampered chain did not fail the handler at all").not.toBeNull();
+      expect(thrown).toBeInstanceOf(UnrecoverableError);
+      expect((thrown as Error).message).toMatch(/audit chain mismatch/);
     } finally {
       spy.mockRestore();
     }
