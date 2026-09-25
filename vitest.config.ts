@@ -8,9 +8,11 @@ import { configDefaults, defineConfig } from "vitest/config";
 // `dist/**` is excluded because vitest 4 NARROWED `configDefaults.exclude` to
 // `node_modules` and `.git` only — earlier versions carried `**/dist/**`, and
 // dropping it was a silent behaviour change. `pnpm test:unit` is
-// `vitest run test/unit src`, and those positional arguments are SUBSTRING
-// FILTERS rather than paths, so `test/unit` matches `dist/test/unit/...` and
-// `src` matches `dist/src/...` the moment a build has been run on the host.
+// `vitest run test/unit src contracts` (STORY-155 added `contracts` — five
+// contract test files had never been collected), and those positional
+// arguments are SUBSTRING FILTERS rather than paths, so `test/unit` matches
+// `dist/test/unit/...` and `src` matches `dist/src/...` the moment a build has
+// been run on the host.
 // The compiled copies are the same suite, so they add no coverage — they just
 // resolve their relative paths one directory deeper and fail on artifacts that
 // are not there. That produced 20 failures across 12 files, every one of them
@@ -21,5 +23,8 @@ import { configDefaults, defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     exclude: [...configDefaults.exclude, "dist/**", "test/integration/**", "test/isolation/**"],
+    // STORY-155 — every worker refuses to read a SIBLING of this repository
+    // (gap G-12's class). See test/support/no-sibling-reads.ts.
+    setupFiles: ["test/support/no-sibling-reads.ts"],
   },
 });

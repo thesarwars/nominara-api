@@ -1,0 +1,132 @@
+# STORY-155 — the merge-blocking gates from testing-strategy.md §10, run on
+# every push instead of by hand.
+#
+# Before this file, every gate below EXISTED and nothing enforced that it had
+# been run — and two of them were not passing on a clean checkout. A local
+# clean-room run that read exit codes found `pnpm test:integration` exiting 1
+# after all 1547 tests passed (an unhandled error); every earlier report had
+# quoted the "Tests" line, which a pipe strips of its exit status. The FIRST CI
+# run then found `test:unit` failing on gap G-12 — the local run could not,
+# because it ran beside the docs snapshot the failing test read.
+#
+# ⚠ §10 GATES THIS PIPELINE CANNOT CLAIM, because nothing exists to run:
+#   always:                        scoring and parser golden sets (no runner;
+#                                  test/golden/ absent)
+#   when a migration is present:   migration forward + rollback, as a general
+#                                  gate (per-migration specs only)
+#   when a read path changes:      EXPLAIN budget regression (one spec, no gate)
+#   when parser/scoring changes:   accuracy gates at launch-set sizes
+#
+# test/unit/ci/gates-workflow.spec.ts holds this file to package.json and to
+# the repository's test files, on the PARSED workflow: every script is either
+# run here or classified with a reason, every tracked test file is collected
+# by a script that runs here, and the top-level keys, each job's settings,
+# each action's inputs and each gate script's body are pinned by VALUE — so
+# changing what a gate runs means changing that spec in the same diff. The one
+# change it cannot see is one that stops the spec itself running; that edit
+# has to touch a pinned body too, so the diff shows it.
+#
+# Supply chain: exactly two actions, both GitHub-owned, each pinned to a full
+# commit SHA (a tag can be moved; a SHA cannot). pnpm comes from Node's own
+# corepack, pinned with its sha512 in package.json#packageManager, so the
+# version and its integrity have one source for local and CI alike — and
+# pnpm 11's default 24-hour minimumReleaseAge travels with it.
+
+name: gates
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # On a branch, a newer push supersedes the older run. On main, every commit
+  # gets a group of its OWN: `cancel-in-progress: false` alone protects only the
+  # run already in progress — GitHub keeps one PENDING run per group and cancels
+  # it when the next arrives, so a shared group on main silently dropped the
+  # middle of three quick merges.
+  group: ${{ github.ref == 'refs/heads/main' && format('gates-main-{0}', github.sha) || format('gates-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  static-and-database:
+    name: static + database gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      # The three shadow-database gates each CREATE their own throwaway
+      # database from the migrations, so a bare server is all they need —
+      # the same image docker-compose.yml runs.
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: nominara
+          POSTGRES_PASSWORD: nominara
+          POSTGRES_DB: nominara
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nominara -d nominara"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://nominara:nominara@localhost:5432/nominara
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+        id: install
+      # ⚠ EVERY GATE REPORTS ON ITS OWN. Without the `if:` below, the first
+      # failing gate skips every step after it — the first CI run failed
+      # test:unit and left all three database gates unrun and unknown. The
+      # job still fails if any gate fails; it just says which ones did.
+      - run: pnpm lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - run: pnpm typecheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - run: pnpm contracts:check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - run: pnpm test:unit
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - run: pnpm db:drift-check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - run: pnpm db:rls-check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - run: pnpm db:schema-check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+
+  containers:
+    name: integration + isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Testcontainers starts its own Postgres, Valkey and pgbouncer per spec
+    # against the runner's Docker daemon; no service block, no socket
+    # overrides — those are colima workarounds this runner does not need.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+        id: install
+      # Includes the 200-way concurrent debit (credit-wallet.spec.ts).
+      - run: pnpm test:integration
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - run: pnpm test:isolation
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - run: pnpm test:isolation:breakers
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}

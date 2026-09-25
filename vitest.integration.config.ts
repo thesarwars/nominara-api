@@ -55,6 +55,9 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: ["test/integration/**/*.spec.ts"],
+    // STORY-155 — every worker refuses to read a SIBLING of this repository
+    // (gap G-12's class). See test/support/no-sibling-reads.ts.
+    setupFiles: ["test/support/no-sibling-reads.ts"],
     fileParallelism: false,
     // A generous, uniform floor so a `beforeEach` re-migration or a
     // multi-query mutation/restore sequence running slowly under contended

@@ -4,7 +4,7 @@ import type { Reflector } from "@nestjs/core";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { firstValueFrom, of, throwError } from "rxjs";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { CreditGuard } from "../../src/api/guards/credit.guard.js";
@@ -52,6 +52,38 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     await pool.end();
     await db.end();
     await container.stop();
+  });
+
+  // ⚠ EVERY INTERCEPTOR BUILT HERE IS SETTLED BEFORE ITS TEST ENDS — STORY-155.
+  //
+  // `CreditInterceptor` releases a failed request's reservation FIRE-AND-
+  // FORGET (`setImmediate(() => void this.release(...))`) on a settlement pool
+  // of its own. `runInterceptor` built one per call and never destroyed it, so
+  // releases outlived the test that caused them. Two consequences, both
+  // observed rather than inferred:
+  //
+  //   1. CROSS-TEST BLEED. `k-commit-fails`'s release ran AFTER the next
+  //      test's TRUNCATE and logged "has an open reservation and no wallet row
+  //      to release it against" — a release acting on the next test's world.
+  //   2. AN UNHANDLED ERROR ON EVERY RUN. The last in-flight release still held
+  //      a checked-out client when `container.stop()` ran. pg-pool detaches its
+  //      error listener at checkout, so the dying connection's "Connection
+  //      terminated unexpectedly" had no listener and Vitest recorded
+  //      `Errors 1 error` — exit code 1 on every run, 3 of 3, with all 28
+  //      tests green. Nobody saw it because every report quoted the Tests line.
+  //      A local clean-room run that read the EXIT CODE surfaced it, while
+  //      the CI workflow was being built; CI never saw it fail.
+  //
+  // `onModuleDestroy()` ends the settlement pool, and `pool.end()` waits for
+  // checked-out clients — so after one setImmediate turn (letting any release
+  // scheduled by the test reach `pool.connect()`) it waits for that release to
+  // finish. The interceptor's own comment on `onModuleDestroy` names this exact
+  // error from an earlier sighting; that fix covered the app's lifecycle, and
+  // this spec's hand-built interceptors never reached it.
+  const interceptors: CreditInterceptor[] = [];
+  afterEach(async () => {
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const interceptor of interceptors.splice(0)) await interceptor.onModuleDestroy();
   });
 
   beforeEach(async () => {
@@ -252,8 +284,11 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
         }),
       ).rejects.toThrow(/handler blew up/u);
 
-      // Scheduled off the critical path, like the existing release test.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Scheduled off the critical path, so wait for the release itself —
+      // never a fixed sleep: a fire-and-forget release on a fresh settlement
+      // pool lands in ~100ms idle and far later under load (STORY-155).
+      // `entry` returns undefined, not null, when there is no row.
+      await expect.poll(async () => entry("release"), { timeout: 5_000 }).toBeDefined();
       expect(await entry("release")).toMatchObject({ actor_id: userId, actor_type: "user" });
     });
 
@@ -397,6 +432,7 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
 
   async function runInterceptor(req: Req, handler: () => unknown, stamped?: Map<string, string>): Promise<unknown> {
     const interceptor = new CreditInterceptor(pool);
+    interceptors.push(interceptor);
     const next: CallHandler = {
       handle: () => {
         try {
@@ -434,6 +470,18 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     await expect(runInterceptor(req, () => ({ ok: true }))).rejects.toBeDefined();
     // The request fails rather than handing out a free run.
     expect(await ledger("commit")).toBe(0);
+
+    // ⚠ AND THE RESERVATION IS RELEASED, WHICH IS WHAT THE TITLE SAYS — STORY-155.
+    // Until this assertion the test checked only the two lines above, so a
+    // regression that stranded the reservation on a commit failure passed. It
+    // was worse than untested: this release used to run AFTER the next test's
+    // TRUNCATE, failed with "no wallet row to release it against", and the
+    // test stayed green throughout. The settle in afterEach keeps the release
+    // inside this test; this makes the test look at it. Measured: the release
+    // entry lands ~100ms after the rejection, and the swept wallet stays at
+    // reserved 0 with its balance untouched — closed, not double-refunded.
+    await expect.poll(async () => ledger("release"), { timeout: 5_000 }).toBe(1);
+    expect(await wallet()).toMatchObject({ reserved: 0, includedBalance: 300 });
   });
 
   it("releases on a handler failure, off the request's connection", async () => {
@@ -447,10 +495,9 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
       }),
     ).rejects.toThrow(/handler exploded/);
 
-    // Scheduled off the critical path, so give the immediate a turn.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Scheduled off the critical path, so wait for the release itself.
+    await expect.poll(async () => ledger("release"), { timeout: 5_000 }).toBe(1);
     expect(await wallet()).toMatchObject({ reserved: 0, includedBalance: 300 });
-    expect(await ledger("release")).toBe(1);
   });
 
   it("BLOCKER 3 — the release completes on its own pool WHILE the request holds the only other connection", async () => {
@@ -508,7 +555,7 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
         throw new Error("transient");
       }),
     ).rejects.toThrow(/transient/);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await expect.poll(async () => ledger("release"), { timeout: 5_000 }).toBe(1);
     expect(await wallet()).toMatchObject({ reserved: 0, includedBalance: 300 });
 
     // The retry must get credits of its own.
@@ -555,7 +602,9 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
         throw new Error("transient");
       }),
     ).rejects.toThrow(/transient/);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // `job`'s release must land before the second seat reserves, or the
+    // reserved-total assertions below measure the race, not the keys.
+    await expect.poll(async () => ledger("release"), { timeout: 5_000 }).toBe(1);
 
     // A second seat's own key, which used to collide with `job`'s attempt 2.
     const b = request("job#2");

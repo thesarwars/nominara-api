@@ -511,15 +511,24 @@ pre-existed.
 
 ## Disclosed gaps (STORY-013)
 
-- **G-12 — one test reads the reference from OUTSIDE this repository.**
+- **G-12 — RESOLVED (STORY-155): the reference is a vendored mirror.**
   `test/unit/realtime-event-catalog.spec.ts` checks the §11 event catalog
-  against `../Nominara-Dev-Docs-main/references/api-specification.md` itself,
-  because a list transcribed into the test would only prove the transcription
-  matches itself. That snapshot has no git history and is not part of a fresh
-  clone, so when CI exists it must be given the reference — a submodule, a
-  vendored copy, or a fetch step. Which of those is a decision, not something
-  the test can make. The failure names the problem rather than reading as a
-  broken assertion.
+  against `api-specification.md` itself, because a list transcribed into the
+  test would only prove the transcription matches itself. It used to read the
+  file from `../Nominara-Dev-Docs-main/`, which no fresh clone has, and it
+  was the one failure in the first CI run. The docs snapshot cannot be pushed
+  anywhere CI could fetch it, so the file now lives at
+  `docs/references/api-specification.md` — a byte-identical copy, the same
+  arrangement `docs/plans/dev-plan.md` uses. `test/unit/docs-reference-mirror.spec.ts`
+  keeps it honest: wherever the snapshot is present, every mirrored file must
+  match its original byte for byte (the comparison shows as *skipped*, never
+  silently passing, where the snapshot is absent — CI included); and nothing in
+  `src/` or `test/` may reach outside the repository at all — by the snapshot's
+  name, by a path that climbs past its own file's depth, or by `..` resolved
+  against a ROOT variable — so the next test to read a sibling fails here
+  instead of in CI. **When you edit
+  `references/api-specification.md` in the docs snapshot, re-copy it** — the
+  local unit run tells you if you forget.
 - **G-11 — 21 queues, 0 handlers.** `src/lib/queue/handlers.ts`
   (STORY-124) is the registry a story registers its handler in, and
   `src/worker.ts` derives each worker's `autorun` from whether one is
