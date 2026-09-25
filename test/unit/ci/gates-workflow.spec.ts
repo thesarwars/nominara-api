@@ -1,114 +1,245 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
+import { MIGRATION_OWNER_ROLE, RUNTIME_ROLES } from "../../../src/db/conventions.js";
 
-// ⚠ STORY-155 — THE WORKFLOW'S GATE LIST, HELD AGAINST THE SCRIPTS IT RUNS.
+// ⚠ STORY-155 — THE CI WORKFLOW, HELD AGAINST WHAT IT CLAIMS TO RUN.
 //
-// `.github/workflows/gates.yml` names each gate by hand, and a hand-written
-// list is the shape this codebase has paid for over and over: complete for the
-// world as it stood, silent about the next entry. A `test:golden` script added
-// next month would exist, pass locally, and never run in CI — with nothing to
-// say so.
+// `.github/workflows/gates.yml` names its gates by hand, and a hand-written
+// list is the shape this codebase keeps paying for: complete for the world as
+// it stood, silent about the next entry. The first version of this spec
+// repeated the mistake one level down — it read the workflow with LINE
+// REGEXES, so a review walked `continue-on-error`, a job-level `needs:`, a
+// flow-style `- { uses: x@v1 }` and a renamed install step straight past it,
+// and it classified scripts by a naming convention that missed half the
+// plausible gate names. It also never looked at test FILES, and five contract
+// test files (62 tests) had never run in CI.
 //
-// So the population is DERIVED from package.json: every script named like a
-// gate must be run by the workflow or declared exempt WITH A REASON, and the
-// exemptions are themselves checked for liveness. The default is to report.
-describe("STORY-155 · the CI workflow runs every gate package.json declares", () => {
-  const root = (relative: string): string => fileURLToPath(new URL(`../../../${relative}`, import.meta.url));
-  const workflow = readFileSync(root(".github/workflows/gates.yml"), "utf8");
-  const scripts = (JSON.parse(readFileSync(root("package.json"), "utf8")) as { scripts: Record<string, string> }).scripts;
+// So everything here works on the PARSED workflow, and the default is to
+// REPORT: an unrecognised step, an unrecognised job setting, an unclassified
+// script or an uncollected test file fails, naming itself.
 
-  /** A gate, by naming convention: lint, typecheck, `test:*`, or anything ending in `check`. */
-  const GATE = /^(?:lint|typecheck|test:.+|.+[:-]check)$/u;
+const GUARD = "${{ !cancelled() && steps.install.outcome == 'success' }}";
+const INSTALL = "pnpm install --frozen-lockfile";
+const PINNED_ACTION = /^actions\/[a-z0-9-]+@[0-9a-f]{40}$/u;
 
-  /** Every `- run: pnpm <script>` step. Anchored to a step, so a YAML comment mentioning a script does not count. */
-  const invoked = new Set([...workflow.matchAll(/^\s*-\s*run:\s*pnpm\s+([a-z][\w:.-]*)\s*$/gmu)].map((m) => m[1]!));
+interface Step {
+  readonly [key: string]: unknown;
+  readonly id?: string;
+  readonly uses?: string;
+  readonly run?: string;
+  readonly if?: string;
+  readonly with?: Record<string, unknown>;
+}
+interface Job {
+  readonly [key: string]: unknown;
+  readonly steps: Step[];
+}
+interface Workflow {
+  readonly on: Record<string, unknown>;
+  readonly permissions: unknown;
+  readonly concurrency: Record<string, unknown>;
+  readonly jobs: Record<string, Job>;
+}
 
-  /**
-   * Gate-shaped scripts CI deliberately does not run. Each needs a reason a
-   * reviewer can argue with; "not wired up yet" is not one — that is a gap,
-   * and a gap should fail.
-   */
-  const EXEMPT: Readonly<Record<string, string>> = {
-    "db:role-check":
-      "asserts the connection is NOT the migration owner — a deploy-time check against the runtime role's URL. " +
-      "CI connects as the superuser that owns the shadow databases, so it fails here by design.",
-    "db:purge-check":
-      "the release-train half of NFR-CMP-05, read against production's purge_failures table. " +
-      "On CI's empty database it can only ever pass, which would make it decorative.",
-  };
+const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const workflow = parse(readFileSync(`${ROOT}.github/workflows/gates.yml`, "utf8")) as Workflow;
+const pkg = JSON.parse(readFileSync(`${ROOT}package.json`, "utf8")) as { scripts: Record<string, string>; packageManager?: string };
+const scripts = pkg.scripts;
+const allSteps = Object.values(workflow.jobs).flatMap((job) => job.steps);
 
-  it("the census found the gates, and the matchers recognise what they claim to", () => {
-    // Anti-vacuity, both directions. A regex that matched nothing would make
-    // every assertion below pass on an empty set.
-    expect(invoked.size, "no `run: pnpm <script>` steps found — the matcher is broken").toBeGreaterThanOrEqual(10);
+/** A gate step is exactly `pnpm <script>` — no arguments, no chaining, nothing that could narrow or excuse it. */
+const gateScriptOf = (step: Step): string | null => {
+  const match = typeof step.run === "string" ? /^pnpm ([a-z][\w:.-]*)$/u.exec(step.run.trim()) : null;
+  return match && match[1] !== "install" ? match[1]! : null;
+};
+const gateSteps = allSteps.filter((step) => gateScriptOf(step) !== null);
+const invoked = new Set(gateSteps.map((step) => gateScriptOf(step)!));
+
+/** Scripts that are not gates, each with the reason. A new script that is not here and not run fails the suite. */
+const NOT_A_GATE: Readonly<Record<string, string>> = {
+  build: "compiles for deployment; typecheck covers the same sources",
+  start: "runs the API",
+  "start:gateway": "runs the realtime gateway",
+  "start:worker": "runs the queue workers",
+  test: "developer convenience over the default config; the census below proves every file it collects is collected by a script CI runs",
+  "db:generate": "writes a migration scaffold",
+  "db:migrate": "mutates a database",
+  "db:rollback": "mutates a database",
+  "db:reset": "mutates a database",
+  "db:dev-credentials": "provisions local role passwords",
+  "db:rls-generate": "writes generated RLS artifacts; db:rls-check is the gate over them",
+  "db:schema-generate": "writes the generated Drizzle schema; db:schema-check is the gate over it",
+  "db:studio": "an interactive UI",
+  "db:maintenance:run": "an operational job",
+  "db:maintenance:sweep": "an operational job",
+  "credits:verify": "an operational job against a live ledger",
+  "credits:reconcile": "an operational job against a live ledger",
+  "plan:set": "the operator CLI; it changes a workspace's plan",
+  "audit:verify": "an operational job against a live audit chain",
+  "audit:export": "an operational export",
+  "contracts:generate": "writes the generated OpenAPI document; contracts:check is the gate over it",
+  "contracts:diff": "a developer report between two documents",
+  "client:generate": "writes the generated client; the app's CI builds and type-checks against it",
+};
+
+/**
+ * Gate-shaped scripts CI deliberately does not run. Each reason is CHECKED
+ * below, because the first version's reasons were both false — each described
+ * the other script's behaviour, and a review measured it.
+ */
+const EXEMPT_GATE: Readonly<Record<string, string>> = {
+  "db:role-check":
+    "asserts the connection is not the migration owner. CI connects as the image's superuser, which is neither the owner " +
+    "nor a runtime role, so it would PASS VACUOUSLY; it only means something against a deploy URL.",
+  "db:purge-check":
+    "reads production's purge_failures table. CI's service database is never migrated (the shadow-database gates build " +
+    "their own), so the table does not exist and it would ERROR; it only means something against production.",
+};
+
+describe("STORY-155 · the CI workflow, parsed, runs every gate this repository declares", () => {
+  it("the parse found what it should — the checks below are not running over nothing", () => {
+    expect(Object.keys(workflow.jobs).length).toBeGreaterThanOrEqual(2);
+    expect(gateSteps.length, "no gate steps parsed").toBeGreaterThanOrEqual(10);
     expect(invoked.has("test:integration")).toBe(true);
-    for (const name of ["lint", "typecheck", "test:unit", "test:isolation:breakers", "contracts:check", "db:rls-check"]) {
-      expect(GATE.test(name), `${name} should count as a gate`).toBe(true);
-    }
-    for (const name of ["build", "db:migrate", "audit:verify", "test", "client:generate"]) {
-      expect(GATE.test(name), `${name} should not count as a gate`).toBe(false);
-    }
-    // A commented-out step is not a step.
-    expect(/^\s*-\s*run:\s*pnpm\s+([a-z][\w:.-]*)\s*$/mu.test("      # - run: pnpm test:golden")).toBe(false);
+    expect(gateScriptOf({ run: "pnpm lint" })).toBe("lint");
+    expect(gateScriptOf({ run: "pnpm lint --quiet" }), "an argument can narrow a gate").toBeNull();
+    expect(gateScriptOf({ run: "pnpm lint || true" }), "a chained gate can be excused").toBeNull();
+    expect(gateScriptOf({ run: INSTALL })).toBeNull();
   });
 
-  it("⚠ every gate-shaped script is run by the workflow or exempt with a reason", () => {
-    const unrun = Object.keys(scripts).filter((name) => GATE.test(name) && !invoked.has(name) && !(name in EXEMPT));
+  it("⚠ triggers on every push to every branch, with no path filter that could skip a change", () => {
+    expect(Object.keys(workflow.on).sort()).toEqual(["push", "workflow_dispatch"]);
+    expect(workflow.on.push).toEqual({ branches: ["**"] });
+  });
+
+  it("⚠ no job carries a setting that could skip it, excuse it, or make it wait on another job", () => {
+    // `needs:` is the job-level form of the hiding the per-step guard fixed:
+    // a job that needs a failed job is skipped. `if:` and `continue-on-error:`
+    // skip or excuse outright. The allowed set is closed; anything else reports.
+    const ALLOWED = new Set(["name", "runs-on", "timeout-minutes", "services", "env", "steps"]);
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      const extra = Object.keys(job).filter((key) => !ALLOWED.has(key));
+      expect(extra, `job ${name} has settings this spec does not recognise`).toEqual([]);
+    }
+  });
+
+  it("⚠ every step is one this spec recognises — anything else could run before a gate and change what it sees", () => {
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      for (const step of job.steps) {
+        const keys = Object.keys(step).sort();
+        const kind =
+          gateScriptOf(step) !== null
+            ? "gate"
+            : step.run === INSTALL
+              ? "install"
+              : step.run === "corepack enable"
+                ? "corepack"
+                : typeof step.uses === "string"
+                  ? "action"
+                  : "unknown";
+        expect(kind, `job ${name}: unrecognised step ${JSON.stringify(step)}`).not.toBe("unknown");
+        const allowed: Record<string, string[]> = {
+          gate: ["if", "run"],
+          install: ["id", "run"],
+          corepack: ["run"],
+          action: ["uses", "with"],
+        };
+        expect(keys, `job ${name}: ${kind} step carries unexpected keys — continue-on-error, shell and the like can neutralise it`).toEqual(
+          allowed[kind],
+        );
+      }
+    }
+  });
+
+  it("⚠ every gate step runs whenever install succeeded, whatever happened to the gates before it", () => {
+    // The first CI run failed test:unit and SKIPPED all three database gates.
+    for (const step of gateSteps) expect(step.if, `pnpm ${gateScriptOf(step)!}`).toBe(GUARD);
+    // The guard names `steps.install`, so every job with gates has exactly one
+    // install step with that id, BEFORE its first gate.
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      const firstGate = job.steps.findIndex((step) => gateScriptOf(step) !== null);
+      if (firstGate === -1) continue;
+      const installs = job.steps.map((step, index) => ({ step, index })).filter(({ step }) => step.id === "install");
+      expect(installs.length, `job ${name}`).toBe(1);
+      expect(installs[0]!.step.run).toBe(INSTALL);
+      expect(installs[0]!.index, `job ${name}: install must precede the gates`).toBeLessThan(firstGate);
+    }
+  });
+
+  it("⚠ every script is run by CI or classified with a reason — an unknown name is reported, not guessed", () => {
+    const unclassified = Object.keys(scripts).filter((name) => !invoked.has(name) && !(name in NOT_A_GATE) && !(name in EXEMPT_GATE));
+    expect(unclassified, "classify each: run it in gates.yml, or add it to NOT_A_GATE / EXEMPT_GATE with a reason").toEqual([]);
+    expect([...invoked].filter((name) => !(name in scripts)), "a step names a script that does not exist").toEqual([]);
+    for (const name of [...Object.keys(NOT_A_GATE), ...Object.keys(EXEMPT_GATE)]) {
+      expect(name in scripts, `${name} is classified but no longer a script`).toBe(true);
+      expect(invoked.has(name), `${name} is classified as not run, but CI runs it — delete the entry`).toBe(false);
+    }
+  });
+
+  it("⚠ each exemption's reason is true of this workflow, not just written down", () => {
+    const url = new URL(String((workflow.jobs["static-and-database"]!.env as Record<string, string>).DATABASE_URL));
+    // db:role-check passes vacuously: CI's role is neither the owner it looks for nor a runtime role.
+    expect(url.username).not.toBe(MIGRATION_OWNER_ROLE);
+    expect(RUNTIME_ROLES as readonly string[]).not.toContain(url.username);
+    // db:purge-check would error: nothing migrates CI's service database.
+    expect(invoked.has("db:migrate")).toBe(false);
+    expect(allSteps.some((step) => typeof step.run === "string" && step.run.includes("db:migrate"))).toBe(false);
+  });
+
+  it("⚠ every tracked test file is collected by a test script CI runs", { timeout: 120_000 }, () => {
+    // The census that found five contract test files (62 tests) CI never ran:
+    // `test:unit`'s positional filters were `test/unit src`, and nothing else
+    // collected `contracts/`. Asked of vitest itself, not re-implemented.
+    const tracked = execFileSync("git", ["ls-files"], { cwd: ROOT, encoding: "utf8" })
+      .split("\n")
+      .filter((file) => /\.(?:test|spec)\.[cm]?[jt]sx?$/u.test(file));
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("VITEST")));
+    const collected = new Set<string>();
+    for (const name of invoked) {
+      const body = scripts[name]!;
+      if (!body.startsWith("vitest run")) continue;
+      const listed = execFileSync("sh", ["-c", `./node_modules/.bin/${body.replace(/^vitest run/u, "vitest list --filesOnly")}`], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env,
+      });
+      for (const line of listed.split("\n")) if (line.trim()) collected.add(line.trim());
+    }
+    expect(tracked.length, "git ls-files found no test files — the census would be vacuous").toBeGreaterThan(300);
+    expect(collected.size, "no CI script collected anything — the listing is broken").toBeGreaterThan(300);
     expect(
-      unrun,
-      "a gate script exists that CI never runs. Add a `- run: pnpm <name>` step to .github/workflows/gates.yml, " +
-        "or add it to EXEMPT here with a reason a reviewer can argue with.",
+      tracked.filter((file) => !collected.has(file)),
+      "tracked test files no CI-run script collects. Widen that script's filters, or move the file.",
     ).toEqual([]);
   });
 
-  it("⚠ every gate step still runs when an earlier gate failed", () => {
-    // The first CI run failed test:unit and SKIPPED all three database gates,
-    // so it proved nothing about them. A gate that only runs when every gate
-    // before it passed reports on the first failure and hides the rest. Each
-    // gate step therefore carries a guard that runs it whenever install
-    // succeeded; the job still fails if any of them does.
-    const GUARD = "if: ${{ !cancelled() && steps.install.outcome == 'success' }}";
-    const unguarded = [...workflow.matchAll(/^\s*-\s*run:\s*pnpm\s+([a-z][\w:.-]*)\s*\n(.*)$/gmu)]
-      .filter((m) => GATE.test(m[1]!) && m[2]!.trim() !== GUARD)
-      .map((m) => m[1]!);
-    expect(unguarded, "these gate steps are skipped whenever an earlier gate fails").toEqual([]);
-    // The guard is only meaningful if the step it names exists.
-    expect(workflow.match(/^\s*id:\s*install\s*$/gmu)?.length, "every job needs an `install` step id").toBe(
-      (workflow.match(/^\s*-\s*run:\s*pnpm install --frozen-lockfile\s*$/gmu) ?? []).length,
-    );
-  });
-
-  it("every step names a script that exists", () => {
-    // A renamed script would otherwise surface only as a red run on GitHub.
-    expect([...invoked].filter((name) => !(name in scripts))).toEqual([]);
-  });
-
-  it("every exemption is still a script, and still not run — so none outlives its reason", () => {
-    for (const name of Object.keys(EXEMPT)) {
-      expect(name in scripts, `EXEMPT names ${name}, which package.json no longer has`).toBe(true);
-      expect(invoked.has(name), `${name} is both exempt and run — delete the exemption`).toBe(false);
+  it("⚠ every action is GitHub-owned and pinned to a full commit SHA, and checkout keeps no token", () => {
+    const uses = allSteps.filter((step) => step.uses !== undefined);
+    expect(uses.length).toBeGreaterThanOrEqual(2);
+    for (const step of uses) {
+      expect(step.uses, "a tag can be re-pointed; a third-party action is a dependency (§6)").toMatch(PINNED_ACTION);
+      if (step.uses!.startsWith("actions/checkout@")) expect(step.with?.["persist-credentials"]).toBe(false);
     }
+    expect(workflow.permissions).toEqual({ contents: "read" });
   });
 
-  it("⚠ every action is GitHub-owned and pinned to a full commit SHA", () => {
-    // A tag like `@v7` can be re-pointed by whoever controls the action's
-    // repository; a 40-hex SHA cannot. And a third-party action is a
-    // dependency (development-workflow.md §6), so adding one should be a
-    // visible decision that fails here first rather than a line in a diff.
-    const uses = [...workflow.matchAll(/^\s*(?:-\s*)?uses:\s*(\S+)/gmu)].map((m) => m[1]!);
-    expect(uses.length, "no `uses:` lines found — the matcher is broken").toBeGreaterThanOrEqual(2);
-    for (const ref of uses) {
-      expect(ref, `${ref} is not pinned to a full commit SHA`).toMatch(/@[0-9a-f]{40}$/u);
-      expect(ref, `${ref} is not a GitHub-owned action`).toMatch(/^actions\//u);
-    }
+  it("⚠ main runs are never cancelled — neither in progress nor pending — and branches supersede", () => {
+    // A shared group on main still let GitHub cancel the PENDING run when a
+    // third arrived; each main commit now gets a group of its own.
+    expect(workflow.concurrency).toEqual({
+      group: "${{ github.ref == 'refs/heads/main' && format('gates-main-{0}', github.sha) || format('gates-{0}', github.ref) }}",
+      "cancel-in-progress": "${{ github.ref != 'refs/heads/main' }}",
+    });
   });
 
-  it("the toolchain has one source: .nvmrc for Node, packageManager (with integrity) for pnpm", () => {
-    expect(existsSync(root(".nvmrc"))).toBe(true);
-    expect(workflow).toContain("node-version-file: .nvmrc");
-    const pkg = JSON.parse(readFileSync(root("package.json"), "utf8")) as { packageManager?: string };
-    expect(pkg.packageManager, "pnpm must be pinned with its integrity hash").toMatch(/^pnpm@\d+\.\d+\.\d+\+sha512\.[0-9a-f]{128}$/u);
-    expect(workflow).toContain("corepack enable");
+  it("the toolchain has one source: .nvmrc for Node, packageManager with integrity for pnpm", () => {
+    expect(existsSync(`${ROOT}.nvmrc`)).toBe(true);
+    const setupNode = allSteps.filter((step) => step.uses?.startsWith("actions/setup-node@"));
+    expect(setupNode.length).toBeGreaterThan(0);
+    for (const step of setupNode) expect(step.with?.["node-version-file"]).toBe(".nvmrc");
+    expect(pkg.packageManager).toMatch(/^pnpm@\d+\.\d+\.\d+\+sha512\.[0-9a-f]{128}$/u);
   });
 });
