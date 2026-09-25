@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, promises as fsPromises, readFileSync, readdirSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
+import { SiblingReadError, allowSiblingReads, isSibling } from "../support/no-sibling-reads.js";
 
 // ⚠ STORY-155 — GAP G-12, SETTLED AS A VENDORED MIRROR.
 //
@@ -14,24 +16,26 @@ import { describe, expect, it } from "vitest";
 // mirror under docs/references/, the arrangement docs/plans/dev-plan.md
 // already uses.
 //
-// A mirror is only as good as its freshness, and this file is what keeps it
-// honest. Two halves:
+// Two halves keep that honest:
 //   1. wherever the snapshot IS present — every machine that edits the docs —
 //      every mirrored file must equal its original byte for byte;
-//   2. nothing in src/ or test/ may reach OUTSIDE the repository — by the
-//      snapshot's name, by a path that climbs past the file's own depth, or by
-//      `..` resolved against a ROOT variable. Without this half, the next test
-//      to read a sibling reopens G-12 and nobody finds out until CI is red.
+//   2. no test may read a SIBLING of the repository at all. That half is
+//      enforced at RUNTIME by test/support/no-sibling-reads.ts in every vitest
+//      worker; this file proves the guard is installed everywhere and fires.
+//      The two static versions before it were pattern lists, and a review
+//      walked five more ways of writing a path straight past the second.
+const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
+const PARENT = dirname(resolve(REPO_ROOT));
+const MIRROR = resolve(REPO_ROOT, "docs/references");
+/** Overridable so the comparison itself can be tested against a planted snapshot. */
+const SNAPSHOT = resolve(process.env.NOMINARA_DOCS_SNAPSHOT ?? join(PARENT, "Nominara-Dev-Docs-main"), "references");
+// The one deliberate sibling read in the suite.
+const SNAPSHOT_PRESENT = allowSiblingReads(() => existsSync(SNAPSHOT));
+
+const mirrored = readdirSync(MIRROR).filter((name) => statSync(join(MIRROR, name)).isFile());
+const sha256 = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
+
 describe("STORY-155 · docs/references is a faithful mirror of the docs snapshot", () => {
-  const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
-  const MIRROR = resolve(REPO_ROOT, "docs/references");
-  /** Overridable so the comparison itself can be tested against a planted snapshot. */
-  const SNAPSHOT = resolve(process.env.NOMINARA_DOCS_SNAPSHOT ?? resolve(REPO_ROOT, "../Nominara-Dev-Docs-main"), "references");
-  const SNAPSHOT_PRESENT = existsSync(SNAPSHOT);
-
-  const mirrored = readdirSync(MIRROR).filter((name) => statSync(join(MIRROR, name)).isFile());
-  const sha256 = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
-
   it("the mirror exists and carries the reference the catalog test reads", () => {
     // Runs everywhere, CI included. A deleted mirror must fail here, not
     // surface as a confusing read error somewhere else.
@@ -44,77 +48,71 @@ describe("STORY-155 · docs/references is a faithful mirror of the docs snapshot
   describe.skipIf(!SNAPSHOT_PRESENT)(`byte-identical to the snapshot at ${SNAPSHOT}`, () => {
     it.each(mirrored)("⚠ %s matches its original", (name) => {
       const original = join(SNAPSHOT, name);
-      expect(existsSync(original), `${name} is mirrored but the snapshot has no such file — delete the mirror or restore the original`).toBe(true);
-      expect(
-        sha256(join(MIRROR, name)),
-        `docs/references/${name} has drifted from the snapshot. Re-copy it: cp ${original} docs/references/${name}`,
-      ).toBe(sha256(original));
+      allowSiblingReads(() => {
+        expect(existsSync(original), `${name} is mirrored but the snapshot has no such file — delete the mirror or restore the original`).toBe(true);
+        expect(
+          sha256(join(MIRROR, name)),
+          `docs/references/${name} has drifted from the snapshot. Re-copy it: cp ${original} docs/references/${name}`,
+        ).toBe(sha256(original));
+      });
     });
   });
+});
 
-  it("⚠ nothing in src/ or test/ reaches outside the repository", () => {
-    // ⚠ THE HAZARD, NOT A NAME. The first version searched for the literal
-    // "Nominara-Dev-Docs-main" and nothing else, so a test reading any OTHER
-    // sibling — this machine also has ../client and ../nominara-api — or one
-    // that assembled the snapshot's name from parts would pass locally, where
-    // the siblings exist, and break or go vacuous in CI. That is G-12 again.
-    //
-    // So this flags any path literal that climbs out of the repository:
-    //   - relative to its own FILE, when it has more leading `../` than the
-    //     file is deep (how `new URL("../..", import.meta.url)` paths escape);
-    //   - relative to a *ROOT* variable, when a `..` literal is the argument
-    //     right after one — `resolve(REPO_ROOT, "../x")` and
-    //     `resolve(REPO_ROOT, "..", "x")`. A ROOT *declaration* built from
-    //     `new URL("../..", import.meta.url)` is file-relative, not this.
-    // The snapshot's name is still flagged outright, however it is used.
-    const THIS_FILE = relative(REPO_ROOT, fileURLToPath(import.meta.url));
-    const LITERAL = /(["'`])(\.\.(?:\/[^"'`$]*)?)\1/gu;
-    const AGAINST_ROOT = /\b[A-Za-z_]*ROOT\b\s*,\s*["'`]\.\.(?:["'`]|\/)/u;
-    const offenders: string[] = [];
-    let scanned = 0;
-    const walk = (dir: string): void => {
-      for (const name of readdirSync(dir)) {
-        const full = join(dir, name);
-        if (statSync(full).isDirectory()) {
-          if (name !== "node_modules") walk(full);
-          continue;
-        }
-        if (!/\.[cm]?tsx?$/u.test(name)) continue;
-        scanned++;
-        const rel = relative(REPO_ROOT, full);
-        if (rel === THIS_FILE) continue; // the one file that reads the snapshot on purpose, to compare
-        const depth = rel.split("/").length - 1;
-        readFileSync(full, "utf8")
-          .split("\n")
-          .forEach((line, index) => {
-            const trimmed = line.trim();
-            if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
-            const where = `${rel}:${String(index + 1)} — ${trimmed}`;
-            if (trimmed.includes("Nominara-Dev-Docs-main")) offenders.push(where);
-            for (const match of trimmed.matchAll(LITERAL)) {
-              const climbs = match[2]!.split("/").filter((segment) => segment === "..").length;
-              if (climbs > depth) offenders.push(`${where}   [climbs ${String(climbs)} from depth ${String(depth)}]`);
-            }
-            if (AGAINST_ROOT.test(trimmed)) offenders.push(`${where}   [.. resolved against a ROOT variable]`);
-          });
-      }
-    };
-    walk(resolve(REPO_ROOT, "src"));
-    walk(resolve(REPO_ROOT, "test"));
+describe("STORY-155 · no test can read a sibling of the repository", () => {
+  it("⚠ the guard is wired into every vitest config — unit, integration and isolation", async () => {
+    // Asked of the configs themselves, imported, not grepped.
+    for (const file of ["vitest.config.ts", "vitest.integration.config.ts", "vitest.isolation.config.ts"]) {
+      const config = ((await import(pathToFileURL(resolve(REPO_ROOT, file)).href)) as { default: { test?: { setupFiles?: string[] } } }).default;
+      expect(config.test?.setupFiles, file).toContain("test/support/no-sibling-reads.ts");
+    }
+    // And it is installed in THIS worker, over the module's own export list.
+    expect((globalThis as { __nominaraSiblingGuard?: number }).__nominaraSiblingGuard).toBeGreaterThan(100);
+  });
 
-    expect(scanned, "the walk found nothing — this check would be vacuous").toBeGreaterThan(200);
-    // The matcher, pinned against the three forms it exists for.
-    const probe = (text: string): string[] => [...text.matchAll(LITERAL)].map((m) => m[2]!);
-    expect(probe('new URL("../../../../x", import.meta.url)')).toEqual(["../../../../x"]);
-    expect(probe("import { a } from \"./local.js\";")).toEqual([]);
-    expect(AGAINST_ROOT.test('resolve(REPO_ROOT, "../sibling/x.md")')).toBe(true);
-    expect(AGAINST_ROOT.test('resolve(REPO_ROOT, "..", "sibling")')).toBe(true);
-    expect(AGAINST_ROOT.test('const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));'), "a ROOT declaration is file-relative").toBe(false);
-    expect(AGAINST_ROOT.test('resolve(REPO_ROOT, "docs/references")')).toBe(false);
-    expect(
-      offenders,
-      "code outside this repository is not in a fresh clone, so CI cannot see it (gap G-12). Mirror the file " +
-        "into docs/references/ and read it from there — the mirror check above keeps it faithful.",
-    ).toEqual([]);
+  it("⚠ it refuses every way of writing a sibling path the reviews found — and the file need not exist", async () => {
+    // The first guard matched a name; the second matched three spellings. Each
+    // of these got past one of them. None is a pattern here: they all RESOLVE
+    // under the repository's parent and outside the repository.
+    expect(resolve(process.cwd()), "the cwd-relative case assumes vitest runs from the repository root").toBe(resolve(REPO_ROOT));
+    const REPO_ROOT_lower = REPO_ROOT;
+    const attempts: Array<[string, () => unknown]> = [
+      ["the original G-12 form", () => readFileSync(resolve(REPO_ROOT, "../Nominara-Dev-Docs-main/references/api-specification.md"))],
+      ["a different sibling", () => readFileSync(resolve(REPO_ROOT, "../client/package.json"))],
+      ["separate `..` arguments", () => existsSync(join(REPO_ROOT, "..", "client"))],
+      ["a bare cwd-relative path", () => readFileSync("../client/package.json")],
+      ["a template join", () => existsSync(`${REPO_ROOT}/../client/package.json`)],
+      ["a lower-case root variable", () => statSync(resolve(REPO_ROOT_lower, "..", "Nominara-Dev-Docs-main"))],
+      ["a URL climbing from this file", () => readFileSync(new URL("../../../client/package.json", import.meta.url))],
+      ["the parent directory itself", () => readdirSync(PARENT)],
+      ["the symlink back to this repository", () => existsSync(join(PARENT, "nominara-api", "package.json"))],
+      ["a name assembled from parts", () => existsSync(join(PARENT, ["Nominara", "Dev", "Docs", "main"].join("-")))],
+    ];
+    for (const [label, attempt] of attempts) expect(attempt, label).toThrow(SiblingReadError);
+    await expect(fsPromises.readFile(join(PARENT, "client", "package.json")), "fs/promises").rejects.toThrow(SiblingReadError);
+  });
+
+  it("does NOT refuse the repository, the temp directory, or paths above the repository's parent", () => {
+    // Anti-overreach: testcontainers reads its own config under $HOME, and
+    // plenty of tests write to the temp directory.
+    expect(isSibling(resolve(REPO_ROOT, "package.json"))).toBe(false);
+    expect(isSibling(resolve(REPO_ROOT))).toBe(false);
+    expect(isSibling(tmpdir())).toBe(false);
+    expect(isSibling(homedir())).toBe(false);
+    expect(() => readFileSync(resolve(REPO_ROOT, "package.json"))).not.toThrow();
+    expect(() => existsSync(join(tmpdir(), "nominara-no-such-file"))).not.toThrow();
+  });
+
+  it("the one exemption re-arms as soon as it returns", () => {
+    const sibling = join(PARENT, "Nominara-Dev-Docs-main");
+    expect(() => allowSiblingReads(() => existsSync(sibling))).not.toThrow();
+    expect(() => existsSync(sibling)).toThrow(SiblingReadError);
+    // Even when the allowed block throws.
+    expect(() =>
+      allowSiblingReads(() => {
+        throw new Error("inside");
+      }),
+    ).toThrow("inside");
+    expect(() => existsSync(sibling)).toThrow(SiblingReadError);
   });
 });
