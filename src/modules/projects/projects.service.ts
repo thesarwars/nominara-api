@@ -27,6 +27,7 @@ import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
 import { handlerFor } from "../../lib/queue/handlers.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
+import { confidenceFor, sentimentBand } from "../../lib/scoring/index.js";
 
 // STORY-043 — URL-only project creation. api-specification.md §4.
 //
@@ -213,9 +214,11 @@ export class ProjectsService {
 
     const result = await client.query<ProjectRow>(
       `SELECT id, name, slug::text AS slug, root_domain, kind, status, discovery_status,
-              prompts_active, prompts_cap, open_task_count,
+              prompts_active, prompts_cap, open_task_count, open_tasks_by_severity,
               domain_verified_at, created_at,
-              visibility_blended, visibility_delta_30d, aux_score_current, sparkline_30d,
+              visibility_blended, visibility_delta_30d, rendering_quality, rendering_delta_30d,
+              source_coverage, aux_score_current, sentiment_score, sentiment_delta_30d, cells_30d,
+              visibility_by_engine, sparkline_30d, demo_seeded_at,
               created_at::text AS created_at_key
          FROM projects
         WHERE deleted_at IS NULL
@@ -511,6 +514,18 @@ export class ProjectsService {
   }
 }
 
+interface ProjectEngineScoreRow {
+  score: number;
+  delta_30d: number | null;
+}
+
+interface OpenTasksBySeverityRow {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+}
+
 interface ProjectRow {
   id: string;
   name: string;
@@ -522,12 +537,21 @@ interface ProjectRow {
   prompts_active: number;
   prompts_cap: number;
   open_task_count: number;
+  open_tasks_by_severity: OpenTasksBySeverityRow;
   domain_verified_at: Date | null;
   created_at: Date;
   visibility_blended: string | null;
   visibility_delta_30d: string | null;
+  rendering_quality: string | null;
+  rendering_delta_30d: string | null;
+  source_coverage: string | null;
   aux_score_current: string | null;
+  sentiment_score: string | null;
+  sentiment_delta_30d: string | null;
+  cells_30d: number | null;
+  visibility_by_engine: Record<string, ProjectEngineScoreRow> | null;
   sparkline_30d: unknown;
+  demo_seeded_at: Date | null;
   created_at_key: string;
 }
 
@@ -545,6 +569,7 @@ function numericOrNull(value: string | null): number | null {
 }
 
 function toProjectListItem(row: ProjectRow): ProjectListItem {
+  const sentimentScore = numericOrNull(row.sentiment_score);
   return {
     id: row.id,
     name: row.name,
@@ -556,13 +581,38 @@ function toProjectListItem(row: ProjectRow): ProjectListItem {
     prompts_active: row.prompts_active,
     prompts_cap: row.prompts_cap,
     open_task_count: row.open_task_count,
+    open_tasks_by_severity: row.open_tasks_by_severity,
     domain_verified_at: row.domain_verified_at?.toISOString() ?? null,
     created_at: row.created_at.toISOString(),
     visibility_blended: numericOrNull(row.visibility_blended),
     visibility_delta_30d: numericOrNull(row.visibility_delta_30d),
+    rendering_quality: numericOrNull(row.rendering_quality),
+    rendering_delta_30d: numericOrNull(row.rendering_delta_30d),
+    source_coverage: numericOrNull(row.source_coverage),
     aux_score_current: numericOrNull(row.aux_score_current),
+    sentiment_score: sentimentScore,
+    sentiment_delta_30d: numericOrNull(row.sentiment_delta_30d),
+    // Read-time classification, not stored: the band is a rendering of the
+    // score, and storing it would let the two disagree after a rounding
+    // change. Null exactly when the score itself is — never "positive" for
+    // no data, matching how the score's own null already refuses 50.
+    sentiment_band: sentimentBand(sentimentScore),
+    // Read-time, from the cell count denormalizeProject already wrote — no
+    // second query over metric_daily. Null when cells_30d is null: nothing
+    // has been measured at all, which is a different fact from "low".
+    confidence: row.cells_30d === null ? null : confidenceFor(row.cells_30d),
+    engine_scores: toEngineScores(row.visibility_by_engine),
     sparkline_30d: row.sparkline_30d ?? null,
+    demo_seeded: row.demo_seeded_at !== null,
   };
+}
+
+/** `projects.visibility_by_engine`'s stored object, as the sorted array the wire contract wants. */
+function toEngineScores(byEngine: Record<string, ProjectEngineScoreRow> | null): ProjectListItem["engine_scores"] {
+  if (byEngine === null) return null;
+  return Object.entries(byEngine)
+    .map(([engineKey, value]) => ({ engine_key: engineKey, score: value.score, delta_30d: value.delta_30d }))
+    .sort((a, b) => b.score - a.score);
 }
 
 /** The honest empty payload for a project whose discovery has written nothing yet. */

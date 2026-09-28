@@ -9624,6 +9624,38 @@
                             "minimum": 0,
                             "maximum": 9007199254740991
                           },
+                          "open_tasks_by_severity": {
+                            "type": "object",
+                            "properties": {
+                              "critical": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "high": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "medium": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "low": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              }
+                            },
+                            "required": [
+                              "critical",
+                              "high",
+                              "medium",
+                              "low"
+                            ],
+                            "additionalProperties": false
+                          },
                           "domain_verified_at": {
                             "anyOf": [
                               {
@@ -9657,10 +9689,128 @@
                               }
                             ]
                           },
+                          "rendering_quality": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "rendering_delta_30d": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "source_coverage": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "aux_score_current": {
                             "anyOf": [
                               {
                                 "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "sentiment_score": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "sentiment_delta_30d": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "sentiment_band": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "enum": [
+                                  "positive",
+                                  "neutral",
+                                  "negative"
+                                ]
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "confidence": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "enum": [
+                                  "low",
+                                  "medium",
+                                  "high"
+                                ]
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "engine_scores": {
+                            "anyOf": [
+                              {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "engine_key": {
+                                      "type": "string",
+                                      "minLength": 1
+                                    },
+                                    "score": {
+                                      "type": "number"
+                                    },
+                                    "delta_30d": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "engine_key",
+                                    "score",
+                                    "delta_30d"
+                                  ],
+                                  "additionalProperties": false
+                                }
                               },
                               {
                                 "type": "null"
@@ -9674,6 +9824,9 @@
                                 "type": "null"
                               }
                             ]
+                          },
+                          "demo_seeded": {
+                            "type": "boolean"
                           }
                         },
                         "required": [
@@ -9687,12 +9840,22 @@
                           "prompts_active",
                           "prompts_cap",
                           "open_task_count",
+                          "open_tasks_by_severity",
                           "domain_verified_at",
                           "created_at",
                           "visibility_blended",
                           "visibility_delta_30d",
+                          "rendering_quality",
+                          "rendering_delta_30d",
+                          "source_coverage",
                           "aux_score_current",
-                          "sparkline_30d"
+                          "sentiment_score",
+                          "sentiment_delta_30d",
+                          "sentiment_band",
+                          "confidence",
+                          "engine_scores",
+                          "sparkline_30d",
+                          "demo_seeded"
                         ],
                         "additionalProperties": false
                       }
