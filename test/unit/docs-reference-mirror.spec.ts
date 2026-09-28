@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, promises as fsPromises, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { SiblingReadError, allowSiblingReads, isSibling } from "../support/no-sibling-reads.js";
@@ -76,6 +76,13 @@ describe("STORY-155 · no test can read a sibling of the repository", () => {
     // under the repository's parent and outside the repository.
     expect(resolve(process.cwd()), "the cwd-relative case assumes vitest runs from the repository root").toBe(resolve(REPO_ROOT));
     const REPO_ROOT_lower = REPO_ROOT;
+    // ⚠ NOT A HARD-CODED NAME. This repository is checked out as `api` here,
+    // beside a `nominara-api` symlink back to it — and as `nominara-api` on
+    // a GitHub runner, where `../nominara-api` IS the repository. The first
+    // version hard-coded "nominara-api", passed here, and failed in CI run
+    // 36141088388: a test encoding this machine's layout, in the file whose
+    // job is to stop exactly that.
+    const otherName = basename(resolve(REPO_ROOT)) === "nominara-api" ? "api" : "nominara-api";
     const attempts: Array<[string, () => unknown]> = [
       ["the original G-12 form", () => readFileSync(resolve(REPO_ROOT, "../Nominara-Dev-Docs-main/references/api-specification.md"))],
       ["a different sibling", () => readFileSync(resolve(REPO_ROOT, "../client/package.json"))],
@@ -85,7 +92,7 @@ describe("STORY-155 · no test can read a sibling of the repository", () => {
       ["a lower-case root variable", () => statSync(resolve(REPO_ROOT_lower, "..", "Nominara-Dev-Docs-main"))],
       ["a URL climbing from this file", () => readFileSync(new URL("../../../client/package.json", import.meta.url))],
       ["the parent directory itself", () => readdirSync(PARENT)],
-      ["the symlink back to this repository", () => existsSync(join(PARENT, "nominara-api", "package.json"))],
+      ["the repository's other name (a symlink back to it, here)", () => existsSync(join(PARENT, otherName, "package.json"))],
       ["a name assembled from parts", () => existsSync(join(PARENT, ["Nominara", "Dev", "Docs", "main"].join("-")))],
     ];
     for (const [label, attempt] of attempts) expect(attempt, label).toThrow(SiblingReadError);
