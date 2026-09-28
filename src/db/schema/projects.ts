@@ -90,4 +90,10 @@ export const projects = pgTable("projects", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  renderingDelta30d: numeric("rendering_delta_30d", { precision: 6, scale: 3 }),
+  sentimentScore: numeric("sentiment_score", { precision: 6, scale: 3 }),
+  sentimentDelta30d: numeric("sentiment_delta_30d", { precision: 6, scale: 3 }),
+  cells30d: integer("cells_30d"),
+  openTasksBySeverity: jsonb("open_tasks_by_severity").notNull().default(sql`'{"low": 0, "high": 0, "medium": 0, "critical": 0}'::jsonb`),
+  demoSeededAt: timestamp("demo_seeded_at", { withTimezone: true }),
 });
