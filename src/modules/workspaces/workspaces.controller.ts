@@ -34,7 +34,9 @@ import {
   type WorkspaceListItemWithRelationship,
   type WorkspaceResponse,
 } from "./dto/index.js";
+import { actionItemListResponseSchema, type ActionItem } from "../tasks/dto/index.js";
 import { InvitationsService } from "./invitations.service.js";
+import { TasksService } from "../tasks/tasks.service.js";
 import { WorkspacesService, type AuditRequestMeta } from "./workspaces.service.js";
 
 // STORY-021 — thin HTTP surface only (coding-standards.md §1: a conditional
@@ -57,6 +59,7 @@ export class WorkspacesController {
   constructor(
     private readonly service: WorkspacesService,
     private readonly invitations: InvitationsService,
+    private readonly tasks: TasksService,
   ) {}
 
   @Post("workspaces")
@@ -202,6 +205,33 @@ export class WorkspacesController {
   ): Promise<Page<InvitationResponse>> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
     return this.invitations.list(id, pagination);
+  }
+
+  // STORY-169 (API step 2/3) — api-specification.md §3: "GET /workspaces/
+  // {id}/summary · /action-items — project:read / task:read — Command
+  // Center matrix; cross-project queue." Lives HERE, not on
+  // TasksController: this controller already owns every other
+  // `workspaces/:id/*` cross-resource route (members, invitations above),
+  // flattened for exactly that reason (see the top-of-file comment);
+  // TasksController's own `@Controller("tasks")` prefix cannot serve a
+  // `workspaces/:id/...` path. `tasks` is TasksService's table
+  // (coding-standards.md §1), so the query lives there and this method
+  // only resolves the request, calls it, and returns.
+  @Get("workspaces/:id/action-items")
+  @RequirePermission("task:read")
+  @ApiContract({
+    operationId: "listActionItems",
+    querySchema: paginationRequestSchema,
+    responseSchema: actionItemListResponseSchema,
+    listOf: true,
+  })
+  listActionItems(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<ActionItem>> {
+    assertMatchesTenant(id, req.tenant!.workspaceId);
+    return this.tasks.listActionItems(pagination);
   }
 
   @Post("workspaces/:id/invitations/accept")

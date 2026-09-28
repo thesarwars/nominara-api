@@ -8,6 +8,7 @@ import {
 } from "../../lib/cache/realtime-publisher.js";
 import { AuditModule } from "../audit/audit.module.js";
 import { IdentityModule } from "../identity/identity.module.js";
+import { TasksModule } from "../tasks/tasks.module.js";
 import { LocalDekProvisioner } from "./adapters/local-dek-provisioner.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { WorkspacesController } from "./workspaces.controller.js";
@@ -29,8 +30,14 @@ import { InvitationsService } from "./invitations.service.js";
 // resolving them unchanged — and there is exactly ONE cache instance per
 // process, which is what stops a revoked member being served from a second Map
 // for thirty seconds (security-and-tenancy.md §7).
+//
+// STORY-169 (API step 2/3) adds TasksModule: `GET /v1/workspaces/{id}/
+// action-items` joins this controller's `workspaces/:id/*` route family
+// (members, invitations), and `tasks` is TasksService's table to own
+// (coding-standards.md §1 "one table, one owning service") — so this module
+// imports the SERVICE rather than querying `tasks` here.
 @Module({
-  imports: [AuditModule, IdentityModule, TenancyAccessModule],
+  imports: [AuditModule, IdentityModule, TenancyAccessModule, TasksModule],
   controllers: [WorkspacesController],
   providers: [
     WorkspacesService,
