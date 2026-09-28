@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { requireDatabaseUrl } from "./client.js";
+import { LOCAL_HOSTS, hostnameOf, isLocalTarget } from "./local-target.js";
 
 // STORY-128 — `pnpm db:studio`, a preflight in front of `drizzle-kit studio`.
 //
@@ -19,9 +20,14 @@ import { requireDatabaseUrl } from "./client.js";
 // src/db/dev-credentials.ts takes — a tool with no production path that says
 // so — except that script only sets known-local passwords, while this one
 // would happily open production if DATABASE_URL happened to name it.
+//
+// STORY-169 — `LOCAL_HOSTS` and the "is this host local" check moved to
+// `./local-target.js`, a shared module, so the dev-only demo seed can reuse
+// the exact same allow-list rather than a second copy that could drift from
+// this one. Studio's own class name and message are kept byte-for-byte so
+// `test/unit/studio-target.spec.ts` needed no change.
 
-/** Hostnames that are a developer's own machine, and nothing else. */
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", "host.docker.internal", "postgres"]);
+export { LOCAL_HOSTS };
 
 export class NonLocalStudioTargetError extends Error {
   constructor(host: string) {
@@ -36,16 +42,11 @@ export class NonLocalStudioTargetError extends Error {
 
 /** Throws unless `databaseUrl` names a local host. Exported for its test. */
 export function assertLocalTarget(databaseUrl: string): void {
-  let host: string;
-  try {
-    host = new URL(databaseUrl).hostname;
-  } catch {
-    // An unparseable URL is not evidence of a local target. Refuse rather
-    // than pass it through to Studio and find out.
-    throw new NonLocalStudioTargetError("(unparseable DATABASE_URL)");
-  }
-  if (!LOCAL_HOSTS.has(host)) {
-    throw new NonLocalStudioTargetError(host);
+  if (!isLocalTarget(databaseUrl)) {
+    // An unparseable URL is not evidence of a local target either —
+    // `hostnameOf` reports it by its placeholder name rather than throwing,
+    // so it is refused here exactly like any other non-local host.
+    throw new NonLocalStudioTargetError(hostnameOf(databaseUrl));
   }
 }
 
