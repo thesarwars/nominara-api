@@ -27,8 +27,12 @@ import type { ClientBase } from "pg";
  * same reason: one canonical "current" reading per domain, not a window
  * chosen per task.
  */
-const SOURCE_INDEX_ENGINE_KEY = "all";
-const SOURCE_INDEX_WINDOW_DAYS = 30;
+// Exported for `TasksService.listActionItems` (STORY-169 API step 2/3),
+// which needs the SAME "current" reading per domain to derive severity for
+// the cross-project action queue — one canonical choice of window, in one
+// place, rather than a second literal that could drift from this one.
+export const SOURCE_INDEX_ENGINE_KEY = "all";
+export const SOURCE_INDEX_WINDOW_DAYS = 30;
 
 export interface TaskSeverityCounts {
   readonly critical: number;
