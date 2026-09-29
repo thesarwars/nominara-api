@@ -62,7 +62,7 @@ describe("STORY-021 · member listing, role changes, and removal within the matr
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
       membership,
-      new SessionService(pool),
+      new SessionService(pool, membership),
       realtime,
     );
   });

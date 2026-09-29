@@ -93,12 +93,13 @@ describe("STORY-024 · AC8 — two overlapping PATCHes cannot both win", () => {
   });
 
   function makeService(): WorkspacesService {
+    const membership = new MembershipService(new MembershipCacheService());
     return new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
-      new MembershipService(new MembershipCacheService()),
-      new SessionService(pool), new NoopRealtimePublisher());
+      membership,
+      new SessionService(pool, membership), new NoopRealtimePublisher());
   }
 
   async function createUser(): Promise<string> {

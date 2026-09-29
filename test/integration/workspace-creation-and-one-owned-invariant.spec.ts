@@ -79,7 +79,7 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
   });
 
   function makeService(dekProvisioner: DekProvisioner = new LocalDekProvisioner(WRAPPING_KEY, "local:dev")): WorkspacesService {
-    return new WorkspacesService(pool, dekProvisioner, new AuditChainService(), membership, new SessionService(pool), new NoopRealtimePublisher());
+    return new WorkspacesService(pool, dekProvisioner, new AuditChainService(), membership, new SessionService(pool, membership), new NoopRealtimePublisher());
   }
 
   async function createUser(email = `owner-${randomUUID()}@example.com`): Promise<string> {

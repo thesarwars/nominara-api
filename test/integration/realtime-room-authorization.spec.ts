@@ -91,12 +91,13 @@ describe("STORY-026 · room authorisation over a real socket", () => {
     // The FIXTURE pool stays the owner: seeding workspaces and sessions is
     // setup, not the behaviour under test.
     pool = new Pool({ connectionString: container.getConnectionUri() });
-    sessions = new SessionService(pool);
+    const membership = new MembershipService(new MembershipCacheService());
+    sessions = new SessionService(pool, membership);
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
-      new MembershipService(new MembershipCacheService()),
+      membership,
       sessions,
       new NoopRealtimePublisher(),
     );

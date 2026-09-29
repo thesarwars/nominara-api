@@ -70,7 +70,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
     const membership = new MembershipService(new MembershipCacheService());
-    const sessions = new SessionService(pool);
+    const sessions = new SessionService(pool, membership);
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),

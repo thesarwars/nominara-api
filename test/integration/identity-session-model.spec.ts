@@ -7,6 +7,8 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
+import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { AuthGuard, type AuthenticatedRequest } from "../../src/api/guards/auth.guard.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
@@ -114,7 +116,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     userId = userRow.rows[0]!.id;
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
-    sessions = new SessionService(pool);
+    sessions = new SessionService(pool, new MembershipService(new MembershipCacheService()));
   });
 
   afterEach(async () => {
@@ -205,6 +207,14 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     const initialClaims = decodeClaims(initial.accessToken);
     expect(initialClaims.ws).toBeNull();
 
+    // STORY-170 — sessions.active_workspace_id now FK-references workspaces
+    // (migration 0029), so switchWorkspace's own UPDATE needs a real row to
+    // point at, not just a plausible-looking uuid literal.
+    await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'Test Workspace', $2, 'free')", [
+      "0192f1a0-aaaa-7000-8000-000000000001",
+      "test-workspace-scenario-8",
+    ]);
+
     const switched = await sessions.switchWorkspace(
       initial.sid,
       userId,
@@ -237,6 +247,11 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
 
   it("STORY-017 · scenario 10 (narrowed) — AuthGuard authorises identical requests regardless of the role claim's value", async () => {
     const ownerTokens = await sessions.createSession(userId);
+    // STORY-170 — see scenario 8's own comment: a real row, not a bare uuid.
+    await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'Test Workspace', $2, 'free')", [
+      "0192f1a0-aaaa-7000-8000-000000000001",
+      "test-workspace-scenario-10",
+    ]);
     const asOwner = await sessions.switchWorkspace(
       ownerTokens.sid,
       userId,

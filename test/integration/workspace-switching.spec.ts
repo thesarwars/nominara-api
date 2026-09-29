@@ -83,7 +83,7 @@ describe("STORY-021 · workspace switching mints a fresh, single-tenant token", 
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
     const membership = new MembershipService(new MembershipCacheService());
-    sessions = new SessionService(pool);
+    sessions = new SessionService(pool, membership);
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),

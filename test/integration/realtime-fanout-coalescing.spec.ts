@@ -87,12 +87,13 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
     await migrateUp(db);
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
-    sessions = new SessionService(pool);
+    const membership = new MembershipService(new MembershipCacheService());
+    sessions = new SessionService(pool, membership);
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
-      new MembershipService(new MembershipCacheService()),
+      membership,
       sessions,
       new NoopRealtimePublisher(),
     );

@@ -61,12 +61,13 @@ describe("STORY-117 · cursor pagination on the shipped list endpoints", () => {
     await migrateUp(db);
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
+    const membership = new MembershipService(new MembershipCacheService());
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
-      new MembershipService(new MembershipCacheService()),
-      new SessionService(pool), new NoopRealtimePublisher());
+      membership,
+      new SessionService(pool, membership), new NoopRealtimePublisher());
     invitations = new InvitationsService(pool, new AuditChainService());
   });
 

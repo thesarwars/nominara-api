@@ -124,7 +124,7 @@ describe("STORY-019 · RbacGuard + step-up, against real Postgres", () => {
     workspaceGuard = new WorkspaceGuard(pool, membership, new Reflector());
     authGuard = new AuthGuard(new Reflector(), pool);
     rbacGuard = new RbacGuard(new Reflector());
-    sessions = new SessionService(pool);
+    sessions = new SessionService(pool, membership);
   });
 
   afterEach(async () => {

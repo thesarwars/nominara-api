@@ -141,7 +141,7 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
       unusedDekProvisioner,
       new AuditChainService(),
       membership,
-      new SessionService(pool), new NoopRealtimePublisher());
+      new SessionService(pool, membership), new NoopRealtimePublisher());
     guard = new WorkspaceGuard(pool, membership, new Reflector());
   });
 
@@ -444,7 +444,7 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
     const workspaceId = await createWorkspace();
     await addMember(workspaceId, userId, "owner");
 
-    const sessions = new SessionService(pool);
+    const sessions = new SessionService(pool, membership);
     const tokens = await sessions.createSession(userId);
     await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, 1);
     await sessions.logout(tokens.sid);

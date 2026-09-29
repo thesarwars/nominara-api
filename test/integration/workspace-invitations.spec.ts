@@ -75,7 +75,7 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
       membership,
-      new SessionService(pool), new NoopRealtimePublisher());
+      new SessionService(pool, membership), new NoopRealtimePublisher());
     invitations = new InvitationsService(pool, new AuditChainService());
   });
 

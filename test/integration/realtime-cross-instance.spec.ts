@@ -86,12 +86,13 @@ describe("STORY-026 · a broadcast from one gateway reaches a client on another"
     await migrateUp(db);
 
     pool = new Pool({ connectionString: postgres.getConnectionUri() });
-    sessions = new SessionService(pool);
+    const membership = new MembershipService(new MembershipCacheService());
+    sessions = new SessionService(pool, membership);
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
-      new MembershipService(new MembershipCacheService()),
+      membership,
       sessions,
       new NoopRealtimePublisher(),
     );
