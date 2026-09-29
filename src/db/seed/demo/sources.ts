@@ -19,12 +19,18 @@ import { chance, rngFor, uniform, uniformInt } from "./rng.js";
 // still scoped to the one project, never the whole workspace, so a workspace
 // with other projects is untouched by this project's re-seed.
 
-const DOMAIN_TEMPLATES: readonly { readonly suffix: string; readonly sourceClass: string; readonly seedable: boolean }[] = [
-  { suffix: "community-forum.example", sourceClass: "community_forum", seedable: true },
-  { suffix: "review-marketplace.example", sourceClass: "review_marketplace", seedable: true },
-  { suffix: "industry-encyclopedia.example", sourceClass: "encyclopedic", seedable: false },
-  { suffix: "trade-news.example", sourceClass: "news_media", seedable: false },
-  { suffix: "dev-platform.example", sourceClass: "developer_platform", seedable: true },
+const DOMAIN_TEMPLATES: readonly {
+  readonly suffix: string;
+  readonly sourceClass: string;
+  readonly seedable: boolean;
+  /** `source_domains.seeding_playbook_slug` — null for a non-seedable class, since there is no playbook for one. */
+  readonly seedingPlaybookSlug: string | null;
+}[] = [
+  { suffix: "community-forum.example", sourceClass: "community_forum", seedable: true, seedingPlaybookSlug: "seed-community-forum" },
+  { suffix: "review-marketplace.example", sourceClass: "review_marketplace", seedable: true, seedingPlaybookSlug: "seed-review-marketplace" },
+  { suffix: "industry-encyclopedia.example", sourceClass: "encyclopedic", seedable: false, seedingPlaybookSlug: null },
+  { suffix: "trade-news.example", sourceClass: "news_media", seedable: false, seedingPlaybookSlug: null },
+  { suffix: "dev-platform.example", sourceClass: "developer_platform", seedable: true, seedingPlaybookSlug: "seed-developer-platform" },
 ];
 
 export async function deleteExistingDemoSources(tx: ClientBase, workspaceId: string, projectId: string): Promise<void> {
@@ -45,6 +51,8 @@ export interface SeededSourceDomain {
   readonly id: string;
   readonly domain: string;
   readonly gapSeverity: "critical" | "high" | "medium" | "low" | "none";
+  /** `source_domains.seeding_playbook_slug` — null for a non-seedable domain (there is no playbook for it). */
+  readonly seedingPlaybookSlug: string | null;
 }
 
 interface DomainSeed {
@@ -53,6 +61,7 @@ interface DomainSeed {
   readonly isSeedable: boolean;
   readonly contextWeight: number;
   readonly brandPresent: boolean;
+  readonly seedingPlaybookSlug: string | null;
 }
 
 export interface SeedSourcesResult {
@@ -87,21 +96,21 @@ export async function resetAndSeedProjectSources(tx: ClientBase, project: DemoPr
   const rng = rngFor(project.id, "sources");
   await deleteExistingDemoSources(tx, project.workspaceId, project.id);
 
-  const inserted: { id: string; domain: string; isSeedable: boolean }[] = [];
+  const inserted: { id: string; domain: string; isSeedable: boolean; seedingPlaybookSlug: string | null }[] = [];
   for (const template of DOMAIN_TEMPLATES) {
     const domain = `${project.rootDomain.replace(/\./gu, "-")}.${template.suffix}`;
     const row = await tx.query<{ id: string }>(
-      `INSERT INTO source_domains (id, workspace_id, domain, display_name, source_class, authority_tier, is_seedable)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (workspace_id, domain) DO UPDATE SET last_seen_at = now()
+      `INSERT INTO source_domains (id, workspace_id, domain, display_name, source_class, authority_tier, is_seedable, seeding_playbook_slug)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (workspace_id, domain) DO UPDATE SET last_seen_at = now(), seeding_playbook_slug = EXCLUDED.seeding_playbook_slug
        RETURNING id`,
-      [uuidV7(), project.workspaceId, domain, domain, template.sourceClass, uniformInt(rng, 1, 5), template.seedable],
+      [uuidV7(), project.workspaceId, domain, domain, template.sourceClass, uniformInt(rng, 1, 5), template.seedable, template.seedingPlaybookSlug],
     );
     // `RETURNING id` on a conflict yields the EXISTING row's id, never the
     // freshly generated one this call happened to mint — reading it back is
     // what keeps `project_source_index` pointing at the row that actually
     // exists rather than an id nothing references.
-    inserted.push({ id: row.rows[0]!.id, domain, isSeedable: template.seedable });
+    inserted.push({ id: row.rows[0]!.id, domain, isSeedable: template.seedable, seedingPlaybookSlug: template.seedingPlaybookSlug });
   }
 
   // ⚠ TWO DOMAINS ARE FORCED TO A GAP, NOT TWO SEVERITIES CHOSEN DIRECTLY —
@@ -144,7 +153,12 @@ export async function resetAndSeedProjectSources(tx: ClientBase, project: DemoPr
     // critical/high for a non-seedable domain), kept so a future edit to
     // the formula cannot silently reopen this without also touching here.
     if ((gapSeverity === "critical" || gapSeverity === "high") && domain.isSeedable) {
-      criticalOrHighDomains.push({ id: domain.id, domain: domain.domain, gapSeverity });
+      criticalOrHighDomains.push({
+        id: domain.id,
+        domain: domain.domain,
+        gapSeverity,
+        seedingPlaybookSlug: domain.seedingPlaybookSlug,
+      });
     }
     await tx.query(
       `INSERT INTO project_source_index

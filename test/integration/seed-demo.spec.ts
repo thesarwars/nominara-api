@@ -198,6 +198,36 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     }
   }, 120_000);
 
+  it("STORY-169 review · an authority task's playbook_slug comes from source_domains.seeding_playbook_slug, never a fabricated literal", async () => {
+    // The exact review violation: EVERY `TG-SOURCE-ABSENCE` authority task
+    // carried the hardcoded literal `playbook_slug = 'seed-source-domain'`
+    // — a slug no `source_domains` row, and no playbook catalog, has ever
+    // defined. The fix reads `source_domains.seeding_playbook_slug` (set on
+    // the seeded rows themselves) instead of inventing one.
+    const workspaceId = await createWorkspace("business");
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+
+    const rows = await client.query<{
+      task_playbook_slug: string | null;
+      domain_playbook_slug: string | null;
+      task_id: string;
+    }>(
+      `SELECT t.playbook_slug AS task_playbook_slug, sd.seeding_playbook_slug AS domain_playbook_slug, t.id AS task_id
+         FROM tasks t
+         JOIN source_domains sd ON sd.id = t.source_domain_id
+        WHERE t.workspace_id = $1 AND t.rule_code = 'TG-SOURCE-ABSENCE'`,
+      [workspaceId],
+    );
+    expect(rows.rows.length).toBeGreaterThanOrEqual(1);
+    for (const row of rows.rows) {
+      // Never the fabricated literal the review found.
+      expect(row.task_playbook_slug).not.toBe("seed-source-domain");
+      // Exactly what the LINKED source_domains row carries — null included,
+      // never a value the seed invented independently of that row.
+      expect(row.task_playbook_slug).toBe(row.domain_playbook_slug);
+    }
+  }, 120_000);
+
   it("STORY-169 review · seeded gap_severity matches scoring-models.md §5 — critical/high only on a seedable domain, never on brand-present rows", async () => {
     // The exact review violation: `gap_severity` used to be picked at
     // random, independent of `context_weight`/`is_seedable`, so a

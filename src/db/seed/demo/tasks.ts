@@ -153,7 +153,16 @@ function buildCandidates(
       sourceFindingId: null,
       sourceDomainId: domain.id,
       severityHint: domain.gapSeverity === "none" ? null : domain.gapSeverity,
-      playbookSlug: "seed-source-domain",
+      // STORY-169 review — `source_domains.seeding_playbook_slug`, never a
+      // fabricated literal. `domains` here is exactly `resetAndSeedProject
+      // Sources`'s `criticalOrHighDomains`, which only ever contains
+      // `is_seedable` domains (sources.ts's own belt-and-suspenders check),
+      // so this is never null in practice today — but reading it off the
+      // seeded row rather than inventing a string keeps this task's
+      // `open_playbook` target meaning what the contract says it means: a
+      // REAL `source_domains`-scoped playbook slug, not a string no
+      // playbook catalog will ever recognise.
+      playbookSlug: domain.seedingPlaybookSlug,
     });
   }
 
