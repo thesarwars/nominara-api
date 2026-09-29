@@ -34,6 +34,45 @@ import { isWorkspaceUsable, MembershipService } from "../workspaces/membership.s
 // and refresh must all show up in the very first token refresh mints.
 // Fails closed: an unverifiable workspace mints ws:null and clears the
 // column, the same outcome sign-in already produces.
+//
+// ⚠ VERIFICATION RUNS BEFORE `BEGIN`, NEVER WHILE A CONNECTION FROM THIS
+// SAME POOL IS ALREADY CHECKED OUT. The first version called the
+// MembershipService re-check (two more `pool.connect()`s) from INSIDE
+// `refresh`'s own rotation transaction — i.e. while `client`, checked out of
+// the very same `this.pool`, was already open and holding `FOR UPDATE` locks
+// on `refresh_tokens`/`sessions`. `createPgPool` sets no
+// `connectionTimeoutMillis` (run-estimate.service.ts's own header names the
+// same trap), so at `pool.max` concurrently refreshing SWITCHED sessions
+// every outer connection is a transaction waiting on an inner `connect()`
+// that can only be satisfied by a connection one of the OTHER waiters is
+// holding — the pool starves itself permanently, and because every route on
+// the instance shares `PG_POOL`, the blast radius is every route, not just
+// `/auth/refresh` (reproduced on `createPgPool` defaults: 10 concurrent
+// switched-session refreshes deadlock the pool and an unrelated
+// `pool.query('SELECT 1')` hangs with them).
+//
+// The fix: `verifyWorkspaceContext` below reads and re-verifies the
+// workspace BEFORE any connection for the rotation is taken, on plain,
+// auto-releasing `pool.query`/`MembershipService` calls that are sequential
+// with each other and never nested inside a held connection. Only the
+// SINGLE conditional write this produces (`finalizeWorkspaceContext`
+// clearing a stale `active_workspace_id`) runs on the rotation's own
+// `client`, because it already owns that connection and the row lock. A
+// switch that races in between the pre-read and the rotation's own
+// `FOR UPDATE` on `sessions` is caught by comparing the two observations
+// (`finalizeWorkspaceContext`'s mismatch branch) rather than trusted stale:
+// it mints `ws:null` for this one refresh WITHOUT clearing the column, so
+// the switch's own value survives for the next refresh to verify fresh.
+//
+// This restructuring also closes a second, correctness gap for free: a
+// transient failure inside verification (the membership service throwing,
+// not just returning "unusable") now happens before `BEGIN` — nothing has
+// rotated yet, so the caller's presented refresh token is untouched and a
+// retry with the SAME token succeeds. The previous, in-transaction
+// placement rolled the whole rotation back on such a failure too, but only
+// because it happened to run before COMMIT; moving verification to where it
+// no longer needs the rotation's connection at all makes that safety a
+// structural property instead of an ordering coincidence.
 
 export interface SessionTokens {
   readonly sid: string;
@@ -105,6 +144,29 @@ export class SessionService {
    */
   async refresh(rawRefreshToken: string, now: Date = new Date()): Promise<SessionTokens> {
     const tokenHash = hashRefreshToken(rawRefreshToken);
+
+    // STORY-170 — see this file's header. Read and verify BEFORE taking the
+    // rotation's connection: a plain `pool.query` (auto-acquires, runs,
+    // releases) followed by `verifyWorkspaceContext`'s own sequential,
+    // auto-releasing calls, so nothing here ever holds one connection from
+    // `this.pool` while asking it for a second. `preActiveWorkspaceId` is
+    // the value observed at THIS moment — `finalizeWorkspaceContext` below
+    // re-compares it against what the rotation's own `FOR UPDATE` sees,
+    // because a `switchWorkspace` can race in between.
+    const preRead = await this.pool.query<{ user_id: string; active_workspace_id: string | null }>(
+      `SELECT s.user_id, s.active_workspace_id
+         FROM refresh_tokens rt
+         JOIN sessions s ON s.id = rt.session_id
+        WHERE rt.token_hash = $1`,
+      [tokenHash],
+    );
+    const preRow = preRead.rows[0];
+    const preActiveWorkspaceId = preRow?.active_workspace_id ?? null;
+    const preVerified =
+      preRow !== undefined && preActiveWorkspaceId !== null
+        ? await this.verifyWorkspaceContext(preRow.user_id, preActiveWorkspaceId)
+        : null;
+
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -160,25 +222,20 @@ export class SessionService {
       );
       await client.query(`UPDATE sessions SET last_used_at = now() WHERE id = $1`, [sessionRow.id]);
 
-      // STORY-170 — BEFORE the commit below, deliberately, and NOT because
-      // the read itself needs the transaction (MembershipService opens its
-      // own short-lived context transactions on separate connections, same
-      // as WorkspaceGuard/WorkspacesService.switchTo). If this were after
-      // the commit and a transient failure hit here, the rotation above
-      // would already be durable — the presented refresh token consumed,
-      // the new one minted — but the response that hands the new one back
-      // would never be sent, stranding the caller with no valid token at
-      // all. Inside the transaction, a failure here rolls the WHOLE
-      // rotation back too, so the caller's existing (still-unconsumed)
-      // refresh token remains good for a retry. The row lock `sessionRow`
-      // was read under (`FOR UPDATE` above) also means a concurrent
-      // `switchWorkspace` on the SAME session serializes against this
-      // rather than racing it.
-      const active = await this.reverifyActiveWorkspace(
+      // STORY-170 — the verification already ran, above, BEFORE this
+      // transaction's connection was even taken (see this file's header).
+      // All that is left is to reconcile what was observed then
+      // (`preActiveWorkspaceId`/`preVerified`) against what THIS row lock
+      // sees now, and — only when reconciliation calls for it — clear a
+      // stale `active_workspace_id` on the connection this transaction
+      // already holds. No second connection is acquired here, so nothing
+      // below can contend with another in-flight refresh for one.
+      const active = await this.finalizeWorkspaceContext(
         client,
         sessionRow.id,
-        sessionRow.user_id,
         sessionRow.active_workspace_id,
+        preActiveWorkspaceId,
+        preVerified,
       );
 
       await client.query("COMMIT");
@@ -205,43 +262,77 @@ export class SessionService {
    * STORY-170 — the same five-condition usability check and live-membership
    * re-check `WorkspaceGuard`/`WorkspacesService.switchTo` run on every
    * request, applied here so a token refresh can never mint role/scope/ent_v
-   * that are stale relative to the live database. Returns all-null when
-   * there is nothing to re-verify (a pre-onboarding session) OR when
-   * re-verification fails — both mint the same ws:null token sign-in already
-   * produces, which is the fail-closed contract.
+   * that are stale relative to the live database.
    *
-   * On failure, clears `active_workspace_id` back to NULL — guarded by
-   * `WHERE active_workspace_id = $2`, the value THIS call observed, so a
-   * `switchWorkspace` racing concurrently is never clobbered by a refresh
-   * that started before it.
+   * Deliberately takes NO `client` and opens NO transaction of its own: it
+   * runs entirely on sequential, auto-releasing `MembershipService` calls
+   * against `this.pool`, called from `refresh()` BEFORE that method's own
+   * rotation connection is checked out (this file's header explains why —
+   * the pool-starvation defect this restructuring fixes). Returns `null`
+   * both when there is nothing usable to verify and when verification
+   * itself fails; the caller (`finalizeWorkspaceContext`) treats both the
+   * same way, which is the fail-closed contract sign-in already produces.
+   * A throw from either `MembershipService` call propagates straight out of
+   * `refresh()` here, before any rotation has begun.
    */
-  private async reverifyActiveWorkspace(
+  private async verifyWorkspaceContext(
+    userId: string,
+    workspaceId: string,
+  ): Promise<{ ws: string; role: string | null; scope: readonly string[] | null; entV: number } | null> {
+    const workspace = await this.membership.getWorkspaceStatus(this.pool, workspaceId);
+    if (!isWorkspaceUsable(workspace)) {
+      return null;
+    }
+    const live = await this.membership.getLiveMembership(this.pool, userId, workspaceId);
+    if (!live || live.status !== "active") {
+      return null;
+    }
+    return { ws: workspaceId, role: live.role, scope: live.projectScope, entV: workspace.entitlementVersion };
+  }
+
+  /**
+   * STORY-170 — reconciles what `verifyWorkspaceContext` observed BEFORE the
+   * rotation's connection was taken against what THIS row lock
+   * (`sessionActiveWorkspaceId`, read under `refresh()`'s own
+   * `SELECT ... FOR UPDATE`) sees now, and performs the one write that
+   * reconciliation can call for — on `client`, the connection this
+   * transaction already holds, never a new one.
+   *
+   * - No active workspace at all: nothing to verify or clear.
+   * - The row lock's value differs from the value verification observed: a
+   *   `switchWorkspace` raced in (either direction) between the two reads.
+   *   Mint `ws:null` for THIS refresh without touching the column — the
+   *   racing switch's own value is left standing for the next refresh to
+   *   verify fresh, rather than being clobbered by a decision made against
+   *   a value that is already stale.
+   * - The values agree and verification succeeded: mint that context.
+   * - The values agree and verification failed: clear `active_workspace_id`
+   *   back to NULL, guarded by `WHERE active_workspace_id = $2` — the value
+   *   this call is acting on — so a switch that lands in the instant between
+   *   this comparison and the write still cannot be clobbered.
+   */
+  private async finalizeWorkspaceContext(
     client: ClientBase,
     sid: string,
-    userId: string,
-    activeWorkspaceId: string | null,
+    sessionActiveWorkspaceId: string | null,
+    preActiveWorkspaceId: string | null,
+    preVerified: { ws: string; role: string | null; scope: readonly string[] | null; entV: number } | null,
   ): Promise<{ ws: string | null; role: string | null; scope: readonly string[] | null; entV: number | null }> {
-    if (activeWorkspaceId === null) {
+    if (sessionActiveWorkspaceId === null) {
       return { ws: null, role: null, scope: null, entV: null };
     }
 
-    const workspace = await this.membership.getWorkspaceStatus(this.pool, activeWorkspaceId);
-    if (isWorkspaceUsable(workspace)) {
-      const live = await this.membership.getLiveMembership(this.pool, userId, activeWorkspaceId);
-      if (live && live.status === "active") {
-        return { ws: activeWorkspaceId, role: live.role, scope: live.projectScope, entV: workspace.entitlementVersion };
-      }
+    if (sessionActiveWorkspaceId !== preActiveWorkspaceId) {
+      return { ws: null, role: null, scope: null, entV: null };
     }
 
-    // On the OUTER transaction's own connection/client — see refresh()'s
-    // call site comment for why this runs before that transaction commits.
-    // The `AND active_workspace_id = $2` guard is redundant with the row
-    // lock `refresh()` already holds (a concurrent switchWorkspace on this
-    // session cannot even start until this transaction ends) but costs
-    // nothing and keeps the write self-explaining on its own.
+    if (preVerified !== null) {
+      return preVerified;
+    }
+
     await client.query(`UPDATE sessions SET active_workspace_id = NULL WHERE id = $1 AND active_workspace_id = $2`, [
       sid,
-      activeWorkspaceId,
+      sessionActiveWorkspaceId,
     ]);
     return { ws: null, role: null, scope: null, entV: null };
   }
@@ -272,9 +363,14 @@ export class SessionService {
         throw new UnauthorizedException("session revoked");
       }
       // STORY-170 — recorded in the SAME transaction as the revocation check
-      // above (and under the same row lock `refresh`'s own `SELECT ... FOR
-      // UPDATE` takes), so a switch and a concurrent refresh of the same
-      // session serialize rather than race.
+      // above, under a `FOR UPDATE` on the same `sessions` row `refresh()`
+      // locks. Whether or not that interleaves with a concurrent refresh is
+      // NOT relied on for correctness here: `refresh()`'s own
+      // `finalizeWorkspaceContext` re-compares the value it verified before
+      // its rotation began against whatever this write leaves behind, and
+      // fails closed to `ws:null` (without clobbering this column) on any
+      // mismatch — so a race either way is handled explicitly rather than
+      // assumed away by lock ordering.
       await client.query(`UPDATE sessions SET active_workspace_id = $2 WHERE id = $1`, [sid, ws]);
       await client.query("COMMIT");
     } catch (error) {
