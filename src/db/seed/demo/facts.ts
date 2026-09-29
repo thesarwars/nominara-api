@@ -1,7 +1,9 @@
 import type { ClientBase } from "pg";
 import { uuidV7 } from "../../../lib/ids/uuidv7.js";
+import { structuralLimitFrom } from "../../../lib/entitlements/classification.js";
 import { resolveEntitlements } from "../../../lib/entitlements/resolution.js";
 import { PROMPT_OCCUPIES_SLOT } from "../../../lib/entitlements/structural-usage.js";
+import type { EntitlementValue } from "../plan-entitlements.js";
 import { insertRows } from "./batch-insert.js";
 import { DEMO_COMPETITOR_NAMES, DEMO_PROMPT_MARKER_KEY, DEMO_PROMPT_TEMPLATES, DEMO_SEED_MARKER } from "./constants.js";
 import { type Rng, chance, pick, rngFor, uniform, uniformInt } from "./rng.js";
@@ -106,11 +108,23 @@ async function workspaceLocalWindow(tx: ClientBase, timezone: string, windowDays
 /**
  * A plan entitlement's numeric ceiling, resolved through the REAL
  * entitlement pipeline (never a hardcoded number — `no-hardcoded-plan-
- * values`). `null`/`"custom"`/`"uncapped"` all mean "no numeric ceiling",
- * which resolves to `Infinity` so a `cap - used` headroom computation below
- * is never accidentally negative-Infinity or `NaN`. Matches
- * `projects.ts`'s own `projectsMaxCap` exactly, for the two other
- * structural keys the seed can exceed (STORY-169 review, PROBE E).
+ * values`) — delegating to `structuralLimitFrom`, the ONE place that knows
+ * what a resolved entitlement value means (`classification.ts`'s own
+ * comment), exactly as `projects.service.ts`'s `resolveCap` and
+ * `activation.service.ts`'s `resolveCap` already do for this same key.
+ *
+ * ⚠ REVIEW FIX (STORY-169 re-audit) — this used to return `Infinity` for
+ * ANY non-number, including `null` and `false`. `structuralLimitFrom`
+ * resolves those to a FINITE limit of `0` ("no allowance at all" —
+ * `classification.ts` names `prompts.max_per_project` on the free plan as
+ * its own example), so on a plan whose cap is `null` this seed was writing
+ * competitors and prompts PAST a cap that should have let it write none —
+ * fail-open on exactly the values documentation says mean "nothing". Only
+ * `"unlimited"`/`"uncapped"`/`"custom"`/`"negotiated"` resolve to `Infinity`
+ * here (never bounded into a `smallint` column by this function, unlike
+ * `prompts_cap`, so unbounded is the right reading for a `cap - used`
+ * headroom computation). An unrecognised value — including an absent key —
+ * fails closed at `0`, matching `projects.service.ts`'s own `resolveCap`.
  */
 async function structuralCap(
   tx: ClientBase,
@@ -119,7 +133,9 @@ async function structuralCap(
 ): Promise<number> {
   const resolved = await resolveEntitlements(tx, workspaceId);
   const raw = resolved.entitlements[key]?.value;
-  return typeof raw === "number" ? raw : Number.POSITIVE_INFINITY;
+  const limit = structuralLimitFrom((raw ?? null) as EntitlementValue);
+  if (limit === undefined) return 0;
+  return limit.kind === "unlimited" ? Number.POSITIVE_INFINITY : limit.limit;
 }
 
 /** How many prompt slots (`PROMPT_OCCUPIES_SLOT`) are already used — workspace-wide, or one project's share of it. */
@@ -289,32 +305,59 @@ function buildEngineProfiles(projectId: string, engines: readonly EntitledEngine
   });
 }
 
-export async function deleteExistingDemoFacts(tx: ClientBase, projectId: string, earliestDay: string): Promise<void> {
+/**
+ * ⚠ REVIEW FIX (STORY-169 re-audit) — `earliestDay` IS A WORKSPACE-LOCAL
+ * DATE, and it must be compared as one, never cast bare to `::date`.
+ * `$2::date` is midnight in the SESSION's timezone (`Etc/UTC`), but this
+ * function's callers now stamp `captured_at` at LOCAL NOON of each
+ * workspace-local day (`workspaceLocalWindow`'s own header). For any
+ * workspace at UTC+13 or above (Pacific/Auckland in NZDT, Pacific/
+ * Tongatapu, Pacific/Kiritimati, Pacific/Apia…), local noon on the
+ * earliest window day falls BEFORE midnight UTC of that same calendar
+ * day — on `earliestDay - 1` in UTC — so a bare `captured_at >=
+ * $2::date` filter silently excludes it: a same-day re-run duplicates
+ * the earliest day's facts instead of replacing them, and `--purge`
+ * leaves them behind as unmarked, undated synthetic data on a real
+ * project (STORY-169 re-audit, PROBE G).
+ *
+ * The fix casts the BOUND into the workspace's own local midnight,
+ * expressed as the UTC instant it actually is —
+ * `$2::date::timestamp AT TIME ZONE $4` — rather than wrapping the
+ * (indexed, partitioned) `captured_at` column in `AT TIME ZONE`, which
+ * would give the same answer but defeat partition pruning on every
+ * demo-seed delete.
+ */
+export async function deleteExistingDemoFacts(
+  tx: ClientBase,
+  projectId: string,
+  earliestDay: string,
+  timezone: string,
+): Promise<void> {
   await tx.query(
     `DELETE FROM mention_facts
       WHERE project_id = $1
-        AND captured_at >= $2::date
+        AND captured_at >= ($2::date::timestamp AT TIME ZONE $4)
         AND result_id IN (
           SELECT id FROM answer_captures
-           WHERE project_id = $1 AND captured_at >= $2::date AND normalizer_version = $3
+           WHERE project_id = $1 AND captured_at >= ($2::date::timestamp AT TIME ZONE $4) AND normalizer_version = $3
         )`,
-    [projectId, earliestDay, DEMO_SEED_MARKER],
+    [projectId, earliestDay, DEMO_SEED_MARKER, timezone],
   );
   await tx.query(
     `DELETE FROM citation_facts
       WHERE project_id = $1
-        AND captured_at >= $2::date
+        AND captured_at >= ($2::date::timestamp AT TIME ZONE $4)
         AND result_id IN (
           SELECT id FROM answer_captures
-           WHERE project_id = $1 AND captured_at >= $2::date AND normalizer_version = $3
+           WHERE project_id = $1 AND captured_at >= ($2::date::timestamp AT TIME ZONE $4) AND normalizer_version = $3
         )`,
-    [projectId, earliestDay, DEMO_SEED_MARKER],
+    [projectId, earliestDay, DEMO_SEED_MARKER, timezone],
   );
-  await tx.query(`DELETE FROM answer_captures WHERE project_id = $1 AND captured_at >= $2::date AND normalizer_version = $3`, [
-    projectId,
-    earliestDay,
-    DEMO_SEED_MARKER,
-  ]);
+  await tx.query(
+    `DELETE FROM answer_captures
+      WHERE project_id = $1 AND captured_at >= ($2::date::timestamp AT TIME ZONE $4) AND normalizer_version = $3`,
+    [projectId, earliestDay, DEMO_SEED_MARKER, timezone],
+  );
 }
 
 interface CaptureRow {
@@ -350,7 +393,7 @@ export async function resetAndSeedProjectFacts(
   const promptIds = await ensurePrompts(tx, project, promptCount);
   const competitorIds = await ensureCompetitors(tx, project, rngFor(project.id, "competitors"));
 
-  await deleteExistingDemoFacts(tx, project.id, days[0]!.day);
+  await deleteExistingDemoFacts(tx, project.id, days[0]!.day, timezone);
 
   if (engines.length === 0 || promptIds.length === 0) {
     // No entitled engine (a plan with none active) or no prompt slot at all

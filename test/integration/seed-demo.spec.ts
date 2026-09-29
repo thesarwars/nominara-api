@@ -493,6 +493,89 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     expect(projectRow.rows[0]!.prompts_active).toBe(1);
   }, 180_000);
 
+  // STORY-169 re-audit, PROBE G — the test above never catches the
+  // `deleteExistingDemoFacts` timezone bug, because its workspace is UTC:
+  // `captured_at >= $2::date` casts `$2` to midnight in the SESSION's
+  // timezone, which only diverges from the WORKSPACE's own local midnight
+  // (what `earliestDay` actually means) on a workspace at UTC+13 or above,
+  // where local noon on the earliest window day is still the PRIOR day in
+  // UTC. Pacific/Kiritimati is a fixed +14 offset year-round — deterministic,
+  // no DST edge to chase. Two things break without the fix: a same-day
+  // re-run duplicates the earliest day's facts (never deleted, so re-insert
+  // doubles them), and `--purge` leaves that day's demo-marked facts behind
+  // on a real project — unmarked synthetic data past the point `--purge`
+  // claims to have removed it.
+  it("STORY-169 re-audit · on a UTC+14 pre-existing project, a re-seed does not duplicate facts and --purge removes every demo-marked one", async () => {
+    const workspaceId = await createWorkspace("growth", "Pacific/Kiritimati");
+    const project = await client.query<{ id: string }>(
+      `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, status)
+       VALUES ($1,'Real Project','real-project-g','https://real-g.example','real-g.example','active')
+       RETURNING id`,
+      [workspaceId],
+    );
+    const projectId = project.rows[0]!.id;
+
+    // A REAL rollup row, 90 days before today — well outside the seed's own
+    // 60-day backfill window, so it is untouched by anything the seed does.
+    await client.query(
+      `INSERT INTO metric_daily
+         (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date,
+          cells_total, cells_present, presence_rate, sov, visibility_score, scoring_version)
+       VALUES ($1,$2,'all','brand',$2, (CURRENT_DATE - 90), 5, 3, 0.6, 0.4, 42.5, 'v1')`,
+      [workspaceId, projectId],
+    );
+
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+
+    const capturesAfterFirstSeed = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM answer_captures WHERE project_id = $1 AND normalizer_version = 'demo-seed'`,
+      [projectId],
+    );
+    expect(Number(capturesAfterFirstSeed.rows[0]!.n)).toBeGreaterThan(0);
+
+    // Re-run, same day — idempotent means the SAME demo capture count, not
+    // the earliest window day's facts doubled up.
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    const capturesAfterReSeed = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM answer_captures WHERE project_id = $1 AND normalizer_version = 'demo-seed'`,
+      [projectId],
+    );
+    expect(Number(capturesAfterReSeed.rows[0]!.n)).toBe(Number(capturesAfterFirstSeed.rows[0]!.n));
+
+    await runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: testPool(), log: () => {} });
+
+    // Every demo-marked capture is gone — none left behind on the earliest
+    // window day (or any other), unmarked, on a REAL project.
+    const capturesAfterPurge = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM answer_captures WHERE project_id = $1 AND normalizer_version = 'demo-seed'`,
+      [projectId],
+    );
+    expect(Number(capturesAfterPurge.rows[0]!.n)).toBe(0);
+
+    // No metric_daily row survives inside the seed's own 60-day window —
+    // the real 90-day-old row is the only history left.
+    const demoWindowRows = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM metric_daily WHERE project_id = $1 AND metric_date >= (CURRENT_DATE - 59)`,
+      [projectId],
+    );
+    expect(Number(demoWindowRows.rows[0]!.n)).toBe(0);
+
+    const realRow = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM metric_daily
+        WHERE project_id = $1 AND metric_date = (CURRENT_DATE - 90) AND engine_key = 'all' AND entity_type = 'brand'`,
+      [projectId],
+    );
+    expect(Number(realRow.rows[0]!.n)).toBe(1);
+
+    // The real project's own denormalised score is not a leftover synthetic
+    // one — the demo marker was cleared with everything else.
+    const projectRow = await client.query<{ demo_seeded_at: string | null }>(
+      `SELECT demo_seeded_at FROM projects WHERE id = $1`,
+      [projectId],
+    );
+    expect(projectRow.rows[0]!.demo_seeded_at).toBeNull();
+  }, 180_000);
+
   // STORY-169 review, PROBE E — the seed's first version counted only
   // `status = 'active'` projects against `projects.max`, and never checked
   // `prompts.max_per_project`/`prompts.max_total`/`competitors.max_per_project`
@@ -560,6 +643,52 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     expect(Number(slotOccupyingPrompts.rows[0]!.n)).toBe(40);
   }, 180_000);
 
+  // STORY-169 re-audit — `structuralCap`/`projectsMaxCap` mapped ANY
+  // non-number (including `null`/`false`) to `Infinity`, "no numeric
+  // ceiling". `classification.ts`'s own `structuralLimitFrom` — the ONE
+  // place that knows what a resolved entitlement value means — says the
+  // opposite: `null`/`false` mean a FINITE cap of `0`, "no allowance at
+  // all", and names `prompts.max_per_project` on the FREE plan (migration
+  // 0002) as its own example. So the seed was writing competitors and
+  // prompts PAST a cap that should have let it write NONE. `projects.max`
+  // on free is `0` too, so this needs a PRE-EXISTING active project — the
+  // seed's `ensureDemoProjects` never creates a fixture on this plan, but
+  // `listActiveProjects` still targets whatever is already active.
+  it("STORY-169 re-audit · on the free plan, adds no competitors and caps prompts at what activation.service would write (0)", async () => {
+    const workspaceId = await createWorkspace("free");
+    const project = await client.query<{ id: string }>(
+      `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, status)
+       VALUES ($1,'Free Plan Project','free-plan-project','https://free-plan.example','free-plan.example','active')
+       RETURNING id`,
+      [workspaceId],
+    );
+    const projectId = project.rows[0]!.id;
+
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+
+    const competitors = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM competitors WHERE project_id = $1 AND deleted_at IS NULL`,
+      [projectId],
+    );
+    expect(Number(competitors.rows[0]!.n)).toBe(0);
+
+    const prompts = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM tracked_prompts WHERE project_id = $1 AND deleted_at IS NULL`,
+      [projectId],
+    );
+    expect(Number(prompts.rows[0]!.n)).toBe(0);
+
+    const projectRow = await client.query<{ prompts_active: number; prompts_cap: number }>(
+      `SELECT prompts_active, prompts_cap FROM projects WHERE id = $1`,
+      [projectId],
+    );
+    // Matches what activation.service.ts's own resolveCap would write for
+    // this same entitlement value — a FINITE 0, never the column's
+    // smallint-max sentinel `structuralCap` used to fall back to.
+    expect(projectRow.rows[0]!.prompts_cap).toBe(0);
+    expect(projectRow.rows[0]!.prompts_active).toBe(0);
+  }, 180_000);
+
   // STORY-169 review (minor) — `noonUtc` used to stamp every capture at a
   // bare 12:00 UTC regardless of the workspace's own timezone. For any
   // workspace at UTC+12 through +14, 12:00 UTC already falls on the NEXT
@@ -596,6 +725,55 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
 
     expect(projects[0]!.visibility_blended).not.toBeNull();
     expect(projects[0]!.demo_seeded_at).not.toBeNull();
+
+    // STORY-169 re-audit — the two assertions above cannot fail without the
+    // fix: EVERY day's capture shifts forward by exactly one LOCAL day under
+    // the bug (bare UTC noon of calendar day D is already D+1 local at
+    // UTC+14), so "today"'s rollup exists anyway (built from yesterday's
+    // shifted facts) and "tomorrow" stays empty (the loop below only calls
+    // `rollUpDay` for days INSIDE the window, never for "tomorrow" itself —
+    // so today's own facts, shifted there, are simply never rolled up, not
+    // visibly absent). Mutation-tested: reverting `workspaceLocalWindow` to
+    // bare UTC noon (`AT TIME ZONE 'UTC'` instead of the workspace's own
+    // timezone) left both assertions above green. These three do not:
+    //
+    // 1. No demo capture is ever bucketed onto a LOCAL date after today —
+    //    under the bug, today's own noon-UTC captures land on tomorrow.
+    const futureCaptures = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM answer_captures
+        WHERE project_id = $1 AND normalizer_version = 'demo-seed'
+          AND (captured_at AT TIME ZONE 'Pacific/Kiritimati')::date > $2::date`,
+      [projectId, today],
+    );
+    expect(Number(futureCaptures.rows[0]!.n)).toBe(0);
+
+    // 2. The distinct LOCAL capture dates are EXACTLY the 60-day window
+    //    ending today — under the bug the whole set shifts one day late
+    //    (today-58 .. tomorrow), which still has 60 distinct dates but the
+    //    wrong ones; this pins the actual dates, not just the count.
+    const distinctDates = await client.query<{ d: string }>(
+      `SELECT DISTINCT to_char((captured_at AT TIME ZONE 'Pacific/Kiritimati')::date, 'YYYY-MM-DD') AS d
+         FROM answer_captures
+        WHERE project_id = $1 AND normalizer_version = 'demo-seed'
+        ORDER BY d`,
+      [projectId],
+    );
+    const expectedDates = Array.from({ length: FAST_OPTIONS.windowDays }, (_, i) => {
+      const d = new Date(`${today}T00:00:00Z`);
+      d.setUTCDate(d.getUTCDate() - (FAST_OPTIONS.windowDays - 1 - i));
+      return d.toISOString().slice(0, 10);
+    });
+    expect(distinctDates.rows.map((r) => r.d)).toEqual(expectedDates);
+
+    // 3. The EARLIEST window day (today - 59) has its own metric_daily row —
+    //    under the bug this day's captures shift to today-58, and nothing
+    //    shifts IN from today-60 (never generated), so today-59 gets none.
+    const earliestDay = expectedDates[0]!;
+    const earliestRollup = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM metric_daily WHERE project_id = $1 AND metric_date = $2::date`,
+      [projectId, earliestDay],
+    );
+    expect(Number(earliestRollup.rows[0]!.n)).toBeGreaterThan(0);
   }, 180_000);
 
   it("STORY-169 · provisions a wallet through the real grant path, and leaves an existing one alone", async () => {

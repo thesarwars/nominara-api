@@ -128,7 +128,7 @@ async function purgeMetricHistory(tx: ClientBase, project: PurgeableProject, tim
     return;
   }
 
-  await deleteExistingDemoFacts(tx, project.id, earliestDay);
+  await deleteExistingDemoFacts(tx, project.id, earliestDay, timezone);
 
   await withProjectQueueLock(tx, "rollup.metric_daily", project.id, async () => {
     await tx.query(`DELETE FROM metric_daily WHERE project_id = $1 AND metric_date BETWEEN $2::date AND $3::date`, [

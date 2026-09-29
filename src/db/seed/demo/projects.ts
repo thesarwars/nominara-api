@@ -1,7 +1,9 @@
 import type { ClientBase } from "pg";
 import { uuidV7 } from "../../../lib/ids/uuidv7.js";
+import { structuralLimitFrom } from "../../../lib/entitlements/classification.js";
 import { resolveEntitlements } from "../../../lib/entitlements/resolution.js";
 import { SYSTEM_ACTOR_ID } from "../../../tenancy/constants.js";
+import type { EntitlementValue } from "../plan-entitlements.js";
 import { DEMO_PROJECT_CREATED_KEY, DEMO_PROJECT_FIXTURES } from "./constants.js";
 
 // STORY-169 — which projects the seed targets, and creating the fixture
@@ -72,15 +74,24 @@ function slugFromDomain(domain: string): string {
 
 /**
  * The plan's `projects.max`, resolved through the real entitlement pipeline
- * — never a hardcoded number (`no-hardcoded-plan-values`). `null` ("not
- * applicable"), `"custom"`, or `"uncapped"` all mean this plan places no
- * numeric ceiling the seed can read, so they resolve to `Infinity` here —
- * `min(3, cap)` then simply stays 3.
+ * — never a hardcoded number (`no-hardcoded-plan-values`) — via
+ * `structuralLimitFrom`, the one place that knows what a resolved
+ * entitlement value means.
+ *
+ * ⚠ REVIEW FIX (STORY-169 re-audit) — `null` is NOT "not applicable"; per
+ * `classification.ts`, `null`/`false` mean a FINITE cap of `0` ("no
+ * allowance at all"), and this used to resolve them to `Infinity`, which
+ * `min(3, cap)` then left at 3 regardless. Only `"unlimited"`/`"uncapped"`/
+ * `"custom"`/`"negotiated"` resolve to `Infinity` here — `min(3, cap)` then
+ * simply stays 3, which is the ONLY case that comment was ever true for. An
+ * unrecognised value, including an absent key, fails closed at `0`.
  */
 export async function projectsMaxCap(tx: ClientBase, workspaceId: string): Promise<number> {
   const resolved = await resolveEntitlements(tx, workspaceId);
   const raw = resolved.entitlements["projects.max"]?.value;
-  return typeof raw === "number" ? raw : Number.POSITIVE_INFINITY;
+  const limit = structuralLimitFrom((raw ?? null) as EntitlementValue);
+  if (limit === undefined) return 0;
+  return limit.kind === "unlimited" ? Number.POSITIVE_INFINITY : limit.limit;
 }
 
 /**
