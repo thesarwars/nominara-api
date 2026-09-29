@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import { sourceCoverage } from "../scoring/index.js";
+import { SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS } from "./refresh-project-task-counts.js";
 
 // STORY-169 — `projects.source_coverage`, via the pure `sourceCoverage()`
 // formula in `src/lib/scoring/source-coverage.ts`.
@@ -12,9 +13,14 @@ import { sourceCoverage } from "../scoring/index.js";
 // `window_start` for that pair is "current" — a recompute replaces rather
 // than accumulates, so there is exactly one row per domain to read once the
 // window is fixed.
-
-const SOURCE_INDEX_ENGINE_KEY = "all";
-const SOURCE_INDEX_WINDOW_DAYS = 30;
+//
+// ⚠ REVIEW FIX — `SOURCE_INDEX_ENGINE_KEY`/`SOURCE_INDEX_WINDOW_DAYS` are
+// IMPORTED, not redeclared. This file used to carry its own private copy of
+// both, alongside `refresh-project-task-counts.ts`'s exported pair (which
+// `TasksService.listActionItems` and the demo seed already import) — two
+// literals naming the same "current" window that could silently drift apart
+// and make `source_coverage` and an action item's severity read different
+// windows for the same project.
 
 /** Recompute one project's source coverage from `project_source_index`. */
 export async function refreshProjectSourceCoverage(tx: ClientBase, projectId: string): Promise<void> {

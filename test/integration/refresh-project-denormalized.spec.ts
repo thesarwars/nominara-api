@@ -231,6 +231,64 @@ describe("STORY-169 · the three non-metric project-refresh producers", () => {
       expect(row.open_task_count).toBe(1);
       expect(row.open_tasks_by_severity).toEqual({ critical: 1, high: 0, medium: 0, low: 0 });
     });
+
+    it("STORY-169 review · serialises two concurrent writers via a row lock, never losing either one's task", async () => {
+      // PROBE reproduced: without a lock, writer B's plain SELECT count runs
+      // BEFORE writer A commits, so B's later UPDATE — unblocked only once A
+      // commits and releases the row — overwrites A's correct total with
+      // B's own STALE count, taken before A's task ever existed. Two tasks
+      // end up in `tasks`; `open_task_count` ends up 1. `SELECT ... FOR
+      // UPDATE` on the project row, taken BEFORE counting, fixes this by
+      // making B's whole read-then-write wait for A's, not just its UPDATE.
+      const writerA = new Client({ connectionString: container.getConnectionUri() });
+      const writerB = new Client({ connectionString: container.getConnectionUri() });
+      await writerA.connect();
+      await writerB.connect();
+      try {
+        const insertTask = (writer: Client, shortRef: string): Promise<unknown> =>
+          writer.query(
+            `INSERT INTO tasks
+               (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status)
+             VALUES ($1,$2,$3,$4,'technical',sha256(random()::text::bytea),'t','d','todo')`,
+            [randomUUID(), workspaceId, projectId, shortRef],
+          );
+
+        // A: insert, then refresh (still uncommitted afterward — A keeps
+        // holding the project row's `FOR UPDATE` lock until it commits).
+        await writerA.query("BEGIN");
+        await insertTask(writerA, `T-${randomUUID().slice(0, 8)}`);
+        await refreshProjectTaskCounts(writerA, projectId);
+
+        // B starts CONCURRENTLY, after A already holds the lock. Even B's
+        // own `INSERT` cannot proceed yet — a `tasks.project_id` FK takes a
+        // `FOR KEY SHARE` lock on the referenced `projects` row, which
+        // conflicts with A's `FOR UPDATE` — so the whole chain, not just
+        // B's later `refreshProjectTaskCounts`, waits for A to commit.
+        let bSettled = false;
+        const bDone = (async () => {
+          await writerB.query("BEGIN");
+          await insertTask(writerB, `T-${randomUUID().slice(0, 8)}`);
+          await refreshProjectTaskCounts(writerB, projectId);
+        })().then(() => {
+          bSettled = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(bSettled).toBe(false);
+
+        await writerA.query("COMMIT");
+        await bDone;
+        expect(bSettled).toBe(true);
+        await writerB.query("COMMIT");
+
+        const row = await db.query<{ open_task_count: number }>("SELECT open_task_count FROM projects WHERE id = $1", [
+          projectId,
+        ]);
+        expect(row.rows[0]!.open_task_count).toBe(2);
+      } finally {
+        await writerA.end();
+        await writerB.end();
+      }
+    }, 30_000);
   });
 
   // ---------------------------------------------------------------------

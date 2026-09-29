@@ -41,8 +41,22 @@ export interface TaskSeverityCounts {
   readonly low: number;
 }
 
-/** Recompute one project's open-task count and severity breakdown from `tasks`. */
+/**
+ * Recompute one project's open-task count and severity breakdown from `tasks`.
+ *
+ * ⚠ REVIEW FIX — locks the project row FIRST. This function's own header
+ * names `task.generate` and every future task-mutation endpoint as callers,
+ * plural — with no lock, two concurrent callers each SELECT the count
+ * before either UPDATEs, so the second caller's UPDATE (which blocks on the
+ * row, then overwrites) can land a COUNT taken before the first caller's
+ * task existed, silently losing that task from the denormalised total.
+ * `SELECT ... FOR UPDATE` serialises the two calls instead: the second
+ * caller's count only starts once the first has committed its UPDATE, so it
+ * counts the first caller's write too. Latent today because only the seed
+ * calls this; real once a mutation endpoint does.
+ */
 export async function refreshProjectTaskCounts(tx: ClientBase, projectId: string): Promise<void> {
+  await tx.query(`SELECT id FROM projects WHERE id = $1 FOR UPDATE`, [projectId]);
   const result = await tx.query<{ critical: string; high: string; medium: string; low: string; total: string }>(
     `WITH open_tasks AS (
        SELECT t.id,
