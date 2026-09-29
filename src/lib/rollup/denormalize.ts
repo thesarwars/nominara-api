@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import { CONFIDENCE_THRESHOLDS, SCORING_VERSION, visibilityDelta } from "../scoring/index.js";
+import { AGGREGATE_ATTRIBUTE_CAPABLE_ENGINES } from "./aggregate-day.js";
 import { CROSS_ENGINE_KEY } from "./roll-up-day.js";
 
 // STORY-042 AC9 — the dashboard block, written onto the project row.
@@ -73,19 +74,44 @@ export async function denormalizeProject(tx: ClientBase, projectId: string, time
   // (0028's own `COMMENT ON COLUMN projects.rendering_delta_30d`, and
   // `NFR-ANL-03`, which is not scoped to the visibility score specifically:
   // "No trend delta, arrow, or percentage change is rendered when n < 30").
-  // The gate is the window's OVERALL measured-cell count — the same
-  // `currentCells`/`cellsIn(prior)` visibility and sentiment read — not a
-  // count of days that happened to have a non-null rendering_quality.
-  // Otherwise a single attribute-capable-engine day in each window (n=1, far
-  // below any confidence threshold) would publish a confident-looking delta.
-  // Rendering quality is already null on any day with no attribute-capable
-  // mention, so `meanOf` over the non-null days is still the right window
-  // mean — only the null-below-30 GATE moves to the shared cell count.
+  //
+  // ⚠ REVIEW FIX (STORY-169 re-audit) — the gate MUST be the count of
+  // ATTRIBUTE-CAPABLE-ENGINE measured cells, never `currentCells`/
+  // `cellsIn(prior)` (the window's OVERALL cell count across every engine,
+  // §8 excludes non-attribute-capable engines from RenderingQuality's own
+  // population). `rendering_quality` on the "all" cross-engine row is a
+  // per-DAY weighted mean over whichever attribute-capable engines mentioned
+  // the brand that day — it carries no cell count of its own, so gating on
+  // the shared `currentCells` silently substitutes "how many cells this
+  // project measured, across every engine" for "how many cells the
+  // rendering figure itself rests on". A project with 30 `chatgpt` cells
+  // (non-attribute-capable, so `rendering_quality` is null every day) and
+  // ONE `google_ai_mode` cell PER WINDOW clears `currentCells >= 30` while
+  // the rendering figure still rests on n=1 per window — exactly the
+  // "single attribute-capable-engine day" this comment used to say the gate
+  // already prevented, which was false the moment another engine supplied
+  // the other 29+ cells (STORY-169 re-audit, PROBE B — cells_30d: 31,
+  // rendering_delta_30d published from n=1). Read straight from the
+  // per-engine rows, restricted to `AGGREGATE_ATTRIBUTE_CAPABLE_ENGINES` —
+  // the SAME two engines `aggregate-day.ts`'s own `render_mention_rows`
+  // computes rendering from.
   const currentRenderingMean = meanOf(nonNullNumbers(current, "rendering_quality"));
   const priorRenderingMean = meanOf(nonNullNumbers(prior, "rendering_quality"));
+  const renderingCellRows = await tx.query<{ metric_date: string; cells_total: string }>(
+    `SELECT to_char(md.metric_date, 'YYYY-MM-DD') AS metric_date, md.cells_total::text
+       FROM metric_daily md
+      WHERE md.project_id = $1
+        AND md.engine_key = ANY($2::text[])
+        AND md.entity_type = 'brand'
+        AND md.scoring_version = $3
+        AND md.metric_date > ((now() AT TIME ZONE $4)::date - ($5 * 2)::int)`,
+    [projectId, AGGREGATE_ATTRIBUTE_CAPABLE_ENGINES, SCORING_VERSION, timezone, WINDOW_DAYS],
+  );
+  const renderingCurrentCells = cellsIn(renderingCellRows.rows.filter((row) => row.metric_date > boundary));
+  const renderingPriorCells = cellsIn(renderingCellRows.rows.filter((row) => row.metric_date <= boundary));
   const renderingDelta30d = visibilityDelta(
-    { score: currentRenderingMean, measuredCells: currentCells },
-    { score: priorRenderingMean, measuredCells: cellsIn(prior) },
+    { score: currentRenderingMean, measuredCells: renderingCurrentCells },
+    { score: priorRenderingMean, measuredCells: renderingPriorCells },
   );
 
   const visibilityByEngine = await perEngineWindow(tx, projectId, timezone, boundary);

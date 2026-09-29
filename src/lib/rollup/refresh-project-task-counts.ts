@@ -50,13 +50,31 @@ export interface TaskSeverityCounts {
  * before either UPDATEs, so the second caller's UPDATE (which blocks on the
  * row, then overwrites) can land a COUNT taken before the first caller's
  * task existed, silently losing that task from the denormalised total.
- * `SELECT ... FOR UPDATE` serialises the two calls instead: the second
- * caller's count only starts once the first has committed its UPDATE, so it
- * counts the first caller's write too. Latent today because only the seed
- * calls this; real once a mutation endpoint does.
+ * `SELECT ... FOR NO KEY UPDATE` serialises the two calls instead: the
+ * second caller's count only starts once the first has committed its
+ * UPDATE, so it counts the first caller's write too. Latent today because
+ * only the seed calls this; real once a mutation endpoint does.
+ *
+ * ⚠ REVIEW FIX 2 — `FOR NO KEY UPDATE`, NOT `FOR UPDATE`. `tasks.project_id`
+ * references `projects(id)`, so every `INSERT INTO tasks` takes a `FOR KEY
+ * SHARE` lock on the project row for the duration of its transaction. `FOR
+ * UPDATE` conflicts with `FOR KEY SHARE`: two writers that each insert a
+ * task and then call this function can deadlock — writer A holds `FOR KEY
+ * SHARE` (from its insert) and waits on writer B's `FOR KEY SHARE` to
+ * upgrade to `FOR UPDATE`, while writer B is waiting on A's for the same
+ * reason. Postgres detects the cycle and aborts one side with `40P01`,
+ * rolling back that writer's task insert along with the count it came here
+ * to record — the exact "task.generate" concurrent-writer shape this
+ * function's own header names. `FOR NO KEY UPDATE` only conflicts with
+ * `FOR UPDATE`/`FOR NO KEY UPDATE`, never with `FOR KEY SHARE`, so it still
+ * serialises two concurrent refreshers against each other (the lost-update
+ * fix above) without conflicting with a FK-driven `INSERT`. Nothing here
+ * changes the project row through THIS statement — no column that a `FOR
+ * KEY SHARE` locker (a referencing INSERT) could be racing to protect — so
+ * the weaker lock loses no correctness.
  */
 export async function refreshProjectTaskCounts(tx: ClientBase, projectId: string): Promise<void> {
-  await tx.query(`SELECT id FROM projects WHERE id = $1 FOR UPDATE`, [projectId]);
+  await tx.query(`SELECT id FROM projects WHERE id = $1 FOR NO KEY UPDATE`, [projectId]);
   const result = await tx.query<{ critical: string; high: string; medium: string; low: string; total: string }>(
     `WITH open_tasks AS (
        SELECT t.id,

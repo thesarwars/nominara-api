@@ -482,6 +482,47 @@ describe("STORY-042 · rollup.metric_daily", () => {
     expect(row.rows[0]!.rendering_delta_30d).toBeNull();
   });
 
+  it("STORY-169 re-audit · rendering_delta_30d stays NULL even when the WINDOW's overall cell count clears 30, if only ONE cell per window is attribute-capable", async () => {
+    // The gap the first review fix left open: it gated on `currentCells`
+    // (the window's OVERALL measured-cell count, across EVERY engine), not
+    // on the count of cells the rendering figure itself rests on. Thirty
+    // `chatgpt` cells a window are NOT attribute-capable (`rendering_quality`
+    // stays null on every one of them) and pad `cells_30d`/`currentCells`
+    // to 31 — comfortably over the 30-cell gate, and even "high" confidence
+    // territory (>= 120 would be needed for that, but well past "low") —
+    // while the rendering figure itself still rests on exactly ONE
+    // `google_ai_mode` cell per window. Before this fix that published a
+    // confident-looking delta anyway (PROBE B: cells_30d 31,
+    // rendering_delta_30d "70.000" from n=1 per window).
+    const priorDay = new Date(Date.now() - 40 * 86_400_000).toISOString();
+    const currentDay = new Date(Date.now() - 2 * 86_400_000).toISOString();
+
+    for (let i = 0; i < 30; i += 1) {
+      await addCell({ capturedAt: priorDay, engineKey: "chatgpt", brandPresent: false, sov: 0 });
+      await addCell({ capturedAt: currentDay, engineKey: "chatgpt", brandPresent: false, sov: 0 });
+    }
+    const priorCell = await addCell({ capturedAt: priorDay, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+    await addMention(priorCell, priorDay, { renderScore: 0.2 });
+    const currentCell = await addCell({ capturedAt: currentDay, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+    await addMention(currentCell, currentDay, { renderScore: 0.9 });
+
+    await roll(priorDay.slice(0, 10));
+    await roll(currentDay.slice(0, 10));
+    await denormalizeProject(db, projectId, "UTC");
+
+    const row = await db.query<{
+      rendering_quality: string | null;
+      rendering_delta_30d: string | null;
+      cells_30d: number | null;
+    }>("SELECT rendering_quality::text, rendering_delta_30d::text, cells_30d FROM projects WHERE id = $1", [projectId]);
+    // The window's OVERALL cell count clears the gate...
+    expect(row.rows[0]!.cells_30d).toBe(31);
+    expect(Number(row.rows[0]!.rendering_quality)).toBeGreaterThan(0);
+    // ...but the rendering figure itself still rests on one cell per window,
+    // so the delta must stay null.
+    expect(row.rows[0]!.rendering_delta_30d).toBeNull();
+  });
+
   it("STORY-169 · rendering_delta_30d is the current window mean minus the prior window mean, once both windows clear the 30-cell gate", async () => {
     const priorDay = new Date(Date.now() - 40 * 86_400_000).toISOString();
     const currentDay = new Date(Date.now() - 2 * 86_400_000).toISOString();

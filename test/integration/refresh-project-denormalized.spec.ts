@@ -289,6 +289,98 @@ describe("STORY-169 · the three non-metric project-refresh producers", () => {
         await writerB.end();
       }
     }, 30_000);
+
+    it("STORY-169 re-audit · two writers that BOTH insert before EITHER refreshes deadlock under FOR UPDATE — FOR NO KEY UPDATE must not", async () => {
+      // The lock-held test above never exercises the FK-driven conflict this
+      // one does: it lets A finish inserting AND calling refresh (still
+      // holding the lock) before B's INSERT even starts, so B's `tasks`
+      // FK-driven `FOR KEY SHARE` never has to coexist with A's own. Here
+      // both writers insert FIRST — each taking a `FOR KEY SHARE` lock on the
+      // SAME `projects` row via the `tasks.project_id` FK, which two
+      // transactions may hold simultaneously (`FOR KEY SHARE` does not
+      // conflict with itself) — and only THEN does either call
+      // `refreshProjectTaskCounts`. Under `FOR UPDATE` (the mode this
+      // function used before the review fix), A's `SELECT ... FOR UPDATE`
+      // must wait for B's `FOR KEY SHARE` to release, and B's must wait for
+      // A's, for the same reason — a genuine wait-cycle across two real
+      // connections, not a simulated one. Postgres detects it and aborts one
+      // side with `40P01 deadlock detected`, rolling that writer's task
+      // insert back with it: 1 task survives, not 2. `FOR NO KEY UPDATE`
+      // conflicts only with another `FOR UPDATE`/`FOR NO KEY UPDATE`, never
+      // with `FOR KEY SHARE`, so the two refreshers merely serialise against
+      // EACH OTHER — no cycle, no abort, both tasks survive.
+      const writerA = new Client({ connectionString: container.getConnectionUri() });
+      const writerB = new Client({ connectionString: container.getConnectionUri() });
+      await writerA.connect();
+      await writerB.connect();
+      try {
+        const insertTask = (writer: Client, shortRef: string): Promise<unknown> =>
+          writer.query(
+            `INSERT INTO tasks
+               (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status)
+             VALUES ($1,$2,$3,$4,'technical',sha256(random()::text::bytea),'t','d','todo')`,
+            [randomUUID(), workspaceId, projectId, shortRef],
+          );
+
+        await writerA.query("BEGIN");
+        await writerB.query("BEGIN");
+        // Both INSERTs land before either refresh — the FK's `FOR KEY SHARE`
+        // on `projects` is held by BOTH transactions at once.
+        await insertTask(writerA, `T-${randomUUID().slice(0, 8)}`);
+        await insertTask(writerB, `T-${randomUUID().slice(0, 8)}`);
+
+        // Both requests are IN FLIGHT, CONCURRENTLY, before either commits —
+        // that is what makes the old code's cycle real: under `FOR UPDATE`,
+        // A's lock request conflicts with B's already-held `FOR KEY SHARE`
+        // and B's conflicts with A's, so BOTH block on each other and
+        // Postgres's own deadlock detector (not this test) breaks the cycle
+        // by aborting one side with `40P01` after `deadlock_timeout` (1 s).
+        // Under `FOR NO KEY UPDATE`, WHICHEVER of A/B happens to reach the
+        // lock request first resolves immediately WITHOUT committing (the
+        // lock is still held) — committing THAT ONE is what then unblocks
+        // the other's pending request.
+        //
+        // ⚠ Neither connection is guaranteed to "win" that race — the two
+        // `refreshProjectTaskCounts` calls are started back to back, with no
+        // ordering between them. So each writer commits/rolls back the
+        // INSTANT ITS OWN call settles, never waiting on the other first:
+        // an earlier version of this test always awaited A before touching
+        // B's connection, which deadlocked the TEST ITSELF (not the
+        // database) whenever B happened to win the race — B would then be
+        // the one sitting resolved-but-uncommitted, while A blocked forever
+        // waiting for a commit this code would only ever send after A
+        // resolved.
+        const settle = (writer: Client): Promise<{ status: "ok" } | { status: "error"; error: unknown }> =>
+          refreshProjectTaskCounts(writer, projectId).then(
+            async () => {
+              await writer.query("COMMIT");
+              return { status: "ok" as const };
+            },
+            async (error: unknown) => {
+              await writer.query("ROLLBACK");
+              return { status: "error" as const, error };
+            },
+          );
+
+        const [resultA, resultB] = await Promise.all([settle(writerA), settle(writerB)]);
+
+        expect(resultA.status).toBe("ok");
+        expect(resultB.status).toBe("ok");
+
+        const taskCount = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM tasks WHERE project_id = $1", [
+          projectId,
+        ]);
+        expect(Number(taskCount.rows[0]!.n)).toBe(2);
+
+        const row = await db.query<{ open_task_count: number }>("SELECT open_task_count FROM projects WHERE id = $1", [
+          projectId,
+        ]);
+        expect(row.rows[0]!.open_task_count).toBe(2);
+      } finally {
+        await writerA.end();
+        await writerB.end();
+      }
+    }, 30_000);
   });
 
   // ---------------------------------------------------------------------
