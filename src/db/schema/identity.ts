@@ -63,6 +63,7 @@ export const sessions = pgTable("sessions", {
   lastUsedAt: timestamp("last_used_at", { withTimezone: true }).notNull().default(sql`now()`),
   lastStrongAuthAt: timestamp("last_strong_auth_at", { withTimezone: true }),
   lastStrongAuthMethod: text("last_strong_auth_method"),
+  activeWorkspaceId: uuid("active_workspace_id"),
 });
 
 export const userCredentials = pgTable("user_credentials", {
