@@ -7,8 +7,9 @@ can carry — real Visibility Score / AUX / source-coverage / task data, run
 through the same production code paths (`rollUpDay`, `denormalizeProject`,
 `refreshProjectAux`, `refreshProjectTaskCounts`, `refreshProjectSourceCoverage`)
 those endpoints already use. Nothing about the data pipeline is faked; only
-the underlying facts are synthetic, and every row it writes is marked as
-such (see "What is marked" below).
+the underlying facts are synthetic. **Not every row it writes carries a
+marker** — see "What is marked" below for exactly which tables do and which
+do not.
 
 **Dev-only.** It refuses to run unless `NODE_ENV` is not `production`, both
 `DATABASE_URL` and `DATABASE_URL_POOLED` name a local host, and you pass an
@@ -85,6 +86,8 @@ credits if one already exists.
 
 ## What is marked
 
+**Carries an explicit marker:**
+
 - `answer_captures.normalizer_version = 'demo-seed'`
 - `aux_audits.rule_version` / `.tokenizer = 'demo-seed'`, and every
   `aux_findings.rule_version` it writes
@@ -99,11 +102,26 @@ credits if one already exists.
   into) — this is what `--purge` reads to decide whether to delete the
   project outright or only clean it.
 
-**Known gap: `competitors` carries no marker column.** A competitor the seed
-adds to a PRE-EXISTING project cannot be told apart from that project's own,
-so `--purge` cannot remove it (see "`--purge`" below). `ensureCompetitors`
-still respects `competitors.max_per_project`, so it stops writing once the
-plan's cap is reached; it just cannot clean up what it already wrote.
+**Carries NO marker at all:**
+
+- `competitors` — a competitor the seed adds to a PRE-EXISTING project
+  cannot be told apart from that project's own, so `--purge` cannot remove
+  it (see "`--purge`" below). `ensureCompetitors` still respects
+  `competitors.max_per_project`, so it stops writing once the plan's cap is
+  reached; it just cannot clean up what it already wrote.
+- `source_domains` and `project_source_index` — NOT because the seed forgot
+  to mark them, but because nothing else in the codebase writes either table
+  today (`sources.ts`'s own header comment: "there is no `crawl.audit`-
+  equivalent producer for sources yet"), so every row `--purge` finds for a
+  project is, by construction, something this seed put there. That fact
+  could stop being true the day a real producer for either table ships,
+  and this seed would then need a real marker too.
+- `metric_daily` — rolled up FROM marked facts, but the rollup itself keeps
+  no column saying so. `--purge` never deletes it by a marker: it re-rolls
+  the demo facts' own date range (read from `answer_captures` before they
+  are deleted) from whatever facts remain, real or demo, which is correct
+  regardless of whether any individual `metric_daily` row is markable (see
+  "`--purge`" below).
 
 `aux_rule_catalog` and `task_generation_rules` rows use real spec codes
 (`AUX-R-001`, `TG-SOV-DROP-ENGINE`, …) and are inserted `ON CONFLICT DO
@@ -127,8 +145,12 @@ For every project in the workspace with `demo_seeded_at` set:
   captured — never a blanket `DELETE FROM metric_daily WHERE project_id = …`;
 - re-runs `refreshProjectAux` / `refreshProjectTaskCounts` /
   `refreshProjectSourceCoverage` (each already reports null/zero on empty
-  input) and recomputes `prompts_active`/`prompts_cap`
-  (`activation.service.ts`'s own statement);
+  input) and recomputes BOTH `prompts_active` (a count over what remains)
+  AND `prompts_cap` (resolved fresh from the workspace's CURRENT
+  entitlement — the same resolution `activation.service.ts`'s own
+  `resolveCap` uses, never a value stored from the seed run or from before
+  it — so a plan change between seeding and purging is reflected, exactly
+  as it would be for a real project);
 - calls `denormalizeProject` over the re-rolled range, then directly nulls
   the metric-derived `projects` columns ONLY if `metric_daily` is left
   genuinely empty for the project afterward — `denormalizeProject` cannot

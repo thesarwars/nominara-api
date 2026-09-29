@@ -523,6 +523,41 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     expect(projectRow.rows[0]!.prompts_active).toBe(1);
   }, 180_000);
 
+  // STORY-169 review — `prompts_cap` used to be left at whatever
+  // `ensurePrompts` wrote during the seed run; `--purge` never touched it.
+  // Asserting the SAME cap after purge (growth's own 40) would pass even
+  // without the fix, since nothing changes the workspace's entitlement in
+  // between — the fix and its absence would write the SAME number. This
+  // test tells them apart by changing the PLAN between seed and purge, so
+  // only a REAL recomputation, not a leftover value, can match afterward.
+  it("STORY-169 review · --purge recomputes prompts_cap from the CURRENT entitlement, not a value left over from the seed run", async () => {
+    const workspaceId = await createWorkspace("growth"); // prompts.max_per_project = 40
+    const project = await client.query<{ id: string }>(
+      `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, status)
+       VALUES ($1,'Real Project','real-project-cap','https://real-cap.example','real-cap.example','active')
+       RETURNING id`,
+      [workspaceId],
+    );
+    const projectId = project.rows[0]!.id;
+
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+
+    const afterSeed = await client.query<{ prompts_cap: number }>(`SELECT prompts_cap FROM projects WHERE id = $1`, [projectId]);
+    expect(afterSeed.rows[0]!.prompts_cap).toBe(40);
+
+    // Downgrade the WORKSPACE's plan after seeding, before purging —
+    // starter's `prompts.max_per_project` is 30 (migration 0002). The
+    // seed-time cap of 40 is now stale.
+    await client.query(`UPDATE workspaces SET plan_key = 'starter' WHERE id = $1`, [workspaceId]);
+
+    await runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: testPool(), log: () => {} });
+
+    // Recomputed from the CURRENT (starter) entitlement — 30, never the
+    // stale 40 a purge that skips this recomputation would leave in place.
+    const afterPurge = await client.query<{ prompts_cap: number }>(`SELECT prompts_cap FROM projects WHERE id = $1`, [projectId]);
+    expect(afterPurge.rows[0]!.prompts_cap).toBe(30);
+  }, 180_000);
+
   // STORY-169 re-audit, PROBE G — the test above never catches the
   // `deleteExistingDemoFacts` timezone bug, because its workspace is UTC:
   // `captured_at >= $2::date` casts `$2` to midnight in the SESSION's

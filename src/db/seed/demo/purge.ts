@@ -9,9 +9,12 @@ import { refreshProjectTaskCounts } from "../../../lib/rollup/refresh-project-ta
 import { rollUpDay } from "../../../lib/rollup/roll-up-day.js";
 import { deleteExistingDemoAudits } from "./aux.js";
 import { DEMO_PROJECT_CREATED_KEY, DEMO_PROMPT_MARKER_KEY, DEMO_SEED_MARKER } from "./constants.js";
-import { deleteExistingDemoFacts } from "./facts.js";
+import { deleteExistingDemoFacts, structuralCap } from "./facts.js";
 import { deleteExistingDemoSources } from "./sources.js";
 import { deleteExistingDemoTasks } from "./tasks.js";
+
+/** `projects.prompts_cap` is `smallint` — same duplicated constant as `facts.ts`'s own `ensurePrompts` and `activation.service.ts`'s `PROMPTS_CAP_COLUMN_MAX` (a one-line constant from an unrelated story's file, not worth a cross-module import). */
+const PROMPTS_CAP_COLUMN_MAX = 32_767;
 
 // STORY-169 — `--purge`: removes everything the seed created for a
 // workspace, except the wallet and the ledger (append-only, never touched).
@@ -158,21 +161,31 @@ async function purgeMetricHistory(tx: ClientBase, project: PurgeableProject, tim
  * Removes exactly the `tracked_prompts` rows this seed INSERTED for the
  * project (never one it only reused because a pre-existing prompt already
  * had the same `text_hash` — `facts.ts`'s `ensurePrompts` marks only its own
- * inserts), then recomputes `prompts_active`/`prompts_cap` the same way
- * `activation.service.ts` does — never left stale after a status-changing
- * write to `tracked_prompts`.
+ * inserts), then recomputes BOTH `prompts_active` AND `prompts_cap` the same
+ * way `activation.service.ts` does — never left stale after a status-
+ * changing write to `tracked_prompts`.
+ *
+ * ⚠ REVIEW FIX — `prompts_cap` used to be left at whatever `ensurePrompts`
+ * wrote during the seed run, not restored. It needs no pre-seed snapshot to
+ * fix: `structuralCap` (`facts.ts`) resolves it straight from the
+ * workspace's CURRENT entitlement, exactly as `activation.service.ts`'s own
+ * `resolveCap` does — the column is a cache of that resolution, never its
+ * own source of truth, so recomputing it here is always correct, the same
+ * way `prompts_active` already was.
  */
-async function purgeDemoPrompts(tx: ClientBase, projectId: string): Promise<void> {
+async function purgeDemoPrompts(tx: ClientBase, project: PurgeableProject): Promise<void> {
   await tx.query(`DELETE FROM tracked_prompts WHERE project_id = $1 AND generator_meta ->> $2 = $3`, [
-    projectId,
+    project.id,
     DEMO_PROMPT_MARKER_KEY,
     DEMO_SEED_MARKER,
   ]);
+  const cap = await structuralCap(tx, project.workspaceId, "prompts.max_per_project");
   await tx.query(
     `UPDATE projects
-        SET prompts_active = (SELECT count(*) FROM tracked_prompts WHERE project_id = $1 AND ${PROMPT_OCCUPIES_SLOT})
+        SET prompts_active = (SELECT count(*) FROM tracked_prompts WHERE project_id = $1 AND ${PROMPT_OCCUPIES_SLOT}),
+            prompts_cap = $2
       WHERE id = $1`,
-    [projectId],
+    [project.id, Math.min(cap, PROMPTS_CAP_COLUMN_MAX)],
   );
 }
 
@@ -191,7 +204,7 @@ export async function purgeOneProject(tx: ClientBase, project: PurgeableProject,
   await deleteExistingDemoSources(tx, project.workspaceId, project.id);
   await refreshProjectSourceCoverage(tx, project.id);
 
-  await purgeDemoPrompts(tx, project.id);
+  await purgeDemoPrompts(tx, project);
   // competitors — SEE THIS FILE'S OWN HEADER: no marker column exists yet,
   // so a seeded competitor on a pre-existing project is not removed here.
 

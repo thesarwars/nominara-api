@@ -125,8 +125,15 @@ async function workspaceLocalWindow(tx: ClientBase, timezone: string, windowDays
  * `prompts_cap`, so unbounded is the right reading for a `cap - used`
  * headroom computation). An unrecognised value — including an absent key —
  * fails closed at `0`, matching `projects.service.ts`'s own `resolveCap`.
+ *
+ * Exported so `purge.ts` can recompute `projects.prompts_cap` with this
+ * SAME resolution when `--purge` removes the seed's own prompts from a
+ * pre-existing project — never a stored pre-seed snapshot, for the same
+ * reason `activation.service.ts`'s own `resolveCap` reads the entitlement
+ * rather than the column: the entitlement is the authority and moves with
+ * the plan, so recomputing it is always correct, not just at seed time.
  */
-async function structuralCap(
+export async function structuralCap(
   tx: ClientBase,
   workspaceId: string,
   key: "prompts.max_total" | "prompts.max_per_project" | "competitors.max_per_project",
