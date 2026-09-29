@@ -5,6 +5,7 @@ import { Reflector } from "@nestjs/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectParam } from "../decorators/project-param.decorator.js";
 import { RequirePermission } from "../decorators/require-permission.decorator.js";
+import { ScopedByQuery } from "../decorators/scoped-by-query.decorator.js";
 import { PermissionDeniedException, ProjectOutOfScopeException, StepUpRequiredException } from "../../tenancy/errors.js";
 import { RbacGuard, type RbacScopedRequest } from "./rbac.guard.js";
 
@@ -36,6 +37,25 @@ class LookupExecuteController {
 }
 
 class NoPermissionController {
+  handler(): void {}
+}
+
+// STORY-169 review — a workspace-level LIST route, exactly the shape
+// `ProjectsController.list` / `WorkspacesController.listActionItems` are:
+// a "scoped" permission, no `@ProjectParam()` (there is no single project
+// id in the URL), and `@ScopedByQuery()` opted in because the query itself
+// narrows by `app.current_scope_projects()`.
+class TaskReadListController {
+  @RequirePermission("task:read")
+  @ScopedByQuery()
+  handler(): void {}
+}
+
+// The SAME shape with NO `@ScopedByQuery()` — every other "scoped"
+// permission route with no `@ProjectParam()` in the app looks like this,
+// and must stay refused. Proves the fix WIDENS nothing it was not told to.
+class TaskReadNoParamController {
+  @RequirePermission("task:read")
   handler(): void {}
 }
 
@@ -206,5 +226,135 @@ describe("STORY-019 · RbacGuard", () => {
     const plainResult = guard.canActivate(makeContext(LookupExecuteController, plainReq));
     expect(plainResult).toBe(true);
     expect(plainResult).not.toBeInstanceOf(Promise);
+  });
+
+  // ---- STORY-169 review — FIXED: workspace-level list routes now serve a
+  // scoped manager/viewer via `@ScopedByQuery()`, instead of refusing them
+  // outright. `task:read` and `project:read` are both "scoped" for
+  // manager/viewer (permission-matrix.ts); before `@ScopedByQuery()`
+  // existed, `assertInScope` found no `@ProjectParam` on either route,
+  // read `projectId` as `undefined`, and refused unconditionally — even a
+  // manager scoped to many projects, not zero. These scenarios pin the
+  // FIX against the two real, currently-shipping routes it affects, not a
+  // synthetic stand-in, and the next `describe` below pins that every
+  // OTHER scoped-permission route with no `@ProjectParam` is untouched.
+  describe("STORY-169 review — @ScopedByQuery() lets a scoped manager/viewer reach a workspace-level list route", () => {
+    it("a manager scoped to projects (not unrestricted) is let through GET /workspaces/{id}/action-items", async () => {
+      const { WorkspacesController } = await import("../../modules/workspaces/workspaces.controller.js");
+      const req: RbacScopedRequest = {
+        membership: { role: "manager", projectScope: ["proj-a", "proj-b"] },
+        params: { id: "ws-1" },
+      };
+      const context = {
+        getHandler: () => WorkspacesController.prototype.listActionItems,
+        getClass: () => WorkspacesController,
+        switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
+      } as unknown as ExecutionContext;
+      expect(guard.canActivate(context)).toBe(true);
+    });
+
+    it("a viewer scoped to projects is let through the same route", async () => {
+      const { WorkspacesController } = await import("../../modules/workspaces/workspaces.controller.js");
+      const req: RbacScopedRequest = {
+        membership: { role: "viewer", projectScope: ["proj-a"] },
+        params: { id: "ws-1" },
+      };
+      const context = {
+        getHandler: () => WorkspacesController.prototype.listActionItems,
+        getClass: () => WorkspacesController,
+        switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
+      } as unknown as ExecutionContext;
+      expect(guard.canActivate(context)).toBe(true);
+    });
+
+    it("a manager scoped to ZERO projects is still refused — an empty scope must never read as unrestricted", async () => {
+      // The hazard `@ScopedByQuery()`'s own comment names: `tenant-
+      // context.ts` only sets the `app.current_scope_projects()` GUC when
+      // `scopeProjectIds.length > 0`. If this case were let through, the
+      // query's `cardinality(...) = 0` branch — correct for a genuinely
+      // unrestricted member — would show this zero-project manager every
+      // project in the workspace.
+      const { WorkspacesController } = await import("../../modules/workspaces/workspaces.controller.js");
+      const req: RbacScopedRequest = {
+        membership: { role: "manager", projectScope: [] },
+        params: { id: "ws-1" },
+      };
+      const context = {
+        getHandler: () => WorkspacesController.prototype.listActionItems,
+        getClass: () => WorkspacesController,
+        switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
+      } as unknown as ExecutionContext;
+      expect(() => guard.canActivate(context)).toThrow(ProjectOutOfScopeException);
+    });
+
+    it("an UNRESTRICTED manager (projectScope: null) is let through the same route", async () => {
+      const { WorkspacesController } = await import("../../modules/workspaces/workspaces.controller.js");
+      const req: RbacScopedRequest = {
+        membership: { role: "manager", projectScope: null },
+        params: { id: "ws-1" },
+      };
+      const context = {
+        getHandler: () => WorkspacesController.prototype.listActionItems,
+        getClass: () => WorkspacesController,
+        switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
+      } as unknown as ExecutionContext;
+      expect(guard.canActivate(context)).toBe(true);
+    });
+
+    it("the SAME fix applies to GET /v1/projects — a scoped manager is let through there too", async () => {
+      const { ProjectsController } = await import("../../modules/projects/projects.controller.js");
+      const req: RbacScopedRequest = {
+        membership: { role: "manager", projectScope: ["proj-a"] },
+      };
+      const context = {
+        getHandler: () => ProjectsController.prototype.list,
+        getClass: () => ProjectsController,
+        switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
+      } as unknown as ExecutionContext;
+      expect(guard.canActivate(context)).toBe(true);
+    });
+
+    it("a scoped manager with ZERO projects is refused on GET /v1/projects too", async () => {
+      const { ProjectsController } = await import("../../modules/projects/projects.controller.js");
+      const req: RbacScopedRequest = {
+        membership: { role: "manager", projectScope: [] },
+      };
+      const context = {
+        getHandler: () => ProjectsController.prototype.list,
+        getClass: () => ProjectsController,
+        switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
+      } as unknown as ExecutionContext;
+      expect(() => guard.canActivate(context)).toThrow(ProjectOutOfScopeException);
+    });
+  });
+
+  // ---- Proves the fix WIDENS nothing beyond the two routes that opted in.
+  describe("STORY-169 review — every other scoped-permission route with no @ProjectParam stays refused", () => {
+    it("a synthetic list route with NO @ScopedByQuery() still refuses a scoped manager", () => {
+      const req: RbacScopedRequest = { membership: { role: "manager", projectScope: ["proj-a"] } };
+      expect(() => guard.canActivate(makeContext(TaskReadNoParamController, req))).toThrow(ProjectOutOfScopeException);
+    });
+
+    it("a synthetic list route WITH @ScopedByQuery() lets the same manager through", () => {
+      const req: RbacScopedRequest = { membership: { role: "manager", projectScope: ["proj-a"] } };
+      expect(guard.canActivate(makeContext(TaskReadListController, req))).toBe(true);
+    });
+
+    it("@ScopedByQuery() never overrides an @ProjectParam() route — an out-of-scope project id is still refused", () => {
+      // Defence against a future edit that adds both decorators to one
+      // route: the single-project check must still run, and win, when a
+      // project id IS present in the URL.
+      class BothDecoratorsController {
+        @RequirePermission("project:read")
+        @ProjectParam("projectId")
+        @ScopedByQuery()
+        handler(): void {}
+      }
+      const req: RbacScopedRequest = {
+        membership: { role: "manager", projectScope: ["proj-a"] },
+        params: { projectId: "proj-b" },
+      };
+      expect(() => guard.canActivate(makeContext(BothDecoratorsController, req))).toThrow(ProjectOutOfScopeException);
+    });
   });
 });

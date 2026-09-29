@@ -24,6 +24,7 @@ import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequireEntitlement } from "../../api/decorators/require-entitlement.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
@@ -138,8 +139,16 @@ export class ProjectsController {
 
   // §3: `GET /projects` — "workspace matrix". `project:read`, not
   // `project:create`: a viewer must be able to see the list.
+  //
+  // STORY-169 review — `@ScopedByQuery()`: this list has no single project
+  // id to check with `@ProjectParam()`, and `ProjectsService.list` already
+  // narrows by `app.current_scope_projects()` itself (its own doc comment).
+  // Without this, RbacGuard refused EVERY project-scoped manager/viewer
+  // outright, whether scoped to one project or fifty — see
+  // `rbac.guard.spec.ts`'s "STORY-169 review" scenarios for the reproduction.
   @Get()
   @RequirePermission("project:read")
+  @ScopedByQuery()
   @ApiContract({
     operationId: "listProjects",
     querySchema: paginationRequestSchema,

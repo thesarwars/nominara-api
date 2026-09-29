@@ -8,6 +8,7 @@ import { entityTagFor, formatEntityTag } from "../../api/etag/entity-tag.js";
 import { parseIfMatch } from "../../api/etag/if-match.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
 import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
@@ -217,8 +218,18 @@ export class WorkspacesController {
   // `workspaces/:id/...` path. `tasks` is TasksService's table
   // (coding-standards.md §1), so the query lives there and this method
   // only resolves the request, calls it, and returns.
+  // STORY-169 review — `@ScopedByQuery()`: same reasoning as `ProjectsController
+  // .list` — this route names a WORKSPACE, not a project, so `@ProjectParam()`
+  // has nothing to point at, and `TasksService.listActionItems`'s own query
+  // already narrows by `app.current_scope_projects()` (copied from
+  // `ProjectsService.list` for exactly this reason). Without this, a
+  // project-scoped manager or viewer was refused this route outright,
+  // regardless of how many projects they were scoped to (FR-DASH-04 was not
+  // actually served for that population — `rbac.guard.spec.ts`'s "STORY-169
+  // review" scenarios reproduce it against this exact handler).
   @Get("workspaces/:id/action-items")
   @RequirePermission("task:read")
+  @ScopedByQuery()
   @ApiContract({
     operationId: "listActionItems",
     querySchema: paginationRequestSchema,

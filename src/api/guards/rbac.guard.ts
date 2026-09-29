@@ -6,6 +6,7 @@ import { evaluatePermission, type Permission } from "../../tenancy/permission-ma
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
 import { PROJECT_PARAM_KEY } from "../decorators/project-param.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../decorators/require-permission.decorator.js";
+import { SCOPED_BY_QUERY_KEY } from "../decorators/scoped-by-query.decorator.js";
 import type { WorkspaceScopedRequest } from "./workspace.guard.js";
 
 // STORY-019 — security-and-tenancy.md §6/§7. Replaces the STORY-022 no-op:
@@ -90,10 +91,29 @@ export class RbacGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
-    const projectId = paramName ? req.params?.[paramName] : undefined;
-    if (!projectId || !scope.includes(projectId)) {
-      throw new ProjectOutOfScopeException();
+    if (paramName) {
+      const projectId = req.params?.[paramName];
+      if (!projectId || !scope.includes(projectId)) {
+        throw new ProjectOutOfScopeException();
+      }
+      return;
     }
+
+    // No `@ProjectParam()` — a single-project id to compare `scope` against
+    // does not exist on this route. `@ScopedByQuery()` is the one documented
+    // exception (see its own comment): the route's query narrows by
+    // `app.current_scope_projects()` itself, so a NON-EMPTY scope is let
+    // through here rather than refused. `scope.length === 0` is refused
+    // regardless — see `@ScopedByQuery()` for why that case must never
+    // reach the query.
+    const scopedByQuery = this.reflector.getAllAndOverride<boolean>(SCOPED_BY_QUERY_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (scopedByQuery && scope.length > 0) {
+      return;
+    }
+    throw new ProjectOutOfScopeException();
   }
 
   private assertStepUp(req: RbacScopedRequest): void {
