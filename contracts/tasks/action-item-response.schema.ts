@@ -46,14 +46,34 @@ export type ActionItemPrimaryActionKind = z.infer<typeof actionItemPrimaryAction
 /**
  * `target` is deliberately a bare string, not a URL — its meaning is keyed by
  * `kind` (a task id, a playbook slug, a finding id, a displacement id).
- * See tasks.service.ts `derivePrimaryAction` for the exact mapping, which is
- * a documented judgement call: the spec names the source columns and
- * `playbook_slug` as the derivation's inputs but not the mapping itself.
+ * See tasks.service.ts `derivePrimaryAction` for the exact derivation
+ * precedence, which is a documented judgement call: the spec names the
+ * source columns and `playbook_slug` as the derivation's inputs but not the
+ * mapping itself. The lead's decision (STORY-169 review): ONE documented
+ * meaning of `target` per `kind`, stated here so a client reads it from the
+ * contract rather than inferring it from a code comment.
  */
 export const actionItemPrimaryActionSchema = z
   .object({
     kind: actionItemPrimaryActionKindSchema,
-    target: z.string().min(1),
+    /**
+     * The meaning is fixed by `kind`, never ambiguous within one kind:
+     * - `copy_patch`     → `aux_findings.id` (the finding to fetch the
+     *                      copy-ready patch for; never patch text itself).
+     * - `diagnose`       → `displacements.id` (the share-of-voice drop to
+     *                      diagnose).
+     * - `open_playbook`  → `source_domains`-scoped playbook slug (a
+     *                      source-seeding/authority action ONLY — never
+     *                      emitted for an AUX-finding-derived task, whose
+     *                      guided fix is its own `copy_patch`).
+     * - `open_task`      → `tasks.id` itself (no more specific evidence
+     *                      link exists).
+     */
+    target: z.string().min(1).describe(
+      "Bare id, meaning fixed by `kind`: copy_patch -> aux_findings.id; diagnose -> displacements.id; " +
+        "open_playbook -> a source-seeding/authority playbook slug (never emitted for an AUX-finding-derived " +
+        "task); open_task -> tasks.id. Never a URL or patch text.",
+    ),
   })
   .strict();
 

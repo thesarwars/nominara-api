@@ -21371,7 +21371,8 @@
                               },
                               "target": {
                                 "type": "string",
-                                "minLength": 1
+                                "minLength": 1,
+                                "description": "Bare id, meaning fixed by `kind`: copy_patch -> aux_findings.id; diagnose -> displacements.id; open_playbook -> a source-seeding/authority playbook slug (never emitted for an AUX-finding-derived task); open_task -> tasks.id. Never a URL or patch text."
                               }
                             },
                             "required": [

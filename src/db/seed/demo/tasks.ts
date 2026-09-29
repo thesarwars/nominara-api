@@ -127,7 +127,19 @@ function buildCandidates(
       sourceFindingId: finding.id,
       sourceDomainId: null,
       severityHint: finding.severity === "info" ? null : finding.severity,
-      playbookSlug: `fix-${finding.ruleCode.toLowerCase()}`,
+      // STORY-169 review — NO playbook_slug here. `derivePrimaryAction`
+      // (tasks.service.ts) checks `playbook_slug` before `source_finding_id`
+      // ON PURPOSE, for a task that legitimately carries both (an authority
+      // task an AUX finding recommended). A fabricated slug like
+      // `fix-aux-r-001` is not that case — playbooks are source-seeding/
+      // authority actions (sources-and-rollups.md, `is_seedable`), and an
+      // AUX finding's own guided fix is its `suggested_fix` PATCH
+      // (`FR-AX-04`), which is exactly what leaving this `null` reaches:
+      // `copy_patch`, keyed to `source_finding_id` below. Setting a slug no
+      // real playbook ever has made every demo AUX item — including the
+      // critical AUX-R-001 robots.txt row — resolve to `open_playbook` and
+      // route a client to a Sources-page playbook that does not exist.
+      playbookSlug: null,
     });
   }
 
