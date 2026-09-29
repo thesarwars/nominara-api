@@ -11,6 +11,7 @@ import type {
 } from "../../../contracts/projects/index.js";
 import { COLUMN_FOR_FIELD, LIST_VALUED_FIELDS } from "../../../contracts/projects/index.js";
 import { OPTIONAL_PROJECT_FIELDS } from "../../../contracts/projects/index.js";
+import { openTasksBySeveritySchema, visibilityByEngineSchema } from "../../../contracts/projects/index.js";
 import { ConflictError, EntitlementExceededError, NotFoundError, UnsafeTargetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { GuardedFetchRefusal } from "../../lib/net/guarded-fetch.js";
 import { UrlGuard } from "../../lib/net/url-guard.service.js";
@@ -514,18 +515,6 @@ export class ProjectsService {
   }
 }
 
-interface ProjectEngineScoreRow {
-  score: number;
-  delta_30d: number | null;
-}
-
-interface OpenTasksBySeverityRow {
-  critical: number;
-  high: number;
-  medium: number;
-  low: number;
-}
-
 interface ProjectRow {
   id: string;
   name: string;
@@ -537,7 +526,14 @@ interface ProjectRow {
   prompts_active: number;
   prompts_cap: number;
   open_task_count: number;
-  open_tasks_by_severity: OpenTasksBySeverityRow;
+  /**
+   * STORY-169 review — `unknown`, not a hand-written interface: this is a
+   * jsonb column, and `coding-standards.md` requires a zod schema for every
+   * one, parsed at read time (`toProjectListItem` does, via
+   * `openTasksBySeveritySchema` — the SAME schema the wire contract already
+   * declares, since the stored and wire shapes are identical here).
+   */
+  open_tasks_by_severity: unknown;
   domain_verified_at: Date | null;
   created_at: Date;
   visibility_blended: string | null;
@@ -549,7 +545,8 @@ interface ProjectRow {
   sentiment_score: string | null;
   sentiment_delta_30d: string | null;
   cells_30d: number | null;
-  visibility_by_engine: Record<string, ProjectEngineScoreRow> | null;
+  /** STORY-169 review — jsonb; parsed via `visibilityByEngineSchema` (its STORED shape, `toEngineScores` converts to the wire's sorted array). */
+  visibility_by_engine: unknown;
   sparkline_30d: unknown;
   demo_seeded_at: Date | null;
   created_at_key: string;
@@ -581,7 +578,7 @@ function toProjectListItem(row: ProjectRow): ProjectListItem {
     prompts_active: row.prompts_active,
     prompts_cap: row.prompts_cap,
     open_task_count: row.open_task_count,
-    open_tasks_by_severity: row.open_tasks_by_severity,
+    open_tasks_by_severity: openTasksBySeveritySchema.parse(row.open_tasks_by_severity),
     domain_verified_at: row.domain_verified_at?.toISOString() ?? null,
     created_at: row.created_at.toISOString(),
     visibility_blended: numericOrNull(row.visibility_blended),
@@ -607,10 +604,17 @@ function toProjectListItem(row: ProjectRow): ProjectListItem {
   };
 }
 
-/** `projects.visibility_by_engine`'s stored object, as the sorted array the wire contract wants. */
-function toEngineScores(byEngine: Record<string, ProjectEngineScoreRow> | null): ProjectListItem["engine_scores"] {
+/**
+ * `projects.visibility_by_engine`'s stored object, as the sorted array the
+ * wire contract wants. Parses through `visibilityByEngineSchema` FIRST
+ * (STORY-169 review — a jsonb column read with no runtime check at all
+ * before this) — `null` is the honest "no per-engine data" case and is
+ * never itself a validation failure.
+ */
+function toEngineScores(byEngine: unknown): ProjectListItem["engine_scores"] {
   if (byEngine === null) return null;
-  return Object.entries(byEngine)
+  const parsed = visibilityByEngineSchema.parse(byEngine);
+  return Object.entries(parsed)
     .map(([engineKey, value]) => ({ engine_key: engineKey, score: value.score, delta_30d: value.delta_30d }))
     .sort((a, b) => b.score - a.score);
 }

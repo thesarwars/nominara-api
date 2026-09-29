@@ -870,6 +870,26 @@ describe("STORY-132 · ProjectsService.list", () => {
       expect(page.items[0]!.open_tasks_by_severity).toEqual({ critical: 2, high: 1, medium: 0, low: 3 });
     });
 
+    // STORY-169 review — `open_tasks_by_severity`/`visibility_by_engine` are
+    // jsonb columns, and coding-standards.md requires a zod schema for
+    // every one, checked at read time — not a hand-written TypeScript
+    // interface with no runtime check. These two prove the schemas are
+    // actually WIRED IN, by feeding shapes each schema's own `.strict()`/
+    // member types reject, rather than merely existing unused.
+    it("throws rather than passing through an open_tasks_by_severity object with an unknown key", async () => {
+      await expect(
+        serviceReading([row({ open_tasks_by_severity: { critical: 0, high: 0, medium: 0, low: 0, extra: 1 } })]).list({
+          limit: 50,
+        } as never),
+      ).rejects.toThrow();
+    });
+
+    it("throws rather than passing through a visibility_by_engine entry missing delta_30d", async () => {
+      await expect(
+        serviceReading([row({ visibility_by_engine: { chatgpt: { score: 40 } } })]).list({ limit: 50 } as never),
+      ).rejects.toThrow();
+    });
+
     it("demo_seeded is true only when demo_seeded_at is set", async () => {
       const real = await serviceReading([row()]).list({ limit: 50 } as never);
       expect(real.items[0]!.demo_seeded).toBe(false);

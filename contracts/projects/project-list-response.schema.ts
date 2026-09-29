@@ -34,6 +34,20 @@ export const openTasksBySeveritySchema = z
   })
   .strict();
 
+/**
+ * STORY-169 review — `projects.visibility_by_engine`'s STORED jsonb shape:
+ * `{engine_key: {score, delta_30d}}`, keyed by engine, written by
+ * `denormalizeProject`'s `perEngineWindow`. This is NOT the same shape as
+ * `engine_scores` above (the WIRE contract: a score-sorted ARRAY with
+ * `engine_key` embedded in each entry) — `ProjectsService`'s own
+ * `toEngineScores` is what converts one into the other at read time.
+ * `coding-standards.md` requires a zod schema for every jsonb column; this
+ * was previously read through a hand-written `ProjectEngineScoreRow`
+ * TypeScript interface with no runtime check at all.
+ */
+export const storedEngineScoreSchema = projectEngineScoreSchema.omit({ engine_key: true });
+export const visibilityByEngineSchema = z.record(z.string(), storedEngineScoreSchema);
+
 export const projectListItemSchema = z
   .object({
     id: z.string().uuid(),
@@ -59,7 +73,7 @@ export const projectListItemSchema = z
     visibility_delta_30d: z.number().nullable(),
     /** §8's 0–100 composite, over attribute-capable engines only. Null otherwise. */
     rendering_quality: z.number().nullable(),
-    /** STORY-169 — current vs prior 30d window mean. Null unless both windows have data. */
+    /** STORY-169 — current vs prior 30d window mean. Same NFR-ANL-03 gate as visibility_delta_30d: null unless both windows have >= 30 measured cells. */
     rendering_delta_30d: z.number().nullable(),
     /** STORY-169 — 100*(1 - Σ context_weight of critical/high gap domains). Null with no project_source_index rows. */
     source_coverage: z.number().nullable(),
