@@ -22,11 +22,25 @@ function includedGrantOf(entitlements: Readonly<Record<string, { readonly value:
 }
 
 export interface EnsureWalletResult {
+  /** A NEW wallet row now exists that did not before this call — true even when `grant` is 0. */
   readonly provisioned: boolean;
   readonly grant: number;
 }
 
-/** Provisions a wallet if the workspace has none. Idempotent: a workspace that already has one is untouched. Must run inside `withTenantContext`. */
+/**
+ * Provisions a wallet if the workspace has none. Idempotent: a workspace
+ * that already has one is untouched. Must run inside `withTenantContext`.
+ *
+ * ⚠ REVIEW FIX — `provisioned` is `outcome.wallet !== null`, NOT
+ * `outcome.applied`. `provisionWalletWithGrant` (balance.ts) returns
+ * `applied: false` whenever `grant === 0`, EVEN THOUGH IT STILL CREATES THE
+ * WALLET (`created`) — `applied` there means "a ledger entry was written",
+ * which a zero grant correctly never needs, not "nothing changed". Reading
+ * `outcome.applied` as "provisioned" made a real, irreversible wallet
+ * creation on a zero-grant plan log as "workspace already has a wallet —
+ * left untouched." (`seed-demo.ts`), which is false: the wallet did not
+ * exist a moment before, and it does now.
+ */
 export async function ensureDemoWallet(tx: ClientBase, workspaceId: string): Promise<EnsureWalletResult> {
   const existing = await readWallet(tx, workspaceId);
   if (existing !== null) {
@@ -38,5 +52,5 @@ export async function ensureDemoWallet(tx: ClientBase, workspaceId: string): Pro
   const period = await resolveBillingPeriod(tx, workspaceId);
   const outcome = await provisionWalletWithGrant(tx, workspaceId, grant, period);
 
-  return { provisioned: outcome.applied, grant };
+  return { provisioned: outcome.wallet !== null, grant };
 }

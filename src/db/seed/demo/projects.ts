@@ -27,6 +27,31 @@ export async function listActiveProjects(tx: ClientBase, workspaceId: string): P
   return result.rows.map((row) => ({ id: row.id, workspaceId: row.workspace_id, name: row.name, slug: row.slug, rootDomain: row.root_domain }));
 }
 
+interface ExistingProject {
+  readonly id: string;
+  readonly rootDomain: string;
+}
+
+/**
+ * Every non-deleted project, ANY status — `structural-usage.ts`'s own
+ * `COUNTERS["projects.max"]` predicate (`deleted_at IS NULL`, no status
+ * filter), reused verbatim here so `ensureDemoProjects`'s cap check counts
+ * exactly what the real guard counts. `listActiveProjects` above counts only
+ * `status = 'active'`, which is right for "which projects get facts seeded"
+ * but WRONG for "how many of the plan's project slots are already spoken
+ * for" — a paused or still-`initializing` project occupies a slot too
+ * (STORY-169 review, PROBE E: a paused + an initializing + one active
+ * project, on a 3-project plan, left `ensureDemoProjects` room for two MORE
+ * before this fix, five projects total against a cap of three).
+ */
+async function listNonDeletedProjects(tx: ClientBase, workspaceId: string): Promise<ExistingProject[]> {
+  const result = await tx.query<{ id: string; root_domain: string }>(
+    `SELECT id, root_domain FROM projects WHERE workspace_id = $1 AND deleted_at IS NULL`,
+    [workspaceId],
+  );
+  return result.rows.map((row) => ({ id: row.id, rootDomain: row.root_domain }));
+}
+
 async function freeSlug(tx: ClientBase, workspaceId: string, base: string): Promise<string> {
   const taken = await tx.query<{ slug: string }>(
     `SELECT slug::text AS slug FROM projects WHERE workspace_id = $1 AND deleted_at IS NULL AND (slug = $2 OR slug LIKE $3)`,
@@ -69,7 +94,7 @@ export async function projectsMaxCap(tx: ClientBase, workspaceId: string): Promi
  * here makes a network call).
  */
 export async function ensureDemoProjects(tx: ClientBase, workspaceId: string): Promise<TargetProject[]> {
-  const existing = await listActiveProjects(tx, workspaceId);
+  const existing = await listNonDeletedProjects(tx, workspaceId);
   const cap = await projectsMaxCap(tx, workspaceId);
   const target = Math.min(3, cap);
   if (existing.length >= target) return [];

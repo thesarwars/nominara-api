@@ -1,9 +1,14 @@
 import type { ClientBase } from "pg";
+import { PROMPT_OCCUPIES_SLOT } from "../../../lib/entitlements/structural-usage.js";
+import { withProjectQueueLock } from "../../../lib/queue/locks.js";
+import { datesWithFacts } from "../../../lib/rollup/aggregate-day.js";
+import { denormalizeProject } from "../../../lib/rollup/denormalize.js";
 import { refreshProjectAux } from "../../../lib/rollup/refresh-project-aux.js";
 import { refreshProjectSourceCoverage } from "../../../lib/rollup/refresh-project-source-coverage.js";
 import { refreshProjectTaskCounts } from "../../../lib/rollup/refresh-project-task-counts.js";
+import { rollUpDay } from "../../../lib/rollup/roll-up-day.js";
 import { deleteExistingDemoAudits } from "./aux.js";
-import { DEMO_PROJECT_CREATED_KEY } from "./constants.js";
+import { DEMO_PROJECT_CREATED_KEY, DEMO_PROMPT_MARKER_KEY, DEMO_SEED_MARKER } from "./constants.js";
 import { deleteExistingDemoFacts } from "./facts.js";
 import { deleteExistingDemoSources } from "./sources.js";
 import { deleteExistingDemoTasks } from "./tasks.js";
@@ -15,14 +20,36 @@ import { deleteExistingDemoTasks } from "./tasks.js";
 // none" — it returns early the moment `metric_daily` has zero rows for the
 // project (see its own header comment), which is correct for "never
 // rolled up" and leaves a PRIOR value in place for "was rolled up, and the
-// facts are now gone". So this file NULLs the metric-derived `projects`
-// columns directly, after deleting the metric_daily rows that fed them —
-// the honest state for "no rollup has ever run", which is what purging a
-// demo project's facts actually leaves it in. AUX/task/source producers do
-// NOT have this problem — each already reports null/zero on an empty input
-// (`refreshProjectAux`'s subquery, `refreshProjectTaskCounts`'s `count(*)`,
-// `sourceCoverage()`'s empty-array null) — so those three are re-run for
-// real rather than special-cased.
+// facts are now gone". AUX/task/source producers do NOT have this problem —
+// each already reports null/zero on an empty input (`refreshProjectAux`'s
+// subquery, `refreshProjectTaskCounts`'s `count(*)`, `sourceCoverage()`'s
+// empty-array null) — so those three are re-run for real rather than
+// special-cased.
+//
+// ⚠ REVIEW FIX — `metric_daily` is RE-ROLLED, never blanket-deleted. The
+// first version of this file ran `DELETE FROM metric_daily WHERE project_id
+// = $1` unconditionally, which for a PRE-EXISTING (not seed-created) project
+// destroyed real rollup history outside the seed's own window — a real
+// project with one real `metric_daily` row from 90 days ago lost it on
+// `--purge`, with nothing marking that row as anything but real. The fix:
+// delete ONLY the demo-marked facts, `DELETE metric_daily` for exactly the
+// date range that could have been touched (its own min `metric_date` through
+// today), then `rollUpDay` every day inside that range that still has
+// remaining (real) facts — `datesWithFacts`, the SAME function the real
+// rebuild path uses. A day left with zero facts after the demo ones are
+// gone correctly gets NO row, matching what the real pipeline would have
+// produced for a day nobody ever captured. Only when the project's entire
+// `metric_daily` history is empty afterward — genuinely "never rolled up" —
+// are the denormalised columns NULLed directly.
+//
+// ⚠ KNOWN, UNDECIDED GAP — `tracked_prompts` rows this seed actually
+// inserted (not reused from a pre-existing project) are marked via
+// `generator_meta->>'demo_seed_marker'` and removed here. `competitors` has
+// no comparable jsonb column, so a seeded competitor on a pre-existing
+// project is NOT removed by `--purge` — `facts.ts`'s `ensureCompetitors` at
+// least stops writing past the plan's cap now, but telling a seeded
+// competitor apart from the project's own needs a schema decision this
+// review does not make unilaterally.
 
 export interface PurgeableProject {
   readonly id: string;
@@ -43,7 +70,13 @@ export async function listSeededProjects(tx: ClientBase, workspaceId: string): P
   }));
 }
 
-async function clearDenormalizedColumns(tx: ClientBase, projectId: string): Promise<void> {
+/** Unconditional — the demo marker itself, regardless of whether any metric-derived column survives. */
+async function clearDemoMarker(tx: ClientBase, projectId: string): Promise<void> {
+  await tx.query(`UPDATE projects SET demo_seeded_at = NULL WHERE id = $1`, [projectId]);
+}
+
+/** Only correct when `metric_daily` truly has zero rows for the project afterward — see this file's own header comment on why `denormalizeProject` cannot express that state itself. */
+async function clearMetricColumns(tx: ClientBase, projectId: string): Promise<void> {
   await tx.query(
     `UPDATE projects
         SET visibility_blended = NULL,
@@ -54,24 +87,100 @@ async function clearDenormalizedColumns(tx: ClientBase, projectId: string): Prom
             sentiment_score = NULL,
             sentiment_delta_30d = NULL,
             cells_30d = NULL,
-            sparkline_30d = NULL,
-            demo_seeded_at = NULL
+            sparkline_30d = NULL
       WHERE id = $1`,
     [projectId],
   );
 }
 
-/** Purges one project's demo data. Deletes the project row outright when the seed created it; otherwise cleans it back to its pre-seed, never-rolled-up state. */
-export async function purgeOneProject(tx: ClientBase, project: PurgeableProject): Promise<void> {
-  // Facts + metric_daily first — nothing downstream depends on them.
-  const earliest = await tx.query<{ min: string | null }>(
-    `SELECT to_char(min(metric_date), 'YYYY-MM-DD') AS min FROM metric_daily WHERE project_id = $1`,
-    [project.id],
+/**
+ * Deletes this seed's own demo facts, then RE-ROLLS the affected date range
+ * from whatever real facts remain — never a blanket `DELETE FROM
+ * metric_daily`. A day with no remaining facts correctly ends up with no
+ * `metric_daily` row at all, exactly like a day the real pipeline never
+ * captured; a day with real facts still present is recomputed from them,
+ * not deleted.
+ *
+ * ⚠ THE AFFECTED RANGE IS THE DEMO FACTS' OWN DATE SPAN, read from
+ * `answer_captures` BEFORE they are deleted — never `metric_daily`'s own
+ * `min(metric_date)`. The first version of this fix used the latter, which
+ * is wrong the moment a pre-existing project has REAL rollup history: its
+ * earliest REAL day becomes `min(metric_date)`, which then puts that real
+ * day inside the "affected range" and deletes it right back out — the
+ * exact defect this function exists to fix, reintroduced one query up.
+ * Scoping to the demo facts' own min/max keeps the deleted-and-rerolled
+ * window to exactly what the seed could have touched.
+ */
+async function purgeMetricHistory(tx: ClientBase, project: PurgeableProject, timezone: string): Promise<void> {
+  const demoRange = await tx.query<{ min: string | null; max: string | null }>(
+    `SELECT to_char(min((captured_at AT TIME ZONE $2)::date), 'YYYY-MM-DD') AS min,
+            to_char(max((captured_at AT TIME ZONE $2)::date), 'YYYY-MM-DD') AS max
+       FROM answer_captures
+      WHERE project_id = $1 AND normalizer_version = $3`,
+    [project.id, timezone, DEMO_SEED_MARKER],
   );
-  const earliestDay = earliest.rows[0]?.min ?? "1970-01-01";
+  const earliestDay = demoRange.rows[0]?.min;
+  const latestDay = demoRange.rows[0]?.max;
+  if (earliestDay === null || earliestDay === undefined || latestDay === null || latestDay === undefined) {
+    // No demo facts ever existed for this project (e.g. a re-run of
+    // `--purge`, or a project with no entitled engine) — nothing to
+    // re-roll, and whatever `metric_daily` already holds is already honest.
+    return;
+  }
+
   await deleteExistingDemoFacts(tx, project.id, earliestDay);
-  await tx.query(`DELETE FROM metric_daily WHERE project_id = $1`, [project.id]);
-  await clearDenormalizedColumns(tx, project.id);
+
+  await withProjectQueueLock(tx, "rollup.metric_daily", project.id, async () => {
+    await tx.query(`DELETE FROM metric_daily WHERE project_id = $1 AND metric_date BETWEEN $2::date AND $3::date`, [
+      project.id,
+      earliestDay,
+      latestDay,
+    ]);
+    const remainingDays = await datesWithFacts(tx, project.id, timezone, earliestDay, latestDay);
+    for (const day of remainingDays) {
+      await rollUpDay(tx, project.workspaceId, project.id, day, timezone);
+    }
+    await denormalizeProject(tx, project.id, timezone);
+  });
+
+  const remaining = await tx.query<{ n: string }>(`SELECT count(*)::text AS n FROM metric_daily WHERE project_id = $1`, [
+    project.id,
+  ]);
+  if (Number(remaining.rows[0]!.n) === 0) {
+    // `denormalizeProject` returned early above (its own documented
+    // behaviour on zero rows) and left the PRIOR values in place — the
+    // "never rolled up" state has to be written explicitly.
+    await clearMetricColumns(tx, project.id);
+  }
+}
+
+/**
+ * Removes exactly the `tracked_prompts` rows this seed INSERTED for the
+ * project (never one it only reused because a pre-existing prompt already
+ * had the same `text_hash` — `facts.ts`'s `ensurePrompts` marks only its own
+ * inserts), then recomputes `prompts_active`/`prompts_cap` the same way
+ * `activation.service.ts` does — never left stale after a status-changing
+ * write to `tracked_prompts`.
+ */
+async function purgeDemoPrompts(tx: ClientBase, projectId: string): Promise<void> {
+  await tx.query(`DELETE FROM tracked_prompts WHERE project_id = $1 AND generator_meta ->> $2 = $3`, [
+    projectId,
+    DEMO_PROMPT_MARKER_KEY,
+    DEMO_SEED_MARKER,
+  ]);
+  await tx.query(
+    `UPDATE projects
+        SET prompts_active = (SELECT count(*) FROM tracked_prompts WHERE project_id = $1 AND ${PROMPT_OCCUPIES_SLOT})
+      WHERE id = $1`,
+    [projectId],
+  );
+}
+
+/** Purges one project's demo data. Deletes the project row outright when the seed created it; otherwise cleans it back to its pre-seed state. */
+export async function purgeOneProject(tx: ClientBase, project: PurgeableProject, timezone: string): Promise<void> {
+  // Facts + metric_daily first — nothing downstream depends on them.
+  await purgeMetricHistory(tx, project, timezone);
+  await clearDemoMarker(tx, project.id);
 
   await deleteExistingDemoAudits(tx, project.id);
   await refreshProjectAux(tx, project.id);
@@ -81,6 +190,10 @@ export async function purgeOneProject(tx: ClientBase, project: PurgeableProject)
 
   await deleteExistingDemoSources(tx, project.workspaceId, project.id);
   await refreshProjectSourceCoverage(tx, project.id);
+
+  await purgeDemoPrompts(tx, project.id);
+  // competitors — SEE THIS FILE'S OWN HEADER: no marker column exists yet,
+  // so a seeded competitor on a pre-existing project is not removed here.
 
   if (project.seedCreated) {
     // Hard delete — `ON DELETE CASCADE` takes competitors, tracked_prompts,

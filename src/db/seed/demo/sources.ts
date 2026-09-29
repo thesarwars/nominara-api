@@ -3,7 +3,7 @@ import { uuidV7 } from "../../../lib/ids/uuidv7.js";
 import { SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS } from "../../../lib/rollup/refresh-project-task-counts.js";
 import { refreshProjectSourceCoverage } from "../../../lib/rollup/refresh-project-source-coverage.js";
 import type { DemoProjectRef } from "./facts.js";
-import { type Rng, pick, rngFor, uniformInt } from "./rng.js";
+import { chance, rngFor, uniform, uniformInt } from "./rng.js";
 
 // STORY-169 — `source_domains` and `project_source_index` for one project,
 // then `refreshProjectSourceCoverage` (STORY-169's own real producer) to
@@ -27,8 +27,6 @@ const DOMAIN_TEMPLATES: readonly { readonly suffix: string; readonly sourceClass
   { suffix: "dev-platform.example", sourceClass: "developer_platform", seedable: true },
 ];
 
-const GAP_SEVERITIES: readonly ("critical" | "high" | "medium" | "low" | "none")[] = ["critical", "high", "medium", "low", "none"];
-
 export async function deleteExistingDemoSources(tx: ClientBase, workspaceId: string, projectId: string): Promise<void> {
   await tx.query(`DELETE FROM project_source_index WHERE project_id = $1`, [projectId]);
   // Orphaned only AFTER the delete above — a domain another still-seeded
@@ -51,8 +49,10 @@ export interface SeededSourceDomain {
 
 interface DomainSeed {
   readonly id: string;
+  readonly domain: string;
+  readonly isSeedable: boolean;
   readonly contextWeight: number;
-  readonly gapSeverity: "critical" | "high" | "medium" | "low" | "none";
+  readonly brandPresent: boolean;
 }
 
 export interface SeedSourcesResult {
@@ -60,16 +60,37 @@ export interface SeedSourcesResult {
   readonly criticalOrHighDomains: readonly SeededSourceDomain[];
 }
 
+/**
+ * §5's own formula (scoring-models.md), applied verbatim — NOT a random
+ * pick (STORY-169 review, PROBE: the seed used to draw `gap_severity`
+ * independently of `context_weight`/`is_seedable`, which let a non-seedable
+ * encyclopedic/news domain come back `critical` and generate a
+ * `TG-SOURCE-ABSENCE` authority task for a domain the brand cannot
+ * legitimately seed — §5's own words: "escalating a domain the brand
+ * cannot legitimately contribute to... is noise", and "ONLY critical and
+ * high gaps on SEEDABLE domains generate authority tasks").
+ *
+ * `is_seedable` gates ONLY the top two tiers — `medium`/`low` apply to any
+ * domain, matching the formula exactly (no `is_seedable` term on those two
+ * branches).
+ */
+export function deriveGapSeverity(contextWeight: number, isSeedable: boolean, brandPresent: boolean): "critical" | "high" | "medium" | "low" | "none" {
+  if (brandPresent) return "none";
+  if (contextWeight >= 0.15 && isSeedable) return "critical";
+  if (contextWeight >= 0.08 && isSeedable) return "high";
+  if (contextWeight >= 0.03) return "medium";
+  if (contextWeight > 0) return "low";
+  return "none";
+}
+
 export async function resetAndSeedProjectSources(tx: ClientBase, project: DemoProjectRef): Promise<SeedSourcesResult> {
   const rng = rngFor(project.id, "sources");
   await deleteExistingDemoSources(tx, project.workspaceId, project.id);
 
-  const domains: DomainSeed[] = [];
-  const domainNames: string[] = [];
-  const rawWeights: number[] = [];
+  const inserted: { id: string; domain: string; isSeedable: boolean }[] = [];
   for (const template of DOMAIN_TEMPLATES) {
     const domain = `${project.rootDomain.replace(/\./gu, "-")}.${template.suffix}`;
-    const inserted = await tx.query<{ id: string }>(
+    const row = await tx.query<{ id: string }>(
       `INSERT INTO source_domains (id, workspace_id, domain, display_name, source_class, authority_tier, is_seedable)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
        ON CONFLICT (workspace_id, domain) DO UPDATE SET last_seen_at = now()
@@ -80,22 +101,50 @@ export async function resetAndSeedProjectSources(tx: ClientBase, project: DemoPr
     // freshly generated one this call happened to mint — reading it back is
     // what keeps `project_source_index` pointing at the row that actually
     // exists rather than an id nothing references.
-    rawWeights.push(uniformInt(rng, 5, 25));
-    domains.push({ id: inserted.rows[0]!.id, contextWeight: 0, gapSeverity: "none" });
-    domainNames.push(domain);
+    inserted.push({ id: row.rows[0]!.id, domain, isSeedable: template.seedable });
   }
 
-  // Normalise to sum to 1 — `sourceCoverage()`'s own precondition.
-  const weightTotal = rawWeights.reduce((total, weight) => total + weight, 0);
-  const severities = assignSeverities(rng, domains.length);
+  // ⚠ TWO DOMAINS ARE FORCED TO A GAP, NOT TWO SEVERITIES CHOSEN DIRECTLY —
+  // "at least one critical and one high, always" (the story's own worked
+  // example, "enough for the card to have something to show") now has to be
+  // engineered THROUGH `context_weight` and `brand_present`, since severity
+  // is derived from them rather than picked. `DOMAIN_TEMPLATES[0]`
+  // (community-forum) and `[1]` (review-marketplace) are both `is_seedable`,
+  // forced NOT brand-present, and given target shares of the normalised
+  // total comfortably inside the critical (>= 0.15) and high ([0.08, 0.15))
+  // bands respectively — exact target shares, not a raw-weight draw
+  // normalised afterward, so the OTHER three domains' random weights can
+  // never push either share across a band boundary.
+  const forcedCriticalShare = uniform(rng, 0.2, 0.32);
+  const forcedHighShare = uniform(rng, 0.09, 0.13);
+  const remainingShare = 1 - forcedCriticalShare - forcedHighShare;
+
+  const otherRawWeights = inserted.slice(2).map(() => uniformInt(rng, 5, 25));
+  const otherRawTotal = otherRawWeights.reduce((total, weight) => total + weight, 0);
+
+  const domains: DomainSeed[] = inserted.map((row, index) => {
+    if (index === 0) return { ...row, contextWeight: forcedCriticalShare, brandPresent: false };
+    if (index === 1) return { ...row, contextWeight: forcedHighShare, brandPresent: false };
+    const share = (otherRawWeights[index - 2]! / otherRawTotal) * remainingShare;
+    // Non-forced domains: presence is a coin flip, independent of weight —
+    // a heavily-cited domain can still already carry the brand.
+    return { ...row, contextWeight: share, brandPresent: chance(rng, 0.5) };
+  });
+
   const windowStart = await currentWindowStart(tx);
   const criticalOrHighDomains: SeededSourceDomain[] = [];
 
   for (const [index, domain] of domains.entries()) {
-    const contextWeight = rawWeights[index]! / weightTotal;
-    const gapSeverity = severities[index]!;
-    if (gapSeverity === "critical" || gapSeverity === "high") {
-      criticalOrHighDomains.push({ id: domain.id, domain: domainNames[index]!, gapSeverity });
+    const gapSeverity = deriveGapSeverity(domain.contextWeight, domain.isSeedable, domain.brandPresent);
+    // Belt and suspenders (matching `tasks.service.ts`'s own
+    // `normalizeSeverity` posture): `criticalOrHighDomains` feeds
+    // `TG-SOURCE-ABSENCE` authority-task generation directly, and §5 is
+    // explicit that only a SEEDABLE domain's critical/high gap may — a
+    // structurally redundant check today (`deriveGapSeverity` cannot return
+    // critical/high for a non-seedable domain), kept so a future edit to
+    // the formula cannot silently reopen this without also touching here.
+    if ((gapSeverity === "critical" || gapSeverity === "high") && domain.isSeedable) {
+      criticalOrHighDomains.push({ id: domain.id, domain: domain.domain, gapSeverity });
     }
     await tx.query(
       `INSERT INTO project_source_index
@@ -104,7 +153,8 @@ export async function resetAndSeedProjectSources(tx: ClientBase, project: DemoPr
           rank_position, brand_present_on_domain, gap_severity, top_urls)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'[]'::jsonb)
        ON CONFLICT (project_id, source_domain_id, engine_key, window_start, window_days)
-       DO UPDATE SET context_weight = EXCLUDED.context_weight, gap_severity = EXCLUDED.gap_severity`,
+       DO UPDATE SET context_weight = EXCLUDED.context_weight, gap_severity = EXCLUDED.gap_severity,
+                      brand_present_on_domain = EXCLUDED.brand_present_on_domain`,
       [
         project.workspaceId,
         project.id,
@@ -115,10 +165,10 @@ export async function resetAndSeedProjectSources(tx: ClientBase, project: DemoPr
         uniformInt(rng, 0, 12),
         uniformInt(rng, 0, 6),
         uniformInt(rng, 0, 8),
-        contextWeight,
-        contextWeight,
+        domain.contextWeight,
+        domain.contextWeight,
         index + 1,
-        gapSeverity === "none",
+        domain.brandPresent,
         gapSeverity,
       ],
     );
@@ -126,15 +176,6 @@ export async function resetAndSeedProjectSources(tx: ClientBase, project: DemoPr
 
   await refreshProjectSourceCoverage(tx, project.id);
   return { criticalOrHighDomains };
-}
-
-/** At least one critical and one high gap, always — "enough for the card to have something to show", per the story's own worked example. */
-function assignSeverities(rng: Rng, count: number): ("critical" | "high" | "medium" | "low" | "none")[] {
-  const severities: ("critical" | "high" | "medium" | "low" | "none")[] = ["critical", "high"];
-  for (let i = severities.length; i < count; i += 1) {
-    severities.push(pick(rng, GAP_SEVERITIES));
-  }
-  return severities;
 }
 
 async function currentWindowStart(tx: ClientBase): Promise<string> {

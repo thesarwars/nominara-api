@@ -23,6 +23,18 @@ export const DEMO_PROJECT_CREATED_KEY = "demo_seed_created";
 /** `tasks.playbook_payload` marker key, read back by `--purge`. */
 export const DEMO_TASK_MARKER_KEY = "demo_seed_marker";
 
+/**
+ * `tracked_prompts.generator_meta` marker key (STORY-169 review) — set ONLY
+ * on a prompt row this seed actually INSERTED, never on one `ensurePrompts`
+ * reused because a pre-existing project already had a prompt with the same
+ * `text_hash`. `--purge` reads this key to remove exactly the prompts the
+ * seed added to a pre-existing (not seed-created) project, leaving the
+ * customer's own prompts untouched — `competitors` has no comparable jsonb
+ * column to carry the same marker, which is a known, undecided gap (see
+ * `purge.ts`'s own header comment).
+ */
+export const DEMO_PROMPT_MARKER_KEY = "demo_seed_marker";
+
 export interface DemoProjectFixture {
   readonly name: string;
   readonly rootDomain: string;

@@ -1,7 +1,9 @@
 import type { ClientBase } from "pg";
 import { uuidV7 } from "../../../lib/ids/uuidv7.js";
+import { resolveEntitlements } from "../../../lib/entitlements/resolution.js";
+import { PROMPT_OCCUPIES_SLOT } from "../../../lib/entitlements/structural-usage.js";
 import { insertRows } from "./batch-insert.js";
-import { DEMO_COMPETITOR_NAMES, DEMO_PROMPT_TEMPLATES, DEMO_SEED_MARKER } from "./constants.js";
+import { DEMO_COMPETITOR_NAMES, DEMO_PROMPT_MARKER_KEY, DEMO_PROMPT_TEMPLATES, DEMO_SEED_MARKER } from "./constants.js";
 import { type Rng, chance, pick, rngFor, uniform, uniformInt } from "./rng.js";
 
 // STORY-169 — the fact layer: `tracked_prompts`, `competitors`,
@@ -61,10 +63,36 @@ async function entitledEngines(tx: ClientBase, projectId: string): Promise<Entit
   return result.rows.map((row) => ({ engineKey: row.engine_key, adapterVersion: row.adapter_version, captureMode: row.capture_mode }));
 }
 
-/** The `windowDays` workspace-local dates ending at today, ascending — computed in Postgres, never the Node clock. */
-async function workspaceLocalWindow(tx: ClientBase, timezone: string, windowDays: number): Promise<string[]> {
-  const result = await tx.query<{ d: string }>(
-    `SELECT to_char(gs::date, 'YYYY-MM-DD') AS d
+interface WorkspaceLocalDay {
+  readonly day: string;
+  /** Local noon of `day`, IN THE WORKSPACE'S OWN TIMEZONE, as the correct UTC instant — see this function's own header. */
+  readonly capturedAt: Date;
+}
+
+/**
+ * The `windowDays` workspace-local dates ending at today, ascending, EACH
+ * PAIRED WITH ITS OWN LOCAL NOON — computed entirely in Postgres, never the
+ * Node clock, and never a bare `Date.UTC(y, m, d, 12)`.
+ *
+ * ⚠ REVIEW FIX — a bare UTC-noon timestamp is wrong for any workspace whose
+ * offset is +12 through +14 (Pacific/Auckland, Pacific/Tongatapu, Pacific/
+ * Apia, Pacific/Kiritimati): 12:00 UTC on calendar day D is already D+1 in
+ * those zones, so `rollUpDay`'s own bucketing (`(captured_at AT TIME ZONE
+ * tz)::date`) would file every capture this seed writes for "day D" under
+ * D+1 instead — today's facts land on a day that is never rolled up at all
+ * (`workspaceLocalWindow`'s own last entry is "today", not "tomorrow"), and
+ * the forced-presence day at the PRIOR/CURRENT window boundary
+ * (`forcedPresenceDayIndices`, below) shifts a day out of the window it was
+ * placed in to guarantee. `(gs::date::timestamp + interval '12 hours') AT
+ * TIME ZONE $1` reads as "local noon, AS WALL-CLOCK TIME IN ZONE $1,
+ * converted to the UTC instant that means" — Postgres's own tz database
+ * resolves the DST-aware offset for that exact calendar day, which no fixed
+ * JS offset arithmetic can.
+ */
+async function workspaceLocalWindow(tx: ClientBase, timezone: string, windowDays: number): Promise<WorkspaceLocalDay[]> {
+  const result = await tx.query<{ d: string; noon_utc: Date }>(
+    `SELECT to_char(gs::date, 'YYYY-MM-DD') AS d,
+            ((gs::date::timestamp + interval '12 hours') AT TIME ZONE $1) AS noon_utc
        FROM generate_series(
               (now() AT TIME ZONE $1)::date - ($2 - 1),
               (now() AT TIME ZONE $1)::date,
@@ -72,66 +100,165 @@ async function workspaceLocalWindow(tx: ClientBase, timezone: string, windowDays
             ) gs`,
     [timezone, windowDays],
   );
-  return result.rows.map((row) => row.d);
+  return result.rows.map((row) => ({ day: row.d, capturedAt: row.noon_utc }));
 }
 
+/**
+ * A plan entitlement's numeric ceiling, resolved through the REAL
+ * entitlement pipeline (never a hardcoded number — `no-hardcoded-plan-
+ * values`). `null`/`"custom"`/`"uncapped"` all mean "no numeric ceiling",
+ * which resolves to `Infinity` so a `cap - used` headroom computation below
+ * is never accidentally negative-Infinity or `NaN`. Matches
+ * `projects.ts`'s own `projectsMaxCap` exactly, for the two other
+ * structural keys the seed can exceed (STORY-169 review, PROBE E).
+ */
+async function structuralCap(
+  tx: ClientBase,
+  workspaceId: string,
+  key: "prompts.max_total" | "prompts.max_per_project" | "competitors.max_per_project",
+): Promise<number> {
+  const resolved = await resolveEntitlements(tx, workspaceId);
+  const raw = resolved.entitlements[key]?.value;
+  return typeof raw === "number" ? raw : Number.POSITIVE_INFINITY;
+}
+
+/** How many prompt slots (`PROMPT_OCCUPIES_SLOT`) are already used — workspace-wide, or one project's share of it. */
+async function promptSlotsUsed(tx: ClientBase, workspaceId: string, projectId?: string): Promise<number> {
+  const result = await tx.query<{ n: string }>(
+    projectId === undefined
+      ? `SELECT count(*)::text AS n FROM tracked_prompts WHERE workspace_id = $1 AND ${PROMPT_OCCUPIES_SLOT}`
+      : `SELECT count(*)::text AS n FROM tracked_prompts WHERE workspace_id = $1 AND project_id = $2 AND ${PROMPT_OCCUPIES_SLOT}`,
+    projectId === undefined ? [workspaceId] : [workspaceId, projectId],
+  );
+  return Number(result.rows[0]!.n);
+}
+
+/**
+ * Up to `count` tracked prompts, never exceeding EITHER `prompts.max_total`
+ * or `prompts.max_per_project` (STORY-169 review, PROBE E — the seed
+ * previously ignored both and could push a project or a workspace over its
+ * plan's cap). SELECT-first rather than `INSERT … ON CONFLICT`: the cap
+ * check needs to know, before writing, whether a template will consume a
+ * NEW slot or merely resolve to a prompt that already exists — reusing an
+ * existing id never costs headroom, and a demo seed is a single-operator
+ * dev tool, never a concurrent write path, so the `ON CONFLICT` race safety
+ * that pattern bought is not needed here.
+ *
+ * A row this call actually INSERTS is marked
+ * `generator_meta->>'demo_seed_marker'` (never one it only reused) — the
+ * marker `--purge` reads to remove exactly what the seed added to a
+ * pre-existing project, leaving that project's own prompts alone.
+ */
 async function ensurePrompts(tx: ClientBase, project: DemoProjectRef, count: number): Promise<string[]> {
   const templates = DEMO_PROMPT_TEMPLATES.slice(0, Math.min(count, DEMO_PROMPT_TEMPLATES.length));
+
+  const [perProjectCap, totalCap, perProjectUsed, totalUsed] = await Promise.all([
+    structuralCap(tx, project.workspaceId, "prompts.max_per_project"),
+    structuralCap(tx, project.workspaceId, "prompts.max_total"),
+    promptSlotsUsed(tx, project.workspaceId, project.id),
+    promptSlotsUsed(tx, project.workspaceId),
+  ]);
+  let headroom = Math.max(0, Math.min(perProjectCap - perProjectUsed, totalCap - totalUsed));
+
   const ids: string[] = [];
   for (const template of templates) {
     const text = template.text(project.name);
+    const existing = await tx.query<{ id: string }>(
+      `SELECT id FROM tracked_prompts WHERE project_id = $1 AND text_hash = sha256($2::bytea) AND deleted_at IS NULL`,
+      [project.id, text],
+    );
+    if (existing.rows[0] !== undefined) {
+      ids.push(existing.rows[0].id);
+      continue;
+    }
+    if (headroom <= 0) continue; // the plan's cap is already full — an honestly smaller demo prompt set, never one that exceeds it
     const id = uuidV7();
-    const result = await tx.query<{ id: string }>(
+    await tx.query(
       `INSERT INTO tracked_prompts
-         (id, workspace_id, project_id, generation_source, text, text_hash, intent_archetype, funnel_stage, status)
-       VALUES ($1,$2,$3,'generated',$4,sha256($5::bytea),$6,$7,'active')
-       ON CONFLICT (project_id, text_hash) WHERE deleted_at IS NULL DO NOTHING
-       RETURNING id`,
+         (id, workspace_id, project_id, generation_source, text, text_hash, intent_archetype, funnel_stage, status, generator_meta)
+       VALUES ($1,$2,$3,'generated',$4,sha256($5::bytea),$6,$7,'active',$8::jsonb)`,
       // `text` is bound TWICE ($4 and $5) rather than referencing $4 a second
       // time under a `::bytea` cast — Postgres's parser refuses to deduce two
       // different types for one parameter number within a single statement
       // ("inconsistent types deduced for parameter $4"), even though the two
       // usages here never conflict at the value level.
-      [id, project.workspaceId, project.id, text, text, template.intentArchetype, template.funnelStage],
+      [
+        id,
+        project.workspaceId,
+        project.id,
+        text,
+        text,
+        template.intentArchetype,
+        template.funnelStage,
+        JSON.stringify({ [DEMO_PROMPT_MARKER_KEY]: DEMO_SEED_MARKER }),
+      ],
     );
-    if (result.rows[0] !== undefined) {
-      ids.push(result.rows[0].id);
-    } else {
-      // Already exists from a prior run — the id is stable by text_hash, so
-      // re-select it rather than mint a second one this run would orphan.
-      const existing = await tx.query<{ id: string }>(
-        `SELECT id FROM tracked_prompts WHERE project_id = $1 AND text_hash = sha256($2::bytea) AND deleted_at IS NULL`,
-        [project.id, text],
-      );
-      ids.push(existing.rows[0]!.id);
-    }
+    ids.push(id);
+    headroom -= 1;
   }
+
+  // AC10/§10's own invariant — `prompts_active`/`prompts_cap` are maintained
+  // in the SAME transaction as any prompt-status change, never by a later
+  // job (activation.service.ts's own rule). Every prompt this seed writes is
+  // inserted `status='active'` directly, bypassing that service entirely, so
+  // this call is what keeps the denormalised columns from going stale the
+  // same way a real activation call would have kept them current.
+  await tx.query(
+    `UPDATE projects
+        SET prompts_active = (SELECT count(*) FROM tracked_prompts WHERE project_id = $1 AND ${PROMPT_OCCUPIES_SLOT}),
+            prompts_cap = $2,
+            updated_at = now()
+      WHERE id = $1`,
+    // `projects.prompts_cap` is `smallint` (activation.service.ts's own
+    // `PROMPTS_CAP_COLUMN_MAX` — duplicated here rather than imported
+    // cross-module for a one-line constant from an unrelated story's file).
+    [project.id, Math.min(perProjectCap, 32_767)],
+  );
+
   return ids;
 }
 
 async function ensureCompetitors(tx: ClientBase, project: DemoProjectRef, rng: Rng): Promise<string[]> {
   const count = uniformInt(rng, 2, 3);
   const names = DEMO_COMPETITOR_NAMES.slice(0, count);
+
+  // STORY-169 review, PROBE E — `competitors.max_per_project` is a real cap
+  // this seed previously ignored entirely. `competitors` carries no jsonb
+  // column to mark a seed-INSERTED row the way `tracked_prompts.
+  // generator_meta` does above, so unlike prompts, a seeded competitor
+  // cannot be told apart from the project's own and `--purge` cannot remove
+  // it — a known, undecided gap (`purge.ts`'s own header comment). This at
+  // least stops the seed from writing PAST the plan's ceiling.
+  const cap = await structuralCap(tx, project.workspaceId, "competitors.max_per_project");
+  const used = await (async () => {
+    const result = await tx.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM competitors WHERE workspace_id = $1 AND project_id = $2 AND deleted_at IS NULL`,
+      [project.workspaceId, project.id],
+    );
+    return Number(result.rows[0]!.n);
+  })();
+  let headroom = Math.max(0, cap - used);
+
   const ids: string[] = [];
   for (const [index, name] of names.entries()) {
-    const id = uuidV7();
     const domain = `${name.toLowerCase().replace(/[^a-z0-9]+/gu, "-")}.example.com`;
-    const result = await tx.query<{ id: string }>(
+    const existing = await tx.query<{ id: string }>(
+      `SELECT id FROM competitors WHERE project_id = $1 AND lower(name) = lower($2) AND deleted_at IS NULL`,
+      [project.id, name],
+    );
+    if (existing.rows[0] !== undefined) {
+      ids.push(existing.rows[0].id);
+      continue;
+    }
+    if (headroom <= 0) continue; // the plan's cap is already full
+    const id = uuidV7();
+    await tx.query(
       `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source, is_primary)
-       VALUES ($1,$2,$3,$4,$5,ARRAY[]::text[],'user',$6)
-       ON CONFLICT (project_id, lower(name)) WHERE deleted_at IS NULL DO NOTHING
-       RETURNING id`,
+       VALUES ($1,$2,$3,$4,$5,ARRAY[]::text[],'user',$6)`,
       [id, project.workspaceId, project.id, name, domain, index === 0],
     );
-    if (result.rows[0] !== undefined) {
-      ids.push(result.rows[0].id);
-    } else {
-      const existing = await tx.query<{ id: string }>(
-        `SELECT id FROM competitors WHERE project_id = $1 AND lower(name) = lower($2) AND deleted_at IS NULL`,
-        [project.id, name],
-      );
-      ids.push(existing.rows[0]!.id);
-    }
+    ids.push(id);
+    headroom -= 1;
   }
   return ids;
 }
@@ -190,12 +317,6 @@ export async function deleteExistingDemoFacts(tx: ClientBase, projectId: string,
   ]);
 }
 
-/** Midday UTC of a `YYYY-MM-DD` calendar date, as a Date — built from `Date.UTC`, never a colon-joined interpolated timestamp string (ISO-13's key-construction scanner). */
-function noonUtc(day: string): Date {
-  const [year, month, date] = day.split("-").map(Number) as [number, number, number];
-  return new Date(Date.UTC(year, month - 1, date, 12, 0, 0));
-}
-
 interface CaptureRow {
   readonly id: string;
   readonly engineKey: string;
@@ -229,12 +350,12 @@ export async function resetAndSeedProjectFacts(
   const promptIds = await ensurePrompts(tx, project, promptCount);
   const competitorIds = await ensureCompetitors(tx, project, rngFor(project.id, "competitors"));
 
-  await deleteExistingDemoFacts(tx, project.id, days[0]!);
+  await deleteExistingDemoFacts(tx, project.id, days[0]!.day);
 
   if (engines.length === 0 || promptIds.length === 0) {
     // No entitled engine (a plan with none active) or no prompt slot at all
     // — an honestly empty demo project. Nothing further to write.
-    return { days, promptIds, competitorIds, engineKeys: [] };
+    return { days: days.map((d) => d.day), promptIds, competitorIds, engineKeys: [] };
   }
 
   const profiles = buildEngineProfiles(project.id, engines);
@@ -278,9 +399,7 @@ export async function resetAndSeedProjectFacts(
   // fields, not a replacement for the probabilistic draw everywhere else.
   const forcedPresenceDayIndices = new Set([days.length - 1, days.length - 31].filter((index) => index >= 0));
 
-  for (const [dayIndex, day] of days.entries()) {
-    const capturedAt = noonUtc(day);
-
+  for (const [dayIndex, { capturedAt }] of days.entries()) {
     for (const engine of profiles) {
       const presenceProbability = clamp01(engine.basePresence + engine.drift * dayIndex);
       const isAttributeCapable = ATTRIBUTE_CAPABLE_ENGINES.has(engine.engineKey);
@@ -356,7 +475,7 @@ export async function resetAndSeedProjectFacts(
   await insertRows(tx, "mention_facts", mentionColumns, mentionRows, { captured_at: "timestamptz" });
   await insertRows(tx, "citation_facts", citationColumns, citationRows, { captured_at: "timestamptz" });
 
-  return { days, promptIds, competitorIds, engineKeys: engines.map((engine) => engine.engineKey) };
+  return { days: days.map((d) => d.day), promptIds, competitorIds, engineKeys: engines.map((engine) => engine.engineKey) };
 }
 
 function buildCapture(
