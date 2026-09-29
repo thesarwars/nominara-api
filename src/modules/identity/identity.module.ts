@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 import { DbModule } from "../../db/db.module.js";
+import { TenancyAccessModule } from "../../tenancy/tenancy-access.module.js";
 import { DevEmailSenderAdapter } from "./adapters/dev-email-sender.adapter.js";
 import { LoggingEmailSenderAdapter } from "./adapters/logging-email-sender.adapter.js";
 import { loadEnv } from "../../config/env.js";
@@ -26,8 +27,15 @@ import { SessionService } from "./session.service.js";
 // overrides this provider with a fake at the port boundary
 // (test/integration/identity-oauth-pkce.spec.ts), so OpenidClientAdapter
 // itself carries zero test coverage from this module.
+// STORY-170 — TenancyAccessModule imported so SessionService can inject
+// MembershipService (refresh re-verifies the session's active workspace
+// through the SAME instance WorkspaceGuard and WorkspacesService use — see
+// tenancy-access.module.ts's own "ONE INSTANCE PER PROCESS" comment). No
+// cycle: TenancyAccessModule depends on nothing in this module, and
+// WorkspacesModule (which already imports both) is unaffected — Nest caches
+// one instance per module class across the whole graph.
 @Module({
-  imports: [DbModule],
+  imports: [DbModule, TenancyAccessModule],
   controllers: [IdentityController, OauthController, EmailOtpController],
   providers: [
     IdentityService,

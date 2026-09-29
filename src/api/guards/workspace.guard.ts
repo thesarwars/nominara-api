@@ -99,8 +99,14 @@ export class WorkspaceGuard implements CanActivate {
     //
     //   GET  /v1/workspaces            the client asks this FIRST, to decide
     //                                  whether the user belongs anywhere at all
-    //   POST /v1/workspaces/{id}/switch  the ONLY route that re-mints a token
-    //                                  carrying the CURRENT ent_v
+    //   POST /v1/workspaces/{id}/switch  at the time, the ONLY route that
+    //                                  re-minted a token carrying the CURRENT
+    //                                  ent_v (STORY-170 — SessionService
+    //                                  .refresh re-verifies and re-mints the
+    //                                  session's active workspace fresh too,
+    //                                  now a second way out of this same
+    //                                  deadlock; this guard's own staleness
+    //                                  check below is unchanged either way)
     //
     // So the recovery could not run and the thing that would have fixed the
     // session was itself refused. Every member of a workspace whose plan
