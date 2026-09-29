@@ -57,22 +57,32 @@ export const actionItemPrimaryActionSchema = z
   .object({
     kind: actionItemPrimaryActionKindSchema,
     /**
-     * The meaning is fixed by `kind`, never ambiguous within one kind:
+     * The meaning is fixed by `kind`, never ambiguous within one kind.
+     * `kind` is chosen by precedence — `playbook_slug` is checked BEFORE
+     * `source_finding_id`/`source_displacement_id` (see tasks.service.ts
+     * `derivePrimaryAction`) — so a task can be AUX-finding-derived
+     * (`source` = `"aux"`) and still emit `open_playbook`, when that same
+     * task also carries a playbook slug (e.g. an authority task an AUX
+     * finding recommended):
+     * - `open_playbook`  → `source_domains`-scoped playbook slug. Emitted
+     *                      whenever `tasks.playbook_slug` is set, checked
+     *                      FIRST — regardless of whether the task also
+     *                      carries a finding or displacement id.
+     * - `diagnose`       → `displacements.id` (the share-of-voice drop to
+     *                      diagnose). Only when no playbook slug is set.
      * - `copy_patch`     → `aux_findings.id` (the finding to fetch the
      *                      copy-ready patch for; never patch text itself).
-     * - `diagnose`       → `displacements.id` (the share-of-voice drop to
-     *                      diagnose).
-     * - `open_playbook`  → `source_domains`-scoped playbook slug (a
-     *                      source-seeding/authority action ONLY — never
-     *                      emitted for an AUX-finding-derived task, whose
-     *                      guided fix is its own `copy_patch`).
+     *                      Only when no playbook slug or displacement is
+     *                      set.
      * - `open_task`      → `tasks.id` itself (no more specific evidence
      *                      link exists).
      */
     target: z.string().min(1).describe(
-      "Bare id, meaning fixed by `kind`: copy_patch -> aux_findings.id; diagnose -> displacements.id; " +
-        "open_playbook -> a source-seeding/authority playbook slug (never emitted for an AUX-finding-derived " +
-        "task); open_task -> tasks.id. Never a URL or patch text.",
+      "Bare id, meaning fixed by `kind`, checked in this precedence order: playbook_slug set -> " +
+        "open_playbook, target the playbook slug (checked FIRST, even for an AUX-finding-derived task " +
+        "that also carries a finding or displacement id); else source_displacement_id set -> diagnose, " +
+        "target displacements.id; else source_finding_id set -> copy_patch, target aux_findings.id; " +
+        "else open_task, target tasks.id. Never a URL or patch text.",
     ),
   })
   .strict();

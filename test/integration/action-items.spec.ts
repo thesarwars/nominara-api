@@ -364,6 +364,86 @@ describe("STORY-169 · TasksService.listActionItems — real SQL", () => {
     });
   });
 
+  // ---- primary_action derivation — real SQL, not a mocked-row unit test -----
+  //
+  // The unit tests in tasks.service.spec.ts drive `derivePrimaryAction`
+  // through a mocked pg client's rows, never through a real query. This
+  // pins the SAME documented precedence (contracts/tasks/action-item-
+  // response.schema.ts's `target` .describe(): playbook_slug checked FIRST,
+  // even when the task also carries a finding or displacement id) against
+  // rows `listActionItems` actually reads off disk.
+
+  describe("primary_action derivation — real SQL", () => {
+    it("open_playbook wins over a finding id when a task carries BOTH (an authority task an AUX finding recommended)", async () => {
+      const workspaceId = await createWorkspace();
+      const projectId = await createProject(workspaceId);
+      const findingId = await createAuxFinding(workspaceId, projectId, { severity: "high" });
+      const taskId = await createTask(workspaceId, projectId, {
+        sourceFindingId: findingId,
+        playbookSlug: "reddit-seeding",
+      });
+
+      const page = await listAll(CTX(workspaceId));
+      const item = page.items.find((i) => i.id === taskId)!;
+      expect(item.primary_action).toEqual({ kind: "open_playbook", target: "reddit-seeding" });
+      // Still traced back to the AUX finding on `source`, even though the
+      // primary action is the playbook — these are independent fields.
+      expect(item.source).toBe("aux");
+    });
+
+    it("open_playbook wins over a displacement id when a task carries both", async () => {
+      const workspaceId = await createWorkspace();
+      const projectId = await createProject(workspaceId);
+      const taskId = await createTask(workspaceId, projectId, {
+        sourceDisplacementId: "0195e5b7-0000-7000-8000-0000000000e1",
+        playbookSlug: "authority-backlink",
+      });
+
+      const page = await listAll(CTX(workspaceId));
+      const item = page.items.find((i) => i.id === taskId)!;
+      expect(item.primary_action).toEqual({ kind: "open_playbook", target: "authority-backlink" });
+    });
+
+    it("diagnose, targeting the displacement id, when no playbook_slug is set", async () => {
+      const workspaceId = await createWorkspace();
+      const projectId = await createProject(workspaceId);
+      const taskId = await createTask(workspaceId, projectId, {
+        sourceDisplacementId: "0195e5b7-0000-7000-8000-0000000000e2",
+      });
+
+      const page = await listAll(CTX(workspaceId));
+      expect(page.items.find((i) => i.id === taskId)!.primary_action).toEqual({
+        kind: "diagnose",
+        target: "0195e5b7-0000-7000-8000-0000000000e2",
+      });
+    });
+
+    it("copy_patch, targeting the finding id, when no playbook_slug or displacement id is set", async () => {
+      const workspaceId = await createWorkspace();
+      const projectId = await createProject(workspaceId);
+      const findingId = await createAuxFinding(workspaceId, projectId, { severity: "critical", ruleCode: "AUX-R-001" });
+      const taskId = await createTask(workspaceId, projectId, { sourceFindingId: findingId });
+
+      const page = await listAll(CTX(workspaceId));
+      expect(page.items.find((i) => i.id === taskId)!.primary_action).toEqual({
+        kind: "copy_patch",
+        target: findingId,
+      });
+    });
+
+    it("open_task, targeting the task itself, when the task derives none of the above", async () => {
+      const workspaceId = await createWorkspace();
+      const projectId = await createProject(workspaceId);
+      const taskId = await createTask(workspaceId, projectId, {});
+
+      const page = await listAll(CTX(workspaceId));
+      expect(page.items.find((i) => i.id === taskId)!.primary_action).toEqual({
+        kind: "open_task",
+        target: taskId,
+      });
+    });
+  });
+
   // ---- code -----------------------------------------------------------------
 
   it("code is COALESCE(aux_findings.rule_code, tasks.rule_code)", async () => {
