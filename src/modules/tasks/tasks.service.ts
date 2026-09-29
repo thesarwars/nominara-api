@@ -31,6 +31,22 @@ export class TasksService {
    * `ProjectsService.list` so the two can never disagree about who is
    * in scope.
    *
+   * FIXED (STORY-169 review): this predicate can only narrow rows that
+   * reach it, and until `@ScopedByQuery()` existed, NO scoped manager or
+   * viewer ever did. `RbacGuard.assertInScope` refuses a "scoped"
+   * permission on any route with no `@ProjectParam()` by default —
+   * `WorkspacesController.listActionItems`'s URL names a WORKSPACE, not a
+   * project, so it has none, and the guard threw `ProjectOutOfScopeException`
+   * for EVERY project-scoped manager/viewer, including one scoped to many
+   * projects, not zero. `GET /v1/projects` had the identical gap. Both
+   * routes now carry `@ScopedByQuery()`, which lets a NON-EMPTY scope
+   * through so this predicate is the thing that actually narrows the rows
+   * — and still refuses a scope of zero projects outright, because an empty
+   * scope never reaches `set_config` (`tenant-context.ts`) and would
+   * otherwise read as "unrestricted" here. `rbac.guard.spec.ts`'s "STORY-169
+   * review" scenarios and `test/integration/action-items.spec.ts`'s scope
+   * tests cover both routes.
+   *
    * ORDERING CONFLICT, RESOLVED TOWARD THE REFERENCE (spec-navigation: a
    * reference beats a story). product-spec.md `FR-GD-02` ranks "impact
    * score then severity then age" — impact first. `STORY-089`'s AC reads
@@ -59,9 +75,19 @@ export class TasksService {
    * `projects.open_tasks_by_severity`, imported from there rather than
    * re-declared so the two constants cannot drift apart. A task deriving
    * neither, or whose only signal is `gap_severity = 'none'` ("no gap",
-   * not "no data"), gets a null severity — `NULLIF(..., 'none')` turns that
-   * literal into SQL NULL before it reaches the mapper, so it can never leak
-   * onto the wire as a value the contract's enum does not carry.
+   * not "no data"), gets a null severity.
+   *
+   * `severity` IS WHITELISTED, not merely `NULLIF(..., 'none')`.
+   * `aux_findings.severity`'s own CHECK allows `'info'` (schemas/aux-and-
+   * geo-analysis.md — a real, low-priority finding, not a data gap), which
+   * `NULLIF(..., 'none')` would pass straight through onto the wire. The
+   * contract's `actionItemSeveritySchema` is `critical|high|medium|low` —
+   * four members, not five — so an 'info'-severity finding's task would
+   * publish a value the enum does not carry, failing every strict client
+   * parse of the whole page. The `CASE WHEN ... IN (...)` below only ever
+   * emits one of the four contract members or SQL NULL, matching
+   * `refreshProjectTaskCounts`'s own `FILTER (WHERE severity = ...)` counts,
+   * which already put `'info'` in no bucket the same way.
    */
   async listActionItems(pagination: PaginationRequest): Promise<Page<ActionItem>> {
     const client = currentTenantStore()!.client;
@@ -77,8 +103,10 @@ export class TasksService {
            p.slug::text AS project_slug,
            COALESCE(af.rule_code, t.rule_code) AS code,
            t.title,
-           NULLIF(COALESCE(af.severity, psi.gap_severity), 'none') AS severity,
-           CASE NULLIF(COALESCE(af.severity, psi.gap_severity), 'none')
+           CASE WHEN COALESCE(af.severity, psi.gap_severity) IN ('critical', 'high', 'medium', 'low')
+                THEN COALESCE(af.severity, psi.gap_severity)
+           END AS severity,
+           CASE COALESCE(af.severity, psi.gap_severity)
              WHEN 'critical' THEN 0
              WHEN 'high'     THEN 1
              WHEN 'medium'   THEN 2
@@ -165,6 +193,22 @@ interface ActionItemRow {
   created_at_key: string;
 }
 
+const VALID_SEVERITIES: ReadonlySet<string> = new Set(["critical", "high", "medium", "low"]);
+
+/**
+ * Second, defensive check on top of the SQL whitelist (the `CASE WHEN ...
+ * IN (...)` above) — `aux_findings.severity`'s CHECK constraint allows
+ * `'info'`, one value outside the contract's four-member enum. Belt and
+ * suspenders: an unchecked `row.severity as ActionItem["severity"]` cast
+ * would silently start publishing a fifth value again the moment the SQL
+ * and this mapper drift, with no compiler or runtime error either side of
+ * the wire — exactly the failure mode this whole finding was.
+ */
+function normalizeSeverity(raw: string | null): ActionItem["severity"] {
+  if (raw === null) return null;
+  return VALID_SEVERITIES.has(raw) ? (raw as ActionItem["severity"]) : null;
+}
+
 const VALID_EFFORT_BANDS: ReadonlySet<string> = new Set(["xs", "s", "m", "l", "xl"]);
 
 /**
@@ -233,7 +277,7 @@ function toActionItem(row: ActionItemRow): ActionItem {
     project_slug: row.project_slug,
     code: row.code,
     title: row.title,
-    severity: row.severity as ActionItem["severity"],
+    severity: normalizeSeverity(row.severity),
     source: deriveSource(row),
     kind: row.kind as ActionItem["kind"],
     impact: row.impact_score,

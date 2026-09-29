@@ -338,6 +338,22 @@ describe("STORY-169 · TasksService.listActionItems — real SQL", () => {
       expect(page.items.find((i) => i.id === taskId)!.severity).toBeNull();
     });
 
+    it("maps aux_findings.severity = 'info' to null — 'info' is a valid CHECK value but outside the 4-member contract enum", async () => {
+      // The exact review violation: aux_findings.severity allows 'info'
+      // (schemas/aux-and-geo-analysis.md), which is not one of the
+      // contract's critical|high|medium|low. Before the fix this leaked
+      // "info" straight onto the wire, and a strict client parse of the
+      // page rejected the whole response.
+      const workspaceId = await createWorkspace();
+      const projectId = await createProject(workspaceId);
+      const findingId = await createAuxFinding(workspaceId, projectId, { severity: "info" });
+
+      const taskId = await createTask(workspaceId, projectId, { sourceFindingId: findingId });
+
+      const page = await listAll(CTX(workspaceId));
+      expect(page.items.find((i) => i.id === taskId)!.severity).toBeNull();
+    });
+
     it("is null when the task derives neither (a manual task with no source link)", async () => {
       const workspaceId = await createWorkspace();
       const projectId = await createProject(workspaceId);

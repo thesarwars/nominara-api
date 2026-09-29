@@ -120,10 +120,29 @@ describe("STORY-169 · TasksService.listActionItems", () => {
     });
   });
 
-  // gap_severity's own "no gap" value must never leak onto the wire as a
-  // literal severity the contract's enum does not carry.
-  it("maps a 'none' severity (from project_source_index.gap_severity) to null", async () => {
-    const page = await serviceReading([row({ severity: null })]).listActionItems({ limit: 50 } as never);
+  // STORY-169 review — REMOVED: a unit test here that fed `severity: null`
+  // straight into the mapper and asserted `null` could not fail if the SQL's
+  // `NULLIF`/`CASE WHEN` ever stopped turning `gap_severity = 'none'` into
+  // SQL NULL — it tested the mapper's trivial null-passthrough, not the
+  // "'none' → null" mapping it was named for. `test/integration/action-
+  // items.spec.ts`'s "maps gap_severity = 'none' to null, never leaking the
+  // literal onto the wire" is the real-SQL case that actually exercises the
+  // SQL side; the mapper's out-of-enum defence is covered directly below.
+
+  // aux_findings.severity's own CHECK allows 'info' — a real value, but one
+  // outside the contract's 4-member critical|high|medium|low enum. The SQL
+  // whitelist (`CASE WHEN ... IN (...)`) is what actually keeps it off the
+  // wire in production; this pins the SQL text AND the mapper's own,
+  // second, defensive normalisation (`normalizeSeverity`) in case a row
+  // ever reaches the mapper with something the SQL should have already
+  // excluded.
+  it("SQL whitelists severity to the four contract values, not merely NULLIF(..., 'none')", async () => {
+    await serviceReading([]).listActionItems({ limit: 50 } as never);
+    expect(calls[0]!.sql).toContain("CASE WHEN COALESCE(af.severity, psi.gap_severity) IN ('critical', 'high', 'medium', 'low')");
+  });
+
+  it("maps an out-of-enum severity value (e.g. 'info') reaching the mapper to null, defensively", async () => {
+    const page = await serviceReading([row({ severity: "info" })]).listActionItems({ limit: 50 } as never);
     expect(page.items[0]!.severity).toBeNull();
   });
 
