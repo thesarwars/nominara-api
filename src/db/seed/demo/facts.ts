@@ -168,12 +168,14 @@ async function promptSlotsUsed(tx: ClientBase, workspaceId: string, projectId?: 
 async function ensurePrompts(tx: ClientBase, project: DemoProjectRef, count: number): Promise<string[]> {
   const templates = DEMO_PROMPT_TEMPLATES.slice(0, Math.min(count, DEMO_PROMPT_TEMPLATES.length));
 
-  const [perProjectCap, totalCap, perProjectUsed, totalUsed] = await Promise.all([
-    structuralCap(tx, project.workspaceId, "prompts.max_per_project"),
-    structuralCap(tx, project.workspaceId, "prompts.max_total"),
-    promptSlotsUsed(tx, project.workspaceId, project.id),
-    promptSlotsUsed(tx, project.workspaceId),
-  ]);
+  // Sequential, deliberately — `tx` is a single pg client/transaction, and
+  // concurrent queries on one connection are a deprecated pattern (pg 8.23
+  // warns on it; pg 9 removes it), not real parallelism. Same posture as
+  // `seed-demo.spec.ts`'s own `countsFor` helper.
+  const perProjectCap = await structuralCap(tx, project.workspaceId, "prompts.max_per_project");
+  const totalCap = await structuralCap(tx, project.workspaceId, "prompts.max_total");
+  const perProjectUsed = await promptSlotsUsed(tx, project.workspaceId, project.id);
+  const totalUsed = await promptSlotsUsed(tx, project.workspaceId);
   let headroom = Math.max(0, Math.min(perProjectCap - perProjectUsed, totalCap - totalUsed));
 
   const ids: string[] = [];
