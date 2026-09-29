@@ -3,6 +3,7 @@ import type { Client as PgClient, ClientBase } from "pg";
 import { connect, requireDatabaseUrl } from "./client.js";
 import { createPgPool } from "./pg-pool.js";
 import { PARTITIONED_FACT_TABLES } from "./conventions.js";
+import { describeTarget } from "./local-target.js";
 import { ensurePartitionsForTable } from "../workers/rollup/maintenance.js";
 import { DemoSeedRefusedError, assertDemoSeedAllowed } from "./seed/demo/guard.js";
 import { ensureDemoProjects, listActiveProjects } from "./seed/demo/projects.js";
@@ -283,6 +284,16 @@ async function main(): Promise<void> {
     databaseUrlPooled: process.env.DATABASE_URL_POOLED,
     optIn: process.env.NOMINARA_DEMO_SEED,
   });
+
+  // `assertDemoSeedAllowed`'s local-host check is BY NAME ONLY
+  // (`local-target.ts`'s own header) — it cannot tell a real local Postgres
+  // apart from a `localhost` port-forward to a remote one (a Cloud SQL Auth
+  // Proxy, `kubectl port-forward`, `ssh -L`). Printing the RESOLVED
+  // host/port/database before writing a single row is the mitigation: an
+  // operator not expecting the database on the other end of a tunnel sees
+  // it named here, before any write.
+  process.stdout.write(`DATABASE_URL resolves to ${describeTarget(process.env.DATABASE_URL ?? "")}\n`);
+  process.stdout.write(`DATABASE_URL_POOLED resolves to ${describeTarget(process.env.DATABASE_URL_POOLED ?? "")}\n`);
 
   const ownerClient = await connect(requireDatabaseUrl());
   const pool = createPgPool(process.env.DATABASE_URL_POOLED!);

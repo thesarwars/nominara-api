@@ -13,7 +13,21 @@ do not.
 
 **Dev-only.** It refuses to run unless `NODE_ENV` is not `production`, both
 `DATABASE_URL` and `DATABASE_URL_POOLED` name a local host, and you pass an
-explicit opt-in — see `src/db/seed/demo/guard.ts`.
+explicit opt-in (`NOMINARA_DEMO_SEED=1`) — see `src/db/seed/demo/guard.ts`.
+
+**Known limitation: the local-host check is by NAME ONLY.** It cannot tell
+a real local Postgres apart from a `localhost` (or `127.0.0.1`) port-forward
+to a REMOTE database — a Cloud SQL Auth Proxy on `127.0.0.1:5432`, `kubectl
+port-forward svc/postgres 5432:5432`, or `ssh -L 5432:remote-db:5432` all
+pass it, because the hostname genuinely is local and the tunnelling happens
+below anything a hostname parse can see (`src/db/local-target.ts`'s own
+header). This seed does not attempt to detect that by opening a connection
+and probing it (no `SELECT inet_server_addr()`, no network probe of any
+kind) — every run is a human at a terminal, so the mitigation is: **it
+prints the RESOLVED `host:port/database` for both connection strings before
+writing a single row.** Read that line. A port-forward tunnel usually
+reveals itself in the port or the database name even when the host reads
+"localhost".
 
 ## Usage
 

@@ -24,6 +24,24 @@
 // `pg.Client` instead reads the exact host node-postgres itself resolves to,
 // including the query-param override, and constructing a `Client` performs
 // no I/O — it only builds `ConnectionParameters`, it does not open a socket.
+//
+// ⚠ KNOWN, DELIBERATE LIMITATION (STORY-169 review) — this check is by NAME
+// ONLY, never by what actually answers on the other end. A `localhost` (or
+// `127.0.0.1`) port-forward to a REMOTE database — a Cloud SQL Auth Proxy
+// listening on `127.0.0.1:5432`, `kubectl port-forward svc/postgres
+// 5432:5432`, or `ssh -L 5432:remote-db:5432` — passes this check every
+// time: the hostname genuinely is local, node-postgres genuinely opens a
+// socket to `localhost`, and the traffic is genuinely tunnelled somewhere
+// else afterward, entirely outside anything a hostname parse can see. This
+// module intentionally does NOT open a connection to find that out (no
+// `SELECT inet_server_addr()`, no network probe of any kind) — every
+// caller of this guard is a dev-only tool a human runs directly, so the
+// mitigation is a human one: `pnpm db:seed-demo` prints the RESOLVED
+// host/port/database it is about to write to before it writes anything
+// (see `src/db/seed-demo.ts`'s `main()`), so a port-forward reads as
+// "localhost:5432/nominara" rather than silently naming the remote
+// database at the other end of the tunnel — an operator who is not
+// expecting that database to be local sees it before any row is written.
 import { Client } from "pg";
 
 /** Hostnames that are a developer's own machine, and nothing else. */
@@ -55,4 +73,33 @@ export function hostnameOf(databaseUrl: string): string {
 /** Whether `databaseUrl` names a host in `LOCAL_HOSTS` — false for an unparseable URL, never a throw. */
 export function isLocalTarget(databaseUrl: string): boolean {
   return LOCAL_HOSTS.has(hostnameOf(databaseUrl));
+}
+
+/**
+ * `"host:port/database"`, resolved the SAME way `hostnameOf` is — via
+ * `pg.Client`'s own parser, never `new URL(...)`, and never a throw. For a
+ * human to read before a dev-only write tool runs, precisely because
+ * `isLocalTarget` is a name-only check (see this module's own header): a
+ * `localhost` port-forward to a remote database resolves its hostname to
+ * "localhost" here too, but the PORT often gives it away (a Cloud SQL Auth
+ * Proxy or an `ssh -L`/`kubectl port-forward` tunnel rarely happens to bind
+ * the same port Postgres would use un-forwarded), and the DATABASE NAME at
+ * the far end of a tunnel is frequently not the developer's own local one
+ * either. Printing all three is the mitigation this module can offer
+ * without opening a connection to find out more — see the header for why
+ * it deliberately does not do that.
+ */
+export function describeTarget(databaseUrl: string): string {
+  if (databaseUrl.trim() === "") {
+    return "(unparseable DATABASE_URL)";
+  }
+  try {
+    const client = new Client({ connectionString: databaseUrl });
+    if (client.host === "") {
+      return "(unparseable DATABASE_URL)";
+    }
+    return `${client.host}:${String(client.port)}/${client.database}`;
+  } catch {
+    return "(unparseable DATABASE_URL)";
+  }
 }
