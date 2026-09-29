@@ -643,6 +643,93 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     expect(Number(slotOccupyingPrompts.rows[0]!.n)).toBe(40);
   }, 180_000);
 
+  // STORY-169 review — PROBE C above proves a REAL fact OUTSIDE the demo
+  // window survives `--purge` byte-for-byte, but its own real row sits 90
+  // days back, so it never exercises purge.ts's RE-ROLL half at all: a day
+  // INSIDE the demo window that ALSO carries a real fact. This is the
+  // headline behaviour commit 9e45f54's message claims ("re-roll real
+  // metric_daily on --purge") and, before this test, nothing could catch a
+  // regression in it — a blanket `DELETE FROM metric_daily` for the whole
+  // range (the pre-review defect) and a purge that skips the re-roll
+  // entirely (leaving the demo-inflated row in place) both produce
+  // DIFFERENT wrong answers than the real-only re-roll, and this test tells
+  // all three apart.
+  it("STORY-169 review · --purge re-rolls a day with a REAL fact inside the demo window to its real-only value, and drops rows for demo-only days", async () => {
+    const workspaceId = await createWorkspace("growth");
+    const project = await client.query<{ id: string }>(
+      `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, status)
+       VALUES ($1,'Real Project','real-project-h','https://real-h.example','real-h.example','active')
+       RETURNING id`,
+      [workspaceId],
+    );
+    const projectId = project.rows[0]!.id;
+
+    // A REAL prompt and a REAL, present `chatgpt` capture, on a fixed
+    // calendar day well INSIDE the seed's 60-day window (today - 5) —
+    // never derived from `now()` at test-run time, so it cannot flake
+    // across a UTC midnight boundary.
+    const realPrompt = await client.query<{ id: string }>(
+      `INSERT INTO tracked_prompts (workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status)
+       VALUES ($1,$2,'a real customer prompt no demo template ever produces',
+               sha256('a real customer prompt no demo template ever produces'::bytea),'custom','decision','active')
+       RETURNING id`,
+      [workspaceId, projectId],
+    );
+    await client.query(
+      `INSERT INTO answer_captures
+         (workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
+          capture_mode, adapter_version, normalizer_version, content_hash, payload,
+          brand_present, sov, sentiment_label, status)
+       VALUES ($1,$2,gen_random_uuid(),$3,'chatgpt',0,
+               ((CURRENT_DATE - 5)::timestamp + interval '10 hours')::timestamptz,
+               'api','1.0.0','real-capture-h',sha256('real-capture-h'::bytea),'{}'::jsonb,
+               true,0.5,'positive','parsed')`,
+      [workspaceId, projectId, realPrompt.rows[0]!.id],
+    );
+
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+
+    // Before purge: the mixed day's `all`-engine rollup combines the real
+    // cell with the seed's own demo cells for that same day — strictly
+    // more than the real fact's own count of 1.
+    const beforePurge = await client.query<{ cells_total: string }>(
+      `SELECT cells_total::text FROM metric_daily
+        WHERE project_id = $1 AND metric_date = (CURRENT_DATE - 5) AND engine_key = 'all' AND entity_type = 'brand'`,
+      [projectId],
+    );
+    expect(beforePurge.rows).toHaveLength(1);
+    expect(Number(beforePurge.rows[0]!.cells_total)).toBeGreaterThan(1);
+
+    await runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: testPool(), log: () => {} });
+
+    // Re-rolled, not blanket-deleted and not left at its demo-inflated
+    // value: the mixed day KEEPS a row, now computed from the real fact
+    // ALONE.
+    const afterPurgeMixedDay = await client.query<{ cells_total: string }>(
+      `SELECT cells_total::text FROM metric_daily
+        WHERE project_id = $1 AND metric_date = (CURRENT_DATE - 5) AND engine_key = 'all' AND entity_type = 'brand'`,
+      [projectId],
+    );
+    expect(afterPurgeMixedDay.rows).toHaveLength(1);
+    expect(Number(afterPurgeMixedDay.rows[0]!.cells_total)).toBe(1);
+
+    // The real capture itself survives purge, untouched.
+    const realCaptureStillThere = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM answer_captures WHERE project_id = $1 AND normalizer_version = 'real-capture-h'`,
+      [projectId],
+    );
+    expect(Number(realCaptureStillThere.rows[0]!.n)).toBe(1);
+
+    // A demo-ONLY day (no real fact at all, today - 10) inside the same
+    // window loses its row entirely — never left behind, and never
+    // recreated from nothing.
+    const demoOnlyDayRow = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM metric_daily WHERE project_id = $1 AND metric_date = (CURRENT_DATE - 10)`,
+      [projectId],
+    );
+    expect(Number(demoOnlyDayRow.rows[0]!.n)).toBe(0);
+  }, 180_000);
+
   // STORY-169 re-audit — `structuralCap`/`projectsMaxCap` mapped ANY
   // non-number (including `null`/`false`) to `Infinity`, "no numeric
   // ceiling". `classification.ts`'s own `structuralLimitFrom` — the ONE
