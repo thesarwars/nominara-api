@@ -1,11 +1,11 @@
 import "reflect-metadata";
 import type { ExecutionContext } from "@nestjs/common";
-import { NotFoundException } from "@nestjs/common";
+import { NotFoundException, SetMetadata } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectParam } from "../decorators/project-param.decorator.js";
 import { RequirePermission } from "../decorators/require-permission.decorator.js";
-import { ScopedByQuery } from "../decorators/scoped-by-query.decorator.js";
+import { ScopedByQuery, SCOPED_BY_QUERY_KEY } from "../decorators/scoped-by-query.decorator.js";
 import { PermissionDeniedException, ProjectOutOfScopeException, StepUpRequiredException } from "../../tenancy/errors.js";
 import { RbacGuard, type RbacScopedRequest } from "./rbac.guard.js";
 
@@ -355,6 +355,37 @@ describe("STORY-019 · RbacGuard", () => {
         params: { projectId: "proj-b" },
       };
       expect(() => guard.canActivate(makeContext(BothDecoratorsController, req))).toThrow(ProjectOutOfScopeException);
+    });
+
+    // STORY-169 review (minor) — `@ScopedByQuery()` is typed `MethodDecorator`
+    // ONLY now, so `@ScopedByQuery() class Foo {}` is a compile error. This
+    // proves the RUNTIME half holds too, in case that metadata ever lands on
+    // a class some other way (a future refactor, a decorator applied via a
+    // type assertion): `RbacGuard` must read it from the handler alone, so a
+    // controller carrying it at the class level widens NOTHING for a route
+    // that never opted in itself.
+    it("metadata attached at the CLASS level (bypassing the type restriction) is ignored — RbacGuard reads the handler only", () => {
+      @RequirePermission("task:read")
+      class ClassLevelScopedController {
+        handler(): void {}
+      }
+      // Simulates the metadata landing on the CLASS rather than the method —
+      // exactly what `@ScopedByQuery(): MethodDecorator & ClassDecorator`
+      // used to allow a caller to do directly. `SetMetadata(...)` itself is
+      // still callable as a class decorator at runtime (only the exported
+      // `ScopedByQuery` wrapper is now restricted to `MethodDecorator` by
+      // its TYPE), so this is the one way this metadata could still reach a
+      // class — and RbacGuard must not honour it there.
+      SetMetadata(SCOPED_BY_QUERY_KEY, true)(ClassLevelScopedController);
+
+      const req: RbacScopedRequest = { membership: { role: "manager", projectScope: ["proj-a"] } };
+      const context = {
+        getHandler: () => ClassLevelScopedController.prototype.handler,
+        getClass: () => ClassLevelScopedController,
+        switchToHttp: () => ({ getRequest: () => req, getResponse: () => ({}) }),
+      } as unknown as ExecutionContext;
+
+      expect(() => guard.canActivate(context)).toThrow(ProjectOutOfScopeException);
     });
   });
 });

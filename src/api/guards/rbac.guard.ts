@@ -106,10 +106,13 @@ export class RbacGuard implements CanActivate {
     // through here rather than refused. `scope.length === 0` is refused
     // regardless — see `@ScopedByQuery()` for why that case must never
     // reach the query.
-    const scopedByQuery = this.reflector.getAllAndOverride<boolean>(SCOPED_BY_QUERY_KEY, [
-      context.getHandler(),
-      context.getClass(),
-    ]);
+    //
+    // Read from the HANDLER ONLY, deliberately never `getAllAndOverride`
+    // against `[handler, class]` — see the decorator's own comment: this is
+    // the one metadata key on this guard's path that WIDENS access, so it
+    // must never be reachable by putting the decorator on a controller
+    // class, only on the one route that opts in.
+    const scopedByQuery = this.reflector.get<boolean>(SCOPED_BY_QUERY_KEY, context.getHandler());
     if (scopedByQuery && scope.length > 0) {
       return;
     }

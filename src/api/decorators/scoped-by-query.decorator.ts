@@ -31,5 +31,15 @@ import { SetMetadata } from "@nestjs/common";
 // UNCHANGED: still refused. This decorator only ever WIDENS access on a
 // route that explicitly opts in, never narrows it, and never touches the
 // single-project `@ProjectParam()` path at all.
+//
+// STORY-169 review (minor) — `MethodDecorator` ONLY, never `ClassDecorator`.
+// A route this decorator WIDENS access on is exactly the kind of thing that
+// must never apply to a whole controller by accident: `RbacGuard` reads
+// this metadata from `context.getHandler()` alone (never `getAllAndOverride`
+// against `[handler, class]`, unlike `@RequirePermission`/`@ProjectParam()`,
+// which only ever NARROW and are safe at either level), so a controller
+// carrying this decorator at the class level would silently opt every route
+// in it into the widened check — including ones whose query does no
+// scope-narrowing of its own.
 export const SCOPED_BY_QUERY_KEY = "scopedByQuery";
-export const ScopedByQuery = (): MethodDecorator & ClassDecorator => SetMetadata(SCOPED_BY_QUERY_KEY, true);
+export const ScopedByQuery = (): MethodDecorator => SetMetadata(SCOPED_BY_QUERY_KEY, true) as MethodDecorator;
