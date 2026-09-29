@@ -69,16 +69,24 @@ export async function denormalizeProject(tx: ClientBase, projectId: string, time
     { score: meanOf(nonNullNumbers(prior, "sentiment_score")), measuredCells: cellsIn(prior) },
   );
 
-  // Rendering has its OWN rule, deliberately not the 30-cell threshold above:
-  // "null unless both windows have data" — a project with three
-  // attribute-capable-engine days in each window has a rendering delta even
-  // if its overall cell count (across every engine) has not reached 30.
+  // Rendering shares the SAME window/threshold rule as visibility_delta_30d
+  // (0028's own `COMMENT ON COLUMN projects.rendering_delta_30d`, and
+  // `NFR-ANL-03`, which is not scoped to the visibility score specifically:
+  // "No trend delta, arrow, or percentage change is rendered when n < 30").
+  // The gate is the window's OVERALL measured-cell count — the same
+  // `currentCells`/`cellsIn(prior)` visibility and sentiment read — not a
+  // count of days that happened to have a non-null rendering_quality.
+  // Otherwise a single attribute-capable-engine day in each window (n=1, far
+  // below any confidence threshold) would publish a confident-looking delta.
   // Rendering quality is already null on any day with no attribute-capable
-  // mention, so `meanOf` over the non-null days is the honest window mean.
+  // mention, so `meanOf` over the non-null days is still the right window
+  // mean — only the null-below-30 GATE moves to the shared cell count.
   const currentRenderingMean = meanOf(nonNullNumbers(current, "rendering_quality"));
   const priorRenderingMean = meanOf(nonNullNumbers(prior, "rendering_quality"));
-  const renderingDelta30d =
-    currentRenderingMean === null || priorRenderingMean === null ? null : currentRenderingMean - priorRenderingMean;
+  const renderingDelta30d = visibilityDelta(
+    { score: currentRenderingMean, measuredCells: currentCells },
+    { score: priorRenderingMean, measuredCells: cellsIn(prior) },
+  );
 
   const visibilityByEngine = await perEngineWindow(tx, projectId, timezone, boundary);
 

@@ -431,11 +431,13 @@ describe("STORY-042 · rollup.metric_daily", () => {
     expect(row.rows[0]!.cells_30d).toBe(1);
   });
 
-  it("STORY-169 · rendering_delta_30d is NULL unless both windows have data, even with a single well-sampled day", async () => {
-    // rendering_delta_30d's own rule ("null unless both windows have data")
-    // is deliberately NOT the 30-cell threshold above — a project can have a
-    // rendering mean in the current window with no prior-window data at all,
-    // and the delta must still be null rather than "current minus nothing".
+  it("STORY-169 · rendering_delta_30d is NULL when the prior window has no cells at all, even with a well-sampled current day", async () => {
+    // rendering_delta_30d shares visibility_delta_30d's window/threshold
+    // rule (0028's own COMMENT ON COLUMN, and NFR-ANL-03, which is not
+    // scoped to the visibility score specifically). Here the prior window's
+    // OVERALL cell count is zero — under the 30-cell gate on either side —
+    // so the delta must stay null rather than "current minus nothing", quite
+    // apart from the current window's single day having a real rendering mean.
     const at = new Date(Date.now() - 2 * 86_400_000).toISOString();
     const cell = await addCell({ capturedAt: at, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
     await addMention(cell, at, { renderScore: 0.6 });
@@ -450,7 +452,14 @@ describe("STORY-042 · rollup.metric_daily", () => {
     expect(row.rows[0]!.rendering_delta_30d).toBeNull();
   });
 
-  it("STORY-169 · rendering_delta_30d is the current window mean minus the prior window mean", async () => {
+  it("STORY-169 review · rendering_delta_30d is NULL when both windows have a rendering mean but fewer than 30 cells", async () => {
+    // The exact violation review caught: one well-sampled-LOOKING day per
+    // window (a real, non-null rendering_quality on both sides) but each
+    // window's OVERALL measured-cell count is 1 — nowhere near the 30-cell
+    // gate — so the delta must stay null, not "current minus prior".
+    // Reproduces PROBE B: two 'all' brand rows with cells_total=1 used to
+    // publish a non-null delta ("40.000") while visibility_delta_30d, over
+    // the identical windows, correctly stayed null.
     const priorAt = new Date(Date.now() - 40 * 86_400_000).toISOString();
     const currentAt = new Date(Date.now() - 2 * 86_400_000).toISOString();
 
@@ -463,6 +472,31 @@ describe("STORY-042 · rollup.metric_daily", () => {
     await roll(currentAt.slice(0, 10));
     await denormalizeProject(db, projectId, "UTC");
 
+    const row = await db.query<{
+      rendering_quality: string | null;
+      rendering_delta_30d: string | null;
+      cells_30d: number | null;
+    }>("SELECT rendering_quality::text, rendering_delta_30d::text, cells_30d FROM projects WHERE id = $1", [projectId]);
+    expect(Number(row.rows[0]!.rendering_quality)).toBeGreaterThan(0);
+    expect(row.rows[0]!.cells_30d).toBe(1);
+    expect(row.rows[0]!.rendering_delta_30d).toBeNull();
+  });
+
+  it("STORY-169 · rendering_delta_30d is the current window mean minus the prior window mean, once both windows clear the 30-cell gate", async () => {
+    const priorDay = new Date(Date.now() - 40 * 86_400_000).toISOString();
+    const currentDay = new Date(Date.now() - 2 * 86_400_000).toISOString();
+
+    for (let i = 0; i < 30; i += 1) {
+      const priorCell = await addCell({ capturedAt: priorDay, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+      await addMention(priorCell, priorDay, { renderScore: 0.4 });
+      const currentCell = await addCell({ capturedAt: currentDay, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+      await addMention(currentCell, currentDay, { renderScore: 0.8 });
+    }
+
+    await roll(priorDay.slice(0, 10));
+    await roll(currentDay.slice(0, 10));
+    await denormalizeProject(db, projectId, "UTC");
+
     const dayRendering = async (date: string): Promise<number> => {
       const result = await db.query<{ v: string }>(
         `SELECT rendering_quality::text AS v FROM metric_daily
@@ -471,13 +505,14 @@ describe("STORY-042 · rollup.metric_daily", () => {
       );
       return Number(result.rows[0]!.v);
     };
-    const priorRendering = await dayRendering(priorAt.slice(0, 10));
-    const currentRendering = await dayRendering(currentAt.slice(0, 10));
+    const priorRendering = await dayRendering(priorDay.slice(0, 10));
+    const currentRendering = await dayRendering(currentDay.slice(0, 10));
 
-    const row = await db.query<{ rendering_delta_30d: string | null }>(
-      "SELECT rendering_delta_30d::text FROM projects WHERE id = $1",
+    const row = await db.query<{ rendering_delta_30d: string | null; cells_30d: number | null }>(
+      "SELECT rendering_delta_30d::text, cells_30d FROM projects WHERE id = $1",
       [projectId],
     );
+    expect(row.rows[0]!.cells_30d).toBe(30);
     expect(Number(row.rows[0]!.rendering_delta_30d)).toBeCloseTo(currentRendering - priorRendering, 3);
   });
 
