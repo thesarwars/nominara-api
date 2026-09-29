@@ -42,6 +42,13 @@ describe("STORY-169 · assertDemoSeedAllowed", () => {
     // credentials that CONTAIN a local hostname are not evidence the HOST is
     // local — the user here is "localhost"; the host is not.
     "postgres://localhost:pw@db.prod.internal:5432/nominara",
+    // A `?host=` query parameter overrides the parsed authority for
+    // node-postgres, even though `new URL(...).hostname` still reports
+    // "localhost" — the same hole `studio-target.spec.ts` pins.
+    "postgres://nominara:pw@localhost:5432/nominara?host=prod-db.internal.example.com",
+    // The Cloud SQL Unix-socket idiom is the same trick with a socket path.
+    "postgres://u:p@localhost/db?host=/cloudsql/proj:region:inst",
+    "postgres://nominara:pw@localhost:5432/nominara?host=10.0.0.5",
   ])("refuses a non-local DATABASE_URL: %s", (url) => {
     expect(() => assertDemoSeedAllowed({ ...ALLOWED, databaseUrl: url })).toThrow(DemoSeedRefusedError);
     expect(() => assertDemoSeedAllowed({ ...ALLOWED, databaseUrl: url })).toThrow(/DATABASE_URL names/);
@@ -50,6 +57,7 @@ describe("STORY-169 · assertDemoSeedAllowed", () => {
   it.each([
     "postgres://u:p@db.production.internal:6432/nominara",
     "postgres://u:p@pgbouncer.prod.internal:6432/nominara",
+    "postgres://nominara_app:pw@localhost:6432/nominara?host=prod-db.internal.example.com",
   ])("refuses a non-local DATABASE_URL_POOLED even when DATABASE_URL is local: %s", (url) => {
     expect(() => assertDemoSeedAllowed({ ...ALLOWED, databaseUrlPooled: url })).toThrow(DemoSeedRefusedError);
     expect(() => assertDemoSeedAllowed({ ...ALLOWED, databaseUrlPooled: url })).toThrow(/DATABASE_URL_POOLED names/);
