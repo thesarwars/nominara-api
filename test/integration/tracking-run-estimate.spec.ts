@@ -240,7 +240,12 @@ describe("STORY-034 · estimating a manual deep scan", () => {
     // would silently mis-bill the largest accounts.
     await db.query("UPDATE workspaces SET plan_key = 'enterprise' WHERE id = $1", [workspaceId]);
 
-    await expect(deepScanPrice(db, workspaceId)).rejects.toMatchObject({ code: "precondition_unmet" });
+    // `details.reason` is what tells a client THIS refusal from the other
+    // `precondition_unmet` the same endpoint raises (nothing to capture).
+    await expect(deepScanPrice(db, workspaceId)).rejects.toMatchObject({
+      code: "precondition_unmet",
+      details: { reason: "price_not_agreed" },
+    });
   });
 
   it("takes a negotiated price from the workspace's override", async () => {

@@ -18,10 +18,12 @@ import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { CREDITS_KEY, CREDIT_PRICE_KEY, type CreditAction } from "../decorators/credits.decorator.js";
 import {
   ConflictError,
+  DomainError,
   InsufficientCreditsError,
   PriceChangedError,
   ValidationFailedError,
 } from "../errors/domain-errors.js";
+import { CREDIT_PRECONDITIONS, type CreditPreconditionRequest } from "./credit-preconditions.js";
 import type { DailyCapScopedRequest } from "./daily-cap.guard.js";
 import type { AuthenticatedRequest } from "./auth.guard.js";
 import type { WorkspaceScopedRequest } from "./workspace.guard.js";
@@ -45,7 +47,7 @@ import type { WorkspaceScopedRequest } from "./workspace.guard.js";
 
 const logger = new Logger("credit-guard");
 
-interface CreditScopedRequest extends WorkspaceScopedRequest, DailyCapScopedRequest {
+interface CreditScopedRequest extends WorkspaceScopedRequest, DailyCapScopedRequest, CreditPreconditionRequest {
   headers?: Record<string, string | string[] | undefined>;
   /**
    * AC10 — what the interceptor settles.
@@ -256,6 +258,8 @@ export class CreditGuard implements CanActivate {
     let heldCredits: number | null = null;
     /** Collected, not thrown: throwing here would roll back the transaction that read the claim. */
     let reattachMismatch: InstanceType<typeof PriceChangedError> | null = null;
+    /** A precondition's refusal — collected for the same reason `refusal` is, and thrown after the same compensation. */
+    let unmet: DomainError | null = null;
 
     const client = await this.pool.connect();
     try {
@@ -324,6 +328,32 @@ export class CreditGuard implements CanActivate {
         // Every prior attempt was released, so this is a genuine retry and
         // needs credits of its own.
         attempt = claim.attempts + 1;
+
+        // ⚠ NOTHING TO BUY IS REFUSED BEFORE ANYTHING IS RESERVED. STORY-034.
+        //
+        // Here, and only here: this is the one point where a NEW reservation
+        // is about to be made. A committed action and a re-attached
+        // reservation return above, so a redelivery keeps the meaning it had.
+        //
+        // The handler refuses an empty deep scan too (`planManualRun`), but
+        // it runs after this guard. On a funded wallet that left a permanent
+        // reserve-and-release pair in the customer's own ledger beside a 422
+        // saying nothing was charged; on a low balance the wallet refused
+        // first and told the customer to buy credits for a scan that could not
+        // run. The handler's refusal stays, as the in-transaction backstop.
+        const precondition = CREDIT_PRECONDITIONS[action];
+        if (precondition !== null) {
+          try {
+            await precondition(tx, request);
+          } catch (error) {
+            // A domain refusal is COLLECTED, not thrown: it would roll back
+            // this transaction, and the daily-cap increment has to be given
+            // back outside it (below). Anything else is a defect and escapes.
+            if (!(error instanceof DomainError)) throw error;
+            unmet = error;
+            return;
+          }
+        }
 
         const outcome = await reserveCredits(tx, workspaceId, price);
         if (!outcome.ok) {
@@ -444,6 +474,13 @@ export class CreditGuard implements CanActivate {
     }
 
     if (reattachMismatch !== null) throw reattachMismatch;
+
+    if (unmet !== null) {
+      // Given back like a wallet refusal's: the request spent nothing, so it
+      // must not have spent the day's allowance either.
+      await this.compensateDaily(request);
+      throw unmet;
+    }
 
     if (refusal !== null) {
       // ⚠ OUTSIDE the transaction that failed, and on its own connection.
