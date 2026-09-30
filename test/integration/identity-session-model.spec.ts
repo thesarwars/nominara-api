@@ -7,6 +7,7 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { AuthGuard, type AuthenticatedRequest } from "../../src/api/guards/auth.guard.js";
@@ -23,11 +24,16 @@ import { REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS } from "../../src/lib/auth/refres
 import * as metrics from "../../src/lib/telemetry/metrics.js";
 
 // STORY-170 — this file's env block sets no REFRESH_TOKEN_GRACE_WINDOW_MS,
-// so SessionService.refresh uses the schema's own default. A replay
-// presented this far after the rotation that consumed it is unambiguously
-// OUTSIDE the window regardless of how long the default ever changes to.
-function afterGraceWindow(base: Date): Date {
-  return new Date(base.getTime() + REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS + 1_000);
+// so SessionService.refresh uses the schema's own default. The window is a
+// TTL on the grace slot in the cache, so it runs on the CACHE'S clock, not on
+// refresh()'s `now` argument: the cache handed to `sessions` below is an
+// InMemoryCacheAdapter whose clock this file owns, and "a replay presented
+// this far after the rotation that consumed it" is that clock advanced past
+// the default window with a full second to spare, so it is unambiguously
+// OUTSIDE the window however the default ever changes.
+let cacheClockMs = Date.now();
+function afterGraceWindow(): void {
+  cacheClockMs += REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS + 1_000;
 }
 
 interface ParsedCookie {
@@ -125,7 +131,12 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     userId = userRow.rows[0]!.id;
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
-    sessions = new SessionService(pool, new MembershipService(new MembershipCacheService()));
+    cacheClockMs = Date.now();
+    sessions = new SessionService(
+      pool,
+      new MembershipService(new MembershipCacheService()),
+      new InMemoryCacheAdapter(() => cacheClockMs),
+    );
   });
 
   afterEach(async () => {
@@ -144,10 +155,9 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
   });
 
   it("STORY-017 · scenario 3 — refresh rotates: a new access and refresh token are issued, and the old refresh token is dead once its STORY-170 grace window has closed", async () => {
-    const now = new Date();
     const initial = await sessions.createSession(userId);
 
-    const rotated = await sessions.refresh(initial.refreshToken, now);
+    const rotated = await sessions.refresh(initial.refreshToken);
 
     expect(rotated.sid).toBe(initial.sid);
     expect(rotated.accessToken).not.toBe(initial.accessToken);
@@ -156,24 +166,23 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     // STORY-170 — an IMMEDIATE replay is now the grace-window case
     // (session-refresh-grace-window.spec.ts owns that behaviour); this
     // scenario's own assertion — the old refresh token is genuinely dead —
-    // is presented OUTSIDE the (default 2s) window, past
-    // OUTSIDE_GRACE_WINDOW_MS below.
-    await expect(sessions.refresh(initial.refreshToken, afterGraceWindow(now))).rejects.toThrow(UnauthorizedException);
+    // is presented OUTSIDE the (default 2s) window: the cache's clock has
+    // moved past it.
+    afterGraceWindow();
+    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow(UnauthorizedException);
   });
 
   it("STORY-017 · scenario 4 — presenting a consumed refresh token OUTSIDE its STORY-170 grace window revokes the whole family and raises a security event", async () => {
     const counterSpy = vi.spyOn(metrics, "incrementCounter");
-    const now = new Date();
     const initial = await sessions.createSession(userId);
-    await sessions.refresh(initial.refreshToken, now);
+    await sessions.refresh(initial.refreshToken);
 
     // STORY-170 — an immediate replay is grace-eligible
     // (session-refresh-grace-window.spec.ts's own scenario for that); this
     // scenario is specifically the reuse case that still revokes — the
     // SAME consumed token, presented once the window has closed.
-    await expect(sessions.refresh(initial.refreshToken, afterGraceWindow(now))).rejects.toThrow(
-      "refresh token already used",
-    );
+    afterGraceWindow();
+    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
 
     const sessionRow = await db.query<{ revoked_at: Date | null; revoked_reason: string | null }>(
       "SELECT revoked_at, revoked_reason FROM sessions WHERE id = $1",
@@ -213,14 +222,12 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
   });
 
   it("STORY-017 · scenario 5 — a previously-issued access token is refused via the deny list once family revocation has happened", async () => {
-    const now = new Date();
     const initial = await sessions.createSession(userId);
-    const rotated = await sessions.refresh(initial.refreshToken, now);
+    const rotated = await sessions.refresh(initial.refreshToken);
     // Reuse of the now-consumed original refresh token, OUTSIDE its
     // STORY-170 grace window, revokes the family.
-    await expect(sessions.refresh(initial.refreshToken, afterGraceWindow(now))).rejects.toThrow(
-      "refresh token already used",
-    );
+    afterGraceWindow();
+    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
 
     const guard = new AuthGuard(new Reflector(), pool);
     const req: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: rotated.accessToken }, method: "GET" };

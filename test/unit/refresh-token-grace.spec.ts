@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { decryptGraceSuccessor, encryptGraceSuccessor, generateRefreshToken } from "../../src/lib/auth/refresh-token.js";
+import {
+  decryptGraceSuccessor,
+  encryptGraceSuccessor,
+  generateRefreshToken,
+  hashRefreshToken,
+  parseGraceSlot,
+  serializeGraceSlot,
+} from "../../src/lib/auth/refresh-token.js";
 
 // STORY-170 — the refresh-token grace window keeps the successor encrypted
 // under a key derived from the PREDECESSOR token (security-and-tenancy.md §5).
@@ -49,5 +56,33 @@ describe("STORY-170 · grace-window successor encryption", () => {
     const predecessor = generateRefreshToken();
     const successor = generateRefreshToken();
     expect(encryptGraceSuccessor(SESSION, predecessor, successor)).not.toBe(encryptGraceSuccessor(SESSION, predecessor, successor));
+  });
+});
+
+describe("STORY-170 · the grace slot's stored form", () => {
+  const slot = () => ({
+    predecessorHash: hashRefreshToken(generateRefreshToken()),
+    successorCiphertext: encryptGraceSuccessor(SESSION, generateRefreshToken(), generateRefreshToken()),
+  });
+
+  it("round-trips exactly the predecessor hash and the sealed successor", () => {
+    const stored = slot();
+    expect(parseGraceSlot(serializeGraceSlot(stored))).toEqual(stored);
+  });
+
+  it.each([
+    ["not JSON", "v1:refresh-grace-v1:abc:def"],
+    ["JSON that is not an object", "\"a string\""],
+    ["an object missing the successor", JSON.stringify({ predecessorHash: "abc" })],
+    ["an object missing the predecessor hash", JSON.stringify({ successorCiphertext: "abc" })],
+    ["an empty field", JSON.stringify({ predecessorHash: "", successorCiphertext: "abc" })],
+    ["a field of the wrong type", JSON.stringify({ predecessorHash: 1, successorCiphertext: "abc" })],
+    ["an object carrying an unknown key", JSON.stringify({ ...slot(), expiresAt: "2099-01-01" })],
+  ])("a value that is %s is NOT a slot — an absent one, never a partial grant", (_label, raw) => {
+    expect(parseGraceSlot(raw)).toBeUndefined();
+  });
+
+  it("carries no expiry of its own — the cache's TTL is the only clock", () => {
+    expect(Object.keys(JSON.parse(serializeGraceSlot(slot())) as object).sort()).toEqual(["predecessorHash", "successorCiphertext"]);
   });
 });

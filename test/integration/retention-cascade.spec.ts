@@ -9,6 +9,7 @@ import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { importEd25519PublicKeyFromDer, verifyAccessToken } from "../../src/lib/auth/access-token.js";
@@ -894,7 +895,7 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
 
     const pool = new Pool({ connectionString: container.getConnectionUri() });
     try {
-      const sessionService = new SessionService(pool, new MembershipService(new MembershipCacheService()));
+      const sessionService = new SessionService(pool, new MembershipService(new MembershipCacheService()), new InMemoryCacheAdapter());
 
       const workspaceId = await createWorkspace();
       const userId = await createUser();

@@ -96,6 +96,31 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
     expect(env.REFRESH_TOKEN_GRACE_WINDOW_MS).toBe(0);
   });
 
+  // "0" is the switch that DISABLES grace, and z.coerce.number() turns ""
+  // (and any whitespace) into 0. `REFRESH_TOKEN_GRACE_WINDOW_MS=` in a deploy
+  // template must therefore mean "not set", or it silently turns the feature
+  // off with no error and no log line.
+  it.each([["an empty string", ""], ["a single space", " "], ["tabs and newlines", "\t \n"]])(
+    "STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS as %s is UNSET (the 2000 default), never 0 — it must not silently disable grace",
+    (_label, value) => {
+      const env = loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: value });
+      expect(env.REFRESH_TOKEN_GRACE_WINDOW_MS).toBe(2000);
+    },
+  );
+
+  it("STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS accepts exactly the hard maximum (5000) and rejects 5001 — the cap is rejected at boot, not clamped", () => {
+    expect(loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "5000" }).REFRESH_TOKEN_GRACE_WINDOW_MS).toBe(5000);
+    expect(() => loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "5001" })).toThrow(/REFRESH_TOKEN_GRACE_WINDOW_MS/);
+    expect(() => loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "60000" })).toThrow(/REFRESH_TOKEN_GRACE_WINDOW_MS/);
+  });
+
+  it.each([["negative", "-1"], ["fractional", "2000.5"], ["not a number", "two seconds"]])(
+    "STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS that is %s throws, naming that exact key",
+    (_label, value) => {
+      expect(() => loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: value })).toThrow(/REFRESH_TOKEN_GRACE_WINDOW_MS/);
+    },
+  );
+
   it("a MISSING required var throws EnvValidationError naming that exact key", () => {
     const { DATABASE_URL: _drop, ...rest } = VALID;
     expect(() => loadEnv(rest)).toThrow(EnvValidationError);

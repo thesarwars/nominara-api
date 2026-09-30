@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 import { DbModule } from "../../db/db.module.js";
+import { CacheModule } from "../../lib/cache/cache.module.js";
 import { TenancyAccessModule } from "../../tenancy/tenancy-access.module.js";
 import { DevEmailSenderAdapter } from "./adapters/dev-email-sender.adapter.js";
 import { LoggingEmailSenderAdapter } from "./adapters/logging-email-sender.adapter.js";
@@ -34,8 +35,12 @@ import { SessionService } from "./session.service.js";
 // cycle: TenancyAccessModule depends on nothing in this module, and
 // WorkspacesModule (which already imports both) is unaffected — Nest caches
 // one instance per module class across the whole graph.
+// STORY-170 — CacheModule imported EXPLICITLY even though it is @Global(),
+// as PromptsModule/TrackingModule do, so this module compiles on its own:
+// SessionService keeps the refresh-token grace slot in the shared cache
+// (session.service.ts's header says why it is not in Postgres).
 @Module({
-  imports: [DbModule, TenancyAccessModule],
+  imports: [DbModule, CacheModule, TenancyAccessModule],
   controllers: [IdentityController, OauthController, EmailOtpController],
   providers: [
     IdentityService,

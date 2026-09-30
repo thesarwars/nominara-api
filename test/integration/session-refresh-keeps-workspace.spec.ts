@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
@@ -447,7 +448,7 @@ describe("STORY-170 · session refresh keeps the session's active workspace", ()
       password: appPassword,
     });
     try {
-      const appSessionService = new SessionService(appPool, new MembershipService(new MembershipCacheService()));
+      const appSessionService = new SessionService(appPool, new MembershipService(new MembershipCacheService()), new InMemoryCacheAdapter());
 
       // Fixtures (workspace + owner membership) via the harness's own
       // superuser-backed app — only the SUBJECT session below (created,

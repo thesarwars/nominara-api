@@ -10,6 +10,7 @@ import { WorkspacesService, type AuditRequestMeta } from "../../src/modules/work
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 
@@ -70,7 +71,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
     const membership = new MembershipService(new MembershipCacheService());
-    const sessions = new SessionService(pool, membership);
+    const sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),

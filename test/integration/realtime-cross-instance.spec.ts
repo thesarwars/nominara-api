@@ -13,6 +13,7 @@ import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME } from "../../src/lib/auth/cookies
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
@@ -87,7 +88,7 @@ describe("STORY-026 · a broadcast from one gateway reaches a client on another"
 
     pool = new Pool({ connectionString: postgres.getConnectionUri() });
     const membership = new MembershipService(new MembershipCacheService());
-    sessions = new SessionService(pool, membership);
+    sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),

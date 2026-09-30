@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { applyPlanChange, planKeyOnly } from "../../src/lib/billing/apply-plan.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
@@ -34,7 +35,7 @@ describe("STORY-151 · a workspace can change plan, and that is what makes the p
 
   beforeEach(() => {
     pool = new Pool({ connectionString: process.env.DATABASE_URL });
-    sessions = new SessionService(pool, new MembershipService(new MembershipCacheService()));
+    sessions = new SessionService(pool, new MembershipService(new MembershipCacheService()), new InMemoryCacheAdapter());
   });
 
   afterEach(async () => {

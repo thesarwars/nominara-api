@@ -14,6 +14,7 @@ import { WorkspacesService } from "../../src/modules/workspaces/workspaces.servi
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 import { ACCESS_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
@@ -98,7 +99,7 @@ describe("STORY-169 re-audit · a project-scoped manager on GET /v1/projects and
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
     const membership = new MembershipService(new MembershipCacheService());
-    sessions = new SessionService(pool, membership);
+    sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),

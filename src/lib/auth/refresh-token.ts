@@ -1,4 +1,5 @@
 import { createHash, hkdfSync, randomBytes } from "node:crypto";
+import { z } from "zod";
 import { decryptField, encryptField } from "../crypto/envelope.js";
 
 // STORY-017 — refresh tokens are opaque, high-entropy random, stored hashed
@@ -23,8 +24,7 @@ export function hashRefreshToken(raw: string): string {
 // requests racing the same rotation (multiple tabs, multiple app instances)
 // converge on one token instead of one of them revoking the session
 // (SessionService.refresh owns the eligibility decision; this file only
-// owns the window's bound and the at-rest encryption of the value it
-// governs).
+// owns the window's bound and the sealing of the value it governs).
 //
 // Default ~2s: long enough to absorb the in-flight-request race this exists
 // for, short enough that a genuinely stolen-and-replayed token is still
@@ -35,8 +35,23 @@ export function hashRefreshToken(raw: string): string {
 export const REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS = 2_000;
 export const REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS = 5_000;
 
-// The grace successor's raw value is held only for the window
-// (sessions.refresh_grace_successor_ciphertext), encrypted with
+// The longest SessionService will wait on the cache for the grace slot, in
+// either direction. The slot is written and read while the rotation
+// transaction holds row locks and a pool connection, so an unbounded await
+// on a cache that accepted the connection and then went quiet would pin both
+// on every refresh. Past this the cache counts as unavailable: the rotation
+// goes ahead without a slot, and a replay revokes as the strict rule says.
+export const REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS = 500;
+
+// WHERE THE SLOT LIVES: one Valkey key per session (valkey-keys.ts's
+// refreshGraceSlotKey), written with a TTL equal to the window as the last
+// step of the rotation, so the window is anchored at the rotation's commit on
+// Valkey's own clock and the slot ceases to exist when the window closes.
+// It is NEVER in Postgres: a database read must not be able to reach a live
+// refresh token, and a row an idle session leaves behind would outlive the
+// window for as long as the session sat idle.
+//
+// The successor's raw value inside the slot is sealed with
 // src/lib/crypto/envelope.ts — the same AES-256-GCM field format
 // security-and-tenancy.md §8 uses for workspace_keys — under a key DERIVED
 // FROM THE PREDECESSOR TOKEN ITSELF (HKDF-SHA256, salted with the session
@@ -45,22 +60,21 @@ export const REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS = 5_000;
 // - The server never stores the predecessor raw token (only its hash), so
 //   the ciphertext can be opened only by a caller PRESENTING that token —
 //   which is exactly the late arrival the window exists to serve. A leaked
-//   database row, even together with every server secret, does not reveal
-//   the live successor. A server-held key would have made "database + key"
-//   enough to lift the live refresh token of every recently-rotated
-//   session, undoing what storing tokens hashed buys.
-// - A slot left behind by an idle session is therefore inert at rest: it
-//   needs the consumed predecessor to open, and presenting that predecessor
-//   once the window has closed revokes the family instead. That is why no
-//   sweep job exists for expired slots.
+//   cache read, even together with every server secret, does not reveal the
+//   live successor. A server-held key would have made "cache + key" enough
+//   to lift the live refresh token of every recently-rotated session, undoing
+//   what storing tokens hashed buys.
 // - Nothing new to provision: no environment secret, so an existing
 //   deployment's configuration is unchanged by this feature.
 //
-// The AAD binds the ciphertext to this session's row; the HKDF salt binds
-// the key to the session too, so a ciphertext copied onto another session's
-// row, or opened with another session's token, fails authentication.
-const GRACE_ENVELOPE_TABLE = "sessions";
-const GRACE_ENVELOPE_COLUMN = "refresh_grace_successor_ciphertext";
+// The AAD binds the ciphertext to this session's id; the HKDF salt binds the
+// key to the session too, so a ciphertext copied onto another session's slot,
+// or opened with another session's token, fails authentication. The table and
+// column in the AAD are domain-separation labels only — there is no such
+// column; they exist so this ciphertext can never be confused with a
+// workspace_keys field sealed under a different key.
+const GRACE_ENVELOPE_TABLE = "cache";
+const GRACE_ENVELOPE_COLUMN = "refresh_grace_slot";
 const GRACE_ENVELOPE_WORKSPACE_ID = "global";
 const GRACE_ENVELOPE_DEK_ID = "refresh-grace-v1";
 const GRACE_KEY_INFO = "nominara/refresh-grace/v1";
@@ -81,4 +95,29 @@ export function encryptGraceSuccessor(sessionId: string, rawPredecessorToken: st
 /** Recovers the successor; throws if the token, the session or the ciphertext does not match. */
 export function decryptGraceSuccessor(sessionId: string, rawPredecessorToken: string, ciphertext: string): string {
   return decryptField(ciphertext, graceKey(sessionId, rawPredecessorToken), graceAad(sessionId));
+}
+
+// What is stored under the slot key: the predecessor's HASH (so an eligibility
+// check needs no secret) and the sealed successor. Nothing else — in
+// particular no expiry, because the cache's TTL IS the expiry.
+const graceSlotSchema = z
+  .object({
+    predecessorHash: z.string().min(1),
+    successorCiphertext: z.string().min(1),
+  })
+  .strict();
+export type RefreshGraceSlot = z.infer<typeof graceSlotSchema>;
+
+export function serializeGraceSlot(slot: RefreshGraceSlot): string {
+  return JSON.stringify(slot);
+}
+
+/** `undefined` for anything that is not exactly a slot — a malformed value is an absent one, never a partial grant. */
+export function parseGraceSlot(raw: string): RefreshGraceSlot | undefined {
+  try {
+    const parsed = graceSlotSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : undefined;
+  } catch {
+    return undefined;
+  }
 }

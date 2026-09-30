@@ -13,6 +13,7 @@ import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
@@ -92,7 +93,7 @@ describe("STORY-026 · room authorisation over a real socket", () => {
     // setup, not the behaviour under test.
     pool = new Pool({ connectionString: container.getConnectionUri() });
     const membership = new MembershipService(new MembershipCacheService());
-    sessions = new SessionService(pool, membership);
+    sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),

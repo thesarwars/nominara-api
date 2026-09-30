@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach } from "vitest";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { CACHE, type Cache } from "../../src/lib/cache/cache.port.js";
 import { applyFakeApiEnv } from "./fake-env.js";
 
 // STORY-024 T8 — one boot of the REAL, deployed ApiModule against a real
@@ -31,8 +32,18 @@ export interface ApiHarness {
   app(): NestFastifyApplication;
 }
 
+export interface ApiHarnessOptions {
+  /**
+   * Replaces the CACHE provider, built afresh for every booted app. For a
+   * spec whose subject is what the cache holds (STORY-170's refresh grace
+   * slot) and that needs to own the cache's clock; every other spec keeps the
+   * composition root's own provider.
+   */
+  readonly cache?: () => Cache;
+}
+
 /** Call inside a `describe`. Registers the container/app lifecycle hooks and returns accessors. */
-export function useApiHarness(): ApiHarness {
+export function useApiHarness(options: ApiHarnessOptions = {}): ApiHarness {
   let container: StartedPostgreSqlContainer;
   let db: Client;
   let app: NestFastifyApplication;
@@ -73,7 +84,9 @@ export function useApiHarness(): ApiHarness {
     await db.query("CREATE SCHEMA public");
     await migrateUp(db);
 
-    const moduleRef = await Test.createTestingModule({ imports: [ApiModule] }).compile();
+    const builder = Test.createTestingModule({ imports: [ApiModule] });
+    if (options.cache !== undefined) builder.overrideProvider(CACHE).useValue(options.cache());
+    const moduleRef = await builder.compile();
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
     await configureApp(app);
     await app.init();

@@ -5,12 +5,18 @@ import { PG_POOL } from "../../db/pg-pool.js";
 import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { computeCsrfToken } from "../../lib/auth/csrf.js";
 import {
+  REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS,
   REFRESH_TOKEN_TTL_MS,
   decryptGraceSuccessor,
   encryptGraceSuccessor,
   generateRefreshToken,
   hashRefreshToken,
+  parseGraceSlot,
+  serializeGraceSlot,
 } from "../../lib/auth/refresh-token.js";
+import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
+import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
+import { refreshGraceSlotKey } from "../../lib/cache/valkey-keys.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { isWorkspaceUsable, MembershipService } from "../workspaces/membership.service.js";
@@ -80,6 +86,32 @@ import { isWorkspaceUsable, MembershipService } from "../workspaces/membership.s
 // no longer needs the rotation's connection at all makes that safety a
 // structural property instead of an ordering coincidence.
 
+// STORY-170 — the refresh-token reuse GRACE WINDOW (security-and-tenancy.md
+// §5 "Session model"). The slot naming the session's most recent rotation
+// lives in the shared cache (Valkey), NOT in Postgres, and this is the whole
+// design rather than a detail of it:
+//
+// - It carries a TTL equal to the window, so it ceases to exist when the
+//   window closes. A database column would outlive the window for as long as
+//   the session sat idle, and "a database read plus an old, already-consumed
+//   token" would open the live successor offline — a consumed token would no
+//   longer be worthless.
+// - It is written as the LAST step of the rotation, inside the transaction,
+//   immediately before COMMIT. That anchors the window at the commit on the
+//   cache's own clock — not on the `now` captured when the request arrived
+//   (before membership reads, pool.connect and FOR UPDATE waits, on one
+//   instance's own clock) — and it means a racer blocked on the token row's
+//   FOR UPDATE reads the slot right after the commit that released it.
+// - The cache is never trusted to be there. If a write, a read or a delete
+//   fails, or does not answer inside REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS,
+//   the rotation still succeeds (a cache outage must never fail a normal
+//   refresh) but leaves no slot, and a replay then revokes exactly as the
+//   strict rule says. Fail closed.
+// - A slot is honoured only while EVERY condition holds (see
+//   `readGraceSuccessor`); one of them is that the successor it names is
+//   still a live refresh token of this session, so a slot that was not
+//   rewritten by some later rotation can never hand out a dead token.
+
 export interface SessionTokens {
   readonly sid: string;
   readonly accessToken: string;
@@ -94,6 +126,7 @@ export class SessionService {
   constructor(
     @Inject(PG_POOL) private readonly pool: Pool,
     private readonly membership: MembershipService,
+    @Inject(CACHE) private readonly cache: Cache,
   ) {}
 
   private async mintAccessAndCsrf(
@@ -176,6 +209,7 @@ export class SessionService {
         ? await this.verifyWorkspaceContext(preRow.user_id, preActiveWorkspaceId)
         : null;
 
+    let revokedSessionId: string | null = null;
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -194,63 +228,48 @@ export class SessionService {
       }
 
       if (tokenRow.consumed_at !== null) {
-        // STORY-170 — the refresh-token reuse GRACE WINDOW
-        // (security-and-tenancy.md §5). A single slot on `sessions`
-        // (migration 0030) names the token consumed by this session's OWN
-        // IMMEDIATELY-PRECEDING rotation and holds that rotation's
-        // successor, envelope-encrypted, until `refresh_grace_expires_at`.
-        // Locked FOR UPDATE on the SAME row the normal rotation branch
-        // below already locks — this is the one extra read the grace
-        // feature costs, not a new connection or a new table.
+        // STORY-170 — the refresh-token reuse GRACE WINDOW. The session row
+        // is locked FOR UPDATE — the SAME lock, taken in the SAME order
+        // (token row, then session row), the normal rotation branch below
+        // takes — before anything is decided, so a rotation that is still
+        // committing has finished by the time the slot is read.
         const graceSessionResult = await client.query<{
           id: string;
           user_id: string;
           revoked_at: Date | null;
           active_workspace_id: string | null;
-          refresh_grace_predecessor_hash: string | null;
-          refresh_grace_successor_ciphertext: string | null;
-          refresh_grace_expires_at: Date | null;
-        }>(
-          `SELECT id, user_id, revoked_at, active_workspace_id, refresh_grace_predecessor_hash,
-                  refresh_grace_successor_ciphertext, refresh_grace_expires_at
-             FROM sessions WHERE id = $1 FOR UPDATE`,
-          [tokenRow.session_id],
-        );
+        }>(`SELECT id, user_id, revoked_at, active_workspace_id FROM sessions WHERE id = $1 FOR UPDATE`, [
+          tokenRow.session_id,
+        ]);
         const graceSession = graceSessionResult.rows[0];
 
-        // Eligible only for the IMMEDIATE predecessor (this exact token
-        // hash — an older, two-back token never matches the single slot,
-        // which the next rotation always overwrites), a live (non-revoked)
-        // family, and strictly inside the window. Anything else — an older
-        // token, a different session, an already-revoked family, or this
-        // same token presented again after the window closed — falls
+        // Eligible only for the IMMEDIATE predecessor of a LIVE (non-revoked)
+        // family whose slot still exists, and only while the successor it
+        // names is itself still live — see `readGraceSuccessor`. A revoked
+        // session (a logout inside the window, an earlier reuse revocation)
+        // never reads the slot at all. Anything else — an older token, a
+        // different session, an already-dead family, a window that has
+        // closed (the slot is simply gone), an unreachable cache — falls
         // through to the unchanged revoke-and-raise path below.
-        const graceEligible =
-          graceSession !== undefined &&
-          graceSession.revoked_at === null &&
-          graceSession.refresh_grace_predecessor_hash === tokenHash &&
-          graceSession.refresh_grace_successor_ciphertext !== null &&
-          graceSession.refresh_grace_expires_at !== null &&
-          graceSession.refresh_grace_expires_at.getTime() > now.getTime();
+        const successorRaw =
+          graceSession !== undefined && graceSession.revoked_at === null
+            ? await this.readGraceSuccessor(
+                client,
+                graceSession.id,
+                tokenHash,
+                rawRefreshToken,
+                env.REFRESH_TOKEN_GRACE_WINDOW_MS,
+                now,
+              )
+            : null;
 
-        if (graceEligible) {
-          // Opened with the key derived from the token this caller just
-          // presented — the predecessor — which is the only thing that can
-          // open it (see refresh-token.ts).
-          const successorRaw = decryptGraceSuccessor(
-            graceSession!.id,
-            rawRefreshToken,
-            graceSession!.refresh_grace_successor_ciphertext!,
-          );
-
-          // The grace slot itself is left untouched (NOT cleared, NOT
-          // re-dated) — a second, third, ... racing caller inside the same
-          // window must keep hitting this same branch and keep getting the
-          // same successor back. It is wiped only by the next real
-          // rotation (unconditional overwrite below) or by this session's
-          // next access once the window has closed (the non-eligible
-          // branch's wipe, further down).
-          await client.query(`UPDATE sessions SET last_used_at = now() WHERE id = $1`, [graceSession!.id]);
+        if (graceSession !== undefined && successorRaw !== null) {
+          // The slot itself is left untouched (NOT deleted, NOT re-dated) —
+          // a second, third, ... racing caller inside the same window must
+          // keep hitting this same branch and keep getting the same
+          // successor back. It is replaced by the next real rotation and
+          // expires with the window either way.
+          await client.query(`UPDATE sessions SET last_used_at = now() WHERE id = $1`, [graceSession.id]);
 
           // STORY-170 — "the workspace re-verification STORY-170 added
           // still runs": a grace hit re-mints from the SAME
@@ -261,8 +280,8 @@ export class SessionService {
           // window.
           const active = await this.finalizeWorkspaceContext(
             client,
-            graceSession!.id,
-            graceSession!.active_workspace_id,
+            graceSession.id,
+            graceSession.active_workspace_id,
             preActiveWorkspaceId,
             preVerified,
           );
@@ -270,37 +289,39 @@ export class SessionService {
           await client.query("COMMIT");
 
           // Audited security event, distinct from session.reuse_detected —
-          // the session id only, never the token (NFR-SEC-11).
-          this.logger.warn(`refresh token grace-window reuse — same successor returned session_id=${graceSession!.id}`);
-          incrementCounter("nominara_identity_session_refresh_grace_reuse_total", { session_id: graceSession!.id });
+          // the session id only, never a token (NFR-SEC-11).
+          this.logger.warn(
+            `session.refresh_grace_reuse — refresh token grace-window reuse, same successor returned session_id=${graceSession.id}`,
+          );
+          incrementCounter("nominara_identity_session_refresh_grace_reuse_total", { session_id: graceSession.id });
 
           const { accessToken, csrfToken } = await this.mintAccessAndCsrf(
-            graceSession!.id,
-            graceSession!.user_id,
+            graceSession.id,
+            graceSession.user_id,
             now,
             active.ws,
             active.role,
             active.scope,
             active.entV,
           );
-          return { sid: graceSession!.id, accessToken, refreshToken: successorRaw, csrfToken };
+          return { sid: graceSession.id, accessToken, refreshToken: successorRaw, csrfToken };
         }
 
-        // Outside the window, an older (non-immediate-predecessor) token,
-        // or an already-dead family: unchanged from pre-grace-window
-        // behaviour — revoke the whole family and raise
-        // session.reuse_detected. Also wipes any grace state this session
-        // still carried, so a dead family never holds a decryptable
-        // successor at rest either.
+        // Not grace-eligible: unchanged from pre-grace-window behaviour —
+        // revoke the whole family and raise session.reuse_detected.
         await client.query(
-          `UPDATE sessions SET revoked_at = now(), revoked_reason = 'reuse_detected',
-                  refresh_grace_predecessor_hash = NULL, refresh_grace_successor_ciphertext = NULL, refresh_grace_expires_at = NULL
-             WHERE id = $1 AND revoked_at IS NULL`,
+          `UPDATE sessions SET revoked_at = now(), revoked_reason = 'reuse_detected' WHERE id = $1 AND revoked_at IS NULL`,
           [tokenRow.session_id],
         );
         await client.query("COMMIT");
         this.logger.warn(`refresh token reuse detected — session family revoked session_id=${tokenRow.session_id}`);
         incrementCounter("nominara_identity_session_reuse_detected_total", { session_id: tokenRow.session_id });
+        // Flagged for the `finally` below, which removes the slot AFTER the
+        // connection is released: the family is already revoked (which is
+        // what makes the slot inert), so the removal only stops a dead
+        // session leaving a sealed successor in the cache for the rest of its
+        // TTL, and must not pin a pool connection while it waits on the cache.
+        revokedSessionId = tokenRow.session_id;
         throw new UnauthorizedException("refresh token already used");
       }
 
@@ -330,28 +351,7 @@ export class SessionService {
         [uuidV7(), sessionRow.id, hashRefreshToken(rawNewRefreshToken), expiresAt],
       );
 
-      // STORY-170 — this rotation's own token (the one just presented,
-      // `tokenHash`) becomes the ONE grace-eligible predecessor for this
-      // session, unconditionally overwriting whatever the session's
-      // previous rotation left here — "wiped ... on the next rotation" is
-      // this overwrite, not a separate step. graceWindowMs === 0 is the
-      // documented way to disable the feature: no slot is written, so the
-      // very next reuse of ANY token revokes exactly as before STORY-170.
-      const graceWindowMs = env.REFRESH_TOKEN_GRACE_WINDOW_MS;
-      const graceExpiresAt = graceWindowMs > 0 ? new Date(now.getTime() + graceWindowMs) : null;
-      const graceSuccessorCiphertext =
-        graceWindowMs > 0
-          ? encryptGraceSuccessor(sessionRow.id, rawRefreshToken, rawNewRefreshToken)
-          : null;
-      await client.query(
-        `UPDATE sessions
-            SET last_used_at = now(),
-                refresh_grace_predecessor_hash = $2,
-                refresh_grace_successor_ciphertext = $3,
-                refresh_grace_expires_at = $4
-          WHERE id = $1`,
-        [sessionRow.id, graceWindowMs > 0 ? tokenHash : null, graceSuccessorCiphertext, graceExpiresAt],
-      );
+      await client.query(`UPDATE sessions SET last_used_at = now() WHERE id = $1`, [sessionRow.id]);
 
       // STORY-170 — the verification already ran, above, BEFORE this
       // transaction's connection was even taken (see this file's header).
@@ -367,6 +367,23 @@ export class SessionService {
         sessionRow.active_workspace_id,
         preActiveWorkspaceId,
         preVerified,
+      );
+
+      // STORY-170 — the grace slot, and it is deliberately the LAST thing
+      // this transaction does. This rotation's own token (the one just
+      // presented, `tokenHash`) becomes the ONE grace-eligible predecessor of
+      // this session, replacing whatever the previous rotation left. Written
+      // here, with a TTL equal to the window, the window is anchored at the
+      // commit on the cache's clock, and a racer blocked on this token row's
+      // FOR UPDATE reads the slot the instant the commit below releases it.
+      // Never throws: a cache that cannot take the slot costs the window,
+      // not the rotation.
+      await this.writeGraceSlot(
+        sessionRow.id,
+        tokenHash,
+        rawRefreshToken,
+        rawNewRefreshToken,
+        env.REFRESH_TOKEN_GRACE_WINDOW_MS,
       );
 
       await client.query("COMMIT");
@@ -386,7 +403,146 @@ export class SessionService {
       throw error;
     } finally {
       client.release();
+      // Never throws (see discardGraceSlot), so it cannot replace the
+      // UnauthorizedException that is already on its way out.
+      if (revokedSessionId !== null) await this.discardGraceSlot(revokedSessionId);
     }
+  }
+
+  /**
+   * STORY-170 — the grace slot's write, called as the last step of a
+   * rotation, inside its transaction. `windowMs === 0` is the documented way
+   * to disable the feature: no slot is written, so the very next reuse of ANY
+   * token revokes exactly as before STORY-170.
+   *
+   * NEVER THROWS. A cache that errors, is unreachable, or does not answer
+   * inside the deadline leaves the rotation to commit without a slot; a replay
+   * then revokes as the strict rule says. The failure is logged (session id and
+   * error class only — an error message can carry a connection URL) and
+   * counted.
+   */
+  private async writeGraceSlot(
+    sessionId: string,
+    predecessorHash: string,
+    rawPredecessorToken: string,
+    rawSuccessorToken: string,
+    windowMs: number,
+  ): Promise<void> {
+    if (windowMs <= 0) return;
+    try {
+      const slot = serializeGraceSlot({
+        predecessorHash,
+        successorCiphertext: encryptGraceSuccessor(sessionId, rawPredecessorToken, rawSuccessorToken),
+      });
+      await this.withinCacheDeadline(
+        this.cache.set(refreshGraceSlotKey(cacheKeyNamespace(), sessionId), slot, { ttlMs: windowMs }),
+      );
+    } catch (error) {
+      this.reportGraceCacheFailure("write", sessionId, error);
+    }
+  }
+
+  /**
+   * STORY-170 — the successor a grace-window hit returns, or `null` when the
+   * presented token is not entitled to one. Runs on `client`, AFTER the
+   * session row is locked, and returns the raw successor only when EVERY
+   * condition holds:
+   *
+   * - the window is enabled (`windowMs > 0` — 0 disables grace outright, even
+   *   if a slot written under an earlier setting is still in the cache);
+   * - a slot exists — the cache's TTL is the expiry, so a closed window is an
+   *   absent key, not a comparison this code could get wrong;
+   * - the slot is well-formed and its predecessor hash equals the presented
+   *   token's hash — only the IMMEDIATE predecessor, never a token two
+   *   rotations back;
+   * - the successor opens with a key derived from the token presented (the
+   *   only thing that can open it), under this session's id;
+   * - the successor is LIVE: an unconsumed, unexpired refresh_tokens row of
+   *   THIS session. A slot that some path failed to replace can therefore
+   *   never hand a two-back token an already-consumed successor.
+   *
+   * A cache error or a missed deadline is "no slot" — fail closed, and never
+   * an exception: the caller falls through to the revoke path.
+   */
+  private async readGraceSuccessor(
+    client: ClientBase,
+    sessionId: string,
+    presentedHash: string,
+    rawPresentedToken: string,
+    windowMs: number,
+    now: Date,
+  ): Promise<string | null> {
+    if (windowMs <= 0) return null;
+
+    let stored: string | undefined;
+    try {
+      stored = await this.withinCacheDeadline(this.cache.get(refreshGraceSlotKey(cacheKeyNamespace(), sessionId)));
+    } catch (error) {
+      this.reportGraceCacheFailure("read", sessionId, error);
+      return null;
+    }
+    if (stored === undefined) return null;
+
+    const slot = parseGraceSlot(stored);
+    if (slot === undefined || slot.predecessorHash !== presentedHash) return null;
+
+    let successorRaw: string;
+    try {
+      successorRaw = decryptGraceSuccessor(sessionId, rawPresentedToken, slot.successorCiphertext);
+    } catch {
+      return null;
+    }
+
+    const live = await client.query(
+      `SELECT 1 FROM refresh_tokens
+        WHERE token_hash = $1 AND session_id = $2 AND consumed_at IS NULL AND expires_at > $3`,
+      [hashRefreshToken(successorRaw), sessionId, now],
+    );
+    return live.rows.length > 0 ? successorRaw : null;
+  }
+
+  /** STORY-170 — best-effort removal of a dead session's slot. Never throws; see the call site. */
+  private async discardGraceSlot(sessionId: string): Promise<void> {
+    try {
+      await this.withinCacheDeadline(this.cache.delete(refreshGraceSlotKey(cacheKeyNamespace(), sessionId)));
+    } catch (error) {
+      this.reportGraceCacheFailure("delete", sessionId, error);
+    }
+  }
+
+  /**
+   * Rejects when `operation` has not settled inside
+   * REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS. The grace slot is touched while the
+   * rotation transaction holds row locks and a pool connection; a cache that
+   * accepts the connection and then goes quiet must cost the window, never
+   * those. (A late settlement of the abandoned call is handled by the race, so
+   * it cannot surface as an unhandled rejection.)
+   */
+  private async withinCacheDeadline<T>(operation: Promise<T>): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error("cache deadline exceeded"));
+      }, REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS);
+    });
+    try {
+      return await Promise.race([operation, deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private reportGraceCacheFailure(operation: "write" | "read" | "delete", sessionId: string, error: unknown): void {
+    // The error CLASS only. A connection error's message can carry the cache
+    // URL, and the URL can carry credentials.
+    const errorClass = error instanceof Error ? error.name : "unknown";
+    const consequence = {
+      write: "this rotation leaves no grace slot, so a replay will revoke",
+      read: "this replay gets no grace and revokes",
+      delete: "the dead session's slot is left to expire with its TTL",
+    }[operation];
+    this.logger.warn(`refresh grace slot ${operation} failed — ${consequence} session_id=${sessionId} error=${errorClass}`);
+    incrementCounter("nominara_identity_session_refresh_grace_cache_failure_total", { operation });
   }
 
   /**

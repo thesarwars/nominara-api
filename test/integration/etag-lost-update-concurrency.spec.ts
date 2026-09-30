@@ -7,6 +7,7 @@ import { entityTagFor } from "../../src/api/etag/entity-tag.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
@@ -99,7 +100,7 @@ describe("STORY-024 · AC8 — two overlapping PATCHes cannot both win", () => {
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
       membership,
-      new SessionService(pool, membership), new NoopRealtimePublisher());
+      new SessionService(pool, membership, new InMemoryCacheAdapter()), new NoopRealtimePublisher());
   }
 
   async function createUser(): Promise<string> {

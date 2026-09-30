@@ -10,6 +10,7 @@ import { CanonicalParamsGuard } from "../../src/api/guards/canonical-params.guar
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { StepUpRequiredException, ProjectOutOfScopeException, PermissionDeniedException } from "../../src/tenancy/errors.js";
 import { RequirePermission } from "../../src/api/decorators/require-permission.decorator.js";
 import { ProjectParam } from "../../src/api/decorators/project-param.decorator.js";
@@ -124,7 +125,7 @@ describe("STORY-019 · RbacGuard + step-up, against real Postgres", () => {
     workspaceGuard = new WorkspaceGuard(pool, membership, new Reflector());
     authGuard = new AuthGuard(new Reflector(), pool);
     rbacGuard = new RbacGuard(new Reflector());
-    sessions = new SessionService(pool, membership);
+    sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
   });
 
   afterEach(async () => {
