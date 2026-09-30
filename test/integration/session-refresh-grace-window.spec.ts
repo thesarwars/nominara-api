@@ -889,6 +889,36 @@ describe("STORY-170 · refresh-token reuse grace window", () => {
       expect(count("set"), "three concurrent rotations, three cache writes").toBe(6);
     });
 
+    // Round-3 audit, MINOR: nothing pinned that the breaker can never get stuck
+    // OPEN. Deleting the reset of the in-probe flag after a probe passed every
+    // other test, and left grace disabled for the life of the process after the
+    // first failed probe (fail-closed, so availability rather than security).
+    it("FR-170-GRACE-15j · the breaker cannot get stuck open: a failed probe, then a later probe is admitted and closes it; it can re-open and probe again", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const s = await Promise.all(Array.from({ length: 6 }, () => sessions.createSession(userId)));
+
+      cache.faults.set("set", "reject");
+      await sessions.refresh(s[0]!.refreshToken); // opens
+      coolOff();
+      await sessions.refresh(s[1]!.refreshToken); // probe #1 fails, cool-off restarts
+      expect(count("set"), "the first probe was attempted").toBe(2);
+
+      cache.faults.clear();
+      coolOff();
+      await sessions.refresh(s[2]!.refreshToken); // probe #2 must be admitted
+      expect(count("set"), "a second probe is admitted after a failed one").toBe(3);
+      await sessions.refresh(s[3]!.refreshToken); // it succeeded: closed
+      expect(count("set"), "and it closed the breaker").toBe(4);
+
+      cache.faults.set("set", "reject");
+      await sessions.refresh(s[4]!.refreshToken); // re-opens
+      cache.faults.clear();
+      coolOff();
+      await sessions.refresh(s[5]!.refreshToken); // probe #3 admitted
+      expect(count("set"), "a re-opened breaker probes again").toBe(6);
+    });
+
     it("FR-170-GRACE-15i · a call that was already in flight when the breaker opened, and that then SUCCEEDS, does not close it — only the probe does", async () => {
       const userId = await createUser();
       const sessions = harness.app().get(SessionService);
