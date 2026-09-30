@@ -4,7 +4,7 @@ import type { Cache } from "../cache/cache.port.js";
 import { cacheKeyNamespace } from "../cache/key-namespace.js";
 import { resolveEntitlements } from "../entitlements/resolution.js";
 import { resolveBillingPeriod } from "../usage/billing-period.js";
-import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
 import { deepScanPriceOrThrow } from "./deep-scan-price.js";
 import type { ProjectCadence } from "./dispatch-cells.js";
 import { planRun, type PlannedRun } from "./plan-run.js";
@@ -253,6 +253,27 @@ export async function planManualRun(
       ? {}
       : { captureReadyEngineKeys: options.captureReadyEngineKeys }),
   });
+
+  // ⚠ NOTHING TO CAPTURE IS REFUSED — NEVER STARTED, NEVER CHARGED.
+  //
+  // A run with zero planned cells (no engine this project is entitled to can
+  // capture yet, or no active prompts) used to be planned, recorded and
+  // returned with the full flat price, and `@Credits("deep_scan")` debits on
+  // any 2xx — so the customer paid for a scan that could capture nothing.
+  // That is every project today: no engine adapter is capture-ready until
+  // STORY-001, so `captureReadyEngineKeys()` is empty in production.
+  //
+  // Thrown INSIDE the request transaction and before anything reaches the
+  // debit: TenantContextInterceptor rolls the capture_runs row back, and
+  // CreditInterceptor settles only on a handler's success value. `planned`,
+  // not `live` — a run whose every cell the cache answers is still real work
+  // with a result, just a cheaper one; only an EMPTY scope is refused.
+  if (plan.planned === 0) {
+    throw new PreconditionUnmetError({
+      message:
+        "this deep scan has nothing to capture: no engine this project can use is able to capture yet, or it has no active prompts. The scan was not started and nothing was charged.",
+    });
+  }
 
   // The price travels back with the plan so the response can state it
   // WITHOUT a second resolution — the two would then be two readings of a

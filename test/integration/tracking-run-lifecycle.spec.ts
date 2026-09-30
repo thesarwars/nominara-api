@@ -10,6 +10,7 @@ import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
 import { captureL1Key } from "../../src/lib/capture/l1-cache-key.js";
 import { adapterMajorOf } from "../../src/lib/capture/l1-exact-hash.js";
 import { loadManualRunProject, planManualRun } from "../../src/lib/capture/manual-run.js";
+import { PreconditionUnmetError } from "../../src/api/errors/domain-errors.js";
 import { etaMsFrom, pctFrom, readRunProgress } from "../../src/lib/capture/run-progress.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
@@ -134,6 +135,51 @@ describe("STORY-034 · the manual run lifecycle", () => {
     }
     return runId;
   }
+
+  // ⚠ A deep scan with NOTHING TO CAPTURE must be refused, not planned and
+  // priced: `@Credits("deep_scan")` debits on any 2xx, and in production no
+  // engine is capture-ready yet (STORY-001), so every scan would charge the
+  // flat price for zero work. The harness mirrors production: the request's
+  // transaction rolls back on the throw, so no run row may survive.
+  describe("a scope with nothing to capture", () => {
+    async function triggerWith(captureReadyEngineKeys: readonly string[]): Promise<string> {
+      const runId = uuidV7();
+      const project = await loadManualRunProject(db, projectId);
+      await db.query("BEGIN");
+      try {
+        await planManualRun(db, cache, project, { runId, triggeredBy: null, now: NOW, captureReadyEngineKeys });
+        await db.query("COMMIT");
+      } catch (error) {
+        await db.query("ROLLBACK");
+        throw error;
+      }
+      return runId;
+    }
+
+    it("⚠ is refused as precondition_unmet when no engine can capture — and leaves no run behind", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      const before = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM capture_runs WHERE project_id = $1", [projectId]);
+
+      await expect(triggerWith([])).rejects.toBeInstanceOf(PreconditionUnmetError);
+
+      const after = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM capture_runs WHERE project_id = $1", [projectId]);
+      expect(after.rows[0]!.n).toBe(before.rows[0]!.n);
+    });
+
+    it("⚠ is refused when the capture-ready engines are ones this project is not entitled to", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      await expect(triggerWith(["an-engine-no-plan-entitles"])).rejects.toBeInstanceOf(PreconditionUnmetError);
+    });
+
+    it("⚠ is refused when an engine can capture but the project has no active prompts", async () => {
+      await expect(triggerWith([SEEDED_ENGINE_KEY])).rejects.toBeInstanceOf(PreconditionUnmetError);
+    });
+
+    it("a real scope is still planned and priced exactly as before", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      await expect(triggerWith([SEEDED_ENGINE_KEY])).resolves.toMatch(/.+/);
+    });
+  });
 
   it("records the run as manual over the FULL tracked set", async () => {
     // §3: "Runs the full tracked set on every enabled engine... The body
