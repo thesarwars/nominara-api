@@ -188,6 +188,27 @@ describe("STORY-034 · estimating a manual deep scan", () => {
     expect(result.engineKeys).toEqual(["perplexity"]);
   });
 
+  // STORY-034 — the estimate states whether the trigger would accept the
+  // scan, on the same basis as the trigger's own refusal (no planned cells).
+  describe("capturable", () => {
+    it("is true when the scope plans cells", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      expect((await estimate()).capturable).toBe(true);
+    });
+
+    it("⚠ is false with no capture-ready engine — production today — even though the price is quoted", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      const project = await loadManualRunProject(db, projectId);
+      const result = await estimateManualRun(db, cache, project, NOW, { captureReadyEngineKeys: [] });
+      expect(result.capturable).toBe(false);
+      expect(result.credits).toBeGreaterThan(0);
+    });
+
+    it("⚠ is false with an engine but no active prompts", async () => {
+      expect((await estimate()).capturable).toBe(false);
+    });
+  });
+
   it("WRITES NOTHING — no run row, no counter, no suppressed capture", async () => {
     await addPrompt("best crm for a 50-rep sales team");
     await estimate();

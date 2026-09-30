@@ -98,6 +98,12 @@ export interface ManualRunEstimate {
   readonly forecast: ManualRunForecast;
   readonly promptCount: number;
   readonly engineKeys: readonly string[];
+  /**
+   * Whether the trigger would accept this scan: at least one planned cell.
+   * The SAME basis as planManualRun's refusal (`plan.planned === 0` → 422
+   * precondition_unmet), so the estimate and the trigger cannot disagree.
+   */
+  readonly capturable: boolean;
 }
 
 /**
@@ -180,6 +186,7 @@ export async function estimateManualRun(
     // be a second chance to disagree with the number just probed.
     promptCount: probe.engines.length === 0 ? 0 : probe.cells.length / probe.engines.length,
     engineKeys: probe.engines.map((engine) => engine.engineKey),
+    capturable: probe.cells.length > 0,
   };
 }
 
