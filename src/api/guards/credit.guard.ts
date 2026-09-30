@@ -267,6 +267,13 @@ export class CreditGuard implements CanActivate {
         // Nothing else in the product creates a wallet row — see
         // `provisionWallet`. On the request path so there is no window in
         // which a cycle has begun and the row does not exist.
+        //
+        // It runs BEFORE the precondition below, so a refused scan on a
+        // workspace that has never been charged still creates the wallet and
+        // its included `grant` (idempotent per cycle — the lazy provisioning
+        // every workspace goes through on its first priced request). A refusal
+        // never writes a reserve, a release or a debit; the grant is the only
+        // ledger row it can leave (deep-scan-zero-scope-http.spec.ts).
         const period = await resolveBillingPeriod(tx, workspaceId);
         await provisionWalletWithGrant(tx, workspaceId, includedGrantOf(entitlements), period);
 

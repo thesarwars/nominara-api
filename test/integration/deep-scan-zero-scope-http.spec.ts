@@ -87,7 +87,7 @@ describe("STORY-034 · a deep scan with nothing to capture, over HTTP", () => {
   }
 
   /** A growth workspace with one project, one engine row, and — unless `prompts` is 0 — active prompts. */
-  async function scenario(options: { prompts: number; included: number }): Promise<Scenario> {
+  async function scenario(options: { prompts: number; included: number; wallet?: boolean }): Promise<Scenario> {
     const db = harness.db();
     const userId = uuidV7();
     await db.query(
@@ -137,12 +137,14 @@ describe("STORY-034 · a deep scan with nothing to capture, over HTTP", () => {
         [workspaceId, projectId, text, Buffer.from(text, "utf8")],
       );
     }
-    await db.query(
-      `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
-       VALUES ($1, $2, 0, 0, (now() AT TIME ZONE 'UTC')::date, (now() AT TIME ZONE 'UTC')::date + 30)
-       ON CONFLICT (workspace_id) DO UPDATE SET included_balance = $2, reserved = 0`,
-      [workspaceId, options.included],
-    );
+    if (options.wallet !== false) {
+      await db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
+         VALUES ($1, $2, 0, 0, (now() AT TIME ZONE 'UTC')::date, (now() AT TIME ZONE 'UTC')::date + 30)
+         ON CONFLICT (workspace_id) DO UPDATE SET included_balance = $2, reserved = 0`,
+        [workspaceId, options.included],
+      );
+    }
     return { workspaceId, projectId, entered };
   }
 
@@ -195,6 +197,24 @@ describe("STORY-034 · a deep scan with nothing to capture, over HTTP", () => {
     });
     expect(await books(s), "the refused scan left the customer's books exactly as it found them").toEqual(before);
     expect((await books(s)).wallet).toEqual({ included_balance: 2_400, purchased_balance: 0, reserved: 0 });
+  });
+
+  // Round-3 audit, MINOR: "no ledger row" held only for an existing wallet.
+  // Wallet provisioning runs before the precondition — it is how every
+  // workspace's wallet comes to exist, on its first priced request — so a
+  // refused scan on a never-charged workspace still creates the wallet and its
+  // included grant. That is the documented lazy provisioning, idempotent per
+  // cycle; what must never appear is a reserve, a release, or a debit.
+  it("STORY-034 · nothing to capture on a workspace with NO wallet yet: 422, and the only ledger row is the plan's opening grant — no reserve, no release, no run", async () => {
+    const s = await scenario({ prompts: 2, included: 0, wallet: false });
+
+    const res = await trigger(s);
+
+    expect(res.statusCode, res.body).toBe(422);
+    const after = await books(s);
+    expect((after.ledger as Array<{ entry_type: string }>).map((row) => row.entry_type)).toEqual(["grant"]);
+    expect((after.wallet as { reserved: number }).reserved).toBe(0);
+    expect(after.runs).toBe(0);
   });
 
   it("STORY-034 · nothing to capture on a LOW balance: 422, never 402 — the customer is not told to buy credits for a scan that could not run", async () => {
