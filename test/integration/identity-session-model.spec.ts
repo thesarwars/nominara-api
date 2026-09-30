@@ -19,7 +19,16 @@ import {
   CSRF_HEADER_NAME,
   REFRESH_COOKIE_NAME,
 } from "../../src/lib/auth/cookies.js";
+import { REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS } from "../../src/lib/auth/refresh-token.js";
 import * as metrics from "../../src/lib/telemetry/metrics.js";
+
+// STORY-170 — this file's env block sets no REFRESH_TOKEN_GRACE_WINDOW_MS,
+// so SessionService.refresh uses the schema's own default. A replay
+// presented this far after the rotation that consumed it is unambiguously
+// OUTSIDE the window regardless of how long the default ever changes to.
+function afterGraceWindow(base: Date): Date {
+  return new Date(base.getTime() + REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS + 1_000);
+}
 
 interface ParsedCookie {
   name: string;
@@ -134,24 +143,37 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     expect(req.auth?.sid).toBe(tokens.sid);
   });
 
-  it("STORY-017 · scenario 3 — refresh rotates: a new access and refresh token are issued, and the old refresh token is dead", async () => {
+  it("STORY-017 · scenario 3 — refresh rotates: a new access and refresh token are issued, and the old refresh token is dead once its STORY-170 grace window has closed", async () => {
+    const now = new Date();
     const initial = await sessions.createSession(userId);
 
-    const rotated = await sessions.refresh(initial.refreshToken);
+    const rotated = await sessions.refresh(initial.refreshToken, now);
 
     expect(rotated.sid).toBe(initial.sid);
     expect(rotated.accessToken).not.toBe(initial.accessToken);
     expect(rotated.refreshToken).not.toBe(initial.refreshToken);
 
-    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow(UnauthorizedException);
+    // STORY-170 — an IMMEDIATE replay is now the grace-window case
+    // (session-refresh-grace-window.spec.ts owns that behaviour); this
+    // scenario's own assertion — the old refresh token is genuinely dead —
+    // is presented OUTSIDE the (default 2s) window, past
+    // OUTSIDE_GRACE_WINDOW_MS below.
+    await expect(sessions.refresh(initial.refreshToken, afterGraceWindow(now))).rejects.toThrow(UnauthorizedException);
   });
 
-  it("STORY-017 · scenario 4 — presenting a consumed refresh token revokes the whole family and raises a security event", async () => {
+  it("STORY-017 · scenario 4 — presenting a consumed refresh token OUTSIDE its STORY-170 grace window revokes the whole family and raises a security event", async () => {
     const counterSpy = vi.spyOn(metrics, "incrementCounter");
+    const now = new Date();
     const initial = await sessions.createSession(userId);
-    await sessions.refresh(initial.refreshToken);
+    await sessions.refresh(initial.refreshToken, now);
 
-    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+    // STORY-170 — an immediate replay is grace-eligible
+    // (session-refresh-grace-window.spec.ts's own scenario for that); this
+    // scenario is specifically the reuse case that still revokes — the
+    // SAME consumed token, presented once the window has closed.
+    await expect(sessions.refresh(initial.refreshToken, afterGraceWindow(now))).rejects.toThrow(
+      "refresh token already used",
+    );
 
     const sessionRow = await db.query<{ revoked_at: Date | null; revoked_reason: string | null }>(
       "SELECT revoked_at, revoked_reason FROM sessions WHERE id = $1",
@@ -191,10 +213,14 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
   });
 
   it("STORY-017 · scenario 5 — a previously-issued access token is refused via the deny list once family revocation has happened", async () => {
+    const now = new Date();
     const initial = await sessions.createSession(userId);
-    const rotated = await sessions.refresh(initial.refreshToken);
-    // Reuse of the now-consumed original refresh token revokes the family.
-    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+    const rotated = await sessions.refresh(initial.refreshToken, now);
+    // Reuse of the now-consumed original refresh token, OUTSIDE its
+    // STORY-170 grace window, revokes the family.
+    await expect(sessions.refresh(initial.refreshToken, afterGraceWindow(now))).rejects.toThrow(
+      "refresh token already used",
+    );
 
     const guard = new AuthGuard(new Reflector(), pool);
     const req: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: rotated.accessToken }, method: "GET" };
@@ -305,7 +331,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
       await app.close();
     });
 
-    it("POST /auth/refresh with a valid refresh cookie returns 200, sets new access/refresh/csrf cookies, and kills the old refresh token", async () => {
+    it("POST /auth/refresh with a valid refresh cookie returns 200, sets new access/refresh/csrf cookies, and an immediate replay (STORY-170 grace window) converges on the SAME refresh token rather than dying", async () => {
       const sessionService = app.get(SessionService);
       const initial = await sessionService.createSession(userId);
 
@@ -325,12 +351,24 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
       expect(csrf?.value).toBeTruthy();
       expect(refresh?.value).not.toBe(initial.refreshToken);
 
+      // STORY-170 — this replay lands well inside the default 2s grace
+      // window (real elapsed wall-clock time between two `app.inject()`
+      // calls in the same test), so it is a grace-window hit, not reuse:
+      // 200, the SAME successor cookie, session still alive.
+      // session-refresh-grace-window.spec.ts owns proving the OUTSIDE-window
+      // and two-back cases still revoke.
       const replay = await app.inject({
         method: "POST",
         url: apiUrl("/auth/refresh"),
         cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
       });
-      expect(replay.statusCode).toBe(401);
+      expect(replay.statusCode).toBe(200);
+      expect(cookiesByName(replay).get(REFRESH_COOKIE_NAME)?.value).toBe(refresh?.value);
+
+      const sessionRow = await pool.query<{ revoked_at: Date | null }>("SELECT revoked_at FROM sessions WHERE id = $1", [
+        initial.sid,
+      ]);
+      expect(sessionRow.rows[0]!.revoked_at).toBeNull();
     });
 
     it("POST /auth/refresh with no refresh cookie is refused", async () => {

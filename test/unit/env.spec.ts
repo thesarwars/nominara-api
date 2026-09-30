@@ -75,6 +75,27 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
     );
   });
 
+  it("STORY-170 · the grace window needs no new secret — a pre-STORY-170 environment still loads", () => {
+    // The successor is encrypted under a key derived from the predecessor
+    // token (refresh-token.ts), so an existing deployment's configuration
+    // is unchanged by this feature.
+    expect(() => loadEnv(VALID)).not.toThrow();
+  });
+
+  it("STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS is optional and defaults to 2000", () => {
+    const env = loadEnv(VALID);
+    expect(env.REFRESH_TOKEN_GRACE_WINDOW_MS).toBe(2000);
+  });
+
+  it("STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS above the hard maximum (5000) throws, naming that exact key", () => {
+    expect(() => loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "5001" })).toThrow(/REFRESH_TOKEN_GRACE_WINDOW_MS/);
+  });
+
+  it("STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS accepts 0 — the documented way to disable the grace window without a redeploy", () => {
+    const env = loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "0" });
+    expect(env.REFRESH_TOKEN_GRACE_WINDOW_MS).toBe(0);
+  });
+
   it("a MISSING required var throws EnvValidationError naming that exact key", () => {
     const { DATABASE_URL: _drop, ...rest } = VALID;
     expect(() => loadEnv(rest)).toThrow(EnvValidationError);

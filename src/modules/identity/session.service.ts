@@ -4,7 +4,13 @@ import { loadEnv } from "../../config/env.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { computeCsrfToken } from "../../lib/auth/csrf.js";
-import { REFRESH_TOKEN_TTL_MS, generateRefreshToken, hashRefreshToken } from "../../lib/auth/refresh-token.js";
+import {
+  REFRESH_TOKEN_TTL_MS,
+  decryptGraceSuccessor,
+  encryptGraceSuccessor,
+  generateRefreshToken,
+  hashRefreshToken,
+} from "../../lib/auth/refresh-token.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { isWorkspaceUsable, MembershipService } from "../workspaces/membership.service.js";
@@ -139,11 +145,14 @@ export class SessionService {
 
   /**
    * Rotates the presented refresh token. Presenting an already-consumed
-   * token (scenario 4) revokes the entire session family and raises a
-   * security event, rather than just rejecting the one token.
+   * token revokes the entire session family and raises a security event —
+   * UNLESS it is the token consumed by this session's own
+   * immediately-preceding rotation and still inside its grace window
+   * (STORY-170), in which case the same successor is returned instead.
    */
   async refresh(rawRefreshToken: string, now: Date = new Date()): Promise<SessionTokens> {
     const tokenHash = hashRefreshToken(rawRefreshToken);
+    const env = loadEnv();
 
     // STORY-170 — see this file's header. Read and verify BEFORE taking the
     // rotation's connection: a plain `pool.query` (auto-acquires, runs,
@@ -185,8 +194,108 @@ export class SessionService {
       }
 
       if (tokenRow.consumed_at !== null) {
+        // STORY-170 — the refresh-token reuse GRACE WINDOW
+        // (security-and-tenancy.md §5). A single slot on `sessions`
+        // (migration 0030) names the token consumed by this session's OWN
+        // IMMEDIATELY-PRECEDING rotation and holds that rotation's
+        // successor, envelope-encrypted, until `refresh_grace_expires_at`.
+        // Locked FOR UPDATE on the SAME row the normal rotation branch
+        // below already locks — this is the one extra read the grace
+        // feature costs, not a new connection or a new table.
+        const graceSessionResult = await client.query<{
+          id: string;
+          user_id: string;
+          revoked_at: Date | null;
+          active_workspace_id: string | null;
+          refresh_grace_predecessor_hash: string | null;
+          refresh_grace_successor_ciphertext: string | null;
+          refresh_grace_expires_at: Date | null;
+        }>(
+          `SELECT id, user_id, revoked_at, active_workspace_id, refresh_grace_predecessor_hash,
+                  refresh_grace_successor_ciphertext, refresh_grace_expires_at
+             FROM sessions WHERE id = $1 FOR UPDATE`,
+          [tokenRow.session_id],
+        );
+        const graceSession = graceSessionResult.rows[0];
+
+        // Eligible only for the IMMEDIATE predecessor (this exact token
+        // hash — an older, two-back token never matches the single slot,
+        // which the next rotation always overwrites), a live (non-revoked)
+        // family, and strictly inside the window. Anything else — an older
+        // token, a different session, an already-revoked family, or this
+        // same token presented again after the window closed — falls
+        // through to the unchanged revoke-and-raise path below.
+        const graceEligible =
+          graceSession !== undefined &&
+          graceSession.revoked_at === null &&
+          graceSession.refresh_grace_predecessor_hash === tokenHash &&
+          graceSession.refresh_grace_successor_ciphertext !== null &&
+          graceSession.refresh_grace_expires_at !== null &&
+          graceSession.refresh_grace_expires_at.getTime() > now.getTime();
+
+        if (graceEligible) {
+          // Opened with the key derived from the token this caller just
+          // presented — the predecessor — which is the only thing that can
+          // open it (see refresh-token.ts).
+          const successorRaw = decryptGraceSuccessor(
+            graceSession!.id,
+            rawRefreshToken,
+            graceSession!.refresh_grace_successor_ciphertext!,
+          );
+
+          // The grace slot itself is left untouched (NOT cleared, NOT
+          // re-dated) — a second, third, ... racing caller inside the same
+          // window must keep hitting this same branch and keep getting the
+          // same successor back. It is wiped only by the next real
+          // rotation (unconditional overwrite below) or by this session's
+          // next access once the window has closed (the non-eligible
+          // branch's wipe, further down).
+          await client.query(`UPDATE sessions SET last_used_at = now() WHERE id = $1`, [graceSession!.id]);
+
+          // STORY-170 — "the workspace re-verification STORY-170 added
+          // still runs": a grace hit re-mints from the SAME
+          // preRead/preVerified this call already computed above (BEFORE
+          // BEGIN, exactly like the normal rotation branch), never from
+          // whatever ws/role/scope the original rotation minted — time has
+          // passed, and membership/role/plan may have changed inside the
+          // window.
+          const active = await this.finalizeWorkspaceContext(
+            client,
+            graceSession!.id,
+            graceSession!.active_workspace_id,
+            preActiveWorkspaceId,
+            preVerified,
+          );
+
+          await client.query("COMMIT");
+
+          // Audited security event, distinct from session.reuse_detected —
+          // the session id only, never the token (NFR-SEC-11).
+          this.logger.warn(`refresh token grace-window reuse — same successor returned session_id=${graceSession!.id}`);
+          incrementCounter("nominara_identity_session_refresh_grace_reuse_total", { session_id: graceSession!.id });
+
+          const { accessToken, csrfToken } = await this.mintAccessAndCsrf(
+            graceSession!.id,
+            graceSession!.user_id,
+            now,
+            active.ws,
+            active.role,
+            active.scope,
+            active.entV,
+          );
+          return { sid: graceSession!.id, accessToken, refreshToken: successorRaw, csrfToken };
+        }
+
+        // Outside the window, an older (non-immediate-predecessor) token,
+        // or an already-dead family: unchanged from pre-grace-window
+        // behaviour — revoke the whole family and raise
+        // session.reuse_detected. Also wipes any grace state this session
+        // still carried, so a dead family never holds a decryptable
+        // successor at rest either.
         await client.query(
-          `UPDATE sessions SET revoked_at = now(), revoked_reason = 'reuse_detected' WHERE id = $1 AND revoked_at IS NULL`,
+          `UPDATE sessions SET revoked_at = now(), revoked_reason = 'reuse_detected',
+                  refresh_grace_predecessor_hash = NULL, refresh_grace_successor_ciphertext = NULL, refresh_grace_expires_at = NULL
+             WHERE id = $1 AND revoked_at IS NULL`,
           [tokenRow.session_id],
         );
         await client.query("COMMIT");
@@ -220,7 +329,29 @@ export class SessionService {
         `INSERT INTO refresh_tokens (id, session_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
         [uuidV7(), sessionRow.id, hashRefreshToken(rawNewRefreshToken), expiresAt],
       );
-      await client.query(`UPDATE sessions SET last_used_at = now() WHERE id = $1`, [sessionRow.id]);
+
+      // STORY-170 — this rotation's own token (the one just presented,
+      // `tokenHash`) becomes the ONE grace-eligible predecessor for this
+      // session, unconditionally overwriting whatever the session's
+      // previous rotation left here — "wiped ... on the next rotation" is
+      // this overwrite, not a separate step. graceWindowMs === 0 is the
+      // documented way to disable the feature: no slot is written, so the
+      // very next reuse of ANY token revokes exactly as before STORY-170.
+      const graceWindowMs = env.REFRESH_TOKEN_GRACE_WINDOW_MS;
+      const graceExpiresAt = graceWindowMs > 0 ? new Date(now.getTime() + graceWindowMs) : null;
+      const graceSuccessorCiphertext =
+        graceWindowMs > 0
+          ? encryptGraceSuccessor(sessionRow.id, rawRefreshToken, rawNewRefreshToken)
+          : null;
+      await client.query(
+        `UPDATE sessions
+            SET last_used_at = now(),
+                refresh_grace_predecessor_hash = $2,
+                refresh_grace_successor_ciphertext = $3,
+                refresh_grace_expires_at = $4
+          WHERE id = $1`,
+        [sessionRow.id, graceWindowMs > 0 ? tokenHash : null, graceSuccessorCiphertext, graceExpiresAt],
+      );
 
       // STORY-170 — the verification already ran, above, BEFORE this
       // transaction's connection was even taken (see this file's header).

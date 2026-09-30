@@ -64,6 +64,9 @@ export const sessions = pgTable("sessions", {
   lastStrongAuthAt: timestamp("last_strong_auth_at", { withTimezone: true }),
   lastStrongAuthMethod: text("last_strong_auth_method"),
   activeWorkspaceId: uuid("active_workspace_id"),
+  refreshGracePredecessorHash: text("refresh_grace_predecessor_hash"),
+  refreshGraceSuccessorCiphertext: text("refresh_grace_successor_ciphertext"),
+  refreshGraceExpiresAt: timestamp("refresh_grace_expires_at", { withTimezone: true }),
 });
 
 export const userCredentials = pgTable("user_credentials", {

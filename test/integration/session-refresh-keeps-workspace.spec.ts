@@ -310,7 +310,19 @@ describe("STORY-170 · session refresh keeps the session's active workspace", ()
     const rotated = await refreshSession(switched.refresh);
     expect(rotated.statusCode).toBe(200);
 
-    // Replaying the now-consumed switch-time refresh token — reuse.
+    // STORY-170 (grace-window revision) — an IMMEDIATE replay of
+    // `switched.refresh` here would now be the grace-eligible case
+    // (session-refresh-grace-window.spec.ts's own scenario for that): the
+    // token consumed by the session's own immediately-preceding rotation,
+    // presented milliseconds later. A second, legitimate rotation moves the
+    // session's ONE grace slot on to name `rotated`'s token instead
+    // (FR-170-GRACE-4/6), so `switched.refresh` below is genuinely a
+    // two-back reuse, not the grace case — this is what this test exists to
+    // prove for a switched session.
+    const rotatedAgain = await refreshSession(rotated.tokens!.refresh);
+    expect(rotatedAgain.statusCode).toBe(200);
+
+    // Replaying the now TWO-ROTATIONS-STALE switch-time refresh token — reuse.
     const replay = await refreshSession(switched.refresh);
     expect(replay.statusCode).toBe(401);
 
@@ -322,7 +334,7 @@ describe("STORY-170 · session refresh keeps the session's active workspace", ()
     expect(sessionRow.rows[0]!.revoked_reason).toBe("reuse_detected");
 
     // The family is dead — even the still-unconsumed, latest token cannot refresh.
-    const afterRevocation = await refreshSession(rotated.tokens!.refresh);
+    const afterRevocation = await refreshSession(rotatedAgain.tokens!.refresh);
     expect(afterRevocation.statusCode).toBe(401);
   });
 
@@ -566,8 +578,20 @@ describe("STORY-170 · session refresh keeps the session's active workspace", ()
     20_000,
   );
 
+  // STORY-170 (grace-window revision) — before the refresh-token reuse
+  // grace window, this scenario proved exactly one of ten racers won the
+  // `FOR UPDATE` lock and the other nine were rejected as reuse. That is no
+  // longer correct: nine of the ten NECESSARILY present the token the
+  // winner's own rotation just consumed, milliseconds apart and so
+  // comfortably inside the default 2s grace window — which is exactly the
+  // "multiple tabs/instances racing the same rotation" case the window
+  // exists for (security-and-tenancy.md §5). The pool-starvation property
+  // this test exists to pin — every racer settles, the unrelated pool query
+  // is unaffected — still holds and is still asserted; what changed is that
+  // "settles" now means "fulfils with the identical successor", not
+  // "nine of ten reject".
   it(
-    "STORY-170 · pool starvation — one switched session's refresh token sent 10x concurrently settles, exactly one rotation succeeds, and an unrelated pool query is unaffected",
+    "STORY-170 · pool starvation — one switched session's refresh token sent 10x concurrently settles, every racer converges on the identical successor, and an unrelated pool query is unaffected",
     async () => {
       const CONCURRENCY = 10;
       const userId = await createUser();
@@ -589,13 +613,22 @@ describe("STORY-170 · session refresh keeps the session's active workspace", ()
       );
 
       expect(probeResult.rows[0]).toEqual({ probe: 1 });
-      const fulfilled = results.filter((r) => r.status === "fulfilled");
+      const fulfilled = results.filter(
+        (r): r is PromiseFulfilledResult<Awaited<ReturnType<SessionService["refresh"]>>> => r.status === "fulfilled",
+      );
       const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
-      expect(fulfilled.length).toBe(1);
-      expect(rejected.length).toBe(CONCURRENCY - 1);
-      for (const r of rejected) {
-        expect((r.reason as Error).message).toMatch(/refresh token already used/);
-      }
+      expect(rejected).toEqual([]);
+      expect(fulfilled.length).toBe(CONCURRENCY);
+      // Every racer got back the SAME raw refresh token — the grace window's
+      // whole point, so every tab/instance's cookie converges on one value
+      // instead of each other's replay revoking the session.
+      const distinctRefreshTokens = new Set(fulfilled.map((r) => r.value.refreshToken));
+      expect(distinctRefreshTokens.size).toBe(1);
+
+      const sessionRow = await pool.query<{ revoked_at: Date | null }>("SELECT revoked_at FROM sessions WHERE id = $1", [
+        initial.sid,
+      ]);
+      expect(sessionRow.rows[0]!.revoked_at).toBeNull();
     },
     20_000,
   );
