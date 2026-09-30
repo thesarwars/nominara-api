@@ -24,7 +24,11 @@ import { startValkey, type StartedValkey } from "../support/valkey-fixture.js";
 //     arrival: a rotation delayed past the window by a lock still lets a
 //     replay that arrives just after its commit converge on the successor;
 //  3. a cache that is down, or that accepted the call and went quiet, costs
-//     the window and never the rotation.
+//     the window and never the rotation;
+//  4. a slot write the rotation ABANDONED at its deadline is not abandoned by
+//     Valkey — it executes when the cache wakes, with a FULL TTL from then — and
+//     the window is therefore also bounded on POSTGRES's clock, which no cache
+//     stall can move.
 //
 // Real Postgres and real Valkey, and `SessionService` built directly on them:
 // the delayed rotation needs a second connection holding a real row lock, and
@@ -34,6 +38,7 @@ describe("STORY-170 · refresh-token grace slot on a real Valkey", () => {
   let valkey: StartedValkey;
   let adapter: ValkeyCacheAdapter;
   let probe: Redis;
+  let pauser: Redis;
   let pool: Pool;
   let db: Client;
   let sessions: SessionService;
@@ -62,10 +67,14 @@ describe("STORY-170 · refresh-token grace slot on a real Valkey", () => {
     adapter = new ValkeyCacheAdapter(valkey.url);
     await adapter.connect();
     probe = new Redis(valkey.url);
+    // CLIENT PAUSE also blocks the issuing connection's own writes, so the
+    // pause is issued from a connection that never writes anything else.
+    pauser = new Redis(valkey.url);
   }, 180_000);
 
   afterAll(async () => {
     probe.disconnect();
+    pauser.disconnect();
     await adapter.onModuleDestroy();
     await Promise.all([postgres.stop(), valkey.stop()]);
     process.env = { ...originalEnv };
@@ -252,6 +261,57 @@ describe("STORY-170 · refresh-token grace slot on a real Valkey", () => {
         expect(await revokedReason(initial.sid)).toBe("reuse_detected");
       } finally {
         // Let the pause end so the abandoned commands drain before the next case.
+        await sleep(Math.max(0, pausedAt + pauseMs + 200 - Date.now()));
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "FR-170-GRACE-V6 · a slot write abandoned at the deadline that Valkey executes AFTER the window (CLIENT PAUSE WRITE) grants nothing — the replay revokes, on Postgres's clock",
+    async () => {
+      const windowMs = 600;
+      process.env.REFRESH_TOKEN_GRACE_WINDOW_MS = String(windowMs);
+      const userId = await createUser();
+      const initial = await sessions.createSession(userId);
+      const key = slotKey(initial.sid);
+
+      // The pause outlasts the window AND the deadline together: the stalled
+      // SET can only execute after the last moment a slot could honestly be
+      // honoured for this rotation.
+      const pauseMs = 2_500;
+      await pauser.call("CLIENT", "PAUSE", String(pauseMs), "WRITE");
+      const pausedAt = Date.now();
+      try {
+        const rotated = await sessions.refresh(initial.refreshToken);
+        const committedAt = Date.now();
+        expect(rotated.refreshToken).not.toBe(initial.refreshToken);
+        expect(await probe.exists(key), "the write missed its deadline: no slot is visible at commit").toBe(0);
+
+        // The abandoned SET is still queued inside Valkey. It lands when the pause ends.
+        await waitUntil(async () => (await probe.exists(key)) === 1, pauseMs + 3_000, "the stalled SET to execute");
+        const landedMs = Date.now() - committedAt;
+        expect(
+          landedMs,
+          "precondition: the slot landed after window + deadline — a slot that lands inside the bound proves nothing",
+        ).toBeGreaterThan(windowMs + REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS);
+        expect(await probe.pttl(key), "precondition: it landed with a full, live TTL from then").toBeGreaterThan(0);
+
+        // The consumed token is presented while that late slot is alive. The
+        // cache would honour it; Postgres's own record of WHEN the rotation
+        // happened must not.
+        //
+        // ⚠ THROUGH ANOTHER INSTANCE, AND THAT IS LOAD-BEARING. The instance
+        // that rotated has had its circuit breaker opened by the missed
+        // deadline, so it would refuse this replay without ever reading the
+        // slot — and this test would pass with the hard bound deleted
+        // (mutation-tested). A different process's breaker never tripped: it
+        // reads the late slot, and only the database's clock stands between it
+        // and the live successor.
+        const otherInstance = new SessionService(pool, new MembershipService(new MembershipCacheService()), adapter);
+        await expect(otherInstance.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+        expect(await revokedReason(initial.sid)).toBe("reuse_detected");
+      } finally {
         await sleep(Math.max(0, pausedAt + pauseMs + 200 - Date.now()));
       }
     },

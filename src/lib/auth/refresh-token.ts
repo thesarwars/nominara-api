@@ -41,7 +41,33 @@ export const REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS = 5_000;
 // on a cache that accepted the connection and then went quiet would pin both
 // on every refresh. Past this the cache counts as unavailable: the rotation
 // goes ahead without a slot, and a replay revokes as the strict rule says.
+//
+// The deadline bounds ONE wait, not the cost of a quiet cache: every
+// rotation that reaches a silent cache would still hold its connection and
+// its row locks for this long. REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS below is
+// what stops that repeating.
 export const REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS = 500;
+
+// After the cache misses a deadline or errors, SessionService stops using it
+// for this long (per process): no slot is written and none is read, so a
+// replay revokes as the strict rule says — fail closed — and a rotation costs
+// what it would cost with no grace window at all. When it elapses ONE call is
+// let through to find out whether the cache is back; the rest keep skipping
+// until that call settles.
+export const REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS = 30_000;
+
+// THE HARD BOUND, on Postgres's clock. The slot's TTL is the cache's promise
+// that the window closes, and a cache can break it: a slot write the rotation
+// abandoned at its deadline is NOT cancelled — Valkey executes it when it
+// recovers, with a full relative TTL from THAT moment, so a token consumed
+// long ago would be handed the live successor. So the eligibility check also
+// requires the presented predecessor's own `refresh_tokens.consumed_at` —
+// stamped with `clock_timestamp()` by the rotation, inside the transaction
+// that commits it — to be younger than the window plus the longest the slot
+// write could have been waited on. Nothing a cache does can move it.
+export function graceHardBoundMs(windowMs: number): number {
+  return windowMs + REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS;
+}
 
 // WHERE THE SLOT LIVES: one Valkey key per session (valkey-keys.ts's
 // refreshGraceSlotKey), written with a TTL equal to the window as the last

@@ -5,11 +5,13 @@ import { PG_POOL } from "../../db/pg-pool.js";
 import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { computeCsrfToken } from "../../lib/auth/csrf.js";
 import {
+  REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS,
   REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS,
   REFRESH_TOKEN_TTL_MS,
   decryptGraceSuccessor,
   encryptGraceSuccessor,
   generateRefreshToken,
+  graceHardBoundMs,
   hashRefreshToken,
   parseGraceSlot,
   serializeGraceSlot,
@@ -107,10 +109,24 @@ import { isWorkspaceUsable, MembershipService } from "../workspaces/membership.s
 //   the rotation still succeeds (a cache outage must never fail a normal
 //   refresh) but leaves no slot, and a replay then revokes exactly as the
 //   strict rule says. Fail closed.
+// - ...and it is never trusted to be PROMPT. A write that missed its deadline
+//   is not cancelled: Valkey executes it when it recovers, with a full TTL
+//   from then. So the slot is not the only bound — the presented
+//   predecessor's `consumed_at`, stamped by the rotation with Postgres's
+//   `clock_timestamp()`, must also be younger than the window plus the cache
+//   deadline (`graceHardBoundMs`). A slot that lands late is inert.
+// - A cache that is quiet costs a deadline per rotation, held on a pool
+//   connection and row locks, until the circuit breaker below opens: after one
+//   miss or error the cache is skipped altogether for a cool-off (per
+//   process), so a replay revokes and a rotation costs what it would with no
+//   grace window at all.
 // - A slot is honoured only while EVERY condition holds (see
 //   `readGraceSuccessor`); one of them is that the successor it names is
 //   still a live refresh token of this session, so a slot that was not
 //   rewritten by some later rotation can never hand out a dead token.
+
+// What `viaGraceCache` returns instead of a cache result when the breaker is open.
+const CACHE_SKIPPED = Symbol("grace-cache-skipped");
 
 export interface SessionTokens {
   readonly sid: string;
@@ -122,6 +138,14 @@ export interface SessionTokens {
 @Injectable()
 export class SessionService {
   private readonly logger = new Logger(SessionService.name);
+
+  // The grace cache's circuit breaker, per process. `performance.now()` (not
+  // the wall clock) so a clock step cannot shorten or stretch the cool-off.
+  // 0 means closed: the cache is in use. Otherwise the cache is skipped until
+  // this instant; once it has passed, ONE call (the probe) is let through and
+  // only its outcome closes the breaker or restarts the cool-off.
+  private graceCacheOpenUntilMs = 0;
+  private graceCacheProbing = false;
 
   constructor(
     @Inject(PG_POOL) private readonly pool: Pool,
@@ -342,7 +366,11 @@ export class SessionService {
         throw new UnauthorizedException("session revoked");
       }
 
-      await client.query(`UPDATE refresh_tokens SET consumed_at = now() WHERE id = $1`, [tokenRow.id]);
+      // `clock_timestamp()`, not `now()`: `now()` is the transaction's START,
+      // which precedes every lock wait above, so a rotation that queued for a
+      // second would be stamped a second too early. The hard bound in
+      // `readGraceSuccessor` reads this stamp.
+      await client.query(`UPDATE refresh_tokens SET consumed_at = clock_timestamp() WHERE id = $1`, [tokenRow.id]);
 
       const rawNewRefreshToken = generateRefreshToken();
       const expiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS);
@@ -419,7 +447,8 @@ export class SessionService {
    * inside the deadline leaves the rotation to commit without a slot; a replay
    * then revokes as the strict rule says. The failure is logged (session id and
    * error class only — an error message can carry a connection URL) and
-   * counted.
+   * counted, and it opens the circuit breaker (see `viaGraceCache`), so while
+   * that is open no slot is attempted at all.
    */
   private async writeGraceSlot(
     sessionId: string,
@@ -434,7 +463,7 @@ export class SessionService {
         predecessorHash,
         successorCiphertext: encryptGraceSuccessor(sessionId, rawPredecessorToken, rawSuccessorToken),
       });
-      await this.withinCacheDeadline(
+      await this.viaGraceCache("write", () =>
         this.cache.set(refreshGraceSlotKey(cacheKeyNamespace(), sessionId), slot, { ttlMs: windowMs }),
       );
     } catch (error) {
@@ -459,7 +488,10 @@ export class SessionService {
    *   only thing that can open it), under this session's id;
    * - the successor is LIVE: an unconsumed, unexpired refresh_tokens row of
    *   THIS session. A slot that some path failed to replace can therefore
-   *   never hand a two-back token an already-consumed successor.
+   *   never hand a two-back token an already-consumed successor;
+   * - the presented token was consumed no longer ago than the window plus the
+   *   cache deadline, on Postgres's clock — so a slot that a stalled cache
+   *   wrote LATE, with a fresh TTL, opens nothing.
    *
    * A cache error or a missed deadline is "no slot" — fail closed, and never
    * an exception: the caller falls through to the revoke path.
@@ -474,14 +506,17 @@ export class SessionService {
   ): Promise<string | null> {
     if (windowMs <= 0) return null;
 
-    let stored: string | undefined;
+    let stored: string | undefined | typeof CACHE_SKIPPED;
     try {
-      stored = await this.withinCacheDeadline(this.cache.get(refreshGraceSlotKey(cacheKeyNamespace(), sessionId)));
+      stored = await this.viaGraceCache("read", () =>
+        this.cache.get(refreshGraceSlotKey(cacheKeyNamespace(), sessionId)),
+      );
     } catch (error) {
       this.reportGraceCacheFailure("read", sessionId, error);
       return null;
     }
-    if (stored === undefined) return null;
+    // Breaker open: the cache was not asked, so there is no slot to honour.
+    if (stored === undefined || stored === CACHE_SKIPPED) return null;
 
     const slot = parseGraceSlot(stored);
     if (slot === undefined || slot.predecessorHash !== presentedHash) return null;
@@ -493,10 +528,21 @@ export class SessionService {
       return null;
     }
 
+    // Two conditions, one statement, evaluated after every cache wait above:
+    //  - the successor is LIVE (unconsumed, unexpired, this session's);
+    //  - the presented predecessor's own consumption is inside the HARD BOUND
+    //    (window + cache deadline) on POSTGRES's clock — the one bound a stalled
+    //    cache cannot move (see `graceHardBoundMs`). `clock_timestamp()`, not
+    //    `now()`: `now()` would freeze at this transaction's start and hide the
+    //    time the cache waits above just took.
     const live = await client.query(
       `SELECT 1 FROM refresh_tokens
-        WHERE token_hash = $1 AND session_id = $2 AND consumed_at IS NULL AND expires_at > $3`,
-      [hashRefreshToken(successorRaw), sessionId, now],
+        WHERE token_hash = $1 AND session_id = $2 AND consumed_at IS NULL AND expires_at > $3
+          AND EXISTS (SELECT 1 FROM refresh_tokens predecessor
+                       WHERE predecessor.token_hash = $4 AND predecessor.session_id = $2
+                         AND predecessor.consumed_at
+                             > clock_timestamp() - ($5::double precision * interval '1 millisecond'))`,
+      [hashRefreshToken(successorRaw), sessionId, now, presentedHash, graceHardBoundMs(windowMs)],
     );
     return live.rows.length > 0 ? successorRaw : null;
   }
@@ -504,19 +550,85 @@ export class SessionService {
   /** STORY-170 — best-effort removal of a dead session's slot. Never throws; see the call site. */
   private async discardGraceSlot(sessionId: string): Promise<void> {
     try {
-      await this.withinCacheDeadline(this.cache.delete(refreshGraceSlotKey(cacheKeyNamespace(), sessionId)));
+      await this.viaGraceCache("delete", () => this.cache.delete(refreshGraceSlotKey(cacheKeyNamespace(), sessionId)));
     } catch (error) {
       this.reportGraceCacheFailure("delete", sessionId, error);
     }
   }
 
   /**
+   * Every grace-slot cache call goes through here, and it is the circuit
+   * breaker's only door. Returns `CACHE_SKIPPED` without calling the cache while
+   * the breaker is open; otherwise runs `call` under the deadline. A rejection
+   * or a missed deadline OPENS the breaker (for
+   * REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS) and is rethrown for the caller to
+   * report; when the cool-off has passed, the first caller is the probe — the
+   * rest keep skipping until it settles — and only the probe's success closes
+   * the breaker (a slow answer to a call that started before it opened proves
+   * nothing about now).
+   *
+   * Without it a silent cache costs the deadline on EVERY rotation, each held
+   * on a pool connection and row locks: measured, 40 concurrent refreshes on a
+   * 10-connection pool blocked an unrelated `SELECT 1` for ~2s. With it the
+   * cost is one deadline per cool-off, plus whatever was already in flight
+   * when it opened.
+   */
+  private async viaGraceCache<T>(
+    operation: "write" | "read" | "delete",
+    call: () => Promise<T>,
+  ): Promise<T | typeof CACHE_SKIPPED> {
+    const admission = this.admitGraceCache();
+    if (admission === "skip") {
+      incrementCounter("nominara_identity_session_refresh_grace_cache_skipped_total", { operation });
+      return CACHE_SKIPPED;
+    }
+    try {
+      const result = await this.withinCacheDeadline(call());
+      if (admission === "probe") this.closeGraceCache();
+      return result;
+    } catch (error) {
+      this.openGraceCache(admission === "probe");
+      throw error;
+    } finally {
+      if (admission === "probe") this.graceCacheProbing = false;
+    }
+  }
+
+  private admitGraceCache(): "use" | "probe" | "skip" {
+    if (this.graceCacheOpenUntilMs === 0) return "use";
+    if (this.graceCacheProbing || performance.now() < this.graceCacheOpenUntilMs) return "skip";
+    this.graceCacheProbing = true;
+    return "probe";
+  }
+
+  private openGraceCache(wasProbe: boolean): void {
+    const wasClosed = this.graceCacheOpenUntilMs === 0;
+    this.graceCacheOpenUntilMs = performance.now() + REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS;
+    // One line per transition — a burst of calls that were already in flight
+    // when it opened must not write one each.
+    if (wasClosed || wasProbe) {
+      this.logger.warn(
+        `refresh grace cache circuit open — no grace slot is written or read for ${String(REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS)}ms, so a replay revokes`,
+      );
+    }
+  }
+
+  private closeGraceCache(): void {
+    this.graceCacheOpenUntilMs = 0;
+    this.logger.log("refresh grace cache circuit closed — the cache answered its probe, grace slots resume");
+  }
+
+  /**
    * Rejects when `operation` has not settled inside
    * REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS. The grace slot is touched while the
-   * rotation transaction holds row locks and a pool connection; a cache that
-   * accepts the connection and then goes quiet must cost the window, never
-   * those. (A late settlement of the abandoned call is handled by the race, so
-   * it cannot surface as an unhandled rejection.)
+   * rotation transaction holds row locks and a pool connection, so this bounds
+   * ONE wait: a cache that accepts the connection and then goes quiet still
+   * costs each caller up to the deadline holding both. What stops that
+   * repeating is the circuit breaker in `viaGraceCache`. (A late settlement of
+   * the abandoned call is handled by the race, so it cannot surface as an
+   * unhandled rejection — but the abandoned call is NOT cancelled, and a write
+   * may still land later; the hard bound in `readGraceSuccessor` is what makes
+   * that harmless.)
    */
   private async withinCacheDeadline<T>(operation: Promise<T>): Promise<T> {
     let timer: NodeJS.Timeout | undefined;

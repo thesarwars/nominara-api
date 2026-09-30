@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionService } from "../../src/modules/identity/session.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import {
+  REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS,
   REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS,
   REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS,
   generateRefreshToken,
@@ -25,7 +26,8 @@ import { importEd25519PublicKeyFromDer, verifyAccessToken } from "../../src/lib/
 import { apiUrl } from "../support/api-url.js";
 import { dataOf } from "../support/envelope.js";
 import { HARNESS_PUBLIC_KEY_DER, useApiHarness } from "../support/api-harness.js";
-import { FAULT_ERROR_SECRET, FaultInjectingCache } from "../support/fault-injecting-cache.js";
+import { FAULT_ERROR_SECRET, FaultInjectingCache, type CacheOperation } from "../support/fault-injecting-cache.js";
+import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import * as metrics from "../../src/lib/telemetry/metrics.js";
 
 // STORY-170 (grace-window revision) — security-and-tenancy.md §5 "Session
@@ -509,6 +511,99 @@ describe("STORY-170 · refresh-token reuse grace window", () => {
     expect((await sessionRow(initial.sid)).revoked_at).toBeNull();
   });
 
+  // The hard bound. The slot's TTL is the cache's promise, and a cache can
+  // break it (a write abandoned at the deadline is still executed by Valkey
+  // when it wakes, with a full TTL from then — session-refresh-grace-valkey
+  // .spec.ts FR-170-GRACE-V6 shows that on a real Valkey). So Postgres carries
+  // its own bound, on its own clock: the predecessor's consumed_at, stamped
+  // by the rotation, must be younger than window + cache deadline. Here the
+  // cache's clock is frozen (the slot is alive whatever happens) and only
+  // Postgres's record of WHEN the rotation happened is moved.
+  describe("the hard bound on the database's clock", () => {
+    /** Moves the predecessor's consumption back in time on POSTGRES's clock. */
+    async function consumedAgo(rawToken: string, ageMs: number): Promise<void> {
+      const res = await pool.query(
+        `UPDATE refresh_tokens SET consumed_at = clock_timestamp() - ($2::double precision * interval '1 millisecond')
+          WHERE token_hash = $1 AND consumed_at IS NOT NULL`,
+        [hashRefreshToken(rawToken), ageMs],
+      );
+      expect(res.rowCount, "the predecessor row was consumed and is now re-dated").toBe(1);
+    }
+
+    it("FR-170-GRACE-14a · a consumed token older than window + cache deadline on POSTGRES's clock is refused even though the cache still holds its live slot", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const initial = await sessions.createSession(userId);
+      await sessions.refresh(initial.refreshToken);
+      expect(await cache.get(slotKey(initial.sid)), "the slot is alive on the cache's (frozen) clock").toBeDefined();
+
+      await consumedAgo(initial.refreshToken, REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS + REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS + 250);
+
+      await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+      expect((await sessionRow(initial.sid)).revoked_reason).toBe("reuse_detected");
+    });
+
+    it("FR-170-GRACE-14b · just inside window + cache deadline it is still honoured — the bound is the window PLUS the deadline, because a slot write may legitimately take the whole deadline", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const initial = await sessions.createSession(userId);
+      const rotated = await sessions.refresh(initial.refreshToken);
+
+      await consumedAgo(initial.refreshToken, REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS + REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS - 250);
+
+      const replay = await sessions.refresh(initial.refreshToken);
+      expect(replay.refreshToken).toBe(rotated.refreshToken);
+      expect((await sessionRow(initial.sid)).revoked_at).toBeNull();
+    });
+
+    it("FR-170-GRACE-14c · the bound follows the CONFIGURED window: with a 500ms window, a token consumed 1.2s ago (past 500ms + 500ms) is refused though 1.2s is inside the 2s default", async () => {
+      process.env.REFRESH_TOKEN_GRACE_WINDOW_MS = "500";
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const initial = await sessions.createSession(userId);
+      await sessions.refresh(initial.refreshToken);
+
+      await consumedAgo(initial.refreshToken, 500 + REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS + 200);
+
+      await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+    });
+
+    it("FR-170-GRACE-14e · the bound is read AFTER the cache wait, on the live clock — a slow cache read that carries a replay past window + deadline refuses it, though it was inside the bound when the replay arrived", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const initial = await sessions.createSession(userId);
+      await sessions.refresh(initial.refreshToken);
+
+      // 200ms inside the bound when the replay ARRIVES; the cache then takes
+      // 400ms to answer, so by the time the decision is made it is 200ms over.
+      // A bound read at the transaction's start (`now()`) would still see it as
+      // inside.
+      await consumedAgo(initial.refreshToken, REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS + REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS - 200);
+      cache.delays.set("get", 400);
+
+      await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+      expect((await sessionRow(initial.sid)).revoked_reason).toBe("reuse_detected");
+    });
+
+    it("FR-170-GRACE-14d · the bound reads the PRESENTED token's own consumption — ageing one session's predecessor does not refuse another session's replay", async () => {
+      // Two sessions rotated; only the FIRST session's predecessor is aged out.
+      // The second session's own replay is unaffected.
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const old = await sessions.createSession(userId);
+      const fresh = await sessions.createSession(userId);
+      await sessions.refresh(old.refreshToken);
+      const freshRotated = await sessions.refresh(fresh.refreshToken);
+
+      await consumedAgo(old.refreshToken, REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS + REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS + 250);
+
+      const replay = await sessions.refresh(fresh.refreshToken);
+      expect(replay.refreshToken).toBe(freshRotated.refreshToken);
+      await expect(sessions.refresh(old.refreshToken)).rejects.toThrow("refresh token already used");
+      expect((await sessionRow(fresh.sid)).revoked_at, "the other session survives").toBeNull();
+    });
+  });
+
   describe("cache unavailable — fail closed", () => {
     it("FR-170-GRACE-11a · every cache write fails: the rotation STILL succeeds (without a slot), the failure is logged and counted, and a replay revokes", async () => {
       const userId = await createUser();
@@ -614,6 +709,268 @@ describe("STORY-170 · refresh-token reuse grace window", () => {
         expect((await sessionRow(initial.sid)).revoked_reason).toBe("reuse_detected");
       },
       20_000,
+    );
+  });
+
+  // A cache that accepts the call and goes quiet is paid for ONCE per cool-off
+  // per process, not once per rotation. The deadline bounds one wait; without
+  // this, N concurrent refreshes each hold a pool connection and row locks for
+  // the whole deadline (measured on a 10-connection pool: an unrelated
+  // `SELECT 1` waited ~2s behind 40 refreshes). While the breaker is open the
+  // cache is not touched AT ALL — no slot written, none read — so a replay
+  // revokes as the strict rule says. The cool-off is measured on the process's
+  // monotonic clock, which these specs move with `skewMs`.
+  describe("cache circuit breaker", () => {
+    let skewMs = 0;
+    let entered: CacheOperation[] = [];
+
+    beforeEach(() => {
+      skewMs = 0;
+      entered = [];
+      const realNow = performance.now.bind(performance);
+      vi.spyOn(performance, "now").mockImplementation(() => realNow() + skewMs);
+      cache.onEnter = (operation) => {
+        entered.push(operation);
+      };
+    });
+
+    const coolOff = (): void => {
+      skewMs += REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS + 1;
+    };
+    const count = (operation: CacheOperation): number => entered.filter((entry) => entry === operation).length;
+    async function waitFor(condition: () => boolean): Promise<void> {
+      const giveUpAt = Date.now() + 5_000;
+      while (!condition()) {
+        if (Date.now() > giveUpAt) throw new Error("timed out waiting for a condition");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+    async function timed<T>(work: Promise<T>): Promise<{ value: T; ms: number }> {
+      const startedAt = performance.now();
+      const value = await work;
+      return { value, ms: performance.now() - startedAt };
+    }
+
+    it("FR-170-GRACE-15a · after a slot write misses its deadline, the NEXT rotation does not wait on the cache — it never touches it — and its replay revokes without a read", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const first = await sessions.createSession(userId);
+      const second = await sessions.createSession(userId);
+      const counterSpy = vi.spyOn(metrics, "incrementCounter");
+      cache.faults.set("set", "hang");
+      cache.faults.set("get", "hang");
+
+      const tripping = await timed(sessions.refresh(first.refreshToken));
+      expect(tripping.ms, "the first rotation paid the deadline").toBeGreaterThanOrEqual(REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS - 50);
+      expect(count("set")).toBe(1);
+
+      const skipped = await timed(sessions.refresh(second.refreshToken));
+      expect(skipped.value.refreshToken).not.toBe(second.refreshToken);
+      expect(count("set"), "the second rotation never entered the cache").toBe(1);
+      expect(skipped.ms, "and so did not wait on it").toBeLessThan(REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS - 100);
+      expect(counterSpy).toHaveBeenCalledWith(
+        "nominara_identity_session_refresh_grace_cache_skipped_total",
+        expect.objectContaining({ operation: "write" }),
+      );
+
+      const replay = await timed(sessions.refresh(second.refreshToken).then(() => "granted", () => "revoked"));
+      expect(replay.value).toBe("revoked");
+      expect(count("get"), "no slot is read while the breaker is open").toBe(0);
+      expect(replay.ms).toBeLessThan(REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS - 100);
+      expect((await sessionRow(second.sid)).revoked_reason).toBe("reuse_detected");
+      expect(counterSpy).toHaveBeenCalledWith(
+        "nominara_identity_session_refresh_grace_cache_skipped_total",
+        expect.objectContaining({ operation: "read" }),
+      );
+    });
+
+    it("FR-170-GRACE-15b · once the cool-off has passed the cache is used again — a slot is written and a racer converges on the successor", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const first = await sessions.createSession(userId);
+      const second = await sessions.createSession(userId);
+      const third = await sessions.createSession(userId);
+      cache.faults.set("set", "hang");
+      await sessions.refresh(first.refreshToken);
+      await sessions.refresh(second.refreshToken);
+      expect(count("set"), "still cooling off: the second rotation skipped the cache").toBe(1);
+
+      cache.faults.clear();
+      skewMs += REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS - 1_000;
+      const stillCooling = await sessions.createSession(userId);
+      await sessions.refresh(stillCooling.refreshToken);
+      expect(count("set"), "1s before the cool-off ends the cache is still not touched").toBe(1);
+
+      skewMs += 1_001;
+      const rotated = await sessions.refresh(third.refreshToken);
+      expect(count("set"), "the cool-off is over: this rotation used the cache").toBe(2);
+      expect(await cache.get(slotKey(third.sid))).toBeDefined();
+      const replay = await sessions.refresh(third.refreshToken);
+      expect(replay.refreshToken).toBe(rotated.refreshToken);
+    });
+
+    it("FR-170-GRACE-15c · a cache ERROR opens it too, not only a missed deadline — and a cache that has since recovered is still left alone until the cool-off ends", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const first = await sessions.createSession(userId);
+      const second = await sessions.createSession(userId);
+      cache.faults.set("set", "reject");
+      await sessions.refresh(first.refreshToken);
+      cache.faults.clear();
+
+      await sessions.refresh(second.refreshToken);
+
+      expect(count("set")).toBe(1);
+      expect(await cache.get(slotKey(second.sid)), "no slot: the healthy cache was not written to during the cool-off").toBeUndefined();
+      await expect(sessions.refresh(second.refreshToken)).rejects.toThrow("refresh token already used");
+    });
+
+    it("FR-170-GRACE-15d · a failed READ opens it as well — the next rotation writes no slot", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const first = await sessions.createSession(userId);
+      const second = await sessions.createSession(userId);
+      await sessions.refresh(first.refreshToken);
+      cache.faults.set("get", "hang");
+      await expect(sessions.refresh(first.refreshToken)).rejects.toThrow("refresh token already used");
+      cache.faults.clear();
+      const setsBefore = count("set");
+
+      await sessions.refresh(second.refreshToken);
+
+      expect(count("set"), "the read failure opened the breaker: the write was skipped").toBe(setsBefore);
+    });
+
+    it("FR-170-GRACE-15e · when the cool-off ends exactly ONE call is let through to probe the cache — concurrent rotations keep skipping — and a failed probe restarts the cool-off", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const tripping = await sessions.createSession(userId);
+      const burst = await Promise.all(Array.from({ length: 5 }, () => sessions.createSession(userId)));
+      const after = await sessions.createSession(userId);
+      cache.faults.set("set", "hang");
+      await sessions.refresh(tripping.refreshToken);
+      expect(count("set")).toBe(1);
+
+      coolOff();
+      await Promise.all(burst.map((session) => sessions.refresh(session.refreshToken)));
+      expect(count("set"), "five concurrent rotations, one probe").toBe(2);
+
+      await sessions.refresh(after.refreshToken);
+      expect(count("set"), "the probe missed its deadline: the cool-off started again").toBe(2);
+    });
+
+    it("FR-170-GRACE-15f · a successful probe CLOSES the breaker — the very next rotation uses the cache too, it is not left in a probing state", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const tripping = await sessions.createSession(userId);
+      const probing = await sessions.createSession(userId);
+      const following = await sessions.createSession(userId);
+      cache.faults.set("set", "reject");
+      await sessions.refresh(tripping.refreshToken);
+      cache.faults.clear();
+
+      coolOff();
+      await sessions.refresh(probing.refreshToken);
+      expect(count("set"), "the probe went through").toBe(2);
+      await sessions.refresh(following.refreshToken);
+
+      expect(count("set"), "and it succeeded, so the cache is in use again").toBe(3);
+      expect(await cache.get(slotKey(following.sid))).toBeDefined();
+
+      // Closed, not merely "probing again": concurrent rotations ALL use the
+      // cache. A breaker that stayed half-open would let one of them through
+      // and make the rest skip.
+      // The writes are slowed so the three genuinely overlap: a probe that
+      // settles in a millisecond would let the others through one by one and
+      // hide the difference.
+      const concurrent = await Promise.all(Array.from({ length: 3 }, () => sessions.createSession(userId)));
+      cache.delays.set("set", 150);
+      await Promise.all(concurrent.map((session) => sessions.refresh(session.refreshToken)));
+      expect(count("set"), "three concurrent rotations, three cache writes").toBe(6);
+    });
+
+    it("FR-170-GRACE-15i · a call that was already in flight when the breaker opened, and that then SUCCEEDS, does not close it — only the probe does", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const slow = await sessions.createSession(userId);
+      const failing = await sessions.createSession(userId);
+      const after = await sessions.createSession(userId);
+
+      // `slow`'s write enters a healthy-but-slow cache and will succeed 400ms on.
+      cache.delays.set("set", 400);
+      const slowRotation = sessions.refresh(slow.refreshToken);
+      await waitFor(() => count("set") === 1);
+
+      // While it is in flight another write fails, which opens the breaker.
+      cache.delays.delete("set");
+      cache.faults.set("set", "reject");
+      await sessions.refresh(failing.refreshToken);
+      cache.faults.clear();
+      expect(count("set")).toBe(2);
+      await slowRotation;
+
+      await sessions.refresh(after.refreshToken);
+      expect(count("set"), "the slow success did not reopen the cache: still cooling off").toBe(2);
+    });
+
+    it("FR-170-GRACE-15g · opening the breaker is logged ONCE however many in-flight calls miss together, with no token in it, and every skipped call is counted", async () => {
+      const userId = await createUser();
+      const sessions = harness.app().get(SessionService);
+      const burst = await Promise.all(Array.from({ length: 3 }, () => sessions.createSession(userId)));
+      const after = await sessions.createSession(userId);
+      const warnSpy = vi.spyOn(Logger.prototype, "warn");
+      const counterSpy = vi.spyOn(metrics, "incrementCounter");
+      cache.faults.set("set", "hang");
+
+      // Three rotations reach the silent cache together, so all three are
+      // admitted and all three miss their deadline: three failures, one opening.
+      const rotated = await Promise.all(burst.map((session) => sessions.refresh(session.refreshToken)));
+      expect(count("set")).toBe(3);
+      await sessions.refresh(after.refreshToken);
+
+      const opened = warnSpy.mock.calls.filter((call) => String(call[0]).includes("circuit open"));
+      expect(opened, "one line for the transition, none per failure or per skipped call").toHaveLength(1);
+      expect(String(opened[0]![0])).toContain(String(REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS));
+      const observed = [
+        ...warnSpy.mock.calls.map((call) => String(call[0])),
+        ...counterSpy.mock.calls.map((call) => JSON.stringify(call)),
+      ].join("\n");
+      for (const token of [...burst, after, ...rotated].map((session) => session.refreshToken)) {
+        expect(observed).not.toContain(token);
+      }
+      const skips = counterSpy.mock.calls.filter(
+        (call) => call[0] === "nominara_identity_session_refresh_grace_cache_skipped_total",
+      );
+      expect(skips, "the one rotation that found the breaker open").toHaveLength(1);
+      expect(skips[0]![1]).toEqual({ operation: "write" });
+    });
+
+    it(
+      "FR-170-GRACE-15h · with a silent cache and the breaker open, 40 concurrent refreshes on a 10-connection pool leave an unrelated query on the same pool unblocked",
+      async () => {
+        const smallPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+        try {
+          const sessions = new SessionService(smallPool, new MembershipService(new MembershipCacheService()), cache);
+          const userId = await createUser();
+          const tripping = await sessions.createSession(userId);
+          const created = [];
+          for (let i = 0; i < 40; i++) created.push(await sessions.createSession(userId));
+          cache.faults.set("set", "hang");
+          await sessions.refresh(tripping.refreshToken);
+          expect(count("set")).toBe(1);
+
+          const rotations = Promise.all(created.map((session) => sessions.refresh(session.refreshToken)));
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          const unrelated = await timed(smallPool.query("SELECT 1"));
+          await rotations;
+
+          expect(count("set"), "not one of the 40 waited on the cache").toBe(1);
+          expect(unrelated.ms).toBeLessThan(REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS / 2);
+        } finally {
+          await smallPool.end();
+        }
+      },
+      60_000,
     );
   });
 
