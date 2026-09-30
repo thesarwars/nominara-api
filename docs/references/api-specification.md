@@ -93,7 +93,7 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | **409** | **`workspace_limit_reached`** | A user may own only one workspace. `details.{owned_workspace_id, owned_workspace_name}` plus the transfer path. **Joining by invitation never hits this** |
 | **409** | **`price_changed`** | `X-Nominara-Confirmed-Credits` does not match the server's current price. `details.{shown, recomputed, reason}`; the client re-presents the modal |
 | 422 | `domain_not_verified` | Audit requested beyond public-surface scope on an unverified domain |
-| 422 | `precondition_unmet` | e.g. a patch whose `content_before_hash` no longer matches |
+| 422 | `precondition_unmet` | e.g. a patch whose `content_before_hash` no longer matches. When a manual deep scan is refused, `details.reason` says which precondition failed: `price_not_agreed` (the plan's deep-scan price is negotiated and none has been agreed) or `no_capturable_scope` (the scope plans no cells — no capture-ready engine the project is entitled to, or no active prompts). A deep scan refused either way reserves and charges nothing. An absent `reason` is an unclassified refusal |
 | **422** | **`unsafe_target`** | A well-formed URL the **guarded fetcher** refuses — internal or loopback address, disallowed port, unsupported scheme, or a redirect landing on any of those. The canonical code for all three user-supplied URL surfaces: project root URL, audit target, and beacon origin. `details.reason` names the check that refused it, **never the resolved address** |
 | 429 | `rate_limited` | `details.retry_after_ms`; `Retry-After` set |
 | 429 | `quota_exceeded` | A non-credit **tier cap** is exhausted |
