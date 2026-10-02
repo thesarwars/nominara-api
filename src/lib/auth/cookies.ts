@@ -47,9 +47,13 @@ export function setAuthCookies(reply: FastifyReply, tokens: AuthCookieTokens): v
 }
 
 export function clearAuthCookies(reply: FastifyReply): void {
-  reply.clearCookie(ACCESS_COOKIE_NAME, { path: "/" });
-  reply.clearCookie(REFRESH_COOKIE_NAME, { path: "/" });
-  reply.clearCookie(CSRF_COOKIE_NAME, { path: "/" });
+  // STORY-171 — a deletion of a `__Host-` cookie is ignored by a browser unless
+  // it carries Secure + Path=/ and no Domain, exactly like the set. The options
+  // come from the SAME constants the setters spread, so set and clear cannot
+  // drift (and HttpOnly/SameSite match, targeting the same cookie).
+  reply.clearCookie(ACCESS_COOKIE_NAME, HARDENED_HTTP_ONLY);
+  reply.clearCookie(REFRESH_COOKIE_NAME, HARDENED_HTTP_ONLY);
+  reply.clearCookie(CSRF_COOKIE_NAME, HARDENED_READABLE);
 }
 
 // STORY-015 — SameSite=Lax (via HARDENED_HTTP_ONLY) is required here, not
@@ -62,5 +66,6 @@ export function setOauthBindingCookie(reply: FastifyReply, value: string, maxAge
 }
 
 export function clearOauthBindingCookie(reply: FastifyReply): void {
-  reply.clearCookie(OAUTH_BINDING_COOKIE_NAME, { path: "/" });
+  // STORY-171 — same hardening as setOauthBindingCookie; see clearAuthCookies.
+  reply.clearCookie(OAUTH_BINDING_COOKIE_NAME, HARDENED_HTTP_ONLY);
 }
