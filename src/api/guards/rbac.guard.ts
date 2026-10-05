@@ -1,8 +1,8 @@
 import { CanActivate, ExecutionContext, Injectable } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
-import { ACCEPTABLE_STEP_UP_METHODS, STEP_UP_WINDOW_MS } from "../../tenancy/constants.js";
-import { PermissionDeniedException, ProjectOutOfScopeException, StepUpRequiredException } from "../../tenancy/errors.js";
+import { PermissionDeniedException, ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { evaluatePermission, type Permission } from "../../tenancy/permission-matrix.js";
+import { assertStepUpFresh } from "../../tenancy/step-up.js";
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
 import { PROJECT_PARAM_KEY } from "../decorators/project-param.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../decorators/require-permission.decorator.js";
@@ -97,12 +97,8 @@ export class RbacGuard implements CanActivate {
   }
 
   private assertStepUp(req: RbacScopedRequest): void {
-    const lastStrongAuthAt = req.session?.lastStrongAuthAt ?? null;
-    const ageMs = lastStrongAuthAt ? Date.now() - lastStrongAuthAt.getTime() : Number.POSITIVE_INFINITY;
-    // Closed interval: exactly STEP_UP_WINDOW_MS old still passes, refused
-    // only once strictly older.
-    if (ageMs > STEP_UP_WINDOW_MS) {
-      throw new StepUpRequiredException(ACCEPTABLE_STEP_UP_METHODS);
-    }
+    // The window and its closed edge live in tenancy/step-up.ts (STORY-173
+    // moved them there so adding a passkey applies the same rule).
+    assertStepUpFresh(req.session?.lastStrongAuthAt ?? null);
   }
 }

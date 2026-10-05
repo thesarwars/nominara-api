@@ -144,6 +144,23 @@ export class EmailOtpService {
     }
 
     const outcome = await withUniformDuration(REQUEST_TIMING_FLOOR_MS, async () => {
+      // STORY-173 — an address with no account gets one, `unverified`, with no
+      // credential and no session; only the code mailed to the address can
+      // turn it into something usable. This is how a new person proves their
+      // address BEFORE their first passkey exists, and it makes the two
+      // branches the same work: the old unknown-address branch (decoy hash,
+      // nothing mailed) was a response-time and mailbox oracle on whether an
+      // account existed.
+      //
+      // DO NOTHING, never DO UPDATE: an anonymous request must not touch an
+      // existing row — not its status, and not even the casing of its stored
+      // address (STORY-173 AC3). A suspended or deleted-and-reused address
+      // still falls through to the decoy below.
+      await this.pool.query(
+        `INSERT INTO users (id, email, status) VALUES ($1, $2, 'unverified')
+         ON CONFLICT (email) WHERE deleted_at IS NULL DO NOTHING`,
+        [uuidV7(), normalizedEmail],
+      );
       const userResult = await this.pool.query<{ id: string }>(
         `SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL AND status IN ('active', 'unverified')`,
         [normalizedEmail],
@@ -318,6 +335,37 @@ export class EmailOtpService {
       }
 
       await client.query(`UPDATE email_otp_codes SET consumed_at = now() WHERE id = $1`, [matchedId]);
+      // STORY-173 — the FIRST proof of an address revokes everything that
+      // predates it. Until now nobody had shown control of this address, so a
+      // credential or session already on the account was put there by someone
+      // who never proved it either (a passkey from the old anonymous
+      // registration, an OAuth link from a provider that did not verify the
+      // address): the person who has just proved the address is the first one
+      // entitled to it. The row is locked so a concurrent proof cannot both
+      // see "first".
+      const prior = await client.query<{ email_verified_at: Date | null }>(
+        `SELECT email_verified_at FROM users WHERE id = $1 FOR UPDATE`,
+        [user.id],
+      );
+      if (prior.rows[0]!.email_verified_at === null) {
+        const credentials = await client.query(
+          `UPDATE user_credentials SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`,
+          [user.id],
+        );
+        const sessions = await client.query(
+          `UPDATE sessions SET revoked_at = now(), revoked_reason = 'address_proved'
+           WHERE user_id = $1 AND revoked_at IS NULL`,
+          [user.id],
+        );
+        if ((credentials.rowCount ?? 0) > 0 || (sessions.rowCount ?? 0) > 0) {
+          // IDs and counts only — never the address.
+          this.logger.warn(
+            `first proof of address revoked earlier access user_id=${user.id} ` +
+              `credentials=${String(credentials.rowCount ?? 0)} sessions=${String(sessions.rowCount ?? 0)}`,
+          );
+          incrementCounter("nominara_identity_first_proof_revocation_total");
+        }
+      }
       await client.query(
         `UPDATE email_otp_codes SET invalidated_at = now(), invalidated_reason = 'superseded'
          WHERE user_id = $1 AND id != $2 AND consumed_at IS NULL AND invalidated_at IS NULL`,
@@ -351,7 +399,11 @@ export class EmailOtpService {
       client.release();
     }
 
-    return this.sessions.createSession(verifiedUserId!);
+    // The code just proved control of the address, which is the platform
+    // itself performing a re-authentication: stamp the session so it satisfies
+    // step-up for the next five minutes (this is what lets the person add
+    // their first passkey straight after signing up).
+    return this.sessions.createSession(verifiedUserId!, new Date(), "email_otp");
   }
 
   /**

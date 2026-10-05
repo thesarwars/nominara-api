@@ -283,12 +283,21 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     return { statusCode: res.statusCode, cookies: extractAuthCookies(res), body: res.json?.() };
   }
 
-  async function registerPasskeyForEmail(email: string, credentialIdB64url: string): Promise<void> {
+  // STORY-173 — a passkey is added only from a signed-in session that has
+  // stepped up (POST /me/passkeys/{options,verify}); there is no anonymous
+  // registration to name an address with any more. The OAuth session carries
+  // no strong re-authentication of its own, so the test records the one an
+  // email one-time code would have (the seam STORY-019 added) before adding.
+  async function addPasskeyToSession(cookies: AuthCookies, credentialIdB64url: string): Promise<number> {
+    const sid = (JSON.parse(Buffer.from(cookies.access.split(".")[1]!, "base64url").toString("utf8")) as { sid: string }).sid;
+    await db.query("UPDATE sessions SET last_strong_auth_at = now(), last_strong_auth_method = 'email_otp' WHERE id = $1", [sid]);
     const optionsRes = await app.inject({
       method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email },
+      url: apiUrl("/me/passkeys/options"),
+      payload: {},
+      ...mutatingHeaders(cookies),
     });
+    if (optionsRes.statusCode !== 201) return optionsRes.statusCode;
     verifyRegistrationMock.mockResolvedValue({
       verified: true,
       registrationInfo: {
@@ -297,9 +306,9 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
         credentialBackedUp: false,
       },
     });
-    await app.inject({
+    const verifyRes = await app.inject({
       method: "POST",
-      url: apiUrl("/auth/passkey/verify"),
+      url: apiUrl("/me/passkeys/verify"),
       payload: {
         ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id,
         response: {
@@ -310,7 +319,9 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
           response: { clientDataJSON: "x", attestationObject: "y" },
         },
       },
+      ...mutatingHeaders(cookies),
     });
+    return verifyRes.statusCode;
   }
 
   // ---- Task 5 / Test Scenario 1 -------------------------------------------
@@ -643,7 +654,14 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
 
   it("STORY-015 · S7 shape — a different subject on the email of an EXISTING PASSKEY-only user never auto-links onto it", async () => {
     const email = "passkey-only@example.com";
-    await registerPasskeyForEmail(email, Buffer.from("cred-passkey-only", "utf8").toString("base64url"));
+    const seeded = await db.query<{ id: string }>(
+      "INSERT INTO users (email, status, email_verified_at) VALUES ($1, 'active', now()) RETURNING id",
+      [email],
+    );
+    await db.query(
+      "INSERT INTO user_credentials (user_id, kind, credential_id, public_key, sign_count) VALUES ($1, 'passkey', $2, $3, 0)",
+      [seeded.rows[0]!.id, Buffer.from("cred-passkey-only", "utf8"), Buffer.from([1, 2, 3, 4])],
+    );
     const owner = await db.query("SELECT id FROM users WHERE email = $1", [email]);
     expect(owner.rows).toHaveLength(1);
 
@@ -816,7 +834,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     );
     expect(login.statusCode).toBe(200);
 
-    await registerPasskeyForEmail("with-passkey@example.com", Buffer.from("cred-oauth-unlink", "utf8").toString("base64url"));
+    expect(await addPasskeyToSession(login.cookies!, Buffer.from("cred-oauth-unlink", "utf8").toString("base64url"))).toBe(200);
 
     const res = await app.inject({
       method: "DELETE",
@@ -963,63 +981,54 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
     }
   });
 
-  // ---- QA-ADDED (temporary): STORY-014 bundled status-promotion fix --------
+  // ---- STORY-173: supersedes STORY-014's "bundled status-promotion fix" ------
+  //
+  // The two tests that stood here asserted that a completed passkey
+  // registration promotes users.status 'unverified' -> 'active' and that a
+  // passkey-registered user can then create a workspace. That promotion took a
+  // WebAuthn ceremony for proof of control of the address, which it is not; it
+  // was half of the anonymous account takeover. They now assert the opposite:
+  // an account whose address nobody proved cannot add a passkey, so it cannot
+  // be promoted by one, and cannot create a workspace.
 
-  it("STORY-015 · bundled STORY-014 fix — a completed passkey registration promotes users.status from 'unverified' to 'active'", async () => {
-    const email = "passkey-promote@example.com";
-    const optionsRes = await app.inject({
+  it("STORY-173 · an unverified (OAuth) account cannot add a passkey, so a passkey can never promote it to 'active'", async () => {
+    const login = await completeLogin(
+      "microsoft",
+      { externalSubject: "sub-no-promote", email: "no-promote@example.com", emailVerified: false },
+      "code-no-promote",
+    );
+    expect(login.statusCode).toBe(200);
+
+    expect(await addPasskeyToSession(login.cookies!, Buffer.from("cred-no-promote", "utf8").toString("base64url"))).toBe(403);
+
+    const row = await db.query("SELECT status, email_verified_at FROM users WHERE email = 'no-promote@example.com'");
+    expect(row.rows[0].status).toBe("unverified");
+    expect(row.rows[0].email_verified_at).toBeNull();
+    const credentials = await db.query("SELECT kind FROM user_credentials WHERE user_id = (SELECT id FROM users WHERE email = 'no-promote@example.com')");
+    expect(credentials.rows.map((r: { kind: string }) => r.kind)).toEqual(["oauth"]);
+    const createRes = await app.inject({
       method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email },
+      url: apiUrl("/workspaces"),
+      payload: { name: "Still Refused" },
+      ...mutatingHeaders(login.cookies!),
     });
-    expect(optionsRes.statusCode).toBe(201);
-    const before = await db.query("SELECT status FROM users WHERE email = $1", [email]);
-    expect(before.rows[0].status).toBe("unverified");
-
-    await registerPasskeyForEmail(email, Buffer.from("cred-promote", "utf8").toString("base64url"));
-
-    const after = await db.query("SELECT status FROM users WHERE email = $1", [email]);
-    expect(after.rows[0].status).toBe("active");
+    expect(createRes.statusCode).toBe(403);
   });
 
-  it("STORY-015 · bundled STORY-014 fix — a passkey-registered user can create a workspace over HTTP (the exact regression the fix exists to prevent)", async () => {
-    const email = "passkey-workspace@example.com";
-    const optionsRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email },
-    });
-    verifyRegistrationMock.mockResolvedValue({
-      verified: true,
-      registrationInfo: {
-        credential: { id: "cred-ws-b64", publicKey: new Uint8Array([1, 2, 3, 4]), counter: 0 },
-        credentialDeviceType: "singleDevice",
-        credentialBackedUp: false,
-      },
-    });
-    const verifyRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/verify"),
-      payload: {
-        ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id,
-        response: {
-          id: "cred-ws-b64",
-          rawId: "cred-ws-b64",
-          type: "public-key",
-          clientExtensionResults: {},
-          response: { clientDataJSON: "x", attestationObject: "y" },
-        },
-      },
-    });
-    expect(verifyRes.statusCode).toBe(200);
-    const cookies = extractAuthCookies(verifyRes);
-    expect(cookies).not.toBeNull();
+  it("STORY-173 · a verified (OAuth) account adds a passkey from its own session and keeps the right to create a workspace", async () => {
+    const login = await completeLogin(
+      "google",
+      { externalSubject: "sub-verified-adds", email: "verified-adds@example.com", emailVerified: true },
+      "code-verified-adds",
+    );
+    expect(login.statusCode).toBe(200);
+    expect(await addPasskeyToSession(login.cookies!, Buffer.from("cred-verified-adds", "utf8").toString("base64url"))).toBe(200);
 
     const createRes = await app.inject({
       method: "POST",
       url: apiUrl("/workspaces"),
       payload: { name: "Passkey Owned Workspace" },
-      ...mutatingHeaders(cookies!),
+      ...mutatingHeaders(login.cookies!),
     });
     expect(createRes.statusCode).toBe(201);
   });
@@ -1163,7 +1172,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       "code-relink-1",
     );
     expect(login.statusCode).toBe(200);
-    await registerPasskeyForEmail(email, Buffer.from("cred-relink", "utf8").toString("base64url"));
+    expect(await addPasskeyToSession(login.cookies!, Buffer.from("cred-relink", "utf8").toString("base64url"))).toBe(200);
 
     const unlink = await app.inject({ method: "DELETE", url: apiUrl("/me/oauth/google"), ...mutatingHeaders(login.cookies!) });
     expect(unlink.statusCode).toBe(200);
@@ -1194,7 +1203,7 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       "code-relogin-1",
     );
     const userId = decodeClaims(login.cookies!.access).sub;
-    await registerPasskeyForEmail(email, Buffer.from("cred-relogin", "utf8").toString("base64url"));
+    expect(await addPasskeyToSession(login.cookies!, Buffer.from("cred-relogin", "utf8").toString("base64url"))).toBe(200);
     const unlink = await app.inject({ method: "DELETE", url: apiUrl("/me/oauth/google"), ...mutatingHeaders(login.cookies!) });
     expect(unlink.statusCode).toBe(200);
 
@@ -1359,10 +1368,9 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       "code-contested-revoked-owner",
     );
     const ownerId = decodeClaims(owner.cookies!.access).sub;
-    await registerPasskeyForEmail(
-      "contested-revoked-owner@example.com",
-      Buffer.from("cred-contested-revoked", "utf8").toString("base64url"),
-    );
+    expect(
+      await addPasskeyToSession(owner.cookies!, Buffer.from("cred-contested-revoked", "utf8").toString("base64url")),
+    ).toBe(200);
     const ownerUnlink = await app.inject({
       method: "DELETE",
       url: apiUrl("/me/oauth/google"),

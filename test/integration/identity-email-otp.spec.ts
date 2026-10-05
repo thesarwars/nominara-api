@@ -301,7 +301,17 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
   // ---- Scenario 2 -----------------------------------------------------------
 
-  it("STORY-016 · scenario 2 — request for an unknown address is byte-identical to a known address, and writes no email_otp_codes row", async () => {
+  // STORY-173 — this scenario used to add "...and writes no email_otp_codes
+  // row" for the unknown address. That was the OLD mechanism for staying
+  // indistinguishable (a decoy hash, nothing stored, nothing mailed); the
+  // story's own assertion is only that the response is identical. A new person
+  // has to prove their address by this code BEFORE their first passkey exists,
+  // so an unknown address now gets an `unverified` account and a real code —
+  // the same work as a known one, which removes the branch the old mechanism
+  // had to hide. The identical-response assertion is unchanged; the stored-row
+  // assertion is deliberately inverted (the statement-level equivalence is
+  // asserted in identity-passkey-registration-proves-email.spec.ts).
+  it("STORY-016 · scenario 2 — request for an unknown address is byte-identical to a known address (and, since STORY-173, does the same work)", async () => {
     const knownEmail = "s2-known@example.com";
     const unknownEmail = "s2-unknown@example.com";
     await createUser(knownEmail);
@@ -310,11 +320,13 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
     const unknownRes = await requestOtp(unknownEmail);
     const afterUnknown = await db.query("SELECT count(*)::int AS c FROM email_otp_codes");
-    expect(afterUnknown.rows[0].c).toBe(before.rows[0].c);
+    expect(afterUnknown.rows[0].c).toBe(before.rows[0].c + 1);
+    const created = await db.query("SELECT status, email_verified_at FROM users WHERE email = $1", [unknownEmail]);
+    expect(created.rows).toEqual([{ status: "unverified", email_verified_at: null }]);
 
     const knownRes = await requestOtp(knownEmail);
     const afterKnown = await db.query("SELECT count(*)::int AS c FROM email_otp_codes");
-    expect(afterKnown.rows[0].c).toBe(before.rows[0].c + 1);
+    expect(afterKnown.rows[0].c).toBe(before.rows[0].c + 2);
 
     expect(knownRes.statusCode).toBe(unknownRes.statusCode);
     expect(comparableBody(knownRes)).toBe(comparableBody(unknownRes));

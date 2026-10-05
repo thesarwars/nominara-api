@@ -2,23 +2,26 @@ import type { Pool } from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { verifyRegistrationResponse } from "@simplewebauthn/server";
 import { IdentityService } from "../../src/modules/identity/identity.service.js";
-import type { SessionService, SessionTokens } from "../../src/modules/identity/session.service.js";
-import type { PasskeyVerifyRequest } from "../../src/modules/identity/dto/index.js";
+import type { SessionService } from "../../src/modules/identity/session.service.js";
+import type { RegistrationVerifyRequest } from "../../src/modules/identity/dto/index.js";
 import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
-// STORY-015 — unit-level regression for the bundled STORY-014 fix: without
-// this UPDATE, every passkey user stays 'unverified' forever and silently
-// loses the workspace-create right this story's AC4 gate reads
-// (users.status). The end-to-end HTTP proof lives alongside it in
-// test/integration/identity-oauth-pkce.spec.ts; this test isolates the
-// promotion itself against a fake pg client, no real database.
+// STORY-173 — supersedes STORY-015's "bundled STORY-014 fix", which asserted
+// the OPPOSITE: that a completed passkey registration promotes users.status
+// from 'unverified' to 'active'. That promotion treated "someone completed a
+// WebAuthn ceremony" as proof of control of the address, which it is not — it
+// was half of an anonymous account takeover and let a passkey-only account
+// reach 'active' with email_verified_at NULL. Only an email one-time code
+// proves an address. This isolates the guarantee against a fake pg client:
+// registering a credential issues no status change, and issues no credential
+// insert at all unless the account's proof is read first.
 vi.mock("@simplewebauthn/server", async () => {
   const actual = await vi.importActual<typeof import("@simplewebauthn/server")>("@simplewebauthn/server");
   return { ...actual, verifyRegistrationResponse: vi.fn() };
 });
 const verifyRegistrationMock = verifyRegistrationResponse as unknown as Mock;
 
-describe("STORY-015 · IdentityService.finishRegistration promotes users.status", () => {
+describe("STORY-173 · IdentityService.verifyRegistration never promotes users.status", () => {
   const originalEnv = { ...process.env };
   const userId = "01926a1e-0000-7000-8000-000000000001";
 
@@ -49,26 +52,23 @@ describe("STORY-015 · IdentityService.finishRegistration promotes users.status"
     process.env = { ...originalEnv };
   });
 
-  it("issues UPDATE users SET status = 'active' ... for the registering user_id after a verified attestation", async () => {
-    const queries: Array<{ sql: string; params: unknown[] }> = [];
+  function harness(proved: boolean) {
+    const queries: string[] = [];
     const client = {
-      query: vi.fn(async (sql: string, params?: unknown[]) => {
-        queries.push({ sql, params: params ?? [] });
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
         if (sql.startsWith("UPDATE webauthn_challenges")) {
-          return {
-            rows: [
-              { id: "ceremony-1", purpose: "registration", user_id: userId, challenge: Buffer.from("challenge") },
-            ],
-          };
+          return { rows: [{ challenge: Buffer.from("challenge") }] };
+        }
+        if (sql.includes("FROM users") && sql.includes("email_verified_at IS NOT NULL")) {
+          return { rows: proved ? [{ id: userId, email: "a@example.com" }] : [] };
         }
         return { rows: [] };
       }),
       release: vi.fn(),
     };
     const pool = { connect: vi.fn().mockResolvedValue(client) } as unknown as Pool;
-    const tokens: SessionTokens = { sid: "sid-1", accessToken: "a", refreshToken: "r", csrfToken: "c" };
-    const sessions = { createSession: vi.fn().mockResolvedValue(tokens) } as unknown as SessionService;
-
+    const sessions = { createSession: vi.fn() } as unknown as SessionService;
     verifyRegistrationMock.mockResolvedValue({
       verified: true,
       registrationInfo: {
@@ -77,16 +77,26 @@ describe("STORY-015 · IdentityService.finishRegistration promotes users.status"
         credentialBackedUp: false,
       },
     });
+    return { queries, service: new IdentityService(pool, sessions), sessions };
+  }
+  const fresh = { lastStrongAuthAt: new Date(), lastStrongAuthMethod: "email_otp" };
+  const body = {
+    ceremony_id: "01926a1e-0000-7000-8000-000000000002",
+    response: { id: "cred-1", rawId: "cred-1", type: "public-key", clientExtensionResults: {}, response: {} },
+  } as unknown as RegistrationVerifyRequest;
 
-    const service = new IdentityService(pool, sessions);
-    const result = await service.verifyPasskey({
-      ceremony_id: "01926a1e-0000-7000-8000-000000000002",
-      response: { id: "cred-1", rawId: "cred-1", type: "public-key", clientExtensionResults: {}, response: {} },
-    } as unknown as PasskeyVerifyRequest);
+  it("registers a credential for a proved account without touching users.status and without minting a session", async () => {
+    const { queries, service, sessions } = harness(true);
+    await service.verifyRegistration(userId, fresh, body);
+    expect(queries.some((q) => q.includes("INSERT INTO user_credentials"))).toBe(true);
+    expect(queries.filter((q) => /UPDATE\s+users/i.test(q))).toEqual([]);
+    expect(sessions.createSession).not.toHaveBeenCalled();
+  });
 
-    expect(result).toBe(tokens);
-    const promotion = queries.find((q) => q.sql.includes("UPDATE users SET status = 'active'"));
-    expect(promotion).toBeDefined();
-    expect(promotion!.params).toEqual([userId]);
+  it("inserts nothing for an account whose address is not proved", async () => {
+    const { queries, service } = harness(false);
+    await expect(service.verifyRegistration(userId, fresh, body)).rejects.toThrow(/not been verified/);
+    expect(queries.some((q) => q.includes("INSERT INTO user_credentials"))).toBe(false);
+    expect(queries).toContain("ROLLBACK");
   });
 });

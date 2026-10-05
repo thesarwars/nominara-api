@@ -60,6 +60,11 @@ describe("STORY-016 · EmailOtpService.requestCode defers the email-send call pa
     const pool = {
       connect: vi.fn().mockResolvedValue(client),
       query: vi.fn(async (sql: string) => {
+        // STORY-173 — the request now creates the account for an unknown
+        // address (DO NOTHING when it exists) before looking it up.
+        if (sql.includes("INSERT INTO users")) {
+          return { rows: [] };
+        }
         if (sql.startsWith("SELECT id FROM users")) {
           return { rows: [{ id: "01926a1e-0000-7000-8000-000000000001" }] };
         }

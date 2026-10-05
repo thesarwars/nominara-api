@@ -131,7 +131,7 @@ describe("STORY-019 · RbacGuard", () => {
     } catch (error) {
       const stepUp = error as StepUpRequiredException;
       expect(stepUp.getStatus()).toBe(401);
-      expect(stepUp.getResponse()).toMatchObject({ code: "step_up_required", details: { methods: ["webauthn"] } });
+      expect(stepUp.getResponse()).toMatchObject({ code: "step_up_required", details: { methods: ["webauthn", "email_otp"] } });
     }
   });
 

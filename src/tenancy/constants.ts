@@ -28,8 +28,13 @@ export const WORKSPACE_HEADER_NAME = "x-nominara-workspace";
 // exactly 5 minutes old still passes, refused only once strictly older.
 export const STEP_UP_WINDOW_MS = 5 * 60 * 1000;
 
-// Extensible on purpose: OAuth (STORY-015) and Email OTP (STORY-016) are
-// still Backlog, so only WebAuthn re-verification counts today. Landing
-// either adds a literal here, not a rewrite of every call site that reads
-// this list (RbacGuard, StepUpRequiredException's `details.methods`).
-export const ACCEPTABLE_STEP_UP_METHODS = ["webauthn"] as const;
+// Extensible on purpose: landing a method adds a literal here, not a rewrite
+// of every call site that reads this list (assertStepUpFresh,
+// StepUpRequiredException's `details.methods`). STORY-173 added "email_otp"
+// when an email one-time code began stamping the session it creates
+// (sessions.last_strong_auth_method, migration 0030) — security-and-tenancy.md
+// §5: "a fresh WebAuthn or OTP within 5 minutes". OAuth is deliberately NOT
+// here: a provider sign-in is not a re-authentication ceremony the platform
+// itself performed.
+export const ACCEPTABLE_STEP_UP_METHODS = ["webauthn", "email_otp"] as const;
+export type StrongAuthMethod = (typeof ACCEPTABLE_STEP_UP_METHODS)[number];

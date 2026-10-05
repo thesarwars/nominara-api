@@ -6,6 +6,7 @@ import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/
 import { computeCsrfToken } from "../../lib/auth/csrf.js";
 import { REFRESH_TOKEN_TTL_MS, generateRefreshToken, hashRefreshToken } from "../../lib/auth/refresh-token.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import type { StrongAuthMethod } from "../../tenancy/constants.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 
 // STORY-017 — dangerous area: rotation and reuse-detection logic. Full
@@ -52,8 +53,22 @@ export class SessionService {
     return { accessToken, csrfToken };
   }
 
-  /** New session at authentication time. Workspace context starts empty — a real workspace is only ever entered via switchWorkspace. */
-  async createSession(userId: string, now: Date = new Date()): Promise<SessionTokens> {
+  /**
+   * New session at authentication time. Workspace context starts empty — a real workspace is only ever entered via switchWorkspace.
+   *
+   * `strongAuth` (STORY-173) names the ceremony the platform itself just
+   * performed to create this session — a WebAuthn assertion or an email
+   * one-time code — and stamps `last_strong_auth_at/method` with it, so the
+   * session counts as freshly re-authenticated for the step-up window
+   * (security-and-tenancy.md §5). Left null for a session that was not
+   * created by such a ceremony (OAuth, workspace switch), which then has to
+   * step up before anything that demands it.
+   */
+  async createSession(
+    userId: string,
+    now: Date = new Date(),
+    strongAuth: StrongAuthMethod | null = null,
+  ): Promise<SessionTokens> {
     const sid = uuidV7();
     const rawRefreshToken = generateRefreshToken();
     const expiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS);
@@ -61,7 +76,10 @@ export class SessionService {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(`INSERT INTO sessions (id, user_id) VALUES ($1, $2)`, [sid, userId]);
+      await client.query(
+        `INSERT INTO sessions (id, user_id, last_strong_auth_at, last_strong_auth_method) VALUES ($1, $2, $3, $4)`,
+        [sid, userId, strongAuth === null ? null : now, strongAuth],
+      );
       await client.query(
         `INSERT INTO refresh_tokens (id, session_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
         [uuidV7(), sid, hashRefreshToken(rawRefreshToken), expiresAt],
@@ -186,7 +204,7 @@ export class SessionService {
    * not built here). Lets RbacGuard's step-up tests set up a session with a
    * real last_strong_auth_at/method instead of simulating the column.
    */
-  async recordStrongAuth(sessionId: string, method: "webauthn", at: Date = new Date()): Promise<void> {
+  async recordStrongAuth(sessionId: string, method: StrongAuthMethod, at: Date = new Date()): Promise<void> {
     await this.pool.query("UPDATE sessions SET last_strong_auth_at = $2, last_strong_auth_method = $3 WHERE id = $1", [
       sessionId,
       at,
