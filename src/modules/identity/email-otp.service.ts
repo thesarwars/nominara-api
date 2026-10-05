@@ -175,12 +175,25 @@ export class EmailOtpService {
       const code = generateOtpCode();
       const codeHash = await hash(code);
       const expiresAt = new Date(Date.now() + OTP_TTL_MS);
-      await this.pool.query(`INSERT INTO email_otp_codes (id, user_id, code_hash, expires_at) VALUES ($1, $2, $3, $4)`, [
-        uuidV7(),
-        user.id,
-        codeHash,
-        expiresAt,
-      ]);
+      try {
+        await this.pool.query(`INSERT INTO email_otp_codes (id, user_id, code_hash, expires_at) VALUES ($1, $2, $3, $4)`, [
+          uuidV7(),
+          user.id,
+          codeHash,
+          expiresAt,
+        ]);
+      } catch (error) {
+        // 23503: the account was removed between the lookup and this insert (the
+        // stale-unverified sweep, racing a code request for a long-idle row). Not
+        // an error to the caller — answering 500 here would make "an account was
+        // being swept" visible. It takes the same path as an address with no
+        // usable account: a decoy hash, nothing mailed, the same fixed response.
+        if ((error as { code?: string }).code === "23503") {
+          await verifyDecoy(generateOtpCode());
+          return null;
+        }
+        throw error;
+      }
       return { userId: user.id, code };
     });
 

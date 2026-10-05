@@ -160,8 +160,8 @@ export class OauthService {
     // (a stolen session cookie must not be able to attach the thief's own
     // Google account and keep the account after the cookie is revoked).
     if (purpose === "link") {
-      requireFreshStrongAuth(linkUserId!, session, this.logger);
-      await requireProvedAccount(this.pool, linkUserId!, this.logger);
+      requireFreshStrongAuth(linkUserId!, session, this.logger, "oauth_link");
+      await requireProvedAccount(this.pool, linkUserId!, this.logger, "oauth_link");
     }
     const id = uuidV7();
     const { verifier: codeVerifier, challenge: codeChallenge } = await this.client.generatePkce();
@@ -256,7 +256,7 @@ export class OauthService {
       }
       // Re-checked here, not only at link/start: the person spent time at the
       // provider, and the window is five minutes.
-      requireFreshStrongAuth(authenticated.userId, authenticated, this.logger);
+      requireFreshStrongAuth(authenticated.userId, authenticated, this.logger, "oauth_link");
     }
 
     let identity: OauthIdentity;
@@ -408,7 +408,10 @@ export class OauthService {
           // credential its own owner unlinked (or a legacy row with no
           // reason) is reactivated.
           if (credentialRow.revoked_reason === ADDRESS_PROVED) {
-            this.rejectCallback(httpRequestId, "credential_revoked_by_first_proof");
+            // The SAME answer the planter got before the proof (403
+            // email_not_verified): a changed answer would tell them the
+            // address has since been proved — and by someone else.
+            this.refuseUnverified(provider, "credential_revoked_by_first_proof");
           }
           await client.query(`UPDATE user_credentials SET revoked_at = NULL, revoked_reason = NULL WHERE id = $1`, [
             credentialRow.id,
@@ -505,11 +508,16 @@ export class OauthService {
    * Counted by reason; the provider name is the only variable and is not
    * sensitive. Never carries the address.
    */
-  private refuseUnverified(provider: OauthProvider, reason: "provider_email_unverified" | "account_unproven"): never {
+  private refuseUnverified(provider: OauthProvider, reason: string): never {
     this.logger.warn(`oauth sign-in refused reason=${reason} provider=${provider}`);
     incrementCounter("nominara_identity_oauth_refused_total", { reason, provider });
+    // The words claim only what is true. "Did not verify" is for a provider that
+    // said so; for an account that was never proved (or whose credential the
+    // first proof revoked) the honest instruction is the same and the blame is not.
     throw new EmailNotVerifiedException(
-      `${provider} did not verify this email address; sign in with an email code first, then connect ${provider} from settings`,
+      reason === "provider_email_unverified"
+        ? `${provider} did not verify this email address; sign in with an email code first, then connect ${provider} from settings`
+        : `the email address for this account has not been verified; sign in with an email code first, then connect ${provider} from settings`,
     );
   }
 
@@ -538,7 +546,7 @@ export class OauthService {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         oauthCredentialLockKey(provider, identity.externalSubject),
       ]);
-      await requireProvedAccount(client, userId, this.logger);
+      await requireProvedAccount(client, userId, this.logger, "oauth_link");
       const existing = await client.query<{ id: string; user_id: string; revoked_at: Date | null }>(
         `SELECT id, user_id, revoked_at FROM user_credentials
          WHERE kind = 'oauth' AND provider = $1 AND external_subject = $2
@@ -644,7 +652,7 @@ export class OauthService {
   async unlink(userId: string, provider: OauthProvider, session?: SessionStrongAuth): Promise<void> {
     // STORY-173 — removing a credential is as sensitive as adding one: a
     // stolen session must not strip the owner's other methods to lock them out.
-    requireFreshStrongAuth(userId, session, this.logger);
+    requireFreshStrongAuth(userId, session, this.logger, "oauth_unlink");
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");

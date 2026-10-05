@@ -50,6 +50,9 @@ vi.mock("@simplewebauthn/server", async () => {
 const verifyRegistrationMock = verifyRegistrationResponse as unknown as Mock;
 const verifyAuthenticationMock = verifyAuthenticationResponse as unknown as Mock;
 
+// STORY-173 — revoking a passkey needs a fresh step-up; the race below drives the service directly.
+const FRESH_STEP_UP = { lastStrongAuthAt: new Date(), lastStrongAuthMethod: "email_otp" } as const;
+
 interface AuthCookies {
   access: string;
   refresh: string;
@@ -599,8 +602,8 @@ describe("STORY-014 · passkey registration and assertion", () => {
     let outcomes: PromiseSettledResult<void>[];
     try {
       outcomes = await Promise.allSettled([
-        service.revokePasskey(sub, list[0]!.id),
-        service.revokePasskey(sub, list[1]!.id),
+        service.revokePasskey(sub, list[0]!.id, FRESH_STEP_UP),
+        service.revokePasskey(sub, list[1]!.id, FRESH_STEP_UP),
       ]);
     } finally {
       querySpy.mockRestore();

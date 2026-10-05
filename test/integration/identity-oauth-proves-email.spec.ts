@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Logger } from "@nestjs/common";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { Test } from "@nestjs/testing";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
@@ -373,6 +374,57 @@ describe("STORY-173 · OAuth never binds an address nobody proved", () => {
     expect((await counts()).sessions).toBe(sessionsBefore);
   });
 
+  it.each([
+    ["no reason recorded (a row from before the column existed)", null],
+    ["a reason of 'user' (the planter unlinked it themselves a day earlier)", "user"],
+  ])(
+    "STORY-173 · MAJOR-A — a credential revoked BEFORE the proof, with %s, is not revived by signing in afterwards (Z3c)",
+    async (_label, reason) => {
+      const target = `z3c-${randomUUID()}@corp.example`;
+      const planted = await seedUser({ email: target, verified: false, status: "unverified" });
+      const credentialId = await seedOauthCredential(planted.id, "microsoft", "ms-early-planter");
+      await db.query("UPDATE user_credentials SET revoked_at = now() - interval '1 day', revoked_reason = $2 WHERE id = $1", [
+        credentialId,
+        reason,
+      ]);
+      const revokedAt = (await credential(credentialId)).revoked_at as Date;
+
+      await otpSignIn(target); // the owner proves the address
+
+      const marked = await credential(credentialId);
+      expect(marked.revoked_reason).toBe("address_proved");
+      // the original revocation time is kept: the proof marks it, it does not re-date it
+      expect((marked.revoked_at as Date).getTime()).toBe(revokedAt.getTime());
+      const sessionsBefore = (await counts()).sessions;
+      for (const emailVerified of [false, true]) {
+        const again = await oauth("microsoft", { externalSubject: "ms-early-planter", email: target, emailVerified });
+        expect(again.status, `emailVerified=${String(emailVerified)}`).not.toBe(200);
+        expect(again.cookies).toBeNull();
+      }
+      expect((await credential(credentialId)).revoked_at).not.toBeNull();
+      expect((await counts()).sessions).toBe(sessionsBefore);
+    },
+  );
+
+  it("STORY-173 · NIT — the planter gets the SAME answer after the proof as before it, and the words claim only what is true", async () => {
+    const target = `same-${randomUUID()}@corp.example`;
+    const planted = await seedUser({ email: target, verified: false, status: "unverified" });
+    await seedOauthCredential(planted.id, "microsoft", "ms-same");
+    const identity = { externalSubject: "ms-same", email: target, emailVerified: false };
+
+    const before = await oauth("microsoft", identity);
+    await otpSignIn(target);
+    const after = await oauth("microsoft", identity);
+
+    expect(after.status).toBe(before.status);
+    expect(after.status).toBe(403);
+    expect(scrub(after.json)).toEqual(scrub(before.json));
+    // a legacy unproved ACCOUNT is not "a provider that did not verify": the
+    // text must not blame the provider
+    expect(before.json.error.message).not.toMatch(/did not verify/);
+    expect(before.json.error.message).toMatch(/email code/i);
+  });
+
   it("STORY-173 · BLOCKER-1 — a credential a person unlinked themselves IS reactivated by signing in (the old behaviour, kept)", async () => {
     const user = await seedUser();
     const credentialId = await seedOauthCredential(user.id, "google", "g-mine");
@@ -714,6 +766,103 @@ describe("STORY-173 · OAuth never binds an address nobody proved", () => {
     const res = await passkeySignIn("k-soft", 1);
     expect(res.status).toBe(400);
     expect(res.cookies).toBeNull();
+  });
+
+  // ---- MINOR-B: the passkey sign-in re-check under lock (Z17) --------------------------------------
+
+  it("STORY-173 · MINOR-B — a credential revoked WHILE the ceremony is being verified yields no session (Z17)", async () => {
+    const user = await seedUser();
+    const credentialRow = await db.query<{ id: string }>(
+      "INSERT INTO user_credentials (user_id, kind, credential_id, public_key, sign_count) VALUES ($1, 'passkey', $2, $3, 0) RETURNING id",
+      [user.id, Buffer.from(credId("mid-revoke"), "base64url"), Buffer.from([1])],
+    );
+    const sessionsBefore = (await counts()).sessions;
+    const options = await app.inject({ method: "POST", url: apiUrl("/auth/passkey/options"), payload: { purpose: "assertion" } });
+    assertionMock.mockImplementation(async () => {
+      // the signature verifies, and in the same instant the credential is revoked
+      await db.query("UPDATE user_credentials SET revoked_at = now(), revoked_reason = 'user' WHERE id = $1", [credentialRow.rows[0]!.id]);
+      return { verified: true, authenticationInfo: { newCounter: 1, credentialDeviceType: "singleDevice", credentialBackedUp: false } };
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: apiUrl("/auth/passkey/verify"),
+      payload: { ceremony_id: dataOf<{ ceremony_id: string }>(options).ceremony_id, response: credentialResponse(credId("mid-revoke")) },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(cookiesOf(res)).toBeNull();
+    expect((await counts()).sessions).toBe(sessionsBefore);
+    // and nothing was written for a sign-in that did not happen
+    expect((await db.query("SELECT sign_count, last_used_at FROM user_credentials WHERE id = $1", [credentialRow.rows[0]!.id])).rows[0]).toEqual({
+      sign_count: "0",
+      last_used_at: null,
+    });
+  });
+
+  it("STORY-173 · MINOR-B — an account suspended WHILE the ceremony is being verified yields no session (Z17)", async () => {
+    const user = await seedUser();
+    await db.query(
+      "INSERT INTO user_credentials (user_id, kind, credential_id, public_key, sign_count) VALUES ($1, 'passkey', $2, $3, 0)",
+      [user.id, Buffer.from(credId("mid-suspend"), "base64url"), Buffer.from([1])],
+    );
+    const sessionsBefore = (await counts()).sessions;
+    const options = await app.inject({ method: "POST", url: apiUrl("/auth/passkey/options"), payload: { purpose: "assertion" } });
+    assertionMock.mockImplementation(async () => {
+      await db.query("UPDATE users SET status = 'suspended' WHERE id = $1", [user.id]);
+      return { verified: true, authenticationInfo: { newCounter: 1, credentialDeviceType: "singleDevice", credentialBackedUp: false } };
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: apiUrl("/auth/passkey/verify"),
+      payload: { ceremony_id: dataOf<{ ceremony_id: string }>(options).ceremony_id, response: credentialResponse(credId("mid-suspend")) },
+    });
+    expect(res.statusCode).toBe(400);
+    expect((await counts()).sessions).toBe(sessionsBefore);
+  });
+
+  // ---- MINOR-D: revoking a passkey needs a step-up, like unlinking a provider (Z11) ----------------
+
+  it("STORY-173 · MINOR-D — revoking a passkey needs a fresh step-up (Z11)", async () => {
+    const user = await seedUser();
+    for (const label of ["keep-a", "keep-b"]) {
+      await db.query(
+        "INSERT INTO user_credentials (user_id, kind, credential_id, public_key, sign_count) VALUES ($1, 'passkey', $2, $3, 0)",
+        [user.id, Buffer.from(credId(label), "base64url"), Buffer.from([1])],
+      );
+    }
+    const target = (await db.query<{ id: string }>("SELECT id FROM user_credentials WHERE user_id = $1 ORDER BY created_at LIMIT 1", [user.id])).rows[0]!.id;
+    const stale = await app.get(SessionService).createSession(user.id);
+    const refused = await app.inject({
+      method: "DELETE",
+      url: apiUrl(`/me/passkeys/${target}`),
+      ...mutating({ access: stale.accessToken, csrf: stale.csrfToken }),
+    });
+    expect(refused.statusCode).toBe(401);
+    expect(refused.json().error.code).toBe("step_up_required");
+    expect((await credential(target)).revoked_at).toBeNull();
+
+    const fresh = await otpSignIn(user.email);
+    const ok = await app.inject({ method: "DELETE", url: apiUrl(`/me/passkeys/${target}`), ...mutating(fresh) });
+    expect(ok.statusCode).toBe(200);
+    expect((await credential(target)).revoked_reason).toBe("user");
+  });
+
+  // ---- NIT: the refusal metric names what was refused ------------------------------------------------
+
+  it("STORY-173 · NIT — link and unlink refusals are counted under the credential-change metric, labelled by action, not as passkey registrations", async () => {
+    const lines: string[] = [];
+    vi.spyOn(Logger.prototype, "warn").mockImplementation((m: unknown) => void lines.push(typeof m === "string" ? m : JSON.stringify(m)));
+    vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(typeof m === "string" ? m : JSON.stringify(m)));
+    const user = await seedUser();
+    await seedOauthCredential(user.id, "google", "g-metric");
+    const session = await app.get(SessionService).createSession(user.id); // no strong auth
+    const cookies = { access: session.accessToken, csrf: session.csrfToken };
+    await app.inject({ method: "POST", url: apiUrl("/auth/oauth/google/link/start"), ...mutating(cookies) });
+    await app.inject({ method: "DELETE", url: apiUrl("/me/oauth/google"), ...mutating(cookies) });
+
+    const metrics = lines.filter((l) => l.includes("nominara_identity_credential_change_refused_total"));
+    expect(metrics.some((l) => l.includes("oauth_link") && l.includes("step_up_required"))).toBe(true);
+    expect(metrics.some((l) => l.includes("oauth_unlink") && l.includes("step_up_required"))).toBe(true);
+    expect(lines.filter((l) => l.includes("nominara_identity_passkey_registration_refused_total"))).toEqual([]);
   });
 
   // ---- MINOR-2: a duplicate credential id is the uniform 400 (Y6) ---------------------------

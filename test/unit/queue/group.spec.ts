@@ -26,6 +26,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "maintenance.partition",
     // STORY-143 — not in §4; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "audit.verify",
+    // STORY-173 — not in §4 either; see ADDED_BEYOND_REFERENCE.
+    "identity.sweep_unverified",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],

@@ -159,6 +159,6 @@ export class IdentityController {
   @SkipTenantContext()
   @ApiContract({ operationId: "revokePasskey", voidResponse: true })
   revoke(@Req() req: AuthenticatedRequest, @Param("id") id: string): Promise<void> {
-    return this.service.revokePasskey(req.auth!.sub, id);
+    return this.service.revokePasskey(req.auth!.sub, id, req.session);
   }
 }

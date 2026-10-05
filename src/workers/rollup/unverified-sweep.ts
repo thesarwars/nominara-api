@@ -27,12 +27,23 @@ export interface UnverifiedSweepResult {
 }
 
 /**
- * Deletes `unverified` accounts with NO proof, NO credential (revoked ones
- * included — a revoked row is evidence), NO session and NO workspace
- * membership, older than the TTL. Each row is deleted under its own savepoint
- * and re-checks every condition in the DELETE itself, so a row that gained a
- * credential or session between the SELECT and the DELETE is not removed, and
- * a row some other table still references is skipped rather than forced.
+ * Deletes `unverified` accounts that are STALE: no proof, NO credential
+ * (revoked ones included — a revoked row is evidence), no session, no workspace
+ * membership, nothing happening on them within the TTL, and created before it.
+ *
+ * "Nothing happening" is measured from the last ACTIVITY, not from creation: an
+ * account whose email code was issued inside the TTL is a person mid sign-up
+ * (an old squatted row that its owner has just re-requested a code for), and
+ * sweeping it would make their verify fail. The age of the row alone is not
+ * staleness.
+ *
+ * Each row is its own transaction, so no lock outlives its own row. Locks are
+ * taken in the order the email-code verify takes them (codes, then the users
+ * row — the cascade would take them the other way round) and with NOWAIT: a row
+ * somebody else is holding is by definition not stale, and is skipped rather
+ * than waited for. The DELETE re-checks every condition, so a row that gained a
+ * credential, session or code since it was selected is not removed, and a row
+ * another table still references is skipped, never forced.
  */
 export async function sweepStaleUnverifiedAccounts(
   client: ClientBase,
@@ -40,44 +51,41 @@ export async function sweepStaleUnverifiedAccounts(
   ttlDays: number = UNVERIFIED_ACCOUNT_TTL_DAYS,
 ): Promise<UnverifiedSweepResult> {
   const cutoff = new Date(now.getTime() - ttlDays * 24 * 60 * 60 * 1000);
-  await client.query("BEGIN");
-  try {
-    const candidates = await client.query<{ id: string }>(
-      `SELECT id FROM users
-       WHERE status = 'unverified' AND email_verified_at IS NULL AND deleted_at IS NULL AND created_at < $1
-       ORDER BY created_at`,
-      [cutoff],
-    );
-    let deleted = 0;
-    let skipped = 0;
-    for (const { id } of candidates.rows) {
-      await client.query("SAVEPOINT sweep_one");
-      try {
-        // Its own pending codes go with it (the FK cascades), then the row —
-        // only if it is STILL unproved, credential-less, session-less and
-        // memberless.
-        const result = await client.query(
-          `DELETE FROM users u
-           WHERE u.id = $1 AND u.status = 'unverified' AND u.email_verified_at IS NULL AND u.deleted_at IS NULL
-             AND u.created_at < $2
-             AND NOT EXISTS (SELECT 1 FROM user_credentials c WHERE c.user_id = u.id)
-             AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id)
-             AND NOT EXISTS (SELECT 1 FROM workspace_members m WHERE m.user_id = u.id)`,
-          [id, cutoff],
-        );
-        deleted += result.rowCount ?? 0;
-        await client.query("RELEASE SAVEPOINT sweep_one");
-      } catch {
-        await client.query("ROLLBACK TO SAVEPOINT sweep_one");
-        skipped += 1;
-      }
+  const candidates = await client.query<{ id: string }>(
+    `SELECT u.id FROM users u
+     WHERE u.status = 'unverified' AND u.email_verified_at IS NULL AND u.deleted_at IS NULL AND u.created_at < $1
+       AND NOT EXISTS (SELECT 1 FROM email_otp_codes o WHERE o.user_id = u.id AND o.created_at >= $1)
+     ORDER BY u.created_at`,
+    [cutoff],
+  );
+  let deleted = 0;
+  let skipped = 0;
+  for (const { id } of candidates.rows) {
+    await client.query("BEGIN");
+    try {
+      await client.query("SELECT id FROM email_otp_codes WHERE user_id = $1 FOR UPDATE NOWAIT", [id]);
+      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT", [id]);
+      // Its own pending codes go with it (the FK cascades) — only if it is
+      // STILL unproved, credential-less, session-less, memberless and idle.
+      const result = await client.query(
+        `DELETE FROM users u
+         WHERE u.id = $1 AND u.status = 'unverified' AND u.email_verified_at IS NULL AND u.deleted_at IS NULL
+           AND u.created_at < $2
+           AND NOT EXISTS (SELECT 1 FROM user_credentials c WHERE c.user_id = u.id)
+           AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id)
+           AND NOT EXISTS (SELECT 1 FROM workspace_members m WHERE m.user_id = u.id)
+           AND NOT EXISTS (SELECT 1 FROM email_otp_codes o WHERE o.user_id = u.id AND o.created_at >= $2)`,
+        [id, cutoff],
+      );
+      await client.query("COMMIT");
+      deleted += result.rowCount ?? 0;
+    } catch {
+      // 55P03 (held by someone: not stale) or 23503 (still referenced).
+      await client.query("ROLLBACK").catch(() => {});
+      skipped += 1;
     }
-    await client.query("COMMIT");
-    return { deleted, skipped };
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw error;
   }
+  return { deleted, skipped };
 }
 
 async function main(): Promise<void> {

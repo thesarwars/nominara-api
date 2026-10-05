@@ -20,6 +20,9 @@ import { incrementCounter } from "../../lib/telemetry/metrics.js";
 
 type Queryable = { query: Pool["query"] };
 
+/** What the person was trying to do when a rule refused them — the one label the refusal metric carries besides the reason. */
+export type CredentialAction = "passkey_add" | "passkey_revoke" | "oauth_link" | "oauth_unlink";
+
 /** Why a credential or session was revoked by the first proof of an address. Never reactivated by a sign-in. */
 export const ADDRESS_PROVED = "address_proved";
 
@@ -35,6 +38,7 @@ export async function requireProvedAccount(
   client: Queryable,
   userId: string,
   logger: Logger,
+  action: CredentialAction,
 ): Promise<{ id: string; email: string }> {
   const result = await client.query<{ id: string; email: string }>(
     `SELECT id, email::text AS email FROM users
@@ -44,7 +48,7 @@ export async function requireProvedAccount(
   );
   const user = result.rows[0];
   if (!user) {
-    refuse(logger, userId, "address_unproven");
+    refuse(logger, userId, action, "address_unproven");
     throw new EmailNotVerifiedException(
       "the email address of this account has not been verified; sign in with an email code first",
     );
@@ -57,20 +61,28 @@ export function requireFreshStrongAuth(
   userId: string,
   session: Pick<SessionStrongAuth, "lastStrongAuthAt"> | undefined,
   logger: Logger,
+  action: CredentialAction,
 ): void {
   try {
     assertStepUpFresh(session?.lastStrongAuthAt ?? null);
   } catch (error) {
     if (error instanceof StepUpRequiredException) {
-      refuse(logger, userId, "step_up_required");
+      refuse(logger, userId, action, "step_up_required");
     }
     throw error;
   }
 }
 
-function refuse(logger: Logger, userId: string, reason: "address_unproven" | "step_up_required"): void {
-  logger.warn(`credential change refused reason=${reason} user_id=${userId}`);
-  incrementCounter("nominara_identity_passkey_registration_refused_total", { reason });
+/**
+ * One metric for every credential change a rule refused — adding or revoking a
+ * passkey, connecting or disconnecting a provider — labelled by what was being
+ * attempted and why it was refused. (It used to be counted under a
+ * passkey-registration name even for OAuth link and unlink.) The account ID is
+ * logged, never the address.
+ */
+export function refuse(logger: Logger, userId: string, action: CredentialAction, reason: string): void {
+  logger.warn(`credential change refused action=${action} reason=${reason} user_id=${userId}`);
+  incrementCounter("nominara_identity_credential_change_refused_total", { action, reason });
 }
 
 /**
@@ -101,9 +113,16 @@ export async function applyFirstProof(
   if (prior.rows[0]!.email_verified_at !== null) {
     return { firstProof: false };
   }
+  // EVERY credential of the account that is not already marked, live or not.
+  // One revoked BEFORE the proof (a planter's credential its planter unlinked a
+  // day earlier, or one with no reason from before the column existed) keeps its
+  // revocation time but takes the durable reason: left as `user` or NULL, a
+  // sign-in would "reactivate" it, which is the revival this reason exists to
+  // stop.
   const credentials = await client.query(
-    `UPDATE user_credentials SET revoked_at = now(), revoked_reason = $2
-     WHERE user_id = $1 AND revoked_at IS NULL`,
+    `UPDATE user_credentials
+     SET revoked_at = COALESCE(revoked_at, now()), revoked_reason = $2
+     WHERE user_id = $1 AND revoked_reason IS DISTINCT FROM $2`,
     [userId, ADDRESS_PROVED],
   );
   const sessions = await client.query(

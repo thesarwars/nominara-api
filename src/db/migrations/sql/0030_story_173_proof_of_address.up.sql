@@ -6,9 +6,13 @@
 --
 -- Additive only (every value already in the tables still satisfies every
 -- CHECK below); no index or table changes, so nothing here touches RLS. Every
--- CHECK is added NOT VALID and then VALIDATEd: VALIDATE CONSTRAINT takes only
--- SHARE UPDATE EXCLUSIVE, so a populated `sessions` table is not held under
--- ACCESS EXCLUSIVE for a full scan the way a plain ADD CONSTRAINT would.
+-- CHECK is added NOT VALID, which takes ACCESS EXCLUSIVE only for the instant
+-- of the catalog change and scans nothing. The VALIDATE statements are in
+-- 0031, NOT here: the runner wraps each file in ONE transaction, so a VALIDATE
+-- in this file would run its full scan of `sessions` while this file's DROP /
+-- ADD CONSTRAINT still held ACCESS EXCLUSIVE — exactly the long lock NOT VALID
+-- exists to avoid. In its own file (its own transaction) VALIDATE takes only
+-- SHARE UPDATE EXCLUSIVE.
 --
 -- 1. sessions.last_strong_auth_method gains 'email_otp'. 0010 narrowed it to
 --    'webauthn' "until OTP lands", saying widening it is "an additive
@@ -29,16 +33,13 @@ ALTER TABLE sessions DROP CONSTRAINT sessions_last_strong_auth_method_check;
 ALTER TABLE sessions
   ADD CONSTRAINT sessions_last_strong_auth_method_check
   CHECK (last_strong_auth_method IN ('webauthn', 'email_otp')) NOT VALID;
-ALTER TABLE sessions VALIDATE CONSTRAINT sessions_last_strong_auth_method_check;
 
 ALTER TABLE sessions DROP CONSTRAINT sessions_revoked_reason_check;
 ALTER TABLE sessions
   ADD CONSTRAINT sessions_revoked_reason_check
   CHECK (revoked_reason IN ('logout', 'reuse_detected', 'address_proved')) NOT VALID;
-ALTER TABLE sessions VALIDATE CONSTRAINT sessions_revoked_reason_check;
 
 ALTER TABLE user_credentials ADD COLUMN revoked_reason text;
 ALTER TABLE user_credentials
   ADD CONSTRAINT user_credentials_revoked_reason_check
   CHECK (revoked_reason IN ('user', 'address_proved')) NOT VALID;
-ALTER TABLE user_credentials VALIDATE CONSTRAINT user_credentials_revoked_reason_check;

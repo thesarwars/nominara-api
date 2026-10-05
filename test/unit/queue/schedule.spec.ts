@@ -61,6 +61,11 @@ const FROM_OTHER_REFERENCES: Record<string, { cron: string; section: string; sou
     section: "§12",
     source: "security-and-tenancy.md §12 — a verifier job re-walks each chain daily and pages on the first mismatch",
   },
+  "identity.sweep_unverified": {
+    cron: "50 2 * * *",
+    section: "STORY-173",
+    source: "STORY-173 (owner decision, 2026-10-05) — the stale-unverified-account sweep runs daily",
+  },
 };
 
 describe("G12 · the schedule table matches the reference", () => {
@@ -109,8 +114,10 @@ describe("G12 · the schedule table matches the reference", () => {
     // The count is the point: five cron queues cannot be scheduled from the
     // references as written, and that gap belongs in a test rather than in
     // somebody's memory. It was six until STORY-142 chose an hour for
-    // `maintenance.partition` — chose, and wrote down why.
-    expect(datedSchedules()).toHaveLength(6);
+    // `maintenance.partition` — chose, and wrote down why. The dated count is
+    // 7 since STORY-173 added `identity.sweep_unverified`, which is dated by
+    // owner decision and not one of the five.
+    expect(datedSchedules()).toHaveLength(7);
     expect(undatedSchedules()).toHaveLength(5);
   });
 
@@ -136,7 +143,7 @@ describe("G12 · the schedule table matches the reference", () => {
     expect(inertQueueNames()).toEqual(expect.arrayContaining(datedAndInert));
   });
 
-  it("⚠ exactly ONE of the ten can actually be driven by a bare tick today, and each refusal has a distinct reason", () => {
+  it("⚠ exactly the four of the twelve that can actually be driven by a bare tick today, and each refusal has a distinct reason", () => {
     // ⚠ A ROW IN THE TABLE IS NOT A QUEUE THAT TICKS, and the first cut of
     // this work conflated the two. The table records what §4 SAYS; three
     // separate conditions decide what can run, and every one of them is
@@ -150,7 +157,7 @@ describe("G12 · the schedule table matches the reference", () => {
     // has BOTH a cron and a handler, so a gate on those two alone scheduled
     // it, and a bare tick on a tenant-scoped queue throws in the signature
     // path before the handler is reached — once an hour, into the DLQ,
-    // forever. This test is the arithmetic written down: 11 − 5 − 2 − 1 = 3.
+    // forever. This test is the arithmetic written down: 12 − 5 − 2 − 1 = 4.
     const dated = datedSchedules().map((s) => s.queue);
     const inert = dated.filter((queue) => handlerFor(queue) === undefined);
     const tenantScoped = dated.filter((queue) => handlerFor(queue) !== undefined && topologyFor(queue).tenantScoped);
@@ -158,7 +165,7 @@ describe("G12 · the schedule table matches the reference", () => {
 
     expect(inert.sort()).toEqual(["attribution.rollup", "capture.plan"]);
     expect(tenantScoped.sort()).toEqual(["rollup.metric_daily"]);
-    expect(schedulable.sort()).toEqual(["audit.verify", "credit.reconcile", "maintenance.partition"]);
+    expect(schedulable.sort()).toEqual(["audit.verify", "credit.reconcile", "identity.sweep_unverified", "maintenance.partition"]);
     // The three reasons partition the dated rows — no queue is refused twice
     // and none falls through unaccounted for.
     expect(inert.length + tenantScoped.length + schedulable.length).toBe(dated.length);
@@ -198,6 +205,6 @@ describe("G12 · describeSchedules — the one line a boot log gets", () => {
   });
 
   it("reports the cadence gap so an operator need not go and read the table", () => {
-    expect(describeSchedules(empty)).toContain("6 of 11 cron queues state a time");
+    expect(describeSchedules(empty)).toContain("7 of 12 cron queues state a time");
   });
 });

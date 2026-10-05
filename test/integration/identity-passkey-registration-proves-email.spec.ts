@@ -436,6 +436,35 @@ describe("STORY-173 · passkey registration proves the address", () => {
     await mailTo(fresh, sentBefore);
   });
 
+  it("STORY-173 · MINOR-E — an account removed between the lookup and the code insert (the sweep, racing) is the same uniform response, not a 500 (Z16)", async () => {
+    const address = "swept-mid-request@corp.example";
+    await seedUser({ email: address, verified: false, status: "unverified" });
+    const baseline = await requestCode("baseline-uniform@corp.example");
+
+    const proto = Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+    const raw = proto.query;
+    let removed = false;
+    vi.spyOn(proto, "query").mockImplementation(function (this: Client, ...args: unknown[]) {
+      const text = typeof args[0] === "string" ? args[0] : undefined;
+      if (text?.startsWith("INSERT INTO email_otp_codes") && !removed && this !== db) {
+        removed = true;
+        // the sweep's DELETE lands in the gap
+        return db.query("DELETE FROM users WHERE email = $1", [address]).then(() => raw.apply(this, args as never));
+      }
+      return raw.apply(this, args as never);
+    });
+    const sentBefore = sent.length;
+    const res = await requestCode(address);
+    vi.restoreAllMocks();
+
+    expect(removed).toBe(true);
+    expect(res.statusCode).toBe(baseline.statusCode);
+    expect(scrub(res.json())).toEqual(scrub(baseline.json()));
+    // nothing is mailed for an account that no longer exists
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(sent.slice(sentBefore).filter((m) => m.to === address)).toEqual([]);
+  });
+
   it("STORY-173 · AC2 — completing a ceremony for an unknown id, a used id and a registration id is one refusal", async () => {
     const owner = await seedUser();
     const cookies = await otpSignIn(owner.email);
@@ -818,9 +847,10 @@ describe("STORY-173 · passkey registration proves the address", () => {
     const res = await addPasskeyOptions({ access: session.accessToken, csrf: session.csrfToken });
     expect(res.statusCode).toBe(403);
 
-    const metric = lines.find((l) => l.includes("nominara_identity_passkey_registration_refused_total"));
+    const metric = lines.find((l) => l.includes("nominara_identity_credential_change_refused_total"));
     expect(metric).toBeDefined();
     expect(metric).toContain("address_unproven");
+    expect(metric).toContain("passkey_add");
     expect(lines.filter((l) => l.includes("secret.person"))).toEqual([]);
   });
 

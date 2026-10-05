@@ -21,7 +21,7 @@ import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { nextCounter } from "../../lib/webauthn/sign-counter-policy.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type { SessionStrongAuth } from "../../api/guards/auth.guard.js";
-import { requireFreshStrongAuth, requireProvedAccount } from "./account-proof.js";
+import { refuse, requireFreshStrongAuth, requireProvedAccount } from "./account-proof.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
 import type {
   AssertionOptionsRequest,
@@ -83,11 +83,11 @@ export class IdentityService {
     session: SessionStrongAuth | undefined,
     input: PasskeyAddOptionsRequest,
   ): Promise<PasskeyOptionsResult> {
-    requireFreshStrongAuth(userId, session, this.logger);
+    requireFreshStrongAuth(userId, session, this.logger, "passkey_add");
     const env = loadEnv();
     const client = await this.pool.connect();
     try {
-      const user = await requireProvedAccount(client, userId, this.logger);
+      const user = await requireProvedAccount(client, userId, this.logger, "passkey_add");
 
       const existing = await client.query<{ credential_id: Buffer; transports: string[] | null }>(
         `SELECT credential_id, transports FROM user_credentials
@@ -212,7 +212,7 @@ export class IdentityService {
     input: RegistrationVerifyRequest,
   ): Promise<void> {
     // Before the claim: a stale session must not consume the ceremony.
-    requireFreshStrongAuth(userId, session, this.logger);
+    requireFreshStrongAuth(userId, session, this.logger, "passkey_add");
     const env = loadEnv();
     const client = await this.pool.connect();
     try {
@@ -287,7 +287,7 @@ export class IdentityService {
     // ago: the account must be proved at the moment the credential is bound.
     try {
       await client.query("BEGIN");
-      await requireProvedAccount(client, userId, this.logger);
+      await requireProvedAccount(client, userId, this.logger, "passkey_add");
       await client.query(
         `INSERT INTO user_credentials
            (id, user_id, kind, credential_id, public_key, sign_count, transports, authenticator_attachment, device_label)
@@ -310,8 +310,7 @@ export class IdentityService {
       // uniform 400 as a bad attestation — never a 500, and never a message
       // that tells the caller another account holds that credential.
       if ((error as { code?: string }).code === "23505") {
-        this.logger.warn(`passkey registration refused reason=credential_id_taken user_id=${userId}`);
-        incrementCounter("nominara_identity_passkey_registration_refused_total", { reason: "credential_id_taken" });
+        refuse(this.logger, userId, "passkey_add", "credential_id_taken");
         throw new BadRequestException("passkey registration could not be verified");
       }
       throw error;
@@ -500,7 +499,11 @@ export class IdentityService {
     }
   }
 
-  async revokePasskey(userId: string, credentialId: string): Promise<void> {
+  async revokePasskey(userId: string, credentialId: string, session?: SessionStrongAuth): Promise<void> {
+    // STORY-173 (audit) — removing a credential is as sensitive as adding one: a
+    // stolen session must not strip the owner's other methods to lock them out,
+    // or leave the thief's as the only one. The same rule as OAuth unlink.
+    requireFreshStrongAuth(userId, session, this.logger, "passkey_revoke");
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");

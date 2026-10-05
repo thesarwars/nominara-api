@@ -299,7 +299,7 @@ describe("STORY-096C · a person cannot be locked out by removing their last two
 
       // Fired together: one removes the last passkey, the other the last link.
       const [a, b] = await Promise.allSettled([
-        identity.revokePasskey(id, passkey.rows[0]!.id),
+        identity.revokePasskey(id, passkey.rows[0]!.id, FRESH_STEP_UP),
         oauth.unlink(id, "google", FRESH_STEP_UP),
       ]);
 

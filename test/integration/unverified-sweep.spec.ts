@@ -58,6 +58,13 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
     );
     return result.rows[0]!.id;
   }
+  async function codeFor(userId: string, createdAt: Date): Promise<void> {
+    await db.query("INSERT INTO email_otp_codes (user_id, code_hash, expires_at, created_at) VALUES ($1, 'h', $2, $3)", [
+      userId,
+      new Date(createdAt.getTime() + 10 * 60 * 1000),
+      createdAt,
+    ]);
+  }
   async function exists(id: string): Promise<boolean> {
     return (await db.query("SELECT 1 FROM users WHERE id = $1", [id])).rows.length === 1;
   }
@@ -139,7 +146,11 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
       let injected = false;
       (db as unknown as { query: (...args: unknown[]) => Promise<unknown> }).query = async (...args: unknown[]) => {
         const text = typeof args[0] === "string" ? args[0] : "";
-        if (text.startsWith("DELETE FROM users") && !injected) {
+        // After the candidate was chosen, before the row is locked: the window in
+        // which a session can still appear. (Once the sweep holds the users row,
+        // an INSERT INTO sessions for it blocks on the foreign key until the
+        // sweep's own transaction ends — the lock closes the race from there.)
+        if (text.includes("FROM email_otp_codes") && text.includes("FOR UPDATE NOWAIT") && !injected) {
           injected = true;
           await other.query("INSERT INTO sessions (user_id) VALUES ($1)", [racing]);
         }
@@ -150,6 +161,83 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
       expect(await exists(racing)).toBe(true);
     } finally {
       await other.end();
+    }
+  });
+
+  it("STORY-173 · sweep — staleness is last ACTIVITY: a row with a code issued inside the TTL is a person mid sign-up and is kept", async () => {
+    const midSignUp = await user({ ageDays: 30 });
+    await codeFor(midSignUp, new Date(NOW.getTime() - 1 * DAY));
+    const idle = await user({ ageDays: 30 });
+    await codeFor(idle, new Date(NOW.getTime() - (UNVERIFIED_ACCOUNT_TTL_DAYS + 2) * DAY));
+    const result = await sweepStaleUnverifiedAccounts(db, NOW);
+    expect(result).toEqual({ deleted: 1, skipped: 0 });
+    expect(await exists(midSignUp)).toBe(true);
+    expect(await exists(idle)).toBe(false);
+  });
+
+  it("STORY-173 · sweep — a code issued after the sweep chose its candidates still protects the row (the DELETE re-checks)", async () => {
+    const racing = await user({ ageDays: 30 });
+    const realQuery = db.query.bind(db) as (...args: unknown[]) => Promise<unknown>;
+    let injected = false;
+    (db as unknown as { query: (...args: unknown[]) => Promise<unknown> }).query = async (...args: unknown[]) => {
+      const text = typeof args[0] === "string" ? args[0] : "";
+      if (text.startsWith("DELETE FROM users") && !injected) {
+        injected = true;
+        await realQuery("INSERT INTO email_otp_codes (user_id, code_hash, expires_at, created_at) VALUES ($1, 'h', $2, $3)", [
+          racing,
+          new Date(NOW.getTime() + 600_000),
+          NOW,
+        ]);
+      }
+      return realQuery(...args);
+    };
+    const result = await sweepStaleUnverifiedAccounts(db, NOW);
+    expect(result.deleted).toBe(0);
+    expect(await exists(racing)).toBe(true);
+  });
+
+  it("STORY-173 · sweep — each row is its own transaction, so no lock outlives its own row", async () => {
+    await user({ ageDays: 30 });
+    await user({ ageDays: 31 });
+    await user({ ageDays: 32 });
+    const statements: string[] = [];
+    const realQuery = db.query.bind(db) as (...args: unknown[]) => Promise<unknown>;
+    (db as unknown as { query: (...args: unknown[]) => Promise<unknown> }).query = async (...args: unknown[]) => {
+      if (typeof args[0] === "string") statements.push(args[0].replace(/\s+/g, " ").trim());
+      return realQuery(...args);
+    };
+    expect(await sweepStaleUnverifiedAccounts(db, NOW)).toEqual({ deleted: 3, skipped: 0 });
+    expect(statements.filter((s) => s === "BEGIN")).toHaveLength(3);
+    expect(statements.filter((s) => s === "COMMIT")).toHaveLength(3);
+    // codes before the users row — the order the email-code verify takes them
+    const firstCodes = statements.findIndex((s) => s.includes("FROM email_otp_codes") && s.includes("FOR UPDATE NOWAIT"));
+    const firstUsers = statements.findIndex((s) => s.includes("FROM users") && s.includes("FOR UPDATE NOWAIT"));
+    expect(firstCodes).toBeGreaterThan(-1);
+    expect(firstUsers).toBeGreaterThan(firstCodes);
+  });
+
+  it("STORY-173 · sweep — a row whose lock somebody else holds is skipped without waiting, and the rest are still swept", async () => {
+    const busyUsers = await user({ ageDays: 30 });
+    const busyCodes = await user({ ageDays: 31 });
+    await codeFor(busyCodes, new Date(NOW.getTime() - 20 * DAY));
+    const free = await user({ ageDays: 32 });
+
+    const holder = new Client({ connectionString: container.getConnectionUri() });
+    await holder.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [busyUsers]);
+      await holder.query("SELECT id FROM email_otp_codes WHERE user_id = $1 FOR UPDATE", [busyCodes]);
+      const started = Date.now();
+      const result = await sweepStaleUnverifiedAccounts(db, NOW);
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(result).toEqual({ deleted: 1, skipped: 2 });
+      expect(await exists(busyUsers)).toBe(true);
+      expect(await exists(busyCodes)).toBe(true);
+      expect(await exists(free)).toBe(false);
+    } finally {
+      await holder.query("ROLLBACK").catch(() => {});
+      await holder.end();
     }
   });
 });
