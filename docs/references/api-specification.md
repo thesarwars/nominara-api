@@ -117,7 +117,8 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | Method | Path | Permission | Notes |
 |---|---|---|---|
 | `POST` | `/auth/passkey/options` · `/auth/passkey/verify` | public | WebAuthn **assertion (sign-in) only**. `purpose` is `assertion`; a `registration` body is `400 validation_failed` for every address (STORY-173) |
-| `POST` | `/auth/oauth/{provider}/start` · `/callback` | public | PKCE |
+| `POST` | `/auth/oauth/{provider}/start` · `/callback` | public | PKCE. A provider that did **not** verify the address binds nothing: `403 forbidden`, `details.reason = email_not_verified`, message pointing at the email code (STORY-173). A verified address with no account creates one; with an unproved account, claims it as a first proof; with a proved account, `400` (never an auto-link) |
+| `POST` | `/auth/oauth/{provider}/link/start` ↑ · `DELETE` `/me/oauth/{provider}` ↑ | session | connecting or disconnecting a provider needs a proved address and a fresh step-up (STORY-173): `401 step_up_required`, or `403 forbidden` / `email_not_verified` |
 | `POST` | `/auth/otp/request` · `/auth/otp/verify` | public | rate-limited 3/h/email, uniform response and timing. A request for an unknown address creates it `unverified` and mails a code (STORY-173); a verified code proves the address and stamps the session as strongly authenticated (`email_otp`) |
 | `POST` | `/auth/sso/{workspace_slug}/start` · `/callback` | public | **OIDC** in v1. `/acs` (SAML) is enabled per connection only after the security review |
 | `GET`/`POST`/`PATCH`/`DELETE` | `/scim/v2/Users` · `/scim/v2/Groups` | SCIM bearer token | RFC 7644; workspace-scoped; **cannot authenticate an interactive session** |

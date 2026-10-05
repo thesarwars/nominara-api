@@ -45,6 +45,8 @@ const assertionMock = verifyAuthenticationResponse as unknown as Mock;
 const CSRF_SECRET = "test-csrf-secret";
 const BINDING = "__Host-nominara-oauth-binding";
 type Cookies = { access: string; csrf: string };
+// Only the members these tests read; the real body is the problem+json envelope.
+type ErrorBody = { error: { code: string; message: string; details: { reason?: string; methods?: string[] } }; data: { outcome: string; user_status: string } };
 
 class FakeOauth implements OauthClient {
   readonly byCode = new Map<string, OauthIdentity>();
@@ -189,7 +191,7 @@ describe("STORY-173 · OAuth never binds an address nobody proved", () => {
   async function oauth(provider: string, identity: OauthIdentity, opts: { link?: Cookies } = {}) {
     const path = opts.link ? `/auth/oauth/${provider}/link/start` : `/auth/oauth/${provider}/start`;
     const start = await app.inject({ method: "POST", url: apiUrl(path), ...(opts.link ? mutating(opts.link) : {}) });
-    if (start.statusCode >= 400) return { status: start.statusCode, cookies: null, json: start.json() as Record<string, any> };
+    if (start.statusCode >= 400) return { status: start.statusCode, cookies: null, json: start.json() as ErrorBody };
     const state = new URL(dataOf<{ authorization_url: string }>(start).authorization_url).searchParams.get("state")!;
     const binding = start.cookies.find((c) => c.name === BINDING)?.value;
     const code = randomUUID();
@@ -203,7 +205,7 @@ describe("STORY-173 · OAuth never binds an address nobody proved", () => {
       url: apiUrl(`/auth/oauth/${provider}/callback?state=${encodeURIComponent(state)}&code=${code}`),
       cookies,
     });
-    return { status: cb.statusCode, cookies: cookiesOf(cb), json: cb.json() as Record<string, any> };
+    return { status: cb.statusCode, cookies: cookiesOf(cb), json: cb.json() as ErrorBody };
   }
 
   async function mailTo(email: string, after: number): Promise<string> {
@@ -288,11 +290,11 @@ describe("STORY-173 · OAuth never binds an address nobody proved", () => {
       url: apiUrl("/auth/passkey/verify"),
       payload: { ceremony_id: dataOf<{ ceremony_id: string }>(options).ceremony_id, response: credentialResponse(credId(label)) },
     });
-    return { status: res.statusCode, cookies: cookiesOf(res), json: res.json() as Record<string, any> };
+    return { status: res.statusCode, cookies: cookiesOf(res), json: res.json() as ErrorBody };
   }
   async function addPasskey(c: Cookies, label: string) {
     const options = await app.inject({ method: "POST", url: apiUrl("/me/passkeys/options"), payload: {}, ...mutating(c) });
-    if (options.statusCode !== 201) return { status: options.statusCode, json: options.json() as Record<string, any> };
+    if (options.statusCode !== 201) return { status: options.statusCode, json: options.json() as ErrorBody };
     registrationMock.mockResolvedValue({
       verified: true,
       registrationInfo: {
@@ -307,7 +309,7 @@ describe("STORY-173 · OAuth never binds an address nobody proved", () => {
       payload: { ceremony_id: dataOf<{ ceremony_id: string }>(options).ceremony_id, response: credentialResponse(credId(label)) },
       ...mutating(c),
     });
-    return { status: verified.statusCode, json: verified.json() as Record<string, any> };
+    return { status: verified.statusCode, json: verified.json() as ErrorBody };
   }
 
   // ---- decision (1): refuse an unverified provider ----------------------------
