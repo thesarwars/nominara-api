@@ -504,6 +504,54 @@ describe("STORY-173 · OAuth never binds an address nobody proved", () => {
     expect(claimsOf(signedIn.cookies!).sub).toBe(user.id);
   });
 
+  it("STORY-173 · MAJOR-2 — link/start itself refuses a stale session and an unproved account, before any authorization request exists", async () => {
+    const proved = await seedUser();
+    const cookies = await otpSignIn(proved.email);
+    await db.query("UPDATE sessions SET last_strong_auth_at = now() - interval '6 minutes' WHERE id = $1", [claimsOf(cookies).sid]);
+    const stale = await app.inject({ method: "POST", url: apiUrl("/auth/oauth/google/link/start"), ...mutating(cookies) });
+    expect(stale.statusCode).toBe(401);
+    expect(stale.json().error.code).toBe("step_up_required");
+
+    const unproved = await seedUser({ verified: false, status: "unverified" });
+    const session = await app.get(SessionService).createSession(unproved.id, new Date(), "email_otp");
+    const refused = await app.inject({
+      method: "POST",
+      url: apiUrl("/auth/oauth/google/link/start"),
+      ...mutating({ access: session.accessToken, csrf: session.csrfToken }),
+    });
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json().error.details.reason).toBe("email_not_verified");
+    expect((await db.query("SELECT 1 FROM oauth_authorization_requests")).rows).toHaveLength(0);
+  });
+
+  it("STORY-173 · MAJOR-2 — the account must still be proved at the callback: a proof withdrawn after link/start binds nothing", async () => {
+    const user = await seedUser();
+    const cookies = await otpSignIn(user.email);
+    const start = await app.inject({ method: "POST", url: apiUrl("/auth/oauth/google/link/start"), ...mutating(cookies) });
+    expect(start.statusCode).toBe(201);
+    await db.query("UPDATE users SET email_verified_at = NULL WHERE id = $1", [user.id]);
+    const state = new URL(dataOf<{ authorization_url: string }>(start).authorization_url).searchParams.get("state")!;
+    const code = randomUUID();
+    fake.byCode.set(code, { externalSubject: "g-late", email: "late@gmail.example", emailVerified: true });
+    const cb = await app.inject({
+      method: "GET",
+      url: apiUrl(`/auth/oauth/google/callback?state=${encodeURIComponent(state)}&code=${code}`),
+      cookies: { [BINDING]: start.cookies.find((c) => c.name === BINDING)!.value, [ACCESS_COOKIE_NAME]: cookies.access },
+    });
+    expect(cb.statusCode).toBe(403);
+    expect((await db.query("SELECT 1 FROM user_credentials WHERE external_subject = 'g-late'")).rows).toHaveLength(0);
+  });
+
+  it("STORY-173 · MAJOR-2 — a proved owner who links a provider account whose credential the first proof had revoked brings it back, deliberately", async () => {
+    const user = await seedUser();
+    const credentialId = await seedOauthCredential(user.id, "google", "g-returning");
+    await db.query("UPDATE user_credentials SET revoked_at = now(), revoked_reason = 'address_proved' WHERE id = $1", [credentialId]);
+    const cookies = await otpSignIn(user.email);
+    const link = await oauth("google", { externalSubject: "g-returning", email: "r@gmail.example", emailVerified: true }, { link: cookies });
+    expect(link.status).toBe(200);
+    expect(await credential(credentialId)).toEqual({ revoked_at: null, revoked_reason: null });
+  });
+
   it("STORY-173 · MAJOR-2 — the step-up is checked again at the callback, after the time spent at the provider", async () => {
     const user = await seedUser();
     const cookies = await otpSignIn(user.email);
@@ -652,6 +700,18 @@ describe("STORY-173 · OAuth never binds an address nobody proved", () => {
       [user.id],
     );
     const res = await passkeySignIn("k-del", 1);
+    expect(res.status).toBe(400);
+    expect(res.cookies).toBeNull();
+  });
+
+  it("STORY-173 · MINOR-1 — a soft-deleted account whose status was not changed still yields no passkey session", async () => {
+    const user = await seedUser();
+    await db.query(
+      "INSERT INTO user_credentials (user_id, kind, credential_id, public_key, sign_count) VALUES ($1, 'passkey', $2, $3, 0)",
+      [user.id, Buffer.from(credId("k-soft"), "base64url"), Buffer.from([1])],
+    );
+    await db.query("UPDATE users SET deleted_at = now() WHERE id = $1", [user.id]);
+    const res = await passkeySignIn("k-soft", 1);
     expect(res.status).toBe(400);
     expect(res.cookies).toBeNull();
   });
