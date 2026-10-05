@@ -16,6 +16,7 @@ import { EMAIL_SENDER } from "../../src/modules/identity/ports/email-sender.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
 import { apiUrl } from "../support/api-url.js";
 import { eachRequestFromItsOwnClient } from "../support/distinct-source.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 import { dataOf } from "../support/envelope.js";
 
 // STORY-173 — an anonymous caller could bind their own passkey to ANY existing
@@ -151,10 +152,9 @@ describe("STORY-173 · passkey registration proves the address", () => {
       OAUTH_STATE_SECRET: "test-oauth-state-secret",
       OTP_EMAIL_HASH_PEPPER: "test-otp-email-hash-pepper",
       OTP_EMAIL_FROM: "Nominara <no-reply@nominara.test>",
-      // Unreachable on purpose: nothing here needs a cache, and this file must
-      // never point at a developer's running Valkey.
-      VALKEY_CACHE_URL: "redis://127.0.0.1:2",
-      QUEUE_REDIS_URL: "redis://127.0.0.1:1",
+      // STORY-174 — the run's own throwaway Valkey containers, never a developer's.
+      VALKEY_CACHE_URL: testCacheRedisUrl(),
+      QUEUE_REDIS_URL: testQueueRedisUrl(),
       ENGINE_TOKEN_BUCKETS:
         '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}',
       QUEUE_JOB_SIGNING_KEY: Buffer.alloc(32, 3).toString("base64"),
