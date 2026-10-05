@@ -12,18 +12,50 @@ import { connect, requireDatabaseUrl } from "../../db/client.js";
 //
 // Same surface as credit-verify.ts / audit-verify.ts: a plain exported function
 // over a privileged client, plus a main() an operator or a scheduler runs.
-// ⚠ NOT YET ON A SCHEDULE. Running it from the queue needs a new queue
-// (topology.ts + schedule.ts + a handler), which is a decision for the owner
-// rather than something this story slips in. Until then it is run by hand:
-// `pnpm identity:sweep-unverified`.
+// It runs DAILY at 02:50 UTC as the `identity.sweep_unverified` queue (owner
+// decision, 2026-10-05; see lib/queue/handlers/identity-sweep-unverified.handler.ts),
+// and `pnpm identity:sweep-unverified` remains the manual entry point.
 
 /** An unproved account nobody has touched for this long is stale. A decision, proposed here, adjustable by one constant. */
 export const UNVERIFIED_ACCOUNT_TTL_DAYS = 7;
 
 export interface UnverifiedSweepResult {
   readonly deleted: number;
-  /** Candidates that a foreign key still referenced; left in place, never forced. */
-  readonly skipped: number;
+  /** Candidates that another table still references (a foreign key); left in place, never forced. */
+  readonly skippedReferenced: number;
+  /** Candidates somebody else held a lock on (NOWAIT): by definition not stale this run, retried tomorrow. */
+  readonly skippedLocked: number;
+}
+
+/** Thrown, before anything is read or deleted, when the connection cannot see past row-level security. */
+export class SweepBlindError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SweepBlindError";
+  }
+}
+
+/**
+ * ⚠ THE SWEEP DELETES FROM A TABLE WHOSE CHILDREN IT CANNOT SEE ON A BLIND
+ * CONNECTION. `workspace_members` carries FORCE ROW LEVEL SECURITY with
+ * policies for the runtime roles only, and its `user_id` foreign key is
+ * `ON DELETE CASCADE`. A connection that is neither a superuser nor BYPASSRLS
+ * sees ZERO memberships, concludes an unverified user has none, deletes it —
+ * and the cascade silently removes the membership it could not see. Same
+ * precedent and same query as `assertVerifierCanSee` in audit-verify.ts, with
+ * its own words: a property of the role, true or false regardless of how much
+ * data exists, so it cannot itself be hidden by what it guards against.
+ */
+export async function assertSweepCanSee(client: ClientBase): Promise<void> {
+  const result = await client.query<{ can_see: boolean; who: string }>(
+    "SELECT (rolsuper OR rolbypassrls) AS can_see, rolname AS who FROM pg_roles WHERE rolname = current_user",
+  );
+  const row = result.rows[0];
+  if (row?.can_see === true) return;
+  throw new SweepBlindError(
+    `the unverified-account sweep is connected as "${row?.who ?? "unknown"}", which neither bypasses row-level security nor is a superuser — ` +
+      "workspace_members carries FORCE ROW LEVEL SECURITY and cascades on delete, so this role would see no memberships and delete accounts that have them",
+  );
 }
 
 /**
@@ -50,6 +82,9 @@ export async function sweepStaleUnverifiedAccounts(
   now: Date = new Date(),
   ttlDays: number = UNVERIFIED_ACCOUNT_TTL_DAYS,
 ): Promise<UnverifiedSweepResult> {
+  // Before anything is read: a blind role's empty view is exactly what must not
+  // be mistaken for "nothing holds this account".
+  await assertSweepCanSee(client);
   const cutoff = new Date(now.getTime() - ttlDays * 24 * 60 * 60 * 1000);
   const candidates = await client.query<{ id: string }>(
     `SELECT u.id FROM users u
@@ -59,7 +94,8 @@ export async function sweepStaleUnverifiedAccounts(
     [cutoff],
   );
   let deleted = 0;
-  let skipped = 0;
+  let skippedReferenced = 0;
+  let skippedLocked = 0;
   for (const { id } of candidates.rows) {
     await client.query("BEGIN");
     try {
@@ -79,20 +115,26 @@ export async function sweepStaleUnverifiedAccounts(
       );
       await client.query("COMMIT");
       deleted += result.rowCount ?? 0;
-    } catch {
-      // 55P03 (held by someone: not stale) or 23503 (still referenced).
+    } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
-      skipped += 1;
+      const code = (error as { code?: string }).code;
+      if (code === "55P03") {
+        skippedLocked += 1; // held by someone: not stale this run
+      } else if (code === "23503") {
+        skippedReferenced += 1; // still referenced by another table
+      } else {
+        throw error; // anything else is a fault, not a skip
+      }
     }
   }
-  return { deleted, skipped };
+  return { deleted, skippedReferenced, skippedLocked };
 }
 
 async function main(): Promise<void> {
   const client = await connect(requireDatabaseUrl());
   try {
     const result = await sweepStaleUnverifiedAccounts(client);
-    console.log(`identity:sweep-unverified — deleted ${String(result.deleted)}, skipped ${String(result.skipped)}`);
+    console.log(`identity:sweep-unverified — deleted ${String(result.deleted)}, skipped ${String(result.skippedReferenced)} referenced / ${String(result.skippedLocked)} locked`);
   } finally {
     await client.end();
   }

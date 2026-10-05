@@ -3,7 +3,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { sweepStaleUnverifiedAccounts, UNVERIFIED_ACCOUNT_TTL_DAYS } from "../../src/workers/rollup/unverified-sweep.js";
+import { SweepBlindError, sweepStaleUnverifiedAccounts, UNVERIFIED_ACCOUNT_TTL_DAYS } from "../../src/workers/rollup/unverified-sweep.js";
 
 // STORY-173 (owner decision "claim it + clean up") — an anonymous email-code
 // request creates an `unverified` account; this sweep removes the ones nobody
@@ -73,7 +73,7 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
     const stale = await user({ ageDays: UNVERIFIED_ACCOUNT_TTL_DAYS + 1 });
     await db.query("INSERT INTO email_otp_codes (user_id, code_hash, expires_at) VALUES ($1, 'h', now())", [stale]);
     const result = await sweepStaleUnverifiedAccounts(db, NOW);
-    expect(result).toEqual({ deleted: 1, skipped: 0 });
+    expect(result).toEqual({ deleted: 1, skippedReferenced: 0, skippedLocked: 0 });
     expect(await exists(stale)).toBe(false);
     expect((await db.query("SELECT 1 FROM email_otp_codes WHERE user_id = $1", [stale])).rows).toHaveLength(0);
   });
@@ -94,7 +94,7 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
     const proved = await user({ ageDays: 30, status: "unverified", verified: true });
     const active = await user({ ageDays: 30, status: "active", verified: false });
     const suspended = await user({ ageDays: 30, status: "suspended" });
-    expect(await sweepStaleUnverifiedAccounts(db, NOW)).toEqual({ deleted: 0, skipped: 0 });
+    expect(await sweepStaleUnverifiedAccounts(db, NOW)).toEqual({ deleted: 0, skippedReferenced: 0, skippedLocked: 0 });
     for (const id of [fresh, proved, active, suspended]) expect(await exists(id)).toBe(true);
   });
 
@@ -111,7 +111,7 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
       await workspace(),
       withMembership,
     ]);
-    expect(await sweepStaleUnverifiedAccounts(db, NOW)).toEqual({ deleted: 0, skipped: 0 });
+    expect(await sweepStaleUnverifiedAccounts(db, NOW)).toEqual({ deleted: 0, skippedReferenced: 0, skippedLocked: 0 });
     expect(await exists(withCredential)).toBe(true);
     expect(await exists(withSession)).toBe(true);
     expect(await exists(withMembership)).toBe(true);
@@ -129,7 +129,7 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
       [wsId, Buffer.from(randomUUID()), inviter, referenced],
     );
     const result = await sweepStaleUnverifiedAccounts(db, NOW);
-    expect(result).toEqual({ deleted: 1, skipped: 1 });
+    expect(result).toEqual({ deleted: 1, skippedReferenced: 1, skippedLocked: 0 });
     expect(await exists(referenced)).toBe(true);
     expect(await exists(orphan)).toBe(false);
   });
@@ -170,7 +170,7 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
     const idle = await user({ ageDays: 30 });
     await codeFor(idle, new Date(NOW.getTime() - (UNVERIFIED_ACCOUNT_TTL_DAYS + 2) * DAY));
     const result = await sweepStaleUnverifiedAccounts(db, NOW);
-    expect(result).toEqual({ deleted: 1, skipped: 0 });
+    expect(result).toEqual({ deleted: 1, skippedReferenced: 0, skippedLocked: 0 });
     expect(await exists(midSignUp)).toBe(true);
     expect(await exists(idle)).toBe(false);
   });
@@ -206,7 +206,7 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
       if (typeof args[0] === "string") statements.push(args[0].replace(/\s+/g, " ").trim());
       return realQuery(...args);
     };
-    expect(await sweepStaleUnverifiedAccounts(db, NOW)).toEqual({ deleted: 3, skipped: 0 });
+    expect(await sweepStaleUnverifiedAccounts(db, NOW)).toEqual({ deleted: 3, skippedReferenced: 0, skippedLocked: 0 });
     expect(statements.filter((s) => s === "BEGIN")).toHaveLength(3);
     expect(statements.filter((s) => s === "COMMIT")).toHaveLength(3);
     // codes before the users row — the order the email-code verify takes them
@@ -231,7 +231,7 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
       const started = Date.now();
       const result = await sweepStaleUnverifiedAccounts(db, NOW);
       expect(Date.now() - started).toBeLessThan(5000);
-      expect(result).toEqual({ deleted: 1, skipped: 2 });
+      expect(result).toEqual({ deleted: 1, skippedReferenced: 0, skippedLocked: 2 });
       expect(await exists(busyUsers)).toBe(true);
       expect(await exists(busyCodes)).toBe(true);
       expect(await exists(free)).toBe(false);
@@ -239,5 +239,44 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
       await holder.query("ROLLBACK").catch(() => {});
       await holder.end();
     }
+  });
+
+  it("STORY-173 · sweep — REFUSES on a connection that cannot see past row-level security, and deletes nothing (F-blind)", async () => {
+    // workspace_members is FORCE RLS with policies for the runtime roles only and
+    // cascades on delete: a blind role sees no memberships, would delete the
+    // account that has one, and the cascade would silently remove the membership.
+    const holder = await user({ ageDays: 30 });
+    const wsId = await workspace();
+    await db.query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1, $2, 'owner', 'active')", [wsId, holder]);
+    const plain = await user({ ageDays: 31 });
+
+    await db.query("ALTER ROLE nominara_app PASSWORD 'blindsweep'");
+    const blind = new Client({
+      connectionString: `postgres://nominara_app:blindsweep@${container.getHost()}:${String(container.getMappedPort(5432))}/nominara_test`,
+    });
+    await blind.connect();
+    try {
+      await expect(sweepStaleUnverifiedAccounts(blind, NOW)).rejects.toBeInstanceOf(SweepBlindError);
+      await expect(sweepStaleUnverifiedAccounts(blind, NOW)).rejects.toThrow(/neither bypasses row-level security nor is a superuser/);
+    } finally {
+      await blind.end();
+    }
+    expect(await exists(holder)).toBe(true);
+    expect(await exists(plain)).toBe(true);
+    expect((await db.query("SELECT 1 FROM workspace_members WHERE user_id = $1", [holder])).rows).toHaveLength(1);
+  });
+
+  it("STORY-173 · sweep — an error that is neither a held lock nor a foreign key is a fault, not a skip: it propagates and the row survives", async () => {
+    const victim = await user({ ageDays: 30 });
+    const realQuery = db.query.bind(db) as (...args: unknown[]) => Promise<unknown>;
+    (db as unknown as { query: (...args: unknown[]) => Promise<unknown> }).query = async (...args: unknown[]) => {
+      if (typeof args[0] === "string" && args[0].startsWith("DELETE FROM users")) throw new Error("disk on fire");
+      return realQuery(...args);
+    };
+    await expect(sweepStaleUnverifiedAccounts(db, NOW)).rejects.toThrow("disk on fire");
+    (db as unknown as { query: unknown }).query = realQuery;
+    expect(await exists(victim)).toBe(true);
+    // and the connection is left clean (the failed row's transaction was rolled back)
+    expect(await sweepStaleUnverifiedAccounts(db, NOW)).toEqual({ deleted: 1, skippedReferenced: 0, skippedLocked: 0 });
   });
 });

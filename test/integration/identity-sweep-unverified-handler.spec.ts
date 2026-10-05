@@ -136,4 +136,25 @@ describe("STORY-173 · identity.sweep_unverified handler", () => {
       await db.query("SELECT pg_advisory_unlock_all()");
     }
   });
+
+  it("fails LOUDLY on a blind connection: a failed job, a metric, an error line, and nothing deleted", async () => {
+    const stale = await staleUser();
+    await db.query("ALTER ROLE nominara_app PASSWORD 'blindhandler'");
+    const blindEnv = {
+      DATABASE_URL: `postgres://nominara_app:blindhandler@${container.getHost()}:${String(container.getMappedPort(5432))}/nominara_test`,
+    } as unknown as Env;
+    const errors: string[] = [];
+    const spy = vi.spyOn(Logger.prototype, "error").mockImplementation((m: unknown) => void errors.push(String(m)));
+    try {
+      await expect(createIdentitySweepUnverifiedHandler({ pool: noPool, env: blindEnv })(db, tick())).rejects.toThrow(
+        /neither bypasses row-level security nor is a superuser/,
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await exists(stale)).toBe(true);
+    expect(counters.map((c) => c.name)).toContain("nominara_identity_unverified_sweep_blind_total");
+    expect(counters.map((c) => c.name)).not.toContain("nominara_identity_unverified_sweep_runs_total");
+    expect(errors.some((l) => l.includes("row-level security"))).toBe(true);
+  });
 });

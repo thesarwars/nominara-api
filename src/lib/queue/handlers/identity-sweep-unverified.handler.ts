@@ -2,7 +2,7 @@ import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
-import { sweepStaleUnverifiedAccounts } from "../../../workers/rollup/unverified-sweep.js";
+import { SweepBlindError, sweepStaleUnverifiedAccounts } from "../../../workers/rollup/unverified-sweep.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { globalQueueLockKey, releaseAdvisorySessionLock, tryAdvisorySessionLock } from "../locks.js";
 import type { QueueHandlerContext } from "../handlers.js";
@@ -36,13 +36,26 @@ export function createIdentitySweepUnverifiedHandler(context: QueueHandlerContex
         logger.warn("another replica holds the unverified-sweep lock; yielding this tick");
         return;
       }
-      const result = await sweepStaleUnverifiedAccounts(client);
+      let result;
+      try {
+        result = await sweepStaleUnverifiedAccounts(client);
+      } catch (error) {
+        if (error instanceof SweepBlindError) {
+          // Loud: a job that fails (DLQ), a metric, and an error line. Nothing
+          // was deleted — the check runs before the first read.
+          incrementCounter("nominara_identity_unverified_sweep_blind_total");
+          logger.error(error.message);
+        }
+        throw error;
+      }
       incrementCounter("nominara_identity_unverified_sweep_runs_total");
       if (result.deleted > 0) {
         incrementCounter("nominara_identity_unverified_accounts_deleted_total");
       }
       // Counts only — never an address or an account id.
-      logger.log(`unverified sweep: deleted ${String(result.deleted)}, skipped ${String(result.skipped)}`);
+      logger.log(
+        `unverified sweep: deleted ${String(result.deleted)}, skipped ${String(result.skippedReferenced)} referenced / ${String(result.skippedLocked)} locked`,
+      );
     } finally {
       if (held && !(await releaseAdvisorySessionLock(client, lockKey))) {
         logger.error("unverified-sweep lock was not held at release — the lock key or the connection changed under us");
