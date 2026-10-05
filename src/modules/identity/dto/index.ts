@@ -13,6 +13,10 @@ export {
   type PasskeyOptionsRequest,
 } from "../../../../contracts/identity/passkey-options-request.schema.js";
 export {
+  passkeyAddOptionsRequestSchema,
+  type PasskeyAddOptionsRequest,
+} from "../../../../contracts/identity/passkey-add-options-request.schema.js";
+export {
   passkeyOptionsResponseSchema,
   type PasskeyOptionsResponse,
 } from "../../../../contracts/identity/passkey-options-response.schema.js";
