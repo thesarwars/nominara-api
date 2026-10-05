@@ -11,6 +11,8 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { PG_POOL } from "../../src/db/pg-pool.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { computeCsrfToken } from "../../src/lib/auth/csrf.js";
+import { conflictDetailsSchema } from "../../contracts/common/error-details.schema.js";
+import { hashInvitationToken } from "../../src/lib/auth/invitation-token.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
 import { InvitationsService } from "../../src/modules/workspaces/invitations.service.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
@@ -75,7 +77,9 @@ describe("STORY-172 · invitation acceptance is bound to the invited, verified e
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
     process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    // STORY-172 — 6380 is a developer's running valkey on some machines; this file
+    // never enqueues, so S172_QUEUE_REDIS_URL lets a run point somewhere unused.
+    process.env.QUEUE_REDIS_URL = process.env.S172_QUEUE_REDIS_URL ?? "redis://localhost:6380";
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
@@ -225,6 +229,12 @@ describe("STORY-172 · invitation acceptance is bound to the invited, verified e
     const expired = await invite(workspaceId, owner.id, `x-${randomUUID()}@example.com`);
     await db.query("UPDATE workspace_invitations SET expires_at = now() - interval '1 hour' WHERE id = $1", [expired.id]);
 
+    const revoked = await invite(workspaceId, owner.id, `r-${randomUUID()}@example.com`);
+    await db.query("UPDATE workspace_invitations SET revoked_at = now() WHERE id = $1", [revoked.id]);
+    const usedFor = await createUser();
+    const used = await invite(workspaceId, owner.id, usedFor.email);
+    expect((await accept(usedFor.id, workspaceId, used.token!)).statusCode).toBe(200);
+
     const mismatch = refusalShape(await accept(stranger.id, workspaceId, live.token!));
     const unknown = refusalShape(await accept(stranger.id, workspaceId, "no-such-token"));
     const expiredRes = refusalShape(await accept(stranger.id, workspaceId, expired.token!));
@@ -232,9 +242,98 @@ describe("STORY-172 · invitation acceptance is bound to the invited, verified e
     expect(mismatch.status).toBe(400);
     expect(unknown).toEqual(mismatch);
     expect(expiredRes).toEqual(mismatch);
+    expect(refusalShape(await accept(stranger.id, workspaceId, revoked.token!))).toEqual(mismatch);
+    expect(refusalShape(await accept(stranger.id, workspaceId, used.token!))).toEqual(mismatch);
   });
 
-  it("STORY-172-AC5 · median latency of a mismatch and of an unknown token is within tolerance", async () => {
+  /**
+   * Records every statement text issued by any pg client while `fn` runs, by
+   * wrapping `Client.prototype.query` for the duration. The pool the app injects
+   * is itself a guard Proxy (query-guard.ts), so swapping `pool.connect` here
+   * would recurse; the prototype is the one place below every wrapper.
+   */
+  async function recordStatements(fn: () => Promise<void>): Promise<string[]> {
+    const log: string[] = [];
+    // Timers too: a refusal path that sleeps (a deliberate delay, or a retry
+    // back-off) schedules one, and a stopwatch cannot see a 20 ms difference
+    // through container jitter but a recorded setTimeout delay can.
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((handler: unknown, delay?: number, ...rest: unknown[]) => {
+      if ((delay ?? 0) >= 5) log.push(`<timer ${String(delay)}ms>`);
+      return (realSetTimeout as unknown as (...a: unknown[]) => unknown)(handler, delay, ...rest);
+    }) as unknown as typeof setTimeout;
+    const proto = Client.prototype as unknown as { query: (...a: unknown[]) => unknown };
+    const original = proto.query;
+    proto.query = function (this: unknown, ...a: unknown[]) {
+      const first = a[0];
+      log.push((typeof first === "string" ? first : String((first as { text?: unknown }).text)).replace(/\s+/g, " ").trim());
+      return original.apply(this, a);
+    };
+    try {
+      await fn();
+    } finally {
+      proto.query = original;
+      globalThis.setTimeout = realSetTimeout;
+    }
+    return log;
+  }
+
+  it("STORY-172-AC4b · every refusal runs the SAME SQL sequence and writes nothing (deterministic, not a stopwatch)", async () => {
+    const owner = await createUser();
+    const workspaceId = await createWorkspace(owner.id);
+    const invitee = await createUser();
+    const live = await invite(workspaceId, owner.id, invitee.email);
+    const expired = await invite(workspaceId, owner.id, `e-${randomUUID()}@example.com`);
+    await db.query("UPDATE workspace_invitations SET expires_at = now() - interval '1 hour' WHERE id = $1", [expired.id]);
+    const revoked = await invite(workspaceId, owner.id, `r-${randomUUID()}@example.com`);
+    await db.query("UPDATE workspace_invitations SET revoked_at = now() WHERE id = $1", [revoked.id]);
+    const usedFor = await createUser();
+    const used = await invite(workspaceId, owner.id, usedFor.email);
+    expect((await accept(usedFor.id, workspaceId, used.token!)).statusCode).toBe(200);
+
+    const snapshot = async () => ({
+      invitations: (await db.query("SELECT id, accepted_at, accepted_user_id, revoked_at FROM workspace_invitations ORDER BY id")).rows,
+      audit: (await db.query("SELECT count(*)::int AS n FROM audit_log")).rows[0].n as number,
+      members: (await db.query("SELECT count(*)::int AS n FROM workspace_members")).rows[0].n as number,
+    });
+
+    const cases: Array<[string, string]> = [
+      ["mismatch", live.token!],
+      ["unknown", `unknown-${randomUUID()}`],
+      ["expired", expired.token!],
+      ["revoked", revoked.token!],
+      ["used", used.token!],
+    ];
+    const sequences = new Map<string, string[]>();
+    for (const [label, token] of cases) {
+      const stranger = await createUser();
+      // Mint the session BEFORE recording: only the accept request is compared.
+      const tokens = await app.get(SessionService).createSession(stranger.id);
+      const csrf = computeCsrfToken(tokens.sid, CSRF_SECRET);
+      const before = await snapshot();
+      let status = 0;
+      const statements = await recordStatements(async () => {
+        const res = await app.inject({
+          method: "POST",
+          url: apiUrl(`/workspaces/${workspaceId}/invitations/accept`),
+          cookies: { [ACCESS_COOKIE_NAME]: tokens.accessToken, [CSRF_COOKIE_NAME]: csrf },
+          headers: { [CSRF_HEADER_NAME]: csrf },
+          payload: { token },
+        });
+        status = res.statusCode;
+      });
+      expect(status, label).toBe(400);
+      expect(await snapshot(), `${label} must write nothing`).toEqual(before);
+      expect(statements.some((q) => /UPDATE workspace_invitations/.test(q)), `${label} reached the claim`).toBe(true);
+      sequences.set(label, statements);
+    }
+    const reference = sequences.get("mismatch")!;
+    for (const [label, statements] of sequences) {
+      expect(statements, `${label} must issue the same statements as a mismatch`).toEqual(reference);
+    }
+  });
+
+  it("STORY-172-AC5 · smoke only — median latency of a mismatch and of an unknown token is within tolerance (AC4b is the real uniformity check)", async () => {
     const owner = await createUser();
     const workspaceId = await createWorkspace(owner.id);
     // A fresh caller per request: the writes rate limit is per user, and a
@@ -282,6 +381,8 @@ describe("STORY-172 · invitation acceptance is bound to the invited, verified e
     const res = await accept(invitee.id, workspaceId, invitation.token!);
     expect(res.statusCode).toBe(409);
     expect(res.json().error).toMatchObject({ code: "conflict", details: { reason: "already_member" } });
+    // The published contract: details must satisfy the strict conflict schema.
+    expect(conflictDetailsSchema.safeParse(res.json().error.details).success).toBe(true);
 
     expect((await invitationRow(invitation.id)).accepted_at).toBeNull();
     expect(await memberCount(workspaceId, invitee.id)).toBe(1);
@@ -362,10 +463,24 @@ describe("STORY-172 · invitation acceptance is bound to the invited, verified e
 
     const emitted = [...logSpy.mock.calls, ...warnSpy.mock.calls].map((call) => JSON.stringify(call[0]));
     expect(emitted.some((line) => line.includes("nominara_identity_invitation_accept_refused_total") && line.includes("email_mismatch"))).toBe(true);
+    const refusalLine = emitted.find((line) => line.includes("invitation accept refused"))!;
+    expect(refusalLine).toContain(`workspace_id=${workspaceId}`);
+    expect(refusalLine).toContain(`user_id=${stranger.id}`);
+    expect(refusalLine).toContain(`invitation_id=${invitation.id}`);
+    expect(refusalLine).toContain("reason=email_mismatch");
     for (const line of emitted) {
       expect(line).not.toContain(invitation.token!);
+      // The stored hash is as good as the secret for anyone who can read the DB.
+      const hash = hashInvitationToken(invitation.token!);
+      expect(line).not.toContain(hash.toString("hex"));
+      expect(line).not.toContain(hash.toString("base64"));
       expect(line.toLowerCase()).not.toContain(invitee.email.toLowerCase());
     }
+    // An unknown token names no invitation (there is none to name).
+    emitted.length = 0;
+    await accept(stranger.id, workspaceId, "no-such-token");
+    const unknownLine = [...logSpy.mock.calls, ...warnSpy.mock.calls].map((c) => JSON.stringify(c[0])).find((l) => l.includes("reason=token_unusable"))!;
+    expect(unknownLine).not.toContain("invitation_id");
     // The response never names the reason.
     expect(JSON.stringify(res.json())).not.toMatch(/mismatch|verified|another account/i);
   });
@@ -382,7 +497,50 @@ describe("STORY-172 · invitation acceptance is bound to the invited, verified e
 
     const res = await accept(invitee.id, workspaceId, invitation.token!);
     expect(res.statusCode).toBe(409);
-    expect(res.json().error).toMatchObject({ details: { reason: "member_suspended" } });
+    expect(res.json().error).toMatchObject({ code: "conflict", details: { reason: "member_suspended" } });
+    expect(conflictDetailsSchema.safeParse(res.json().error.details).success).toBe(true);
     expect((await invitationRow(invitation.id)).accepted_at).toBeNull();
   });
+  it("STORY-172-AC12 · a concurrent erasure of the acceptor cannot leave a deleted user with an active membership", async () => {
+    const owner = await createUser();
+    const workspaceId = await createWorkspace(owner.id);
+    const invitee = await createUser();
+    const invitation = await invite(workspaceId, owner.id, invitee.email);
+
+    // The erasure (retention.ts) updates users, THEN sweeps memberships, in one
+    // transaction. Hold it open between the two statements.
+    const eraser = new Client({ connectionString: container.getConnectionUri() });
+    await eraser.connect();
+    try {
+      await eraser.query("BEGIN");
+      await eraser.query("UPDATE users SET status = 'deleted', deleted_at = now() WHERE id = $1", [invitee.id]);
+
+      let settled = false;
+      const attempt = app
+        .get(InvitationsService)
+        .accept(workspaceId, invitee.id, invitation.token!, meta)
+        .then(
+          () => "accepted" as const,
+          (error: unknown) => {
+            return (error as { status?: number }).status === 400 ? ("refused" as const) : ("other" as const);
+          },
+        )
+        .finally(() => {
+          settled = true;
+        });
+
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(settled, "accept must WAIT for the erasure's row lock, not read the pre-erasure row").toBe(false);
+
+      await eraser.query("UPDATE workspace_members SET status = 'removed' WHERE user_id = $1", [invitee.id]);
+      await eraser.query("COMMIT");
+
+      expect(await attempt).toBe("refused");
+    } finally {
+      await eraser.end();
+    }
+    const active = await db.query("SELECT 1 FROM workspace_members WHERE user_id = $1 AND status = 'active'", [invitee.id]);
+    expect(active.rowCount).toBe(0);
+    expect((await invitationRow(invitation.id)).accepted_at).toBeNull();
+  }, 30_000);
 });

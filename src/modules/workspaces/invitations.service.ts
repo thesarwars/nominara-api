@@ -1,4 +1,5 @@
-import { ConflictException, Inject, Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger } from "@nestjs/common";
+import { ConflictError } from "../../api/errors/domain-errors.js";
 import type { ClientBase, Pool } from "pg";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { PG_POOL } from "../../db/pg-pool.js";
@@ -159,9 +160,17 @@ export class InvitationsService {
    *  2. "Verified" is `users.email_verified_at IS NOT NULL`, never
    *     `status = 'active'`: a passkey registration promotes status without
    *     anyone proving they control the address.
-   *  3. Email comparison is `users.email = i.email`; both columns are citext,
-   *     so it is case-insensitive without a second normaliser. (OTP/OAuth
-   *     store users.email via normalizeEmail; the invite stores it as typed.)
+   *  3. Email comparison is `users.email = i.email`. Correctness rests on
+   *     BOTH columns being citext (case-insensitive equality in the database).
+   *     It does NOT rely on normalizeEmail: OTP stores users.email normalised
+   *     (trim + lowercase) but the invitation stores the address as typed, and
+   *     OAuth/passkey store the provider's / caller's spelling. Surrounding
+   *     whitespace is not citext-equal, but z.email() on create rejects it.
+   *  4. The EXISTS locks the acceptor's users row (FOR SHARE) so a concurrent
+   *     erasure (retention.ts: users UPDATE, then the membership sweep) either
+   *     finishes first, and the re-check sees status 'deleted' and refuses, or
+   *     waits for this transaction and then sweeps the membership created here.
+   *     Without it a deleted user could end with an ACTIVE membership.
    *
    * An already-active member is refused with a 409 AFTER the claim, by
    * throwing so the transaction rolls the claim back (token unconsumed). That
@@ -182,6 +191,7 @@ export class InvitationsService {
                SELECT 1 FROM users u
                WHERE u.id = $1 AND u.email = i.email
                  AND u.email_verified_at IS NOT NULL AND u.deleted_at IS NULL AND u.status = 'active'
+               FOR SHARE OF u
              )
            RETURNING i.role, i.project_scope, i.invited_by`,
           [userId, workspaceId, tokenHash],
@@ -216,8 +226,7 @@ export class InvitationsService {
           // suspended member is an administrative action this story does
           // not build a path for (see the story's "Out of scope" list).
           if (memberRow.status === "suspended") {
-            throw new ConflictException({
-              code: "conflict",
+            throw new ConflictError({
               message: "this member is suspended and cannot accept a new invitation — an admin must reactivate them first",
               details: { reason: "member_suspended" },
             });
@@ -230,8 +239,7 @@ export class InvitationsService {
           // (e.g. an admin can revoke it, or re-invite at a different role
           // after removing the member). Reachable only by the verified
           // holder of the invited address — see the method comment.
-          throw new ConflictException({
-            code: "conflict",
+          throw new ConflictError({
             message: "you are already a member of this workspace",
             details: { reason: "already_member" },
           });
@@ -269,19 +277,20 @@ export class InvitationsService {
    * a victim workspace's chain, and an append that happened only on a mismatch
    * would also be a timing tell.
    *
+   * `workspace_id` in the line is CALLER-CHOSEN for an unknown token (it is the
+   * URL's `:id`), so do not alert or aggregate per workspace on it; only a line
+   * with an `invitation_id` is tied to a real invitation.
+   *
    * Timing: this single diagnostic SELECT runs on EVERY refusal (unknown token
    * included), so a mismatch costs the same round trips as an unknown token.
    * It re-states the claim's predicates and must stay in step with them; it
    * only labels a refusal that has already happened and never grants anything.
    */
-  private async recordRefusal(
-    tx: ClientBase,
-    workspaceId: string,
-    userId: string,
-    tokenHash: Buffer,
-  ): Promise<void> {
-    const probe = await tx.query<{ email_match: boolean | null; account_ok: boolean | null }>(
-      `SELECT (u.email = i.email) AS email_match,
+  private async recordRefusal(tx: ClientBase, workspaceId: string, userId: string, tokenHash: Buffer): Promise<void> {
+    const probe = await tx.query<{ invitation_id: string; user_found: boolean; email_match: boolean | null; account_ok: boolean | null }>(
+      `SELECT i.id AS invitation_id,
+              (u.id IS NOT NULL) AS user_found,
+              (u.email = i.email) AS email_match,
               (u.email_verified_at IS NOT NULL AND u.deleted_at IS NULL AND u.status = 'active') AS account_ok
        FROM workspace_invitations i
        LEFT JOIN users u ON u.id = $1
@@ -290,8 +299,20 @@ export class InvitationsService {
       [userId, workspaceId, tokenHash],
     );
     const row = probe.rows[0];
-    const reason = !row ? "token_unusable" : row.email_match !== true ? "email_mismatch" : row.account_ok !== true ? "account_not_verified" : "unclassified";
+    const reason = !row
+      ? "token_unusable"
+      : !row.user_found
+        ? "acceptor_not_found"
+        : row.email_match !== true
+          ? "email_mismatch"
+          : row.account_ok !== true
+            ? "account_not_verified"
+            : "unclassified";
     incrementCounter("nominara_identity_invitation_accept_refused_total", { reason });
-    this.logger.warn(`invitation accept refused workspace_id=${workspaceId} reason=${reason}`);
+    // The invitation id is logged only where a real invitation was matched
+    // (never for an unknown token: there is nothing to name). Never the token,
+    // the address, or a workspace name.
+    const invitation = row !== undefined && reason !== "token_unusable" ? ` invitation_id=${row.invitation_id}` : "";
+    this.logger.warn(`invitation accept refused workspace_id=${workspaceId} user_id=${userId}${invitation} reason=${reason}`);
   }
 }

@@ -15,6 +15,7 @@ import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { hashInvitationToken } from "../../src/lib/auth/invitation-token.js";
 import { InvitationInvalidException } from "../../src/tenancy/errors.js";
+import { ConflictError } from "../../src/api/errors/domain-errors.js";
 
 // STORY-021 — Test Scenarios 10, 11, 12 (E-6/E-7). Real Postgres: E-7's
 // uniform-timing claim can only be measured honestly against real query
@@ -381,9 +382,10 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
     );
     // Previously this burned the token and answered 200 with the EXISTING
     // role, the invited role silently not applied.
-    await expect(invitations.accept(targetWorkspace.id, inviteeId, second.token!, meta)).rejects.toMatchObject({
-      response: { code: "conflict", details: { reason: "already_member" } },
-    });
+    // Typed, so ProblemFilter validates details against the published contract.
+    const refusal = await invitations.accept(targetWorkspace.id, inviteeId, second.token!, meta).catch((e: unknown) => e);
+    expect(refusal).toBeInstanceOf(ConflictError);
+    expect(refusal).toMatchObject({ code: "conflict", details: { reason: "already_member" } });
 
     const row = await db.query<{ accepted_at: Date | null }>(
       "SELECT accepted_at FROM workspace_invitations WHERE id = $1",
@@ -414,9 +416,9 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
       invitations.create(targetWorkspace.id, inviterOwnerId, { email: "suspend-me@example.com", role: "manager" }),
     );
 
-    await expect(invitations.accept(targetWorkspace.id, inviteeId, second.token!, meta)).rejects.toMatchObject({
-      response: { code: "conflict", details: { reason: "member_suspended" } },
-    });
+    const suspendedRefusal = await invitations.accept(targetWorkspace.id, inviteeId, second.token!, meta).catch((e: unknown) => e);
+    expect(suspendedRefusal).toBeInstanceOf(ConflictError);
+    expect(suspendedRefusal).toMatchObject({ code: "conflict", details: { reason: "member_suspended" } });
 
     const row = await db.query<{ status: string; role: string }>(
       "SELECT status, role FROM workspace_members WHERE id = $1",
