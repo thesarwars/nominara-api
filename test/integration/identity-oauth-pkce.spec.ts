@@ -5,6 +5,7 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { verifyRegistrationResponse } from "@simplewebauthn/server";
+import { SessionService } from "../../src/modules/identity/session.service.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
@@ -280,7 +281,17 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
       { state: start.state ?? "", code },
       start.bindingCookie ? { [OAUTH_BINDING_COOKIE_NAME]: start.bindingCookie } : {},
     );
-    return { statusCode: res.statusCode, cookies: extractAuthCookies(res), body: res.json?.() };
+    const cookies = extractAuthCookies(res);
+    // STORY-173 — connecting or disconnecting a provider needs a fresh step-up,
+    // and an OAuth sign-in carries none. The scenarios below that link and
+    // unlink are not about step-up (identity-oauth-proves-email.spec.ts pins
+    // it), so a successful login here is recorded as if the person had just
+    // re-authenticated by email code, via the seam STORY-019 added.
+    if (cookies) {
+      const sid = (JSON.parse(Buffer.from(cookies.access.split(".")[1]!, "base64url").toString("utf8")) as { sid: string }).sid;
+      await db.query("UPDATE sessions SET last_strong_auth_at = now(), last_strong_auth_method = 'email_otp' WHERE id = $1", [sid]);
+    }
+    return { statusCode: res.statusCode, cookies, body: res.json?.() };
   }
 
   // STORY-173 — a passkey is added only from a signed-in session that has
@@ -488,30 +499,27 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
 
   // ---- Task 9 / Test Scenario 5 -------------------------------------------
 
-  it("STORY-015 · scenario 5 — an unverified email creates the account unverified, with no workspace-create right", async () => {
+  // STORY-173 (owner decision "refuse it") supersedes this scenario's old
+  // assertion — that an unverified email creates the account `unverified` WITH a
+  // session. That account is exactly what an attacker planted on an address
+  // before its owner arrived. The AC's own concern (no workspace-create right for
+  // an unproved address) is now met more strongly: there is no account and no
+  // session at all, and the refusal says why.
+  it("STORY-015 · scenario 5 — an unverified email creates no account and no session, and says to use the email code", async () => {
     const login = await completeLogin(
       "microsoft",
       { externalSubject: "sub-unverified", email: "unverified@example.com", emailVerified: false },
       "code-unverified",
     );
-    expect(login.statusCode).toBe(200);
-    // STORY-024 T10 — the success body is enveloped; the resource is under `data`.
-    expect((login.body as { data: { user_status: string } }).data.user_status).toBe("unverified");
+    expect(login.statusCode).toBe(403);
+    const error = (login.body as { error: { code: string; details: { reason: string }; message: string } }).error;
+    expect(error.code).toBe("forbidden");
+    expect(error.details.reason).toBe("email_not_verified");
+    expect(error.message).toMatch(/email code/i);
 
-    const userRow = await db.query("SELECT status, email_verified_at FROM users WHERE email = $1", [
-      "unverified@example.com",
-    ]);
-    expect(userRow.rows[0].status).toBe("unverified");
-    expect(userRow.rows[0].email_verified_at).toBeNull();
-
-    expect(login.cookies).not.toBeNull();
-    const createRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/workspaces"),
-      payload: { name: "Should Be Refused" },
-      ...mutatingHeaders(login.cookies!),
-    });
-    expect(createRes.statusCode).toBe(403);
+    const userRow = await db.query("SELECT 1 FROM users WHERE email = $1", ["unverified@example.com"]);
+    expect(userRow.rows).toHaveLength(0);
+    expect(login.cookies).toBeNull();
   });
 
   // ---- Task 10 / Test Scenario 6 -------------------------------------------
@@ -991,26 +999,27 @@ describe("STORY-015 · OAuth 2.1 + PKCE for google/github/microsoft", () => {
   // an account whose address nobody proved cannot add a passkey, so it cannot
   // be promoted by one, and cannot create a workspace.
 
-  it("STORY-173 · an unverified (OAuth) account cannot add a passkey, so a passkey can never promote it to 'active'", async () => {
-    const login = await completeLogin(
-      "microsoft",
-      { externalSubject: "sub-no-promote", email: "no-promote@example.com", emailVerified: false },
-      "code-no-promote",
+  it("STORY-173 · an account whose address nobody proved cannot add a passkey, so a passkey can never promote it to 'active'", async () => {
+    // Such a row can no longer be created by OAuth (see scenario 5); it can still
+    // exist from before the fix, and a session for it must not collect credentials.
+    const seeded = await db.query<{ id: string }>(
+      "INSERT INTO users (email, status) VALUES ('no-promote@example.com', 'unverified') RETURNING id",
     );
-    expect(login.statusCode).toBe(200);
+    const session = await app.get(SessionService).createSession(seeded.rows[0]!.id, new Date(), "email_otp");
+    const cookies = { access: session.accessToken, csrf: session.csrfToken };
 
-    expect(await addPasskeyToSession(login.cookies!, Buffer.from("cred-no-promote", "utf8").toString("base64url"))).toBe(403);
+    expect(await addPasskeyToSession(cookies, Buffer.from("cred-no-promote", "utf8").toString("base64url"))).toBe(403);
 
     const row = await db.query("SELECT status, email_verified_at FROM users WHERE email = 'no-promote@example.com'");
     expect(row.rows[0].status).toBe("unverified");
     expect(row.rows[0].email_verified_at).toBeNull();
-    const credentials = await db.query("SELECT kind FROM user_credentials WHERE user_id = (SELECT id FROM users WHERE email = 'no-promote@example.com')");
-    expect(credentials.rows.map((r: { kind: string }) => r.kind)).toEqual(["oauth"]);
+    const credentials = await db.query("SELECT 1 FROM user_credentials WHERE user_id = $1", [seeded.rows[0]!.id]);
+    expect(credentials.rows).toHaveLength(0);
     const createRes = await app.inject({
       method: "POST",
       url: apiUrl("/workspaces"),
       payload: { name: "Still Refused" },
-      ...mutatingHeaders(login.cookies!),
+      ...mutatingHeaders(cookies),
     });
     expect(createRes.statusCode).toBe(403);
   });

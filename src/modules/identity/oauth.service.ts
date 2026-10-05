@@ -1,15 +1,17 @@
-import { ConflictException, ForbiddenException, Inject, Injectable, Logger } from "@nestjs/common";
+import { ConflictException, ForbiddenException, HttpException, Inject, Injectable, Logger } from "@nestjs/common";
 import type { KeyObject } from "node:crypto";
 import type { Pool } from "pg";
 import { API_VERSION_PREFIX } from "../../api/configure-app.js";
 import { loadEnv } from "../../config/env.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { importEd25519PublicKeyFromDer, verifyAccessToken, type KeyResolver } from "../../lib/auth/access-token.js";
-import { OauthFailedException } from "../../tenancy/errors.js";
+import type { SessionStrongAuth } from "../../api/guards/auth.guard.js";
+import { EmailNotVerifiedException, OauthFailedException } from "../../tenancy/errors.js";
 import { hashBinding, newBindingValue, signState, verifyState } from "../../lib/auth/oauth-state.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { OAUTH_CLIENT, type OauthClient, type OauthIdentity } from "./ports/oauth-client.js";
+import { ADDRESS_PROVED, applyFirstProof, requireFreshStrongAuth, requireProvedAccount } from "./account-proof.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
 import type { OauthCallbackQuery, OauthCallbackResponse, OauthLinkItem, OauthProvider } from "./dto/index.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
@@ -147,7 +149,20 @@ export class OauthService {
   }
 
   /** POST /auth/oauth/:provider/start and /link/start — purpose='link' carries the authenticated caller's own id, never anyone else's. */
-  async start(provider: OauthProvider, purpose: "login" | "link", linkUserId: string | null): Promise<OauthStartResult> {
+  async start(
+    provider: OauthProvider,
+    purpose: "login" | "link",
+    linkUserId: string | null,
+    session?: SessionStrongAuth,
+  ): Promise<OauthStartResult> {
+    // STORY-173 — connecting a provider adds a credential, so it follows the
+    // one rule for adding any credential: a proved address and a fresh step-up
+    // (a stolen session cookie must not be able to attach the thief's own
+    // Google account and keep the account after the cookie is revoked).
+    if (purpose === "link") {
+      requireFreshStrongAuth(linkUserId!, session, this.logger);
+      await requireProvedAccount(this.pool, linkUserId!, this.logger);
+    }
     const id = uuidV7();
     const { verifier: codeVerifier, challenge: codeChallenge } = await this.client.generatePkce();
     const bindingValue = newBindingValue();
@@ -235,10 +250,13 @@ export class OauthService {
     // never links"). Read from the claimed row's link_user_id only, never
     // from any request parameter.
     if (row.purpose === "link") {
-      const authenticatedUserId = await this.resolveAuthenticatedUserId(accessCookieValue);
-      if (authenticatedUserId === null || authenticatedUserId !== row.link_user_id) {
+      const authenticated = await this.resolveAuthenticatedUser(accessCookieValue);
+      if (authenticated === null || authenticated.userId !== row.link_user_id) {
         this.rejectCallback(httpRequestId, "link_session_mismatch");
       }
+      // Re-checked here, not only at link/start: the person spent time at the
+      // provider, and the window is five minutes.
+      requireFreshStrongAuth(authenticated.userId, authenticated, this.logger);
     }
 
     let identity: OauthIdentity;
@@ -263,10 +281,8 @@ export class OauthService {
         ? await this.linkCredential(row.link_user_id!, row.provider, identity, httpRequestId)
         : await this.resolveOrCreateForLogin(identity, row.provider, httpRequestId);
 
-    const tokens = await this.sessions.createSession(resolved.userId);
-
     return {
-      tokens,
+      tokens: resolved.tokens,
       body: {
         outcome: row.purpose === "link" ? "linked" : "signed_in",
         user_status: resolved.status as OauthCallbackResponse["user_status"],
@@ -285,21 +301,23 @@ export class OauthService {
     return providedHash.equals(storedHash);
   }
 
-  private async resolveAuthenticatedUserId(accessCookieValue: string | undefined): Promise<string | null> {
+  private async resolveAuthenticatedUser(
+    accessCookieValue: string | undefined,
+  ): Promise<{ userId: string; lastStrongAuthAt: Date | null } | null> {
     if (!accessCookieValue) {
       return null;
     }
     try {
       const claims = await verifyAccessToken(accessCookieValue, this.resolveKey);
-      const sessionResult = await this.pool.query<{ revoked_at: Date | null }>(
-        "SELECT revoked_at FROM sessions WHERE id = $1",
+      const sessionResult = await this.pool.query<{ revoked_at: Date | null; last_strong_auth_at: Date | null }>(
+        "SELECT revoked_at, last_strong_auth_at FROM sessions WHERE id = $1",
         [claims.sid],
       );
       const session = sessionResult.rows[0];
       if (!session || session.revoked_at !== null) {
         return null;
       }
-      return claims.sub;
+      return { userId: claims.sub, lastStrongAuthAt: session.last_strong_auth_at };
     } catch {
       return null;
     }
@@ -334,80 +352,135 @@ export class OauthService {
     identity: OauthIdentity,
     provider: OauthProvider,
     httpRequestId: string,
-  ): Promise<{ userId: string; status: string }> {
+  ): Promise<{ tokens: SessionTokens; status: string }> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         oauthCredentialLockKey(provider, identity.externalSubject),
       ]);
+
+      // LOCK ORDER IS users, THEN user_credentials — the order the first-proof
+      // writer (account-proof.ts applyFirstProof) takes them. The credential
+      // is therefore PEEKED without a lock to learn whose it is, the users row
+      // is locked, and only then is the credential row locked and re-read.
+      // Locking the credential first would let a sign-in and a proof each hold
+      // one lock and wait for the other.
+      //
       // NOT filtered by revoked_at: ux_credentials_oauth is unique on
       // (provider, external_subject) regardless of revoked_at, so a
       // previously-unlinked credential for this subject is the SAME row a
-      // fresh insert would collide with — it must be found and reactivated,
-      // never blindly inserted around. FOR UPDATE closes the same race the
-      // create path already closes on the email row below.
-      const existing = await client.query<{ id: string; user_id: string; revoked_at: Date | null }>(
-        `SELECT id, user_id, revoked_at FROM user_credentials
-         WHERE kind = 'oauth' AND provider = $1 AND external_subject = $2
-         FOR UPDATE`,
+      // fresh insert would collide with.
+      const peek = await client.query<{ user_id: string }>(
+        `SELECT user_id FROM user_credentials
+         WHERE kind = 'oauth' AND provider = $1 AND external_subject = $2`,
         [provider, identity.externalSubject],
       );
-      const credentialRow = existing.rows[0];
-      if (credentialRow) {
-        if (credentialRow.revoked_at !== null) {
-          await client.query(`UPDATE user_credentials SET revoked_at = NULL WHERE id = $1`, [credentialRow.id]);
+      if (peek.rows[0]) {
+        const ownerId = peek.rows[0].user_id;
+        const account = await client.query<{ status: string; email_verified_at: Date | null; deleted_at: Date | null }>(
+          `SELECT status, email_verified_at, deleted_at FROM users WHERE id = $1 FOR UPDATE`,
+          [ownerId],
+        );
+        const credential = await client.query<{ id: string; revoked_at: Date | null; revoked_reason: string | null }>(
+          `SELECT id, revoked_at, revoked_reason FROM user_credentials
+           WHERE kind = 'oauth' AND provider = $1 AND external_subject = $2
+           FOR UPDATE`,
+          [provider, identity.externalSubject],
+        );
+        const owner = account.rows[0];
+        const credentialRow = credential.rows[0];
+        if (!owner || !credentialRow || owner.deleted_at !== null) {
+          this.rejectCallback(httpRequestId, "account_not_active");
         }
-        const statusResult = await client.query<{ status: string }>("SELECT status FROM users WHERE id = $1", [
-          credentialRow.user_id,
-        ]);
+        // An account whose address was never proved gets no session from a
+        // credential, whoever put the credential there (STORY-173).
+        if (owner.email_verified_at === null) {
+          this.refuseUnverified(provider, "account_unproven");
+        }
+        if (owner.status !== "active") {
+          this.rejectCallback(httpRequestId, "account_not_active");
+        }
+        if (credentialRow.revoked_at !== null) {
+          // DURABLE: a credential the first proof of the address revoked is
+          // never brought back by signing in with it again — that would undo
+          // the revocation for anyone who kept the provider identity. Only a
+          // credential its own owner unlinked (or a legacy row with no
+          // reason) is reactivated.
+          if (credentialRow.revoked_reason === ADDRESS_PROVED) {
+            this.rejectCallback(httpRequestId, "credential_revoked_by_first_proof");
+          }
+          await client.query(`UPDATE user_credentials SET revoked_at = NULL, revoked_reason = NULL WHERE id = $1`, [
+            credentialRow.id,
+          ]);
+        }
+        const tokens = await this.sessions.createSessionOn(client, ownerId);
         await client.query("COMMIT");
-        return { userId: credentialRow.user_id, status: statusResult.rows[0]!.status };
+        return { tokens, status: owner.status };
       }
 
       if (identity.email === null) {
-        await client.query("ROLLBACK");
         this.rejectCallback(httpRequestId, "missing_email");
+      }
+
+      // STORY-173 (owner decision, 2026-10-05: "refuse it") — an address the
+      // provider did NOT verify binds no credential, creates no account and
+      // mints no session. It used to create an `unverified` account with the
+      // credential attached, which is how someone could plant a working
+      // sign-in on an address before its owner arrived. The refusal depends
+      // only on what the provider said, never on whether an account exists, so
+      // it is not an enumeration oracle.
+      if (!identity.emailVerified) {
+        this.refuseUnverified(provider, "provider_email_unverified");
       }
 
       // Locks any existing row at this email so a concurrent second
       // callback for the same address cannot also decide "no owner" and
       // double-insert.
-      const emailOwner = await client.query<{ id: string }>(
-        `SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL FOR UPDATE`,
+      const emailOwner = await client.query<{ id: string; status: string; email_verified_at: Date | null }>(
+        `SELECT id, status, email_verified_at FROM users WHERE email = $1 AND deleted_at IS NULL FOR UPDATE`,
         [identity.email],
       );
-      if (emailOwner.rows[0]) {
-        await client.query("ROLLBACK");
+      const existingOwner = emailOwner.rows[0];
+
+      let userId: string;
+      if (existingOwner === undefined) {
+        userId = uuidV7();
+        // The provider verified the address -> active + email_verified_at now().
+        await client.query(`INSERT INTO users (id, email, status, email_verified_at) VALUES ($1, $2, 'active', now())`, [
+          userId,
+          identity.email,
+        ]);
+      } else if (
+        existingOwner.email_verified_at === null &&
+        (existingOwner.status === "unverified" || existingOwner.status === "active")
+      ) {
+        // STORY-173 (owner decision "claim it + clean up") — a row nobody has
+        // proved (an address squatted by an anonymous code request, or one
+        // left by the pre-fix registration) is claimed by the provider's
+        // verified assertion, as the FIRST PROOF: everything that predates it
+        // is revoked durably, then this credential and session are bound — all
+        // in this transaction. A PROVED row is never claimed: that would be
+        // auto-linking by email, which STORY-015 forbids (email_collision).
+        userId = existingOwner.id;
+        await applyFirstProof(client, userId, this.logger);
+        incrementCounter("nominara_identity_oauth_unproved_row_claimed_total", { provider });
+      } else {
         this.logger.warn(`oauth sign-in refused: email already registered to a different account provider=${provider}`);
         incrementCounter("nominara_identity_oauth_email_collision_total", { provider });
         this.rejectCallback(httpRequestId, "email_collision");
       }
 
-      const userId = uuidV7();
-      // AC "An email the provider did not verify creates the account in an
-      // unverified state with no workspace-create right" — a provider
-      // asserting an address it never confirmed is an account-takeover
-      // vector for any address at that domain, so this fails closed:
-      // verified -> active + email_verified_at now(); anything else ->
-      // unverified + email_verified_at NULL (workspaces.service.ts's
-      // create() gate reads this status).
-      const status = identity.emailVerified ? "active" : "unverified";
-      await client.query(`INSERT INTO users (id, email, status, email_verified_at) VALUES ($1, $2, $3, $4)`, [
-        userId,
-        identity.email,
-        status,
-        identity.emailVerified ? new Date() : null,
-      ]);
       await client.query(
         `INSERT INTO user_credentials (id, user_id, kind, provider, external_subject) VALUES ($1, $2, 'oauth', $3, $4)`,
         [uuidV7(), userId, provider, identity.externalSubject],
       );
+      const tokens = await this.sessions.createSessionOn(client, userId);
       await client.query("COMMIT");
-      return { userId, status };
+      return { tokens, status: "active" };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
-      if (error instanceof OauthFailedException) {
+      if (error instanceof HttpException) {
         throw error;
       }
       // Belt-and-suspenders: should never happen once the advisory lock
@@ -426,29 +499,46 @@ export class OauthService {
   }
 
   /**
+   * The honest, distinct refusal for an address nobody has proved: `403
+   * forbidden`, `details.reason = email_not_verified` — the client can show
+   * "sign in with an email code first, then connect <provider> from settings".
+   * Counted by reason; the provider name is the only variable and is not
+   * sensitive. Never carries the address.
+   */
+  private refuseUnverified(provider: OauthProvider, reason: "provider_email_unverified" | "account_unproven"): never {
+    this.logger.warn(`oauth sign-in refused reason=${reason} provider=${provider}`);
+    incrementCounter("nominara_identity_oauth_refused_total", { reason, provider });
+    throw new EmailNotVerifiedException(
+      `${provider} did not verify this email address; sign in with an email code first, then connect ${provider} from settings`,
+    );
+  }
+
+  /**
    * Links a provider identity onto `userId` — the already-authenticated
-   * caller, re-verified by callback() just before this runs. The same
-   * subject-as-join-key rule applies here too: a subject already linked to
-   * a DIFFERENT account is a conflict, never silently re-pointed (this
-   * would let a stolen state+code steal a credential FROM one account and
-   * attach it to another) — this holds whether that other account's row is
-   * active OR revoked (ux_credentials_oauth is unique on (provider,
-   * external_subject) regardless of revoked_at). Already linked to THIS
-   * same account is idempotent, not an error; a revoked row for THIS same
-   * account is reactivated rather than blindly re-inserted.
+   * caller, re-verified by callback() just before this runs, with a fresh
+   * step-up (checked at link/start and again in callback()). STORY-173: the
+   * account's address must be proved, re-read under lock in THIS transaction.
+   * The same subject-as-join-key rule applies: a subject already linked to
+   * a DIFFERENT account is a conflict, never silently re-pointed — whether
+   * that other account's row is active OR revoked. Already linked to THIS
+   * same account is idempotent. A revoked row for THIS same account is
+   * reactivated, whatever revoked it: here the caller is a proved, stepped-up
+   * owner who has just authenticated at the provider on purpose, which is the
+   * one thing a sign-in alone is not.
    */
   private async linkCredential(
     userId: string,
     provider: OauthProvider,
     identity: OauthIdentity,
     httpRequestId: string,
-  ): Promise<{ userId: string; status: string }> {
+  ): Promise<{ tokens: SessionTokens; status: string }> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         oauthCredentialLockKey(provider, identity.externalSubject),
       ]);
+      await requireProvedAccount(client, userId, this.logger);
       const existing = await client.query<{ id: string; user_id: string; revoked_at: Date | null }>(
         `SELECT id, user_id, revoked_at FROM user_credentials
          WHERE kind = 'oauth' AND provider = $1 AND external_subject = $2
@@ -457,14 +547,15 @@ export class OauthService {
       );
       const credentialRow = existing.rows[0];
       if (credentialRow && credentialRow.user_id !== userId) {
-        await client.query("ROLLBACK");
         this.logger.warn(`oauth link refused: credential already linked to a different account provider=${provider}`);
         incrementCounter("nominara_identity_oauth_link_conflict_total", { provider });
         this.rejectCallback(httpRequestId, "link_conflict");
       }
       if (credentialRow) {
         if (credentialRow.revoked_at !== null) {
-          await client.query(`UPDATE user_credentials SET revoked_at = NULL WHERE id = $1`, [credentialRow.id]);
+          await client.query(`UPDATE user_credentials SET revoked_at = NULL, revoked_reason = NULL WHERE id = $1`, [
+            credentialRow.id,
+          ]);
         }
       } else {
         await client.query(
@@ -472,18 +563,15 @@ export class OauthService {
           [uuidV7(), userId, provider, identity.externalSubject],
         );
       }
-      const statusResult = await client.query<{ status: string }>("SELECT status FROM users WHERE id = $1", [userId]);
+      const tokens = await this.sessions.createSessionOn(client, userId);
       await client.query("COMMIT");
-      return { userId, status: statusResult.rows[0]!.status };
+      return { tokens, status: "active" };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
-      if (error instanceof OauthFailedException) {
+      if (error instanceof HttpException) {
         throw error;
       }
-      // Belt-and-suspenders: should never happen once the advisory lock
-      // above serializes resolution attempts, but an unhandled DB error
-      // here must still funnel through rejectCallback's neutral shape
-      // rather than rethrow raw and become an untyped 500 via ProblemFilter.
+      // Belt-and-suspenders: see resolveOrCreateForLogin.
       this.logger.warn(
         `oauth credential resolution failed unexpectedly request_id=${httpRequestId} message=${
           error instanceof Error ? error.message : String(error)
@@ -553,7 +641,10 @@ export class OauthService {
    * method's comment for why locking only the target row races two
    * concurrent last-two-credential revokes into a double self-lockout.
    */
-  async unlink(userId: string, provider: OauthProvider): Promise<void> {
+  async unlink(userId: string, provider: OauthProvider, session?: SessionStrongAuth): Promise<void> {
+    // STORY-173 — removing a credential is as sensitive as adding one: a
+    // stolen session must not strip the owner's other methods to lock them out.
+    requireFreshStrongAuth(userId, session, this.logger);
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -582,7 +673,7 @@ export class OauthService {
         throw new ConflictException("cannot revoke the last remaining credential with no alternative auth method");
       }
 
-      await client.query(`UPDATE user_credentials SET revoked_at = now() WHERE id = $1`, [target.id]);
+      await client.query(`UPDATE user_credentials SET revoked_at = now(), revoked_reason = 'user' WHERE id = $1`, [target.id]);
       await client.query("COMMIT");
 
       this.logger.log(`oauth credential unlinked user_id=${userId} provider=${provider}`);

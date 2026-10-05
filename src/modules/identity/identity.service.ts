@@ -20,9 +20,8 @@ import { PG_POOL } from "../../db/pg-pool.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { nextCounter } from "../../lib/webauthn/sign-counter-policy.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { assertStepUpFresh } from "../../tenancy/step-up.js";
-import { StepUpRequiredException } from "../../tenancy/errors.js";
 import type { SessionStrongAuth } from "../../api/guards/auth.guard.js";
+import { requireFreshStrongAuth, requireProvedAccount } from "./account-proof.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
 import type {
   AssertionOptionsRequest,
@@ -84,11 +83,11 @@ export class IdentityService {
     session: SessionStrongAuth | undefined,
     input: PasskeyAddOptionsRequest,
   ): Promise<PasskeyOptionsResult> {
-    this.requireFreshStrongAuth(userId, session);
+    requireFreshStrongAuth(userId, session, this.logger);
     const env = loadEnv();
     const client = await this.pool.connect();
     try {
-      const user = await this.requireProvedAccount(client, userId);
+      const user = await requireProvedAccount(client, userId, this.logger);
 
       const existing = await client.query<{ credential_id: Buffer; transports: string[] | null }>(
         `SELECT credential_id, transports FROM user_credentials
@@ -117,51 +116,6 @@ export class IdentityService {
     } finally {
       client.release();
     }
-  }
-
-  // The shared "fresh WebAuthn or OTP within 5 minutes" rule (tenancy/
-  // step-up.ts). A refusal is counted so a burst of them (someone replaying a
-  // stolen cookie) is visible; the account id is logged, never the address.
-  private requireFreshStrongAuth(userId: string, session: SessionStrongAuth | undefined): void {
-    try {
-      assertStepUpFresh(session?.lastStrongAuthAt ?? null);
-    } catch (error) {
-      if (error instanceof StepUpRequiredException) {
-        this.refuseRegistration(userId, "step_up_required");
-      }
-      throw error;
-    }
-  }
-
-  private refuseRegistration(userId: string, reason: "address_unproven" | "step_up_required"): void {
-    this.logger.warn(`passkey registration refused reason=${reason} user_id=${userId}`);
-    incrementCounter("nominara_identity_passkey_registration_refused_total", { reason });
-  }
-
-  /**
-   * The account must exist, be active, and have a PROVED address. `active`
-   * alone is not proof (historically a passkey registration promoted
-   * `unverified -> active` without any proof, and rows from then still
-   * exist), so the proof column is checked explicitly. `FOR SHARE` pins the
-   * row until the caller's transaction ends, so the proof cannot be withdrawn
-   * between this check and the credential insert.
-   */
-  private async requireProvedAccount(
-    client: { query: Pool["query"] },
-    userId: string,
-  ): Promise<{ id: string; email: string }> {
-    const result = await client.query<{ id: string; email: string }>(
-      `SELECT id, email::text AS email FROM users
-       WHERE id = $1 AND status = 'active' AND email_verified_at IS NOT NULL AND deleted_at IS NULL
-       FOR SHARE`,
-      [userId],
-    );
-    const user = result.rows[0];
-    if (!user) {
-      this.refuseRegistration(userId, "address_unproven");
-      throw new ForbiddenException("the email address of this account has not been verified");
-    }
-    return user;
   }
 
   async createAssertionOptions(_input: AssertionOptionsRequest): Promise<PasskeyOptionsResult> {
@@ -258,7 +212,7 @@ export class IdentityService {
     input: RegistrationVerifyRequest,
   ): Promise<void> {
     // Before the claim: a stale session must not consume the ceremony.
-    this.requireFreshStrongAuth(userId, session);
+    requireFreshStrongAuth(userId, session, this.logger);
     const env = loadEnv();
     const client = await this.pool.connect();
     try {
@@ -333,7 +287,7 @@ export class IdentityService {
     // ago: the account must be proved at the moment the credential is bound.
     try {
       await client.query("BEGIN");
-      await this.requireProvedAccount(client, userId);
+      await requireProvedAccount(client, userId, this.logger);
       await client.query(
         `INSERT INTO user_credentials
            (id, user_id, kind, credential_id, public_key, sign_count, transports, authenticator_attachment, device_label)
@@ -351,6 +305,15 @@ export class IdentityService {
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
+      // A credential id that is already registered (to this account or to
+      // another) violates the unique index on credential_id. It is the same
+      // uniform 400 as a bad attestation — never a 500, and never a message
+      // that tells the caller another account holds that credential.
+      if ((error as { code?: string }).code === "23505") {
+        this.logger.warn(`passkey registration refused reason=credential_id_taken user_id=${userId}`);
+        incrementCounter("nominara_identity_passkey_registration_refused_total", { reason: "credential_id_taken" });
+        throw new BadRequestException("passkey registration could not be verified");
+      }
       throw error;
     }
 
@@ -376,13 +339,15 @@ export class IdentityService {
       // STORY-173 — a credential signs in only if its account's address is
       // proved. Rows from before the fix can hold a passkey on an address
       // nobody ever confirmed (and an attacker may have put it there); until
-      // the address is proved that credential yields no session. Same
-      // uniform refusal as an unknown credential, so which case applies is
-      // not observable.
+      // the address is proved that credential yields no session. Likewise a
+      // suspended or erased account (STORY-173 review): its passkeys do not
+      // sign in. Same uniform refusal as an unknown credential, so which
+      // case applies is not observable.
       `SELECT c.id, c.user_id, c.credential_id, c.public_key, c.sign_count, c.transports
        FROM user_credentials c
        JOIN users u ON u.id = c.user_id
-       WHERE c.credential_id = $1 AND c.revoked_at IS NULL AND u.email_verified_at IS NOT NULL`,
+       WHERE c.credential_id = $1 AND c.revoked_at IS NULL
+         AND u.email_verified_at IS NOT NULL AND u.status = 'active' AND u.deleted_at IS NULL`,
       [Buffer.from(rawId, "base64url")],
     );
     if (credentialResult.rows.length === 0) {
@@ -446,14 +411,40 @@ export class IdentityService {
       throw new ForbiddenException("sign counter did not advance — possible cloned authenticator");
     }
 
-    await client.query(`UPDATE user_credentials SET sign_count = $1, last_used_at = now() WHERE id = $2`, [
-      reported.toString(),
-      row.id,
-    ]);
-
-    // A WebAuthn assertion is itself a fresh strong authentication: stamp the
-    // session so this sign-in satisfies step-up for the next five minutes.
-    return await this.sessions.createSession(row.user_id, new Date(), "webauthn");
+    // The session is minted in the SAME transaction that re-reads, under lock,
+    // that this credential is still live and its account still proved and
+    // active (users first, then the credential — the order every first-proof
+    // writer takes). Decided on the lookup above and minted afterwards, the
+    // first proof of the address could land in between: its revocation would
+    // miss a session that did not exist yet.
+    try {
+      await client.query("BEGIN");
+      const account = await client.query(
+        `SELECT 1 FROM users
+         WHERE id = $1 AND email_verified_at IS NOT NULL AND status = 'active' AND deleted_at IS NULL
+         FOR SHARE`,
+        [row.user_id],
+      );
+      const live = await client.query(
+        `SELECT 1 FROM user_credentials WHERE id = $1 AND revoked_at IS NULL FOR UPDATE`,
+        [row.id],
+      );
+      if (account.rows.length === 0 || live.rows.length === 0) {
+        throw new BadRequestException("unknown or revoked credential");
+      }
+      await client.query(`UPDATE user_credentials SET sign_count = $1, last_used_at = now() WHERE id = $2`, [
+        reported.toString(),
+        row.id,
+      ]);
+      // A WebAuthn assertion is itself a fresh strong authentication: stamp the
+      // session so this sign-in satisfies step-up for the next five minutes.
+      const tokens = await this.sessions.createSessionOn(client, row.user_id, new Date(), "webauthn");
+      await client.query("COMMIT");
+      return tokens;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    }
   }
 
   /**
@@ -538,7 +529,7 @@ export class IdentityService {
         throw new ConflictException("cannot revoke the last remaining credential with no alternative auth method");
       }
 
-      await client.query(`UPDATE user_credentials SET revoked_at = now() WHERE id = $1`, [credentialId]);
+      await client.query(`UPDATE user_credentials SET revoked_at = now(), revoked_reason = 'user' WHERE id = $1`, [credentialId]);
       await client.query("COMMIT");
 
       this.logger.log(`passkey revoked user_id=${userId} credential_id=${credentialId}`);

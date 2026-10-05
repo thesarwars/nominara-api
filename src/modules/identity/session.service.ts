@@ -69,28 +69,47 @@ export class SessionService {
     now: Date = new Date(),
     strongAuth: StrongAuthMethod | null = null,
   ): Promise<SessionTokens> {
-    const sid = uuidV7();
-    const rawRefreshToken = generateRefreshToken();
-    const expiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS);
-
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(
-        `INSERT INTO sessions (id, user_id, last_strong_auth_at, last_strong_auth_method) VALUES ($1, $2, $3, $4)`,
-        [sid, userId, strongAuth === null ? null : now, strongAuth],
-      );
-      await client.query(
-        `INSERT INTO refresh_tokens (id, session_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
-        [uuidV7(), sid, hashRefreshToken(rawRefreshToken), expiresAt],
-      );
+      const tokens = await this.createSessionOn(client, userId, now, strongAuth);
       await client.query("COMMIT");
+      return tokens;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       throw error;
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * STORY-173 — the same session, inserted on the CALLER'S client inside the
+   * CALLER'S transaction (no BEGIN/COMMIT here). A sign-in that decides who the
+   * user is, under a lock on that user, must mint the session in that same
+   * transaction: minted afterwards, there is a gap in which the first proof of
+   * the address can revoke the account's sessions and miss this one. The
+   * tokens are signed after the inserts and only mean anything if the caller
+   * commits.
+   */
+  async createSessionOn(
+    client: { query: Pool["query"] },
+    userId: string,
+    now: Date = new Date(),
+    strongAuth: StrongAuthMethod | null = null,
+  ): Promise<SessionTokens> {
+    const sid = uuidV7();
+    const rawRefreshToken = generateRefreshToken();
+    const expiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS);
+
+    await client.query(
+      `INSERT INTO sessions (id, user_id, last_strong_auth_at, last_strong_auth_method) VALUES ($1, $2, $3, $4)`,
+      [sid, userId, strongAuth === null ? null : now, strongAuth],
+    );
+    await client.query(
+      `INSERT INTO refresh_tokens (id, session_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+      [uuidV7(), sid, hashRefreshToken(rawRefreshToken), expiresAt],
+    );
 
     const { accessToken, csrfToken } = await this.mintAccessAndCsrf(sid, userId, now);
     return { sid, accessToken, refreshToken: rawRefreshToken, csrfToken };

@@ -18,6 +18,7 @@ import { EmailOtpInvalidException, OtpRateLimitedException } from "../../tenancy
 import type { EmailOtpRequestResponse } from "./dto/index.js";
 import { EMAIL_SENDER, type EmailSender } from "./ports/email-sender.js";
 import { renderOtpEmail } from "./otp-email-template.js";
+import { applyFirstProof } from "./account-proof.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
 
 // STORY-016 — dangerous area: the request path is the enumeration-
@@ -282,7 +283,7 @@ export class EmailOtpService {
   async verifyCode(email: string, code: string, httpRequestId: string): Promise<SessionTokens> {
     const normalizedEmail = normalizeEmail(email);
     const client = await this.pool.connect();
-    let verifiedUserId: string | null = null;
+    let tokens: SessionTokens | null = null;
     try {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [emailOtpLockKey(normalizedEmail)]);
@@ -336,36 +337,8 @@ export class EmailOtpService {
 
       await client.query(`UPDATE email_otp_codes SET consumed_at = now() WHERE id = $1`, [matchedId]);
       // STORY-173 — the FIRST proof of an address revokes everything that
-      // predates it. Until now nobody had shown control of this address, so a
-      // credential or session already on the account was put there by someone
-      // who never proved it either (a passkey from the old anonymous
-      // registration, an OAuth link from a provider that did not verify the
-      // address): the person who has just proved the address is the first one
-      // entitled to it. The row is locked so a concurrent proof cannot both
-      // see "first".
-      const prior = await client.query<{ email_verified_at: Date | null }>(
-        `SELECT email_verified_at FROM users WHERE id = $1 FOR UPDATE`,
-        [user.id],
-      );
-      if (prior.rows[0]!.email_verified_at === null) {
-        const credentials = await client.query(
-          `UPDATE user_credentials SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`,
-          [user.id],
-        );
-        const sessions = await client.query(
-          `UPDATE sessions SET revoked_at = now(), revoked_reason = 'address_proved'
-           WHERE user_id = $1 AND revoked_at IS NULL`,
-          [user.id],
-        );
-        if ((credentials.rowCount ?? 0) > 0 || (sessions.rowCount ?? 0) > 0) {
-          // IDs and counts only — never the address.
-          this.logger.warn(
-            `first proof of address revoked earlier access user_id=${user.id} ` +
-              `credentials=${String(credentials.rowCount ?? 0)} sessions=${String(sessions.rowCount ?? 0)}`,
-          );
-          incrementCounter("nominara_identity_first_proof_revocation_total");
-        }
-      }
+      // predates it, durably, in this transaction (account-proof.ts says why).
+      await applyFirstProof(client, user.id, this.logger);
       await client.query(
         `UPDATE email_otp_codes SET invalidated_at = now(), invalidated_reason = 'superseded'
          WHERE user_id = $1 AND id != $2 AND consumed_at IS NULL AND invalidated_at IS NULL`,
@@ -382,8 +355,13 @@ export class EmailOtpService {
          WHERE id = $1`,
         [user.id],
       );
+      // The code just proved control of the address, which is the platform
+      // itself performing a re-authentication: stamp the session so it
+      // satisfies step-up for the next five minutes (this is what lets the
+      // person add their first passkey straight after signing up). Minted in
+      // THIS transaction, with the proof it depends on.
+      tokens = await this.sessions.createSessionOn(client, user.id, new Date(), "email_otp");
       await client.query("COMMIT");
-      verifiedUserId = user.id;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       if (error instanceof EmailOtpInvalidException) {
@@ -399,11 +377,7 @@ export class EmailOtpService {
       client.release();
     }
 
-    // The code just proved control of the address, which is the platform
-    // itself performing a re-authentication: stamp the session so it satisfies
-    // step-up for the next five minutes (this is what lets the person add
-    // their first passkey straight after signing up).
-    return this.sessions.createSession(verifiedUserId!, new Date(), "email_otp");
+    return tokens!;
   }
 
   /**

@@ -57,7 +57,7 @@ export class OauthController {
     @Param("provider", new ZodValidationPipe(oauthProviderSchema)) provider: OauthProvider,
     @Res({ passthrough: true }) reply: FastifyReply,
   ): Promise<OauthStartResponse> {
-    const result = await this.service.start(provider, "link", req.auth!.sub);
+    const result = await this.service.start(provider, "link", req.auth!.sub, req.session);
     setOauthBindingCookie(reply, result.bindingValue, OAUTH_BINDING_COOKIE_MAX_AGE_SECONDS);
     return { authorization_url: result.authorizationUrl, state_expires_at: result.stateExpiresAt.toISOString() };
   }
@@ -128,6 +128,6 @@ export class OauthController {
     @Req() req: AuthenticatedRequest,
     @Param("provider", new ZodValidationPipe(oauthProviderSchema)) provider: OauthProvider,
   ): Promise<void> {
-    return this.service.unlink(req.auth!.sub, provider);
+    return this.service.unlink(req.auth!.sub, provider, req.session);
   }
 }

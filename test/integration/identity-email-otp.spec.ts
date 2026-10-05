@@ -752,11 +752,17 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
 
   // ---- Cross-story: D2 promotion unlocks the workspace-create right ---------
 
-  it("STORY-016 · D2 cross-story — an OAuth-created unverified user is refused POST /workspaces until they complete an OTP verification for that email, after which it succeeds", async () => {
+  // STORY-173 — the premise changed. A provider that did not verify the address
+  // used to create an `unverified` account WITH a session, and this test then
+  // showed OTP promoting it. That sign-in is now refused outright (nothing is
+  // created, no session is minted), so the person's way in is the email code:
+  // the request creates the account `unverified`, the verified code promotes it,
+  // and only then does the workspace-create right exist.
+  it("STORY-016 · D2 cross-story — a provider-unverified OAuth sign-in is refused, and the OTP verification for that email is what unlocks POST /workspaces", async () => {
     const email = "cross-story-otp-promotion@example.com";
 
-    // Step 1: sign in via OAuth with a provider-UNVERIFIED email (STORY-015
-    // semantics) — creates the account 'unverified', still issues a session.
+    // Step 1: sign in via OAuth with a provider-UNVERIFIED email — refused,
+    // pointing at the email code; no account, no session.
     const startRes = await app.inject({ method: "POST", url: "/auth/oauth/google/start" });
     expect(startRes.statusCode).toBe(201);
     const startBody = dataOf<{ authorization_url: string }>(startRes);
@@ -772,22 +778,10 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
       url: `/auth/oauth/google/callback?${new URLSearchParams({ state, code: "code-cross-story" }).toString()}`,
       cookies: bindingCookie ? { "__Host-nominara-oauth-binding": bindingCookie } : {},
     });
-    expect(callbackRes.statusCode).toBe(200);
-    expect(dataOf<{ user_status: string }>(callbackRes).user_status).toBe("unverified");
-    const loginCookies = extractAuthCookies(callbackRes);
-    expect(loginCookies).not.toBeNull();
-
+    expect(callbackRes.statusCode).toBe(403);
+    expect(extractAuthCookies(callbackRes)).toBeNull();
     const beforeRow = await db.query("SELECT status FROM users WHERE email = $1", [email]);
-    expect(beforeRow.rows[0].status).toBe("unverified");
-
-    // Step 2: refused, matching STORY-015's existing gate.
-    const refused = await app.inject({
-      method: "POST",
-      url: "/workspaces",
-      payload: { name: "Should Still Be Refused" },
-      ...mutatingHeaders(loginCookies!),
-    });
-    expect(refused.statusCode).toBe(403);
+    expect(beforeRow.rows).toHaveLength(0);
 
     // Step 3: complete an OTP verification for the SAME address.
     const otpReq = await requestOtp(email);

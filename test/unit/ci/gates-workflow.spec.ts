@@ -86,6 +86,7 @@ const NOT_A_GATE: Readonly<Record<string, string>> = {
   "db:studio": "an interactive UI",
   "db:maintenance:run": "an operational job",
   "db:maintenance:sweep": "an operational job",
+  "identity:sweep-unverified": "an operational job that deletes stale unverified accounts; not yet on a queue schedule (STORY-173)",
   "credits:verify": "an operational job against a live ledger",
   "credits:reconcile": "an operational job against a live ledger",
   "plan:set": "the operator CLI; it changes a workspace's plan",
