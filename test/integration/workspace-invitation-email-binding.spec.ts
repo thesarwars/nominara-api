@@ -17,6 +17,7 @@ import { SessionService } from "../../src/modules/identity/session.service.js";
 import { InvitationsService } from "../../src/modules/workspaces/invitations.service.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 import { apiUrl } from "../support/api-url.js";
 
 // STORY-172 — an invitation can only be accepted by the account whose VERIFIED
@@ -76,10 +77,8 @@ describe("STORY-172 · invitation acceptance is bound to the invited, verified e
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
-    // STORY-172 — 6380 is a developer's running valkey on some machines; this file
-    // never enqueues, so S172_QUEUE_REDIS_URL lets a run point somewhere unused.
-    process.env.QUEUE_REDIS_URL = process.env.S172_QUEUE_REDIS_URL ?? "redis://localhost:6380";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
+    process.env.QUEUE_REDIS_URL = testQueueRedisUrl();
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
@@ -543,4 +542,29 @@ describe("STORY-172 · invitation acceptance is bound to the invited, verified e
     expect(active.rowCount).toBe(0);
     expect((await invitationRow(invitation.id)).accepted_at).toBeNull();
   }, 30_000);
+  it("STORY-172-AC13 · (STORY-173 dependency) an anonymous passkey registration against the invited address yields no ceremony and no session, so the link cannot be accepted by taking over that account", async () => {
+    const owner = await createUser();
+    const workspaceId = await createWorkspace(owner.id);
+    const invitee = await createUser();
+    const invitation = await invite(workspaceId, owner.id, invitee.email, "admin");
+    const sessionsBefore = (await db.query("SELECT count(*)::int AS n FROM sessions")).rows[0].n as number;
+
+    // The pre-173 takeover: found-or-create the invitee's row, bind the caller's
+    // passkey to it, and be handed a session for it. It must be refused outright.
+    const options = await app.inject({
+      method: "POST",
+      url: apiUrl("/auth/passkey/options"),
+      payload: { purpose: "registration", email: invitee.email },
+    });
+    expect(options.statusCode).toBe(400);
+    expect(options.cookies.find((c) => c.name === ACCESS_COOKIE_NAME)).toBeUndefined();
+    expect((await db.query("SELECT count(*)::int AS n FROM sessions")).rows[0].n).toBe(sessionsBefore);
+
+    // An address nobody has proved stays unable to accept (AC2), and the token survives.
+    const unproven = await createUser({ email: `unproven-${randomUUID()}@example.com`, verified: false });
+    const forUnproven = await invite(workspaceId, owner.id, unproven.email);
+    expect((await accept(unproven.id, workspaceId, forUnproven.token!)).statusCode).toBe(400);
+    expect((await invitationRow(forUnproven.id)).accepted_at).toBeNull();
+    expect((await invitationRow(invitation.id)).accepted_at).toBeNull();
+  });
 });
