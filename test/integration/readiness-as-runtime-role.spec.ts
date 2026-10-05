@@ -20,6 +20,7 @@ import { MIGRATIONS_DIR_TOKEN } from "../../src/modules/health/health.service.js
 import { configureApp } from "../../src/api/configure-app.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixture.js";
+import { DEAD_VALKEY_URL } from "../support/test-valkey.js";
 
 // STORY-120 — readiness, exercised AS THE ROLE THAT ACTUALLY RUNS IT.
 //
@@ -415,7 +416,7 @@ describe("STORY-120 · readiness as the runtime role", () => {
   it("an unreachable queue instance degrades readiness instead of hanging it", async () => {
     // A port nothing listens on, chosen the same way the STORY-022 breaker
     // scenario picks one: a connection refused fast, never a black hole.
-    process.env.QUEUE_REDIS_URL = "redis://127.0.0.1:1";
+    process.env.QUEUE_REDIS_URL = DEAD_VALKEY_URL;
 
     const moduleRef = await Test.createTestingModule({ imports: [DbModule, HealthModule] }).compile();
     const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());

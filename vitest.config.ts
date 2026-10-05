@@ -25,6 +25,7 @@ export default defineConfig({
     exclude: [...configDefaults.exclude, "dist/**", "test/integration/**", "test/isolation/**"],
     // STORY-155 — every worker refuses to read a SIBLING of this repository
     // (gap G-12's class). See test/support/no-sibling-reads.ts.
-    setupFiles: ["test/support/no-sibling-reads.ts"],
+    setupFiles: ["test/support/no-sibling-reads.ts", "test/support/test-valkey-env.ts"],
+    // STORY-174 — no container here: the setup file exports INERT Valkey URLs.
   },
 });

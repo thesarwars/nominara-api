@@ -9,6 +9,7 @@ import { HealthModule } from "../../src/modules/health/health.module.js";
 import { HealthService } from "../../src/modules/health/health.service.js";
 import { EngineBreakerRegistry } from "../../src/lib/engines/engine-breaker-registry.js";
 import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixture.js";
+import { DEAD_VALKEY_URL } from "../support/test-valkey.js";
 
 // STORY-031 Phase I — D16: readiness's `engines[]` array is wired with real
 // data (per-engine `engines.status` + breaker `circuitState`). A read
@@ -111,7 +112,7 @@ describe("STORY-031 · readiness engines[] — real per-engine status + circuit 
   });
 
   it("a cache Valkey read failure does NOT blank engines[] — each engine still reports, circuitState falling back to closed (D19), never flips `ready`", async () => {
-    process.env.VALKEY_CACHE_URL = "redis://127.0.0.1:1"; // unreachable
+    process.env.VALKEY_CACHE_URL = DEAD_VALKEY_URL; // unreachable
 
     const moduleRef = await Test.createTestingModule({ imports: [DbModule, HealthModule] }).compile();
     try {

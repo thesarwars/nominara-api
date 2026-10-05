@@ -15,6 +15,7 @@ import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixture.js";
+import { DEAD_VALKEY_URL, testCacheRedisUrl } from "../support/test-valkey.js";
 
 // STORY-022 — HealthModule against a real Postgres (testing-strategy.md §1:
 // integration tests never mock the database). Each scenario builds its own
@@ -60,7 +61,7 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
     // STORY-030 — DbModule/HealthModule's providers call loadEnv(), which
     // (since Phase B) also requires the queue-signing env vars even though
     // this file never signs a job payload itself.
@@ -248,7 +249,7 @@ describe("STORY-022 · health/readiness against real Postgres", () => {
   // resolution, nothing to time out — and the container sat unhealthy with no
   // HTTP response at all.
   it("STORY-121 · an unreachable QUEUE instance degrades readiness rather than hanging it", async () => {
-    process.env.QUEUE_REDIS_URL = "redis://127.0.0.1:1";
+    process.env.QUEUE_REDIS_URL = DEAD_VALKEY_URL;
 
     const moduleRef = await Test.createTestingModule({ imports: [DbModule, HealthModule] }).compile();
     const service = moduleRef.get(HealthService);

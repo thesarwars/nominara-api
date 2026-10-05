@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it } from "vitest";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
 // QA-ADDED: OpenidClientAdapter has ZERO coverage. The integration suite
 // overrides OAUTH_CLIENT with a fake whose authorizationUrl() itself sets
@@ -21,11 +22,11 @@ const ENV = {
   OAUTH_STATE_SECRET: "test-oauth-state-secret",
   OTP_EMAIL_HASH_PEPPER: "test-otp-email-hash-pepper",
   OTP_EMAIL_FROM: "Nominara <no-reply@nominara.test>",
-  VALKEY_CACHE_URL: "redis://localhost:6379",
+  VALKEY_CACHE_URL: testCacheRedisUrl(),
   GOOGLE_OAUTH_CLIENT_ID: "google-client-id",
   GITHUB_OAUTH_CLIENT_ID: "github-client-id",
   MICROSOFT_OAUTH_CLIENT_ID: "microsoft-client-id",
-  QUEUE_REDIS_URL: "redis://localhost:6380",
+  QUEUE_REDIS_URL: testQueueRedisUrl(),
   ENGINE_TOKEN_BUCKETS: '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}',
   QUEUE_JOB_SIGNING_KEY: Buffer.alloc(32, 1).toString("base64"),
   QUEUE_JOB_SIGNING_KID: "test-queue-kid-1",

@@ -5,6 +5,7 @@ import {
   createQueueWorkerConnection,
   queueKeyPrefix,
 } from "../../src/lib/queue/connection.js";
+import { DEAD_VALKEY_URL } from "../support/test-valkey.js";
 
 // STORY-121 — one factory served two roles whose requirements are OPPOSITE,
 // and the health probe got the wrong one.
@@ -24,7 +25,7 @@ import {
 //
 // A port nothing listens on, chosen the same way the STORY-022 breaker
 // scenario picks one: connection refused fast, never a black hole.
-const DEAD_ADDRESS = "redis://127.0.0.1:1";
+const DEAD_ADDRESS = DEAD_VALKEY_URL;
 
 describe("STORY-121 · the queue connection's two roles", () => {
   const open: Redis[] = [];
