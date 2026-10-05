@@ -375,6 +375,26 @@ describe("STORY-173 · passkey registration proves the address", () => {
     expect(completed.statusCode).toBe(200);
   });
 
+  it("STORY-173 · AC1 — the public verify route refuses a ceremony of the wrong purpose and does not consume it", async () => {
+    // A registration-purpose row with no owner is unreachable through the API
+    // today; the claim must still key on purpose, so a future code path that
+    // produced one could never be redeemed as a sign-in.
+    const ceremony = randomUUID();
+    await db.query(
+      `INSERT INTO webauthn_challenges (id, purpose, user_id, challenge, rp_id, origin, expires_at)
+       VALUES ($1, 'registration', NULL, $2, 'localhost', 'http://localhost:3000', now() + interval '5 minutes')`,
+      [ceremony, Buffer.from("c")],
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: apiUrl("/auth/passkey/verify"),
+      payload: { ceremony_id: ceremony, response: credentialResponse(credId("anything")) },
+    });
+    expect(res.statusCode).toBe(400);
+    const row = await db.query("SELECT consumed_at FROM webauthn_challenges WHERE id = $1", [ceremony]);
+    expect(row.rows[0].consumed_at).toBeNull();
+  });
+
   // ---- AC2 · uniform anonymous surface ---------------------------------------
 
   it("STORY-173 · AC2 — anonymous registration is the same refusal, with the same statements, for an existing and a new address", async () => {
@@ -564,6 +584,14 @@ describe("STORY-173 · passkey registration proves the address", () => {
     expect(res.statusCode).toBe(403);
     expect(res.json().error.code).toBe("forbidden");
     expect((await counts()).challenges).toBe(challengesBefore);
+  });
+
+  it("STORY-173 · AC5 — a suspended account, even with a proved address, cannot add a passkey", async () => {
+    const user = await seedUser({ status: "active" });
+    await db.query("UPDATE users SET status = 'suspended' WHERE id = $1", [user.id]);
+    const session = await app.get(SessionService).createSession(user.id, new Date(), "email_otp");
+    const res = await addPasskeyOptions({ access: session.accessToken, csrf: session.csrfToken });
+    expect(res.statusCode).toBe(403);
   });
 
   it("STORY-173 · AC5 — an address proved after the ceremony began is re-checked at verify (the account is never bound unproven)", async () => {
