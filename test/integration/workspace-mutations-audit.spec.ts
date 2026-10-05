@@ -135,9 +135,12 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
   }
 
   /** Mints a session and its deterministic CSRF token, no workspace claimed yet. */
-  async function newSession() {
+  async function newSession(email?: string, verified = false) {
     const sessions = app.get(SessionService);
-    const userId = await createUser();
+    const userId = await createUser(email);
+    if (verified) {
+      await db.query("UPDATE users SET email_verified_at = now(), status = 'active' WHERE id = $1", [userId]);
+    }
     const tokens = await sessions.createSession(userId);
     const csrf = computeCsrfToken(tokens.sid, CSRF_SECRET);
     return { userId, ...tokens, csrf };
@@ -236,12 +239,15 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     expect(removed).toEqual({ actor_id: owner.userId, resource_id: removeTargetId });
 
     // ---- (6) POST /workspaces/:id/invitations -> member.invited -------------
+    // STORY-172 — only the account whose VERIFIED email is the invited
+    // address can accept (step 7), so the invitee is created to match.
+    const inviteeEmail = `invitee-${randomUUID()}@example.com`;
     const inviteRes = await app.inject({
       method: "POST",
       url: apiUrl(`/workspaces/${workspace.id}/invitations`),
       cookies: scoped,
       headers: csrfHeader,
-      payload: { email: `invitee-${randomUUID()}@example.com`, role: "viewer" },
+      payload: { email: inviteeEmail, role: "viewer" },
     });
     expect(inviteRes.statusCode).toBe(201);
     const invitation = dataOf<{ id: string; token: string }>(inviteRes);
@@ -249,7 +255,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     expect(invited).toEqual({ actor_id: owner.userId, resource_id: invitation.id });
 
     // ---- (7) POST /workspaces/:id/invitations/accept -> member.invitation_accepted
-    const invitee = await newSession();
+    const invitee = await newSession(inviteeEmail, true);
     const acceptRes = await app.inject({
       method: "POST",
       url: apiUrl(`/workspaces/${workspace.id}/invitations/accept`),
