@@ -164,7 +164,7 @@ describe("STORY-061 · A6 sentiment drivers (persisted, read)", () => {
     expect((await rows()).filter((x) => x.window_days === 30)).toHaveLength(1);
   });
 
-  it("data_source is null when nothing was measured, not demo", async () => {
+  it("an empty window is persisted as insufficient with zero cells, not skipped", async () => {
     await refresh();
     expect((await rows()).find((x) => x.window_days === 30)).toMatchObject({ sufficient: false, evidence_cells: 0 });
   });
