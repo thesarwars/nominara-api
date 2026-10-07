@@ -11,7 +11,6 @@ import {
 import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { composeDigest, summarize, validFindings, type StoredAnalysis } from "../../lib/geo/insights.js";
 import { writeGeoAnalysis } from "../../lib/geo/persist-analysis.js";
-import { buildStructure, loadStructureInput } from "../../lib/geo/structure.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -68,7 +67,7 @@ export class GeoService {
     const days = WINDOW_DAYS[query.timeframe];
     const row = (await this.latestRows(projectId, days, slug))[0] ?? null;
     incrementCounter("nominara_geo_analysis_read_total", { analysis: slug });
-    const detail = await this.detailFor(projectId, slug, row);
+    const detail = this.detailFor(slug, row);
     const sentiment = slug === "sentiment" ? geoSentimentDetailSchema.safeParse(detail) : null;
     const actions =
       sentiment?.success === true
@@ -83,22 +82,19 @@ export class GeoService {
   }
 
   /**
-   * Per-slug detail. `structure` (STORY-060) has a builder over the stored
-   * window's facts; `sentiment` (STORY-061) is read back from the finding the
-   * rollup persisted it on, and NEVER recomputed; the rest stay null until
-   * their own story. A suppressed analysis has no detail: the
-   * suppression reason is the whole answer. The detail is a deterministic
-   * aggregate of the stored window's facts through the same function the
-   * rollup used, so the two cannot disagree about what the window contains.
+   * Per-slug detail, READ BACK from the finding the rollup persisted it on and
+   * never recomputed, so the detail and the stored row cannot disagree. The
+   * analyses without a detail yet stay null until their own story. A suppressed
+   * analysis has no detail: the suppression reason is the whole answer.
    */
-  private async detailFor(projectId: string, slug: GeoSlug, row: StoredAnalysis | null): Promise<GeoAnalysis["detail"]> {
+  private detailFor(slug: GeoSlug, row: StoredAnalysis | null): GeoAnalysis["detail"] {
     if (slug === "sentiment") {
       if (row === null || !row.sufficient) return null;
       return validFindings(row).find((f) => f.sentiment !== undefined)?.sentiment ?? null;
     }
-    if (slug !== "structure" || row === null || !row.sufficient || row.windowStart === undefined) return null;
-    const input = await loadStructureInput(this.tx(), projectId, row.windowStart, row.windowDays as 7 | 30 | 90);
-    return buildStructure(input).detail;
+    if (slug !== "structure" || row === null || !row.sufficient) return null;
+    // Read back, never re-aggregated: a row persisted before the detail rode on the finding has none until the next rollup.
+    return validFindings(row).find((f) => f.structure !== undefined)?.structure ?? null;
   }
 
   /** The newest row per analysis for the window, current scoring version only. */
