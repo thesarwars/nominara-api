@@ -1,4 +1,10 @@
-// STORY-022 — scaffold only. DTOs are ALWAYS derived from a zod schema in
-// contracts/ (never hand-written, coding-standards.md §2) — they land with
-// this bounded area's own future story, once its contracts/ schemas exist.
-export {};
+// STORY-085-A — DTOs are derived from the zod schemas in contracts/command/
+// (coding-standards.md §2), never hand-written.
+export {
+  commandParseRequestSchema,
+  type CommandParseRequest,
+} from "../../../../contracts/command/parse-request.schema.js";
+export {
+  commandParseResponseSchema,
+  type CommandParseResponse,
+} from "../../../../contracts/command/parse-response.schema.js";
