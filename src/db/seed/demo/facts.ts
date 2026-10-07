@@ -428,7 +428,7 @@ export async function resetAndSeedProjectFacts(
     "entity_type", "entity_id", "entity_label", "matched_alias",
     "occurrence_index", "char_start", "char_end", "first_token_index", "prominence", "list_position",
     "sentiment_label", "sentiment_score", "sentiment_confidence", "sentiment_method",
-    "render_form", "render_score", "position_class",
+    "render_form", "render_score", "position_class", "answer_form",
   ];
   const citationColumns = [
     "workspace_id", "project_id", "result_id", "prompt_id", "engine_key", "captured_at",
@@ -462,6 +462,7 @@ export async function resetAndSeedProjectFacts(
         const present = isForcedDay || chance(rng, presenceProbability);
 
         const capture = buildCapture(rng, { engine, promptId, capturedAt, present });
+        const answerForm = demoAnswerForm(promptId, engine.engineKey, dayIndex);
 
         // Mentions and citations are computed FIRST, into cell-local arrays,
         // so the capture row's own `citation_count`/`owned_citation_count`
@@ -482,6 +483,7 @@ export async function resetAndSeedProjectFacts(
             isAttributeCapable ? pick(rng, ["linked", "described", "structured_row"] as const) : "bare_text",
             renderScore,
             capture.brandRank === 1 ? "recommendation" : capture.brandRank !== null && capture.brandRank <= 3 ? "ranked" : "neutral_list",
+            answerForm,
           ]);
 
           if (chance(rng, 0.7)) {
@@ -501,7 +503,7 @@ export async function resetAndSeedProjectFacts(
             "competitor", competitorId, `Competitor ${String(competitorIndex + 1)}`, `Competitor ${String(competitorIndex + 1)}`,
             1, 100, 200, 10, prominence, uniformInt(rng, 1, 5),
             labelFor(sentimentScore), sentimentScore, uniform(rng, 0.5, 0.9), "lexicon",
-            "bare_text", 0, "neutral_list",
+            "bare_text", 0, "neutral_list", answerForm,
           ]);
 
           if (chance(rng, 0.5)) {
@@ -528,6 +530,31 @@ export async function resetAndSeedProjectFacts(
   await insertRows(tx, "citation_facts", citationColumns, citationRows, { captured_at: "timestamptz" });
 
   return { days: days.map((d) => d.day), promptIds, competitorIds, engineKeys: engines.map((engine) => engine.engineKey) };
+}
+
+const DEMO_ANSWER_FORMS = [
+  ["ranked_list", 28],
+  ["comparison_table", 30],
+  ["single_recommendation", 12],
+  ["neutral_enumeration", 12],
+  ["narrative", 18],
+] as const;
+
+/**
+ * STORY-060 — the answer's form. Every mention row of one answer carries the
+ * answer's form, so it is a function of the cell, not of the mention. A hash
+ * rather than an `rng` draw, on purpose: drawing from the shared generator
+ * would shift every number the seed produces after this point.
+ */
+function demoAnswerForm(promptId: string, engineKey: string, dayIndex: number): string {
+  let h = 2166136261;
+  for (const ch of `${promptId}|${engineKey}|${String(dayIndex)}`) h = Math.imul(h ^ ch.charCodeAt(0), 16777619) >>> 0;
+  let pick = h % 100;
+  for (const [form, weight] of DEMO_ANSWER_FORMS) {
+    if (pick < weight) return form;
+    pick -= weight;
+  }
+  return "narrative";
 }
 
 function buildCapture(

@@ -24,6 +24,8 @@ export interface StoredAnalysis {
   findings: unknown[];
   leverRank: number | null;
   windowDays: number;
+  /** ISO date the stored window starts on. */
+  windowStart?: string;
 }
 
 export type TaskLink = { task_id: string; label: string; href: string };

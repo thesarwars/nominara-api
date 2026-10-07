@@ -1,15 +1,16 @@
 import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import {
-  geoAnalysisWriteSchema,
   type GeoAnalysis,
   type GeoAnalysisWrite,
   type GeoDigest,
   type GeoInsightsQuery,
   type GeoSlug,
 } from "../../../contracts/analytics/index.js";
-import { NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { composeDigest, summarize, validFindings, type StoredAnalysis } from "../../lib/geo/insights.js";
+import { writeGeoAnalysis } from "../../lib/geo/persist-analysis.js";
+import { buildStructure, loadStructureInput } from "../../lib/geo/structure.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -32,6 +33,7 @@ interface Row {
   findings: unknown[];
   lever_rank: number | null;
   window_days: number;
+  window_start: string;
 }
 
 @Injectable()
@@ -46,36 +48,7 @@ export class GeoService {
    * on the composite key so a recompute REPLACES.
    */
   async persistAnalysis(projectId: string, input: unknown): Promise<GeoAnalysisWrite> {
-    const parsed = geoAnalysisWriteSchema.safeParse(input);
-    if (!parsed.success) {
-      incrementCounter("nominara_geo_analysis_rejected_total", { reason: "invalid" });
-      throw new ValidationFailedError({
-        message: "the analysis violates the geo_analyses write contract",
-        details: { issues: parsed.error.issues.map((i) => ({ path: i.path.map(String), message: i.message })) },
-      });
-    }
-    const a = parsed.data;
-    const tx = this.tx();
-    const result = await tx.query(
-      `INSERT INTO geo_analyses
-         (workspace_id, project_id, analysis, window_start, window_days, score, score_label,
-          evidence_cells, evidence_passages, sufficient, suppression_reason, findings, lever_rank,
-          scoring_version, computed_at)
-       SELECT p.workspace_id, p.id, $2, $3::date, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, now()
-         FROM projects p WHERE p.id = $1 AND p.deleted_at IS NULL
-       ON CONFLICT (project_id, analysis, window_start, window_days, scoring_version) DO UPDATE SET
-         score = EXCLUDED.score, score_label = EXCLUDED.score_label,
-         evidence_cells = EXCLUDED.evidence_cells, evidence_passages = EXCLUDED.evidence_passages,
-         sufficient = EXCLUDED.sufficient, suppression_reason = EXCLUDED.suppression_reason,
-         findings = EXCLUDED.findings, lever_rank = EXCLUDED.lever_rank, computed_at = now()`,
-      [
-        projectId, a.analysis, a.window_start, a.window_days, a.score, a.score_label,
-        a.evidence_cells, a.evidence_passages, a.sufficient, a.suppression_reason,
-        JSON.stringify(a.findings), a.lever_rank, SCORING_VERSION,
-      ],
-    );
-    if (result.rowCount === 0) throw new NotFoundError({ message: "no such project" });
-    incrementCounter("nominara_geo_analysis_persisted_total", { analysis: a.analysis, sufficient: String(a.sufficient) });
+    const a = await writeGeoAnalysis(this.tx(), projectId, input);
     // Workspace ID is not available here by design: the log carries the analysis and window only.
     this.logger.log({ event: "geo_analysis_persisted", analysis: a.analysis, window_days: a.window_days, findings: a.findings.length });
     return a;
@@ -100,7 +73,20 @@ export class GeoService {
             .filter((f) => f.task_rule_code !== undefined)
             .map((f) => ({ label: f.headline, task_title: null, task_id: null, href: null, engines: [] as string[] }))
         : [];
-    return { summary: summarize(slug, row, days), detail: null, actions };
+    return { summary: summarize(slug, row, days), detail: await this.detailFor(projectId, slug, row), actions };
+  }
+
+  /**
+   * Per-slug detail. Only `structure` has a builder so far (STORY-060); the rest
+   * stay null until their own story. A suppressed analysis has no detail: the
+   * suppression reason is the whole answer. The detail is a deterministic
+   * aggregate of the stored window's facts through the same function the
+   * rollup used, so the two cannot disagree about what the window contains.
+   */
+  private async detailFor(projectId: string, slug: GeoSlug, row: StoredAnalysis | null): Promise<GeoAnalysis["detail"]> {
+    if (slug !== "structure" || row === null || !row.sufficient || row.windowStart === undefined) return null;
+    const input = await loadStructureInput(this.tx(), projectId, row.windowStart, row.windowDays as 7 | 30 | 90);
+    return buildStructure(input).detail;
   }
 
   /** The newest row per analysis for the window, current scoring version only. */
@@ -111,7 +97,7 @@ export class GeoService {
     const res = await tx.query<Row>(
       `SELECT DISTINCT ON (analysis)
               analysis, score::text AS score, evidence_cells, evidence_passages, sufficient,
-              suppression_reason, findings, lever_rank, window_days
+              suppression_reason, findings, lever_rank, window_days, window_start::text AS window_start
          FROM geo_analyses
         WHERE project_id = $1 AND window_days = $2 AND scoring_version = $3
           AND ($4::text IS NULL OR analysis = $4)
@@ -128,6 +114,7 @@ export class GeoService {
       findings: r.findings,
       leverRank: r.lever_rank,
       windowDays: r.window_days,
+      windowStart: r.window_start,
     }));
   }
 
