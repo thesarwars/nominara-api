@@ -8,8 +8,13 @@ import { SetMetadata } from "@nestjs/common";
 export interface AuditOptions {
   readonly action: string;
   readonly resourceType: string;
-  /** Where to read resource_id from. "params" reads req.params[paramName] (default); "response" reads the handler's returned body's `.id`. */
-  readonly resourceIdFrom?: "params" | "response";
+  /**
+   * Where to read resource_id from. "params" reads req.params[paramName] (default); "response" reads the handler's returned body's `.id`.
+   * "workspace" (STORY-075a) is for a mutation on a workspace-singleton resource that has no id of its own and
+   * whose response carries none (a billing-portal session): the resource IS the caller's workspace, and its id
+   * is taken from the tenant context — never from the request.
+   */
+  readonly resourceIdFrom?: "params" | "response" | "workspace";
   /** Only used when resourceIdFrom is "params" (the default). The req.params key to read. Defaults to "id". */
   readonly paramName?: string;
 }

@@ -55,6 +55,18 @@ const EXEMPT: Readonly<Record<string, string>> = Object.freeze({
   "WorkspacesController.acceptInvitation": "the caller is not yet a member, so they hold no role to require",
 });
 
+/**
+ * `@Public()` routes whose absence of a permission is a decision, each with the
+ * reason. `@Public()` already skips the gate above; this list exists so the
+ * decision is written down, and the test below fails if one is no longer public
+ * (a route that quietly gained a session requirement would lose its reason) or
+ * if the list names a route that does not exist.
+ */
+const PUBLIC_WITH_REASON: Readonly<Record<string, string>> = Object.freeze({
+  "StripeWebhookController.receive":
+    "POST /v1/webhooks/stripe (NEW-D-2) — Stripe has no session; the caller is authenticated by an HMAC over the raw body (Stripe-Signature, 300 s tolerance), and the workspace is resolved from the re-fetched Stripe object, never from the caller",
+});
+
 describe("STORY-096A · every workspace-scoped route states the permission it needs", () => {
   it("⚠ no route reaches RbacGuard's fail-open branch unaccounted for", async () => {
     applyFakeApiEnv();
@@ -108,6 +120,19 @@ describe("STORY-096A · every workspace-scoped route states the permission it ne
     expect(billingRead.admin.access).toBe("allow");
     for (const role of ["manager", "analyst", "viewer"] as const) {
       expect(billingRead[role].access, `${role} must not hold billing:read`).toBe("deny");
+    }
+  });
+});
+
+describe("NEW-D-2 · every deliberately public, permission-less route states why", () => {
+  it("each PUBLIC_WITH_REASON entry names a real route that is still @Public()", async () => {
+    applyFakeApiEnv();
+    const routes = await discoverRealRoutes();
+    for (const [id, reason] of Object.entries(PUBLIC_WITH_REASON)) {
+      const route = routes.find((r) => `${r.controllerName}.${r.methodName}` === id);
+      expect(route, `${id} is listed but no such route is registered`).toBeDefined();
+      expect(Reflect.getMetadata(IS_PUBLIC_KEY, route!.handler), `${id} (${reason})`).toBe(true);
+      expect(Reflect.getMetadata(REQUIRE_PERMISSION_KEY, route!.handler), `${id} must not also claim a permission`).toBeUndefined();
     }
   });
 });

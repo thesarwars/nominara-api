@@ -110,6 +110,16 @@ export interface ApplyPlanOptions {
   readonly allowNegotiatedTier?: boolean;
   /** Injected so the pro-rata boundary is testable; never read from the clock here. */
   readonly now?: Date;
+  /**
+   * STORY-075 AC8 — accept a move to a LOWER plan. Off unless the writer is the
+   * signature-verified webhook reconciler: there the provider has already
+   * ended or reduced the subscription, so refusing would leave the workspace
+   * on a plan nobody is paying for. It changes FEATURE ACCESS only; the
+   * structural reductions (pausing excess projects and prompts, the retention
+   * tier) are STORY-077's period-end policy and are recorded on the audit row
+   * as deferred, never performed here.
+   */
+  readonly allowDowngrade?: boolean;
 }
 
 /** The only reconciler STORY-151 ships: change the plan, carry everything else forward. */
@@ -257,7 +267,8 @@ export async function applyPlanChange(
 
   // 5. DIRECTION, then the negotiated tier by name — the order matters,
   //    because `sort_order` can never refuse enterprise (it is the maximum).
-  if (targetPlan.sort_order < currentPlan.sort_order) {
+  const isDowngrade = targetPlan.sort_order < currentPlan.sort_order;
+  if (isDowngrade && options.allowDowngrade !== true) {
     throw new DowngradeNotSupportedError(before.plan_key, desired.planKey);
   }
   if (NEGOTIATED_TIERS.has(desired.planKey) && options.allowNegotiatedTier !== true) {
@@ -405,6 +416,7 @@ export async function applyPlanChange(
       operator: provenance.operator,
       reason: provenance.reason,
       credits_topped_up: creditsToppedUp,
+      ...(isDowngrade ? { downgrade: { feature_access: "applied", structural_reductions: "deferred_to_story_077" } } : {}),
       ...(creditsNote === undefined ? {} : { credits_note: creditsNote }),
     },
     requestId: provenance.requestId,

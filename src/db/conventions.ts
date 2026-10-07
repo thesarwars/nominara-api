@@ -98,6 +98,12 @@ export const GLOBAL_TABLES = [
   // 0014_email_otp.up.sql.
   "email_otp_codes",
   "email_otp_requests",
+  // NEW-D-2 — Stripe webhook de-duplication ledger (event id PK). Global
+  // because an event is deduplicated BEFORE its workspace is known, and an
+  // event for an unknown subject is recorded too; it holds no tenant data.
+  // GRANT-protected like the auth tables: only the API's webhook route
+  // (nominara_app) writes it. Migration 0048_stripe_webhook_events.up.sql.
+  "stripe_webhook_events",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -388,7 +394,8 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
     table === "refresh_tokens" ||
     table === "oauth_authorization_requests" ||
     table === "email_otp_codes" ||
-    table === "email_otp_requests"
+    table === "email_otp_requests" ||
+    table === "stripe_webhook_events"
   ) {
     return role === "nominara_app" ? FULL_WRITE : NO_PRIVILEGES;
   }

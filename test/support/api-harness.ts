@@ -1,5 +1,5 @@
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
-import { Test } from "@nestjs/testing";
+import { Test, type TestingModuleBuilder } from "@nestjs/testing";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach } from "vitest";
@@ -51,6 +51,11 @@ export interface ApiHarnessOptions {
    * URLs exist only after that spec's own `beforeAll`.
    */
   readonly env?: () => Readonly<Record<string, string>>;
+  /**
+   * NEW-D-2 — lets a spec bind a provider (a fake `StripeGateway`) before the
+   * module compiles. Called with the builder; runs after `cache`.
+   */
+  readonly configure?: (builder: TestingModuleBuilder) => void;
 }
 
 /** Call inside a `describe`. Registers the container/app lifecycle hooks and returns accessors. */
@@ -98,6 +103,7 @@ export function useApiHarness(options: ApiHarnessOptions = {}): ApiHarness {
 
     const builder = Test.createTestingModule({ imports: [ApiModule] });
     if (options.cache !== undefined) builder.overrideProvider(CACHE).useValue(options.cache());
+    options.configure?.(builder);
     const moduleRef = await builder.compile();
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
     await configureApp(app);

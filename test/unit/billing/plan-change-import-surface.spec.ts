@@ -30,8 +30,18 @@ import { describe, expect, it } from "vitest";
 describe("STORY-151 · nothing customer-reachable can change a plan", () => {
   const root = fileURLToPath(new URL("../../../src/", import.meta.url));
 
-  /** The one file allowed to import it: the operator CLI. */
+  /** The operator CLI. */
   const ALLOWED = path.join(root, "workers", "billing", "plan-set.ts");
+  /**
+   * STORY-075a — OWNER-APPROVED, and the ONLY addition to this gate: the
+   * webhook reconciler. It is reachable solely from StripeWebhookService, after
+   * the raw-body signature verified and the subscription was re-fetched from
+   * Stripe; no request body is an input to the plan it writes. A THIRD importer
+   * still fails the build below, and so does anything but the module importing
+   * the reconciler itself.
+   */
+  const RECONCILER = path.join(root, "modules", "billing", "stripe-subscription.handler.ts");
+  const RECONCILER_REGISTRAR = path.join(root, "modules", "billing", "billing.module.ts");
 
   // ⚠ THE SCOPE IS WIDER THAN "src/modules AND src/api", AND THAT MATTERS.
   // Queue handlers open their own connection from `env.DATABASE_URL` directly
@@ -79,9 +89,9 @@ describe("STORY-151 · nothing customer-reachable can change a plan", () => {
     }
   });
 
-  it("⚠ NOTHING BUT THE OPERATOR CLI REACHES applyPlanChange", () => {
+  it("⚠ NOTHING BUT THE OPERATOR CLI AND THE WEBHOOK RECONCILER REACHES applyPlanChange", () => {
     const offenders = files
-      .filter((file) => file !== ALLOWED)
+      .filter((file) => file !== ALLOWED && file !== RECONCILER)
       .filter((file) => {
         const source = readFileSync(file, "utf8");
         return REACHES_APPLY_PLAN.test(source) || REACHES_CLI.test(source);
@@ -91,6 +101,25 @@ describe("STORY-151 · nothing customer-reachable can change a plan", () => {
       offenders.map((f) => path.relative(root, f)),
       "a new importer here is a new way for a customer to reach a plan write — see this file's header",
     ).toEqual([]);
+  });
+
+  // One hop out from the reconciler, as REACHES_CLI is for the CLI: whoever
+  // imports it inherits its reach. Only the module that registers it may.
+  const REACHES_RECONCILER = /(?:from|import|require)\s*\(?\s*["'][^"']*stripe-subscription\.handler\.js["']/u;
+
+  it("⚠ ONLY billing.module.ts IMPORTS THE WEBHOOK RECONCILER, AND IT IS NOT A CONTROLLER", () => {
+    const importers = files.filter((file) => file !== RECONCILER && REACHES_RECONCILER.test(readFileSync(file, "utf8")));
+    expect(importers.map((f) => path.relative(root, f))).toEqual([path.relative(root, RECONCILER_REGISTRAR)]);
+    expect(files, "the reconciler must be in scope of the scan").toContain(RECONCILER);
+    const source = readFileSync(RECONCILER, "utf8");
+    expect(source).not.toMatch(/@Controller\(/u);
+    expect(source).not.toMatch(/@(Get|Post|Put|Patch|Delete)\(/u);
+  });
+
+  it("the reconciler pattern catches the import forms and not unrelated ones", () => {
+    expect(REACHES_RECONCILER.test('import { StripeSubscriptionHandler } from "./stripe-subscription.handler.js";')).toBe(true);
+    expect(REACHES_RECONCILER.test("const m = await import('../x/stripe-subscription.handler.js');")).toBe(true);
+    expect(REACHES_RECONCILER.test('import { StripeEventHandler } from "./stripe-event-handler.js";')).toBe(false);
   });
 
   // ⚠ A DETECTOR THAT CANNOT FAIL IS NOT A CONTROL. Every form below was found
