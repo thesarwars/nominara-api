@@ -35,7 +35,6 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
   let dispatchSawRun: boolean[];
   let wsA: string;
   let projA: string;
-  let wsB: string;
   let projB: string;
   const originalKey = process.env.GEMINI_API_KEY;
 
@@ -66,16 +65,19 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     await container.stop();
   });
 
+  // 'business': the seeded catalog (migration 0027) makes gemini `min_plan_key =
+  // 'business'` with a business cadence, so a lower plan is never entitled to it
+  // and a scheduled run would legitimately cover nothing.
   async function seedTenant(): Promise<{ ws: string; project: string }> {
     const ws = randomUUID();
     const project = randomUUID();
-    await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1,'W',$2,'growth')", [
+    await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1,'W',$2,'business')", [
       ws,
       `w-${randomUUID().slice(0, 8)}`,
     ]);
     await db.query(
       `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, priority_prompt_limit, next_run_at)
-       VALUES ($1,$2,'P',$3,'https://e.test','e.test',10, now() - interval '10 minutes')`,
+       VALUES ($1,$2,'P',$3,'https://e.test','e.test',10, date_trunc('milliseconds', now() - interval '10 minutes'))`,
       [project, ws, `p-${randomUUID().slice(0, 8)}`],
     );
     for (const text of ["best crm", "top crm for startups", "crm pricing"]) {
@@ -96,7 +98,7 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     dispatched = [];
     dispatchSawRun = [];
     ({ ws: wsA, project: projA } = await seedTenant());
-    ({ ws: wsB, project: projB } = await seedTenant());
+    ({ project: projB } = await seedTenant());
   });
 
   afterEach(() => {
@@ -248,6 +250,16 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     await expect(processor()(job)).rejects.toThrow();
     expect(await runsFor(projA)).toEqual([]);
     expect(await runsFor(projB)).toEqual([]);
+  });
+
+  it("NEW-A-10 · a lost schedule advance rolls the run row back instead of committing an undispatched run", async () => {
+    // A next_run_at with sub-millisecond precision cannot be matched by the JS
+    // Date the claim carries, so planScheduledRun's compare-and-set loses AFTER
+    // it has written the run row.
+    await db.query("UPDATE projects SET next_run_at = now() - interval '10 minutes' + interval '1 microsecond' WHERE id = $1", [projA]);
+    await expect(processor()(signedJob(wsA, projA))).rejects.toThrow(/compare-and-set/);
+    expect(await runsFor(projA)).toEqual([]);
+    expect(dispatched).toHaveLength(0);
   });
 
   it("NEW-A-10 · a project that is not due yet is skipped without a run", async () => {

@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 import type { Env } from "../../config/env.schema.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
+import { createCapturePlanHandler } from "./handlers/capture-plan.handler.js";
 import { createCaptureParseHandler } from "./handlers/capture-parse.handler.js";
 import { createCreditReconcileHandler } from "./handlers/credit-reconcile.handler.js";
 import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
@@ -63,13 +64,15 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * would need this file edited under whatever incident first made someone
  * want the reconciler running, and the handler is correct and tested now.
  *
- * `capture.plan` and `capture.arbitrate` are STILL INERT and that is
- * deliberate. Planning happens on the request path inside the trigger's
- * transaction rather than as a job, so nothing enqueues it; arbitration has
- * no bound model (STORY-038 left the port unbound pending a dependency
- * decision), and a worker pulling a job it cannot process would fail it into
- * the dead-letter queue — turning "not built yet" into "tried and failed" in
- * the record an operator reads during an incident.
+ * `capture.plan` lands with NEW-A-10: it plans and dispatches one scheduled
+ * run for one project. It is tenant-scoped, so the schedule registrar will
+ * never tick it as a bare cron; its producer is the sweep (NEW-A-13).
+ *
+ * `capture.arbitrate` is STILL INERT and that is deliberate: it has no bound
+ * model (STORY-038 left the port unbound pending a dependency decision), and a
+ * worker pulling a job it cannot process would fail it into the dead-letter
+ * queue — turning "not built yet" into "tried and failed" in the record an
+ * operator reads during an incident.
  *
  * `maintenance.partition` is the obvious first real entry — non-tenant-
  * scoped, and its logic already exists in src/workers/rollup/maintenance.ts,
@@ -78,6 +81,7 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  */
 export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "crawl.discover": (context) => createCrawlDiscoverHandler(context),
+  "capture.plan": (context) => createCapturePlanHandler(context),
   "capture.execute": (context) => createCaptureExecuteHandler(context),
   "capture.parse": (context) => createCaptureParseHandler(context),
   "rollup.metric_daily": (context) => createRollupMetricDailyHandler(context),

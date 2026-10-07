@@ -110,6 +110,62 @@ export async function claimDueProjects(
 }
 
 /**
+ * NEW-A-10 — claims ONE project by id, if it is due, inside the caller's
+ * transaction. The per-project form of `claimDueProjects`: the same
+ * conditions (an allow-listed workspace status, an active undeleted project,
+ * `next_run_at` set and past), so a `capture.plan` job and the sweep can never
+ * disagree about what "due" means.
+ *
+ * Returns null when the project is not due, is paused or deleted, belongs to a
+ * workspace that is not capturable — or is simply invisible to the job's
+ * tenant context, which RLS makes indistinguishable from absent on purpose.
+ *
+ * `FOR UPDATE` (no SKIP LOCKED): a duplicate delivery of the same job must
+ * WAIT for the first, then re-check `next_run_at` against the advanced value
+ * and find nothing due. Skipping the locked row instead would let the second
+ * delivery report "not due" while the first was still mid-plan, which is
+ * correct but would hide a genuine race behind a benign-looking outcome.
+ */
+export async function claimDueProject(tx: ClientBase, projectId: string, now: Date): Promise<DueProject | null> {
+  const result = await tx.query<{
+    id: string;
+    workspace_id: string;
+    cadence: ProjectCadence;
+    priority_prompt_limit: number;
+    next_run_at: Date;
+    locale: string;
+    plan_key: string;
+  }>(
+    `
+    SELECT p.id, p.workspace_id, p.cadence, p.priority_prompt_limit, p.next_run_at,
+           p.locale, w.plan_key
+      FROM projects p
+      JOIN workspaces w ON w.id = p.workspace_id
+     WHERE p.id = $1
+       AND p.status = 'active'
+       AND p.deleted_at IS NULL
+       AND p.next_run_at IS NOT NULL
+       AND p.next_run_at <= $2
+       AND w.status = ANY($3::text[])
+       AND w.deleted_at IS NULL
+       FOR UPDATE OF p
+    `,
+    [projectId, now, [...CAPTURABLE_WORKSPACE_STATUSES]],
+  );
+  const row = result.rows[0];
+  if (row === undefined) return null;
+  return {
+    projectId: row.id,
+    workspaceId: row.workspace_id,
+    cadence: row.cadence,
+    priorityPromptLimit: row.priority_prompt_limit,
+    nextRunAt: row.next_run_at,
+    planKey: row.plan_key,
+    locale: row.locale,
+  };
+}
+
+/**
  * Advances `next_run_at`, and returns whether it actually moved.
  *
  * CALLED BEFORE THE ENQUEUE, in the same transaction — see this file's

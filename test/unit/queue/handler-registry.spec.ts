@@ -129,7 +129,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
 
   it("a group with SOME handlers reports both halves", () => {
     const capture = QUEUE_TOPOLOGY.filter((entry) => entry.workerGroup === "capture").map((entry) => entry.name);
-    expect(liveQueueNames(capture)).toEqual(["capture.execute"]);
+    expect(liveQueueNames(capture)).toEqual(["capture.plan", "capture.execute"]);
     expect(inertQueueNames(capture).length).toBeGreaterThan(0);
   });
 
