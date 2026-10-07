@@ -10,6 +10,11 @@ export interface AuditOptions {
   readonly resourceType: string;
   /** Where to read resource_id from. "params" reads req.params[paramName] (default); "response" reads the handler's returned body's `.id`. */
   readonly resourceIdFrom?: "params" | "response";
+  /**
+   * Only used when resourceIdFrom is "response": a dotted path to the id inside a NESTED response body
+   * (e.g. "token.id" for `{ token: { id }, secret }`). Absent, the body's own `id` / `<resourceType>_id` is read.
+   */
+  readonly responseIdPath?: string;
   /** Only used when resourceIdFrom is "params" (the default). The req.params key to read. Defaults to "id". */
   readonly paramName?: string;
 }
