@@ -11,5 +11,6 @@ import { AuditModule } from "../audit/audit.module.js";
   imports: [AuditModule],
   controllers: [AgencyController, ShareTokensController],
   providers: [AgencyService, ShareTokensService],
+  exports: [ShareTokensService],
 })
 export class AgencyModule {}

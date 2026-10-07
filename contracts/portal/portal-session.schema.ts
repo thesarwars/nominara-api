@@ -21,6 +21,11 @@ export const portalSessionRequestSchema = z
   .object({
     secret: z.string().min(16).max(256),
     password: z.string().min(1).max(128).optional(),
+    /**
+     * integrations-and-sharing.md §3 session flow: `{ secret, password, email? }`. Required, and its domain
+     * checked, only where the token has `allowed_email_domains`. A link without domains ignores it.
+     */
+    email: z.email().max(254).optional(),
   })
   .strict();
 

@@ -63,6 +63,8 @@ const EXEMPT: Readonly<Record<string, string>> = Object.freeze({
  * if the list names a route that does not exist.
  */
 const PUBLIC_WITH_REASON: Readonly<Record<string, string>> = Object.freeze({
+  "PortalController.createSession":
+    "POST /v1/portal/session (NEW-E-098b) — the visitor has no Nominara session or membership; the caller is authenticated by the token secret (sha256 lookup) plus the per-token Argon2id password, rate-limited 10/hour per address with a 5-failure/15-minute lock per token, and the workspace and scope come from the token row, never from the request",
   "StripeWebhookController.receive":
     "POST /v1/webhooks/stripe (NEW-D-2) — Stripe has no session; the caller is authenticated by an HMAC over the raw body (Stripe-Signature, 300 s tolerance), and the workspace is resolved from the re-fetched Stripe object, never from the caller",
 });

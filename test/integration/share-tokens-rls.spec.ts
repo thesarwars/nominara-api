@@ -134,7 +134,16 @@ describe("STORY-098 ISO-09 · ShareTokensService under RLS, as nominara_app", ()
         [a.workspaceId, Buffer.from(randomUUID()), [a.projectId], a.actorId],
       );
     }
-    const settled = await Promise.allSettled([1, 2, 3].map(() => inTenant(a, () => service.mint(request({ scope_project_ids: [a.projectId] }), meta))));
+    // Deterministic overlap: a test-only trigger holds every insert open for 400 ms, so
+    // each of the 20 attempts has already counted 9 before any insert lands. Without the
+    // advisory lock all 20 pass the count and all 20 insert; with it they are serialised
+    // and exactly one gets in. (Unsynchronised mints only overlapped by timing, which let
+    // a missing lock survive roughly one run in five.)
+    await admin.query(`CREATE FUNCTION public.hold_share_token_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.4); RETURN NEW; END $$`);
+    await admin.query("CREATE TRIGGER hold_insert BEFORE INSERT ON share_tokens FOR EACH ROW EXECUTE FUNCTION public.hold_share_token_insert()");
+    const settled = await Promise.allSettled(
+      Array.from({ length: 20 }, () => inTenant(a, () => service.mint(request({ scope_project_ids: [a.projectId] }), meta))),
+    );
     expect(settled.filter((r) => r.status === "fulfilled")).toHaveLength(1);
     expect(settled.filter((r) => r.status === "rejected").every((r) => (r as PromiseRejectedResult).reason?.code === "entitlement_exceeded")).toBe(true);
     expect((await admin.query("SELECT count(*)::int AS n FROM share_tokens")).rows[0]).toEqual({ n: 10 });

@@ -10,6 +10,12 @@ import { TENANT_TABLES } from "./rls/tenant-tables.generated.js";
 // consumer defines its own competing token.
 export const PG_POOL = Symbol("PG_POOL");
 
+/**
+ * NEW-E-098b — the SECOND pool: logs in as `nominara_portal` (SELECT only, `portal_scope_*` policies). `null` when
+ * DATABASE_URL_PORTAL is unset, so the portal fails closed (503) instead of quietly serving from the app pool.
+ */
+export const PORTAL_PG_POOL = Symbol("PORTAL_PG_POOL");
+
 // STORY-118 — security-and-tenancy.md §4's NFR-SEC-01, in force.
 //
 // STORY-011 built the guard, the client-wrapping Proxy, the generated
