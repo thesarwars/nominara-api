@@ -65,6 +65,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "capture.parse",
       "crawl.discover",
       "credit.reconcile",
+      "identity.sweep_unverified",
       "maintenance.partition",
       "rollup.metric_daily",
     ]);
@@ -81,6 +82,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       // Declared after maintenance.partition in topology.ts — STORY-143's
       // addition sits at the end of the rollup group's entries.
       "audit.verify",
+      // STORY-173 — added after audit.verify in topology.ts.
+      "identity.sweep_unverified",
     ]);
   });
 

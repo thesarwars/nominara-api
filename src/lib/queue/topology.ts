@@ -299,6 +299,26 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "auditver:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // ⚠ THE SECOND QUEUE §4 DOES NOT CONTAIN (after `audit.verify`), added for the
+  // same reason and by the same precedent. STORY-173: an email-code request for an
+  // address with no account creates that account `unverified`, and the rows nobody
+  // came back for must not accumulate (or stay squatted). The sweep
+  // (`workers/rollup/unverified-sweep.ts`) has existed since that story; the owner
+  // decided it runs DAILY on this system rather than by hand. A queue of its own
+  // rather than folded into `maintenance.partition`, so a DLQ entry or boot line
+  // names the job that failed. Not tenant-scoped: `users` is global.
+  // Advisory-locked (`locks.ts`): concurrency 1 bounds one Worker instance, not
+  // the queue, and two replicas deleting the same rows is pure duplicated cost.
+  {
+    name: "identity.sweep_unverified",
+    producer: "cron daily (STORY-173; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "unvsweep:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",

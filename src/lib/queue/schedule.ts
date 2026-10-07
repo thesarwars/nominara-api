@@ -64,6 +64,14 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // estate-wide walks do not contend for the same connections.
   { queue: "audit.verify", cron: "40 2 * * *", statedAs: "security-and-tenancy.md §12: verifier re-walks each chain daily" },
 
+  // ⚠ NOT FROM §4 EITHER — STORY-173's stale-unverified-account sweep, daily by
+  // owner decision (2026-10-05). 02:50 UTC: the same quiet window as the audit
+  // verifier (02:40) and the partition tick (03:20), ten minutes after the
+  // former so the two do not contend for connections; :50 and not :00 for the
+  // reason §6.1 gives `capture.plan` :05. The job is idempotent and cheap when
+  // nothing is stale, so a missed day costs nothing the next day does not cure.
+  { queue: "identity.sweep_unverified", cron: "50 2 * * *", statedAs: "STORY-173: sweep stale unverified accounts daily" },
+
   // ⚠ PERIOD STATED, TIME NOT. Scheduling these needs an hour of the day (and
   // for weekly, a day) that no reference gives. Left null deliberately — see
   // this file's header. `maintenance.partition` was here until STORY-142; it

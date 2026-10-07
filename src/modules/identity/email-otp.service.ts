@@ -18,6 +18,7 @@ import { EmailOtpInvalidException, OtpRateLimitedException } from "../../tenancy
 import type { EmailOtpRequestResponse } from "./dto/index.js";
 import { EMAIL_SENDER, type EmailSender } from "./ports/email-sender.js";
 import { renderOtpEmail } from "./otp-email-template.js";
+import { applyFirstProof } from "./account-proof.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
 
 // STORY-016 — dangerous area: the request path is the enumeration-
@@ -144,6 +145,23 @@ export class EmailOtpService {
     }
 
     const outcome = await withUniformDuration(REQUEST_TIMING_FLOOR_MS, async () => {
+      // STORY-173 — an address with no account gets one, `unverified`, with no
+      // credential and no session; only the code mailed to the address can
+      // turn it into something usable. This is how a new person proves their
+      // address BEFORE their first passkey exists, and it makes the two
+      // branches the same work: the old unknown-address branch (decoy hash,
+      // nothing mailed) was a response-time and mailbox oracle on whether an
+      // account existed.
+      //
+      // DO NOTHING, never DO UPDATE: an anonymous request must not touch an
+      // existing row — not its status, and not even the casing of its stored
+      // address (STORY-173 AC3). A suspended or deleted-and-reused address
+      // still falls through to the decoy below.
+      await this.pool.query(
+        `INSERT INTO users (id, email, status) VALUES ($1, $2, 'unverified')
+         ON CONFLICT (email) WHERE deleted_at IS NULL DO NOTHING`,
+        [uuidV7(), normalizedEmail],
+      );
       const userResult = await this.pool.query<{ id: string }>(
         `SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL AND status IN ('active', 'unverified')`,
         [normalizedEmail],
@@ -157,12 +175,25 @@ export class EmailOtpService {
       const code = generateOtpCode();
       const codeHash = await hash(code);
       const expiresAt = new Date(Date.now() + OTP_TTL_MS);
-      await this.pool.query(`INSERT INTO email_otp_codes (id, user_id, code_hash, expires_at) VALUES ($1, $2, $3, $4)`, [
-        uuidV7(),
-        user.id,
-        codeHash,
-        expiresAt,
-      ]);
+      try {
+        await this.pool.query(`INSERT INTO email_otp_codes (id, user_id, code_hash, expires_at) VALUES ($1, $2, $3, $4)`, [
+          uuidV7(),
+          user.id,
+          codeHash,
+          expiresAt,
+        ]);
+      } catch (error) {
+        // 23503: the account was removed between the lookup and this insert (the
+        // stale-unverified sweep, racing a code request for a long-idle row). Not
+        // an error to the caller — answering 500 here would make "an account was
+        // being swept" visible. It takes the same path as an address with no
+        // usable account: a decoy hash, nothing mailed, the same fixed response.
+        if ((error as { code?: string }).code === "23503") {
+          await verifyDecoy(generateOtpCode());
+          return null;
+        }
+        throw error;
+      }
       return { userId: user.id, code };
     });
 
@@ -265,7 +296,7 @@ export class EmailOtpService {
   async verifyCode(email: string, code: string, httpRequestId: string): Promise<SessionTokens> {
     const normalizedEmail = normalizeEmail(email);
     const client = await this.pool.connect();
-    let verifiedUserId: string | null = null;
+    let tokens: SessionTokens | null = null;
     try {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [emailOtpLockKey(normalizedEmail)]);
@@ -318,6 +349,9 @@ export class EmailOtpService {
       }
 
       await client.query(`UPDATE email_otp_codes SET consumed_at = now() WHERE id = $1`, [matchedId]);
+      // STORY-173 — the FIRST proof of an address revokes everything that
+      // predates it, durably, in this transaction (account-proof.ts says why).
+      await applyFirstProof(client, user.id, this.logger);
       await client.query(
         `UPDATE email_otp_codes SET invalidated_at = now(), invalidated_reason = 'superseded'
          WHERE user_id = $1 AND id != $2 AND consumed_at IS NULL AND invalidated_at IS NULL`,
@@ -334,8 +368,13 @@ export class EmailOtpService {
          WHERE id = $1`,
         [user.id],
       );
+      // The code just proved control of the address, which is the platform
+      // itself performing a re-authentication: stamp the session so it
+      // satisfies step-up for the next five minutes (this is what lets the
+      // person add their first passkey straight after signing up). Minted in
+      // THIS transaction, with the proof it depends on.
+      tokens = await this.sessions.createSessionOn(client, user.id, new Date(), "email_otp");
       await client.query("COMMIT");
-      verifiedUserId = user.id;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       if (error instanceof EmailOtpInvalidException) {
@@ -351,7 +390,7 @@ export class EmailOtpService {
       client.release();
     }
 
-    return this.sessions.createSession(verifiedUserId!);
+    return tokens!;
   }
 
   /**

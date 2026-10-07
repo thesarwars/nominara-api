@@ -81,6 +81,7 @@ export const userCredentials = pgTable("user_credentials", {
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   authenticatorAttachment: text("authenticator_attachment"),
+  revokedReason: text("revoked_reason"),
 });
 
 export const users = pgTable("users", {
