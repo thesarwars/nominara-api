@@ -1,0 +1,165 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { FeatureNotInPlanError } from "../../api/errors/domain-errors.js";
+import * as metrics from "../../lib/telemetry/metrics.js";
+import * as tenantContext from "../../tenancy/tenant-context.js";
+import { workspaceSummaryResponseSchema } from "../../../contracts/workspaces/workspace-summary-response.schema.js";
+import type { ProjectListItem } from "../../../contracts/projects/index.js";
+
+const resolveEntitlements = vi.fn();
+vi.mock("../../lib/entitlements/resolution.js", () => ({ resolveEntitlements: (...a: unknown[]) => resolveEntitlements(...a) }));
+const captureReady = vi.fn<() => string[]>(() => ["gemini"]);
+vi.mock("../../lib/engines/registry.js", () => ({ captureReadyEngineKeys: () => captureReady() }));
+
+import { WorkspaceSummaryService } from "./workspace-summary.service.js";
+
+// NEW-B-2 — GET /v1/workspaces/{id}/summary. FR-DASH-01 / STORY-089: the whole
+// matrix from one request, scoped counts, null is not zero.
+
+const WS = "11111111-1111-7111-8111-111111111111";
+
+function project(overrides: Partial<ProjectListItem> = {}): ProjectListItem {
+  return {
+    id: "22222222-2222-7222-8222-222222222222",
+    name: "P",
+    slug: "p",
+    root_domain: "p.com",
+    kind: "brand",
+    status: "active",
+    discovery_status: "completed",
+    prompts_active: 5,
+    prompts_cap: 30,
+    open_task_count: 0,
+    open_tasks_by_severity: { critical: 0, high: 0, medium: 0, low: 0 },
+    domain_verified_at: null,
+    created_at: "2026-01-01T00:00:00.000Z",
+    visibility_blended: null,
+    visibility_delta_30d: null,
+    rendering_quality: null,
+    rendering_delta_30d: null,
+    source_coverage: null,
+    aux_score_current: null,
+    sentiment_score: null,
+    sentiment_delta_30d: null,
+    sentiment_band: null,
+    confidence: null,
+    engine_scores: null,
+    sparkline_30d: null,
+    demo_seeded: false,
+    ...overrides,
+  } as ProjectListItem;
+}
+
+function entitlements(values: Record<string, unknown>) {
+  return {
+    workspace_id: WS,
+    plan_key: "growth",
+    entitlement_version: 1,
+    entitlements: Object.fromEntries(Object.entries(values).map(([k, v]) => [k, { value: v }])),
+  };
+}
+
+function setup(opts: { projects?: ProjectListItem[]; engines?: string[]; wallet?: unknown; ent?: Record<string, unknown> } = {}) {
+  const projects = {
+    listForSummary: vi.fn(async () => ({ projects: opts.projects ?? [], engineKeys: opts.engines ?? [] })),
+  };
+  const billing = {
+    wallet: vi.fn(async () => {
+      if (opts.wallet instanceof Error) throw opts.wallet;
+      return opts.wallet ?? { available: 100, expiring_soon: null, cycle_end: "2026-11-01", included_balance: 100, purchased_balance: 0 };
+    }),
+  };
+  resolveEntitlements.mockResolvedValue(entitlements(opts.ent ?? { "projects.max": 3, "prompts.max_total": 120 }));
+  vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client: {}, context: { workspaceId: WS, actorId: "a" } } as never);
+  return { service: new WorkspaceSummaryService(projects as never, billing as never), projects, billing };
+}
+
+describe("NEW-B-2 · WorkspaceSummaryService", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    resolveEntitlements.mockReset();
+    captureReady.mockReturnValue(["gemini"]);
+  });
+
+  it("FR-DASH-01: one projects read serves the whole matrix, and the response satisfies the contract", async () => {
+    const { service, projects } = setup({ projects: [project(), project({ id: "33333333-3333-7333-8333-333333333333" })] });
+    const out = await service.summary(WS);
+    expect(projects.listForSummary).toHaveBeenCalledTimes(1);
+    expect(out.window_days).toBe(30);
+    expect(workspaceSummaryResponseSchema.safeParse(out).success).toBe(true);
+  });
+
+  it("scoped counts: projects_used and prompts_used come from the rows returned, not the workspace", async () => {
+    const { service } = setup({ projects: [project({ prompts_active: 5 }), project({ prompts_active: 7 })] });
+    const out = await service.summary(WS);
+    expect(out.health.projects_used).toBe(2);
+    expect(out.health.prompts_used).toBe(12);
+  });
+
+  it("an empty matrix is projects_used 0, not an error", async () => {
+    const out = await setup().service.summary(WS);
+    expect(out.projects).toEqual([]);
+    expect(out.health.projects_used).toBe(0);
+    expect(out.health.prompts_used).toBe(0);
+  });
+
+  it("non-numeric limits ('custom', 'uncapped') are null, a numeric 0 stays 0", async () => {
+    const custom = await setup({ ent: { "projects.max": "custom", "prompts.max_total": "uncapped" } }).service.summary(WS);
+    expect(custom.health.projects_limit).toBeNull();
+    expect(custom.health.prompts_limit).toBeNull();
+    const zero = await setup({ ent: { "projects.max": 0, "prompts.max_total": 0 } }).service.summary(WS);
+    expect(zero.health.projects_limit).toBe(0);
+    expect(zero.health.prompts_limit).toBe(0);
+  });
+
+  it("data_source: a capture-ready engine is live, every other is demo, on scores and on the filter list", async () => {
+    const { service } = setup({
+      projects: [
+        project({
+          engine_scores: [
+            { engine_key: "gemini", score: 60, delta_30d: null },
+            { engine_key: "chatgpt", score: 40, delta_30d: 1 },
+          ],
+        }),
+      ],
+      engines: ["chatgpt", "gemini"],
+    });
+    const out = await service.summary(WS);
+    expect(out.projects[0]!.engine_scores).toEqual([
+      { engine_key: "gemini", score: 60, delta_30d: null, data_source: "live" },
+      { engine_key: "chatgpt", score: 40, delta_30d: 1, data_source: "demo" },
+    ]);
+    expect(out.engines).toEqual([
+      { engine_key: "chatgpt", data_source: "demo" },
+      { engine_key: "gemini", data_source: "live" },
+    ]);
+  });
+
+  it("with no capture-ready engine everything is demo (fail toward honesty)", async () => {
+    captureReady.mockReturnValue([]);
+    const out = await setup({ engines: ["gemini"] }).service.summary(WS);
+    expect(out.engines).toEqual([{ engine_key: "gemini", data_source: "demo" }]);
+  });
+
+  it("null scores stay null — absence is not zero", async () => {
+    const out = await setup({ projects: [project()] }).service.summary(WS);
+    expect(out.projects[0]!.visibility_blended).toBeNull();
+    expect(out.projects[0]!.engine_scores).toBeNull();
+  });
+
+  it("credits carry only the available balance, expiry and cycle end — no bucket split", async () => {
+    const out = await setup().service.summary(WS);
+    expect(out.health.credits).toEqual({ available: 100, expiring_soon: null, cycle_end: "2026-11-01" });
+  });
+
+  it("a negotiated grant (FeatureNotInPlan) is credits null; any other wallet failure propagates", async () => {
+    const negotiated = new FeatureNotInPlanError({ message: "negotiated", details: { key: "credits.included_per_cycle", min_plan: "enterprise" } });
+    expect((await setup({ wallet: negotiated }).service.summary(WS)).health.credits).toBeNull();
+    await expect(setup({ wallet: new Error("db down") }).service.summary(WS)).rejects.toThrow("db down");
+  });
+
+  it("observability: counts the read and logs the workspace id, never a name", async () => {
+    const counter = vi.spyOn(metrics, "incrementCounter");
+    await setup({ projects: [project()] }).service.summary(WS);
+    expect(counter).toHaveBeenCalledWith("nominara_workspace_summary_reads_total", { empty: "false" });
+  });
+});

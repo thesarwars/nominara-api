@@ -4,3 +4,5 @@ export * from "./discovery-response.schema.js";
 export * from "./confirm-discovery-request.schema.js";
 export * from "./domain-verification.schema.js";
 export * from "./project-list-response.schema.js";
+export * from "./topic-response.schema.js";
+export * from "./rename-topic-request.schema.js";

@@ -48,6 +48,17 @@ import { confidenceFor, sentimentBand } from "../../lib/scoring/index.js";
 
 const DISCOVERY_EXPECTED_MS = 20_000;
 
+// The matrix row's columns. Shared by `list` and `listForSummary` so the two
+// readers of the denormalised columns cannot drift apart.
+const PROJECT_LIST_SELECT = `SELECT id, name, slug::text AS slug, root_domain, kind, status, discovery_status,
+              prompts_active, prompts_cap, open_task_count, open_tasks_by_severity,
+              domain_verified_at, created_at,
+              visibility_blended, visibility_delta_30d, rendering_quality, rendering_delta_30d,
+              source_coverage, aux_score_current, sentiment_score, sentiment_delta_30d, cells_30d,
+              visibility_by_engine, sparkline_30d, demo_seeded_at,
+              created_at::text AS created_at_key
+         FROM projects`;
+
 @Injectable()
 export class ProjectsService {
   private readonly logger = new Logger(ProjectsService.name);
@@ -214,14 +225,7 @@ export class ProjectsService {
     const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
 
     const result = await client.query<ProjectRow>(
-      `SELECT id, name, slug::text AS slug, root_domain, kind, status, discovery_status,
-              prompts_active, prompts_cap, open_task_count, open_tasks_by_severity,
-              domain_verified_at, created_at,
-              visibility_blended, visibility_delta_30d, rendering_quality, rendering_delta_30d,
-              source_coverage, aux_score_current, sentiment_score, sentiment_delta_30d, cells_30d,
-              visibility_by_engine, sparkline_30d, demo_seeded_at,
-              created_at::text AS created_at_key
-         FROM projects
+      `${PROJECT_LIST_SELECT}
         WHERE deleted_at IS NULL
           AND (cardinality(app.current_scope_projects()) = 0
                OR id = ANY(app.current_scope_projects()))
@@ -232,6 +236,42 @@ export class ProjectsService {
     );
 
     return pageFrom(result.rows, pagination.limit, toProjectListItem, (row) => [row.created_at_key, row.id]);
+  }
+
+  /**
+   * NEW-B-2 — the Command Center's matrix, whole, for `GET /workspaces/{id}/
+   * summary`. FR-DASH-01: one request, no per-project query — this is TWO
+   * statements however many projects there are.
+   *
+   * Scoped exactly as `list` is (see its comment): RLS gives the workspace,
+   * `app.current_scope_projects()` gives the project scope, and the second
+   * statement re-uses the SAME scoped set so the engine filter cannot name an
+   * engine only an out-of-scope project is entitled to. Not paginated — the
+   * matrix is bounded by the plan's `projects.max`.
+   */
+  async listForSummary(): Promise<{ projects: ProjectListItem[]; engineKeys: string[] }> {
+    const client = currentTenantStore()!.client;
+
+    const result = await client.query<ProjectRow>(
+      `${PROJECT_LIST_SELECT}
+        WHERE deleted_at IS NULL
+          AND (cardinality(app.current_scope_projects()) = 0
+               OR id = ANY(app.current_scope_projects()))
+        ORDER BY created_at ASC, id ASC`,
+    );
+
+    // The entitled set is DERIVED (STORY-152), never stored. `enabled` honours
+    // a project's own narrowing; the view is security_invoker, so RLS applies.
+    const engines = await client.query<{ engine_key: string }>(
+      `SELECT DISTINCT engine_key
+         FROM project_entitled_engines
+        WHERE enabled
+          AND (cardinality(app.current_scope_projects()) = 0
+               OR project_id = ANY(app.current_scope_projects()))
+        ORDER BY engine_key`,
+    );
+
+    return { projects: result.rows.map(toProjectListItem), engineKeys: engines.rows.map((row) => row.engine_key) };
   }
 
   /**

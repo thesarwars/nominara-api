@@ -26,6 +26,8 @@ import {
   updateWorkspaceRequestSchema,
   workspaceListResponseSchema,
   workspaceResponseSchema,
+  workspaceSummaryResponseSchema,
+  type WorkspaceSummaryResponse,
   type AcceptInvitationParams,
   type AcceptInvitationRequest,
   type CreateInvitationRequest,
@@ -41,6 +43,7 @@ import { actionItemListResponseSchema, type ActionItem } from "../tasks/dto/inde
 import { InvitationsService } from "./invitations.service.js";
 import { TasksService } from "../tasks/tasks.service.js";
 import { WorkspacesService, type AuditRequestMeta } from "./workspaces.service.js";
+import { WorkspaceSummaryService } from "./workspace-summary.service.js";
 
 // STORY-021 — thin HTTP surface only (coding-standards.md §1: a conditional
 // here is a smell). Flattened @Controller() (no path prefix) because
@@ -63,6 +66,7 @@ export class WorkspacesController {
     private readonly service: WorkspacesService,
     private readonly invitations: InvitationsService,
     private readonly tasks: TasksService,
+    private readonly summaries: WorkspaceSummaryService,
   ) {}
 
   @Post("workspaces")
@@ -208,6 +212,20 @@ export class WorkspacesController {
   ): Promise<Page<InvitationResponse>> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
     return this.invitations.list(id, pagination);
+  }
+
+  // NEW-B-2 — api-specification.md §3: "GET /workspaces/{id}/summary —
+  // project:read — Command Center matrix". `@ScopedByQuery()` for the reason
+  // given on `listActionItems` below: the route names a workspace, and the
+  // project scope is applied inside `ProjectsService.listForSummary`.
+  // `assertMatchesTenant` first, so another workspace's id is refused.
+  @Get("workspaces/:id/summary")
+  @RequirePermission("project:read")
+  @ScopedByQuery()
+  @ApiContract({ operationId: "getWorkspaceSummary", responseSchema: workspaceSummaryResponseSchema })
+  summary(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<WorkspaceSummaryResponse> {
+    assertMatchesTenant(id, req.tenant!.workspaceId);
+    return this.summaries.summary(id);
   }
 
   // STORY-169 (API step 2/3) — api-specification.md §3: "GET /workspaces/
