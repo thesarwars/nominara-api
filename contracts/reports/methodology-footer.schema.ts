@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { engineDataSourceSchema, reportTimeframeSchema } from "./report-shared.schema.js";
+import { dataSourceSchema } from "../analytics/data-source.schema.js";
+import { reportTimeframeSchema } from "./report-shared.schema.js";
 
 // NEW-E-0 — GET /v1/projects/{id}/reports/methodology?timeframe=
 //
@@ -15,7 +16,7 @@ import { engineDataSourceSchema, reportTimeframeSchema } from "./report-shared.s
 export const methodologyQuerySchema = z.object({ timeframe: reportTimeframeSchema.default("30d") }).strict();
 
 export const methodologyEngineSourceSchema = z
-  .object({ engine_key: z.string().min(1), data_source: engineDataSourceSchema })
+  .object({ engine_key: z.string().min(1), data_source: dataSourceSchema.nullable() })
   .strict();
 
 export const methodologyFooterSchema = z
@@ -24,7 +25,7 @@ export const methodologyFooterSchema = z
     data_through: z.iso.date().nullable(),
     /** Engine keys included — the frontend's field name and shape, unchanged. */
     engines: z.array(z.string().min(1)),
-    /** Owner decision: one live/demo marker per included engine. */
+    /** Owner decision: one marker per included engine, in the one vocabulary: live | demo | mixed | null (null = nothing measured). */
     engine_data_sources: z.array(methodologyEngineSourceSchema),
     timeframe: reportTimeframeSchema,
     sample_size: z.number().int().nonnegative(),

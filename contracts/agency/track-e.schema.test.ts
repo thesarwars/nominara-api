@@ -105,6 +105,9 @@ describe("Track E contracts (NEW-E-0)", () => {
     };
     expect(methodologyFooterSchema.safeParse(base).success).toBe(true);
     expect(methodologyFooterSchema.safeParse({ ...base, engine_data_sources: [{ engine_key: "gemini", data_source: "mock" }] }).success).toBe(false);
+    for (const data_source of ["mixed", null]) {
+      expect(methodologyFooterSchema.safeParse({ ...base, engine_data_sources: [{ engine_key: "gemini", data_source }] }).success).toBe(true);
+    }
   });
 
   it("STORY-100: PATCH never applies create defaults; create does", () => {
