@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DIVERGENCE_OUTCOME,
   crossEngineDivergence,
+  divergenceClassFor,
   type DivergenceEngineResult,
   type DivergencePromptInput,
 } from "../../../src/lib/scoring/index.js";
@@ -78,7 +79,18 @@ describe("NEW-C-12 · which prompts qualify", () => {
     ]);
     expect(out.prompts.map((p) => p.promptId)).toEqual(["pair"]);
     expect(out.qualifyingPrompts).toBe(1);
-    expect(out.excluded).toEqual({ fewerThanTwoEngines: 1, noStability: 0 });
+    expect(out.excluded).toEqual({ fewerThanTwoEngines: 1, noStability: 0, unscoredResults: 0 });
+    // The excluded solo prompt must not dilute the mean: (0.7 - 0.4) * 1 = 0.3, over ONE prompt.
+    expect(out.projectDivergence).toBeCloseTo(0.3, 12);
+  });
+
+  it("[A4-8b] a null-stability prompt does not dilute the mean: it equals the qualifying prompt's value alone", () => {
+    const out = run([
+      prompt("stable", 1, [r("a", "recommendation"), r("b", "absent")]),
+      prompt("unmeasured", null, [r("a", "recommendation"), r("b", "absent")]),
+    ]);
+    expect(out.qualifyingPrompts).toBe(1);
+    expect(out.projectDivergence).toBeCloseTo(1, 12);
   });
 
   it("[A4-9] no qualifying prompt = null (nothing measured), never 0", () => {
@@ -202,5 +214,71 @@ describe("NEW-C-12 · fail closed on bad input", () => {
     expect(lo.projectDivergence).toBe(0);
     expect(nan.projectDivergence).toBeNull();
     expect(nan.excluded.noStability).toBe(1);
+  });
+});
+
+describe("NEW-C-12 audit · the stored position_class domain maps to o(e) in the library", () => {
+  it("[A4-24] every stored mention_facts.position_class maps; 'neutral_list' is the reference's 'neutral list'", () => {
+    expect(divergenceClassFor("recommendation")).toBe("recommendation");
+    expect(divergenceClassFor("ranked")).toBe("ranked");
+    expect(divergenceClassFor("neutral_list")).toBe("neutral");
+  });
+
+  it("[A4-25] no mention at all (null) and 'absent' are o = 0.0", () => {
+    expect(divergenceClassFor(null)).toBe("absent");
+    expect(divergenceClassFor("absent")).toBe("absent");
+  });
+
+  it("[A4-26] 'also_consider' and 'caveat' have no o(e) in the reference: they are 'unscored', never a throw and never a guessed number", () => {
+    expect(divergenceClassFor("also_consider")).toBe("unscored");
+    expect(divergenceClassFor("caveat")).toBe("unscored");
+  });
+
+  it("[A4-27] a value outside the stored domain still fails closed", () => {
+    expect(() => divergenceClassFor("bogus")).toThrow(/position class/i);
+  });
+
+  it("[A4-28] an unscored result is dropped from its prompt and counted, so it can neither raise nor dilute divergence", () => {
+    const out = run([
+      prompt("p1", 1, [r("a", "recommendation"), r("b", "absent"), r("c", "unscored")]),
+      // Dropping the unscored result leaves one engine: the prompt is excluded as a solo prompt.
+      prompt("p2", 1, [r("a", "ranked"), r("c", "unscored")]),
+    ]);
+    expect(out.qualifyingPrompts).toBe(1);
+    expect(out.projectDivergence).toBeCloseTo(1, 12);
+    expect(out.excluded).toEqual({ fewerThanTwoEngines: 1, noStability: 0, unscoredResults: 2 });
+  });
+});
+
+describe("NEW-C-12 audit · live-only divergence for the alert (owner decision on demo-as-live is open)", () => {
+  it("[A4-29] the live-only mean uses prompts with >= 2 LIVE results, computed over the live results", () => {
+    const out = run([
+      prompt("liveLive", 1, [r("a", "recommendation"), r("b", "absent")]),
+      prompt("liveDemo", 1, [r("a", "recommendation", [], "live"), r("b", "absent", [], "demo")]),
+    ]);
+    expect(out.qualifyingPrompts).toBe(2);
+    expect(out.projectDivergence).toBeCloseTo(1, 12);
+    expect(out.qualifyingLivePrompts).toBe(1);
+    expect(out.projectDivergenceLive).toBeCloseTo(1, 12);
+    expect(out.prompts.find((p) => p.promptId === "liveDemo")!.divergenceLive).toBeNull();
+  });
+
+  it("[A4-30] a live+demo-only workload has no live mean (null, not 0) while the blended mean still exists", () => {
+    const out = run([prompt("p1", 1, [r("a", "recommendation", [], "live"), r("b", "absent", [], "demo")])]);
+    expect(out.projectDivergence).toBeCloseTo(1, 12);
+    expect(out.qualifyingLivePrompts).toBe(0);
+    expect(out.projectDivergenceLive).toBeNull();
+  });
+
+  it("[A4-31] a demo engine does not move the live mean: three engines, one demo, live pair decides", () => {
+    const out = run([prompt("p1", 1, [r("a", "ranked"), r("b", "neutral"), r("c", "recommendation", [], "demo")])]);
+    expect(out.projectDivergence).toBeCloseTo(0.6, 12);
+    expect(out.projectDivergenceLive).toBeCloseTo(0.3, 12);
+  });
+
+  it("[A4-32] live engines that agree are 0, distinct from null", () => {
+    const out = run([prompt("p1", 1, [r("a", "ranked"), r("b", "ranked")])]);
+    expect(out.projectDivergenceLive).toBe(0);
+    expect(out.qualifyingLivePrompts).toBe(1);
   });
 });
