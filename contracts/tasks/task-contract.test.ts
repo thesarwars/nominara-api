@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { getTableColumns } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { tasks } from "../../src/db/schema/tasks.js";
-import { taskListQuerySchema, taskSchema, taskSortSchema, taskStatusSchema } from "./index.js";
+import { completeTaskResponseSchema, taskListQuerySchema, taskSchema, taskSortSchema, taskStatusSchema } from "./index.js";
 
 // STORY-064 test #3 — "Search the schema and API for an ordering field: None
 // exists." Three independent searches, so one blind spot cannot hide it:
@@ -62,5 +62,19 @@ describe("STORY-064 · task contract", () => {
     };
     expect(taskSchema.safeParse(base).success).toBe(true);
     expect(taskSchema.safeParse({ ...base, lane_order: 1 }).success).toBe(false);
+  });
+
+  it("[STORY-064-D] the complete response is strict and verification is nullable (null until STORY-067)", () => {
+    const task = {
+      id: "0198f6a0-0000-7000-8000-000000000001", short_ref: "HUB-1", project_id: "0198f6a0-0000-7000-8000-000000000002",
+      goal_id: null, title: "t", description: "d", kind: "content", origin: "auto", status: "done", severity: null,
+      source: "content", rule_code: null, priority: 3, impact_score: 10, effort: null, assignee_id: null, due_at: null,
+      dismissed_reason: null, resurface_at: null, completed_at: "x", affected_url: null, created_at: "x", updated_at: "x",
+    };
+    const body = { task, milestone: { id: "0198f6a0-0000-7000-8000-000000000003", kind: "task_completed", occurred_at: "x" }, verification: null };
+    expect(completeTaskResponseSchema.safeParse(body).success).toBe(true);
+    expect(completeTaskResponseSchema.safeParse({ ...body, verification: undefined }).success).toBe(false);
+    expect(completeTaskResponseSchema.safeParse({ ...body, extra: 1 }).success).toBe(false);
+    expect(completeTaskResponseSchema.safeParse({ ...body, milestone: { ...body.milestone, kind: "deployment" } }).success).toBe(false);
   });
 });
