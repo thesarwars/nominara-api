@@ -312,6 +312,22 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     expect(Number(otherWallet.rows[0]!.n)).toBe(0);
   }, 120_000);
 
+  it("STORY-060 · every seeded mention row carries its answer's form, and one answer has exactly one form", async () => {
+    const workspaceId = await createWorkspace("growth");
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    const unclassified = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM mention_facts WHERE workspace_id = $1 AND answer_form IS NULL`,
+      [workspaceId],
+    );
+    expect(Number(unclassified.rows[0]!.n)).toBe(0);
+    const split = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM (SELECT result_id FROM mention_facts WHERE workspace_id = $1
+        GROUP BY result_id HAVING count(DISTINCT answer_form) > 1) t`,
+      [workspaceId],
+    );
+    expect(Number(split.rows[0]!.n)).toBe(0);
+  }, 120_000);
+
   it("STORY-169 · a re-run without --purge is idempotent — no doubled cells", async () => {
     const workspaceId = await createWorkspace("growth");
 
