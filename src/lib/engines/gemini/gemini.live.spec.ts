@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parseCapture } from "../../parser/parse-capture.js";
 import { rawCaptureSchema, type CaptureContext } from "../contract.js";
 import { GeminiApiAdapter } from "./gemini-api-adapter.js";
 
@@ -24,5 +25,35 @@ describe.skipIf(!enabled)("STORY-028 · scenario 1 · live Gemini capture", () =
     expect(result.text.length).toBeGreaterThan(0);
     expect((result.structuredCitations ?? []).length).toBeGreaterThan(0);
     expect(result.latencyMs).toBeGreaterThan(0);
-  }, 40_000);
+
+    // NEW-A-4 AC6, second half: run the capture through the REAL parse stage (default guarded
+    // fetch) and require the vertexaisearch grounding redirects to resolve to more than one
+    // distinct, non-wrapper domain. Logs counts only, never the key or the answer text.
+    const parsed = await parseCapture(
+      {
+        resultId: "live-smoke",
+        workspaceId: "live-smoke",
+        projectId: "live-smoke",
+        promptId: "live-smoke",
+        engineKey: "gemini",
+        capturedAt: new Date(),
+        text: result.text,
+        structuredCitations: (result.structuredCitations ?? []).map((c) => ({
+          url: c.url,
+          slot: c.slot,
+          ...(c.title !== undefined ? { title: c.title } : {}),
+        })),
+        flags: [],
+      },
+      { rootDomain: "example.invalid", ownedDomains: [], competitorDomains: [], negativeAliases: [], aliases: [] },
+    );
+    const resolved = parsed.citations.filter((c) => c.httpStatus !== null);
+    const domains = new Set(resolved.map((c) => c.domain));
+    process.stdout.write(
+      `gemini-live-smoke citations=${parsed.citations.length} resolved=${resolved.length} distinctDomains=${domains.size} latencyMs=${result.latencyMs}\n`,
+    );
+    expect(resolved.length).toBeGreaterThan(1);
+    expect(domains.size).toBeGreaterThan(1);
+    expect([...domains].some((d) => d.endsWith("vertexaisearch.cloud.google.com"))).toBe(false);
+  }, 90_000);
 });
