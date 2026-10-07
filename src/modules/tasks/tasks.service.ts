@@ -398,7 +398,8 @@ export class TasksService {
       `SELECT t.project_id, t.status, t.title,
               (cardinality(app.current_scope_projects()) = 0 OR t.project_id = ANY(app.current_scope_projects())) AS in_scope
          FROM tasks t
-        WHERE t.id = $1 AND t.deleted_at IS NULL
+         JOIN projects p ON p.id = t.project_id
+        WHERE t.id = $1 AND t.deleted_at IS NULL AND p.deleted_at IS NULL
         FOR UPDATE OF t`,
       [taskId],
     );
@@ -482,11 +483,13 @@ export class TasksService {
     return pageFrom(result.rows, query.limit, toTaskEvent, (row) => [row.occurred_key, row.id]);
   }
 
-  /** 404 for an absent/other-tenant/soft-deleted task; the scope 403 for an in-tenant task outside the caller's scope. */
+  /** 404 for an absent/other-tenant/soft-deleted task or a task of a soft-deleted project; the scope 403 for an in-tenant task outside the caller's scope. */
   private async assertTaskReadable(client: ClientBase, taskId: string): Promise<void> {
     const found = await client.query<{ in_scope: boolean }>(
       `SELECT (cardinality(app.current_scope_projects()) = 0 OR t.project_id = ANY(app.current_scope_projects())) AS in_scope
-         FROM tasks t WHERE t.id = $1 AND t.deleted_at IS NULL`,
+         FROM tasks t
+         JOIN projects p ON p.id = t.project_id
+        WHERE t.id = $1 AND t.deleted_at IS NULL AND p.deleted_at IS NULL`,
       [taskId],
     );
     const row = found.rows[0];
