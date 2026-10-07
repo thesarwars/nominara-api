@@ -151,7 +151,7 @@ export const scorecardEntrySchema = z
      * demo-seeded. Null when nothing was measured; never "demo" by default.
      * On the blended entry: the combination across every engine in the blend.
      */
-    data_source: dataSourceSchema.nullable(),
+    data_source: dataSourceSchema.nullable().optional(),
   })
   .strict();
 
@@ -178,7 +178,7 @@ export const scorecardsResponseSchema = z
     engines: z.array(scorecardEntrySchema),
     blended: scorecardEntrySchema,
     /** NEW-A-5 — which engines fed `blended`, by provenance. */
-    blend: blendDisclosureSchema,
+    blend: blendDisclosureSchema.optional(),
   })
   .strict();
 

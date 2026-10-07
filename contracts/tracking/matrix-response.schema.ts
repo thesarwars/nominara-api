@@ -84,7 +84,7 @@ export const matrixCellSchema = z
      */
     cache_age_ms: z.number().int().nonnegative().nullable(),
     /** NEW-A-5 — null on a pending, failed or blocked cell: nothing was measured. */
-    data_source: dataSourceSchema.nullable(),
+    data_source: dataSourceSchema.nullable().optional(),
   })
   .strict();
 
@@ -118,7 +118,7 @@ export const matrixResponseSchema = z
     /** The column order every row's `cells` follows, so a client need not sort. */
     engine_keys: z.array(z.string().min(1)),
     /** NEW-A-5 — provenance per column, in `engine_keys` order. */
-    engines: z.array(engineDataSourceSchema),
+    engines: z.array(engineDataSourceSchema).optional(),
     prompts: z.array(matrixRowSchema),
   })
   .strict();

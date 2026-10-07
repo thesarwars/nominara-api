@@ -18183,8 +18183,7 @@
                               "label",
                               "entity_type",
                               "color_role",
-                              "points",
-                              "data_source"
+                              "points"
                             ],
                             "additionalProperties": false
                           }
@@ -18534,7 +18533,6 @@
                         "granularity",
                         "timeframe",
                         "series",
-                        "engines",
                         "milestones",
                         "annotations",
                         "summary",
@@ -19057,8 +19055,7 @@
                                     "brand_rank_position",
                                     "sov",
                                     "sentiment_label",
-                                    "cache_age_ms",
-                                    "data_source"
+                                    "cache_age_ms"
                                   ],
                                   "additionalProperties": false
                                 }
@@ -19080,7 +19077,6 @@
                         "project_id",
                         "timeframe",
                         "engine_keys",
-                        "engines",
                         "prompts"
                       ],
                       "additionalProperties": false
@@ -22664,8 +22660,7 @@
                               "metrics",
                               "metrics_delta",
                               "last_captured_at",
-                              "next_run_at",
-                              "data_source"
+                              "next_run_at"
                             ],
                             "additionalProperties": false
                           }
@@ -22950,8 +22945,7 @@
                             "metrics",
                             "metrics_delta",
                             "last_captured_at",
-                            "next_run_at",
-                            "data_source"
+                            "next_run_at"
                           ],
                           "additionalProperties": false
                         },
@@ -22992,8 +22986,7 @@
                         "timeframe",
                         "window",
                         "engines",
-                        "blended",
-                        "blend"
+                        "blended"
                       ],
                       "additionalProperties": false
                     },
