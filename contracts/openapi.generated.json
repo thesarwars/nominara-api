@@ -34982,11 +34982,18 @@
                                           ]
                                         },
                                         "data_source": {
-                                          "type": "string",
-                                          "enum": [
-                                            "live",
-                                            "demo",
-                                            "mixed"
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "enum": [
+                                                "live",
+                                                "demo",
+                                                "mixed"
+                                              ]
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
                                           ]
                                         }
                                       },
@@ -35046,11 +35053,18 @@
                                 "minLength": 1
                               },
                               "data_source": {
-                                "type": "string",
-                                "enum": [
-                                  "live",
-                                  "demo",
-                                  "mixed"
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "enum": [
+                                      "live",
+                                      "demo",
+                                      "mixed"
+                                    ]
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
                                 ]
                               }
                             },

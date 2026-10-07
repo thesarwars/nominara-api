@@ -13,17 +13,17 @@ import { projectEngineScoreSchema, projectListItemSchema } from "../projects/pro
 // one-request budget. `window_days` is a literal rather than a number so a
 // client cannot render a "7 days" selector this payload cannot honour.
 //
-// `data_source` IS PER ENGINE, NOT PER RESPONSE. Gemini is captured live; the
-// other engines' numbers are demonstration data until their adapters exist. A
-// blended score can mix both, so each engine entry says which it is, and a
-// client that blends them must say so.
+// `data_source` IS PER ENGINE, NOT PER RESPONSE, and it is CAPTURE PROVENANCE:
+// derived from `answer_captures.normalizer_version` over the 30-day window, not
+// from whether an adapter is configured. `live|demo|mixed`, and `null` when
+// nothing was measured for that engine (absence, never "demo").
 //
 // NULL IS NOT ZERO throughout (see project-list-response.schema.ts): a limit
 // of `null` is "no numeric cap" (custom/uncapped), `credits: null` is "the
 // plan's grant is negotiated, not a figure" — never 0.
 
 export const summaryEngineScoreSchema = projectEngineScoreSchema
-  .extend({ data_source: dataSourceSchema })
+  .extend({ data_source: dataSourceSchema.nullable() })
   .strict();
 
 export const summaryProjectSchema = projectListItemSchema
@@ -32,7 +32,7 @@ export const summaryProjectSchema = projectListItemSchema
   .strict();
 
 export const summaryEngineSchema = z
-  .object({ engine_key: z.string().min(1), data_source: dataSourceSchema })
+  .object({ engine_key: z.string().min(1), data_source: dataSourceSchema.nullable() })
   .strict();
 
 export const summaryCreditsSchema = z
