@@ -68,6 +68,9 @@ function isEnumSubset(narrower: unknown[], wider: unknown[]): boolean {
 function compareSharedField(previous: JsonSchemaObjectLike, current: JsonSchemaObjectLike): SemverBump {
   if (JSON.stringify(previous) === JSON.stringify(current)) return "none";
 
+  const union = compareUnion(previous, current);
+  if (union !== undefined) return union;
+
   const nested = compareNestedShape(previous, current);
   if (nested !== undefined) return nested;
 
@@ -101,6 +104,29 @@ function without(schema: JsonSchemaObjectLike, keys: readonly string[]): string 
     return value;
   };
   return JSON.stringify(sorted(Object.fromEntries(Object.entries(schema).filter(([key]) => !keys.includes(key)))));
+}
+
+/**
+ * A NULLABLE field is `anyOf: [<schema>, {type: "null"}]`. When both sides are
+ * unions of the same arity with nothing else different, each branch is
+ * compared with its counterpart and the most severe result wins, so a nullable
+ * enum that gains a value reads as it does bare (`patch`). A union appearing,
+ * disappearing or changing arity (a field BECOMING nullable) is `major`: it
+ * must not fall through to the "fixed set -> any value" widening below, which
+ * reads a missing `enum` as "accepts anything".
+ */
+function compareUnion(previous: JsonSchemaObjectLike, current: JsonSchemaObjectLike): SemverBump | undefined {
+  const previousUnion = previous.anyOf as JsonSchemaObjectLike[] | undefined;
+  const currentUnion = current.anyOf as JsonSchemaObjectLike[] | undefined;
+  if (previousUnion === undefined && currentUnion === undefined) return undefined;
+  if (previousUnion === undefined || currentUnion === undefined) return "major";
+  if (previousUnion.length !== currentUnion.length) return "major";
+  if (without(previous, ["anyOf"]) !== without(current, ["anyOf"])) return "major";
+  let bump: SemverBump = "none";
+  for (let index = 0; index < previousUnion.length; index += 1) {
+    bump = mostSevere(bump, compareSharedField(previousUnion[index]!, currentUnion[index]!));
+  }
+  return bump;
 }
 
 /**

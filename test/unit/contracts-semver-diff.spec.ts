@@ -430,6 +430,35 @@ describe("NEW-A-5 · contracts:diff recurses into nested object and array-item s
     expect(deriveSemverBump(previous, current)).toBe("major");
   });
 
+  it("NEW-A-5 · a RECORD (additionalProperties is a schema) whose value enum gains a value is patch", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.sources = {
+      type: "object",
+      propertyNames: { type: "string" },
+      additionalProperties: { anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }] },
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.sources.additionalProperties.anyOf[0].enum = ["live", "demo", "mixed"];
+
+    expect(deriveSemverBump(previous, current)).toBe("patch");
+  });
+
+  it("NEW-A-5 · a record value whose enum LOSES a value, or a closed object that opens up, is major", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.sources = {
+      type: "object",
+      propertyNames: { type: "string" },
+      additionalProperties: { type: "string", enum: ["live", "demo", "mixed"] },
+    };
+    const narrowed = deepClone(previous);
+    dataSchema(narrowed).properties.sources.additionalProperties.enum = ["live"];
+    expect(deriveSemverBump(previous, narrowed)).toBe("major");
+
+    const closed = deepClone(previous);
+    dataSchema(closed).properties.sources.additionalProperties = false;
+    expect(deriveSemverBump(previous, closed)).toBe("major");
+  });
+
   it("NEW-A-5 · an unchanged nested document is none", () => {
     const previous = nestedDocument();
     expect(deriveSemverBump(previous, deepClone(previous))).toBe("none");
