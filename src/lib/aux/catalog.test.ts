@@ -56,4 +56,8 @@ describe("NEW-C-8 AC3 · catalog weight assertion", () => {
     const partial = [...CRAWLER, rule("AUX-R-008", 0.14, "structured_data")];
     expect(() => loadAuxCatalog(partial)).not.toThrow();
   });
+
+  it("NEW-C-8 AC3.7b · a code listed twice is refused rather than double-counted", () => {
+    expect(() => loadAuxCatalog([...CRAWLER, rule("AUX-R-001", 0)])).toThrow(AuxCatalogWeightError);
+  });
 });

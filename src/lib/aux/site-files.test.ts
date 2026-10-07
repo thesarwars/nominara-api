@@ -1,10 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as metrics from "../telemetry/metrics.js";
 import { siteFileFindingSchema } from "../../../contracts/aux/index.js";
 import {
   AI_CRAWLER_AGENTS,
   SITE_FILE_THRESHOLDS,
   evaluateLlmsTxt,
   evaluateRobotsTxt,
+  evaluateSiteFiles,
   evaluateSitemap,
   type SiteFile,
 } from "./site-files.js";
@@ -275,5 +277,27 @@ describe("NEW-C-8 AC2 · findings are contract-valid and the evaluators are pure
   it("NEW-C-8 AC2.3 · same input, same output (deterministic)", () => {
     const body = ok("User-agent: GPTBot\nDisallow: /pricing\n");
     expect(evaluateRobotsTxt(body, ["/pricing"])).toEqual(evaluateRobotsTxt(body, ["/pricing"]));
+  });
+});
+
+describe("NEW-C-8 AC2 · evaluateSiteFiles observability", () => {
+  it("NEW-C-8 AC2.4 · counts each finding by rule and severity, with no URL, host or file text in the labels", () => {
+    const spy = vi.spyOn(metrics, "incrementCounter").mockImplementation(() => undefined);
+    const findings = evaluateSiteFiles({
+      robots: ok("User-agent: GPTBot\nDisallow: /\n"),
+      llmsTxt: null,
+      llmsTxtWellKnown: null,
+      sitemap: null,
+      sitemapDeclaredInRobots: false,
+      trackedPaths: ["/"],
+      now: NOW,
+    });
+    expect(codes(findings)).toEqual(["AUX-R-001", "AUX-R-004", "AUX-R-007"]);
+    expect(spy.mock.calls).toEqual([
+      ["nominara_aux_site_file_findings_total", { rule_code: "AUX-R-001", severity: "critical" }],
+      ["nominara_aux_site_file_findings_total", { rule_code: "AUX-R-004", severity: "low" }],
+      ["nominara_aux_site_file_findings_total", { rule_code: "AUX-R-007", severity: "medium" }],
+    ]);
+    spy.mockRestore();
   });
 });

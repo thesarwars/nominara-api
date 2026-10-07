@@ -89,13 +89,28 @@ describe("NEW-C-8 · migration 0070 — crawler_access catalog", () => {
     expect(await rows()).toHaveLength(7);
   });
 
-  it("NEW-C-8 AC3.15 · down removes AUX-R-002..007 but never a row an aux_finding references", async () => {
+  it("NEW-C-8 AC3.15 · down removes unreferenced AUX-R-001..007 but never a row an aux_finding references", async () => {
     const ws = (await client.query("INSERT INTO workspaces (name, slug, plan_key) VALUES ('W','w-aux8','free') RETURNING id")).rows[0].id;
-    const pr = (await client.query("SELECT 1")).rows; // keep lint quiet about unused
-    expect(pr).toHaveLength(1);
-    expect(ws).toBeTruthy();
+    const pj = (
+      await client.query(
+        "INSERT INTO projects (workspace_id, name, slug, root_url, root_domain) VALUES ($1,'P','p-aux8','https://example.com','example.com') RETURNING id",
+        [ws],
+      )
+    ).rows[0].id;
+    const audit = (
+      await client.query(
+        `INSERT INTO aux_audits (workspace_id, project_id, trigger, target_urls, rule_version, tokenizer)
+         VALUES ($1,$2,'manual',ARRAY['https://example.com/'],'v1','cl100k') RETURNING id`,
+        [ws, pj],
+      )
+    ).rows[0].id;
+    await client.query(
+      `INSERT INTO aux_findings (workspace_id, project_id, audit_id, rule_code, severity, fingerprint, title, evidence, rule_version)
+       VALUES ($1,$2,$3,'AUX-R-004','low',sha256('f'::bytea),'T','{}'::jsonb,'v1')`,
+      [ws, pj, audit],
+    );
     expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe(MIGRATION);
     const left = (await client.query("SELECT code FROM aux_rule_catalog WHERE category='crawler_access' ORDER BY code")).rows.map((x) => x.code);
-    expect(left).toEqual(["AUX-R-001"]);
+    expect(left).toEqual(["AUX-R-004"]);
   });
 });
