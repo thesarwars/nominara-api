@@ -63,6 +63,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "audit.verify",
       "capture.execute",
       "capture.parse",
+      "crawl.audit",
       "crawl.discover",
       "credit.reconcile",
       "identity.sweep_unverified",
@@ -76,6 +77,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "capture.execute",
       "capture.parse",
       "crawl.discover",
+      // NEW-C-9 — after crawl.fingerprint (inert), before the embed group.
+      "crawl.audit",
       "rollup.metric_daily",
       "credit.reconcile",
       "maintenance.partition",
