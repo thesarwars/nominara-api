@@ -1082,12 +1082,7 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
 
   /** One REAL (non-demo-marked) Gemini capture, as a live adapter would write it. */
   async function insertRealGeminiCapture(workspaceId: string, projectId: string): Promise<string> {
-    const prompt = await client.query<{ id: string }>(
-      `INSERT INTO tracked_prompts (workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status)
-       VALUES ($1,$2,'a real customer prompt for gemini',sha256('a real customer prompt for gemini'::bytea),'custom','decision','active')
-       RETURNING id`,
-      [workspaceId, projectId],
-    );
+    const prompt = await client.query<{ id: string }>(`SELECT id FROM tracked_prompts WHERE project_id = $1 LIMIT 1`, [projectId]);
     const id = randomUUID();
     await client.query(
       `INSERT INTO answer_captures
@@ -1118,6 +1113,53 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
       const engines = await client.query<{ engine_key: string }>(`SELECT DISTINCT engine_key FROM ${table} WHERE project_id = $1`, [projectId]);
       expect(engines.rows.map((r) => r.engine_key), table).not.toContain("gemini");
     }
+  }, 180_000);
+
+  it("NEW-A-8 audit · --facts-only inserts no prompt and no competitor, and leaves the project's prompt, competitor and project rows untouched (count and xmin)", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-audit");
+    const snapshot = async () => ({
+      prompts: (await client.query(`SELECT id, xmin::text AS x FROM tracked_prompts WHERE project_id = $1 ORDER BY id`, [projectId])).rows,
+      competitors: (await client.query(`SELECT id, xmin::text AS x FROM competitors WHERE project_id = $1 ORDER BY id`, [projectId])).rows,
+      prompts_active: (await client.query(`SELECT prompts_active, prompts_cap FROM projects WHERE id = $1`, [projectId])).rows,
+    });
+    const before = await snapshot();
+    expect(before.prompts).toHaveLength(1);
+    expect(before.competitors).toHaveLength(1);
+
+    await runSeedDemo(
+      { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+
+    expect(await snapshot()).toEqual(before);
+    // The facts landed on the project's REAL prompt and competitor.
+    const onReal = await client.query<{ n: string }>(
+      `SELECT count(DISTINCT prompt_id)::text AS n FROM answer_captures WHERE project_id = $1`,
+      [projectId],
+    );
+    expect(Number(onReal.rows[0]!.n)).toBe(1);
+    const rival = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM mention_facts WHERE project_id = $1 AND entity_type = 'competitor'
+          AND entity_id = (SELECT id FROM competitors WHERE project_id = $1)`,
+      [projectId],
+    );
+    expect(Number(rival.rows[0]!.n)).toBeGreaterThan(0);
+  }, 180_000);
+
+  it("NEW-A-8 audit · --facts-only on a project with no prompts writes nothing and inserts nothing", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-audit-empty");
+    await client.query(`DELETE FROM tracked_prompts WHERE project_id = $1`, [projectId]);
+    await runSeedDemo(
+      { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+    expect(await captureEngines(projectId)).toEqual([]);
+    const prompts = await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM tracked_prompts WHERE project_id = $1`, [projectId]);
+    expect(Number(prompts.rows[0]!.n)).toBe(0);
   }, 180_000);
 
   it("NEW-A-8 #2 · --facts-only never provisions a wallet and never writes the ledger", async () => {
