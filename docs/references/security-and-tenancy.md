@@ -1,0 +1,365 @@
+# Security & Multi-Tenancy
+
+Isolation is the platform's load-bearing property. Competing brands are frequently tracked inside the same infrastructure, and an agency's two clients may be direct competitors. The isolation boundary therefore lives **inside PostgreSQL**, not in application code, so that an application defect cannot produce a cross-tenant read or write.
+
+---
+
+## 1. Entity hierarchy
+
+```
+users (global identity, owns no data)
+  └─ workspace_members (role, status, project_scope)   ← the ONLY bridge between identity and data
+       └─ workspaces (TENANT ROOT — the RLS boundary, owns billing and residency)
+            ├─ projects
+            │    ├─ tracked_prompts → answer_captures → mention/citation facts → displacement_events
+            │    ├─ competitors, goals, project_source_index
+            │    ├─ aux_audits → aux_findings
+            │    ├─ tasks → task_events → milestones
+            │    └─ geo_alignments → content_chunks, semantic_nodes, patches
+            ├─ tool_runs
+            ├─ gsc_connections, attribution_configs (envelope-encrypted credentials)
+            ├─ share_tokens, brand_themes, custom_domains
+            ├─ subscriptions, credit_wallets, credit_ledger, usage_counters, invoices
+            └─ audit_log (hash-chained, per-tenant chain)
+```
+
+**R1.** A `users` row never carries data. Every data row carries `workspace_id`. Authorisation is therefore always the same question: *does this session have a live membership in this workspace, at a sufficient role, within scope?*
+
+**R2.** Exactly **ten tables** are not workspace-scoped, and each is explicitly enumerated and reviewed: `users`, `user_credentials`, `plans`, `engines`, `credit_packs`, `platform_metrics`, `niche_reports`, `aux_rule_catalog`, `task_generation_rules`, `engine_health`. Every other table has `workspace_id uuid NOT NULL` and a generated RLS policy. CI asserts this — a migration adding a table without `workspace_id` fails unless the name is in the `GLOBAL_TABLES` allow-list.
+
+**"Global" is a statement about scope, not about access.** `users` and `user_credentials` hold no tenant rows, but they are still restricted — by `GRANT`, which is the correct tool for "only the auth path may read this". `nominara_worker`, `nominara_report`, and `nominara_portal` have **no privilege at all** on `user_credentials`. RLS would have been the weaker control there, because it would imply the table was reachable and merely filtered.
+
+**Every `GLOBAL_TABLES` entry is a catalog, a build-time artifact, or global identity. No table in the schema is writable by an unauthenticated request.** That invariant removes an entire class of reasoning from every future RLS review, and it is worth preserving deliberately.
+
+## 2. Database roles
+
+```sql
+-- Migration/DDL owner. Owns all objects. NEVER used by a running service.
+CREATE ROLE nominara_owner NOINHERIT NOLOGIN;
+
+-- Runtime roles. RLS applies to all of them (see FORCE ROW LEVEL SECURITY, §3).
+CREATE ROLE nominara_app     LOGIN NOINHERIT CONNECTION LIMIT 400;  -- src/api, src/gateway
+CREATE ROLE nominara_worker  LOGIN NOINHERIT CONNECTION LIMIT 300;  -- src/workers/*
+CREATE ROLE nominara_report  LOGIN NOINHERIT CONNECTION LIMIT 40;   -- read-only, replica only
+CREATE ROLE nominara_portal  LOGIN NOINHERIT CONNECTION LIMIT 60;   -- share-token portal, read-only
+
+-- Break-glass. Dual approval + a 60-minute TTL credential from Secrets Manager.
+CREATE ROLE nominara_breakglass LOGIN NOINHERIT BYPASSRLS CONNECTION LIMIT 2;
+
+GRANT USAGE ON SCHEMA app, public TO nominara_app, nominara_worker, nominara_report, nominara_portal;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO nominara_app, nominara_worker;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO nominara_report, nominara_portal;
+
+REVOKE ALL ON audit_log FROM nominara_app, nominara_worker;   -- append-only, see §7
+GRANT INSERT, SELECT ON audit_log TO nominara_app, nominara_worker;
+
+REVOKE ALL ON user_credentials FROM nominara_worker, nominara_report, nominara_portal;
+```
+
+- **No service role has `BYPASSRLS`.** `nominara_breakglass` exists solely for incident response; its use emits a PagerDuty event and an immutable audit record, and its credential is time-boxed.
+- `nominara_portal` and `nominara_report` hold `SELECT` only, so the read-only portal cannot mutate state even if a route were mis-registered.
+
+## 3. Forced row-level security
+
+The detail most implementations miss: **table owners bypass RLS by default.** Every tenant table therefore gets both `ENABLE` and `FORCE`.
+
+```sql
+CREATE SCHEMA IF NOT EXISTS app;
+
+-- Transaction-scoped context accessors. STABLE so the planner can inline them.
+CREATE OR REPLACE FUNCTION app.current_workspace() RETURNS uuid
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+  SELECT NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+$$;
+
+CREATE OR REPLACE FUNCTION app.current_actor() RETURNS uuid
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+  SELECT NULLIF(current_setting('app.current_actor_id', true), '')::uuid
+$$;
+
+-- Portal / share-token sessions expose only an explicit project allow-list.
+CREATE OR REPLACE FUNCTION app.current_scope_projects() RETURNS uuid[]
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+  SELECT COALESCE(
+    string_to_array(NULLIF(current_setting('app.current_scope_projects', true), ''), ',')::uuid[],
+    ARRAY[]::uuid[])
+$$;
+```
+
+Applied to every tenant table by a **generated** migration, so a new table cannot ship without isolation:
+
+```sql
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects FORCE  ROW LEVEL SECURITY;
+
+CREATE POLICY ws_isolation_projects ON projects
+  FOR ALL
+  TO nominara_app, nominara_worker, nominara_report
+  USING      (workspace_id = app.current_workspace())
+  WITH CHECK (workspace_id = app.current_workspace());
+
+-- Portal role additionally constrained to the share token's project scope.
+CREATE POLICY portal_scope_projects ON projects
+  FOR SELECT
+  TO nominara_portal
+  USING (workspace_id = app.current_workspace()
+         AND id = ANY (app.current_scope_projects()));
+```
+
+Project-descendant tables carry **both** keys, so a mis-set `project_id` cannot escape the tenant and portal scope is enforced without a join:
+
+```sql
+CREATE POLICY portal_scope_answer_captures ON answer_captures
+  FOR SELECT TO nominara_portal
+  USING (workspace_id = app.current_workspace()
+         AND project_id = ANY (app.current_scope_projects()));
+```
+
+**Why `WITH CHECK` is mandatory.** `USING` filters reads. Without `WITH CHECK`, a defect or a crafted payload could `INSERT` — or `UPDATE … SET workspace_id = <other tenant>` — writing into a tenant it could never read. Every `FOR ALL` policy specifies both, and CI asserts that `pg_policies` contains a non-null `with_check` for every one of them.
+
+**Fail-closed default.** `app.current_workspace()` returns `NULL` when the setting is unset. Because `workspace_id = NULL` evaluates to `NULL` rather than true, an un-contextualised query returns **zero rows** and every write is rejected. There is no configuration in which "forgot to set the tenant" means "see everything".
+
+## 4. Tenant context propagation and the pooling constraint
+
+pgBouncer runs in **transaction pooling** mode, so a server connection is leased only for the duration of a transaction. This makes session-level `SET` unsafe — it would leak to the next tenant that borrows the connection — and makes `SET LOCAL` mandatory.
+
+```ts
+// nominara-api/src/tenancy/tenant-context.interceptor.ts
+@Injectable()
+export class TenantContextInterceptor implements NestInterceptor {
+  constructor(private readonly db: DrizzleService) {}
+
+  intercept(ctx: ExecutionContext, next: CallHandler) {
+    const req = ctx.switchToHttp().getRequest<AuthedRequest>();
+    const { workspaceId, actorId, scopeProjectIds } = req.tenant; // set by WorkspaceGuard
+
+    // The whole handler body executes inside ONE transaction carrying the tenant context.
+    return from(
+      this.db.transaction(async (tx) => {
+        // set_config(..., is_local => true) === SET LOCAL: reverts at COMMIT/ROLLBACK.
+        await tx.execute(sql`SELECT set_config('app.current_workspace_id', ${workspaceId}, true)`);
+        await tx.execute(sql`SELECT set_config('app.current_actor_id',     ${actorId},     true)`);
+        if (scopeProjectIds?.length) {
+          await tx.execute(
+            sql`SELECT set_config('app.current_scope_projects', ${scopeProjectIds.join(',')}, true)`,
+          );
+        }
+        return AsyncLocalStorageTx.run(tx, () => lastValueFrom(next.handle()));
+      }),
+    );
+  }
+}
+```
+
+Worker-side context, with signature verification **before** any `set_config`:
+
+```ts
+// nominara-api/src/lib/queue/with-tenant.ts
+export async function withTenant<T>(db: DrizzleService, job: TenantJob, fn: (tx: Tx) => Promise<T>) {
+  assertJobSignature(job);                                   // NFR-SEC-04 · ISO-11
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT set_config('app.current_workspace_id', ${job.data.workspaceId}, true)`);
+    await tx.execute(sql`SELECT set_config('app.current_actor_id', ${SYSTEM_ACTOR_ID}, true)`);
+    return fn(tx);
+  });
+}
+```
+
+| ID | Guardrail |
+|---|---|
+| `NFR-SEC-01` | A Drizzle `beforeQuery` hook throws `TenantContextMissingError` if a query targeting a table in the generated `TENANT_TABLES` set executes outside an `AsyncLocalStorageTx` transaction. This converts "forgot the interceptor" from a data leak into a 500 in CI. |
+| `NFR-SEC-02` | Session-scoped `SET` is banned in application code by lint. Only `set_config(..., true)` is permitted. |
+| `NFR-SEC-03` | Long-running analytics reads use the replica pool with the **identical** interceptor. There is no unscoped read path. |
+| `NFR-SEC-04` | Workers set tenant context from the job payload's `workspace_id`, and the payload is HMAC-SHA256 signed over its canonical JSON with a rotating queue key, so a poisoned Valkey entry cannot redirect a worker into another tenant. |
+| `NFR-SEC-05` | Cross-tenant platform aggregates are computed by a dedicated job reading **only** `metric_daily` through a `SECURITY DEFINER` function that returns pre-anonymised aggregates: no `workspace_id`, k-anonymity ≥ 20. |
+
+## 5. Authentication
+
+| Method | Availability | Implementation notes |
+|---|---|---|
+| **Passkeys (WebAuthn)** | all plans, default | `@simplewebauthn/server`; resident keys; user verification `preferred`; multiple credentials per user; `authenticator_attachment` recorded |
+| **OAuth 2.1 + PKCE** | Google, GitHub, Microsoft | `openid-client`; the email must be provider-verified or the account is created `unverified` with no workspace-create right |
+| **Email OTP** | all plans | 8-digit code, 10-minute TTL, 5 attempts, Argon2id-hashed at rest, single use, rate-limited 3/hour/email |
+| **OIDC SSO** | Enterprise | per-workspace IdP config via `openid-client`. Authorization Code + PKCE; `state` and `nonce` bound to the session; `iss`/`aud`/`azp` checked; discovery document and JWKS cached with a bounded TTL. **The v1 SSO path** |
+| **SAML 2.0 SSO** | post-launch, on request | `@node-saml/node-saml`, hardened per `NFR-SEC-17…21`. **Not enabled for any customer until an external review passes** |
+| **SCIM 2.0** | Enterprise | built in-house against RFC 7644 — `/Users` and `/Groups`, `PATCH` semantics, a bearer token per connection, soft-deactivate on `active:false` |
+| **Service API keys** | Business+ | `nk_live_{22 chars}` shown once; stored as SHA-256; scoped to one workspace and an explicit permission set; last-used IP recorded |
+
+### Session model
+
+- **Access token.** JWT, EdDSA (Ed25519), 15-minute TTL, claims `{sub, sid, ws, role, scope, ent_v, iat, exp, jti}`. `ws` is the **active** workspace; switching workspaces mints a new token. **A token is never valid for two tenants.**
+- **Refresh token.** Opaque 32-byte random, stored hashed, 30-day sliding TTL, **rotating with reuse detection**: presenting a consumed refresh token revokes the entire session family and raises a `session.reuse_detected` security event.
+- **Refresh-token reuse grace window.** The one documented exception to the rule above: a refresh presenting the token consumed by the session's **own immediately-preceding rotation**, within a short window after that rotation (default 2s, `REFRESH_TOKEN_GRACE_WINDOW_MS`, hard-capped at 5s), receives the **identical successor** refresh token back instead of being treated as reuse — never a sibling, never a revocation. This exists because a request can legitimately arrive after its session's own rotation already completed (a second browser tab, a second app instance, a retried request that raced the winning one) presenting the token that rotation just consumed; without this window that arrival reads as theft and kills the session it belongs to. It is deliberately narrow: an older, two-back token, a different session's token, or this same token presented once its window has closed all still revoke the whole family and raise `session.reuse_detected` exactly as before. The successor's raw value is held in a **slot in the cache (Valkey) — never in Postgres**, written with a TTL equal to the window as the last step of the rotation's transaction, so the window is anchored at the rotation's commit on the cache's clock and the slot ceases to exist when the window closes. **The cache is not the only bound on that window:** a slot write the rotation abandoned at its deadline is not cancelled — Valkey executes it when it recovers, with a full TTL from that moment — so the eligibility check also requires the presented token's own consumption, stamped by the rotation with the database's `clock_timestamp()` inside the transaction that commits it, to be younger than **the window plus the cache deadline** (`REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS`, 500ms). That is the hard bound: it is measured on the database's clock, from a stamp never later than the rotation's commit, and no cache stall can move it, so a slot that lands late is inert. It is kept encrypted with the same AES-256-GCM envelope format §8 uses for `workspace_keys`, under a key derived from the **predecessor token itself** (HKDF-SHA256, salted with the session id) — never a server-held key. The slot stores only the predecessor's hash next to that ciphertext, so only a caller presenting that token can recover the successor: a database read cannot reach a live refresh token at all, and a cache read alone, even with every server secret, does not reveal it. A slot is honoured only while the session is not revoked and only while the successor it names is still a live (unconsumed, unexpired) refresh token of that session. The next rotation overwrites the slot and a reuse revocation deletes it. **The cache is never trusted to be there:** when Valkey is unavailable the grace window is skipped — the rotation still succeeds, without a slot, and a replay of the consumed token then revokes the family exactly as the strict rule above says. After one missed deadline or cache error the cache is skipped altogether for a cool-off (30s, per process) — no slot written, none read — so a silent cache costs one deadline rather than one per rotation, and a replay in that time revokes; one call then probes it before it is used again. A grace-window hit raises its own `session.refresh_grace_reuse` security event, naming the session id and never the token.
+- **Cookies.** `HttpOnly; Secure; SameSite=Lax; Path=/; __Host-` prefix, plus a separate CSRF double-submit token for cookie-authenticated mutating requests.
+- **Step-up re-auth** (a fresh WebAuthn or OTP within 5 minutes) is required for: ownership transfer, SSO configuration changes, custom-domain changes, API-key creation, integration credential creation, share-token password changes, workspace deletion, and data export.
+
+### Enforcement chain — every authenticated route, in this order
+
+```
+AuthGuard          verify JWT signature and expiry, load the session, reject a revoked jti
+ → WorkspaceGuard  resolve the target workspace from the JWT `ws` (or X-Nominara-Workspace for an
+                   API key); RE-VERIFY A LIVE workspace_members ROW — never trust the token's role
+                   alone; populate req.tenant
+   → RbacGuard     @RequirePermission('project:write') evaluated against the §6 matrix
+     → EntitlementGuard  @RequireEntitlement('projects.max') | @RequireFeature('integrations.gsc')
+                         → 403 entitlement_exceeded | 403 feature_not_in_plan
+       → QuotaGuard      @Meter('pdf_exports', n) — non-credit TIER CAPS only → 429 quota_exceeded
+         → DailyCapGuard @DailyCap('lookup') → 429 daily_limit_reached, debits nothing
+           → RateLimitGuard  Valkey token bucket keyed (route class, workspace, user, ip)
+             → CreditGuard @Credits('manual_scan', estimator) — reserve from credit_wallets; verify
+                           X-Nominara-Confirmed-Credits → 402 insufficient_credits | 409 price_changed
+               → TenantContextInterceptor   open the TX, SET LOCAL context
+                 → handler
+                   → CreditInterceptor  commit the actual debit (≤ reservation) or release on failure
+                   → AuditInterceptor   append a hash-chained audit_log row on a mutating route
+```
+
+The order matters and is asserted by test. A rate-limited request must never reach `CreditGuard`, so no reservation is created; a permission failure must be a `403` distinct from a `402` for insufficient balance.
+
+**STORY-022-E-1.** This ordering — `RateLimitGuard` before `CreditGuard` — is what the diagram above shows, and this prose was always correct; [`system-architecture.md`](./system-architecture.md#2-logical-architecture) and [`EPIC-03`](../epics/EPIC-03-api-platform-and-contracts.md#the-global-chain) previously diagrammed the reverse order and are corrected to match this prose, never the other way around.
+
+## 6. Permission matrix
+
+Roles are workspace-scoped. `manager` may additionally be restricted to an explicit project set via `workspace_members.project_scope uuid[]` (`NULL` = all projects). "scoped" below means "only within `project_scope`".
+
+| Permission | `owner` | `admin` | `manager` | `analyst` | `viewer` | share token |
+|---|---|---|---|---|---|---|
+| `workspace:read` | ✓ | ✓ | ✓ | ✓ | ✓ | metadata only |
+| `workspace:update` | ✓ | ✓ | — | — | — | — |
+| `workspace:delete` | ✓ (step-up) | — | — | — | — | — |
+| `workspace:transfer_ownership` | ✓ (step-up + dual accept) | — | — | — | — | — |
+| `member:invite` | ✓ | ✓ | — | — | — | — |
+| `member:update_role` | ✓ | ✓ (cannot grant `owner`) | — | — | — | — |
+| `member:remove` | ✓ | ✓ (not `owner`) | — | — | — | — |
+| `billing:read` (incl. credit ledger) | ✓ | ✓ | — | — | — | — |
+| `billing:write` (plan, add-ons, packs, auto-top-up) | ✓ | ✓ | — | — | — | — |
+| `credits:spend` | ✓ | ✓ | scoped | ✓ (tools only) | — | — |
+| `sso:configure` | ✓ (step-up) | ✓ (step-up) | — | — | — | — |
+| `apikey:create` | ✓ (step-up) | ✓ (step-up) | — | — | — | — |
+| `project:create` | ✓ | ✓ | ✓ | — | — | — |
+| `project:read` | ✓ | ✓ | scoped | ✓ | scoped | token scope |
+| `project:update` | ✓ | ✓ | scoped | — | — | — |
+| `project:delete` | ✓ | ✓ | — | — | — | — |
+| `prompt:write` | ✓ | ✓ | scoped | — | — | — |
+| `tracking:trigger` | ✓ | ✓ | scoped | — | — | — |
+| `tracking:read` | ✓ | ✓ | scoped | ✓ | scoped | token scope |
+| `lookup:execute` | ✓ | ✓ | ✓ | ✓ | — | — |
+| `lookup:read_history` | ✓ | ✓ | ✓ | ✓ | — | — |
+| `aux:trigger` | ✓ | ✓ | scoped | — | — | — |
+| `aux:read` | ✓ | ✓ | scoped | ✓ | scoped | token scope |
+| `task:create` / `task:move` | ✓ | ✓ | scoped | — | — | — |
+| `task:comment` | ✓ | ✓ | scoped | ✓ | — | — |
+| `task:read` | ✓ | ✓ | scoped | ✓ | scoped | token scope |
+| `optimizer:use` | ✓ | ✓ | scoped | — | — | — |
+| `agency:branding` | ✓ | ✓ | — | — | — | — |
+| `agency:custom_domain` | ✓ (step-up) | ✓ (step-up) | — | — | — | — |
+| `share_token:mint` / `:revoke` | ✓ | ✓ | scoped | — | — | — |
+| `export:data` | ✓ (step-up) | ✓ (step-up) | scoped | ✓ (CSV only) | — | PDF only |
+| `audit_log:read` | ✓ | ✓ | — | — | — | — |
+
+**Invariants.**
+- Exactly one `owner` per workspace at all times, enforced by a partial unique index.
+- `owner` cannot be removed; ownership must be **transferred**.
+- `viewer` is a first-class read-only role for named external stakeholders who need a login; anonymous stakeholders use share tokens instead.
+- **`credits:spend` is separable from `billing:write` on purpose.** An `analyst` may run tools without any ability to buy credits, and a finance-focused `admin` may buy credits without spending them. This is the separation of duties agencies and finance teams ask for.
+- Every credit-debiting route additionally passes `CreditGuard`, so lacking balance is a `402`, distinct from lacking permission (`403`).
+- A permission denial returns `403 forbidden` naming the required permission — **never `404`**, since the resource's existence within the tenant is already known to the caller.
+
+## 7. Revocation and freshness
+
+Access tokens are short-lived but not instantly revocable, which is unacceptable for seat removal in a competitive-brand context. Four layers:
+
+1. **Membership re-check on every request.** `WorkspaceGuard` reads `workspace_members`, cached in Valkey for 30 s keyed `mem:{user}:{ws}` and **invalidated synchronously** on any membership mutation. Removing a seat takes effect within 30 s worst case, immediately in the common case.
+2. **Session revocation list.** `sid`/`jti` deny-list in Valkey with TTL equal to the remaining token lifetime. Populated on logout, credential change, role downgrade, refresh-reuse detection, and workspace suspension.
+3. **Entitlement version.** The JWT carries `ent_v`; a plan change bumps `workspaces.entitlement_version`, and a mismatch forces a token refresh so a downgraded entitlement cannot be exercised with a stale token.
+4. **WebSocket re-authorisation.** Sockets re-validate membership every 60 s and on any `member.changed` event; failed re-validation closes with `4403`.
+
+`RbacGuard` evaluates against the **live** membership row. The token's `role` claim is a hint for UI rendering only.
+
+## 8. Secrets and encryption
+
+**At rest.**
+- Aurora storage encryption with a per-region KMS CMK; S3 buckets `SSE-KMS` with bucket keys.
+- **Application-level envelope encryption for customer-held secrets** — integration credentials, SSO client secrets, GA4 credentials. Share-token passwords are *hashed*, not encrypted.
+  - One **DEK per workspace**, AES-256-GCM, generated by KMS `GenerateDataKey`, stored only as ciphertext in `workspace_keys.wrapped_dek`.
+  - Field format `v1:{dek_id}:{base64(iv)}:{base64(ciphertext||tag)}`. **AAD binds `workspace_id|table|column|row_id`**, so a ciphertext copied to another row or tenant fails to decrypt (`ISO-12`).
+  - Plaintext DEKs are cached in-process for ≤ 5 minutes, never logged, and zeroed on eviction.
+  - DEKs rotate every 90 days; a background job re-encrypts lazily on read when `dek_id` differs. Ownership transfer forces an immediate re-wrap.
+- Password-like values use Argon2id (m=64 MiB, t=3, p=1); high-entropy random tokens use SHA-256.
+
+**In transit.** **TLS 1.3, with 1.2 as the hard floor and nothing below it accepted** — everywhere, including intra-VPC database and Valkey connections; HSTS `max-age=31536000; includeSubDomains; preload`. Certificate pinning is deliberately **not** used — it breaks agency custom domains.
+
+**Egress.** Outbound requests from `worker-crawl` pass through a NAT gateway with a static egress IP set that customers can allow-list, and are filtered by the SSRF guard in §9. **The egress NAT has no IAM role attached**, IMDSv2 is required, and the hop limit is 1.
+
+## 9. Application security controls
+
+| Threat | Control |
+|---|---|
+| **SSRF via user-supplied URLs** (project root URL, audit target, beacon origin) | Strict allow-list: scheme ∈ {http,https}, port ∈ {80,443}; DNS resolved **before** connect and **re-checked after every redirect**; reject RFC1918, loopback, link-local, CGNAT, IPv6-ULA, and metadata addresses; max 3 redirects, all re-validated; 10 s connect / 20 s total timeout; 5 MB response cap; egress via the dedicated no-IAM-role NAT |
+| **Domain-ownership spoofing** (auditing a domain you do not own) | Audits beyond public-surface scope require verification: DNS `TXT _nominara-verify=<nonce>`, a `/.well-known/nominara-<nonce>.txt` file, or a meta tag. Unverified domains receive a rate-limited, robots-respecting public-surface audit with every excluded rule named |
+| **Stored XSS via scraped engine text** | Raw response text is stored as text and rendered **only** through a strict sanitizer that emits `<mark data-entity-id>` from Nominara's own span map. No engine-supplied HTML is ever rendered. CSP: `default-src 'self'; script-src 'self' 'strict-dynamic' 'nonce-…'; object-src 'none'; base-uri 'none'; frame-ancestors <agency-domains>` |
+| **SQL injection** | Parameterised queries only; raw SQL restricted to `src/db` with `sql` tagged templates; lint bans string concatenation into `sql.raw` |
+| **IDOR** | Not expressible: RLS filters by tenant, and every resource read is additionally checked against `project_scope` for scoped roles |
+| **Mass assignment** | zod `.strict()` on every request DTO — an unknown key is a `400`, never silently ignored |
+| **CSRF** | Cookie sessions require a double-submit token bound to `sid`; API-key auth is header-only and cookie-less |
+| **Replay** | `Idempotency-Key` required on every `POST` that creates a billable or external effect; stored 24 h in Valkey with the response envelope |
+| **Enumeration** | Login, OTP, and invitation endpoints return uniform responses **and uniform timing**; workspace slugs are non-sequential; share tokens are 256-bit random |
+| **Prompt injection via scraped content** | Any scraped text reaching the sentiment arbiter is wrapped in a delimited, instruction-free envelope; the arbiter is constrained to a zod-validated enum output, has no tools and no network, and a non-conforming output fails closed to `neutral` with `arbiter_rejected=true`. **Scraped text never constructs a tool call, a URL, a SQL fragment, or a prompt template.** A 60-payload red-team fixture suite runs in CI |
+| **Dependency supply chain** | Lockfile integrity, Renovate with a 3-day cooldown, an audit + Socket gate in CI, a CycloneDX SBOM attached to every image, images signed with cosign and verified at deploy |
+| **Container** | Distroless base, non-root UID, read-only root filesystem, no shell in production images, seccomp default, registry scanning blocking `HIGH`+ |
+
+## 10. Isolation verification suite
+
+`test/isolation`, blocking in CI and nightly against staging. **Any failure is a release blocker, and a P1 incident if found in production.**
+
+| Test | Assertion |
+|---|---|
+| `ISO-01` | For each of the 59 tenant tables: `SELECT count(*)` with **no** tenant context returns 0 |
+| `ISO-02` | For each tenant table: reading with tenant A's context returns zero rows belonging to B (fixture: 3 tenants × 50 rows) |
+| `ISO-03` | `INSERT` with A's context and B's `workspace_id` raises `42501 new row violates row-level security policy` |
+| `ISO-04` | `UPDATE … SET workspace_id = B` under A's context affects 0 rows, or raises |
+| `ISO-05` | `pg_policies` has a non-null `with_check` for every `FOR ALL` policy; every tenant table has `relforcerowsecurity = true` |
+| `ISO-06` | Every table in `information_schema.tables` either has `workspace_id` with RLS enabled, appears in `TENANT_SCOPE_COLUMN`, or appears in `GLOBAL_TABLES`. **The census counts are asserted too** — 59 tenant, 10 global — so a table added without a decision fails here rather than silently shrinking `ISO-01`'s loop |
+| `ISO-07` | No runtime role has `rolbypassrls`; only `nominara_breakglass` does |
+| `ISO-08` | Fuzz: 500 randomised authenticated requests replaying tenant A's resource IDs under tenant B's session yield only 403/404 — never 200 with A's data |
+| `ISO-09` | A share-token session cannot read a project outside `scope_project_ids`, even within the same workspace |
+| `ISO-10` | A share-token session receives `42501` on any `INSERT`/`UPDATE`/`DELETE` — the role has no grants |
+| `ISO-11` | A worker job whose payload signature is tampered is rejected **before** any `set_config` executes |
+| `ISO-12` | Ciphertext from tenant A fails to decrypt when copied into tenant B's row (AAD binding). Runs against **every** table holding an envelope-encrypted column, **discovered from the schema rather than named**, so a table added later is picked up automatically |
+| `ISO-13` | Valkey keys are namespaced `{env}:{ws}:…`; a scan asserts no un-namespaced tenant key exists. The global answer cache (`{env}:global:sim:…`) is the single documented exception |
+| `ISO-14` | S3 object keys are prefixed `{env}/{workspace_id}/`; an IAM policy evaluation confirms a task role restricted by prefix cannot read another prefix |
+| `ISO-15` | Platform aggregates derived from `metric_daily` contain no `workspace_id` and satisfy k ≥ 20 |
+| `ISO-16` | **Materialized views are absent from the schema.** RLS does not apply to matviews, so all pre-aggregation uses ordinary tables maintained incrementally. Migration lint enforces this |
+
+## 11. Internal access, support and impersonation
+
+- Support engineers have **no standing data access.** Reading a tenant's data requires a time-boxed grant in `support_grants`: workspace, `requested_by`, `approved_by ≠ requested_by`, justification, ticket reference, TTL ≤ 4 h, scope ∈ {metadata, findings, full}.
+- Grants are visible to the workspace `owner`/`admin` in a **Trust & Access** panel in real time, are announced by email at issue time, and appear in the tenant's own audit log.
+- Impersonation renders a persistent banner, blocks all mutating routes by default (a separate write grant with owner consent is required), and stamps every log line and audit row with `actor_type='support'` plus the grant ID.
+- Break-glass database access additionally requires a linked incident and produces a mandatory post-incident review with a query-log attachment.
+
+## 12. Audit log
+
+Hash-chained, append-only, per-tenant chain. Full DDL in [`../schemas/tools-attribution-agency.md`](../schemas/tools-attribution-agency.md#audit_log--hash-chained-append-only).
+
+- `row_hash = sha256(prev_hash || canonical_json(row_without_hashes))`; `prev_hash` is the previous row's `row_hash` **for the same workspace**, so one tenant's export does not disclose another's activity volume.
+- Append-only enforced by a trigger rejecting `UPDATE`/`DELETE`, plus `REVOKE UPDATE, DELETE`.
+- Nightly export to S3 with Object Lock in COMPLIANCE mode, 7-year retention. A verifier job re-walks each chain daily and **pages on the first mismatch**.
+- `before_state`/`after_state` are redacted: secrets are replaced with `[redacted]` before the row is written, never after.
+
+## 13. Non-functional security requirements
+
+| ID | Requirement |
+|---|---|
+| `NFR-SEC-10` | No cross-tenant data disclosure. Verified by §10 on every pull request and nightly in staging. |
+| `NFR-SEC-11` | Secrets never appear in logs, traces, error messages, crash payloads, or audit state fields. Enforced by a redaction transport with a deny-list **plus** a high-entropy-string detector. |
+| `NFR-SEC-12` | All privileged actions require re-authentication within 5 minutes. |
+| `NFR-SEC-13` | Vulnerability remediation: `CRITICAL` 24 h, `HIGH` 7 d, `MEDIUM` 30 d, `LOW` 90 d, measured from triage. |
+| `NFR-SEC-14` | Annual third-party penetration test with an explicit multi-tenant isolation objective; findings tracked to closure. |
+| `NFR-SEC-15` | Backups are encrypted, cross-region replicated, and restore-tested monthly; PITR window 35 days. **Restore drills re-assert `relforcerowsecurity` post-restore, and re-apply every purge recorded in the purge journal after the snapshot timestamp** — see [`data-model.md`](./data-model.md#7-retention-erasure-and-the-deletion-cascade). A restore that resurrects a purged tenant is a compliance incident caused by a recovery procedure. |
+| `NFR-SEC-16` | Every production database credential is issued by Secrets Manager with 30-day automatic rotation. No service reads a credential from an environment variable baked into an image. |
+| `NFR-SEC-17` | *(SAML, post-launch)* Assertions are validated against a **pinned IdP certificate**, never against a certificate embedded in the assertion. Signature verification precedes any parsing of assertion content. |
+| `NFR-SEC-18` | *(SAML)* **XML Signature Wrapping defence**: the signed element is resolved by reference and the *signed* subtree is the only one read. A document containing more than one `Assertion`, or any `Assertion` outside the signed subtree, is **rejected outright** rather than disambiguated. |
+| `NFR-SEC-19` | *(SAML)* `Audience`, `Recipient`, `NotBefore`/`NotOnOrAfter`, and `InResponseTo` are all validated. `ID` enters a replay cache for the assertion lifetime; a repeat is a security event and a rejected login. |
+| `NFR-SEC-20` | *(SAML)* XML parsing runs with DTD loading and external entity resolution **disabled**, with an entity-expansion limit. **Parser configuration is asserted by a unit test**, never left to library defaults. |
+| `NFR-SEC-21` | SCIM bearer tokens are per connection, hashed at rest, revocable independently of the SSO connection, and scoped to that workspace's `/Users` and `/Groups` only. A SCIM token can never authenticate an interactive session. |

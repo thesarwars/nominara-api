@@ -8,6 +8,7 @@ import { paginationRequestSchema } from "../../contracts/common/pagination.schem
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 import { InvitationsService } from "../../src/modules/workspaces/invitations.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
@@ -61,12 +62,13 @@ describe("STORY-117 · cursor pagination on the shipped list endpoints", () => {
     await migrateUp(db);
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
+    const membership = new MembershipService(new MembershipCacheService());
     workspaces = new WorkspacesService(
       pool,
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
-      new MembershipService(new MembershipCacheService()),
-      new SessionService(pool), new NoopRealtimePublisher());
+      membership,
+      new SessionService(pool, membership, new InMemoryCacheAdapter()), new NoopRealtimePublisher());
     invitations = new InvitationsService(pool, new AuditChainService());
   });
 

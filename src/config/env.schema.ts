@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { engineKeySchema } from "../lib/engines/contract.js";
+import { REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS, REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS } from "../lib/auth/refresh-token.js";
 
 // STORY-022-E-4 — configuration validation lives here, as zod (already a
 // dependency), NOT Joi/class-validator/@nestjs/config. coding-standards.md
@@ -124,6 +125,34 @@ export const envSchema = z
     // exists yet, so "local:dev" is the honest default rather than a
     // fabricated ARN shape.
     WORKSPACE_KMS_KEY_ARN: requiredString.default("local:dev"),
+
+    // STORY-170 — the refresh-token reuse grace window
+    // (security-and-tenancy.md §5 "Session model"). A refresh presenting a
+    // token consumed by the session's own immediately-preceding rotation,
+    // within this window, gets the identical successor back instead of
+    // being treated as reuse. No secret is needed: the successor is held
+    // encrypted under a key derived from the predecessor token itself
+    // (src/lib/auth/refresh-token.ts), in a Valkey slot whose TTL is this
+    // window.
+    // How long a consumed token stays grace-eligible. Configurable so an
+    // operator can shrink or disable it (0) without a redeploy; capped at
+    // REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS (src/lib/auth/refresh-token.ts)
+    // so it can never be turned into a de-facto non-rotating token. A value
+    // above the cap is REJECTED at boot, never clamped: a clamp would run the
+    // process on a window nobody configured.
+    // An empty or whitespace-only value is UNSET, not 0. `z.coerce.number()`
+    // turns "" into 0, and 0 is the switch that disables grace outright, so
+    // `REFRESH_TOKEN_GRACE_WINDOW_MS=` in a deploy template would have turned
+    // the feature off with no error and no log line.
+    REFRESH_TOKEN_GRACE_WINDOW_MS: z.preprocess(
+      (value) => (typeof value === "string" && value.trim().length === 0 ? undefined : value),
+      z.coerce
+        .number()
+        .int()
+        .nonnegative()
+        .max(REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS)
+        .default(REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS),
+    ),
 
     // STORY-015 — OAuth 2.1 + PKCE (Google, GitHub, Microsoft), via
     // `openid-client`. Provider credentials are OPTIONAL config: every test

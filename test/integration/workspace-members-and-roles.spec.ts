@@ -10,6 +10,7 @@ import { WorkspacesService } from "../../src/modules/workspaces/workspaces.servi
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
@@ -62,7 +63,7 @@ describe("STORY-021 · member listing, role changes, and removal within the matr
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
       membership,
-      new SessionService(pool),
+      new SessionService(pool, membership, new InMemoryCacheAdapter()),
       realtime,
     );
   });

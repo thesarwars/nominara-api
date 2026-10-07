@@ -10,6 +10,7 @@ import { MembershipService } from "../../src/modules/workspaces/membership.servi
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import type { DekProvisioner } from "../../src/modules/workspaces/ports/dek-provisioner.js";
 import { WORKSPACE_HEADER_NAME } from "../../src/tenancy/constants.js";
@@ -141,7 +142,7 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
       unusedDekProvisioner,
       new AuditChainService(),
       membership,
-      new SessionService(pool), new NoopRealtimePublisher());
+      new SessionService(pool, membership, new InMemoryCacheAdapter()), new NoopRealtimePublisher());
     guard = new WorkspaceGuard(pool, membership, new Reflector());
   });
 
@@ -444,7 +445,7 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
     const workspaceId = await createWorkspace();
     await addMember(workspaceId, userId, "owner");
 
-    const sessions = new SessionService(pool);
+    const sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
     const tokens = await sessions.createSession(userId);
     await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, 1);
     await sessions.logout(tokens.sid);

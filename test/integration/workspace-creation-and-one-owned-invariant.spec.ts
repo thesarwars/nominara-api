@@ -9,6 +9,7 @@ import { WorkspacesService } from "../../src/modules/workspaces/workspaces.servi
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 import type { DekProvisioner } from "../../src/modules/workspaces/ports/dek-provisioner.js";
@@ -79,7 +80,7 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
   });
 
   function makeService(dekProvisioner: DekProvisioner = new LocalDekProvisioner(WRAPPING_KEY, "local:dev")): WorkspacesService {
-    return new WorkspacesService(pool, dekProvisioner, new AuditChainService(), membership, new SessionService(pool), new NoopRealtimePublisher());
+    return new WorkspacesService(pool, dekProvisioner, new AuditChainService(), membership, new SessionService(pool, membership, new InMemoryCacheAdapter()), new NoopRealtimePublisher());
   }
 
   async function createUser(email = `owner-${randomUUID()}@example.com`): Promise<string> {

@@ -10,6 +10,7 @@ import { InvitationsService } from "../../src/modules/workspaces/invitations.ser
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
@@ -75,7 +76,7 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
       new LocalDekProvisioner(WRAPPING_KEY, "local:dev"),
       new AuditChainService(),
       membership,
-      new SessionService(pool), new NoopRealtimePublisher());
+      new SessionService(pool, membership, new InMemoryCacheAdapter()), new NoopRealtimePublisher());
     invitations = new InvitationsService(pool, new AuditChainService());
   });
 

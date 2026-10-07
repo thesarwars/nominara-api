@@ -6,6 +6,7 @@ import {
   idempotencyScopeFingerprint,
   rateLimitConfigKey,
   rateLimitCounterKey,
+  refreshGraceSlotKey,
   requestBodyHash,
   tenantKey,
 } from "../../src/lib/cache/valkey-keys.js";
@@ -128,5 +129,26 @@ describe("STORY-025 · the idempotency fingerprint", () => {
   it("hashes the raw key for the conflict detail, so a 409 never echoes it", () => {
     expect(hashIdempotencyKey("retry-1")).toMatch(/^[0-9a-f]{64}$/);
     expect(hashIdempotencyKey("retry-1")).not.toContain("retry");
+  });
+});
+
+describe("STORY-170 · the refresh grace slot key", () => {
+  const SESSION_A = "0192f1a0-0000-7000-8000-0000000000a1";
+  const SESSION_B = "0192f1a0-0000-7000-8000-0000000000b1";
+
+  it("is `{env}:global:refresh-grace:{session_id}`, built by the helper rather than spelled out at the call site", () => {
+    expect(refreshGraceSlotKey("test", SESSION_A)).toBe(`test:global:refresh-grace:${SESSION_A}`);
+  });
+
+  it("gives two sessions two slots — one session's slot can never be another's", () => {
+    expect(refreshGraceSlotKey("test", SESSION_A)).not.toBe(refreshGraceSlotKey("test", SESSION_B));
+  });
+
+  it("keeps two deployments sharing one cache instance from reading each other's slots", () => {
+    expect(refreshGraceSlotKey("staging", SESSION_A)).not.toBe(refreshGraceSlotKey("production", SESSION_A));
+  });
+
+  it("refuses a session id carrying a separator — it would shift every segment after it", () => {
+    expect(() => refreshGraceSlotKey("test", "a:b")).toThrow(/must not contain/);
   });
 });
