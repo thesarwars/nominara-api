@@ -36,3 +36,7 @@ export const auditLogEntrySchema = z
   .strict();
 
 export type AuditLogEntry = z.infer<typeof auditLogEntrySchema>;
+
+/** `GET /v1/audit-log` — the page's items; the cursor lives in the envelope's `pagination`. */
+export const auditLogListResponseSchema = z.array(auditLogEntrySchema);
+export type AuditLogListResponse = z.infer<typeof auditLogListResponseSchema>;
