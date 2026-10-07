@@ -397,10 +397,11 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
       expect(logoutRes.statusCode).toBe(200);
 
       // clearAuthCookies (src/lib/auth/cookies.ts) calls reply.clearCookie
-      // for each of the three cookies with `{ path: "/" }` only — @fastify/
-      // cookie's clearCookie forces `value: ""`, `maxAge: 0`, and
-      // `expires: new Date(0)` regardless of what's passed, so THAT is the
-      // wire behavior to assert, not made-up flags the code never sets.
+      // for each of the three cookies with the same HARDENED_* options the
+      // setters use — @fastify/cookie's clearCookie forces `value: ""`,
+      // `maxAge: 0`, and `expires: new Date(0)` regardless of what's passed.
+      // STORY-171 — and a browser ignores a `__Host-` deletion that lacks
+      // Secure, so the raw header must carry Secure + Path=/ and no Domain.
       const byName = cookiesByName(logoutRes);
       for (const name of [ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, CSRF_COOKIE_NAME]) {
         const cleared = byName.get(name);
@@ -408,6 +409,13 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
         expect(cleared?.value).toBe("");
         expect(cleared?.maxAge).toBe(0);
         expect(cleared?.expires && cleared.expires.getTime()).toBe(0);
+      }
+      const rawSetCookie = ([] as string[]).concat(logoutRes.headers["set-cookie"] ?? []);
+      for (const name of [ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, CSRF_COOKIE_NAME]) {
+        const raw = rawSetCookie.find((h) => h.startsWith(`${name}=`));
+        expect(raw, name).toMatch(/;\s*Secure(;|$)/);
+        expect(raw, name).toMatch(/;\s*Path=\/(;|$)/);
+        expect(raw, name).not.toMatch(/;\s*Domain=/i);
       }
 
       const refreshAttempt = await app.inject({
