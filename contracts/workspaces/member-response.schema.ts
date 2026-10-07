@@ -8,6 +8,11 @@ export const memberResponseSchema = z
   .object({
     id: z.uuid(),
     user_id: z.uuid(),
+    // NEW-A-12 — the member's display name (users.full_name, null until they
+    // set one) and address. Additive. Joined from `users`, which has no RLS,
+    // starting from the RLS-scoped workspace_members row.
+    name: z.string().nullable(),
+    email: z.string(),
     role: z.enum(["owner", "admin", "manager", "analyst", "viewer"]),
     project_scope: z.array(z.uuid()).nullable(),
     status: z.enum(["active", "suspended", "removed"]),
