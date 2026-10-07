@@ -102,10 +102,11 @@ export const projectSourceIndex = pgTable("project_source_index", {
   avgPositionWeight: real("avg_position_weight").notNull().default(sql`0`),
   contextWeight: real("context_weight").notNull().default(sql`0`),
   rankPosition: smallint("rank_position"),
-  brandPresentOnDomain: boolean("brand_present_on_domain").notNull().default(sql`false`),
+  brandPresentOnDomain: boolean("brand_present_on_domain"),
   gapSeverity: text("gap_severity"),
   topUrls: jsonb("top_urls").notNull().default(sql`'[]'::jsonb`),
   computedAt: timestamp("computed_at", { withTimezone: true }).notNull().default(sql`now()`),
+  verifiedAt: timestamp("verified_at", { withTimezone: true }),
 }, (table) => [primaryKey({ columns: [table.projectId, table.sourceDomainId, table.engineKey, table.windowStart, table.windowDays] })]);
 
 export const sourceDomains = pgTable("source_domains", {

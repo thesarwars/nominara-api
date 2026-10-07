@@ -22,6 +22,10 @@ import { SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS } from "./refresh-pro
 // and make `source_coverage` and an action item's severity read different
 // windows for the same project.
 
+// NEW-C-4 — a NULL `gap_severity` means presence on the domain is not yet
+// verified; such rows are left out, so a window with nothing verified reads
+// NULL ("not measured"), never 100.
+
 /** Recompute one project's source coverage from `project_source_index`. */
 export async function refreshProjectSourceCoverage(tx: ClientBase, projectId: string): Promise<void> {
   const latestWindow = await tx.query<{ window_start: string | null }>(
@@ -39,9 +43,10 @@ export async function refreshProjectSourceCoverage(tx: ClientBase, projectId: st
       ? []
       : (
           await tx.query<{ context_weight: string; gap_severity: "none" | "low" | "medium" | "high" | "critical" }>(
-            `SELECT context_weight::text, COALESCE(gap_severity, 'none') AS gap_severity
+            `SELECT context_weight::text, gap_severity
                FROM project_source_index
-              WHERE project_id = $1 AND engine_key = $2 AND window_days = $3 AND window_start = $4::date`,
+              WHERE project_id = $1 AND engine_key = $2 AND window_days = $3 AND window_start = $4::date
+                AND gap_severity IS NOT NULL`,
             [projectId, SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS, windowStart],
           )
         ).rows;
