@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dataSourceSchema } from "./data-source.schema.js";
 
 // STORY-062 — `GET /v1/projects/{id}/geo-insights` (the digest) and
 // `GET /v1/projects/{id}/geo-insights/{analysis}` (one analysis), plus the
@@ -41,6 +42,81 @@ export const geoEvidenceSchema = z
   })
   .strict();
 
+// ------------------------------------------------------ A6 sentiment detail
+
+/**
+ * `GET /geo-insights/sentiment` -> `detail` (STORY-061, A6).
+ *
+ * Built ONCE, by the rollup, and persisted inside the finding that speaks for
+ * the analysis (`GeoFinding.sentiment`); a read returns that stored object and
+ * never re-aggregates `mention_facts`.
+ *
+ * `factual_error` is false WITH A REASON on every mention: there is no verified
+ * structured data to compare an engine's claim against, so a contradiction is
+ * never guessed at. `reason` is null (not a made-up class) when the parser
+ * found none; `cues` are the stored `negative_reasons`.
+ * `data_source` is null when nothing was measured (not "demo").
+ */
+export const sentimentMentionSchema = z
+  .object({
+    result_id: z.string().min(1),
+    engine: z.string().min(1),
+    captured_at: z.string().min(1),
+    label: z.enum(["neutral", "negative"]),
+    evidence_start: z.number().int().nonnegative(),
+    evidence_end: z.number().int().nonnegative(),
+    /** The sentence the verdict rests on; null when the capture's text is no longer held. */
+    evidence_text: z.string().nullable(),
+    cues: z.array(z.string()),
+    reason: z.string().nullable(),
+    factual_error: z.literal(false),
+    factual_error_reason: z.string().min(1),
+    /** The citation slot nearest the span, located in the answer text; null when none can be located. */
+    citation: z
+      .object({ slot_index: z.number().int().nonnegative(), url: z.string().min(1), domain: z.string().min(1) })
+      .strict()
+      .nullable(),
+  })
+  .strict();
+export type SentimentMention = z.infer<typeof sentimentMentionSchema>;
+
+export const sentimentClusterSchema = z
+  .object({
+    domain: z.string().min(1),
+    mention_count: z.number().int().positive(),
+    engine_count: z.number().int().positive(),
+    engines: z.array(z.string()),
+    reasons: z.array(z.string()),
+  })
+  .strict();
+
+export const sentimentReasonClassSchema = z
+  .object({
+    reason: z.string().min(1),
+    mention_count: z.number().int().positive(),
+    /** The task this class will generate; the task engine is deferred, so there is a title and no task id. */
+    task_title: z.string().min(1),
+  })
+  .strict();
+
+export const geoSentimentDetailSchema = z
+  .object({
+    slug: z.literal("sentiment"),
+    data_source: dataSourceSchema.nullable(),
+    brand_mentions: z.number().int().nonnegative(),
+    non_positive_mentions: z.number().int().nonnegative(),
+    /** Non-positive mentions whose citation could not be located: counted, never assigned a guessed source. */
+    unattributed_mentions: z.number().int().nonnegative(),
+    /** Most recent first, capped; `non_positive_mentions` is the uncapped count. */
+    mentions: z.array(sentimentMentionSchema),
+    /** Ranked: spanning more engines first, then more mentions, then domain. */
+    clusters: z.array(sentimentClusterSchema),
+    reason_classes: z.array(sentimentReasonClassSchema),
+    factual_error_reason: z.string().min(1),
+  })
+  .strict();
+export type GeoSentimentDetail = z.infer<typeof geoSentimentDetailSchema>;
+
 /**
  * One persisted finding (geo-and-vectors.md `geo_analyses.findings`).
  *
@@ -60,6 +136,8 @@ export const geoFindingSchema = z
     task_rule_code: z.string().min(1).optional(),
     no_action: z.literal(true).optional(),
     lever_rank: z.number().int().min(1).max(3).optional(),
+    /** The A6 detail, carried by the one finding that speaks for the analysis (STORY-061). */
+    sentiment: geoSentimentDetailSchema.optional(),
   })
   .strict()
   .refine((f) => (f.task_rule_code !== undefined) !== (f.no_action === true), {
