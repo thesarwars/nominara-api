@@ -36,9 +36,8 @@ import {
 // every project. A real scope needs the registry's answer changed, which is
 // the mock below; everything else is the deployed composition.
 //
-// TWO VALKEYS OF THIS SPEC'S OWN. `applyFakeApiEnv` points the queue at
-// localhost:6380 and the cache at localhost:6379 — a developer's own local
-// services — and a successful trigger enqueues its cells. Neither is touched:
+// TWO VALKEYS OF THIS SPEC'S OWN. `applyFakeApiEnv` points the queue and the cache at
+// a developer's own local services — and a successful trigger enqueues its cells. Neither is touched:
 // the harness is told (its `env` option) to use containers started here.
 
 const capture = vi.hoisted(() => ({ ready: [] as string[] }));

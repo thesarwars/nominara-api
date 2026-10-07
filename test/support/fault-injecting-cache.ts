@@ -37,7 +37,7 @@ export class FaultInjectingCache implements Cache {
     this.onEnter?.(operation);
     const fault = this.faults.get(operation);
     if (fault === "reject") {
-      throw new Error(`connect ECONNREFUSED redis://cache:${FAULT_ERROR_SECRET}@valkey.internal:6379`);
+      throw new Error(`connect ECONNREFUSED redis://cache:${FAULT_ERROR_SECRET}@valkey.internal:6390`);
     }
     if (fault === "hang") {
       // Accepted the call and never answers — the failure a refused

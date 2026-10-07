@@ -1,4 +1,5 @@
 import { randomUUID, createHash } from "node:crypto";
+import { INERT_CACHE_REDIS_URL, INERT_QUEUE_REDIS_URL } from "../support/test-valkey.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
@@ -80,8 +81,8 @@ describe("STORY-169 re-audit · a project-scoped manager on GET /v1/projects and
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.VALKEY_CACHE_URL = INERT_CACHE_REDIS_URL;
+    process.env.QUEUE_REDIS_URL = INERT_QUEUE_REDIS_URL;
     process.env.ENGINE_TOKEN_BUCKETS =
       '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
