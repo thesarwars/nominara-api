@@ -353,6 +353,21 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     expect(await total()).toBe(0);
   }, 180_000);
 
+  it("STORY-060 · the seed computes the A3 structure row from its own facts, and --purge leaves no stale sufficient row", async () => {
+    const workspaceId = await createWorkspace("growth");
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    const seeded = await client.query<{ sufficient: boolean; evidence_cells: number; window_days: number }>(
+      `SELECT sufficient, evidence_cells, window_days FROM geo_analyses WHERE workspace_id = $1 AND analysis = 'structure' AND window_days = 30`,
+      [workspaceId],
+    );
+    expect(seeded.rows.length).toBeGreaterThan(0);
+    expect(seeded.rows.some((r) => r.sufficient && r.evidence_cells >= 30)).toBe(true);
+
+    await runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: testPool(), log: () => {} });
+    const stale = await client.query(`SELECT 1 FROM geo_analyses WHERE workspace_id = $1 AND sufficient`, [workspaceId]);
+    expect(stale.rowCount).toBe(0);
+  }, 120_000);
+
   it("STORY-169 · a re-run without --purge is idempotent — no doubled cells", async () => {
     const workspaceId = await createWorkspace("growth");
 

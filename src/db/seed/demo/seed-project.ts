@@ -1,6 +1,7 @@
 import type { ClientBase } from "pg";
 import { denormalizeProject } from "../../../lib/rollup/denormalize.js";
 import { backfillProjectDisplacements } from "../../../lib/rollup/refresh-project-displacements.js";
+import { refreshProjectGeoWindows } from "../../../lib/rollup/refresh-project-geo.js";
 import { rollUpDay } from "../../../lib/rollup/roll-up-day.js";
 import { withProjectQueueLock } from "../../../lib/queue/locks.js";
 import { resetAndSeedProjectAux } from "./aux.js";
@@ -42,6 +43,8 @@ async function seedFactsAndRollup(
     if (facts.days.length > 0) {
       await backfillProjectDisplacements(tx, project.id, timezone, facts.days[0]!, facts.days[facts.days.length - 1]!);
     }
+    // STORY-060 — A3 over the seeded facts (demo engines are marked by the seed's normalizer_version).
+    await refreshProjectGeoWindows(tx, project.id);
   });
   return facts;
 }

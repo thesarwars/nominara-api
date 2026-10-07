@@ -3,6 +3,7 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
 import { denormalizeProject } from "../../rollup/denormalize.js";
+import { refreshProjectGeoWindows } from "../../rollup/refresh-project-geo.js";
 import { datesWithFacts } from "../../rollup/aggregate-day.js";
 import { refreshProjectDisplacements } from "../../rollup/refresh-project-displacements.js";
 import { refreshProjectSourceIndex } from "../../rollup/refresh-project-source-index.js";
@@ -90,6 +91,11 @@ export function createRollupMetricDailyHandler(_context: QueueHandlerContext): J
       // transaction and lock, so it never serves a stale or seeded index. It
       // reads only this database: no network call.
       await refreshProjectSourceIndex(tx, payload.projectId, await localToday(tx, timezone));
+
+      // STORY-060 — A3 answer structure, persisted to geo_analyses so the
+      // read endpoints only read. Same transaction and lock; reads only this
+      // database (no network call), free and unmetered.
+      await refreshProjectGeoWindows(tx, payload.projectId);
     });
   };
 }

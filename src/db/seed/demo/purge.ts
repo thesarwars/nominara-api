@@ -3,6 +3,7 @@ import { PROMPT_OCCUPIES_SLOT } from "../../../lib/entitlements/structural-usage
 import { withProjectQueueLock } from "../../../lib/queue/locks.js";
 import { datesWithFacts } from "../../../lib/rollup/aggregate-day.js";
 import { denormalizeProject } from "../../../lib/rollup/denormalize.js";
+import { refreshProjectGeoWindows } from "../../../lib/rollup/refresh-project-geo.js";
 import { refreshProjectAux } from "../../../lib/rollup/refresh-project-aux.js";
 import { refreshProjectSourceCoverage } from "../../../lib/rollup/refresh-project-source-coverage.js";
 import { refreshProjectTaskCounts } from "../../../lib/rollup/refresh-project-task-counts.js";
@@ -205,6 +206,8 @@ async function purgeDemoPrompts(tx: ClientBase, project: PurgeableProject): Prom
 export async function purgeOneProject(tx: ClientBase, project: PurgeableProject, timezone: string): Promise<void> {
   // Facts + metric_daily first — nothing downstream depends on them.
   await purgeMetricHistory(tx, project, timezone);
+  // STORY-060 — recompute A3 over what is left, so no stale "sufficient" structure row outlives the seeded facts.
+  await refreshProjectGeoWindows(tx, project.id);
   if (project.factsOnly) {
     // NEW-A-8 — a `--facts-only` project never had AUX, sources, tasks or a
     // demo marker written, and its sources/aux/tasks (if any) are REAL: the

@@ -121,6 +121,20 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
         ? ` The brand sits in the recommendation clause in ${pct(rec.share)} of its answers (no prior window to compare).`
         : ` The brand's recommendation-clause share moved from ${pct(rec.prior)} to ${pct(rec.share)}.`;
 
+  const detail: GeoStructureDetail = {
+    slug: "structure",
+    forms,
+    total,
+    dominant_form: dominant.form,
+    engines,
+    page_forms: [],
+    brand_answers: brandAnswers,
+    prior_brand_answers: priorAnswers,
+    position,
+    template: null,
+    rationale: NO_PAGE_CRAWL_REASON,
+  };
+
   const finding: GeoFinding = {
     id: "structure-dominant-form",
     severity: "info",
@@ -130,6 +144,8 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
     evidence: [{ url: `https://${input.rootDomain}/`, snippet: "No page crawl: the page's answer forms could not be assessed." }],
     metric: { name: "dominant_form_share", value: round4(dominant.count / total) },
     no_action: true,
+    // The detail rides on the finding so a read returns the stored row's own aggregate.
+    structure: detail,
   };
 
   return {
@@ -142,19 +158,7 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
       findings: [finding],
       lever_rank: null,
     },
-    detail: {
-      slug: "structure",
-      forms,
-      total,
-      dominant_form: dominant.form,
-      engines,
-      page_forms: [],
-      brand_answers: brandAnswers,
-      prior_brand_answers: priorAnswers,
-      position,
-      template: null,
-      rationale: NO_PAGE_CRAWL_REASON,
-    },
+    detail,
   };
 }
 
