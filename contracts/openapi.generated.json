@@ -14247,7 +14247,8 @@
                                 "type": "string",
                                 "enum": [
                                   "live",
-                                  "demo"
+                                  "demo",
+                                  "mixed"
                                 ]
                               },
                               {
@@ -34286,7 +34287,8 @@
                                           "type": "string",
                                           "enum": [
                                             "live",
-                                            "demo"
+                                            "demo",
+                                            "mixed"
                                           ]
                                         }
                                       },
@@ -34349,7 +34351,8 @@
                                 "type": "string",
                                 "enum": [
                                   "live",
-                                  "demo"
+                                  "demo",
+                                  "mixed"
                                 ]
                               }
                             },

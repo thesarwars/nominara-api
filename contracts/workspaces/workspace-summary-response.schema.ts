@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dataSourceSchema } from "../analytics/data-source.schema.js";
 import { projectEngineScoreSchema, projectListItemSchema } from "../projects/project-list-response.schema.js";
 
 // NEW-B-2 — `GET /v1/workspaces/{id}/summary`. api-specification.md §3:
@@ -21,11 +22,8 @@ import { projectEngineScoreSchema, projectListItemSchema } from "../projects/pro
 // of `null` is "no numeric cap" (custom/uncapped), `credits: null` is "the
 // plan's grant is negotiated, not a figure" — never 0.
 
-export const ENGINE_DATA_SOURCES = ["live", "demo"] as const;
-export const engineDataSourceSchema = z.enum(ENGINE_DATA_SOURCES);
-
 export const summaryEngineScoreSchema = projectEngineScoreSchema
-  .extend({ data_source: engineDataSourceSchema })
+  .extend({ data_source: dataSourceSchema })
   .strict();
 
 export const summaryProjectSchema = projectListItemSchema
@@ -34,7 +32,7 @@ export const summaryProjectSchema = projectListItemSchema
   .strict();
 
 export const summaryEngineSchema = z
-  .object({ engine_key: z.string().min(1), data_source: engineDataSourceSchema })
+  .object({ engine_key: z.string().min(1), data_source: dataSourceSchema })
   .strict();
 
 export const summaryCreditsSchema = z

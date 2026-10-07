@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dataSourceSchema } from "./data-source.schema.js";
 
 // NEW-C-1 — `GET /v1/projects/{id}/competitors/panel`, `api-specification.md`
 // §3's Analytics row ("per-engine comparison, head-to-head win rate,
@@ -18,9 +19,6 @@ export const competitorPanelQuerySchema = z
     engines: z.string().min(1).optional(),
   })
   .strict();
-
-/** Where an engine's captures in the window came from. */
-export const competitorEngineDataSourceSchema = z.enum(["live", "demo"]);
 
 export const competitorRowSchema = z
   .object({
@@ -70,11 +68,11 @@ export const competitorPanelResponseSchema = z
     /** The engine keys the per-engine columns cover. */
     engines: z.array(z.string()),
     /**
-     * Per engine, whether the window's captures are real or seeded demo data.
-     * `demo` as soon as ANY capture in the window is seeded — a mixed engine
-     * is not presented as live. Null when nothing was captured.
+     * Per engine, whether the window's captures are real or seeded demo data:
+     * `live`, `demo`, or `mixed` when both kinds contributed. Null when
+     * nothing was measured — never `demo` by default.
      */
-    engine_data_source: z.record(z.string(), competitorEngineDataSourceSchema.nullable()),
+    engine_data_source: z.record(z.string(), dataSourceSchema.nullable()),
     /** `competitors.max_per_project`; null when the plan is unlimited. */
     competitors_cap: z.number().int().nonnegative().nullable(),
     tracked_count: z.number().int().nonnegative(),
@@ -83,6 +81,5 @@ export const competitorPanelResponseSchema = z
   .strict();
 
 export type CompetitorPanelQuery = z.infer<typeof competitorPanelQuerySchema>;
-export type CompetitorEngineDataSource = z.infer<typeof competitorEngineDataSourceSchema>;
 export type CompetitorRow = z.infer<typeof competitorRowSchema>;
 export type CompetitorPanelResponse = z.infer<typeof competitorPanelResponseSchema>;

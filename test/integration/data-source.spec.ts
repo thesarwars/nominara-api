@@ -107,19 +107,19 @@ describe("NEW-A-5 · data_source provenance", () => {
   const matrix = () => ctx(() => new MatrixService().matrix(projectId, { timeframe: "30d" }));
   const scorecards = () => ctx(() => new ScorecardsService().scorecards(projectId, { timeframe: "30d" }));
   const growth = () => ctx(() => new GrowthMapService().growthMap(projectId, { timeframe: "7d", granularity: "day" }));
-  const sourceOf = (list: { engine_key: string; data_source: string | null }[], key: string) =>
-    list.find((entry) => entry.engine_key === key)?.data_source;
+  const sourceOf = (list: { engine_key: string; data_source?: string | null | undefined }[] | undefined, key: string) =>
+    list?.find((entry) => entry.engine_key === key)?.data_source;
 
   it("NEW-A-5 AC2 — a project with only demo-seeded captures shows demo on every engine, on all three surfaces", async () => {
     for (const engine of ["gemini", "chatgpt", "perplexity"]) await capture(engine, DEMO_SEED_MARKER);
     const m = await matrix();
     const s = await scorecards();
     const g = await growth();
-    expect(m.engines.map((e) => e.data_source)).toEqual(["demo", "demo", "demo"]);
+    expect(m.engines!.map((e) => e.data_source)).toEqual(["demo", "demo", "demo"]);
     expect(m.prompts[0]!.cells.map((c) => c.data_source)).toEqual(["demo", "demo", "demo"]);
     expect(s.engines.map((e) => e.data_source)).toEqual(["demo", "demo", "demo"]);
     expect(s.blended.data_source).toBe("demo");
-    expect(g.engines.map((e) => e.data_source)).toEqual(["demo", "demo", "demo"]);
+    expect(g.engines!.map((e) => e.data_source)).toEqual(["demo", "demo", "demo"]);
     expect(g.series.every((series) => series.data_source === "demo")).toBe(true);
   });
 
@@ -138,7 +138,7 @@ describe("NEW-A-5 · data_source provenance", () => {
     expect(m.prompts[0]!.cells.find((c) => c.engine_key === "gemini")!.data_source).toBe("live");
     // The blend includes demo engines, says so, and counts them.
     expect(s.blended.data_source).toBe("mixed");
-    expect(s.blend).toEqual({ policy: "all_measured_engines", live_engines: 1, demo_engines: 2, mixed_engines: 0 });
+    expect(s.blend!).toEqual({ policy: "all_measured_engines", live_engines: 1, demo_engines: 2, mixed_engines: 0 });
     expect(g.series[0]!.data_source).toBe("mixed");
     expect(scorecardsResponseSchema.safeParse(s).success).toBe(true);
     expect(growthMapResponseSchema.safeParse(g).success).toBe(true);
@@ -161,7 +161,7 @@ describe("NEW-A-5 · data_source provenance", () => {
     expect(s.blended.visibility_score).not.toBe(gemini.visibility_score);
     expect(s.blended.visibility_score!).toBeGreaterThan(Math.min(gemini.visibility_score!, chatgpt.visibility_score!));
     expect(s.blended.visibility_score!).toBeLessThan(Math.max(gemini.visibility_score!, chatgpt.visibility_score!));
-    expect(s.blend).toEqual({ policy: "all_measured_engines", live_engines: 1, demo_engines: 1, mixed_engines: 0 });
+    expect(s.blend!).toEqual({ policy: "all_measured_engines", live_engines: 1, demo_engines: 1, mixed_engines: 0 });
     expect(s.blended.data_source).toBe("mixed");
   });
 
@@ -192,14 +192,14 @@ describe("NEW-A-5 · data_source provenance", () => {
     expect(sourceOf(m.engines, "gemini")).toBe("mixed");
     const s = await scorecards();
     expect(sourceOf(s.engines, "gemini")).toBe("mixed");
-    expect(s.blend.mixed_engines).toBe(1);
+    expect(s.blend!.mixed_engines).toBe(1);
   });
 
   it("NEW-A-5 AC2 — an empty project reports null everywhere and an all-zero blend", async () => {
     const s = await scorecards();
     expect(s.engines.every((e) => e.data_source === null)).toBe(true);
     expect(s.blended.data_source).toBeNull();
-    expect(s.blend).toEqual({ policy: "all_measured_engines", live_engines: 0, demo_engines: 0, mixed_engines: 0 });
+    expect(s.blend!).toEqual({ policy: "all_measured_engines", live_engines: 0, demo_engines: 0, mixed_engines: 0 });
     const g = await growth();
     expect(g.engines).toEqual([]);
     expect(g.series.every((series) => series.data_source === null)).toBe(true);

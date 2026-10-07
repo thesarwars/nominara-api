@@ -16,12 +16,4 @@ export type ReportFormat = z.infer<typeof reportFormatSchema>;
 export const reportTimeframeSchema = z.enum(["24h", "7d", "30d", "90d"]);
 export type ReportTimeframe = z.infer<typeof reportTimeframeSchema>;
 
-/**
- * Owner decision (Track E, 7-day push): Gemini is the one live engine; the
- * other five carry demo data. Every number that can mix them carries this
- * marker per engine. Never inferred from the score.
- */
-export const engineDataSourceSchema = z.enum(["live", "demo"]);
-export type EngineDataSource = z.infer<typeof engineDataSourceSchema>;
-
 export const hexColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/);
