@@ -455,7 +455,7 @@ describe("STORY-120 · readiness as the runtime role", () => {
     const owner = await ownerClient();
     const rolledBack: string[] = [];
     try {
-      for (let step = 0; step < 20; step += 1) {
+      for (let step = 0; step < 200; step += 1) {
         const name = await rollbackLast(owner);
         if (name === null) break;
         rolledBack.push(name);

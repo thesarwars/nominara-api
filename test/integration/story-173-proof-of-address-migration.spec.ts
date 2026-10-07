@@ -109,7 +109,18 @@ describe("STORY-173 · migrations 0030 / 0031 — sessions strong-auth method an
       [userId],
     );
 
-    expect(await rollbackLast(client)).toBe("0031_story_173_validate_constraints");
+    // Roll back UNTIL 0031 rather than assuming it is the newest migration:
+    // later stories add migrations on top of it, and a test coupled to "my
+    // migration is last" breaks for the next person to add one.
+    const newer: string[] = [];
+    for (let step = 0; step < 200; step += 1) {
+      const name = await rollbackLast(client);
+      if (name === null || name === "0031_story_173_validate_constraints") {
+        expect(name).toBe("0031_story_173_validate_constraints");
+        break;
+      }
+      newer.push(name);
+    }
     expect(await rollbackLast(client)).toBe("0030_story_173_proof_of_address");
 
     const otpRow = await client.query("SELECT last_strong_auth_at, last_strong_auth_method FROM sessions WHERE id = $1", [otp.rows[0]!.id]);
@@ -126,7 +137,7 @@ describe("STORY-173 · migrations 0030 / 0031 — sessions strong-auth method an
       client.query("INSERT INTO sessions (user_id, last_strong_auth_at, last_strong_auth_method) VALUES ($1, now(), 'email_otp')", [userId]),
     ).rejects.toThrow(/sessions_last_strong_auth_method_check/);
 
-    expect(await migrateUp(client)).toEqual(["0030_story_173_proof_of_address", "0031_story_173_validate_constraints"]);
+    expect(await migrateUp(client)).toEqual(["0030_story_173_proof_of_address", "0031_story_173_validate_constraints", ...[...newer].reverse()]);
     await client.query(
       "INSERT INTO sessions (user_id, last_strong_auth_at, last_strong_auth_method) VALUES ($1, now(), 'email_otp')",
       [userId],
