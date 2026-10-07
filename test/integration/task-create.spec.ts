@@ -1,3 +1,4 @@
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
@@ -17,7 +18,7 @@ describe("STORY-064-C · create / comment / events — real SQL", () => {
   let container: StartedPostgreSqlContainer;
   let client: Client;
   let seq = 0;
-  const service = new TasksService();
+  const service = new TasksService(new NoopRealtimePublisher());
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18")

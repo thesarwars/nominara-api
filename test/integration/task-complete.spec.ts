@@ -75,26 +75,11 @@ describe("STORY-064-D · complete / realtime publish — real SQL", () => {
       [workspaceId, `Project ${seq}`, `project-${seq}`, `example-${seq}.com`]);
     return r.rows[0]!.id;
   }
-  async function createGoal(workspaceId: string, projectId: string): Promise<string> {
-    const r = await client.query<{ id: string }>(
-      `INSERT INTO goals (workspace_id, project_id, title, kind, target) VALUES ($1, $2, 'Goal', 'custom', '{}'::jsonb) RETURNING id`,
-      [workspaceId, projectId]);
-    return r.rows[0]!.id;
-  }
   const CTX = (workspaceId: string, actorId: string, scope?: readonly string[]): TenantContext => ({
     workspaceId, actorId, ...(scope !== undefined ? { scopeProjectIds: scope } : {}),
   });
   const create = (ctx: TenantContext, projectId: string, body: Record<string, unknown>) =>
     inTenant(ctx, () => service.createTask(projectId, createTaskRequestSchema.parse(body)));
-  const comment = (ctx: TenantContext, taskId: string, body: Record<string, unknown>) =>
-    inTenant(ctx, () => service.createComment(taskId, createCommentRequestSchema.parse(body)));
-  const timeline = (ctx: TenantContext, taskId: string, query: Record<string, unknown> = {}) =>
-    inTenant(ctx, () => service.listTaskEvents(taskId, taskEventListQuerySchema.parse(query)));
-  const refs = async (workspaceId: string) =>
-    (await client.query<{ short_ref: string }>("SELECT short_ref FROM tasks WHERE workspace_id = $1", [workspaceId])).rows.map((r) => r.short_ref);
-  const counter = async (workspaceId: string, prefix: string) =>
-    (await client.query<{ next_value: number }>("SELECT next_value FROM ref_counters WHERE workspace_id = $1 AND prefix = $2", [workspaceId, prefix])).rows[0]?.next_value;
-
   const complete = (ctx: TenantContext, taskId: string) => inTenant(ctx, () => service.completeTask(taskId));
   const patch = (ctx: TenantContext, taskId: string, body: Record<string, unknown>) =>
     inTenant(ctx, () => service.updateTask(taskId, updateTaskRequestSchema.parse(body)));
@@ -149,7 +134,7 @@ describe("STORY-064-D · complete / realtime publish — real SQL", () => {
     publisher.published.length = 0;
     const err = await complete(CTX(ws, actor), t.id).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ConflictError);
-    expect((err as ConflictError).details).toMatchObject({ current_state: "done" });
+    expect((err as { details: unknown }).details).toMatchObject({ current_state: "done" });
     expect((await client.query(`SELECT 1 FROM milestones WHERE project_id = $1`, [p])).rows).toHaveLength(1);
     expect((await client.query(`SELECT 1 FROM task_events WHERE task_id = $1 AND event = 'completed'`, [t.id])).rows).toHaveLength(1);
     expect(publisher.published).toEqual([]);
@@ -161,7 +146,7 @@ describe("STORY-064-D · complete / realtime publish — real SQL", () => {
     await patch(CTX(ws, actor), t.id, { status: "dismissed", dismiss_reason: "not relevant" });
     const err = await complete(CTX(ws, actor), t.id).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ConflictError);
-    expect((err as ConflictError).details).toMatchObject({ current_state: "dismissed" });
+    expect((err as { details: unknown }).details).toMatchObject({ current_state: "dismissed" });
     expect((await client.query(`SELECT status, completed_at, milestone_id FROM tasks WHERE id = $1`, [t.id])).rows[0]).toEqual({ status: "dismissed", completed_at: null, milestone_id: null });
     expect((await client.query(`SELECT 1 FROM milestones WHERE project_id = $1`, [p])).rows).toHaveLength(0);
   });

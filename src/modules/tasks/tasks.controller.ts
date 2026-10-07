@@ -1,5 +1,6 @@
 import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from "@nestjs/common";
 import {
+  completeTaskResponseSchema,
   createCommentRequestSchema,
   createTaskRequestSchema,
   taskEventListQuerySchema,
@@ -9,6 +10,7 @@ import {
   taskListResponseSchema,
   taskSchema,
   updateTaskRequestSchema,
+  type CompleteTaskResponse,
   type CreateCommentRequest,
   type CreateTaskRequest,
   type Task,
@@ -103,6 +105,19 @@ export class TasksController {
     @Body(new ZodValidationPipe(createCommentRequestSchema)) body: CreateCommentRequest,
   ): Promise<TaskEvent> {
     return this.service.createComment(id, body);
+  }
+
+  // STORY-064 (step D) — `POST /tasks/{id}/complete`, `task:move`. No body.
+  // Idempotent: a replayed key returns the first response, not a second 409.
+  @Post("tasks/:id/complete")
+  @HttpCode(200)
+  @Idempotent()
+  @RequirePermission("task:move")
+  @ScopedByQuery()
+  @Audit({ action: "task.completed", resourceType: "task" })
+  @ApiContract({ operationId: "completeTask", responseSchema: completeTaskResponseSchema })
+  complete(@Param("id") id: string): Promise<CompleteTaskResponse> {
+    return this.service.completeTask(id);
   }
 
   // `GET /tasks/{id}/events`, `task:read` — the timeline, newest first.

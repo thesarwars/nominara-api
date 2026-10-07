@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
+import type { RealtimeEventPayloads } from "../../../contracts/events/catalog.schema.js";
 import type {
+  CompleteTaskResponse,
   CreateCommentRequest,
   CreateTaskRequest,
   Task,
@@ -23,7 +25,8 @@ import { SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS } from "../../lib/rol
 
 /** schemas/tasks-and-goals.md: a dismissed task re-surfaces after 180 days. */
 export const TASK_RESURFACE_DAYS = 180;
-import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
+import { REALTIME_PUBLISHER, type RealtimePublisher } from "../../lib/cache/realtime-publisher.js";
 
 // STORY-169 (API step 2/3) — `GET /v1/workspaces/{id}/action-items`. Owns
 // `tasks` (coding-standards.md §1 "one table, one owning service") — this
@@ -32,6 +35,11 @@ import { currentTenantStore } from "../../tenancy/tenant-context.js";
 @Injectable()
 export class TasksService {
   private readonly logger = new Logger(TasksService.name);
+
+  // STORY-064 (step D): `task.moved` / `task.created` are published to the
+  // workspace room AFTER the transaction commits (`afterCommit`), never from
+  // inside it, so a rolled-back change announces nothing.
+  constructor(@Inject(REALTIME_PUBLISHER) private readonly realtime: RealtimePublisher) {}
 
   /**
    * `GET /v1/projects/{id}/tasks` — STORY-064 (step A). api-specification.md
@@ -244,6 +252,10 @@ export class TasksService {
       if (events.some((e) => e.event === "dismissed" || e.event === "reopened" || e.event === "status_changed")) {
         await refreshProjectTaskCounts(client, current.project_id);
       }
+      const moved = events.find((e) => e.event === "dismissed" || e.event === "reopened" || e.event === "status_changed");
+      if (moved !== undefined && actorId !== undefined) {
+        this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id, from_status: current.status, to_status: body.status as string, actor_id: actorId });
+      }
     }
 
     incrementCounter("nominara_tasks_update_total", { changed: events.length > 0 ? "true" : "false" });
@@ -338,7 +350,94 @@ export class TasksService {
     incrementCounter("nominara_tasks_events_written_total", { event: "created" });
     // Workspace/task/project IDs only — never the title.
     this.logger.log({ message: "task created", workspace_id: store.context.workspaceId, task_id: taskId, project_id: projectId });
-    return this.readTask(client, taskId);
+    const created = await this.readTask(client, taskId);
+    const workspaceId = store.context.workspaceId;
+    afterCommit(() => {
+      this.realtime.toWorkspace(workspaceId, "task.created", {
+        task_id: created.id,
+        project_id: created.project_id,
+        status: created.status,
+        title: created.title,
+        priority: String(created.priority),
+        impact_score: created.impact_score,
+        rule_code: created.rule_code,
+      });
+    });
+    return created;
+  }
+
+  private publishMoved(workspaceId: string, payload: RealtimeEventPayloads["task.moved"]): void {
+    afterCommit(() => {
+      this.realtime.toWorkspace(workspaceId, "task.moved", payload);
+    });
+  }
+
+  /**
+   * `POST /v1/tasks/{id}/complete` — STORY-064 (step D). Completion is a
+   * workflow event, not a status flip (schemas/tasks-and-goals.md).
+   *
+   * ONE TRANSACTION (the ambient one): the row lock, the `done` write
+   * (`completed_at`/`completed_by`), the `task_completed` milestone, the
+   * `completed` event and the open-count refresh commit or roll back together.
+   * The row is locked `FOR UPDATE`, so two concurrent completions serialise and
+   * the loser sees `done` and gets the 409 — one milestone, never two.
+   *
+   * `baseline_metrics` is NOT written: it was captured at CREATION (the before
+   * must predate the work). Nothing here re-measures — `verification` is null
+   * until STORY-067's scheduler exists, rather than a promise this code
+   * cannot keep.
+   *
+   * A `done` or `dismissed` task is a 409 carrying `current_state`.
+   */
+  async completeTask(taskId: string): Promise<CompleteTaskResponse> {
+    const store = currentTenantStore()!;
+    const client = store.client;
+    const actorId = store.context.actorId;
+
+    const found = await client.query<{ project_id: string; status: string; title: string; in_scope: boolean }>(
+      `SELECT t.project_id, t.status, t.title,
+              (cardinality(app.current_scope_projects()) = 0 OR t.project_id = ANY(app.current_scope_projects())) AS in_scope
+         FROM tasks t
+        WHERE t.id = $1 AND t.deleted_at IS NULL
+        FOR UPDATE OF t`,
+      [taskId],
+    );
+    const current = found.rows[0];
+    if (current === undefined) throw new NotFoundError({ message: "no such task" });
+    if (!current.in_scope) throw new ProjectOutOfScopeException();
+    if (current.status !== "todo" && current.status !== "in_progress") {
+      throw new ConflictError({ message: `a ${current.status} task cannot be completed`, details: { current_state: current.status } });
+    }
+
+    const milestone = await client.query<{ id: string; occurred_at: Date }>(
+      `INSERT INTO milestones (workspace_id, project_id, occurred_at, kind, title, severity, source_type, source_id, created_by)
+       VALUES (app.current_workspace(), $1, clock_timestamp(), 'task_completed', $2, 'positive', 'task', $3, $4)
+       RETURNING id, occurred_at`,
+      [current.project_id, current.title, taskId, actorId],
+    );
+    const pinned = milestone.rows[0]!;
+    await client.query(
+      `UPDATE tasks SET status = 'done', completed_at = $2, completed_by = $3, milestone_id = $4 WHERE id = $1`,
+      [taskId, pinned.occurred_at, actorId, pinned.id],
+    );
+    await client.query(
+      `INSERT INTO task_events (workspace_id, task_id, actor_id, actor_type, event, from_value, to_value, occurred_at)
+       VALUES (app.current_workspace(), $1, $2, 'user', 'completed', $3, 'done', clock_timestamp())`,
+      [taskId, actorId, current.status],
+    );
+    await refreshProjectTaskCounts(client, current.project_id);
+
+    incrementCounter("nominara_tasks_events_written_total", { event: "completed" });
+    incrementCounter("nominara_tasks_completed_total", {});
+    // IDs only — never the title.
+    this.logger.log({ message: "task completed", workspace_id: store.context.workspaceId, task_id: taskId, project_id: current.project_id, milestone_id: pinned.id });
+    this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id, from_status: current.status, to_status: "done", actor_id: actorId });
+
+    return {
+      task: await this.readTask(client, taskId),
+      milestone: { id: pinned.id, kind: "task_completed", occurred_at: pinned.occurred_at.toISOString() },
+      verification: null,
+    };
   }
 
   /**

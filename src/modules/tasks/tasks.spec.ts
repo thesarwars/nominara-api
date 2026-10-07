@@ -1,3 +1,5 @@
+import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
+import { NoopRealtimePublisher } from "../../lib/cache/realtime-publisher.js";
 import { Test } from "@nestjs/testing";
 import { describe, expect, it } from "vitest";
 import { TasksModule } from "./tasks.module.js";
@@ -8,9 +10,13 @@ import { TasksController } from "./tasks.controller.js";
 // area's own future story.
 describe("STORY-022 · TasksModule compiles", () => {
   it("resolves in a Nest testing module", async () => {
+    // STORY-064 (step D): TasksModule now builds the realtime publisher, which validates the env eagerly.
+    const originalEnv = { ...process.env };
+    applyFakeApiEnv();
     const moduleRef = await Test.createTestingModule({ imports: [TasksModule] }).compile();
     expect(moduleRef.get(TasksController)).toBeInstanceOf(TasksController);
     await moduleRef.close();
+    process.env = originalEnv;
   });
 });
 
@@ -52,7 +58,7 @@ describe("STORY-064 · project task list route", () => {
     const log = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void logs.push(m));
     const seen: string[] = [];
     await withTenantContext(fakeClient([{ id: "p" }], seen), ctx("ws-1"), () =>
-      new TasksService().listProjectTasks("p", taskListQuerySchema.parse({ sort: "age" })),
+      new TasksService(new NoopRealtimePublisher()).listProjectTasks("p", taskListQuerySchema.parse({ sort: "age" })),
     );
     log.mockRestore();
     expect(logs).toContainEqual({ metric: "nominara_tasks_list_total", value: 1, sort: "age" });
@@ -64,7 +70,7 @@ describe("STORY-064 · project task list route", () => {
     const seen: string[] = [];
     await expect(
       withTenantContext(fakeClient([], seen), ctx("ws-1"), () =>
-        new TasksService().listProjectTasks("p", taskListQuerySchema.parse({})),
+        new TasksService(new NoopRealtimePublisher()).listProjectTasks("p", taskListQuerySchema.parse({})),
       ),
     ).rejects.toBeInstanceOf(NotFoundError);
     expect(seen.some((q) => q.includes("FROM tasks"))).toBe(false);
@@ -101,7 +107,7 @@ describe("STORY-064 · PATCH /tasks/{id} route", () => {
     const seen: string[] = [];
     await expect(
       withTenantContext(fakeClient([], seen), ctx("ws-1"), () =>
-        new TasksService().updateTask("t", updateTaskRequestSchema.parse({ status: "done" })),
+        new TasksService(new NoopRealtimePublisher()).updateTask("t", updateTaskRequestSchema.parse({ status: "done" })),
       ),
     ).rejects.toBeInstanceOf(ConflictError);
     expect(seen.some((q) => q.includes("FROM tasks"))).toBe(false);
@@ -110,7 +116,7 @@ describe("STORY-064 · PATCH /tasks/{id} route", () => {
   it("an unknown task is a NotFoundError", async () => {
     await expect(
       withTenantContext(fakeClient([], []), ctx("ws-1"), () =>
-        new TasksService().updateTask("t", updateTaskRequestSchema.parse({ priority: 2 })),
+        new TasksService(new NoopRealtimePublisher()).updateTask("t", updateTaskRequestSchema.parse({ priority: 2 })),
       ),
     ).rejects.toBeInstanceOf(NotFoundError);
   });
@@ -132,7 +138,7 @@ describe("STORY-064 · PATCH /tasks/{id} route", () => {
       },
     } as unknown as ClientBase;
     await withTenantContext(client, ctx("ws-1"), () =>
-      new TasksService().updateTask("t", updateTaskRequestSchema.parse({ status: "dismissed", dismiss_reason: "SECRET REASON" })),
+      new TasksService(new NoopRealtimePublisher()).updateTask("t", updateTaskRequestSchema.parse({ status: "dismissed", dismiss_reason: "SECRET REASON" })),
     );
     log.mockRestore();
     expect(logs).toContainEqual({ metric: "nominara_tasks_events_written_total", value: 1, event: "dismissed" });
@@ -206,7 +212,7 @@ describe("STORY-064-C · route wiring and contracts", () => {
         return { rows: [{ critical: "0", high: "0", medium: "0", low: "0", total: "0" }] };
       },
     } as unknown as ClientBase;
-    await withTenantContext(client, ctx("ws-1"), () => new TasksService().createTask("p", createTaskRequestSchema.parse({ title: "SECRET TITLE" })));
+    await withTenantContext(client, ctx("ws-1"), () => new TasksService(new NoopRealtimePublisher()).createTask("p", createTaskRequestSchema.parse({ title: "SECRET TITLE" })));
     log.mockRestore();
     expect(logs).toContainEqual({ metric: "nominara_tasks_created_total", value: 1, origin: "manual" });
     expect(logs.find((l) => (l as { message?: string }).message === "task created")).toEqual({ message: "task created", workspace_id: "ws-1", task_id: "t", project_id: "p" });

@@ -1,3 +1,4 @@
+import { NoopRealtimePublisher } from "../../lib/cache/realtime-publisher.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TasksService } from "./tasks.service.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
@@ -31,7 +32,7 @@ describe("STORY-169 · TasksService.listActionItems", () => {
         }),
       },
     } as never);
-    return new TasksService();
+    return new TasksService(new NoopRealtimePublisher());
   }
 
   beforeEach(() => {
