@@ -132,4 +132,24 @@ describe("STORY-060 · A3 is computed by the rollup handler from parser output",
     expect(thirty).toMatchObject({ sufficient: false, evidence_cells: 3 });
     expect(thirty.suppression_reason).toMatch(/30/);
   }, 120_000);
+
+  it("STORY-062 · a READ never recomputes structure: facts changed after the rollup leave the detail matching the stored row", async () => {
+    for (let i = 0; i < 31; i++) await parse("gemini", await capture("gemini", ANSWER));
+    await rollup();
+    const read = () =>
+      withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => new GeoService().analysis(projectId, "structure", { timeframe: "30d" }));
+    const before = await read();
+    expect(geoStructureDetailSchema.parse(before.detail).total).toBe(31);
+
+    for (let i = 0; i < 5; i++) await parse("gemini", await capture("gemini", ANSWER));
+
+    const stored = (await structureRows()).find((r) => r.window_days === 30);
+    expect(stored.evidence_cells).toBe(31);
+    const after = await read();
+    expect(after.detail).toEqual(before.detail);
+    expect(geoStructureDetailSchema.parse(after.detail).total).toBe(stored.evidence_cells);
+
+    await rollup();
+    expect(geoStructureDetailSchema.parse((await read()).detail).total).toBe(36);
+  }, 120_000);
 });
