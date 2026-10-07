@@ -81,10 +81,14 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
 
   const job = (over: Record<string, unknown> = {}): Job =>
     ({ data: { payload: { projectId, auditId: randomUUID(), trigger: "onboarding", workspaceId, kid: "k1", ...over } } }) as unknown as Job;
-  const run = (j: Job, deps: CrawlAuditDeps): Promise<void> =>
-    createCrawlAuditHandler({ pool: {} as never, env: {} as never }, deps)(db as never, j);
-  const audits = async (): Promise<Record<string, any>[]> => (await db.query("SELECT * FROM aux_audits ORDER BY created_at")).rows;
-  const findings = async (): Promise<Record<string, any>[]> => (await db.query("SELECT * FROM aux_findings ORDER BY created_at")).rows;
+  const run = async (j: Job, deps: CrawlAuditDeps): Promise<void> => {
+    await createCrawlAuditHandler({ pool: {} as never, env: {} as never }, deps)(db as never, j);
+  };
+  // Rows are asserted by column name; a per-column interface would restate the schema.
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const audits = async (): Promise<any[]> => (await db.query("SELECT * FROM aux_audits ORDER BY created_at")).rows;
+  const findings = async (): Promise<any[]> => (await db.query("SELECT * FROM aux_findings ORDER BY created_at")).rows;
+  /* eslint-enable @typescript-eslint/no-explicit-any */
 
   it("NEW-C-9 AC1.1 · is registered as the crawl.audit handler", () => {
     expect(handlerFor("crawl.audit")).toBeDefined();
@@ -179,8 +183,8 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     const all = await findings();
     expect(all).toHaveLength(1);
     expect(all[0]).toMatchObject({ status: "regressed", severity: "medium" });
-    expect(all[0].first_detected_at).toEqual(first.first_detected_at);
-    expect(all[0].regressed_at).not.toBeNull();
+    expect(all[0]!.first_detected_at).toEqual(first.first_detected_at);
+    expect(all[0]!.regressed_at).not.toBeNull();
   });
 
   it("NEW-C-9 AC3.20 · an unreachable robots.txt (our fetch failed) is partial and resolves nothing", async () => {
