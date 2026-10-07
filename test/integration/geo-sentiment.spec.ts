@@ -80,7 +80,7 @@ describe("STORY-061 · A6 sentiment drivers (persisted, read)", () => {
       const url = a.cite ?? "https://reddit.com/r/crm/1";
       await db.query(
         `INSERT INTO citation_facts (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,slot_index,raw_url,normalized_url,url_hash,domain,position_weight)
-         VALUES ($1,$2,$3,$4,$5,$6,1,$7,$7,sha256($7::bytea),$8,1)`,
+         VALUES ($1,$2,$3,$4,$5,$6,1,$7::text,$7::text,sha256(convert_to($7::text,'UTF8')),$8,1)`,
         [workspaceId, projectId, id, randomUUID(), engine, at, url, new URL(url).hostname],
       );
     }
@@ -133,7 +133,7 @@ describe("STORY-061 · A6 sentiment drivers (persisted, read)", () => {
     const d = geoSentimentDetailSchema.parse((await read()).detail);
     expect(d.non_positive_mentions).toBe(1);
     expect(d.mentions[0]!.label).toBe("neutral");
-    expect(d.brand_mentions).toBe(33);
+    expect(d.brand_mentions).toBe(32); // 30 positive + the unevidenced + the neutral; competitor and outside-window do not count
   });
 
   it("#13 · below 30 brand mentions the row is persisted insufficient with its reason and the read has no detail", async () => {
