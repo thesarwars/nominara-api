@@ -13767,6 +13767,21 @@
                                   ],
                                   "additionalProperties": false
                                 }
+                              },
+                              "data_source": {
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "enum": [
+                                      "live",
+                                      "demo",
+                                      "mixed"
+                                    ]
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
                               }
                             },
                             "required": [
@@ -13774,7 +13789,40 @@
                               "label",
                               "entity_type",
                               "color_role",
-                              "points"
+                              "points",
+                              "data_source"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "engines": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "engine_key": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "data_source": {
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "enum": [
+                                      "live",
+                                      "demo",
+                                      "mixed"
+                                    ]
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "engine_key",
+                              "data_source"
                             ],
                             "additionalProperties": false
                           }
@@ -14092,6 +14140,7 @@
                         "granularity",
                         "timeframe",
                         "series",
+                        "engines",
                         "milestones",
                         "annotations",
                         "summary",
@@ -14388,6 +14437,38 @@
                             "minLength": 1
                           }
                         },
+                        "engines": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "engine_key": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "data_source": {
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "enum": [
+                                      "live",
+                                      "demo",
+                                      "mixed"
+                                    ]
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "engine_key",
+                              "data_source"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
                         "prompts": {
                           "type": "array",
                           "items": {
@@ -14553,6 +14634,21 @@
                                           "type": "null"
                                         }
                                       ]
+                                    },
+                                    "data_source": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string",
+                                          "enum": [
+                                            "live",
+                                            "demo",
+                                            "mixed"
+                                          ]
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
                                     }
                                   },
                                   "required": [
@@ -14567,7 +14663,8 @@
                                     "brand_rank_position",
                                     "sov",
                                     "sentiment_label",
-                                    "cache_age_ms"
+                                    "cache_age_ms",
+                                    "data_source"
                                   ],
                                   "additionalProperties": false
                                 }
@@ -14589,6 +14686,7 @@
                         "project_id",
                         "timeframe",
                         "engine_keys",
+                        "engines",
                         "prompts"
                       ],
                       "additionalProperties": false
@@ -18143,6 +18241,21 @@
                                     "type": "null"
                                   }
                                 ]
+                              },
+                              "data_source": {
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "enum": [
+                                      "live",
+                                      "demo",
+                                      "mixed"
+                                    ]
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
                               }
                             },
                             "required": [
@@ -18157,7 +18270,8 @@
                               "metrics",
                               "metrics_delta",
                               "last_captured_at",
-                              "next_run_at"
+                              "next_run_at",
+                              "data_source"
                             ],
                             "additionalProperties": false
                           }
@@ -18413,6 +18527,21 @@
                                   "type": "null"
                                 }
                               ]
+                            },
+                            "data_source": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "enum": [
+                                    "live",
+                                    "demo",
+                                    "mixed"
+                                  ]
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
                             }
                           },
                           "required": [
@@ -18427,7 +18556,39 @@
                             "metrics",
                             "metrics_delta",
                             "last_captured_at",
-                            "next_run_at"
+                            "next_run_at",
+                            "data_source"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "blend": {
+                          "type": "object",
+                          "properties": {
+                            "policy": {
+                              "type": "string",
+                              "const": "all_measured_engines"
+                            },
+                            "live_engines": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "demo_engines": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "mixed_engines": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            }
+                          },
+                          "required": [
+                            "policy",
+                            "live_engines",
+                            "demo_engines",
+                            "mixed_engines"
                           ],
                           "additionalProperties": false
                         }
@@ -18437,7 +18598,8 @@
                         "timeframe",
                         "window",
                         "engines",
-                        "blended"
+                        "blended",
+                        "blend"
                       ],
                       "additionalProperties": false
                     },

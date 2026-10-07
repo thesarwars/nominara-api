@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { blendDisclosureSchema, dataSourceSchema } from "./data-source.schema.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`, `api-specification.md` §3's
 // Analytics row: "per-engine and blended score, presence, share of voice,
@@ -145,6 +146,12 @@ export const scorecardEntrySchema = z
      * is no "next" to compute from a cadence that does not exist.
      */
     next_run_at: z.string().datetime({ offset: true }).nullable(),
+    /**
+     * NEW-A-5 — whether the measured captures behind this entry are real or
+     * demo-seeded. Null when nothing was measured; never "demo" by default.
+     * On the blended entry: the combination across every engine in the blend.
+     */
+    data_source: dataSourceSchema.nullable(),
   })
   .strict();
 
@@ -170,6 +177,8 @@ export const scorecardsResponseSchema = z
      */
     engines: z.array(scorecardEntrySchema),
     blended: scorecardEntrySchema,
+    /** NEW-A-5 — which engines fed `blended`, by provenance. */
+    blend: blendDisclosureSchema,
   })
   .strict();
 
