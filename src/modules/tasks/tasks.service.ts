@@ -1,4 +1,7 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Logger } from "@nestjs/common";
+import type { Task, TaskListQuery, TaskSort } from "../../../contracts/tasks/index.js";
+import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type { ActionItem, ActionItemEffort, ActionItemPrimaryActionKind, ActionItemSource } from "../../../contracts/tasks/index.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -12,6 +15,99 @@ import { currentTenantStore } from "../../tenancy/tenant-context.js";
 // querying `tasks` itself.
 @Injectable()
 export class TasksService {
+  private readonly logger = new Logger(TasksService.name);
+
+  /**
+   * `GET /v1/projects/{id}/tasks` — STORY-064 (step A). api-specification.md
+   * §3: "list grouped by status, ordered by `impact_score`". Read-only.
+   *
+   * THE PROJECT LOOKUP IS THE 404. `projects` is RLS-scoped to the workspace,
+   * so another tenant's project is simply absent (never a 403 that confirms
+   * it exists), and the same `app.current_scope_projects()` predicate
+   * `listActionItems` uses makes an out-of-scope project absent too. (On the
+   * HTTP path RbacGuard's `@ProjectParam` refuses an out-of-scope id with the
+   * 403 naming the permission first; this is the in-depth layer.)
+   *
+   * ORDERING IS A READ, NEVER A STORED POSITION. Every sort is expressed as
+   * five ASCENDING keys (descending measures are negated) so one row-wise
+   * comparison `(k1..k5) > cursor` is a correct keyset predicate for all four
+   * sorts, with `id` as the unique last key. See task-list-query.schema.ts.
+   *
+   * SEVERITY: same derivation as `listActionItems` (aux finding, then source
+   * index gap, whitelisted to four values, else null).
+   */
+  async listProjectTasks(projectId: string, query: TaskListQuery): Promise<Page<Task>> {
+    const client = currentTenantStore()!.client;
+    const project = await client.query<{ id: string }>(
+      `SELECT id FROM projects
+        WHERE id = $1 AND deleted_at IS NULL
+          AND (cardinality(app.current_scope_projects()) = 0 OR id = ANY(app.current_scope_projects()))`,
+      [projectId],
+    );
+    if (project.rows.length === 0) throw new NotFoundError({ message: "no such project" });
+
+    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, 5);
+    const result = await client.query<TaskRow>(
+      `WITH items AS (
+         SELECT
+           t.id, t.short_ref, t.project_id, t.goal_id, t.title, t.description, t.kind, t.origin, t.status,
+           CASE WHEN COALESCE(af.severity, psi.gap_severity) IN ('critical', 'high', 'medium', 'low')
+                THEN COALESCE(af.severity, psi.gap_severity)
+           END AS severity,
+           t.source_finding_id, t.source_domain_id, t.source_displacement_id,
+           t.rule_code, t.priority, t.impact_score, t.effort_band, t.assignee_id, t.due_at,
+           t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at,
+           ${SORT_KEYS[query.sort]}
+         FROM tasks t
+         LEFT JOIN goals g ON g.id = t.goal_id
+         LEFT JOIN aux_findings af ON af.id = t.source_finding_id
+         LEFT JOIN LATERAL (
+           SELECT gap_severity
+             FROM project_source_index
+            WHERE source_domain_id = t.source_domain_id
+              AND project_id = t.project_id
+              AND engine_key = $2
+              AND window_days = $3
+            ORDER BY window_start DESC
+            LIMIT 1
+         ) psi ON t.source_domain_id IS NOT NULL
+         WHERE t.project_id = $1
+           AND t.deleted_at IS NULL
+           AND ($4::text IS NULL OR t.status = $4::text)
+       )
+       SELECT *, k1::text AS k1_key, k2::text AS k2_key, k3::text AS k3_key, k4::text AS k4_key
+         FROM items
+        WHERE $5::float8 IS NULL
+           OR (k1, k2, k3, k4, id) > ($5::float8, $6::float8, $7::float8, $8::timestamptz, $9::uuid)
+        ORDER BY k1, k2, k3, k4, id
+        LIMIT $10`,
+      [
+        projectId,
+        SOURCE_INDEX_ENGINE_KEY,
+        SOURCE_INDEX_WINDOW_DAYS,
+        query.status ?? null,
+        after?.[0] ?? null,
+        after?.[1] ?? null,
+        after?.[2] ?? null,
+        after?.[3] ?? null,
+        after?.[4] ?? null,
+        query.limit + 1,
+      ],
+    );
+
+    incrementCounter("nominara_tasks_list_total", { sort: query.sort });
+    // Workspace/project IDs only — never a task title or description.
+    this.logger.log({
+      message: "project tasks listed",
+      workspace_id: currentTenantStore()!.context.workspaceId,
+      project_id: projectId,
+      sort: query.sort,
+      returned: Math.min(result.rows.length, query.limit),
+    });
+
+    return pageFrom(result.rows, query.limit, toTask, (row) => [row.k1_key, row.k2_key, row.k3_key, row.k4_key, row.id]);
+  }
+
   /**
    * The cross-project action queue. api-specification.md §3:
    * "GET /workspaces/{id}/summary · /action-items — project:read /
@@ -225,7 +321,7 @@ function normalizeEffort(raw: string | null): ActionItemEffort | null {
 }
 
 /** Which evidence table a task traces back to — `tasks.source_*`, aux > source > displacement > content. */
-function deriveSource(row: ActionItemRow): ActionItemSource {
+function deriveSource(row: Pick<ActionItemRow, "source_finding_id" | "source_domain_id" | "source_displacement_id">): ActionItemSource {
   if (row.source_finding_id !== null) return "aux";
   if (row.source_domain_id !== null) return "source";
   if (row.source_displacement_id !== null) return "displacement";
@@ -284,5 +380,85 @@ function toActionItem(row: ActionItemRow): ActionItem {
     effort: normalizeEffort(row.effort_band),
     primary_action: derivePrimaryAction(row),
     created_at: row.created_at.toISOString(),
+  };
+}
+
+/**
+ * The five ascending keys per sort (the fifth is `id`, appended by the query).
+ * Descending measures are negated so ONE row-wise `>` is the keyset predicate
+ * for every sort. Static constants indexed by the validated `TaskSort` enum —
+ * no request value is ever interpolated into SQL.
+ *
+ *   impact   -impact, -priority, 0,            created_at
+ *   priority -priority, -impact, 0,            created_at
+ *   age      0, 0, 0,                          created_at   (oldest first)
+ *   goal     unlinked-flag, goal created epoch, -impact, created_at
+ */
+const SORT_KEYS: Record<TaskSort, string> = {
+  impact: "(-t.impact_score)::float8 AS k1, (-t.priority)::float8 AS k2, 0::float8 AS k3, t.created_at AS k4",
+  priority: "(-t.priority)::float8 AS k1, (-t.impact_score)::float8 AS k2, 0::float8 AS k3, t.created_at AS k4",
+  age: "0::float8 AS k1, 0::float8 AS k2, 0::float8 AS k3, t.created_at AS k4",
+  goal:
+    "(CASE WHEN t.goal_id IS NULL THEN 1 ELSE 0 END)::float8 AS k1, " +
+    "COALESCE(EXTRACT(EPOCH FROM g.created_at), 0)::float8 AS k2, (-t.impact_score)::float8 AS k3, t.created_at AS k4",
+};
+
+interface TaskRow {
+  id: string;
+  short_ref: string;
+  project_id: string;
+  goal_id: string | null;
+  title: string;
+  description: string;
+  kind: string;
+  origin: string;
+  status: string;
+  severity: string | null;
+  source_finding_id: string | null;
+  source_domain_id: string | null;
+  source_displacement_id: string | null;
+  rule_code: string | null;
+  priority: number;
+  impact_score: number;
+  effort_band: string | null;
+  assignee_id: string | null;
+  due_at: Date | null;
+  dismissed_reason: string | null;
+  resurface_at: Date | null;
+  completed_at: Date | null;
+  affected_url: string | null;
+  created_at: Date;
+  updated_at: Date;
+  k1_key: string;
+  k2_key: string;
+  k3_key: string;
+  k4_key: string;
+}
+
+function toTask(row: TaskRow): Task {
+  return {
+    id: row.id,
+    short_ref: row.short_ref,
+    project_id: row.project_id,
+    goal_id: row.goal_id,
+    title: row.title,
+    description: row.description,
+    kind: row.kind as Task["kind"],
+    origin: row.origin as Task["origin"],
+    status: row.status as Task["status"],
+    severity: normalizeSeverity(row.severity),
+    source: deriveSource(row),
+    rule_code: row.rule_code,
+    priority: row.priority,
+    impact_score: row.impact_score,
+    effort: normalizeEffort(row.effort_band),
+    assignee_id: row.assignee_id,
+    due_at: row.due_at?.toISOString() ?? null,
+    dismissed_reason: row.dismissed_reason,
+    resurface_at: row.resurface_at?.toISOString() ?? null,
+    completed_at: row.completed_at?.toISOString() ?? null,
+    affected_url: row.affected_url,
+    created_at: row.created_at.toISOString(),
+    updated_at: row.updated_at.toISOString(),
   };
 }
