@@ -44,3 +44,7 @@ export {
   acceptInvitationParamsSchema,
   type AcceptInvitationParams,
 } from "../../../../contracts/workspaces/accept-invitation-params.schema.js";
+export {
+  workspaceSummaryResponseSchema,
+  type WorkspaceSummaryResponse,
+} from "../../../../contracts/workspaces/workspace-summary-response.schema.js";
