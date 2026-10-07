@@ -1043,4 +1043,259 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
       runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: superuserPool(), log: () => {} }),
     ).rejects.toThrow(DemoSeedRefusedError);
   }, 60_000);
+
+  // ---------------------------------------------------------------------
+  // NEW-A-8 — demo captures for the five non-Gemini engines. Gemini is real
+  // (owner decision); every other engine is demo. `--facts-only` is a MONEY
+  // PATH guard: the STORY-169 wallet grant is irreversible (append-only
+  // ledger), so facts-only must never provision, read-for-write or touch
+  // the wallet or the ledger.
+  // ---------------------------------------------------------------------
+  const BUSINESS_SIX_ENGINES = 6;
+
+  async function createActiveProject(workspaceId: string, slug: string): Promise<string> {
+    const result = await client.query<{ id: string }>(
+      `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, status)
+       VALUES ($1,$2,$3,$4,$5,'active') RETURNING id`,
+      [workspaceId, `Project ${slug}`, slug, `https://${slug}.example`, `${slug}.example`],
+    );
+    return result.rows[0]!.id;
+  }
+
+  async function entitledKeys(projectId: string): Promise<string[]> {
+    const result = await client.query<{ engine_key: string }>(
+      `SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 AND enabled ORDER BY engine_key`,
+      [projectId],
+    );
+    return result.rows.map((row) => row.engine_key);
+  }
+
+  async function captureEngines(projectId: string, marker?: "demo" | "real"): Promise<string[]> {
+    const filter =
+      marker === "demo" ? "AND normalizer_version = 'demo-seed'" : marker === "real" ? "AND normalizer_version <> 'demo-seed'" : "";
+    const result = await client.query<{ engine_key: string }>(
+      `SELECT DISTINCT engine_key FROM answer_captures WHERE project_id = $1 ${filter} ORDER BY engine_key`,
+      [projectId],
+    );
+    return result.rows.map((row) => row.engine_key);
+  }
+
+  /** One REAL (non-demo-marked) Gemini capture, as a live adapter would write it. */
+  async function insertRealGeminiCapture(workspaceId: string, projectId: string): Promise<string> {
+    const prompt = await client.query<{ id: string }>(
+      `INSERT INTO tracked_prompts (workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status)
+       VALUES ($1,$2,'a real customer prompt for gemini',sha256('a real customer prompt for gemini'::bytea),'custom','decision','active')
+       RETURNING id`,
+      [workspaceId, projectId],
+    );
+    const id = randomUUID();
+    await client.query(
+      `INSERT INTO answer_captures
+         (id, workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at, capture_mode, adapter_version,
+          normalizer_version, content_hash, payload, brand_present, citation_count, owned_citation_count, flags, cache_layer, status)
+       VALUES ($1,$2,$3,$4,$5,'gemini',0, now(), 'api','gemini-v1','real-v1', sha256($1::text::bytea), '{}'::jsonb, true, 0, 0, ARRAY[]::text[], 'live','parsed')`,
+      [id, workspaceId, projectId, randomUUID(), prompt.rows[0]!.id],
+    );
+    return id;
+  }
+
+  it("NEW-A-8 #1 · --facts-only --exclude-engines gemini writes demo-marked facts for the other five entitled engines only", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-one");
+    const entitled = await entitledKeys(projectId);
+    expect(entitled).toContain("gemini");
+    expect(entitled).toHaveLength(BUSINESS_SIX_ENGINES);
+
+    await runSeedDemo(
+      { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+
+    expect(await captureEngines(projectId)).toEqual(entitled.filter((key) => key !== "gemini"));
+    expect(await captureEngines(projectId, "real")).toEqual([]);
+    for (const table of ["mention_facts", "citation_facts"]) {
+      const engines = await client.query<{ engine_key: string }>(`SELECT DISTINCT engine_key FROM ${table} WHERE project_id = $1`, [projectId]);
+      expect(engines.rows.map((r) => r.engine_key), table).not.toContain("gemini");
+    }
+  }, 180_000);
+
+  it("NEW-A-8 #2 · --facts-only never provisions a wallet and never writes the ledger", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-two");
+    const seen: string[] = [];
+    const recording = testPool();
+    const pool: SeedDemoPool = {
+      async connect() {
+        const inner = await recording.connect();
+        const original = inner.query.bind(inner) as (...a: unknown[]) => unknown;
+        (inner as unknown as { query: (...a: unknown[]) => unknown }).query = (...a: unknown[]) => {
+          const first = a[0];
+          seen.push(typeof first === "string" ? first : ((first as { text?: string } | undefined)?.text ?? ""));
+          return original(...a);
+        };
+        return inner;
+      },
+      end: () => recording.end(),
+    };
+
+    await runSeedDemo(
+      { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool, log: () => {} },
+      FAST_OPTIONS,
+    );
+
+    const wallets = await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM credit_wallets WHERE workspace_id = $1`, [workspaceId]);
+    expect(Number(wallets.rows[0]!.n)).toBe(0);
+    const ledger = await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM credit_ledger WHERE workspace_id = $1`, [workspaceId]);
+    expect(Number(ledger.rows[0]!.n)).toBe(0);
+    // Not even a statement that names the money tables ran on the tenant connection.
+    expect(seen.filter((sql) => /credit_wallets|credit_ledger/i.test(sql))).toEqual([]);
+  }, 180_000);
+
+  it("NEW-A-8 #2b · --facts-only leaves an EXISTING wallet byte-for-byte untouched (same row version, same ledger)", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-twob");
+    // A prior full seed of ANOTHER project provisioned the wallet.
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    const snapshot = async () => ({
+      wallet: (await client.query(`SELECT xmin::text AS v, * FROM credit_wallets WHERE workspace_id = $1`, [workspaceId])).rows,
+      ledger: (await client.query(`SELECT xmin::text AS v, * FROM credit_ledger WHERE workspace_id = $1 ORDER BY id`, [workspaceId])).rows,
+    });
+    const before = await snapshot();
+    expect(before.wallet).toHaveLength(1);
+
+    await runSeedDemo(
+      { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+    expect(await snapshot()).toEqual(before);
+  }, 240_000);
+
+  it("NEW-A-8 #2c · --facts-only writes no AUX audit, source index, task, created project or demo_seeded_at, and creates no demo projects", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-twoc");
+
+    await runSeedDemo(
+      { workspaceId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+
+    expect(await projectsOf(workspaceId)).toHaveLength(1);
+    for (const table of ["aux_audits", "project_source_index", "tasks"]) {
+      const r = await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM ${table} WHERE project_id = $1`, [projectId]);
+      expect(Number(r.rows[0]!.n), table).toBe(0);
+    }
+    const row = await client.query<{ demo_seeded_at: string | null }>(`SELECT demo_seeded_at FROM projects WHERE id = $1`, [projectId]);
+    expect(row.rows[0]!.demo_seeded_at).toBeNull();
+    expect((await captureEngines(projectId)).length).toBe(BUSINESS_SIX_ENGINES - 1);
+  }, 180_000);
+
+  it("NEW-A-8 #3 · --purge removes only demo-marked rows and never a real Gemini capture, after a facts-only seed", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-three");
+    const realId = await insertRealGeminiCapture(workspaceId, projectId);
+
+    await runSeedDemo(
+      { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+    expect((await captureEngines(projectId, "demo")).length).toBe(BUSINESS_SIX_ENGINES - 1);
+
+    await runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: testPool(), log: () => {} });
+
+    expect(await captureEngines(projectId, "demo")).toEqual([]);
+    const real = await client.query<{ id: string }>(`SELECT id FROM answer_captures WHERE project_id = $1`, [projectId]);
+    expect(real.rows.map((r) => r.id)).toEqual([realId]);
+    // The project itself, and its real prompt, survive.
+    const prompts = await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM tracked_prompts WHERE project_id = $1`, [projectId]);
+    expect(Number(prompts.rows[0]!.n)).toBe(1);
+    expect((await projectsOf(workspaceId))).toHaveLength(1);
+  }, 240_000);
+
+  it("NEW-A-8 #3b · a facts-only seed with --exclude-engines gemini leaves a real Gemini capture and never re-rolls it away", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-threeb");
+    const realId = await insertRealGeminiCapture(workspaceId, projectId);
+
+    await runSeedDemo(
+      { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+    // Re-seed (reset-then-write) must not touch the real row either.
+    await runSeedDemo(
+      { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+    const real = await client.query<{ id: string }>(`SELECT id FROM answer_captures WHERE project_id = $1 AND engine_key = 'gemini'`, [projectId]);
+    expect(real.rows.map((r) => r.id)).toEqual([realId]);
+  }, 240_000);
+
+  it("NEW-A-8 #4 · re-running on the same day produces byte-identical demo rows (ids and run ids aside)", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-four");
+    const dump = async () => {
+      const captures = await client.query(
+        `SELECT engine_key, prompt_id, captured_at, sample_index, capture_mode, adapter_version, normalizer_version, payload,
+                brand_present, brand_rank_position, sov, sentiment_label, sentiment_score, citation_count, owned_citation_count, status
+           FROM answer_captures WHERE project_id = $1 ORDER BY engine_key, prompt_id, captured_at`,
+        [projectId],
+      );
+      const mentions = await client.query(
+        `SELECT engine_key, prompt_id, captured_at, entity_type, entity_label, occurrence_index, prominence, list_position, sentiment_label, answer_form
+           FROM mention_facts WHERE project_id = $1 ORDER BY engine_key, prompt_id, captured_at, entity_type, entity_label, occurrence_index`,
+        [projectId],
+      );
+      return { captures: captures.rows, mentions: mentions.rows };
+    };
+    const args = { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] } as const;
+    await runSeedDemo(args, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    const first = await dump();
+    expect(first.captures.length).toBeGreaterThan(0);
+    await runSeedDemo(args, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    expect(await dump()).toEqual(first);
+  }, 240_000);
+
+  it("NEW-A-8 #5 · an unknown engine key in --exclude-engines is refused before any write", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-five");
+    await expect(
+      runSeedDemo(
+        { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemni"] },
+        { ownerClient: client, pool: testPool(), log: () => {} },
+        FAST_OPTIONS,
+      ),
+    ).rejects.toThrow(/gemni/);
+    expect(await captureEngines(projectId)).toEqual([]);
+  }, 60_000);
+
+  it("NEW-A-8 #6 · --project restricts the seed to that project; another project in the workspace is untouched", async () => {
+    const workspaceId = await createWorkspace("business");
+    const target = await createActiveProject(workspaceId, "a8-six-a");
+    const other = await createActiveProject(workspaceId, "a8-six-b");
+    await runSeedDemo(
+      { workspaceId, projectId: target, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+    expect((await captureEngines(target)).length).toBeGreaterThan(0);
+    expect(await captureEngines(other)).toEqual([]);
+  }, 180_000);
+
+  it("NEW-A-8 #7 · the three-condition guard is unchanged: production and a non-local target are still refused", () => {
+    expect(() =>
+      assertDemoSeedAllowed({ nodeEnv: "production", databaseUrl: "postgres://u:p@localhost/db", databaseUrlPooled: "postgres://u:p@localhost/db", optIn: "1" }),
+    ).toThrow(DemoSeedRefusedError);
+    expect(() =>
+      assertDemoSeedAllowed({ nodeEnv: "development", databaseUrl: "postgres://u:p@db.example.com/db", databaseUrlPooled: "postgres://u:p@localhost/db", optIn: "1" }),
+    ).toThrow(DemoSeedRefusedError);
+    expect(() =>
+      assertDemoSeedAllowed({ nodeEnv: "development", databaseUrl: "postgres://u:p@localhost/db", databaseUrlPooled: "postgres://u:p@localhost/db", optIn: undefined }),
+    ).toThrow(DemoSeedRefusedError);
+  });
 });
