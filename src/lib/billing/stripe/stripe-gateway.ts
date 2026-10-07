@@ -52,12 +52,51 @@ export interface SubscriptionCheckoutInput {
   readonly customerId?: string;
   readonly successUrl: string;
   readonly cancelUrl: string;
+  /**
+   * NEW-D-2 audit — the checkout intent (`subscriptions.pending_checkout.id`),
+   * written to the subscription's metadata so the webhook can find the price
+   * frozen for THIS session. Not a secret and not authority: it is a lookup key.
+   */
+  readonly intentId: string;
+  /**
+   * NEW-D-2 audit — the Stripe `Idempotency-Key`. The same key with the same
+   * body returns the SAME session, so a retry after a crash can recover the
+   * session the crashed request created (and expire it) instead of minting a
+   * second payable one.
+   */
+  readonly idempotencyKey: string;
+}
+
+/**
+ * STORY-076a — everything Stripe needs to host a one-time credit-pack payment.
+ * The price comes from OUR `credit_purchases` row, written before this call; the
+ * client supplies neither a price nor a redirect.
+ */
+export interface CreditPackCheckoutInput {
+  readonly workspaceId: string;
+  /** `credit_purchases.id` — travels as metadata on the session AND the PaymentIntent. */
+  readonly purchaseId: string;
+  readonly packKey: string;
+  readonly productName: string;
+  readonly credits: number;
+  /** Integer minor units, from the purchase row's `numeric(12,2)`. Never a float. */
+  readonly unitAmountCents: number;
+  readonly currency: string;
+  readonly successUrl: string;
+  readonly cancelUrl: string;
 }
 
 export interface HostedSession {
   readonly id: string;
   readonly url: string;
 }
+
+/**
+ * What closing a Checkout session found. `expired`: it can no longer be paid.
+ * `complete`: it was ALREADY paid, and `subscriptionLive` says whether the
+ * subscription it bought is still entitled (so the webhook has yet to apply it).
+ */
+export type ClosedCheckoutSession = { readonly status: "expired" } | { readonly status: "complete"; readonly subscriptionLive: boolean };
 
 export interface StripeGateway {
   /** False when the secret key or the webhook secret is absent; Stripe routes then answer 503. */
@@ -77,6 +116,21 @@ export interface StripeGateway {
    * data touches this system. Throws `StripeUpstreamError`.
    */
   createSubscriptionCheckout(input: SubscriptionCheckoutInput): Promise<HostedSession>;
+
+  /**
+   * Hosted Checkout, mode=payment, for one credit pack. Sets `metadata`
+   * (`workspace_id`, `purchase_id`) on the session AND on the PaymentIntent, so
+   * either event's FRESH fetch names the purchase. The Stripe idempotency key
+   * is the purchase id: a retried call cannot mint a second payable session.
+   * Throws `StripeUpstreamError`.
+   */
+  createCreditPackCheckout(input: CreditPackCheckoutInput): Promise<HostedSession>;
+
+  /**
+   * Makes a Checkout session unpayable, or reports that it already was paid.
+   * Idempotent for an already-expired session. Throws `StripeUpstreamError`.
+   */
+  closeCheckoutSession(sessionId: string): Promise<ClosedCheckoutSession>;
 
   /** Hosted billing portal for an existing customer. Throws `StripeUpstreamError`. */
   createPortalSession(input: { readonly customerId: string; readonly returnUrl: string }): Promise<{ readonly url: string }>;

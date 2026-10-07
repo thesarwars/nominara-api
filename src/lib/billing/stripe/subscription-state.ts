@@ -7,8 +7,41 @@ import type { BillingInterval, ProviderSubscriptionState, SubscriptionStatus } f
 // what makes two events delivered in either order write the same row.
 
 export type DesiredSubscription =
-  | { readonly kind: "write"; readonly state: ProviderSubscriptionState }
-  | { readonly kind: "ignore"; readonly reason: string };
+  | {
+      readonly kind: "write";
+      readonly state: ProviderSubscriptionState;
+      /** The charge that was verified, for an entitled state; null for an ended one. It is what gets frozen on the row. */
+      readonly charge: FrozenCharge | null;
+    }
+  /** `mismatch`: the subscription claims a plan that is not what Stripe charges for it. Refused, and worth an alarm. */
+  | { readonly kind: "ignore"; readonly reason: string; readonly mismatch?: true };
+
+/**
+ * What the plan a subscription CLAIMS (its `plan_key` metadata) costs, from the
+ * `plans` row — the only thing the charged price is checked against. `null` =
+ * no such plan.
+ */
+export interface ClaimedPlanPrice {
+  readonly monthlyCents: number;
+  readonly annualCents: number;
+  /** ISO 4217, any case. */
+  readonly currency: string;
+  /**
+   * NEW-D-2 audit — the charge ADOPTED at checkout, frozen on our side. When
+   * present it is what the plan item is compared with, and the catalog above is
+   * not consulted: a later catalog price change must not freeze every existing
+   * subscription (their Stripe price is the one they signed up at).
+   */
+  readonly frozen?: FrozenCharge;
+}
+
+/** What a subscription is charged: the amount, currency and interval of its plan item. */
+export interface FrozenCharge {
+  readonly unitAmountCents: number;
+  /** ISO 4217, any case. */
+  readonly currency: string;
+  readonly interval: "month" | "year";
+}
 
 /** Statuses under which the customer is entitled to the paid plan. All three are "live" for `ux_subscriptions_active`. */
 const ENTITLED: ReadonlySet<string> = new Set<SubscriptionStatus>(["active", "trialing", "past_due"]);
@@ -64,9 +97,43 @@ export function toCents(price: string): number {
   return Number(match[1]) * 100 + Number((match[2] ?? "").padEnd(2, "0"));
 }
 
+// ⚠ THE PLAN IS WHAT IS CHARGED, NOT WHAT THE METADATA SAYS. `plan_key` is a
+// label our checkout wrote on the subscription; Stripe's billing portal can
+// switch the price without rewriting it (an upgrade charged but never granted,
+// a downgrade that keeps the dearer plan). So an entitled subscription is only
+// reconciled when its plan item's unit amount, currency and interval equal what
+// the claimed plan was priced at WHEN THE CUSTOMER BOUGHT IT (`frozen`), or, for
+// a subscription whose price was never frozen, the catalog price now. Anything
+// else is a `mismatch`: refused, never guessed at. An ended subscription is
+// exempt — it can only take a plan AWAY.
+//
+// ⚠ NEVER THE CATALOG ONCE THERE IS A FROZEN CHARGE. Existing customers keep the
+// Stripe price they signed up at, so comparing them with today's catalog would
+// call every one of them a mismatch after the first price change.
+function planItemCharge(planItem: Record<string, unknown> | undefined): FrozenCharge | null {
+  if (planItem === undefined) return null;
+  const price = planItem.price;
+  if (!isRecord(price) || !isRecord(price.recurring)) return null;
+  const interval = price.recurring.interval;
+  const intervalCount = price.recurring.interval_count;
+  if (interval !== "month" && interval !== "year") return null;
+  if (intervalCount !== undefined && intervalCount !== 1) return null;
+  if (planItem.quantity !== undefined && planItem.quantity !== 1) return null;
+  if (typeof price.unit_amount !== "number" || typeof price.currency !== "string") return null;
+  return { unitAmountCents: price.unit_amount, currency: price.currency, interval };
+}
+
+function chargedPriceMatches(charged: FrozenCharge | null, claimed: ClaimedPlanPrice | null): boolean {
+  if (claimed === null || charged === null) return false;
+  if (charged.currency.toLowerCase() !== (claimed.frozen?.currency ?? claimed.currency).trim().toLowerCase()) return false;
+  if (claimed.frozen !== undefined) return charged.interval === claimed.frozen.interval && charged.unitAmountCents === claimed.frozen.unitAmountCents;
+  return charged.unitAmountCents === (charged.interval === "year" ? claimed.annualCents : claimed.monthlyCents);
+}
+
 export function desiredFromStripeSubscription(
   raw: Readonly<Record<string, unknown>>,
   metadata: Readonly<Record<string, string>>,
+  claimedPlan: ClaimedPlanPrice | null,
 ): DesiredSubscription {
   const status = typeof raw.status === "string" ? raw.status : "";
   if (status === "incomplete") return { kind: "ignore", reason: "subscription is incomplete: payment has not been taken" };
@@ -80,12 +147,18 @@ export function desiredFromStripeSubscription(
   if (customerId === null || subscriptionId === null) return { kind: "ignore", reason: "subscription carries no customer or id" };
 
   const lines = items(raw);
-  const first = lines[0];
+  // The item Checkout created for the plan itself; add-on items (STORY-076b) are other lines.
+  const first = lines.find((line) => productKind(line) === "plan");
+
+  const charge = planItemCharge(first);
+  if (ENTITLED.has(status) && !chargedPriceMatches(charge, claimedPlan)) {
+    return { kind: "ignore", mismatch: true, reason: "the price charged does not match the plan the subscription claims" };
+  }
 
   // API versions from 2025-03-31 moved the period onto the items; older ones
   // carry it on the subscription. Either way it is read from the fetch.
-  const periodStart = seconds(raw.current_period_start) ?? seconds(first?.current_period_start);
-  const periodEnd = seconds(raw.current_period_end) ?? seconds(first?.current_period_end);
+  const periodStart = seconds(raw.current_period_start) ?? seconds((first ?? lines[0])?.current_period_start);
+  const periodEnd = seconds(raw.current_period_end) ?? seconds((first ?? lines[0])?.current_period_end);
   if (periodStart === null || periodEnd === null) return { kind: "ignore", reason: "subscription carries no billing period" };
 
   // The interval Stripe actually charges beats the metadata we wrote at checkout.
@@ -106,6 +179,8 @@ export function desiredFromStripeSubscription(
   const entitled = ENTITLED.has(status);
   return {
     kind: "write",
+    // Verified above for an entitled state, so it is exactly what gets frozen on the row.
+    charge: entitled ? charge : null,
     state: {
       provider: "stripe",
       providerCustomerId: customerId,

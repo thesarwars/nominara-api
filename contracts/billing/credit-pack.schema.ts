@@ -24,3 +24,9 @@ export const creditPackKeyParamSchema = z.string().min(1).max(64);
 
 export type CreditPack = z.infer<typeof creditPackSchema>;
 export type CreditPackListQuery = z.infer<typeof creditPackListQuerySchema>;
+
+// STORY-076a — the catalog is a handful of rows, so the response is the array
+// itself (the ledger's precedent), not a cursor page. `creditPackListQuerySchema`
+// stays for the day the catalog outgrows one response.
+export const creditPackListResponseSchema = z.array(creditPackSchema);
+export type CreditPackListResponse = z.infer<typeof creditPackListResponseSchema>;

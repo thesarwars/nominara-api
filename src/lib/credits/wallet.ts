@@ -361,6 +361,8 @@ export interface PurchasableOption {
   readonly credits: number;
   readonly priceUsd: string;
   readonly currency: string;
+  /** Lowest plan that may buy it; null = every tier. */
+  readonly minPlanKey: string | null;
 }
 
 /**
@@ -379,8 +381,9 @@ export async function purchasableOptions(tx: ClientBase, workspaceId: string): P
     credits: string;
     price_usd: string;
     currency: string;
+    min_plan_key: string | null;
   }>(
-    `SELECT p.key, p.display_name, p.credits::text, p.price_usd::text, p.currency
+    `SELECT p.key, p.display_name, p.credits::text, p.price_usd::text, p.currency, p.min_plan_key
        FROM credit_packs p
        JOIN workspaces w ON w.id = $1
        JOIN plans workspace_plan ON workspace_plan.key = w.plan_key
@@ -396,6 +399,7 @@ export async function purchasableOptions(tx: ClientBase, workspaceId: string): P
     credits: Number(row.credits),
     priceUsd: row.price_usd,
     currency: row.currency,
+    minPlanKey: row.min_plan_key,
   }));
 }
 

@@ -51,6 +51,8 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       // NEW-E-1 — second post-0006 tenant table (scheduled_report_deliveries).
       "0051_track_e_sharing",
       "0052_track_e_sharing_validate",
+      // NEW-D-2 checkpoint-1 — third post-0006 tenant table (stripe_subscription_syncs).
+      "0074_stripe_subscription_syncs",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");

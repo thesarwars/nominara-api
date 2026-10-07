@@ -2,6 +2,8 @@ import Stripe from "stripe";
 import {
   StripeSignatureError,
   StripeUpstreamError,
+  type ClosedCheckoutSession,
+  type CreditPackCheckoutInput,
   type FetchedStripeObject,
   type HostedSession,
   type StripeGateway,
@@ -91,14 +93,82 @@ export class StripeHttpGateway implements StripeGateway {
         // The workspace is found from THIS metadata on the re-fetched
         // subscription — never from an event payload.
         subscription_data: {
-          metadata: { workspace_id: input.workspaceId, plan_key: input.planKey, billing_interval: input.billingInterval },
+          metadata: {
+            workspace_id: input.workspaceId,
+            plan_key: input.planKey,
+            billing_interval: input.billingInterval,
+            // The lookup key for the price frozen at checkout (not authority).
+            checkout_intent_id: input.intentId,
+          },
         },
         metadata: { workspace_id: input.workspaceId },
         success_url: input.successUrl,
         cancel_url: input.cancelUrl,
-      });
+      }, { idempotencyKey: input.idempotencyKey });
       if (typeof session.url !== "string") throw new StripeUpstreamError(undefined);
       return { id: session.id, url: session.url };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async createCreditPackCheckout(input: CreditPackCheckoutInput): Promise<HostedSession> {
+    const client = this.requireClient();
+    try {
+      const metadata = { workspace_id: input.workspaceId, purchase_id: input.purchaseId, pack_key: input.packKey };
+      const session = await client.checkout.sessions.create(
+        {
+          mode: "payment",
+          client_reference_id: input.workspaceId,
+          line_items: [
+            {
+              quantity: 1,
+              price_data: {
+                currency: input.currency.toLowerCase(),
+                unit_amount: input.unitAmountCents,
+                product_data: { name: input.productName, metadata: { nominara_kind: "credit_pack" } },
+              },
+            },
+          ],
+          // Both objects carry the ids, so payment_intent.* events resolve the
+          // purchase from their own fresh fetch.
+          payment_intent_data: { metadata },
+          metadata,
+          success_url: input.successUrl,
+          cancel_url: input.cancelUrl,
+        },
+        { idempotencyKey: `credit-pack-${input.purchaseId}` },
+      );
+      if (typeof session.url !== "string") throw new StripeUpstreamError(undefined);
+      return { id: session.id, url: session.url };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async closeCheckoutSession(sessionId: string): Promise<ClosedCheckoutSession> {
+    const client = this.requireClient();
+    try {
+      const expand = { expand: ["subscription"] };
+      let session = await client.checkout.sessions.retrieve(sessionId, expand);
+      if (session.status === "open") {
+        try {
+          session = await client.checkout.sessions.expire(sessionId, expand);
+        } catch (error) {
+          // Paid or expired between the read and the expire: the truth is on the session.
+          if (!(error instanceof Stripe.errors.StripeInvalidRequestError)) throw error;
+          session = await client.checkout.sessions.retrieve(sessionId, expand);
+        }
+      }
+      if (session.status === "expired") return { status: "expired" };
+      if (session.status === "complete") {
+        const subscription = session.subscription;
+        const status = subscription !== null && typeof subscription === "object" ? subscription.status : undefined;
+        // Unknown means live: this answer blocks a second purchase, so doubt blocks.
+        return { status: "complete", subscriptionLive: !(status === "canceled" || status === "incomplete_expired" || status === "unpaid" || status === "paused") };
+      }
+      // Still open after an expire that did not throw: it was not closed.
+      throw new StripeUpstreamError(undefined);
     } catch (error) {
       throw this.asUpstream(error);
     }

@@ -162,6 +162,10 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
     );
     subscriptionIds.push(result.rows[0]!.id);
   }
+  // NEW-D-2 checkpoint-1 (migration 0074) — a stale-fetch mark per subscription.
+  for (let i = 0; i < R; i++) {
+    await client.query("INSERT INTO stripe_subscription_syncs (workspace_id, stripe_subscription_id, fetch_started_at) VALUES ($1, $2, now())", [workspaceId, `sub_${label}_${i}`]);
+  }
   // credit_wallets: PRIMARY KEY (workspace_id) alone — structurally ONE row per tenant.
   await client.query("INSERT INTO credit_wallets (workspace_id, cycle_start, cycle_end) VALUES ($1, CURRENT_DATE, CURRENT_DATE + INTERVAL '30 days')", [
     workspaceId,

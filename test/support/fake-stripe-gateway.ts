@@ -1,8 +1,10 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import {
   StripeSignatureError,
+  StripeUpstreamError,
   type FetchedStripeObject,
   type StripeGateway,
+  type CreditPackCheckoutInput,
   type HostedSession,
   type StripeObjectKind,
   type SubscriptionCheckoutInput,
@@ -55,11 +57,54 @@ export class FakeStripeGateway implements StripeGateway {
 
   readonly checkouts: SubscriptionCheckoutInput[] = [];
   readonly portals: Array<{ customerId: string; returnUrl: string }> = [];
+  /** Session ids closed through `closeCheckoutSession`, in call order. */
+  readonly expired: string[] = [];
+  /** Sessions Stripe reports as already paid, with whether their subscription is still live. */
+  readonly completedSessions = new Map<string, { subscriptionLive: boolean }>();
 
-  createSubscriptionCheckout(input: SubscriptionCheckoutInput): Promise<HostedSession> {
+  closeCheckoutSession(sessionId: string): Promise<{ status: "expired" } | { status: "complete"; subscriptionLive: boolean }> {
     if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
+    const completed = this.completedSessions.get(sessionId);
+    if (completed !== undefined) return Promise.resolve({ status: "complete", subscriptionLive: completed.subscriptionLive });
+    this.expired.push(sessionId);
+    return Promise.resolve({ status: "expired" });
+  }
+
+  /**
+   * NEW-D-2 audit — runs AFTER Stripe created a session and BEFORE the call
+   * returns to the API: the instant a crash (a killed pod, a dropped database
+   * connection) strands a payable session the API never recorded.
+   */
+  onSessionCreated: (() => Promise<void>) | undefined;
+  /** Sessions by Idempotency-Key, like Stripe: the same key returns the SAME session and creates nothing. */
+  private readonly sessionsByKey = new Map<string, { session: HostedSession; body: string }>();
+
+  async createSubscriptionCheckout(input: SubscriptionCheckoutInput): Promise<HostedSession> {
+    if (this.failFetchWith !== undefined) throw this.failFetchWith;
+    if (input.idempotencyKey !== undefined) {
+      const replay = this.sessionsByKey.get(input.idempotencyKey);
+      // Stripe refuses a reused key whose parameters differ (idempotency_error, 400).
+      if (replay !== undefined) {
+        if (replay.body !== JSON.stringify(input)) throw new StripeUpstreamError(400);
+        return replay.session;
+      }
+    }
     this.checkouts.push(input);
-    return Promise.resolve({ id: `cs_test_${String(this.checkouts.length)}`, url: `https://checkout.stripe.test/c/pay/cs_test_${String(this.checkouts.length)}` });
+    const session = { id: `cs_test_${String(this.checkouts.length)}`, url: `https://checkout.stripe.test/c/pay/cs_test_${String(this.checkouts.length)}` };
+    if (input.idempotencyKey !== undefined) this.sessionsByKey.set(input.idempotencyKey, { session, body: JSON.stringify(input) });
+    await this.onSessionCreated?.();
+    return session;
+  }
+
+  /** STORY-076a — credit-pack Checkout sessions created, in call order. */
+  readonly packCheckouts: CreditPackCheckoutInput[] = [];
+
+  async createCreditPackCheckout(input: CreditPackCheckoutInput): Promise<HostedSession> {
+    if (this.failFetchWith !== undefined) throw this.failFetchWith;
+    this.packCheckouts.push(input);
+    const session = { id: `cs_pack_${String(this.packCheckouts.length)}`, url: `https://checkout.stripe.test/c/pay/cs_pack_${String(this.packCheckouts.length)}` };
+    await this.onSessionCreated?.();
+    return session;
   }
 
   createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }> {
