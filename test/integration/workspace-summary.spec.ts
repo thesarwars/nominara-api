@@ -51,7 +51,7 @@ describe("NEW-B-2 · WorkspaceSummaryService — real SQL", () => {
     await client.end();
   });
 
-  async function inTenant<T>(context: TenantContext, fn: (queries: () => number) => Promise<T>): Promise<T> {
+  async function inTenant<T>(context: TenantContext, fn: (queries: () => number, conn: Client) => Promise<T>): Promise<T> {
     const app = new Client({
       host: container.getHost(),
       port: container.getMappedPort(5432),
@@ -68,7 +68,7 @@ describe("NEW-B-2 · WorkspaceSummaryService — real SQL", () => {
           count += 1;
           return original(...a);
         };
-        return await fn(() => count);
+        return await fn(() => count, app);
       });
     } finally {
       await app.end();
@@ -166,6 +166,24 @@ describe("NEW-B-2 · WorkspaceSummaryService — real SQL", () => {
       return n();
     });
     expect(bigCount).toBe(smallCount);
+  });
+
+  it("the tenant connection is the RLS-bound runtime role, and RLS alone hides another workspace's rows", async () => {
+    const mine = await createWorkspace();
+    const theirs = await createWorkspace();
+    await createProject(mine);
+    await createProject(theirs);
+    const seen = await inTenant(CTX(mine), async (_n, conn) => {
+      const who = await conn.query<{ u: string; super: boolean; bypass: boolean }>(
+        `SELECT current_user AS u, r.rolsuper AS super, r.rolbypassrls AS bypass
+           FROM pg_roles r WHERE r.rolname = current_user`,
+      );
+      // No workspace_id filter: only RLS can narrow this.
+      const rows = await conn.query<{ workspace_id: string }>("SELECT workspace_id FROM projects");
+      return { who: who.rows[0]!, workspaces: new Set(rows.rows.map((r) => r.workspace_id)) };
+    });
+    expect(seen.who).toEqual({ u: "nominara_app", super: false, bypass: false });
+    expect([...seen.workspaces]).toEqual([mine]);
   });
 
   it("a workspace with no projects returns an empty matrix and no engines (the zero-project layout)", async () => {

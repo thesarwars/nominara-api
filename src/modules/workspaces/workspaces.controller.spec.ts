@@ -1,6 +1,8 @@
 import { NotFoundException } from "@nestjs/common";
 import { describe, expect, it, vi } from "vitest";
 import { WorkspacesController } from "./workspaces.controller.js";
+import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.decorator.js";
+import { SCOPED_BY_QUERY_KEY } from "../../api/decorators/scoped-by-query.decorator.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 
 // STORY-169 review (minor) — `listActionItems` was the only route in this
@@ -70,5 +72,15 @@ describe("NEW-B-2 · WorkspacesController.summary — assertMatchesTenant", () =
     const summary = vi.fn().mockResolvedValue({ ok: true });
     await expect(controllerWith(summary).summary(req, "ws-real")).resolves.toEqual({ ok: true });
     expect(summary).toHaveBeenCalledWith("ws-real");
+  });
+});
+
+describe("NEW-B-2 · WorkspacesController.summary — route metadata", () => {
+  it("requires project:read (a swap to another permission must fail this test)", () => {
+    expect(Reflect.getMetadata(REQUIRE_PERMISSION_KEY, WorkspacesController.prototype.summary)).toBe("project:read");
+  });
+
+  it("opts in to ScopedByQuery, so the project scope is applied inside the query", () => {
+    expect(Reflect.getMetadata(SCOPED_BY_QUERY_KEY, WorkspacesController.prototype.summary)).toBe(true);
   });
 });
