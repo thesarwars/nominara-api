@@ -46,7 +46,7 @@ export function categoryPredicate(category: Category): { include?: string[]; exc
 }
 
 function utcMidnight(day: string): number {
-  const ms = Date.parse(`${day}T00:00:00.000Z`);
+  const ms = Date.parse(day + "T00:00:00.000Z");
   // Date.parse accepts nothing for 2026-02-31 in some engines and rolls it over in others; the round trip settles it.
   if (Number.isNaN(ms) || new Date(ms).toISOString().slice(0, 10) !== day) {
     throw new ValidationFailedError({
