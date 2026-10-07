@@ -236,4 +236,24 @@ describe("STORY-064 · TasksService.updateTask — real SQL", () => {
     expect((await events(t)).map((e) => e.event).sort()).toEqual(["dismissed", "priority_changed"]);
     expect(await openCount(p)).toBe(1);
   });
+
+  // Two STATUS changes touch the same column, so only the row lock (FOR UPDATE)
+  // makes the second see the first's result. Without it both record from_value
+  // 'todo'. Looped so the race is actually hit.
+  it("concurrent status changes form a from/to chain, ordered by occurred_at, ending at the final status", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+    for (let i = 0; i < 10; i++) {
+      const t = await createTask(ws, p);
+      await Promise.all([
+        patch(CTX(ws, actor), t, { status: "in_progress" }),
+        patch(CTX(ws, actor), t, { status: "dismissed", dismiss_reason: "x" }),
+      ]);
+      const ev = await events(t); // ORDER BY occurred_at, id
+      expect(ev).toHaveLength(2);
+      expect(ev[0]!.from_value).toBe("todo");
+      expect(ev[0]!.to_value).toBe(ev[1]!.from_value);
+      const final = (await client.query<{ status: string }>("SELECT status FROM tasks WHERE id = $1", [t])).rows[0]!.status;
+      expect(ev[1]!.to_value).toBe(final);
+    }
+  });
 });

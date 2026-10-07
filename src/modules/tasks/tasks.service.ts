@@ -224,8 +224,8 @@ export class TasksService {
       await client.query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $1`, params);
       for (const e of events) {
         await client.query(
-          `INSERT INTO task_events (workspace_id, task_id, actor_id, actor_type, event, from_value, to_value, payload)
-           VALUES (app.current_workspace(), $1, $2, 'user', $3, $4, $5, $6::jsonb)`,
+          `INSERT INTO task_events (workspace_id, task_id, actor_id, actor_type, event, from_value, to_value, payload, occurred_at)
+           VALUES (app.current_workspace(), $1, $2, 'user', $3, $4, $5, $6::jsonb, clock_timestamp())`,
           [taskId, actorId, e.event, e.from, e.to, e.payload === undefined ? null : JSON.stringify(e.payload)],
         );
         incrementCounter("nominara_tasks_events_written_total", { event: e.event });
