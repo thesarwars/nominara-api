@@ -24,6 +24,7 @@ describe("NEW-C-2 · track and untrack a competitor", () => {
   let projectId: string;
   let otherProjectId: string;
   let promptId: string;
+  let actorId: string;
   let cap = 5;
   let enqueued: { name: string; workspaceId: string; payload: Record<string, unknown>; options: { idempotencyKey: string } }[];
 
@@ -60,6 +61,10 @@ describe("NEW-C-2 · track and untrack a competitor", () => {
     );
     cap = 5;
     enqueued = [];
+    await db.query("TRUNCATE users CASCADE");
+    actorId = (
+      await db.query("INSERT INTO users (email, status) VALUES ($1, 'active') RETURNING id", [`a-${randomUUID()}@example.com`])
+    ).rows[0].id;
     workspaceId = randomUUID();
     projectId = randomUUID();
     otherProjectId = randomUUID();
@@ -102,12 +107,12 @@ describe("NEW-C-2 · track and untrack a competitor", () => {
   }
 
   const track = (body: { name: string; root_domain?: string; aliases?: string[] }, project = projectId) =>
-    withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
-      service.track(workspaceId, randomUUID(), project, body),
+    withTenantContext(db, { workspaceId, actorId }, () =>
+      service.track(workspaceId, actorId, project, body),
     );
   const untrack = (competitorId: string, project = projectId) =>
-    withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
-      service.untrack(workspaceId, randomUUID(), project, competitorId),
+    withTenantContext(db, { workspaceId, actorId }, () =>
+      service.untrack(workspaceId, actorId, project, competitorId),
     );
 
   async function counts() {
@@ -233,7 +238,7 @@ describe("NEW-C-2 · track and untrack a competitor", () => {
 
     const error = await track({ name: "Pipedrive" }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(EntitlementExceededError);
-    expect((error as EntitlementExceededError).details).toEqual({ key: "competitors.max_per_project", limit: 2, current: 2 });
+    expect((error as { details: unknown }).details).toEqual({ key: "competitors.max_per_project", limit: 2, current: 2 });
     expect((await db.query("SELECT count(*)::int AS n FROM competitors")).rows[0].n).toBe(2);
     expect((await db.query("SELECT entity_type FROM mention_facts")).rows).toEqual([{ entity_type: "other" }]);
     expect((await db.query("SELECT count(*)::int AS n FROM milestones")).rows[0].n).toBe(0);
