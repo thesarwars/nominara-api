@@ -1,12 +1,14 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
+import type { ClientBase, Pool } from "pg";
 import type { CreditPack, CreditPackPurchaseResponse } from "../../../contracts/billing/index.js";
 import { DegradedError, FeatureNotInPlanError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { loadEnv } from "../../config/env.js";
+import { PG_POOL } from "../../db/pg-pool.js";
 import { STRIPE_GATEWAY, StripeUpstreamError, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { purchasableOptions } from "../../lib/credits/wallet.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 
 // STORY-076a / STORY-076 AC1-AC2 — the credit-pack catalog and the purchase.
 //
@@ -16,16 +18,28 @@ import { currentTenantStore } from "../../tenancy/tenant-context.js";
 // count are read from OUR catalog row at this moment and frozen on the purchase
 // row — the webhook credits from that row, never from anything Stripe sends.
 //
-// ⚠ THE SAME KNOWN DEVIATION AS CHECKOUT (billing-subscription.service.ts): the
-// request's transaction is open while Stripe answers (one call, bounded at 10 s).
-// If Stripe fails the transaction rolls back, so a failed attempt leaves no
-// `pending` row behind.
+// ⚠ THE `pending` ROW IS COMMITTED BEFORE STRIPE IS ASKED FOR A SESSION, IN ITS
+// OWN SHORT TRANSACTION. The request's transaction commits only after the
+// response is built, so a row inserted in it could vanish (a pod killed mid-
+// deploy, a dropped connection, a failing audit write) while the Stripe session
+// it names stayed payable: the customer charged, the webhook finding no
+// purchase, nothing credited and nothing to reconcile. An orphaned `pending` row
+// is harmless; an orphaned payable session is not, so the row goes first.
+//
+// A Stripe failure marks the row `failed` rather than deleting it: a timeout
+// does not prove the session was not created, and a `failed` purchase still
+// settles if its session is paid (StripeCreditPackHandler: pending|failed ->
+// succeeded). The request's transaction is still open while Stripe answers
+// (one call, bounded at 10 s), the known KAD-06 deviation shared with checkout.
 
 @Injectable()
 export class CreditPacksService {
   private readonly logger = new Logger(CreditPacksService.name);
 
-  constructor(@Inject(STRIPE_GATEWAY) private readonly gateway: StripeGateway) {}
+  constructor(
+    @Inject(STRIPE_GATEWAY) private readonly gateway: StripeGateway,
+    @Inject(PG_POOL) private readonly pool: Pool,
+  ) {}
 
   /** `GET /v1/billing/credit-packs` — already filtered to the caller's tier, in SQL. */
   async list(): Promise<CreditPack[]> {
@@ -68,12 +82,15 @@ export class CreditPacksService {
       throw new FeatureNotInPlanError({ details: { key: `credit_pack.${pack.key}`, min_plan: pack.min_plan_key ?? "starter" } });
     }
 
-    const inserted = await client.query<{ id: string }>(
-      `INSERT INTO credit_purchases (workspace_id, pack_key, credits, amount_usd, source, status, purchased_by)
-       VALUES ($1, $2, $3, $4::numeric, 'manual', 'pending', $5) RETURNING id`,
-      [workspaceId, pack.key, pack.credits, pack.price_usd, actorId],
-    );
-    const purchaseId = inserted.rows[0]!.id;
+    // Committed on its OWN connection before Stripe is called (see the header).
+    const purchaseId = await this.inOwnTransaction(workspaceId, actorId, async (tx) => {
+      const inserted = await tx.query<{ id: string }>(
+        `INSERT INTO credit_purchases (workspace_id, pack_key, credits, amount_usd, source, status, purchased_by)
+         VALUES ($1, $2, $3, $4::numeric, 'manual', 'pending', $5) RETURNING id`,
+        [workspaceId, pack.key, pack.credits, pack.price_usd, actorId],
+      );
+      return inserted.rows[0]!.id;
+    });
 
     const returnBase = new URL("/settings/plan", loadEnv().WEBAUTHN_ORIGIN);
     const withState = (state: "success" | "cancel"): string => {
@@ -100,9 +117,32 @@ export class CreditPacksService {
     } catch (error) {
       if (!(error instanceof StripeUpstreamError)) throw error;
       incrementCounter("nominara_billing_credit_pack_purchase_total", { outcome: "upstream_error" });
+      await this.markFailed(workspaceId, actorId, purchaseId);
       // Status code only: Stripe's own text can echo request details.
       this.logger.error({ message: "stripe credit pack checkout failed", workspace_id: workspaceId, status: error.statusCode });
       throw new DegradedError({ message: "payment provider is unavailable" });
+    }
+  }
+
+  /** No session is expected to exist, but a timeout cannot prove it: `failed` still settles if it is paid. */
+  private async markFailed(workspaceId: string, actorId: string, purchaseId: string): Promise<void> {
+    try {
+      await this.inOwnTransaction(workspaceId, actorId, async (tx) => {
+        await tx.query("UPDATE credit_purchases SET status = 'failed' WHERE id = $1 AND status = 'pending'", [purchaseId]);
+      });
+    } catch {
+      // The row stays `pending`, which settles all the same; the Stripe failure is what the caller must see.
+      this.logger.error({ message: "could not mark an unsent credit pack purchase failed", workspace_id: workspaceId, purchase_id: purchaseId });
+    }
+  }
+
+  /** A short transaction on its own pooled connection, so it commits independently of the request's. */
+  private async inOwnTransaction<T>(workspaceId: string, actorId: string, fn: (tx: ClientBase) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      return await withTenantContext(client, { workspaceId, actorId }, fn);
+    } finally {
+      client.release();
     }
   }
 

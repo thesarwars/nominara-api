@@ -89,7 +89,21 @@ export class StripeCreditPackHandler implements StripeEventHandler {
       )
     ).rows[0];
     if (purchase === undefined) {
-      this.logger.warn({ message: "credit pack settlement names no purchase of this workspace", event_id: event.id, workspace_id: workspaceId });
+      if (outcome === "paid") {
+        // ⚠ MONEY WAS TAKEN AND NOTHING CAN BE CREDITED. The purchase route
+        // commits its row before it asks Stripe for a session, so this should
+        // be unreachable; if it is not, a person must reconcile or refund it.
+        incrementCounter("nominara_billing_credit_pack_orphan_payment_total", {});
+        this.logger.error({
+          message: "credit pack PAID for a purchase this workspace has no record of: nothing credited, reconcile or refund at Stripe",
+          event_id: event.id,
+          workspace_id: workspaceId,
+          purchase_id: purchaseId.data,
+          payment_intent_id: paymentIntentId,
+        });
+      } else {
+        this.logger.warn({ message: "credit pack settlement names no purchase of this workspace", event_id: event.id, workspace_id: workspaceId });
+      }
       this.record(workspaceId, purchaseId.data, event.id, "unknown_purchase");
       return;
     }

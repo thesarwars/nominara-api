@@ -18,6 +18,7 @@ import { WorkspacesService } from "../../src/modules/workspaces/workspaces.servi
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
+import { whileRequestConnectionIsKilledAfterStripeCreatesASession } from "../support/kill-request-connection.js";
 import { dataOf } from "../support/envelope.js";
 import { FakeStripeGateway, signFakeStripePayload } from "../support/fake-stripe-gateway.js";
 
@@ -208,21 +209,17 @@ describe("STORY-076a · credit packs", () => {
     gateway.failFetchWith = undefined;
     gateway.configured = false;
     expect((await purchase(owner, "starter_vault")).statusCode).toBe(503);
-    expect((await harness.db().query("SELECT 1 FROM credit_purchases WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(0);
+    // The row is committed before Stripe is called (audit blocker), so the outage leaves it `failed`, never `pending`.
+    expect((await harness.db().query("SELECT 1 FROM credit_purchases WHERE workspace_id = $1 AND status = 'pending'", [workspaceId])).rowCount).toBe(0);
   });
 
   // ---- NEW-D-2 audit · a payable session must never outlive its purchase row ----------------------
 
-  /** The request's own connection: the only backend idle IN a transaction while the API waits on Stripe. */
-  const killIdleRequestBackends = async (): Promise<void> => {
-    await harness.db().query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction' AND pid <> pg_backend_pid()");
-  };
+  const dyingRequest = <T>(fn: () => Promise<T>): Promise<T> => whileRequestConnectionIsKilledAfterStripeCreatesASession(harness.app(), harness.db(), gateway, fn);
 
   it("AUDIT BLOCKER (PROBE-A) · a request that dies after Stripe created the session leaves a purchase row the webhook can still settle", async () => {
     const { workspaceId, owner } = await newWorkspace();
-    gateway.onSessionCreated = killIdleRequestBackends;
-    const res = await purchase(owner, "starter_vault");
-    gateway.onSessionCreated = undefined;
+    const res = await dyingRequest(() => purchase(owner, "starter_vault"));
     expect(res.statusCode, "the request itself failed").toBeGreaterThanOrEqual(500);
     expect(gateway.packCheckouts, "Stripe did create a payable session").toHaveLength(1);
     const purchaseId = gateway.packCheckouts[0]!.purchaseId;

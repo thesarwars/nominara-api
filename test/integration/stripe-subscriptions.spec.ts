@@ -16,6 +16,7 @@ import { WorkspacesService } from "../../src/modules/workspaces/workspaces.servi
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
+import { whileRequestConnectionIsKilledAfterStripeCreatesASession } from "../support/kill-request-connection.js";
 import { dataOf } from "../support/envelope.js";
 import { FakeStripeGateway, signFakeStripePayload } from "../support/fake-stripe-gateway.js";
 
@@ -743,17 +744,12 @@ describe("STORY-075a · subscriptions", () => {
 
   // ---- NEW-D-2 audit · a checkout whose request dies is not a second payable session --------------
 
-  /** The request's own connection: the only backend idle IN a transaction while the API waits on Stripe. */
-  const killIdleRequestBackends = async (): Promise<void> => {
-    await harness.db().query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction' AND pid <> pg_backend_pid()");
-  };
+  const dyingRequest = <T>(fn: () => Promise<T>): Promise<T> => whileRequestConnectionIsKilledAfterStripeCreatesASession(harness.app(), harness.db(), gateway, fn);
   const payable = (): number => gateway.checkouts.length - new Set(gateway.expired).size;
 
   it("AUDIT MAJOR (PROBE-B) · the retry after a request that died once Stripe had created the session expires it: one payable session, not two", async () => {
     const { owner } = await newWorkspace();
-    gateway.onSessionCreated = killIdleRequestBackends;
-    const first = await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
-    gateway.onSessionCreated = undefined;
+    const first = await dyingRequest(() => post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" }));
     expect(first.statusCode, "the first request failed").toBeGreaterThanOrEqual(500);
     expect(gateway.checkouts).toHaveLength(1);
     const second = await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
@@ -773,9 +769,7 @@ describe("STORY-075a · subscriptions", () => {
 
   it("AUDIT MAJOR · a retry that asks for a DIFFERENT plan still finds and expires the session the dead request created", async () => {
     const { owner } = await newWorkspace();
-    gateway.onSessionCreated = killIdleRequestBackends;
-    await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
-    gateway.onSessionCreated = undefined;
+    await dyingRequest(() => post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" }));
     const second = await post(owner, "/billing/checkout-session", { plan_key: "business", billing_interval: "annual" });
     expect(second.statusCode, second.body).toBe(200);
     expect(payable()).toBe(1);
