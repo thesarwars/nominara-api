@@ -6,6 +6,8 @@ import { CompetitorPanelController } from "./competitor-panel.controller.js";
 import { CompetitorPanelService } from "./competitor-panel.service.js";
 import { GrowthMapController } from "./growth-map.controller.js";
 import { GrowthMapService } from "./growth-map.service.js";
+import { SourcesController } from "./sources.controller.js";
+import { SourcesService } from "./sources.service.js";
 import { ScorecardsController } from "./scorecards.controller.js";
 import { ScorecardsService } from "./scorecards.service.js";
 
@@ -20,7 +22,13 @@ import { ScorecardsService } from "./scorecards.service.js";
 // not children of an `/analytics` prefix that appears nowhere in the spec.
 @Module({
   imports: [EntitlementsModule],
-  controllers: [AnalyticsController, ScorecardsController, GrowthMapController, CompetitorPanelController],
-  providers: [AnalyticsService, ScorecardsService, GrowthMapService, CompetitorPanelService],
+  controllers: [
+    AnalyticsController,
+    ScorecardsController,
+    GrowthMapController,
+    CompetitorPanelController,
+    SourcesController,
+  ],
+  providers: [AnalyticsService, ScorecardsService, GrowthMapService, CompetitorPanelService, SourcesService],
 })
 export class AnalyticsModule {}

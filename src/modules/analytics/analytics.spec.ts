@@ -50,3 +50,14 @@ describe("AnalyticsModule", () => {
     await moduleRef.close();
   });
 });
+
+describe("NEW-C-7 sources", () => {
+  it("mounts the sources route and its service", async () => {
+    const { SourcesController } = await import("./sources.controller.js");
+    const { SourcesService } = await import("./sources.service.js");
+    const moduleRef = await Test.createTestingModule({ imports: [AnalyticsModule] }).compile();
+    expect(moduleRef.get(SourcesController)).toBeInstanceOf(SourcesController);
+    expect(moduleRef.get(SourcesService)).toBeInstanceOf(SourcesService);
+    await moduleRef.close();
+  });
+});
