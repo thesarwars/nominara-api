@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, Logger } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, Logger, UnauthorizedException } from "@nestjs/common";
 import {
   generateAuthenticationOptions,
   generateRegistrationOptions,
@@ -24,6 +24,8 @@ import type { SessionStrongAuth } from "../../api/guards/auth.guard.js";
 import { refuse, requireFreshStrongAuth, requireProvedAccount } from "./account-proof.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
 import type {
+  MeResponse,
+  Persona,
   AssertionOptionsRequest,
   PasskeyAddOptionsRequest,
   PasskeyListItem,
@@ -47,6 +49,46 @@ import type {
 // a way to plant a working credential on an address before its owner
 // arrived. Do not reintroduce a path that finds-or-creates a user from a
 // typed address and binds a credential to it.
+
+const ME_COLUMNS =
+  "id, email, full_name, locale, timezone, persona_org_type, persona_volume_band, persona_focus, persona_skipped";
+
+interface MeRow {
+  id: string;
+  email: string;
+  full_name: string | null;
+  locale: string;
+  timezone: string;
+  persona_org_type: Persona["org_type"];
+  persona_volume_band: string | null;
+  persona_focus: Persona["focus"];
+  persona_skipped: boolean | null;
+}
+
+const BRAND_COUNTS: ReadonlySet<string> = new Set(["one", "2_5", "6_20", "gt_20"]);
+
+// A person who never answered and never skipped has no persona at all (null),
+// which the client reads as "ask them". A value from the retired lt_1k..gt_100k
+// vocabulary is not a brand count, so it reads as unanswered rather than being
+// passed through to a client that cannot render it.
+function toMe(row: MeRow, activeWorkspaceId: string | null): MeResponse {
+  const volume = row.persona_volume_band !== null && BRAND_COUNTS.has(row.persona_volume_band) ? (row.persona_volume_band as Persona["volume"]) : null;
+  const skipped = row.persona_skipped === true;
+  const answered = row.persona_org_type !== null || volume !== null || row.persona_focus !== null || skipped;
+  return {
+    user: {
+      user_id: row.id,
+      // The address's local part when the person never gave a name, so the
+      // shell never renders an empty greeting.
+      name: row.full_name !== null && row.full_name.trim() !== "" ? row.full_name : row.email.split("@")[0]!,
+      email: row.email,
+    },
+    active_workspace_id: activeWorkspaceId,
+    persona: answered ? { org_type: row.persona_org_type, volume, focus: row.persona_focus, skipped } : null,
+    locale: row.locale,
+    timezone: row.timezone,
+  };
+}
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
@@ -480,6 +522,55 @@ export class IdentityService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * NEW-A-2 — GET /me. The caller's own row, keyed on the session's `sub`; the
+   * active workspace is the verified token's `ws` claim handed in by the
+   * controller, never read from a query or body. `users` has no RLS (identity
+   * is person state, not tenant data), so the WHERE on id is the control.
+   */
+  async getMe(userId: string, activeWorkspaceId: string | null): Promise<MeResponse> {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<MeRow>(`SELECT ${ME_COLUMNS} FROM users WHERE id = $1 AND deleted_at IS NULL`, [userId]);
+      return toMe(this.requireRow(result.rows[0], userId), activeWorkspaceId);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * NEW-A-2 — PATCH /me. Replaces the whole persona on the caller's own row
+   * (a person who changes their answer to "agency / 6-20 brands" must not keep
+   * a stale focus). One statement, so there is no read-modify-write to race.
+   */
+  async updatePersona(userId: string, activeWorkspaceId: string | null, persona: Persona): Promise<MeResponse> {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<MeRow>(
+        `UPDATE users
+            SET persona_org_type = $2, persona_volume_band = $3, persona_focus = $4,
+                persona_skipped = $5, updated_at = now()
+          WHERE id = $1 AND deleted_at IS NULL
+      RETURNING ${ME_COLUMNS}`,
+        [userId, persona.org_type, persona.volume, persona.focus, persona.skipped],
+      );
+      incrementCounter("nominara_identity_persona_updated_total", { skipped: String(persona.skipped) });
+      this.logger.log(`persona updated user_id=${userId} skipped=${persona.skipped}`);
+      return toMe(this.requireRow(result.rows[0], userId), activeWorkspaceId);
+    } finally {
+      client.release();
+    }
+  }
+
+  private requireRow(row: MeRow | undefined, userId: string): MeRow {
+    if (row === undefined) {
+      // A valid token for a deleted account: fail closed rather than invent an identity.
+      this.logger.warn(`me for missing user user_id=${userId}`);
+      throw new UnauthorizedException("account no longer exists");
+    }
+    return row;
   }
 
   async renamePasskey(userId: string, credentialId: string, deviceLabel: string): Promise<void> {
