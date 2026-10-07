@@ -57,3 +57,8 @@ export const sourceIndexResponseSchema = z
 export type SourceIndexQuery = z.infer<typeof sourceIndexQuerySchema>;
 export type SourceDomain = z.infer<typeof sourceDomainSchema>;
 export type SourceIndexResponse = z.infer<typeof sourceIndexResponseSchema>;
+
+/** The shape the index job stores in `project_source_index.top_urls` (jsonb). */
+export const storedTopUrlsSchema = z.array(
+  z.object({ url: z.string(), count: z.number().int().nonnegative(), last_seen: z.string() }).strict(),
+);

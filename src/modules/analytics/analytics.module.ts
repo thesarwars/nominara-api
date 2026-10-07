@@ -3,6 +3,8 @@ import { AnalyticsController } from "./analytics.controller.js";
 import { AnalyticsService } from "./analytics.service.js";
 import { GrowthMapController } from "./growth-map.controller.js";
 import { GrowthMapService } from "./growth-map.service.js";
+import { SourcesController } from "./sources.controller.js";
+import { SourcesService } from "./sources.service.js";
 import { ScorecardsController } from "./scorecards.controller.js";
 import { ScorecardsService } from "./scorecards.service.js";
 
@@ -16,7 +18,7 @@ import { ScorecardsService } from "./scorecards.service.js";
 // MatrixController is separate: the paths are siblings under `/projects`,
 // not children of an `/analytics` prefix that appears nowhere in the spec.
 @Module({
-  controllers: [AnalyticsController, ScorecardsController, GrowthMapController],
-  providers: [AnalyticsService, ScorecardsService, GrowthMapService],
+  controllers: [AnalyticsController, ScorecardsController, GrowthMapController, SourcesController],
+  providers: [AnalyticsService, ScorecardsService, GrowthMapService, SourcesService],
 })
 export class AnalyticsModule {}
