@@ -17,7 +17,7 @@ import { SessionService } from "../../src/modules/identity/session.service.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
-import { ACCESS_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
+import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { RATE_LIMIT_HEADERS } from "../../contracts/common/rate-limit.schema.js";
 import { COMMAND_INTENTS } from "../../contracts/command/command-intent.schema.js";
 import { QueueProducer } from "../../src/lib/queue/queue-producer.js";
@@ -118,17 +118,18 @@ describe("STORY-085-A audit · POST /v1/command/parse over the real guard/interc
     return result.rows[0]!.id;
   }
 
+  type Cookie = { accessToken: string; csrfToken: string };
   const ROLES = ["owner", "admin", "manager", "analyst", "viewer"] as const;
 
-  async function tokenForRole(workspaceId: string, ownerId: string, role: (typeof ROLES)[number]): Promise<string> {
+  async function tokenForRole(workspaceId: string, ownerId: string, role: (typeof ROLES)[number]): Promise<Cookie> {
     if (role === "owner") {
       const tokens = await sessions.createSession(ownerId);
-      return (await workspaces.switchTo(ownerId, tokens.sid, workspaceId, meta)).accessToken;
+      return workspaces.switchTo(ownerId, tokens.sid, workspaceId, meta);
     }
     const userId = await createUser();
     await db.query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1,$2,$3,'active')", [workspaceId, userId, role]);
     const tokens = await sessions.createSession(userId);
-    return (await workspaces.switchTo(userId, tokens.sid, workspaceId, meta)).accessToken;
+    return workspaces.switchTo(userId, tokens.sid, workspaceId, meta);
   }
 
   /** Row count of every public table, so a write to ANY table shows up. */
@@ -161,11 +162,11 @@ describe("STORY-085-A audit · POST /v1/command/parse over the real guard/interc
     "create new",
   ];
 
-  function parse(token: string, query: string) {
+  function parse(token: Cookie, query: string) {
     return app.inject({
       method: "POST",
       url: apiUrl("/command/parse"),
-      cookies: { [ACCESS_COOKIE_NAME]: token },
+      headers: { cookie: `${ACCESS_COOKIE_NAME}=${token.accessToken}; ${CSRF_COOKIE_NAME}=${token.csrfToken}`, [CSRF_HEADER_NAME]: token.csrfToken },
       payload: { query },
     });
   }
@@ -208,7 +209,7 @@ describe("STORY-085-A audit · POST /v1/command/parse over the real guard/interc
     expect(dispatch).not.toHaveBeenCalled();
   });
 
-  it("STORY-085-A audit #1: the audit row names the parse and carries no query text", async () => {
+  it("STORY-085-A audit #1: the audit row is command.parsed on the caller's workspace", async () => {
     const ownerId = await createUser();
     const workspace = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
     const res = await parse(await tokenForRole(workspace.id, ownerId, "owner"), "invite secret.person@example.com as viewer");
