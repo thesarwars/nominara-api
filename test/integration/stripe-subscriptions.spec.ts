@@ -49,6 +49,8 @@ describe("STORY-075a · subscriptions", () => {
     await harness.db().query(`ALTER ROLE nominara_app PASSWORD '${resolvePassword("nominara_app", {})}'`);
     gateway.objects.clear();
     gateway.checkouts.length = 0;
+    gateway.expired.length = 0;
+    gateway.completedSessions.clear();
     gateway.portals.length = 0;
     gateway.fetches.length = 0;
     gateway.configured = true;
@@ -126,15 +128,36 @@ describe("STORY-075a · subscriptions", () => {
   /** Stripe's CURRENT state of a subscription, as the gateway will fetch it. */
   function stripeSubscription(
     workspaceId: string,
-    over: { id?: string; customer?: string; status?: string; plan?: string; interval?: "month" | "year"; cancelAtPeriodEnd?: boolean; extraSeats?: number; extraProjects?: number } = {},
+    over: {
+      id?: string;
+      customer?: string;
+      status?: string;
+      plan?: string;
+      interval?: "month" | "year";
+      cancelAtPeriodEnd?: boolean;
+      extraSeats?: number;
+      extraProjects?: number;
+      /** What Stripe actually charges per interval, in cents; defaults to the catalog price of `plan`. */
+      amount?: number;
+      currency?: string;
+    } = {},
   ): string {
+    // The catalog (migration 0002): monthly / annual dollars per plan.
+    const catalog: Record<string, [number, number]> = { starter: [49, 490], growth: [129, 1290], business: [349, 3490] };
+    const plan = over.plan ?? "growth";
+    const charged = over.amount ?? (catalog[plan] ?? [0, 0])[over.interval === "year" ? 1 : 0]! * 100;
     const id = over.id ?? "sub_1";
     const data: unknown[] = [
       {
         quantity: 1,
         current_period_start: T0,
         current_period_end: T0 + 30 * 86_400,
-        price: { recurring: { interval: over.interval ?? "month" }, product: { metadata: { nominara_kind: "plan" } } },
+        price: {
+          unit_amount: charged,
+          currency: over.currency ?? "usd",
+          recurring: { interval: over.interval ?? "month" },
+          product: { metadata: { nominara_kind: "plan" } },
+        },
       },
     ];
     if (over.extraSeats) data.push({ quantity: over.extraSeats, price: { product: { metadata: { nominara_kind: "extra_seat" } } } });
@@ -142,7 +165,7 @@ describe("STORY-075a · subscriptions", () => {
     gateway.putObject(
       "subscription",
       id,
-      { workspace_id: workspaceId, plan_key: over.plan ?? "growth", billing_interval: over.interval === "year" ? "annual" : "monthly" },
+      { workspace_id: workspaceId, plan_key: plan, billing_interval: over.interval === "year" ? "annual" : "monthly" },
       { customer: over.customer ?? "cus_1", status: over.status ?? "active", cancel_at_period_end: over.cancelAtPeriodEnd ?? false, trial_end: null, items: { data } },
     );
     return id;
@@ -509,5 +532,204 @@ describe("STORY-075a · subscriptions", () => {
     await deliver(eventBody("evt_iso", "customer.subscription.created", stripeSubscription(a.workspaceId)));
     expect(await row(b.workspaceId)).toEqual(bBefore);
     expect((await row(a.workspaceId)).plan_key).toBe("growth");
+  });
+
+  // ---- checkpoint-1 · d-billing re-audit ----------------------------------------------------------
+
+  async function walletFor(workspaceId: string): Promise<void> {
+    await harness.db().query(
+      `INSERT INTO credit_wallets (workspace_id, included_balance, cycle_start, cycle_end)
+       VALUES ($1, 60, (now() - interval '10 days')::date, (now() + interval '20 days')::date)`,
+      [workspaceId],
+    );
+  }
+  const ledgerCount = async (workspaceId: string): Promise<number> =>
+    (await harness.db().query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [workspaceId])).rowCount ?? 0;
+
+  it("CP1 BLOCKER · a cancelled NEW subscription's held 'active' fetch cannot resurrect it or earn credits", async () => {
+    const { workspaceId } = await newWorkspace();
+    await walletFor(workspaceId);
+    const before = await row(workspaceId);
+    expect(before).toMatchObject({ plan_key: "free" });
+    stripeSubscription(workspaceId, { id: "sub_n", plan: "growth" });
+
+    // `customer.subscription.created` fetches the subscription active, and is held.
+    const release = gateway.holdNextFetch("subscription", "sub_n");
+    const fetchesBefore = gateway.fetches.length;
+    const stale = deliver(eventBody("evt_nA", "customer.subscription.created", "sub_n"));
+    await vi.waitFor(() => expect(gateway.fetches.length).toBe(fetchesBefore + 1));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // The customer cancels; `customer.subscription.deleted` fetches `canceled` and commits first.
+    stripeSubscription(workspaceId, { id: "sub_n", plan: "growth", status: "canceled" });
+    expect(outcomeOf(await deliver(eventBody("evt_nB", "customer.subscription.deleted", "sub_n")))).toBe("processed");
+    const afterCancel = await row(workspaceId);
+    expect(afterCancel).toMatchObject({ plan_key: "free", ws_plan: "free" });
+    const ledgerAfterCancel = await ledgerCount(workspaceId);
+
+    release();
+    expect((await stale).statusCode).toBe(200);
+    expect(await row(workspaceId), "the stale 'active growth' snapshot must not resurrect a cancelled subscription").toEqual(afterCancel);
+    expect(await ledgerCount(workspaceId), "and must not earn a pro-rata grant").toBe(ledgerAfterCancel);
+  });
+
+  it("CP1 BLOCKER · the same through checkout.session.completed, and when re-subscribing after an earlier cancel", async () => {
+    const { workspaceId } = await newWorkspace();
+    await walletFor(workspaceId);
+    // An earlier subscription was bought and cancelled.
+    stripeSubscription(workspaceId, { id: "sub_first", plan: "starter" });
+    await deliver(eventBody("evt_e1", "customer.subscription.created", "sub_first"));
+    stripeSubscription(workspaceId, { id: "sub_first", plan: "starter", status: "canceled" });
+    await deliver(eventBody("evt_e2", "customer.subscription.deleted", "sub_first"));
+    expect(await row(workspaceId)).toMatchObject({ plan_key: "free" });
+
+    // A second one: its checkout.session.completed follows the session to the subscription, and is held there.
+    stripeSubscription(workspaceId, { id: "sub_second", plan: "business" });
+    gateway.putObject("checkout_session", "cs_second", { workspace_id: workspaceId }, { mode: "subscription", subscription: "sub_second" });
+    const release = gateway.holdNextFetch("subscription", "sub_second");
+    const fetchesBefore = gateway.fetches.length;
+    const stale = deliver(eventBody("evt_s1", "checkout.session.completed", "cs_second"));
+    await vi.waitFor(() => expect(gateway.fetches.length).toBe(fetchesBefore + 2));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    stripeSubscription(workspaceId, { id: "sub_second", plan: "business", status: "canceled" });
+    await deliver(eventBody("evt_s2", "customer.subscription.deleted", "sub_second"));
+    const settled = await row(workspaceId);
+    const ledgerSettled = await ledgerCount(workspaceId);
+
+    release();
+    expect((await stale).statusCode).toBe(200);
+    expect(await row(workspaceId)).toEqual(settled);
+    expect(settled).toMatchObject({ plan_key: "free", ws_plan: "free" });
+    expect(await ledgerCount(workspaceId)).toBe(ledgerSettled);
+  });
+
+  it("CP1 MINOR · the stale guard is ordered by the database clock: an instance whose wall clock runs an hour behind does not drop a newer write", async () => {
+    const { workspaceId } = await newWorkspace();
+    stripeSubscription(workspaceId, { id: "sub_k", plan: "growth" });
+    expect(outcomeOf(await deliver(eventBody("evt_k1", "customer.subscription.created", "sub_k")))).toBe("processed");
+    expect(await row(workspaceId)).toMatchObject({ plan_key: "growth" });
+
+    // The customer upgrades; the API instance that handles it has a clock one hour slow.
+    stripeSubscription(workspaceId, { id: "sub_k", plan: "business" });
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() - 3_600_000 });
+    try {
+      expect(outcomeOf(await deliver(eventBody("evt_k2", "customer.subscription.updated", "sub_k")))).toBe("processed");
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(await row(workspaceId), "a paid upgrade must not be dropped as 'stale' because of clock skew").toMatchObject({ plan_key: "business" });
+  });
+
+  // ---- checkpoint-1 · a double subscription is PREVENTED, not just detected -----------------------
+
+  it("CP1 MAJOR · opening a second checkout expires the first open session at Stripe, so only one can be paid", async () => {
+    const { owner } = await newWorkspace();
+    const first = await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
+    expect(first.statusCode, first.body).toBe(200);
+    expect(gateway.expired).toEqual([]);
+    const second = await post(owner, "/billing/checkout-session", { plan_key: "starter", billing_interval: "monthly" });
+    expect(second.statusCode, second.body).toBe(200);
+    expect(gateway.checkouts).toHaveLength(2);
+    expect(gateway.expired, "the earlier session is expired before the new one is handed out").toEqual(["cs_test_1"]);
+    // A third supersedes the second only.
+    expect((await post(owner, "/billing/checkout-session", { plan_key: "business", billing_interval: "annual" })).statusCode).toBe(200);
+    expect(gateway.expired).toEqual(["cs_test_1", "cs_test_2"]);
+  });
+
+  it("CP1 MAJOR · two checkouts opened at the same moment leave exactly one payable session", async () => {
+    const { owner } = await newWorkspace();
+    const results = await Promise.all([
+      post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" }),
+      post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" }),
+    ]);
+    const created = results.filter((r) => r.statusCode === 200).length;
+    expect(results.every((r) => r.statusCode === 200 || r.statusCode === 409), results.map((r) => r.body).join("|")).toBe(true);
+    expect(gateway.checkouts).toHaveLength(created);
+    expect(gateway.checkouts.length - gateway.expired.length, "sessions created minus sessions expired = sessions still payable").toBe(1);
+  });
+
+  it("CP1 MAJOR · a previous session that was already PAID (webhook not yet applied) is a 409, and no second session is created", async () => {
+    const { owner } = await newWorkspace();
+    expect((await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" })).statusCode).toBe(200);
+    gateway.completedSessions.set("cs_test_1", { subscriptionLive: true });
+    const res = await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
+    expect(res.statusCode, res.body).toBe(409);
+    expect(gateway.checkouts).toHaveLength(1);
+  });
+
+  it("CP1 MAJOR · a paid session whose subscription has since ended does not block a new checkout forever", async () => {
+    const { owner } = await newWorkspace();
+    expect((await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" })).statusCode).toBe(200);
+    gateway.completedSessions.set("cs_test_1", { subscriptionLive: false });
+    expect((await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" })).statusCode).toBe(200);
+    expect(gateway.checkouts).toHaveLength(2);
+  });
+
+  it("CP1 MAJOR · once the subscription is adopted the session is settled: a later cancel then re-checkout expires nothing", async () => {
+    const { workspaceId, owner: first } = await newWorkspace();
+    expect((await post(first, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" })).statusCode).toBe(200);
+    stripeSubscription(workspaceId, { id: "sub_p", plan: "growth" });
+    await deliver(eventBody("evt_p1", "customer.subscription.created", "sub_p"));
+    stripeSubscription(workspaceId, { id: "sub_p", plan: "growth", status: "canceled" });
+    await deliver(eventBody("evt_p2", "customer.subscription.deleted", "sub_p"));
+    const owner = await reenter(first, workspaceId);
+    expect((await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" })).statusCode).toBe(200);
+    expect(gateway.expired, "the adopted session is not re-expired").toEqual([]);
+  });
+
+  it("CP1 MAJOR · the 409 for an already-subscribed workspace does not send plan changes to the portal", async () => {
+    const { workspaceId, owner: first } = await newWorkspace();
+    await deliver(eventBody("evt_pm", "customer.subscription.created", stripeSubscription(workspaceId)));
+    const owner = await reenter(first, workspaceId);
+    const res = await post(owner, "/billing/checkout-session", { plan_key: "business", billing_interval: "monthly" });
+    expect(res.statusCode).toBe(409);
+    expect(res.body).not.toMatch(/change it in the billing portal/u);
+  });
+
+  // ---- checkpoint-1 · the plan is verified against what Stripe charges ----------------------------
+
+  it("CP1 MAJOR · metadata that names a dearer plan than the price charged is refused and alarmed, and earns nothing", async () => {
+    const { workspaceId } = await newWorkspace();
+    await walletFor(workspaceId);
+    const before = await row(workspaceId);
+    const alarm = vi.spyOn(Logger.prototype, "error");
+    // plan_key says business; the item charges the starter amount.
+    stripeSubscription(workspaceId, { id: "sub_x", plan: "business", amount: 4_900 });
+    const res = await deliver(eventBody("evt_x1", "customer.subscription.created", "sub_x"));
+    expect(res.statusCode, "refusing is a 2xx: a retry cannot fix a price").toBe(200);
+    expect(await row(workspaceId)).toEqual(before);
+    expect(await ledgerCount(workspaceId)).toBe(0);
+    expect(alarm, "a plan/price mismatch is alarmed").toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the amount of another plan", { plan: "growth", amount: 34_900 }],
+    ["the right amount in the wrong currency", { plan: "growth", currency: "eur" }],
+    ["a monthly amount on a yearly price", { plan: "growth", interval: "year" as const, amount: 12_900 }],
+  ])("CP1 MAJOR · %s is not the plan it claims", async (_label, over) => {
+    const { workspaceId } = await newWorkspace();
+    const before = await row(workspaceId);
+    stripeSubscription(workspaceId, { id: "sub_m", ...over });
+    expect((await deliver(eventBody("evt_m1", "customer.subscription.created", "sub_m"))).statusCode).toBe(200);
+    expect(await row(workspaceId)).toEqual(before);
+  });
+
+  it("CP1 MAJOR · a portal price switch (metadata unchanged, price changed) neither upgrades nor downgrades: the tracked plan holds and the mismatch is alarmed", async () => {
+    const { workspaceId } = await newWorkspace();
+    await deliver(eventBody("evt_q1", "customer.subscription.created", stripeSubscription(workspaceId, { id: "sub_q", plan: "growth" })));
+    const tracked = await row(workspaceId);
+    expect(tracked).toMatchObject({ plan_key: "growth" });
+    const alarm = vi.spyOn(Logger.prototype, "error");
+    // The portal switched the item to the business price; the metadata still says growth.
+    stripeSubscription(workspaceId, { id: "sub_q", plan: "growth", amount: 34_900 });
+    expect((await deliver(eventBody("evt_q2", "customer.subscription.updated", "sub_q"))).statusCode).toBe(200);
+    expect(await row(workspaceId)).toEqual(tracked);
+    expect(alarm).toHaveBeenCalled();
+  });
+
+  it("CP1 MAJOR · a correct annual price is accepted as the annual plan", async () => {
+    const { workspaceId } = await newWorkspace();
+    await deliver(eventBody("evt_y1", "customer.subscription.created", stripeSubscription(workspaceId, { id: "sub_y", plan: "growth", interval: "year" })));
+    expect(await row(workspaceId)).toMatchObject({ plan_key: "growth", billing_interval: "annual" });
   });
 });

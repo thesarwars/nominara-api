@@ -55,6 +55,18 @@ export class FakeStripeGateway implements StripeGateway {
 
   readonly checkouts: SubscriptionCheckoutInput[] = [];
   readonly portals: Array<{ customerId: string; returnUrl: string }> = [];
+  /** Session ids closed through `closeCheckoutSession`, in call order. */
+  readonly expired: string[] = [];
+  /** Sessions Stripe reports as already paid, with whether their subscription is still live. */
+  readonly completedSessions = new Map<string, { subscriptionLive: boolean }>();
+
+  closeCheckoutSession(sessionId: string): Promise<{ status: "expired" } | { status: "complete"; subscriptionLive: boolean }> {
+    if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
+    const completed = this.completedSessions.get(sessionId);
+    if (completed !== undefined) return Promise.resolve({ status: "complete", subscriptionLive: completed.subscriptionLive });
+    this.expired.push(sessionId);
+    return Promise.resolve({ status: "expired" });
+  }
 
   createSubscriptionCheckout(input: SubscriptionCheckoutInput): Promise<HostedSession> {
     if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
