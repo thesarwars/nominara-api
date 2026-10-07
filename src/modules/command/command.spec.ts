@@ -220,3 +220,44 @@ describe("STORY-085-A · the route", () => {
     await moduleRef.close();
   });
 });
+
+// STORY-085-A audit [major] — written from api-specification.md §10 (a parse
+// never mutates; execution of a spending action is two-step) and the
+// security-and-tenancy.md §6 permission matrix, NOT copied from ACTIONS.
+// `requires_confirmation` is what the client reads to decide whether to show a
+// confirmation before a spending action, so a silent flip is a credit hazard.
+// Every intent is pinned; a new intent fails the key-set check until it is.
+const EXPECTED: Readonly<Record<CommandIntent, { mutating: boolean; permission: string | null }>> = {
+  filter_find: { mutating: false, permission: "project:read" },
+  compare: { mutating: false, permission: "project:read" },
+  navigate: { mutating: false, permission: null },
+  run_visibility_scan: { mutating: true, permission: "tracking:trigger" },
+  run_prompt_research: { mutating: true, permission: "prompt:write" },
+  run_competitor_finder: { mutating: true, permission: "project:update" },
+  run_aux_audit: { mutating: true, permission: "aux:trigger" },
+  run_deep_scan: { mutating: true, permission: "tracking:trigger" },
+  create_project: { mutating: true, permission: "project:create" },
+  create_task: { mutating: true, permission: "task:create" },
+  show_tasks: { mutating: false, permission: "task:read" },
+  build_report: { mutating: true, permission: "export:data" },
+  explain_metric: { mutating: false, permission: null },
+  invite_member: { mutating: true, permission: "member:invite" },
+};
+
+describe("STORY-085-A audit · every intent's action flags and permission are pinned", () => {
+  it("the fixture covers exactly the canonical intents", () => {
+    expect(Object.keys(EXPECTED).sort()).toEqual([...COMMAND_INTENTS].sort());
+  });
+
+  it.each(COMMAND_INTENTS)("%s: is_mutating, requires_confirmation and required_permission", async (intent) => {
+    const result = await makeService().parse(WS_A, PHRASES[intent]);
+    const expected = EXPECTED[intent];
+    expect(result.actions).toHaveLength(1);
+    expect(result.actions[0]).toMatchObject({
+      kind: intent,
+      is_mutating: expected.mutating,
+      requires_confirmation: expected.mutating,
+      required_permission: expected.permission,
+    });
+  });
+});
