@@ -187,7 +187,7 @@ export class ShareTokensService {
 
     incrementCounter("nominara_share_token_mints_total", { password: body.password === null ? "none" : "required" });
     this.logger.log(`share token minted workspace_id=${workspaceId} share_token_id=${row.id} password_required=${String(row.password_required)}`);
-    return { token: toShareToken(row), secret, url: `${PORTAL_BASE_URL}/r/${secret}` };
+    return { token: toShareToken(row), secret, url: new URL(`/r/${secret}`, PORTAL_BASE_URL).toString() };
   }
 
   /** Idempotent: revoking a revoked token returns it unchanged, keeping the first `revoked_at`. */

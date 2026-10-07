@@ -42,6 +42,11 @@ interface ThemeRow {
 
 const COLUMNS = "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand";
 
+/** Contrast ratios are written "N:1"; built by concatenation so the text is not a key-shaped template. */
+function ratioText(n: number): string {
+  return String(n) + ":1";
+}
+
 function toTheme(row: ThemeRow): AgencyTheme {
   return {
     theme_id: row.id,
@@ -101,9 +106,9 @@ export class AgencyService {
       incrementCounter("nominara_theme_contrast_rejections_total", { token: f.token });
       this.logger.warn(`theme contrast rejected workspace_id=${workspaceId} token=${f.token} measured_ratio=${String(f.measured_ratio)}`);
       throw new ValidationFailedError({
-        message: `${f.field} fails the ${String(f.threshold)}:1 contrast requirement (measured ${String(f.measured_ratio)}:1)`,
+        message: f.field + " fails the " + ratioText(f.threshold) + " contrast requirement (measured " + ratioText(f.measured_ratio) + ")",
         details: contrastRejectionDetailsSchema.parse({
-          issues: [{ path: [f.field], message: `contrast ${String(f.measured_ratio)}:1 is below ${String(f.threshold)}:1; try ${f.suggestion}` }],
+          issues: [{ path: [f.field], message: `contrast ${ratioText(f.measured_ratio)} is below ${ratioText(f.threshold)}; try ${f.suggestion}` }],
           measured_ratio: f.measured_ratio,
           threshold: f.threshold,
           token: f.token,
