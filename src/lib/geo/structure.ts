@@ -1,7 +1,7 @@
 import type { ClientBase } from "pg";
 import {
   type AnswerFormValue,
-  type DataSource,
+  type GeoDataSource,
   type GeoAnalysisWrite,
   type GeoFinding,
   type GeoStructureDetail,
@@ -46,7 +46,7 @@ export interface StructureInput {
   windowDays: 7 | 30 | 90;
   rootDomain: string;
   /** Distinct answers per engine and form in the window. */
-  forms: { engine: string; dataSource: DataSource; form: AnswerFormValue; answers: number }[];
+  forms: { engine: string; dataSource: GeoDataSource; form: AnswerFormValue; answers: number }[];
   /** Distinct answers per position class of the brand's first mention, current window. */
   position: { cls: PositionClassValue; answers: number }[];
   /** The same, for the window of equal length immediately before. */
@@ -90,7 +90,7 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
     return {
       engine,
       // Any demo row taints the engine's numbers: 'live' is only claimed when nothing is seeded.
-      data_source: (rows.some((r) => r.dataSource === "demo") ? "demo" : "live") as DataSource,
+      data_source: (rows.some((r) => r.dataSource === "demo") ? "demo" : "live") as GeoDataSource,
       total: rows.reduce((n, r) => n + r.answers, 0),
       forms: formCounts(rows),
     };

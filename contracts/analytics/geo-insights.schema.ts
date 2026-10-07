@@ -170,8 +170,8 @@ export const positionClassSchema = z.enum(["recommendation", "ranked", "neutral_
 export type PositionClassValue = z.infer<typeof positionClassSchema>;
 
 /** Where an engine's numbers come from. Gemini is `live`; the other engines are seeded demo data. */
-export const dataSourceSchema = z.enum(["live", "demo"]);
-export type DataSource = z.infer<typeof dataSourceSchema>;
+export const geoDataSourceSchema = z.enum(["live", "demo"]);
+export type GeoDataSource = z.infer<typeof geoDataSourceSchema>;
 
 const formCountSchema = z.object({ form: answerFormSchema, count: z.number().int().nonnegative() }).strict();
 
@@ -194,7 +194,7 @@ export const geoStructureDetailSchema = z
       z
         .object({
           engine: z.string(),
-          data_source: dataSourceSchema,
+          data_source: geoDataSourceSchema,
           total: z.number().int().nonnegative(),
           forms: z.array(formCountSchema),
         })

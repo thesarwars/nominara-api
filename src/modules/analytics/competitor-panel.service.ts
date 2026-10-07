@@ -4,7 +4,7 @@ import type {
   CompetitorPanelQuery,
   CompetitorPanelResponse,
   CompetitorRow,
-  EngineDataSource,
+  CompetitorEngineDataSource,
 } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
@@ -493,7 +493,7 @@ export class CompetitorPanelService {
     to: string,
     timezone: string,
     engines: string[] | null,
-  ): Promise<Map<string, EngineDataSource>> {
+  ): Promise<Map<string, CompetitorEngineDataSource>> {
     const result = await tx.query<{ engine_key: string; demo: boolean }>(
       `SELECT c.engine_key, bool_or(c.normalizer_version = $6) AS demo
          FROM answer_captures c

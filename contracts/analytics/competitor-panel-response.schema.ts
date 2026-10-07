@@ -20,7 +20,7 @@ export const competitorPanelQuerySchema = z
   .strict();
 
 /** Where an engine's captures in the window came from. */
-export const engineDataSourceSchema = z.enum(["live", "demo"]);
+export const competitorEngineDataSourceSchema = z.enum(["live", "demo"]);
 
 export const competitorRowSchema = z
   .object({
@@ -74,7 +74,7 @@ export const competitorPanelResponseSchema = z
      * `demo` as soon as ANY capture in the window is seeded — a mixed engine
      * is not presented as live. Null when nothing was captured.
      */
-    engine_data_source: z.record(z.string(), engineDataSourceSchema.nullable()),
+    engine_data_source: z.record(z.string(), competitorEngineDataSourceSchema.nullable()),
     /** `competitors.max_per_project`; null when the plan is unlimited. */
     competitors_cap: z.number().int().nonnegative().nullable(),
     tracked_count: z.number().int().nonnegative(),
@@ -83,6 +83,6 @@ export const competitorPanelResponseSchema = z
   .strict();
 
 export type CompetitorPanelQuery = z.infer<typeof competitorPanelQuerySchema>;
-export type EngineDataSource = z.infer<typeof engineDataSourceSchema>;
+export type CompetitorEngineDataSource = z.infer<typeof competitorEngineDataSourceSchema>;
 export type CompetitorRow = z.infer<typeof competitorRowSchema>;
 export type CompetitorPanelResponse = z.infer<typeof competitorPanelResponseSchema>;
