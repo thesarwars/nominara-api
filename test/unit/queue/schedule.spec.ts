@@ -131,7 +131,7 @@ describe("G12 · the schedule table matches the reference", () => {
   });
 
   it("⚠ records which dated queues are still inert, so the gap is visible", () => {
-    // `capture.plan` and `attribution.rollup` have a cron and NO handler.
+    // `attribution.rollup` has a cron and NO handler (`capture.plan` was wired by NEW-A-10).
     // They are in the table on purpose — they light up the moment a handler
     // lands — but nothing schedules them today, and that must not be a
     // surprise discovered in production.
@@ -139,7 +139,7 @@ describe("G12 · the schedule table matches the reference", () => {
       .map((s) => s.queue)
       .filter((queue) => handlerFor(queue) === undefined);
 
-    expect(datedAndInert.sort()).toEqual(["attribution.rollup", "capture.plan"]);
+    expect(datedAndInert.sort()).toEqual(["attribution.rollup"]);
     expect(inertQueueNames()).toEqual(expect.arrayContaining(datedAndInert));
   });
 
@@ -163,8 +163,8 @@ describe("G12 · the schedule table matches the reference", () => {
     const tenantScoped = dated.filter((queue) => handlerFor(queue) !== undefined && topologyFor(queue).tenantScoped);
     const schedulable = dated.filter((queue) => handlerFor(queue) !== undefined && !topologyFor(queue).tenantScoped);
 
-    expect(inert.sort()).toEqual(["attribution.rollup", "capture.plan"]);
-    expect(tenantScoped.sort()).toEqual(["rollup.metric_daily"]);
+    expect(inert.sort()).toEqual(["attribution.rollup"]);
+    expect(tenantScoped.sort()).toEqual(["capture.plan", "rollup.metric_daily"]);
     expect(schedulable.sort()).toEqual(["audit.verify", "credit.reconcile", "identity.sweep_unverified", "maintenance.partition"]);
     // The three reasons partition the dated rows — no queue is refused twice
     // and none falls through unaccounted for.
