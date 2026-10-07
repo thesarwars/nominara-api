@@ -66,14 +66,18 @@ NOMINARA_DEMO_SEED=1 pnpm db:seed-demo --workspace <uuid> --project <uuid> \
 - `--facts-only` — demo-marked captures, mentions and citations plus the real
   rollup over them, and nothing else: **no wallet or ledger is provisioned,
   read-for-write or touched**, no project is created, and no AUX audit,
-  source index or task is written. `demo_seeded_at` is not set.
+  source index or task is written. `demo_seeded_at` is not set. **It inserts
+  no prompt and no competitor**: the facts are written against the project's
+  existing active prompts and existing competitors only (a project with no
+  active prompt gets nothing), so the capture planner never sees a demo
+  prompt and real share of voice is never changed.
 - `--project <uuid>` — restrict either mode to one active project.
 - `--purge` takes none of these; it removes every demo-marked row
   (`normalizer_version = 'demo-seed'`) and never a real capture. A
   facts-only project is found by its demo-marked captures; its purge removes
   only facts, the re-rolled `metric_daily` and marked prompts (never
   sources, AUX or tasks, which on such a project are real).
-- Competitors the seed adds to a project remain unmarked (the existing gap).
+- In a FULL seed (not `--facts-only`) competitors the seed adds to a project remain unmarked (the existing gap).
 - The three-condition guard is unchanged. Re-running on the same day yields
   identical demo rows (ids aside).
 

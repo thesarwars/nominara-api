@@ -50,6 +50,14 @@ export interface SeedFactsOptions {
    * engine's rows — real or demo — are never touched by a re-seed.
    */
   readonly excludeEngines?: readonly string[];
+  /**
+   * NEW-A-8 audit — `--facts-only` on a REAL project: write facts against the
+   * project's existing active prompts and existing competitors, and insert no
+   * prompt and no competitor (a demo-inserted active prompt would be picked up
+   * by the capture planner and spend real vendor money; a fabricated
+   * competitor would corrupt real share of voice and cannot be purged).
+   */
+  readonly existingOnly?: boolean;
 }
 
 export interface SeedFactsResult {
@@ -250,6 +258,24 @@ async function ensurePrompts(tx: ClientBase, project: DemoProjectRef, count: num
   return ids;
 }
 
+/** NEW-A-8 audit — the project's own active prompts, read only (nothing inserted, `projects` untouched). */
+async function existingActivePrompts(tx: ClientBase, projectId: string): Promise<string[]> {
+  const result = await tx.query<{ id: string }>(
+    `SELECT id FROM tracked_prompts WHERE project_id = $1 AND status = 'active' AND deleted_at IS NULL ORDER BY id`,
+    [projectId],
+  );
+  return result.rows.map((row) => row.id);
+}
+
+/** NEW-A-8 audit — the project's own competitors, read only. */
+async function existingCompetitors(tx: ClientBase, projectId: string): Promise<string[]> {
+  const result = await tx.query<{ id: string }>(
+    `SELECT id FROM competitors WHERE project_id = $1 AND deleted_at IS NULL ORDER BY id`,
+    [projectId],
+  );
+  return result.rows.map((row) => row.id);
+}
+
 async function ensureCompetitors(tx: ClientBase, project: DemoProjectRef, rng: Rng): Promise<string[]> {
   const count = uniformInt(rng, 2, 3);
   const names = DEMO_COMPETITOR_NAMES.slice(0, count);
@@ -415,8 +441,11 @@ export async function resetAndSeedProjectFacts(
   const days = await workspaceLocalWindow(tx, timezone, windowDays);
   const excluded = new Set(options.excludeEngines ?? []);
   const engines = (await entitledEngines(tx, project.id)).filter((engine) => !excluded.has(engine.engineKey));
-  const promptIds = await ensurePrompts(tx, project, promptCount);
-  const competitorIds = await ensureCompetitors(tx, project, rngFor(project.id, "competitors"));
+  const existingOnly = options.existingOnly === true;
+  const promptIds = existingOnly ? await existingActivePrompts(tx, project.id) : await ensurePrompts(tx, project, promptCount);
+  const competitorIds = existingOnly
+    ? await existingCompetitors(tx, project.id)
+    : await ensureCompetitors(tx, project, rngFor(project.id, "competitors"));
 
   await deleteExistingDemoFacts(
     tx,

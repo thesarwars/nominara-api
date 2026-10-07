@@ -27,7 +27,9 @@ import { withTenantContext } from "../tenancy/tenant-context.js";
 // (Gemini is real; the other five are demo). `--facts-only` writes demo-
 // marked facts and their rollup and NOTHING else — it never creates a
 // project, never provisions or touches a wallet or the credit ledger (the
-// full seed's grant is irreversible), and writes no AUX/sources/tasks.
+// full seed's grant is irreversible), and writes no AUX/sources/tasks. It
+// also inserts no prompt and no competitor: facts go on the project's
+// existing active prompts and competitors only.
 // `--project` restricts either mode to one active project. `--purge` takes
 // none of the NEW-A-8 flags: it removes every demo-marked row, and no
 // unmarked (real) one.

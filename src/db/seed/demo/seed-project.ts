@@ -42,7 +42,9 @@ async function seedFactsAndRollup(
 
 /**
  * NEW-A-8 — `--facts-only`: demo-marked captures/mentions/citations and the
- * real rollup over them, and NOTHING else. No AUX audit, source index, task,
+ * real rollup over them, and NOTHING else — written against the project's
+ * EXISTING active prompts and competitors; no prompt and no competitor is
+ * inserted (audit: an inserted active prompt would be captured for real money). No AUX audit, source index, task,
  * `demo_seeded_at` marker — and, because the wallet is provisioned by
  * `runSeedDemo` and not here, no wallet or ledger. `--purge` finds such a
  * project by its demo-marked captures (`listSeededProjects`).
@@ -53,7 +55,7 @@ export async function seedProjectFactsOnly(
   timezone: string,
   options: SeedFactsOptions = {},
 ): Promise<{ readonly projectId: string; readonly days: number; readonly engines: number }> {
-  const facts = await seedFactsAndRollup(tx, project, timezone, options);
+  const facts = await seedFactsAndRollup(tx, project, timezone, { ...options, existingOnly: true });
   return { projectId: project.id, days: facts.days.length, engines: facts.engineKeys.length };
 }
 
