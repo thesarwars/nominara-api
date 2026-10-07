@@ -35,6 +35,7 @@ describe("STORY-075 AC5 · every synchronised field comes from the fetched subsc
     const out = desiredFromStripeSubscription(raw, metadata, GROWTH);
     expect(out).toEqual({
       kind: "write",
+      charge: { unitAmountCents: 12_900, currency: "usd", interval: "month" },
       state: {
         provider: "stripe",
         providerCustomerId: "cus_1",

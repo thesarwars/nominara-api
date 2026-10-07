@@ -176,6 +176,10 @@ export const subscriptions = pgTable("subscriptions", {
   provider: text("provider").notNull().default(sql`'none'::text`),
   providerSyncedAt: timestamp("provider_synced_at", { withTimezone: true }),
   openCheckoutSessionId: text("open_checkout_session_id"),
+  pendingCheckout: jsonb("pending_checkout"),
+  chargedUnitAmountCents: integer("charged_unit_amount_cents"),
+  chargedCurrency: char("charged_currency", { length: 3 }),
+  chargedInterval: text("charged_interval"),
 });
 
 export const usageCounters = pgTable("usage_counters", {

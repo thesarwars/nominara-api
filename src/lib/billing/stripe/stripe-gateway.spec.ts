@@ -151,3 +151,28 @@ describe("NEW-D-2 · which Stripe object an event type points at", () => {
     expect(objectKindForEventType("")).toBeNull();
   });
 });
+
+describe("NEW-D-2 audit · the subscription Checkout call a retry can replay", () => {
+  const input = {
+    workspaceId: "w1",
+    planKey: "growth",
+    billingInterval: "monthly" as const,
+    productName: "Nominara Growth",
+    unitAmountCents: 12_900,
+    currency: "USD",
+    successUrl: "https://app.test/settings/plan?checkout=success",
+    cancelUrl: "https://app.test/settings/plan?checkout=cancel",
+    intentId: "0199c0de-0000-7000-8000-000000000001",
+    idempotencyKey: "subscription-checkout-0199c0de-0000-7000-8000-000000000001",
+  };
+
+  it("names the intent in the subscription's metadata and sends the intent's Idempotency-Key, so the same call returns the same session", async () => {
+    const create = vi.fn().mockResolvedValue({ id: "cs_1", url: "https://checkout.stripe.test/c/pay/cs_1" });
+    const gw = gateway();
+    (gw as unknown as { client: unknown }).client = { checkout: { sessions: { create } } };
+    await gw.createSubscriptionCheckout(input);
+    const [params, options] = create.mock.calls[0] as [{ subscription_data: { metadata: Record<string, string> } }, { idempotencyKey: string }];
+    expect(params.subscription_data.metadata).toEqual({ workspace_id: "w1", plan_key: "growth", billing_interval: "monthly", checkout_intent_id: input.intentId });
+    expect(options).toEqual({ idempotencyKey: input.idempotencyKey });
+  });
+});

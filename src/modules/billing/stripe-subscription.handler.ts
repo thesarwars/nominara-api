@@ -1,4 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common";
+import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
 import { applyPlanChange, type SubscriptionReconciler } from "../../lib/billing/apply-plan.js";
 import { desiredFromStripeSubscription, toCents, type ClaimedPlanPrice } from "../../lib/billing/stripe/subscription-state.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -39,7 +40,13 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     // session to its subscription, so anything else here is not ours.
     if (object.kind !== "subscription") return;
 
-    const claimedPlan = await this.claimedPlanPrice(tx, object.metadata.plan_key);
+    // ⚠ THE WORKSPACE LOCK COMES FIRST. The price this subscription is verified
+    // against is read from the workspace's `subscriptions` row (its frozen
+    // charge, or the intent of the checkout that bought it), and a concurrent
+    // adoption writes both; reading them unlocked could compare against the
+    // catalog instead and refuse a customer who paid the price they were shown.
+    await tx.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    const claimedPlan = await this.claimedPlanPrice(tx, workspaceId, object.metadata, object.id);
     const desired = desiredFromStripeSubscription(object.raw, object.metadata, claimedPlan);
     if (desired.kind === "ignore") {
       if (desired.mismatch === true) {
@@ -64,8 +71,8 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     // outside the transaction (KAD-06), so an event fetched at t1 can commit
     // after one fetched at t2 > t1 for the SAME subscription and put its older
     // state back (a cancelled plan returning to growth, plus a pro-rata grant).
-    // The workspace row is the serialiser applyPlanChange also locks first;
-    // taking it here makes the read below the one the write is ordered by.
+    // The workspace row is the serialiser applyPlanChange also locks first; it
+    // was taken above, so the read below is the one the write is ordered by.
     //
     // ⚠ THE MARK IS KEPT PER SUBSCRIPTION, WHETHER OR NOT THE ROW ADOPTS IT.
     // Reading it off the `subscriptions` row only covered the subscription that
@@ -73,7 +80,6 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     // first event committed left no mark, and the held `active` fetch then
     // resurrected it. `fetchStartedAt` is the DATABASE's clock, so two API
     // instances with skewed wall clocks order their writes consistently.
-    await tx.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
     const marked = await tx.query<{ fetch_started_at: Date }>(
       "SELECT fetch_started_at FROM stripe_subscription_syncs WHERE workspace_id = $1 AND stripe_subscription_id = $2",
       [workspaceId, desired.state.providerSubscriptionId],
@@ -136,11 +142,24 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       return;
     }
 
+    // The charge this subscription was verified at is frozen on the row, so a
+    // later catalog price change cannot turn it into a "mismatch". Only the
+    // subscription the row tracks owns it; an ended one clears it.
+    await tx.query(
+      `UPDATE subscriptions
+          SET charged_unit_amount_cents = $3, charged_currency = $4, charged_interval = $5
+        WHERE workspace_id = $1 AND stripe_subscription_id = $2 AND status IN ('trialing','active','past_due')
+          AND (charged_unit_amount_cents, charged_currency, charged_interval) IS DISTINCT FROM ($3::integer, $4::char(3), $5::text)`,
+      [workspaceId, desired.state.providerSubscriptionId, desired.charge?.unitAmountCents ?? null, desired.charge?.currency.toLowerCase() ?? null, desired.charge?.interval ?? null],
+    );
+
     // A paid subscription was adopted: the Checkout session that bought it is
     // settled, so a later checkout has nothing to supersede.
     if (desired.state.planKey !== "free") {
       await tx.query(
-        "UPDATE subscriptions SET open_checkout_session_id = NULL WHERE workspace_id = $1 AND status IN ('trialing','active','past_due') AND open_checkout_session_id IS NOT NULL",
+        `UPDATE subscriptions SET open_checkout_session_id = NULL, pending_checkout = NULL
+          WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')
+            AND (open_checkout_session_id IS NOT NULL OR pending_checkout IS NOT NULL)`,
         [workspaceId],
       );
     }
@@ -157,8 +176,22 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     });
   }
 
-  /** The catalog price of the plan a subscription's metadata claims, or null when there is no such plan. */
-  private async claimedPlanPrice(tx: StripeEventContext["tx"], planKey: string | undefined): Promise<ClaimedPlanPrice | null> {
+  /**
+   * What the subscription's plan item is verified against. The catalog row for
+   * the plan its metadata claims, plus, when we hold one, the charge FROZEN for
+   * it: first the charge the row recorded when it adopted THIS subscription,
+   * else the intent of the checkout that bought it (named by the subscription's
+   * own `checkout_intent_id`, and honoured only when it is this workspace's
+   * pending intent for this plan). A frozen charge always wins over the catalog,
+   * and is only ever used for the plan it was frozen for.
+   */
+  private async claimedPlanPrice(
+    tx: StripeEventContext["tx"],
+    workspaceId: string,
+    metadata: Readonly<Record<string, string>>,
+    subscriptionId: string,
+  ): Promise<ClaimedPlanPrice | null> {
+    const planKey = metadata.plan_key;
     if (planKey === undefined || planKey.length === 0) return null;
     const result = await tx.query<{ monthly_price: string; annual_price: string; currency: string }>(
       "SELECT monthly_price, annual_price, currency FROM plans WHERE key = $1",
@@ -166,6 +199,40 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     );
     const plan = result.rows[0];
     if (plan === undefined) return null;
-    return { monthlyCents: toCents(plan.monthly_price), annualCents: toCents(plan.annual_price), currency: plan.currency };
+    const catalog: ClaimedPlanPrice = { monthlyCents: toCents(plan.monthly_price), annualCents: toCents(plan.annual_price), currency: plan.currency };
+
+    const live = await tx.query<{
+      plan_key: string;
+      stripe_subscription_id: string;
+      charged_unit_amount_cents: number | null;
+      charged_currency: string | null;
+      charged_interval: "month" | "year" | null;
+      pending_checkout: unknown;
+    }>(
+      `SELECT plan_key, stripe_subscription_id, charged_unit_amount_cents, charged_currency, charged_interval, pending_checkout
+         FROM subscriptions WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')`,
+      [workspaceId],
+    );
+    const row = live.rows[0];
+    if (row === undefined) return catalog;
+
+    if (
+      row.stripe_subscription_id === subscriptionId &&
+      row.plan_key === planKey &&
+      row.charged_unit_amount_cents !== null &&
+      row.charged_currency !== null &&
+      row.charged_interval !== null
+    ) {
+      return { ...catalog, frozen: { unitAmountCents: row.charged_unit_amount_cents, currency: row.charged_currency, interval: row.charged_interval } };
+    }
+
+    const pending = row.pending_checkout === null || row.pending_checkout === undefined ? undefined : pendingCheckoutSchema.safeParse(row.pending_checkout);
+    if (pending?.success === true && pending.data.id === metadata.checkout_intent_id && pending.data.plan_key === planKey) {
+      return {
+        ...catalog,
+        frozen: { unitAmountCents: pending.data.unit_amount_cents, currency: pending.data.currency, interval: pending.data.billing_interval === "annual" ? "year" : "month" },
+      };
+    }
+    return catalog;
   }
 }

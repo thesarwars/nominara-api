@@ -775,6 +775,19 @@ describe("STORY-075a · subscriptions", () => {
     expect(payable()).toBe(1);
   });
 
+  it("AUDIT MAJOR · even when the write that recorded the session is lost too, the retry replays the intent, finds that session and expires it", async () => {
+    const { workspaceId, owner } = await newWorkspace();
+    const first = await dyingRequest(() => post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" }));
+    expect(first.statusCode).toBeGreaterThanOrEqual(500);
+    // The session-id write was lost as well: only the intent (committed before Stripe) survives.
+    await harness.db().query("UPDATE subscriptions SET open_checkout_session_id = NULL WHERE workspace_id = $1", [workspaceId]);
+    const second = await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
+    expect(second.statusCode, second.body).toBe(200);
+    expect(gateway.checkouts, "the replay created nothing: it returned the first session").toHaveLength(2);
+    expect(gateway.expired).toEqual(["cs_test_1"]);
+    expect(payable()).toBe(1);
+  });
+
   it("AUDIT MAJOR · every checkout names its intent and carries a Stripe idempotency key", async () => {
     const { owner } = await newWorkspace();
     await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
@@ -819,6 +832,16 @@ describe("STORY-075a · subscriptions", () => {
       expect(await row(workspaceId)).toEqual(tracked);
       expect(alarm).toHaveBeenCalled();
     });
+  });
+
+  it("AUDIT MAJOR · a frozen charge belongs to the plan it was frozen for: the same subscription re-labelled a dearer plan at the same price is refused", async () => {
+    const { workspaceId } = await newWorkspace();
+    await deliver(eventBody("evt_r1", "customer.subscription.created", stripeSubscription(workspaceId, { id: "sub_r", plan: "growth" })));
+    const tracked = await row(workspaceId);
+    // Metadata now says business; the item still charges growth's $129.
+    stripeSubscription(workspaceId, { id: "sub_r", plan: "business", amount: 12_900 });
+    expect((await deliver(eventBody("evt_r2", "customer.subscription.updated", "sub_r"))).statusCode).toBe(200);
+    expect(await row(workspaceId)).toEqual(tracked);
   });
 
   it("AUDIT MAJOR · a checkout paid after the catalog moved is adopted at the price it was opened at", async () => {

@@ -11,7 +11,7 @@ export type DesiredSubscription =
       readonly kind: "write";
       readonly state: ProviderSubscriptionState;
       /** The charge that was verified, for an entitled state; null for an ended one. It is what gets frozen on the row. */
-      readonly charge?: FrozenCharge | null;
+      readonly charge: FrozenCharge | null;
     }
   /** `mismatch`: the subscription claims a plan that is not what Stripe charges for it. Refused, and worth an alarm. */
   | { readonly kind: "ignore"; readonly reason: string; readonly mismatch?: true };
@@ -101,21 +101,33 @@ export function toCents(price: string): number {
 // label our checkout wrote on the subscription; Stripe's billing portal can
 // switch the price without rewriting it (an upgrade charged but never granted,
 // a downgrade that keeps the dearer plan). So an entitled subscription is only
-// reconciled when its plan item's unit amount, currency and interval equal the
-// claimed plan's catalog price. Anything else is a `mismatch`: refused, never
-// guessed at. An ended subscription is exempt — it can only take a plan AWAY.
-function chargedPriceMatches(planItem: Record<string, unknown> | undefined, claimed: ClaimedPlanPrice | null): boolean {
-  if (claimed === null || planItem === undefined) return false;
+// reconciled when its plan item's unit amount, currency and interval equal what
+// the claimed plan was priced at WHEN THE CUSTOMER BOUGHT IT (`frozen`), or, for
+// a subscription whose price was never frozen, the catalog price now. Anything
+// else is a `mismatch`: refused, never guessed at. An ended subscription is
+// exempt — it can only take a plan AWAY.
+//
+// ⚠ NEVER THE CATALOG ONCE THERE IS A FROZEN CHARGE. Existing customers keep the
+// Stripe price they signed up at, so comparing them with today's catalog would
+// call every one of them a mismatch after the first price change.
+function planItemCharge(planItem: Record<string, unknown> | undefined): FrozenCharge | null {
+  if (planItem === undefined) return null;
   const price = planItem.price;
-  if (!isRecord(price) || !isRecord(price.recurring)) return false;
+  if (!isRecord(price) || !isRecord(price.recurring)) return null;
   const interval = price.recurring.interval;
   const intervalCount = price.recurring.interval_count;
-  if (interval !== "month" && interval !== "year") return false;
-  if (intervalCount !== undefined && intervalCount !== 1) return false;
-  if (planItem.quantity !== undefined && planItem.quantity !== 1) return false;
-  if (typeof price.unit_amount !== "number" || typeof price.currency !== "string") return false;
-  if (price.currency.toLowerCase() !== claimed.currency.trim().toLowerCase()) return false;
-  return price.unit_amount === (interval === "year" ? claimed.annualCents : claimed.monthlyCents);
+  if (interval !== "month" && interval !== "year") return null;
+  if (intervalCount !== undefined && intervalCount !== 1) return null;
+  if (planItem.quantity !== undefined && planItem.quantity !== 1) return null;
+  if (typeof price.unit_amount !== "number" || typeof price.currency !== "string") return null;
+  return { unitAmountCents: price.unit_amount, currency: price.currency, interval };
+}
+
+function chargedPriceMatches(charged: FrozenCharge | null, claimed: ClaimedPlanPrice | null): boolean {
+  if (claimed === null || charged === null) return false;
+  if (charged.currency.toLowerCase() !== (claimed.frozen?.currency ?? claimed.currency).trim().toLowerCase()) return false;
+  if (claimed.frozen !== undefined) return charged.interval === claimed.frozen.interval && charged.unitAmountCents === claimed.frozen.unitAmountCents;
+  return charged.unitAmountCents === (charged.interval === "year" ? claimed.annualCents : claimed.monthlyCents);
 }
 
 export function desiredFromStripeSubscription(
@@ -138,7 +150,8 @@ export function desiredFromStripeSubscription(
   // The item Checkout created for the plan itself; add-on items (STORY-076b) are other lines.
   const first = lines.find((line) => productKind(line) === "plan");
 
-  if (ENTITLED.has(status) && !chargedPriceMatches(first, claimedPlan)) {
+  const charge = planItemCharge(first);
+  if (ENTITLED.has(status) && !chargedPriceMatches(charge, claimedPlan)) {
     return { kind: "ignore", mismatch: true, reason: "the price charged does not match the plan the subscription claims" };
   }
 
@@ -166,6 +179,8 @@ export function desiredFromStripeSubscription(
   const entitled = ENTITLED.has(status);
   return {
     kind: "write",
+    // Verified above for an entitled state, so it is exactly what gets frozen on the row.
+    charge: entitled ? charge : null,
     state: {
       provider: "stripe",
       providerCustomerId: customerId,

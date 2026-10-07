@@ -23,6 +23,9 @@ export const pendingCheckoutSchema = z
     currency: currencySchema,
     /** The Stripe customer the session was built for, or null when Checkout creates one. */
     customer_id: z.string().min(1).nullable(),
+    /** Frozen too, so a replay is byte-identical even if the configured origin changes in between. */
+    success_url: z.url(),
+    cancel_url: z.url(),
   })
   .strict();
 

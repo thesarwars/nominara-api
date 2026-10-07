@@ -93,12 +93,18 @@ export class StripeHttpGateway implements StripeGateway {
         // The workspace is found from THIS metadata on the re-fetched
         // subscription — never from an event payload.
         subscription_data: {
-          metadata: { workspace_id: input.workspaceId, plan_key: input.planKey, billing_interval: input.billingInterval },
+          metadata: {
+            workspace_id: input.workspaceId,
+            plan_key: input.planKey,
+            billing_interval: input.billingInterval,
+            // The lookup key for the price frozen at checkout (not authority).
+            checkout_intent_id: input.intentId,
+          },
         },
         metadata: { workspace_id: input.workspaceId },
         success_url: input.successUrl,
         cancel_url: input.cancelUrl,
-      });
+      }, { idempotencyKey: input.idempotencyKey });
       if (typeof session.url !== "string") throw new StripeUpstreamError(undefined);
       return { id: session.id, url: session.url };
     } catch (error) {
