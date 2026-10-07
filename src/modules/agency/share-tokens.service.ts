@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
-import type { ClientBase } from "pg";
+import type { ClientBase, Pool } from "pg";
 import type { MintedShareToken, MintShareTokenRequest, ShareToken, ShareTokenView } from "../../../contracts/agency/index.js";
 import { EntitlementExceededError, NotFoundError, ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
@@ -45,6 +45,77 @@ export function activeLinkLimit(value: unknown): number | null {
     if (m !== null) return Number(m[1]);
   }
   return 0;
+}
+
+/** integrations-and-sharing.md §3 step 2: 5 wrong passwords per token lock it for 15 minutes. */
+export const PASSWORD_FAILURE_LIMIT = 5;
+export const PASSWORD_LOCK_MS = 15 * 60 * 1000;
+
+/** What the portal gate is allowed to know about a token before it has authenticated anyone. */
+export interface GateRow {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly passwordHash: string | null;
+  readonly passwordRequired: boolean;
+  readonly scopeProjectIds: readonly string[];
+  readonly scopeTabs: readonly string[];
+  readonly themeId: string | null;
+  readonly allowedEmailDomains: readonly string[];
+  readonly revokedAt: Date | null;
+  readonly expiresAt: Date | null;
+  readonly maxViews: number | null;
+  readonly viewCount: number;
+  readonly lockedUntil: Date | null;
+}
+
+/** FR-AGY-01m/n: revoked, expired and view-capped are ONE refusal to the caller; the reason is for our metric only. */
+export type GateRefusal = "revoked" | "expired" | "view_cap";
+
+export function gateRefusal(row: Pick<GateRow, "revokedAt" | "expiresAt" | "maxViews" | "viewCount">, now: Date): GateRefusal | null {
+  if (row.revokedAt !== null) return "revoked";
+  if (row.expiresAt !== null && row.expiresAt.getTime() <= now.getTime()) return "expired";
+  if (row.maxViews !== null && row.viewCount >= row.maxViews) return "view_cap";
+  return null;
+}
+
+interface GateDbRow {
+  id: string;
+  workspace_id: string;
+  password_hash: string | null;
+  password_required: boolean;
+  scope_project_ids: string[];
+  scope_tabs: string[];
+  theme_id: string | null;
+  allowed_email_domains: string[];
+  revoked_at: Date | null;
+  expires_at: Date | null;
+  max_views: number | null;
+  view_count: number;
+  locked_until: Date | null;
+}
+
+function toGateRow(r: GateDbRow): GateRow {
+  return {
+    id: r.id,
+    workspaceId: r.workspace_id,
+    passwordHash: r.password_hash,
+    passwordRequired: r.password_required,
+    scopeProjectIds: r.scope_project_ids,
+    scopeTabs: r.scope_tabs,
+    themeId: r.theme_id,
+    allowedEmailDomains: r.allowed_email_domains,
+    revokedAt: r.revoked_at,
+    expiresAt: r.expires_at,
+    maxViews: r.max_views,
+    viewCount: r.view_count,
+    lockedUntil: r.locked_until,
+  };
+}
+
+export interface ViewFacts {
+  readonly ip: string | null;
+  readonly userAgent: string | null;
+  readonly authenticated: boolean;
 }
 
 interface TokenRow {
@@ -232,6 +303,103 @@ export class ShareTokensService {
       pages: r.pages,
       duration_s: r.duration_s,
     }));
+  }
+
+  // ---- STORY-098 part B: the portal gate. Called by PortalSessionService / PortalContextInterceptor, never by a controller of ours.
+
+  /**
+   * The pre-auth lookup: resolves sha256(secret) to the gate row through `app.share_token_by_hash`, the one
+   * SECURITY DEFINER function (migration 0080). Runs on a bare pool connection with NO tenant context, because the
+   * workspace is exactly what this finds out. Returns null for an unknown hash.
+   */
+  async findForGate(pool: Pool, tokenHash: Buffer): Promise<GateRow | null> {
+    const result = await pool.query<GateDbRow>("SELECT * FROM app.share_token_by_hash($1)", [tokenHash]);
+    const r = result.rows[0];
+    return r === undefined ? null : toGateRow(r);
+  }
+
+  /**
+   * Serialises attempts on ONE token: the row lock is taken before any password is verified and held to the end of the
+   * transaction (Argon2 is local CPU, not an external call). That is what makes the 5-failure limit a limit: parallel
+   * guesses queue behind the lock, and each sees the lock the previous one set. Null if the token is not visible to
+   * the context (another workspace's, by RLS).
+   */
+  async lockForAttempt(id: string): Promise<GateRow | null> {
+    const { client } = this.store();
+    const result = await client.query<GateDbRow>(
+      `SELECT id, workspace_id, password_hash, password_required, scope_project_ids, scope_tabs, theme_id,
+              COALESCE(allowed_email_domains::text[], ARRAY[]::text[]) AS allowed_email_domains,
+              revoked_at, expires_at, max_views, view_count, locked_until
+         FROM share_tokens WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    const r = result.rows[0];
+    return r === undefined ? null : toGateRow(r);
+  }
+
+  /**
+   * One wrong (or missing) password. The UPDATE takes the row lock, so concurrent attempts serialise and none can
+   * slip past the limit. The 5th failure sets the 15-minute lock and restarts the count from zero.
+   * A token the context cannot see (another workspace's, by RLS) updates nothing and reports no lock.
+   */
+  async recordFailedPassword(id: string): Promise<{ lockedUntil: Date | null }> {
+    const { client } = this.store();
+    const result = await client.query<{ locked_until: Date | null; just_locked: boolean }>(
+      `UPDATE share_tokens
+          SET failed_attempts = CASE WHEN COALESCE(failed_attempts, 0) + 1 >= $2 THEN 0 ELSE COALESCE(failed_attempts, 0) + 1 END,
+              locked_until    = CASE WHEN COALESCE(failed_attempts, 0) + 1 >= $2 THEN now() + make_interval(secs => $3::float8 / 1000) ELSE locked_until END
+        WHERE id = $1
+        RETURNING locked_until, (failed_attempts = 0) AS just_locked`,
+      [id, PASSWORD_FAILURE_LIMIT, PASSWORD_LOCK_MS],
+    );
+    const row = result.rows[0];
+    return { lockedUntil: row !== undefined && row.just_locked ? row.locked_until : null };
+  }
+
+  /**
+   * A session mint (FR-AGY-01m, scenario 18): one atomic statement re-checks revoked / expiry / view cap, increments
+   * `view_count`, clears the failure count and lock, and a view row is written in the same transaction. False means
+   * the token was refused at the last possible moment (revoked or capped between lookup and now), and nothing was
+   * written. The cap is evaluated inside the UPDATE, so N parallel mints on a cap of M produce exactly M sessions.
+   */
+  async consumeView(id: string, view: ViewFacts): Promise<boolean> {
+    const { client, workspaceId } = this.store();
+    const updated = await client.query(
+      `UPDATE share_tokens
+          SET view_count = view_count + 1, last_viewed_at = now(), failed_attempts = 0, locked_until = NULL
+        WHERE id = $1
+          AND revoked_at IS NULL
+          AND (expires_at IS NULL OR expires_at > now())
+          AND (max_views IS NULL OR view_count < max_views)
+          AND (locked_until IS NULL OR locked_until <= now())`,
+      [id],
+    );
+    if (updated.rowCount !== 1) return false;
+    await client.query(
+      `INSERT INTO share_token_views (workspace_id, share_token_id, ip, user_agent, authenticated) VALUES ($1, $2, $3::inet, $4, $5)`,
+      [workspaceId, id, view.ip, view.userAgent, view.authenticated],
+    );
+    return true;
+  }
+
+  /**
+   * FR-AGY-01m, checked on EVERY portal request: is the session's token still live? Revoked and expired end it.
+   * The view cap is NOT a mid-session condition: `view_count == max_views` is the session that took the last
+   * permitted view, and it must keep working; only a count ABOVE the cap (which the mint's atomic check forbids) is
+   * refused here, as defence in depth. Scoped to the context's workspace by RLS, so another workspace's id is false.
+   */
+  async isSessionLive(id: string): Promise<boolean> {
+    const { client, workspaceId } = this.store();
+    // RLS already hides another workspace's row; the explicit predicate keeps the answer right on a connection that is
+    // not subject to RLS (a superuser test harness), where a cookie naming the wrong workspace must still be refused.
+    const result = await client.query<{ revoked_at: Date | null; expires_at: Date | null; max_views: number | null; view_count: number }>(
+      `SELECT revoked_at, expires_at, max_views, view_count FROM share_tokens WHERE id = $1 AND workspace_id = $2`,
+      [id, workspaceId],
+    );
+    const row = result.rows[0];
+    if (row === undefined) return false;
+    const refusal = gateRefusal({ revokedAt: row.revoked_at, expiresAt: row.expires_at, maxViews: row.max_views, viewCount: row.view_count - 1 /* gateRefusal is >=; this makes it > */ }, new Date());
+    return refusal === null;
   }
 
   private async loadVisible(client: ClientBase, id: string): Promise<TokenRow> {

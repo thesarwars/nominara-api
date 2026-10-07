@@ -234,6 +234,8 @@ export const shareTokens = pgTable("share_tokens", {
   createdBy: uuid("created_by").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  failedAttempts: integer("failed_attempts").default(sql`0`),
+  lockedUntil: timestamp("locked_until", { withTimezone: true }),
 });
 
 export const toolRuns = pgTable("tool_runs", {

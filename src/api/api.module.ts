@@ -16,6 +16,7 @@ import { GeoModule } from "../modules/geo/geo.module.js";
 import { DisplacementModule } from "../modules/displacement/displacement.module.js";
 import { IntegrationsModule } from "../modules/integrations/integrations.module.js";
 import { AgencyModule } from "../modules/agency/agency.module.js";
+import { PortalModule } from "../modules/portal/portal.module.js";
 import { ToolsModule } from "../modules/tools/tools.module.js";
 import { BillingModule } from "../modules/billing/billing.module.js";
 import { CreditsModule } from "../modules/credits/credits.module.js";
@@ -71,6 +72,7 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     DisplacementModule,
     IntegrationsModule,
     AgencyModule,
+    PortalModule,
     ToolsModule,
     BillingModule,
     CreditsModule,

@@ -41,6 +41,7 @@ describe("NEW-E-1 · migration 0051 — Track E sharing", () => {
   });
 
   async function rollbackBoth(): Promise<void> {
+    expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe("0080_portal_session_gate");
     expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe("0079_scheduled_report_deliveries_tenant_fk");
     expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe("0052_track_e_sharing_validate");
     expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe("0051_track_e_sharing");

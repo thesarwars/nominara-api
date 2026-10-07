@@ -355,6 +355,14 @@ export const envSchema = z
     STRIPE_SECRET_KEY: requiredString.optional(),
     STRIPE_WEBHOOK_SECRET: requiredString.optional(),
     STRIPE_PUBLISHABLE_KEY: requiredString.optional(),
+
+    // NEW-E-098b — the share-token portal. BOTH optional, deliberately, like Stripe: the API boots without them and
+    // POST /portal/session then answers 503 `degraded` (and every portal route 503), failing CLOSED rather than
+    // refusing to start. PORTAL_COOKIE_KEY is 32 random bytes, base64url (43 characters): the root of both the
+    // signing and the encryption key of the portal session cookie. DATABASE_URL_PORTAL logs in as `nominara_portal`
+    // (SELECT only, portal_scope_* policies) and is a DIFFERENT pool from DATABASE_URL_POOLED. Credentials: never logged.
+    PORTAL_COOKIE_KEY: requiredString.optional(),
+    DATABASE_URL_PORTAL: requiredString.optional(),
   })
   .strict()
   // STORY-127 — the first of the two checks that keep plaintext one-time

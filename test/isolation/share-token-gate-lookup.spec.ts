@@ -12,7 +12,7 @@ describe("STORY-098 · app.share_token_by_hash is a pinned SECURITY DEFINER func
     try {
       const r = await client.query<{ secdef: boolean; config: string[] | null; roles: string[] }>(
         `SELECT p.prosecdef AS secdef, p.proconfig AS config,
-                (SELECT array_agg(r.rolname ORDER BY r.rolname) FROM pg_roles r WHERE has_function_privilege(r.oid, p.oid, 'EXECUTE')
+                (SELECT array_agg(r.rolname::text ORDER BY r.rolname) FROM pg_roles r WHERE has_function_privilege(r.oid, p.oid, 'EXECUTE')
                     AND r.rolname LIKE 'nominara\\_%' AND NOT r.rolsuper AND r.oid <> p.proowner) AS roles
            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
           WHERE n.nspname = 'app' AND p.proname = 'share_token_by_hash'`,

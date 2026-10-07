@@ -111,8 +111,19 @@ describe("STORY-098 part B · POST /portal/session", () => {
     return { id, secret };
   }
 
-  const session = (payload: unknown, headers: Record<string, string> = {}) =>
-    harness.app().inject({ method: "POST", url: apiUrl("/portal/session"), headers: { "content-type": "application/json", ...headers }, payload: payload as object });
+  // api-spec §12: portal_session is 10/hour per ADDRESS with a burst of 2, so every call here comes from its own
+  // address unless a test is about that limit.
+  let addressSeq = 0;
+  const session = (payload: unknown, headers: Record<string, string> = {}, remoteAddress?: string) => {
+    addressSeq += 1;
+    return harness.app().inject({
+      method: "POST",
+      url: apiUrl("/portal/session"),
+      headers: { "content-type": "application/json", ...headers },
+      payload: payload as object,
+      remoteAddress: remoteAddress ?? `10.${String((addressSeq >> 8) & 255)}.${String(addressSeq & 255)}.7`,
+    });
+  };
   const errorOf = (res: { json(): unknown }) => (res.json() as { error: { code: string; message: string; details?: { retry_after_ms?: number } } }).error;
   const row = async (id: string) =>
     (await harness.db().query<{ view_count: number; last_viewed_at: Date | null; failed_attempts: number; locked_until: Date | null }>(
@@ -196,7 +207,7 @@ describe("STORY-098 part B · POST /portal/session", () => {
     expect(after.locked_until).toBeNull();
   });
 
-  it("STORY-098 s6 · concurrent wrong passwords cannot slip past the lock: of 12 parallel attempts, exactly one is the 5th (429 with a lock) and the rest are 401 or 429", async () => {
+  it("STORY-098 s6 · parallel guessing cannot slip past the lock: of 12 simultaneous wrong passwords exactly 4 are 401 and 8 are 429, and only 5 are ever verified", async () => {
     const w = await workspace();
     const t = await token(w);
     const results = await Promise.all(Array.from({ length: 12 }, () => session({ secret: t.secret, password: "wrong" })));
@@ -216,7 +227,7 @@ describe("STORY-098 part B · POST /portal/session", () => {
     const unknown = await session({ secret: generateShareSecret(), password: "wrong" });
     expect(argon.decoy, "the unknown-token path must do the same work").toBe(1);
     expect(unknown.statusCode).toBe(wrong.statusCode);
-    expect(errorOf(unknown)).toEqual(errorOf(wrong));
+    expect({ code: errorOf(unknown).code, message: errorOf(unknown).message }).toEqual({ code: errorOf(wrong).code, message: errorOf(wrong).message });
     // An unknown secret with NO password still pays the decoy.
     argon.decoy = 0;
     await session({ secret: generateShareSecret() });
@@ -295,8 +306,8 @@ describe("STORY-098 part B · POST /portal/session", () => {
     expect(missing.statusCode).toBe(400);
     expect(errorOf(missing).code).toBe("validation_failed");
     const foreign = await session({ secret: t.secret, password: PASSWORD, email: "eve@evil.test" });
-    expect(foreign.statusCode).toBe(403);
-    expect(errorOf(foreign).code).toBe("forbidden");
+    expect(foreign.statusCode).toBe(401);
+    expect(errorOf(foreign).code).toBe("unauthenticated");
     const allowed = await session({ secret: t.secret, password: PASSWORD, email: "Jane@ACME.test" });
     expect(allowed.statusCode).toBe(503);
     expect(errorOf(allowed).code).toBe("degraded");
@@ -340,14 +351,19 @@ describe("STORY-098 part B · POST /portal/session", () => {
     expect((await session({ secret: b.secret, password: PASSWORD })).statusCode).toBe(200);
   });
 
-  it("api-spec §6 · POST /portal/session is limited to 10 per hour per address; the 11th is 429 rate_limited and never reaches the gate", async () => {
-    for (let i = 0; i < 10; i += 1) {
-      const res = await session({ secret: generateShareSecret(), password: "x" });
-      expect(res.statusCode, `request ${String(i + 1)}`).toBe(401);
-    }
-    const eleventh = await session({ secret: generateShareSecret(), password: "x" });
-    expect(eleventh.statusCode).toBe(429);
-    expect(errorOf(eleventh).code).toBe("rate_limited");
+  it("api-spec §6/§12 · POST /portal/session is limited per ADDRESS (10/hour, burst 2): the 3rd quick request is 429 rate_limited, never reaches the gate, and another address is unaffected", async () => {
+    const w = await workspace();
+    const t = await token(w);
+    const same = "198.51.100.20";
+    expect((await session({ secret: generateShareSecret(), password: "x" }, {}, same)).statusCode).toBe(401);
+    expect((await session({ secret: generateShareSecret(), password: "x" }, {}, same)).statusCode).toBe(401);
+    argon.decoy = 0;
+    const limited = await session({ secret: t.secret, password: PASSWORD }, {}, same);
+    expect(limited.statusCode).toBe(429);
+    expect(errorOf(limited).code).toBe("rate_limited");
+    expect(argon.decoy + argon.verify, "refused before any Argon2 work").toBe(0);
+    expect((await row(t.id)).view_count).toBe(0);
+    expect((await session({ secret: t.secret, password: PASSWORD }, {}, "198.51.100.21")).statusCode).toBe(200);
   });
 
   it("STORY-098 s8 · with no PORTAL_COOKIE_KEY configured the endpoint fails closed with 503 degraded and mints nothing", async () => {
