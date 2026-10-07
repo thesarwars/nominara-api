@@ -19,12 +19,39 @@ export const DIVERGENCE_OUTCOME = Object.freeze({
 
 export type DivergencePositionClass = keyof typeof DIVERGENCE_OUTCOME;
 
+/**
+ * Stored `mention_facts.position_class` -> the class `o(e)` is defined for.
+ *
+ * `neutral_list` is the reference's "neutral list". A brand with no mention is
+ * `null` (no row) or 'absent'. `also_consider` and `caveat` have NO `o(e)` in
+ * §10 A4 (reference gap, escalated to the owner): they are 'unscored' —
+ * dropped from the prompt and counted, never a guessed number, never a throw
+ * (a throw here would abort the daily rollup). Anything outside the stored
+ * domain still fails closed.
+ */
+export function divergenceClassFor(stored: string | null): DivergencePositionClass | "unscored" {
+  if (stored === null || stored === "absent") return "absent";
+  switch (stored) {
+    case "recommendation":
+    case "ranked":
+      return stored;
+    case "neutral_list":
+      return "neutral";
+    case "also_consider":
+    case "caveat":
+      return "unscored";
+    default:
+      throw new RangeError(`unknown position class: ${stored}`);
+  }
+}
+
 /** The one `data_source` vocabulary: `null` means nothing was measured. */
 export type DivergenceDataSource = "live" | "demo" | "mixed";
 
 export interface DivergenceEngineResult {
   readonly engine: string;
-  readonly positionClass: DivergencePositionClass;
+  /** 'unscored' = a stored class the reference gives no o(e); see `divergenceClassFor`. */
+  readonly positionClass: DivergencePositionClass | "unscored";
   /** Domains this engine's answer cited for the prompt. */
   readonly citedDomains: readonly string[];
   /** Seeded demo engines count as results but are labelled, never passed off as live. */
@@ -55,6 +82,8 @@ export interface DivergenceAttribution {
 export interface PromptDivergence {
   readonly promptId: string;
   readonly divergence: number;
+  /** The same formula over the LIVE results only; `null` with fewer than 2 live results. */
+  readonly divergenceLive: number | null;
   /** `null` when the prompt does not diverge. */
   readonly attribution: DivergenceAttribution | null;
   readonly dataSource: DivergenceDataSource;
@@ -66,7 +95,19 @@ export interface DivergenceResult {
   /** `null` = no qualifying prompt (nothing measured); `0` = engines agree. */
   readonly projectDivergence: number | null;
   readonly qualifyingPrompts: number;
-  readonly excluded: { readonly fewerThanTwoEngines: number; readonly noStability: number };
+  /**
+   * Reference §10 A4 says "live" results. Whether seeded demo results may count is an OPEN
+   * owner decision, so the live-only mean is exposed for any alert to gate on:
+   * `null` = no prompt with >= 2 live results; `0` = those engines agree.
+   */
+  readonly projectDivergenceLive: number | null;
+  readonly qualifyingLivePrompts: number;
+  readonly excluded: {
+    readonly fewerThanTwoEngines: number;
+    readonly noStability: number;
+    /** Engine results whose stored class has no o(e) in the reference. */
+    readonly unscoredResults: number;
+  };
   readonly dataSource: DivergenceDataSource | null;
 }
 
@@ -78,6 +119,7 @@ function combine(sources: readonly DivergenceDataSource[]): DivergenceDataSource
 }
 
 function outcome(positionClass: string): number {
+  if (positionClass === "unscored") throw new RangeError("unscored results are dropped before scoring");
   if (!Object.hasOwn(DIVERGENCE_OUTCOME, positionClass)) {
     throw new RangeError(`unknown position class: ${positionClass}`);
   }
@@ -91,6 +133,7 @@ export function crossEngineDivergence(input: DivergenceInput): DivergenceResult 
   const prompts: PromptDivergence[] = [];
   let fewer = 0;
   let noStability = 0;
+  let unscored = 0;
 
   for (const prompt of input.prompts) {
     const seen = new Set<string>();
@@ -99,7 +142,9 @@ export function crossEngineDivergence(input: DivergenceInput): DivergenceResult 
       seen.add(e.engine);
     }
     // Validate every class even for prompts that will be excluded.
-    const scored = prompt.engines.map((e) => ({ e, o: outcome(e.positionClass) }));
+    const all = prompt.engines.map((e) => ({ e, o: e.positionClass === "unscored" ? null : outcome(e.positionClass) }));
+    unscored += all.filter((s) => s.o === null).length;
+    const scored = all.filter((s): s is { e: DivergenceEngineResult; o: number } => s.o !== null);
     if (scored.length < 2) {
       fewer += 1;
       continue;
@@ -128,20 +173,28 @@ export function crossEngineDivergence(input: DivergenceInput): DivergenceResult 
       attribution = { winningEngine: winner.engine, losingEngine: loser.engine, domains: named };
     }
 
+    const live = sorted.filter((s) => s.e.dataSource === "live");
+    const divergenceLive =
+      live.length < 2 ? null : (Math.max(...live.map((s) => s.o)) - Math.min(...live.map((s) => s.o))) * stability;
+
     prompts.push({
       promptId: prompt.promptId,
       divergence,
+      divergenceLive,
       attribution,
       dataSource: combine(sorted.map((s) => s.e.dataSource))!,
       engines: sorted.map((s) => ({ engine: s.e.engine, dataSource: s.e.dataSource })),
     });
   }
 
+  const liveValues = prompts.flatMap((p) => (p.divergenceLive === null ? [] : [p.divergenceLive]));
   return {
     prompts,
     projectDivergence: prompts.length === 0 ? null : prompts.reduce((sum, p) => sum + p.divergence, 0) / prompts.length,
     qualifyingPrompts: prompts.length,
-    excluded: { fewerThanTwoEngines: fewer, noStability },
+    projectDivergenceLive: liveValues.length === 0 ? null : liveValues.reduce((a, b) => a + b, 0) / liveValues.length,
+    qualifyingLivePrompts: liveValues.length,
+    excluded: { fewerThanTwoEngines: fewer, noStability, unscoredResults: unscored },
     dataSource: combine(prompts.map((p) => p.dataSource)),
   };
 }
