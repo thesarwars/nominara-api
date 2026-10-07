@@ -8,7 +8,7 @@ import {
   shareTokenSchema,
   shareTokenViewSchema,
 } from "./share-token.schema.js";
-import { portalSessionResponseSchema } from "../portal/portal-session.schema.js";
+import { portalSessionRequestSchema, portalSessionResponseSchema } from "../portal/portal-session.schema.js";
 import { portalProjectQuerySchema } from "../portal/portal-read.schema.js";
 import { createScheduledReportRequestSchema, updateScheduledReportRequestSchema } from "../reports/scheduled-report.schema.js";
 import { exportFeatureNotInPlanDetailsSchema, exportQuotaExceededDetailsSchema } from "../reports/export.schema.js";
@@ -127,5 +127,12 @@ describe("Track E contracts (NEW-E-0)", () => {
 
   it("STORY-098 s5: the session response carries no data beyond expiry", () => {
     expect(portalSessionResponseSchema.safeParse({ expires_at: new Date().toISOString(), projects: [] }).success).toBe(false);
+  });
+
+  it("STORY-098 s7: the session request takes an optional email, and still refuses an unknown key", () => {
+    const secret = "s".repeat(43);
+    expect(portalSessionRequestSchema.safeParse({ secret, password: "pw", email: "a@acme.test" }).success).toBe(true);
+    expect(portalSessionRequestSchema.safeParse({ secret, email: "not-an-email" }).success).toBe(false);
+    expect(portalSessionRequestSchema.safeParse({ secret, project_id: "x" }).success).toBe(false);
   });
 });
