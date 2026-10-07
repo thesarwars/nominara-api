@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classPenaltyKindFor, displacementImpact } from "../../../src/lib/scoring/displacement-impact.js";
+import { CLASS_PENALTY, classPenaltyKindFor, displacementImpact, displacementImpactForEvent } from "../../../src/lib/scoring/displacement-impact.js";
 
 // STORY-056 — scoring-models.md §9 (D1). Every expectation is a hand-computed
 // value from the formula, never read back from the implementation.
@@ -76,4 +76,57 @@ describe("STORY-056 · displacement impact (D1)", () => {
     expect(classPenaltyKindFor("render_downgraded", "ranked", "ranked")).toBe("render_downgrade_only");
     expect(classPenaltyKindFor("position_lost", "ranked", "ranked")).toBeNull();
   });
+
+  it("scenario 6b — every §9 class_penalty constant is pinned exactly", () => {
+    expect(CLASS_PENALTY.recommendation_to_absent).toBeCloseTo(1.0, 9);
+    expect(CLASS_PENALTY.recommendation_to_ranked).toBeCloseTo(0.55, 9);
+    expect(CLASS_PENALTY.ranked_to_also_consider).toBeCloseTo(0.4, 9);
+    expect(CLASS_PENALTY.any_to_caveat).toBeCloseTo(0.7, 9);
+    expect(CLASS_PENALTY.render_downgrade_only).toBeCloseTo(0.25, 9);
+  });
+
+  it("a caveat-to-caveat move is not a new caveat demotion (row null)", () => {
+    expect(classPenaltyKindFor("position_lost", "caveat", "caveat")).toBeNull();
+  });
+
+  it("a render_downgraded event takes the render-only row even when the class also changed", () => {
+    expect(classPenaltyKindFor("render_downgraded", "recommendation", "ranked")).toBe("render_downgrade_only");
+    expect(classPenaltyKindFor("render_downgraded", "ranked", "caveat")).toBe("render_downgrade_only");
+  });
+
+  it("presence_lost keeps the recommendation_to_absent row for every before class (flagged reading, pinned)", () => {
+    for (const before of ["recommendation", "ranked", "also_consider", "caveat", null]) {
+      expect(classPenaltyKindFor("presence_lost", before, null)).toBe("recommendation_to_absent");
+    }
+  });
+
+  it("a multi-kind change is scored per event: render-only 0.25 with no position loss, recommendation_lost with no position loss", () => {
+    const common = { funnelStage: "decision" as const, topicRankByIntent: 1, engineWeight: 1, maxEngineWeight: 2, citationGap: 2 };
+    const before = { class: "recommendation", position: 1 };
+    const after = { class: "ranked", position: 4 };
+    const kinds = ["position_lost", "recommendation_lost", "render_downgraded"] as const;
+    const scores = Object.fromEntries(
+      kinds.map((kind) => [kind, scoreDetected(kind, before, after, common)]),
+    ) as Record<(typeof kinds)[number], number>;
+    // shared tail: 0.20·1 + 0.10·0.5 + 0.10·0.6 = 0.31
+    expect(scores.render_downgraded).toBeCloseTo(100 * (0.25 * 0.25 + 0.31), 9); // 37.25
+    expect(scores.recommendation_lost).toBeCloseTo(100 * (0.25 * 0.55 + 0.31), 9); // 44.75
+    expect(scores.position_lost).toBeCloseTo(100 * (0.35 * 0.75 + 0.25 * 0.55 + 0.31), 9); // 71
+  });
 });
+
+function scoreDetected(
+  kind: "position_lost" | "recommendation_lost" | "render_downgraded",
+  before: { class: string; position: number },
+  after: { class: string; position: number },
+  common: { funnelStage: "decision"; topicRankByIntent: number; engineWeight: number; maxEngineWeight: number; citationGap: number },
+): number {
+  return displacementImpactForEvent({
+    kind,
+    beforePosition: before.position,
+    afterPosition: after.position,
+    beforeClass: before.class,
+    afterClass: after.class,
+    ...common,
+  });
+}
