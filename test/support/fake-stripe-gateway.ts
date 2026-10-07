@@ -21,6 +21,18 @@ export function signFakeStripePayload(body: string, secret = FAKE_WEBHOOK_SECRET
   return `t=${timestampSeconds},v1=${mac}`;
 }
 
+export interface FakeCreditPackCheckoutInput {
+  workspaceId: string;
+  purchaseId: string;
+  packKey: string;
+  productName: string;
+  credits: number;
+  unitAmountCents: number;
+  currency: string;
+  successUrl: string;
+  cancelUrl: string;
+}
+
 export class FakeStripeGateway implements StripeGateway {
   /** What `fetchObject` answers, keyed `${kind}:${id}`. A missing key means "Stripe has no such object". */
   readonly objects = new Map<string, FetchedStripeObject>();
@@ -72,6 +84,15 @@ export class FakeStripeGateway implements StripeGateway {
     if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
     this.checkouts.push(input);
     return Promise.resolve({ id: `cs_test_${String(this.checkouts.length)}`, url: `https://checkout.stripe.test/c/pay/cs_test_${String(this.checkouts.length)}` });
+  }
+
+  /** STORY-076a — credit-pack Checkout sessions created, in call order. */
+  readonly packCheckouts: FakeCreditPackCheckoutInput[] = [];
+
+  createCreditPackCheckout(input: FakeCreditPackCheckoutInput): Promise<HostedSession> {
+    if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
+    this.packCheckouts.push(input);
+    return Promise.resolve({ id: `cs_pack_${String(this.packCheckouts.length)}`, url: `https://checkout.stripe.test/c/pay/cs_pack_${String(this.packCheckouts.length)}` });
   }
 
   createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }> {
