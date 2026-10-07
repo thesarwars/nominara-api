@@ -55,18 +55,23 @@ export class CompetitorTrackingService {
     if (store === undefined) throw new Error("CompetitorTrackingService requires an active tenant context");
     const tx = store.client;
 
-    // RLS scopes this to the tenant; no workspace predicate by design.
+    // RLS is the guarantee; the workspace predicate is belt and braces.
     const project = await tx.query<{ timezone: string }>(
       `SELECT w.timezone FROM projects p JOIN workspaces w ON w.id = p.workspace_id
-        WHERE p.id = $1 AND p.deleted_at IS NULL`,
-      [projectId],
+        WHERE p.id = $1 AND p.workspace_id = $2 AND p.deleted_at IS NULL`,
+      [projectId, workspaceId],
     );
     const timezone = project.rows[0]?.timezone;
     if (timezone === undefined) throw new NotFoundError({ message: "no such project" });
 
+    // Serialise per project BEFORE counting: under READ COMMITTED, concurrent
+    // requests would all see the same live count and each pass the cap (and the
+    // duplicate-name check). Transaction-scoped, released at COMMIT/ROLLBACK.
+    await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [`competitors:${projectId}`]);
+
     const live = await tx.query<{ name: string }>(
-      "SELECT name FROM competitors WHERE project_id = $1 AND deleted_at IS NULL",
-      [projectId],
+      "SELECT name FROM competitors WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+      [projectId, workspaceId],
     );
     const wanted = input.name.toLowerCase();
     if (live.rows.some((row) => row.name.toLowerCase() === wanted)) {
@@ -89,19 +94,26 @@ export class CompetitorTrackingService {
     const revived = await tx.query<{ id: string }>(
       `UPDATE competitors SET deleted_at = NULL, root_domain = $3, aliases = $4
         WHERE id = (SELECT id FROM competitors
-                     WHERE project_id = $1 AND lower(name) = $2 AND deleted_at IS NOT NULL
+                     WHERE project_id = $1 AND workspace_id = $5 AND lower(name) = $2 AND deleted_at IS NOT NULL
                      ORDER BY deleted_at DESC LIMIT 1)
         RETURNING id`,
-      [projectId, wanted, input.root_domain ?? null, input.aliases ?? []],
+      [projectId, wanted, input.root_domain ?? null, input.aliases ?? [], workspaceId],
     );
     let entityId = revived.rows[0]?.id;
     if (entityId === undefined) {
       entityId = uuidV7();
-      await tx.query(
-        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source)
-         VALUES ($1,$2,$3,$4,$5,$6,'user')`,
-        [entityId, workspaceId, projectId, input.name, input.root_domain ?? null, input.aliases ?? []],
-      );
+      try {
+        await tx.query(
+          `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source)
+           VALUES ($1,$2,$3,$4,$5,$6,'user')`,
+          [entityId, workspaceId, projectId, input.name, input.root_domain ?? null, input.aliases ?? []],
+        );
+      } catch (error) {
+        if (isUniqueViolation(error, "ux_competitors_project_name")) {
+          throw new ConflictError({ message: "this competitor is already tracked" });
+        }
+        throw error;
+      }
     }
 
     const names = [wanted, ...(input.aliases ?? []).map((alias) => alias.toLowerCase())];
@@ -110,6 +122,7 @@ export class CompetitorTrackingService {
          UPDATE mention_facts
             SET entity_type = 'competitor', entity_id = $2
           WHERE project_id = $1
+            AND workspace_id = $5
             AND entity_type = 'other'
             AND entity_id IS NULL
             AND (lower(entity_label) = ANY($3::text[]) OR lower(matched_alias) = ANY($3::text[]))
@@ -119,7 +132,7 @@ export class CompetitorTrackingService {
               to_char(min((captured_at AT TIME ZONE $4)::date), 'YYYY-MM-DD')               AS from_date,
               to_char(max((captured_at AT TIME ZONE $4)::date), 'YYYY-MM-DD')               AS to_date
          FROM moved`,
-      [projectId, entityId, names, timezone],
+      [projectId, entityId, names, timezone, workspaceId],
     );
     const span: BackfillSpan = {
       days: backfill.rows[0]!.days,
@@ -158,16 +171,16 @@ export class CompetitorTrackingService {
 
     const removed = await tx.query<{ name: string }>(
       `UPDATE competitors SET deleted_at = now()
-        WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL
+        WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL
         RETURNING name`,
-      [competitorId, projectId],
+      [competitorId, projectId, workspaceId],
     );
     const name = removed.rows[0]?.name;
     if (name === undefined) throw new NotFoundError({ message: "no such competitor" });
 
     const remaining = await tx.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM competitors WHERE project_id = $1 AND deleted_at IS NULL",
-      [projectId],
+      "SELECT count(*)::int AS n FROM competitors WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+      [projectId, workspaceId],
     );
     await this.annotate(
       tx,
@@ -212,4 +225,10 @@ export class CompetitorTrackingService {
         });
     });
   }
+}
+
+function isUniqueViolation(error: unknown, constraint: string): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const pgError = error as { code?: unknown; constraint?: unknown };
+  return pgError.code === "23505" && pgError.constraint === constraint;
 }
