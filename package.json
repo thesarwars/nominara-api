@@ -31,6 +31,8 @@
     "credits:verify": "tsx src/workers/rollup/credit-verify.ts",
     "credits:reconcile": "tsx src/workers/rollup/credit-reconcile.ts",
     "plan:set": "tsx src/workers/billing/plan-set.ts",
+    "support:grant": "tsx src/workers/support/support-grant.ts grant",
+    "support:revoke": "tsx src/workers/support/support-grant.ts revoke",
     "audit:verify": "tsx src/workers/rollup/audit-verify.ts",
     "audit:export": "tsx src/workers/rollup/audit-export.ts",
     "db:purge-check": "tsx src/db/purge-check.ts",

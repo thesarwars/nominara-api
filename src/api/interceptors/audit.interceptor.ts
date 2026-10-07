@@ -220,7 +220,7 @@ export class AuditInterceptor implements NestInterceptor {
       afterState: responseBody ?? null,
       requestId: req.id !== undefined ? String(req.id) : "",
       supportGrantId: req.supportGrant?.id ?? null,
-      severity: "info",
+      severity: options.severity ?? "info",
     });
   }
 }

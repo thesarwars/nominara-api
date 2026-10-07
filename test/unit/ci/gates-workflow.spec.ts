@@ -91,6 +91,8 @@ const NOT_A_GATE: Readonly<Record<string, string>> = {
   "credits:verify": "an operational job against a live ledger",
   "credits:reconcile": "an operational job against a live ledger",
   "plan:set": "the operator CLI; it changes a workspace's plan",
+  "support:grant": "the operator CLI; it issues a time-boxed support access grant",
+  "support:revoke": "the operator CLI; it revokes a support access grant",
   "audit:verify": "an operational job against a live audit chain",
   "audit:export": "an operational export",
   "contracts:generate": "writes the generated OpenAPI document; contracts:check is the gate over it",

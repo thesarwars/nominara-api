@@ -41,7 +41,14 @@ describe("NEW-E-1 · migration 0051 — Track E sharing", () => {
   });
 
   async function rollbackBoth(): Promise<void> {
-    expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe("0052_track_e_sharing_validate");
+    // Roll back UNTIL 0052 rather than assuming it is the newest migration (as 88c6277 did for 0031).
+    for (let step = 0; step < 200; step += 1) {
+      const name = await rollbackLast(client, MIGRATIONS_DIR);
+      if (name === null || name === "0052_track_e_sharing_validate") {
+        expect(name).toBe("0052_track_e_sharing_validate");
+        break;
+      }
+    }
     expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe("0051_track_e_sharing");
   }
 
