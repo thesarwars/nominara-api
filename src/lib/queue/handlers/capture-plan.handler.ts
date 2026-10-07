@@ -5,13 +5,15 @@ import { capturePlanJobSchema } from "../../../../contracts/tracking/capture-pla
 import type { Cache } from "../../cache/cache.port.js";
 import { ValkeyCacheAdapter } from "../../cache/valkey-cache.adapter.js";
 import { cacheKeyNamespace } from "../../cache/key-namespace.js";
+import { releaseFairUseCapacity } from "../../capture/fair-use.js";
 import { claimDueProject, planScheduledRun, priorityVariantFor, type ScheduledRun } from "../../capture/scheduler.js";
 import { resolveEntitlements } from "../../entitlements/resolution.js";
 import { uuidV7 } from "../../ids/uuidv7.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../usage/billing-period.js";
-import { afterCommit } from "../../../tenancy/tenant-context.js";
+import { SYSTEM_ACTOR_ID } from "../../../tenancy/constants.js";
+import { afterCommit, withTenantContext } from "../../../tenancy/tenant-context.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
 import { signingKeysFromEnv } from "../worker-factory.js";
@@ -53,6 +55,12 @@ export interface CapturePlanDeps {
   /** Injected in tests; production signs and enqueues the run's cells. Called AFTER the job's transaction commits. */
   readonly dispatch?: (scheduled: ScheduledRun) => Promise<unknown>;
   readonly now?: () => Date;
+  /**
+   * Runs `fn` on a connection for the dispatch-failure compensation (a SECOND
+   * transaction, after the job's own has committed). Injected in tests;
+   * production borrows one from the worker pool.
+   */
+  readonly withClient?: <T>(fn: (client: ClientBase) => Promise<T>) => Promise<T>;
 }
 
 type Outcome = "planned" | "skipped" | "no_capturable_engine" | "dispatch_failed";
@@ -81,6 +89,43 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
       });
     });
 
+  const withClient =
+    deps?.withClient ??
+    (async <T>(fn: (client: ClientBase) => Promise<T>): Promise<T> => {
+      const client = await context.pool.connect();
+      try {
+        return await fn(client);
+      } finally {
+        client.release();
+      }
+    });
+
+  /**
+   * A run whose cells could not be handed to the queue will never be captured:
+   * `next_run_at` has already moved and nothing replans a `queued` run. Left
+   * alone it shows as queued indefinitely and its fair-use reservation (made
+   * for cells that never ran) stays consumed for the cycle. So: in a fresh
+   * tenant transaction, fail the run and give the reservation back.
+   *
+   * Only a run still `queued` is failed — if any cell had already started it
+   * is `running`, some cells did go out, and its reservation is not ours to
+   * release. Best-effort and logged: it must never turn into a thrown job.
+   */
+  const failUndispatchedRun = async (workspaceId: string, runId: string, periodStart: string, live: number): Promise<void> => {
+    await withClient((client) =>
+      withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        const failed = await tx.query(
+          `UPDATE capture_runs
+              SET status = 'failed', finished_at = now(),
+                  error_summary = '{"reason":"dispatch_failed"}'::jsonb
+            WHERE id = $1 AND status = 'queued'`,
+          [runId],
+        );
+        if ((failed.rowCount ?? 0) === 1) await releaseFairUseCapacity(tx, workspaceId, periodStart, live);
+      }),
+    );
+  };
+
   const record = (outcome: Outcome, workspaceId: string, projectId: string, runId?: string): void => {
     incrementCounter("nominara_capture_plan_runs_total", { outcome });
     // IDs only — never the workspace's name, a prompt's text or an engine answer.
@@ -108,12 +153,13 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
     cache ??= new ValkeyCacheAdapter(context.env.VALKEY_CACHE_URL);
     const resolved = await resolveEntitlements(tx, project.workspaceId);
     const runId = uuidV7();
+    const periodStart = (await resolveBillingPeriod(tx, project.workspaceId, now)).start;
     const scheduled = await planScheduledRun(
       tx,
       cache,
       project,
       {
-        periodStart: (await resolveBillingPeriod(tx, project.workspaceId, now)).start,
+        periodStart,
         normalizerVersion: NORMALIZER_VERSION,
         captureMode: "api",
         env: cacheKeyNamespace(),
@@ -124,10 +170,12 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
 
     if (scheduled === null) {
       // `planScheduledRun` also returns null when its compare-and-set on
-      // `next_run_at` LOSES — after it has already written the run row. Under
-      // the row lock above that should be impossible, but a run row with no
-      // dispatch is a permanently `queued` run nothing will ever complete, so
-      // roll the whole transaction back (retry) rather than commit it.
+      // `next_run_at` LOSES — after it has already written the run row. The
+      // row is locked FOR UPDATE and the advance re-asserts the claim's own
+      // `next_run_at <= now`, so under the lock this cannot happen; if it ever
+      // does, a run row with no dispatch is a permanently `queued` run nothing
+      // will ever complete, so roll the whole transaction back (retry) rather
+      // than commit it.
       const orphan = await tx.query("SELECT 1 FROM capture_runs WHERE id = $1", [runId]);
       if ((orphan.rowCount ?? 0) > 0) {
         throw new Error("capture.plan: the schedule advance lost its compare-and-set after the run row was written");
@@ -139,13 +187,22 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
     record("planned", project.workspaceId, project.projectId, runId);
     // AFTER COMMIT, and never inside the transaction: dispatch is not
     // transactional, and a job for a run that rolled back is not recoverable
-    // while a lost one is (a replan re-creates it under the same keys).
+    // while a lost one is compensated for (the run is failed, the reservation released).
     afterCommit(() => {
       void dispatch(scheduled).catch((error: unknown) => {
         // The run row EXISTS. Failing the job would retry into a project that
-        // is no longer due; the run is left `queued` for a replan to recover.
+        // is no longer due, and nothing replans a queued run — so the run is
+        // failed and its reservation released in a follow-up transaction.
         record("dispatch_failed", project.workspaceId, project.projectId, runId);
         logger.error({ event: "capture.plan.dispatch_error", run_id: runId, error: error instanceof Error ? error.name : "unknown" });
+        return failUndispatchedRun(project.workspaceId, runId, periodStart, scheduled.plan.live).catch((compensationError: unknown) => {
+          logger.error({
+            event: "capture.plan.compensation_error",
+            workspace_id: project.workspaceId,
+            run_id: runId,
+            error: compensationError instanceof Error ? compensationError.name : "unknown",
+          });
+        });
       });
     });
   };

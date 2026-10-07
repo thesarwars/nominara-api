@@ -169,11 +169,19 @@ export async function claimDueProject(tx: ClientBase, projectId: string, now: Da
  * Advances `next_run_at`, and returns whether it actually moved.
  *
  * CALLED BEFORE THE ENQUEUE, in the same transaction — see this file's
- * header. The `next_run_at = $2` guard makes it a compare-and-set: if another
- * transaction advanced this project since it was claimed, this updates
- * nothing and returns false, and the caller must not enqueue. Without the
- * guard a lock lost to a timeout, or a claim replayed after a rollback, would
- * schedule a second identical run.
+ * header. The `next_run_at <= ranAt` guard makes it a compare-and-set: if
+ * another transaction advanced this project since it was claimed, its
+ * `next_run_at` is in the future, this updates nothing and returns false, and
+ * the caller must not enqueue. Without the guard a lock lost to a timeout, or
+ * a claim replayed after a rollback, would schedule a second identical run.
+ *
+ * THE GUARD IS "STILL DUE", NOT `next_run_at = <the claimed Date>`. A claim
+ * reads `next_run_at` back as a JS Date, which holds milliseconds; a value
+ * written by SQL (`now()`, an ops backfill) has microseconds and never equals
+ * it. Equality would then lose EVERY advance for that project after the run
+ * row was written, and the project would never be planned again. `ranAt` is the
+ * same instant the claim tested `next_run_at <= now` against, so the predicate
+ * is exactly the claim's own, re-asserted under the row lock.
  */
 export async function advanceNextRun(
   tx: ClientBase,
@@ -185,8 +193,9 @@ export async function advanceNextRun(
     `UPDATE projects
         SET next_run_at = $3, last_run_at = $4
       WHERE id = $1
-        AND next_run_at = $2`,
-    [project.projectId, project.nextRunAt, nextRunAt, ranAt],
+        AND next_run_at IS NOT NULL
+        AND next_run_at <= $2`,
+    [project.projectId, ranAt, nextRunAt, ranAt],
   );
   return (result.rowCount ?? 0) === 1;
 }

@@ -73,6 +73,30 @@ export async function reserveFairUseCapacity(
 }
 
 /**
+ * Gives `cells` back to this cycle's fair-use ceiling — the compensation for a
+ * reservation whose cells were never captured (NEW-A-10: a run that could not
+ * be dispatched).
+ *
+ * `GREATEST(..., 0)` because `ck_usage_nonneg` would otherwise turn a
+ * compensation into a failed transaction. Reserved only, never `used_value`:
+ * nothing was captured, so nothing was used.
+ */
+export async function releaseFairUseCapacity(
+  tx: ClientBase,
+  workspaceId: string,
+  periodStart: string,
+  cells: number,
+): Promise<void> {
+  if (cells <= 0) return;
+  await tx.query(
+    `UPDATE usage_counters
+        SET reserved_value = GREATEST(reserved_value - $4, 0), updated_at = now()
+      WHERE workspace_id = $1 AND metric = $2 AND period_start = $3`,
+    [workspaceId, FAIR_USE_METRIC, periodStart, cells],
+  );
+}
+
+/**
  * The throwing form.
  *
  * THE CEILING IS NOT IN THE DETAILS, and that is `FR-CRD-19` rather than an
