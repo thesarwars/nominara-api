@@ -36,7 +36,12 @@ interface StructuralCounter {
  * decides otherwise, this predicate is the one line to change and the tests
  * below say what depends on it.
  */
-const PROMPT_OCCUPIES_SLOT = "status <> 'archived' AND deleted_at IS NULL";
+// Exported (STORY-169 review) so the dev-only demo seed can count against
+// the EXACT same predicate this file's own `COUNTERS["prompts.max_total" /
+// "prompts.max_per_project"]` use, rather than a second literal that could
+// silently drift from this one and under- or over-count what actually
+// occupies a slot.
+export const PROMPT_OCCUPIES_SLOT = "status <> 'archived' AND deleted_at IS NULL";
 
 const COUNTERS: Record<StructuralLimitKey, StructuralCounter> = {
   "projects.max": {

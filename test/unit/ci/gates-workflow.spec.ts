@@ -84,6 +84,7 @@ const NOT_A_GATE: Readonly<Record<string, string>> = {
   "db:rls-generate": "writes generated RLS artifacts; db:rls-check is the gate over them",
   "db:schema-generate": "writes the generated Drizzle schema; db:schema-check is the gate over it",
   "db:studio": "an interactive UI",
+  "db:seed-demo": "a dev-only operator CLI; mutates a database (behind its own NODE_ENV/local-host/opt-in guard — see src/db/seed/demo/guard.ts)",
   "db:maintenance:run": "an operational job",
   "db:maintenance:sweep": "an operational job",
   "credits:verify": "an operational job against a live ledger",

@@ -415,11 +415,244 @@ describe("STORY-042 · rollup.metric_daily", () => {
     await roll(at.slice(0, 10));
     await denormalizeProject(db, projectId, "UTC");
 
-    const row = await db.query<{ visibility_delta_30d: string | null }>(
-      "SELECT visibility_delta_30d::text FROM projects WHERE id = $1",
+    const row = await db.query<{
+      visibility_delta_30d: string | null;
+      sentiment_delta_30d: string | null;
+      cells_30d: number | null;
+    }>(
+      "SELECT visibility_delta_30d::text, sentiment_delta_30d::text, cells_30d FROM projects WHERE id = $1",
       [projectId],
     );
     expect(row.rows[0]!.visibility_delta_30d).toBeNull();
+    // STORY-169 — sentiment_delta_30d shares the same 30-cell threshold rule.
+    expect(row.rows[0]!.sentiment_delta_30d).toBeNull();
+    // cells_30d has no threshold of its own — it is what confidenceFor()
+    // reads, and a single measured cell is a real (if "low") count.
+    expect(row.rows[0]!.cells_30d).toBe(1);
+  });
+
+  it("STORY-169 · rendering_delta_30d is NULL when the prior window has no cells at all, even with a well-sampled current day", async () => {
+    // rendering_delta_30d shares visibility_delta_30d's window/threshold
+    // rule (0028's own COMMENT ON COLUMN, and NFR-ANL-03, which is not
+    // scoped to the visibility score specifically). Here the prior window's
+    // OVERALL cell count is zero — under the 30-cell gate on either side —
+    // so the delta must stay null rather than "current minus nothing", quite
+    // apart from the current window's single day having a real rendering mean.
+    const at = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    const cell = await addCell({ capturedAt: at, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+    await addMention(cell, at, { renderScore: 0.6 });
+    await roll(at.slice(0, 10));
+    await denormalizeProject(db, projectId, "UTC");
+
+    const row = await db.query<{ rendering_quality: string | null; rendering_delta_30d: string | null }>(
+      "SELECT rendering_quality::text, rendering_delta_30d::text FROM projects WHERE id = $1",
+      [projectId],
+    );
+    expect(Number(row.rows[0]!.rendering_quality)).toBeGreaterThan(0);
+    expect(row.rows[0]!.rendering_delta_30d).toBeNull();
+  });
+
+  it("STORY-169 review · rendering_delta_30d is NULL when both windows have a rendering mean but fewer than 30 cells", async () => {
+    // The exact violation review caught: one well-sampled-LOOKING day per
+    // window (a real, non-null rendering_quality on both sides) but each
+    // window's OVERALL measured-cell count is 1 — nowhere near the 30-cell
+    // gate — so the delta must stay null, not "current minus prior".
+    // Reproduces PROBE B: two 'all' brand rows with cells_total=1 used to
+    // publish a non-null delta ("40.000") while visibility_delta_30d, over
+    // the identical windows, correctly stayed null.
+    const priorAt = new Date(Date.now() - 40 * 86_400_000).toISOString();
+    const currentAt = new Date(Date.now() - 2 * 86_400_000).toISOString();
+
+    const priorCell = await addCell({ capturedAt: priorAt, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+    await addMention(priorCell, priorAt, { renderScore: 0.4 });
+    const currentCell = await addCell({ capturedAt: currentAt, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+    await addMention(currentCell, currentAt, { renderScore: 0.8 });
+
+    await roll(priorAt.slice(0, 10));
+    await roll(currentAt.slice(0, 10));
+    await denormalizeProject(db, projectId, "UTC");
+
+    const row = await db.query<{
+      rendering_quality: string | null;
+      rendering_delta_30d: string | null;
+      cells_30d: number | null;
+    }>("SELECT rendering_quality::text, rendering_delta_30d::text, cells_30d FROM projects WHERE id = $1", [projectId]);
+    expect(Number(row.rows[0]!.rendering_quality)).toBeGreaterThan(0);
+    expect(row.rows[0]!.cells_30d).toBe(1);
+    expect(row.rows[0]!.rendering_delta_30d).toBeNull();
+  });
+
+  it("STORY-169 re-audit · rendering_delta_30d stays NULL even when the WINDOW's overall cell count clears 30, if only ONE cell per window is attribute-capable", async () => {
+    // The gap the first review fix left open: it gated on `currentCells`
+    // (the window's OVERALL measured-cell count, across EVERY engine), not
+    // on the count of cells the rendering figure itself rests on. Thirty
+    // `chatgpt` cells a window are NOT attribute-capable (`rendering_quality`
+    // stays null on every one of them) and pad `cells_30d`/`currentCells`
+    // to 31 — comfortably over the 30-cell gate, and even "high" confidence
+    // territory (>= 120 would be needed for that, but well past "low") —
+    // while the rendering figure itself still rests on exactly ONE
+    // `google_ai_mode` cell per window. Before this fix that published a
+    // confident-looking delta anyway (PROBE B: cells_30d 31,
+    // rendering_delta_30d "70.000" from n=1 per window).
+    const priorDay = new Date(Date.now() - 40 * 86_400_000).toISOString();
+    const currentDay = new Date(Date.now() - 2 * 86_400_000).toISOString();
+
+    for (let i = 0; i < 30; i += 1) {
+      await addCell({ capturedAt: priorDay, engineKey: "chatgpt", brandPresent: false, sov: 0 });
+      await addCell({ capturedAt: currentDay, engineKey: "chatgpt", brandPresent: false, sov: 0 });
+    }
+    const priorCell = await addCell({ capturedAt: priorDay, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+    await addMention(priorCell, priorDay, { renderScore: 0.2 });
+    const currentCell = await addCell({ capturedAt: currentDay, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+    await addMention(currentCell, currentDay, { renderScore: 0.9 });
+
+    await roll(priorDay.slice(0, 10));
+    await roll(currentDay.slice(0, 10));
+    await denormalizeProject(db, projectId, "UTC");
+
+    const row = await db.query<{
+      rendering_quality: string | null;
+      rendering_delta_30d: string | null;
+      cells_30d: number | null;
+    }>("SELECT rendering_quality::text, rendering_delta_30d::text, cells_30d FROM projects WHERE id = $1", [projectId]);
+    // The window's OVERALL cell count clears the gate...
+    expect(row.rows[0]!.cells_30d).toBe(31);
+    expect(Number(row.rows[0]!.rendering_quality)).toBeGreaterThan(0);
+    // ...but the rendering figure itself still rests on one cell per window,
+    // so the delta must stay null.
+    expect(row.rows[0]!.rendering_delta_30d).toBeNull();
+  });
+
+  it("STORY-169 · rendering_delta_30d is the current window mean minus the prior window mean, once both windows clear the 30-cell gate", async () => {
+    const priorDay = new Date(Date.now() - 40 * 86_400_000).toISOString();
+    const currentDay = new Date(Date.now() - 2 * 86_400_000).toISOString();
+
+    for (let i = 0; i < 30; i += 1) {
+      const priorCell = await addCell({ capturedAt: priorDay, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+      await addMention(priorCell, priorDay, { renderScore: 0.4 });
+      const currentCell = await addCell({ capturedAt: currentDay, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+      await addMention(currentCell, currentDay, { renderScore: 0.8 });
+    }
+
+    await roll(priorDay.slice(0, 10));
+    await roll(currentDay.slice(0, 10));
+    await denormalizeProject(db, projectId, "UTC");
+
+    const dayRendering = async (date: string): Promise<number> => {
+      const result = await db.query<{ v: string }>(
+        `SELECT rendering_quality::text AS v FROM metric_daily
+          WHERE project_id = $1 AND engine_key = $2 AND entity_type = 'brand' AND metric_date = $3::date`,
+        [projectId, CROSS_ENGINE_KEY, date],
+      );
+      return Number(result.rows[0]!.v);
+    };
+    const priorRendering = await dayRendering(priorDay.slice(0, 10));
+    const currentRendering = await dayRendering(currentDay.slice(0, 10));
+
+    const row = await db.query<{ rendering_delta_30d: string | null; cells_30d: number | null }>(
+      "SELECT rendering_delta_30d::text, cells_30d FROM projects WHERE id = $1",
+      [projectId],
+    );
+    expect(row.rows[0]!.cells_30d).toBe(30);
+    expect(Number(row.rows[0]!.rendering_delta_30d)).toBeCloseTo(currentRendering - priorRendering, 3);
+  });
+
+  it("STORY-169 · sentiment_score and sentiment_delta_30d, from a well-sampled window pair", async () => {
+    // 30 cells in each window — exactly the threshold visibilityDelta shares
+    // with sentiment_delta_30d — with opposite sentiment so the delta is
+    // unambiguous rather than incidentally close to zero.
+    const priorDay = new Date(Date.now() - 40 * 86_400_000).toISOString();
+    const currentDay = new Date(Date.now() - 2 * 86_400_000).toISOString();
+
+    for (let i = 0; i < 30; i += 1) {
+      const priorCell = await addCell({ capturedAt: priorDay, brandPresent: true, sov: 1 });
+      await addMention(priorCell, priorDay, { sentimentScore: -0.8 });
+      const currentCell = await addCell({ capturedAt: currentDay, brandPresent: true, sov: 1 });
+      await addMention(currentCell, currentDay, { sentimentScore: 0.8 });
+    }
+
+    await roll(priorDay.slice(0, 10));
+    await roll(currentDay.slice(0, 10));
+    await denormalizeProject(db, projectId, "UTC");
+
+    const row = await db.query<{ sentiment_score: string | null; sentiment_delta_30d: string | null; cells_30d: number | null }>(
+      "SELECT sentiment_score::text, sentiment_delta_30d::text, cells_30d FROM projects WHERE id = $1",
+      [projectId],
+    );
+    // SentimentScore(T) = 50 * (raw + 1): 0.8 -> 90, -0.8 -> 10.
+    expect(Number(row.rows[0]!.sentiment_score)).toBeCloseTo(90, 3);
+    expect(Number(row.rows[0]!.sentiment_delta_30d)).toBeCloseTo(80, 3);
+    expect(row.rows[0]!.cells_30d).toBe(30);
+  });
+
+  it("STORY-169 · visibility_by_engine — one entry per engine, cells-weighted, matching the per-engine metric_daily row", async () => {
+    const at = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    const strong = await addCell({ capturedAt: at, engineKey: "google_ai_mode", brandPresent: true, sov: 1 });
+    await addMention(strong, at);
+    const weak = await addCell({ capturedAt: at, engineKey: "chatgpt", brandPresent: false, sov: 0 });
+    await addMention(weak, at, { prominence: 0.1, sentimentScore: 0 });
+
+    await roll(at.slice(0, 10));
+    await denormalizeProject(db, projectId, "UTC");
+
+    const heavy = Number((await metricRow("google_ai_mode"))!.visibility_score);
+    const light = Number((await metricRow("chatgpt"))!.visibility_score);
+
+    const row = await db.query<{ visibility_by_engine: Record<string, { score: number; delta_30d: number | null }> | null }>(
+      "SELECT visibility_by_engine FROM projects WHERE id = $1",
+      [projectId],
+    );
+    const byEngine = row.rows[0]!.visibility_by_engine!;
+    expect(byEngine.google_ai_mode!.score).toBeCloseTo(heavy, 3);
+    expect(byEngine.chatgpt!.score).toBeCloseTo(light, 3);
+    // A single day is under the 30-cell threshold in both windows.
+    expect(byEngine.google_ai_mode!.delta_30d).toBeNull();
+    expect(byEngine.chatgpt!.delta_30d).toBeNull();
+  });
+
+  it("STORY-169 · denormalizeProject touches only the named project — a second workspace's project is untouched", async () => {
+    const otherWorkspaceId = randomUUID();
+    const otherProjectId = randomUUID();
+    await db.query("INSERT INTO workspaces (id, name, slug, plan_key, timezone) VALUES ($1,'Other',$2,'growth','UTC')", [
+      otherWorkspaceId,
+      `w-${randomUUID().slice(0, 8)}`,
+    ]);
+    await db.query(
+      `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain)
+       VALUES ($1,$2,'Other Co',$3,'https://other.example','other.example')`,
+      [otherProjectId, otherWorkspaceId, `p-${randomUUID().slice(0, 8)}`],
+    );
+
+    const at = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    const cell = await addCell({ capturedAt: at, brandPresent: true, sov: 1 });
+    await addMention(cell, at);
+    await roll(at.slice(0, 10));
+    await denormalizeProject(db, projectId, "UTC");
+
+    const untouched = await db.query<{
+      rendering_delta_30d: string | null;
+      sentiment_score: string | null;
+      sentiment_delta_30d: string | null;
+      cells_30d: number | null;
+      visibility_by_engine: unknown;
+      open_task_count: number;
+      open_tasks_by_severity: { critical: number; high: number; medium: number; low: number };
+      demo_seeded_at: string | null;
+    }>(
+      `SELECT rendering_delta_30d::text, sentiment_score::text, sentiment_delta_30d::text, cells_30d,
+              visibility_by_engine, open_task_count, open_tasks_by_severity, demo_seeded_at
+         FROM projects WHERE id = $1`,
+      [otherProjectId],
+    );
+    const other = untouched.rows[0]!;
+    expect(other.rendering_delta_30d).toBeNull();
+    expect(other.sentiment_score).toBeNull();
+    expect(other.sentiment_delta_30d).toBeNull();
+    expect(other.cells_30d).toBeNull();
+    expect(other.visibility_by_engine).toBeNull();
+    expect(other.open_task_count).toBe(0);
+    expect(other.open_tasks_by_severity).toEqual({ critical: 0, high: 0, medium: 0, low: 0 });
+    expect(other.demo_seeded_at).toBeNull();
   });
 
   it("Scenario 11 — a rebuild over a range matches the incremental result", async () => {

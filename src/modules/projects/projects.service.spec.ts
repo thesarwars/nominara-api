@@ -734,12 +734,21 @@ describe("STORY-132 · ProjectsService.list", () => {
       prompts_active: 0,
       prompts_cap: 40,
       open_task_count: 0,
+      open_tasks_by_severity: { critical: 0, high: 0, medium: 0, low: 0 },
       domain_verified_at: null,
       created_at: new Date("2026-09-01T00:00:00Z"),
       visibility_blended: null,
       visibility_delta_30d: null,
+      rendering_quality: null,
+      rendering_delta_30d: null,
+      source_coverage: null,
       aux_score_current: null,
+      sentiment_score: null,
+      sentiment_delta_30d: null,
+      cells_30d: null,
+      visibility_by_engine: null,
       sparkline_30d: null,
+      demo_seeded_at: null,
       created_at_key: "2026-09-01 00:00:00+00",
       ...over,
     };
@@ -793,7 +802,15 @@ describe("STORY-132 · ProjectsService.list", () => {
 
     expect(page.items[0]!.visibility_blended).toBeNull();
     expect(page.items[0]!.visibility_delta_30d).toBeNull();
+    expect(page.items[0]!.rendering_quality).toBeNull();
+    expect(page.items[0]!.rendering_delta_30d).toBeNull();
+    expect(page.items[0]!.source_coverage).toBeNull();
     expect(page.items[0]!.aux_score_current).toBeNull();
+    expect(page.items[0]!.sentiment_score).toBeNull();
+    expect(page.items[0]!.sentiment_delta_30d).toBeNull();
+    expect(page.items[0]!.sentiment_band).toBeNull();
+    expect(page.items[0]!.confidence).toBeNull();
+    expect(page.items[0]!.engine_scores).toBeNull();
     expect(page.items[0]!.sparkline_30d).toBeNull();
   });
 
@@ -807,6 +824,79 @@ describe("STORY-132 · ProjectsService.list", () => {
 
     expect(page.items[0]!.visibility_blended).toBe(88.2);
     expect(page.items[0]!.aux_score_current).toBe(74.5);
+  });
+
+  // STORY-169 — the fields computed at READ time rather than stored.
+  describe("STORY-169 · read-time fields", () => {
+    it("derives sentiment_band from sentiment_score, and stays null when the score is null", async () => {
+      const positive = await serviceReading([row({ sentiment_score: "82.000" })]).list({ limit: 50 } as never);
+      expect(positive.items[0]!.sentiment_band).toBe("positive");
+
+      const absent = await serviceReading([row()]).list({ limit: 50 } as never);
+      expect(absent.items[0]!.sentiment_band).toBeNull();
+    });
+
+    it("derives confidence from cells_30d, and stays null when cells_30d is null — not the same as 'low'", async () => {
+      const low = await serviceReading([row({ cells_30d: 5 })]).list({ limit: 50 } as never);
+      expect(low.items[0]!.confidence).toBe("low");
+
+      const high = await serviceReading([row({ cells_30d: 150 })]).list({ limit: 50 } as never);
+      expect(high.items[0]!.confidence).toBe("high");
+
+      const unmeasured = await serviceReading([row({ cells_30d: null })]).list({ limit: 50 } as never);
+      expect(unmeasured.items[0]!.confidence).toBeNull();
+    });
+
+    it("turns visibility_by_engine into an array sorted by score descending", async () => {
+      const page = await serviceReading([
+        row({
+          visibility_by_engine: {
+            chatgpt: { score: 40, delta_30d: null },
+            google_ai_mode: { score: 71.5, delta_30d: 3.2 },
+          },
+        }),
+      ]).list({ limit: 50 } as never);
+
+      expect(page.items[0]!.engine_scores).toEqual([
+        { engine_key: "google_ai_mode", score: 71.5, delta_30d: 3.2 },
+        { engine_key: "chatgpt", score: 40, delta_30d: null },
+      ]);
+    });
+
+    it("passes open_tasks_by_severity through unchanged", async () => {
+      const page = await serviceReading([row({ open_tasks_by_severity: { critical: 2, high: 1, medium: 0, low: 3 } })]).list({
+        limit: 50,
+      } as never);
+      expect(page.items[0]!.open_tasks_by_severity).toEqual({ critical: 2, high: 1, medium: 0, low: 3 });
+    });
+
+    // STORY-169 review — `open_tasks_by_severity`/`visibility_by_engine` are
+    // jsonb columns, and coding-standards.md requires a zod schema for
+    // every one, checked at read time — not a hand-written TypeScript
+    // interface with no runtime check. These two prove the schemas are
+    // actually WIRED IN, by feeding shapes each schema's own `.strict()`/
+    // member types reject, rather than merely existing unused.
+    it("throws rather than passing through an open_tasks_by_severity object with an unknown key", async () => {
+      await expect(
+        serviceReading([row({ open_tasks_by_severity: { critical: 0, high: 0, medium: 0, low: 0, extra: 1 } })]).list({
+          limit: 50,
+        } as never),
+      ).rejects.toThrow();
+    });
+
+    it("throws rather than passing through a visibility_by_engine entry missing delta_30d", async () => {
+      await expect(
+        serviceReading([row({ visibility_by_engine: { chatgpt: { score: 40 } } })]).list({ limit: 50 } as never),
+      ).rejects.toThrow();
+    });
+
+    it("demo_seeded is true only when demo_seeded_at is set", async () => {
+      const real = await serviceReading([row()]).list({ limit: 50 } as never);
+      expect(real.items[0]!.demo_seeded).toBe(false);
+
+      const demo = await serviceReading([row({ demo_seeded_at: new Date("2026-09-01T00:00:00Z") })]).list({ limit: 50 } as never);
+      expect(demo.items[0]!.demo_seeded).toBe(true);
+    });
   });
 
   it("scenario 8 — orders stably and asks for one more than the limit, so has_more is knowable", async () => {

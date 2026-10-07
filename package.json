@@ -24,6 +24,7 @@
     "db:schema-generate": "tsx src/db/schema/generate.ts",
     "db:schema-check": "tsx src/db/schema/schema-check.ts",
     "db:studio": "tsx src/db/studio.ts",
+    "db:seed-demo": "tsx src/db/seed-demo.ts",
     "db:maintenance:run": "tsx src/workers/rollup/maintenance.ts",
     "db:maintenance:sweep": "tsx src/workers/rollup/retention.ts",
     "credits:verify": "tsx src/workers/rollup/credit-verify.ts",
