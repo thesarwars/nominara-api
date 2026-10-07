@@ -68,6 +68,9 @@ function isEnumSubset(narrower: unknown[], wider: unknown[]): boolean {
 function compareSharedField(previous: JsonSchemaObjectLike, current: JsonSchemaObjectLike): SemverBump {
   if (JSON.stringify(previous) === JSON.stringify(current)) return "none";
 
+  const nested = compareNestedShape(previous, current);
+  if (nested !== undefined) return nested;
+
   if (previous.type !== undefined && current.type !== undefined && previous.type !== current.type) {
     return "major";
   }
@@ -85,10 +88,51 @@ function compareSharedField(previous: JsonSchemaObjectLike, current: JsonSchemaO
   return "major";
 }
 
+function without(schema: JsonSchemaObjectLike, keys: readonly string[]): string {
+  const sorted = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sorted);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .sort(([a], [b]) => (a < b ? -1 : 1))
+          .map(([key, inner]) => [key, sorted(inner)]),
+      );
+    }
+    return value;
+  };
+  return JSON.stringify(sorted(Object.fromEntries(Object.entries(schema).filter(([key]) => !keys.includes(key)))));
+}
+
+/**
+ * NEW-A-5 option A. A shared field whose schema is an OBJECT (compared on
+ * its `properties`/`required`) or an ARRAY (compared on its `items`) is
+ * walked into, so one optional field added inside a nested response object
+ * is not rated like a type change. The walk only applies when everything
+ * ELSE about the node is identical (`type`, `maxItems`, `additionalProperties`,
+ * ...): a constraint that moved beside the part being recursed still falls
+ * through to the conservative `major`. `undefined` = not a nested shape this
+ * function can reason about.
+ */
+function compareNestedShape(previous: JsonSchemaObjectLike, current: JsonSchemaObjectLike): SemverBump | undefined {
+  if (previous.type === "object" && current.type === "object") {
+    if (without(previous, ["properties", "required"]) !== without(current, ["properties", "required"])) return undefined;
+    return compareObjectSchema(previous, current, true);
+  }
+  if (previous.type === "array" && current.type === "array") {
+    const previousItems = previous.items as JsonSchemaObjectLike | undefined;
+    const currentItems = current.items as JsonSchemaObjectLike | undefined;
+    if (!previousItems || !currentItems) return undefined;
+    if (without(previous, ["items"]) !== without(current, ["items"])) return undefined;
+    return compareSharedField(previousItems, currentItems);
+  }
+  return undefined;
+}
+
 /** `properties`/`required` diff shared by a request body schema and a response schema alike. */
 function compareObjectSchema(
   previous: JsonSchemaObjectLike | undefined,
   current: JsonSchemaObjectLike | undefined,
+  nested = false,
 ): SemverBump {
   if (!previous && !current) return "none";
   if (!previous && current) return "patch"; // a schema appearing where there was none before
@@ -110,7 +154,9 @@ function compareObjectSchema(
       continue;
     }
     if (!inPrevious && inCurrent) {
-      bump = mostSevere(bump, currentRequired.has(name) ? "major" : "patch"); // field added
+      // field added: required is breaking; optional is `patch` at the top of a
+      // body and `minor` anywhere nested (owner decision, NEW-A-5 option A).
+      bump = mostSevere(bump, currentRequired.has(name) ? "major" : nested ? "minor" : "patch");
       continue;
     }
 
