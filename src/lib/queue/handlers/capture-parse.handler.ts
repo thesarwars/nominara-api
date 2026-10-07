@@ -2,13 +2,19 @@ import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
+import { capturedInRunStatusSql, hasFactsStatusSql } from "../../rollup/aggregate-day.js";
+import { readRunProgress } from "../../capture/run-progress.js";
+import { incrementCounter } from "../../telemetry/metrics.js";
+import { afterCommit } from "../../../tenancy/tenant-context.js";
 import { decideL3 } from "../../capture/l3-short-circuit.js";
 import { loadParseContext, parseCapture, persistParse, type CaptureRow } from "../../parser/parse-capture.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import type { SentimentArbiter } from "../../parser/sentiment/arbiter.js";
 import { SCORING_VERSION } from "../../scoring/index.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
+import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
-import type { JobProcessor } from "../worker-factory.js";
+import { signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
 
 // STORY-135 — `capture.parse`, the second real entry in STORY-124's registry.
 //
@@ -39,11 +45,19 @@ const payloadSchema = z
 export interface CaptureParseDeps {
   /** Unbound in production — see sentiment/arbiter.ts. */
   readonly arbiter?: SentimentArbiter;
+  /** Injected in tests; production builds a producer from env on first use. */
+  readonly enqueueRollup?: (
+    queue: "rollup.metric_daily",
+    workspaceId: string,
+    payload: Record<string, unknown>,
+    idempotencyKey: string,
+  ) => Promise<unknown>;
 }
 
 interface CaptureRecord {
   id: string;
   project_id: string;
+  run_id: string | null;
   prompt_id: string;
   engine_key: string;
   captured_at: Date;
@@ -60,11 +74,78 @@ interface CaptureRecord {
 export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: CaptureParseDeps): JobProcessor {
   const logger = new Logger("capture.parse");
 
+  // Built on the first rollup request, not at registration (see capture.execute:
+  // the static handler table is evaluated in every worker group).
+  let producer: QueueProducer | undefined;
+  const enqueueRollup =
+    deps?.enqueueRollup ??
+    (async (queue, workspaceId, rollupPayload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(_context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(_context.env.NODE_ENV),
+        signingKeysFromEnv(_context.env),
+      );
+      return producer.enqueueTenantJob(queue, workspaceId, rollupPayload, { idempotencyKey });
+    });
+
+  /**
+   * NEW-A-7 — when this parse leaves the run with every cell accounted for and
+   * none still waiting to be parsed, the day's facts are complete: ask for the
+   * rollup now rather than at the next hourly tick.
+   *
+   * FROM HERE AND NOT FROM capture.execute: finalisation precedes parsing, so
+   * a rollup requested there would read facts that do not exist yet.
+   *
+   * AFTER COMMIT: the rollup job runs on another connection and must see this
+   * parse's facts. One key per run, so a replay or a force re-parse does not
+   * queue a second pass. A failed enqueue is logged, never thrown: the parse
+   * is stored, and the hourly cron still covers the day.
+   */
+  const requestRollupIfRunComplete = async (tx: ClientBase, record: CaptureRecord, workspaceId: string): Promise<void> => {
+    if (record.run_id === null) return;
+    const run = await tx.query("SELECT 1 FROM capture_runs WHERE id = $1", [record.run_id]);
+    if (run.rowCount === 0) return;
+
+    const progress = await readRunProgress(tx, record.run_id);
+    if (progress.captured + progress.failed + progress.skipped < progress.planned) return;
+    const unparsed = await tx.query(`SELECT 1 FROM answer_captures
+        WHERE run_id = $1 AND ${capturedInRunStatusSql("status")} AND NOT ${hasFactsStatusSql("status")} LIMIT 1`, [
+      record.run_id,
+    ]);
+    if ((unparsed.rowCount ?? 0) > 0) return;
+
+    const day = await tx.query<{ metric_date: string }>(
+      `SELECT to_char(($2::timestamptz AT TIME ZONE w.timezone)::date, 'YYYY-MM-DD') AS metric_date
+         FROM workspaces w WHERE w.id = $1`,
+      [workspaceId, record.captured_at],
+    );
+    const metricDate = day.rows[0]?.metric_date;
+    if (metricDate === undefined) return;
+
+    const runId = record.run_id;
+    const projectId = record.project_id;
+    afterCommit(() => {
+      void enqueueRollup(
+        "rollup.metric_daily",
+        workspaceId,
+        { projectId, metricDate, reason: "run_parsed" },
+        `rollup:${projectId}:run:${runId}`,
+      )
+        .then(() => {
+          incrementCounter("nominara_rollup_requested_total", { reason: "run_parsed" });
+          logger.log({ event: "rollup.requested", workspace_id: workspaceId, project_id: projectId, run_id: runId });
+        })
+        .catch((error: unknown) => {
+          logger.error({ event: "rollup.request_failed", workspace_id: workspaceId, project_id: projectId, run_id: runId, error: error instanceof Error ? error.name : "unknown" });
+        });
+    });
+  };
+
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
 
     const found = await tx.query<CaptureRecord>(
-      `SELECT id, project_id, prompt_id, engine_key, captured_at, status, content_hash,
+      `SELECT id, project_id, run_id, prompt_id, engine_key, captured_at, status, content_hash,
               payload, response_excerpt, flags, normalizer_version, scoring_version, alias_fingerprint
          FROM answer_captures
         WHERE id = $1`,
@@ -122,6 +203,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
         record.id,
         NORMALIZER_VERSION,
       ]);
+      await requestRollupIfRunComplete(tx, record, payload.workspaceId);
       return;
     }
 
@@ -144,6 +226,8 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
 
     // Stage 6 — the facts and the capture, in the job's own transaction.
     await persistParse(tx, capture, result, aliasFingerprint);
+
+    await requestRollupIfRunComplete(tx, record, payload.workspaceId);
 
     logger.log(
       `parsed ${record.id}: ${String(result.mentions.length)} mentions, ${String(result.citations.length)} citations`,

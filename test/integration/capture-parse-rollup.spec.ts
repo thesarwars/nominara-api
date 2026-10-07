@@ -244,7 +244,9 @@ describe("NEW-A-7 · rollup requested from the parse completion path", () => {
     const bCapture = await seedCapture(b.workspaceId, b.projectId, b.promptId, bRun);
     // B's facts exist and are parsed by B's own context.
     await withTenantContext(db, { workspaceId: b.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
-      await createCaptureParseHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext)(tx, {
+      await createCaptureParseHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, {
+        enqueueRollup: async () => undefined,
+      })(tx, {
         data: {
           payload: {
             workspaceId: b.workspaceId,
