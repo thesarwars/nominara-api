@@ -162,6 +162,59 @@ export type GeoDigest = z.infer<typeof geoDigestSchema>;
  */
 export const geoDetailSchema = z.object({ slug: geoSlugSchema }).catchall(z.unknown());
 
+// ------------------------------------------------------- A3 structure detail
+
+export const answerFormSchema = z.enum(["ranked_list", "comparison_table", "single_recommendation", "neutral_enumeration", "narrative"]);
+export type AnswerFormValue = z.infer<typeof answerFormSchema>;
+export const positionClassSchema = z.enum(["recommendation", "ranked", "neutral_list", "also_consider", "caveat"]);
+export type PositionClassValue = z.infer<typeof positionClassSchema>;
+
+/** Where an engine's numbers come from. Gemini is `live`; the other engines are seeded demo data. */
+export const dataSourceSchema = z.enum(["live", "demo"]);
+export type DataSource = z.infer<typeof dataSourceSchema>;
+
+const formCountSchema = z.object({ form: answerFormSchema, count: z.number().int().nonnegative() }).strict();
+
+/**
+ * `GET /geo-insights/structure` -> `detail` (STORY-060, A3).
+ *
+ * `page_forms` is `[]` and `template`/`rationale` carry the reason, because the
+ * structure-match gap needs the brand's own page and no page crawl exists. A
+ * gap is never inferred. `position` is `[]` (not zeros) when the brand was in
+ * no answer: absent is not a share of zero.
+ */
+export const geoStructureDetailSchema = z
+  .object({
+    slug: z.literal("structure"),
+    /** Distinct answers per form, across every engine. All five forms are listed, zeros included. */
+    forms: z.array(formCountSchema),
+    total: z.number().int().nonnegative(),
+    dominant_form: answerFormSchema.nullable(),
+    engines: z.array(
+      z
+        .object({
+          engine: z.string(),
+          data_source: dataSourceSchema,
+          total: z.number().int().nonnegative(),
+          forms: z.array(formCountSchema),
+        })
+        .strict(),
+    ),
+    page_forms: z.array(z.string()),
+    brand_answers: z.number().int().nonnegative(),
+    prior_brand_answers: z.number().int().nonnegative(),
+    /** `prior` is null when the prior window held no brand answer: no baseline, not a baseline of zero. */
+    position: z.array(
+      z
+        .object({ cls: positionClassSchema, share: z.number().min(0).max(1), prior: z.number().min(0).max(1).nullable() })
+        .strict(),
+    ),
+    template: z.string().nullable(),
+    rationale: z.string().nullable(),
+  })
+  .strict();
+export type GeoStructureDetail = z.infer<typeof geoStructureDetailSchema>;
+
 export const geoAnalysisSchema = z
   .object({
     summary: geoAnalysisSummarySchema,
