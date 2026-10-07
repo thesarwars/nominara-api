@@ -328,7 +328,7 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     expect(Number(split.rows[0]!.n)).toBe(0);
   }, 120_000);
 
-  it("STORY-060 · the seed computes the A3 structure row from its own facts, marks demo engines, and --purge leaves no stale sufficient row", async () => {
+  it("STORY-060 · the seed computes the A3 structure row from its own facts, and --purge leaves no stale sufficient row", async () => {
     const workspaceId = await createWorkspace("growth");
     await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
     const seeded = await client.query<{ sufficient: boolean; evidence_cells: number; window_days: number }>(

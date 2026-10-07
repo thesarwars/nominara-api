@@ -46,3 +46,17 @@ export async function refreshProjectGeo(
   });
   return persisted;
 }
+
+/** Every window the read endpoints serve (7d, 30d, 90d). A read of a window never computes one. */
+export const GEO_WINDOWS: readonly (7 | 30 | 90)[] = [7, 30, 90];
+
+/** Recompute A3 for all three served windows, so no timeframe on the read side answers "not computed yet". */
+export async function refreshProjectGeoWindows(
+  tx: ClientBase,
+  projectId: string,
+  options: Omit<RefreshProjectGeoOptions, "windowDays"> = {},
+): Promise<GeoAnalysisWrite[]> {
+  const out: GeoAnalysisWrite[] = [];
+  for (const windowDays of GEO_WINDOWS) out.push(await refreshProjectGeo(tx, projectId, { ...options, windowDays }));
+  return out;
+}

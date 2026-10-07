@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import { denormalizeProject } from "../../../lib/rollup/denormalize.js";
+import { refreshProjectGeoWindows } from "../../../lib/rollup/refresh-project-geo.js";
 import { rollUpDay } from "../../../lib/rollup/roll-up-day.js";
 import { withProjectQueueLock } from "../../../lib/queue/locks.js";
 import { resetAndSeedProjectAux } from "./aux.js";
@@ -36,6 +37,8 @@ export async function seedOneProject(
       await rollUpDay(tx, project.workspaceId, project.id, date, timezone);
     }
     await denormalizeProject(tx, project.id, timezone);
+    // STORY-060 — A3 over the seeded facts (demo engines are marked by the seed's normalizer_version).
+    await refreshProjectGeoWindows(tx, project.id);
   });
 
   const auxResult = await resetAndSeedProjectAux(tx, project);
