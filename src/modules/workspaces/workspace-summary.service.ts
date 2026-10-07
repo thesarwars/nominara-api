@@ -5,7 +5,8 @@ import type {
   WorkspaceSummaryResponse,
 } from "../../../contracts/workspaces/workspace-summary-response.schema.js";
 import { FeatureNotInPlanError } from "../../api/errors/domain-errors.js";
-import { captureReadyEngineKeys } from "../../lib/engines/registry.js";
+import type { DataSource } from "../../../contracts/analytics/index.js";
+import { combineDataSources, engineDataSourcesForDates } from "../../lib/analytics/data-source.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -17,8 +18,9 @@ import { ProjectsService } from "../projects/projects.service.js";
 // A COMPOSITION, NOT A TABLE OWNER. The matrix is `ProjectsService`'s table,
 // the wallet is `BillingService`'s, and the limits are the entitlement
 // resolver's; this service imports the owners (coding-standards.md §1 "one
-// table, one owning service") and joins what they return. It runs no SQL of
-// its own, so the scoping that matters — `app.current_scope_projects()` — is
+// table, one owning service") and joins what they return. Its only SQL
+// is the 30-day window's bounds (workspace timezone); capture provenance comes
+// from `lib/analytics/data-source`. So the scoping that matters — `app.current_scope_projects()` — is
 // applied once, inside `ProjectsService.listForSummary`, and everything here
 // that counts (`projects_used`, `prompts_used`) counts THAT result. Counting
 // from a second query would let the numbers disagree with the rows.
@@ -30,6 +32,8 @@ import { ProjectsService } from "../projects/projects.service.js";
 function numericLimit(value: unknown): number | null {
   return typeof value === "number" ? value : null;
 }
+
+const WINDOW_DAYS = 30;
 
 @Injectable()
 export class WorkspaceSummaryService {
@@ -60,15 +64,27 @@ export class WorkspaceSummaryService {
       if (!(error instanceof FeatureNotInPlanError)) throw error;
     }
 
-    const live = new Set<string>(captureReadyEngineKeys());
-    const dataSource = (engineKey: string): "live" | "demo" => (live.has(engineKey) ? "live" : "demo");
+    // NEW-B-2 audit — `data_source` is CAPTURE PROVENANCE
+    // (`answer_captures.normalizer_version`) over the same 30-day workspace-
+    // local window the matrix columns cover — never "does the engine have an
+    // API key". Nothing measured is null, not demo.
+    const window = await this.window(workspaceId, store.client);
+    const perProject = new Map<string, Map<string, DataSource>>();
+    for (const project of projects) {
+      perProject.set(
+        project.id,
+        await engineDataSourcesForDates(store.client, project.id, window.from, window.to, window.timezone),
+      );
+    }
+    const workspaceSource = (engineKey: string): DataSource | null =>
+      combineDataSources([...perProject.values()].map((sources) => sources.get(engineKey) ?? null));
 
     const response: WorkspaceSummaryResponse = {
       workspace_id: workspaceId,
       plan_key: resolved.plan_key,
       window_days: 30,
-      projects: projects.map((project) => withDataSources(project, dataSource)),
-      engines: engineKeys.map((engineKey) => ({ engine_key: engineKey, data_source: dataSource(engineKey) })),
+      projects: projects.map((project) => withDataSources(project, perProject.get(project.id)!)),
+      engines: engineKeys.map((engineKey) => ({ engine_key: engineKey, data_source: workspaceSource(engineKey) })),
       health: {
         projects_used: projects.length,
         projects_limit: numericLimit(resolved.entitlements["projects.max"]?.value),
@@ -83,14 +99,27 @@ export class WorkspaceSummaryService {
     this.logger.log(`workspace ${workspaceId} summary: ${String(projects.length)} projects, ${String(engineKeys.length)} engines`);
     return response;
   }
+
+  /** The 30 workspace-local days ending today, inclusive, in the workspace's own timezone. */
+  private async window(workspaceId: string, client: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }): Promise<{ timezone: string; from: string; to: string }> {
+    const result = await client.query(
+      `SELECT w.timezone,
+              to_char((now() AT TIME ZONE w.timezone)::date - ($1::int - 1), 'YYYY-MM-DD') AS from,
+              to_char((now() AT TIME ZONE w.timezone)::date, 'YYYY-MM-DD')                  AS to
+         FROM workspaces w
+        WHERE w.id = $2`,
+      [WINDOW_DAYS, workspaceId],
+    );
+    return result.rows[0] as { timezone: string; from: string; to: string };
+  }
 }
 
-function withDataSources(project: ProjectListItem, dataSource: (engineKey: string) => "live" | "demo"): SummaryProject {
+function withDataSources(project: ProjectListItem, sources: ReadonlyMap<string, DataSource>): SummaryProject {
   return {
     ...project,
     engine_scores:
       project.engine_scores === null
         ? null
-        : project.engine_scores.map((score) => ({ ...score, data_source: dataSource(score.engine_key) })),
+        : project.engine_scores.map((score) => ({ ...score, data_source: sources.get(score.engine_key) ?? null })),
   };
 }
