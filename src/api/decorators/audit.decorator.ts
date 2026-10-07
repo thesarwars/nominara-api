@@ -1,4 +1,5 @@
 import { SetMetadata } from "@nestjs/common";
+import type { AuditSeverity } from "../../lib/crypto/audit-chain.js";
 
 // STORY-020 — declares what AuditInterceptor writes for a mutating route:
 // the action name and resource type are static (known at route-definition
@@ -22,6 +23,8 @@ export interface AuditOptions {
   readonly responseIdPath?: string;
   /** Only used when resourceIdFrom is "params" (the default). The req.params key to read. Defaults to "id". */
   readonly paramName?: string;
+  /** The row's severity. Defaults to "info"; a credential being minted or revoked declares a higher one (NEW-D-4). */
+  readonly severity?: AuditSeverity;
 }
 
 export const AUDIT_METADATA_KEY = "auditOptions";

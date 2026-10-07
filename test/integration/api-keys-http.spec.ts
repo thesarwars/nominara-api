@@ -48,7 +48,6 @@ describe("NEW-D-4 · API keys over HTTP", () => {
     readonly userId: string;
     readonly cookie: string;
     readonly csrf: string;
-    readonly sid?: string;
   }
 
   async function newUser(): Promise<string> {
@@ -80,8 +79,8 @@ describe("NEW-D-4 · API keys over HTTP", () => {
       client.release();
     }
     const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, 2);
-    if (opts.stepUp !== false) await sessions.recordStrongAuth(entered.sid, "webauthn");
-    return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken, sid: entered.sid };
+    if (opts.stepUp !== false) await sessions.recordStrongAuth(tokens.sid, "webauthn");
+    return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken };
   }
 
   async function member(workspaceId: string, role: "admin" | "manager" | "analyst" | "viewer", stepUp = true): Promise<Actor> {
@@ -92,8 +91,8 @@ describe("NEW-D-4 · API keys over HTTP", () => {
     );
     const tokens = await sessions.createSession(userId);
     const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, role, null, 2);
-    if (stepUp) await sessions.recordStrongAuth(entered.sid, "webauthn");
-    return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken, sid: entered.sid };
+    if (stepUp) await sessions.recordStrongAuth(tokens.sid, "webauthn");
+    return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken };
   }
 
   const payload = (over: Record<string, unknown> = {}): Record<string, unknown> => ({ name: "CI deploy", permissions: ["project:read", "tracking:read"], ...over });
@@ -223,14 +222,11 @@ describe("NEW-D-4 · API keys over HTTP", () => {
     expect(stored.revoked_at.toISOString()).toBe(at);
   });
 
-  it("NEW-D-4 AC5 · another workspace's key is 404 on revoke and absent from the list; a malformed id is 400", async () => {
+  // Cross-workspace isolation is asserted in api-keys-rls.spec.ts, as nominara_app: this harness connects as a
+  // superuser, which would see every workspace's keys and pass a cross-tenant assertion for the wrong reason.
+  it("NEW-D-4 AC5 · an unknown key id is 404 and a malformed id is 400", async () => {
     const a = await owner("business");
-    const b = await owner("business");
-    const c = data<Created>(await create(a));
-    expect((await revoke(b, c.key.id)).statusCode).toBe(404);
-    expect(data<unknown[]>(await list(b))).toEqual([]);
-    const stored = (await harness.db().query(`SELECT revoked_at FROM api_keys WHERE id = $1`, [c.key.id])).rows[0] as { revoked_at: unknown };
-    expect(stored.revoked_at).toBeNull();
+    expect((await revoke(a, uuidV7())).statusCode).toBe(404);
     expect((await revoke(a, "not-a-uuid")).statusCode).toBe(400);
   });
 
