@@ -7,7 +7,7 @@ import { describeTarget } from "./local-target.js";
 import { ensurePartitionsForTable } from "../workers/rollup/maintenance.js";
 import { DemoSeedRefusedError, assertDemoSeedAllowed } from "./seed/demo/guard.js";
 import { ensureDemoProjects, listActiveProjects } from "./seed/demo/projects.js";
-import { seedOneProject } from "./seed/demo/seed-project.js";
+import { seedOneProject, seedProjectFactsOnly } from "./seed/demo/seed-project.js";
 import { listSeededProjects, purgeOneProject } from "./seed/demo/purge.js";
 import { ensureDemoWallet } from "./seed/demo/wallet.js";
 import { SYSTEM_ACTOR_ID } from "../tenancy/constants.js";
@@ -20,6 +20,17 @@ import { withTenantContext } from "../tenancy/tenant-context.js";
 // Usage:
 //   NOMINARA_DEMO_SEED=1 pnpm db:seed-demo --workspace <uuid>
 //   NOMINARA_DEMO_SEED=1 pnpm db:seed-demo --workspace <uuid> --purge
+//   NOMINARA_DEMO_SEED=1 pnpm db:seed-demo --workspace <uuid> --project <uuid> \
+//       --exclude-engines gemini --facts-only          (NEW-A-8)
+//
+// NEW-A-8: `--exclude-engines a,b` writes no demo facts for those engines
+// (Gemini is real; the other five are demo). `--facts-only` writes demo-
+// marked facts and their rollup and NOTHING else — it never creates a
+// project, never provisions or touches a wallet or the credit ledger (the
+// full seed's grant is irreversible), and writes no AUX/sources/tasks.
+// `--project` restricts either mode to one active project. `--purge` takes
+// none of the NEW-A-8 flags: it removes every demo-marked row, and no
+// unmarked (real) one.
 //
 // `--workspace` is required unless the database has EXACTLY one workspace.
 //
@@ -45,11 +56,20 @@ export class SeedDemoUsageError extends Error {
 export interface SeedDemoArgs {
   readonly workspaceId: string | undefined;
   readonly purge: boolean;
+  /** NEW-A-8 — engine keys to write no demo facts for. Absent/empty: every entitled engine. */
+  readonly excludeEngines?: readonly string[];
+  /** NEW-A-8 — demo-marked facts + rollup only; no wallet, ledger, project creation, AUX, sources or tasks. */
+  readonly factsOnly?: boolean;
+  /** NEW-A-8 — restrict to this one active project. */
+  readonly projectId?: string;
 }
 
 export function parseSeedDemoArgs(argv: readonly string[]): SeedDemoArgs {
   let workspaceId: string | undefined;
   let purge = false;
+  let projectId: string | undefined;
+  let factsOnly = false;
+  let excludeEngines: string[] | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i]!;
     if (token === "--purge") {
@@ -65,9 +85,46 @@ export function parseSeedDemoArgs(argv: readonly string[]): SeedDemoArgs {
       i += 1;
       continue;
     }
+    if (token === "--facts-only") {
+      factsOnly = true;
+      continue;
+    }
+    if (token === "--project") {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        throw new SeedDemoUsageError("--project needs a value");
+      }
+      projectId = value;
+      i += 1;
+      continue;
+    }
+    if (token === "--exclude-engines") {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        throw new SeedDemoUsageError("--exclude-engines needs a comma-separated list of engine keys");
+      }
+      const keys = value.split(",").map((key) => key.trim()).filter((key) => key.length > 0);
+      if (keys.length === 0) {
+        throw new SeedDemoUsageError("--exclude-engines needs at least one engine key");
+      }
+      excludeEngines = keys;
+      i += 1;
+      continue;
+    }
     throw new SeedDemoUsageError(`unknown argument: ${token}`);
   }
-  return { workspaceId, purge };
+  if (purge && (factsOnly || excludeEngines !== undefined)) {
+    throw new SeedDemoUsageError(
+      "--purge cannot be combined with --facts-only or --exclude-engines: a purge removes every demo-marked row.",
+    );
+  }
+  return {
+    workspaceId,
+    purge,
+    factsOnly,
+    excludeEngines: excludeEngines ?? [],
+    ...(projectId === undefined ? {} : { projectId }),
+  };
 }
 
 async function resolveWorkspaceId(ownerClient: PgClient, argWorkspaceId: string | undefined): Promise<string> {
@@ -184,12 +241,25 @@ export async function runSeedDemo(args: SeedDemoArgs, deps: SeedDemoDeps, option
     throw new SeedDemoUsageError(`workspace ${workspaceId} does not exist`);
   }
 
+  const excludeEngines = args.excludeEngines ?? [];
+  if (excludeEngines.length > 0) {
+    // An unknown key would silently exclude nothing — refuse before any write.
+    const known = await ownerClient.query<{ key: string }>(`SELECT key FROM engines WHERE key = ANY($1::text[])`, [
+      [...excludeEngines],
+    ]);
+    const knownKeys = new Set(known.rows.map((row) => row.key));
+    const unknown = excludeEngines.filter((key) => !knownKeys.has(key));
+    if (unknown.length > 0) {
+      throw new SeedDemoUsageError(`--exclude-engines names unknown engine key(s): ${unknown.join(", ")}`);
+    }
+  }
+
   if (args.purge) {
     const client = await pool.connect();
     try {
       await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
         await assertPooledConnectionIsRuntimeApp(tx);
-        const seeded = await listSeededProjects(tx, workspaceId);
+        const seeded = await listSeededProjects(tx, workspaceId, args.projectId);
         for (const project of seeded) {
           await purgeOneProject(tx, project, timezone);
           log(`purged demo data for project ${project.id}${project.seedCreated ? " (project deleted — it was seed-created)" : ""}`);
@@ -229,18 +299,39 @@ export async function runSeedDemo(args: SeedDemoArgs, deps: SeedDemoDeps, option
   try {
     const summary = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
       await assertPooledConnectionIsRuntimeApp(tx);
-      const createdProjects = await ensureDemoProjects(tx, workspaceId);
-      for (const created of createdProjects) {
-        log(`created demo project "${created.name}" (${created.rootDomain})`);
+      // `--facts-only` never creates a project: it writes into the ones that exist.
+      if (!args.factsOnly) {
+        const createdProjects = await ensureDemoProjects(tx, workspaceId);
+        for (const created of createdProjects) {
+          log(`created demo project "${created.name}" (${created.rootDomain})`);
+        }
       }
 
-      const targets = await listActiveProjects(tx, workspaceId);
+      const activeProjects = await listActiveProjects(tx, workspaceId);
+      const targets = args.projectId === undefined ? activeProjects : activeProjects.filter((project) => project.id === args.projectId);
+      if (args.projectId !== undefined && targets.length === 0) {
+        throw new SeedDemoUsageError(`--project ${args.projectId} is not an active project of workspace ${workspaceId}`);
+      }
+      const factsOptions = {
+        windowDays,
+        ...(options.promptsPerProject === undefined ? {} : { promptsPerProject: options.promptsPerProject }),
+        ...(excludeEngines.length === 0 ? {} : { excludeEngines }),
+      };
+
+      if (args.factsOnly) {
+        const factResults = [];
+        for (const project of targets) {
+          const result = await seedProjectFactsOnly(tx, project, timezone, factsOptions);
+          factResults.push(result);
+          log(`seeded facts only for ${project.name}: ${String(result.days)} days, ${String(result.engines)} engine(s)`);
+        }
+        log("--facts-only: wallet and credit_ledger were not touched.");
+        return factResults;
+      }
+
       const results = [];
       for (const project of targets) {
-        const result = await seedOneProject(tx, project, timezone, {
-          windowDays,
-          ...(options.promptsPerProject === undefined ? {} : { promptsPerProject: options.promptsPerProject }),
-        });
+        const result = await seedOneProject(tx, project, timezone, factsOptions);
         results.push(result);
         log(
           `seeded ${project.name}: ${String(result.days)} days, ${String(result.engines)} engine(s), ` +

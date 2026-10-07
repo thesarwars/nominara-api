@@ -1093,7 +1093,7 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
       `INSERT INTO answer_captures
          (id, workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at, capture_mode, adapter_version,
           normalizer_version, content_hash, payload, brand_present, citation_count, owned_citation_count, flags, cache_layer, status)
-       VALUES ($1,$2,$3,$4,$5,'gemini',0, now(), 'api','gemini-v1','real-v1', sha256($1::text::bytea), '{}'::jsonb, true, 0, 0, ARRAY[]::text[], 'live','parsed')`,
+       VALUES ($1::uuid,$2,$3,$4,$5,'gemini',0, now(), 'api','gemini-v1','real-v1', sha256(convert_to($1::text,'UTF8')), '{}'::jsonb, true, 0, 0, ARRAY[]::text[], 'live','parsed')`,
       [id, workspaceId, projectId, randomUUID(), prompt.rows[0]!.id],
     );
     return id;
@@ -1234,6 +1234,24 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     );
     const real = await client.query<{ id: string }>(`SELECT id FROM answer_captures WHERE project_id = $1 AND engine_key = 'gemini'`, [projectId]);
     expect(real.rows.map((r) => r.id)).toEqual([realId]);
+  }, 240_000);
+
+  it("NEW-A-8 #3c · a re-seed with --exclude-engines gemini leaves an existing demo-marked gemini row alone (the reset is scoped to the engines written)", async () => {
+    const workspaceId = await createWorkspace("business");
+    const projectId = await createActiveProject(workspaceId, "a8-threec");
+    await runSeedDemo({ workspaceId, projectId, purge: false, factsOnly: true }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    const geminiBefore = await client.query<{ id: string }>(`SELECT id FROM answer_captures WHERE project_id = $1 AND engine_key = 'gemini' ORDER BY id`, [projectId]);
+    expect(geminiBefore.rows.length).toBeGreaterThan(0);
+
+    await runSeedDemo(
+      { workspaceId, projectId, purge: false, factsOnly: true, excludeEngines: ["gemini"] },
+      { ownerClient: client, pool: testPool(), log: () => {} },
+      FAST_OPTIONS,
+    );
+    const geminiAfter = await client.query<{ id: string }>(`SELECT id FROM answer_captures WHERE project_id = $1 AND engine_key = 'gemini' ORDER BY id`, [projectId]);
+    expect(geminiAfter.rows).toEqual(geminiBefore.rows);
+    const mentions = await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM mention_facts WHERE project_id = $1 AND engine_key = 'gemini'`, [projectId]);
+    expect(Number(mentions.rows[0]!.n)).toBeGreaterThan(0);
   }, 240_000);
 
   it("NEW-A-8 #4 · re-running on the same day produces byte-identical demo rows (ids and run ids aside)", async () => {

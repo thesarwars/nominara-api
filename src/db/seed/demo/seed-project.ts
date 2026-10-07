@@ -23,12 +23,12 @@ export interface SeedProjectSummary {
   readonly criticalOrHighSources: number;
 }
 
-export async function seedOneProject(
+async function seedFactsAndRollup(
   tx: ClientBase,
   project: TargetProject,
   timezone: string,
-  options: SeedFactsOptions = {},
-): Promise<SeedProjectSummary> {
+  options: SeedFactsOptions,
+): Promise<Awaited<ReturnType<typeof resetAndSeedProjectFacts>>> {
   const facts = await resetAndSeedProjectFacts(tx, project, timezone, options);
 
   await withProjectQueueLock(tx, "rollup.metric_daily", project.id, async () => {
@@ -37,6 +37,33 @@ export async function seedOneProject(
     }
     await denormalizeProject(tx, project.id, timezone);
   });
+  return facts;
+}
+
+/**
+ * NEW-A-8 — `--facts-only`: demo-marked captures/mentions/citations and the
+ * real rollup over them, and NOTHING else. No AUX audit, source index, task,
+ * `demo_seeded_at` marker — and, because the wallet is provisioned by
+ * `runSeedDemo` and not here, no wallet or ledger. `--purge` finds such a
+ * project by its demo-marked captures (`listSeededProjects`).
+ */
+export async function seedProjectFactsOnly(
+  tx: ClientBase,
+  project: TargetProject,
+  timezone: string,
+  options: SeedFactsOptions = {},
+): Promise<{ readonly projectId: string; readonly days: number; readonly engines: number }> {
+  const facts = await seedFactsAndRollup(tx, project, timezone, options);
+  return { projectId: project.id, days: facts.days.length, engines: facts.engineKeys.length };
+}
+
+export async function seedOneProject(
+  tx: ClientBase,
+  project: TargetProject,
+  timezone: string,
+  options: SeedFactsOptions = {},
+): Promise<SeedProjectSummary> {
+  const facts = await seedFactsAndRollup(tx, project, timezone, options);
 
   const auxResult = await resetAndSeedProjectAux(tx, project);
   const sourcesResult = await resetAndSeedProjectSources(tx, project);

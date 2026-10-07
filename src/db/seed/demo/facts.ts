@@ -43,6 +43,13 @@ export interface SeedFactsOptions {
   readonly windowDays?: number;
   /** Tracked prompts to create. Spec default 8 (capped at the template count). */
   readonly promptsPerProject?: number;
+  /**
+   * NEW-A-8 — engine keys to leave alone (Gemini is a REAL engine; the other
+   * five are demo). Nothing is generated for them, and the reset-then-write
+   * delete is scoped to the engines actually written, so an excluded
+   * engine's rows — real or demo — are never touched by a re-seed.
+   */
+  readonly excludeEngines?: readonly string[];
 }
 
 export interface SeedFactsResult {
@@ -341,31 +348,39 @@ export async function deleteExistingDemoFacts(
   projectId: string,
   earliestDay: string,
   timezone: string,
+  /** NEW-A-8 — when given, only these engines' demo rows are deleted (a re-seed with excluded engines). Omitted: every engine (`--purge`). */
+  engineKeys?: readonly string[],
 ): Promise<void> {
+  const engineFilter = engineKeys === undefined ? "" : "AND engine_key = ANY($5::text[])";
+  const params: unknown[] = [projectId, earliestDay, DEMO_SEED_MARKER, timezone];
+  if (engineKeys !== undefined) params.push([...engineKeys]);
   await tx.query(
     `DELETE FROM mention_facts
       WHERE project_id = $1
         AND captured_at >= ($2::date::timestamp AT TIME ZONE $4)
+        ${engineFilter}
         AND result_id IN (
           SELECT id FROM answer_captures
            WHERE project_id = $1 AND captured_at >= ($2::date::timestamp AT TIME ZONE $4) AND normalizer_version = $3
         )`,
-    [projectId, earliestDay, DEMO_SEED_MARKER, timezone],
+    params,
   );
   await tx.query(
     `DELETE FROM citation_facts
       WHERE project_id = $1
         AND captured_at >= ($2::date::timestamp AT TIME ZONE $4)
+        ${engineFilter}
         AND result_id IN (
           SELECT id FROM answer_captures
            WHERE project_id = $1 AND captured_at >= ($2::date::timestamp AT TIME ZONE $4) AND normalizer_version = $3
         )`,
-    [projectId, earliestDay, DEMO_SEED_MARKER, timezone],
+    params,
   );
   await tx.query(
     `DELETE FROM answer_captures
-      WHERE project_id = $1 AND captured_at >= ($2::date::timestamp AT TIME ZONE $4) AND normalizer_version = $3`,
-    [projectId, earliestDay, DEMO_SEED_MARKER, timezone],
+      WHERE project_id = $1 AND captured_at >= ($2::date::timestamp AT TIME ZONE $4) AND normalizer_version = $3
+        ${engineFilter}`,
+    params,
   );
 }
 
@@ -398,11 +413,18 @@ export async function resetAndSeedProjectFacts(
   const promptCount = options.promptsPerProject ?? 8;
 
   const days = await workspaceLocalWindow(tx, timezone, windowDays);
-  const engines = await entitledEngines(tx, project.id);
+  const excluded = new Set(options.excludeEngines ?? []);
+  const engines = (await entitledEngines(tx, project.id)).filter((engine) => !excluded.has(engine.engineKey));
   const promptIds = await ensurePrompts(tx, project, promptCount);
   const competitorIds = await ensureCompetitors(tx, project, rngFor(project.id, "competitors"));
 
-  await deleteExistingDemoFacts(tx, project.id, days[0]!.day, timezone);
+  await deleteExistingDemoFacts(
+    tx,
+    project.id,
+    days[0]!.day,
+    timezone,
+    excluded.size === 0 ? undefined : engines.map((engine) => engine.engineKey),
+  );
 
   if (engines.length === 0 || promptIds.length === 0) {
     // No entitled engine (a plan with none active) or no prompt slot at all
