@@ -13,7 +13,7 @@ import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.deco
 import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { REFRESH_COOKIE_NAME, setAuthCookies } from "../../lib/auth/cookies.js";
-import { assertMatchesTenant } from "../../tenancy/assert-matches-tenant.js";
+import { assertMatchesTenant, assertPathIsTokenWorkspace } from "../../tenancy/assert-matches-tenant.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import {
   acceptInvitationParamsSchema,
@@ -21,6 +21,10 @@ import {
   createInvitationRequestSchema,
   createWorkspaceRequestSchema,
   invitationResponseSchema,
+  invitationRevokeParamsSchema,
+  workspaceDetailResponseSchema,
+  type InvitationRevokeParams,
+  type WorkspaceDetailResponse,
   memberResponseSchema,
   updateMemberRoleRequestSchema,
   updateWorkspaceRequestSchema,
@@ -130,6 +134,21 @@ export class WorkspacesController {
     return workspace;
   }
 
+  // NEW-A-12 — api-specification.md §3: "GET /workspaces/{id} — workspace:read".
+  @Get("workspaces/:id")
+  @RequirePermission("workspace:read")
+  @ApiContract({ operationId: "getWorkspace", responseSchema: workspaceDetailResponseSchema, emitsEntityTag: true })
+  async getOne(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ): Promise<WorkspaceDetailResponse> {
+    assertPathIsTokenWorkspace(id, req.tenant!.workspaceId);
+    const { detail, entityTag } = await this.service.getDetail(id);
+    reply.header("ETag", formatEntityTag(entityTagFor(entityTag)));
+    return detail;
+  }
+
   @Post("workspaces/:id/switch")
   @SkipTenantContext()
   @HttpCode(200)
@@ -160,7 +179,7 @@ export class WorkspacesController {
     @Param("id") id: string,
     @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
   ): Promise<Page<MemberResponse>> {
-    assertMatchesTenant(id, req.tenant!.workspaceId);
+    assertPathIsTokenWorkspace(id, req.tenant!.workspaceId);
     return this.service.listMembers(pagination);
   }
 
@@ -212,6 +231,19 @@ export class WorkspacesController {
   ): Promise<Page<InvitationResponse>> {
     assertMatchesTenant(id, req.tenant!.workspaceId);
     return this.invitations.list(id, pagination);
+  }
+
+  // NEW-A-12 — revoke a pending invitation. Same permission as creating one.
+  @Delete("workspaces/:id/invitations/:invitationId")
+  @RequirePermission("member:invite")
+  @Audit({ action: "member.invitation_revoked", resourceType: "invitation", paramName: "invitationId" })
+  @ApiContract({ operationId: "revokeInvitation", paramsSchema: invitationRevokeParamsSchema, voidResponse: true })
+  revokeInvitation(
+    @Req() req: RbacScopedRequest,
+    @Param(new ZodValidationPipe(invitationRevokeParamsSchema)) { id, invitationId }: InvitationRevokeParams,
+  ): Promise<void> {
+    assertPathIsTokenWorkspace(id, req.tenant!.workspaceId);
+    return this.invitations.revoke(id, invitationId);
   }
 
   // NEW-B-2 — api-specification.md §3: "GET /workspaces/{id}/summary —
