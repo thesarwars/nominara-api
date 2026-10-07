@@ -65,6 +65,7 @@ export const TENANT_TABLES: ReadonlySet<string> = new Set([
   "share_tokens",
   "source_domains",
   "sso_configurations",
+  "stripe_subscription_syncs",
   "subscription_addons",
   "subscriptions",
   "support_grants",

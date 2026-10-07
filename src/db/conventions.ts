@@ -297,6 +297,8 @@ export const POLICY_IN_OWN_MIGRATION: readonly string[] = [
   "usage_reservations",
   // 0051_track_e_sharing.up.sql — NEW-E-1; tenant-scoped, NOT portal-readable.
   "scheduled_report_deliveries",
+  // 0074_stripe_subscription_syncs.up.sql — NEW-D-2 checkpoint-1; tenant-scoped, NOT portal-readable.
+  "stripe_subscription_syncs",
 ];
 
 // STORY-011 — which runtime roles receive which generated policy. Every

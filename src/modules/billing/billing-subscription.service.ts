@@ -16,9 +16,12 @@ import { currentTenantStore } from "../../tenancy/tenant-context.js";
 //
 // ⚠ ONE KNOWN DEVIATION, STATED. KAD-06 says no handler holds a transaction
 // open across an await on an external service, and the request's ambient
-// transaction is open here while Stripe answers. It has taken only reads — no
-// row lock, no write — and the gateway bounds the call at 10 s, so the cost is
-// one pooled connection for that time. Moving it off needs a route that opens
+// transaction is open here while Stripe answers. The gateway bounds each call
+// at 10 s, so the cost is one pooled connection for that time. CHECKOUT NOW ALSO
+// HOLDS THE WORKSPACE ROW LOCK for it (at most two Stripe calls: expire the
+// previous session, create the new one): the lock is what makes "at most one
+// payable session" true under two simultaneous requests, and it delays only
+// this workspace's own billing writes. Moving it off needs a route that opens
 // its own short contexts (the @Streaming() precedent), which is a pattern
 // decision for the owner, not something to introduce silently.
 
@@ -34,6 +37,7 @@ interface SubscriptionRow {
   cancel_at_period_end: boolean;
   seats_purchased: number;
   projects_purchased: number;
+  open_checkout_session_id: string | null;
   sort_order: number;
 }
 
@@ -81,12 +85,18 @@ export class BillingSubscriptionService {
       });
     }
 
+    // ⚠ SERIALISE CHECKOUTS PER WORKSPACE, THEN READ. A concurrent request
+    // waits here until the first has recorded its session, so it sees it.
+    await client.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
     const current = await this.liveSubscription();
     // ⚠ A SECOND SUBSCRIPTION IS A DOUBLE CHARGE. A workspace already paying
-    // through Stripe changes plan in the portal; a comped (operator) plan at or
-    // above the target is not replaced by a card checkout.
+    // through Stripe does not buy another; a comped (operator) plan at or above
+    // the target is not replaced by a card checkout. The portal manages payment
+    // details and cancellation — a plan is NOT changed there: the webhook takes
+    // the plan from the price Stripe charges, so a portal price switch is
+    // refused and alarmed, never granted.
     if (current.provider === "stripe" && current.plan_key !== "free") {
-      throw new ConflictError({ message: "this workspace already has an active subscription: change it in the billing portal" });
+      throw new ConflictError({ message: "this workspace already has an active subscription: manage payment details or cancel it in the billing portal" });
     }
     if (target.sort_order <= current.sort_order) {
       throw new ConflictError({ message: "the workspace is already on this plan or a higher one" });
@@ -101,6 +111,19 @@ export class BillingSubscriptionService {
     };
 
     try {
+      // ⚠ PREVENT THE DOUBLE SUBSCRIPTION, DO NOT JUST DETECT IT. Two tabs or a
+      // retry would each hand out a payable session and the customer could pay
+      // twice. The session this workspace was last given is made unpayable
+      // BEFORE the next one exists. If it was already paid, its webhook has yet
+      // to apply: a second checkout is refused until it does.
+      if (current.open_checkout_session_id !== null) {
+        const closed = await this.gateway.closeCheckoutSession(current.open_checkout_session_id);
+        if (closed.status === "complete" && closed.subscriptionLive) {
+          incrementCounter("nominara_billing_checkout_session_total", { outcome: "paid_pending" });
+          throw new ConflictError({ message: "a checkout for this workspace has been paid and is being confirmed: wait a moment, then refresh" });
+        }
+        incrementCounter("nominara_billing_checkout_session_total", { outcome: closed.status === "expired" ? "superseded" : "settled" });
+      }
       const session = await this.gateway.createSubscriptionCheckout({
         workspaceId,
         planKey: target.key,
@@ -112,6 +135,10 @@ export class BillingSubscriptionService {
         successUrl: withState("success"),
         cancelUrl: withState("cancel"),
       });
+      await client.query(
+        "UPDATE subscriptions SET open_checkout_session_id = $2 WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')",
+        [workspaceId, session.id],
+      );
       incrementCounter("nominara_billing_checkout_session_total", { outcome: "created" });
       this.logger.log({ message: "stripe checkout session created", workspace_id: workspaceId, plan_key: target.key, billing_interval: request.billing_interval });
       return { checkout_url: session.url, session_id: session.id };
@@ -168,7 +195,7 @@ export class BillingSubscriptionService {
     const result = await client.query<SubscriptionRow>(
       `SELECT s.plan_key, s.billing_interval, s.status, s.provider, s.stripe_customer_id,
               s.current_period_start, s.current_period_end, s.trial_ends_at, s.cancel_at_period_end,
-              s.seats_purchased, s.projects_purchased, p.sort_order
+              s.seats_purchased, s.projects_purchased, s.open_checkout_session_id, p.sort_order
          FROM subscriptions s JOIN plans p ON p.key = s.plan_key
         WHERE s.workspace_id = $1 AND s.status IN ('trialing','active','past_due')`,
       [workspaceId],

@@ -43,6 +43,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "usage_reservations",
     "invoices",
     "stripe_webhook_events",
+    "stripe_subscription_syncs",
   ],
   projects: ["projects", "project_engines", "competitors", "domain_verifications"],
   prompts: ["tracked_prompts", "prompt_stability", "topic_clusters"],

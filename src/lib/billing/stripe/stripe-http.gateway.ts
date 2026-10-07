@@ -2,6 +2,7 @@ import Stripe from "stripe";
 import {
   StripeSignatureError,
   StripeUpstreamError,
+  type ClosedCheckoutSession,
   type FetchedStripeObject,
   type HostedSession,
   type StripeGateway,
@@ -99,6 +100,34 @@ export class StripeHttpGateway implements StripeGateway {
       });
       if (typeof session.url !== "string") throw new StripeUpstreamError(undefined);
       return { id: session.id, url: session.url };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async closeCheckoutSession(sessionId: string): Promise<ClosedCheckoutSession> {
+    const client = this.requireClient();
+    try {
+      const expand = { expand: ["subscription"] };
+      let session = await client.checkout.sessions.retrieve(sessionId, expand);
+      if (session.status === "open") {
+        try {
+          session = await client.checkout.sessions.expire(sessionId, expand);
+        } catch (error) {
+          // Paid or expired between the read and the expire: the truth is on the session.
+          if (!(error instanceof Stripe.errors.StripeInvalidRequestError)) throw error;
+          session = await client.checkout.sessions.retrieve(sessionId, expand);
+        }
+      }
+      if (session.status === "expired") return { status: "expired" };
+      if (session.status === "complete") {
+        const subscription = session.subscription;
+        const status = subscription !== null && typeof subscription === "object" ? subscription.status : undefined;
+        // Unknown means live: this answer blocks a second purchase, so doubt blocks.
+        return { status: "complete", subscriptionLive: !(status === "canceled" || status === "incomplete_expired" || status === "unpaid" || status === "paused") };
+      }
+      // Still open after an expire that did not throw: it was not closed.
+      throw new StripeUpstreamError(undefined);
     } catch (error) {
       throw this.asUpstream(error);
     }

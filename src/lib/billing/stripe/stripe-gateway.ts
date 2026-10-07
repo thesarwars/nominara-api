@@ -59,6 +59,13 @@ export interface HostedSession {
   readonly url: string;
 }
 
+/**
+ * What closing a Checkout session found. `expired`: it can no longer be paid.
+ * `complete`: it was ALREADY paid, and `subscriptionLive` says whether the
+ * subscription it bought is still entitled (so the webhook has yet to apply it).
+ */
+export type ClosedCheckoutSession = { readonly status: "expired" } | { readonly status: "complete"; readonly subscriptionLive: boolean };
+
 export interface StripeGateway {
   /** False when the secret key or the webhook secret is absent; Stripe routes then answer 503. */
   isConfigured(): boolean;
@@ -77,6 +84,12 @@ export interface StripeGateway {
    * data touches this system. Throws `StripeUpstreamError`.
    */
   createSubscriptionCheckout(input: SubscriptionCheckoutInput): Promise<HostedSession>;
+
+  /**
+   * Makes a Checkout session unpayable, or reports that it already was paid.
+   * Idempotent for an already-expired session. Throws `StripeUpstreamError`.
+   */
+  closeCheckoutSession(sessionId: string): Promise<ClosedCheckoutSession>;
 
   /** Hosted billing portal for an existing customer. Throws `StripeUpstreamError`. */
   createPortalSession(input: { readonly customerId: string; readonly returnUrl: string }): Promise<{ readonly url: string }>;

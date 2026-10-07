@@ -95,7 +95,9 @@ export class StripeWebhookService {
 
     if (await this.alreadySeen(event.id)) return { received: true, outcome: "duplicate" };
 
-    let fetchStartedAt = new Date();
+    // ⚠ THE DATABASE'S CLOCK, not this process's: the stale-fetch guard compares
+    // this instant with one another API instance stamped, and wall clocks differ.
+    let fetchStartedAt = await this.databaseNow();
     let object = await this.fetch(event, kind, event.objectId);
     if (object === null) return await this.acknowledgeOnly(event, "stripe has no such object");
 
@@ -106,7 +108,7 @@ export class StripeWebhookService {
     if (object.kind === "checkout_session" && object.raw.mode === "subscription") {
       const subscriptionId = subscriptionIdOf(object.raw.subscription);
       if (subscriptionId === null) return await this.acknowledgeOnly(event, "checkout session carries no subscription");
-      fetchStartedAt = new Date();
+      fetchStartedAt = await this.databaseNow();
       object = await this.fetch(event, "subscription", subscriptionId);
       if (object === null) return await this.acknowledgeOnly(event, "stripe has no such subscription");
     }
@@ -145,6 +147,12 @@ export class StripeWebhookService {
       this.logger.error({ message: "stripe re-fetch failed", event_id: event.id, event_type: event.type, status: error.statusCode });
       throw new DegradedError({ message: "payment provider is unavailable" });
     }
+  }
+
+  /** `clock_timestamp()` — the instant a fetch starts, on the one clock every instance shares. */
+  private async databaseNow(): Promise<Date> {
+    const result = await this.pool.query<{ now: Date }>("SELECT clock_timestamp() AS now");
+    return result.rows[0]!.now;
   }
 
   private async alreadySeen(eventId: string): Promise<boolean> {

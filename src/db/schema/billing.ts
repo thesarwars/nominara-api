@@ -129,6 +129,12 @@ export const plans = pgTable("plans", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
 });
 
+export const stripeSubscriptionSyncs = pgTable("stripe_subscription_syncs", {
+  workspaceId: uuid("workspace_id").notNull(),
+  stripeSubscriptionId: text("stripe_subscription_id").notNull(),
+  fetchStartedAt: timestamp("fetch_started_at", { withTimezone: true }).notNull(),
+}, (table) => [primaryKey({ columns: [table.workspaceId, table.stripeSubscriptionId] })]);
+
 export const stripeWebhookEvents = pgTable("stripe_webhook_events", {
   eventId: text("event_id").primaryKey(),
   type: text("type").notNull(),
@@ -169,6 +175,7 @@ export const subscriptions = pgTable("subscriptions", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
   provider: text("provider").notNull().default(sql`'none'::text`),
   providerSyncedAt: timestamp("provider_synced_at", { withTimezone: true }),
+  openCheckoutSessionId: text("open_checkout_session_id"),
 });
 
 export const usageCounters = pgTable("usage_counters", {

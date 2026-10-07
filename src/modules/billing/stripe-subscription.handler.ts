@@ -1,6 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { applyPlanChange, type SubscriptionReconciler } from "../../lib/billing/apply-plan.js";
-import { desiredFromStripeSubscription } from "../../lib/billing/stripe/subscription-state.js";
+import { desiredFromStripeSubscription, toCents, type ClaimedPlanPrice } from "../../lib/billing/stripe/subscription-state.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
 
@@ -39,10 +39,24 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     // session to its subscription, so anything else here is not ours.
     if (object.kind !== "subscription") return;
 
-    const desired = desiredFromStripeSubscription(object.raw, object.metadata);
+    const claimedPlan = await this.claimedPlanPrice(tx, object.metadata.plan_key);
+    const desired = desiredFromStripeSubscription(object.raw, object.metadata, claimedPlan);
     if (desired.kind === "ignore") {
-      incrementCounter("nominara_billing_subscription_reconcile_total", { outcome: "ignored" });
-      this.logger.warn({ message: `stripe subscription not reconciled: ${desired.reason}`, event_id: event.id, workspace_id: workspaceId });
+      if (desired.mismatch === true) {
+        // ⚠ ALARM, NOT A SHRUG. A customer may be paying for a plan they are
+        // not being given (a portal price switch), or the other way round.
+        incrementCounter("nominara_billing_plan_price_mismatch_total", {});
+        this.logger.error({
+          message: "stripe subscription price does not match its claimed plan: not reconciled",
+          event_id: event.id,
+          workspace_id: workspaceId,
+          subscription_id: object.id,
+          claimed_plan_key: object.metadata.plan_key ?? null,
+        });
+      } else {
+        this.logger.warn({ message: `stripe subscription not reconciled: ${desired.reason}`, event_id: event.id, workspace_id: workspaceId });
+      }
+      incrementCounter("nominara_billing_subscription_reconcile_total", { outcome: desired.mismatch === true ? "price_mismatch" : "ignored" });
       return;
     }
 
@@ -52,18 +66,29 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     // state back (a cancelled plan returning to growth, plus a pro-rata grant).
     // The workspace row is the serialiser applyPlanChange also locks first;
     // taking it here makes the read below the one the write is ordered by.
+    //
+    // ⚠ THE MARK IS KEPT PER SUBSCRIPTION, WHETHER OR NOT THE ROW ADOPTS IT.
+    // Reading it off the `subscriptions` row only covered the subscription that
+    // row already tracked; a NEW subscription that was cancelled before its
+    // first event committed left no mark, and the held `active` fetch then
+    // resurrected it. `fetchStartedAt` is the DATABASE's clock, so two API
+    // instances with skewed wall clocks order their writes consistently.
     await tx.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
-    const synced = await tx.query<{ provider_synced_at: Date | null }>(
-      `SELECT provider_synced_at FROM subscriptions
-        WHERE workspace_id = $1 AND status IN ('trialing','active','past_due') AND stripe_subscription_id = $2`,
+    const marked = await tx.query<{ fetch_started_at: Date }>(
+      "SELECT fetch_started_at FROM stripe_subscription_syncs WHERE workspace_id = $1 AND stripe_subscription_id = $2",
       [workspaceId, desired.state.providerSubscriptionId],
     );
-    const syncedAt = synced.rows[0]?.provider_synced_at ?? null;
-    if (syncedAt !== null && syncedAt.getTime() > fetchStartedAt.getTime()) {
+    const markedAt = marked.rows[0]?.fetch_started_at ?? null;
+    if (markedAt !== null && markedAt.getTime() > fetchStartedAt.getTime()) {
       incrementCounter("nominara_billing_subscription_reconcile_total", { outcome: "stale_fetch" });
       this.logger.warn({ message: "stripe subscription fetch is older than the committed state: skipped", event_id: event.id, workspace_id: workspaceId });
       return;
     }
+    await tx.query(
+      `INSERT INTO stripe_subscription_syncs (workspace_id, stripe_subscription_id, fetch_started_at) VALUES ($1, $2, $3)
+       ON CONFLICT (workspace_id, stripe_subscription_id) DO UPDATE SET fetch_started_at = GREATEST(stripe_subscription_syncs.fetch_started_at, EXCLUDED.fetch_started_at)`,
+      [workspaceId, desired.state.providerSubscriptionId, fetchStartedAt],
+    );
 
     let doubleSubscriptionWith: string | null = null;
     const reconcile: SubscriptionReconciler = (current) => {
@@ -111,12 +136,14 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       return;
     }
 
-    // Stamp the fetch that produced the row, so an older one cannot undo it.
-    await tx.query(
-      `UPDATE subscriptions SET provider_synced_at = GREATEST(COALESCE(provider_synced_at, '-infinity'::timestamptz), $3)
-        WHERE workspace_id = $1 AND status IN ('trialing','active','past_due') AND stripe_subscription_id = $2`,
-      [workspaceId, desired.state.providerSubscriptionId, fetchStartedAt],
-    );
+    // A paid subscription was adopted: the Checkout session that bought it is
+    // settled, so a later checkout has nothing to supersede.
+    if (desired.state.planKey !== "free") {
+      await tx.query(
+        "UPDATE subscriptions SET open_checkout_session_id = NULL WHERE workspace_id = $1 AND status IN ('trialing','active','past_due') AND open_checkout_session_id IS NOT NULL",
+        [workspaceId],
+      );
+    }
 
     incrementCounter("nominara_billing_subscription_reconcile_total", { outcome: outcome.changed ? "changed" : "unchanged" });
     this.logger.log({
@@ -128,5 +155,17 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       to: outcome.to,
       entitlement_version: outcome.entitlementVersion,
     });
+  }
+
+  /** The catalog price of the plan a subscription's metadata claims, or null when there is no such plan. */
+  private async claimedPlanPrice(tx: StripeEventContext["tx"], planKey: string | undefined): Promise<ClaimedPlanPrice | null> {
+    if (planKey === undefined || planKey.length === 0) return null;
+    const result = await tx.query<{ monthly_price: string; annual_price: string; currency: string }>(
+      "SELECT monthly_price, annual_price, currency FROM plans WHERE key = $1",
+      [planKey],
+    );
+    const plan = result.rows[0];
+    if (plan === undefined) return null;
+    return { monthlyCents: toCents(plan.monthly_price), annualCents: toCents(plan.annual_price), currency: plan.currency };
   }
 }
