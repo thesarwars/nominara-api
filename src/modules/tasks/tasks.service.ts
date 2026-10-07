@@ -1,5 +1,16 @@
+import { createHash, randomUUID } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
-import type { Task, TaskListQuery, TaskSort, UpdateTaskRequest } from "../../../contracts/tasks/index.js";
+import type { ClientBase } from "pg";
+import type {
+  CreateCommentRequest,
+  CreateTaskRequest,
+  Task,
+  TaskEvent,
+  TaskEventListQuery,
+  TaskListQuery,
+  TaskSort,
+  UpdateTaskRequest,
+} from "../../../contracts/tasks/index.js";
 import { ConflictError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { refreshProjectTaskCounts } from "../../lib/rollup/refresh-project-task-counts.js";
@@ -244,6 +255,10 @@ export class TasksService {
       events: events.map((e) => e.event),
     });
 
+    return this.readTask(client, taskId);
+  }
+
+  private async readTask(client: ClientBase, taskId: string): Promise<Task> {
     const row = await client.query<TaskRow>(
       `SELECT t.id, t.short_ref, t.project_id, t.goal_id, t.title, t.description, t.kind, t.origin, t.status,
               CASE WHEN COALESCE(af.severity, psi.gap_severity) IN ('critical', 'high', 'medium', 'low')
@@ -263,6 +278,128 @@ export class TasksService {
       [taskId, SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS],
     );
     return toTask(row.rows[0] as TaskRow);
+  }
+
+  /**
+   * `POST /v1/projects/{id}/tasks` — STORY-064 (step C). A MANUAL task.
+   *
+   * ONE TRANSACTION (the ambient one): the reference allocation, the task row,
+   * its `created` event and the open-count refresh commit or roll back together,
+   * so a rolled-back create never consumes a reference (gapless).
+   *
+   * THE REFERENCE. `ref_counters (workspace_id, prefix)` is incremented with
+   * `UPDATE ... RETURNING` inside this transaction (schemas/tasks-and-goals.md).
+   * The row is first ensured with `INSERT ... ON CONFLICT DO NOTHING` at
+   * next_value 1, so there is exactly ONE increment path: two concurrent first
+   * creates serialise on the inserted row and then on the UPDATE's row lock,
+   * and neither can skip a number. (The demo seeder's insert-at-2-then-update
+   * path would skip 1; it is single-threaded and not this code's pattern.)
+   *
+   * DEFAULTS (the plan's recommendation; the owner may override): the
+   * `dedupe_fingerprint` of a manual task is sha256 of a fresh random id, so a
+   * manual task NEVER collapses into another (two people may file the same
+   * title); `description` is the empty string (the column is NOT NULL) and
+   * `kind` defaults to `content`. Impact is 0 — a manual task has no measured
+   * impact until a verification run gives it one.
+   */
+  async createTask(projectId: string, body: CreateTaskRequest): Promise<Task> {
+    const store = currentTenantStore()!;
+    const client = store.client;
+
+    const project = await client.query<{ id: string; name: string; in_scope: boolean }>(
+      `SELECT id, name,
+              (cardinality(app.current_scope_projects()) = 0 OR id = ANY(app.current_scope_projects())) AS in_scope
+         FROM projects WHERE id = $1 AND deleted_at IS NULL`,
+      [projectId],
+    );
+    const found = project.rows[0];
+    if (found === undefined) throw new NotFoundError({ message: "no such project" });
+    if (!found.in_scope) throw new ProjectOutOfScopeException();
+
+    if (body.goal_id !== undefined) await this.assertGoalOfProject(client, body.goal_id, projectId);
+
+    const shortRef = await nextShortRef(client, store.context.workspaceId, shortRefPrefix(found.name));
+    const fingerprint = createHash("sha256").update(`manual:${randomUUID()}`).digest();
+    const inserted = await client.query<{ id: string }>(
+      `INSERT INTO tasks (workspace_id, project_id, short_ref, kind, origin, dedupe_fingerprint, title, description, goal_id)
+       VALUES (app.current_workspace(), $1, $2, $3, 'manual', $4, $5, '', $6)
+       RETURNING id`,
+      [projectId, shortRef, body.kind ?? "content", fingerprint, body.title, body.goal_id ?? null],
+    );
+    const taskId = inserted.rows[0]!.id;
+    await client.query(
+      `INSERT INTO task_events (workspace_id, task_id, actor_id, actor_type, event, to_value, occurred_at)
+       VALUES (app.current_workspace(), $1, $2, 'user', 'created', 'todo', clock_timestamp())`,
+      [taskId, store.context.actorId],
+    );
+    await refreshProjectTaskCounts(client, projectId);
+
+    incrementCounter("nominara_tasks_created_total", { origin: "manual" });
+    incrementCounter("nominara_tasks_events_written_total", { event: "created" });
+    // Workspace/task/project IDs only — never the title.
+    this.logger.log({ message: "task created", workspace_id: store.context.workspaceId, task_id: taskId, project_id: projectId });
+    return this.readTask(client, taskId);
+  }
+
+  /**
+   * `POST /v1/tasks/{id}/comments` — a comment is an event, so one timeline
+   * carries both history and conversation. 404 for a foreign-tenant task
+   * (absent under RLS), the scope 403 for an out-of-scope one.
+   */
+  async createComment(taskId: string, body: CreateCommentRequest): Promise<TaskEvent> {
+    const store = currentTenantStore()!;
+    const client = store.client;
+    await this.assertTaskReadable(client, taskId);
+
+    const inserted = await client.query<{ id: string }>(
+      `INSERT INTO task_events (workspace_id, task_id, actor_id, actor_type, event, comment_body, occurred_at)
+       VALUES (app.current_workspace(), $1, $2, 'user', 'commented', $3, clock_timestamp())
+       RETURNING id`,
+      [taskId, store.context.actorId, body.body],
+    );
+    incrementCounter("nominara_tasks_events_written_total", { event: "commented" });
+    // IDs only — the comment text is the customer's record and never reaches a log line.
+    this.logger.log({ message: "task comment added", workspace_id: store.context.workspaceId, task_id: taskId });
+
+    const row = await client.query<TaskEventRow>(`${TASK_EVENT_SELECT} WHERE e.id = $1`, [inserted.rows[0]!.id]);
+    return toTaskEvent(row.rows[0] as TaskEventRow);
+  }
+
+  /** `GET /v1/tasks/{id}/events` — the timeline, newest first, keyset-paginated on (occurred_at, id). */
+  async listTaskEvents(taskId: string, query: TaskEventListQuery): Promise<Page<TaskEvent>> {
+    const client = currentTenantStore()!.client;
+    await this.assertTaskReadable(client, taskId);
+
+    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, 2);
+    const result = await client.query<TaskEventRow>(
+      `${TASK_EVENT_SELECT}
+        WHERE e.task_id = $1
+          AND ($2::timestamptz IS NULL OR (e.occurred_at, e.id) < ($2::timestamptz, $3::uuid))
+        ORDER BY e.occurred_at DESC, e.id DESC
+        LIMIT $4`,
+      [taskId, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
+    );
+    incrementCounter("nominara_tasks_events_list_total", {});
+    return pageFrom(result.rows, query.limit, toTaskEvent, (row) => [row.occurred_key, row.id]);
+  }
+
+  /** 404 for an absent/other-tenant/soft-deleted task; the scope 403 for an in-tenant task outside the caller's scope. */
+  private async assertTaskReadable(client: ClientBase, taskId: string): Promise<void> {
+    const found = await client.query<{ in_scope: boolean }>(
+      `SELECT (cardinality(app.current_scope_projects()) = 0 OR t.project_id = ANY(app.current_scope_projects())) AS in_scope
+         FROM tasks t WHERE t.id = $1 AND t.deleted_at IS NULL`,
+      [taskId],
+    );
+    const row = found.rows[0];
+    if (row === undefined) throw new NotFoundError({ message: "no such task" });
+    if (!row.in_scope) throw new ProjectOutOfScopeException();
+  }
+
+  private async assertGoalOfProject(client: ClientBase, goalId: string, projectId: string): Promise<void> {
+    const goal = await client.query(`SELECT 1 FROM goals WHERE id = $1 AND project_id = $2`, [goalId, projectId]);
+    if (goal.rows.length === 0) {
+      throw new ValidationFailedError({ message: "goal_id must be a goal of this task's project", details: { issues: [{ path: ["goal_id"], message: "not a goal of this task's project" }] } });
+    }
   }
 
   /**
@@ -636,5 +773,59 @@ function toTask(row: TaskRow): Task {
     affected_url: row.affected_url,
     created_at: row.created_at.toISOString(),
     updated_at: row.updated_at.toISOString(),
+  };
+}
+
+/** The prefix `ref_counters` tracks for a project — the first 3 letters of its name, uppercased, alpha-only (the demo seeder's derivation). */
+export function shortRefPrefix(projectName: string): string {
+  const letters = projectName.toUpperCase().replace(/[^A-Z]/gu, "");
+  return (letters.slice(0, 3) || "TSK").padEnd(3, "X");
+}
+
+/** Gapless: ensure the counter row exists, then increment it with UPDATE ... RETURNING in the caller's transaction. */
+async function nextShortRef(client: ClientBase, workspaceId: string, prefix: string): Promise<string> {
+  await client.query(
+    `INSERT INTO ref_counters (workspace_id, prefix, next_value) VALUES ($1, $2, 1) ON CONFLICT (workspace_id, prefix) DO NOTHING`,
+    [workspaceId, prefix],
+  );
+  const updated = await client.query<{ used: number }>(
+    `UPDATE ref_counters SET next_value = next_value + 1 WHERE workspace_id = $1 AND prefix = $2
+     RETURNING next_value - 1 AS used`,
+    [workspaceId, prefix],
+  );
+  return `${prefix}-${String(updated.rows[0]!.used)}`;
+}
+
+interface TaskEventRow {
+  id: string;
+  task_id: string;
+  event: string;
+  actor_id: string | null;
+  actor_type: string;
+  full_name: string | null;
+  from_value: string | null;
+  to_value: string | null;
+  comment_body: string | null;
+  payload: Record<string, unknown> | null;
+  occurred_at: Date;
+  occurred_key: string;
+}
+
+const TASK_EVENT_SELECT = `SELECT e.id, e.task_id, e.event, e.actor_id, e.actor_type, u.full_name, e.from_value, e.to_value,
+       e.comment_body, e.payload, e.occurred_at, e.occurred_at::text AS occurred_key
+  FROM task_events e
+  LEFT JOIN users u ON u.id = e.actor_id`;
+
+function toTaskEvent(row: TaskEventRow): TaskEvent {
+  return {
+    id: row.id,
+    task_id: row.task_id,
+    event: row.event as TaskEvent["event"],
+    actor: { id: row.actor_id, display_name: row.full_name, type: row.actor_type === "system" ? "system" : "user" },
+    from_value: row.from_value,
+    to_value: row.to_value,
+    comment_body: row.comment_body,
+    payload: row.payload,
+    occurred_at: row.occurred_at.toISOString(),
   };
 }

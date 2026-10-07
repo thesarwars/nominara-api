@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { RUNTIME_ROLES, BREAKGLASS_ROLE } from "../../src/db/conventions.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { ConflictError, NotFoundError, ValidationFailedError } from "../../src/api/errors/domain-errors.js";
+import { NotFoundError, ValidationFailedError } from "../../src/api/errors/domain-errors.js";
 import { ProjectOutOfScopeException } from "../../src/tenancy/errors.js";
 import { TasksService } from "../../src/modules/tasks/tasks.service.js";
 import { withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
@@ -78,18 +78,6 @@ describe("STORY-064-C · create / comment / events — real SQL", () => {
       [workspaceId, projectId]);
     return r.rows[0]!.id;
   }
-  async function createTask(workspaceId: string, projectId: string, status = "todo", extra: { completed?: boolean } = {}): Promise<string> {
-    seq += 1;
-    const r = await client.query<{ id: string }>(
-      `INSERT INTO tasks (workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status, dismissed_reason, resurface_at, completed_at)
-       VALUES ($1, $2, $3, 'content', $4, 'T', 'D', $5, $6, $7, $8) RETURNING id`,
-      [workspaceId, projectId, `HUB-${seq}`, createHash("sha256").update(`t-${seq}-${randomUUID()}`).digest(), status,
-        status === "dismissed" ? "old reason" : null, status === "dismissed" ? "2027-01-01T00:00:00Z" : null,
-        extra.completed ? new Date() : null]);
-    await client.query("UPDATE projects SET open_task_count = (SELECT count(*) FROM tasks WHERE project_id = $1 AND status IN ('todo','in_progress')) WHERE id = $1", [projectId]);
-    return r.rows[0]!.id;
-  }
-
   const CTX = (workspaceId: string, actorId: string, scope?: readonly string[]): TenantContext => ({
     workspaceId, actorId, ...(scope !== undefined ? { scopeProjectIds: scope } : {}),
   });
