@@ -95,6 +95,7 @@ export class StripeWebhookService {
 
     if (await this.alreadySeen(event.id)) return { received: true, outcome: "duplicate" };
 
+    let fetchStartedAt = new Date();
     let object = await this.fetch(event, kind, event.objectId);
     if (object === null) return await this.acknowledgeOnly(event, "stripe has no such object");
 
@@ -105,6 +106,7 @@ export class StripeWebhookService {
     if (object.kind === "checkout_session" && object.raw.mode === "subscription") {
       const subscriptionId = subscriptionIdOf(object.raw.subscription);
       if (subscriptionId === null) return await this.acknowledgeOnly(event, "checkout session carries no subscription");
+      fetchStartedAt = new Date();
       object = await this.fetch(event, "subscription", subscriptionId);
       if (object === null) return await this.acknowledgeOnly(event, "stripe has no such subscription");
     }
@@ -126,7 +128,7 @@ export class StripeWebhookService {
           return { received: true, outcome: "ignored" } as const;
         }
 
-        for (const handler of handlers) await handler.handle({ tx, workspaceId, event, object });
+        for (const handler of handlers) await handler.handle({ tx, workspaceId, event, object, fetchStartedAt });
         return { received: true, outcome: "processed" } as const;
       });
     } finally {

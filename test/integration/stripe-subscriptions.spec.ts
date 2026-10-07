@@ -126,7 +126,7 @@ describe("STORY-075a · subscriptions", () => {
   /** Stripe's CURRENT state of a subscription, as the gateway will fetch it. */
   function stripeSubscription(
     workspaceId: string,
-    over: { id?: string; status?: string; plan?: string; interval?: "month" | "year"; cancelAtPeriodEnd?: boolean; extraSeats?: number; extraProjects?: number } = {},
+    over: { id?: string; customer?: string; status?: string; plan?: string; interval?: "month" | "year"; cancelAtPeriodEnd?: boolean; extraSeats?: number; extraProjects?: number } = {},
   ): string {
     const id = over.id ?? "sub_1";
     const data: unknown[] = [
@@ -143,7 +143,7 @@ describe("STORY-075a · subscriptions", () => {
       "subscription",
       id,
       { workspace_id: workspaceId, plan_key: over.plan ?? "growth", billing_interval: over.interval === "year" ? "annual" : "monthly" },
-      { customer: "cus_1", status: over.status ?? "active", cancel_at_period_end: over.cancelAtPeriodEnd ?? false, trial_end: null, items: { data } },
+      { customer: over.customer ?? "cus_1", status: over.status ?? "active", cancel_at_period_end: over.cancelAtPeriodEnd ?? false, trial_end: null, items: { data } },
     );
     return id;
   }
@@ -410,6 +410,65 @@ describe("STORY-075a · subscriptions", () => {
     await deliver(eventBody("evt_n1", "customer.subscription.created", "sub_new"));
     await deliver(eventBody("evt_n2", "customer.subscription.deleted", "sub_old"));
     expect(await row(workspaceId)).toMatchObject({ plan_key: "business", stripe_subscription_id: "sub_new" });
+  });
+
+  it("audit · two live Stripe subscriptions for one workspace: the first holds; delivering either's events alternately flips nothing and mints nothing", async () => {
+    const { workspaceId } = await newWorkspace();
+    const db = harness.db();
+    await db.query(
+      `INSERT INTO credit_wallets (workspace_id, included_balance, cycle_start, cycle_end)
+       VALUES ($1, 60, (now() - interval '10 days')::date, (now() + interval '20 days')::date)`,
+      [workspaceId],
+    );
+    // Two checkouts opened from free: each Stripe session created its own customer.
+    stripeSubscription(workspaceId, { id: "sub_s2", customer: "cus_2", plan: "starter" });
+    stripeSubscription(workspaceId, { id: "sub_s1", customer: "cus_9", plan: "growth" });
+    await deliver(eventBody("evt_d0", "customer.subscription.created", "sub_s2"));
+    const settled = await row(workspaceId);
+    expect(settled).toMatchObject({ plan_key: "starter", stripe_subscription_id: "sub_s2", stripe_customer_id: "cus_2" });
+    const ledger = async () => (await db.query("SELECT idempotency_key FROM credit_ledger WHERE workspace_id = $1 ORDER BY idempotency_key", [workspaceId])).rows;
+    const ledgerSettled = await ledger();
+
+    const alarm = vi.spyOn(Logger.prototype, "error");
+    for (const [i, sub] of ["sub_s1", "sub_s2", "sub_s1", "sub_s2", "sub_s1"].entries()) {
+      const res = await deliver(eventBody(`evt_d${String(i + 1)}`, "customer.subscription.updated", sub));
+      expect(res.statusCode, res.body).toBe(200);
+      expect(await row(workspaceId), `after event ${String(i)}`).toEqual(settled);
+      expect(await ledger()).toEqual(ledgerSettled);
+    }
+    expect(alarm, "a double subscription is alarmed, not silently dropped").toHaveBeenCalled();
+    expect(await auditRows(workspaceId)).toHaveLength(1);
+  });
+
+  it("audit · a fetch taken before a newer event committed cannot overwrite it", async () => {
+    const { workspaceId } = await newWorkspace();
+    const db = harness.db();
+    await db.query(
+      `INSERT INTO credit_wallets (workspace_id, included_balance, cycle_start, cycle_end)
+       VALUES ($1, 60, (now() - interval '10 days')::date, (now() + interval '20 days')::date)`,
+      [workspaceId],
+    );
+    stripeSubscription(workspaceId, { id: "sub_r", plan: "growth" });
+    await deliver(eventBody("evt_r0", "customer.subscription.created", "sub_r"));
+    expect(await row(workspaceId)).toMatchObject({ plan_key: "growth" });
+
+    // Event A fetches while the subscription is active on growth, and is held.
+    const release = gateway.holdNextFetch("subscription", "sub_r");
+    const fetchesBefore = gateway.fetches.length;
+    const stale = deliver(eventBody("evt_rA", "customer.subscription.updated", "sub_r"));
+    await vi.waitFor(() => expect(gateway.fetches.length).toBe(fetchesBefore + 1));
+    // Stripe cancels; event B fetches the canceled state and commits first.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    stripeSubscription(workspaceId, { id: "sub_r", plan: "growth", status: "canceled" });
+    expect(outcomeOf(await deliver(eventBody("evt_rB", "customer.subscription.deleted", "sub_r")))).toBe("processed");
+    const afterB = await row(workspaceId);
+    expect(afterB).toMatchObject({ plan_key: "free", ws_plan: "free" });
+    const ledgerB = (await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [workspaceId])).rowCount;
+
+    release();
+    expect((await stale).statusCode).toBe(200);
+    expect(await row(workspaceId), "the stale growth snapshot must not resurrect a canceled plan").toEqual(afterB);
+    expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(ledgerB);
   });
 
   it("an incomplete subscription (first payment not taken) changes nothing", async () => {

@@ -68,9 +68,30 @@ export class FakeStripeGateway implements StripeGateway {
     return Promise.resolve({ url: `https://billing.stripe.test/p/session_${input.customerId}` });
   }
 
-  fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null> {
-    this.fetches.push(`${kind}:${objectId}`);
-    if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
-    return Promise.resolve(this.objects.get(`${kind}:${objectId}`) ?? null);
+  /** Fetches held open by `holdNextFetch`, keyed `${kind}:${id}`. */
+  private readonly held = new Map<string, Promise<void>>();
+
+  /**
+   * Makes the NEXT fetch of this object snapshot Stripe's state now and then wait
+   * for the returned release — the interleaving a stale fetch needs: the answer is
+   * old by the time it is used. Returns `release`.
+   */
+  holdNextFetch(kind: StripeObjectKind, objectId: string): () => void {
+    let release!: () => void;
+    this.held.set(`${kind}:${objectId}`, new Promise<void>((resolve) => (release = resolve)));
+    return release;
+  }
+
+  async fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null> {
+    const key = `${kind}:${objectId}`;
+    this.fetches.push(key);
+    if (this.failFetchWith !== undefined) throw this.failFetchWith;
+    const snapshot = this.objects.get(key) ?? null;
+    const hold = this.held.get(key);
+    if (hold !== undefined) {
+      this.held.delete(key);
+      await hold;
+    }
+    return snapshot;
   }
 }

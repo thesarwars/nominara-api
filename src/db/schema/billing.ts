@@ -168,6 +168,7 @@ export const subscriptions = pgTable("subscriptions", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
   provider: text("provider").notNull().default(sql`'none'::text`),
+  providerSyncedAt: timestamp("provider_synced_at", { withTimezone: true }),
 });
 
 export const usageCounters = pgTable("usage_counters", {

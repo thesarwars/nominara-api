@@ -16,6 +16,8 @@ export interface StripeEventContext {
   readonly event: VerifiedStripeEvent;
   /** Stripe's CURRENT state of the object. Write it wholesale; never apply the event as a delta. */
   readonly object: FetchedStripeObject;
+  /** When the fetch that produced `object` STARTED. A write whose fetch began before a newer committed one is stale. */
+  readonly fetchStartedAt: Date;
 }
 
 export interface StripeEventHandler {
