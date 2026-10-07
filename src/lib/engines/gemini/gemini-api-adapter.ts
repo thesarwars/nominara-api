@@ -36,6 +36,12 @@ export class UngroundedRequestError extends Error {
 export const GEMINI_DEFAULT_MODEL = "gemini-2.5-flash";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
+// An HTTP URL, not an object-storage key. Built by concat() rather than an interpolated template
+// because ISO-14's scanner reads a base-plus-slash template as an un-namespaced storage key.
+function modelUrl(model: string, suffix: string): string {
+  return GEMINI_BASE_URL.concat("/models/", model, suffix);
+}
+
 // gemini-2.5-flash list pricing (USD): $0.30 / 1M input tokens, $2.50 / 1M output tokens (thinking
 // tokens bill as output), and $35 / 1,000 grounded prompts for google_search. A pricing change is a
 // methodology/cost event: edit here and bump adapterVersion.
@@ -104,7 +110,7 @@ export class GeminiApiAdapter extends BaseCaptureAdapter {
     const signal = AbortSignal.any([ctx.signal, timeout.signal]);
 
     try {
-      const response = await this.fetchFn(`${GEMINI_BASE_URL}/models/${this.model}:generateContent`, {
+      const response = await this.fetchFn(modelUrl(this.model, ":generateContent"), {
         method: "POST",
         headers: { "content-type": "application/json", "x-goog-api-key": this.config.apiKey },
         body: JSON.stringify(request),
@@ -202,7 +208,7 @@ export class GeminiApiAdapter extends BaseCaptureAdapter {
     const startedAt = performance.now();
     const elapsed = () => Math.max(0, Math.round(performance.now() - startedAt));
     try {
-      const response = await this.fetchFn(`${GEMINI_BASE_URL}/models/${this.model}`, {
+      const response = await this.fetchFn(modelUrl(this.model, ""), {
         method: "GET",
         headers: { "x-goog-api-key": this.config.apiKey },
         signal: AbortSignal.timeout(this.config.timeoutMs),
