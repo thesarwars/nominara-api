@@ -9,6 +9,9 @@ import {
 import { AuditModule } from "../audit/audit.module.js";
 import { IdentityModule } from "../identity/identity.module.js";
 import { TasksModule } from "../tasks/tasks.module.js";
+import { BillingModule } from "../billing/billing.module.js";
+import { ProjectsModule } from "../projects/projects.module.js";
+import { WorkspaceSummaryService } from "./workspace-summary.service.js";
 import { LocalDekProvisioner } from "./adapters/local-dek-provisioner.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { WorkspacesController } from "./workspaces.controller.js";
@@ -37,11 +40,12 @@ import { InvitationsService } from "./invitations.service.js";
 // (coding-standards.md §1 "one table, one owning service") — so this module
 // imports the SERVICE rather than querying `tasks` here.
 @Module({
-  imports: [AuditModule, IdentityModule, TenancyAccessModule, TasksModule],
+  imports: [AuditModule, IdentityModule, TenancyAccessModule, TasksModule, ProjectsModule, BillingModule],
   controllers: [WorkspacesController],
   providers: [
     WorkspacesService,
     InvitationsService,
+    WorkspaceSummaryService,
     // STORY-026 T22 / D9 — the API process publishes realtime events onto a
     // Valkey channel the gateway reads, never by standing up a socket.io
     // server of its own. (It used @socket.io/redis-emitter until the delivery

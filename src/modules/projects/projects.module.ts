@@ -28,5 +28,6 @@ import { defaultCheckDeps } from "../../lib/verification/checkers.js";
     // is in the container's /etc/resolv.conf (STORY-048 AC4).
     { provide: CHECK_DEPS, useFactory: () => defaultCheckDeps() },
   ],
+  exports: [ProjectsService],
 })
 export class ProjectsModule {}

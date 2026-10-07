@@ -21,6 +21,7 @@ describe("STORY-169 review · WorkspacesController.listActionItems — assertMat
       {} as ConstructorParameters<typeof WorkspacesController>[0],
       {} as ConstructorParameters<typeof WorkspacesController>[1],
       tasks,
+      {} as ConstructorParameters<typeof WorkspacesController>[3],
     );
   }
 
@@ -45,5 +46,29 @@ describe("STORY-169 review · WorkspacesController.listActionItems — assertMat
     const result = await controller.listActionItems(req, "ws-real", { limit: 50 } as never);
     expect(result).toBe(page);
     expect(listActionItems).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("NEW-B-2 · WorkspacesController.summary — assertMatchesTenant", () => {
+  const req = { tenant: { workspaceId: "ws-real", actorId: "actor-1" } } as unknown as RbacScopedRequest;
+  function controllerWith(summary: ReturnType<typeof vi.fn>): WorkspacesController {
+    return new WorkspacesController(
+      {} as ConstructorParameters<typeof WorkspacesController>[0],
+      {} as ConstructorParameters<typeof WorkspacesController>[1],
+      {} as ConstructorParameters<typeof WorkspacesController>[2],
+      { summary } as unknown as ConstructorParameters<typeof WorkspacesController>[3],
+    );
+  }
+
+  it("another workspace's id is refused (NotFoundException) and nothing is read", () => {
+    const summary = vi.fn();
+    expect(() => controllerWith(summary).summary(req, "ws-other")).toThrow(NotFoundException);
+    expect(summary).not.toHaveBeenCalled();
+  });
+
+  it("the tenant's own id calls through", async () => {
+    const summary = vi.fn().mockResolvedValue({ ok: true });
+    await expect(controllerWith(summary).summary(req, "ws-real")).resolves.toEqual({ ok: true });
+    expect(summary).toHaveBeenCalledWith("ws-real");
   });
 });
