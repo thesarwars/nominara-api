@@ -6,3 +6,4 @@ export * from "./domain-verification.schema.js";
 export * from "./project-list-response.schema.js";
 export * from "./topic-response.schema.js";
 export * from "./rename-topic-request.schema.js";
+export * from "./competitor-track.schema.js";

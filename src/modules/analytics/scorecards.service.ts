@@ -14,18 +14,13 @@ import {
 import { blendDisclosure, combineDataSources, engineDataSourcesForDates, recordDemoDataServed } from "../../lib/analytics/data-source.js";
 import { aggregateRange, answeredStatusSql, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
+import { resolveWindow, TIMEFRAME_DAYS } from "../../lib/analytics/window.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`.
 //
 // Every figure on the Project Overview screen, from one request. The
 // arithmetic lives in `src/lib/analytics/scorecard.ts`; this resolves the
 // window, reads the facts, and joins the engine configuration onto them.
-
-const TIMEFRAME_DAYS: Readonly<Record<ScorecardsQuery["timeframe"], number>> = Object.freeze({
-  "7d": 7,
-  "30d": 30,
-  "90d": 90,
-});
 
 interface EngineConfig {
   engine_key: string;
@@ -46,14 +41,6 @@ interface EngineConfig {
  */
 const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
 
-interface ResolvedWindow {
-  from: string;
-  to: string;
-  priorFrom: string;
-  priorTo: string;
-  timezone: string;
-}
-
 @Injectable()
 export class ScorecardsService {
   async scorecards(projectId: string, query: ScorecardsQuery): Promise<ScorecardsResponse> {
@@ -61,7 +48,7 @@ export class ScorecardsService {
     if (store === undefined) throw new Error("ScorecardsService requires an active tenant context");
     const tx = store.client;
 
-    const window = await this.resolveWindow(tx, projectId, TIMEFRAME_DAYS[query.timeframe]);
+    const window = await resolveWindow(tx, projectId, TIMEFRAME_DAYS[query.timeframe]);
     const requested = query.engines?.split(",").map((key) => key.trim()).filter((key) => key.length > 0) ?? null;
     // ⚠ `priorFrom`, NOT `from` — THE MEMBERSHIP SPAN COVERS BOTH LEGS.
     //
@@ -129,40 +116,6 @@ export class ScorecardsService {
       blended: toEntry(blended, null, combineDataSources(perEngine)),
       blend: blendDisclosure(perEngine),
     };
-  }
-
-  /**
-   * The window, in the PROJECT'S WORKSPACE TIMEZONE.
-   *
-   * Asked of Postgres rather than computed in Node, so the conversion uses
-   * the same tz database `aggregateRange` does — a rollup bucketing a capture
-   * into one day while this window excludes it would make the scorecard and
-   * the chart disagree at every DST boundary.
-   *
-   * The prior window is the SAME LENGTH immediately before, which is what
-   * §3's delta compares. An unaligned prior window would make the delta a
-   * comparison of a month against a fortnight.
-   */
-  private async resolveWindow(tx: ClientBase, projectId: string, days: number): Promise<ResolvedWindow> {
-    const settings = await tx.query<{ timezone: string }>(
-      `SELECT w.timezone
-         FROM projects p JOIN workspaces w ON w.id = p.workspace_id
-        WHERE p.id = $1 AND p.deleted_at IS NULL`,
-      [projectId],
-    );
-    const timezone = settings.rows[0]?.timezone;
-    if (timezone === undefined) throw new NotFoundError({ message: "no such project" });
-
-    const bounds = await tx.query<{ from: string; to: string; prior_from: string; prior_to: string }>(
-      `SELECT to_char(today - make_interval(days => $1::int - 1), 'YYYY-MM-DD') AS from,
-              to_char(today, 'YYYY-MM-DD')                                      AS to,
-              to_char(today - make_interval(days => $1::int * 2 - 1), 'YYYY-MM-DD') AS prior_from,
-              to_char(today - make_interval(days => $1::int), 'YYYY-MM-DD')     AS prior_to
-         FROM (SELECT (now() AT TIME ZONE $2)::date AS today) t`,
-      [days, timezone],
-    );
-    const row = bounds.rows[0]!;
-    return { from: row.from, to: row.to, priorFrom: row.prior_from, priorTo: row.prior_to, timezone };
   }
 
   /**
