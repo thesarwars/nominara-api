@@ -1,6 +1,6 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { resolveEnabledEngines } from "../../src/lib/capture/plan-cells.js";
@@ -558,7 +558,18 @@ describe("STORY-152 · a project resolves its engines from the catalog", () => {
   // breaker and retry ladder branch on it", and the matrix would have rendered
   // "We asked and no answer came back" for an engine we never asked.
   describe("capture-ready", () => {
-    it("a business project is entitled to six engines and can capture on NONE of them", async () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    // NEW-A-4: changed from "NONE of them" — Gemini is real once GEMINI_API_KEY is set.
+    it("a business project with a Gemini key can capture on gemini ONLY", async () => {
+      vi.stubEnv("GEMINI_API_KEY", "test-key-not-a-secret");
+      const { workspaceId, projectId } = await projectOnPlan("business");
+
+      expect(await capturableFor(workspaceId, projectId)).toEqual(["gemini"]);
+    });
+
+    it("a business project is entitled to six engines and, with no Gemini key, can capture on NONE of them", async () => {
+      vi.stubEnv("GEMINI_API_KEY", "");
       const { workspaceId, projectId } = await projectOnPlan("business");
 
       expect(await enginesFor(workspaceId, projectId)).toHaveLength(6);
@@ -569,9 +580,8 @@ describe("STORY-152 · a project resolves its engines from the catalog", () => {
     });
 
     it("the capture-ready set is derived from the registry, not listed", () => {
-      // Empty today. When an adapter story binds a real adapter it flips its
-      // own captureReady flag, and this becomes non-empty in the same commit —
-      // which is why the set is derived rather than maintained by hand.
+      // Empty keyless; NEW-A-4 made it ["gemini"] when a key is configured.
+      vi.stubEnv("GEMINI_API_KEY", "");
       expect(captureReadyEngineKeys()).toEqual([]);
     });
   });

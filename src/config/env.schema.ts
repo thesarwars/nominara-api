@@ -340,6 +340,9 @@ export const envSchema = z
         message: "must be a JSON object mapping engine keys to a positive USD ceiling",
       })
       .optional(),
+    // NEW-A-4 — optional: absent leaves Gemini honestly not capture-ready (registry.ts), it
+    // does not fail boot. Never logged, never echoed in an error.
+    GEMINI_API_KEY: requiredString.optional(),
   })
   .strict()
   // STORY-127 — the first of the two checks that keep plaintext one-time

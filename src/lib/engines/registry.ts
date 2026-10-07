@@ -1,6 +1,7 @@
 import type { CaptureAdapter, EngineKey } from "./contract.js";
 import { engineKeySchema } from "./contract.js";
 import { FIXTURE_ADAPTERS } from "./fixtures/index.js";
+import { GeminiApiAdapter } from "./gemini/gemini-api-adapter.js";
 
 // STORY-027 — mirrors src/lib/auth/oauth-providers.ts's static-map shape and
 // src/modules/identity/ports/oauth-client.ts's interface-only port shape. No
@@ -70,6 +71,8 @@ const REGISTRY: Record<EngineKey, EngineRegistration> = {
   google_ai_mode: { status: "active", adapter: FIXTURE_ADAPTERS.google_ai_mode, captureReady: false },
   perplexity: { status: "active", adapter: FIXTURE_ADAPTERS.perplexity, captureReady: false },
   chatgpt: { status: "active", adapter: FIXTURE_ADAPTERS.chatgpt, captureReady: false },
+  // NEW-A-4: gemini is the one real adapter. Its binding is resolved per call (see geminiBinding)
+  // because it exists only when GEMINI_API_KEY does; this static entry is the keyless fallback.
   gemini: { status: "active", adapter: FIXTURE_ADAPTERS.gemini, captureReady: false },
   claude: { status: "active", adapter: FIXTURE_ADAPTERS.claude, captureReady: false },
   grok: { status: "disabled" },
@@ -77,6 +80,24 @@ const REGISTRY: Record<EngineKey, EngineRegistration> = {
   meta_ai: { status: "disabled" },
   deepseek: { status: "disabled" },
 };
+
+// NEW-A-4 — hard per-capture timeout for the real Gemini adapter (p95 profile is ~11 s).
+const GEMINI_CAPTURE_TIMEOUT_MS = 30_000;
+let geminiAdapterCache: { readonly key: string; readonly adapter: GeminiApiAdapter } | undefined;
+
+/** The real Gemini registration when a key is configured; otherwise the honest keyless fallback. */
+function registrationFor(engineKey: EngineKey): EngineRegistration {
+  if (engineKey === "gemini") {
+    const key = process.env.GEMINI_API_KEY;
+    if (key !== undefined && key.trim().length > 0) {
+      if (geminiAdapterCache?.key !== key) {
+        geminiAdapterCache = { key, adapter: new GeminiApiAdapter({ apiKey: key, timeoutMs: GEMINI_CAPTURE_TIMEOUT_MS }) };
+      }
+      return { status: "active", adapter: geminiAdapterCache.adapter, captureReady: true };
+    }
+  }
+  return REGISTRY[engineKey];
+}
 
 // STORY-031 — derived from REGISTRY (never hand-duplicated) so the canary
 // (canary.ts) and anything else needing "every dispatching engine" can
@@ -90,7 +111,7 @@ export function resolveEngine(engineKey: string): CaptureAdapter {
   if (!parsed.success) {
     throw new EngineRefusalError(engineKey, "unknown");
   }
-  const registration = REGISTRY[parsed.data];
+  const registration = registrationFor(parsed.data);
   if (registration.status === "disabled") {
     throw new EngineRefusalError(parsed.data, "disabled");
   }
@@ -104,8 +125,8 @@ export async function healthProbeEngine(engineKey: string): Promise<{ ok: boolea
 /**
  * The engine keys a capture may actually be attempted on.
  *
- * ⚠ EMPTY TODAY, DELIBERATELY, AND THAT IS THE PRODUCT'S TRUE STATE. Every
- * active engine is fixture-backed; none can answer a real prompt. Planning a
+ * ⚠ EMPTY WITHOUT A KEY, DELIBERATELY. Only gemini has a real adapter (NEW-A-4), and only when
+ * GEMINI_API_KEY is set. The other five are fixture-backed; none can answer a real prompt. Planning a
  * cell for one would manufacture a failure out of a thing we never tried.
  *
  * Derived from REGISTRY rather than listed, so an adapter story cannot bind a
@@ -113,7 +134,7 @@ export async function healthProbeEngine(engineKey: string): Promise<{ ok: boolea
  */
 export function captureReadyEngineKeys(): readonly EngineKey[] {
   return (Object.keys(REGISTRY) as EngineKey[]).filter((key) => {
-    const entry = REGISTRY[key];
+    const entry = registrationFor(key);
     return entry.status === "active" && entry.captureReady;
   });
 }
