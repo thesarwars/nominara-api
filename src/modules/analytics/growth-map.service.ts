@@ -2,6 +2,7 @@ import { Injectable } from "@nestjs/common";
 import { nonMeasurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import type { ClientBase } from "pg";
 import type {
+  DataSource,
   GrowthMapQuery,
   GrowthMapResponse,
   GrowthMapSeries,
@@ -19,6 +20,7 @@ import {
   type DailySeriesRow,
   type FailureDay,
 } from "../../lib/analytics/growth-map.js";
+import { combineDataSources, engineDataSourcesForDates, recordDemoDataServed } from "../../lib/analytics/data-source.js";
 import { CROSS_ENGINE_KEY } from "../../lib/rollup/roll-up-day.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 
@@ -65,6 +67,11 @@ export class GrowthMapService {
     const wantCompetitors = wanted.has("competitors");
 
     const rows = await this.seriesRows(tx, projectId, from, to);
+    // NEW-A-5 — the series are the cross-engine blend, so each one carries the
+    // combination of every measured engine's provenance in the window.
+    const engineSources = await engineDataSourcesForDates(tx, projectId, from, to, timezone);
+    const blendSource: DataSource | null = combineDataSources([...engineSources.values()]);
+    recordDemoDataServed("growth_map", store.context.workspaceId, [...engineSources.values()]);
     const series: GrowthMapSeries[] = [];
 
     const brandRows = rows.filter((row) => row.entityType === "brand");
@@ -76,6 +83,7 @@ export class GrowthMapService {
         entity_type: "brand",
         color_role: "primary",
         points: brandPoints,
+        data_source: blendSource,
       });
     }
 
@@ -93,6 +101,7 @@ export class GrowthMapService {
           entity_type: "competitor",
           color_role: "comparison",
           points: pointsFor(days, entityRows),
+          data_source: blendSource,
         });
       }
       series.push(...competitorSeries);
@@ -107,6 +116,7 @@ export class GrowthMapService {
           entity_type: "derived",
           color_role: "baseline",
           points: baselinePoints(days, competitorSeries),
+          data_source: blendSource,
         });
       }
     }
@@ -120,6 +130,7 @@ export class GrowthMapService {
       granularity: "day",
       timeframe: { from, to, timezone },
       series,
+      engines: [...engineSources].sort(([a], [b]) => a.localeCompare(b)).map(([engine_key, data_source]) => ({ engine_key, data_source })),
       milestones: await this.milestones(tx, projectId, from, to, timezone),
       annotations: {
         // The gaps are the BRAND's. A competitor absent from an answer is not

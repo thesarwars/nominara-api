@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import type { ClientBase } from "pg";
-import type { ScorecardsQuery, ScorecardsResponse, ScorecardEntry } from "../../../contracts/analytics/index.js";
+import type { DataSource, ScorecardsQuery, ScorecardsResponse, ScorecardEntry } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import {
@@ -11,6 +11,7 @@ import {
   type Scorecard,
   type WindowMetrics,
 } from "../../lib/analytics/scorecard.js";
+import { blendDisclosure, combineDataSources, engineDataSourcesForDates, recordDemoDataServed } from "../../lib/analytics/data-source.js";
 import { aggregateRange, answeredStatusSql, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 
@@ -113,12 +114,20 @@ export class ScorecardsService {
       })),
     );
 
+    // NEW-A-5 — provenance over the SAME span as the blend's membership
+    // (prior window start to current end), so the marker describes every
+    // capture that can move the score or its delta.
+    const sources = await engineDataSourcesForDates(tx, projectId, window.priorFrom, window.to, window.timezone);
+    const perEngine = entries.map((entry) => sources.get(entry.engine.engine_key) ?? null);
+    recordDemoDataServed("scorecards", store.context.workspaceId, perEngine);
+
     return {
       project_id: projectId,
       timeframe: query.timeframe,
       window: { from: window.from, to: window.to, timezone: window.timezone },
-      engines: entries.map((entry) => toEntry(entry.scorecard, entry.engine)),
-      blended: toEntry(blended, null),
+      engines: entries.map((entry, index) => toEntry(entry.scorecard, entry.engine, perEngine[index]!)),
+      blended: toEntry(blended, null, combineDataSources(perEngine)),
+      blend: blendDisclosure(perEngine),
     };
   }
 
@@ -372,8 +381,9 @@ function nextRunAt(engine: EngineConfig): string | null {
 }
 
 /** `null` config marks the blended entry — it has no engine to name or schedule. */
-function toEntry(scorecard: Scorecard, engine: EngineConfig | null): ScorecardEntry {
+function toEntry(scorecard: Scorecard, engine: EngineConfig | null, dataSource: DataSource | null): ScorecardEntry {
   return {
+    data_source: dataSource,
     engine_key: scorecard.engineKey,
     display_name: engine?.display_name ?? null,
     cadence_runs_per_cycle: engine?.cadenceRunsPerCycle ?? null,

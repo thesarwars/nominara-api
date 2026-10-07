@@ -29,6 +29,7 @@ const series = (points: GrowthMapPoint[]): GrowthMapSeries => ({
   entity_type: "competitor",
   color_role: "comparison",
   points,
+  data_source: null,
 });
 
 describe("STORY-137 · calendarDays", () => {
