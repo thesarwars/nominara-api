@@ -340,6 +340,18 @@ export const envSchema = z
         message: "must be a JSON object mapping engine keys to a positive USD ceiling",
       })
       .optional(),
+
+    // NEW-D-2 — Stripe (SANDBOX keys in every environment this week). All three
+    // are OPTIONAL, deliberately: the API must boot without a payment provider,
+    // and every Stripe route then answers 503 `degraded` instead of the process
+    // refusing to start. The secret key and the webhook signing secret are
+    // credentials — they are never logged, never put in an error, and never
+    // returned (src/lib/billing/stripe/stripe-http.gateway.ts). The publishable
+    // key is public by design but is carried here so the one place that names
+    // Stripe configuration names all three.
+    STRIPE_SECRET_KEY: requiredString.optional(),
+    STRIPE_WEBHOOK_SECRET: requiredString.optional(),
+    STRIPE_PUBLISHABLE_KEY: requiredString.optional(),
   })
   .strict()
   // STORY-127 — the first of the two checks that keep plaintext one-time

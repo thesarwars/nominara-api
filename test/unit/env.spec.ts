@@ -303,3 +303,22 @@ describe("STORY-127 · KNOWN_KEYS covers the schema", () => {
     expect(stale, "in KNOWN_KEYS but not declared by envSchema").toEqual([]);
   });
 });
+
+describe("NEW-D-2 · Stripe configuration is optional — the API boots without a payment provider", () => {
+  it("loads with none of the three Stripe variables set, and leaves them undefined", () => {
+    const env = loadEnv(VALID);
+    expect(env.STRIPE_SECRET_KEY).toBeUndefined();
+    expect(env.STRIPE_WEBHOOK_SECRET).toBeUndefined();
+    expect(env.STRIPE_PUBLISHABLE_KEY).toBeUndefined();
+  });
+
+  it("reads all three when present", () => {
+    const env = loadEnv({ ...VALID, STRIPE_SECRET_KEY: "sk_test_x", STRIPE_WEBHOOK_SECRET: "whsec_x", STRIPE_PUBLISHABLE_KEY: "pk_test_x" });
+    expect([env.STRIPE_SECRET_KEY, env.STRIPE_WEBHOOK_SECRET, env.STRIPE_PUBLISHABLE_KEY]).toEqual(["sk_test_x", "whsec_x", "pk_test_x"]);
+  });
+
+  it("a blank value is refused rather than read as 'configured' — a blank secret would verify nothing", () => {
+    expect(() => loadEnv({ ...VALID, STRIPE_WEBHOOK_SECRET: "  " })).toThrow(/STRIPE_WEBHOOK_SECRET/);
+  });
+});
+
