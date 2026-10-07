@@ -1,9 +1,22 @@
 import { z } from "zod";
-import { sourceClassSchema } from "./source-index-response.schema.js";
 
 // NEW-C-3 / STORY-056 + STORY-057 — the three jsonb columns of
 // `displacement_events` (`schemas/captures-and-facts.md`). Every jsonb column
 // has a schema; the rollup step parses what it writes through these.
+
+/** The `citation_facts.source_class` CHECK list, verbatim (it includes `social`, which the read-side enum omits). */
+export const displacementSourceClassSchema = z.enum([
+  "community_forum",
+  "review_marketplace",
+  "encyclopedic",
+  "news_media",
+  "vendor_owned",
+  "developer_platform",
+  "social",
+  "blog",
+  "academic",
+  "other",
+]);
 
 export const displacementPositionClassSchema = z.enum(["recommendation", "ranked", "neutral_list", "also_consider", "caveat"]);
 
@@ -16,7 +29,7 @@ export const displacedByEntrySchema = z
     position: z.number().int().positive().nullable(),
     prominence: z.number(),
     position_class: displacementPositionClassSchema,
-    citations: z.array(z.object({ url: z.string(), domain: z.string(), source_class: sourceClassSchema }).strict()),
+    citations: z.array(z.object({ url: z.string(), domain: z.string(), source_class: displacementSourceClassSchema }).strict()),
   })
   .strict();
 
@@ -29,7 +42,7 @@ export const citationGapEntrySchema = z
   .object({
     url: z.string().min(1),
     domain: z.string().min(1),
-    source_class: sourceClassSchema,
+    source_class: displacementSourceClassSchema,
     held_by: z.array(z.string().min(1)).min(1),
     brand_present: z.boolean().nullable(),
   })

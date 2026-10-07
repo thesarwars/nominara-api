@@ -49,7 +49,7 @@ export interface DetectedDisplacement {
 /** §2.4's `form_multiplier` order, worst to best. */
 const RENDER_ORDER = ["bare_text", "linked", "described", "structured_row", "featured"] as const;
 
-function renderLevel(form: string | null): number {
+export function renderLevel(form: string | null): number {
   return form === null ? -1 : RENDER_ORDER.indexOf(form as (typeof RENDER_ORDER)[number]);
 }
 
@@ -114,4 +114,24 @@ export function detectDisplacement(before: CaptureSnapshot, after: CaptureSnapsh
     afterPositionClass: after.brandPresent ? after.brandPositionClass : null,
     displacedBy: displacers(kind, before, after),
   }));
+}
+
+/**
+ * `scoring-models.md` §9 Recovery — does a LATER capture restore what the
+ * event lost? Compared against the event's own `before` endpoint, never a
+ * fresh baseline: presence back; position back to (or better than) where it
+ * was; the recommendation class back; the render form back to (or above) it.
+ */
+export function restoresSlot(kind: DetectedKind, before: CaptureSnapshot, later: CaptureSnapshot): boolean {
+  if (!later.brandPresent) return false;
+  switch (kind) {
+    case "presence_lost":
+      return true;
+    case "position_lost":
+      return later.brandPosition !== null && before.brandPosition !== null && later.brandPosition <= before.brandPosition;
+    case "recommendation_lost":
+      return later.brandPositionClass === "recommendation";
+    case "render_downgraded":
+      return renderLevel(later.brandRenderForm) >= renderLevel(before.brandRenderForm);
+  }
 }

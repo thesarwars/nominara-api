@@ -4,6 +4,7 @@ import type { ClientBase } from "pg";
 import { z } from "zod";
 import { denormalizeProject } from "../../rollup/denormalize.js";
 import { datesWithFacts } from "../../rollup/aggregate-day.js";
+import { refreshProjectDisplacements } from "../../rollup/refresh-project-displacements.js";
 import { refreshProjectSourceIndex } from "../../rollup/refresh-project-source-index.js";
 import { rollUpDay } from "../../rollup/roll-up-day.js";
 import { withProjectQueueLock } from "../locks.js";
@@ -73,6 +74,10 @@ export function createRollupMetricDailyHandler(_context: QueueHandlerContext): J
       for (const date of dates) {
         const groups = await rollUpDay(tx, payload.workspaceId, payload.projectId, date, timezone);
         logger.log(`rolled up ${payload.projectId} ${date}: ${String(groups)} groups`);
+        // NEW-C-3 — displacement persistence after each day's rollup, in date
+        // order (recovery needs the earlier event to exist). Idempotent on a
+        // dirty date: the pair's unique key makes a re-run an update.
+        await refreshProjectDisplacements(tx, payload.projectId, date, timezone);
       }
 
       // AC9 — ONCE, after every date. Denormalising per date would write the

@@ -328,6 +328,31 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     expect(Number(split.rows[0]!.n)).toBe(0);
   }, 120_000);
 
+  it("NEW-C-3 · seeded demo days yield displacement rows tied to real captures; re-seed and purge leave no orphan", async () => {
+    const workspaceId = await createWorkspace("growth");
+    const orphans = async (): Promise<number> =>
+      Number(
+        (
+          await client.query<{ n: string }>(
+            `SELECT count(*)::text AS n FROM displacement_events e
+              WHERE e.workspace_id = $1
+                AND (NOT EXISTS (SELECT 1 FROM answer_captures a WHERE a.id = e.before_result_id)
+                  OR NOT EXISTS (SELECT 1 FROM answer_captures a WHERE a.id = e.after_result_id))`,
+            [workspaceId],
+          )
+        ).rows[0]!.n,
+      );
+    const total = async (): Promise<number> =>
+      Number((await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM displacement_events WHERE workspace_id = $1`, [workspaceId])).rows[0]!.n);
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    expect(await total()).toBeGreaterThan(0);
+    expect(await orphans()).toBe(0);
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    expect(await orphans()).toBe(0);
+    await runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: testPool(), log: () => {} });
+    expect(await total()).toBe(0);
+  }, 180_000);
+
   it("STORY-169 · a re-run without --purge is idempotent — no doubled cells", async () => {
     const workspaceId = await createWorkspace("growth");
 

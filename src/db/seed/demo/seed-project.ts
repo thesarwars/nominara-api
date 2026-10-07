@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import { denormalizeProject } from "../../../lib/rollup/denormalize.js";
+import { backfillProjectDisplacements } from "../../../lib/rollup/refresh-project-displacements.js";
 import { rollUpDay } from "../../../lib/rollup/roll-up-day.js";
 import { withProjectQueueLock } from "../../../lib/queue/locks.js";
 import { resetAndSeedProjectAux } from "./aux.js";
@@ -36,6 +37,11 @@ export async function seedOneProject(
       await rollUpDay(tx, project.workspaceId, project.id, date, timezone);
     }
     await denormalizeProject(tx, project.id, timezone);
+    // NEW-C-3 — the same displacement step the rollup handler runs, over the
+    // seeded days, so demo engines get displacement rows.
+    if (facts.days.length > 0) {
+      await backfillProjectDisplacements(tx, project.id, timezone, facts.days[0]!, facts.days[facts.days.length - 1]!);
+    }
   });
 
   const auxResult = await resetAndSeedProjectAux(tx, project);
