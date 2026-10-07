@@ -213,7 +213,11 @@ describe("STORY-098 part B · POST /portal/session", () => {
     const results = await Promise.all(Array.from({ length: 12 }, () => session({ secret: t.secret, password: "wrong" })));
     const codes = results.map((r) => r.statusCode);
     expect(codes.every((c) => c === 401 || c === 429)).toBe(true);
-    expect(codes.filter((c) => c === 401).length).toBeLessThanOrEqual(4 + 0);
+    // The row lock makes this deterministic: attempts 1-5 serialise (4 x 401, the 5th sets the lock and answers 429);
+    // 6-12 queue behind it and are refused before any Argon2 verify. Without FOR UPDATE all 12 pay a verify.
+    expect(codes.filter((c) => c === 401).length).toBe(4);
+    expect(codes.filter((c) => c === 429).length).toBe(8);
+    expect(argon.verify).toBe(5);
     expect((await row(t.id)).locked_until).not.toBeNull();
   });
 
