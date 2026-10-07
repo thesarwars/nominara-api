@@ -10,7 +10,7 @@ import { ProjectOutOfScopeException } from "../../src/tenancy/errors.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { TasksService } from "../../src/modules/tasks/tasks.service.js";
 import { withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
-import { completeTaskResponseSchema, createTaskRequestSchema, updateTaskRequestSchema } from "../../contracts/tasks/index.js";
+import { completeTaskResponseSchema, createCommentRequestSchema, createTaskRequestSchema, taskEventListQuerySchema, updateTaskRequestSchema } from "../../contracts/tasks/index.js";
 
 // STORY-064 (step C) — manual create (gapless short_ref), comments and the event
 // timeline, real SQL as the real `nominara_app` role. Tenant write path: dangerous area.
@@ -218,5 +218,82 @@ describe("STORY-064-D · complete / realtime publish — real SQL", () => {
       throw new Error("rollback");
     })).rejects.toThrow("rollback");
     expect(publisher.published).toEqual([]);
+  });
+
+  // Checkpoint-1 audit: the soft-delete guards were untested (a mutation removing
+  // `t.deleted_at IS NULL` survived) and a task of a soft-deleted project was reachable.
+  describe("soft-deleted task / project guards", () => {
+    const createComment = (ctx: TenantContext, taskId: string) =>
+      inTenant(ctx, () => service.createComment(taskId, createCommentRequestSchema.parse({ body: "hi" })));
+    const listEvents = (ctx: TenantContext, taskId: string) =>
+      inTenant(ctx, () => service.listTaskEvents(taskId, taskEventListQuerySchema.parse({})));
+    const counts = async (taskId: string, projectId: string) => ({
+      milestones: (await client.query(`SELECT 1 FROM milestones WHERE project_id = $1`, [projectId])).rows.length,
+      events: (await client.query(`SELECT 1 FROM task_events WHERE task_id = $1`, [taskId])).rows.length,
+      status: (await client.query(`SELECT status FROM tasks WHERE id = $1`, [taskId])).rows[0].status,
+    });
+    async function seed() {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+      const t = await create(CTX(ws, actor), p, { title: "T" });
+      publisher.published.length = 0;
+      return { ws, actor, p, t, ctx: CTX(ws, actor) };
+    }
+
+    it("[STORY-064-D] completing a soft-deleted task is a 404 and writes nothing", async () => {
+      const { p, t, ctx } = await seed();
+      await client.query(`UPDATE tasks SET deleted_at = now() WHERE id = $1`, [t.id]);
+      const before = await counts(t.id, p);
+      await expect(complete(ctx, t.id)).rejects.toBeInstanceOf(NotFoundError);
+      expect(await counts(t.id, p)).toEqual(before);
+      expect(publisher.published).toEqual([]);
+    });
+
+    it("[STORY-064-D] completing a task of a soft-deleted project is a 404 and writes nothing", async () => {
+      const { p, t, ctx } = await seed();
+      await client.query(`UPDATE projects SET deleted_at = now() WHERE id = $1`, [p]);
+      const before = await counts(t.id, p);
+      await expect(complete(ctx, t.id)).rejects.toBeInstanceOf(NotFoundError);
+      expect(await counts(t.id, p)).toEqual(before);
+      expect(publisher.published).toEqual([]);
+    });
+
+    it("[STORY-064-C] commenting on a soft-deleted task is a 404 and writes nothing", async () => {
+      const { p, t, ctx } = await seed();
+      await client.query(`UPDATE tasks SET deleted_at = now() WHERE id = $1`, [t.id]);
+      const before = await counts(t.id, p);
+      await expect(createComment(ctx, t.id)).rejects.toBeInstanceOf(NotFoundError);
+      expect(await counts(t.id, p)).toEqual(before);
+    });
+
+    it("[STORY-064-C] commenting on a task of a soft-deleted project is a 404 and writes nothing", async () => {
+      const { p, t, ctx } = await seed();
+      await client.query(`UPDATE projects SET deleted_at = now() WHERE id = $1`, [p]);
+      const before = await counts(t.id, p);
+      await expect(createComment(ctx, t.id)).rejects.toBeInstanceOf(NotFoundError);
+      expect(await counts(t.id, p)).toEqual(before);
+    });
+
+    it("[STORY-064-C] listing the timeline of a soft-deleted task is a 404", async () => {
+      const { t, ctx } = await seed();
+      await client.query(`UPDATE tasks SET deleted_at = now() WHERE id = $1`, [t.id]);
+      await expect(listEvents(ctx, t.id)).rejects.toBeInstanceOf(NotFoundError);
+    });
+
+    it("[STORY-064-C] listing the timeline of a task of a soft-deleted project is a 404", async () => {
+      const { p, t, ctx } = await seed();
+      await client.query(`UPDATE projects SET deleted_at = now() WHERE id = $1`, [p]);
+      await expect(listEvents(ctx, t.id)).rejects.toBeInstanceOf(NotFoundError);
+    });
+
+    it("[STORY-064-C] creating a task on a soft-deleted project is a 404 and consumes no reference", async () => {
+      const { ws, p, ctx } = await seed();
+      await client.query(`UPDATE projects SET deleted_at = now() WHERE id = $1`, [p]);
+      const tasksBefore = (await client.query(`SELECT 1 FROM tasks WHERE project_id = $1`, [p])).rows.length;
+      const refBefore = (await client.query(`SELECT next_value FROM ref_counters WHERE workspace_id = $1`, [ws])).rows;
+      await expect(create(ctx, p, { title: "nope" })).rejects.toBeInstanceOf(NotFoundError);
+      expect((await client.query(`SELECT 1 FROM tasks WHERE project_id = $1`, [p])).rows).toHaveLength(tasksBefore);
+      expect((await client.query(`SELECT next_value FROM ref_counters WHERE workspace_id = $1`, [ws])).rows).toEqual(refBefore);
+      expect(publisher.published).toEqual([]);
+    });
   });
 });
