@@ -16,6 +16,7 @@ import { QueueProducer } from "../queue-producer.js";
 import { signingKeysFromEnv } from "../worker-factory.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
+import { requestRollupIfRunComplete, type EnqueueRollup } from "./run-rollup-request.js";
 
 // STORY-034 — `capture.execute`, the handler STORY-124's registry named:
 // "the capture queues with STORY-034".
@@ -50,6 +51,8 @@ export interface CaptureExecuteDeps {
   readonly realtime: RealtimePublisher;
   /** Injected in tests; production builds a producer from env on first use. */
   readonly enqueueParse?: (payload: ParseJobPayload) => Promise<unknown>;
+  /** Injected in tests; production builds a producer from env on first use. */
+  readonly enqueueRollup?: EnqueueRollup;
 }
 
 /** What `capture.parse` needs to find and re-read the row this handler wrote. */
@@ -100,6 +103,17 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
         // row rather than queueing a second pass over it.
         idempotencyKey: `parse:${payload.resultId}`,
       });
+    });
+
+  const enqueueRollup: EnqueueRollup =
+    deps?.enqueueRollup ??
+    (async (queue, workspaceId, rollupPayload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob(queue, workspaceId, rollupPayload, { idempotencyKey });
     });
 
   return async (tx: ClientBase, job: Job): Promise<void> => {
@@ -186,6 +200,30 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
           logger.error(`failed to enqueue parse for capture ${target.id}: ${String(error)}`);
         });
       }
+    }
+
+    // NEW-A-7 — a cell that ends in a terminal failure or a block is never
+    // parsed, so if it is the LAST to settle no parse follows to request the
+    // rollup. Ask here; the request checks the run is complete and has nothing
+    // left to parse, so it is a no-op while any parse is still to come.
+    if (outcome.kind !== "captured") {
+      const settled = await tx.query<{ captured_at: Date }>(
+        `SELECT captured_at FROM answer_captures
+          WHERE run_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = $4
+          ORDER BY captured_at DESC LIMIT 1`,
+        [payload.runId, payload.promptId, payload.engineKey, payload.sampleIndex],
+      );
+      await requestRollupIfRunComplete(
+        tx,
+        {
+          runId: payload.runId,
+          projectId: payload.projectId,
+          workspaceId: payload.workspaceId,
+          capturedAt: settled.rows[0]?.captured_at ?? new Date(),
+        },
+        enqueueRollup,
+        logger,
+      );
     }
 
     const progress = await readRunProgress(tx, payload.runId);

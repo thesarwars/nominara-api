@@ -2,10 +2,6 @@ import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
-import { capturedInRunStatusSql, hasFactsStatusSql } from "../../rollup/aggregate-day.js";
-import { readRunProgress } from "../../capture/run-progress.js";
-import { incrementCounter } from "../../telemetry/metrics.js";
-import { afterCommit } from "../../../tenancy/tenant-context.js";
 import { decideL3 } from "../../capture/l3-short-circuit.js";
 import { loadParseContext, parseCapture, persistParse, type CaptureRow } from "../../parser/parse-capture.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
@@ -14,6 +10,7 @@ import { SCORING_VERSION } from "../../scoring/index.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
+import { requestRollupIfRunComplete as requestRunRollup } from "./run-rollup-request.js";
 import { signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
 
 // STORY-135 — `capture.parse`, the second real entry in STORY-124's registry.
@@ -88,58 +85,14 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       return producer.enqueueTenantJob(queue, workspaceId, rollupPayload, { idempotencyKey });
     });
 
-  /**
-   * NEW-A-7 — when this parse leaves the run with every cell accounted for and
-   * none still waiting to be parsed, the day's facts are complete: ask for the
-   * rollup now rather than at the next hourly tick.
-   *
-   * FROM HERE AND NOT FROM capture.execute: finalisation precedes parsing, so
-   * a rollup requested there would read facts that do not exist yet.
-   *
-   * AFTER COMMIT: the rollup job runs on another connection and must see this
-   * parse's facts. One key per run, so a replay or a force re-parse does not
-   * queue a second pass. A failed enqueue is logged, never thrown: the parse
-   * is stored, and the hourly cron still covers the day.
-   */
-  const requestRollupIfRunComplete = async (tx: ClientBase, record: CaptureRecord, workspaceId: string): Promise<void> => {
-    if (record.run_id === null) return;
-    const run = await tx.query("SELECT 1 FROM capture_runs WHERE id = $1", [record.run_id]);
-    if (run.rowCount === 0) return;
-
-    const progress = await readRunProgress(tx, record.run_id);
-    if (progress.captured + progress.failed + progress.skipped < progress.planned) return;
-    const unparsed = await tx.query(`SELECT 1 FROM answer_captures
-        WHERE run_id = $1 AND ${capturedInRunStatusSql("status")} AND NOT ${hasFactsStatusSql("status")} LIMIT 1`, [
-      record.run_id,
-    ]);
-    if ((unparsed.rowCount ?? 0) > 0) return;
-
-    const day = await tx.query<{ metric_date: string }>(
-      `SELECT to_char(($2::timestamptz AT TIME ZONE w.timezone)::date, 'YYYY-MM-DD') AS metric_date
-         FROM workspaces w WHERE w.id = $1`,
-      [workspaceId, record.captured_at],
+  /** NEW-A-7 — see run-rollup-request.ts. FROM HERE AND NOT FROM THE FINALISATION: finalisation precedes parsing, so a rollup requested there would read facts that do not exist yet. */
+  const requestRollupIfRunComplete = (tx: ClientBase, record: CaptureRecord, workspaceId: string): Promise<void> =>
+    requestRunRollup(
+      tx,
+      { runId: record.run_id, projectId: record.project_id, workspaceId, capturedAt: record.captured_at },
+      enqueueRollup,
+      logger,
     );
-    const metricDate = day.rows[0]?.metric_date;
-    if (metricDate === undefined) return;
-
-    const runId = record.run_id;
-    const projectId = record.project_id;
-    afterCommit(() => {
-      void enqueueRollup(
-        "rollup.metric_daily",
-        workspaceId,
-        { projectId, metricDate, reason: "run_parsed" },
-        `rollup:${projectId}:run:${runId}`,
-      )
-        .then(() => {
-          incrementCounter("nominara_rollup_requested_total", { reason: "run_parsed" });
-          logger.log({ event: "rollup.requested", workspace_id: workspaceId, project_id: projectId, run_id: runId });
-        })
-        .catch((error: unknown) => {
-          logger.error({ event: "rollup.request_failed", workspace_id: workspaceId, project_id: projectId, run_id: runId, error: error instanceof Error ? error.name : "unknown" });
-        });
-    });
-  };
 
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
@@ -189,6 +142,8 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
     );
     if (!payload.force && decision.shortCircuit) {
       logger.log(`capture ${payload.resultId} short-circuits to ${decision.sourceResultId}`);
+      // A redelivery after a failed rollup enqueue lands here; re-request (same key).
+      await requestRollupIfRunComplete(tx, record, payload.workspaceId);
       return;
     }
 
