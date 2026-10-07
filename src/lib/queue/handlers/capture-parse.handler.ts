@@ -7,8 +7,11 @@ import { loadParseContext, parseCapture, persistParse, type CaptureRow } from ".
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import type { SentimentArbiter } from "../../parser/sentiment/arbiter.js";
 import { SCORING_VERSION } from "../../scoring/index.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
+import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
-import type { JobProcessor } from "../worker-factory.js";
+import { requestRollupIfRunComplete as requestRunRollup } from "./run-rollup-request.js";
+import { signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
 
 // STORY-135 — `capture.parse`, the second real entry in STORY-124's registry.
 //
@@ -39,11 +42,19 @@ const payloadSchema = z
 export interface CaptureParseDeps {
   /** Unbound in production — see sentiment/arbiter.ts. */
   readonly arbiter?: SentimentArbiter;
+  /** Injected in tests; production builds a producer from env on first use. */
+  readonly enqueueRollup?: (
+    queue: "rollup.metric_daily",
+    workspaceId: string,
+    payload: Record<string, unknown>,
+    idempotencyKey: string,
+  ) => Promise<unknown>;
 }
 
 interface CaptureRecord {
   id: string;
   project_id: string;
+  run_id: string | null;
   prompt_id: string;
   engine_key: string;
   captured_at: Date;
@@ -60,11 +71,34 @@ interface CaptureRecord {
 export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: CaptureParseDeps): JobProcessor {
   const logger = new Logger("capture.parse");
 
+  // Built on the first rollup request, not at registration (see capture.execute:
+  // the static handler table is evaluated in every worker group).
+  let producer: QueueProducer | undefined;
+  const enqueueRollup =
+    deps?.enqueueRollup ??
+    (async (queue, workspaceId, rollupPayload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(_context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(_context.env.NODE_ENV),
+        signingKeysFromEnv(_context.env),
+      );
+      return producer.enqueueTenantJob(queue, workspaceId, rollupPayload, { idempotencyKey });
+    });
+
+  /** NEW-A-7 — see run-rollup-request.ts. FROM HERE AND NOT FROM THE FINALISATION: finalisation precedes parsing, so a rollup requested there would read facts that do not exist yet. */
+  const requestRollupIfRunComplete = (tx: ClientBase, record: CaptureRecord, workspaceId: string): Promise<void> =>
+    requestRunRollup(
+      tx,
+      { runId: record.run_id, projectId: record.project_id, workspaceId, capturedAt: record.captured_at },
+      enqueueRollup,
+      logger,
+    );
+
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
 
     const found = await tx.query<CaptureRecord>(
-      `SELECT id, project_id, prompt_id, engine_key, captured_at, status, content_hash,
+      `SELECT id, project_id, run_id, prompt_id, engine_key, captured_at, status, content_hash,
               payload, response_excerpt, flags, normalizer_version, scoring_version, alias_fingerprint
          FROM answer_captures
         WHERE id = $1`,
@@ -108,6 +142,8 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
     );
     if (!payload.force && decision.shortCircuit) {
       logger.log(`capture ${payload.resultId} short-circuits to ${decision.sourceResultId}`);
+      // A redelivery after a failed rollup enqueue lands here; re-request (same key).
+      await requestRollupIfRunComplete(tx, record, payload.workspaceId);
       return;
     }
 
@@ -122,6 +158,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
         record.id,
         NORMALIZER_VERSION,
       ]);
+      await requestRollupIfRunComplete(tx, record, payload.workspaceId);
       return;
     }
 
@@ -144,6 +181,8 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
 
     // Stage 6 — the facts and the capture, in the job's own transaction.
     await persistParse(tx, capture, result, aliasFingerprint);
+
+    await requestRollupIfRunComplete(tx, record, payload.workspaceId);
 
     logger.log(
       `parsed ${record.id}: ${String(result.mentions.length)} mentions, ${String(result.citations.length)} citations`,

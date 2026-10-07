@@ -110,14 +110,78 @@ export async function claimDueProjects(
 }
 
 /**
+ * NEW-A-10 — claims ONE project by id, if it is due, inside the caller's
+ * transaction. The per-project form of `claimDueProjects`: the same
+ * conditions (an allow-listed workspace status, an active undeleted project,
+ * `next_run_at` set and past), so a `capture.plan` job and the sweep can never
+ * disagree about what "due" means.
+ *
+ * Returns null when the project is not due, is paused or deleted, belongs to a
+ * workspace that is not capturable — or is simply invisible to the job's
+ * tenant context, which RLS makes indistinguishable from absent on purpose.
+ *
+ * `FOR UPDATE` (no SKIP LOCKED): a duplicate delivery of the same job must
+ * WAIT for the first, then re-check `next_run_at` against the advanced value
+ * and find nothing due. Skipping the locked row instead would let the second
+ * delivery report "not due" while the first was still mid-plan, which is
+ * correct but would hide a genuine race behind a benign-looking outcome.
+ */
+export async function claimDueProject(tx: ClientBase, projectId: string, now: Date): Promise<DueProject | null> {
+  const result = await tx.query<{
+    id: string;
+    workspace_id: string;
+    cadence: ProjectCadence;
+    priority_prompt_limit: number;
+    next_run_at: Date;
+    locale: string;
+    plan_key: string;
+  }>(
+    `
+    SELECT p.id, p.workspace_id, p.cadence, p.priority_prompt_limit, p.next_run_at,
+           p.locale, w.plan_key
+      FROM projects p
+      JOIN workspaces w ON w.id = p.workspace_id
+     WHERE p.id = $1
+       AND p.status = 'active'
+       AND p.deleted_at IS NULL
+       AND p.next_run_at IS NOT NULL
+       AND p.next_run_at <= $2
+       AND w.status = ANY($3::text[])
+       AND w.deleted_at IS NULL
+       FOR UPDATE OF p
+    `,
+    [projectId, now, [...CAPTURABLE_WORKSPACE_STATUSES]],
+  );
+  const row = result.rows[0];
+  if (row === undefined) return null;
+  return {
+    projectId: row.id,
+    workspaceId: row.workspace_id,
+    cadence: row.cadence,
+    priorityPromptLimit: row.priority_prompt_limit,
+    nextRunAt: row.next_run_at,
+    planKey: row.plan_key,
+    locale: row.locale,
+  };
+}
+
+/**
  * Advances `next_run_at`, and returns whether it actually moved.
  *
  * CALLED BEFORE THE ENQUEUE, in the same transaction — see this file's
- * header. The `next_run_at = $2` guard makes it a compare-and-set: if another
- * transaction advanced this project since it was claimed, this updates
- * nothing and returns false, and the caller must not enqueue. Without the
- * guard a lock lost to a timeout, or a claim replayed after a rollback, would
- * schedule a second identical run.
+ * header. The `next_run_at <= ranAt` guard makes it a compare-and-set: if
+ * another transaction advanced this project since it was claimed, its
+ * `next_run_at` is in the future, this updates nothing and returns false, and
+ * the caller must not enqueue. Without the guard a lock lost to a timeout, or
+ * a claim replayed after a rollback, would schedule a second identical run.
+ *
+ * THE GUARD IS "STILL DUE", NOT `next_run_at = <the claimed Date>`. A claim
+ * reads `next_run_at` back as a JS Date, which holds milliseconds; a value
+ * written by SQL (`now()`, an ops backfill) has microseconds and never equals
+ * it. Equality would then lose EVERY advance for that project after the run
+ * row was written, and the project would never be planned again. `ranAt` is the
+ * same instant the claim tested `next_run_at <= now` against, so the predicate
+ * is exactly the claim's own, re-asserted under the row lock.
  */
 export async function advanceNextRun(
   tx: ClientBase,
@@ -129,8 +193,9 @@ export async function advanceNextRun(
     `UPDATE projects
         SET next_run_at = $3, last_run_at = $4
       WHERE id = $1
-        AND next_run_at = $2`,
-    [project.projectId, project.nextRunAt, nextRunAt, ranAt],
+        AND next_run_at IS NOT NULL
+        AND next_run_at <= $2`,
+    [project.projectId, ranAt, nextRunAt, ranAt],
   );
   return (result.rowCount ?? 0) === 1;
 }

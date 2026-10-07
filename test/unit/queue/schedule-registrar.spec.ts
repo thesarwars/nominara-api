@@ -87,18 +87,30 @@ describe("G12 · reconcileSchedules", () => {
   });
 
   it("⚠ REFUSES a queue whose handler is not wired, however clear its cron", async () => {
-    // `capture.plan` has `5 * * * *` from §6.1 and no handler. A repeatable
+    // `attribution.rollup` has `0 * * * *` and no handler (`capture.plan` had
+    // the same until NEW-A-10 wired it). A repeatable
     // here would fail every job down the retry ladder into the DLQ on a
     // timer — turning "not built yet" into "tried and failed" in the record
     // an operator reads during an incident. `src/worker.ts` makes the same
     // argument for the workers: inert is a better lie than broken.
     const queue = fakeQueue();
 
+    const result = await reconcileSchedules(new Map([["attribution.rollup", asQueue(queue)]]));
+
+    expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
+    expect(result.scheduled).toEqual([]);
+    expect(result.skippedInert).toEqual(["attribution.rollup"]);
+  });
+
+  it("NEW-A-10 · capture.plan now has a handler but is tenant-scoped, so a bare cron is still refused", async () => {
+    const queue = fakeQueue();
+
     const result = await reconcileSchedules(new Map([["capture.plan", asQueue(queue)]]));
 
     expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
     expect(result.scheduled).toEqual([]);
-    expect(result.skippedInert).toEqual(["capture.plan"]);
+    expect(result.skippedInert).toEqual([]);
+    expect(result.skippedTenantScoped).toEqual(["capture.plan"]);
   });
 
   it("⚠ schedules nothing for a queue whose cadence states no time", async () => {

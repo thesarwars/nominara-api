@@ -63,6 +63,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "audit.verify",
       "capture.execute",
       "capture.parse",
+      "capture.plan",
       "crawl.discover",
       "credit.reconcile",
       "identity.sweep_unverified",
@@ -73,6 +74,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
     // QUEUE_TOPOLOGY, and the capture queues are declared before the crawl
     // ones, which come before the rollup group's.
     expect(liveQueueNames()).toEqual([
+      "capture.plan",
       "capture.execute",
       "capture.parse",
       "crawl.discover",
@@ -87,14 +89,12 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
     ]);
   });
 
-  // `capture.plan` and `capture.arbitrate` STAY INERT, each for its own
-  // reason rather than by oversight: planning happens on the request path
-  // inside the trigger's transaction rather than as a job, so nothing
-  // enqueues it; and arbitration has no bound model — STORY-038 left the port
-  // unbound pending a dependency decision, and a worker pulling a job it
+  // `capture.plan` is wired by NEW-A-10 (the scheduled-run planner).
+  // `capture.arbitrate` STAYS INERT: it has no bound model — STORY-038 left the
+  // port unbound pending a dependency decision, and a worker pulling a job it
   // cannot process would fail it into the dead-letter queue.
   it("leaves the rest of the capture queues inert", () => {
-    for (const name of ["capture.plan", "capture.arbitrate"]) {
+    for (const name of ["capture.arbitrate"]) {
       expect(handlerFor(name), `${name} should still be inert`).toBeUndefined();
     }
   });
@@ -129,7 +129,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
 
   it("a group with SOME handlers reports both halves", () => {
     const capture = QUEUE_TOPOLOGY.filter((entry) => entry.workerGroup === "capture").map((entry) => entry.name);
-    expect(liveQueueNames(capture)).toEqual(["capture.execute"]);
+    expect(liveQueueNames(capture)).toEqual(["capture.plan", "capture.execute"]);
     expect(inertQueueNames(capture).length).toBeGreaterThan(0);
   });
 
