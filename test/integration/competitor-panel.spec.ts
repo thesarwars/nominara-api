@@ -8,6 +8,7 @@ import { CompetitorPanelService } from "../../src/modules/analytics/competitor-p
 import type { EntitlementResolver } from "../../src/lib/entitlements/entitlement-resolver.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { resetAndSeedProjectFacts } from "../../src/db/seed/demo/facts.js";
 import { DEMO_SEED_MARKER } from "../../src/db/seed/demo/constants.js";
 
 // NEW-C-1 — `GET /v1/projects/{id}/competitors/panel`, against real facts.
@@ -278,6 +279,33 @@ describe("NEW-C-1 · competitor panel", () => {
     await addCell([brand(0.6)], { engine: "chatgpt" });
     await addCell([brand(0.6)], { engine: "gemini" });
     expect((await panel()).engine_data_source).toEqual({ chatgpt: "mixed", gemini: "live" });
+  });
+
+  // CP1 QA, NEW-C-1 criterion 5 (demo half): the panel is computed over the
+  // STORY-169 seed itself, not only over hand-built facts. The seed writes no
+  // `other` mentions, so a demo panel has no detected-not-tracked rows — that
+  // is the stated, tested behaviour, and every engine reads as demo.
+  it("CP1 NEW-C-1 — over STORY-169 seed output the panel has brand and tracked rows, every engine demo, no detected-not-tracked rows", async () => {
+    await withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
+      resetAndSeedProjectFacts(
+        db,
+        { id: projectId, workspaceId, name: "HubSpot", rootDomain: "hubspot.com" },
+        "UTC",
+        { windowDays: 60, promptsPerProject: 4 },
+      ),
+    );
+    const seeded = await db.query("SELECT count(*)::int AS n FROM mention_facts WHERE project_id=$1", [projectId]);
+    expect(seeded.rows[0].n).toBeGreaterThan(0);
+    expect((await db.query("SELECT count(*)::int AS n FROM mention_facts WHERE entity_type='other'")).rows[0].n).toBe(0);
+
+    const document = await panel();
+    expect(competitorPanelResponseSchema.safeParse(document).success).toBe(true);
+    expect(document.rows[0]!.is_brand).toBe(true);
+    expect(document.rows.filter((r) => !r.is_brand).length).toBeGreaterThan(0);
+    expect(document.rows.filter((r) => r.tracked === false)).toEqual([]);
+    const sources = Object.values(document.engine_data_source);
+    expect(sources.length).toBeGreaterThan(0);
+    expect(sources.every((s) => s === "demo")).toBe(true);
   });
 
   it("the engines filter narrows the per-engine columns", async () => {

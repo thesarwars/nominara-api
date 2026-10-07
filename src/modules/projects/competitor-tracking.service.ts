@@ -4,6 +4,7 @@ import { ConflictError, EntitlementExceededError, NotFoundError } from "../../ap
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import { lockProjectCompetitors } from "./competitor-cap-lock.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -67,7 +68,7 @@ export class CompetitorTrackingService {
     // Serialise per project BEFORE counting: under READ COMMITTED, concurrent
     // requests would all see the same live count and each pass the cap (and the
     // duplicate-name check). Transaction-scoped, released at COMMIT/ROLLBACK.
-    await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [`competitors:${projectId}`]);
+    await lockProjectCompetitors(tx, projectId);
 
     const live = await tx.query<{ name: string }>(
       "SELECT name FROM competitors WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
@@ -210,7 +211,12 @@ export class CompetitorTrackingService {
     );
   }
 
-  /** After COMMIT: a job enqueued from inside the transaction could run against rows that are not yet visible. */
+  /**
+   * The key carries a nonce: a revive reuses the competitor's id, and the
+   * queue's dedup window would otherwise swallow the second recompute while
+   * the dates it re-tagged are still stale.
+   *
+   * After COMMIT: a job enqueued from inside the transaction could run against rows that are not yet visible. */
   private requestRecompute(workspaceId: string, projectId: string, entityId: string, fromDate: string, toDate: string): void {
     afterCommit(() => {
       void this.queues
@@ -218,7 +224,7 @@ export class CompetitorTrackingService {
           "rollup.metric_daily",
           workspaceId,
           { projectId, fromDate, toDate, reason: "competitor_tracked" },
-          { idempotencyKey: `rollup:${projectId}:competitor-tracked:${entityId}` },
+          { idempotencyKey: `rollup:${projectId}:competitor-tracked:${entityId}:${uuidV7()}` },
         )
         .catch((error: unknown) => {
           this.logger.error(`failed to enqueue recompute for project ${projectId}: ${String(error)}`);

@@ -359,7 +359,10 @@ describe("NEW-C-2 · track and untrack a competitor", () => {
     }
   });
 
-  it("tenancy audit — the backfill never re-tags another workspace's same-label `other` fact", async () => {
+  // Scope note: the `project_id` predicate already separates these rows, so this does
+  // NOT prove workspace isolation on its own — the 404 tests above (project lookup
+  // under RLS) do. It pins that a same-label fact elsewhere is left alone.
+  it("the backfill leaves another workspace's project's same-label `other` fact untouched", async () => {
     const other = await secondWorkspace();
     await db.query(
       `INSERT INTO mention_facts

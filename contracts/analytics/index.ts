@@ -5,3 +5,4 @@ export * from "./competitor-panel-response.schema.js";
 export * from "./source-index-response.schema.js";
 export * from "./playbook-response.schema.js";
 export * from "./geo-insights.schema.js";
+export * from "./displacement-event.schema.js";

@@ -380,6 +380,19 @@ export async function deleteExistingDemoFacts(
   const engineFilter = engineKeys === undefined ? "" : "AND engine_key = ANY($5::text[])";
   const params: unknown[] = [projectId, earliestDay, DEMO_SEED_MARKER, timezone];
   if (engineKeys !== undefined) params.push([...engineKeys]);
+  // NEW-C-3 — displacement events point at demo captures by id (no FK), so they
+  // go first or they would outlive the captures they diagnose.
+  await tx.query(
+    `DELETE FROM displacement_events
+      WHERE project_id = $1
+        AND (after_result_id IN (
+               SELECT id FROM answer_captures
+                WHERE project_id = $1 AND captured_at >= ($2::date::timestamp AT TIME ZONE $4) AND normalizer_version = $3 ${engineFilter})
+             OR before_result_id IN (
+               SELECT id FROM answer_captures
+                WHERE project_id = $1 AND captured_at >= ($2::date::timestamp AT TIME ZONE $4) AND normalizer_version = $3 ${engineFilter}))`,
+    params,
+  );
   await tx.query(
     `DELETE FROM mention_facts
       WHERE project_id = $1
@@ -446,6 +459,14 @@ export async function resetAndSeedProjectFacts(
   const competitorIds = existingOnly
     ? await existingCompetitors(tx, project.id)
     : await ensureCompetitors(tx, project, rngFor(project.id, "competitors"));
+  // NEW-C-3 — a competitor's seeded citations sit on ITS root domain, so the
+  // displacement citation gap can attribute them (the only stored link from a
+  // competitor to a slot is the domain).
+  const competitorDomains = new Map(
+    (await tx.query<{ id: string; root_domain: string | null }>(`SELECT id, root_domain FROM competitors WHERE project_id = $1`, [project.id])).rows.map(
+      (r) => [r.id, r.root_domain] as const,
+    ),
+  );
 
   await deleteExistingDemoFacts(
     tx,
@@ -559,7 +580,7 @@ export async function resetAndSeedProjectFacts(
 
           if (chance(rng, 0.5)) {
             cellCitations.push(
-              buildCitation(project.workspaceId, project.id, capture, cellCitations.length + 1, `${competitorId.slice(0, 8)}.example.com`, false, rng),
+              buildCitation(project.workspaceId, project.id, capture, cellCitations.length + 1, competitorDomains.get(competitorId) ?? `${competitorId.slice(0, 8)}.example.com`, false, rng),
             );
           }
         }

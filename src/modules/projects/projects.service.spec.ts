@@ -602,7 +602,10 @@ describe("STORY-044 · ProjectsService.confirmDiscovery", () => {
 
     const inserts = calls.filter((c) => c.sql.includes("INSERT INTO competitors"));
     expect(inserts).toHaveLength(2);
-    expect(inserts[0]!.sql).toContain("user_authored");
+    // Column and value are the real ones (`source`, CHECK ('user','auto_detected'));
+    // the real-database proof is test/integration/competitor-confirm-cap.spec.ts.
+    expect(inserts[0]!.sql).toMatch(/aliases, source\)\s+VALUES \(.*'user'\)/s);
+    expect(inserts[0]!.sql).not.toContain("origin");
   });
 
   it("scenario 7 — confirming beyond the cap fails with the structural limit, naming it", async () => {

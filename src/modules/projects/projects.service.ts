@@ -16,6 +16,7 @@ import { ConflictError, EntitlementExceededError, NotFoundError, UnsafeTargetErr
 import { GuardedFetchRefusal } from "../../lib/net/guarded-fetch.js";
 import { UrlGuard } from "../../lib/net/url-guard.service.js";
 import { UnparsableHostError } from "../../lib/net/registrable-domain.js";
+import { lockProjectCompetitors } from "./competitor-cap-lock.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { insertPromptStatement, manualPromptRow } from "../../lib/promptgen/persist.js";
@@ -412,6 +413,9 @@ export class ProjectsService {
     competitors: NonNullable<ConfirmDiscoveryRequest["competitors"]>,
     entitlementVersion: number | undefined,
   ): Promise<void> {
+    // Serialise with `CompetitorTrackingService.track` BEFORE counting.
+    await lockProjectCompetitors(client, projectId);
+
     const resolved =
       entitlementVersion === undefined
         ? await this.entitlements.resolveForWorkspace(workspaceId)
@@ -419,8 +423,8 @@ export class ProjectsService {
     const cap = resolveCap(resolved.entitlements["competitors.max_per_project"]?.value);
 
     const existing = await client.query(
-      "SELECT name FROM competitors WHERE project_id = $1 AND deleted_at IS NULL",
-      [projectId],
+      "SELECT name FROM competitors WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+      [projectId, workspaceId],
     );
     const present = new Set(existing.rows.map((row) => row.name.toLowerCase()));
     // AC7 — re-confirming a competitor already tracked is a no-op, not a
@@ -431,8 +435,8 @@ export class ProjectsService {
 
     for (const competitor of toInsert) {
       await client.query(
-        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, origin)
-         VALUES ($1,$2,$3,$4,$5,$6,'user_authored')`,
+        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source)
+         VALUES ($1,$2,$3,$4,$5,$6,'user')`,
         [uuidV7(), workspaceId, projectId, competitor.name, competitor.root_domain ?? null, competitor.aliases ?? []],
       );
     }
