@@ -17,6 +17,7 @@ import { DisplacementModule } from "../modules/displacement/displacement.module.
 import { IntegrationsModule } from "../modules/integrations/integrations.module.js";
 import { AgencyModule } from "../modules/agency/agency.module.js";
 import { ApiKeysModule } from "../modules/api-keys/api-keys.module.js";
+import { TrustModule } from "../modules/trust/trust.module.js";
 import { ToolsModule } from "../modules/tools/tools.module.js";
 import { BillingModule } from "../modules/billing/billing.module.js";
 import { CreditsModule } from "../modules/credits/credits.module.js";
@@ -73,6 +74,7 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     IntegrationsModule,
     AgencyModule,
     ApiKeysModule,
+    TrustModule,
     ToolsModule,
     BillingModule,
     CreditsModule,

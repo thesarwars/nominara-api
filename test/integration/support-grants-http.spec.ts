@@ -1,7 +1,5 @@
-import { createHash } from "node:crypto";
 import { Pool } from "pg";
-import { Logger } from "@nestjs/common";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { applyPlanChange, planKeyOnly } from "../../src/lib/billing/apply-plan.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
@@ -145,13 +143,8 @@ describe("NEW-D-5 · access grants over HTTP", () => {
     expect(data<unknown[]>(res)).toEqual([]);
   }, 60_000);
 
-  it("NEW-D-5 AC4 · a grant on workspace B does not appear in workspace A's response", async () => {
-    const a = await owner("business");
-    const b = await owner("business");
-    await grant(b.workspaceId);
-    expect(data<unknown[]>(await get(a))).toEqual([]);
-    expect(data<unknown[]>(await get(b))).toHaveLength(1);
-  }, 120_000);
+  // AC4 (workspace B's grant invisible to A) is asserted in support-grants-rls.spec.ts as nominara_app:
+  // this harness connects as a superuser, which bypasses RLS and would make the assertion vacuous.
 
   it("NEW-D-5 AC1 · an unknown query key is a 400, never silently dropped", async () => {
     const a = await owner("business");
@@ -161,14 +154,14 @@ describe("NEW-D-5 · access grants over HTTP", () => {
   it("NEW-D-5 AC2 · no HTTP route creates, updates or revokes a grant", async () => {
     const a = await owner("business");
     const id = await grant(a.workspaceId);
-    const headers = { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json" };
+    const headers = { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf };
     for (const [method, url] of [
       ["POST", "/trust/access-grants"],
       ["PUT", `/trust/access-grants/${id}`],
       ["PATCH", `/trust/access-grants/${id}`],
       ["DELETE", `/trust/access-grants/${id}`],
     ] as const) {
-      const res = await harness.app().inject({ method, url: apiUrl(url), headers, payload: method === "DELETE" ? undefined : {} });
+      const res = await harness.app().inject({ method, url: apiUrl(url), headers, ...(method === "DELETE" ? {} : { payload: {} }) });
       expect([404, 405], `${method} ${url}`).toContain(res.statusCode);
     }
     expect((await harness.db().query(`SELECT revoked_at FROM support_grants WHERE id = $1`, [id])).rows[0]).toEqual({ revoked_at: null });
