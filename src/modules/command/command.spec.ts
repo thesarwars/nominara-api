@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync } from "node:fs";
+import { Global, Module } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { describe, expect, it, vi } from "vitest";
 import { COMMAND_INTENTS, UNRESOLVED_INTENT, type CommandIntent } from "../../../contracts/command/command-intent.schema.js";
@@ -156,7 +157,8 @@ describe("STORY-085 #11 · a parse never mutates and never enqueues", () => {
 
   it("the service's only dependency is the cache: no database, queue, credit or billing collaborator can be reached", () => {
     const service = makeService();
-    expect(Object.values(service as unknown as Record<string, unknown>).length).toBeLessThanOrEqual(1);
+    const held = Object.keys(service as unknown as Record<string, unknown>).sort();
+    expect(held).toEqual(["cache", "logger"]);
     expect(CommandService.length).toBe(1);
   });
 
@@ -177,6 +179,10 @@ describe("STORY-085 #11 · a parse never mutates and never enqueues", () => {
     expect(result.actions[0]).toMatchObject({ kind: "run_deep_scan", is_mutating: true, requires_confirmation: true });
   });
 });
+
+@Global()
+@Module({ providers: [{ provide: CACHE, useValue: new InMemoryCacheAdapter() }], exports: [CACHE] })
+class StubCacheModule {}
 
 describe("STORY-085-A · the route", () => {
   const handler = CommandController.prototype.parse;
@@ -208,10 +214,8 @@ describe("STORY-085-A · the route", () => {
   });
 
   it("resolves in a Nest testing module", async () => {
-    const moduleRef = await Test.createTestingModule({ imports: [CommandModule] })
-      .overrideProvider(CACHE)
-      .useValue(new InMemoryCacheAdapter())
-      .compile();
+    const moduleRef = await Test.createTestingModule({ imports: [StubCacheModule, CommandModule] }).compile();
+    expect(moduleRef.get<Cache>(CACHE)).toBeDefined();
     expect(moduleRef.get(CommandController)).toBeInstanceOf(CommandController);
     await moduleRef.close();
   });
