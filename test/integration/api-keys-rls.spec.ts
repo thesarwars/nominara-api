@@ -82,7 +82,7 @@ describe("NEW-D-4 · ApiKeysService under RLS, as nominara_app", () => {
   it("NEW-D-4 AC5 · workspace B cannot list or revoke workspace A's key (404, not 403), and the key is left untouched", async () => {
     const a = await tenant();
     const b = await tenant();
-    const created = await inTenant(a, () => service.create(request()));
+    const created = await inTenant(a, () => service.create("owner", request()));
 
     expect(await inTenant(b, () => service.list())).toEqual([]);
     await expect(inTenant(b, () => service.revoke(created.key.id))).rejects.toBeInstanceOf(NotFoundError);
@@ -99,7 +99,7 @@ describe("NEW-D-4 · ApiKeysService under RLS, as nominara_app", () => {
       "INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1,$2,'P',$3,'https://b.test','b.test')",
       [foreign, b.workspaceId, `p-${foreign.slice(0, 8)}`],
     );
-    await expect(inTenant(a, () => service.create(request({ project_scope: [foreign] })))).rejects.toMatchObject({ code: "validation_failed" });
+    await expect(inTenant(a, () => service.create("owner", request({ project_scope: [foreign] })))).rejects.toMatchObject({ code: "validation_failed" });
     expect((await admin.query("SELECT count(*)::int AS n FROM api_keys")).rows[0]).toEqual({ n: 0 });
   });
 
@@ -112,7 +112,7 @@ describe("NEW-D-4 · ApiKeysService under RLS, as nominara_app", () => {
         [a.workspaceId, Buffer.from(randomUUID()), a.actorId],
       );
     }
-    const settled = await Promise.allSettled([1, 2, 3].map(() => inTenant(a, () => service.create(request()))));
+    const settled = await Promise.allSettled([1, 2, 3].map(() => inTenant(a, () => service.create("owner", request()))));
     expect(settled.filter((r) => r.status === "fulfilled")).toHaveLength(1);
     expect(settled.filter((r) => r.status === "rejected").every((r) => (r as PromiseRejectedResult).reason?.code === "entitlement_exceeded")).toBe(true);
     expect((await admin.query("SELECT count(*)::int AS n FROM api_keys")).rows[0]).toEqual({ n: 3 });
@@ -128,7 +128,7 @@ describe("NEW-D-4 · ApiKeysService under RLS, as nominara_app", () => {
       "INSERT INTO api_keys (workspace_id, name, key_prefix, key_hash, permissions, created_by, revoked_at) VALUES ($1,'x','nk_live_abcd',$2,'{project:read}',$3, now())",
       [a.workspaceId, Buffer.from(randomUUID()), a.actorId],
     );
-    for (let i = 0; i < 3; i += 1) await inTenant(a, () => service.create(request()));
-    await expect(inTenant(a, () => service.create(request()))).rejects.toMatchObject({ code: "entitlement_exceeded" });
+    for (let i = 0; i < 3; i += 1) await inTenant(a, () => service.create("owner", request()));
+    await expect(inTenant(a, () => service.create("owner", request()))).rejects.toMatchObject({ code: "entitlement_exceeded" });
   });
 });

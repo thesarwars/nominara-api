@@ -100,3 +100,13 @@ describe("NEW-D-4 audit · grantable permissions", () => {
     }
   });
 });
+
+describe("NEW-D-4 audit · a key never exceeds its creator's role", () => {
+  it("NEW-D-4 audit · the service refuses a permission the caller's role is denied, before touching the database", async () => {
+    const { ApiKeysService } = await import("./api-keys.service.js");
+    const svc = new ApiKeysService();
+    const body = { name: "k", permissions: ["member:update_role"], project_scope: null, expires_at: null };
+    await expect(svc.create("analyst", body)).rejects.toMatchObject({ response: { details: { required_permission: "member:update_role" } } });
+    await expect(svc.create("not-a-role", body)).rejects.toMatchObject({ response: { details: { required_permission: "member:update_role" } } });
+  });
+});

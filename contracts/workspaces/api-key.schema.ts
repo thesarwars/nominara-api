@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { PERMISSIONS } from "../../src/tenancy/permission-matrix.js";
+import { PERMISSION_MATRIX, PERMISSIONS, ROLES } from "../../src/tenancy/permission-matrix.js";
 
 // NEW-D-4 — /v1/api-keys. api-specification.md §3: `GET`/`POST`/`DELETE`
 // `/api-keys`, permission `apikey:create` (owner and admin, step-up), "secret
@@ -17,8 +17,14 @@ import { PERMISSIONS } from "../../src/tenancy/permission-matrix.js";
 //  - ONLY createdApiKeySchema carries `secret`. ApiKey (list, revoke) has
 //    neither the secret nor the hash.
 
-/** `apikey:create` itself is never grantable to a key: a key must not mint keys. */
-export const GRANTABLE_API_KEY_PERMISSIONS = PERMISSIONS.filter((p) => p !== "apikey:create");
+/**
+ * What a key can ever hold. `apikey:create` is out (a key must not mint keys), and so is every
+ * permission that needs step-up for ANY role: a key can never step up, so holding one would bypass
+ * NFR-SEC-12 for good. ApiKeysService additionally limits a key to what the CALLER's own role holds.
+ */
+export const GRANTABLE_API_KEY_PERMISSIONS = PERMISSIONS.filter(
+  (p) => p !== "apikey:create" && !ROLES.some((r) => PERMISSION_MATRIX[p][r].stepUp),
+);
 
 export const apiKeyPermissionSchema = z.enum(GRANTABLE_API_KEY_PERMISSIONS as [string, ...string[]]);
 

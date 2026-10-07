@@ -1549,22 +1549,19 @@
                   },
                   "permissions": {
                     "minItems": 1,
-                    "maxItems": 33,
+                    "maxItems": 28,
                     "type": "array",
                     "items": {
                       "type": "string",
                       "enum": [
                         "workspace:read",
                         "workspace:update",
-                        "workspace:delete",
-                        "workspace:transfer_ownership",
                         "member:invite",
                         "member:update_role",
                         "member:remove",
                         "billing:read",
                         "billing:write",
                         "credits:spend",
-                        "sso:configure",
                         "project:create",
                         "project:read",
                         "project:update",
@@ -1582,10 +1579,8 @@
                         "task:read",
                         "optimizer:use",
                         "agency:branding",
-                        "agency:custom_domain",
                         "share_token:mint",
                         "share_token:revoke",
-                        "export:data",
                         "audit_log:read"
                       ]
                     }

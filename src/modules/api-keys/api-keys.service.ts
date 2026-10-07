@@ -5,6 +5,8 @@ import type { ApiKey, CreateApiKeyRequest, CreatedApiKey } from "../../../contra
 import { EntitlementExceededError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { structuralLimitFrom, wouldExceed } from "../../lib/entitlements/classification.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
+import { evaluatePermission, type Permission } from "../../tenancy/permission-matrix.js";
+import { PermissionDeniedException } from "../../tenancy/errors.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
@@ -70,7 +72,11 @@ export class ApiKeysService {
     return result.rows.map(toApiKey);
   }
 
-  async create(body: CreateApiKeyRequest): Promise<CreatedApiKey> {
+  async create(callerRole: string, body: CreateApiKeyRequest): Promise<CreatedApiKey> {
+    // A key can hold only what its creator holds: an admin cannot mint owner-only authority.
+    for (const permission of body.permissions) {
+      if (evaluatePermission(callerRole, permission as Permission).access === "deny") throw new PermissionDeniedException(permission);
+    }
     const { client, workspaceId, actorId } = this.store();
     if (body.project_scope !== null) await this.assertProjectsReadable(client, body.project_scope);
     await this.assertWithinKeyLimit(client, workspaceId);

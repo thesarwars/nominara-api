@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Post, Req } from "@nestjs/common";
 import { z } from "zod";
 import {
   apiKeyListResponseSchema,
@@ -13,6 +13,7 @@ import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequireEntitlement } from "../../api/decorators/require-entitlement.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { ApiKeysService } from "./api-keys.service.js";
 
@@ -35,8 +36,8 @@ export class ApiKeysController {
   @RequireEntitlement("api.keys_max")
   @Audit({ action: "api_key.created", resourceType: "api_key", resourceIdFrom: "response", responseIdPath: "key.id", severity: "warning" })
   @ApiContract({ operationId: "createApiKey", requestSchema: createApiKeyRequestSchema, responseSchema: createdApiKeySchema })
-  create(@Body(new ZodValidationPipe(createApiKeyRequestSchema)) body: CreateApiKeyRequest): Promise<CreatedApiKey> {
-    return this.service.create(body);
+  create(@Req() req: RbacScopedRequest, @Body(new ZodValidationPipe(createApiKeyRequestSchema)) body: CreateApiKeyRequest): Promise<CreatedApiKey> {
+    return this.service.create(req.membership!.role, body);
   }
 
   @Delete(":id")
