@@ -19,6 +19,7 @@ export * from "./visibility.js";
 export * from "./aux.js";
 export * from "./source-coverage.js";
 export * from "./source-index.js";
+export * from "./displacement-impact.js";
 
 /**
  * `scoring_version` — stamped on every fact row and every rollup.
