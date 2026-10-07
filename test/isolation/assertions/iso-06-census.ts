@@ -26,18 +26,20 @@ import { NOOP_REVERT, type Breaker } from "../support/breakers.js";
 // its own migration — see POLICY_IN_OWN_MIGRATION in src/db/conventions.ts
 // for why 0006 must not carry it.
 //
-// 78/60/18 as of NEW-D-2: `stripe_webhook_events` (migration 0048) is global —
-// a delivery is deduplicated by event id before its workspace is known.
+// 79/61/18 as of the integration merge: `stripe_webhook_events` (NEW-D-2, migration 0048) is global —
+// a delivery is deduplicated by event id before its workspace is known — and
+// `scheduled_report_deliveries` (NEW-E-1, migration 0051) is a tenant table
+// (workspace_id, own-migration policy, not portal-readable).
 export async function assertIso06Census(ctx: AssertionContext): Promise<void> {
   const client = await connectSuperuser(ctx);
   try {
     const census = await computeCensus(client);
 
-    if (census.totalTables !== 78) {
-      throw new Error(`ISO-06: expected 78 total base tables, discovered ${census.totalTables}`);
+    if (census.totalTables !== 79) {
+      throw new Error(`ISO-06: expected 79 total base tables, discovered ${census.totalTables}`);
     }
-    if (census.tenantTables.length !== 60) {
-      throw new Error(`ISO-06: expected 60 tenant tables, discovered ${census.tenantTables.length}`);
+    if (census.tenantTables.length !== 61) {
+      throw new Error(`ISO-06: expected 61 tenant tables, discovered ${census.tenantTables.length}`);
     }
     if (census.globalTables.length !== 18) {
       throw new Error(`ISO-06: expected 18 global tables, discovered ${census.globalTables.length}`);

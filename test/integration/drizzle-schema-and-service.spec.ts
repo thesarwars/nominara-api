@@ -42,7 +42,7 @@ async function refusalFrom(promise: Promise<unknown>): Promise<unknown> {
 // context succeeds as the owner and returns zero rows in production. A
 // schema layer proven only against the owner would prove the wrong thing.
 
-const EXPECTED_TABLE_COUNT = 78; // 77 + stripe_webhook_events (NEW-D-2, migration 0048)
+const EXPECTED_TABLE_COUNT = 79; // 77 + stripe_webhook_events (NEW-D-2, 0048) + scheduled_report_deliveries (NEW-E-1, 0051)
 
 describe("STORY-122 · the Drizzle schema layer", () => {
   let container: StartedPostgreSqlContainer;

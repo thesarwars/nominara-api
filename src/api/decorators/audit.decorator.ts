@@ -15,6 +15,11 @@ export interface AuditOptions {
    * is taken from the tenant context — never from the request.
    */
   readonly resourceIdFrom?: "params" | "response" | "workspace";
+  /**
+   * Only used when resourceIdFrom is "response": a dotted path to the id inside a NESTED response body
+   * (e.g. "token.id" for `{ token: { id }, secret }`). Absent, the body's own `id` / `<resourceType>_id` is read.
+   */
+  readonly responseIdPath?: string;
   /** Only used when resourceIdFrom is "params" (the default). The req.params key to read. Defaults to "id". */
   readonly paramName?: string;
 }

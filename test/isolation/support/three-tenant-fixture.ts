@@ -544,10 +544,19 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
   for (let i = 0; i < R; i++) {
     await client.query("INSERT INTO share_token_views (workspace_id, share_token_id) VALUES ($1, $2)", [workspaceId, shareTokenIds[i]]);
   }
+  const scheduledReportIds: string[] = [];
+  for (let i = 0; i < R; i++) {
+    const result = await client.query<{ id: string }>(
+      "INSERT INTO scheduled_reports (workspace_id, name, project_ids, cadence, recipients) VALUES ($1, $2, $3, 'weekly', ARRAY['owner@example.com']::citext[]) RETURNING id",
+      [workspaceId, `Report ${i}`, [projectIds[i]]],
+    );
+    scheduledReportIds.push(result.rows[0]!.id);
+  }
+  // NEW-E-1 (migration 0051) — delivery history, one row per scheduled report.
   for (let i = 0; i < R; i++) {
     await client.query(
-      "INSERT INTO scheduled_reports (workspace_id, name, project_ids, cadence, recipients) VALUES ($1, $2, $3, 'weekly', ARRAY['owner@example.com']::citext[])",
-      [workspaceId, `Report ${i}`, [projectIds[i]]],
+      "INSERT INTO scheduled_report_deliveries (workspace_id, scheduled_report_id, status, recipient_count) VALUES ($1, $2, 'delivered', 1)",
+      [workspaceId, scheduledReportIds[i]],
     );
   }
   for (let i = 0; i < R; i++) {

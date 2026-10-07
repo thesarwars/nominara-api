@@ -295,6 +295,8 @@ export const ACTOR_SELF_SCOPED_TABLES = ["workspaces", "workspace_members"] as c
 export const POLICY_IN_OWN_MIGRATION: readonly string[] = [
   // 0019_usage_reservations.up.sql
   "usage_reservations",
+  // 0051_track_e_sharing.up.sql — NEW-E-1; tenant-scoped, NOT portal-readable.
+  "scheduled_report_deliveries",
 ];
 
 // STORY-011 — which runtime roles receive which generated policy. Every
