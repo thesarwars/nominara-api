@@ -1,3 +1,4 @@
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
@@ -28,7 +29,7 @@ describe("STORY-169 · TasksService.listActionItems — real SQL", () => {
   let client: Client; // superuser — fixture setup and catalog seeding ONLY
   let seq = 0;
 
-  const service = new TasksService();
+  const service = new TasksService(new NoopRealtimePublisher());
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18")

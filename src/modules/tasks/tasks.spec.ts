@@ -1,3 +1,5 @@
+import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
+import { NoopRealtimePublisher } from "../../lib/cache/realtime-publisher.js";
 import { Test } from "@nestjs/testing";
 import { describe, expect, it } from "vitest";
 import { TasksModule } from "./tasks.module.js";
@@ -8,9 +10,13 @@ import { TasksController } from "./tasks.controller.js";
 // area's own future story.
 describe("STORY-022 · TasksModule compiles", () => {
   it("resolves in a Nest testing module", async () => {
+    // STORY-064 (step D): TasksModule now builds the realtime publisher, which validates the env eagerly.
+    const originalEnv = { ...process.env };
+    applyFakeApiEnv();
     const moduleRef = await Test.createTestingModule({ imports: [TasksModule] }).compile();
     expect(moduleRef.get(TasksController)).toBeInstanceOf(TasksController);
     await moduleRef.close();
+    process.env = originalEnv;
   });
 });
 
@@ -52,7 +58,7 @@ describe("STORY-064 · project task list route", () => {
     const log = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void logs.push(m));
     const seen: string[] = [];
     await withTenantContext(fakeClient([{ id: "p" }], seen), ctx("ws-1"), () =>
-      new TasksService().listProjectTasks("p", taskListQuerySchema.parse({ sort: "age" })),
+      new TasksService(new NoopRealtimePublisher()).listProjectTasks("p", taskListQuerySchema.parse({ sort: "age" })),
     );
     log.mockRestore();
     expect(logs).toContainEqual({ metric: "nominara_tasks_list_total", value: 1, sort: "age" });
@@ -64,7 +70,7 @@ describe("STORY-064 · project task list route", () => {
     const seen: string[] = [];
     await expect(
       withTenantContext(fakeClient([], seen), ctx("ws-1"), () =>
-        new TasksService().listProjectTasks("p", taskListQuerySchema.parse({})),
+        new TasksService(new NoopRealtimePublisher()).listProjectTasks("p", taskListQuerySchema.parse({})),
       ),
     ).rejects.toBeInstanceOf(NotFoundError);
     expect(seen.some((q) => q.includes("FROM tasks"))).toBe(false);
@@ -101,7 +107,7 @@ describe("STORY-064 · PATCH /tasks/{id} route", () => {
     const seen: string[] = [];
     await expect(
       withTenantContext(fakeClient([], seen), ctx("ws-1"), () =>
-        new TasksService().updateTask("t", updateTaskRequestSchema.parse({ status: "done" })),
+        new TasksService(new NoopRealtimePublisher()).updateTask("t", updateTaskRequestSchema.parse({ status: "done" })),
       ),
     ).rejects.toBeInstanceOf(ConflictError);
     expect(seen.some((q) => q.includes("FROM tasks"))).toBe(false);
@@ -110,7 +116,7 @@ describe("STORY-064 · PATCH /tasks/{id} route", () => {
   it("an unknown task is a NotFoundError", async () => {
     await expect(
       withTenantContext(fakeClient([], []), ctx("ws-1"), () =>
-        new TasksService().updateTask("t", updateTaskRequestSchema.parse({ priority: 2 })),
+        new TasksService(new NoopRealtimePublisher()).updateTask("t", updateTaskRequestSchema.parse({ priority: 2 })),
       ),
     ).rejects.toBeInstanceOf(NotFoundError);
   });
@@ -132,12 +138,84 @@ describe("STORY-064 · PATCH /tasks/{id} route", () => {
       },
     } as unknown as ClientBase;
     await withTenantContext(client, ctx("ws-1"), () =>
-      new TasksService().updateTask("t", updateTaskRequestSchema.parse({ status: "dismissed", dismiss_reason: "SECRET REASON" })),
+      new TasksService(new NoopRealtimePublisher()).updateTask("t", updateTaskRequestSchema.parse({ status: "dismissed", dismiss_reason: "SECRET REASON" })),
     );
     log.mockRestore();
     expect(logs).toContainEqual({ metric: "nominara_tasks_events_written_total", value: 1, event: "dismissed" });
     const line = logs.find((l) => (l as { message?: string }).message === "task updated");
     expect(line).toEqual({ message: "task updated", workspace_id: "ws-1", task_id: "t", events: ["dismissed"] });
     expect(JSON.stringify(logs)).not.toContain("SECRET REASON");
+  });
+});
+
+// STORY-064 (step C) — POST /projects/{id}/tasks, POST /tasks/{id}/comments, GET /tasks/{id}/events.
+import { IDEMPOTENT_KEY } from "../../api/decorators/idempotent.decorator.js";
+import { API_CONTRACT_KEY } from "../../api/decorators/api-contract.decorator.js";
+import { createCommentRequestSchema, createTaskRequestSchema } from "../../../contracts/tasks/index.js";
+
+describe("STORY-064-C · route wiring and contracts", () => {
+  const reflector = new Reflector();
+  const proto = TasksController.prototype as unknown as Record<string, () => void>;
+
+  it("create: task:create, idempotent, project-scoped by :id, audited", () => {
+    const h = proto.create!;
+    expect(reflector.get(REQUIRE_PERMISSION_KEY, h)).toBe("task:create");
+    expect(reflector.get(IDEMPOTENT_KEY, h)).toBe(true);
+    expect(reflector.get(PROJECT_PARAM_KEY, h)).toBe("id");
+    expect(reflector.get(AUDIT_METADATA_KEY, h)).toMatchObject({ action: "task.created", resourceType: "task" });
+    expect(reflector.get(API_CONTRACT_KEY, h)).toMatchObject({ operationId: "createProjectTask" });
+  });
+
+  it("comment: task:comment, idempotent, scope enforced by the service", () => {
+    const h = proto.comment!;
+    expect(reflector.get(REQUIRE_PERMISSION_KEY, h)).toBe("task:comment");
+    expect(reflector.get(IDEMPOTENT_KEY, h)).toBe(true);
+    expect(reflector.get(SCOPED_BY_QUERY_KEY, h)).toBe(true);
+    expect(reflector.get(API_CONTRACT_KEY, h)).toMatchObject({ operationId: "createTaskComment" });
+  });
+
+  it("events: task:read, a paginated list, scope enforced by the service", () => {
+    const h = proto.events!;
+    expect(reflector.get(REQUIRE_PERMISSION_KEY, h)).toBe("task:read");
+    expect(reflector.get(SCOPED_BY_QUERY_KEY, h)).toBe(true);
+    expect(reflector.get(API_CONTRACT_KEY, h)).toMatchObject({ operationId: "listTaskEvents", listOf: true });
+  });
+
+  it("create request is strict: an ordering field, origin, status and an empty or oversized title are refused", () => {
+    expect(createTaskRequestSchema.safeParse({ title: "t" }).success).toBe(true);
+    expect(createTaskRequestSchema.safeParse({ title: "t", position: 1 }).success).toBe(false);
+    expect(createTaskRequestSchema.safeParse({ title: "t", origin: "auto" }).success).toBe(false);
+    expect(createTaskRequestSchema.safeParse({ title: "t", status: "done" }).success).toBe(false);
+    expect(createTaskRequestSchema.safeParse({ title: "   " }).success).toBe(false);
+    expect(createTaskRequestSchema.safeParse({ title: "t", kind: "bogus" }).success).toBe(false);
+  });
+
+  it("comment body is 1..4000 characters and strict", () => {
+    expect(createCommentRequestSchema.safeParse({ body: "" }).success).toBe(false);
+    expect(createCommentRequestSchema.safeParse({ body: "a".repeat(4000) }).success).toBe(true);
+    expect(createCommentRequestSchema.safeParse({ body: "a".repeat(4001) }).success).toBe(false);
+    expect(createCommentRequestSchema.safeParse({ body: "x", extra: 1 }).success).toBe(false);
+  });
+
+  it("create counts the task and logs the workspace and task IDs only — never the title", async () => {
+    const logs: unknown[] = [];
+    const log = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void logs.push(m));
+    const taskRow = { id: "t", short_ref: "PRO-1", project_id: "p", goal_id: null, title: "SECRET TITLE", description: "", kind: "content", origin: "manual", status: "todo", severity: null,
+      source_finding_id: null, source_domain_id: null, source_displacement_id: null, rule_code: null, priority: 3, impact_score: 0, effort_band: "m", assignee_id: null,
+      due_at: null, dismissed_reason: null, resurface_at: null, completed_at: null, affected_url: null, created_at: new Date(), updated_at: new Date() };
+    const client = {
+      query: async (sql: string) => {
+        if (sql.includes("FROM projects")) return { rows: [{ id: "p", name: "Project", in_scope: true }] };
+        if (sql.includes("RETURNING next_value")) return { rows: [{ used: 1 }] };
+        if (sql.includes("INSERT INTO tasks")) return { rows: [{ id: "t" }] };
+        if (sql.includes("FROM tasks t")) return { rows: [taskRow] };
+        return { rows: [{ critical: "0", high: "0", medium: "0", low: "0", total: "0" }] };
+      },
+    } as unknown as ClientBase;
+    await withTenantContext(client, ctx("ws-1"), () => new TasksService(new NoopRealtimePublisher()).createTask("p", createTaskRequestSchema.parse({ title: "SECRET TITLE" })));
+    log.mockRestore();
+    expect(logs).toContainEqual({ metric: "nominara_tasks_created_total", value: 1, origin: "manual" });
+    expect(logs.find((l) => (l as { message?: string }).message === "task created")).toEqual({ message: "task created", workspace_id: "ws-1", task_id: "t", project_id: "p" });
+    expect(JSON.stringify(logs)).not.toContain("SECRET TITLE");
   });
 });

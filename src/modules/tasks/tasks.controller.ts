@@ -1,16 +1,28 @@
-import { Body, Controller, Get, Param, Patch, Query } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from "@nestjs/common";
 import {
+  completeTaskResponseSchema,
+  createCommentRequestSchema,
+  createTaskRequestSchema,
+  taskEventListQuerySchema,
+  taskEventListResponseSchema,
+  taskEventSchema,
   taskListQuerySchema,
   taskListResponseSchema,
   taskSchema,
   updateTaskRequestSchema,
+  type CompleteTaskResponse,
+  type CreateCommentRequest,
+  type CreateTaskRequest,
   type Task,
+  type TaskEvent,
+  type TaskEventListQuery,
   type TaskListQuery,
   type UpdateTaskRequest,
 } from "../../../contracts/tasks/index.js";
 import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
+import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
@@ -60,5 +72,68 @@ export class TasksController {
     @Body(new ZodValidationPipe(updateTaskRequestSchema)) body: UpdateTaskRequest,
   ): Promise<Task> {
     return this.service.updateTask(id, body);
+  }
+
+  // STORY-064 (step C) — `POST /projects/{id}/tasks`, `task:create` (manager
+  // scoped). Idempotent: a replayed `Idempotency-Key` returns the same task
+  // rather than a second one with the next reference.
+  @Post("projects/:id/tasks")
+  @HttpCode(201)
+  @Idempotent()
+  @RequirePermission("task:create")
+  @ProjectParam("id")
+  @Audit({ action: "task.created", resourceType: "task", resourceIdFrom: "response" })
+  @ApiContract({ operationId: "createProjectTask", requestSchema: createTaskRequestSchema, responseSchema: taskSchema })
+  create(
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(createTaskRequestSchema)) body: CreateTaskRequest,
+  ): Promise<Task> {
+    return this.service.createTask(id, body);
+  }
+
+  // `POST /tasks/{id}/comments`, `task:comment`. Like PATCH, the URL names a
+  // task: scope is enforced by the service against the task's project.
+  @Post("tasks/:id/comments")
+  @HttpCode(201)
+  @Idempotent()
+  @RequirePermission("task:comment")
+  @ScopedByQuery()
+  @Audit({ action: "task.commented", resourceType: "task" })
+  @ApiContract({ operationId: "createTaskComment", requestSchema: createCommentRequestSchema, responseSchema: taskEventSchema })
+  comment(
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(createCommentRequestSchema)) body: CreateCommentRequest,
+  ): Promise<TaskEvent> {
+    return this.service.createComment(id, body);
+  }
+
+  // STORY-064 (step D) — `POST /tasks/{id}/complete`, `task:move`. No body.
+  // Idempotent: a replayed key returns the first response, not a second 409.
+  @Post("tasks/:id/complete")
+  @HttpCode(200)
+  @Idempotent()
+  @RequirePermission("task:move")
+  @ScopedByQuery()
+  @Audit({ action: "task.completed", resourceType: "task" })
+  @ApiContract({ operationId: "completeTask", responseSchema: completeTaskResponseSchema })
+  complete(@Param("id") id: string): Promise<CompleteTaskResponse> {
+    return this.service.completeTask(id);
+  }
+
+  // `GET /tasks/{id}/events`, `task:read` — the timeline, newest first.
+  @Get("tasks/:id/events")
+  @RequirePermission("task:read")
+  @ScopedByQuery()
+  @ApiContract({
+    operationId: "listTaskEvents",
+    querySchema: taskEventListQuerySchema,
+    responseSchema: taskEventListResponseSchema,
+    listOf: true,
+  })
+  events(
+    @Param("id") id: string,
+    @Query(new ZodValidationPipe(taskEventListQuerySchema)) query: TaskEventListQuery,
+  ): Promise<Page<TaskEvent>> {
+    return this.service.listTaskEvents(id, query);
   }
 }
