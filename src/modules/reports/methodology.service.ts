@@ -16,7 +16,7 @@ import { currentTenantStore } from "../../tenancy/tenant-context.js";
 // and scorecards use, so the footer cannot disagree with the numbers it sits
 // under.
 
-const TIMEFRAME_DAYS: Readonly<Record<ReportTimeframe, number>> = Object.freeze({ "24h": 1, "7d": 7, "30d": 30, "90d": 90 });
+export const TIMEFRAME_DAYS: Readonly<Record<ReportTimeframe, number>> = Object.freeze({ "24h": 1, "7d": 7, "30d": 30, "90d": 90 });
 
 const weightOverridesSchema = z.record(z.string(), z.number());
 const logger = new Logger("MethodologyService");

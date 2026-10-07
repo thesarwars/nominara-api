@@ -181,6 +181,8 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     expect(row.methodology_footer).toEqual(exported.footer);
     expect(row.scheduled_report_id).toBeNull();
     expect(new Date(row.expires_at as string).getTime()).toBeGreaterThan(Date.now());
+    const audit = (await harness.db().query(`SELECT action, resource_type, resource_id FROM audit_log WHERE workspace_id = $1 AND action = 'report.exported'`, [a.workspaceId])).rows;
+    expect(audit).toEqual([{ action: "report.exported", resource_type: "report_artifact", resource_id: exported.export_id }]);
   }, 120_000);
 
   it("STORY-100 s1 — a CSV export carries the footer rows and the per-engine rows beside the blend", async () => {
@@ -323,6 +325,8 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const res = await exportReport(a, foreign, body());
     expect(res.statusCode, res.body).toBe(404);
     expect(await usage(b.workspaceId)).toBeUndefined();
+    // the unit QuotaGuard reserved for a PDF that can never succeed is given back
+    expect(await usage(a.workspaceId)).toEqual({ used: 0, reserved: 0 });
   }, 120_000);
 
   it("STORY-100 s6 — a project with no rollup exports an honest empty document, not zeros", async () => {

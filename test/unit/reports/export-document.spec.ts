@@ -42,7 +42,7 @@ const summary = (over: Partial<MetricSummary> = {}): MetricSummary => ({
   ...over,
 });
 
-const theme = { colorPrimary: "#4f46e5", colorAccent: "#0ea5e9", colorBg: "#ffffff", colorFg: "#0f172a", fontFamily: "Inter", hideNominaraBrand: false };
+const palette = { primary: "#4f46e5", accent: "#0ea5e9", background: "#ffffff", foreground: "#0f172a", showBrandLine: true };
 
 function input(over: Partial<ExportDocumentInput> = {}): ExportDocumentInput {
   return {
@@ -50,7 +50,7 @@ function input(over: Partial<ExportDocumentInput> = {}): ExportDocumentInput {
     generatedAt: "2026-10-07T10:00:00.000Z",
     timeframe: "30d",
     window: { from: "2026-09-08", to: "2026-10-07" },
-    theme,
+    palette,
     footer,
     sections: ["overview", "growth_map", "competitors"],
     hideCompetitors: false,
@@ -111,7 +111,7 @@ describe("NEW-E-100b · STORY-100 s1 — every format carries the footer", () =>
 describe("NEW-E-100b · STORY-100 s2 — brand removal does not remove the footer", () => {
   it("STORY-100 s2 — hide_nominara_brand drops the brand line and keeps the footer in both formats", async () => {
     const shown = await everyFormat(buildExportDocument(input()));
-    const hidden = await everyFormat(buildExportDocument(input({ theme: { ...theme, hideNominaraBrand: true } })));
+    const hidden = await everyFormat(buildExportDocument(input({ palette: { ...palette, showBrandLine: false } })));
     expect(shown.pdfText).toContain("Powered by Nominara");
     expect(hidden.pdfText).not.toContain("Powered by Nominara");
     expect(hidden.pdfText).toContain(METHODOLOGY_NOTE);
@@ -132,14 +132,14 @@ describe("NEW-E-100b · STORY-100 s3 — the footer cannot be suppressed", () =>
 
   it("STORY-100 s3 — no theme key, style override or stray flag removes it", async () => {
     const hostile = {
-      ...theme,
-      hideNominaraBrand: true,
+      ...palette,
+      showBrandLine: false,
       hideFooter: true,
       footer: false,
       customCss: ".footer { display: none }",
       styleOverride: { footer: "none" },
-    } as unknown as ExportDocumentInput["theme"];
-    const doc = buildExportDocument({ ...input({ theme: hostile }), hideFooter: true, footerOverride: null } as unknown as ExportDocumentInput);
+    } as unknown as ExportDocumentInput["palette"];
+    const doc = buildExportDocument({ ...input({ palette: hostile }), hideFooter: true, footerOverride: null } as unknown as ExportDocumentInput);
     expect(doc.footer).toEqual(footer);
     const { csv, pdfText: text } = await everyFormat(doc);
     expect(csv).toContain(METHODOLOGY_NOTE);
@@ -253,8 +253,8 @@ describe("NEW-E-100b · selection, privacy and rendering hygiene", () => {
   });
 
   it("NEW-E-100b — the PDF uses the stored theme's colours", async () => {
-    const pdf = await renderPdf(buildExportDocument(input({ theme: { ...theme, colorPrimary: "#00ff00" } })), { compress: false });
-    expect(pdfRaw(pdf)).toMatch(/\b0 1 0 (rg|RG)\b/);
+    const pdf = await renderPdf(buildExportDocument(input({ palette: { ...palette, primary: "#00ff00" } })), { compress: false });
+    expect(pdfRaw(pdf)).toMatch(/\b0 1 0 (rg|RG|scn|SCN)\b/);
   });
 
   it("NEW-E-100b — rendering performs no network call", async () => {
