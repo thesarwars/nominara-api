@@ -22,9 +22,16 @@ import { SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS } from "./refresh-pro
 // and make `source_coverage` and an action item's severity read different
 // windows for the same project.
 
-// NEW-C-4 — a NULL `gap_severity` means presence on the domain is not yet
-// verified; such rows are left out, so a window with nothing verified reads
-// NULL ("not measured"), never 100.
+// NEW-C-4 audit — a NULL `gap_severity` means presence on the domain is not yet
+// verified. Dropping such rows would treat "not measured" as "no gap" and
+// inflate the score (a domain holding 89% of the weight, unchecked, would
+// read as covered). So the score is published ONLY when every domain in the
+// window is verified; any unverified one makes it NULL ("not measured"),
+// never a number computed over a verified subset.
+// OWNER DECISION PENDING: the alternatives (a verified-weight threshold, or
+// renormalising and labelling the result) need a spec constant or a contract
+// field; this conservative rule invents neither and is encoded in
+// test/integration/refresh-project-source-index.spec.ts.
 
 /** Recompute one project's source coverage from `project_source_index`. */
 export async function refreshProjectSourceCoverage(tx: ClientBase, projectId: string): Promise<void> {
@@ -42,16 +49,16 @@ export async function refreshProjectSourceCoverage(tx: ClientBase, projectId: st
     windowStart === null
       ? []
       : (
-          await tx.query<{ context_weight: string; gap_severity: "none" | "low" | "medium" | "high" | "critical" }>(
+          await tx.query<{ context_weight: string; gap_severity: "none" | "low" | "medium" | "high" | "critical" | null }>(
             `SELECT context_weight::text, gap_severity
                FROM project_source_index
-              WHERE project_id = $1 AND engine_key = $2 AND window_days = $3 AND window_start = $4::date
-                AND gap_severity IS NOT NULL`,
+              WHERE project_id = $1 AND engine_key = $2 AND window_days = $3 AND window_start = $4::date`,
             [projectId, SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS, windowStart],
           )
         ).rows;
 
-  const coverage = sourceCoverage(domains.map((row) => ({ contextWeight: Number(row.context_weight), gapSeverity: row.gap_severity })));
+  const fullyVerified = domains.every((row) => row.gap_severity !== null);
+  const coverage = !fullyVerified ? null : sourceCoverage(domains.map((row) => ({ contextWeight: Number(row.context_weight), gapSeverity: row.gap_severity! })));
 
   await tx.query(`UPDATE projects SET source_coverage = $2 WHERE id = $1`, [projectId, coverage]);
 }

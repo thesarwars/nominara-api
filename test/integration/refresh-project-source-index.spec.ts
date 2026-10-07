@@ -3,6 +3,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { SCORING_VERSION } from "../../src/lib/scoring/index.js";
 import { refreshProjectSourceIndex } from "../../src/lib/rollup/refresh-project-source-index.js";
 
 // NEW-C-4 / STORY-054 scenarios 1-4, 8-11 (scenarios 5-7, the fetch
@@ -87,7 +88,9 @@ describe("NEW-C-4 · refreshProjectSourceIndex", () => {
   async function rows(where = "TRUE", pr = projectId): Promise<SourceIndexRow[]> {
     return (
       await db.query(
-        `SELECT sd.domain, sd.source_class, sd.is_seedable, psi.engine_key, psi.window_days, psi.window_start::text AS window_start,
+        `SELECT sd.domain,
+                CASE WHEN psi.is_competitor_owned THEN 'vendor_owned' ELSE sd.source_class END AS source_class,
+                (sd.is_seedable AND NOT psi.is_competitor_owned) AS is_seedable, psi.engine_key, psi.window_days, psi.window_start::text AS window_start,
                 psi.citation_count, psi.distinct_prompts, psi.context_weight, psi.rank_position,
                 psi.brand_present_on_domain, psi.gap_severity, psi.top_urls
            FROM project_source_index psi JOIN source_domains sd ON sd.id = psi.source_domain_id
@@ -201,6 +204,83 @@ describe("NEW-C-4 · refreshProjectSourceIndex", () => {
     await db.query("COMMIT");
     const result = await db.query("SELECT workspace_id FROM source_domains WHERE domain='reddit.com'");
     expect(result.rows.map((r) => r.workspace_id).sort()).toEqual([workspaceId, other.workspaceId].sort());
+  });
+
+  it("audit #1 · a domain flagged competitor under only ONE engine is never seedable, whatever the GROUP BY order", async () => {
+    // 'aaa' sorts first, so the old first-row-wins loop saw the non-competitor facts.
+    await cite({ domain: "z.example", prompt: "p1", engine: "aaa", competitor: false, sourceClass: "community_forum" });
+    await cite({ domain: "z.example", prompt: "p2", engine: "zzz", competitor: true, sourceClass: "community_forum" });
+    await run();
+    const all = await rows("sd.domain='z.example'");
+    expect(all.length).toBeGreaterThan(0);
+    for (const r of all) {
+      expect(r.source_class, `${r.engine_key}/${r.window_days}`).toBe("vendor_owned");
+      expect(r.is_seedable, `${r.engine_key}/${r.window_days}`).toBe(false);
+    }
+  });
+
+  it("audit #2 · competitor status is per project: one project's recompute never flips another's seedability", async () => {
+    const bId = randomUUID();
+    await db.query(
+      `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1,$2,'B',$3,'https://b.com','b.com')`,
+      [bId, workspaceId, `p-${bId.slice(0, 8)}`],
+    );
+    await cite({ domain: "rival.com", prompt: "p1", competitor: true, sourceClass: "community_forum" });
+    await cite({ domain: "rival.com", prompt: "p1", pr: bId, competitor: false, sourceClass: "community_forum" });
+    await run(); // A
+    await db.query("BEGIN");
+    await refreshProjectSourceIndex(db, bId, TODAY); // B is the last writer
+    await db.query("COMMIT");
+    const a = await rows("psi.engine_key='all' AND psi.window_days=30", projectId);
+    const b = await rows("psi.engine_key='all' AND psi.window_days=30", bId);
+    expect([a[0]!.source_class, a[0]!.is_seedable]).toEqual(["vendor_owned", false]);
+    expect([b[0]!.source_class, b[0]!.is_seedable]).toEqual(["community_forum", true]);
+    expect(a[0]!.gap_severity).toBeNull(); // unverified: still withheld, and consistent with not-seedable
+  });
+
+  it("audit #2 · the shared source_domains row carries the domain's own class, not a project's competitor override", async () => {
+    await cite({ domain: "rival.com", prompt: "p1", competitor: true, sourceClass: "community_forum" });
+    await run();
+    const r = await db.query("SELECT source_class, is_seedable FROM source_domains WHERE domain='rival.com'");
+    expect(r.rows[0]).toEqual({ source_class: "community_forum", is_seedable: true });
+  });
+
+  it("audit #2 · competitor status is decided once per run: a flag seen only in the 90-day window applies to the 7-day rows", async () => {
+    await cite({ domain: "old.example", prompt: "p1", daysAgo: 60, competitor: true, sourceClass: "community_forum" });
+    await cite({ domain: "old.example", prompt: "p2", daysAgo: 2, competitor: false, sourceClass: "community_forum" });
+    await run();
+    const seven = await rows("psi.engine_key='all' AND psi.window_days=7");
+    expect([seven[0]!.source_class, seven[0]!.is_seedable]).toEqual(["vendor_owned", false]);
+  });
+
+  it("audit #5 · every written row carries the scoring module's SCORING_VERSION", async () => {
+    await cite({ domain: "a.example", prompt: "p1" });
+    await run();
+    const r = await db.query("SELECT DISTINCT scoring_version FROM project_source_index WHERE project_id=$1", [projectId]);
+    expect(r.rows).toEqual([{ scoring_version: SCORING_VERSION }]);
+  });
+
+  it("audit #3 · source_coverage is NULL while ANY domain in the window is unverified (partial verification is not 'no gap')", async () => {
+    for (let i = 0; i < 8; i++) await cite({ domain: "big.example", prompt: `p${i}` });
+    await cite({ domain: "reddit.com", prompt: "p1" });
+    await run();
+    await db.query(
+      `UPDATE project_source_index SET brand_present_on_domain=false, verified_at=now()
+        WHERE project_id=$1 AND source_domain_id=(SELECT id FROM source_domains WHERE domain='reddit.com')`,
+      [projectId],
+    );
+    await run();
+    const r = await db.query("SELECT source_coverage FROM projects WHERE id=$1", [projectId]);
+    expect(r.rows[0].source_coverage).toBeNull();
+  });
+
+  it("audit #3 · once every domain is verified, source_coverage is published", async () => {
+    for (let i = 0; i < 6; i++) await cite({ domain: "reddit.com", prompt: `p${i}` });
+    await run();
+    await db.query("UPDATE project_source_index SET brand_present_on_domain=false, verified_at=now() WHERE project_id=$1", [projectId]);
+    await run();
+    const r = await db.query("SELECT source_coverage::float8 AS c FROM projects WHERE id=$1", [projectId]);
+    expect(r.rows[0].c).toBeCloseTo(0, 3);
   });
 
   it("an empty project writes nothing and leaves source_coverage null", async () => {

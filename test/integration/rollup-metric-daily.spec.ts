@@ -688,6 +688,17 @@ describe("STORY-042 · rollup.metric_daily", () => {
     } as unknown as Job;
   }
 
+  it("audit #4 · the handler recomputes the project's source index inside the same run", async () => {
+    await setUp("UTC");
+    const at = new Date(Date.now() - 86_400_000).toISOString();
+    const cell = await addCell({ capturedAt: at, brandPresent: true, sov: 1 });
+    await addCitation(cell, at, false);
+
+    await handler()(db, job({ metricDate: at.slice(0, 10) }));
+    const r = await db.query("SELECT count(*)::int AS n FROM project_source_index WHERE project_id = $1", [projectId]);
+    expect(r.rows[0].n).toBeGreaterThan(0);
+  });
+
   it("reads the timezone from the WORKSPACE, not the payload", async () => {
     // A payload-supplied zone would let a stale job bucket a day against a
     // timezone the workspace has since changed.

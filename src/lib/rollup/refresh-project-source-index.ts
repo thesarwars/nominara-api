@@ -1,7 +1,7 @@
 import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { classifyDomain } from "../parser/citation-url.js";
-import { gapSeverity, isSeedableSourceClass, sourceContextWeights } from "../scoring/index.js";
+import { SCORING_VERSION, gapSeverity, isSeedableSourceClass, sourceContextWeights } from "../scoring/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { refreshProjectSourceCoverage } from "./refresh-project-source-coverage.js";
 
@@ -36,8 +36,6 @@ interface DomainAgg {
   distinct_urls: number;
   raw_weight: number;
   avg_weight: number;
-  is_competitor: boolean;
-  source_class: string | null;
 }
 
 export async function refreshProjectSourceIndex(tx: ClientBase, projectId: string, today?: string): Promise<void> {
@@ -65,6 +63,40 @@ export async function refreshProjectSourceIndex(tx: ClientBase, projectId: strin
 
   await tx.query(`DELETE FROM project_source_index WHERE project_id = $1`, [projectId]);
 
+  // Decided ONCE per run, from the widest window across every engine: a domain
+  // flagged `is_competitor` by any fact in it is competitor-owned. The scoped
+  // (engine) aggregates never decide this — a GROUP BY row order must not.
+  // `source_domains` (shared by every project in the workspace) stores only the
+  // domain's OWN class and seedability; competitor ownership is a per-project
+  // fact and lives on `project_source_index.is_competitor_owned`.
+  const widest = Math.max(...SOURCE_INDEX_WINDOWS);
+  const widestStart = (await tx.query<{ d: string }>(`SELECT to_char($1::date - $2::int, 'YYYY-MM-DD') AS d`, [asOf, widest])).rows[0]!.d;
+  const domainFacts = (
+    await tx.query<{ domain: string; is_competitor: boolean; source_class: string | null }>(
+      `SELECT domain, bool_or(is_competitor) AS is_competitor,
+              mode() WITHIN GROUP (ORDER BY source_class) FILTER (WHERE source_class IS NOT NULL) AS source_class
+         FROM citation_facts
+        WHERE project_id = $1 AND NOT is_owned AND http_status IS NOT NULL
+          AND captured_at >= $2::date AND captured_at < ($3::date + 1)
+        GROUP BY domain`,
+      [projectId, widestStart, asOf],
+    )
+  ).rows;
+  const classByDomain = new Map<string, { ownClass: string; ownSeedable: boolean; competitor: boolean; domainId: string }>();
+  for (const fact of domainFacts) {
+    const ownClass = fact.source_class ?? classifyDomain(fact.domain);
+    const ownSeedable = isSeedableSourceClass(ownClass, false);
+    const res = await tx.query<{ id: string }>(
+      `INSERT INTO source_domains (workspace_id, domain, display_name, source_class, is_seedable)
+       VALUES ($1,$2,$2,$3,$4)
+       ON CONFLICT (workspace_id, domain) DO UPDATE
+         SET source_class = EXCLUDED.source_class, is_seedable = EXCLUDED.is_seedable, last_seen_at = now(), updated_at = now()
+       RETURNING id`,
+      [workspaceId, fact.domain, ownClass, ownSeedable],
+    );
+    classByDomain.set(fact.domain, { ownClass, ownSeedable, competitor: fact.is_competitor, domainId: res.rows[0]!.id });
+  }
+
   let written = 0;
   for (const windowDays of SOURCE_INDEX_WINDOWS) {
     const windowStart = (await tx.query<{ d: string }>(`SELECT to_char($1::date - $2::int, 'YYYY-MM-DD') AS d`, [asOf, windowDays])).rows[0]!.d;
@@ -76,8 +108,7 @@ export async function refreshProjectSourceIndex(tx: ClientBase, projectId: strin
       await tx.query<DomainAgg>(
         `SELECT scope, domain, count(*)::int AS citation_count, count(DISTINCT prompt_id)::int AS distinct_prompts,
                 count(DISTINCT normalized_url)::int AS distinct_urls, sum(position_weight)::float8 AS raw_weight,
-                avg(position_weight)::float8 AS avg_weight, bool_or(is_competitor) AS is_competitor,
-                mode() WITHIN GROUP (ORDER BY source_class) FILTER (WHERE source_class IS NOT NULL) AS source_class
+                avg(position_weight)::float8 AS avg_weight
            FROM (SELECT engine_key AS scope, * ${scoped} UNION ALL SELECT 'all' AS scope, * ${scoped}) f
           GROUP BY scope, domain`,
         [projectId, windowStart, asOf],
@@ -108,26 +139,6 @@ export async function refreshProjectSourceIndex(tx: ClientBase, projectId: strin
       topUrls.set(key, list);
     }
 
-    // Classification is a property of the domain, not the scope — decide it once.
-    const classByDomain = new Map<string, { sourceClass: string; seedable: boolean }>();
-    for (const agg of aggs) {
-      if (classByDomain.has(agg.domain)) continue;
-      const sourceClass = agg.is_competitor ? "vendor_owned" : (agg.source_class ?? classifyDomain(agg.domain));
-      classByDomain.set(agg.domain, { sourceClass, seedable: isSeedableSourceClass(sourceClass, agg.is_competitor) });
-    }
-    const domainIds = new Map<string, string>();
-    for (const [domain, cls] of classByDomain) {
-      const res = await tx.query<{ id: string }>(
-        `INSERT INTO source_domains (workspace_id, domain, display_name, source_class, is_seedable)
-         VALUES ($1,$2,$2,$3,$4)
-         ON CONFLICT (workspace_id, domain) DO UPDATE
-           SET source_class = EXCLUDED.source_class, is_seedable = EXCLUDED.is_seedable, last_seen_at = now(), updated_at = now()
-         RETURNING id`,
-        [workspaceId, domain, cls.sourceClass, cls.seedable],
-      );
-      domainIds.set(domain, res.rows[0]!.id);
-    }
-
     for (const scope of new Set(aggs.map((a) => a.scope))) {
       const inScope = aggs.filter((a) => a.scope === scope);
       const weights = sourceContextWeights(
@@ -140,16 +151,18 @@ export async function refreshProjectSourceIndex(tx: ClientBase, projectId: strin
       for (const [index, { agg, weight }] of ranked.entries()) {
         const cls = classByDomain.get(agg.domain)!;
         const verified = carried.get(agg.domain);
-        const severity = gapSeverity({ contextWeight: weight, brandPresent: verified?.present ?? null, isSeedable: cls.seedable });
+        const seedable = isSeedableSourceClass(cls.ownClass, cls.competitor);
+        const severity = gapSeverity({ contextWeight: weight, brandPresent: verified?.present ?? null, isSeedable: seedable });
         await tx.query(
           `INSERT INTO project_source_index
              (workspace_id, project_id, source_domain_id, engine_key, window_start, window_days, citation_count, distinct_prompts,
-              distinct_urls, avg_position_weight, context_weight, rank_position, brand_present_on_domain, verified_at, gap_severity, top_urls)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)`,
+              distinct_urls, avg_position_weight, context_weight, rank_position, brand_present_on_domain, verified_at, gap_severity, top_urls,
+              is_competitor_owned, scoring_version)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18)`,
           [
-            workspaceId, projectId, domainIds.get(agg.domain), scope, windowStart, windowDays, agg.citation_count, agg.distinct_prompts,
+            workspaceId, projectId, cls.domainId, scope, windowStart, windowDays, agg.citation_count, agg.distinct_prompts,
             agg.distinct_urls, agg.avg_weight, weight, index + 1, verified?.present ?? null, verified?.verifiedAt ?? null, severity,
-            JSON.stringify(topUrls.get(`${scope}\u0000${agg.domain}`) ?? []),
+            JSON.stringify(topUrls.get(`${scope}\u0000${agg.domain}`) ?? []), cls.competitor, SCORING_VERSION,
           ],
         );
         written += 1;

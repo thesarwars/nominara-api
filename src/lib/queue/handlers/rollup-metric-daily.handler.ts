@@ -4,6 +4,7 @@ import type { ClientBase } from "pg";
 import { z } from "zod";
 import { denormalizeProject } from "../../rollup/denormalize.js";
 import { datesWithFacts } from "../../rollup/aggregate-day.js";
+import { refreshProjectSourceIndex } from "../../rollup/refresh-project-source-index.js";
 import { rollUpDay } from "../../rollup/roll-up-day.js";
 import { withProjectQueueLock } from "../locks.js";
 import type { QueueHandlerContext } from "../handlers.js";
@@ -78,6 +79,12 @@ export function createRollupMetricDailyHandler(_context: QueueHandlerContext): J
       // project row N times for one rebuild and leave it holding whichever
       // date happened to be last rather than the most recent one.
       await denormalizeProject(tx, payload.projectId, timezone);
+
+      // NEW-C-4 — the Source Citation Index (and source_coverage) is derived
+      // from citation_facts; recompute it here, inside the same tenant
+      // transaction and lock, so it never serves a stale or seeded index. It
+      // reads only this database: no network call.
+      await refreshProjectSourceIndex(tx, payload.projectId, await localToday(tx, timezone));
     });
   };
 }

@@ -139,7 +139,9 @@ export class SourcesService {
   private async rows(tx: ClientBase, projectId: string, days: number): Promise<IndexRow[]> {
     return (
       await tx.query<IndexRow>(
-        `SELECT sd.domain, sd.source_class, sd.is_seedable, psi.context_weight::float8 AS context_weight, psi.citation_count,
+        `SELECT sd.domain,
+                CASE WHEN psi.is_competitor_owned THEN 'vendor_owned' ELSE sd.source_class END AS source_class,
+                (sd.is_seedable AND NOT psi.is_competitor_owned) AS is_seedable, psi.context_weight::float8 AS context_weight, psi.citation_count,
                 psi.distinct_prompts, psi.brand_present_on_domain, psi.gap_severity, psi.top_urls,
                 to_char(psi.verified_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS verified_at,
                 to_char(psi.window_start, 'YYYY-MM-DD') AS window_start,
