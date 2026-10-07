@@ -205,10 +205,13 @@ describe("NEW-C-1 · competitor panel", () => {
     const rows = (await panel()).rows;
     const me = rows.find((r) => r.is_brand)!;
     const sf = rows.find((r) => r.label === "Salesforce")!;
-    expect(me.sov).toBeCloseTo(0.55, 9);
-    expect(sf.sov).toBeCloseTo(0.4, 9);
-    expect(me.category_share).toBeCloseTo(0.55 / 0.95, 9);
-    expect(sf.category_share).toBeCloseTo(0.4 / 0.95, 9);
+    // `mention_facts.prominence` is a float4 column, so 0.6 is stored as
+    // 0.60000002…: the inputs carry ~1e-8 of storage error, and 6 digits is
+    // the precision the fixture can deliver, not a loosened assertion.
+    expect(me.sov).toBeCloseTo(0.55, 6);
+    expect(sf.sov).toBeCloseTo(0.4, 6);
+    expect(me.category_share).toBeCloseTo(0.55 / 0.95, 6);
+    expect(sf.category_share).toBeCloseTo(0.4 / 0.95, 6);
     expect(me.category_share).not.toBeCloseTo(me.sov!, 3);
   });
 
@@ -250,7 +253,7 @@ describe("NEW-C-1 · competitor panel", () => {
     await addCell([brand(0.6)], { daysAgo: 2 });
     await addCell([brand(0.5), compMention(compA, "Salesforce", 0.5)], { daysAgo: 1 });
     const me = (await panel()).rows.find((r) => r.is_brand)!;
-    expect(me.detection_variance["chatgpt"]).toBeCloseTo(Math.SQRT1_2 / 2, 9);
+    expect(me.detection_variance["chatgpt"]).toBeCloseTo(Math.SQRT1_2 / 2, 6);
     // One measured day cannot have a variance: null, not 0.
     expect(me.detection_variance["gemini"]).toBeNull();
   });
