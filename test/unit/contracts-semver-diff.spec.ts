@@ -393,6 +393,43 @@ describe("NEW-A-5 · contracts:diff recurses into nested object and array-item s
     expect(deriveSemverBump(previous, current)).toBe("major");
   });
 
+  it("NEW-A-5 · a NULLABLE field (anyOf with null) whose enum gains a value is patch, like a bare enum", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo", "mixed"] }, { type: "null" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("patch");
+  });
+
+  it("NEW-A-5 · a nullable field's enum LOSING a value is major", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo", "mixed"] }, { type: "null" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 · a field that becomes nullable (a branch appears) stays major", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = { type: "string", enum: ["live", "demo"] };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
   it("NEW-A-5 · an unchanged nested document is none", () => {
     const previous = nestedDocument();
     expect(deriveSemverBump(previous, deepClone(previous))).toBe("none");
