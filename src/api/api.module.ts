@@ -9,6 +9,7 @@ import { WorkspacesModule } from "../modules/workspaces/workspaces.module.js";
 import { ProjectsModule } from "../modules/projects/projects.module.js";
 import { PromptsModule } from "../modules/prompts/prompts.module.js";
 import { TrackingModule } from "../modules/tracking/tracking.module.js";
+import { ReportsModule } from "../modules/reports/reports.module.js";
 import { AnalyticsModule } from "../modules/analytics/analytics.module.js";
 import { AuxModule } from "../modules/aux/aux.module.js";
 import { TasksModule } from "../modules/tasks/tasks.module.js";
@@ -72,6 +73,7 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     DisplacementModule,
     IntegrationsModule,
     AgencyModule,
+    ReportsModule,
     PortalModule,
     ToolsModule,
     BillingModule,
