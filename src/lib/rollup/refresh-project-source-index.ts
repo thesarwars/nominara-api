@@ -71,6 +71,7 @@ export async function refreshProjectSourceIndex(tx: ClientBase, projectId: strin
   // fact and lives on `project_source_index.is_competitor_owned`.
   const widest = Math.max(...SOURCE_INDEX_WINDOWS);
   const widestStart = (await tx.query<{ d: string }>(`SELECT to_char($1::date - $2::int, 'YYYY-MM-DD') AS d`, [asOf, widest])).rows[0]!.d;
+  // ORDER BY domain below: a fixed visiting order for the shared source_domains upsert, so two projects of one workspace cannot deadlock.
   const domainFacts = (
     await tx.query<{ domain: string; is_competitor: boolean; source_class: string | null }>(
       `SELECT domain, bool_or(is_competitor) AS is_competitor,
@@ -78,7 +79,8 @@ export async function refreshProjectSourceIndex(tx: ClientBase, projectId: strin
          FROM citation_facts
         WHERE project_id = $1 AND NOT is_owned AND http_status IS NOT NULL
           AND captured_at >= $2::date AND captured_at < ($3::date + 1)
-        GROUP BY domain`,
+        GROUP BY domain
+        ORDER BY domain`,
       [projectId, widestStart, asOf],
     )
   ).rows;

@@ -1,13 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { SCORING_VERSION } from "../../src/lib/scoring/index.js";
 import { refreshProjectSourceIndex } from "../../src/lib/rollup/refresh-project-source-index.js";
 
 // NEW-C-4 / STORY-054 scenarios 1-4, 8-11 (scenarios 5-7, the fetch
 // verification, belong to NEW-C-15).
+
+// A version that is NOT the column default ('v1'), so a writer that hard-codes the
+// default instead of stamping SCORING_VERSION fails the version test below.
+vi.mock("../../src/lib/scoring/index.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/lib/scoring/index.js")>()),
+  SCORING_VERSION: "v-audit-test",
+}));
 
 const TODAY = "2026-10-07";
 const promptUuid = (name: string): string => {
@@ -182,6 +189,22 @@ describe("NEW-C-4 · refreshProjectSourceIndex", () => {
     expect(row!.gap_severity).toBe("medium");
   });
 
+  it("audit #1 · a verified-absent, high-influence COMPETITOR-owned domain in a seedable class is never critical/high, and coverage reflects it", async () => {
+    for (let i = 0; i < 6; i++) await cite({ domain: "rival.example", prompt: `p${i}`, competitor: true, sourceClass: "community_forum" });
+    await run();
+    await db.query("UPDATE project_source_index SET brand_present_on_domain=false, verified_at=now() WHERE project_id=$1", [projectId]);
+    await run();
+    const all = await rows("psi.window_days=30 AND psi.engine_key='all'");
+    expect(all).toHaveLength(1);
+    expect(all[0]!.is_seedable).toBe(false);
+    expect(all[0]!.gap_severity).toBe("medium");
+    const every = await rows();
+    expect(every.length).toBeGreaterThan(1);
+    for (const r of every) expect(["critical", "high"], `${r.engine_key}/${r.window_days}`).not.toContain(r.gap_severity);
+    const cov = await db.query("SELECT source_coverage::float8 AS c FROM projects WHERE id=$1", [projectId]);
+    expect(cov.rows[0].c).toBeCloseTo(100, 3);
+  });
+
   it("STORY-054 #10 · a recompute replaces rows and drops domains that left the window", async () => {
     await cite({ domain: "a.example", prompt: "p1" });
     await cite({ domain: "b.example", prompt: "p1" });
@@ -257,7 +280,8 @@ describe("NEW-C-4 · refreshProjectSourceIndex", () => {
     await cite({ domain: "a.example", prompt: "p1" });
     await run();
     const r = await db.query("SELECT DISTINCT scoring_version FROM project_source_index WHERE project_id=$1", [projectId]);
-    expect(r.rows).toEqual([{ scoring_version: SCORING_VERSION }]);
+    expect(SCORING_VERSION).toBe("v-audit-test");
+    expect(r.rows).toEqual([{ scoring_version: "v-audit-test" }]);
   });
 
   it("audit #3 · source_coverage is NULL while ANY domain in the window is unverified (partial verification is not 'no gap')", async () => {

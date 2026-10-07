@@ -122,11 +122,13 @@ describe("NEW-C-7 · sources read and playbook", () => {
       `INSERT INTO competitors (id,workspace_id,project_id,name,root_domain,aliases,source) VALUES ($1,$2,$3,'Rival','rival.com',ARRAY[]::text[],'user')`,
       [randomUUID(), workspaceId, projectId],
     );
-    await cite({ domain: "rival.com", prompt: "p1", competitor: true });
+    // community_forum is a seedable class: only the competitor flag can make it non-seedable.
+    await cite({ domain: "rival.com", prompt: "p1", competitor: true, sourceClass: "community_forum" });
     await refresh();
     const res = await index();
     expect(res.domains[0]!.competitors_present).toEqual(["Rival"]);
     expect(res.domains[0]!.seedable).toBe(false);
+    expect(res.domains[0]!.source_class).toBe("vendor_owned");
     expect(res.source_coverage === null || typeof res.source_coverage === "number").toBe(true);
   });
 
@@ -178,10 +180,31 @@ describe("NEW-C-7 · sources read and playbook", () => {
   });
 
   it("STORY-055 #3 / FR-SR-03a · no playbook (409) for a non-seedable domain", async () => {
-    await cite({ domain: "rival.com", prompt: "p1", competitor: true });
+    // Seedable class + verified absent + critical severity: only the competitor-owned
+    // read (is_seedable AND NOT is_competitor_owned) can refuse this playbook.
+    await cite({ domain: "rival.com", prompt: "p1", competitor: true, sourceClass: "community_forum" });
     await refresh();
     await verify("rival.com", false);
+    const row = (await index()).domains.find((d) => d.domain === "rival.com")!;
+    expect(row).toMatchObject({ seedable: false, source_class: "vendor_owned", brand_present: false });
     await expect(playbook("rival.com")).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("STORY-055 #3 / FR-SR-03a · the same forum, not competitor-owned, DOES get a playbook (the 409 above is the competitor flag)", async () => {
+    await cite({ domain: "rival.com", prompt: "p1", sourceClass: "community_forum" });
+    await refresh();
+    await verify("rival.com", false);
+    expect((await index()).domains[0]).toMatchObject({ seedable: true, source_class: "community_forum" });
+    await expect(playbook("rival.com")).resolves.toMatchObject({ template_slug: "playbook-community_forum" });
+  });
+
+  it("FR-SR-03a · the playbook gate checks seedability itself: a templated class on a domain flagged non-seedable is refused even at critical", async () => {
+    await cite({ domain: "reddit.com", prompt: "p1" });
+    await refresh();
+    await verify("reddit.com", false);
+    await db.query("UPDATE source_domains SET is_seedable=false WHERE domain='reddit.com'");
+    expect((await index()).domains[0]).toMatchObject({ source_class: "community_forum", seedable: false, gap_severity: "critical" });
+    await expect(playbook("reddit.com")).rejects.toMatchObject({ code: "conflict" });
   });
 
   it("FR-SR-03a · 409 when the gap is not critical/high (brand present), and when presence is unverified", async () => {

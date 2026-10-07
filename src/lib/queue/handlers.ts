@@ -7,6 +7,7 @@ import { createCreditReconcileHandler } from "./handlers/credit-reconcile.handle
 import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
 import { createIdentitySweepUnverifiedHandler } from "./handlers/identity-sweep-unverified.handler.js";
 import { createMaintenancePartitionHandler } from "./handlers/maintenance-partition.handler.js";
+import { createCrawlAuditHandler } from "./handlers/crawl-audit.handler.js";
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { createRollupMetricDailyHandler } from "./handlers/rollup-metric-daily.handler.js";
 import { QUEUE_TOPOLOGY } from "./topology.js";
@@ -82,6 +83,7 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
 export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "crawl.discover": (context) => createCrawlDiscoverHandler(context),
   "capture.plan": (context) => createCapturePlanHandler(context),
+  "crawl.audit": (context) => createCrawlAuditHandler(context),
   "capture.execute": (context) => createCaptureExecuteHandler(context),
   "capture.parse": (context) => createCaptureParseHandler(context),
   "rollup.metric_daily": (context) => createRollupMetricDailyHandler(context),
