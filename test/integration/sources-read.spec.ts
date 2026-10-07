@@ -198,6 +198,15 @@ describe("NEW-C-7 · sources read and playbook", () => {
     await expect(playbook("rival.com")).resolves.toMatchObject({ template_slug: "playbook-community_forum" });
   });
 
+  it("FR-SR-03a · the playbook gate checks seedability itself: a templated class on a domain flagged non-seedable is refused even at critical", async () => {
+    await cite({ domain: "reddit.com", prompt: "p1" });
+    await refresh();
+    await verify("reddit.com", false);
+    await db.query("UPDATE source_domains SET is_seedable=false WHERE domain='reddit.com'");
+    expect((await index()).domains[0]).toMatchObject({ source_class: "community_forum", seedable: false, gap_severity: "critical" });
+    await expect(playbook("reddit.com")).rejects.toMatchObject({ code: "conflict" });
+  });
+
   it("FR-SR-03a · 409 when the gap is not critical/high (brand present), and when presence is unverified", async () => {
     await cite({ domain: "reddit.com", prompt: "p1" });
     await cite({ domain: "g2.com", prompt: "p1" });
