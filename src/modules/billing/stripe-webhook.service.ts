@@ -11,6 +11,7 @@ import {
   STRIPE_GATEWAY,
   type FetchedStripeObject,
   type StripeGateway,
+  type StripeObjectKind,
   type VerifiedStripeEvent,
 } from "../../lib/billing/stripe/stripe-gateway.js";
 import { claimWebhookEvent, webhookEventSeen } from "../../lib/billing/stripe/webhook-events.js";
@@ -20,6 +21,12 @@ import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { STRIPE_EVENT_HANDLERS, type StripeEventHandler } from "./stripe-event-handler.js";
 
 const workspaceIdSchema = z.uuid();
+
+function subscriptionIdOf(value: unknown): string | null {
+  if (typeof value === "string" && value.length > 0) return value;
+  if (value !== null && typeof value === "object" && typeof (value as { id?: unknown }).id === "string") return (value as { id: string }).id;
+  return null;
+}
 
 // NEW-D-2 — STORY-075's webhook ingress. The order below is the design:
 //
@@ -88,16 +95,19 @@ export class StripeWebhookService {
 
     if (await this.alreadySeen(event.id)) return { received: true, outcome: "duplicate" };
 
-    let object: FetchedStripeObject | null;
-    try {
-      object = await this.gateway.fetchObject(kind, event.objectId);
-    } catch (error) {
-      if (!(error instanceof StripeUpstreamError)) throw error;
-      // Real failure, nothing recorded: let Stripe retry.
-      this.logger.error({ message: "stripe re-fetch failed", event_id: event.id, event_type: event.type, status: error.statusCode });
-      throw new DegradedError({ message: "payment provider is unavailable" });
-    }
+    let object = await this.fetch(event, kind, event.objectId);
     if (object === null) return await this.acknowledgeOnly(event, "stripe has no such object");
+
+    // STORY-075a — a completed subscription-mode Checkout is a POINTER to the
+    // subscription, which holds the state and the workspace metadata. Follow
+    // it, still outside any transaction. Payment-mode sessions (credit packs,
+    // STORY-076a) are left exactly as fetched.
+    if (object.kind === "checkout_session" && object.raw.mode === "subscription") {
+      const subscriptionId = subscriptionIdOf(object.raw.subscription);
+      if (subscriptionId === null) return await this.acknowledgeOnly(event, "checkout session carries no subscription");
+      object = await this.fetch(event, "subscription", subscriptionId);
+      if (object === null) return await this.acknowledgeOnly(event, "stripe has no such subscription");
+    }
 
     const parsed = workspaceIdSchema.safeParse(object.metadata.workspace_id);
     if (!parsed.success) return await this.acknowledgeOnly(event, "object carries no resolvable workspace_id");
@@ -121,6 +131,17 @@ export class StripeWebhookService {
       });
     } finally {
       client.release();
+    }
+  }
+
+  /** The re-fetch. A Stripe outage is a real failure: nothing is recorded and Stripe retries. */
+  private async fetch(event: VerifiedStripeEvent, kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null> {
+    try {
+      return await this.gateway.fetchObject(kind, objectId);
+    } catch (error) {
+      if (!(error instanceof StripeUpstreamError)) throw error;
+      this.logger.error({ message: "stripe re-fetch failed", event_id: event.id, event_type: event.type, status: error.statusCode });
+      throw new DegradedError({ message: "payment provider is unavailable" });
     }
   }
 

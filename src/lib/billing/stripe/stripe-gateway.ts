@@ -35,6 +35,30 @@ export interface FetchedStripeObject {
   readonly raw: Readonly<Record<string, unknown>>;
 }
 
+/**
+ * STORY-075a — everything Stripe needs to host a subscription checkout. Built
+ * by the service from OUR plan catalog and the caller's workspace; the client
+ * supplies neither a price nor a redirect.
+ */
+export interface SubscriptionCheckoutInput {
+  readonly workspaceId: string;
+  readonly planKey: string;
+  readonly billingInterval: "monthly" | "annual";
+  readonly productName: string;
+  /** Integer minor units, from the plan's `numeric(12,2)` price. Never a float. */
+  readonly unitAmountCents: number;
+  readonly currency: string;
+  /** An existing Stripe customer to reuse, or undefined to let Checkout create one. */
+  readonly customerId?: string;
+  readonly successUrl: string;
+  readonly cancelUrl: string;
+}
+
+export interface HostedSession {
+  readonly id: string;
+  readonly url: string;
+}
+
 export interface StripeGateway {
   /** False when the secret key or the webhook secret is absent; Stripe routes then answer 503. */
   isConfigured(): boolean;
@@ -45,6 +69,17 @@ export interface StripeGateway {
    * (default tolerance 300 s). Never returns an unverified event.
    */
   verifyWebhook(rawBody: Buffer, signatureHeader: string | undefined): VerifiedStripeEvent;
+
+  /**
+   * Hosted Checkout, mode=subscription. Sets `client_reference_id` and
+   * `subscription_data.metadata.workspace_id` — the metadata the webhook reads
+   * back from the FRESHLY FETCHED subscription to find the workspace. No card
+   * data touches this system. Throws `StripeUpstreamError`.
+   */
+  createSubscriptionCheckout(input: SubscriptionCheckoutInput): Promise<HostedSession>;
+
+  /** Hosted billing portal for an existing customer. Throws `StripeUpstreamError`. */
+  createPortalSession(input: { readonly customerId: string; readonly returnUrl: string }): Promise<{ readonly url: string }>;
 
   /** `null` when Stripe has no such object (deleted, or a test-mode id at a live endpoint). */
   fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null>;

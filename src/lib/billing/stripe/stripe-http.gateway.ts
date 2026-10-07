@@ -3,8 +3,10 @@ import {
   StripeSignatureError,
   StripeUpstreamError,
   type FetchedStripeObject,
+  type HostedSession,
   type StripeGateway,
   type StripeObjectKind,
+  type SubscriptionCheckoutInput,
   type VerifiedStripeEvent,
 } from "./stripe-gateway.js";
 
@@ -42,7 +44,7 @@ export class StripeHttpGateway implements StripeGateway {
     this.webhookSecret = config.webhookSecret;
     // maxNetworkRetries: 0 — the webhook handler's own at-least-once redelivery
     // is the retry; a hidden SDK retry loop inside a request would stack on it.
-    this.client = config.secretKey === undefined ? undefined : new Stripe(config.secretKey, { maxNetworkRetries: 0 });
+    this.client = config.secretKey === undefined ? undefined : new Stripe(config.secretKey, { maxNetworkRetries: 0, timeout: 10_000 });
   }
 
   isConfigured(): boolean {
@@ -66,13 +68,72 @@ export class StripeHttpGateway implements StripeGateway {
     return { id: event.id, type: event.type, objectId: object.id };
   }
 
+  async createSubscriptionCheckout(input: SubscriptionCheckoutInput): Promise<HostedSession> {
+    const client = this.requireClient();
+    try {
+      const session = await client.checkout.sessions.create({
+        mode: "subscription",
+        client_reference_id: input.workspaceId,
+        ...(input.customerId === undefined ? {} : { customer: input.customerId }),
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: input.currency.toLowerCase(),
+              unit_amount: input.unitAmountCents,
+              recurring: { interval: input.billingInterval === "annual" ? "year" : "month" },
+              // `nominara_kind` is how the reconciler tells the plan item from
+              // an add-on item on the fetched subscription (STORY-076b).
+              product_data: { name: input.productName, metadata: { nominara_kind: "plan" } },
+            },
+          },
+        ],
+        // The workspace is found from THIS metadata on the re-fetched
+        // subscription — never from an event payload.
+        subscription_data: {
+          metadata: { workspace_id: input.workspaceId, plan_key: input.planKey, billing_interval: input.billingInterval },
+        },
+        metadata: { workspace_id: input.workspaceId },
+        success_url: input.successUrl,
+        cancel_url: input.cancelUrl,
+      });
+      if (typeof session.url !== "string") throw new StripeUpstreamError(undefined);
+      return { id: session.id, url: session.url };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async createPortalSession(input: { readonly customerId: string; readonly returnUrl: string }): Promise<{ readonly url: string }> {
+    const client = this.requireClient();
+    try {
+      const session = await client.billingPortal.sessions.create({ customer: input.customerId, return_url: input.returnUrl });
+      return { url: session.url };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  private requireClient(): Stripe {
+    if (this.client === undefined) throw new StripeUpstreamError(undefined);
+    return this.client;
+  }
+
+  private asUpstream(error: unknown): StripeUpstreamError {
+    if (error instanceof StripeUpstreamError) return error;
+    const status = (error as { statusCode?: unknown }).statusCode;
+    return new StripeUpstreamError(typeof status === "number" ? status : undefined);
+  }
+
   async fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null> {
     const client = this.client;
     if (client === undefined) throw new StripeUpstreamError(undefined);
     try {
       switch (kind) {
         case "subscription": {
-          const object = await client.subscriptions.retrieve(objectId);
+          // The product is expanded so the reconciler can tell the plan item
+          // from add-on items (`product.metadata.nominara_kind`).
+          const object = await client.subscriptions.retrieve(objectId, { expand: ["items.data.price.product"] });
           return this.shape(kind, object);
         }
         case "checkout_session": {

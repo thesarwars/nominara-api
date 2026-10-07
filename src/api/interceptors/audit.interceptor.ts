@@ -88,6 +88,14 @@ function resourceIdFromResponse(body: unknown, resourceType: string): string | n
 function resolveResourceId(req: AuditableRequest, options: AuditOptions, responseBody: unknown): string {
   const routeLabel = `action "${options.action}" (resourceType "${options.resourceType}")`;
 
+  if (options.resourceIdFrom === "workspace") {
+    const workspaceId = currentTenantStore()?.context.workspaceId;
+    if (workspaceId === undefined) {
+      throw new AuditResourceIdUnresolvedError(`AuditInterceptor: ${routeLabel} declares resourceIdFrom: "workspace" but no tenant context is active`);
+    }
+    return workspaceId;
+  }
+
   if (options.resourceIdFrom === "response") {
     const raw = resourceIdFromResponse(responseBody, options.resourceType);
     if (raw === null) {

@@ -3,7 +3,9 @@ import {
   StripeSignatureError,
   type FetchedStripeObject,
   type StripeGateway,
+  type HostedSession,
   type StripeObjectKind,
+  type SubscriptionCheckoutInput,
   type VerifiedStripeEvent,
 } from "../../src/lib/billing/stripe/stripe-gateway.js";
 
@@ -49,6 +51,21 @@ export class FakeStripeGateway implements StripeGateway {
     if (Math.abs(this.now() / 1000 - t) > 300) throw new StripeSignatureError();
     const event = JSON.parse(rawBody.toString("utf8")) as { id: string; type: string; data: { object: { id: string } } };
     return { id: event.id, type: event.type, objectId: event.data.object.id };
+  }
+
+  readonly checkouts: SubscriptionCheckoutInput[] = [];
+  readonly portals: Array<{ customerId: string; returnUrl: string }> = [];
+
+  createSubscriptionCheckout(input: SubscriptionCheckoutInput): Promise<HostedSession> {
+    if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
+    this.checkouts.push(input);
+    return Promise.resolve({ id: `cs_test_${String(this.checkouts.length)}`, url: `https://checkout.stripe.test/c/pay/cs_test_${String(this.checkouts.length)}` });
+  }
+
+  createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }> {
+    if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
+    this.portals.push(input);
+    return Promise.resolve({ url: `https://billing.stripe.test/p/session_${input.customerId}` });
   }
 
   fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null> {
