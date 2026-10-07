@@ -110,6 +110,34 @@ describe("NEW-D-4 · API keys over HTTP", () => {
   const errorOf = (res: { json(): unknown }) => (res.json() as { error: { code: string; details?: Record<string, unknown> } }).error;
   type Created = { key: { id: string; key_prefix: string; name: string; permissions: string[]; revoked_at: string | null }; secret: string };
 
+  it("NEW-D-4 audit · an admin cannot mint a key holding owner-only permissions, and nothing is stored", async () => {
+    const o = await owner("business");
+    const admin = await member(o.workspaceId, "admin");
+    for (const permissions of [["workspace:delete"], ["workspace:transfer_ownership"], ["project:read", "workspace:delete", "member:update_role"]]) {
+      const res = await create(admin, payload({ permissions }));
+      expect([400, 403], res.body).toContain(res.statusCode);
+    }
+    const count = (await harness.db().query(`SELECT count(*)::int AS n FROM api_keys WHERE workspace_id = $1`, [o.workspaceId])).rows[0] as { n: number };
+    expect(count.n).toBe(0);
+  }, 60_000);
+
+  it("NEW-D-4 audit · an admin may grant a key permissions the admin holds without step-up (the allowed path still works)", async () => {
+    const o = await owner("business");
+    const admin = await member(o.workspaceId, "admin");
+    const res = await create(admin, payload({ permissions: ["project:read", "member:update_role"] }));
+    expect(res.statusCode, res.body).toBe(201);
+  }, 60_000);
+
+  it("NEW-D-4 audit · nobody, owner included, can put a step-up-gated permission on a key that can never step up", async () => {
+    const o = await owner("business");
+    for (const permission of ["workspace:delete", "workspace:transfer_ownership", "sso:configure", "agency:custom_domain", "export:data"]) {
+      const res = await create(o, payload({ permissions: ["project:read", permission] }));
+      expect([400, 403], `${permission}: ${res.body}`).toContain(res.statusCode);
+    }
+    const count = (await harness.db().query(`SELECT count(*)::int AS n FROM api_keys WHERE workspace_id = $1`, [o.workspaceId])).rows[0] as { n: number };
+    expect(count.n).toBe(0);
+  }, 60_000);
+
   it("NEW-D-4 AC2/AC3 · create returns the secret once; only sha256(secret) and a 12-char prefix are stored", async () => {
     const a = await owner("business");
     const res = await create(a);

@@ -90,3 +90,13 @@ describe("NEW-D-4 AC6 · @Audit({ severity }) reaches the audit row", () => {
     expect(input).toMatchObject({ action: "api_key.created", severity: "warning", resourceId: "0195e5b7-0000-7000-8000-000000000001" });
   });
 });
+
+describe("NEW-D-4 audit · grantable permissions", () => {
+  it("NEW-D-4 audit · no step-up-gated permission is in the published grantable set", async () => {
+    const { PERMISSION_MATRIX, ROLES } = await import("../../tenancy/permission-matrix.js");
+    const { GRANTABLE_API_KEY_PERMISSIONS } = await import("../../../contracts/workspaces/api-key.schema.js");
+    for (const p of GRANTABLE_API_KEY_PERMISSIONS) {
+      for (const r of ROLES) expect(PERMISSION_MATRIX[p as keyof typeof PERMISSION_MATRIX][r].stepUp, `${p}/${r}`).toBe(false);
+    }
+  });
+});

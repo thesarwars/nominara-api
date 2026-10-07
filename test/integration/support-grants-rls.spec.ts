@@ -159,6 +159,27 @@ describe("NEW-D-5 · support grants under RLS, as nominara_app", () => {
     expect((await admin.query("SELECT count(*)::int AS n FROM support_grants")).rows[0]).toEqual({ n: 0 });
   });
 
+  const rawInsert = (a: string, u1: string, u2: string, minutes: number) => (tx: import("pg").ClientBase) =>
+    tx.query(
+      "INSERT INTO support_grants (workspace_id, requested_by, approved_by, scope, justification, ticket_ref, expires_at) VALUES ($1,$2,$3,'metadata','j','T', now() + make_interval(mins => $4::int)) RETURNING id",
+      [a, u1, u2, minutes],
+    );
+
+  it("NEW-D-5 audit · the 4 h ceiling is in the schema: a direct 241-minute INSERT as nominara_app is refused with 23514", async () => {
+    const [a, u1, u2] = [await workspace(), await user(), await user()];
+    await expect(inTenantTx(a, (tx) => rawInsert(a, u1, u2, 241)(tx))).rejects.toMatchObject({ code: "23514" });
+    await expect(inTenantTx(a, (tx) => rawInsert(a, u1, u2, 240)(tx))).resolves.toBeDefined();
+    expect((await admin.query("SELECT count(*)::int AS n FROM support_grants")).rows[0]).toEqual({ n: 1 });
+  });
+
+  it("NEW-D-5 audit · nominara_app cannot extend a grant: UPDATE of expires_at or created_at is refused (42501); revoking still works", async () => {
+    const [a, u1, u2] = [await workspace(), await user(), await user()];
+    const g = await inTenantTx(a, (tx) => grantSupportAccess(tx, input(a, u1, u2, { ttl_minutes: 60 })));
+    await expect(inTenantTx(a, (tx) => tx.query("UPDATE support_grants SET expires_at = now() + interval '10 hours' WHERE id = $1", [g.id]))).rejects.toMatchObject({ code: "42501" });
+    await expect(inTenantTx(a, (tx) => tx.query("UPDATE support_grants SET created_at = now() + interval '10 hours' WHERE id = $1", [g.id]))).rejects.toMatchObject({ code: "42501" });
+    await expect(inTenantTx(a, (tx) => revokeSupportAccess(tx, { workspaceId: a, grantId: g.id, operator: "alice" }))).resolves.toEqual({ revoked: true });
+  });
+
   it("NEW-D-5 AC2 · expires_at is now() + the TTL, computed by the database clock", async () => {
     const [a, u1, u2] = [await workspace(), await user(), await user()];
     const g = await inTenantTx(a, (tx) => grantSupportAccess(tx, input(a, u1, u2, { ttl_minutes: 240 })));
