@@ -88,7 +88,7 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | **403** | **`entitlement_exceeded`** | A **structural** plan limit is reached — projects, prompts, seats, competitors, share tokens, API keys. `details.{key, limit, current}` plus upgrade/add-on remediation |
 | **403** | **`feature_not_in_plan`** | A **feature flag** entitlement is absent — white-label, Search Console, SSO, CSV export, share links, drift sampling. `details.{key, min_plan}` |
 | 404 | `not_found` | Resource absent **within the caller's tenant** |
-| 409 | `conflict` | `If-Match` mismatch, unique violation, or state-machine violation (`details.current_state`) |
+| 409 | `conflict` | `If-Match` mismatch, unique violation, or state-machine violation (`details.current_state`). Accepting an invitation as an existing member carries `details.reason` — `already_member` or `member_suspended` — and consumes nothing |
 | 409 | `idempotency_conflict` | Same key, different body |
 | **409** | **`workspace_limit_reached`** | A user may own only one workspace. `details.{owned_workspace_id, owned_workspace_name}` plus the transfer path. **Joining by invitation never hits this** |
 | **409** | **`price_changed`** | `X-Nominara-Confirmed-Credits` does not match the server's current price. `details.{shown, recomputed, reason}`; the client re-presents the modal |

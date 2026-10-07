@@ -40,3 +40,7 @@ export {
   acceptInvitationRequestSchema,
   type AcceptInvitationRequest,
 } from "../../../../contracts/workspaces/accept-invitation-request.schema.js";
+export {
+  acceptInvitationParamsSchema,
+  type AcceptInvitationParams,
+} from "../../../../contracts/workspaces/accept-invitation-params.schema.js";

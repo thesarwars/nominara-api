@@ -197,7 +197,17 @@ export const featureNotInPlanDetailsSchema = z
 // §2: "`If-Match` mismatch, unique violation, or state-machine violation
 // (`details.current_state`)" — three conditions under one code, and only the
 // third carries a state, hence optional.
-export const conflictDetailsSchema = z.object({ current_state: z.string().min(1).optional() }).strict();
+//
+// STORY-172 — `reason` names WHICH state conflict an invitation acceptance hit,
+// and is reachable only by the invited, verified account (see
+// security-and-tenancy.md, "Forwarded invitation link"). Closed enum: a new
+// reason is a contract change, not a free-form string.
+export const conflictDetailsSchema = z
+  .object({
+    current_state: z.string().min(1).optional(),
+    reason: z.enum(["member_suspended", "already_member"]).optional(),
+  })
+  .strict();
 
 // §2: "A user may own only one workspace. `details.{owned_workspace_id,
 // owned_workspace_name}` plus the transfer path." The NAME is included on

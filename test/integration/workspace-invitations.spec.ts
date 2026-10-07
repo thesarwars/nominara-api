@@ -16,6 +16,7 @@ import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { hashInvitationToken } from "../../src/lib/auth/invitation-token.js";
 import { InvitationInvalidException } from "../../src/tenancy/errors.js";
+import { ConflictError } from "../../src/api/errors/domain-errors.js";
 
 // STORY-021 — Test Scenarios 10, 11, 12 (E-6/E-7). Real Postgres: E-7's
 // uniform-timing claim can only be measured honestly against real query
@@ -89,6 +90,17 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
 
   async function createUser(email = `user-${randomUUID()}@example.com`): Promise<string> {
     const result = await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [email]);
+    return result.rows[0]!.id;
+  }
+
+  // STORY-172 — accept() only honours an account whose VERIFIED email matches
+  // the invitation, so every acceptor in this file is a verified account whose
+  // address is the one that was invited.
+  async function createVerifiedUser(email: string): Promise<string> {
+    const result = await db.query<{ id: string }>(
+      "INSERT INTO users (email, status, email_verified_at) VALUES ($1, 'active', now()) RETURNING id",
+      [email],
+    );
     return result.rows[0]!.id;
   }
 
@@ -240,7 +252,8 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
     const targetWorkspace = await workspaces.create(inviterOwnerId, { name: `Target ${randomUUID()}` }, meta);
 
     // The invitee already owns their own free-plan (zero-project) workspace.
-    const inviteeId = await createUser();
+    const inviteeEmail = `invitee-${randomUUID()}@example.com`;
+    const inviteeId = await createVerifiedUser(inviteeEmail);
     const inviteeOwnWorkspace = await workspaces.create(inviteeId, { name: `Invitee Own ${randomUUID()}` }, meta);
     const beforeSubscription = await db.query(
       "SELECT plan_key, status, current_period_end FROM subscriptions WHERE workspace_id = $1",
@@ -253,16 +266,13 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
     const projectScope = [randomUUID(), randomUUID()];
     const invitation = await createInWorkspaceContext(targetWorkspace.id, inviterOwnerId, () =>
       invitations.create(targetWorkspace.id, inviterOwnerId, {
-        email: "unused-lookup@example.com",
+        email: inviteeEmail,
         role: "manager",
         project_scope: projectScope,
       }),
     );
-    // accept() resolves the invitee purely from (workspaceId, token) — never
-    // from the invitation's own email — so any authenticated user presenting
-    // the right token is the one who gets the membership. Overwrite the
-    // token's owner intent isn't tested here; the acceptance contract is
-    // "this token, this workspace, this caller".
+    // STORY-172 — the acceptance contract is "this token, this workspace, and a
+    // caller whose verified email IS the invited address".
 
     const memberResponse = await invitations.accept(targetWorkspace.id, inviteeId, invitation.token!, meta);
 
@@ -290,10 +300,10 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
   it("scenario 11 — accept() leaves the target workspace's own subscription row untouched (no new or modified row)", async () => {
     const inviterOwnerId = await createUser();
     const targetWorkspace = await workspaces.create(inviterOwnerId, { name: `Target ${randomUUID()}` }, meta);
-    const inviteeId = await createUser();
+    const inviteeId = await createVerifiedUser("subscription-check@example.com");
 
     const invitation = await createInWorkspaceContext(targetWorkspace.id, inviterOwnerId, () =>
-      invitations.create(targetWorkspace.id, inviterOwnerId, { email: "unused@example.com", role: "viewer" }),
+      invitations.create(targetWorkspace.id, inviterOwnerId, { email: "subscription-check@example.com", role: "viewer" }),
     );
     const before = await db.query("SELECT * FROM subscriptions WHERE workspace_id = $1", [targetWorkspace.id]);
 
@@ -306,13 +316,17 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
   it("accepting an unknown, expired, revoked, or already-accepted token all fail with the identical uniform message", async () => {
     const inviterOwnerId = await createUser();
     const targetWorkspace = await workspaces.create(inviterOwnerId, { name: `Target ${randomUUID()}` }, meta);
-    const inviteeId = await createUser();
+    const strangerId = await createUser();
 
     const unknown = "not-a-real-token";
-    await expect(invitations.accept(targetWorkspace.id, inviteeId, unknown, meta)).rejects.toBeInstanceOf(
+    await expect(invitations.accept(targetWorkspace.id, strangerId, unknown, meta)).rejects.toBeInstanceOf(
       InvitationInvalidException,
     );
 
+    // STORY-172 — each refusal below is for the account the invitation was
+    // SENT TO, so it is the token's state (not an email mismatch) that is
+    // being refused; otherwise this test would pass vacuously on mismatch.
+    const expiredInvitee = await createVerifiedUser("expired@example.com");
     const expiredInvitation = await createInWorkspaceContext(targetWorkspace.id, inviterOwnerId, () =>
       invitations.create(targetWorkspace.id, inviterOwnerId, { email: "expired@example.com", role: "viewer" }),
     );
@@ -320,22 +334,26 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
       expiredInvitation.id,
     ]);
 
+    const revokedInvitee = await createVerifiedUser("revoked@example.com");
     const revokedInvitation = await createInWorkspaceContext(targetWorkspace.id, inviterOwnerId, () =>
       invitations.create(targetWorkspace.id, inviterOwnerId, { email: "revoked@example.com", role: "viewer" }),
     );
     await db.query("UPDATE workspace_invitations SET revoked_at = now() WHERE id = $1", [revokedInvitation.id]);
 
+    const acceptedInvitee = await createVerifiedUser("accepted@example.com");
     const acceptedInvitation = await createInWorkspaceContext(targetWorkspace.id, inviterOwnerId, () =>
       invitations.create(targetWorkspace.id, inviterOwnerId, { email: "accepted@example.com", role: "viewer" }),
     );
-    const firstAccepter = await createUser();
-    await invitations.accept(targetWorkspace.id, firstAccepter, acceptedInvitation.token!, meta);
+    await invitations.accept(targetWorkspace.id, acceptedInvitee, acceptedInvitation.token!, meta);
 
     const errors: unknown[] = [];
-    for (const token of [expiredInvitation.token!, revokedInvitation.token!, acceptedInvitation.token!]) {
+    for (const [accepter, token] of [
+      [expiredInvitee, expiredInvitation.token!],
+      [revokedInvitee, revokedInvitation.token!],
+      [acceptedInvitee, acceptedInvitation.token!],
+    ] as const) {
       try {
-        const secondAccepter = await createUser();
-        await invitations.accept(targetWorkspace.id, secondAccepter, token, meta);
+        await invitations.accept(targetWorkspace.id, accepter, token, meta);
         throw new Error("expected accept() to reject");
       } catch (error) {
         errors.push(error);
@@ -350,10 +368,10 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
     }
   });
 
-  it("accepting the same invitation twice for a user who is already an active member is idempotent, not an error", async () => {
+  it("STORY-172 · accepting a second invitation as a user who is already an active member is refused 409 already_member and the token is not consumed", async () => {
     const inviterOwnerId = await createUser();
     const targetWorkspace = await workspaces.create(inviterOwnerId, { name: `Target ${randomUUID()}` }, meta);
-    const inviteeId = await createUser();
+    const inviteeId = await createVerifiedUser("dup@example.com");
 
     const first = await createInWorkspaceContext(targetWorkspace.id, inviterOwnerId, () =>
       invitations.create(targetWorkspace.id, inviterOwnerId, { email: "dup@example.com", role: "viewer" }),
@@ -363,25 +381,30 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
     const second = await createInWorkspaceContext(targetWorkspace.id, inviterOwnerId, () =>
       invitations.create(targetWorkspace.id, inviterOwnerId, { email: "dup@example.com", role: "manager" }),
     );
-    const secondMember = await invitations.accept(targetWorkspace.id, inviteeId, second.token!, meta);
+    // Previously this burned the token and answered 200 with the EXISTING
+    // role, the invited role silently not applied.
+    // Typed, so ProblemFilter validates details against the published contract.
+    const refusal = await invitations.accept(targetWorkspace.id, inviteeId, second.token!, meta).catch((e: unknown) => e);
+    expect(refusal).toBeInstanceOf(ConflictError);
+    expect(refusal).toMatchObject({ code: "conflict", details: { reason: "already_member" } });
 
-    // ON CONFLICT (workspace_id, user_id) WHERE status <> 'removed' DO
-    // NOTHING — the existing membership (still 'viewer') is returned, not a
-    // new/upgraded row, and no duplicate is created.
-    expect(secondMember.id).toBe(firstMember.id);
-    expect(secondMember.role).toBe("viewer");
+    const row = await db.query<{ accepted_at: Date | null }>(
+      "SELECT accepted_at FROM workspace_invitations WHERE id = $1",
+      [second.id],
+    );
+    expect(row.rows[0]!.accepted_at).toBeNull();
 
-    const count = await db.query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    const members = await db.query<{ id: string; role: string }>(
+      "SELECT id, role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
       [targetWorkspace.id, inviteeId],
     );
-    expect(Number(count.rows[0]!.count)).toBe(1);
+    expect(members.rows).toEqual([{ id: firstMember.id, role: "viewer" }]);
   });
 
   it("STORY-021-E-13 · a suspended member accepting a fresh invitation is refused with 409 member_suspended, not silently reactivated", async () => {
     const inviterOwnerId = await createUser();
     const targetWorkspace = await workspaces.create(inviterOwnerId, { name: `Target ${randomUUID()}` }, meta);
-    const inviteeId = await createUser();
+    const inviteeId = await createVerifiedUser("suspend-me@example.com");
 
     const first = await createInWorkspaceContext(targetWorkspace.id, inviterOwnerId, () =>
       invitations.create(targetWorkspace.id, inviterOwnerId, { email: "suspend-me@example.com", role: "viewer" }),
@@ -394,9 +417,9 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
       invitations.create(targetWorkspace.id, inviterOwnerId, { email: "suspend-me@example.com", role: "manager" }),
     );
 
-    await expect(invitations.accept(targetWorkspace.id, inviteeId, second.token!, meta)).rejects.toMatchObject({
-      response: { code: "conflict", details: { reason: "member_suspended" } },
-    });
+    const suspendedRefusal = await invitations.accept(targetWorkspace.id, inviteeId, second.token!, meta).catch((e: unknown) => e);
+    expect(suspendedRefusal).toBeInstanceOf(ConflictError);
+    expect(suspendedRefusal).toMatchObject({ code: "conflict", details: { reason: "member_suspended" } });
 
     const row = await db.query<{ status: string; role: string }>(
       "SELECT status, role FROM workspace_members WHERE id = $1",
@@ -439,8 +462,8 @@ describe("STORY-021 · invitations — creation, uniform timing, acceptance, and
     expect(pendingForEmail).toHaveLength(1);
     expect(pendingForEmail[0]!.role).toBe("manager");
 
-    // The superseded token no longer works.
-    const accepter = await createUser();
+    // The superseded token no longer works — even for the address it was sent to.
+    const accepter = await createVerifiedUser(email);
     await expect(invitations.accept(workspace.id, accepter, first.token!, meta)).rejects.toBeInstanceOf(
       InvitationInvalidException,
     );

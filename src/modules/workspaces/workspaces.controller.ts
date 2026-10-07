@@ -16,6 +16,7 @@ import { REFRESH_COOKIE_NAME, setAuthCookies } from "../../lib/auth/cookies.js";
 import { assertMatchesTenant } from "../../tenancy/assert-matches-tenant.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import {
+  acceptInvitationParamsSchema,
   acceptInvitationRequestSchema,
   createInvitationRequestSchema,
   createWorkspaceRequestSchema,
@@ -25,6 +26,7 @@ import {
   updateWorkspaceRequestSchema,
   workspaceListResponseSchema,
   workspaceResponseSchema,
+  type AcceptInvitationParams,
   type AcceptInvitationRequest,
   type CreateInvitationRequest,
   type CreateWorkspaceRequest,
@@ -248,10 +250,15 @@ export class WorkspacesController {
   @Post("workspaces/:id/invitations/accept")
   @SkipTenantContext()
   @HttpCode(200)
-  @ApiContract({ operationId: "acceptInvitation", requestSchema: acceptInvitationRequestSchema, responseSchema: memberResponseSchema })
+  @ApiContract({
+    operationId: "acceptInvitation",
+    paramsSchema: acceptInvitationParamsSchema,
+    requestSchema: acceptInvitationRequestSchema,
+    responseSchema: memberResponseSchema,
+  })
   acceptInvitation(
     @Req() req: AuditableRequest,
-    @Param("id") id: string,
+    @Param(new ZodValidationPipe(acceptInvitationParamsSchema)) { id }: AcceptInvitationParams,
     @Body(new ZodValidationPipe(acceptInvitationRequestSchema)) body: AcceptInvitationRequest,
   ): Promise<MemberResponse> {
     return this.invitations.accept(id, req.auth!.sub, body.token, auditMeta(req));

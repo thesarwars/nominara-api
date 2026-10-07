@@ -183,11 +183,14 @@ export class WorkspaceGuard implements CanActivate {
     // it validated — not from the token claim and not from an unvalidated
     // path param. Two do. `WorkspacesService.create` uses a freshly minted
     // uuid. `InvitationsService.accept` opens one on the URL's caller-supplied
-    // `:id` BEFORE validating anything, and holds only because the first
-    // statement inside is the token-gated
-    // `UPDATE ... WHERE workspace_id = $2 AND token_hash = $3` — every later
-    // read is reached only if that claimed a row. That is a property of the
-    // route's internals, not of this guard, and nothing pins it.
+    // `:id`. STORY-172: the route now validates that `:id` is a UUID at the
+    // boundary (`acceptInvitationParamsSchema`), and it still holds only
+    // because the first statement inside is the token-gated, email-bound
+    // `UPDATE ... WHERE workspace_id = $2 AND token_hash = $3 AND <the
+    // acceptor's verified email matches>` — every later read is reached only
+    // if that claimed a row. That is a property of the route's internals, not
+    // of this guard; the integration test
+    // `workspace-invitation-email-binding.spec.ts` (AC7, AC8) pins both halves.
     //
     // Note also what is NOT the net here: `RbacGuard` fails closed on a
     // missing `req.membership`, but the invariant above forbids
