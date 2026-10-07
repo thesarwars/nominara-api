@@ -1,7 +1,9 @@
 import { Injectable } from "@nestjs/common";
 import type { MatrixCell, MatrixQuery, MatrixResponse, MatrixRow } from "../../../contracts/tracking/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
-import { answeredStatusSql } from "../../lib/rollup/aggregate-day.js";
+import { engineDataSourcesForDays, recordDemoDataServed } from "../../lib/analytics/data-source.js";
+import { answeredStatusSql, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
+import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
 // STORY-034 AC8 — the prompt × engine grid.
@@ -41,6 +43,7 @@ interface CellRow {
   brand_rank_position: number | null;
   sov: number | null;
   sentiment_label: string | null;
+  data_source: "live" | "demo" | null;
 }
 
 @Injectable()
@@ -71,7 +74,13 @@ export class MatrixService {
               latest.brand_rank_position AS brand_rank_position,
               latest.sov AS sov,
               latest.sentiment_label AS sentiment_label,
-              success.captured_at AS last_success_at
+              success.captured_at AS last_success_at,
+              -- NEW-A-5 — provenance of THIS cell's answer. Null when there is
+              -- no capture or the capture is not a measurement (failed or
+              -- blocked): nothing was measured, so it is neither live nor demo.
+              CASE WHEN latest.id IS NULL OR NOT (${measurementStatusSql("latest.status")}) THEN NULL
+                   WHEN latest.normalizer_version = $4 THEN 'demo'
+                   ELSE 'live' END AS data_source
          FROM tracked_prompts p
          -- THE VIEW, NOT project_engines. STORY-152.
          --
@@ -88,7 +97,7 @@ export class MatrixService {
               AND ($3::text[] IS NULL OR engine_key = ANY($3::text[]))
          ) e
          LEFT JOIN LATERAL (
-           SELECT c.id, c.status, c.error_code, c.captured_at, c.cache_layer,
+           SELECT c.id, c.status, c.error_code, c.captured_at, c.cache_layer, c.normalizer_version,
                   c.brand_present, c.brand_rank_position, c.sov, c.sentiment_label
              FROM answer_captures c
             WHERE c.project_id = p.project_id
@@ -116,15 +125,21 @@ export class MatrixService {
           AND p.status <> 'archived'
           AND p.deleted_at IS NULL
         ORDER BY p.is_priority DESC, p.created_at ASC, e.engine_key ASC`,
-      [projectId, TIMEFRAME_DAYS[query.timeframe], requested],
+      [projectId, TIMEFRAME_DAYS[query.timeframe], requested, DEMO_SEED_MARKER],
     );
 
     if (result.rows.length === 0) await this.assertProjectExists(projectId);
 
+    const engineKeys = [...new Set(result.rows.map((row) => row.engine_key))];
+    const sources = await engineDataSourcesForDays(store.client, projectId, TIMEFRAME_DAYS[query.timeframe]);
+
+    recordDemoDataServed("matrix", store.context.workspaceId, [...sources.values()]);
+
     return {
       project_id: projectId,
       timeframe: query.timeframe,
-      engine_keys: [...new Set(result.rows.map((row) => row.engine_key))],
+      engine_keys: engineKeys,
+      engines: engineKeys.map((engine_key) => ({ engine_key, data_source: sources.get(engine_key) ?? null })),
       prompts: this.group(result.rows, new Date()),
     };
   }
@@ -177,6 +192,7 @@ export class MatrixService {
       brand_rank_position: row.brand_rank_position,
       sov: row.sov,
       sentiment_label: row.sentiment_label as MatrixCell["sentiment_label"],
+      data_source: row.data_source,
       // AC3 — the TRUE capture age of a reused answer. A cached cell
       // stamped with today's date would claim a freshness it does not have.
       // Null on a live cell: it has no age to report, and 0 would say it was

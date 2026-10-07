@@ -39,6 +39,8 @@ import { applyFakeApiEnv } from "../support/fake-env.js";
  */
 const EXEMPT: Readonly<Record<string, string>> = Object.freeze({
   "IdentityController.logout": "ends the caller's OWN session; there is no workspace role to check",
+  "IdentityController.getMe": "GET /me — the caller's OWN identity (NEW-A-2); the workspace returned is the token's ws claim",
+  "IdentityController.updateMe": "PATCH /me — writes the caller's OWN persona row (NEW-A-2), keyed on the token's sub",
   "IdentityController.list": "GET /me/passkeys — the caller's own credentials, scoped by actor_id",
   "IdentityController.rename": "PATCH /me/passkeys/:id — the caller's own credential",
   "IdentityController.revoke": "DELETE /me/passkeys/:id — the caller's own credential",

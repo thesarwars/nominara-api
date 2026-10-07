@@ -76,3 +76,6 @@ export {
   emailOtpRequestResponseSchema,
   type EmailOtpRequestResponse,
 } from "../../../../contracts/identity/email-otp-request-response.schema.js";
+export { personaSchema, type Persona } from "../../../../contracts/identity/persona.schema.js";
+export { meResponseSchema, type MeResponse } from "../../../../contracts/identity/me-response.schema.js";
+export { meUpdateRequestSchema, type MeUpdateRequest } from "../../../../contracts/identity/me-update-request.schema.js";

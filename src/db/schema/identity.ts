@@ -101,6 +101,7 @@ export const users = pgTable("users", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  personaSkipped: boolean("persona_skipped").default(sql`false`),
 });
 
 export const webauthnChallenges = pgTable("webauthn_challenges", {

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dataSourceSchema, engineDataSourceSchema } from "./data-source.schema.js";
 
 // STORY-137 — `GET /v1/projects/{id}/growth-map`, `api-specification.md` §7.
 //
@@ -46,6 +47,8 @@ export const growthMapSeriesSchema = z
     entity_type: z.enum(["brand", "competitor", "derived"]),
     color_role: z.enum(["primary", "comparison", "baseline"]),
     points: z.array(growthMapPointSchema),
+    /** NEW-A-5 — provenance of the captures in the window; null when none were measured. */
+    data_source: dataSourceSchema.nullable(),
   })
   .strict();
 
@@ -108,6 +111,8 @@ export const growthMapResponseSchema = z
     granularity: z.literal("day"),
     timeframe: z.object({ from: z.string(), to: z.string(), timezone: z.string() }).strict(),
     series: z.array(growthMapSeriesSchema),
+    /** NEW-A-5 — per-engine provenance over the window, one entry per engine measured. */
+    engines: z.array(engineDataSourceSchema),
     milestones: z.array(milestoneSchema),
     annotations: z
       .object({

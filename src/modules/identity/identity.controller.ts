@@ -10,6 +10,10 @@ import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { REFRESH_COOKIE_NAME, clearAuthCookies, setAuthCookies } from "../../lib/auth/cookies.js";
 import {
   passkeyAddOptionsRequestSchema,
+  meResponseSchema,
+  meUpdateRequestSchema,
+  type MeResponse,
+  type MeUpdateRequest,
   passkeyListResponseSchema,
   type PasskeyAddOptionsRequest,
   type PasskeyListItem,
@@ -89,6 +93,28 @@ export class IdentityController {
   async logout(@Req() req: AuthenticatedRequest, @Res({ passthrough: true }) reply: FastifyReply): Promise<void> {
     await this.sessions.logout(req.auth!.sid);
     clearAuthCookies(reply);
+  }
+
+  // NEW-A-2 — the caller's own identity. Tenant-less on purpose: it answers
+  // "who am I and which workspace am I in" and so must work before a workspace
+  // is chosen and after a plan change has made `ent_v` stale (STORY-153). The
+  // workspace returned is the verified token's `ws` claim, nothing a request
+  // supplies.
+  @Get("me")
+  @SkipTenantContext()
+  @ApiContract({ operationId: "getMe", responseSchema: meResponseSchema })
+  getMe(@Req() req: AuthenticatedRequest): Promise<MeResponse> {
+    return this.service.getMe(req.auth!.sub, req.auth!.ws);
+  }
+
+  @Patch("me")
+  @SkipTenantContext()
+  @ApiContract({ operationId: "updateMe", requestSchema: meUpdateRequestSchema, responseSchema: meResponseSchema })
+  updateMe(
+    @Req() req: AuthenticatedRequest,
+    @Body(new ZodValidationPipe(meUpdateRequestSchema)) body: MeUpdateRequest,
+  ): Promise<MeResponse> {
+    return this.service.updatePersona(req.auth!.sub, req.auth!.ws, body.persona);
   }
 
   // @SkipTenantContext() — session-authenticated (AuthGuard requires a real
