@@ -55,6 +55,7 @@ describe("STORY-076a · credit packs", () => {
     gateway.fetches.length = 0;
     gateway.configured = true;
     gateway.failFetchWith = undefined;
+    gateway.onSessionCreated = undefined;
     pool = new Pool({ connectionString: process.env.DATABASE_URL });
     const membership = new MembershipService(new MembershipCacheService());
     sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
@@ -208,6 +209,47 @@ describe("STORY-076a · credit packs", () => {
     gateway.configured = false;
     expect((await purchase(owner, "starter_vault")).statusCode).toBe(503);
     expect((await harness.db().query("SELECT 1 FROM credit_purchases WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(0);
+  });
+
+  // ---- NEW-D-2 audit · a payable session must never outlive its purchase row ----------------------
+
+  /** The request's own connection: the only backend idle IN a transaction while the API waits on Stripe. */
+  const killIdleRequestBackends = async (): Promise<void> => {
+    await harness.db().query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction' AND pid <> pg_backend_pid()");
+  };
+
+  it("AUDIT BLOCKER (PROBE-A) · a request that dies after Stripe created the session leaves a purchase row the webhook can still settle", async () => {
+    const { workspaceId, owner } = await newWorkspace();
+    gateway.onSessionCreated = killIdleRequestBackends;
+    const res = await purchase(owner, "starter_vault");
+    gateway.onSessionCreated = undefined;
+    expect(res.statusCode, "the request itself failed").toBeGreaterThanOrEqual(500);
+    expect(gateway.packCheckouts, "Stripe did create a payable session").toHaveLength(1);
+    const purchaseId = gateway.packCheckouts[0]!.purchaseId;
+    const rows = (await harness.db().query<{ id: string; status: string }>("SELECT id, status FROM credit_purchases WHERE workspace_id = $1", [workspaceId])).rows;
+    expect(rows, "the session carries a purchase_id, so that purchase must exist").toEqual([{ id: purchaseId, status: "pending" }]);
+    // The customer pays the stranded session; the webhook must credit them.
+    const { sessionId, pi } = stripePaid(workspaceId, purchaseId);
+    expect((await settle(sessionId)).statusCode).toBe(200);
+    expect(await ledger(workspaceId)).toMatchObject([{ entry_type: "grant" }, { entry_type: "purchase", credits: 1000, idempotency_key: pi, reference_id: purchaseId }]);
+    expect((await purchaseRow(purchaseId)).status).toBe("succeeded");
+  });
+
+  it("AUDIT BLOCKER · a PAID session that names a purchase the workspace has no row for is an error-level alarm, never a quiet warning", async () => {
+    const { workspaceId } = await newWorkspace();
+    const { sessionId } = stripePaid(workspaceId, randomUUID());
+    expect((await settle(sessionId)).statusCode, "nothing a retry can fix: acknowledged").toBe(200);
+    expect(error, "money was taken and nothing was credited").toHaveBeenCalledWith(expect.objectContaining({ workspace_id: workspaceId }));
+    expect(await ledger(workspaceId)).not.toContainEqual(expect.objectContaining({ entry_type: "purchase" }));
+  });
+
+  it("AUDIT BLOCKER · a Stripe failure after the row was committed leaves no PENDING row (a payment that nonetheless lands can still settle it)", async () => {
+    const { workspaceId, owner } = await newWorkspace();
+    gateway.failFetchWith = new StripeUpstreamError(500);
+    expect((await purchase(owner, "starter_vault")).statusCode).toBe(503);
+    gateway.failFetchWith = undefined;
+    const rows = (await harness.db().query<{ status: string }>("SELECT status FROM credit_purchases WHERE workspace_id = $1", [workspaceId])).rows;
+    expect(rows.filter((r) => r.status === "pending")).toEqual([]);
   });
 
   it("the Idempotency-Key header is required on the purchase POST (400), and a body key is a 400 (.strict())", async () => {

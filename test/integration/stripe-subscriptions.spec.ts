@@ -55,6 +55,7 @@ describe("STORY-075a · subscriptions", () => {
     gateway.fetches.length = 0;
     gateway.configured = true;
     gateway.failFetchWith = undefined;
+    gateway.onSessionCreated = undefined;
     pool = new Pool({ connectionString: process.env.DATABASE_URL });
     const membership = new MembershipService(new MembershipCacheService());
     sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
@@ -140,6 +141,8 @@ describe("STORY-075a · subscriptions", () => {
       /** What Stripe actually charges per interval, in cents; defaults to the catalog price of `plan`. */
       amount?: number;
       currency?: string;
+      /** The checkout intent our own Checkout wrote into the subscription's metadata. */
+      intentId?: string;
     } = {},
   ): string {
     // The catalog (migration 0002): monthly / annual dollars per plan.
@@ -165,7 +168,12 @@ describe("STORY-075a · subscriptions", () => {
     gateway.putObject(
       "subscription",
       id,
-      { workspace_id: workspaceId, plan_key: plan, billing_interval: over.interval === "year" ? "annual" : "monthly" },
+      {
+        workspace_id: workspaceId,
+        plan_key: plan,
+        billing_interval: over.interval === "year" ? "annual" : "monthly",
+        ...(over.intentId === undefined ? {} : { checkout_intent_id: over.intentId }),
+      },
       { customer: over.customer ?? "cus_1", status: over.status ?? "active", cancel_at_period_end: over.cancelAtPeriodEnd ?? false, trial_end: null, items: { data } },
     );
     return id;
@@ -731,5 +739,111 @@ describe("STORY-075a · subscriptions", () => {
     const { workspaceId } = await newWorkspace();
     await deliver(eventBody("evt_y1", "customer.subscription.created", stripeSubscription(workspaceId, { id: "sub_y", plan: "growth", interval: "year" })));
     expect(await row(workspaceId)).toMatchObject({ plan_key: "growth", billing_interval: "annual" });
+  });
+
+  // ---- NEW-D-2 audit · a checkout whose request dies is not a second payable session --------------
+
+  /** The request's own connection: the only backend idle IN a transaction while the API waits on Stripe. */
+  const killIdleRequestBackends = async (): Promise<void> => {
+    await harness.db().query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction' AND pid <> pg_backend_pid()");
+  };
+  const payable = (): number => gateway.checkouts.length - new Set(gateway.expired).size;
+
+  it("AUDIT MAJOR (PROBE-B) · the retry after a request that died once Stripe had created the session expires it: one payable session, not two", async () => {
+    const { owner } = await newWorkspace();
+    gateway.onSessionCreated = killIdleRequestBackends;
+    const first = await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
+    gateway.onSessionCreated = undefined;
+    expect(first.statusCode, "the first request failed").toBeGreaterThanOrEqual(500);
+    expect(gateway.checkouts).toHaveLength(1);
+    const second = await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
+    expect(second.statusCode, second.body).toBe(200);
+    expect(gateway.expired, "the session the dead request created is the one that was expired").toContain("cs_test_1");
+    expect(payable(), "sessions created minus sessions expired = sessions still payable").toBe(1);
+  });
+
+  it("AUDIT MAJOR · a retry after a request that died BEFORE Stripe was reached leaves one payable session as well", async () => {
+    const { owner } = await newWorkspace();
+    gateway.failFetchWith = new StripeUpstreamError(500);
+    expect((await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" })).statusCode).toBe(503);
+    gateway.failFetchWith = undefined;
+    expect((await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" })).statusCode).toBe(200);
+    expect(payable()).toBe(1);
+  });
+
+  it("AUDIT MAJOR · a retry that asks for a DIFFERENT plan still finds and expires the session the dead request created", async () => {
+    const { owner } = await newWorkspace();
+    gateway.onSessionCreated = killIdleRequestBackends;
+    await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
+    gateway.onSessionCreated = undefined;
+    const second = await post(owner, "/billing/checkout-session", { plan_key: "business", billing_interval: "annual" });
+    expect(second.statusCode, second.body).toBe(200);
+    expect(payable()).toBe(1);
+  });
+
+  it("AUDIT MAJOR · every checkout names its intent and carries a Stripe idempotency key", async () => {
+    const { owner } = await newWorkspace();
+    await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" });
+    const input = gateway.checkouts[0]!;
+    expect(input.intentId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(input.idempotencyKey).toBeTruthy();
+  });
+
+  // ---- NEW-D-2 audit · the price ADOPTED at checkout is the one verified, not today's catalog -----
+
+  /** Reprices `growth` for the duration of `fn`, whatever happens inside it: `plans` is shared by every test. */
+  async function whileGrowthCosts139<T>(fn: () => Promise<T>): Promise<T> {
+    await harness.db().query("UPDATE plans SET monthly_price = 139 WHERE key = 'growth'");
+    try {
+      return await fn();
+    } finally {
+      await harness.db().query("UPDATE plans SET monthly_price = 129 WHERE key = 'growth'");
+    }
+  }
+
+  it("AUDIT MAJOR (PROBE-C) · after a catalog price change an existing subscription still takes its updates at the price it signed up at", async () => {
+    const { workspaceId } = await newWorkspace();
+    await deliver(eventBody("evt_c1", "customer.subscription.created", stripeSubscription(workspaceId, { id: "sub_c", plan: "growth" })));
+    expect(await row(workspaceId)).toMatchObject({ plan_key: "growth", status: "active" });
+    await whileGrowthCosts139(async () => {
+      const alarm = vi.spyOn(Logger.prototype, "error");
+      stripeSubscription(workspaceId, { id: "sub_c", plan: "growth", status: "past_due", cancelAtPeriodEnd: true });
+      expect((await deliver(eventBody("evt_c2", "customer.subscription.updated", "sub_c"))).statusCode).toBe(200);
+      expect(await row(workspaceId)).toMatchObject({ plan_key: "growth", status: "past_due", cancel_at_period_end: true });
+      expect(alarm, "a customer who did nothing wrong is not alarmed").not.toHaveBeenCalled();
+    });
+  });
+
+  it("AUDIT MAJOR · and the catalog's NEW price is still not accepted for that subscription: a portal switch to it is refused and alarmed", async () => {
+    const { workspaceId } = await newWorkspace();
+    await deliver(eventBody("evt_d1", "customer.subscription.created", stripeSubscription(workspaceId, { id: "sub_d", plan: "growth" })));
+    const tracked = await row(workspaceId);
+    await whileGrowthCosts139(async () => {
+      const alarm = vi.spyOn(Logger.prototype, "error");
+      stripeSubscription(workspaceId, { id: "sub_d", plan: "growth", amount: 13_900, cancelAtPeriodEnd: true });
+      expect((await deliver(eventBody("evt_d2", "customer.subscription.updated", "sub_d"))).statusCode).toBe(200);
+      expect(await row(workspaceId)).toEqual(tracked);
+      expect(alarm).toHaveBeenCalled();
+    });
+  });
+
+  it("AUDIT MAJOR · a checkout paid after the catalog moved is adopted at the price it was opened at", async () => {
+    const { workspaceId, owner } = await newWorkspace();
+    expect((await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" })).statusCode).toBe(200);
+    const intentId = gateway.checkouts[0]!.intentId;
+    expect(gateway.checkouts[0]!.unitAmountCents).toBe(12_900);
+    await whileGrowthCosts139(async () => {
+      stripeSubscription(workspaceId, { id: "sub_i", plan: "growth", ...(intentId === undefined ? {} : { intentId }) });
+      expect((await deliver(eventBody("evt_i1", "customer.subscription.created", "sub_i"))).statusCode).toBe(200);
+      expect(await row(workspaceId)).toMatchObject({ plan_key: "growth", provider: "stripe" });
+    });
+  });
+
+  it("AUDIT MAJOR · an intent id that is not the workspace's own pending checkout buys no price: the catalog decides, and a cheaper charge is refused", async () => {
+    const { workspaceId } = await newWorkspace();
+    const before = await row(workspaceId);
+    stripeSubscription(workspaceId, { id: "sub_f", plan: "business", amount: 4_900, intentId: randomUUID() });
+    expect((await deliver(eventBody("evt_f1", "customer.subscription.created", "sub_f"))).statusCode).toBe(200);
+    expect(await row(workspaceId)).toEqual(before);
   });
 });

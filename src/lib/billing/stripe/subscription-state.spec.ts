@@ -178,6 +178,56 @@ describe("CP1 · the plan is verified against the price Stripe charges", () => {
   });
 });
 
+describe("NEW-D-2 audit · the plan is verified against the price ADOPTED at checkout, not today's catalog", () => {
+  /** The catalog moved on: growth costs $139 now. Existing customers still pay the $129 they signed up at. */
+  const REPRICED: ClaimedPlanPrice = { monthlyCents: 13_900, annualCents: 139_000, currency: "USD" };
+  const FROZEN_MONTHLY = { unitAmountCents: 12_900, currency: "USD", interval: "month" as const };
+  const withFrozen = (claimed: ClaimedPlanPrice, frozen: ClaimedPlanPrice["frozen"]): ClaimedPlanPrice => ({ ...claimed, ...(frozen === undefined ? {} : { frozen }) });
+  const charged = (price: Record<string, unknown>) => {
+    const { raw, metadata } = sub();
+    (raw.items as { data: Array<{ price: Record<string, unknown> }> }).data[0]!.price = { product: { metadata: { nominara_kind: "plan" } }, ...price };
+    return { raw, metadata };
+  };
+
+  it("PROBE-C · a subscription at the price it signed up at still reconciles after the catalog price changed", () => {
+    const { raw, metadata } = sub({ status: "past_due", cancel_at_period_end: true });
+    const out = desiredFromStripeSubscription(raw, metadata, withFrozen(REPRICED, FROZEN_MONTHLY));
+    expect(out).toMatchObject({ kind: "write", state: { planKey: "growth", status: "past_due", cancelAtPeriodEnd: true } });
+  });
+
+  it("the catalog's NEW price is not accepted for a subscription frozen at the old one (a portal switch to it is still a mismatch)", () => {
+    const { raw, metadata } = charged({ unit_amount: 13_900, currency: "usd", recurring: { interval: "month" } });
+    expect(desiredFromStripeSubscription(raw, metadata, withFrozen(REPRICED, FROZEN_MONTHLY))).toMatchObject({ kind: "ignore", mismatch: true });
+  });
+
+  it.each([
+    ["one cent off", { unit_amount: 12_901, currency: "usd", recurring: { interval: "month" } }],
+    ["another currency", { unit_amount: 12_900, currency: "eur", recurring: { interval: "month" } }],
+    ["another interval at the same amount", { unit_amount: 12_900, currency: "usd", recurring: { interval: "year" } }],
+  ])("a frozen charge is compared exactly: %s is a mismatch", (_label, price) => {
+    const { raw, metadata } = charged(price);
+    expect(desiredFromStripeSubscription(raw, metadata, withFrozen(GROWTH, FROZEN_MONTHLY))).toMatchObject({ kind: "ignore", mismatch: true });
+  });
+
+  it("a frozen annual charge matches its annual item in either letter case of the currency", () => {
+    const { raw, metadata } = charged({ unit_amount: 129_000, currency: "usd", recurring: { interval: "year" } });
+    const out = desiredFromStripeSubscription(raw, metadata, withFrozen(REPRICED, { unitAmountCents: 129_000, currency: "usd", interval: "year" }));
+    expect(out.kind).toBe("write");
+  });
+
+  it("a written, entitled state carries the verified charge so the caller can freeze it; an ended one carries none", () => {
+    const entitled = sub();
+    expect(desiredFromStripeSubscription(entitled.raw, entitled.metadata, GROWTH)).toMatchObject({ kind: "write", charge: { unitAmountCents: 12_900, currency: "usd", interval: "month" } });
+    const ended = sub({ status: "canceled" });
+    expect(desiredFromStripeSubscription(ended.raw, ended.metadata, null)).toMatchObject({ kind: "write", charge: null });
+  });
+
+  it("with no frozen charge the catalog still decides (a subscription not yet adopted)", () => {
+    const { raw, metadata } = sub();
+    expect(desiredFromStripeSubscription(raw, metadata, REPRICED)).toMatchObject({ kind: "ignore", mismatch: true });
+  });
+});
+
 describe("toCents — money is never a float", () => {
   it.each([
     ["49.00", 4900],
