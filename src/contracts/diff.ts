@@ -91,6 +91,10 @@ function compareSharedField(previous: JsonSchemaObjectLike, current: JsonSchemaO
   return "major";
 }
 
+function asSchema(value: unknown): JsonSchemaObjectLike | undefined {
+  return value !== null && typeof value === "object" ? (value as JsonSchemaObjectLike) : undefined;
+}
+
 function without(schema: JsonSchemaObjectLike, keys: readonly string[]): string {
   const sorted = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(sorted);
@@ -141,8 +145,16 @@ function compareUnion(previous: JsonSchemaObjectLike, current: JsonSchemaObjectL
  */
 function compareNestedShape(previous: JsonSchemaObjectLike, current: JsonSchemaObjectLike): SemverBump | undefined {
   if (previous.type === "object" && current.type === "object") {
-    if (without(previous, ["properties", "required"]) !== without(current, ["properties", "required"])) return undefined;
-    return compareObjectSchema(previous, current, true);
+    // A record's `additionalProperties` is a schema (its value type); compared
+    // on its own. A boolean there (closed -> open) stays in the "everything
+    // else identical" check, so it is `major`.
+    const previousValue = asSchema(previous.additionalProperties);
+    const currentValue = asSchema(current.additionalProperties);
+    const bothRecords = previousValue !== undefined && currentValue !== undefined;
+    const skipped = bothRecords ? ["properties", "required", "additionalProperties"] : ["properties", "required"];
+    if (without(previous, skipped) !== without(current, skipped)) return undefined;
+    const shape = compareObjectSchema(previous, current, true);
+    return bothRecords ? mostSevere(shape, compareSharedField(previousValue, currentValue)) : shape;
   }
   if (previous.type === "array" && current.type === "array") {
     const previousItems = previous.items as JsonSchemaObjectLike | undefined;
