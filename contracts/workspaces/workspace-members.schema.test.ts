@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { memberResponseSchema } from "./member-response.schema.js";
 import { workspaceDetailResponseSchema } from "./workspace-detail-response.schema.js";
 import { invitationRevokeParamsSchema } from "./invitation-revoke-params.schema.js";
@@ -20,9 +21,16 @@ describe("NEW-A-12 · member / workspace-detail / invitation-revoke contracts", 
   it("a member carries a nullable name and an email; a missing email is refused", () => {
     expect(memberResponseSchema.parse(member)).toEqual(member);
     expect(memberResponseSchema.safeParse({ ...member, name: "Ada" }).success).toBe(true);
-    const { email: _email, ...noEmail } = member;
-    expect(memberResponseSchema.safeParse(noEmail).success).toBe(false);
+    expect(memberResponseSchema.safeParse({ ...member, email: 7 }).success).toBe(false);
     expect(memberResponseSchema.safeParse({ ...member, extra: 1 }).success).toBe(false);
+  });
+  it("NEW-A-12 audit · name and email are OPTIONAL on the wire, so adding them is additive (contracts:diff patch, not major)", () => {
+    const { name: _name, email: _email, ...legacy } = member;
+    expect(memberResponseSchema.safeParse(legacy).success).toBe(true);
+    const required = (z.toJSONSchema(memberResponseSchema, { io: "output" }) as { required?: string[] }).required ?? [];
+    expect(required).not.toContain("name");
+    expect(required).not.toContain("email");
+    expect(required).toEqual(expect.arrayContaining(["id", "user_id", "role", "status"]));
   });
   it("workspace detail adds a nullable deletion_scheduled_at", () => {
     const detail = {
