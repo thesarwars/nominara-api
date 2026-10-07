@@ -75,14 +75,30 @@ describe("NEW-A-5 · data_source provenance", () => {
     }
   });
 
-  async function capture(engine: string, normalizer: string, status = "parsed", hoursAgo = 2): Promise<void> {
+  async function capture(engine: string, normalizer: string, status = "parsed", hoursAgo = 2, brandPresent = true): Promise<string> {
     const id = randomUUID();
     await db.query(
       `INSERT INTO answer_captures
          (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,
           capture_mode,adapter_version,normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present)
-       VALUES ($1,$2,$3,$4,$5,$6, now() - make_interval(hours => $7::int),'api','1.0.0',$8,$9,'{}'::jsonb,'{}','live',$10,true)`,
-      [id, workspaceId, projectId, uuidV7(), promptId, engine, hoursAgo, normalizer, createHash("sha256").update(id).digest(), status],
+       VALUES ($1,$2,$3,$4,$5,$6, now() - make_interval(hours => $7::int),'api','1.0.0',$8,$9,'{}'::jsonb,'{}','live',$10,$11)`,
+      [id, workspaceId, projectId, uuidV7(), promptId, engine, hoursAgo, normalizer, createHash("sha256").update(id).digest(), status, brandPresent],
+    );
+    return id;
+  }
+
+  /** The mention that makes a capture's brand presence real: presence is read from mention_facts, not the flag. */
+  async function mention(resultId: string, engine: string): Promise<void> {
+    await db.query(
+      `INSERT INTO mention_facts
+         (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,
+          entity_type,entity_id,entity_label,matched_alias,occurrence_index,
+          char_start,char_end,first_token_index,prominence,
+          sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,render_score)
+       SELECT workspace_id,project_id,id,prompt_id,engine_key,captured_at,
+              'brand',NULL,'P','P',0,0,1,0,0.8,'positive',0.5,0.9,'lexicon',0.4
+         FROM answer_captures WHERE id = $1 AND engine_key = $2`,
+      [resultId, engine],
     );
   }
 
@@ -127,6 +143,26 @@ describe("NEW-A-5 · data_source provenance", () => {
     expect(scorecardsResponseSchema.safeParse(s).success).toBe(true);
     expect(growthMapResponseSchema.safeParse(g).success).toBe(true);
     expect(matrixResponseSchema.safeParse(m).success).toBe(true);
+  });
+
+  it("NEW-A-5 O1 — the blended score is over ALL measured engines, demo ones included, and the demo count is disclosed", async () => {
+    // gemini is real and present in its answer; chatgpt is demo and absent
+    // from its. Had the blend dropped the demo engine it would equal gemini's
+    // score; a blend over both lies strictly between the two.
+    await mention(await capture("gemini", "n1", "parsed", 2, true), "gemini");
+    await capture("chatgpt", DEMO_SEED_MARKER, "parsed", 2, false);
+    const s = await scorecards();
+    const gemini = s.engines.find((e) => e.engine_key === "gemini")!;
+    const chatgpt = s.engines.find((e) => e.engine_key === "chatgpt")!;
+    expect(gemini.visibility_score).not.toBeNull();
+    expect(chatgpt.visibility_score).not.toBeNull();
+    expect(gemini.visibility_score).not.toBe(chatgpt.visibility_score);
+    expect(s.blended.measured_cells).toBe(gemini.measured_cells + chatgpt.measured_cells);
+    expect(s.blended.visibility_score).not.toBe(gemini.visibility_score);
+    expect(s.blended.visibility_score!).toBeGreaterThan(Math.min(gemini.visibility_score!, chatgpt.visibility_score!));
+    expect(s.blended.visibility_score!).toBeLessThan(Math.max(gemini.visibility_score!, chatgpt.visibility_score!));
+    expect(s.blend).toEqual({ policy: "all_measured_engines", live_engines: 1, demo_engines: 1, mixed_engines: 0 });
+    expect(s.blended.data_source).toBe("mixed");
   });
 
   it("NEW-A-5 AC2 — a cell never captured stays pending with a null data_source, not demo", async () => {

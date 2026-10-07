@@ -49,11 +49,22 @@ describe("STORY-060 · A3 answer structure (pure)", () => {
     expect(detail!.engines.map((e) => e.engine)).toEqual(["claude", "gemini"]);
   });
 
-  it("data_source is per engine: demo when any of the engine's rows is demo, live otherwise", () => {
+  it("data_source is per engine, in the one live/demo/mixed vocabulary: mixed when an engine has both kinds of row", () => {
     const { detail } = buildStructure(
-      input({ forms: [f("gemini", "comparison_table", 30), f("claude", "narrative", 5, "demo"), f("claude", "ranked_list", 5, "live")] }),
+      input({
+        forms: [
+          f("gemini", "comparison_table", 30),
+          f("claude", "narrative", 5, "demo"),
+          f("claude", "ranked_list", 5, "live"),
+          f("grok", "narrative", 5, "demo"),
+        ],
+      }),
     );
-    expect(Object.fromEntries(detail!.engines.map((e) => [e.engine, e.data_source]))).toEqual({ claude: "demo", gemini: "live" });
+    expect(Object.fromEntries(detail!.engines.map((e) => [e.engine, e.data_source]))).toEqual({
+      claude: "mixed",
+      gemini: "live",
+      grok: "demo",
+    });
   });
 
   it("a tie for dominant breaks on the fixed form order, never on input order", () => {

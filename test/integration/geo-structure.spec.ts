@@ -211,6 +211,15 @@ describe("STORY-060 · A3 answer structure (persisted, read)", () => {
     expect(Object.fromEntries(detail.engines.map((e) => [e.engine, e.data_source]))).toEqual({ claude: "demo", gemini: "live" });
   });
 
+  it("an engine with both demo-seeded and real captures is mixed, not demo", async () => {
+    await many(30, { form: "comparison_table", engine: "gemini" });
+    await many(5, { form: "narrative", engine: "claude", demo: true });
+    await many(5, { form: "ranked_list", engine: "claude" });
+    await refresh();
+    const detail = geoStructureDetailSchema.parse((await ctx((s) => s.analysis(projectId, "structure", { timeframe: "30d" }))).detail);
+    expect(Object.fromEntries(detail.engines.map((e) => [e.engine, e.data_source]))).toEqual({ claude: "mixed", gemini: "live" });
+  });
+
   it("a recompute of the same window replaces rather than accumulates", async () => {
     await many(30, { form: "narrative" });
     await refresh();
