@@ -90,7 +90,14 @@ export type DisplacementKind = "presence_lost" | "position_lost" | "recommendati
  * `null` means the table has no row for it and the penalty term is 0. Two
  * readings are FLAGGED FOR THE SPEC: `recommendation -> neutral_list` is taken
  * as the `recommendation_to_ranked` demotion, and a position-only loss inside
- * one class has no row (0).
+ * one class has no row (0). A THIRD is flagged too: `presence_lost` from ANY
+ * before class takes `recommendation_to_absent` (1.00), because §9 has a row only
+ * for recommendation -> absent. A brand leaving a negative caveat therefore scores
+ * the maximum. Spec-owner ruling needed; behaviour is pinned by a test until then.
+ *
+ * Each kind is scored on its own dimension: `render_downgraded` is the "render
+ * downgrade only" row (and carries no position loss, see
+ * `displacementImpactForEvent`); `any_to_caveat` needs the class to CHANGE.
  */
 export function classPenaltyKindFor(
   kind: DisplacementKind,
@@ -98,11 +105,44 @@ export function classPenaltyKindFor(
   afterClass: string | null,
 ): ClassPenaltyKind | null {
   if (kind === "presence_lost") return "recommendation_to_absent";
-  if (afterClass === "caveat") return "any_to_caveat";
+  if (kind === "render_downgraded") return "render_downgrade_only";
+  if (afterClass === "caveat" && beforeClass !== "caveat") return "any_to_caveat";
   if (beforeClass === "recommendation" && (afterClass === "ranked" || afterClass === "neutral_list")) {
     return "recommendation_to_ranked";
   }
   if (beforeClass === "ranked" && afterClass === "also_consider") return "ranked_to_also_consider";
-  if (kind === "render_downgraded") return "render_downgrade_only";
   return null;
+}
+
+export interface DisplacementEventInput {
+  readonly kind: DisplacementKind;
+  readonly beforePosition: number | null;
+  readonly afterPosition: number | null;
+  readonly beforeClass: string | null;
+  readonly afterClass: string | null;
+  readonly funnelStage: FunnelStage;
+  readonly topicRankByIntent: number;
+  readonly engineWeight: number;
+  readonly maxEngineWeight: number;
+  readonly citationGap: number;
+}
+
+/**
+ * §9 position_loss is "if position only": only a `position_lost` (or a lost
+ * presence) event carries it. `recommendation_lost` and `render_downgraded` are
+ * scored on their class row alone, so one answer change is not counted three times.
+ */
+export function displacementImpactForEvent(e: DisplacementEventInput): number {
+  const carriesPosition = e.kind === "presence_lost" || e.kind === "position_lost";
+  return displacementImpact({
+    presenceLost: e.kind === "presence_lost",
+    beforePosition: carriesPosition ? e.beforePosition : null,
+    afterPosition: carriesPosition ? e.afterPosition : null,
+    classPenalty: classPenaltyKindFor(e.kind, e.beforeClass, e.afterClass),
+    funnelStage: e.funnelStage,
+    topicRankByIntent: e.topicRankByIntent,
+    engineWeight: e.engineWeight,
+    maxEngineWeight: e.maxEngineWeight,
+    citationGap: e.citationGap,
+  });
 }

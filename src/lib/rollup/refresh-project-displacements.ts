@@ -15,7 +15,7 @@ import {
   type SnapshotEntity,
 } from "../analytics/displacement.js";
 import { classifyDomain } from "../parser/citation-url.js";
-import { classPenaltyKindFor, displacementImpact, type FunnelStage } from "../scoring/displacement-impact.js";
+import { displacementImpactForEvent, type FunnelStage } from "../scoring/displacement-impact.js";
 import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { datesWithFacts, measurementStatusSql } from "./aggregate-day.js";
@@ -117,11 +117,12 @@ export async function refreshProjectDisplacements(tx: ClientBase, projectId: str
     const afterCitations = await loadCitationSlots(tx, after.id);
     for (const event of detected) {
       const gap = await citationGap(tx, workspaceId, event, afterCitations);
-      const impact = displacementImpact({
-        presenceLost: event.kind === "presence_lost",
+      const impact = displacementImpactForEvent({
+        kind: event.kind,
         beforePosition: event.beforePosition,
         afterPosition: event.afterPosition,
-        classPenalty: classPenaltyKindFor(event.kind, event.beforePositionClass, event.afterPositionClass),
+        beforeClass: event.beforePositionClass,
+        afterClass: event.afterPositionClass,
         funnelStage: context.funnelStage,
         topicRankByIntent: context.topicRankByIntent,
         engineWeight: context.engineWeight,
