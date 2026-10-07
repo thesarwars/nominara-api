@@ -48,6 +48,9 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       // that IS in the committed tenant-tables.generated.ts, and the drift
       // assertion below fails for a reason that is not drift.
       "0019_usage_reservations",
+      // NEW-E-1 — second post-0006 tenant table (scheduled_report_deliveries).
+      "0051_track_e_sharing",
+      "0052_track_e_sharing_validate",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");

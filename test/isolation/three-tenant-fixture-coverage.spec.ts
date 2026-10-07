@@ -19,7 +19,8 @@ describe("STORY-012 T5 · three-tenant fixture coverage", () => {
       const tenantTables = await discoverTenantTables(client);
       const singleRow = await discoverSingleRowPerTenantTables(client, tenantTables);
       // 60 since STORY-070 added `usage_reservations` (migration 0019).
-      expect(tenantTables.length).toBe(60);
+      // 61 since NEW-E-1 added `scheduled_report_deliveries` (migration 0051).
+      expect(tenantTables.length).toBe(61);
 
       for (const tenant of [ctx.fixture.a, ctx.fixture.b, ctx.fixture.c]) {
         for (const table of tenantTables) {

@@ -25,16 +25,19 @@ import { NOOP_REVERT, type Breaker } from "../support/breakers.js";
 // that moves the tenant count rather than the global one. Its policy ships in
 // its own migration — see POLICY_IN_OWN_MIGRATION in src/db/conventions.ts
 // for why 0006 must not carry it.
+//
+// 78/61/17 as of NEW-E-1: `scheduled_report_deliveries` (migration 0051) is a
+// tenant table (workspace_id, own-migration policy, not portal-readable).
 export async function assertIso06Census(ctx: AssertionContext): Promise<void> {
   const client = await connectSuperuser(ctx);
   try {
     const census = await computeCensus(client);
 
-    if (census.totalTables !== 77) {
-      throw new Error(`ISO-06: expected 77 total base tables, discovered ${census.totalTables}`);
+    if (census.totalTables !== 78) {
+      throw new Error(`ISO-06: expected 78 total base tables, discovered ${census.totalTables}`);
     }
-    if (census.tenantTables.length !== 60) {
-      throw new Error(`ISO-06: expected 60 tenant tables, discovered ${census.tenantTables.length}`);
+    if (census.tenantTables.length !== 61) {
+      throw new Error(`ISO-06: expected 61 tenant tables, discovered ${census.tenantTables.length}`);
     }
     if (census.globalTables.length !== 17) {
       throw new Error(`ISO-06: expected 17 global tables, discovered ${census.globalTables.length}`);
