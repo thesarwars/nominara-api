@@ -48,7 +48,7 @@ export const growthMapSeriesSchema = z
     color_role: z.enum(["primary", "comparison", "baseline"]),
     points: z.array(growthMapPointSchema),
     /** NEW-A-5 — provenance of the captures in the window; null when none were measured. */
-    data_source: dataSourceSchema.nullable(),
+    data_source: dataSourceSchema.nullable().optional(),
   })
   .strict();
 
@@ -112,7 +112,7 @@ export const growthMapResponseSchema = z
     timeframe: z.object({ from: z.string(), to: z.string(), timezone: z.string() }).strict(),
     series: z.array(growthMapSeriesSchema),
     /** NEW-A-5 — per-engine provenance over the window, one entry per engine measured. */
-    engines: z.array(engineDataSourceSchema),
+    engines: z.array(engineDataSourceSchema).optional(),
     milestones: z.array(milestoneSchema),
     annotations: z
       .object({

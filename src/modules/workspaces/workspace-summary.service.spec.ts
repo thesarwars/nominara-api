@@ -4,11 +4,19 @@ import * as metrics from "../../lib/telemetry/metrics.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
 import { workspaceSummaryResponseSchema } from "../../../contracts/workspaces/workspace-summary-response.schema.js";
 import type { ProjectListItem } from "../../../contracts/projects/index.js";
+import type { DataSource } from "../../../contracts/analytics/index.js";
 
 const resolveEntitlements = vi.fn();
 vi.mock("../../lib/entitlements/resolution.js", () => ({ resolveEntitlements: (...a: unknown[]) => resolveEntitlements(...a) }));
 const captureReady = vi.fn<() => string[]>(() => ["gemini"]);
 vi.mock("../../lib/engines/registry.js", () => ({ captureReadyEngineKeys: () => captureReady() }));
+
+// NEW-B-2 audit — provenance is read from the captures, never from adapter readiness.
+const engineSources = vi.fn<(tx: unknown, projectId: string, from: string, to: string, tz: string) => Map<string, DataSource>>(() => new Map());
+vi.mock("../../lib/analytics/data-source.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/analytics/data-source.js")>()),
+  engineDataSourcesForDates: async (...a: Parameters<typeof engineSources>) => engineSources(...a),
+}));
 
 import { WorkspaceSummaryService } from "./workspace-summary.service.js";
 
@@ -69,8 +77,11 @@ function setup(opts: { projects?: ProjectListItem[]; engines?: string[]; wallet?
     }),
   };
   resolveEntitlements.mockResolvedValue(entitlements(opts.ent ?? { "projects.max": 3, "prompts.max_total": 120 }));
-  vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client: {}, context: { workspaceId: WS, actorId: "a" } } as never);
-  return { service: new WorkspaceSummaryService(projects as never, billing as never), projects, billing };
+  const client = {
+    query: vi.fn(async () => ({ rows: [{ timezone: "Asia/Dhaka", from: "2026-09-08", to: "2026-10-07" }] })),
+  };
+  vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client, context: { workspaceId: WS, actorId: "a" } } as never);
+  return { service: new WorkspaceSummaryService(projects as never, billing as never), projects, billing, client };
 }
 
 describe("NEW-B-2 · WorkspaceSummaryService", () => {
@@ -78,6 +89,8 @@ describe("NEW-B-2 · WorkspaceSummaryService", () => {
     vi.restoreAllMocks();
     resolveEntitlements.mockReset();
     captureReady.mockReturnValue(["gemini"]);
+    engineSources.mockReset();
+    engineSources.mockReturnValue(new Map());
   });
 
   it("FR-DASH-01: one projects read serves the whole matrix, and the response satisfies the contract", async () => {
@@ -111,33 +124,58 @@ describe("NEW-B-2 · WorkspaceSummaryService", () => {
     expect(zero.health.prompts_limit).toBe(0);
   });
 
-  it("data_source: a capture-ready engine is live, every other is demo, on scores and on the filter list", async () => {
-    const { service } = setup({
-      projects: [
-        project({
-          engine_scores: [
-            { engine_key: "gemini", score: 60, delta_30d: null },
-            { engine_key: "chatgpt", score: 40, delta_30d: 1 },
-          ],
-        }),
-      ],
-      engines: ["chatgpt", "gemini"],
-    });
-    const out = await service.summary(WS);
-    expect(out.projects[0]!.engine_scores).toEqual([
-      { engine_key: "gemini", score: 60, delta_30d: null, data_source: "live" },
-      { engine_key: "chatgpt", score: 40, delta_30d: 1, data_source: "demo" },
-    ]);
+  const TWO_ENGINE_SCORES = [
+    { engine_key: "gemini", score: 60, delta_30d: null },
+    { engine_key: "chatgpt", score: 40, delta_30d: 1 },
+  ];
+
+  it("NEW-B-2 audit · Gemini has an API key but only seeded captures: it reads 'demo' on the score and on the filter list, not 'live'", async () => {
+    captureReady.mockReturnValue(["gemini"]);
+    engineSources.mockReturnValue(new Map<string, DataSource>([["gemini", "demo"], ["chatgpt", "demo"]]));
+    const out = await setup({ projects: [project({ engine_scores: TWO_ENGINE_SCORES })], engines: ["chatgpt", "gemini"] }).service.summary(WS);
+    expect(out.projects[0]!.engine_scores!.map((s) => [s.engine_key, s.data_source])).toEqual([["gemini", "demo"], ["chatgpt", "demo"]]);
     expect(out.engines).toEqual([
       { engine_key: "chatgpt", data_source: "demo" },
-      { engine_key: "gemini", data_source: "live" },
+      { engine_key: "gemini", data_source: "demo" },
     ]);
   });
 
-  it("with no capture-ready engine everything is demo (fail toward honesty)", async () => {
-    captureReady.mockReturnValue([]);
+  it("NEW-B-2 audit · live captures read 'live', both kinds read 'mixed'", async () => {
+    engineSources.mockReturnValue(new Map<string, DataSource>([["gemini", "live"], ["chatgpt", "mixed"]]));
+    const out = await setup({ projects: [project({ engine_scores: TWO_ENGINE_SCORES })], engines: ["chatgpt", "gemini"] }).service.summary(WS);
+    expect(out.projects[0]!.engine_scores!.map((s) => s.data_source)).toEqual(["live", "mixed"]);
+  });
+
+  it("NEW-B-2 audit · an engine with nothing measured is null, even when its adapter is ready (null is not demo, not live)", async () => {
+    captureReady.mockReturnValue(["gemini"]);
+    engineSources.mockReturnValue(new Map<string, DataSource>([["chatgpt", "demo"]]));
+    const out = await setup({ projects: [project({ engine_scores: TWO_ENGINE_SCORES })], engines: ["chatgpt", "gemini"] }).service.summary(WS);
+    expect(out.projects[0]!.engine_scores!.map((s) => s.data_source)).toEqual([null, "demo"]);
+    expect(out.engines).toEqual([
+      { engine_key: "chatgpt", data_source: "demo" },
+      { engine_key: "gemini", data_source: null },
+    ]);
+    expect(workspaceSummaryResponseSchema.safeParse(out).success).toBe(true);
+  });
+
+  it("NEW-B-2 audit · the filter list combines the scoped projects' provenance per engine (live + demo = mixed)", async () => {
+    const A = "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa";
+    const B = "bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb";
+    engineSources.mockImplementation((_tx, projectId) => new Map<string, DataSource>([["gemini", projectId === A ? "live" : "demo"]]));
+    const out = await setup({ projects: [project({ id: A }), project({ id: B })], engines: ["gemini"] }).service.summary(WS);
+    expect(out.engines).toEqual([{ engine_key: "gemini", data_source: "mixed" }]);
+  });
+
+  it("NEW-B-2 audit · provenance is read over the 30-day workspace-local window, once per project, in the workspace timezone", async () => {
+    const { service, client } = setup({ projects: [project()], engines: ["gemini"] });
+    await service.summary(WS);
+    expect(engineSources).toHaveBeenCalledTimes(1);
+    expect(engineSources).toHaveBeenCalledWith(client, "22222222-2222-7222-8222-222222222222", "2026-09-08", "2026-10-07", "Asia/Dhaka");
+  });
+
+  it("with no captures anywhere everything is null (nothing measured is never folded into demo)", async () => {
     const out = await setup({ engines: ["gemini"] }).service.summary(WS);
-    expect(out.engines).toEqual([{ engine_key: "gemini", data_source: "demo" }]);
+    expect(out.engines).toEqual([{ engine_key: "gemini", data_source: null }]);
   });
 
   it("null scores stay null — absence is not zero", async () => {

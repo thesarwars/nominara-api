@@ -4,7 +4,8 @@ import { portalTabSchema } from "../agency/share-token.schema.js";
 import { confidenceSchema } from "../analytics/scorecards-response.schema.js";
 import { growthMapResponseSchema } from "../analytics/growth-map-response.schema.js";
 import { methodologyFooterSchema } from "../reports/methodology-footer.schema.js";
-import { engineDataSourceSchema, reportTimeframeSchema } from "../reports/report-shared.schema.js";
+import { dataSourceSchema } from "../analytics/data-source.schema.js";
+import { reportTimeframeSchema } from "../reports/report-shared.schema.js";
 
 // NEW-E-0 — GET /v1/portal/{overview,growth-map,matrix,tasks,sources}.
 // Auth: portal cookie only. GET only; every mutating verb on /portal/* is refused.
@@ -63,8 +64,8 @@ export const portalGrowthMapResponseSchema = growthMapResponseSchema;
 export const portalMatrixEngineSchema = z
   .object({
     engine_key: z.string().min(1),
-    /** Owner decision: Gemini is live, the rest demo — marked per engine. */
-    data_source: engineDataSourceSchema,
+    /** Owner decision: Gemini is live, the rest demo — marked per engine. Null = nothing measured. */
+    data_source: dataSourceSchema.nullable(),
     visibility_score: z.number().nullable(),
     presence_rate: z.number().nullable(),
     share_of_voice: z.number().nullable(),

@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
+import { NotFoundException } from "@nestjs/common";
 import { ConflictError } from "../../api/errors/domain-errors.js";
 import type { ClientBase, Pool } from "pg";
 import { AuditChainService } from "../audit/audit-chain.service.js";
@@ -7,11 +8,12 @@ import { generateInvitationToken, hashInvitationToken, INVITATION_TTL_MS } from 
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { InvitationInvalidException } from "../../tenancy/errors.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
+import type { MemberRow } from "./workspaces.service.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
-import type { AuditRequestMeta } from "./workspaces.service.js";
+import { MEMBER_JOINED_COLUMNS, MEMBER_JOINED_FROM, toMemberResponse, type AuditRequestMeta } from "./workspaces.service.js";
 import type { CreateInvitationRequest, InvitationResponse, MemberResponse } from "./dto/index.js";
 
 // STORY-021-E-6/E-7 — invitation lifecycle. The create/list paths are
@@ -30,18 +32,7 @@ interface InvitationRow {
   created_at: Date;
 }
 
-interface MemberRow {
-  id: string;
-  user_id: string;
-  role: string;
-  project_scope: string[] | null;
-  status: string;
-  joined_at: Date;
-  last_active_at: Date | null;
-}
-
 const INVITATION_COLUMNS = "id, workspace_id, email, role, project_scope, expires_at, created_at";
-const MEMBER_COLUMNS = "id, user_id, role, project_scope, status, joined_at, last_active_at";
 
 function toInvitationResponse(row: InvitationRow, token?: string): InvitationResponse {
   return {
@@ -53,18 +44,6 @@ function toInvitationResponse(row: InvitationRow, token?: string): InvitationRes
     expires_at: row.expires_at.toISOString(),
     created_at: row.created_at.toISOString(),
     ...(token !== undefined ? { token } : {}),
-  };
-}
-
-function toMemberResponse(row: MemberRow): MemberResponse {
-  return {
-    id: row.id,
-    user_id: row.user_id,
-    role: row.role as MemberResponse["role"],
-    project_scope: row.project_scope ?? null,
-    status: row.status as MemberResponse["status"],
-    joined_at: row.joined_at.toISOString(),
-    last_active_at: row.last_active_at ? row.last_active_at.toISOString() : null,
   };
 }
 
@@ -139,6 +118,31 @@ export class InvitationsService {
   }
 
   /**
+   * NEW-A-12 — DELETE /workspaces/{id}/invitations/{invitationId}. Ambient
+   * transaction. One conditional UPDATE: it matches only a PENDING invitation
+   * (not accepted, not revoked) that RLS lets this tenant see, so another
+   * tenant's id, an unknown id, and an already-closed invitation are all the
+   * same 404 and write no audit row (the @Audit interceptor is skipped when the
+   * handler throws). The metric and log line carry the workspace ID and the
+   * invitation ID only — never the address.
+   */
+  async revoke(workspaceId: string, invitationId: string): Promise<void> {
+    const client = currentTenantStore()!.client;
+    const result = await client.query(
+      `UPDATE workspace_invitations
+       SET revoked_at = now()
+       WHERE id = $1 AND workspace_id = $2 AND accepted_at IS NULL AND revoked_at IS NULL`,
+      [invitationId, workspaceId],
+    );
+    if (result.rowCount !== 1) {
+      incrementCounter("nominara_identity_invitation_revoke_refused_total", { reason: "not_pending" });
+      throw new NotFoundException();
+    }
+    incrementCounter("nominara_identity_invitation_revoked_total");
+    this.logger.log(`invitation revoked workspace_id=${workspaceId} invitation_id=${invitationId}`);
+  }
+
+  /**
    * STORY-021 AC10/E-12 + STORY-172 — POST /workspaces/{id}/invitations/accept.
    * @SkipTenantContext(): the invitee is not yet a member of `workspaceId`,
    * so this opens its own transaction rather than reusing an ambient one.
@@ -202,21 +206,21 @@ export class InvitationsService {
           throw new InvitationInvalidException();
         }
 
-        const inserted = await tx.query<MemberRow>(
+        const inserted = await tx.query<{ id: string }>(
           `INSERT INTO workspace_members (id, workspace_id, user_id, role, project_scope, invited_by, status)
            VALUES ($1,$2,$3,$4,$5,$6,'active')
            ON CONFLICT (workspace_id, user_id) WHERE status <> 'removed' DO NOTHING
-           RETURNING ${MEMBER_COLUMNS}`,
+           RETURNING id`,
           [uuidV7(), workspaceId, userId, invitation.role, invitation.project_scope, invitation.invited_by],
         );
 
-        let memberRow = inserted.rows[0];
+        const memberRow = inserted.rows[0];
         if (!memberRow) {
-          const existing = await tx.query<MemberRow>(
-            `SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 AND status <> 'removed'`,
+          const existing = await tx.query<{ status: string }>(
+            `SELECT status FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 AND status <> 'removed'`,
             [workspaceId, userId],
           );
-          memberRow = existing.rows[0]!;
+          const existingRow = existing.rows[0]!;
 
           // STORY-021-E-13 — the ON CONFLICT target above also matches a
           // suspended row (only 'active'/'suspended'/'removed' exist), which
@@ -225,7 +229,7 @@ export class InvitationsService {
           // signal anything is wrong. Refuse loudly instead — reactivating a
           // suspended member is an administrative action this story does
           // not build a path for (see the story's "Out of scope" list).
-          if (memberRow.status === "suspended") {
+          if (existingRow.status === "suspended") {
             throw new ConflictError({
               message: "this member is suspended and cannot accept a new invitation — an admin must reactivate them first",
               details: { reason: "member_suspended" },
@@ -245,7 +249,10 @@ export class InvitationsService {
           });
         }
 
-        const response = toMemberResponse(memberRow);
+        // Re-read with the person's name and address (a join from the
+        // RLS-scoped membership row — see MEMBER_JOINED_COLUMNS).
+        const joined = await tx.query<MemberRow>(`SELECT ${MEMBER_JOINED_COLUMNS} ${MEMBER_JOINED_FROM} WHERE m.id = $1`, [memberRow.id]);
+        const response = toMemberResponse(joined.rows[0]!);
         await this.auditChain.append(tx, {
           workspaceId,
           actorType: "user",

@@ -58,18 +58,30 @@ export interface PurgeableProject {
   readonly id: string;
   readonly workspaceId: string;
   readonly seedCreated: boolean;
+  /** NEW-A-8 — found only by its demo-marked captures (`--facts-only`): `demo_seeded_at` was never set, so only facts, the rollup and marked prompts are purged. */
+  readonly factsOnly: boolean;
 }
 
-/** Every project in the workspace this seed touched — `demo_seeded_at IS NOT NULL`. */
-export async function listSeededProjects(tx: ClientBase, workspaceId: string): Promise<PurgeableProject[]> {
-  const result = await tx.query<{ id: string; workspace_id: string; fingerprint: Record<string, unknown> }>(
-    `SELECT id, workspace_id, fingerprint FROM projects WHERE workspace_id = $1 AND demo_seeded_at IS NOT NULL`,
-    [workspaceId],
+/**
+ * Every project in the workspace this seed touched — `demo_seeded_at IS NOT
+ * NULL` (a full seed), or any demo-marked capture (NEW-A-8 `--facts-only`,
+ * which sets no `demo_seeded_at`). `projectId` narrows to one project.
+ */
+export async function listSeededProjects(tx: ClientBase, workspaceId: string, projectId?: string): Promise<PurgeableProject[]> {
+  const result = await tx.query<{ id: string; workspace_id: string; fingerprint: Record<string, unknown>; seeded: boolean }>(
+    `SELECT p.id, p.workspace_id, p.fingerprint, (p.demo_seeded_at IS NOT NULL) AS seeded
+       FROM projects p
+      WHERE p.workspace_id = $1
+        AND ($3::uuid IS NULL OR p.id = $3::uuid)
+        AND (p.demo_seeded_at IS NOT NULL
+             OR EXISTS (SELECT 1 FROM answer_captures c WHERE c.project_id = p.id AND c.normalizer_version = $2))`,
+    [workspaceId, DEMO_SEED_MARKER, projectId ?? null],
   );
   return result.rows.map((row) => ({
     id: row.id,
     workspaceId: row.workspace_id,
-    seedCreated: row.fingerprint?.[DEMO_PROJECT_CREATED_KEY] === true,
+    seedCreated: row.seeded && row.fingerprint?.[DEMO_PROJECT_CREATED_KEY] === true,
+    factsOnly: !row.seeded,
   }));
 }
 
@@ -193,6 +205,14 @@ async function purgeDemoPrompts(tx: ClientBase, project: PurgeableProject): Prom
 export async function purgeOneProject(tx: ClientBase, project: PurgeableProject, timezone: string): Promise<void> {
   // Facts + metric_daily first — nothing downstream depends on them.
   await purgeMetricHistory(tx, project, timezone);
+  if (project.factsOnly) {
+    // NEW-A-8 — a `--facts-only` project never had AUX, sources, tasks or a
+    // demo marker written, and its sources/aux/tasks (if any) are REAL: the
+    // full-seed deletes below remove by project_id with no marker for
+    // sources, so they must not run here.
+    await purgeDemoPrompts(tx, project);
+    return;
+  }
   await clearDemoMarker(tx, project.id);
 
   await deleteExistingDemoAudits(tx, project.id);

@@ -68,6 +68,12 @@ function isEnumSubset(narrower: unknown[], wider: unknown[]): boolean {
 function compareSharedField(previous: JsonSchemaObjectLike, current: JsonSchemaObjectLike): SemverBump {
   if (JSON.stringify(previous) === JSON.stringify(current)) return "none";
 
+  const union = compareUnion(previous, current);
+  if (union !== undefined) return union;
+
+  const nested = compareNestedShape(previous, current);
+  if (nested !== undefined) return nested;
+
   if (previous.type !== undefined && current.type !== undefined && previous.type !== current.type) {
     return "major";
   }
@@ -85,10 +91,86 @@ function compareSharedField(previous: JsonSchemaObjectLike, current: JsonSchemaO
   return "major";
 }
 
+function asSchema(value: unknown): JsonSchemaObjectLike | undefined {
+  return value !== null && typeof value === "object" ? (value as JsonSchemaObjectLike) : undefined;
+}
+
+function without(schema: JsonSchemaObjectLike, keys: readonly string[]): string {
+  const sorted = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sorted);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .sort(([a], [b]) => (a < b ? -1 : 1))
+          .map(([key, inner]) => [key, sorted(inner)]),
+      );
+    }
+    return value;
+  };
+  return JSON.stringify(sorted(Object.fromEntries(Object.entries(schema).filter(([key]) => !keys.includes(key)))));
+}
+
+/**
+ * A NULLABLE field is `anyOf: [<schema>, {type: "null"}]`. When both sides are
+ * unions of the same arity with nothing else different, each branch is
+ * compared with its counterpart and the most severe result wins, so a nullable
+ * enum that gains a value reads as it does bare (`patch`). A union appearing,
+ * disappearing or changing arity (a field BECOMING nullable) is `major`: it
+ * must not fall through to the "fixed set -> any value" widening below, which
+ * reads a missing `enum` as "accepts anything".
+ */
+function compareUnion(previous: JsonSchemaObjectLike, current: JsonSchemaObjectLike): SemverBump | undefined {
+  const previousUnion = previous.anyOf as JsonSchemaObjectLike[] | undefined;
+  const currentUnion = current.anyOf as JsonSchemaObjectLike[] | undefined;
+  if (previousUnion === undefined && currentUnion === undefined) return undefined;
+  if (previousUnion === undefined || currentUnion === undefined) return "major";
+  if (previousUnion.length !== currentUnion.length) return "major";
+  if (without(previous, ["anyOf"]) !== without(current, ["anyOf"])) return "major";
+  let bump: SemverBump = "none";
+  for (let index = 0; index < previousUnion.length; index += 1) {
+    bump = mostSevere(bump, compareSharedField(previousUnion[index]!, currentUnion[index]!));
+  }
+  return bump;
+}
+
+/**
+ * NEW-A-5 option A. A shared field whose schema is an OBJECT (compared on
+ * its `properties`/`required`) or an ARRAY (compared on its `items`) is
+ * walked into, so one optional field added inside a nested response object
+ * is not rated like a type change. The walk only applies when everything
+ * ELSE about the node is identical (`type`, `maxItems`, `additionalProperties`,
+ * ...): a constraint that moved beside the part being recursed still falls
+ * through to the conservative `major`. `undefined` = not a nested shape this
+ * function can reason about.
+ */
+function compareNestedShape(previous: JsonSchemaObjectLike, current: JsonSchemaObjectLike): SemverBump | undefined {
+  if (previous.type === "object" && current.type === "object") {
+    // A record's `additionalProperties` is a schema (its value type); compared
+    // on its own. A boolean there (closed -> open) stays in the "everything
+    // else identical" check, so it is `major`.
+    const previousValue = asSchema(previous.additionalProperties);
+    const currentValue = asSchema(current.additionalProperties);
+    const bothRecords = previousValue !== undefined && currentValue !== undefined;
+    const skipped = bothRecords ? ["properties", "required", "additionalProperties"] : ["properties", "required"];
+    if (without(previous, skipped) !== without(current, skipped)) return undefined;
+    const shape = compareObjectSchema(previous, current, true);
+    return bothRecords ? mostSevere(shape, compareSharedField(previousValue, currentValue)) : shape;
+  }
+  if (previous.type === "array" && current.type === "array") {
+    const previousItems = previous.items as JsonSchemaObjectLike | undefined;
+    const currentItems = current.items as JsonSchemaObjectLike | undefined;
+    if (!previousItems || !currentItems) return undefined;
+    if (without(previous, ["items"]) !== without(current, ["items"])) return undefined;
+    return compareSharedField(previousItems, currentItems);
+  }
+  return undefined;
+}
+
 /** `properties`/`required` diff shared by a request body schema and a response schema alike. */
 function compareObjectSchema(
   previous: JsonSchemaObjectLike | undefined,
   current: JsonSchemaObjectLike | undefined,
+  nested = false,
 ): SemverBump {
   if (!previous && !current) return "none";
   if (!previous && current) return "patch"; // a schema appearing where there was none before
@@ -110,7 +192,9 @@ function compareObjectSchema(
       continue;
     }
     if (!inPrevious && inCurrent) {
-      bump = mostSevere(bump, currentRequired.has(name) ? "major" : "patch"); // field added
+      // field added: required is breaking; optional is `patch` at the top of a
+      // body and `minor` anywhere nested (owner decision, NEW-A-5 option A).
+      bump = mostSevere(bump, currentRequired.has(name) ? "major" : nested ? "minor" : "patch");
       continue;
     }
 

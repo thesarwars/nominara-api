@@ -28,6 +28,7 @@ import type {
   UpdateMemberRoleRequest,
   UpdateWorkspaceRequest,
   WorkspaceListItemWithRelationship,
+  WorkspaceDetailResponse,
   WorkspaceResponse,
 } from "./dto/index.js";
 
@@ -62,9 +63,11 @@ interface WorkspaceRow {
   updated_at: Date;
 }
 
-interface MemberRow {
+export interface MemberRow {
   id: string;
   user_id: string;
+  name: string | null;
+  email: string;
   role: string;
   project_scope: string[] | null;
   status: string;
@@ -75,7 +78,14 @@ interface MemberRow {
 const MAX_SLUG_ATTEMPTS = 5;
 const WORKSPACE_COLUMNS =
   "id, name, slug, org_type, region, timezone, plan_key, entitlement_version, status, created_at, updated_at";
-const MEMBER_COLUMNS = "id, user_id, role, project_scope, status, joined_at, last_active_at";
+// NEW-A-12 — the member list item carries the person's name and address.
+// `users` has no RLS (it is global), so the ONLY safe way to reach it is a join
+// that starts from the RLS-scoped `workspace_members` row: the tenant filter
+// on `m` decides which users are visible, never a filter on `users`.
+export const MEMBER_JOINED_COLUMNS =
+  "m.id, m.user_id, u.full_name AS name, u.email::text AS email, m.role, m.project_scope, m.status, m.joined_at, m.last_active_at";
+export const MEMBER_JOINED_FROM = "FROM workspace_members m JOIN users u ON u.id = m.user_id";
+const MEMBER_JOINED_SELECT = `SELECT ${MEMBER_JOINED_COLUMNS} ${MEMBER_JOINED_FROM}`;
 
 function kebabCase(name: string): string {
   const base = name
@@ -104,10 +114,12 @@ function toWorkspaceResponse(row: WorkspaceRow): WorkspaceResponse {
   };
 }
 
-function toMemberResponse(row: MemberRow): MemberResponse {
+export function toMemberResponse(row: MemberRow): MemberResponse {
   return {
     id: row.id,
     user_id: row.user_id,
+    name: row.name,
+    email: row.email,
     role: row.role as MemberResponse["role"],
     project_scope: row.project_scope ?? null,
     status: row.status as MemberResponse["status"],
@@ -434,6 +446,30 @@ export class WorkspacesService {
   }
 
   /**
+   * NEW-A-12 — GET /workspaces/{id}. Ambient transaction: RLS scopes the read
+   * to the token's workspace, and the controller has already refused a path id
+   * that is not it. `deletion_scheduled_at` is `deletion_execute_at` (null =
+   * not scheduled). `entityTag` is derived from the PATCH response shape, so a
+   * tag taken from this GET is accepted by `If-Match` on the PATCH.
+   */
+  async getDetail(workspaceId: string): Promise<{ detail: WorkspaceDetailResponse; entityTag: WorkspaceResponse }> {
+    const client = currentTenantStore()!.client;
+    const result = await client.query<WorkspaceRow & { deletion_execute_at: Date | null }>(
+      `SELECT ${WORKSPACE_COLUMNS}, deletion_execute_at FROM workspaces WHERE id = $1`,
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new NotFoundException();
+    }
+    const base = toWorkspaceResponse(row);
+    return {
+      detail: { ...base, deletion_scheduled_at: row.deletion_execute_at ? row.deletion_execute_at.toISOString() : null },
+      entityTag: base,
+    };
+  }
+
+  /**
    * STORY-021 AC6/E-3 — POST /workspaces/{id}/switch. @SkipTenantContext():
    * the target workspace is not necessarily the one in the caller's current
    * token, so this opens its own transaction (E-12) rather than relying on
@@ -512,11 +548,10 @@ export class WorkspacesService {
     const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
     const client = currentTenantStore()!.client;
     const result = await client.query<MemberRow & { joined_at_key: string }>(
-      `SELECT ${MEMBER_COLUMNS}, joined_at::text AS joined_at_key
-       FROM workspace_members
-       WHERE status <> 'removed'
-         AND ($1::timestamptz IS NULL OR (joined_at, id) > ($1::timestamptz, $2::uuid))
-       ORDER BY joined_at ASC, id ASC
+      `SELECT ${MEMBER_JOINED_COLUMNS}, m.joined_at::text AS joined_at_key ${MEMBER_JOINED_FROM}
+       WHERE m.status <> 'removed'
+         AND ($1::timestamptz IS NULL OR (m.joined_at, m.id) > ($1::timestamptz, $2::uuid))
+       ORDER BY m.joined_at ASC, m.id ASC
        LIMIT $3`,
       [after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
     );
@@ -536,9 +571,10 @@ export class WorkspacesService {
   ): Promise<MemberResponse> {
     const client = currentTenantStore()!.client;
 
-    const target = await client.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE id = $1`, [
-      memberId,
-    ]);
+    const target = await client.query<{ user_id: string; role: string }>(
+      "SELECT user_id, role FROM workspace_members WHERE id = $1",
+      [memberId],
+    );
     const targetRow = target.rows[0];
     if (!targetRow) {
       throw new NotFoundException();
@@ -577,9 +613,7 @@ export class WorkspacesService {
       ]);
     }
 
-    const updated = await client.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE id = $1`, [
-      memberId,
-    ]);
+    const updated = await client.query<MemberRow>(`${MEMBER_JOINED_SELECT} WHERE m.id = $1`, [memberId]);
     const response = toMemberResponse(updated.rows[0]!);
 
     // STORY-026 T22, decision D7 — `member.changed`. §11 lists `api` as its
@@ -609,9 +643,10 @@ export class WorkspacesService {
   async removeMemberById(workspaceId: string, memberId: string): Promise<void> {
     const client = currentTenantStore()!.client;
 
-    const target = await client.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE id = $1`, [
-      memberId,
-    ]);
+    const target = await client.query<{ user_id: string; role: string }>(
+      "SELECT user_id, role FROM workspace_members WHERE id = $1",
+      [memberId],
+    );
     const targetRow = target.rows[0];
     if (!targetRow) {
       throw new NotFoundException();

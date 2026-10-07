@@ -1,13 +1,13 @@
 import type { ClientBase } from "pg";
 import {
   type AnswerFormValue,
-  type GeoDataSource,
   type GeoAnalysisWrite,
   type GeoFinding,
   type GeoStructureDetail,
   type PositionClassValue,
 } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { dataSourceOf } from "../analytics/data-source.js";
 import { SCORING_VERSION } from "../scoring/index.js";
 
 // STORY-060 — A3 answer structure: the form of the answers engines give, and
@@ -46,7 +46,7 @@ export interface StructureInput {
   windowDays: 7 | 30 | 90;
   rootDomain: string;
   /** Distinct answers per engine and form in the window. */
-  forms: { engine: string; dataSource: GeoDataSource; form: AnswerFormValue; answers: number }[];
+  forms: { engine: string; dataSource: "live" | "demo"; form: AnswerFormValue; answers: number }[];
   /** Distinct answers per position class of the brand's first mention, current window. */
   position: { cls: PositionClassValue; answers: number }[];
   /** The same, for the window of equal length immediately before. */
@@ -89,8 +89,11 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
     const rows = input.forms.filter((r) => r.engine === engine);
     return {
       engine,
-      // Any demo row taints the engine's numbers: 'live' is only claimed when nothing is seeded.
-      data_source: (rows.some((r) => r.dataSource === "demo") ? "demo" : "live") as GeoDataSource,
+      // One vocabulary everywhere: `mixed` when both kinds of answer fed the engine's numbers.
+      data_source: dataSourceOf(
+        rows.filter((r) => r.dataSource === "live").reduce((n, r) => n + r.answers, 0),
+        rows.filter((r) => r.dataSource === "demo").reduce((n, r) => n + r.answers, 0),
+      ),
       total: rows.reduce((n, r) => n + r.answers, 0),
       forms: formCounts(rows),
     };
@@ -166,7 +169,7 @@ interface FormRow {
   engine_key: string;
   answer_form: AnswerFormValue;
   answers: number;
-  has_demo: boolean;
+  is_demo: boolean;
 }
 interface ClassRow {
   position_class: PositionClassValue;
@@ -189,14 +192,14 @@ export async function loadStructureInput(
   // Window bounds are UTC midnights, whatever the session timezone is.
   const forms = await tx.query<FormRow>(
     `SELECT mf.engine_key, mf.answer_form, count(DISTINCT mf.result_id)::int AS answers,
-            bool_or(ac.normalizer_version = $4) AS has_demo
+            (ac.normalizer_version = $4) AS is_demo
        FROM mention_facts mf
        JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at
       WHERE mf.project_id = $1
         AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
         AND mf.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') + make_interval(days => $3)
         AND mf.answer_form IS NOT NULL AND mf.scoring_version = $5
-      GROUP BY mf.engine_key, mf.answer_form`,
+      GROUP BY mf.engine_key, mf.answer_form, (ac.normalizer_version = $4)`,
     [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION, SCORING_VERSION],
   );
 
@@ -222,7 +225,7 @@ export async function loadStructureInput(
     rootDomain: project.rows[0].root_domain,
     forms: forms.rows.map((r) => ({
       engine: r.engine_key,
-      dataSource: r.has_demo ? "demo" : "live",
+      dataSource: r.is_demo ? "demo" : "live",
       form: r.answer_form,
       answers: r.answers,
     })),

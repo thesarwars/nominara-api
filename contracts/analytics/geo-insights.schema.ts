@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dataSourceSchema } from "./data-source.schema.js";
 
 // STORY-062 — `GET /v1/projects/{id}/geo-insights` (the digest) and
 // `GET /v1/projects/{id}/geo-insights/{analysis}` (one analysis), plus the
@@ -169,10 +170,6 @@ export type AnswerFormValue = z.infer<typeof answerFormSchema>;
 export const positionClassSchema = z.enum(["recommendation", "ranked", "neutral_list", "also_consider", "caveat"]);
 export type PositionClassValue = z.infer<typeof positionClassSchema>;
 
-/** Where an engine's numbers come from. Gemini is `live`; the other engines are seeded demo data. */
-export const geoDataSourceSchema = z.enum(["live", "demo"]);
-export type GeoDataSource = z.infer<typeof geoDataSourceSchema>;
-
 const formCountSchema = z.object({ form: answerFormSchema, count: z.number().int().nonnegative() }).strict();
 
 /**
@@ -194,7 +191,7 @@ export const geoStructureDetailSchema = z
       z
         .object({
           engine: z.string(),
-          data_source: geoDataSourceSchema,
+          data_source: dataSourceSchema.nullable(),
           total: z.number().int().nonnegative(),
           forms: z.array(formCountSchema),
         })

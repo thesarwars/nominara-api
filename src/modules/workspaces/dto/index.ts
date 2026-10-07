@@ -48,3 +48,11 @@ export {
   workspaceSummaryResponseSchema,
   type WorkspaceSummaryResponse,
 } from "../../../../contracts/workspaces/workspace-summary-response.schema.js";
+export {
+  workspaceDetailResponseSchema,
+  type WorkspaceDetailResponse,
+} from "../../../../contracts/workspaces/workspace-detail-response.schema.js";
+export {
+  invitationRevokeParamsSchema,
+  type InvitationRevokeParams,
+} from "../../../../contracts/workspaces/invitation-revoke-params.schema.js";

@@ -4,7 +4,7 @@ import type {
   CompetitorPanelQuery,
   CompetitorPanelResponse,
   CompetitorRow,
-  CompetitorEngineDataSource,
+  DataSource,
 } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
@@ -19,6 +19,7 @@ import {
   type Scorecard,
   type WindowMetrics,
 } from "../../lib/analytics/scorecard.js";
+import { dataSourceOf } from "../../lib/analytics/data-source.js";
 import { resolveWindow, TIMEFRAME_DAYS } from "../../lib/analytics/window.js";
 import { aggregateRange, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -485,7 +486,7 @@ export class CompetitorPanelService {
     return result.rows;
   }
 
-  /** `demo` as soon as one capture in the window is seeded. */
+  /** live / demo / mixed per engine over the window; an engine with nothing measured has no entry. */
   private async dataSources(
     tx: ClientBase,
     projectId: string,
@@ -493,9 +494,11 @@ export class CompetitorPanelService {
     to: string,
     timezone: string,
     engines: string[] | null,
-  ): Promise<Map<string, CompetitorEngineDataSource>> {
-    const result = await tx.query<{ engine_key: string; demo: boolean }>(
-      `SELECT c.engine_key, bool_or(c.normalizer_version = $6) AS demo
+  ): Promise<Map<string, DataSource>> {
+    const result = await tx.query<{ engine_key: string; live: string; demo: string }>(
+      `SELECT c.engine_key,
+              count(*) FILTER (WHERE c.normalizer_version <> $6)::text AS live,
+              count(*) FILTER (WHERE c.normalizer_version = $6)::text  AS demo
          FROM answer_captures c
         WHERE c.project_id = $1
           AND (c.captured_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
@@ -504,7 +507,12 @@ export class CompetitorPanelService {
         GROUP BY 1`,
       [projectId, from, to, timezone, engines, DEMO_SEED_MARKER],
     );
-    return new Map(result.rows.map((r) => [r.engine_key, r.demo ? "demo" : "live"] as const));
+    const sources = new Map<string, DataSource>();
+    for (const row of result.rows) {
+      const source = dataSourceOf(Number(row.live), Number(row.demo));
+      if (source !== null) sources.set(row.engine_key, source);
+    }
+    return sources;
   }
 
   private async engineWeights(tx: ClientBase, projectId: string): Promise<Map<string, number>> {

@@ -48,6 +48,39 @@ To undo everything the seed created for a workspace:
 NOMINARA_DEMO_SEED=1 pnpm db:seed-demo --workspace <workspace-uuid> --purge
 ```
 
+## Demo captures for the non-Gemini engines (NEW-A-8)
+
+Gemini is a REAL engine (live captures); the other five are demo. To seed
+demo facts for the five without ever touching Gemini or the money path:
+
+```bash
+NOMINARA_DEMO_SEED=1 pnpm db:seed-demo --workspace <uuid> --project <uuid> \
+  --exclude-engines gemini --facts-only
+```
+
+- `--exclude-engines a,b` — no demo facts for those engines. Keys are checked
+  against the `engines` catalog (an unknown key is refused, never a silent
+  no-op). A re-seed deletes and rewrites only the engines it writes, so an
+  excluded engine's rows (real, or demo from an earlier full seed) are left
+  alone.
+- `--facts-only` — demo-marked captures, mentions and citations plus the real
+  rollup over them, and nothing else: **no wallet or ledger is provisioned,
+  read-for-write or touched**, no project is created, and no AUX audit,
+  source index or task is written. `demo_seeded_at` is not set. **It inserts
+  no prompt and no competitor**: the facts are written against the project's
+  existing active prompts and existing competitors only (a project with no
+  active prompt gets nothing), so the capture planner never sees a demo
+  prompt and real share of voice is never changed.
+- `--project <uuid>` — restrict either mode to one active project.
+- `--purge` takes none of these; it removes every demo-marked row
+  (`normalizer_version = 'demo-seed'`) and never a real capture. A
+  facts-only project is found by its demo-marked captures; its purge removes
+  only facts, the re-rolled `metric_daily` and marked prompts (never
+  sources, AUX or tasks, which on such a project are real).
+- In a FULL seed (not `--facts-only`) competitors the seed adds to a project remain unmarked (the existing gap).
+- The three-condition guard is unchanged. Re-running on the same day yields
+  identical demo rows (ids aside).
+
 ## What it does
 
 1. Targets **every active project** in the workspace. If the workspace has

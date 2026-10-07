@@ -264,13 +264,20 @@ describe("NEW-C-1 · competitor panel", () => {
     expect((await panel()).rows.find((r) => r.is_brand)!.delta).toBeNull();
   });
 
-  it("marks an engine demo when any capture in the window is seeded, live otherwise, null when none", async () => {
+  it("marks an engine demo when every capture in the window is seeded, live when none is, mixed when both kinds contributed, null when none", async () => {
     await addCell([brand(0.6)], { engine: "chatgpt", normalizer: DEMO_SEED_MARKER });
     await addCell([brand(0.6)], { engine: "gemini" });
     const document = await panel();
     expect(document.engine_data_source).toEqual({ chatgpt: "demo", gemini: "live" });
     const empty = await panel({ engines: "chatgpt" });
     expect(Object.keys(empty.engine_data_source)).toEqual(["chatgpt"]);
+  });
+
+  it("an engine with both seeded and real captures in the window is mixed, not demo", async () => {
+    await addCell([brand(0.6)], { engine: "chatgpt", normalizer: DEMO_SEED_MARKER });
+    await addCell([brand(0.6)], { engine: "chatgpt" });
+    await addCell([brand(0.6)], { engine: "gemini" });
+    expect((await panel()).engine_data_source).toEqual({ chatgpt: "mixed", gemini: "live" });
   });
 
   it("the engines filter narrows the per-engine columns", async () => {
