@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { EnvValidationError, loadEnv } from "../../src/config/env.js";
 import { KNOWN_KEYS } from "../../src/config/env.js";
 import { envSchema } from "../../src/config/env.schema.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
 // STORY-022 scenario 6 — "Start with a required configuration value missing
 // → Refuses to start, naming the value." Config validation lives at boot
@@ -32,12 +33,12 @@ const VALID: NodeJS.ProcessEnv = {
   // STORY-025 — the Valkey CACHE instance. Required, with no default: a
   // default connection string is how a service silently talks to the wrong
   // cache, and this schema exists to make that a failed boot instead.
-  VALKEY_CACHE_URL: "redis://localhost:6379",
+  VALKEY_CACHE_URL: testCacheRedisUrl(),
   // STORY-030 — the queue instance's connection, and the rotating
   // HMAC-SHA256 key that signs every tenant-scoped job payload
   // (src/lib/queue/signing.ts). QUEUE_JOB_SIGNING_PREVIOUS_KEY/_KID are
   // optional — set only during a rotation's overlap window.
-  QUEUE_REDIS_URL: "redis://localhost:6380",
+  QUEUE_REDIS_URL: testQueueRedisUrl(),
   QUEUE_JOB_SIGNING_KEY: Buffer.alloc(32, 1).toString("base64"),
   QUEUE_JOB_SIGNING_KID: "test-queue-kid-1",
   // STORY-031 D7 — per-engine token-bucket capacity/refill JSON, on the

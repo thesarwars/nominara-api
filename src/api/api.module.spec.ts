@@ -25,6 +25,7 @@ import { PermissionDeniedException } from "../tenancy/errors.js";
 import { Controller, Get } from "@nestjs/common";
 import { Public } from "./decorators/public.decorator.js";
 import { applyFakeApiEnv } from "../../test/support/fake-env.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../../test/support/test-valkey.js";
 
 // STORY-022 — locks the composition root's global guard/interceptor order
 // against a silent regression (this story's "critical implementation
@@ -90,8 +91,8 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
+    process.env.QUEUE_REDIS_URL = testQueueRedisUrl();
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 1).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";

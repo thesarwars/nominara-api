@@ -13,6 +13,7 @@ import { SessionService } from "../../src/modules/identity/session.service.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
+import { testCacheRedisUrl } from "../support/test-valkey.js";
 
 // STORY-021 — Test Scenario 5. listForActor() runs under withActorContext
 // (ADR-0001), a cross-tenant self-read — its RLS-boundary mechanics already
@@ -57,7 +58,7 @@ describe("STORY-021 · GET /workspaces — owned/joined separation and plan badg
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
 
