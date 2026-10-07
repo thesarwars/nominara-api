@@ -77,7 +77,7 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     ]);
     await db.query(
       `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, priority_prompt_limit, next_run_at)
-       VALUES ($1,$2,'P',$3,'https://e.test','e.test',10, date_trunc('milliseconds', now() - interval '10 minutes'))`,
+       VALUES ($1,$2,'P',$3,'https://e.test','e.test',10, now() - interval '10 minutes')`,
       [project, ws, `p-${randomUUID().slice(0, 8)}`],
     );
     for (const text of ["best crm", "top crm for startups", "crm pricing"]) {
@@ -252,14 +252,23 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     expect(await runsFor(projB)).toEqual([]);
   });
 
-  it("NEW-A-10 · a lost schedule advance rolls the run row back instead of committing an undispatched run", async () => {
-    // A next_run_at with sub-millisecond precision cannot be matched by the JS
-    // Date the claim carries, so planScheduledRun's compare-and-set loses AFTER
-    // it has written the run row.
-    await db.query("UPDATE projects SET next_run_at = now() - interval '10 minutes' + interval '1 microsecond' WHERE id = $1", [projA]);
-    await expect(processor()(signedJob(wsA, projA))).rejects.toThrow(/compare-and-set/);
-    expect(await runsFor(projA)).toEqual([]);
-    expect(dispatched).toHaveLength(0);
+  it("NEW-A-10 · a microsecond-precision next_run_at plans exactly one run", async () => {
+    // The JS Date a claim carries holds milliseconds; a next_run_at written by
+    // SQL (now(), an ops backfill) does not. The schedule advance must still win.
+    await db.query(
+      "UPDATE projects SET next_run_at = now() - interval '10 minutes' + interval '1 microsecond' WHERE id = $1",
+      [projA],
+    );
+    await expect(processor()(signedJob(wsA, projA))).resolves.not.toThrow();
+    await settle();
+    expect(await runsFor(projA)).toHaveLength(1);
+    expect(dispatched).toHaveLength(1);
+    const next = await db.query<{ next_run_at: Date }>("SELECT next_run_at FROM projects WHERE id = $1", [projA]);
+    expect(next.rows[0]!.next_run_at.getTime()).toBeGreaterThan(Date.now());
+    // And the next delivery finds nothing due: still exactly one run.
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(await runsFor(projA)).toHaveLength(1);
   });
 
   it("NEW-A-10 · a project that is not due yet is skipped without a run", async () => {
@@ -282,16 +291,25 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     expect(await runsFor(projA)).toEqual([]);
   });
 
-  it("NEW-A-10 · a dispatch failure does not fail the job (the run row is durable)", async () => {
+  it("NEW-A-10 · a dispatch failure does not fail the job, fails the run and releases its fair-use reservation", async () => {
     const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
     const handler = createCapturePlanHandler(context, {
       cache: new InMemoryCacheAdapter(),
       dispatch: () => Promise.reject(new Error("queue unreachable")),
+      withClient: (fn) => fn(appDb),
     });
     const proc = createJobProcessor(ENTRY, { keys: TEST_SIGNING_KEYS, getClient: () => appDb, process: handler });
     await expect(proc(signedJob(wsA, projA))).resolves.not.toThrow();
     await settle();
-    expect(await runsFor(projA)).toHaveLength(1);
+
+    const runs = await runsFor(projA);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.status, "a never-dispatched run must reach a terminal status").toBe("failed");
+    const counter = await db.query<{ reserved_value: string }>(
+      "SELECT reserved_value::text FROM usage_counters WHERE workspace_id = $1 AND metric = $2",
+      [wsA, FAIR_USE_METRIC],
+    );
+    expect(counter.rows[0]!.reserved_value).toBe("0");
   });
 
   it("NEW-A-10 · observability: emits the outcome metric and a log line carrying the workspace id, not its name or any prompt text", async () => {

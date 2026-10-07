@@ -188,6 +188,57 @@ describe("NEW-A-7 · rollup requested from the parse completion path", () => {
     expect(new Set(enqueued.map((e) => e.idempotencyKey)).size).toBe(1);
   });
 
+  it("NEW-A-7 AC1 · two last cells parsed at the same time enqueue exactly one rollup", async () => {
+    // READ COMMITTED, no lock: tx2 parses B while tx1's parse of A is uncommitted,
+    // sees A still `captured` and skips; tx1 then commits having seen B `captured`
+    // and skips too. Neither requests the rollup. The run row lock serialises them.
+    const a = await seedCapture(workspaceId, projectId, promptId, runId);
+    const b = await seedCapture(workspaceId, projectId, promptId, runId);
+    const second = new Client({ connectionString: container.getConnectionUri() });
+    const monitor = new Client({ connectionString: container.getConnectionUri() });
+    await second.connect();
+    await monitor.connect();
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let tx1Parsed!: () => void;
+      const parsedA = new Promise<void>((resolve) => {
+        tx1Parsed = resolve;
+      });
+
+      const tx1 = withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await parseHandler()(tx, job(a));
+        tx1Parsed();
+        await gate; // hold the transaction open, uncommitted
+      });
+      await parsedA;
+
+      const tx2 = withTenantContext(second, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await parseHandler()(tx, job(b));
+      });
+
+      // Sequence tx2 behind tx1's lock: wait until it is blocked, bounded so the
+      // unfixed (lock-free) code fails on the assertion below rather than hanging.
+      const deadline = Date.now() + 3_000;
+      let waiting = false;
+      while (!waiting && Date.now() < deadline) {
+        const locks = await monitor.query("SELECT 1 FROM pg_locks WHERE NOT granted LIMIT 1");
+        waiting = (locks.rowCount ?? 0) > 0;
+        if (!waiting) await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      release();
+      await Promise.all([tx1, tx2]);
+
+      expect(waiting, "the second completer must block on the run row lock").toBe(true);
+      expect(enqueued).toHaveLength(1);
+    } finally {
+      await second.end();
+      await monitor.end();
+    }
+  }, 30_000);
+
   it("NEW-A-7 AC2 · the enqueue happens after COMMIT, never inside the transaction", async () => {
     const first = await seedCapture(workspaceId, projectId, promptId, runId);
     const second = await seedCapture(workspaceId, projectId, promptId, runId);
