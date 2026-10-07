@@ -120,6 +120,7 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
     auth?: { sub: string };
     authMethod?: "session" | "apiKey";
     creditUsage?: CreditUsage;
+    params?: Record<string, string>;
   }
 
   function request(key: string, over: Partial<Req> = {}): Req {
@@ -396,6 +397,91 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
       [workspaceId],
     );
     expect(Number(used.rows[0]!.used_count)).toBe(0);
+  });
+
+  // ── STORY-034 — nothing to buy is refused before anything is reserved ───
+
+  /**
+   * A real project whose scope is EMPTY under the production default: no engine
+   * is capture-ready until STORY-001, and this spec does not touch the seam.
+   */
+  async function emptyScopeProject(): Promise<string> {
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, kind)
+       VALUES ($1,$2,'P',$3,'https://example.com','example.com','brand')`,
+      [id, workspaceId, `p-${randomUUID().slice(0, 8)}`],
+    );
+    return id;
+  }
+
+  async function dailyUsed(): Promise<number> {
+    const used = await db.query<{ used_count: string }>(
+      "SELECT used_count::text FROM credit_daily_counters WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    return Number(used.rows[0]?.used_count ?? 0);
+  }
+
+  it("STORY-034 · an EMPTY deep-scan scope is refused 422 before the wallet is touched — no reserve, no release — and the daily counter is given back", async () => {
+    await db.query(
+      `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
+       VALUES ($1, 300, 0, 0, (now() AT TIME ZONE 'UTC')::date, (now() AT TIME ZONE 'UTC')::date + 30)`,
+      [workspaceId],
+    );
+    await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () =>
+      incrementDailyCounter(db, workspaceId, "lookup", 3),
+    );
+    const projectId = await emptyScopeProject();
+
+    const req = request("k-empty", {
+      params: { id: projectId },
+      dailyCapCompensation: { workspaceId, action: "lookup" },
+    });
+    await expect(guard().canActivate(contextFor(req))).rejects.toMatchObject({
+      code: "precondition_unmet",
+      details: { reason: "no_capturable_scope" },
+    });
+
+    expect(await wallet()).toMatchObject({ includedBalance: 300, reserved: 0 });
+    expect(await ledger("reserve"), "nothing was reserved").toBe(0);
+    expect(await ledger("release"), "so nothing needed releasing").toBe(0);
+    expect(req.creditReservation, "and nothing is left for the interceptor to settle").toBeUndefined();
+    expect(await dailyUsed(), "the day's allowance is not spent by a refused request").toBe(0);
+  });
+
+  it("STORY-034 · the scope check outranks the wallet: an empty scope on a balance too low for the price is 422, not 402", async () => {
+    await db.query(
+      `INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, reserved, cycle_start, cycle_end)
+       VALUES ($1, 5, 0, 0, (now() AT TIME ZONE 'UTC')::date, (now() AT TIME ZONE 'UTC')::date + 30)`,
+      [workspaceId],
+    );
+    const projectId = await emptyScopeProject();
+
+    await expect(guard().canActivate(contextFor(request("k-poor-empty", { params: { id: projectId } })))).rejects.toMatchObject({
+      code: "precondition_unmet",
+    });
+  });
+
+  it("STORY-034 · an unknown project is a 404 before anything is reserved", async () => {
+    await expect(
+      guard().canActivate(contextFor(request("k-ghost", { params: { id: randomUUID() } }))),
+    ).rejects.toMatchObject({ code: "not_found" });
+    expect(await ledger("reserve")).toBe(0);
+  });
+
+  it("STORY-034 · the check runs only where a NEW reservation is about to be made — a redelivery that re-attaches to an open one is not re-litigated", async () => {
+    // First delivery reserves (no project parameter: nothing to inspect).
+    await guard().canActivate(contextFor(request("k-redeliver")));
+    expect(await ledger("reserve")).toBe(1);
+
+    // The same key again, now naming a project whose scope is empty. The
+    // credits are already held and the action is already in motion: refusing
+    // here would strand the standing reservation.
+    const redelivery = request("k-redeliver", { params: { id: await emptyScopeProject() } });
+    await expect(guard().canActivate(contextFor(redelivery))).resolves.toBe(true);
+    expect(redelivery.creditReservation).toMatchObject({ idempotencyKey: "k-redeliver", amount: PRICE });
+    expect(await ledger("reserve"), "still exactly one reservation").toBe(1);
   });
 
   it("the refusal carries the required amount, the bucket split and the tier-filtered packs", async () => {

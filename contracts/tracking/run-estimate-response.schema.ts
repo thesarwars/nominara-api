@@ -124,6 +124,15 @@ export const runEstimateResponseSchema = z
     prompt_count: z.number().int().nonnegative(),
     engine_keys: z.array(z.string().min(1)),
     /**
+     * Whether POST /projects/{id}/runs would accept this scan. `false` when
+     * the scope plans no cells at all — no capture-ready engine this
+     * project is entitled to, or no active prompts — in which case the
+     * trigger refuses with 422 precondition_unmet and charges nothing.
+     * The price, wallet and confirmation fields still describe what the
+     * scan WOULD cost; this says it cannot run.
+     */
+    capturable: z.boolean(),
+    /**
      * A LITERAL ZERO. §3 marks this route free and carries neither `✚` nor
      * `¢`; typed as the literal so an edit that made the estimate billable
      * could not ship without changing this contract.

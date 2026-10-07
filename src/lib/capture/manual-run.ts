@@ -4,11 +4,11 @@ import type { Cache } from "../cache/cache.port.js";
 import { cacheKeyNamespace } from "../cache/key-namespace.js";
 import { resolveEntitlements } from "../entitlements/resolution.js";
 import { resolveBillingPeriod } from "../usage/billing-period.js";
-import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
 import { deepScanPriceOrThrow } from "./deep-scan-price.js";
 import type { ProjectCadence } from "./dispatch-cells.js";
 import { planRun, type PlannedRun } from "./plan-run.js";
-import { probeRunCells } from "./probe-run.js";
+import { probeRunCells, resolveRunCells } from "./probe-run.js";
 import { NORMALIZER_VERSION } from "../parser/normalize.js";
 
 // STORY-034 — the manual deep scan.
@@ -48,6 +48,69 @@ export interface ManualRunProject {
   readonly locale: string;
   readonly cadence: ProjectCadence;
   readonly planKey: string;
+}
+
+/**
+ * ⚠ THE ONE DEFINITION OF "THIS SCAN HAS SOMETHING TO CAPTURE": at least one
+ * PLANNED cell.
+ *
+ * Three places ask, and they must never disagree about a scope the customer
+ * is about to be charged for:
+ *
+ *   - the estimate's `capturable`            (`estimateManualRun`)
+ *   - the trigger's in-transaction refusal   (`planManualRun`)
+ *   - CreditGuard's refusal BEFORE it reserves (`assertManualRunCapturable`)
+ *
+ * PLANNED, NOT LIVE. A scope whose every cell the cache already answers has
+ * planned cells and no live ones: it is real work with a result — a cheaper
+ * one, at the same flat price — and refusing it, or reporting it
+ * un-capturable, would answer "is anything left to send an engine?", which is
+ * a different question. Taking a number rather than a run is deliberate: the
+ * three callers hold three different shapes (a probe, a plan, a bare cell
+ * count), and none of them offers a way to hand this a liveness figure.
+ */
+export function scopeIsCapturable(plannedCells: number): boolean {
+  return plannedCells > 0;
+}
+
+/**
+ * The refusal for an empty scope, built once so the trigger and CreditGuard
+ * cannot word it — or classify it — differently. `details.reason` is the
+ * discriminator a client reads (see error-details.schema.ts): this endpoint
+ * also refuses with `price_not_agreed`, and the two have different remedies.
+ */
+export function noCapturableScopeError(): InstanceType<typeof PreconditionUnmetError> {
+  return new PreconditionUnmetError({
+    message:
+      "this deep scan has nothing to capture: no engine this project can use is able to capture yet, or it has no active prompts. The scan was not started and nothing was charged.",
+    details: { reason: "no_capturable_scope" },
+  });
+}
+
+/**
+ * Refuses an empty scope BEFORE anything has been reserved. CreditGuard calls
+ * this for `@Credits("deep_scan")`: the trigger's own refusal in `planManualRun`
+ * comes after the reservation, so on its own it charges a reserve-and-release
+ * pair to the customer-visible ledger, and on a low balance it is never
+ * reached at all — the wallet refuses first, with a `402` telling the
+ * customer to buy credits for a scan that could not run.
+ *
+ * Runs on the caller's transaction and reads two tables. It does not touch
+ * the cache: whether a cell would be served from cache is irrelevant to
+ * whether the scope is empty (see `scopeIsCapturable`).
+ *
+ * An unknown project is a 404, exactly as the handler's own
+ * `loadManualRunProject` would answer — now before a reservation rather than
+ * after one.
+ */
+export async function assertManualRunCapturable(tx: ClientBase, projectId: string): Promise<void> {
+  await loadManualRunProject(tx, projectId);
+  // No `captureReadyEngineKeys` seam here, deliberately: this runs in the
+  // request path, where the registry's own answer is the only one there is.
+  // A spec that needs a capture-ready engine replaces the registry
+  // (deep-scan-zero-scope-http.spec.ts), so guard and handler see the same one.
+  const { cells } = await resolveRunCells(tx, { projectId, scope: "all" });
+  if (!scopeIsCapturable(cells.length)) throw noCapturableScopeError();
 }
 
 /** What both the estimate and the trigger need before they can do anything. */
@@ -98,6 +161,12 @@ export interface ManualRunEstimate {
   readonly forecast: ManualRunForecast;
   readonly promptCount: number;
   readonly engineKeys: readonly string[];
+  /**
+   * Whether the trigger would accept this scan. THE SAME PREDICATE as the
+   * trigger's refusal — `scopeIsCapturable` over the planned cells — so the
+   * estimate and the trigger cannot disagree.
+   */
+  readonly capturable: boolean;
 }
 
 /**
@@ -180,6 +249,7 @@ export async function estimateManualRun(
     // be a second chance to disagree with the number just probed.
     promptCount: probe.engines.length === 0 ? 0 : probe.cells.length / probe.engines.length,
     engineKeys: probe.engines.map((engine) => engine.engineKey),
+    capturable: scopeIsCapturable(probe.cells.length),
   };
 }
 
@@ -253,6 +323,28 @@ export async function planManualRun(
       ? {}
       : { captureReadyEngineKeys: options.captureReadyEngineKeys }),
   });
+
+  // ⚠ NOTHING TO CAPTURE IS REFUSED — NEVER STARTED, NEVER CHARGED.
+  //
+  // A run with zero planned cells (no engine this project is entitled to can
+  // capture yet, or no active prompts) used to be planned, recorded and
+  // returned with the full flat price, and `@Credits("deep_scan")` debits on
+  // any 2xx — so the customer paid for a scan that could capture nothing.
+  // That is every project today: no engine adapter is capture-ready until
+  // STORY-001, so `captureReadyEngineKeys()` is empty in production.
+  //
+  // Thrown INSIDE the request transaction and before anything reaches the
+  // debit: TenantContextInterceptor rolls the capture_runs row back, and
+  // CreditInterceptor settles only on a handler's success value. `planned`,
+  // not `live` — a run whose every cell the cache answers is still real work
+  // with a result, just a cheaper one; only an EMPTY scope is refused.
+  //
+  // This is the IN-TRANSACTION BACKSTOP, not the front line. CreditGuard
+  // refuses an empty scope before it reserves (`assertManualRunCapturable`),
+  // so a request reaches here empty only if the scope emptied between that
+  // check and this transaction — and then the reservation is released and the
+  // customer charged nothing, as before.
+  if (!scopeIsCapturable(plan.planned)) throw noCapturableScopeError();
 
   // The price travels back with the plan so the response can state it
   // WITHOUT a second resolution — the two would then be two readings of a

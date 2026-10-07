@@ -40,6 +40,17 @@ export interface ApiHarnessOptions {
    * composition root's own provider.
    */
   readonly cache?: () => Cache;
+  /**
+   * Environment overrides, applied AFTER `applyFakeApiEnv()` on every boot.
+   *
+   * `applyFakeApiEnv()` points the queue at localhost:6380 and the cache at
+   * localhost:6379 — the developer's own local services. A spec whose request
+   * path reaches the queue (a trigger enqueues its cells) or the cache must not
+   * depend on, or write to, whatever happens to be listening there, so it starts
+   * its own containers and names them here. A function, because the container
+   * URLs exist only after that spec's own `beforeAll`.
+   */
+  readonly env?: () => Readonly<Record<string, string>>;
 }
 
 /** Call inside a `describe`. Registers the container/app lifecycle hooks and returns accessors. */
@@ -75,6 +86,7 @@ export function useApiHarness(options: ApiHarnessOptions = {}): ApiHarness {
     process.env.CSRF_SECRET = HARNESS_CSRF_SECRET;
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DATABASE_URL_POOLED = container.getConnectionUri();
+    Object.assign(process.env, options.env?.() ?? {});
 
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();

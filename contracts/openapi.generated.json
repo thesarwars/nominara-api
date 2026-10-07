@@ -16029,6 +16029,9 @@
                             "minLength": 1
                           }
                         },
+                        "capturable": {
+                          "type": "boolean"
+                        },
                         "credits_charged": {
                           "type": "number",
                           "const": 0
@@ -16108,6 +16111,7 @@
                         "forecast",
                         "prompt_count",
                         "engine_keys",
+                        "capturable",
                         "credits_charged",
                         "wallet",
                         "scans_affordable",

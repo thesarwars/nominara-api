@@ -9,7 +9,8 @@ import type { Cache } from "../../src/lib/cache/cache.port.js";
 import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
 import { captureL1Key } from "../../src/lib/capture/l1-cache-key.js";
 import { adapterMajorOf } from "../../src/lib/capture/l1-exact-hash.js";
-import { loadManualRunProject, planManualRun } from "../../src/lib/capture/manual-run.js";
+import { estimateManualRun, loadManualRunProject, planManualRun } from "../../src/lib/capture/manual-run.js";
+import { PreconditionUnmetError } from "../../src/api/errors/domain-errors.js";
 import { etaMsFrom, pctFrom, readRunProgress } from "../../src/lib/capture/run-progress.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
@@ -134,6 +135,82 @@ describe("STORY-034 · the manual run lifecycle", () => {
     }
     return runId;
   }
+
+  // ⚠ A deep scan with NOTHING TO CAPTURE must be refused, not planned and
+  // priced: `@Credits("deep_scan")` debits on any 2xx, and in production no
+  // engine is capture-ready yet (STORY-001), so every scan would charge the
+  // flat price for zero work. The harness mirrors production: the request's
+  // transaction rolls back on the throw, so no run row may survive.
+  describe("a scope with nothing to capture", () => {
+    async function triggerWith(captureReadyEngineKeys: readonly string[]): Promise<string> {
+      const runId = uuidV7();
+      const project = await loadManualRunProject(db, projectId);
+      await db.query("BEGIN");
+      try {
+        await planManualRun(db, cache, project, { runId, triggeredBy: null, now: NOW, captureReadyEngineKeys });
+        await db.query("COMMIT");
+      } catch (error) {
+        await db.query("ROLLBACK");
+        throw error;
+      }
+      return runId;
+    }
+
+    it("⚠ is refused as precondition_unmet when no engine can capture — and leaves no run behind", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      const before = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM capture_runs WHERE project_id = $1", [projectId]);
+
+      await expect(triggerWith([])).rejects.toBeInstanceOf(PreconditionUnmetError);
+      await expect(triggerWith([])).rejects.toMatchObject({
+        code: "precondition_unmet",
+        details: { reason: "no_capturable_scope" },
+      });
+
+      const after = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM capture_runs WHERE project_id = $1", [projectId]);
+      expect(after.rows[0]!.n).toBe(before.rows[0]!.n);
+    });
+
+    it("⚠ is refused when the capture-ready engines are ones this project is not entitled to", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      await expect(triggerWith(["an-engine-no-plan-entitles"])).rejects.toBeInstanceOf(PreconditionUnmetError);
+      await expect(triggerWith(["an-engine-no-plan-entitles"])).rejects.toMatchObject({
+        details: { reason: "no_capturable_scope" },
+      });
+    });
+
+    it("⚠ is refused when an engine can capture but the project has no active prompts", async () => {
+      await expect(triggerWith([SEEDED_ENGINE_KEY])).rejects.toBeInstanceOf(PreconditionUnmetError);
+      await expect(triggerWith([SEEDED_ENGINE_KEY])).rejects.toMatchObject({
+        details: { reason: "no_capturable_scope" },
+      });
+    });
+
+    // ⚠ ONE PREDICATE. `capturable` (the estimate) and the refusal (the
+    // trigger) must be the same question with the same answer, and the case
+    // that separates a right predicate from a plausible neighbour is a scope
+    // whose EVERY cell the cache already answers: planned cells > 0, live
+    // cells = 0. That is real work with a result — a cheaper one — so it is
+    // capturable, and refusing it (or reporting it `false`) would be the
+    // "live cells" reading of "nothing to capture", which is a different and
+    // wrong question.
+    it("STORY-034 · a FULLY CACHED scope is capturable in the estimate AND accepted by the trigger — the two share one predicate", async () => {
+      const text = "best crm for a 50-rep sales team";
+      await addPrompt(text);
+      await seedL1(text);
+      const project = await loadManualRunProject(db, projectId);
+
+      const estimate = await estimateManualRun(db, cache, project, NOW, { captureReadyEngineKeys: [SEEDED_ENGINE_KEY] });
+      expect(estimate.forecast).toMatchObject({ plannedCells: 1, liveCells: 0, cachedCells: 1 });
+      expect(estimate.capturable, "planned > 0, so the estimate says the scan can run").toBe(true);
+
+      await expect(triggerWith([SEEDED_ENGINE_KEY]), "and the trigger accepts the very same scope").resolves.toMatch(/.+/);
+    });
+
+    it("a real scope is still planned and priced exactly as before", async () => {
+      await addPrompt("best crm for a 50-rep sales team");
+      await expect(triggerWith([SEEDED_ENGINE_KEY])).resolves.toMatch(/.+/);
+    });
+  });
 
   it("records the run as manual over the FULL tracked set", async () => {
     // §3: "Runs the full tracked set on every enabled engine... The body

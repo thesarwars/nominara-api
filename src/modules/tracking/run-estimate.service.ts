@@ -97,6 +97,7 @@ export class RunEstimateService {
       },
       prompt_count: estimate.promptCount,
       engine_keys: [...estimate.engineKeys],
+      capturable: estimate.capturable,
       credits_charged: 0,
       wallet: {
         available,
