@@ -52,6 +52,19 @@ export interface SubscriptionCheckoutInput {
   readonly customerId?: string;
   readonly successUrl: string;
   readonly cancelUrl: string;
+  /**
+   * NEW-D-2 audit — the checkout intent (`subscriptions.pending_checkout.id`),
+   * written to the subscription's metadata so the webhook can find the price
+   * frozen for THIS session. Not a secret and not authority: it is a lookup key.
+   */
+  readonly intentId?: string;
+  /**
+   * NEW-D-2 audit — the Stripe `Idempotency-Key`. The same key with the same
+   * body returns the SAME session, so a retry after a crash can recover the
+   * session the crashed request created (and expire it) instead of minting a
+   * second payable one.
+   */
+  readonly idempotencyKey?: string;
 }
 
 /**

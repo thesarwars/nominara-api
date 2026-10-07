@@ -7,7 +7,12 @@ import type { BillingInterval, ProviderSubscriptionState, SubscriptionStatus } f
 // what makes two events delivered in either order write the same row.
 
 export type DesiredSubscription =
-  | { readonly kind: "write"; readonly state: ProviderSubscriptionState }
+  | {
+      readonly kind: "write";
+      readonly state: ProviderSubscriptionState;
+      /** The charge that was verified, for an entitled state; null for an ended one. It is what gets frozen on the row. */
+      readonly charge?: FrozenCharge | null;
+    }
   /** `mismatch`: the subscription claims a plan that is not what Stripe charges for it. Refused, and worth an alarm. */
   | { readonly kind: "ignore"; readonly reason: string; readonly mismatch?: true };
 
@@ -21,6 +26,21 @@ export interface ClaimedPlanPrice {
   readonly annualCents: number;
   /** ISO 4217, any case. */
   readonly currency: string;
+  /**
+   * NEW-D-2 audit — the charge ADOPTED at checkout, frozen on our side. When
+   * present it is what the plan item is compared with, and the catalog above is
+   * not consulted: a later catalog price change must not freeze every existing
+   * subscription (their Stripe price is the one they signed up at).
+   */
+  readonly frozen?: FrozenCharge;
+}
+
+/** What a subscription is charged: the amount, currency and interval of its plan item. */
+export interface FrozenCharge {
+  readonly unitAmountCents: number;
+  /** ISO 4217, any case. */
+  readonly currency: string;
+  readonly interval: "month" | "year";
 }
 
 /** Statuses under which the customer is entitled to the paid plan. All three are "live" for `ux_subscriptions_active`. */
