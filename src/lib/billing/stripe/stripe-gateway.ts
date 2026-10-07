@@ -54,6 +54,25 @@ export interface SubscriptionCheckoutInput {
   readonly cancelUrl: string;
 }
 
+/**
+ * STORY-076a — everything Stripe needs to host a one-time credit-pack payment.
+ * The price comes from OUR `credit_purchases` row, written before this call; the
+ * client supplies neither a price nor a redirect.
+ */
+export interface CreditPackCheckoutInput {
+  readonly workspaceId: string;
+  /** `credit_purchases.id` — travels as metadata on the session AND the PaymentIntent. */
+  readonly purchaseId: string;
+  readonly packKey: string;
+  readonly productName: string;
+  readonly credits: number;
+  /** Integer minor units, from the purchase row's `numeric(12,2)`. Never a float. */
+  readonly unitAmountCents: number;
+  readonly currency: string;
+  readonly successUrl: string;
+  readonly cancelUrl: string;
+}
+
 export interface HostedSession {
   readonly id: string;
   readonly url: string;
@@ -84,6 +103,15 @@ export interface StripeGateway {
    * data touches this system. Throws `StripeUpstreamError`.
    */
   createSubscriptionCheckout(input: SubscriptionCheckoutInput): Promise<HostedSession>;
+
+  /**
+   * Hosted Checkout, mode=payment, for one credit pack. Sets `metadata`
+   * (`workspace_id`, `purchase_id`) on the session AND on the PaymentIntent, so
+   * either event's FRESH fetch names the purchase. The Stripe idempotency key
+   * is the purchase id: a retried call cannot mint a second payable session.
+   * Throws `StripeUpstreamError`.
+   */
+  createCreditPackCheckout(input: CreditPackCheckoutInput): Promise<HostedSession>;
 
   /**
    * Makes a Checkout session unpayable, or reports that it already was paid.

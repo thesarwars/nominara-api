@@ -233,7 +233,7 @@ describe("STORY-076a · credit packs", () => {
     const { sessionId, pi } = stripePaid(workspaceId, id);
     const res = await settle(sessionId);
     expect(res.statusCode, res.body).toBe(200);
-    expect(await ledger(workspaceId)).toMatchObject([{ entry_type: "grant" }, { entry_type: "purchase", bucket: "purchased", credits: "1000", idempotency_key: pi, reference_type: "credit_purchase", reference_id: id }]);
+    expect(await ledger(workspaceId)).toMatchObject([{ entry_type: "grant" }, { entry_type: "purchase", bucket: "purchased", credits: 1000, idempotency_key: pi, reference_type: "credit_purchase", reference_id: id }]);
     expect((await wallet(workspaceId))).toMatchObject({ purchased_balance: 1000, lifetime_purchased: "1000" });
     const row = await purchaseRow(id);
     expect(row).toMatchObject({ status: "succeeded", stripe_payment_intent_id: pi });
@@ -264,6 +264,7 @@ describe("STORY-076a · credit packs", () => {
     expect((await ledger(workspaceId)).filter((e) => e.entry_type === "purchase")).toHaveLength(1);
     expect((await wallet(workspaceId))?.purchased_balance).toBe(1000);
     expect(await verifyWorkspaceWallet(harness.db(), workspaceId)).toBeNull();
+    expect(await audit(workspaceId, "billing.credit_purchase.%"), "one settlement, one audit row").toHaveLength(1);
   });
 
   it("an unpaid session (payment_status != paid) credits nothing", async () => {

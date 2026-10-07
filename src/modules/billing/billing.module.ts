@@ -4,9 +4,12 @@ import { STRIPE_GATEWAY, type StripeGateway } from "../../lib/billing/stripe/str
 import { StripeHttpGateway } from "../../lib/billing/stripe/stripe-http.gateway.js";
 import { BillingSubscriptionController } from "./billing-subscription.controller.js";
 import { BillingSubscriptionService } from "./billing-subscription.service.js";
+import { CreditPacksController } from "./credit-packs.controller.js";
+import { CreditPacksService } from "./credit-packs.service.js";
 import { BillingController } from "./billing.controller.js";
 import { BillingService } from "./billing.service.js";
 import { STRIPE_EVENT_HANDLERS, type StripeEventHandler } from "./stripe-event-handler.js";
+import { StripeCreditPackHandler } from "./stripe-credit-pack.handler.js";
 import { StripeSubscriptionHandler } from "./stripe-subscription.handler.js";
 import { StripeWebhookController } from "./stripe-webhook.controller.js";
 import { StripeWebhookService } from "./stripe-webhook.service.js";
@@ -14,11 +17,13 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
 // STORY-022 — system-architecture.md §5 module inventory. Registration
 // only — no logic here (coding-standards.md §1's module layout).
 @Module({
-  controllers: [BillingController, BillingSubscriptionController, StripeWebhookController],
+  controllers: [BillingController, CreditPacksController, BillingSubscriptionController, StripeWebhookController],
   providers: [
     BillingService,
     BillingSubscriptionService,
+    CreditPacksService,
     StripeSubscriptionHandler,
+    StripeCreditPackHandler,
     StripeWebhookService,
     {
       provide: STRIPE_GATEWAY,
@@ -27,11 +32,11 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
         return new StripeHttpGateway({ secretKey: env.STRIPE_SECRET_KEY, webhookSecret: env.STRIPE_WEBHOOK_SECRET });
       },
     },
-    // The webhook's effects. STORY-076a adds its handler to this list.
+    // The webhook's effects: subscriptions (075a) and credit packs (076a).
     {
       provide: STRIPE_EVENT_HANDLERS,
-      useFactory: (subscriptions: StripeSubscriptionHandler): StripeEventHandler[] => [subscriptions],
-      inject: [StripeSubscriptionHandler],
+      useFactory: (subscriptions: StripeSubscriptionHandler, creditPacks: StripeCreditPackHandler): StripeEventHandler[] => [subscriptions, creditPacks],
+      inject: [StripeSubscriptionHandler, StripeCreditPackHandler],
     },
   ],
   exports: [BillingService, STRIPE_GATEWAY],

@@ -3,6 +3,7 @@ import {
   StripeSignatureError,
   StripeUpstreamError,
   type ClosedCheckoutSession,
+  type CreditPackCheckoutInput,
   type FetchedStripeObject,
   type HostedSession,
   type StripeGateway,
@@ -98,6 +99,40 @@ export class StripeHttpGateway implements StripeGateway {
         success_url: input.successUrl,
         cancel_url: input.cancelUrl,
       });
+      if (typeof session.url !== "string") throw new StripeUpstreamError(undefined);
+      return { id: session.id, url: session.url };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async createCreditPackCheckout(input: CreditPackCheckoutInput): Promise<HostedSession> {
+    const client = this.requireClient();
+    try {
+      const metadata = { workspace_id: input.workspaceId, purchase_id: input.purchaseId, pack_key: input.packKey };
+      const session = await client.checkout.sessions.create(
+        {
+          mode: "payment",
+          client_reference_id: input.workspaceId,
+          line_items: [
+            {
+              quantity: 1,
+              price_data: {
+                currency: input.currency.toLowerCase(),
+                unit_amount: input.unitAmountCents,
+                product_data: { name: input.productName, metadata: { nominara_kind: "credit_pack" } },
+              },
+            },
+          ],
+          // Both objects carry the ids, so payment_intent.* events resolve the
+          // purchase from their own fresh fetch.
+          payment_intent_data: { metadata },
+          metadata,
+          success_url: input.successUrl,
+          cancel_url: input.cancelUrl,
+        },
+        { idempotencyKey: `credit-pack-${input.purchaseId}` },
+      );
       if (typeof session.url !== "string") throw new StripeUpstreamError(undefined);
       return { id: session.id, url: session.url };
     } catch (error) {
