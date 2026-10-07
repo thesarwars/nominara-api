@@ -7,6 +7,8 @@ import { PromptLifecycleService } from "./lifecycle.service.js";
 import { PromptListService } from "./prompt-list.service.js";
 import { PromptsController } from "./prompts.controller.js";
 import { PromptsService } from "./prompts.service.js";
+import { TopicsController } from "./topics.controller.js";
+import { TopicsService } from "./topics.service.js";
 
 // STORY-045 — the prompts bounded area.
 //
@@ -30,7 +32,7 @@ import { PromptsService } from "./prompts.service.js";
 // without it.
 @Module({
   imports: [CacheModule, EntitlementsModule],
-  controllers: [PromptsController, PromptLifecycleController],
-  providers: [PromptsService, PromptActivationService, PromptLifecycleService, PromptListService],
+  controllers: [PromptsController, PromptLifecycleController, TopicsController],
+  providers: [PromptsService, PromptActivationService, PromptLifecycleService, PromptListService, TopicsService],
 })
 export class PromptsModule {}
