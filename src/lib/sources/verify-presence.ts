@@ -5,6 +5,7 @@ import { normalize } from "../parser/normalize.js";
 import { matchEntities, type AliasEntry } from "../parser/entity-matcher.js";
 import { refreshProjectSourceIndex } from "../rollup/refresh-project-source-index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
+import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
 
 // NEW-C-15 / STORY-054 AC4 + AC11 (scenarios 5, 6, 7) — brand presence on a cited
 // domain is VERIFIED BY FETCHING the cited URL and matching it against the
@@ -25,7 +26,9 @@ import { incrementCounter } from "../telemetry/metrics.js";
 //   3. ONLY A REAL CITATION VERIFIES. A demo `.example` domain is never fetched,
 //      and a domain is a candidate only through an engine that has a real
 //      adapter (today: gemini). Demo engines cite invented domains; verifying
-//      them would stamp fabricated data with a real `verified_at`.
+//      them would stamp fabricated data with a real `verified_at`. A capture the
+//      demo seed marked (`normalizer_version = 'demo-seed'`) never counts, whatever
+//      engine key it carries.
 
 const logger = new Logger("verify-presence");
 
@@ -42,10 +45,22 @@ export const LIVE_CITATION_ENGINES: readonly string[] = ["gemini"];
 /** One run fetches at most this many domains, highest influence first — a handler holds its transaction while it fetches, so the run is bounded. The rest wait for the next run. */
 export const MAX_DOMAINS_PER_RUN = 25;
 
-/** A demo domain: the reserved `.example` TLD (RFC 2606), as the demo seed uses. Never verified. */
+/** RFC 2606 reserved top-level names (plus `localhost`): nothing real lives there. */
+const RESERVED_TLDS: ReadonlySet<string> = new Set(["example", "test", "invalid", "localhost"]);
+/** RFC 2606 reserved second-level names, and every subdomain of them. */
+const RESERVED_SECOND_LEVEL: ReadonlySet<string> = new Set(["example.com", "example.net", "example.org"]);
+
+/**
+ * A demo domain: an RFC 2606 reserved name, never a real citation. The demo seed
+ * writes `<name>.example.com` and `*.example` domains, so both are matched, along
+ * with `example.net`/`example.org`, their subdomains, and the reserved TLDs
+ * (`.example`, `.test`, `.invalid`, `.localhost`). Never verified.
+ */
 export function isDemoDomain(domain: string): boolean {
-  const host = domain.trim().toLowerCase().replace(/\.$/u, "");
-  return host === "example" || host.endsWith(".example");
+  const labels = domain.trim().toLowerCase().replace(/\.$/u, "").split(".");
+  const tld = labels[labels.length - 1] ?? "";
+  if (RESERVED_TLDS.has(tld)) return true;
+  return RESERVED_SECOND_LEVEL.has(labels.slice(-2).join("."));
 }
 
 export interface PresenceCandidate {
@@ -196,8 +211,14 @@ export async function verifyProjectSourcePresence(tx: ClientBase, projectId: str
                 AND v.brand_present_on_domain IS NOT NULL) AS verified_at
        FROM project_source_index psi JOIN source_domains sd ON sd.id = psi.source_domain_id
       WHERE psi.project_id = $1 AND psi.engine_key = ANY($2::text[])
+        -- A domain is a candidate only through a citation that is not demo-marked. The seed marks its
+        -- captures (answer_captures.normalizer_version) and writes them under live engines' keys too.
+        AND EXISTS (
+          SELECT 1 FROM citation_facts cf
+           WHERE cf.project_id = psi.project_id AND cf.domain = sd.domain AND cf.engine_key = ANY($2::text[])
+             AND NOT EXISTS (SELECT 1 FROM answer_captures ac WHERE ac.id = cf.result_id AND ac.normalizer_version = $3))
       ORDER BY psi.source_domain_id, psi.window_days DESC, psi.citation_count DESC`,
-    [projectId, [...LIVE_CITATION_ENGINES]],
+    [projectId, [...LIVE_CITATION_ENGINES], DEMO_SEED_MARKER],
   );
   const byInfluence = [...candidates.rows].sort((a, b) => b.context_weight - a.context_weight || a.domain.localeCompare(b.domain));
   const { check, skipped } = selectPresenceChecks(

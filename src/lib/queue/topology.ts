@@ -327,8 +327,8 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
   // (KAD-06) nor inside the rollup transaction, which reads only this database.
   // The `crawl` group because it is an outbound fetcher of third-party pages,
   // like `crawl.audit`; a queue of its own so a DLQ entry names the job that
-  // failed. Tenant-scoped (signed payload, RLS context). Its producer is not
-  // wired yet: nothing in a worker can enqueue after a rollup commits.
+  // failed. Tenant-scoped (signed payload, RLS context). Its producer is
+  // `rollup.metric_daily`, which enqueues it after its own transaction commits.
   {
     name: "source.verify_presence",
     producer: "API, rollup (STORY-054; not in §4)",
