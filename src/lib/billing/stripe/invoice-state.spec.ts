@@ -148,7 +148,7 @@ describe("STORY-075b audit · addon_amount and credit_pack_amount come from the 
     return out.invoice;
   };
 
-  it("an invoice with a $49 extra_project line publishes addon_amount 49.00 and credit_pack_amount 0.00", () => {
+  it("an invoice with an extra_project line publishes the line amount as addon_amount and credit_pack_amount 0.00", () => {
     const inv = write([planLine, addonLine]);
     expect(inv.addonAmount).toBe("49.00");
     expect(inv.creditPackAmount).toBe("0.00");

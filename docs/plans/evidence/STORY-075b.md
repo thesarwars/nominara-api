@@ -40,7 +40,7 @@ After `28ea168`: the unit spec passes, 37 tests.
 
 ## Decisions and known gaps (for the reviewer)
 
-- `addon_amount` and `credit_pack_amount` are written as `0.00` (their column default). Stripe's invoice carries no breakdown by our product kinds without expanding every line's product, and deriving one locally is the arithmetic this story forbids. A breakdown belongs with STORY-076b (add-ons), which creates the add-on lines. The contract still carries both fields.
+- SUPERSEDED by the audit fix below: `addon_amount` / `credit_pack_amount` were once written as the column default; they now come from the invoice's lines.
 - The invoice event list is the five the story names. `invoice.marked_uncollectible` and `invoice.updated` are NOT consumed, so an `uncollectible` status reaches us only on the next consumed event. Adding either is a one-line change to `StripeInvoiceHandler.types`; not done because the story did not name them.
 - Zero- and three-decimal currencies (JPY, KWD, …) are refused with a warning rather than mis-stated by a cents-to-decimal move. The product charges in USD.
 - Past-due moves only `trialing`/`active` <-> `past_due` on `workspaces.status`; `past_due` stays a usable status for sign-in (`USABLE_STATUSES`) so the owner can reach billing to fix the card.
@@ -57,3 +57,13 @@ After `28ea168`: the unit spec passes, 37 tests.
 | `vitest run --config vitest.integration.config.ts test/integration/billing-invoices.spec.ts` | 0 | 29 passed |
 | same config, `test/integration/stripe-subscriptions.spec.ts` + `stripe-webhook.spec.ts` | 0 | 85 passed |
 | `pnpm test:isolation`, `pnpm test:isolation:breakers` | not run | known fixture crash (support_grants TTL), fixed by the d-admin lane; isolation is asserted under `nominara_app` in the integration spec; the merge step runs the suites |
+
+## Audit fix 1 (blocker) — addon_amount / credit_pack_amount were always 0.00
+
+Option (a) of the finding. RED `fa98660` (`vitest run src/lib/billing/stripe/invoice-state.spec.ts`: exit 1, 8 failed / 37 passed; the stated reason, `addonAmount` undefined) plus integration case in `e7aa550`. Fix `74ef6d0` (+ title reword of two tests, no assertion change).
+
+- `desiredFromStripeInvoice` sums Stripe's own integer line `amount`s per category: a line is an add-on when its product (expanded object under `pricing.price_details.product` or legacy `price.product`) has `metadata.nominara_kind` of `extra_project` / `extra_seat`, or its bare product id is our fixed `nominara_addon_<kind>`; a credit pack when `nominara_kind` is `credit_pack`. `record()` writes both columns on INSERT and UPDATE, and `same()` compares them so a changed breakdown rewrites the row.
+- Tests: U `invoice-state.spec.ts` > "STORY-075b audit · ..." (8 tests: add-on line, two kinds + credit pack, bare product id, legacy shape, no lines/unmarked lines = measured 0.00, negative net clamps to 0.00, non-integer amount not counted, totals still Stripe's). S `billing-invoices.spec.ts` > "STORY-075b audit · an invoice that charged for an add-on publishes addon_amount from its lines, and an update rewrites it" (exact figure via GET, then rewrite on re-fetch).
+- Known limits, stated: (1) the invoice gateway fetch does NOT expand line products (an unverified expand path against live Stripe would risk every invoice webhook), so add-on lines are recognised by the fixed product id, which is how our gateway creates them; credit-pack lines are recognised only when a product object with the marker is present, which Checkout payment mode does not produce on subscription invoices. Confirming both against the sandbox is NEW-A-17. (2) A category netting below zero (proration credit) publishes 0.00 because the money contract has no negative amount.
+- Gates: `pnpm lint` 0; `pnpm typecheck` 0; `pnpm test:unit` 0 (282 files passed, 1 skipped; 3416 tests passed); `pnpm contracts:check` 0 (no contract change).
+- NOT RUN: the integration spec. `df -h /System/Volumes/Data` shows 7.7 GiB free (< 8 GiB rule), so no testcontainers. The new integration case and its edit of the existing GET test are unrun and must be run before merge.

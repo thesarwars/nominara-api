@@ -455,7 +455,7 @@ describe("STORY-075b · invoices", () => {
     expect(data[0]).toMatchObject({ currency: "USD", pdf_url: null, paid_at: null, addon_amount: "0.00", credit_pack_amount: "0.00" });
   });
 
-  it("STORY-075b audit · an invoice that charged for an add-on publishes addon_amount from its lines (49.00), and an update rewrites it", async () => {
+  it("STORY-075b audit · an invoice that charged for an add-on publishes addon_amount from its lines , and an update rewrites it", async () => {
     const { workspaceId, owner } = await newWorkspace();
     const planLine = { amount: 12_900, pricing: { price_details: { product: "prod_plan" } } };
     const addonLine = { amount: 4_900, pricing: { price_details: { product: { id: "nominara_addon_extra_project", metadata: { nominara_kind: "extra_project" } } } } };

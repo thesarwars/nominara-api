@@ -196,3 +196,10 @@ Known remaining: `reconcile` still mirrors a duplicated kind as ONE row (summed 
 ### Not done in this round (decisions needed, see the report)
 - Finding 2 (quantity semantics: the recorded call says ADD, the code and contract say TOTAL; catalog listing with prices): NOT changed. It reverses a recorded lead decision and changes the wire contract; the lead/owner must write the decision into `plans-7day/decisions-2026-10-08.md` and the story first.
 - Finding 3 (isolation gates): lane touches no tenant table; `test/isolation/support/three-tenant-fixture.ts` belongs to the d-admin fix. Not touched; the merge step must run `test:isolation` and `:breakers` after it lands.
+
+## Audit round 5
+
+- Finding 2 (Idempotency-Key mutant survived): commit `b58eb81`. The fake gateway now records `addonAttempts` BEFORE it rejects. S `billing-addons.spec.ts` > "AC1 retry · a create that FAILS without changing Stripe is retried under the SAME derived Stripe key; a different Idempotency-Key derives a different one" asserts equal keys across the retry and a different key for a different header. This is a test-only change over correct code, so there is no RED; its proof is the mutant (`${idempotencyKey}-${Math.random()}` in `BillingAddonsController.add`) which MUST now fail this test. **NOT RUN**: disk is 7.7 GiB (< 8 GiB rule), so neither the test nor the mutant was executed. Typecheck and lint pass. Run the integration spec and the mutant before merge.
+- Finding 3 (ADD vs TOTAL, catalog read): NOT changed; stopped on a decision (see the report). Code and contract still say TOTAL.
+- Finding 4 (isolation gate): not a lane defect, the lane adds no tenant table and touches none of the failing files; the merge step runs `test:isolation` and `:breakers` after the d-admin fixture fix and the c-src, c-geo, d-admin namespacing fixes land.
+- Gates after this round: lint 0, typecheck 0, test:unit 0 (3416 passed, 1 skipped).
