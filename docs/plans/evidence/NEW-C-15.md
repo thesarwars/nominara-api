@@ -30,7 +30,7 @@ No endpoint, no migration (uses NEW-C-4's `verified_at`, migration 0044), no fro
 ## Gates (worktree api-wt-c3)
 - `pnpm test:unit`: exit 0, 279 files passed / 1 skipped, 3355 passed / 1 skipped.
 - `pnpm lint`: exit 0. `pnpm typecheck`: exit 0.
-- `pnpm test:integration` for `source-presence-verify.spec.ts` and `worker-group-bootstrap.spec.ts`: **NOT RUN** — `df -h /System/Volumes/Data` showed 6.1 GiB free (< the 8 GiB testcontainers floor). They type-check and lint clean. They must be run by the merge step or NEW-A-17 once disk is freed.
+- `pnpm test:integration test/integration/source-presence-verify.spec.ts test/integration/worker-group-bootstrap.spec.ts` (colima DOCKER_HOST, 14 GiB free): **exit 0**, 2 files / 27 tests passed. This supersedes the earlier "not run" notes above; every integration test named under the acceptance criteria now has a passing run.
 - `test:isolation`: not run (no tenant table touched; tenant isolation asserted in the integration spec under `nominara_app`).
 
 ## Observability
