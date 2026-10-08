@@ -4,7 +4,7 @@ import { Client, Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { BREAKGLASS_ROLE, RUNTIME_ROLES } from "../../src/db/conventions.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
-import { migrateUp } from "../../src/db/migrate-runner.js";
+import { MIGRATIONS_DIR, migrateUp, rollbackLast } from "../../src/db/migrate-runner.js";
 
 // CP2 owner decision (1) — app.share_token_by_hash is ONE narrow SECURITY DEFINER lookup owned by a DEDICATED role
 // (not a superuser, not nominara_app, not the migration identity). Migration 0112 rebuilds it. These tests run as the
@@ -166,9 +166,16 @@ describe("CP2 decision 1 · app.share_token_by_hash is owned by a dedicated, nar
     expect(entries).toEqual(["pg_catalog", "pg_temp"]);
     const app = asRole("nominara_app");
     try {
-      await app.query("SET search_path = evil, public");
-      const r = await app.query("SELECT id FROM app.share_token_by_hash($1)", [a.hash]);
-      expect(r.rows.map((x) => x.id)).toEqual([a.tokenId]);
+      const c = await app.connect();
+      try {
+        await c.query("BEGIN");
+        await c.query("SET LOCAL search_path = evil, public");
+        const r = await c.query("SELECT id FROM app.share_token_by_hash($1)", [a.hash]);
+        expect(r.rows.map((x) => x.id)).toEqual([a.tokenId]);
+      } finally {
+        await c.query("ROLLBACK");
+        c.release();
+      }
     } finally {
       await app.end();
     }
@@ -222,5 +229,33 @@ describe("CP2 decision 1 · app.share_token_by_hash is owned by a dedicated, nar
     expect(iso).toHaveLength(1);
     expect(iso[0]!.roles).not.toContain(LOOKUP_ROLE);
     expect(iso[0]!.qual).toContain("app.current_workspace()");
+  });
+
+  it("DEF-10 · 0112 rolls back cleanly (owner returns to the migration identity, policy and grants gone, lookup still works) and re-applies", async () => {
+    const s = await seedToken();
+    for (let step = 0; step < 200; step += 1) {
+      const name = await rollbackLast(admin, MIGRATIONS_DIR);
+      if (name === null || name === "0112_share_token_lookup_definer_owner") {
+        expect(name).toBe("0112_share_token_lookup_definer_owner");
+        break;
+      }
+    }
+    const owner = await admin.query<{ owner: string }>(
+      `SELECT o.rolname AS owner FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_roles o ON o.oid = p.proowner WHERE n.nspname='app' AND p.proname='share_token_by_hash'`,
+    );
+    expect(owner.rows[0]!.owner).toBe("nominara");
+    expect((await admin.query(`SELECT 1 FROM pg_policies WHERE tablename='share_tokens' AND policyname='share_token_gate_lookup'`)).rowCount).toBe(0);
+    expect((await admin.query(`SELECT has_column_privilege($1,'share_tokens','token_hash','SELECT') AS ok`, [LOOKUP_ROLE])).rows[0]!.ok).toBe(false);
+    const app = asRole("nominara_app");
+    try {
+      expect((await app.query("SELECT id FROM app.share_token_by_hash($1)", [s.hash])).rows.map((x) => x.id)).toEqual([s.tokenId]);
+    } finally {
+      await app.end();
+    }
+    await migrateUp(admin, MIGRATIONS_DIR);
+    const again = await admin.query<{ owner: string }>(
+      `SELECT o.rolname AS owner FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_roles o ON o.oid = p.proowner WHERE n.nspname='app' AND p.proname='share_token_by_hash'`,
+    );
+    expect(again.rows[0]!.owner).toBe(LOOKUP_ROLE);
   });
 });

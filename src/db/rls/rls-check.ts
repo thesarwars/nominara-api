@@ -5,6 +5,7 @@ import { connect, requireDatabaseUrl } from "../client.js";
 import { MIGRATIONS_DIR, migrateUp } from "../migrate-runner.js";
 import {
   computeActorSelfScopedPolicies,
+  computeDefinerOwnerPolicies,
   computeExpectedPolicies,
   generateRlsSql,
   type ExpectedPolicy,
@@ -336,6 +337,8 @@ export async function checkRls(client: Client): Promise<RlsCheckResult> {
   const expectedPolicies: ExpectedPolicy[] = [
     ...computeExpectedPolicies(classifiable),
     ...computeActorSelfScopedPolicies(classifiable),
+    // ADR-0002 — the share-token lookup owner's single SELECT policy.
+    ...computeDefinerOwnerPolicies(classifiable),
   ];
 
   // Fix pass item 1 — every partition child is expected to carry a

@@ -416,6 +416,12 @@ can't be done locally. Each is disclosed here rather than faked:
   as a role other than the one that ran `0005` will need their own
   `ALTER DEFAULT PRIVILEGES FOR ROLE <that role>` added at that time — this
   is deferred, not silently dropped.
+  **Share-token lookup owner (migration `0112`, ADR-0002).**
+  `app.share_token_by_hash` is owned by a dedicated role,
+  `nominara_share_lookup` (NOLOGIN, NOINHERIT, NOSUPERUSER, **NOBYPASSRLS**),
+  admitted to `share_tokens` by one `FOR SELECT` policy and limited to a
+  14-column `SELECT` grant. The migration identity needs `CREATEROLE`; no
+  superuser or BYPASSRLS attribute is involved, and ISO-07 still holds.
 
 **Rollback of migration `0005` does not remove the six roles.** This is
 deliberate, not a bug: `CREATE ROLE` is cluster-scoped (shared across every

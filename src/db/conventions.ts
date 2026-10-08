@@ -147,6 +147,11 @@ export const WIDE_ORDER_COLUMN_PATTERN =
 export const MIGRATION_OWNER_ROLE = "nominara_owner";
 export const BREAKGLASS_ROLE = "nominara_breakglass";
 
+// CP2 decision 1 (migration 0112, ADR-0002) — the dedicated, NOLOGIN owner of app.share_token_by_hash. Not a runtime
+// role: nobody connects as it and no runtime role is a member of it. NOBYPASSRLS (ISO-07 stands): it reads FORCE-RLS
+// share_tokens through one role-targeted SELECT policy, and its reach is bounded by a 14-column SELECT grant.
+export const SHARE_LOOKUP_ROLE = "nominara_share_lookup";
+
 // Ordered src/api, src/gateway, src/workers/*, replica-only reporting,
 // share-token portal — matches the comments in security-and-tenancy.md §2.
 export const RUNTIME_ROLES = ["nominara_app", "nominara_worker", "nominara_report", "nominara_portal"] as const;
