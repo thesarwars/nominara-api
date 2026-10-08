@@ -34,13 +34,20 @@ function colour(value: string | null, fallback: string): string {
   return value !== null && HEX.test(value) ? value : fallback;
 }
 
-/** `undefined` = the workspace has no stored theme: the platform default. */
-export function exportPaletteFrom(theme: StoredThemeValues | undefined): ExportPalette {
+/**
+ * `undefined` = the workspace has no stored theme: the platform default.
+ *
+ * `brandRemovalGranted` is whether the workspace holds `whitelabel.remove_branding` NOW. The stored
+ * `hide_nominara_brand` was validated when it was saved; a later downgrade leaves it stored, and a render
+ * must not honour what the plan no longer grants (STORY-097 scenario 4/5, CP1 audit). Required, so no
+ * caller can forget to say.
+ */
+export function exportPaletteFrom(theme: StoredThemeValues | undefined, brandRemovalGranted: boolean): ExportPalette {
   return {
     primary: colour(theme?.color_primary ?? null, PLATFORM_DEFAULT_COLORS.color_primary),
     accent: colour(theme?.color_accent ?? null, PLATFORM_DEFAULT_COLORS.color_accent),
     background: colour(theme?.color_bg ?? null, PLATFORM_DEFAULT_COLORS.color_bg),
     foreground: colour(theme?.color_fg ?? null, PLATFORM_DEFAULT_COLORS.color_fg),
-    showBrandLine: theme === undefined ? true : !theme.hide_nominara_brand,
+    showBrandLine: theme === undefined ? true : !(theme.hide_nominara_brand && brandRemovalGranted),
   };
 }

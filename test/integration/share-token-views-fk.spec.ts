@@ -3,6 +3,18 @@ import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { MIGRATIONS_DIR, migrateUp, rollbackLast } from "../../src/db/migrate-runner.js";
 
+const MIGRATION = "0081_share_token_tenant_fk";
+
+/** Rolls back newest-first until `name` itself has been rolled back; returns the last name rolled back. */
+async function rollBackThrough(client: Client, name: string): Promise<string> {
+  for (;;) {
+    const rolled = await rollbackLast(client, MIGRATIONS_DIR);
+    if (rolled === null) throw new Error(`${name} was never applied`);
+    if (rolled === name) return rolled;
+    if (rolled < name) throw new Error(`rolled back ${rolled} without meeting ${name}`);
+  }
+}
+
 // CP1 audit (e-reports MAJOR) — share_token_views gained its first runtime writer (ShareTokensService.consumeView).
 // Postgres checks FKs without RLS, so a single-column FK accepted a view row naming ANOTHER tenant's token (an
 // existence oracle) and let that tenant's deletion of its token cascade into this one's rows. Same hazard class as
@@ -107,12 +119,9 @@ describe("CP1 e-reports · share_token_views and share_tokens.theme_id foreign k
   });
 
   it("CP1-E-FK-12 · the new migration rolls back and re-applies cleanly", async () => {
-    // Roll back UNTIL this migration rather than assuming it is the newest (later lanes add migrations).
-    let rolledBack: string | null = null;
-    for (let step = 0; step < 200 && rolledBack !== "0081_share_token_tenant_fk" && (step === 0 || rolledBack !== null); step += 1) {
-      rolledBack = await rollbackLast(client, MIGRATIONS_DIR);
-    }
-    expect(rolledBack).toBe("0081_share_token_tenant_fk");
+    // Roll back every migration newer than this one, then this one: the test pins
+    // this migration's own down, not its position in the chain.
+    expect(await rollBackThrough(client, MIGRATION)).toBe(MIGRATION);
     const a = await tenant("a");
     const b = await tenant("b");
     // single-column FKs are back: the cross-tenant row is accepted again

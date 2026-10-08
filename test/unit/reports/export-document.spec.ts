@@ -264,10 +264,17 @@ describe("NEW-E-100b · selection, privacy and rendering hygiene", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("NEW-E-100b — rendering uses only a built-in font (no font file is fetched or embedded)", async () => {
+  it("NEW-E-100b AC5 — the PDF embeds the bundled Inter (regular and bold) and draws in no built-in font", async () => {
     const pdf = await renderPdf(buildExportDocument(input()), { compress: false });
-    expect(pdfRaw(pdf)).not.toMatch(/FontFile/);
-    expect(pdfRaw(pdf)).toMatch(/\/BaseFont \/Helvetica/);
+    const raw = pdfRaw(pdf);
+    expect(raw).toMatch(/\/FontFile2/);
+    expect(raw).toMatch(/\/BaseFont \/[A-Z]{6}\+Inter-Regular/);
+    expect(raw).toMatch(/\/BaseFont \/[A-Z]{6}\+Inter-Bold/);
+    expect(raw).not.toMatch(/\/BaseFont \/Helvetica/);
+  });
+
+  it("NEW-E-100b AC5 — the theme's font_family cannot change the font: the document model carries none", () => {
+    expect(Object.keys(input().palette).sort()).toEqual(["accent", "background", "foreground", "primary", "showBrandLine"]);
   });
 
   it("NEW-E-100b — a many-day growth map paginates without losing the footer on any page", async () => {

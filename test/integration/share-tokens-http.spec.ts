@@ -301,6 +301,24 @@ describe("STORY-098 · share tokens (agency side) over HTTP", () => {
     expect((await mint(free, body([p2]))).statusCode).toBe(201);
   }, 60_000);
 
+  it("CP1 zero-scope · a manager scoped to ZERO projects is refused on every share-link route and sees nothing (an empty scope is not unrestricted)", async () => {
+    const a = await owner("growth");
+    const p = await project(a.workspaceId);
+    const existing = data<Minted>(await mint(a, body([p])));
+    const nobody = await member(a.workspaceId, "manager", []);
+    for (const [label, res] of [
+      ["list", await list(nobody)],
+      ["mint", await mint(nobody, body([p]))],
+      ["revoke", await revoke(nobody, existing.token.id)],
+      ["views", await views(nobody, existing.token.id)],
+    ] as const) {
+      expect(res.statusCode, `${label}: ${res.body}`).toBe(403);
+      expect(errorOf(res).code, label).toBe("project_out_of_scope");
+    }
+    const still = await harness.db().query(`SELECT revoked_at FROM share_tokens WHERE id = $1`, [existing.token.id]);
+    expect((still.rows[0] as { revoked_at: unknown }).revoked_at).toBeNull();
+  }, 60_000);
+
   it("STORY-098 · scope_project_ids must name projects of this workspace: an unknown project is 400 and stores nothing", async () => {
     const a = await owner("growth");
     const mine = await project(a.workspaceId);

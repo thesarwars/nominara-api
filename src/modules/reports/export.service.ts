@@ -53,6 +53,9 @@ import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 
 const logger = new Logger("ExportService");
 
+/** The entitlement that lets a theme hide the Nominara brand line (same key AgencyService checks on save). */
+const BRAND_REMOVAL_FEATURE = "whitelabel.remove_branding";
+
 /** How long an artifact row is retained as downloadable. */
 const ARTIFACT_TTL_DAYS = 7;
 
@@ -158,7 +161,7 @@ export class ExportService {
         generatedAt: new Date().toISOString(),
         timeframe: body.timeframe,
         window: { from: window.from, to: window.to },
-        palette: await this.palette(tx),
+        palette: await this.palette(tx, entitlements.entitlements[BRAND_REMOVAL_FEATURE]?.value === true),
         footer,
         sections: body.sections,
         hideCompetitors: body.hide_competitors,
@@ -273,13 +276,16 @@ export class ExportService {
     return { engineKeys, days: [...byDate.values()] };
   }
 
-  /** The workspace's default theme as a palette (platform default when none is stored). */
-  private async palette(tx: ClientBase): Promise<ExportPalette> {
+  /**
+   * The workspace's default theme as a palette (platform default when none is stored). Brand removal is
+   * re-checked against the CURRENT entitlements, not trusted from the stored flag.
+   */
+  private async palette(tx: ClientBase, brandRemovalGranted: boolean): Promise<ExportPalette> {
     const result = await tx.query<StoredThemeValues>(
       `SELECT color_primary, color_accent, color_bg, color_fg, hide_nominara_brand
          FROM brand_themes ORDER BY is_default DESC, created_at, id LIMIT 1`,
     );
-    return exportPaletteFrom(result.rows[0]);
+    return exportPaletteFrom(result.rows[0], brandRemovalGranted);
   }
 
   /** used / cap for the response. `cap` null = uncapped; a zero cap is returned as 0. */
