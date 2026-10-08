@@ -333,7 +333,7 @@ export class TasksService {
       }
       const moved = events.find((e) => e.event === "dismissed" || e.event === "reopened" || e.event === "status_changed");
       if (moved !== undefined && actorId !== undefined) {
-        this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id, from_status: current.status, to_status: body.status as string, actor_id: actorId });
+        this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id });
       }
     }
 
@@ -505,7 +505,7 @@ export class TasksService {
     incrementCounter("nominara_tasks_completed_total", {});
     // IDs only — never the title.
     this.logger.log({ message: "task completed", workspace_id: store.context.workspaceId, task_id: taskId, project_id: current.project_id, milestone_id: pinned.id });
-    this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id, from_status: current.status, to_status: "done", actor_id: actorId });
+    this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id });
 
     return {
       task: await this.readTask(client, taskId),

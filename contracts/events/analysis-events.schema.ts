@@ -57,9 +57,6 @@ export const taskMovedEventSchema = z
   .object({
     task_id: uuid,
     project_id: uuid,
-    from_status: z.string().min(1),
-    to_status: z.string().min(1),
-    actor_id: uuid,
   })
   .strict();
 
