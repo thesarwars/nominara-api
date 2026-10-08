@@ -368,6 +368,25 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     expect(stale.rowCount).toBe(0);
   }, 120_000);
 
+  it("STORY-060 · --purge on a PRE-EXISTING project recomputes A3 over what is left: no stale sufficient structure row survives (the project row is not deleted to hide it)", async () => {
+    const workspaceId = await createWorkspace("growth");
+    const pre = await client.query<{ id: string }>(
+      `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, status)
+       VALUES ($1,'Real Project','real-project-geo','https://real-geo.example','real-geo.example','active') RETURNING id`,
+      [workspaceId],
+    );
+    const projectId = pre.rows[0]!.id;
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    const seeded = await client.query(`SELECT 1 FROM geo_analyses WHERE project_id = $1 AND analysis = 'structure' AND sufficient`, [projectId]);
+    expect(seeded.rowCount, "the seed computed a sufficient structure row for the surviving project").toBeGreaterThan(0);
+
+    await runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: testPool(), log: () => {} });
+    const survivor = await client.query(`SELECT 1 FROM projects WHERE id = $1`, [projectId]);
+    expect(survivor.rowCount, "the pre-existing project survives the purge").toBe(1);
+    const stale = await client.query(`SELECT 1 FROM geo_analyses WHERE project_id = $1 AND sufficient`, [projectId]);
+    expect(stale.rowCount).toBe(0);
+  }, 180_000);
+
   it("STORY-169 · a re-run without --purge is idempotent — no doubled cells", async () => {
     const workspaceId = await createWorkspace("growth");
 
