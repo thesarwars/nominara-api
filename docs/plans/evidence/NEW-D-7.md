@@ -312,3 +312,33 @@ What is needed, as decisions (each is outside this story's files or is a hard-bo
 ### Other items still open
 - Customer visibility of an expired stale purchase (email, disabled-reason enum value): undecided, unchanged.
 - One `billing.auto_topup.skipped` audit row per evaluation while there is no saved card: throttle when wired.
+
+## Checkpoint-3 audit pass 2 (findings 1 and 2) — `7day/d-usage-4`
+
+RED: `1169275` — `auto-topup-trigger.spec.ts`: 5 failed / 43 passed (the F1 test and four F2 tests, each failing on the stated behaviour: the old code recharged under a NEW purchase id).
+Fix: `2e249c1`.
+
+### Behaviour change (one decision worth knowing)
+A stale (> 60 min) pending auto-top-up purchase is no longer ever freed by a lookup or the clock, so a new charge under a new purchase id can no longer follow it.
+- Search `failed` -> the decline path (row failed, `auto_topup_enabled=false`, contact told), outcome `declined`, no new claim in that run (finding 1).
+- Search `none` -> Search lags in an outage, so the SAME charge is replayed with the same parameters and key `auto-topup-<purchaseId>` (finding 2). Stripe returns the original PaymentIntent or creates the charge for that same purchase. `submitted` leaves the row pending (outcome `charge_submitted`); `declined` takes the decline path.
+- Older than 23 h (Stripe keeps keys >= 24 h; 23 h is the margin) a replay would be a new charge: fail closed, the row stays pending, outcome `in_flight`, an ERROR log carries `ALERT ... reason=past_idempotency_retention` and `nominara_billing_auto_topup_stale_unreconcilable_total{reason}` counts it. Also fails closed if the pack is no longer purchasable or no saved method exists.
+- Removed as unreachable: `classifyStale`, `expireStalePending`, the `billing.auto_topup.pending_expired` audit write and `nominara_billing_auto_topup_pending_expired_total`. The test that asserted a new charge after `none`/`failed` (it.each) was replaced by the five tests below; it encoded the defect, not a still-valid property.
+- Consequence: a pending row past 23 h that Stripe cannot confirm blocks further auto-top-ups until an operator settles it (alert raised). That is the requested fail-closed.
+- Gateway interface unchanged (no new method); only its doc comment on `findOffSessionPayment` changed.
+
+### Acceptance -> proof (`test/integration/auto-topup-trigger.spec.ts`)
+- F1 failed PI declines, no recharge: "NEW-D-7 checkpoint-3 F1 · a stale pending purchase that Stripe says FAILED ... NO new charge in that run"
+- F2 Search miss replays the same purchase: "... F2 · Search saying `none` proves nothing ... the SAME purchase is replayed ..."
+- F2 declined replay: "... F2 · when the replay of the same purchase comes back declined ..."
+- F2 replay unanswered stays pending: "... F2 · when the replay itself cannot be answered ..."
+- F2 past retention fails closed + alert log: "... F2 · past Stripe's idempotency-key retention ..."
+- Unchanged and still green: the F6 in_progress/succeeded, lookup-outage, KAD-06 no-open-transaction, settles-between-lookup-and-claim and under-an-hour tests.
+
+### Mutations (full `auto-topup-trigger.spec.ts`, source restored with `git checkout`)
+- `failed` no longer declines: 1 failed. Replay allowed past retention: 1 failed. `none` marks the row failed (the old behaviour in kind): 5 failed. (A fourth, replaying under a fresh purchase id, was an invalid mutation: it did not compile, so it proves nothing and is not counted.)
+
+### Gates
+- `pnpm lint` exit 0; `pnpm typecheck` exit 0; `pnpm test:unit` exit 0.
+- Integration (auto-topup-cycle-reset, -trigger, -enqueue, billing-usage-auto-topup, credit-ledger-read, worker-group-bootstrap, identity-tenancy-billing): exit 0, 7 files / 163 tests.
+- `pnpm test:isolation`: exit 1, 1 failed / 52 passed — ISO-14 `namespacing.spec.ts` flags `src/modules/reports/scheduled-reports.service.ts:234` (the e-reports lane). Not touched by this branch (`git diff integration/7day -- src/modules/reports test/isolation` is empty), so it fails identically on the base; belongs to the e-reports lane.
