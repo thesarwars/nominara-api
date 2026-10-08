@@ -291,6 +291,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "request path (KAD-06) nor inside the rollup transaction. A queue of its own, in the crawl group with the other outbound fetchers, so a DLQ " +
       "entry names the job that failed. NEW-C-15.",
   },
+  "billing.auto_topup": {
+    workerGroup: "rollup",
+    because:
+      "NEW-D-7 / owner decision 4 of 2026-10-08: an auto top-up charges a saved card through Stripe, which may never happen on a request path (KAD-06). " +
+      "A balance debit that leaves a workspace below its threshold enqueues one signed tenant job; the worker verifies the signature before any context is " +
+      "set, then evaluates and charges. §4's table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed. STORY-076.",
+  },
 };
 
 describe("STORY-030 · queue topology declares §4's 21 queues, plus what we have added on purpose", () => {

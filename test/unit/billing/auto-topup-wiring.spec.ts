@@ -2,13 +2,12 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-// NEW-D-7 audit finding 4 — "nothing in the code stops `trigger` from being wired". The gate was prose.
-// `AutoTopupService.trigger(workspaceId)` takes a raw workspace id and does its own tenant transactions, and the
-// cycle roll (`auto_topup_count_cycle` is reset by nothing: max_per_cycle is a lifetime cap) and the signed
-// `billing.auto_topup` queue handler (HMAC verified BEFORE any tenant context) do not exist yet. Until they do,
-// no production file may reference the service except the ones below, and none of those may call `.trigger(`.
+// NEW-D-7 audit finding 4, closed by owner decision 4 (2026-10-08) — "the auto-top-up trigger is reached by a signed
+// `billing.auto_topup` queue job, never on the request path". `AutoTopupService.trigger(workspaceId)` takes a raw
+// workspace id and does its own tenant transactions, so the ONLY safe caller is the handler whose workspace id comes from
+// a payload the processor verified before any context was set. This gate keeps it that way: no production file but the
+// ones below may reference the service, and none but the queue handler may call `.trigger(`.
 // DEFAULTS TO REPORT: a new referencing file fails here and is a design question, not an allow-list entry.
-// The change that lands the queue handler edits this file in the same commit, with the handler's own tests.
 const ROOT = resolve(import.meta.dirname, "../../..");
 
 // Each of these uses the lifecycle methods (`disableAfterFailure`, `notifyDisabled`) or registers the provider.
@@ -16,7 +15,11 @@ const MAY_REFERENCE = new Set([
   "src/modules/billing/auto-topup.service.ts",
   "src/modules/billing/billing.module.ts",
   "src/modules/billing/stripe-credit-pack.handler.ts",
+  // The signed queue handler — the one caller of `.trigger(`.
+  "src/lib/queue/handlers/billing-auto-topup.handler.ts",
 ]);
+
+const QUEUE_HANDLER = "src/lib/queue/handlers/billing-auto-topup.handler.ts";
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
@@ -30,7 +33,7 @@ function walk(dir: string, out: string[] = []): string[] {
 const sources = (): { path: string; text: string }[] =>
   [...walk(join(ROOT, "src")), ...walk(join(ROOT, "contracts"))].map((full) => ({ path: relative(ROOT, full), text: readFileSync(full, "utf8") }));
 
-describe("NEW-D-7 audit 4 · the auto-top-up trigger is not wired to anything", () => {
+describe("NEW-D-7 audit 4 · the auto-top-up trigger is reached only by the signed queue handler", () => {
   it("no production file outside the billing module's own lifecycle code references AutoTopupService", () => {
     const referencing = sources()
       .filter((f) => /\bAutoTopupService\b|auto-topup\.service/.test(f.text))
@@ -40,13 +43,18 @@ describe("NEW-D-7 audit 4 · the auto-top-up trigger is not wired to anything", 
     expect(referencing.filter((p) => !p.startsWith("contracts/"))).toEqual([]);
   });
 
-  it("no production file calls AutoTopupService.trigger: nothing but its own spec invokes it", () => {
+  it("only the billing.auto_topup queue handler calls AutoTopupService.trigger, and it does so exactly once", () => {
     const callers = sources()
       .filter((f) => f.path !== "src/modules/billing/auto-topup.service.ts")
-      .filter((f) => MAY_REFERENCE.has(f.path))
-      .filter((f) => /\.trigger\(/.test(f.text))
-      .map((f) => f.path);
-    expect(callers).toEqual([]);
+      .filter((f) => /\bAutoTopupService\b/.test(f.text) && /\.trigger\(/.test(f.text))
+      .map((f) => ({ path: f.path, calls: f.text.match(/\.trigger\(/g)?.length ?? 0 }));
+    expect(callers).toEqual([{ path: QUEUE_HANDLER, calls: 1 }]);
+  });
+
+  it("no request-path code (a controller, a guard, an interceptor) references the service: the interceptor only enqueues", () => {
+    const requestPath = sources().filter((f) => /\.controller\.ts$|^src\/api\//.test(f.path));
+    expect(requestPath.length).toBeGreaterThan(0);
+    expect(requestPath.filter((f) => /AutoTopupService|auto-topup\.service/.test(f.text)).map((f) => f.path)).toEqual([]);
   });
 
   it("the guard itself sees the files it claims to guard (the scan is not vacuous)", () => {

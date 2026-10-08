@@ -162,9 +162,9 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
     const { workspaceId, owner } = await newWorkspace();
     const res = await put(owner, CONFIG);
     expect(res.statusCode, res.body).toBe(200);
-    expect(autoTopupConfigSchema.parse(dataOf(res))).toEqual({ ...CONFIG, used_this_cycle: 0, trigger_active: false });
+    expect(autoTopupConfigSchema.parse(dataOf(res))).toEqual({ ...CONFIG, used_this_cycle: 0, trigger_active: true });
     expect(await row(workspaceId)).toMatchObject({ auto_topup_enabled: true, auto_topup_pack_key: "starter_vault", auto_topup_threshold: 100, auto_topup_max_per_cycle: 5 });
-    expect((await walletOf(owner)).auto_topup).toEqual({ ...CONFIG, used_this_cycle: 0, trigger_active: false });
+    expect((await walletOf(owner)).auto_topup).toEqual({ ...CONFIG, used_this_cycle: 0, trigger_active: true });
   });
 
   it("STORY-076 AC6 · disabling stores enabled=false and may carry nulls", async () => {
@@ -195,7 +195,7 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
   it("NEW-D-6 · auto top-up is off by default: a workspace with no wallet row reads enabled=false and nulls", async () => {
     const { workspaceId, owner } = await newWorkspace();
     expect(await row(workspaceId)).toBeUndefined();
-    expect((await walletOf(owner)).auto_topup).toEqual({ enabled: false, pack_key: null, threshold: null, max_per_cycle: null, used_this_cycle: 0, trigger_active: false });
+    expect((await walletOf(owner)).auto_topup).toEqual({ enabled: false, pack_key: null, threshold: null, max_per_cycle: null, used_this_cycle: 0, trigger_active: true });
   });
 
   it("NEW-D-6 · auto top-up is off by default: a wallet row provisioned by anything else has the column default false", async () => {

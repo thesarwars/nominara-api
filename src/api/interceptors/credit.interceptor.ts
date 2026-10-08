@@ -5,6 +5,7 @@ import {
   Injectable,
   Logger,
   NestInterceptor,
+  Optional,
   type OnModuleDestroy,
 } from "@nestjs/common";
 import { catchError, from, mergeMap, type Observable } from "rxjs";
@@ -17,7 +18,9 @@ import {
   settlementOf,
 } from "../../lib/credits/ledger.js";
 import { releaseReservation } from "../../lib/credits/settle.js";
+import { requestAutoTopupIfBelowThreshold } from "../../lib/credits/auto-topup-request.js";
 import { commitCredits, lockWallet, readWallet } from "../../lib/credits/wallet.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 import type { CreditReservation } from "../guards/credit.guard.js";
@@ -170,7 +173,11 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
    */
   private settlementPool: Pool | null = null;
 
-  constructor(@Inject(PG_POOL) private readonly pool: Pool) {
+  constructor(
+    @Inject(PG_POOL) private readonly pool: Pool,
+    // NEW-D-7 — optional: a process with no queue wired still settles its debits; it just cannot ask for a top-up.
+    @Optional() private readonly producer?: QueueProducer,
+  ) {
     // Built from the same configuration the request pool was, so it reaches
     // the same database through the same pooler.
   }
@@ -379,6 +386,18 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
       ...actor,
       ...usage,
     });
+
+    // NEW-D-7 — a debit that leaves the balance under the threshold asks for an auto top-up. A queue job,
+    // after this transaction commits; the charge itself is never made here.
+    if (this.producer !== undefined) {
+      const producer = this.producer;
+      await requestAutoTopupIfBelowThreshold(
+        store.client,
+        reservation.workspaceId,
+        (queue, workspaceId, payload, idempotencyKey) => producer.enqueueTenantJob(queue, workspaceId, payload, { idempotencyKey }),
+        logger,
+      );
+    }
 
     clearReservation(request);
   }

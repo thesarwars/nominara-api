@@ -61,6 +61,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   it("ships exactly the handlers the stories that landed them declared", () => {
     expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual([
       "audit.verify",
+      "billing.auto_topup",
       "capture.execute",
       "capture.parse",
       "capture.plan",
@@ -92,6 +93,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "identity.sweep_unverified",
       // NEW-C-15 — declared after identity.sweep_unverified in topology.ts.
       "source.verify_presence",
+      // NEW-D-7 — declared after source.verify_presence in topology.ts.
+      "billing.auto_topup",
     ]);
   });
 

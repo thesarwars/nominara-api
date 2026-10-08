@@ -210,10 +210,12 @@ export interface StripeGateway {
 
   /**
    * NEW-D-7 audit 1 — asks Stripe whether the charge for this purchase id exists
-   * and how it ended (PaymentIntent search on `metadata.purchase_id`). A
-   * purchase may be expired ONLY on `none` or `failed`; `in_progress` and
-   * `succeeded` mean the money may be taken. Search is eventually consistent
-   * (about a minute), so ask only about a purchase older than that. Throws
+   * and how it ended (PaymentIntent search on `metadata.purchase_id`). `failed`
+   * means the charge was refused (a decline); `in_progress` and `succeeded` mean
+   * the money may be taken. `none` is NOT proof that no charge exists: Search is
+   * eventually consistent and lags during an outage, so the caller must replay
+   * `createOffSessionPayment` for the same purchase (same idempotency key)
+   * instead of treating `none` as permission to charge again. Throws
    * `StripeUpstreamError` — and the caller must then leave the purchase pending.
    */
   findOffSessionPayment(purchaseId: string): Promise<OffSessionPaymentState>;

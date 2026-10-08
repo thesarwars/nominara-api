@@ -35,7 +35,7 @@ const AUTO_TOPUP_OFF: AutoTopupConfig = {
   threshold: null,
   max_per_cycle: null,
   used_this_cycle: 0,
-  trigger_active: false,
+  trigger_active: true,
 };
 
 async function readAutoTopup(client: ClientBase, workspaceId: string): Promise<AutoTopupConfig | null> {
@@ -71,8 +71,8 @@ async function readAutoTopup(client: ClientBase, workspaceId: string): Promise<A
     threshold: row.auto_topup_threshold,
     max_per_cycle: row.auto_topup_max_per_cycle,
     used_this_cycle: row.auto_topup_count_cycle,
-    // Week 1: the configuration ships, the off-session trigger does not.
-    trigger_active: false,
+    // NEW-D-7: the trigger is wired (a debit below the threshold enqueues billing.auto_topup) and the counter resets on the billing-cycle roll.
+    trigger_active: true,
   };
 }
 
