@@ -1,6 +1,6 @@
 # NEW-C-1 — competitor panel: engine_data_source on the one vocabulary (lane c-comp)
 
-Branch 7day/c-comp-3 from f201f35. Spans DEFERRED to week 2 (decision 3).
+Branch 7day/c-comp-3 from f201f35. Spans DEFERRED to week 2 (decision R3).
 
 ## Result: already in the tip; this item adds proof and no code
 The merge at f201f35 already carries it: `contracts/analytics/competitor-panel-response.schema.ts` declares

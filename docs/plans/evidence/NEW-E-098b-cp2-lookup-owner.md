@@ -51,7 +51,7 @@ ADR-0002 exists (Status: Proposed, pending the auditor). If the owner prefers BY
   column; the policy is hand-written, declared to rls-check). The role is not added to `DATABASE_ROLES` because
   `database-roles-and-grants.spec.ts` migrates 0001-0005 only; DEF-1 asserts its attributes. Evidence needing a real API
   is collected in NEW-A-17.
-- OpenTelemetry spans are deferred to week 2 (owner decision 3). No new metric or log line: this change is a database
+- OpenTelemetry spans are deferred to week 2 (owner decision R3). No new metric or log line: this change is a database
   ownership change with no request-path code.
 - Remaining 098b CP2 notes not addressed here: POST /portal/session writes view rows but no audit row; the observability
   line has no asserting test; `schemas/tools-attribution-agency.md` does not yet list failed_attempts, locked_until or

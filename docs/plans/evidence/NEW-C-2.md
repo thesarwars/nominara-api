@@ -1,6 +1,6 @@
 # NEW-C-2 — track/untrack a competitor: owner decision (8), milestone kind `competitor_removed` (lane c-comp)
 
-Branch 7day/c-comp-3. Migration **0098_milestone_competitor_removed** (range 0098-0099). Spans DEFERRED to week 2 (decision 3).
+Branch 7day/c-comp-3. Migration **0098_milestone_competitor_removed** (range 0098-0099). Spans DEFERRED to week 2 (decision R3).
 
 ## Acceptance criteria (track-plans.json) and this change
 

@@ -1,7 +1,7 @@
 # NEW-C-5 — displacement feed read, dismiss and restore (FR-CO-04; STORY-092 AC 7, 9, 15)
 
 Branch 7day/c-comp-3. Commits: contract 99c18c8 · RED 7deea40 · implementation dbe1576. Migration **0099_displacement_dismissal** (range 0098-0099;
-the plan's "0030" number is superseded by this lane's range). Spans DEFERRED to week 2 (decision 3); metrics and a redacted log line are in.
+the plan's "0030" number is superseded by this lane's range). Spans DEFERRED to week 2 (decision R3); metrics and a redacted log line are in.
 
 ## STATUS: DONE (isolation suite excepted) — container-backed proofs run 2026-10-08 after disk recovered to 18 GiB
 The earlier "NOT RUN" notes below are superseded by this block. With DOCKER_HOST/TESTCONTAINERS_RYUK_DISABLED set (README, colima):

@@ -34,7 +34,7 @@ Pick one:
 
 Then the work is about a day: the contract (`recoveryPlanResponseSchema = z.array(taskSchema)`), RED for scenarios 9, 10, 12 (one task per seedable gap using the same `source_domains.is_seedable` read as `recoveryTaskCount`; none for a non-seedable gap; repeat call returns the same tasks with no duplicates; concept tasks zero until STORY-058), then `POST /displacements/:id/recovery-plan` with `Idempotency-Key`, `task:create`, `@Audit`, and a 409 carrying the existing task ids for a plan that already exists.
 
-Spans: OpenTelemetry deferred to week 2 (owner decision 3).
+Spans: OpenTelemetry deferred to week 2 (owner decision R3).
 
 ## Re-check (2026-10-08, days 5-6 run)
 

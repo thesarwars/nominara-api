@@ -1,6 +1,6 @@
 # CP1 c-comp fixes — CP2 QA close-out (lane c-comp)
 
-Branch 7day/c-comp-3 from f201f35. Spans are DEFERRED to week 2 (owner decision 3); the metric and redacted log line exist.
+Branch 7day/c-comp-3 from f201f35. Spans are DEFERRED to week 2 (owner decision R3); the metric and redacted log line exist.
 
 ## QA failed criteria
 

@@ -61,7 +61,7 @@ demo, nothing measured) and that another workspace's demo capture does not chang
 ## Observability
 
 Metric `nominara_workspace_summary_reads_total` and the redacted log line (workspace ID, counts only) exist; the unit spec asserts the metric.
-OpenTelemetry spans are DEFERRED to week 2 (owner decision 3): a missing span is not a failed criterion this week.
+OpenTelemetry spans are DEFERRED to week 2 (owner decision R3): a missing span is not a failed criterion this week.
 
 ## Needs a running real API
 

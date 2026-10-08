@@ -62,7 +62,7 @@ Also open (not blocking): where the shared intent list lives for the frontend `l
 
 ## Tracing
 
-OpenTelemetry spans are DEFERRED to week 2 (owner decision 3). No tracer exists in the repo; a missing span is not a failed criterion this week.
+OpenTelemetry spans are DEFERRED to week 2 (owner decision R3). No tracer exists in the repo; a missing span is not a failed criterion this week.
 The metric `nominara_command_parse_total` and the redacted log line (workspace ID only, never the query) are in place and now asserted.
 
 ## Gates (tip `8d3aeca`)

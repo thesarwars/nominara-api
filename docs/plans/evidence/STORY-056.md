@@ -2,7 +2,7 @@
 
 Branch 7day/c-comp-3 from integration/7day f201f35. Observability: metric `nominara_rollup_displacements_persisted_total` and a redacted
 log line (workspaceId, projectId, date, count) in `refreshProjectDisplacements`. **OpenTelemetry spans are DEFERRED to week 2
-(owner decision 3); a missing span is not a failed criterion this week.**
+(owner decision R3); a missing span is not a failed criterion this week.**
 
 ## Acceptance criteria (track-plans.json)
 

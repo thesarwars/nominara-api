@@ -1,6 +1,6 @@
 # NEW-E-100c: scheduled reports CRUD, send-now, delivery history, cap skip with explicit notification
 
-Tracing: metrics (`nominara_reports_scheduled_deliveries_total{status}`, `nominara_reports_scheduled_changes_total{event}`) and redacted log lines (workspace ID and scheduled-report ID only, no label, recipients or figures) this week; OpenTelemetry spans deferred to week 2 (owner decision 3).
+Tracing: metrics (`nominara_reports_scheduled_deliveries_total{status}`, `nominara_reports_scheduled_changes_total{event}`) and redacted log lines (workspace ID and scheduled-report ID only, no label, recipients or figures) this week; OpenTelemetry spans deferred to week 2 (owner decision R3).
 Commits: contract 1c1c7bd (send-now response = the delivery attempt), RED 1a60a6f, implementation 75b4e8b, integration spec ff05062, corrected in the following commit.
 RED 1a60a6f, run: `vitest run test/unit/reports/next-send-at.spec.ts src/modules/reports/scheduled-reports.spec.ts` exit 1, 2 files failed, 0 tests ran, reason "Cannot find module" (next-send-at.ts, scheduled-reports.controller/service absent). After implementation: 15 + 13 tests pass. One assertion in the s10 test was corrected after implementation (the notification kind is a SQL literal, so the check reads the statement text as well as the params); no threshold or expectation was relaxed.
 

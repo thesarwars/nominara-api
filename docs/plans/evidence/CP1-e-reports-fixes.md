@@ -1,7 +1,7 @@
 # CP1-e-reports-fixes: checkpoint-2 closure evidence
 
 Lane 7day/e-reports-3 (worktree api-wt-e1), base integration/7day f201f35. Tracing: metrics and redacted log lines
-this week; OpenTelemetry spans are deferred to week 2 (owner decision 3), so a missing span is not a failed criterion.
+this week; OpenTelemetry spans are deferred to week 2 (owner decision R3), so a missing span is not a failed criterion.
 
 Commits: RED 11d6add (tests only) and 714e129 (test fix); implementation 23f44d1, 124d422, cec2a3a.
 

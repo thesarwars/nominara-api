@@ -1,6 +1,6 @@
 # NEW-E-100b: on-demand export (CSV from rollups, PDF via pdfkit), footer baked in, stored in report_artifacts, pdf_exports metered
 
-Tracing: metrics (`nominara_reports_exports_total`) and a redacted log line (workspace ID, no names, no figures) this week; OpenTelemetry spans deferred to week 2 (owner decision 3).
+Tracing: metrics (`nominara_reports_exports_total`) and a redacted log line (workspace ID, no names, no figures) this week; OpenTelemetry spans deferred to week 2 (owner decision R3).
 Commits: RED 52b1c43, implementation a8d9219 (earlier); checkpoint-2: RED 11d6add, fonts 11940b0, brand re-check 23f44d1.
 RED 52b1c43, as reproduced by CP2 QA: 16 of 17 tests fail with 404 "Cannot POST" (the cross-workspace 404 test passes vacuously). Checkpoint-2 RED 11d6add (mine, run): unit 7 failed, integration 2 failed, exit 1 for the stated reasons.
 

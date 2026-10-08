@@ -1,6 +1,6 @@
 # NEW-E-100a: methodology footer service and GET /v1/projects/{id}/reports/methodology
 
-Tracing: metrics and a redacted log line this week; OpenTelemetry spans deferred to week 2 (owner decision 3).
+Tracing: metrics and a redacted log line this week; OpenTelemetry spans deferred to week 2 (owner decision R3).
 Commits: contract dc23887, RED 5532ddc, implementation d9a56e8 (all merged earlier). No change to this story's code in
 checkpoint 2; this file closes the evidence gap and states the one open criterion.
 
