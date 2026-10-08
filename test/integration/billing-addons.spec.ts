@@ -414,7 +414,7 @@ describe("STORY-076b · add-ons", () => {
     const fetchesBefore = gateway.fetches.length;
     const res = await del(owner, "/billing/addons/extra_seat");
     expect(res.statusCode, res.body).toBe(409);
-    expect(JSON.stringify(res.json())).toContain("seats.max");
+    expect(JSON.stringify(res.json())).toContain("8 members are active but the reduced seat limit would be 7");
     expect(gateway.addonRemovals).toHaveLength(0);
     expect(gateway.addonChanges).toHaveLength(0);
     expect(gateway.fetches).toHaveLength(fetchesBefore); // no Stripe traffic of any kind

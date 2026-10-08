@@ -86,6 +86,35 @@ export interface CreditPackCheckoutInput {
   readonly cancelUrl: string;
 }
 
+/**
+ * STORY-076b — set an add-on's subscription item to a TOTAL quantity, pro-rated
+ * by Stripe. With no `existingItemId` a new item is created from inline
+ * `price_data` (owner decision: no Stripe catalog to keep in step with ours).
+ * The caller computed `quantity` from a FRESH fetch, so this is a set, not a delta.
+ */
+export interface AddonChangeInput {
+  readonly subscriptionId: string;
+  readonly kind: "extra_project" | "extra_seat";
+  /** The new total, 1..100. */
+  readonly quantity: number;
+  readonly existingItemId: string | null;
+  readonly productName: string;
+  /** Integer minor units, from the catalog's `numeric(12,2)` text. Never a float. */
+  readonly unitAmountCents: number;
+  readonly currency: string;
+  /** An item's interval must equal the plan item's. */
+  readonly interval: "month" | "year";
+  readonly proration: "create_prorations";
+  readonly idempotencyKey: string;
+}
+
+/** STORY-076b — drop an add-on's item at the end of the current period (STORY-076 AC13), not now. */
+export interface AddonRemovalInput {
+  readonly subscriptionId: string;
+  readonly itemId: string;
+  readonly idempotencyKey: string;
+}
+
 export interface HostedSession {
   readonly id: string;
   readonly url: string;
@@ -134,6 +163,19 @@ export interface StripeGateway {
 
   /** Hosted billing portal for an existing customer. Throws `StripeUpstreamError`. */
   createPortalSession(input: { readonly customerId: string; readonly returnUrl: string }): Promise<{ readonly url: string }>;
+
+  /**
+   * STORY-076b — set an add-on item's quantity with proration (creating the
+   * item when there is none). Throws `StripeUpstreamError`. Writes NOTHING
+   * local: the add-on rows change only when the webhook reconciles.
+   */
+  changeAddonQuantity(input: AddonChangeInput): Promise<void>;
+
+  /**
+   * STORY-076b — schedules the item's removal at the current period end.
+   * Idempotent for an already-scheduled removal. Throws `StripeUpstreamError`.
+   */
+  scheduleAddonRemoval(input: AddonRemovalInput): Promise<void>;
 
   /** `null` when Stripe has no such object (deleted, or a test-mode id at a live endpoint). */
   fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null>;

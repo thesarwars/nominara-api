@@ -85,4 +85,5 @@ export type Addon = z.infer<typeof addonSchema>;
 export type AddonGrant = z.infer<typeof addonGrantSchema>;
 export type AddonChangeResponse = z.infer<typeof addonChangeResponseSchema>;
 export type AddonListResponse = z.infer<typeof addonListResponseSchema>;
+export type AddonListQuery = z.infer<typeof addonListQuerySchema>;
 export type AddonCreateRequest = z.infer<typeof addonCreateRequestSchema>;
