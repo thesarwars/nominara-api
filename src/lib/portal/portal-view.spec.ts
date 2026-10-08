@@ -122,8 +122,8 @@ describe("NEW-E-099a · findCostFields (the hide_costs key scan)", () => {
 // NEW-E-099a audit finding 3 — the cost-key scan is a denylist; the response schemas are the allow-list. A key no
 // schema names (captures, n_captures, runs_used, capture_total ...) must fail closed on the way out.
 describe("NEW-E-099a audit · parsePortalPayload (strict allow-list on the way out)", () => {
-  const footer = { data_through: "2026-10-01", engines: ["gemini"], engine_data_sources: ["live"], timeframe: "30d", sample_size: 3, live_capture_ratio: 1, scoring_version: "v1", weight_overrides: null, note: "n" } as const;
-  const theme = { theme_id: null, name: "Default", primary: null, accent: null, background: null, text: null, font_family: "Inter", logo_url: null, hide_nominara_brand: false, is_default: true } as const;
+  const footer = { data_through: "2026-10-01", engines: ["gemini"], engine_data_sources: [{ engine_key: "gemini", data_source: "live" }], timeframe: "30d", sample_size: 3, live_capture_ratio: 1, scoring_version: "v1", weight_overrides: null, note: "n" } as const;
+  const theme = { theme_id: "0198f6a0-0000-7000-8000-0000000000aa", name: "Default", is_default: true, color_primary: null, color_accent: null, color_bg: null, color_fg: null, font_family: "Inter", logo_url: null, hide_nominara_brand: false } as const;
   const overview = (extra: Record<string, unknown> = {}, projectExtra: Record<string, unknown> = {}) => ({
     agency: "A", theme, label: "L", tabs: ["overview"], hide_competitors: false, hide_costs: true, timeframe: "30d", timeframe_locked: false,
     projects: [{ id: "0198f6a0-0000-7000-8000-00000000000a", name: "P", visibility: 1, delta: null, confidence: "high", sentiment: null, citations: 0, footer, ...projectExtra }],

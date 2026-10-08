@@ -1,5 +1,11 @@
 import type { GrowthMapResponse } from "../../../contracts/analytics/index.js";
-import type { PortalGrowthMapResponse } from "../../../contracts/portal/index.js";
+import {
+  portalGrowthMapResponseSchema,
+  portalMatrixResponseSchema,
+  portalOverviewResponseSchema,
+  portalTasksResponseSchema,
+  type PortalGrowthMapResponse,
+} from "../../../contracts/portal/index.js";
 import type { ReportTimeframe } from "../../../contracts/reports/index.js";
 import { ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 
@@ -75,4 +81,20 @@ export function findCostFields(value: unknown, path = ""): string[] {
     const here = path === "" ? key : `${path}.${key}`;
     return [...(COST_KEY.test(key) ? [here] : []), ...findCostFields(child, here)];
   });
+}
+
+const PORTAL_PAYLOAD_SCHEMAS = {
+  overview: portalOverviewResponseSchema,
+  growth_map: portalGrowthMapResponseSchema,
+  matrix: portalMatrixResponseSchema,
+  tasks: portalTasksResponseSchema,
+} as const;
+
+/**
+ * The ALLOW-LIST. Every portal payload is parsed against its strict response schema before it is cached or served, so
+ * a key no schema names (a new capture count, a usage meter, whatever the next change adds) throws a ZodError instead
+ * of reaching a client. The key scan above is the denylist and only a second line: it can miss a name nobody listed.
+ */
+export function parsePortalPayload<T extends keyof typeof PORTAL_PAYLOAD_SCHEMAS>(tab: T, value: unknown): ReturnType<(typeof PORTAL_PAYLOAD_SCHEMAS)[T]["parse"]> {
+  return PORTAL_PAYLOAD_SCHEMAS[tab].parse(value) as ReturnType<(typeof PORTAL_PAYLOAD_SCHEMAS)[T]["parse"]>;
 }

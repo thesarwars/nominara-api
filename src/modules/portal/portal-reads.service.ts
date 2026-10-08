@@ -12,7 +12,7 @@ import type {
 import type { ReportTimeframe } from "../../../contracts/reports/index.js";
 import { selectPortalProject, type PortalSessionContext } from "../../api/decorators/portal-route.decorator.js";
 import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
-import { assertPortalTab, findCostFields, portalTimeframeDays, resolvePortalTimeframe, toPortalGrowthMap } from "../../lib/portal/portal-view.js";
+import { assertPortalTab, findCostFields, parsePortalPayload, portalTimeframeDays, resolvePortalTimeframe, toPortalGrowthMap } from "../../lib/portal/portal-view.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { AgencyService } from "../agency/agency.service.js";
 import { GrowthMapService, toMeasuredImpact } from "../analytics/growth-map.service.js";
@@ -164,7 +164,8 @@ export class PortalReadsService {
     });
     const value = await this.cache.getOrCompute(key, async () => {
       computed = true;
-      const fresh = await compute();
+      // Allow-list first: a key the strict response schema does not name throws here, before the cache or a client.
+      const fresh = parsePortalPayload(tab, await compute()) as T;
       if (session.policy.hideCosts) {
         const leaked = findCostFields(fresh);
         if (leaked.length > 0) throw new Error(`portal ${tab} payload carries cost-side fields under hide_costs: ${leaked.join(", ")}`);
