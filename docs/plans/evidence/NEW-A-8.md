@@ -22,8 +22,7 @@ twice, as `src/db/seed/demo/facts.ts` does.)
 | 4 | Re-running on the same day gives byte-identical demo rows | "NEW-A-8 #4". |
 | audit | `--facts-only` inserts no prompt and no competitor; project/prompt/competitor rows untouched (count and xmin); facts land on the project's real prompt | "NEW-A-8 audit · --facts-only inserts no prompt and no competitor..." and "NEW-A-8 audit · --facts-only on a project with no prompts writes nothing and inserts nothing". **RED, right reason, re-run this checkpoint:** with `src/db/seed-demo.ts`, `facts.ts`, `seed-project.ts` set back to `1d0ae38^` and the fixed fixture, both audit tests FAIL (2 failed, exit 1) because the old code inserted prompts and competitors; with the fixed source they pass. (The original RED commit e82c300 had failed for the WRONG reason: the missing-fixture precondition.) |
 
-## Gates (all in /Users/sarwaralam/Desktop/Projects/ElegantTech/nominara/api-wt-a2)
-- `pnpm lint` exit 0; `pnpm typecheck` exit 0.
+## Gates
 All run in /Users/sarwaralam/Desktop/Projects/ElegantTech/nominara/api-wt-a2 on 7day/a-api-3, Docker via testcontainers (pgvector:pg18).
 - `pnpm lint` exit 0. `pnpm typecheck` exit 0. `pnpm contracts:generate` no diff; `pnpm contracts:check` exit 0.
 - `pnpm test:unit` exit 0: 277 files passed, 1 skipped; 3316 tests passed, 1 skipped. (One earlier full run, concurrent with a
