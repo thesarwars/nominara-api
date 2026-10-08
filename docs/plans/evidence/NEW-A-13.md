@@ -59,3 +59,43 @@ Not mutation-tested: the worker wiring calling start() (the wiring spec proves p
 - The worker-group-bootstrap spec counts worker connections; the sweep therefore enqueues through the group's one shared producer-side (reader) connection and opens none of its own. First attempt used a new worker connection and failed that spec (7 vs 6).
 - A backlog larger than one batch (500) re-claims the same oldest rows each tick until the handler advances them; their jobs are deduplicated by the queue. A deduplicated add still counts as `enqueued` in the sweep result, so the result does not show it; a follow-up can compare the returned job's creation time if that matters.
 - The bootstrap log line for the capture group still says capture.plan "needs a per-workspace sweep"; it is now stale text (src/lib/queue/schedule-registrar.ts, outside this story's files). Not changed.
+
+# Checkpoint-3 fix pass (branch 7day/a-gemini-4, base integration/7day fee788e)
+
+Two audit findings, fixed red-first. Migrations: none. RED 98b8bfb (unit 7 failed of 13; integration 5 failed: CP3-1d, CP3-2, CP3-3d by timeout/pending, CP3-4a, CP3-4b by missing `armed`/`enqueue`). Fix 9eb8692; a strengthening test commit follows it (connect bound proven alone). The RED commit does not typecheck on its own (it uses the new `limits` option); the fix commit does.
+
+## Finding 1 (blocker): the sweep held row locks across an unbounded Valkey call
+
+Three layers, all in src/lib/capture/scheduler-sweep.ts (src/worker.ts unchanged):
+1. each enqueue raced against `enqueueTimeoutMs` (default 5 s); a timeout is a failed enqueue (`EnqueueTimeoutError`, partial); the claim transaction has a `transactionBudgetMs` (30 s) after which no further row is attempted and the unsent rows are counted failed.
+2. Postgres bounds the transaction: `set_config('lock_timeout', ...)` and `set_config('idle_in_transaction_session_timeout', ...)` with is_local => true, right after BEGIN (15 s idle, 5 s lock by default). No session-level SET.
+3. `tick()` is raced against `tickTimeoutMs` (60 s) and `connect` against `connectTimeoutMs` (10 s); on expiry the connection is ended (locks dropped), a late-opening connection is closed, and arm() runs regardless.
+Defaults are mine (the finding gave no numbers): enqueue 5 s < idle 15 s < budget 30 s < tick 60 s, so the layers nest. Tell me if the owner wants others.
+
+| Required | Proof (file :: test) |
+|---|---|
+| 1. bound each enqueue, timeout = failed enqueue | unit :: "CP3-1a ... abandoned after enqueueTimeoutMs and counted as a failed enqueue (partial)", "CP3-1c ... budgeted" |
+| 2. Postgres-side bound, transaction-scoped | unit :: "CP3-1b ... set lock_timeout and idle_in_transaction_session_timeout transaction-locally, after BEGIN and before the claim" (params, is_local true, no bare SET); integration :: "CP3-2 Postgres bounds the transaction itself" (server ends the session; second connection's FOR UPDATE NOWAIT succeeds with the client never letting go) |
+| 3. bound the tick so arm() always runs | unit :: "CP3-3a connect that never answers ... next :05 tick still fires" (tick bound out of play, connect bound alone), "CP3-3b stalled tick abandoned, connection ended, next :05 tick still fires", "CP3-3c tick() resolves null"; integration :: "CP3-3d tick whose enqueue never resolves ... locks released, tick() settles" |
+| 4. never-resolving enqueue test: locks released within the bound AND next :05 tick fires | integration :: "CP3-1d" (real Postgres, NOWAIT succeeds) + unit CP3-3a/3b (fake timers, next :05 fires). The two halves live in different specs because fake timers cannot drive a real Postgres socket |
+| observability | unit :: "CP3-obs": metric nominara_capture_scheduler_sweeps_total{status=timed_out}, nominara_capture_scheduler_enqueue_failures_total; log lines capture.scheduler.tick_timed_out, capture.scheduler.enqueue_failed (error EnqueueTimeoutError, ids only), capture.scheduler.budget_exhausted. Spans deferred (R3). |
+
+Mutations (each reverted): no enqueue timeout -> CP3-1a, 1c, obs fail; no tick race -> 3b, 3c, obs fail; no budget -> 1c fails; lock_timeout dropped -> 1b fails; idle timeout dropped ("0") -> integration CP3-2 fails; no connect timeout -> 3a fails (first attempt survived, because the tick bound covered it; the test now takes the tick bound out of play).
+The tick bound also protects `connect()` having no `connectionTimeoutMillis` in src/db/client.ts (not touched; the runtime races it instead).
+
+## Finding 2 (major): deleting `sweepRuntime.start()` left every test green
+
+No change to src/worker.ts. Added to the runtime: `get armed()` (true between start() and stop()) and a public `enqueue` (the closure the runtime ticks with). test/integration/worker-scheduler-sweep-wiring.spec.ts:
+- "CP3-4a the capture worker's sweep timer is ARMED": bootstraps the capture group, asserts `holder.runtime.armed`.
+- "CP3-4b the PRODUCTION enqueue closure ...": calls `holder.runtime.enqueue(job)` on the bootstrapped worker against the Valkey fixture and reads the real `capture.plan` queue (production prefix): exactly one job, signature present, payload parses with capturePlanJobSchema (trigger scheduled, the right workspace and project), a repeated key adds no job, a new next_run_at adds one. Jobs are counted across all states because the capture group's own worker consumes capture.plan in-process.
+Mutations on src/worker.ts (each reverted): delete `sweepRuntime.start();` -> CP3-4a fails; per-call random idempotency key -> CP3-4b fails; wrong queue name ("capture.parse") -> CP3-4b fails. Used the allowed alternative to the fake-clock bootstrap (the closure is read through the holder, not re-written in the test); a full fake-clock bootstrap would need a real Postgres in the worker, which this lane left to NEW-A-17.
+
+## Gates (tree after the last commit)
+
+| Command | Exit | Result |
+|---|---|---|
+| pnpm lint | 0 | |
+| pnpm typecheck | 0 | |
+| pnpm test:unit | 0 | 303 files passed, 1 skipped; 3710 tests passed, 1 skipped |
+| vitest integration: capture-scheduler-sweep, worker-scheduler-sweep-wiring, worker-canary-wiring, worker-group-bootstrap, capture-scheduler, capture-plan-handler | 0 | 6 files, 76 tests |
+| pnpm test:isolation | not run | no tenant table or RLS file touched |
