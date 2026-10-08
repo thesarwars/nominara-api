@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import pg from "pg";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PortalCookiePayload } from "../../contracts/portal/index.js";
 import { portalTasksResponseSchema } from "../../contracts/portal/index.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
@@ -171,13 +172,25 @@ describe("NEW-E-099b · portal tasks and first-view notification", () => {
     const w = await world();
     await task(w, w.p1, { title: "Open", status: "todo" });
     const t = await token(w, { scope: [w.p1] });
-    await harness.db().query("SELECT pg_stat_statements_reset()").catch(() => undefined);
-    const res = await get(t.cookie, `/portal/tasks?project=${w.p1}`);
+    // The trace is pg's Client.prototype.query, in-process: every statement of the request, on any pool. (The earlier
+    // pg_stat_statements version passed vacuously: no test container preloads the extension, and a co-filter on `tasks`
+    // would have missed a separate fact-table statement.)
+    const seen: string[] = [];
+    const original = pg.Client.prototype.query;
+    const spy = vi.spyOn(pg.Client.prototype, "query").mockImplementation(function (this: pg.Client, ...args: unknown[]) {
+      const first = args[0];
+      seen.push(typeof first === "string" ? first : typeof first === "object" && first !== null && "text" in first ? String((first as { text: unknown }).text) : "");
+      return (original as (...a: unknown[]) => unknown).apply(this, args);
+    } as never);
+    let res;
+    try {
+      res = await get(t.cookie, `/portal/tasks?project=${w.p1}`);
+    } finally {
+      spy.mockRestore();
+    }
     expect(res.statusCode, res.body).toBe(200);
-    const trace = await harness.db()
-      .query("SELECT query FROM pg_stat_statements WHERE query ~* '(answer_captures|mention_facts|citation_facts)' AND query ~* 'FROM tasks|JOIN tasks'")
-      .catch(() => ({ rows: [] as unknown[] }));
-    expect(trace.rows).toEqual([]);
+    expect(seen.length, "the trace must have seen the request's statements").toBeGreaterThan(0);
+    expect(seen.filter((sql) => /\b(answer_captures|mention_facts|citation_facts)\b/i.test(sql))).toEqual([]);
   });
 
   it("STORY-099 s15 · two tokens on the same path never share a cache entry", async () => {
