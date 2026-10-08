@@ -157,12 +157,13 @@ describe("STORY-137 · growth map", () => {
     await rollUpDay(db, workspaceId, projectId, date, "UTC");
   }
 
-  function read(timeframe: "7d" | "30d" | "90d" = "7d", entities?: string) {
+  function read(timeframe: "7d" | "30d" | "90d" = "7d", entities?: string, engines?: string) {
     return withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
       new GrowthMapService().growthMap(projectId, {
         timeframe,
         granularity: "day",
         ...(entities === undefined ? {} : { entities }),
+        ...(engines === undefined ? {} : { engines }),
       }),
     ) as ReturnType<GrowthMapService["growthMap"]>;
   }
@@ -319,6 +320,44 @@ describe("STORY-137 · growth map", () => {
     const competitorsOnly = await read("7d", "competitors");
     expect(competitorsOnly.series.some((s) => s.series_id === "brand")).toBe(false);
     expect(competitorsOnly.series.some((s) => s.entity_type === "competitor")).toBe(true);
+  });
+
+  /** One rolled-up day with a present brand on `chatgpt` and an absent one on `google_ai_mode`. */
+  async function twoEngineDay(): Promise<void> {
+    const { date, at } = dayAgo(1);
+    const present = await addCell(at, "chatgpt", true);
+    await addMention(present, at);
+    await addCell(at, "google_ai_mode", false);
+    await rollUpDay(db, workspaceId, projectId, date, "UTC");
+  }
+
+  it("NEW-A-14 AC2 — engines=chatgpt plots only chatgpt's measurements and lists only chatgpt", async () => {
+    await twoEngineDay();
+    const all = await read("7d", "brand");
+    const narrowed = await read("7d", "brand", "chatgpt");
+    const lastScored = (r: typeof all) => r.series[0]!.points.filter((p) => p.visibility_score !== null).at(-1)!;
+    expect(narrowed.engines.map((e) => e.engine_key)).toEqual(["chatgpt"]);
+    expect(lastScored(narrowed).cells).toBe(1);
+    expect(lastScored(all).cells).toBe(2);
+    expect(lastScored(narrowed).visibility_score).not.toBe(lastScored(all).visibility_score);
+    expect(growthMapResponseSchema.safeParse(narrowed).success).toBe(true);
+  });
+
+  it("NEW-A-14 AC2 — engines=all is the unfiltered payload", async () => {
+    await twoEngineDay();
+    const [unfiltered, all] = [await read("7d", "brand"), await read("7d", "brand", "all")];
+    expect(all.series).toEqual(unfiltered.series);
+    expect(all.engines).toEqual(unfiltered.engines);
+  });
+
+  it("NEW-A-14 AC2 — an engine the project is not entitled to narrows to nothing and never widens", async () => {
+    await twoEngineDay();
+    const none = await read("7d", "brand", "claude");
+    expect(none.engines).toEqual([]);
+    expect(none.series[0]!.points.every((p) => p.visibility_score === null && p.cells === 0)).toBe(true);
+    expect(none.summary.visibility_end).toBeNull();
+    const mixed = await read("7d", "brand", "chatgpt,claude");
+    expect(mixed.engines.map((e) => e.engine_key)).toEqual(["chatgpt"]);
   });
 
   it("names a best and a worst engine only when there are two to compare", async () => {
