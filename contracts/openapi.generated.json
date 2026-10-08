@@ -54336,42 +54336,11 @@
             "type": "string",
             "format": "uuid",
             "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-          },
-          "status": {
-            "type": "string",
-            "minLength": 1
-          },
-          "title": {
-            "type": "string",
-            "minLength": 1
-          },
-          "priority": {
-            "type": "string",
-            "minLength": 1
-          },
-          "impact_score": {
-            "type": "number"
-          },
-          "rule_code": {
-            "anyOf": [
-              {
-                "type": "string",
-                "minLength": 1
-              },
-              {
-                "type": "null"
-              }
-            ]
           }
         },
         "required": [
           "task_id",
-          "project_id",
-          "status",
-          "title",
-          "priority",
-          "impact_score",
-          "rule_code"
+          "project_id"
         ],
         "additionalProperties": false
       },

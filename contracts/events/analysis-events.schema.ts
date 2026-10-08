@@ -37,18 +37,14 @@ export const auxFindingCreatedEventSchema = z
   })
   .strict();
 
+// IDS ONLY (owner decision 2026-10-08). `task.created` is delivered to the whole
+// workspace room, scoped members included, and the gateway has no per-project
+// delivery; a title, priority or rule code would reach members who cannot read
+// the project. Clients refetch the task through the scoped REST read.
 export const taskCreatedEventSchema = z
   .object({
     task_id: uuid,
     project_id: uuid,
-    status: z.string().min(1),
-    title: z.string().min(1),
-    priority: z.string().min(1),
-    impact_score: z.number(),
-    // A task generated from a rule carries its code; one created by hand does
-    // not. Null rather than an empty string, so "no rule" cannot be mistaken
-    // for a rule whose code happens to be blank.
-    rule_code: z.string().min(1).nullable(),
   })
   .strict();
 
