@@ -2,11 +2,12 @@ import type { GrowthMapResponse } from "../../../contracts/analytics/index.js";
 import {
   portalGrowthMapResponseSchema,
   portalMatrixResponseSchema,
-  portalOverviewResponseSchema,
+  portalOverviewCostsHiddenSchema,
+  portalOverviewCostsVisibleSchema,
   portalTasksResponseSchema,
   type PortalGrowthMapResponse,
 } from "../../../contracts/portal/index.js";
-import type { ReportTimeframe } from "../../../contracts/reports/index.js";
+import type { MethodologyFooter, ReportTimeframe } from "../../../contracts/reports/index.js";
 import { ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 
 // NEW-E-099a — the pure rules of the portal read model: which timeframe a token may be served, which tab it may
@@ -69,9 +70,17 @@ export function toPortalGrowthMap(source: GrowthMapResponse, opts: { readonly hi
 }
 
 // A cost-side field: a quota, a credit balance, a cost or price, a usage meter, or a capture/cell count. The
-// methodology footer's `sample_size` and `live_capture_ratio` are NOT here: the footer is mandatory and unremovable
-// (NFR-AGY-05), and they describe the statistical basis of a figure, not what it cost.
-const COST_KEY = /(^|_)(quota|quotas|credit|credits|cost|costs|spend|price|prices|usage|cells|cells_total|captures_total|capture_count)($|_)/;
+// methodology footer's `live_capture_ratio` is NOT here (a ratio, and the footer is mandatory and unremovable,
+// NFR-AGY-05). `sample_size` IS: owner decision 2026-10-08, it is derived from the capture count, so under hide_costs it
+// is dropped from the footer and this scan is the second line behind the allow-list.
+const COST_KEY = /(^|_)(quota|quotas|credit|credits|cost|costs|spend|price|prices|usage|cells|cells_total|captures_total|capture_count|sample_size)($|_)/;
+
+/** The footer as the portal serves it: `sample_size` is removed when costs are hidden, nothing else is touched. */
+export function toPortalFooter(footer: MethodologyFooter, opts: { readonly hideCosts: boolean }): Omit<MethodologyFooter, "sample_size"> & { sample_size?: number } {
+  if (!opts.hideCosts) return footer;
+  const { sample_size: _dropped, ...rest } = footer;
+  return rest;
+}
 
 /** Paths of every key in `value`, at any depth, that names a cost-side field. Empty means the payload is clean. */
 export function findCostFields(value: unknown, path = ""): string[] {
@@ -87,7 +96,7 @@ export function findCostFields(value: unknown, path = ""): string[] {
 }
 
 const PORTAL_PAYLOAD_SCHEMAS = {
-  overview: portalOverviewResponseSchema,
+  overview: portalOverviewCostsVisibleSchema,
   growth_map: portalGrowthMapResponseSchema,
   matrix: portalMatrixResponseSchema,
   tasks: portalTasksResponseSchema,
@@ -98,6 +107,8 @@ const PORTAL_PAYLOAD_SCHEMAS = {
  * a key no schema names (a new capture count, a usage meter, whatever the next change adds) throws a ZodError instead
  * of reaching a client. The key scan above is the denylist and only a second line: it can miss a name nobody listed.
  */
-export function parsePortalPayload<T extends keyof typeof PORTAL_PAYLOAD_SCHEMAS>(tab: T, value: unknown): ReturnType<(typeof PORTAL_PAYLOAD_SCHEMAS)[T]["parse"]> {
-  return PORTAL_PAYLOAD_SCHEMAS[tab].parse(value) as ReturnType<(typeof PORTAL_PAYLOAD_SCHEMAS)[T]["parse"]>;
+export function parsePortalPayload<T extends keyof typeof PORTAL_PAYLOAD_SCHEMAS>(tab: T, value: unknown, opts: { readonly hideCosts: boolean }): ReturnType<(typeof PORTAL_PAYLOAD_SCHEMAS)[T]["parse"]> {
+  // `hideCosts` is required, not defaulted: a caller that forgets it does not compile rather than serving the wrong footer.
+  const schema = tab === "overview" && opts.hideCosts ? portalOverviewCostsHiddenSchema : PORTAL_PAYLOAD_SCHEMAS[tab];
+  return schema.parse(value) as ReturnType<(typeof PORTAL_PAYLOAD_SCHEMAS)[T]["parse"]>;
 }

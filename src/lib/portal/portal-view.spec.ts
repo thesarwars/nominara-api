@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ZodError } from "zod";
 import type { GrowthMapResponse } from "../../../contracts/analytics/index.js";
 import { portalGrowthMapResponseSchema } from "../../../contracts/portal/index.js";
+import type { MethodologyFooter } from "../../../contracts/reports/index.js";
 import { ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { assertPortalTab, competitorLabel, findCostFields, parsePortalPayload, PORTAL_DEFAULT_TIMEFRAME, portalTimeframeDays, resolvePortalTimeframe, toPortalFooter, toPortalGrowthMap } from "./portal-view.js";
 
@@ -167,8 +168,9 @@ describe("NEW-E-099a audit · parsePortalPayload (strict allow-list on the way o
 
 // Owner decision 2026-10-08: when costs are hidden the footer drops sample_size. The footer itself stays (NFR-AGY-05).
 describe("NEW-E-099a hide_costs footer · sample_size dropped, enforced by the allow-list", () => {
-  const { sample_size: _dropped, ...hiddenFooter } = { data_through: "2026-10-01", engines: ["gemini"], engine_data_sources: [{ engine_key: "gemini", data_source: "live" }], timeframe: "30d", sample_size: 3, live_capture_ratio: 1, scoring_version: "v1", weight_overrides: null, note: "n" } as const;
-  const fullFooter = { ...hiddenFooter, sample_size: 3 };
+  const base: MethodologyFooter = { data_through: "2026-10-01", engines: ["gemini"], engine_data_sources: [{ engine_key: "gemini", data_source: "live" }], timeframe: "30d", sample_size: 3, live_capture_ratio: 1, scoring_version: "v1", weight_overrides: null, note: "n" };
+  const { sample_size: _dropped, ...hiddenFooter } = base;
+  const fullFooter = base;
   const theme = { theme_id: "0198f6a0-0000-7000-8000-0000000000aa", name: "Default", is_default: true, color_primary: null, color_accent: null, color_bg: null, color_fg: null, font_family: "Inter", logo_url: null, hide_nominara_brand: false } as const;
   const overview = (footer: Record<string, unknown>, hide: boolean) => ({
     agency: "A", theme, label: "L", tabs: ["overview"], hide_competitors: false, hide_costs: hide, timeframe: "30d", timeframe_locked: false,

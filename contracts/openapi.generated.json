@@ -20526,7 +20526,6 @@
                                   "engines",
                                   "engine_data_sources",
                                   "timeframe",
-                                  "sample_size",
                                   "live_capture_ratio",
                                   "scoring_version",
                                   "weight_overrides",

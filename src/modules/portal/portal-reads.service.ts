@@ -12,7 +12,7 @@ import type {
 import type { ReportTimeframe } from "../../../contracts/reports/index.js";
 import { selectPortalProject, type PortalSessionContext } from "../../api/decorators/portal-route.decorator.js";
 import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
-import { assertPortalTab, findCostFields, parsePortalPayload, portalTimeframeDays, resolvePortalTimeframe, toPortalGrowthMap } from "../../lib/portal/portal-view.js";
+import { assertPortalTab, findCostFields, parsePortalPayload, portalTimeframeDays, resolvePortalTimeframe, toPortalFooter, toPortalGrowthMap } from "../../lib/portal/portal-view.js";
 import { projectFacts } from "../../lib/portal/portal-facts.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { GrowthMapService, toMeasuredImpact } from "../analytics/growth-map.service.js";
@@ -77,7 +77,8 @@ export class PortalReadsService {
           sentiment: blended.metrics.sentiment_score,
           citations: blended.metrics.citations_total,
           // The footer is built here, unconditionally, from the same builder the export uses: no theme or token setting reaches it.
-          footer: await this.methodology.footer(id, { timeframe }, session.facts.workspace),
+          // Under hide_costs sample_size is dropped (owner decision 2026-10-08); everything else in the footer stays.
+          footer: toPortalFooter(await this.methodology.footer(id, { timeframe }, session.facts.workspace), { hideCosts: session.policy.hideCosts }),
         });
       }
       return {
@@ -162,7 +163,7 @@ export class PortalReadsService {
     const value = await this.cache.getOrCompute(key, async () => {
       computed = true;
       // Allow-list first: a key the strict response schema does not name throws here, before the cache or a client.
-      const fresh = parsePortalPayload(tab, await compute()) as T;
+      const fresh = parsePortalPayload(tab, await compute(), { hideCosts: session.policy.hideCosts }) as T;
       if (session.policy.hideCosts) {
         const leaked = findCostFields(fresh);
         if (leaked.length > 0) throw new Error(`portal ${tab} payload carries cost-side fields under hide_costs: ${leaked.join(", ")}`);
