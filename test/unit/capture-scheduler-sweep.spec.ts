@@ -215,7 +215,7 @@ describe("NEW-A-13 checkpoint-3 · every wait the sweep makes is bounded", () =>
     const runtime = runtimeWith(() => {
       connects.push(new Date().toISOString());
       return new Promise<never>(() => undefined);
-    });
+    }, { tickTimeoutMs: 90 * 60_000 }); // the tick bound is out of play: connectTimeoutMs alone must free it
     runtime.start();
     await vi.advanceTimersByTimeAsync(5 * 60_000 + 2_000);
     expect(connects).toEqual(["2026-10-08T10:05:00.000Z"]);
