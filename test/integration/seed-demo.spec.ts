@@ -1099,7 +1099,22 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
        VALUES ($1,$2,$3,$4,$5,'active') RETURNING id`,
       [workspaceId, `Project ${slug}`, slug, `https://${slug}.example`, `${slug}.example`],
     );
-    return result.rows[0]!.id;
+    const projectId = result.rows[0]!.id;
+    // A real customer project already owns its prompt and its competitor:
+    // --facts-only (NEW-A-8 audit) writes against EXISTING rows only and
+    // inserts neither, so the fixture must carry one of each.
+    const promptText = `what does ${slug} do and who is it for`;
+    await client.query(
+      `INSERT INTO tracked_prompts (workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status)
+       VALUES ($1,$2,$3,sha256($4::bytea),'custom','decision','active')`,
+      [workspaceId, projectId, promptText, promptText],
+    );
+    await client.query(
+      `INSERT INTO competitors (workspace_id, project_id, name, root_domain, aliases, source)
+       VALUES ($1,$2,$3,$4,ARRAY[]::text[],'user')`,
+      [workspaceId, projectId, `Rival of ${slug}`, `rival-${slug}.example`],
+    );
+    return projectId;
   }
 
   async function entitledKeys(projectId: string): Promise<string[]> {
