@@ -63,9 +63,11 @@ export const autoTopupConfigSchema = z
  * Internal: no route returns it. `charge_submitted` is the only outcome that
  * consumed a cap slot and reached the provider; credits still land only on the
  * webhook. `declined` and `email_failed` consumed a slot and charged nothing.
+ * `not_in_plan`: the workspace was downgraded below Growth after enabling it.
  */
 export const AUTO_TOPUP_TRIGGER_OUTCOMES = [
   "not_enabled",
+  "not_in_plan",
   "above_threshold",
   "cap_reached",
   "in_flight",
