@@ -9,6 +9,8 @@ import {
   displacementItemSchema,
 } from "../../../contracts/analytics/index.js";
 import { API_CONTRACT_KEY } from "../../api/decorators/api-contract.decorator.js";
+import { IDEMPOTENT_KEY } from "../../api/decorators/idempotent.decorator.js";
+import { recoveryPlanResponseSchema } from "../../../contracts/analytics/index.js";
 import { AUDIT_METADATA_KEY } from "../../api/decorators/audit.decorator.js";
 import { PROJECT_PARAM_KEY } from "../../api/decorators/project-param.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.decorator.js";
@@ -192,5 +194,25 @@ describe("NEW-C-5 · feed (AC2, AC5)", () => {
     const query = displacementFeedQuerySchema.parse({});
     await expect(run(fakeClient({}, seen), () => service.feed(uuid(9), query))).rejects.toMatchObject({ code: "not_found" });
     expect(seen.some((s) => /FROM displacement_events/i.test(s))).toBe(false);
+  });
+});
+
+describe("NEW-C-6 · route wiring and contract", () => {
+  const reflector = new Reflector();
+  const proto = DisplacementController.prototype as unknown as Record<string, () => void>;
+
+  it("AC3 — the recovery plan needs task:create, requires Idempotency-Key, is scoped by the displacement and audited", () => {
+    const h = proto.recoveryPlan!;
+    expect(h).toBeTypeOf("function");
+    expect(reflector.get(REQUIRE_PERMISSION_KEY, h)).toBe("task:create");
+    expect(reflector.get(IDEMPOTENT_KEY, h)).toBe(true);
+    expect(reflector.get(SCOPED_BY_QUERY_KEY, h)).toBe(true);
+    expect(reflector.get(AUDIT_METADATA_KEY, h)).toMatchObject({ action: "displacement.recovery_planned", resourceType: "displacement" });
+    expect(reflector.get(API_CONTRACT_KEY, h)).toMatchObject({ operationId: "createDisplacementRecoveryPlan", responseSchema: recoveryPlanResponseSchema });
+  });
+
+  it("AC1 — the response is an array of the task schema; an empty plan is valid, an unknown task key is refused", () => {
+    expect(recoveryPlanResponseSchema.safeParse([]).success).toBe(true);
+    expect(recoveryPlanResponseSchema.safeParse([{ id: "not-a-task" }]).success).toBe(false);
   });
 });
