@@ -4,7 +4,7 @@ import { AuxModule } from "./aux.module.js";
 import { AuxController } from "./aux.controller.js";
 import { AuxService } from "./aux.service.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
-import { ConflictError, NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
+import { ConflictError, NotFoundError, type DomainError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.decorator.js";
 import { AUDIT_METADATA_KEY } from "../../api/decorators/audit.decorator.js";
@@ -61,6 +61,7 @@ function auditRow(over: Record<string, unknown> = {}) {
     started_at: new Date("2026-10-01T10:00:00Z"),
     finished_at: new Date("2026-10-01T10:05:00Z"),
     created_at: new Date("2026-10-01T09:59:00Z"),
+    created_at_key: "2026-10-01 09:59:00+00",
     pages_crawled: 12,
     pages_failed: 0,
     aux_score: "68.500",
@@ -106,7 +107,7 @@ function findingRow(over: Record<string, unknown> = {}) {
     occurrence_count: 3,
     rule_version: "2026.10.1",
     task_id: null,
-    severity_key: "0",
+    severity_rank: 0,
     ...over,
   };
 }
@@ -342,7 +343,7 @@ describe("NEW-C-10 · AuxService.updateFinding", () => {
   it("[NEW-C-10 AC2] a refused transition names the current state", async () => {
     const error = await serviceWith(patchRoute("stale")).updateFinding(FINDING_ID, { status: "acknowledged" }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ConflictError);
-    expect((error as ConflictError).getResponse()).toMatchObject({ details: { current_state: "stale" } });
+    expect((error as DomainError).getResponse()).toMatchObject({ details: { current_state: "stale" } });
   });
 
   it("[NEW-C-10 AC3] a missing finding is 404; an out-of-scope project's is 403, and neither writes", async () => {
