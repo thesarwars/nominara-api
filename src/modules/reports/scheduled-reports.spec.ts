@@ -132,6 +132,8 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
     const out = await h.service.sendNow(REPORT_ID);
     expect(h.sent.map((m) => m.to)).toEqual(["a@example.test", "b@example.test"]);
     expect(h.sent[0]!.textBody).toContain("0190aaaa-0000-7000-8000-00000000c10");
+    // The link is a URL, not a storage key: pinned whole so a restructure cannot change what recipients receive.
+    expect(h.sent[0]!.textBody).toContain("https://app.nominara.com/report-artifacts/0190aaaa-0000-7000-8000-00000000c10\n");
     expect(out.status).toBe("logged");
     expect(out.recipients).toBe(2);
     expect(out.reason).toBeNull();
