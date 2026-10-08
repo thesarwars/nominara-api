@@ -66,3 +66,24 @@ OpenTelemetry spans are DEFERRED to week 2 (owner decision R3): a missing span i
 ## Needs a running real API
 
 Nothing here; collected in NEW-A-17 if the Command Center is exercised end to end.
+
+## Checkpoint-3 fix pass (branch `7day/b-ws-4`, from integration/7day fee788e)
+
+The CP2 fixes are ancestors of fee788e; `workspace-summary.spec.ts` is green there (the batched provenance read is in). Added the remaining scoping
+test, test-only commit, no RED possible (the behaviour is already correct): integration "NEW-B-2 scoping: a scoped member's summary, counts and
+engine provenance cover only their projects" - one in-scope live project, one hidden demo project; the scoped summary has only the in-scope project,
+`projects_used` 1, `prompts_used` 4, engine `data_source` "live" (not "mixed") and the hidden project's id appears nowhere in the payload; the unscoped
+caller gets "mixed", so the difference is exactly the hidden project.
+Mutation: dropping the scope clause from `ProjectsService.listForSummary`'s project query fails this test and the two earlier scoped tests (3 failed,
+exit 1); source restored afterwards.
+Independent dangerous-area-auditor verdict on scoping: still NOT recorded (no auditor agent in this lane); the merge step must record one.
+
+### Gates, checkpoint-3 pass (tip after the test commit `d2b55eb`)
+
+| Command | Exit |
+|---|---|
+| `pnpm lint` | 0 |
+| `pnpm typecheck` | 0 |
+| `pnpm test:unit` | 0 (302 files passed, 1 skipped; 3697 tests passed, 1 skipped) |
+| `vitest run --config vitest.integration.config.ts` command-parse-http + workspace-summary | 0 (2 files, 17 tests) |
+| `pnpm test:isolation` | not run: no tenant table or policy was touched |
