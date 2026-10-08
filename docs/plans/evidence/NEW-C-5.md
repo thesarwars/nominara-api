@@ -3,11 +3,13 @@
 Branch 7day/c-comp-3. Commits: contract 99c18c8 · RED 7deea40 · implementation dbe1576. Migration **0099_displacement_dismissal** (range 0098-0099;
 the plan's "0030" number is superseded by this lane's range). Spans DEFERRED to week 2 (decision 3); metrics and a redacted log line are in.
 
-## STATUS: PARTIAL — everything that needs a Postgres container is written but NOT RUN
-`df -h /System/Volumes/Data` showed 7.4 -> 6.6 GiB free (rule: under 8 GiB, no testcontainers). So these were **not run**: `test/integration/displacement-feed.spec.ts`
-(18 tests), `db:migrate`, `db:schema-generate`, `db:schema-check`, `db:rls-check`, `db:rls-generate --check`, `db:drift-check`, the 0099 roll-back/forward.
-`src/db/schema/captures.ts` got the two columns by hand, exactly as the generator emits them (appended in ordinal order); **`pnpm db:schema-generate --check` must be run
-when disk allows** and is the proof. No new table and no policy change, so `db:rls-generate` should produce no diff. The integration spec RED could therefore not be observed; the unit RED was.
+## STATUS: DONE (isolation suite excepted) — container-backed proofs run 2026-10-08 after disk recovered to 18 GiB
+The earlier "NOT RUN" notes below are superseded by this block. With DOCKER_HOST/TESTCONTAINERS_RYUK_DISABLED set (README, colima):
+- `pnpm exec vitest run --config vitest.integration.config.ts test/integration/displacement-feed.spec.ts` -> **exit 0, 17 passed (17)** (the 18 quoted below was a miscount; the file has 17 tests).
+- Against a scratch pgvector container I started and removed (port 55498, not 55432): `db:migrate` 0 (0099 applied) · `db:schema-generate -- --check` 0 (80 tables match, so the hand-written columns equal the generator output)
+  · `db:schema-check` 0 · `db:rls-generate -- --check` 0 · `db:rls-check` 0 · `db:drift-check` 0 · `db:rollback` 0 (rolled back 0099) · `db:migrate` 0 (re-applied) · `db:schema-check` 0.
+- Still NOT run: `test:isolation` (crashes in fixture setup at this tip, d-admin lane; the merge step runs it). Tenant isolation is proven in the integration spec under SET ROLE nominara_app (AC5 tests).
+- The integration RED was never observed failing (written and committed with the unit RED); only the unit RED (exit 1, 10 failed) was.
 
 ## Acceptance criteria (track-plans.json)
 
