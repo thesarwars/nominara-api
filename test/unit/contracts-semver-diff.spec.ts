@@ -419,6 +419,46 @@ describe("NEW-A-5 · contracts:diff recurses into nested object and array-item s
     expect(deriveSemverBump(previous, current)).toBe("major");
   });
 
+  it("NEW-A-5 checkpoint-2 · a union that GAINS a branch (same leading branches) is major: the arity guard", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }, { type: "number" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 checkpoint-2 · a union that LOSES a branch is major: the arity guard, the other direction", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }, { type: "number" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 checkpoint-2 · identical branches with a changed SIBLING key (a default appears) is major: the sibling-keys guard", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+      default: null,
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
   it("NEW-A-5 · a field that becomes nullable (a branch appears) stays major", () => {
     const previous = nestedDocument();
     dataSchema(previous).properties.blended.properties.source = { type: "string", enum: ["live", "demo"] };
