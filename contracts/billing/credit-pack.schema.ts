@@ -25,8 +25,10 @@ export const creditPackKeyParamSchema = z.string().min(1).max(64);
 export type CreditPack = z.infer<typeof creditPackSchema>;
 export type CreditPackListQuery = z.infer<typeof creditPackListQuerySchema>;
 
-// STORY-076a — the catalog is a handful of rows, so the response is the array
-// itself (the ledger's precedent), not a cursor page. `creditPackListQuerySchema`
-// stays for the day the catalog outgrows one response.
+// NEW-D-1 AC3 (checkpoint-4) — the response is the cursor envelope's `data`; the
+// envelope's `pagination` member is published by the route's `listOf` marker and
+// the request carries `creditPackListQuerySchema`. An earlier comment here argued
+// for a bare array because the catalog is a handful of rows; AC3 ("every list
+// response uses the cursor envelope") outranks that and the comment is withdrawn.
 export const creditPackListResponseSchema = z.array(creditPackSchema);
 export type CreditPackListResponse = z.infer<typeof creditPackListResponseSchema>;
