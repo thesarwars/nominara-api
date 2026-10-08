@@ -226,7 +226,7 @@ describe("NEW-C-5 · displacement feed, dismiss and restore", () => {
     await expect(restore(id)).rejects.toMatchObject({ code: "conflict" });
   });
 
-  it("NEW-C-5 AC3 — dismissing twice keeps the first timestamp and does not overwrite the first actor", async () => {
+  it("NEW-C-5 AC3 — dismissing twice keeps the first timestamp", async () => {
     const id = await displacement({});
     const first = await dismiss(id);
     const second = await dismiss(id);

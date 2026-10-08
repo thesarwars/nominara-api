@@ -117,6 +117,8 @@ export const displacementEvents = pgTable("displacement_events", {
   acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true }),
   recoveredAt: timestamp("recovered_at", { withTimezone: true }),
   scoringVersion: text("scoring_version").notNull().default(sql`'v1'::text`),
+  dismissedAt: timestamp("dismissed_at", { withTimezone: true }),
+  dismissedBy: uuid("dismissed_by"),
 });
 
 export const engineHealth = pgTable("engine_health", {

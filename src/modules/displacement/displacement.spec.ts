@@ -155,7 +155,7 @@ describe("NEW-C-5 · dismiss and restore (AC3, AC5)", () => {
     const out = await run(fakeClient({ select: [live], update: [{ id: ID, dismissed_at: stamp }] }, seen), () => service.dismiss(ID));
     expect(out).toEqual({ id: ID, dismissed_at: stamp.toISOString() });
     expect(displacementDismissalResponseSchema.safeParse(out).success).toBe(true);
-    expect(seen.find((s) => /UPDATE/i.test(s))).toMatch(/dismissed_by/);
+    expect(seen.find((s) => /^\s*UPDATE/i.test(s))).toMatch(/dismissed_by/);
 
     const back = await run(fakeClient({ select: [dismissed], update: [{ id: ID, dismissed_at: null }] }), () => service.restore(ID));
     expect(back).toEqual({ id: ID, dismissed_at: null });
