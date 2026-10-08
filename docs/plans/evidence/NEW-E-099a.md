@@ -70,3 +70,29 @@ Commits: contract `d4093d9`; RED `313a701`; GREEN `22a8344`.
 - `pnpm contracts:generate` then `pnpm contracts:check` exit 0; `pnpm contracts:diff` against the previous file reports `minor`
 - `pnpm test:integration` for the spec above: **NOT RUN** (disk under 8 GiB)
 - `pnpm test:isolation`: not runnable at this tip; merge step runs it
+
+## Audit round (checkpoint-2 audit findings) — status
+
+Commits: RED `a932e56` (9 failed | 13 passed in portal-view.spec.ts, exit 1; every negative case asserts ZodError so the RED is the missing
+`parsePortalPayload`, not a coincidental throw); GREEN `712ebd8`. Gates at GREEN: `pnpm lint` exit 0, `pnpm typecheck` exit 0,
+`pnpm test:unit` exit 0 (283 files passed, 3369 tests passed, 1 skipped).
+
+CORRECTION to the "READ THIS FIRST" block above: the integration spec was reported as not run because of the disk rule; the auditor ran it
+on colima and it is RED (11 of 15), all three portal reads failing on the real `nominara_portal` role. That means every "integration NOT RUN"
+row above is **unproven and, for the three reads, known failing**, not "pending".
+
+| Finding | State |
+|---|---|
+| 1 [blocker] portal reads fail on `nominara_portal` | **NOT FIXED. BLOCKED.** `df -h /System/Volumes/Data` shows 4.5 GiB free (rule: stop under 8 GiB), so no testcontainers spec can be run and the RED/GREEN cannot be observed against the real role. The fix touches the analytics SQL (engineConfig's join of the entitled view, catalog and overrides) and cannot be done responsibly unobserved. Needs: free the disk to 8 GiB or more, and the owner picks the route (below). |
+| 2 [major] isolation gate cannot run | **Not this lane's.** `test/isolation/support/three-tenant-fixture.ts` seeds support_grants with a 1-day expiry against the 4-hour cap; the d-admin lane owns the fixture. Nothing changed here. Merge must not proceed until it lands and the suites run. |
+| 3a allow-list on the way out | **DONE.** `parsePortalPayload` in `src/lib/portal/portal-view.ts`, applied in `PortalReadsService.cached` before the cache and before serving. Tests: "NEW-E-099a audit · parsePortalPayload" (9 cases: captures, n_captures, runs_used, capture_total, top-level key, matrix engine key, growth-map point still carrying cells, task row key, and the valid shapes pass). The key scan stays as a second line. Caveat: it is not exercised against real payloads until the integration spec runs; a real payload with a key the strict schema lacks would 500 (fail closed). |
+| 3b footer `sample_size` under hide_costs | **OWNER RULING NEEDED.** Not decided here. Evidence for the ruling: NFR-AGY-05 / the report footer list in integrations-and-sharing.md names data-through, scoring version, weight overrides, engines, timeframe, live-capture ratio and the note; `sample_size` is NOT in that list. So dropping it under hide_costs would not breach NFR-AGY-05 (live_capture_ratio is a ratio, not a count). Needs: ruling, then a portal footer schema without `sample_size` for hide_costs, a RED test, and the exemption test in portal-view.spec.ts inverted. |
+
+### Finding 1 — the two routes, for the owner
+(a) Resolve in the interceptor's app-pool step and pass in: timezone and workspace name (one `workspaces` read), the theme (`AgencyService.themeForPortal`
+on the app tx), and the entitled-engine rows (`project_entitled_engines` + `engines` + `project_engines` overrides) for the scoped projects;
+`resolveWindow`, `GrowthMapService.resolveWindow` and `ScorecardsService.engineConfig` take them as an optional argument. No migration, no ADR; scope stays
+RLS-enforced on every fact table. Cost: the entitled/measured join in engineConfig is split into a view read (app pool) and a measured read (portal pool).
+(b) Portal SELECT policies on workspaces and brand_themes (ADR required for brand_themes, which was deliberately removed from PORTAL_READABLE_TABLES) plus
+a grant on the view and policies on its underlying tables: a migration the story did not name.
+Recommendation: (a). Blocked on disk before either can be proven.
