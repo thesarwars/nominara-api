@@ -148,6 +148,32 @@ describe("NEW-E-099a · portal read endpoints", () => {
     expect(body.milestones.map((m) => m.title)).toEqual(["Shown milestone"]);
   });
 
+  it("STORY-098 s11 · hide_competitors: a task_completed milestone of a displacement-born task is as hidden on growth-map as the task is on tasks (the two tabs agree)", async () => {
+    const w = await world();
+    const title = "Beat Globex on pricing";
+    const [task, milestone] = [randomUUID(), randomUUID()];
+    await harness.db().query(
+      "INSERT INTO milestones (id, workspace_id, project_id, occurred_at, kind, title, source_type, source_id, visible_in_portal) VALUES ($1,$2,$3,now() - interval '1 day','task_completed',$4,'task',$5,true)",
+      [milestone, w.ws, w.p1, title, task],
+    );
+    await harness.db().query(
+      `INSERT INTO tasks (id, workspace_id, project_id, short_ref, kind, title, description, status, impact_score, dedupe_fingerprint, completed_at, milestone_id, source_displacement_id)
+       VALUES ($1,$2,$3,$4,'content',$5,'d','done',0,$6,now(),$7,$8)`,
+      [task, w.ws, w.p1, `T-${task.slice(0, 6)}`, title, randomBytes(16), milestone, randomUUID()],
+    );
+    const hidden = await token(w, { scope: [w.p1], tabs: ["overview", "tasks", "growth_map"], hideCompetitors: true });
+    const tasks = await get(hidden.cookie, `/portal/tasks?project=${w.p1}`);
+    const map = await get(hidden.cookie, `/portal/growth-map?project=${w.p1}`);
+    expect(tasks.statusCode, tasks.body).toBe(200);
+    expect(map.statusCode, map.body).toBe(200);
+    expect(tasks.body).not.toContain("Globex");
+    expect(map.body).not.toContain("Globex");
+    expect(portalGrowthMapResponseSchema.parse((map.json() as { data: unknown }).data).milestones.map((m) => m.title)).toEqual(["Shown milestone"]);
+    // The control: the same pair is served when competitors are not hidden.
+    const open = await token(w, { scope: [w.p1], tabs: ["overview", "tasks", "growth_map"] });
+    expect((await get(open.cookie, `/portal/growth-map?project=${w.p1}`)).body).toContain(title);
+  });
+
   it("STORY-098 s11 · competitors visible: the real label shows (the control for the case above)", async () => {
     const w = await world();
     const t = await token(w, { scope: [w.p1] });
