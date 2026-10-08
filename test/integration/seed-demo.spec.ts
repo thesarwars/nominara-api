@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BREAKGLASS_ROLE, PARTITIONED_FACT_TABLES, RUNTIME_ROLES } from "../../src/db/conventions.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
@@ -367,6 +367,40 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     const stale = await client.query(`SELECT 1 FROM geo_analyses WHERE workspace_id = $1 AND sufficient`, [workspaceId]);
     expect(stale.rowCount).toBe(0);
   }, 120_000);
+
+  it("STORY-060 audit · --purge on a LATER day deletes the seed's geo_analyses rows outright: none survives under an older window_start", async () => {
+    const workspaceId = await createWorkspace("growth");
+    // A PRE-EXISTING project: a seed-created one is deleted outright, which cascades its rows away and hides the defect.
+    const pre = await client.query<{ id: string }>(
+      `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, status)
+       VALUES ($1,'Real Project','real-project-later','https://real-later.example','real-later.example','active') RETURNING id`,
+      [workspaceId],
+    );
+    const projectId = pre.rows[0]!.id;
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    const seeded = await client.query<{ window_start: string }>(
+      `SELECT DISTINCT to_char(window_start, 'YYYY-MM-DD') AS window_start FROM geo_analyses WHERE project_id = $1 AND sufficient`,
+      [projectId],
+    );
+    expect(seeded.rowCount, "the seed wrote sufficient rows").toBeGreaterThan(0);
+    const seedWindows = seeded.rows.map((r) => r.window_start);
+
+    // Only `Date` is faked: pg's sockets and timers keep running. The purge's recompute is
+    // anchored at `new Date()`, so a day later it targets a NEW window_start.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 24 * 60 * 60 * 1000 });
+    try {
+      await runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: testPool(), log: () => {} });
+    } finally {
+      vi.useRealTimers();
+    }
+    const stale = await client.query(`SELECT 1 FROM geo_analyses WHERE project_id = $1 AND sufficient`, [projectId]);
+    expect(stale.rowCount, "no sufficient (demo-derived) row survives").toBe(0);
+    const old = await client.query(`SELECT 1 FROM geo_analyses WHERE project_id = $1 AND to_char(window_start, 'YYYY-MM-DD') = ANY($2::text[])`, [
+      projectId,
+      seedWindows,
+    ]);
+    expect(old.rowCount, "no row from the seed's own windows survives").toBe(0);
+  }, 180_000);
 
   it("STORY-060 · --purge on a PRE-EXISTING project recomputes A3 over what is left: no stale sufficient structure row survives (the project row is not deleted to hide it)", async () => {
     const workspaceId = await createWorkspace("growth");
