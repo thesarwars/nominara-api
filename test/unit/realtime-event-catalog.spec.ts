@@ -212,3 +212,20 @@ describe("STORY-026 · AC10 is deferred, and stays visibly deferred", () => {
     expect(header!.toLowerCase()).not.toContain("invalidation");
   });
 });
+
+describe("STORY-064-D · task.created and task.moved carry ids only (owner decision 2026-10-08)", () => {
+  const ids = { task_id: "0198f2a0-0000-7000-8000-000000000001", project_id: "0198f2a0-0000-7000-8000-000000000002" };
+
+  it("[STORY-064-D realtime ids-only] task.created is exactly {task_id, project_id}: a title is refused", () => {
+    const schema = REALTIME_EVENT_PAYLOADS["task.created"];
+    expect(schema.safeParse(ids).success).toBe(true);
+    expect(schema.safeParse({ ...ids, title: "leak" }).success).toBe(false);
+    expect(Object.keys((schema as unknown as { shape: object }).shape).sort()).toEqual(["project_id", "task_id"]);
+  });
+
+  it("[STORY-064-D realtime ids-only] task.moved declares no free-text field: ids, the two enumerated statuses, no title", () => {
+    const schema = REALTIME_EVENT_PAYLOADS["task.moved"];
+    expect(Object.keys((schema as unknown as { shape: object }).shape).sort()).toEqual(["actor_id", "from_status", "project_id", "task_id", "to_status"]);
+    expect(schema.safeParse({ ...ids, from_status: "todo", to_status: "done", actor_id: ids.task_id, title: "leak" }).success).toBe(false);
+  });
+});

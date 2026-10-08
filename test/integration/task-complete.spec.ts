@@ -196,12 +196,26 @@ describe("STORY-064-D · complete / realtime publish — real SQL", () => {
     ]);
   });
 
+  it("[STORY-064-D realtime ids-only] neither task.created nor task.moved carries the task title (or any free text): a scoped member who cannot read the project learns ids, never content", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+    publisher.published.length = 0;
+    const secret = `Confidential-title-${randomUUID()}`;
+    const t = await create(CTX(ws, actor), p, { title: secret });
+    await patch(CTX(ws, actor), t.id, { status: "in_progress" });
+    await complete(CTX(ws, actor), t.id);
+    const events = publisher.published.filter((e) => e.event === "task.created" || e.event === "task.moved");
+    expect(events.map((e) => e.event)).toEqual(["task.created", "task.moved", "task.moved"]);
+    expect(JSON.stringify(publisher.published)).not.toContain(secret);
+    for (const e of events) expect(Object.keys(e.payload as object)).not.toContain("title");
+    expect(Object.keys(events[0]!.payload as object).sort()).toEqual(["project_id", "task_id"]);
+  });
+
   it("[STORY-064-D] PATCH publishes task.moved on a status change (and only then); create publishes task.created; neither before commit", async () => {
     const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
     publisher.published.length = 0;
     const t = await create(CTX(ws, actor), p, { title: "Brand new" });
     expect(publisher.published).toEqual([
-      { workspaceId: ws, event: "task.created", payload: { task_id: t.id, project_id: p, status: "todo", title: "Brand new", priority: String(t.priority), impact_score: t.impact_score, rule_code: null } },
+      { workspaceId: ws, event: "task.created", payload: { task_id: t.id, project_id: p } },
     ]);
     publisher.published.length = 0;
     await patch(CTX(ws, actor), t.id, { priority: 1 });
