@@ -3,8 +3,8 @@ import { fileURLToPath } from "node:url";
 
 // STORY-023 T3 (GREEN step) — AC5 / NFR-REPO-02: "Merging to `main`
 // publishes `@nominara/client` at a semver derived from the spec diff:
-// patch for additive fields, minor for new endpoints, major for any
-// removal or type narrowing." `deriveSemverBump()` is a PURE function over
+// minor for an added optional field (at any depth) and for new endpoints,
+// major for any removal or type narrowing." `deriveSemverBump()` is a PURE function over
 // two already-generated OpenAPI documents — it never re-derives anything
 // from zod itself, and never reaches for the filesystem; `check.ts`/a
 // future release job supplies both documents.
@@ -153,7 +153,7 @@ function compareNestedShape(previous: JsonSchemaObjectLike, current: JsonSchemaO
     const bothRecords = previousValue !== undefined && currentValue !== undefined;
     const skipped = bothRecords ? ["properties", "required", "additionalProperties"] : ["properties", "required"];
     if (without(previous, skipped) !== without(current, skipped)) return undefined;
-    const shape = compareObjectSchema(previous, current, true);
+    const shape = compareObjectSchema(previous, current);
     return bothRecords ? mostSevere(shape, compareSharedField(previousValue, currentValue)) : shape;
   }
   if (previous.type === "array" && current.type === "array") {
@@ -170,7 +170,6 @@ function compareNestedShape(previous: JsonSchemaObjectLike, current: JsonSchemaO
 function compareObjectSchema(
   previous: JsonSchemaObjectLike | undefined,
   current: JsonSchemaObjectLike | undefined,
-  nested = false,
 ): SemverBump {
   if (!previous && !current) return "none";
   if (!previous && current) return "patch"; // a schema appearing where there was none before
@@ -192,9 +191,9 @@ function compareObjectSchema(
       continue;
     }
     if (!inPrevious && inCurrent) {
-      // field added: required is breaking; optional is `patch` at the top of a
-      // body and `minor` anywhere nested (owner decision, NEW-A-5 option A).
-      bump = mostSevere(bump, currentRequired.has(name) ? "major" : nested ? "minor" : "patch");
+      // field added: required is breaking; optional is `minor` at ANY depth,
+      // the top level of a body included (owner decision 5, 2026-10-08: one rule).
+      bump = mostSevere(bump, currentRequired.has(name) ? "major" : "minor");
       continue;
     }
 
@@ -266,8 +265,8 @@ function compareOperation(previous: OperationLike, current: OperationLike): Semv
 }
 
 /**
- * AC5/NFR-REPO-02 — patch for additive fields, minor for new endpoints,
- * major for any removal or type narrowing. The MOST SEVERE change across
+ * AC5/NFR-REPO-02 — minor for an added optional field (any depth, owner
+ * decision 5) and for new endpoints, major for any removal or type narrowing. The MOST SEVERE change across
  * every path/method/field wins; nothing here reports "the last change it
  * happened to look at" (the whole reason this walk always takes the
  * running max rather than returning early).
