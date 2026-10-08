@@ -2,4 +2,6 @@
 
 | `task.created` | `{task_id, project_id}` | worker-rollup | ≤ 5 / s / project |
 
-`task.moved` keeps `{task_id, project_id, from_status, to_status, actor_id}`: it never carried a title; the two statuses are the enumerated workflow vocabulary, not tenant text. Clients refetch the task through the scoped REST read for anything else.
+| `task.moved` | `{task_id, project_id}` | api | (no budget) |
+
+Both events carry ids only (no title, statuses or actor): the gateway has workspace-room delivery only, so a project-scoped member would otherwise learn of a move and who made it. Clients refetch through the scoped REST read. Also carry to STORY-064-D AC4: "task.created and task.moved payloads are ids only".
