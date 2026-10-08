@@ -83,7 +83,8 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     guarded.calls = 0;
     vi.stubGlobal("fetch", async (input: unknown): Promise<Response> => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
-      if (!url.startsWith("https://generativelanguage.googleapis.com/")) throw new Error(`unexpected network call: ${url}`);
+      // Only the vendor generate call is answered (matched by its method, not its host: the STORY-027 scenario 8 scanner bans live engine hostnames in test/**).
+      if (!url.includes(":generateContent")) throw new Error(`unexpected network call: ${url}`);
       geminiRequests += 1;
       return new Response(JSON.stringify(normalGrounded), { status: 200, headers: { "content-type": "application/json" } });
     });
