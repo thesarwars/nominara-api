@@ -66,7 +66,7 @@ describe("STORY-076b · add (the handler changes Stripe and writes nothing local
     [/FROM subscriptions WHERE workspace_id/u, subRow()],
   ];
 
-  it("AC1 · sets the item to current + requested from a FRESH fetch, and issues no INSERT/UPDATE of its own", async () => {
+  it("AC1 · sets the item to the requested TOTAL from a FRESH fetch, and issues no INSERT/UPDATE of its own", async () => {
     const gw = gateway({
       fetchObject: (kind: string, id: string) =>
         Promise.resolve({
@@ -77,22 +77,22 @@ describe("STORY-076b · add (the handler changes Stripe and writes nothing local
         }),
     } as never);
     const c = client(base);
-    const out = await inTenant(c, () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 2 }));
+    const out = await inTenant(c, () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 5 }, "key-1"));
     expect(out).toMatchObject({ kind: "extra_seat", status: "pending", quantity_requested: 5, effective: "immediate" });
     expect(gw.changes).toEqual([expect.objectContaining({ quantity: 5, existingItemId: "si_seat", unitAmountCents: 1500, currency: "usd", interval: "month", proration: "create_prorations" })]);
     expect(c.calls.filter(({ sql }) => /^\s*(INSERT|UPDATE|DELETE)/iu.test(sql))).toEqual([]);
   });
 
-  it("AC1 boundary · exactly the cap is accepted, one over is a 400 and Stripe is not called", async () => {
+  it("AC1 boundary · a total of exactly the cap is accepted, one over is a 400 and Stripe is not called", async () => {
     const held = (quantity: number) =>
       gateway({
         fetchObject: (kind: string, id: string) =>
           Promise.resolve({ kind, id, metadata: {}, raw: { items: { data: [{ id: "si", quantity, price: { unit_amount: 4900, currency: "usd", product: { metadata: { nominara_kind: "extra_project" } } } }] } } }),
       } as never);
     const ok = held(99);
-    expect((await inTenant(client(base), () => new BillingAddonsService(ok).add({ kind: "extra_project", quantity: 1 }))).quantity_requested).toBe(100);
+    expect((await inTenant(client(base), () => new BillingAddonsService(ok).add({ kind: "extra_project", quantity: 100 }, "key-1"))).quantity_requested).toBe(100);
     const over = held(100);
-    await expect(inTenant(client(base), () => new BillingAddonsService(over).add({ kind: "extra_project", quantity: 1 }))).rejects.toMatchObject({ code: "validation_failed" });
+    await expect(inTenant(client(base), () => new BillingAddonsService(over).add({ kind: "extra_project", quantity: 101 }, "key-1"))).rejects.toMatchObject({ code: "validation_failed" });
     expect(over.changes).toEqual([]);
   });
 
@@ -102,7 +102,7 @@ describe("STORY-076b · add (the handler changes Stripe and writes nothing local
       [/FROM workspaces w JOIN plans/u, planRow("free")],
       [/SELECT key FROM plans WHERE entitlements/u, [{ key: "growth" }]],
     ]);
-    await expect(inTenant(c, () => new BillingAddonsService(gw).add({ kind: "extra_project", quantity: 1 }))).rejects.toMatchObject({
+    await expect(inTenant(c, () => new BillingAddonsService(gw).add({ kind: "extra_project", quantity: 1 }, "key-1"))).rejects.toMatchObject({
       code: "feature_not_in_plan",
       details: { key: "projects.addon_allowed", min_plan: "growth" },
     });
@@ -114,25 +114,25 @@ describe("STORY-076b · add (the handler changes Stripe and writes nothing local
   it("an annual subscription is a 409 and Stripe is not called", async () => {
     const gw = gateway();
     const c = client([[/FROM workspaces w JOIN plans/u, planRow("growth")], [/FROM subscriptions WHERE workspace_id/u, subRow({ billing_interval: "annual" })]]);
-    await expect(inTenant(c, () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 1 }))).rejects.toMatchObject({ code: "conflict" });
+    await expect(inTenant(c, () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 1 }, "key-1"))).rejects.toMatchObject({ code: "conflict" });
     expect(gw.fetches).toEqual([]);
   });
 
   it("no Stripe subscription (operator-comped or none) is precondition_unmet, never an upstream call", async () => {
     const gw = gateway();
     const c = client([[/FROM workspaces w JOIN plans/u, planRow("growth")], [/FROM subscriptions WHERE workspace_id/u, subRow({ provider: "operator", stripe_subscription_id: "" })]]);
-    await expect(inTenant(c, () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 1 }))).rejects.toMatchObject({ code: "precondition_unmet" });
+    await expect(inTenant(c, () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 1 }, "key-1"))).rejects.toMatchObject({ code: "precondition_unmet" });
     expect(gw.changes).toEqual([]);
   });
 
   it("an unconfigured provider is degraded before any database read; an upstream failure is degraded and leaks no Stripe text", async () => {
     const off = gateway({ isConfigured: () => false } as never);
     const c = client(base);
-    await expect(inTenant(c, () => new BillingAddonsService(off).add({ kind: "extra_seat", quantity: 1 }))).rejects.toMatchObject({ code: "degraded" });
+    await expect(inTenant(c, () => new BillingAddonsService(off).add({ kind: "extra_seat", quantity: 1 }, "key-1"))).rejects.toMatchObject({ code: "degraded" });
     expect(c.calls.filter(({ sql }) => /FROM/u.test(sql))).toEqual([]);
 
     const down = gateway({ changeAddonQuantity: () => Promise.reject(new StripeUpstreamError(500)) } as never);
-    const err = await inTenant(client(base), () => new BillingAddonsService(down).add({ kind: "extra_seat", quantity: 1 })).catch((e: unknown) => e);
+    const err = await inTenant(client(base), () => new BillingAddonsService(down).add({ kind: "extra_seat", quantity: 1 }, "key-1")).catch((e: unknown) => e);
     expect(err).toMatchObject({ code: "degraded" });
     expect(JSON.stringify((err as { details?: unknown }).details ?? "")).not.toContain("500");
   });
@@ -257,5 +257,79 @@ describe("STORY-076b · reconcile (the only writer)", () => {
   it("empty collections · no add-ons held and none fetched is a no-op", async () => {
     const c = client(withRows([]));
     expect(await new BillingAddonsService(gateway()).reconcile(c, input([]))).toEqual({ changed: false });
+  });
+});
+
+describe("STORY-076b audit · a retried POST charges once (the quantity is a total and the Stripe key is replayable)", () => {
+  const base: Script = [
+    [/FROM workspaces w JOIN plans/u, planRow("growth")],
+    [/FROM subscriptions WHERE workspace_id/u, subRow()],
+  ];
+
+  /** A Stripe that holds a quantity, applies a change, and (once) loses the reply. */
+  function stripe(start: number, loseFirstReply: boolean) {
+    const state = { quantity: start, calls: [] as Array<{ key: string; quantity: number }>, seen: new Map<string, number>() };
+    let lost = loseFirstReply;
+    const gw = gateway({
+      fetchObject: (kind: string, id: string) =>
+        Promise.resolve({
+          kind,
+          id,
+          metadata: {},
+          raw: { items: { data: state.quantity === 0 ? [] : [{ id: "si_seat", quantity: state.quantity, price: { unit_amount: 1500, currency: "usd", product: { metadata: { nominara_kind: "extra_seat" } } } }] } },
+        }),
+      changeAddonQuantity: (input: { idempotencyKey: string; quantity: number }) => {
+        state.calls.push({ key: input.idempotencyKey, quantity: input.quantity });
+        // Stripe replays a request carrying a key it has already applied.
+        if (!state.seen.has(input.idempotencyKey)) {
+          state.seen.set(input.idempotencyKey, input.quantity);
+          state.quantity = input.quantity;
+        }
+        if (lost) {
+          lost = false;
+          return Promise.reject(new StripeUpstreamError(503));
+        }
+        return Promise.resolve();
+      },
+    } as never);
+    return { state, gw };
+  }
+
+  it("AC1 retry · Stripe applies the change and the reply is lost: the same Idempotency-Key retried leaves exactly ONE unit added", async () => {
+    const { state, gw } = stripe(0, true);
+    const svc = new BillingAddonsService(gw);
+    await expect(inTenant(client(base), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-1"))).rejects.toMatchObject({ code: "degraded" });
+    expect(state.quantity).toBe(1);
+    const retry = await inTenant(client(base), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-1"));
+    expect(retry).toMatchObject({ status: "pending", quantity_requested: 1 });
+    expect(state.quantity).toBe(1);
+  });
+
+  it("AC1 retry · the Stripe key is derived from the workspace and the request's Idempotency-Key: stable on a retry, different for another key or workspace", async () => {
+    const keys = async (ws: string, key: string) => {
+      const { state, gw } = stripe(0, false);
+      await withTenantContext(client(base), { workspaceId: ws, actorId: ws }, () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 1 }, key));
+      return state.calls[0]!.key;
+    };
+    const a = await keys(WS, "client-key-1");
+    expect(await keys(WS, "client-key-1")).toBe(a);
+    expect(await keys(WS, "client-key-2")).not.toBe(a);
+    expect(await keys("00000000-0000-7000-8000-000000000002", "client-key-1")).not.toBe(a);
+    expect(a.length).toBeLessThanOrEqual(255);
+    expect(a).not.toContain("client-key-1");
+  });
+
+  it("AC1 retry · a total already held is a no-op: no Stripe change is issued", async () => {
+    const { state, gw } = stripe(3, false);
+    const out = await inTenant(client(base), () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 3 }, "client-key-1"));
+    expect(out).toMatchObject({ status: "pending", quantity_requested: 3 });
+    expect(state.calls).toEqual([]);
+  });
+
+  it("AC1 boundary · a total below what is held is a 409 (removal is DELETE) and Stripe is not called", async () => {
+    const { state, gw } = stripe(3, false);
+    await expect(inTenant(client(base), () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 2 }, "client-key-1"))).rejects.toMatchObject({ code: "conflict" });
+    expect(state.calls).toEqual([]);
+    expect(state.quantity).toBe(3);
   });
 });
