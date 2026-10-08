@@ -55,3 +55,11 @@ Not built (story criteria outside step A, per the plan): rollup refresh of curre
 - Gates at 6729683: lint 0, typecheck 0, `pnpm test:unit` 0, `contracts:check` 0, tasks module vitest 0.
 - test:isolation: no tenant table or migration touched; tenant isolation is proven by the integration tenancy test run as nominara_app (isolation suites crash in fixture setup at this tip; merge step runs them).
 - Open owner decisions unchanged: goal kinds beyond engine_score/topic_authority; n>=30 sufficiency threshold; GET goals requiring task:create (spec row as written).
+
+## Audit fix (round 4): soft-delete guard on goals
+- Finding: no test covered `deleted_at IS NULL` in `GoalsService.assertProject`; both that clause and the `assertProject` call in `updateGoal` could be removed with 14/14 green.
+- Test added: test/integration/task-goals.spec.ts "[STORY-065 soft-delete] a soft-deleted project's goals are a 404 on list, create and abandon, and nothing is written or changed" (UPDATE projects SET deleted_at = now(); list/create/abandon reject NotFoundError; goals row count still 1; status active; updated_at unchanged). Run as nominara_app.
+- The guard already existed, so the test passes on the unmutated code; the RED proof is mutation (service restored with git checkout after each):
+  - remove `AND deleted_at IS NULL` from assertProject: exit 1, "1 failed | 14 passed (15)", the new test.
+  - remove the `assertProject` call from updateGoal: exit 1, "1 failed | 14 passed (15)", the new test.
+- Unmutated: `pnpm vitest run --config vitest.integration.config.ts test/integration/task-goals.spec.ts` exit 0, 15 passed (15). Disk free 8.7 GiB at start (gate is 8).

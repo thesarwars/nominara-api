@@ -205,6 +205,20 @@ describe("STORY-065-A · goals — real SQL", () => {
     expect((await client.query("SELECT status FROM goals WHERE id = $1", [goal.id])).rows[0]!.status).toBe("active");
   });
 
+  it("[STORY-065 soft-delete] a soft-deleted project's goals are a 404 on list, create and abandon, and nothing is written or changed", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+    const goal = await create(CTX(ws, actor), p);
+    const before = (await client.query("SELECT updated_at, status FROM goals WHERE id = $1", [goal.id])).rows[0]!;
+    await client.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [p]);
+    await expect(list(CTX(ws, actor), p)).rejects.toBeInstanceOf(NotFoundError);
+    await expect(create(CTX(ws, actor), p, engineGoal({ title: "after delete" }))).rejects.toBeInstanceOf(NotFoundError);
+    await expect(abandon(CTX(ws, actor), p, goal.id)).rejects.toBeInstanceOf(NotFoundError);
+    expect((await client.query("SELECT count(*)::int AS n FROM goals WHERE project_id = $1", [p])).rows[0]!.n).toBe(1);
+    const after = (await client.query("SELECT updated_at, status FROM goals WHERE id = $1", [goal.id])).rows[0]!;
+    expect(after.status).toBe("active");
+    expect(after.updated_at).toEqual(before.updated_at);
+  });
+
   it("[STORY-065 #10] deleting the project cascades its goals", async () => {
     const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
     await create(CTX(ws, actor), p);

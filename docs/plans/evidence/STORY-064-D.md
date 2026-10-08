@@ -42,3 +42,6 @@ Needed from the owner: pick 1, 2 or 3, and have it written into STORY-064-D and 
 ## Notes
 - No migration, no schema change, no new dependency.
 - STORY-064-C passed QA at checkpoint 2; its notes (manual-task dedupe fingerprint and empty-description defaults still need an owner decision) are unchanged.
+
+## Audit round 4: scoped task events (still OPEN, awaiting owner)
+Not closed: recording a decision I do not have would be inventing one. The owner must pick option 1 (toProject delivery), 2 (drop title from task.created/task.moved) or 3 (accept for week 1); the pick must then be written into STORY-064-D AC4 and api-specification section 11 (`task.created` row). Code and contract are unchanged.
