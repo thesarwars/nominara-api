@@ -351,7 +351,7 @@ function gapBetween(brand: number | null, baseline: number | null): number | nul
  * screen with no window, no method and no confidence beside it, which is the
  * shape of the causal claim `NFR-ANL-05` exists to prevent.
  */
-function toMeasuredImpact(stored: Record<string, unknown> | null): MeasuredImpact | null {
+export function toMeasuredImpact(stored: Record<string, unknown> | null): MeasuredImpact | null {
   if (stored === null) return null;
   const num = (key: string): number | null => (typeof stored[key] === "number" ? (stored[key] as number) : null);
   const before = num("visibility_before");

@@ -23,6 +23,25 @@ import { Page, pageFrom } from "../../api/pagination/page.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import { SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS } from "../../lib/rollup/refresh-project-task-counts.js";
 
+/** NEW-E-099b — each portal task list is capped; the portal shows a client's progress, not the whole backlog. */
+export const PORTAL_TASKS_LIMIT = 100;
+
+export interface PortalCompletedRow {
+  title: string;
+  completed_at: Date | null;
+  /** `milestones.measured_impact` — free jsonb, validated by the caller, never trusted. */
+  measured_impact: unknown;
+}
+export interface PortalOpenRow {
+  title: string;
+  severity: "critical" | "high" | "medium" | "low" | null;
+  status: "todo" | "in_progress";
+}
+export interface PortalTasksRead {
+  completed: PortalCompletedRow[];
+  open: PortalOpenRow[];
+}
+
 /** schemas/tasks-and-goals.md: a dismissed task re-surfaces after 180 days. */
 export const TASK_RESURFACE_DAYS = 180;
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -130,6 +149,66 @@ export class TasksService {
     });
 
     return pageFrom(result.rows, query.limit, toTask, (row) => [row.k1_key, row.k2_key, row.k3_key, row.k4_key, row.id]);
+  }
+
+  /**
+   * NEW-E-099b — the client portal's task read (STORY-099 s8, s14). TWO bounded statements on the ambient transaction,
+   * which on the portal path is the READ ONLY `nominara_portal` one: RLS (`portal_scope_tasks`, `portal_scope_milestones`,
+   * ...) scopes the project independently of anything here.
+   *
+   * Reads `tasks` and the rows it points at (`milestones` for the measured impact, `aux_findings` and
+   * `project_source_index` for severity) and NOTHING from the fact tables — asserted by a unit test over the SQL text
+   * and by the integration trace. Only the fields the portal shows are selected: no description, assignee, impact
+   * score, credit or capture column leaves this method.
+   *
+   * - completed: status `done`, newest first; the measurement comes from the task's milestone, and a milestone hidden
+   *   from the portal (`visible_in_portal = false`) contributes none — filtered here, not in the view.
+   * - open: `todo` / `in_progress`, ordered by impact (a READ ordering — no stored position exists); dismissed is not open.
+   * - `completedSince` bounds completed work to a token's timeframe lock; null is unbounded.
+   * - `hideCompetitors` excludes a task born of a displacement event: it names a competitor by construction.
+   */
+  async portalTasks(projectId: string, opts: { hideCompetitors: boolean; completedSince: Date | null }): Promise<PortalTasksRead> {
+    const client = currentTenantStore()!.client;
+    const completed = await client.query<PortalCompletedRow>(
+      `SELECT t.title, t.completed_at, m.measured_impact
+         FROM tasks t
+         LEFT JOIN milestones m ON m.id = t.milestone_id AND m.visible_in_portal = true
+        WHERE t.project_id = $1
+          AND t.deleted_at IS NULL
+          AND t.status = 'done'
+          AND ($2::timestamptz IS NULL OR t.completed_at >= $2::timestamptz)
+          AND ($3::boolean = false OR t.source_displacement_id IS NULL)
+        ORDER BY t.completed_at DESC NULLS LAST, t.id
+        LIMIT $4`,
+      [projectId, opts.completedSince, opts.hideCompetitors, PORTAL_TASKS_LIMIT],
+    );
+    const open = await client.query<PortalOpenRow>(
+      `SELECT t.title,
+              CASE WHEN COALESCE(af.severity, psi.gap_severity) IN ('critical', 'high', 'medium', 'low')
+                   THEN COALESCE(af.severity, psi.gap_severity)
+              END AS severity,
+              t.status
+         FROM tasks t
+         LEFT JOIN aux_findings af ON af.id = t.source_finding_id
+         LEFT JOIN LATERAL (
+           SELECT gap_severity
+             FROM project_source_index
+            WHERE source_domain_id = t.source_domain_id
+              AND project_id = t.project_id
+              AND engine_key = $2
+              AND window_days = $3
+            ORDER BY window_start DESC
+            LIMIT 1
+         ) psi ON t.source_domain_id IS NOT NULL
+        WHERE t.project_id = $1
+          AND t.deleted_at IS NULL
+          AND t.status IN ('todo', 'in_progress')
+          AND ($4::boolean = false OR t.source_displacement_id IS NULL)
+        ORDER BY t.impact_score DESC, t.priority DESC, t.created_at, t.id
+        LIMIT $5`,
+      [projectId, SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS, opts.hideCompetitors, PORTAL_TASKS_LIMIT],
+    );
+    return { completed: completed.rows, open: open.rows };
   }
 
   /**

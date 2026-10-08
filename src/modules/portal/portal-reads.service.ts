@@ -1,6 +1,8 @@
 import { Injectable, Logger } from "@nestjs/common";
 import type { ScorecardEntry } from "../../../contracts/analytics/index.js";
 import type {
+  PortalTasksQuery,
+  PortalTasksResponse,
   PortalGrowthMapQuery,
   PortalGrowthMapResponse,
   PortalMatrixResponse,
@@ -13,9 +15,10 @@ import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
 import { assertPortalTab, findCostFields, portalTimeframeDays, resolvePortalTimeframe, toPortalGrowthMap } from "../../lib/portal/portal-view.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { AgencyService } from "../agency/agency.service.js";
-import { GrowthMapService } from "../analytics/growth-map.service.js";
+import { GrowthMapService, toMeasuredImpact } from "../analytics/growth-map.service.js";
 import { ScorecardsService } from "../analytics/scorecards.service.js";
 import { ProjectsService } from "../projects/projects.service.js";
+import { TasksService } from "../tasks/tasks.service.js";
 import { MethodologyService } from "../reports/methodology.service.js";
 import { WorkspacesService } from "../workspaces/workspaces.service.js";
 import { PortalCache, portalCacheKey } from "./portal-cache.js";
@@ -39,7 +42,7 @@ const logger = new Logger("PortalReadsService");
 // value is never what sets the window — `days` is.
 const WINDOW_PLACEHOLDER = "30d" as const;
 
-type Tab = "overview" | "growth_map" | "matrix";
+type Tab = "overview" | "growth_map" | "matrix" | "tasks";
 
 @Injectable()
 export class PortalReadsService {
@@ -52,6 +55,7 @@ export class PortalReadsService {
     private readonly agency: AgencyService,
     private readonly workspaces: WorkspacesService,
     private readonly projects: ProjectsService,
+    private readonly taskReads: TasksService,
   ) {}
 
   async overview(session: PortalSessionContext, query: PortalOverviewQuery): Promise<PortalOverviewResponse> {
@@ -117,6 +121,33 @@ export class PortalReadsService {
     });
   }
 
+  // NEW-E-099b — completed work with its measured impact, and open work by impact. Same rules as the other reads: tab and
+  // project from the session, the timeframe lock bounds completed work, the per-token cache, and the cost-key scan under
+  // hide_costs. `measured` is null — never 0 — when the task's milestone carries no complete, visible impact.
+  async tasks(session: PortalSessionContext, query: PortalTasksQuery): Promise<PortalTasksResponse> {
+    assertPortalTab(session, "tasks");
+    const project = selectPortalProject(session, query.project);
+    const timeframe = resolvePortalTimeframe(undefined, session.policy.timeframeLock);
+    return this.cached(session, "tasks", project, timeframe, async () => {
+      const lock = session.policy.timeframeLock;
+      const read = await this.taskReads.portalTasks(project, {
+        hideCompetitors: session.policy.hideCompetitors,
+        completedSince: lock === null ? null : new Date(Date.now() - portalTimeframeDays(lock) * 86_400_000),
+      });
+      return {
+        completed: read.completed.map((row) => {
+          const impact = toMeasuredImpact(isRecord(row.measured_impact) ? row.measured_impact : null);
+          return {
+            title: row.title,
+            completed_at: row.completed_at === null ? null : row.completed_at.toISOString(),
+            measured: impact === null ? null : { delta: impact.delta, confidence: impact.confidence, window_days: impact.window_days, caveat: impact.caveat },
+          };
+        }),
+        open: read.open.map((row) => ({ title: row.title, severity: row.severity, status: row.status })),
+      };
+    });
+  }
+
   // The per-token cache (NFR-AGY-03/04). It sits AFTER the interceptor's per-request liveness check, its key carries the
   // token id and a fingerprint of the token's policy, and under hide_costs the payload is scanned before it is stored or
   // served: a cost-side field reaching this point is a defect, so it fails closed rather than leaks.
@@ -145,6 +176,10 @@ export class PortalReadsService {
     logger.log({ span: "portal.read", workspace_id: session.workspaceId, token_id: session.tokenId, tab, cache: computed ? "miss" : "hit", duration_ms: Date.now() - started });
     return value;
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function policyFingerprint(session: PortalSessionContext): string {

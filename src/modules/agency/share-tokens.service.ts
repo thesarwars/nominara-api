@@ -3,6 +3,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
 import type { MintedShareToken, MintShareTokenRequest, ShareToken, ShareTokenView } from "../../../contracts/agency/index.js";
 import { EntitlementExceededError, NotFoundError, ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { hash as argon2idHash } from "../../lib/crypto/argon2id.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -372,14 +373,15 @@ export class ShareTokensService {
    */
   async consumeView(id: string, view: ViewFacts): Promise<boolean> {
     const { client, workspaceId } = this.store();
-    const updated = await client.query(
+    const updated = await client.query<{ view_count: number; label: string }>(
       `UPDATE share_tokens
           SET view_count = view_count + 1, last_viewed_at = now(), failed_attempts = 0, locked_until = NULL
         WHERE id = $1
           AND revoked_at IS NULL
           AND (expires_at IS NULL OR expires_at > now())
           AND (max_views IS NULL OR view_count < max_views)
-          AND (locked_until IS NULL OR locked_until <= now())`,
+          AND (locked_until IS NULL OR locked_until <= now())
+        RETURNING view_count, label`,
       [id],
     );
     if (updated.rowCount !== 1) return false;
@@ -387,6 +389,19 @@ export class ShareTokensService {
       `INSERT INTO share_token_views (workspace_id, share_token_id, ip, user_agent, authenticated) VALUES ($1, $2, $3::inet, $4, $5)`,
       [workspaceId, id, view.ip, view.userAgent, view.authenticated],
     );
+    // FR-AGY-01o — the FIRST view notifies the agency. "First" is decided by the same atomic UPDATE that took the view
+    // (the row lock serialises parallel mints, so exactly one of them sees view_count = 1), and the notification commits
+    // or rolls back with it. In-app only (the column default): email is deferred. No visitor address, agent or secret.
+    const taken = updated.rows[0];
+    if (taken !== undefined && taken.view_count === 1) {
+      await client.query(
+        `INSERT INTO notifications (id, workspace_id, kind, severity, title, payload)
+         VALUES ($1, $2, 'portal.first_view', 'info', $3, $4::jsonb)`,
+        [uuidV7(), workspaceId, `${taken.label} was opened for the first time`, JSON.stringify({ share_token_id: id })],
+      );
+      incrementCounter("nominara_portal_first_view_notifications_total", {});
+      this.logger.log({ message: "portal first view notified", workspace_id: workspaceId, share_token_id: id });
+    }
     return true;
   }
 

@@ -9,7 +9,7 @@ const WS = "0198f6a0-0000-7000-8000-000000000001";
 const P1 = "0198f6a0-0000-7000-8000-0000000000b1";
 const P2 = "0198f6a0-0000-7000-8000-0000000000b2";
 
-function session(over: Partial<PortalSessionContext> & { policy?: Partial<PortalSessionContext["policy"]> } = {}): PortalSessionContext {
+function session(over: Partial<Omit<PortalSessionContext, "policy">> & { policy?: Partial<PortalSessionContext["policy"]> } = {}): PortalSessionContext {
   const { policy, ...rest } = over;
   return {
     workspaceId: WS,

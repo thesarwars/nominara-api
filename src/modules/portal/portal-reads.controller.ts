@@ -5,6 +5,10 @@ import {
   portalOverviewQuerySchema,
   portalOverviewResponseSchema,
   portalProjectQuerySchema,
+  portalTasksQuerySchema,
+  portalTasksResponseSchema,
+  type PortalTasksQuery,
+  type PortalTasksResponse,
   type PortalGrowthMapQuery,
   type PortalGrowthMapResponse,
   type PortalMatrixResponse,
@@ -52,5 +56,15 @@ export class PortalReadsController {
     @Query(new ZodValidationPipe(portalProjectQuerySchema)) query: PortalGrowthMapQuery,
   ): Promise<PortalMatrixResponse> {
     return this.reads.matrix(session, query);
+  }
+
+  @Get("tasks")
+  @PortalRoute()
+  @ApiContract({ operationId: "getPortalTasks", querySchema: portalTasksQuerySchema, responseSchema: portalTasksResponseSchema })
+  tasks(
+    @PortalSession() session: PortalSessionContext,
+    @Query(new ZodValidationPipe(portalTasksQuerySchema)) query: PortalTasksQuery,
+  ): Promise<PortalTasksResponse> {
+    return this.reads.tasks(session, query);
   }
 }
