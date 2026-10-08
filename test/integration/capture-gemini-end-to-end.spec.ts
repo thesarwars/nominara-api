@@ -209,7 +209,7 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
         queue.push({ kind: "rollup", source: "parse", workspaceId, payload });
       },
     });
-    const rollup = createRollupMetricDailyHandler(context);
+    const rollup = createRollupMetricDailyHandler(context, { enqueueVerifyPresence: async () => undefined });
     const asJob = (payload: Record<string, unknown>): Job => ({ data: { payload: { kid: "k", ...payload } } }) as unknown as Job;
 
     const ran: string[] = [];
