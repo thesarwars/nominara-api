@@ -44,7 +44,7 @@ Closed in this change:
 - playbook-templates.ts comment said templates were keyed by seeding_playbook_slug; lookup is by source_class. Comment corrected.
 
 Still open and not built, each needing a decision or a story (not decided here):
-- source_domains.source_class / is_seedable is last-writer-wins across projects; the fix is a schema change the story did not name (migrations 0070-0071 unused by it; note 0070 is taken by NEW-C-8 in this lane's history, so any new number must come from 0100-0101).
+- source_domains.source_class / is_seedable is last-writer-wins across projects; the fix is a schema change the story did not name (any new migration takes a number from this lane's range, 0100-0101).
 - Window bounds use the session TimeZone and span N+1 days; bucketing by workspace timezone changes scoring and needs a decision on the bounds.
 - Source-index refresh as its own job changes the queue design; needs a story.
 - Unverified domains keep NULL coverage: owner decision 9 confirms the code's conservative NULL rule, so nothing to change. Platform rule text is still not supplied by the owner.
