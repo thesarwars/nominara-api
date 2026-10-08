@@ -32,3 +32,27 @@ Reads never recompute. `GeoService.detailFor` (src/modules/geo/geo.service.ts) r
 
 Spans: OpenTelemetry spans are DEFERRED to week 2 (owner, 2026-10-08); a missing span is not a failed criterion. Metrics and redacted logs are present (see each section).
 Anything needing a running real API (HTTP-level permission, 0-credit header) is collected in NEW-A-17.
+
+## Audit fix — cross-tenant FK on geo_analyses (major)
+
+Finding: `geo_analyses.project_id` was a single-column FK (0004). FK checks bypass RLS, so as `nominara_app` in tenant B's context a row with `workspace_id` = B and `project_id` = A's project was accepted (existence oracle; A's ON CONFLICT upsert then hit an invisible row and aborted A's rollup). The earlier isolation test only tried `workspace_id` = victim, so "geo_analyses RLS proven" did NOT cover this case; it is now covered. The application path (`writeGeoAnalysis`) was never exposed; the raw-SQL path is what is closed.
+
+- Fix: `src/db/migrations/sql/0072_geo_analyses_tenant_fk.{up,down}.sql` (commit 7f31759): `UNIQUE (workspace_id, id)` on `projects` (it was missing) and `FOREIGN KEY (workspace_id, project_id) REFERENCES projects (workspace_id, id) ON DELETE CASCADE`. Precedent 0079/0081. Existing rows cannot violate it (only writer takes workspace_id from projects).
+- Test (RED first): `test/integration/geo-insights.spec.ts` "STORY-062 isolation · an attacker-workspace row against the victim's project is rejected by the composite FK, is indistinguishable from an unknown project, and cannot block the victim's rollup write". Asserts 23503 for the victim's project, the same code and constraint as a random project id, and that the victim's own persist still succeeds under `SET ROLE nominara_app`.
+- RED commit 52830e6: `geo-insights.spec.ts` exit 1, 1 failed / 12 passed, "the victim's project id must be rejected: expected null not to be null" (the INSERT succeeded).
+- Migration round trip: "STORY-062 migration 0072 · the down file restores the single-column FK and the up file reapplies the composite one" (executes the down then up file on the container).
+- Docs: STORY-062.md (note + scenario 13) and schemas/geo-and-vectors.md DDL updated in Nominara-Dev-Docs-main; that hub has no .git here, so both edits must be carried to the docs repo.
+- Same gap exists on other tables that FK to projects with a single column; not touched (outside this finding). Raise as a follow-up sweep.
+- No schema/*.ts change (generated Drizzle schema carries no FK references), no tenant table added, so db:rls-generate has nothing to regenerate. db:schema-check/db:rls-check/db:drift-check need a database and were not run (55432 is off limits).
+
+| Command | Result |
+|---|---|
+| geo-insights.spec.ts (integration, colima) | exit 0, 14 passed (RED: 1 failed / 12 passed) |
+| `pnpm lint` | 0 |
+| `pnpm typecheck` | 0 |
+| `pnpm test:unit` | 0 (279 files passed, 1 skipped; 3369 tests passed, 1 skipped) |
+| `pnpm test:isolation` | 13 files, 53 passed |
+| `pnpm test:isolation:breakers` | 1 file, 24 passed |
+| integration: generated-rls-and-tenant-context, geo-*, seed-demo | 6 files passed; seed-demo.spec.ts: 9 failed (NEW-A-8 x8, NEW-C-15 audit seed-then-verify) |
+
+The 9 seed-demo failures are NOT from 0072: the identical 9 fail with 0072 removed (run on the RED commit 52830e6, exit 1, 9 failed / 30 passed). They are assertions about NEW-A-8 and NEW-C-15 behaviour that belong to other lanes and are not in this lane's code; to be resolved at the merge step.
