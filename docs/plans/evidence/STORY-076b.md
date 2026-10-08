@@ -70,7 +70,7 @@ Run against `billing-addons.service.spec.ts`, `addon-grant.spec.ts`, `addon-item
 
 ## Decisions and known gaps (for the reviewer / owner)
 
-1. **`quantity` on POST is ADDED to what Stripe already holds, not the new total.** `contracts/billing/addon.schema.ts` (NEW-D-1) does not say; the demo adds one at a time and DELETE exists for removal, so additive is the reading used. The retry hazard: an API-level retry after a crash between the Stripe change and the stored idempotent response would add twice. If the owner prefers "quantity = desired total", it is a small change (and then a reduction would need the same member check). **Needs a decision recorded in STORY-076.**
+1. **RESOLVED by the audit fix (contract commit, RED `ab787a1`, impl `fdf92e2`): `quantity` on POST is the DESIRED TOTAL.** The owner chose neither reading before the audit; the audit allowed "quantity = desired total" or a committed intent, and the total needs no schema change. Consequences the owner/app must carry: (a) the wire meaning changed (the openapi diff tool classes it `major`); the app must send the total it wants, not an increment; (b) a total below what Stripe holds is a 409 (removal is DELETE, whole add-on); a total equal to it is a 202 no-op with no Stripe call; (c) the Stripe idempotency key is `addon-<workspace>-<kind>-<sha256(Idempotency-Key)[0:32]>`. STORY-076 in the docs hub should state this (the docs repo has no .git here; carry it over).
 2. **Annual subscriptions are refused (409).** Stripe needs every item on one interval and only a monthly add-on price ($49, $15) is decided. An annual price is an owner decision.
 3. **Pre-purchase price display.** `GET /billing/addons` lists only add-ons in force; a workspace with none cannot read the $49/$15 from the API before buying, which `check:no-cost-literals` needs on the control. No endpoint for it is named in the story; a catalog read is a story/contract decision.
 4. **While a removal is scheduled, Stripe may refuse direct item changes** (a subscription attached to a schedule). A later POST then returns 503 `degraded` until the schedule releases. Needs sandbox confirmation (NEW-A-17); not handled specially.
@@ -93,3 +93,19 @@ Run against `billing-addons.service.spec.ts`, `addon-grant.spec.ts`, `addon-item
 | `pnpm exec vitest run` of the RED specs at `235e0ab` | 1 | 2 files failed, 0 tests ran (missing modules) |
 | `test/integration/billing-addons.spec.ts` | not run | disk 6.1 GiB < 8 GiB |
 | `pnpm test:isolation` | not run | no tenant table touched; known fixture crash at this tip |
+
+
+## Audit fix: a retried POST charged twice (blocker 1)
+
+| Item | Proof |
+|---|---|
+| Stripe applies the change, the reply is lost, the same Idempotency-Key retried: exactly one unit | `src/modules/billing/billing-addons.service.spec.ts` > "AC1 retry . Stripe applies the change and the reply is lost ..."; HTTP form in `test/integration/billing-addons.spec.ts` "AC1 retry ..." (NOT RUN, see below) |
+| Key derived from workspace + Idempotency-Key (stable on retry, differs by key and by workspace, <= 255, key text not sent) | "AC1 retry . the Stripe key is derived ..." |
+| Total already held is a no-op; a lower total is a 409 | "a total already held is a no-op", "a total below what is held is a 409" |
+| RED | commit `ab787a1`: `vitest run billing-addons.service.spec.ts` exit 1, 6 failed / 16 passed (the old additive arithmetic and the random key) |
+| GREEN | 22 passed / 22. `pnpm lint` 0, `pnpm typecheck` 0, `pnpm test:unit` 0 (282 files passed, 3396 tests) |
+| Mutations on the fix | random key restored: 1 failed. Always-call-Stripe: 1 failed. 409 guard removed: 1 failed. Additive total restored: 5 failed. All killed |
+
+## Audit items 2 and 3: NOT DONE, blocked on disk
+
+`df -h /System/Volumes/Data` showed 4.7 GiB free at the start and 6.3 GiB at the end; the hard rule is 8 GiB before testcontainers. So the STORY-075b / 076b integration specs, `stripe-subscriptions`, `stripe-webhook`, the M1-M6 mutation re-run, `pnpm test:isolation` and `pnpm test:isolation:breakers` were NOT run on this tip. Nothing was removed to make room (the free space is not this lane's to reclaim). Needed: the owner frees disk (>= 8 GiB), then run those suites, record RED against the parent of `c279f9b` / `28ea168`, and re-apply M1-M6.
