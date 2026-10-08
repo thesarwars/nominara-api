@@ -9,12 +9,12 @@ const stored = { color_primary: "#112233", color_accent: "#445566", color_bg: "#
 
 describe("NEW-E-100b · exportPaletteFrom", () => {
   it("NEW-E-100b — uses the stored colours and keeps the brand line unless brand removal is on", () => {
-    expect(exportPaletteFrom(stored)).toEqual({ primary: "#112233", accent: "#445566", background: "#778899", foreground: "#aabbcc", showBrandLine: true });
-    expect(exportPaletteFrom({ ...stored, hide_nominara_brand: true }).showBrandLine).toBe(false);
+    expect(exportPaletteFrom(stored, true)).toEqual({ primary: "#112233", accent: "#445566", background: "#778899", foreground: "#aabbcc", showBrandLine: true });
+    expect(exportPaletteFrom({ ...stored, hide_nominara_brand: true }, true).showBrandLine).toBe(false);
   });
 
   it("NEW-E-100b — no stored theme is the platform default, with the brand line shown", () => {
-    expect(exportPaletteFrom(undefined)).toEqual({
+    expect(exportPaletteFrom(undefined, true)).toEqual({
       primary: PLATFORM_DEFAULT_COLORS.color_primary,
       accent: PLATFORM_DEFAULT_COLORS.color_accent,
       background: PLATFORM_DEFAULT_COLORS.color_bg,
@@ -24,7 +24,7 @@ describe("NEW-E-100b · exportPaletteFrom", () => {
   });
 
   it("NEW-E-100b — a null colour (D6: inherit) or a malformed one falls back to the platform default, per colour", () => {
-    const palette = exportPaletteFrom({ ...stored, color_primary: null, color_accent: "red", color_bg: "#12345", color_fg: "#AABBCC" });
+    const palette = exportPaletteFrom({ ...stored, color_primary: null, color_accent: "red", color_bg: "#12345", color_fg: "#AABBCC" }, true);
     expect(palette.primary).toBe(PLATFORM_DEFAULT_COLORS.color_primary);
     expect(palette.accent).toBe(PLATFORM_DEFAULT_COLORS.color_accent);
     expect(palette.background).toBe(PLATFORM_DEFAULT_COLORS.color_bg);
@@ -32,6 +32,17 @@ describe("NEW-E-100b · exportPaletteFrom", () => {
   });
 
   it("NEW-E-100b — the palette has no footer, stylesheet or section field to carry", () => {
-    expect(Object.keys(exportPaletteFrom(stored)).sort()).toEqual(["accent", "background", "foreground", "primary", "showBrandLine"]);
+    expect(Object.keys(exportPaletteFrom(stored, true)).sort()).toEqual(["accent", "background", "foreground", "primary", "showBrandLine"]);
+  });
+
+  it("CP1 downgrade — a stored hide_nominara_brand is honoured only while whitelabel.remove_branding is granted", () => {
+    const hidden = { ...stored, hide_nominara_brand: true };
+    expect(exportPaletteFrom(hidden, true).showBrandLine).toBe(false);
+    expect(exportPaletteFrom(hidden, false).showBrandLine).toBe(true);
+    // an un-hidden theme shows the line whatever the entitlement says
+    expect(exportPaletteFrom(stored, true).showBrandLine).toBe(true);
+    expect(exportPaletteFrom(stored, false).showBrandLine).toBe(true);
+    // no stored theme: the line is shown whatever the entitlement says
+    expect(exportPaletteFrom(undefined, false).showBrandLine).toBe(true);
   });
 });

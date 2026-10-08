@@ -139,6 +139,25 @@ describe("STORY-097 · agency theme over HTTP", () => {
     expect(list[0]!.name).toBe("Acme");
   });
 
+  it("CP1 first-theme race · two concurrent first saves both succeed and leave exactly one default (no raw 23505, no 500)", async () => {
+    const a = await owner("growth");
+    // A trigger holds every INSERT open for 400 ms AFTER the service has decided "no default exists yet", so both
+    // requests are guaranteed to be past that decision before either row lands. Without serialisation the second
+    // insert dies on ux_brand_themes_default.
+    await harness.db().query(`CREATE FUNCTION public.cp1_slow_theme_insert() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN PERFORM pg_sleep(0.4); RETURN NEW; END $f$`);
+    await harness.db().query(`CREATE TRIGGER cp1_slow_theme_insert BEFORE INSERT ON brand_themes FOR EACH ROW EXECUTE FUNCTION public.cp1_slow_theme_insert()`);
+    try {
+      const results = await Promise.all([put(a, { name: "Alpha" }), put(a, { name: "Beta" })]);
+      expect(results.map((r) => r.statusCode), results.map((r) => r.body).join(" | ")).toEqual([200, 200]);
+    } finally {
+      await harness.db().query(`DROP TRIGGER cp1_slow_theme_insert ON brand_themes`);
+      await harness.db().query(`DROP FUNCTION public.cp1_slow_theme_insert()`);
+    }
+    const list = data<Array<{ is_default: boolean }>>(await get(a));
+    expect(list).toHaveLength(2);
+    expect(list.filter((t) => t.is_default)).toHaveLength(1);
+  }, 60_000);
+
   it("STORY-097 · making another theme the default demotes the old one in the same write", async () => {
     const a = await owner("growth");
     await put(a, { name: "One" });

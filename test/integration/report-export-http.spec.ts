@@ -13,7 +13,7 @@ import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
-import { pdfRaw } from "../support/pdf-text.js";
+import { pdfRaw, pdfText } from "../support/pdf-text.js";
 import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture } from "../support/valkey-fixture.js";
 
 // NEW-E-100b — POST /v1/projects/{id}/reports/export through the REAL ApiModule.
@@ -215,6 +215,30 @@ describe("STORY-100 · on-demand export over HTTP", () => {
       expect(pdfRaw(fileOf(exported))).toContain(METHODOLOGY_NOTE);
       expect(exported.footer.note).toBe(METHODOLOGY_NOTE);
     }
+  }, 120_000);
+
+  async function hideBrandTheme(workspaceId: string): Promise<void> {
+    await harness.db().query(`INSERT INTO brand_themes (id, workspace_id, name, is_default, hide_nominara_brand) VALUES ($1,$2,'T',true,true)`, [uuidV7(), workspaceId]);
+  }
+
+  it("CP1 downgrade — with whitelabel.remove_branding granted (business) a stored hide_nominara_brand drops the brand line; the footer stays", async () => {
+    const { a, p } = await seeded("business");
+    await hideBrandTheme(a.workspaceId);
+    const res = await exportReport(a, p, body());
+    expect(res.statusCode, res.body).toBe(201);
+    const text = pdfText(fileOf(exportResponseSchema.parse(data(res))));
+    expect(text).not.toContain("Powered by Nominara");
+    expect(text).toContain("Methodology");
+  }, 120_000);
+
+  it("CP1 downgrade — a workspace downgraded below the plan that grants brand removal exports WITH the brand line, though its stored theme still says hide", async () => {
+    const { a, p } = await seeded("growth");
+    await hideBrandTheme(a.workspaceId);
+    const res = await exportReport(a, p, body());
+    expect(res.statusCode, res.body).toBe(201);
+    const text = pdfText(fileOf(exportResponseSchema.parse(data(res))));
+    expect(text).toContain("Powered by Nominara");
+    expect(text).toContain("Methodology");
   }, 120_000);
 
   it("STORY-100 s3 — a request that tries to carry a footer or style override is a 400 and creates nothing", async () => {
