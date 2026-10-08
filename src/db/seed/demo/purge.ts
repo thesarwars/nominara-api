@@ -206,7 +206,10 @@ async function purgeDemoPrompts(tx: ClientBase, project: PurgeableProject): Prom
 export async function purgeOneProject(tx: ClientBase, project: PurgeableProject, timezone: string): Promise<void> {
   // Facts + metric_daily first — nothing downstream depends on them.
   await purgeMetricHistory(tx, project, timezone);
-  // STORY-060 — recompute A3 over what is left, so no stale "sufficient" structure row outlives the seeded facts.
+  // STORY-060 — every `geo_analyses` row is derived from the facts just removed, so delete them ALL
+  // before recomputing. Recomputing alone writes under today's `window_start` and never touches a row
+  // the seed wrote under an earlier one, so a purge on a later day left fabricated "sufficient" rows behind.
+  await tx.query(`DELETE FROM geo_analyses WHERE project_id = $1`, [project.id]);
   await refreshProjectGeoWindows(tx, project.id);
   if (project.factsOnly) {
     // NEW-A-8 — a `--facts-only` project never had AUX, sources, tasks or a
