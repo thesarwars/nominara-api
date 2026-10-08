@@ -1,43 +1,46 @@
-# NEW-C-6 — Recovery plan: one authority task per seedable citation gap
+# NEW-C-6 - Recovery plan: one authority task per seedable citation gap (STORY-057 AC6/7/8/9; FR-CO-04b)
 
-Status: BLOCKED (cut by the story's own rule). No code written. Branch 7day/c-comp-3 at ef53037 plus this file.
+Status: DONE (backend). Branch 7day/c-comp-4 from integration/7day fee788e. The earlier "BLOCKED / cut" status is superseded by owner decision 2026-10-08: option 1 (TasksService exports a shared task-insert
+method), fingerprint `sha256('authority:{project_id}:{domain}')`.
 
-## Why it is blocked
+Commits: contract `785d6ee` - RED `a86c10a` - fix `10e5787`.
+RED: `vitest run src/modules/displacement src/lib/analytics/displacement-recovery.spec.ts` -> **4 failed / 22 passed, exit 1** (`recoveryPlan` not a function on the controller; `authorityTaskFingerprint` not exported; the per-domain count);
+`vitest run --config vitest.integration.config.ts test/integration/displacement-recovery-plan.spec.ts` -> **11 failed / 1 passed, exit 1** (`service.recoveryPlan` is not a function; the 1 pass is the empty-table setup case).
 
-The story's last acceptance criterion: "BLOCKED if Track B has not landed a task-insert helper by day 5. Cut it, rather than writing a second task-insert path."
+## What was built
+- `TasksService.createGeneratedTask(input)` (exported via TasksModule): the shared task-insert method. Inputs: projectId, kind, origin, ruleCode, fingerprint, title, description, sourceDisplacementId, sourceDomainId, affectedUrl. Returns `{task, created}`.
+  Idempotent by fingerprint (open = not done, not deleted, the same predicate as `ux_tasks_dedupe`): an existing task is returned and nothing is written, no reference is consumed. A `pg_advisory_xact_lock` on project+fingerprint serialises concurrent callers.
+  `createTask` (manual) now goes through the same private `insertTask`, so there is still ONE `INSERT INTO tasks` in src outside the demo seed. Manual behaviour is unchanged (task-create integration spec green).
+- `DisplacementService.recoveryPlan(id)` + `POST /v1/displacements/{id}/recovery-plan` (201, `@Idempotent()`, `task:create`, `@ScopedByQuery()`, `@Audit displacement.recovery_planned`). Sets `displacement_events.task_id` to the plan's first task, once.
+- `authorityTargets()` / `authorityTaskFingerprint()` in `src/lib/analytics/displacement-recovery.ts`; `recoveryTaskCount` uses `authorityTargets`, so the feed count and the plan cannot disagree.
+- Contract `contracts/analytics/recovery-plan-response.schema.ts`: `z.array(taskSchema)` (Track B's schema, reused). openapi regenerated; `contracts:diff` = **minor** (one new operation), `contracts:check` exit 0.
 
-Checked on integration/7day f201f35 (merged into this branch):
+## Acceptance criteria -> tests
+1. Contract first, Task[] reusing Track B's schema: own commit `785d6ee`; `src/modules/displacement/displacement.spec.ts` > "NEW-C-6 - route wiring and contract" > "AC1 - the response is an array of the task schema ...".
+2. RED from STORY-057 scenarios 9, 10, 12 (`test/integration/displacement-recovery-plan.spec.ts`):
+   - #9 "STORY-057 #9 / NEW-C-6 AC2 - one authority task per seedable citation gap, linked to the displacement, fingerprint per the owner formula"
+   - #10 "STORY-057 #10 / NEW-C-6 AC2 - a non-seedable or unknown domain gets no task, and the gap stays visible in the feed"
+   - #12 "STORY-057 #12 / NEW-C-6 AC2 - a repeat call creates no duplicate task and burns no reference; it returns the same tasks", "STORY-057 #12 - a second displacement on the same project and domain reuses the open task rather than adding another"
+   - concept tasks zero: "STORY-057 / NEW-C-6 AC2 - concept tasks are zero until STORY-058 ..."
+   - widened: done task frees the fingerprint; two URLs on one domain = one task and equals `recovery_task_count`; empty gaps = empty plan; other workspace's seedable domain ignored; concurrent plans (one task, one reference); atomic rollback; fingerprint unit tests in `src/lib/analytics/displacement-recovery.spec.ts` ("NEW-C-6 - authorityTaskFingerprint").
+3. Idempotency-Key required, `task:create`, `@Audit`: "NEW-C-6 - route wiring and contract" > "AC3 - the recovery plan needs task:create, requires Idempotency-Key, is scoped by the displacement and audited". Tenancy: "NEW-C-6 AC3 - under nominara_app, another workspace's displacement id is 404 and nothing is written; a scoped member outside the project is 403".
+4. The cut rule: no longer applies; Track B's helper now exists, and it is the only task-insert path (no second path written).
 
-- The only `INSERT INTO tasks` in `src` outside the demo seed is `TasksService.createTask` in `src/modules/tasks/tasks.service.ts`. It is the manual path: origin is hard-coded `'manual'`, the dedupe fingerprint is `sha256('manual:' + random uuid)` (it never collapses by design), the description is empty, and it takes only title, kind and goal. It cannot set `origin='auto'`, `source_displacement_id`, `affected_url`, `source_domain_id`, a deterministic fingerprint, or `rule_code`.
-- No fingerprint function exists anywhere in `src` (grep for "fingerprint" finds nothing that builds a task fingerprint).
-- No generator (STORY-063) has landed.
+## Decisions I took that the owner can overrule (none was in the story)
+- A repeat call (or a second displacement on the same domain) returns the EXISTING open tasks with 201 and creates nothing, rather than a 409. Reason: the story says "a repeat call creates no duplicates, by dedupe fingerprint" and the response is Task[]; a 409 cannot carry task ids because the `conflict` error-details schema is strict and has no such member (a contract change nobody asked for). The client can tell new from existing by `created_at`. The frontend note "a 409 for an existing plan becomes a link" then needs no 409.
+- Fingerprint per domain means two URLs on one domain are one task (the task's `affected_url` is the first URL in gap order); `recovery_task_count` now counts distinct seedable domains.
+- Task `rule_code` is NULL (no `task_generation_rules` row exists for the plan; migration range says none), `impact_score` and `priority` are the column defaults (the scale of `displacement_events.impact_score` versus `tasks.impact_score` 0..100 is not defined in the reference). Title: "Earn a citation on {domain}".
+- A dismissed displacement can still be planned.
 
-Building the task insert inside the displacement module would be a second task-insert path (the table is owned by the tasks service), which the story forbids. Generalising `createTask` means editing `src/modules/tasks/` and its contract, outside this story's Technical Notes, and it needs Track B's decision on the fingerprint formula and the auto-task fields.
+## Gates (HEAD 10e5787)
+`pnpm lint` exit 0 - `pnpm typecheck` exit 0 - `pnpm test:unit` exit 0 (302 files passed, 1 skipped; 3701 tests) - `pnpm contracts:check` exit 0.
+Integration (`--config vitest.integration.config.ts`): displacement-recovery-plan, displacement-feed, refresh-project-displacements, task-create, task-update, task-complete, task-goals, project-tasks, portal-tasks-http, task-realtime-rooms, rollups-aux-tasks-geo-tools -> **exit 0, 11 files, 176 tests**.
+`pnpm test:isolation` -> exit 1, 1 failed / 52 passed: `test/isolation/namespacing.spec.ts` ISO-14 flags `src/modules/reports/scheduled-reports.service.ts:234` (e-reports lane, NEW-E-100c). PRE-EXISTING: reproduced on the base commit fee788e with my changes stashed (same test fails, exit 1). Not touched here; the e-reports lane owns it. No schema change in this item, so no db:* checks apply.
+Compile-test setup: `DisplacementModule` now imports `TasksModule` (which builds the realtime publisher and validates env), so the existing "DisplacementModule compiles" test now calls `applyFakeApiEnv()` like the TasksModule one; no assertion changed.
 
-## Acceptance criteria
+## Observability
+Metrics `nominara_displacement_recovery_plans_total{outcome}` and `nominara_tasks_generated_deduplicated_total{origin}`; log "displacement recovery plan" with workspace_id, displacement_id and counts only (never a title, URL or competitor name). OpenTelemetry span: deferred to week 2 (decision R3).
+Not unit-asserted: a test of the two new metric lines was not written (the existing task-created metric/log path is shared and covered). Real-API evidence (HTTP 201 envelope, `audit_log` row): collected in NEW-A-17.
 
-| # | Criterion | Status |
-|---|---|---|
-| 1 | Contract first: response is Task[] reusing Track B's task schema | Not started. `contracts/tasks/task-response.schema.ts` exists and could be reused; the contract commit is held back so a route is not declared with no handler. |
-| 2 | RED from STORY-057 scenarios 9, 10, 12 | Not started. No RED sha, no failing count. |
-| 3 | Idempotency-Key required, task:create, @Audit | Not started. (Pattern is in place: `displacement.controller.ts` already uses `task:create`, `@ScopedByQuery`, `@Audit`.) |
-| 4 | BLOCKED if no Track B helper; cut rather than second path | Applied: this item is cut. |
-
-Gates: not run, since there is no change. Last green state is NEW-C-5's evidence.
-Real-API evidence (NEW-A-17): none to collect.
-
-## What is needed to unblock (decision for the owner)
-
-Pick one:
-1. Track B adds a shared task-insert method on `TasksService` (export it, take origin, rule_code, deterministic fingerprint, source_displacement_id, affected_url, source_domain_id, title, description, and return the Task), and states the fingerprint formula. NEW-C-6 then calls it from `DisplacementService`, and sets `displacement_events.task_id`.
-2. The owner authorises widening `createTask` in this lane (touching `src/modules/tasks/`), and decides the authority task fingerprint (suggested: sha256 of `authority:{project_id}:{source_domain_id or lower(domain)}:{displacement prompt_id}`), title and description wording.
-
-Then the work is about a day: the contract (`recoveryPlanResponseSchema = z.array(taskSchema)`), RED for scenarios 9, 10, 12 (one task per seedable gap using the same `source_domains.is_seedable` read as `recoveryTaskCount`; none for a non-seedable gap; repeat call returns the same tasks with no duplicates; concept tasks zero until STORY-058), then `POST /displacements/:id/recovery-plan` with `Idempotency-Key`, `task:create`, `@Audit`, and a 409 carrying the existing task ids for a plan that already exists.
-
-Spans: OpenTelemetry deferred to week 2 (owner decision R3).
-
-## Re-check (2026-10-08, days 5-6 run)
-
-Re-checked integration/7day (f201f35), 7day/b-tasks-3 (e32ffe9) and 7day/b-ws-3: none contains a task-insert helper with origin, rule_code, deterministic fingerprint or source_displacement_id; `git grep -i fingerprint -- src` finds only the idempotency fingerprint. The blocking condition still holds, so the item stays cut. No code, no contract, no RED commit.
-
-Re-check (resume run, 2026-10-08): integration/7day still f201f35, already merged here; 7day/b-tasks-3 and 7day/b-ws-3 still have no task-insert helper (only the schema columns). Blocking condition unchanged; item stays cut.
+## Not done
+Frontend (`lib/api/competitors.ts` already matches; the control showing `recovery_task_count` is app-side). Docs to carry: api-specification.md section 3 needs `POST /displacements/{id}/recovery-plan` (201, Task[], `task:create`, Idempotency-Key) and the per-domain fingerprint.

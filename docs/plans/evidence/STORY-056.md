@@ -46,3 +46,15 @@ loss recovers only when the position is regained, not on any later capture" — 
 Scenarios 11 (milestone on recovery after a completed task) and 13 (no-cooldown alert) remain deferred, named, not faked.
 Scenario 12 (detection lag) has no test. Evidence needing a running real API is collected in NEW-A-17.
 The STORY-056 story file still reads `Backlog`; the docs repo has no .git here, so that status edit is for the owner to carry.
+
+## Checkpoint-3 fix pass (branch 7day/c-comp-4 from integration/7day fee788e)
+
+The CP3 QA failed this item on two points: "the merged tree still ranks by cluster intent" and "the golden-set statement is not in the merged tree".
+Both findings are STALE against fee788e (the QA ran before the merge of 7day/c-comp-3 was complete). Verified on this branch, no code change needed:
+
+- Criterion 4 (rank 1 for every prompt): `TOPIC_RANK_BY_INTENT = 1` at `src/lib/rollup/refresh-project-displacements.ts` (`grep -n TOPIC_RANK_BY_INTENT` lines 364 and 379), pinned by
+  `test/integration/refresh-project-displacements.spec.ts` > "CP2 STORY-056 · rank_of_topic_by_intent is 1 for every prompt, even one in a lower-intent cluster (flagged spec reading)". Owner decision 2026-10-08: "STORY-056: topic rank 1 for every prompt; presence_lost uses the 1.00 penalty" - both are what the code does.
+- Criterion 3 (golden-set gate unavailable): stated in the code comment above `TOPIC_RANK_BY_INTENT` and in the CP2 section of this file (both are in the merged tree; this file is in `docs/plans/evidence`).
+- Re-run on this branch: `pnpm test:unit` exit 0 (302 files passed, 1 skipped; 3701 tests, includes `test/unit/scoring-purity.spec.ts`, `test/unit/analytics/displacement.spec.ts`, `test/unit/scoring/displacement-impact.spec.ts`);
+  `vitest run --config vitest.integration.config.ts test/integration/refresh-project-displacements.spec.ts` (in an 11-file batch) exit 0, 176 tests passed.
+- Observability unchanged (metric + redacted log line; spans deferred, decision R3).
