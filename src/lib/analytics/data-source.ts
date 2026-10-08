@@ -117,7 +117,7 @@ export async function engineDataSourcesForDays(
  * counter is a rate of demo exposure rather than of traffic.
  */
 export function recordDemoDataServed(
-  surface: "matrix" | "scorecards" | "growth_map",
+  surface: "matrix" | "scorecards" | "growth_map" | "rendering_quality",
   workspaceId: string,
   sources: readonly (DataSource | null)[],
 ): void {

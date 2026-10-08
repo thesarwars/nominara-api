@@ -6,6 +6,8 @@ import { CompetitorPanelController } from "./competitor-panel.controller.js";
 import { CompetitorPanelService } from "./competitor-panel.service.js";
 import { GrowthMapController } from "./growth-map.controller.js";
 import { GrowthMapService } from "./growth-map.service.js";
+import { RenderingQualityController } from "./rendering-quality.controller.js";
+import { RenderingQualityService } from "./rendering-quality.service.js";
 import { SourcesController } from "./sources.controller.js";
 import { SourcesService } from "./sources.service.js";
 import { ScorecardsController } from "./scorecards.controller.js";
@@ -28,7 +30,8 @@ import { ScorecardsService } from "./scorecards.service.js";
     GrowthMapController,
     CompetitorPanelController,
     SourcesController,
+    RenderingQualityController,
   ],
-  providers: [AnalyticsService, ScorecardsService, GrowthMapService, CompetitorPanelService, SourcesService],
+  providers: [AnalyticsService, ScorecardsService, GrowthMapService, CompetitorPanelService, SourcesService, RenderingQualityService],
 })
 export class AnalyticsModule {}

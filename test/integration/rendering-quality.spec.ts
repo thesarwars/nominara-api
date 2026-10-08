@@ -104,7 +104,8 @@ describe("NEW-C-11 · RenderingQualityService - real SQL under RLS", () => {
   const ctx = (ws: string): TenantContext => ({ workspaceId: ws, actorId: randomUUID() });
   const read = (ws: string, projectId: string) => inTenant(ctx(ws), () => service.renderingQuality(projectId, { timeframe: "30d" }));
   const find = <T extends { engine_key: string }>(list: T[], key: string) => list.find((e) => e.engine_key === key)!;
-  const attr = (e: { attributes: { attribute: string }[] }, name: string) => e.attributes.find((a) => a.attribute === name) as { coverage: number | null; cause: { finding_id: string } | null; surface_unavailable: boolean };
+  type Cov = { attribute: string; coverage: number | null; cause: { finding_id: string } | null; surface_unavailable: boolean };
+  const attr = (e: { attributes: Cov[] }, name: string): Cov => e.attributes.find((a) => a.attribute === name)!;
 
   it("[NEW-C-11 AC2/AC4] demo engines are computed from seeded render_attrs, gemini is excluded and live, and the response satisfies the contract", async () => {
     const ws = await workspace(); const p = await project(ws);
@@ -123,7 +124,7 @@ describe("NEW-C-11 · RenderingQualityService - real SQL under RLS", () => {
     expect(gemini).toMatchObject({ renders_attributes: false, score: null, mentions_counted: 0, data_source: "live" });
     expect(out.rich_rendering_engines.sort()).toEqual(["google_ai_mode", "google_aio"]);
     expect(out.blended.mentions_counted).toBe(3);
-    expect(out.blended.score).toBeCloseTo(32, 9); // weighted mean of 41 and 22 at equal engine weight... see scorecards blend
+    expect(out.blended.score).toBeCloseTo(31.5, 9); // engine-weighted mean of 41 and 22 (equal weights), the scorecards blend
   });
 
   it("[NEW-C-11 AC2] a project with no mentions reads score null (not 0) and null coverage", async () => {
