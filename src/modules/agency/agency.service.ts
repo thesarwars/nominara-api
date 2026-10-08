@@ -83,6 +83,21 @@ export class AgencyService {
   }
 
   /**
+   * NEW-E-099a — the theme a portal session is rendered with: the token's pinned theme when it names one the workspace
+   * still has, else the workspace default, else the unsaved platform default (null colours). Never an error: a pinned
+   * theme that was deleted must not take a client's portal down. Read-only, so it runs on the portal's transaction.
+   */
+  async themeForPortal(pinnedThemeId: string | null): Promise<AgencyTheme> {
+    const { client } = this.store();
+    const result = await client.query<ThemeRow>(
+      `SELECT ${COLUMNS} FROM brand_themes WHERE ($1::uuid IS NOT NULL AND id = $1::uuid) OR is_default ORDER BY (id = $1::uuid) DESC NULLS LAST, is_default DESC, created_at, id LIMIT 1`,
+      [pinnedThemeId],
+    );
+    const row = result.rows[0];
+    return row === undefined ? platformDefaultTheme() : toTheme(row);
+  }
+
+  /**
    * Creates (no `theme_id`, or the platform-default id) or updates a theme.
    * Everything is checked here, not in the editor: a direct API call must not
    * be able to save what the interface would refuse (STORY-097 scenario 8).

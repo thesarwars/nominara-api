@@ -52,6 +52,14 @@ export const PASSWORD_FAILURE_LIMIT = 5;
 export const PASSWORD_LOCK_MS = 15 * 60 * 1000;
 
 /** What the portal gate is allowed to know about a token before it has authenticated anyone. */
+/** NEW-E-099a — what a live portal session is served with; read from the token row on every request. */
+export interface PortalSessionPolicy {
+  readonly label: string;
+  readonly hideCompetitors: boolean;
+  readonly hideCosts: boolean;
+  readonly timeframeLock: "24h" | "7d" | "30d" | "90d" | null;
+}
+
 export interface GateRow {
   readonly id: string;
   readonly workspaceId: string;
@@ -389,17 +397,44 @@ export class ShareTokensService {
    * refused here, as defence in depth. Scoped to the context's workspace by RLS, so another workspace's id is false.
    */
   async isSessionLive(id: string): Promise<boolean> {
+    return (await this.resolveSession(id)) !== null;
+  }
+
+  /**
+   * NEW-E-099a — the token's LIVE state and its serving policy in ONE read, per request: `null` when the session is
+   * not live (same predicate as before), else the label and the three settings the portal reads must honour. They are
+   * read from the token row on every request and never from the cookie or the request, so editing or tightening a link
+   * applies to the very next read.
+   */
+  async resolveSession(id: string): Promise<PortalSessionPolicy | null> {
     const { client, workspaceId } = this.store();
     // RLS already hides another workspace's row; the explicit predicate keeps the answer right on a connection that is
     // not subject to RLS (a superuser test harness), where a cookie naming the wrong workspace must still be refused.
-    const result = await client.query<{ revoked_at: Date | null; expires_at: Date | null; max_views: number | null; view_count: number }>(
-      `SELECT revoked_at, expires_at, max_views, view_count FROM share_tokens WHERE id = $1 AND workspace_id = $2`,
+    const result = await client.query<{
+      revoked_at: Date | null;
+      expires_at: Date | null;
+      max_views: number | null;
+      view_count: number;
+      label: string;
+      hide_competitors: boolean;
+      hide_costs: boolean;
+      timeframe_lock: string | null;
+    }>(
+      `SELECT revoked_at, expires_at, max_views, view_count, label, hide_competitors, hide_costs, timeframe_lock
+         FROM share_tokens WHERE id = $1 AND workspace_id = $2`,
       [id, workspaceId],
     );
     const row = result.rows[0];
-    if (row === undefined) return false;
+    if (row === undefined) return null;
     const refusal = gateRefusal({ revokedAt: row.revoked_at, expiresAt: row.expires_at, maxViews: row.max_views, viewCount: row.view_count - 1 /* gateRefusal is >=; this makes it > */ }, new Date());
-    return refusal === null;
+    if (refusal !== null) return null;
+    return {
+      label: row.label,
+      hideCompetitors: row.hide_competitors,
+      hideCosts: row.hide_costs,
+      // `custom` is a database value the portal contracts exclude; a locked token that holds it serves its default window.
+      timeframeLock: row.timeframe_lock === "24h" || row.timeframe_lock === "7d" || row.timeframe_lock === "30d" || row.timeframe_lock === "90d" ? row.timeframe_lock : null,
+    };
   }
 
   private async loadVisible(client: ClientBase, id: string): Promise<TokenRow> {

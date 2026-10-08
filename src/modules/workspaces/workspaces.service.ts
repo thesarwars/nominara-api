@@ -445,6 +445,14 @@ export class WorkspacesService {
     return toWorkspaceResponse(result.rows[0]!);
   }
 
+  /** NEW-E-099a — the workspace's display name (the portal's `agency`). One column, on the ambient transaction. */
+  async displayName(): Promise<string> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("WorkspacesService.displayName requires an active tenant context");
+    const result = await store.client.query<{ name: string }>("SELECT name FROM workspaces WHERE id = $1", [store.context.workspaceId]);
+    return result.rows[0]?.name ?? "";
+  }
+
   /**
    * NEW-A-12 — GET /workspaces/{id}. Ambient transaction: RLS scopes the read
    * to the token's workspace, and the controller has already refused a path id

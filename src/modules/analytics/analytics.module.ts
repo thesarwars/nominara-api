@@ -30,5 +30,7 @@ import { ScorecardsService } from "./scorecards.service.js";
     SourcesController,
   ],
   providers: [AnalyticsService, ScorecardsService, GrowthMapService, CompetitorPanelService, SourcesService],
+  // NEW-E-099a — the portal reuses the scorecards and growth-map logic rather than forking it.
+  exports: [ScorecardsService, GrowthMapService],
 })
 export class AnalyticsModule {}

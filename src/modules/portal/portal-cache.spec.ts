@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { PORTAL_CACHE_TTL_MS, PortalCache, portalCacheKey } from "./portal-cache.js";
+import { PORTAL_CACHE_TTL_MS, PortalCache, portalCacheKey, type PortalCacheKeyParts } from "./portal-cache.js";
 
 // NEW-E-099a — integrations-and-sharing.md NFR-AGY-03/04: a 60-second per-token cache whose key always includes token_id.
 const ws = "0198f6a0-0000-7000-8000-000000000001";
 const t1 = "0198f6a0-0000-7000-8000-0000000000a1";
 const t2 = "0198f6a0-0000-7000-8000-0000000000a2";
-const base = { workspaceId: ws, route: "growth-map", project: "0198f6a0-0000-7000-8000-0000000000b1", timeframe: "30d", policy: "hc0-hk0-lock0-theme0" } as const;
+const base: Omit<PortalCacheKeyParts, "tokenId"> = { workspaceId: ws, route: "growth-map", project: "0198f6a0-0000-7000-8000-0000000000b1", timeframe: "30d", policy: "hc0-hk0-lock0-theme0" };
 
 describe("NEW-E-099a · portalCacheKey", () => {
   it("STORY-098 s22 / STORY-099 s15 · the same path under two tokens yields two keys; the key contains the token id", () => {
@@ -17,7 +17,7 @@ describe("NEW-E-099a · portalCacheKey", () => {
   });
 
   it("every dimension of the response is in the key: route, project, timeframe, the token's policy", () => {
-    const k = (over: Partial<typeof base>) => portalCacheKey("test", { ...base, tokenId: t1, ...over });
+    const k = (over: Partial<PortalCacheKeyParts>) => portalCacheKey("test", { ...base, tokenId: t1, ...over });
     const keys = new Set([k({}), k({ route: "matrix" }), k({ project: "0198f6a0-0000-7000-8000-0000000000b2" }), k({ timeframe: "7d" }), k({ policy: "hc1-hk0-lock0-theme0" })]);
     expect(keys.size).toBe(5);
   });

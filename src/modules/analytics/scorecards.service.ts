@@ -43,12 +43,13 @@ const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
 
 @Injectable()
 export class ScorecardsService {
-  async scorecards(projectId: string, query: ScorecardsQuery): Promise<ScorecardsResponse> {
+  /** `opts.days` overrides the query's window — the portal serves a 24h window the agency query has no spelling for. */
+  async scorecards(projectId: string, query: ScorecardsQuery, opts: { readonly days?: number } = {}): Promise<ScorecardsResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ScorecardsService requires an active tenant context");
     const tx = store.client;
 
-    const window = await resolveWindow(tx, projectId, TIMEFRAME_DAYS[query.timeframe]);
+    const window = await resolveWindow(tx, projectId, opts.days ?? TIMEFRAME_DAYS[query.timeframe]);
     const requested = query.engines?.split(",").map((key) => key.trim()).filter((key) => key.length > 0) ?? null;
     // ⚠ `priorFrom`, NOT `from` — THE MEMBERSHIP SPAN COVERS BOTH LEGS.
     //

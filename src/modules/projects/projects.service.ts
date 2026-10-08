@@ -239,6 +239,13 @@ export class ProjectsService {
     return pageFrom(result.rows, pagination.limit, toProjectListItem, (row) => [row.created_at_key, row.id]);
   }
 
+  /** NEW-E-099a — display names for a set of project ids, on the ambient transaction (RLS and the portal scope narrow it). */
+  async namesFor(ids: readonly string[]): Promise<Map<string, string>> {
+    const client = currentTenantStore()!.client;
+    const result = await client.query<{ id: string; name: string }>("SELECT id, name FROM projects WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL", [ids]);
+    return new Map(result.rows.map((row) => [row.id, row.name]));
+  }
+
   /**
    * NEW-B-2 — the Command Center's matrix, whole, for `GET /workspaces/{id}/
    * summary`. FR-DASH-01: one request, no per-project query — this is TWO
