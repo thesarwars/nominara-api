@@ -188,6 +188,7 @@ describe("NEW-D-7 · the saved payment method and the off-session charge (HTTP a
     currency: "USD",
     successUrl: "https://app.test/settings/plan?credit_pack=success",
     cancelUrl: "https://app.test/settings/plan?credit_pack=cancel",
+    saveCard: true,
   };
   const charge = {
     workspaceId: "w1",
@@ -211,6 +212,15 @@ describe("NEW-D-7 · the saved payment method and the off-session charge (HTTP a
     const [params] = create.mock.calls[0] as [{ customer_creation: string; payment_intent_data: { setup_future_usage: string; metadata: Record<string, string> } }];
     expect(params.payment_intent_data.setup_future_usage).toBe("off_session");
     expect(params.customer_creation).toBe("always");
+    expect(params.payment_intent_data.metadata.purchase_id).toBe(packInput.purchaseId);
+  });
+
+  it("owner decision 4 · a credit-pack Checkout for a workspace without auto-top-up saves NO card: no setup_future_usage, no customer_creation", async () => {
+    const create = vi.fn().mockResolvedValue({ id: "cs_1", url: "https://checkout.stripe.test/c/pay/cs_1" });
+    await withClient({ checkout: { sessions: { create } } }).createCreditPackCheckout({ ...packInput, saveCard: false });
+    const [params] = create.mock.calls[0] as [{ customer_creation?: string; payment_intent_data: { setup_future_usage?: string; metadata: Record<string, string> } }];
+    expect(params.payment_intent_data.setup_future_usage).toBeUndefined();
+    expect(params.customer_creation).toBeUndefined();
     expect(params.payment_intent_data.metadata.purchase_id).toBe(packInput.purchaseId);
   });
 

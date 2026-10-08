@@ -499,6 +499,24 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
 
   // ---- AC4: no saved payment method ------------------------------------------------------------
 
+  it("owner decision 4 · the card is saved for off-session use only when the workspace has auto-top-up enabled", async () => {
+    const { workspaceId, owner } = await armed();
+    const buy = () =>
+      harness.app().inject({
+        method: "POST",
+        url: apiUrl("/billing/credit-packs/starter_vault/purchase"),
+        cookies: cookies(owner),
+        headers: { [CSRF_HEADER_NAME]: owner.csrfToken, "content-type": "application/json", "idempotency-key": randomUUID() },
+        payload: {},
+      });
+    gateway.packCheckouts.length = 0;
+    expect((await buy()).statusCode).toBeLessThan(300);
+    expect(gateway.packCheckouts.at(-1)).toMatchObject({ workspaceId, saveCard: true });
+    expect((await put(owner, { enabled: false, pack_key: null, threshold: null, max_per_cycle: null })).statusCode).toBe(200);
+    expect((await buy()).statusCode).toBeLessThan(300);
+    expect(gateway.packCheckouts.at(-1)).toMatchObject({ workspaceId, saveCard: false });
+  });
+
   it("NEW-D-7 AC4 · without a saved payment method the trigger is a no-op that records why: no purchase, no slot, no email, no charge", async () => {
     const { workspaceId } = await armed({ saved: false });
     expect(await service.trigger(workspaceId)).toBe("no_payment_method");
