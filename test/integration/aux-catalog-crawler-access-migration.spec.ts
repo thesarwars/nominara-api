@@ -30,6 +30,17 @@ describe("NEW-C-8 · migration 0070 — crawler_access catalog", () => {
   });
   afterEach(async () => { await client.end(); });
 
+  // Roll back UNTIL 0070 by name, so the test does not depend on 0070 being the newest migration.
+  // Later migrations are undone first; 0070 itself must be the one that is then rolled back.
+  async function rollbackTo0070(): Promise<void> {
+    for (let step = 0; step < 200; step += 1) {
+      const name = await rollbackLast(client, MIGRATIONS_DIR);
+      expect(name, "0070 must be applied on a fully migrated database").not.toBeNull();
+      if (name === MIGRATION) return;
+    }
+    throw new Error(`${MIGRATION} was not reached while rolling back`);
+  }
+
   async function rows(): Promise<{ code: string; category: string; weight: number; rule_version: string; thresholds: Record<string, unknown>; severity_default: string; task_threshold: string; auto_fixable: boolean }[]> {
     return (await client.query("SELECT * FROM aux_rule_catalog WHERE category = 'crawler_access' ORDER BY code")).rows;
   }
@@ -73,7 +84,7 @@ describe("NEW-C-8 · migration 0070 — crawler_access catalog", () => {
   });
 
   it("NEW-C-8 AC3.13 · the demo seed's earlier AUX-R-001 row is taken over (ON CONFLICT DO UPDATE), keeping its id-less PK and findings FK intact", async () => {
-    expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe(MIGRATION);
+    await rollbackTo0070();
     await client.query(
       `INSERT INTO aux_rule_catalog (code, category, title, description, rationale, severity_default, weight, rule_version)
        VALUES ('AUX-R-001','crawler_access','demo','demo','demo','critical',0.3,'1.0.0')`,
@@ -84,7 +95,7 @@ describe("NEW-C-8 · migration 0070 — crawler_access catalog", () => {
   });
 
   it("NEW-C-8 AC3.14 · re-running the up migration is idempotent", async () => {
-    expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe(MIGRATION);
+    await rollbackTo0070();
     await migrateUp(client, MIGRATIONS_DIR);
     expect(await rows()).toHaveLength(7);
   });
@@ -109,7 +120,7 @@ describe("NEW-C-8 · migration 0070 — crawler_access catalog", () => {
        VALUES ($1,$2,$3,'AUX-R-004','low',sha256('f'::bytea),'T','{}'::jsonb,'v1')`,
       [ws, pj, audit],
     );
-    expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe(MIGRATION);
+    await rollbackTo0070();
     const left = (await client.query("SELECT code FROM aux_rule_catalog WHERE category='crawler_access' ORDER BY code")).rows.map((x) => x.code);
     expect(left).toEqual(["AUX-R-004"]);
   });

@@ -7,3 +7,4 @@ export * from "./playbook-response.schema.js";
 export * from "./geo-insights.schema.js";
 export * from "./displacement-event.schema.js";
 export * from "./displacement-response.schema.js";
+export * from "./rendering-quality-response.schema.js";
