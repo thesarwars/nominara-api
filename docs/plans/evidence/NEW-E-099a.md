@@ -96,3 +96,44 @@ RLS-enforced on every fact table. Cost: the entitled/measured join in engineConf
 (b) Portal SELECT policies on workspaces and brand_themes (ADR required for brand_themes, which was deliberately removed from PORTAL_READABLE_TABLES) plus
 a grant on the view and policies on its underlying tables: a migration the story did not name.
 Recommendation: (a). Blocked on disk before either can be proven.
+
+## Finding 1 closed — integration spec now run and GREEN (supersedes every "integration NOT RUN" row above)
+
+The disk rule is satisfied (13 to 18 GiB free at run time), so `test/integration/portal-reads-http.spec.ts` was run on colima
+(`DOCKER_HOST` and `TESTCONTAINERS_RYUK_DISABLED` set). Route (a) from the finding was taken: no migration, no ADR, no new policy.
+
+- RED observed at tip `6ba523a`: `Tests 11 failed | 4 passed (15)`, exit 1. Cause: the services read `workspaces` (timezone, name,
+  scoring version, overrides), `brand_themes`, `project_entitled_engines` and `project_engines`, none of which `nominara_portal`
+  can read, so every portal read was `404 no such project` or an empty body.
+- Fix `08415fe`: `PortalContextInterceptor` reads those facts on the APP pool, in the same short workspace-scoped transaction as the
+  per-request token liveness check (a dead token ends before any is read), via the owning services (`WorkspacesService.portalFacts`,
+  `AgencyService.themeForPortal`, `ProjectsService.portalEngines`), and puts them on `PortalSessionContext.facts`
+  (`src/lib/portal/portal-facts.ts`). `resolveWindow`, `ScorecardsService`, `GrowthMapService` and `MethodologyService.footer` take them
+  as an optional argument; the agency path is unchanged and every fact table is still read on the portal pool under RLS.
+  `ScorecardsService.engineConfig` swaps only its two relation sources (view and override table) for the pre-read rows on the portal path.
+- A second defect surfaced once the reads ran: `findCostFields` matched the overview's own `hide_costs` policy flag, so the overview
+  was a 500 under hide_costs. RED `8124c1c` (1 failed | 22 passed in `portal-view.spec.ts`, exit 1), GREEN in `08415fe`. The exemption is
+  exactly the top-level key `hide_costs` holding a boolean; a figure under that name, or the key nested, still trips the scan.
+- Harness: `test/support/api-harness.ts` `extras` now accepts `imports` (it previously replaced `ApiModule`, so it is merged), and
+  `portal-context-http.spec.ts` imports the three modules the interceptor now depends on. Mechanical, no assertion changed.
+
+### Gates on `08415fe` (exit codes read)
+
+| Command | Result |
+|---|---|
+| `pnpm typecheck` | exit 0 |
+| `pnpm lint` | exit 0 |
+| `pnpm test:unit` | exit 0, 283 files passed | 1 skipped; 3370 tests passed | 1 skipped |
+| `test/integration/portal-reads-http.spec.ts` | exit 0, 15 of 15 (all rows s3, s4, s8, s10 to s16, s22, matrix null path now proven over real HTTP on the real `nominara_portal` role) |
+| `portal-context-http`, `portal-session-http`, `portal-tasks-http`, `share-tokens-http` | exit 0, 10, 18, 14, 16 passed |
+| `scorecards`, `growth-map`, `methodology-footer` integration (agency path unchanged) | exit 0, 29, 14, 11 passed (run before the harness-only edits; no src change since) |
+| `pnpm test:isolation` | not run: known `support_grants` fixture crash, d-admin lane; the merge step runs it. Tenant isolation here is proven by the portal-reads and portal-context specs, which run as `nominara_portal` |
+
+### Updated criteria state
+
+Every row of the Criteria table that read "integration NOT RUN" is now **integration pass** on `08415fe`, except:
+- dangerous-area-auditor second-engineer review: still PENDING (merge step).
+- Observability: the counter `nominara_portal_reads_total` and the redacted `portal.read` log line exist; the integration spec does not assert them. Spans deferred to week 2 (owner decision).
+- Finding 3b (footer `sample_size` under hide_costs): still needs the owner ruling stated above; unchanged.
+- "Rollups only" tension (Decision 1 above): unchanged and still the owner's call.
+- Evidence needing a running real API (live portal against a real stack) is collected in NEW-A-17.
