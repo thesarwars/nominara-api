@@ -137,7 +137,7 @@ export const addonChangeResponseSchema = z
   .strict();
 
 /** `GET /v1/billing/addons`'s list is the cursor envelope's `data`. */
-export const addonListResponseSchema = z.array(addonSchema);
+export const addonListResponseSchema = z.array(addonListItemSchema);
 
 export const addonListQuerySchema = paginationRequestSchema;
 

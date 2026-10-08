@@ -5,7 +5,7 @@ import {
   addonKindSchema,
   addonListQuerySchema,
   addonListResponseSchema,
-  type Addon,
+  type AddonListItem,
   type AddonChangeResponse,
   type AddonCreateRequest,
   type AddonListQuery,
@@ -29,7 +29,7 @@ export class BillingAddonsController {
   @Get()
   @RequirePermission("billing:read")
   @ApiContract({ operationId: "listAddons", querySchema: addonListQuerySchema, responseSchema: addonListResponseSchema, listOf: true })
-  list(@Query(new ZodValidationPipe(addonListQuerySchema)) query: AddonListQuery): Promise<Page<Addon>> {
+  list(@Query(new ZodValidationPipe(addonListQuerySchema)) query: AddonListQuery): Promise<Page<AddonListItem>> {
     return this.service.list(query);
   }
 

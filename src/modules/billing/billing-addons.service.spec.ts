@@ -500,6 +500,22 @@ describe("STORY-076b audit · the two money guards have a test that fails withou
     expect(lockedAtFetch).toBe(true);
   });
 
+  it("lock wait · the workspace lock is waited for at most 3 s (transaction-local), and exceeding it is a retryable 409 with no Stripe call and no intent", async () => {
+    const c = client([
+      [/FROM workspaces w JOIN plans/u, planRow("growth")],
+      [/FROM workspaces WHERE id = \$1 FOR UPDATE/u, () => {
+        throw Object.assign(new Error("canceling statement due to lock timeout"), { code: "55P03" });
+      }],
+    ]);
+    const gw = gateway();
+    const store = intents();
+    await expect(inTenant(c, () => new BillingAddonsService(gw, store.pool).add({ kind: "extra_seat", quantity: 1 }, "k"))).rejects.toMatchObject({ code: "conflict", message: expect.stringMatching(/in progress/u) });
+    const timeout = c.calls.find(({ sql }) => /set_config\('lock_timeout', \$1, true\)/u.test(sql));
+    expect(timeout?.params).toEqual(["3000"]);
+    expect(gw.fetches).toEqual([]);
+    expect(store.state.writes).toEqual([]);
+  });
+
   it("reconcile filter · an event for an OLD subscription id matches no live row (the filter is on the event's subscription, not just the workspace's)", async () => {
     // A database in which the workspace's only live subscription is `sub_current`: a query that
     // does not bind the event's subscription id to the row would find it for ANY id.
@@ -558,10 +574,10 @@ describe("STORY-076b audit · two Stripe lines of one add-on kind are refused (4
     expect(gw.changes).toEqual([]);
   });
 
-  it("AC1 · a duplicate of ANOTHER kind does not block this kind (one line of extra_project still changes)", async () => {
+  it("AC1 · a duplicate of ANOTHER kind does not block this kind (one line of extra_project still changes: 1 held + 2 added = 3)", async () => {
     const gw = twoLines();
     await inTenant(client(addScript), () => new BillingAddonsService(gw, intents().pool).add({ kind: "extra_project", quantity: 2 }, "key-ok"));
-    expect(gw.changes).toEqual([expect.objectContaining({ kind: "extra_project", quantity: 2, existingItemId: "si_p" })]);
+    expect(gw.changes).toEqual([expect.objectContaining({ kind: "extra_project", quantity: 3, existingItemId: "si_p" })]);
   });
 
   it("AC4 · DELETE extra_seat with two held lines is a 409, NO removal is scheduled (it would leave si_b billing), and the money alarm fires", async () => {

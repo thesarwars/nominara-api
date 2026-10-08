@@ -180,6 +180,7 @@ export const subscriptions = pgTable("subscriptions", {
   chargedUnitAmountCents: integer("charged_unit_amount_cents"),
   chargedCurrency: char("charged_currency", { length: 3 }),
   chargedInterval: text("charged_interval"),
+  pendingAddonChanges: jsonb("pending_addon_changes"),
 });
 
 export const usageCounters = pgTable("usage_counters", {

@@ -1,8 +1,18 @@
 import { createHash } from "node:crypto";
 import { Inject, Injectable, Logger } from "@nestjs/common";
-import type { ClientBase } from "pg";
-import { ADDON_MAX_QUANTITY, type Addon, type AddonChangeResponse, type AddonCreateRequest, type AddonListQuery } from "../../../contracts/billing/index.js";
-import { ConflictError, DegradedError, FeatureNotInPlanError, NotFoundError, PreconditionUnmetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import type { ClientBase, Pool } from "pg";
+import {
+  ADDON_MAX_QUANTITY,
+  pendingAddonChangesSchema,
+  type AddonChangeResponse,
+  type AddonCreateRequest,
+  type AddonListItem,
+  type AddonListQuery,
+  type PendingAddonChange,
+  type PendingAddonChanges,
+} from "../../../contracts/billing/index.js";
+import { ConflictError, DegradedError, FeatureNotInPlanError, IdempotencyConflictError, NotFoundError, PreconditionUnmetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { PG_POOL } from "../../db/pg-pool.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
 import type { Entitlement } from "../../db/seed/plan-entitlements.js";
@@ -16,7 +26,7 @@ import { ADDON_KINDS, resolveEntitlements, type AddonKind } from "../../lib/enti
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
-import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 
 // STORY-076b / STORY-076 AC10-AC13 — the one owner of `subscription_addons`.
@@ -29,15 +39,19 @@ import { AuditChainService } from "../audit/audit-chain.service.js";
 // (STORY-075), so an add-on is never granted on a say-so and never lost to an
 // event arriving out of order.
 //
-// ⚠ A QUANTITY IS A SET, NOT AN INCREMENT, AND THE REQUEST IS THE TOTAL. The
-// request's `quantity` is the desired total, fixed by the caller, so a retry
-// after Stripe applied the change (reply lost, timeout, a later commit failure)
-// asks for the same number and cannot add a second unit. The held quantity is
-// read from a FRESH fetch (never the local row, which lags the webhook); a total
-// equal to it is a no-op and a lower one is a 409 (removal is DELETE). The Stripe
-// idempotency key is derived from the workspace and the request's Idempotency-Key,
-// so a retry replays Stripe's own answer. Two requests are serialised by the
-// workspace row lock.
+// ⚠ A POST ADDS, AND A RETRY MUST NOT ADD AGAIN (owner decision, 2026-10-08). The
+// request's `quantity` is the number of units to add to the held quantity, which
+// is read from a FRESH Stripe fetch (never the local row, which lags the webhook).
+// An increment is not idempotent by itself: if Stripe applied the change and the
+// reply was lost, "held + quantity" computed again on the retry charges a second
+// unit. So the chain is Idempotency-Key -> STORED INTENT -> Stripe key: the first
+// time a key is seen, the target total (held + quantity) and a fresh Stripe
+// idempotency key are committed to `subscriptions.pending_addon_changes` in their
+// own short transaction BEFORE Stripe is asked; a retry under the same key reads
+// that intent and re-asks for the STORED total with the STORED key. If Stripe
+// already holds the stored total there is nothing to ask. The same key with a
+// different kind or quantity is 409 idempotency_conflict. Two requests are
+// serialised by the workspace row lock.
 //
 // ⚠ REMOVAL FOLLOWS THE PERIOD-END POLICY (AC13), AND STORY-077 IS NOT BUILT.
 // With no downgrade/retention machinery to call, the removal is scheduled at the
@@ -61,7 +75,14 @@ interface SubscriptionRow {
   provider: string;
   stripe_subscription_id: string;
   current_period_end: Date;
+  pending_addon_changes: unknown;
 }
+
+/** The most intents kept per subscription; the oldest are dropped. Stripe forgets a key after 24 hours. */
+const MAX_PENDING_INTENTS = 20;
+
+/** The longest `add` waits for the workspace row lock before answering a retryable 409. */
+const ADD_LOCK_WAIT_MS = 3_000;
 
 interface AddonRow {
   id: string;
@@ -100,38 +121,47 @@ const ISO_MS = `'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'`;
 export class BillingAddonsService {
   private readonly logger = new Logger(BillingAddonsService.name);
 
-  constructor(@Inject(STRIPE_GATEWAY) private readonly gateway: StripeGateway) {}
+  constructor(
+    @Inject(STRIPE_GATEWAY) private readonly gateway: StripeGateway,
+    @Inject(PG_POOL) private readonly pool: Pool,
+  ) {}
 
-  /** `GET /v1/billing/addons` — the add-ons in force, with the grant each unit carries. */
-  async list(query: AddonListQuery): Promise<Page<Addon>> {
+  /**
+   * `GET /v1/billing/addons` — the purchasable catalog with prices, one entry per kind, and what the
+   * workspace holds of each (owner decision, 2026-10-08). A kind not in force is quantity 0.
+   */
+  async list(query: AddonListQuery): Promise<Page<AddonListItem>> {
     const { client, workspaceId } = this.tenant();
     const after = query.cursor === undefined ? null : afterKind(query.cursor);
     const plan = await this.plan(client, workspaceId);
     // No workspace_id predicate: RLS scopes this to the context's workspace.
-    const result = await client.query<AddonRow>(
-      `SELECT id, kind, quantity, unit_price_usd::text, stripe_subscription_item_id,
-              to_char(active_from AT TIME ZONE 'UTC', ${ISO_MS}) AS active_from,
-              to_char(active_until AT TIME ZONE 'UTC', ${ISO_MS}) AS active_until
-         FROM subscription_addons
-        WHERE active_until IS NULL AND ($1::text IS NULL OR kind > $1)
-        ORDER BY kind
-        LIMIT $2`,
-      [after, query.limit + 1],
-    );
-    return pageFrom(
-      result.rows,
-      query.limit,
-      (row): Addon => ({
-        id: row.id,
-        kind: row.kind,
-        quantity: row.quantity,
-        unit_price_usd: row.unit_price_usd,
-        grant: addonGrant(plan.entitlements, row.kind),
-        active_from: row.active_from,
-        active_until: row.active_until,
-      }),
-      (row) => [row.kind],
-    );
+    const held = (
+      await client.query<AddonRow>(
+        `SELECT id, kind, quantity, unit_price_usd::text, stripe_subscription_item_id,
+                to_char(active_from AT TIME ZONE 'UTC', ${ISO_MS}) AS active_from,
+                to_char(active_until AT TIME ZONE 'UTC', ${ISO_MS}) AS active_until
+           FROM subscription_addons
+          WHERE active_until IS NULL`,
+      )
+    ).rows;
+    const kinds = [...ADDON_KINDS].sort().filter((kind) => after === null || kind > after);
+    const items = kinds.slice(0, query.limit + 1).map((kind): AddonListItem => {
+      const entry = ADDON_CATALOG[kind];
+      const row = held.find((r) => r.kind === kind);
+      return {
+        kind,
+        display_name: entry.displayName,
+        // The price in force for a held add-on is the one Stripe charges it at; the catalog's otherwise.
+        unit_price_usd: row?.unit_price_usd ?? entry.monthlyUsd,
+        purchasable: isFeatureGranted(plan.entitlements[entry.allowedKey]?.value ?? null),
+        quantity: row?.quantity ?? 0,
+        grant: addonGrant(plan.entitlements, kind),
+        id: row?.id ?? null,
+        active_from: row?.active_from ?? null,
+        active_until: row?.active_until ?? null,
+      };
+    });
+    return pageFrom(items, query.limit, (item) => item, (item) => [item.kind]);
   }
 
   /** `POST /v1/billing/addons` — sets the add-on to the requested total; pro-rated by Stripe. */
@@ -148,12 +178,29 @@ export class BillingAddonsService {
       throw new FeatureNotInPlanError({ details: { key: entry.allowedKey, min_plan: await this.minimumPlan(client, entry.allowedKey) } });
     }
 
-    await client.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    await this.lockWorkspace(client, workspaceId, request.kind);
     const subscription = await this.liveSubscription(client, workspaceId);
     // Stripe requires every item of a subscription to share one interval, and only a monthly add-on price is decided.
     if (subscription.billing_interval !== "monthly") {
       incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "annual_unsupported" });
       throw new ConflictError({ message: "add-ons are available on monthly subscriptions only" });
+    }
+
+    const intents = pendingAddonChangesSchema.parse(subscription.pending_addon_changes ?? {});
+    const mapKey = intentKey(idempotencyKey);
+    const stored = intents[mapKey];
+    // The same Idempotency-Key must mean the same purchase: a different one is the caller's bug, not a retry.
+    if (stored !== undefined && (stored.kind !== request.kind || stored.quantity !== request.quantity)) {
+      incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "idempotency_conflict" });
+      throw new IdempotencyConflictError({
+        message: "this Idempotency-Key was already used for a different add-on request",
+        // Hashes and a time only: the first request may have been another member's.
+        details: {
+          key_hash: mapKey,
+          original_request_hash: createHash("sha256").update(`${stored.kind}:${String(stored.quantity)}`).digest("hex"),
+          original_recorded_at: stored.created_at,
+        },
+      });
     }
 
     try {
@@ -162,46 +209,50 @@ export class BillingAddonsService {
       this.refuseDuplicateLines(fetched.raw, request.kind, workspaceId);
       const held = addonItemsFromSubscription(fetched.raw).find((item) => item.kind === request.kind);
       const heldQuantity = held?.quantity ?? 0;
-      const total = request.quantity;
-      if (total > ADDON_MAX_QUANTITY) {
+      // A retry asks for the STORED total, never "held + quantity" again: that would add a second unit.
+      const target = stored?.target_total ?? heldQuantity + request.quantity;
+      if (stored === undefined && target > ADDON_MAX_QUANTITY) {
         incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "over_cap" });
         throw new ValidationFailedError({
           message: "too many units",
           details: { issues: [{ path: ["quantity"], message: `a workspace can hold at most ${String(ADDON_MAX_QUANTITY)} of one add-on` }] },
         });
       }
-      if (total < heldQuantity) {
-        incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "below_held" });
-        throw new ConflictError({ message: "the requested total is below what this workspace holds: remove the add-on instead" });
+      // Stripe already holds the total (the first attempt landed): nothing to ask of Stripe, nothing to charge.
+      if (heldQuantity >= target) {
+        incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "replayed_applied" });
+        this.logger.log({ message: "add-on change already applied; retry answered without a Stripe call", workspace_id: workspaceId, kind: request.kind });
+        return { kind: request.kind, status: "pending", quantity_requested: target, effective: "immediate", effective_at: null, grant: addonGrant(plan.entitlements, request.kind) };
       }
-      // Already at the total (a retry whose first attempt landed): nothing to ask of Stripe, nothing to charge.
-      if (total > heldQuantity) {
-        // ⚠ A SCHEDULED REMOVAL FREEZES THE NEXT PHASE'S ITEMS (audit). The schedule's second phase was
-        // built from the items as they were at DELETE time; a quantity changed now would be silently
-        // reverted at renewal (and the seat check of AC12 never runs for it). Refuse, with the reason,
-        // until Stripe releases the schedule. Whether Stripe even accepts a direct item change on a
-        // scheduled subscription is collected against the sandbox (NEW-A-17).
-        const schedule = (fetched.raw as { schedule?: unknown }).schedule;
-        if (schedule !== null && schedule !== undefined) {
-          incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "removal_scheduled_conflict" });
-          throw new ConflictError({ message: "an add-on removal is scheduled for the end of this billing period: add-ons cannot be changed until it has taken effect" });
-        }
-        await this.gateway.changeAddonQuantity({
-          subscriptionId: subscription.stripe_subscription_id,
-          kind: request.kind,
-          quantity: total,
-          existingItemId: held?.itemId ?? null,
-          productName: `Nominara ${entry.displayName}`,
-          unitAmountCents: toCents(entry.monthlyUsd),
-          currency: "usd",
-          interval: "month",
-          proration: "create_prorations",
-          idempotencyKey: addonIdempotencyKey(workspaceId, request.kind, idempotencyKey),
-        });
+      // ⚠ A SCHEDULED REMOVAL FREEZES THE NEXT PHASE'S ITEMS (audit). The schedule's second phase was
+      // built from the items as they were at DELETE time; a quantity changed now would be silently
+      // reverted at renewal (and the seat check of AC12 never runs for it). Refuse, with the reason,
+      // until Stripe releases the schedule. Whether Stripe even accepts a direct item change on a
+      // scheduled subscription is collected against the sandbox (NEW-A-17).
+      const schedule = (fetched.raw as { schedule?: unknown }).schedule;
+      if (schedule !== null && schedule !== undefined) {
+        incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "removal_scheduled_conflict" });
+        throw new ConflictError({ message: "an add-on removal is scheduled for the end of this billing period: add-ons cannot be changed until it has taken effect" });
       }
+      // ⚠ COMMITTED BEFORE STRIPE IS ASKED, on its own connection: the request's transaction commits
+      // only after the response is built, and a request that dies after Stripe applied the change
+      // must not take the record of what it asked for with it.
+      const intent = stored ?? (await this.recordIntent(workspaceId, mapKey, intents, { kind: request.kind, quantity: request.quantity, target }));
+      await this.gateway.changeAddonQuantity({
+        subscriptionId: subscription.stripe_subscription_id,
+        kind: request.kind,
+        quantity: intent.target_total,
+        existingItemId: held?.itemId ?? null,
+        productName: `Nominara ${entry.displayName}`,
+        unitAmountCents: toCents(entry.monthlyUsd),
+        currency: "usd",
+        interval: "month",
+        proration: "create_prorations",
+        idempotencyKey: intent.stripe_idempotency_key,
+      });
       incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "requested" });
-      this.logger.log({ message: "add-on change requested", workspace_id: workspaceId, kind: request.kind, quantity_requested: total });
-      return { kind: request.kind, status: "pending", quantity_requested: total, effective: "immediate", effective_at: null, grant: addonGrant(plan.entitlements, request.kind) };
+      this.logger.log({ message: "add-on change requested", workspace_id: workspaceId, kind: request.kind, quantity_requested: intent.target_total });
+      return { kind: request.kind, status: "pending", quantity_requested: intent.target_total, effective: "immediate", effective_at: null, grant: addonGrant(plan.entitlements, request.kind) };
     } catch (error) {
       throw this.upstream(error, request.kind);
     }
@@ -341,6 +392,66 @@ export class BillingAddonsService {
   }
 
   /**
+   * ⚠ THE LOCK WAIT IS BOUNDED. `add` commits its intent on a SECOND pooled connection while it holds
+   * the lock; requests queued behind it each hold a connection of their own. With enough of them queued
+   * the pool is empty, the holder waits for a connection no waiter will give back, and every one of
+   * them hangs. A wait of at most `ADD_LOCK_WAIT_MS` makes that a retryable 409 instead of a hang: the
+   * waiters give their connections back and the holder proceeds. The setting is transaction-local.
+   */
+  private async lockWorkspace(client: ClientBase, workspaceId: string, kind: AddonKind): Promise<void> {
+    await client.query("SELECT set_config('lock_timeout', $1, true)", [String(ADD_LOCK_WAIT_MS)]);
+    try {
+      await client.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    } catch (error) {
+      if ((error as { code?: string }).code !== "55P03") throw error;
+      incrementCounter("nominara_billing_addon_change_total", { kind, outcome: "lock_wait_exceeded" });
+      throw new ConflictError({ message: "another billing change for this workspace is in progress: retry shortly" });
+    }
+    await client.query("SELECT set_config('lock_timeout', '0', true)");
+  }
+
+  /**
+   * Commits the intent for this Idempotency-Key in its own short transaction and returns it. Called with
+   * the workspace row lock held by the request, so the read-modify-write of the map cannot interleave
+   * with another purchase's. The map is capped, dropping the oldest, so the column cannot grow without bound.
+   */
+  private async recordIntent(
+    workspaceId: string,
+    mapKey: string,
+    current: PendingAddonChanges,
+    change: { readonly kind: AddonKind; readonly quantity: number; readonly target: number },
+  ): Promise<PendingAddonChange> {
+    const { actorId } = this.tenant();
+    const id = uuidV7();
+    const intent: PendingAddonChange = {
+      id,
+      kind: change.kind,
+      quantity: change.quantity,
+      target_total: change.target,
+      stripe_idempotency_key: `addon-${id}`,
+      created_at: new Date().toISOString(),
+    };
+    const kept = Object.entries(current)
+      .sort(([, x], [, y]) => (x.created_at < y.created_at ? -1 : x.created_at > y.created_at ? 1 : 0))
+      .slice(-(MAX_PENDING_INTENTS - 1));
+    const next: PendingAddonChanges = { ...Object.fromEntries(kept), [mapKey]: intent };
+    const client = await this.pool.connect();
+    try {
+      await withTenantContext(client, { workspaceId, actorId }, async (tx) => {
+        const result = await tx.query(
+          "UPDATE subscriptions SET pending_addon_changes = $2::jsonb, updated_at = now() WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')",
+          [workspaceId, JSON.stringify(next)],
+        );
+        // Fail closed: with no record committed, Stripe must not be asked.
+        if (result.rowCount !== 1) throw new PreconditionUnmetError({ message: "this workspace has no billing subscription yet: start one first" });
+      });
+    } finally {
+      client.release();
+    }
+    return intent;
+  }
+
+  /**
    * ⚠ MONEY ALARM. Two Stripe lines of one kind (a create that timed out but was applied, then
    * retried under a new Idempotency-Key) make "the" item ambiguous: a quantity sent to one leaves
    * the customer billed for both, and a removal of one leaves the other billing forever. Neither
@@ -393,7 +504,7 @@ export class BillingAddonsService {
 
   private async liveSubscription(client: ClientBase, workspaceId: string): Promise<SubscriptionRow> {
     const result = await client.query<SubscriptionRow>(
-      `SELECT plan_key, billing_interval, provider, stripe_subscription_id, current_period_end
+      `SELECT plan_key, billing_interval, provider, stripe_subscription_id, current_period_end, pending_addon_changes
          FROM subscriptions WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')`,
       [workspaceId],
     );
@@ -426,9 +537,9 @@ export class BillingAddonsService {
   }
 }
 
-/** Stripe keys are <= 255 chars: hash the caller's key so its length and content never reach Stripe. */
-function addonIdempotencyKey(workspaceId: string, kind: AddonKind, requestKey: string): string {
-  return `addon-${workspaceId}-${kind}-${createHash("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
+/** The map key an Idempotency-Key is stored under: hashed, so the caller's key (and its length) is never persisted. */
+function intentKey(requestKey: string): string {
+  return createHash("sha256").update(requestKey).digest("hex").slice(0, 32);
 }
 
 function afterKind(cursor: string): AddonKind {

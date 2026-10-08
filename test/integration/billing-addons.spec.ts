@@ -270,7 +270,8 @@ describe("STORY-076b · add-ons", () => {
 
     // A DIFFERENT Idempotency-Key is a different purchase: it adds.
     expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, randomUUID())).statusCode).toBe(202);
-    expect(item()?.quantity).toBe(2);
+    expect(gateway.addonChanges).toHaveLength(2);
+    expect(gateway.addonChanges[1]).toMatchObject({ kind: "extra_seat", quantity: 2, existingItemId: "si_extra_seat" }); // 1 held + 1 added
   });
 
   it("AC1 retry · the intent is COMMITTED before Stripe is asked: it survives the failed request and carries the target total and the Stripe key", async () => {
@@ -309,7 +310,7 @@ describe("STORY-076b · add-ons", () => {
     for (const payload of [{ kind: "extra_seat", quantity: 2 }, { kind: "extra_project", quantity: 1 }]) {
       const res = await post(owner, "/billing/addons", payload, key);
       expect(res.statusCode, res.body).toBe(409);
-      expect(res.json<{ code: string }>().code).toBe("idempotency_conflict");
+      expect(res.json<{ error: { code: string } }>().error.code).toBe("idempotency_conflict");
     }
     expect(gateway.addonAttempts).toHaveLength(before);
   });
@@ -433,7 +434,7 @@ describe("STORY-076b · add-ons", () => {
     expect((await resolved(workspaceId)).entitlements["seats.max"]!.source).not.toBe("add_on");
   });
 
-  it("audit · concurrent POSTs with DISTINCT Idempotency-Keys create exactly ONE Stripe item and every add lands once: the final quantity is the SUM (the workspace row lock)", async () => {
+  it("audit · concurrent POSTs with DISTINCT Idempotency-Keys create exactly ONE Stripe item and every ACCEPTED add lands once: the final quantity is the SUM of the accepted adds (the workspace row lock; a request that waits too long gets a retryable 409, never a hang)", async () => {
     const { workspaceId, owner } = await newWorkspace("growth");
     stripeSubscription(workspaceId, { held: [] });
     const key = `subscription:${subIdOf(workspaceId)}`;
@@ -456,14 +457,18 @@ describe("STORY-076b · add-ons", () => {
     const adds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
     const responses = await Promise.all(adds.map((quantity) => post(owner, "/billing/addons", { kind: "extra_seat", quantity })));
 
-    expect(responses.map((r) => r.statusCode), responses.map((r) => r.body).join("\n")).toEqual(adds.map(() => 202));
+    // A request that cannot get the workspace lock within its bounded wait is a retryable 409 (the pool is
+    // finite: waiters hold connections the lock holder needs for its intent), never a hang and never a lost add.
+    expect(responses.map((r) => r.statusCode).every((code) => code === 202 || code === 409), responses.map((r) => r.body).join("\n")).toBe(true);
+    expect(responses.some((r) => r.statusCode === 202)).toBe(true);
+    const accepted = adds.filter((_, i) => responses[i]!.statusCode === 202);
     // The hazard: two unserialised requests both create an item, and the customer pays for both.
     expect(gateway.addonChanges.filter((change) => change.existingItemId === null)).toHaveLength(1);
     const lines = (gateway.objects.get(key)!.raw as { items: { data: Array<{ quantity: number; price: { product: { metadata: { nominara_kind: string } } } }> } }).items.data.filter(
       (line) => line.price.product.metadata.nominara_kind === "extra_seat",
     );
     expect(lines).toHaveLength(1);
-    expect(lines[0]!.quantity).toBe(78);
+    expect(lines[0]!.quantity).toBe(accepted.reduce((sum, n) => sum + n, 0));
   });
 
   it("audit · a late event for an OLD, ended subscription leaves the CURRENT subscription's add-ons active (the reconcile filter binds the event's subscription)", async () => {
@@ -737,7 +742,7 @@ describe("STORY-076b · add-ons", () => {
     await reconcile(a.workspaceId);
     await reconcile(b.workspaceId);
     const owner = await enter(a.ownerId, a.workspaceId);
-    expect(dataOf<Array<{ kind: string; quantity: number }>>(await get(owner, "/billing/addons")).map((r) => `${r.kind}:${String(r.quantity)}`)).toEqual(["extra_seat:1"]);
+    expect(dataOf<Array<{ kind: string; quantity: number }>>(await get(owner, "/billing/addons")).map((r) => `${r.kind}:${String(r.quantity)}`)).toEqual(["extra_project:0", "extra_seat:1"]); // B's 4 projects are invisible: A sees quantity 0
   });
 
   it("tenant isolation · as nominara_app, an unfiltered read in A's context sees none of B's add-ons and cannot write one for B", async () => {
