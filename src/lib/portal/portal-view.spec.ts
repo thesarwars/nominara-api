@@ -104,6 +104,12 @@ describe("NEW-E-099a · toPortalGrowthMap", () => {
 });
 
 describe("NEW-E-099a · findCostFields (the hide_costs key scan)", () => {
+  it("NEW-E-099a audit · the overview's own hide_costs policy flag (a boolean at the top level) is not a cost field, but a cost value under that name is", () => {
+    expect(findCostFields({ hide_costs: true, hide_competitors: false })).toEqual([]);
+    expect(findCostFields({ hide_costs: 12.5 })).toEqual(["hide_costs"]);
+    expect(findCostFields({ projects: [{ hide_costs: true }] })).toEqual(["projects[0].hide_costs"]);
+  });
+
   it("STORY-098 s12 · finds quota, credit, cost and capture-count keys at any depth, with their paths", () => {
     const found = findCostFields({ a: { quota_used: 1, nested: [{ credits_remaining: 2 }] }, cells_total: 3, cost_usd: 4, price: 1 });
     expect(found).toEqual(expect.arrayContaining(["a.quota_used", "a.nested[0].credits_remaining", "cells_total", "cost_usd", "price"]));
