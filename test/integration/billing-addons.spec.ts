@@ -335,6 +335,117 @@ describe("STORY-076b · add-ons", () => {
     expect(gateway.addonChanges).toHaveLength(0);
   });
 
+  // ---- checkpoint-3 ADV-1: applied-ness is decided from a marker, never from comparing quantities ------
+
+  const seatQuantity = (workspaceId: string): number => {
+    const raw = gateway.objects.get(`subscription:${subIdOf(workspaceId)}`)!.raw as { items: { data: Array<{ id: string; quantity: number }> } };
+    return raw.items.data.find((l) => l.id === "si_extra_seat")?.quantity ?? 0;
+  };
+  /** The Stripe fake applying a change the way Stripe does, replaying a repeated idempotency key. */
+  function stripeApplies(workspaceId: string): void {
+    const seen = new Set<string>();
+    vi.spyOn(gateway, "changeAddonQuantity").mockImplementation((input) => {
+      gateway.addonAttempts.push(input);
+      if (seen.has(input.idempotencyKey)) return Promise.resolve();
+      seen.add(input.idempotencyKey);
+      gateway.addonChanges.push(input);
+      const raw = gateway.objects.get(`subscription:${subIdOf(workspaceId)}`)!.raw as { items: { data: Array<Record<string, unknown>> } };
+      const existing = raw.items.data.find((line) => line.id === input.existingItemId);
+      if (existing !== undefined) existing.quantity = input.quantity;
+      else
+        raw.items.data.push({
+          id: `si_${input.kind}`,
+          quantity: input.quantity,
+          current_period_start: T0,
+          current_period_end: PERIOD_END,
+          price: { id: "price_seat", unit_amount: input.unitAmountCents, currency: "usd", recurring: { interval: "month" }, product: { metadata: { nominara_kind: input.kind } } },
+        });
+      return Promise.resolve();
+    });
+  }
+
+  it("ADV-1 · a retried purchase whose first attempt failed is never answered 202 unsent: every ACCEPTED +1 lands once (two accepted +1 purchases, two seats)", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const keyA = randomUUID();
+    const keyB = randomUUID();
+    gateway.failAddonWith = new StripeUpstreamError(504); // applies nothing
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA)).statusCode).toBe(503);
+    gateway.failAddonWith = undefined;
+    stripeApplies(workspaceId);
+
+    const b = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyB);
+    const retryA = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA);
+    const accepted = [b, retryA].filter((r) => r.statusCode === 202).length;
+    expect([b.statusCode, retryA.statusCode].every((code) => code === 202 || code === 409), `${b.body} ${retryA.body}`).toBe(true);
+    expect(retryA.statusCode, retryA.body).toBe(202);
+    expect(seatQuantity(workspaceId), "the retried purchase was answered 202 but never sent to Stripe").toBe(accepted);
+  });
+
+  it("ADV-1 · A asks +2, B adds +1, A retries: A never sets a stale lower total, and the final quantity is the SUM of the accepted adds", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const keyA = randomUUID();
+    gateway.failAddonWith = new StripeUpstreamError(504);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 }, keyA)).statusCode).toBe(503);
+    gateway.failAddonWith = undefined;
+    stripeApplies(workspaceId);
+
+    const b = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 });
+    const retryA = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 }, keyA);
+    expect(retryA.statusCode, retryA.body).toBe(202);
+    const acceptedUnits = (b.statusCode === 202 ? 1 : 0) + 2;
+    expect(seatQuantity(workspaceId)).toBe(acceptedUnits);
+    // Stripe's quantity never moves DOWN across the sequence.
+    const sent = gateway.addonChanges.map((c) => c.quantity);
+    expect(sent).toEqual([...sent].sort((x, y) => x - y));
+  });
+
+  it("ADV-1 · a new purchase while an earlier one for the same kind is unresolved is a 409 and Stripe is not called; the earlier one's retry then lands", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const keyA = randomUUID();
+    gateway.failAddonWith = new StripeUpstreamError(504);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA)).statusCode).toBe(503);
+    gateway.failAddonWith = undefined;
+    stripeApplies(workspaceId);
+
+    const b = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 });
+    expect(b.statusCode, b.body).toBe(409);
+    expect(gateway.addonChanges).toEqual([]);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA)).statusCode).toBe(202);
+    expect(seatQuantity(workspaceId)).toBe(1);
+    // Resolved: a new purchase is accepted again and adds on top.
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(202);
+    expect(seatQuantity(workspaceId)).toBe(2);
+  });
+
+  it("ADV-1 · a SETTLED purchase retried after another purchase moved the quantity is answered without a Stripe call and does not lower the total", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    stripeApplies(workspaceId);
+    const keyA = randomUUID();
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA)).statusCode).toBe(202);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(202);
+    const calls = gateway.addonAttempts.length;
+    const retry = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA);
+    expect(retry.statusCode, retry.body).toBe(202);
+    expect(gateway.addonAttempts).toHaveLength(calls);
+    expect(seatQuantity(workspaceId)).toBe(2);
+  });
+
+  it("ADV-1 · a purchase Stripe REJECTED outright (4xx) is released: it does not block the next purchase, which derives a different Stripe key", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    gateway.failAddonWith = new StripeUpstreamError(400);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(503);
+    gateway.failAddonWith = undefined;
+    stripeApplies(workspaceId);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(202);
+    expect(seatQuantity(workspaceId)).toBe(1);
+    expect(gateway.addonAttempts[0]!.idempotencyKey).not.toBe(gateway.addonAttempts[1]!.idempotencyKey);
+  });
+
   it("AC1 · request validation: quantity 0, 101, a fractional quantity and an unknown kind are 400s; the Idempotency-Key is required", async () => {
     const { owner } = await newWorkspace("growth");
     for (const payload of [{ kind: "extra_seat", quantity: 0 }, { kind: "extra_seat", quantity: 101 }, { kind: "extra_seat", quantity: 1.5 }, { kind: "extra_gpu", quantity: 1 }, { kind: "extra_seat" }]) {
