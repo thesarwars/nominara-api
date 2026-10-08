@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { Logger } from "@nestjs/common";
+import { Logger, type ExecutionContext } from "@nestjs/common";
+import type { Reflector } from "@nestjs/core";
 import { Pool } from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { creditPackPurchaseResponseSchema, creditPackSchema } from "../../contracts/billing/index.js";
@@ -7,7 +8,9 @@ import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { STRIPE_GATEWAY, StripeUpstreamError } from "../../src/lib/billing/stripe/stripe-gateway.js";
-import { incrementDailyCounter } from "../../src/lib/usage/daily-cap.js";
+import { DailyCapGuard } from "../../src/api/guards/daily-cap.guard.js";
+import { PG_POOL } from "../../src/db/pg-pool.js";
+import { EntitlementResolver } from "../../src/lib/entitlements/entitlement-resolver.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
@@ -211,6 +214,8 @@ describe("STORY-076a · credit packs", () => {
     expect((await purchase(owner, "starter_vault")).statusCode).toBe(503);
     // The row is committed before Stripe is called (audit blocker), so the outage leaves it `failed`, never `pending`.
     expect((await harness.db().query("SELECT 1 FROM credit_purchases WHERE workspace_id = $1 AND status = 'pending'", [workspaceId])).rowCount).toBe(0);
+    const statuses = (await harness.db().query<{ status: string }>("SELECT status FROM credit_purchases WHERE workspace_id = $1 ORDER BY created_at", [workspaceId])).rows;
+    expect(statuses[0], "the first, upstream-failed attempt is positively `failed`").toEqual({ status: "failed" });
   });
 
   // ---- NEW-D-2 audit · a payable session must never outlive its purchase row ----------------------
@@ -260,8 +265,10 @@ describe("STORY-076a · credit packs", () => {
     const { owner } = await newWorkspace();
     const codes: number[] = [];
     for (let i = 0; i < 8; i += 1) codes.push((await purchase(owner, "starter_vault")).statusCode);
-    expect(codes).toContain(429);
-    expect(codes.filter((c) => c === 200).length).toBeLessThanOrEqual(5);
+    // The route class bursts at 2 (rate-limit defaults); the 5/hour user and 10/hour workspace
+    // limits themselves are pinned in test/unit/rate-limit-buckets.spec.ts. Exact, not "at most":
+    // a guard removed from the route would make this 8 x 200.
+    expect(codes).toEqual([200, 200, 429, 429, 429, 429, 429, 429]);
   });
 
   // ---- scenario 3 ------------------------------------------------------------------------------
@@ -382,16 +389,33 @@ describe("STORY-076a · credit packs", () => {
 
   // ---- scenario 5 ------------------------------------------------------------------------------
 
-  it("scenario 5 · on a daily-capped tier, a purchase followed by exceeding the daily cap is still refused, and the counter is untouched by the purchase", async () => {
+  it("scenario 5 · on a daily-capped tier, a purchase followed by exceeding the daily cap is still refused BY DailyCapGuard at the tier's resolved limit, and the counter is untouched by the purchase", async () => {
     const { workspaceId, owner } = await newWorkspace();
-    const db = harness.db();
-    for (let i = 0; i < 3; i += 1) expect(await incrementDailyCounter(db, workspaceId, "lookup", 3)).not.toBeNull();
+    // The REAL guard, the REAL resolver and the tier's own limit (free:
+    // credits.lookups_per_day_max = 3) -- the test chooses no limit of its own.
+    const guard = new DailyCapGuard(
+      { getAllAndOverride: () => "lookup" } as unknown as Reflector,
+      harness.app().get(EntitlementResolver),
+      harness.app().get<Pool>(PG_POOL),
+    );
+    const request = { tenant: { workspaceId } };
+    const context = {
+      getHandler: () => undefined,
+      getClass: () => undefined,
+      switchToHttp: () => ({ getRequest: () => request, getResponse: () => ({ header: () => undefined }) }),
+    } as unknown as ExecutionContext;
+    for (let i = 0; i < 3; i += 1) expect(await guard.canActivate(context)).toBe(true);
+
     const id = await startPurchase(owner);
     const { sessionId } = stripePaid(workspaceId, id);
-    await settle(sessionId);
-    expect((await wallet(workspaceId))?.purchased_balance).toBe(1000);
-    expect(await incrementDailyCounter(db, workspaceId, "lookup", 3)).toBeNull();
-    const counter = await db.query("SELECT used_count FROM credit_daily_counters WHERE workspace_id = $1 AND action_code = 'lookup'", [workspaceId]);
+    expect((await settle(sessionId)).statusCode).toBe(200);
+    expect((await wallet(workspaceId))?.purchased_balance, "credits really landed").toBe(1000);
+
+    await expect(guard.canActivate(context), "1000 purchased credits do not lift the daily cap").rejects.toMatchObject({
+      code: "daily_limit_reached",
+      details: { action_code: "lookup", used: 3, limit: 3 },
+    });
+    const counter = await harness.db().query("SELECT used_count FROM credit_daily_counters WHERE workspace_id = $1 AND action_code = 'lookup'", [workspaceId]);
     expect(counter.rows[0].used_count).toBe(3);
   });
 
