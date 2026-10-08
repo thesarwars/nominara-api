@@ -59,7 +59,7 @@ describe("NEW-C-13 · lever ranking (pure)", () => {
   });
 
   it("[L4] an insufficient analysis is never promoted and carries no lever", () => {
-    const out = rankLevers([row("sentiment", [], { sufficient: false }), row("entity", [act("a", "info")])]);
+    const out = rankLevers([row("sentiment", [act("x", "critical")], { sufficient: false }), row("entity", [act("a", "info")])]);
     expect(rankOf(out, "sentiment")).toBeNull();
     expect(rankOf(out, "entity")).toBe(1);
   });

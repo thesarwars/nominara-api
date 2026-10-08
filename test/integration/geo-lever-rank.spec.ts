@@ -132,6 +132,8 @@ describe("NEW-C-13 · Top Three Levers (persisted)", () => {
 
   it("[C13-7] tenant isolation under nominara_app: another workspace's ranking pass changes none of this project's rows", async () => {
     await refresh();
+    // A stale state a correct pass WOULD repair; only the owner of the rows may repair it.
+    await db.query("UPDATE geo_analyses SET lever_rank = NULL WHERE analysis = 'sentiment' AND window_days = 30");
     const before = await rows();
     const other = await makeProject();
     await db.query("SET ROLE nominara_app");

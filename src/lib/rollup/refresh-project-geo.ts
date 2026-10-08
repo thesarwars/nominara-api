@@ -2,6 +2,7 @@ import type { ClientBase } from "pg";
 import { Logger } from "@nestjs/common";
 import type { GeoAnalysisWrite } from "../../../contracts/analytics/index.js";
 import { writeGeoAnalysis } from "../geo/persist-analysis.js";
+import { rankGeoLevers } from "../geo/lever-rank.js";
 import { buildSentiment, loadSentimentInput } from "../geo/sentiment.js";
 import { buildStructure, loadStructureInput, windowStartFor } from "../geo/structure.js";
 import { incrementCounter } from "../telemetry/metrics.js";
@@ -63,6 +64,9 @@ export async function refreshProjectGeo(
     brand_mentions: sentiment.evidence_cells,
     window_days: windowDays,
   });
+
+  // STORY-062 / NEW-C-13 — rank the Top Three Levers across every analysis persisted for this window.
+  await rankGeoLevers(tx, projectId, persisted.window_start, windowDays);
   return persisted;
 }
 
