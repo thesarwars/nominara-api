@@ -54,6 +54,8 @@ const publisher: RealtimePublisher = { toWorkspace: () => undefined, memberChang
 
 interface Queued {
   kind: "parse" | "rollup";
+  /** The callback that queued it: capture.execute (finalisation) or capture.parse (parse completion). */
+  source: "execute" | "parse";
   workspaceId: string;
   payload: Record<string, unknown>;
 }
@@ -183,7 +185,7 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
   }
 
   /** A deep scan: one run, one cell per prompt, driven to quiescence with no cron and no direct rollUpDay. */
-  async function deepScan(s: Scenario): Promise<{ runId: string; ran: string[] }> {
+  async function deepScan(s: Scenario): Promise<{ runId: string; ran: string[]; rollupSources: string[] }> {
     const runId = uuidV7();
     await harness.db().query(
       `INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys, planned_cells)
@@ -196,21 +198,22 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
       cache: new InMemoryCacheAdapter(),
       realtime: publisher,
       enqueueParse: async (p: ParseJobPayload) => {
-        queue.push({ kind: "parse", workspaceId: p.workspaceId, payload: { ...p } });
+        queue.push({ kind: "parse", source: "execute", workspaceId: p.workspaceId, payload: { ...p } });
       },
       enqueueRollup: async (_q, workspaceId, payload) => {
-        queue.push({ kind: "rollup", workspaceId, payload });
+        queue.push({ kind: "rollup", source: "execute", workspaceId, payload });
       },
     });
     const parse = createCaptureParseHandler(context, {
       enqueueRollup: async (_q, workspaceId, payload) => {
-        queue.push({ kind: "rollup", workspaceId, payload });
+        queue.push({ kind: "rollup", source: "parse", workspaceId, payload });
       },
     });
     const rollup = createRollupMetricDailyHandler(context);
     const asJob = (payload: Record<string, unknown>): Job => ({ data: { payload: { kid: "k", ...payload } } }) as unknown as Job;
 
     const ran: string[] = [];
+    const rollupSources: string[] = [];
     for (const [sampleIndex, promptId] of s.promptIds.entries()) {
       await inTenant(s.workspaceId, (tx) =>
         execute(
@@ -235,10 +238,12 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     // The queue, drained in order. A job enqueued by another job is appended and runs after it.
     for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
       ran.push(next.kind);
+      if (next.kind === "rollup") rollupSources.push(next.source);
       const job = asJob({ ...next.payload, workspaceId: next.workspaceId, ...(next.kind === "parse" ? { force: false } : {}) });
       await inTenant(next.workspaceId, (tx) => (next.kind === "parse" ? parse(tx, job) : rollup(tx, job)));
     }
-    return { runId, ran };
+    // Which callback asked for each rollup, in the order they were requested.
+    return { runId, ran, rollupSources };
   }
 
   it("NEW-A-7 AC4 · before the scan Gemini has no measurement; after it, scorecards.engines[gemini] and the growth map's latest day carry the scan", async () => {
@@ -253,12 +258,15 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     const growthBefore = await growthMap(s);
     expect(growthBefore.series.every((series) => series.points.every((p) => p.cells === 0))).toBe(true);
 
-    const { ran } = await deepScan(s);
+    const { ran, rollupSources } = await deepScan(s);
 
-    // The chain really ran: two vendor calls, citations resolved, a rollup job that only the parse path asked for.
+    // The chain really ran: two vendor calls, citations resolved, and one rollup job,
+    // requested by the parse completion path and by nothing else.
     expect(geminiRequests).toBe(2);
     expect(guarded.calls).toBeGreaterThan(0);
     expect(ran.filter((k) => k === "rollup")).toHaveLength(1);
+    // Finalisation (capture.execute) comes before parsing, so a rollup it requested would run on no facts.
+    expect(rollupSources, "the rollup was requested by parse, not by capture.execute").toEqual(["parse"]);
 
     const after = await scorecards(s);
     const gemini = after.engines.find((e) => e.engine_key === "gemini")!;
@@ -318,11 +326,14 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     );
     // Cells captured but never parsed (the parse queue is not drained): there are no facts, so no rollup can exist.
     const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
+    const rollupRequests: Array<{ workspaceId: string; payload: Record<string, unknown> }> = [];
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
       realtime: publisher,
       enqueueParse: async () => undefined,
-      enqueueRollup: async () => undefined,
+      enqueueRollup: async (_q, workspaceId, payload) => {
+        rollupRequests.push({ workspaceId, payload });
+      },
     });
     for (const [sampleIndex, promptId] of s.promptIds.entries()) {
       await inTenant(s.workspaceId, (tx) =>
@@ -337,6 +348,8 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
         } as unknown as Job),
       );
     }
+    // Recorded, not discarded: finalising unparsed cells must not request a rollup at all.
+    expect(rollupRequests, "no rollup is requested while cells are unparsed").toEqual([]);
     // The growth map reads metric_daily, which only a rollup writes; unparsed cells have produced none.
     const brand = (await growthMap(s)).series.find((series) => series.entity_type === "brand")!;
     expect(brand.points.every((p) => p.cells === 0 && p.visibility_score === null)).toBe(true);
