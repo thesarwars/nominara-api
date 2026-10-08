@@ -85,6 +85,39 @@ describe("NEW-C-13 · lever ranking (pure)", () => {
     }
   });
 
+  it("[L12] severity outranks slug order: a later-slug analysis with higher severity beats earlier slugs, and the cut-off follows severity", () => {
+    // Slug order is alignment < entity < structure < topics < sentiment < freshness; severity runs the other way.
+    const rows = [
+      row("alignment", [act("a", "low")]),
+      row("entity", [act("e", "medium")]),
+      row("structure", [act("s", "high")]),
+      row("freshness", [act("f", "critical")]),
+    ];
+    for (const input of [rows, [...rows].reverse()]) {
+      const out = rankLevers(input);
+      expect(rankOf(out, "freshness")).toBe(1);
+      expect(rankOf(out, "structure")).toBe(2);
+      expect(rankOf(out, "entity")).toBe(3);
+      expect(rankOf(out, "alignment")).toBeNull(); // earliest slug, lowest severity: cut
+    }
+  });
+
+  it("[L13] at equal severity the larger evidence base wins even against slug order; slug order only breaks an exact tie", () => {
+    const rows = [
+      row("alignment", [act("a", "high")], { evidenceCells: 10 }),
+      row("sentiment", [act("s", "high")], { evidenceCells: 40 }),
+      row("freshness", [act("f", "high")], { evidenceCells: 25 }),
+      row("entity", [act("e", "high")], { evidenceCells: 25 }),
+    ];
+    for (const input of [rows, [...rows].reverse()]) {
+      const out = rankLevers(input);
+      expect(rankOf(out, "sentiment")).toBe(1); // most evidence, latest-but-one slug
+      expect(rankOf(out, "entity")).toBe(2); // 25 cells, tie with freshness -> earlier slug
+      expect(rankOf(out, "freshness")).toBe(3);
+      expect(rankOf(out, "alignment")).toBeNull(); // earliest slug, least evidence
+    }
+  });
+
   it("[L7] a stale rank is stripped: findings carry no lever_rank once the analysis is not promoted", () => {
     const stale = act("a", "low", { lever_rank: 1 });
     const slugs: GeoSlug[] = ["alignment", "entity", "topics"];
