@@ -130,6 +130,40 @@
           }
         ]
       }
+    },
+    {
+      "id": "2026-10-08-wallet-auto-topup-required",
+      "recorded": "2026-10-08",
+      "story": "STORY-076",
+      "task": "NEW-D-6",
+      "scope": "getWallet (GET /v1/billing/wallet): data.auto_topup",
+      "from": "a wallet response with no auto-top-up member",
+      "to": "a wallet response whose REQUIRED data.auto_topup carries { enabled, pack_key, threshold, max_per_cycle, used_this_cycle, disabled_reason }",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision of 2026-10-08 (relayed in the checkpoint-3 fix-pass task text) approved making auto_topup a REQUIRED member of the wallet response as a breaking change. api-specification.md section 3 says the wallet carries the auto-top-up config, and a response that sometimes omits it would force every client to guess between off and unknown, so the field is required rather than optional. A consumer generated from the previous contract and a strict response validator would reject the new body, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "getWallet",
+        "path": "/v1/billing/wallet",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "meta"
+        ],
+        "data_properties": [
+          "available",
+          "included_balance",
+          "purchased_balance",
+          "reserved",
+          "expiring_soon",
+          "cycle_end",
+          "lifetime_granted",
+          "lifetime_purchased",
+          "lifetime_spent",
+          "auto_topup"
+        ]
+      }
     }
   ]
 }
