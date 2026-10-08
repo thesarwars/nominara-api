@@ -3,9 +3,10 @@
 Lane `7day/d-usage-3`, base `integration/7day`. Migrations: none (columns, `ck_autotopup_bounded` and
 `credit_purchases.source='auto_topup'` all shipped in 0002).
 
-**STATUS: DONE for the four acceptance criteria and audit findings 1, 2, 3, 5, 6. NOT WIRED to a balance
-drop: the `billing.auto_topup` queue (owner decision 4) and the cycle roll (audit finding 4) are not built,
-so `trigger_active` stays `false`. See "Not met this week".**
+**STATUS: PARTIAL, NOT DONE. The four acceptance criteria and the re-audit's findings 1-3 (stale-pending double
+charge; the `enabled`, threshold and pack guards) are fixed and proven below. NOT WIRED to a balance drop: the
+cycle roll and the signed `billing.auto_topup` queue handler (re-audit finding 4) are NOT built, so
+`trigger_active` stays `false`, and the lane must not be marked done. See "Re-audit round 2" at the end.**
 
 Integration specs now RAN (Docker/colima healthy; 18 GiB free at the start of the run). OpenTelemetry spans are deferred
 to week 2 by owner decision: a missing span is not a failed criterion. Evidence that needs a running real API
@@ -24,6 +25,8 @@ to week 2 by owner decision: a missing span is not a failed criterion. Evidence 
 | `3999a62` | GREEN for F2/F3/F6 | 34/34 exit 0 |
 | `25ae315` | RED: owner decision 4 (card saved only when auto-top-up is on) | **unit 1 failed / 25 passed, exit 1; integration 1 failed / 34 passed, exit 1** |
 | `0d9e419` | GREEN for owner decision 4 | below |
+
+Re-audit round 2 commits are listed in "Re-audit round 2" at the end of this file.
 
 Fixture defects found when the spec first ran (it had never run): 8 of 28 failed, ALL in the test, none in the
 implementation: a UUIDv7 8-char prefix collided across workspaces created in the same millisecond
@@ -50,9 +53,9 @@ un-publishing the pack, because a downgrade now (correctly) answers `not_in_plan
 | 1 | spec never ran | FIXED: ran, 34/34 (exit 0) + `credit-packs`, `stripe-webhook`, `billing-usage-auto-topup`, `credit-ledger-read`: 5 files / 148 tests exit 0. |
 | 2 | timeout on the charge reopened the in-flight guard (double charge) | FIXED `3999a62`: the purchase stays `pending`; test "a provider outage on the charge leaves the purchase pending ... never charged twice". |
 | 3 | kept firing after a downgrade below Growth | FIXED `3999a62`: re-asked in the verdict AND as a predicate of the claim UPDATE; two tests. |
-| 4 | nothing resets `auto_topup_count_cycle` | NOT FIXED: there is no cycle roll anywhere in the code (STORY-075/076). Stated in the contract comment; gate: `trigger_active` stays false and nothing calls `trigger`. |
+| 4 | nothing resets `auto_topup_count_cycle` | NOT FIXED: there is no cycle roll anywhere in the code (STORY-075/076). Gate: `trigger_active` stays false and nothing calls `trigger`; the second half of the gate is now a unit test (`auto-topup-unwired.spec.ts`), see round 2. |
 | 5 | concurrency test could not detect removing the row lock | FIXED: two interleaving tests. |
-| 6 | stuck `pending` blocks forever | FIXED `3999a62` for the lock: a pending purchase older than 60 min is failed and audited (`billing.auto_topup.pending_expired`) by the next claim; a younger one still blocks. NOT done: telling the customer (decision needed, below). |
+| 6 | stuck `pending` blocks forever | The 60-minute expiry of `3999a62` was clock-only and re-opened the double charge (re-audit finding 1). SUPERSEDED by `95222c4`: an hour-old row is expired only when Stripe says `none` / `failed`. NOT done: telling the customer (decision needed, below). |
 
 ## Mutations (each run against the full spec; source restored after each; verified applied)
 
@@ -100,27 +103,95 @@ tests were added.)
 - Frontend (used/cap and the disabled-with-reason state): not in this API-only item; the API returns
   `auto_topup.disabled_reason`.
 
-## Audit (checkpoint 3 re-audit) — status as of this commit
+## Re-audit round 2 (checkpoint-3 re-audit findings 1-4) — `7day/d-usage-3`
 
-**NEW-D-7 REMAINS PARTIAL. It is not done and must not be marked done.**
+**STATUS: PARTIAL. Findings 1, 2, 3 FIXED and mutation-tested. Finding 4 (cycle roll + signed queue handler) NOT BUILT,
+stopped for the decisions below. NEW-D-7 must not be marked done.**
 
-| # | Audit finding | Status |
+| sha | what | RED/GREEN |
 |---|---|---|
-| 1 (blocker) | F6 stale-pending expiry reopens the F2 double charge after 60 min | **PARTLY ADDRESSED, STILL OPEN.** Done: the gateway can now ask Stripe about the original charge, `StripeGateway.findOffSessionPayment(purchaseId)` (PaymentIntent search on `metadata.purchase_id`; states `none` / `in_progress` / `succeeded` / `failed`; `in_progress` for anything not known dead; a non-UUID id is refused before it reaches the query). RED `1a8e1e2` (unit: 2 failed / 26 passed, `findOffSessionPayment is not a function`), GREEN in the next commit (28/28). **NOT done: `AutoTopupService.expireStalePending` still expires without asking, and the F6 integration test still asserts the second charge.** `trigger` has no caller, so nothing can double-charge today; it must not be wired until this lands. |
-| 2 (major) | trigger not wired; cycle roll missing; customer not told of an expired purchase | **NOT STARTED.** Needs the `billing.auto_topup` topology entry (spec section 4 + the topology pin test), an HMAC-verified handler that verifies BEFORE `withTenantContext`, a producer on the debit path (credit ledger, dangerous area), and the cycle roll with its own test in the same change. |
-| 3 | integration/isolation never re-run on this branch | **NOT RUN.** `/System/Volumes/Data` had 3.2 GiB free (floor 8 GiB) when this was attempted, so no testcontainers spec was run. The merge step must run `pnpm test:isolation`, `pnpm test:isolation:breakers`, `auto-topup-trigger.spec.ts` and `billing-usage-auto-topup.spec.ts` and record exit codes. |
+| `492c9ea` | RED: F6 rewritten (in_progress / succeeded keep it pending and charge nothing; none / failed expire it and charge once under a new purchase id; a lookup error leaves it pending; a row that settles between lookup and claim is not failed over) + the three interleaving tests for the claim guards | `auto-topup-trigger.spec.ts`: **6 failed / 37 passed (43), exit 1**. All 6 are the F6 tests, failing because the lookup is never made (`offSessionStateLookups` `[]`, `charge_submitted` where `upstream_error` was expected, row `failed` where `succeeded` expected). The guard tests (enabled / threshold / pack) PASSED at this sha: the guards already exist in the code; the missing thing was proof, so these are proven by mutation, not by a RED. |
+| `95222c4` | `AutoTopupService`: `plan` reads the stale pending ids; `classifyStale` calls `gateway.findOffSessionPayment` per row OUTSIDE any transaction (KAD-06); `claim` expires only the ids Stripe said are `none` / `failed`, still guarded by `status = 'pending'`; any lookup error returns `upstream_error` before the card lookup, the claim, the email and the charge | GREEN 43/43, exit 0 |
+| `cc79d71` | the `enabled` guard test also switches off while KEEPING pack/threshold/cap (the realistic PUT; the first shape was masked by the pack predicate); a KAD-06 test (no `idle in transaction` backend during the stale lookup) | 45/45, exit 0 |
+| `f836e6d` | `test/unit/billing/auto-topup-unwired.spec.ts`: no production file but the three billing files may reference `AutoTopupService`, none may call `.trigger(` | 3/3 |
 
-Why the service change was not made: it is money logic whose proof is the integration spec (the F6 test must be
-rewritten red-first, then mutation-tested), and that spec cannot run at 3.2 GiB free. Writing it unrun would be
-the unverified claim this audit objects to.
+### Finding 1 (blocker) — acceptance
+Stale pending purchase: Stripe is asked, outside the transaction; expired only on `none` / `failed`; left pending on
+`in_progress`, `succeeded`, or a lookup error. Tests (`test/integration/auto-topup-trigger.spec.ts`):
+"NEW-D-7 audit F6 · ... Stripe says in_progress / succeeded is NOT expired and is NOT charged again";
+"... none / failed is failed and audited, and exactly one new charge is made under a NEW purchase id";
+"... when Stripe cannot be asked ... it stays pending"; "... settles between the Stripe lookup and the claim ...";
+"KAD-06: the Stripe lookup ... is made with no transaction open". The old F6 test that locked in the hazard is gone.
+The outcome for in_progress / succeeded is `in_flight` (the claim's own NOT EXISTS pending refuses it).
 
-The remaining change for finding 1, ready to apply when disk allows: in `claim`, before `expireStalePending`
-frees a row, `findOffSessionPayment(id)` for each stale pending row OUTSIDE a transaction (KAD-06: no network call
-inside the tenant tx, so this moves to the plan phase). `none`/`failed` -> expire. `in_progress`/`succeeded`/lookup
-error -> leave it pending (in flight, no new charge). Rewrite F6: 503 on charge, +61 min, `offSessionStates`
-= `in_progress` -> no second charge; = `none` -> expired and charged once more with a NEW purchase id; lookup
-failing -> still pending. The `FakeStripeGateway` already supports this (`offSessionStates`, `failStateLookupWith`).
-Also decide: email the customer on expiry (needs a decision on the disabled-reason enum).
+### Findings 2 and 3 — acceptance
+"the claim re-checks `enabled`" (x2 shapes), "the claim re-checks the threshold", "the claim re-checks the pack",
+each with `gateway.holdLookups()`: no charge, no email, no purchase, `auto_topup_count_cycle` 0.
+The pack test asserts `not.toBe("charge_submitted")` plus the four invariants: the outcome label for a switched pack
+is `in_flight` (the claim falls through to the verdict, which finds nothing to refuse). That label is imprecise;
+the contract's outcome enum has no value for "configuration changed", and adding one is a contract change nobody
+asked for here.
 
-Gates for this commit (`7day/d-usage-3`): `pnpm lint` exit 0, `pnpm typecheck` exit 0, unit subset
-`src/lib/billing src/modules/billing contracts` exit 0 (26 files / 331 tests). Full `test:unit` not re-run here.
+### Mutations (full `auto-topup-trigger.spec.ts` each time, source restored with `git checkout` after each)
+
+| mutation | result |
+|---|---|
+| expire every stale row whatever Stripe says | killed: 2 failed (in_progress, succeeded) |
+| a lookup error expires the row | killed: 1 failed |
+| `succeeded` treated as dead | killed: 1 failed |
+| expire without the `status = 'pending'` guard | killed: 1 failed (settles between lookup and claim) |
+| delete `AND auto_topup_enabled` from the claim | first attempt SURVIVED (the clearing PUT is also refused by the pack predicate); after the second PUT shape: killed, 1 failed |
+| delete the threshold predicate | killed: 1 failed |
+| `auto_topup_pack_key = $2` -> `$2::text IS NOT NULL` | killed: 1 failed |
+| the stale lookup moved inside `inTx` | killed: 1 failed (KAD-06 test) |
+| re-run of the older set: remove the `expireStalePending` call / `lockWallet` / `NOT EXISTS pending` / `count < max` / the claim's plan predicate | each killed (2 / 1 / 3 / 1 / 1 failed) |
+| add `x.trigger(1)` to `stripe-credit-pack.handler.ts`; add an importer of `AutoTopupService` | killed (`auto-topup-unwired.spec.ts`) |
+
+### Gates (tip `f836e6d`)
+- `pnpm lint` exit 0. `pnpm typecheck` exit 0. `pnpm contracts:check` exit 0 (no contract changed in this round).
+- `pnpm test:unit` exit 0: 278 files passed, 1 skipped; 3323 passed, 1 skipped.
+- `vitest --config vitest.integration.config.ts` on `auto-topup-trigger`, `billing-usage-auto-topup`, `credit-packs`,
+  `stripe-webhook`, `credit-ledger-read`: 5 files, 158 tests, exit 0.
+- `test:isolation`: not run (no table, policy or migration touched; known fixture crash at this base; the merge step runs it).
+- DISK: `/System/Volumes/Data` showed 6.2 GiB free when the last testcontainers batch started (the floor is 8 GiB);
+  the run was launched in the same command as the check and was NOT gated on it. It finished exit 0. No further
+  testcontainers run was made; flagged so the merge step does not assume headroom.
+- Spans: deferred to week 2 by owner decision. Metrics/logs added: `nominara_billing_auto_topup_stale_lookup_total{state}`
+  (in_progress | succeeded | failed | none | error); the existing `_pending_expired_total`; log lines carry the
+  workspace and purchase id only. Verified by the existing observability test plus the lookup tests; the new
+  counter itself is not asserted by name (gap, minor).
+- Evidence that needs a real Stripe sandbox (does `paymentIntents.search` find an off-session intent by
+  `metadata.purchase_id`, and how fresh is the index) is collected in NEW-A-17. Stripe search is eventually
+  consistent; an hour-old row is far outside that window, but it has not been observed against the sandbox.
+
+### Finding 4 — NOT BUILT, and why (stopped, not skipped)
+
+What exists: the executable gate (`auto-topup-unwired.spec.ts`), so wiring `trigger` now fails a test instead of
+breaking a prose promise. `trigger_active:false` is still a literal in the response.
+
+What is needed, as decisions (each is outside this story's files or is a hard-boundary item):
+
+1. **Who rolls the wallet cycle?** Nothing does. `credit_wallets.cycle_start/cycle_end` are written at provisioning
+   and never advanced; the "grant refresh at cycle_end" of plans-and-entitlements section 5 / STORY-072 scenario 14
+   has no code. So a counter "reset at cycle roll" has no roll to hang on. Options: (A) build the wallet roll
+   (expire unused included credits, grant, advance dates, zero the counter in ONE statement), which is credit-ledger
+   work and its own story; (B) count `used_this_cycle` from `credit_purchases` (source `auto_topup`,
+   `created_at >= cycle_start`) so the cap follows `cycle_start` with no marker and no migration, which changes what
+   the spec calls "a counter"; (C) a marker column (migration, not named by any story). Recommendation: A + B
+   (B alone is correct the moment A lands). A clock-only reset is NOT acceptable: with no roll it would zero the cap on
+   every claim after `cycle_end`.
+2. **The `billing.auto_topup` queue.** It is in neither section 4 nor the topology pin test; the precedent is
+   `ADDED_BEYOND_REFERENCE` in `test/unit/queue/topology.spec.ts` (`audit.verify`, `identity.sweep_unverified`).
+   BUT `createJobProcessor` holds the job's tenant transaction open for the whole handler, and `trigger` awaits
+   Stripe and the mail port: that is a transaction open across an external await (KAD-06). The existing tenant
+   handlers (`capture.execute`) accept that for engine calls; for a card charge it is not acceptable. It needs a
+   decision on a "verify, then release the connection" processor mode in `worker-factory.ts` (a new pattern: ADR,
+   default no) or on running the three short transactions the service already uses with the job's transaction not
+   held. Also the worker process has no Stripe gateway or `EMAIL_SENDER` today.
+3. Required tests when it lands (both named by the audit): the cycle roll with its own test; the queue handler with a
+   tampered-envelope test showing no `set_config` and no `trigger` call, with `workspaceId` taken only from the
+   verified payload. `auto-topup-unwired.spec.ts` is edited in that same commit.
+
+### Other items still open
+- Customer visibility of an expired stale purchase (email, disabled-reason enum value): undecided, unchanged.
+- One `billing.auto_topup.skipped` audit row per evaluation while there is no saved card: throttle when wired.
