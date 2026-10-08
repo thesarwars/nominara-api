@@ -317,7 +317,7 @@ describe("NEW-D-3 · GET /v1/audit-log", () => {
     const res = await get(a.ownerToken, `?action=zzz.xcursor&cursor=${first.pagination.cursor_next}`);
     expect(res.statusCode).toBe(200);
     const ids = dataOf<AuditLogEntry[]>(res).map((i) => i.id);
-    const bIds = (await db.query<{ h: string }>("SELECT encode(row_hash,'hex') AS h FROM audit_log WHERE workspace_id = $1", [b.workspaceId])).rows.map((r) => r.h);
+    const bIds = (await db.query<{ h: string }>("SELECT seq::text AS h FROM audit_log WHERE workspace_id = $1", [b.workspaceId])).rows.map((r) => r.h);
     expect(ids.filter((id) => bIds.includes(id))).toEqual([]);
   });
 });
