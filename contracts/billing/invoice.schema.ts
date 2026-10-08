@@ -30,5 +30,9 @@ export const invoiceListQuerySchema = paginationRequestSchema
   .extend({ status: z.enum(INVOICE_STATUSES).optional() })
   .strict();
 
+// The list route's `data` member; the envelope adds `pagination` (STORY-023).
+export const invoiceListResponseSchema = z.array(invoiceSchema);
+
 export type Invoice = z.infer<typeof invoiceSchema>;
+export type InvoiceListResponse = z.infer<typeof invoiceListResponseSchema>;
 export type InvoiceListQuery = z.infer<typeof invoiceListQuerySchema>;
