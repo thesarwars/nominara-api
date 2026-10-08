@@ -10358,6 +10358,12 @@
                             },
                             "trigger_active": {
                               "type": "boolean"
+                            },
+                            "disabled_reason": {
+                              "type": "string",
+                              "enum": [
+                                "payment_failed"
+                              ]
                             }
                           },
                           "required": [
@@ -10698,6 +10704,12 @@
                         },
                         "trigger_active": {
                           "type": "boolean"
+                        },
+                        "disabled_reason": {
+                          "type": "string",
+                          "enum": [
+                            "payment_failed"
+                          ]
                         }
                       },
                       "required": [
