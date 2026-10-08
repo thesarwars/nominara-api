@@ -100,6 +100,7 @@ function findingRow(over: Record<string, unknown> = {}) {
     auto_fixable: false,
     requires_human_review: false,
     wont_fix_reason: null,
+    wont_fix_at: null,
     first_detected_at: new Date("2026-09-01T00:00:00Z"),
     last_detected_at: new Date("2026-10-01T00:00:00Z"),
     resolved_at: null,
@@ -278,7 +279,28 @@ describe("NEW-C-10 · AuxService.listProjectFindings", () => {
 
   it("[NEW-C-10 AC2] a wont_fix finding carries its reason as a visible annotation", async () => {
     const page = await serviceWith(projectThen([findingRow({ status: "wont_fix", wont_fix_reason: "Staging only" })])).listProjectFindings(PROJECT_ID, { limit: 50 } as never);
-    expect(page.items[0]!.wont_fix).toEqual({ reason: "Staging only" });
+    expect(page.items[0]!.wont_fix).toEqual({ reason: "Staging only", resurfaces_at: null });
+  });
+
+  it("[NEW-C-10 AC2] a wont_fix finding resurfaces 180 days after wont_fix_at, to the millisecond", async () => {
+    const page = await serviceWith(projectThen([findingRow({ status: "wont_fix", wont_fix_reason: "Staging only", wont_fix_at: new Date("2026-10-01T08:30:00.123Z") })])).listProjectFindings(PROJECT_ID, { limit: 50 } as never);
+    expect(page.items[0]!.wont_fix).toEqual({ reason: "Staging only", resurfaces_at: "2027-03-30T08:30:00.123Z" });
+  });
+
+  it("[NEW-C-10 AC2] a finding set will-not-fix before wont_fix_at existed reports resurfaces_at null, not a guess", async () => {
+    const page = await serviceWith(projectThen([findingRow({ status: "wont_fix", wont_fix_reason: "Old", wont_fix_at: null })])).listProjectFindings(PROJECT_ID, { limit: 50 } as never);
+    expect(page.items[0]!.wont_fix!.resurfaces_at).toBeNull();
+  });
+
+  it("[NEW-C-10 AC2] a finding that is not wont_fix carries no wont_fix annotation even if a stale wont_fix_at is present", async () => {
+    const page = await serviceWith(projectThen([findingRow({ status: "open", wont_fix_at: new Date("2026-10-01T00:00:00Z") })])).listProjectFindings(PROJECT_ID, { limit: 50 } as never);
+    expect(page.items[0]!.wont_fix).toBeNull();
+  });
+
+  it("[NEW-C-10 AC2] the PATCH stamps wont_fix_at from the database clock when moving to wont_fix and clears it otherwise; no client-supplied date", async () => {
+    await serviceWith(patchRoute("open", { after: { status: "wont_fix", wont_fix_reason: "Staging only" } })).updateFinding(FINDING_ID, { status: "wont_fix", reason: "Staging only" });
+    expect(updates()[0]!.sql).toMatch(/wont_fix_at\s*=\s*CASE WHEN \$2 = 'wont_fix' THEN now\(\) ELSE NULL END/);
+    expect(updates()[0]!.params.some((param) => param instanceof Date)).toBe(false);
   });
 
   it("[NEW-C-10 AC4] filters by severity, status, rule and URL as bound parameters, never text", async () => {
@@ -334,7 +356,7 @@ describe("NEW-C-10 · AuxService.updateFinding", () => {
     const result = await serviceWith(patchRoute("open", { after: { status: "wont_fix", wont_fix_reason: "Staging only" } })).updateFinding(FINDING_ID, { status: "wont_fix", reason: "Staging only" });
     expect(updates()).toHaveLength(1);
     expect(updates()[0]!.params).toEqual(expect.arrayContaining(["wont_fix", "Staging only"]));
-    expect(result.wont_fix).toEqual({ reason: "Staging only" });
+    expect(result.wont_fix).toEqual({ reason: "Staging only", resurfaces_at: null });
     for (const from of ["resolved", "stale", "wont_fix"]) {
       await expect(serviceWith(patchRoute(from)).updateFinding(FINDING_ID, { status: "wont_fix", reason: "x" }), from).rejects.toBeInstanceOf(ConflictError);
     }
@@ -352,7 +374,7 @@ describe("NEW-C-10 · AuxService.updateFinding", () => {
     expect(updates()).toHaveLength(0);
   });
 
-  it("[NEW-C-10 AC1] the only UPDATE is on status and wont_fix_reason: no resolved_at, no severity, no fingerprint", async () => {
+  it("[NEW-C-10 AC1] the only UPDATE is on status, wont_fix_reason and wont_fix_at: no resolved_at, no severity, no fingerprint", async () => {
     await serviceWith(patchRoute("open", { after: { status: "acknowledged" } })).updateFinding(FINDING_ID, { status: "acknowledged" });
     const sql = updates()[0]!.sql;
     expect(sql).not.toMatch(/resolved_at|severity|fingerprint|first_detected_at/);
