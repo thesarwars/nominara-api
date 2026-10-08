@@ -605,7 +605,10 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
 
   it("NEW-D-7 checkpoint-3 F2 · past Stripe's idempotency-key retention a replay would be a NEW charge, so it fails closed: stays pending, no charge, no lookup-driven expiry", async () => {
     const { workspaceId, stuck } = await stuckPending(25 * 60);
+    const alert = vi.spyOn(Logger.prototype, "error");
     expect(await service.trigger(workspaceId)).toBe("in_flight");
+    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ workspace_id: workspaceId, purchase_id: stuck.id, reason: "past_idempotency_retention" }));
+    alert.mockRestore();
     expect(gateway.offSessionCharges).toHaveLength(0);
     expect(await autoPurchases(workspaceId)).toEqual([expect.objectContaining({ id: stuck.id, status: "pending" })]);
     expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);

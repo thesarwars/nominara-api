@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
 import type { AutoTopupTriggerOutcome } from "../../../contracts/billing/index.js";
 import { PG_POOL } from "../../db/pg-pool.js";
-import { STRIPE_GATEWAY, StripeUpstreamError, type SavedPaymentMethod, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
+import { STRIPE_GATEWAY, StripeUpstreamError, type OffSessionPaymentInput, type SavedPaymentMethod, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { lockWallet, purchasableOptions, type PurchasableOption } from "../../lib/credits/wallet.js";
 import { AUTO_TOPUP_MIN_PLAN } from "./billing.service.js";
@@ -42,15 +42,24 @@ import { EMAIL_SENDER, type EmailSender } from "../identity/ports/email-sender.j
 // request path (KAD-06). See docs/plans/evidence/NEW-D-7.md.
 
 /**
- * A `pending` auto-top-up purchase older than this is CHECKED WITH STRIPE. The
- * clock alone proves nothing about the money: a 503 or a timeout on the charge
- * request says nothing about whether Stripe took it, and a bank debit can stay
- * `processing` for days. Only Stripe saying `none` or `failed` frees the slot
- * (the row is failed); `in_progress`, `succeeded`, or a lookup that errors leave
- * it pending, which keeps the in-flight guard closed — no second charge — until
- * the webhook settles it. A failed row still settles if the payment is taken.
+ * A `pending` auto-top-up purchase older than this is RECONCILED WITH STRIPE. The clock alone proves
+ * nothing about the money: a 503 or a timeout on the charge request says nothing about whether Stripe
+ * took it, and a bank debit can stay `processing` for days. The clock NEVER frees the slot and a lookup
+ * never does either (checkpoint-3):
+ *   - `failed` (the PaymentIntent was refused) is a DECLINE: the row fails, auto-top-up is switched off,
+ *     the contact is told, and nothing is charged — the same path as a synchronous decline.
+ *   - `in_progress` / `succeeded`: left pending; the webhook settles it.
+ *   - `none`: PaymentIntent Search is eventually consistent and lags exactly during an outage, so `none`
+ *     proves nothing. The SAME charge is replayed under its own idempotency key (`auto-topup-<purchaseId>`):
+ *     Stripe returns the original PaymentIntent, or creates the charge for this same purchase — never a
+ *     second one. Past the key retention a replay would be a NEW charge, so it fails closed: the row stays
+ *     pending and an alert is raised.
+ *   - a lookup or replay that errors leaves the row pending.
  */
 const STALE_PENDING_MINUTES = 60;
+
+/** Stripe keeps an idempotency key for at least 24 hours; a replay is trusted for 23, so clock skew cannot make it a new charge. */
+const IDEMPOTENCY_REPLAY_HOURS = 23;
 
 export const AUTO_TOPUP_TRIGGERED_SUBJECT = "Nominara auto top-up triggered";
 export const AUTO_TOPUP_DISABLED_SUBJECT = "Nominara auto top-up disabled after a failed payment";
@@ -69,9 +78,20 @@ type Verdict = { readonly stop: AutoTopupTriggerOutcome } | { readonly stop: nul
 interface Ready {
   readonly packKey: string;
   readonly contact: string;
-  readonly referencePaymentIntentId: string | null;
-  /** Pending auto-top-up purchases past the stale window, to be asked about at Stripe (never inside a transaction). */
-  readonly staleIds: readonly string[];
+  readonly referencePaymentIntentId: string;
+  /** Pending auto-top-up purchases past the stale window, to be reconciled with Stripe (never inside a transaction). */
+  readonly stale: readonly StalePurchase[];
+}
+
+/** What a replay of the original charge needs, rebuilt from the purchase row — Stripe rejects a replay whose parameters differ. */
+type ReplayCharge = Omit<OffSessionPaymentInput, "customerId" | "paymentMethodId">;
+
+interface StalePurchase {
+  readonly id: string;
+  /** Null when the pack can no longer be priced like the original charge: then no replay is possible. */
+  readonly replay: ReplayCharge | null;
+  /** Older than the idempotency-key retention: a replay would be a new charge. */
+  readonly pastRetention: boolean;
 }
 
 interface Claimed {
@@ -102,22 +122,20 @@ export class AutoTopupService {
     // 1. PLAN — cheap checks that need no network, so a workspace at its cap costs one read.
     const planned = await this.inTx(workspaceId, (tx) => this.plan(tx, workspaceId));
     if ("outcome" in planned) return planned.outcome;
-    const { packKey, contact, referencePaymentIntentId, staleIds } = planned.ready;
+    const { packKey, contact, referencePaymentIntentId, stale } = planned.ready;
 
-    // 2a. STALE PENDING CHARGES — ask Stripe, outside any transaction (KAD-06). Only `none` / `failed` may be expired.
-    const expirable = await this.classifyStale(workspaceId, staleIds);
-    if (expirable === null) return "upstream_error";
+    // 2a. STALE PENDING CHARGES — reconciled with Stripe, outside any transaction (KAD-06). A stale charge is
+    // finished (declined / replayed / left pending) BEFORE anything new is charged: no new claim in this run.
+    if (stale.length > 0) return this.reconcileStale(workspaceId, referencePaymentIntentId, stale);
 
     // 2b. THE SAVED CARD — outside any transaction.
-    let method: SavedPaymentMethod | null = null;
-    if (referencePaymentIntentId !== null) {
-      try {
-        method = await this.gateway.findSavedPaymentMethod(referencePaymentIntentId);
-      } catch (error) {
-        if (!(error instanceof StripeUpstreamError)) throw error;
-        this.logger.error({ message: "auto-top-up could not look up the saved payment method", workspace_id: workspaceId, status: error.statusCode });
-        return "upstream_error";
-      }
+    let method: SavedPaymentMethod | null;
+    try {
+      method = await this.gateway.findSavedPaymentMethod(referencePaymentIntentId);
+    } catch (error) {
+      if (!(error instanceof StripeUpstreamError)) throw error;
+      this.logger.error({ message: "auto-top-up could not look up the saved payment method", workspace_id: workspaceId, status: error.statusCode });
+      return "upstream_error";
     }
     if (method === null) {
       await this.inTx(workspaceId, (tx) => this.recordSkipped(tx, workspaceId, "no_payment_method"));
@@ -125,7 +143,7 @@ export class AutoTopupService {
     }
 
     // 3. CLAIM — the conditional UPDATE, the pending purchase and the audit row commit together.
-    const claim = await this.inTx(workspaceId, (tx) => this.claim(tx, workspaceId, packKey, expirable));
+    const claim = await this.inTx(workspaceId, (tx) => this.claim(tx, workspaceId, packKey));
     if ("outcome" in claim) return claim.outcome;
     const { purchaseId, pack } = claim.claimed;
 
@@ -158,11 +176,7 @@ export class AutoTopupService {
         paymentMethodId: method.paymentMethodId,
       });
       if (result.outcome === "declined") {
-        await this.inTx(workspaceId, async (tx) => {
-          await this.markFailed(tx, purchaseId);
-          await this.disableAfterFailure(tx, workspaceId, purchaseId);
-        });
-        await this.notifyDisabled(workspaceId);
+        await this.declined(workspaceId, purchaseId);
         return "declined";
       }
       return "charge_submitted";
@@ -170,7 +184,7 @@ export class AutoTopupService {
       if (!(error instanceof StripeUpstreamError)) throw error;
       // A timeout does not prove the charge did not happen, so the purchase STAYS pending: the in-flight
       // guard stays closed (no second charge), the webhook settles it if the payment was taken, and
-      // `expireStalePending` frees the slot once Stripe confirms nothing is live.
+      // `reconcileStale` settles it on the next run (decline / replay), never by freeing the slot.
       this.logger.error({ message: "auto-top-up charge request failed", workspace_id: workspaceId, purchase_id: purchaseId, status: error.statusCode });
       return "upstream_error";
     }
@@ -200,13 +214,39 @@ export class AutoTopupService {
       await this.recordSkipped(tx, workspaceId, "no_payment_method");
       return { outcome: "no_payment_method" };
     }
-    const stale = await tx.query<{ id: string }>(
-      `SELECT id FROM credit_purchases
+    const stale = await tx.query<{ id: string; pack_key: string; credits: number; amount_usd: string; past_retention: boolean }>(
+      `SELECT id, pack_key, credits, amount_usd::text AS amount_usd,
+              created_at < now() - make_interval(hours => $3::int) AS past_retention
+         FROM credit_purchases
         WHERE workspace_id = $1 AND source = 'auto_topup' AND status = 'pending' AND created_at < now() - make_interval(mins => $2::int)
         ORDER BY created_at, id`,
-      [workspaceId, STALE_PENDING_MINUTES],
+      [workspaceId, STALE_PENDING_MINUTES, IDEMPOTENCY_REPLAY_HOURS],
     );
-    return { ready: { packKey: verdict.packKey, contact, referencePaymentIntentId, staleIds: stale.rows.map((r) => r.id) } };
+    return {
+      ready: {
+        packKey: verdict.packKey,
+        contact,
+        referencePaymentIntentId,
+        stale: stale.rows.map((r) => {
+          const option = options.find((o) => o.key === r.pack_key);
+          return {
+            id: r.id,
+            pastRetention: r.past_retention,
+            replay:
+              option === undefined
+                ? null
+                : {
+                    workspaceId,
+                    purchaseId: r.id,
+                    packKey: r.pack_key,
+                    productName: `Nominara ${option.displayName} (${String(r.credits)} credits) — auto top-up`,
+                    unitAmountCents: toCents(r.amount_usd),
+                    currency: option.currency.trim(),
+                  },
+          };
+        }),
+      },
+    };
   }
 
   /** Why a trigger would not fire right now, or the pack it would buy. A read: the claim below is the authority. */
@@ -250,48 +290,67 @@ export class AutoTopupService {
   }
 
   /**
-   * Asks Stripe about each stale pending purchase. Returns the ids Stripe says are dead (`none` / `failed`),
-   * or null when ANY lookup could not be answered: an unclassifiable row is a possible live charge, so
-   * nothing is expired and nothing is charged (fail closed).
+   * Reconciles each stale pending purchase with Stripe; see STALE_PENDING_MINUTES for the rules. Returns the
+   * outcome of the run: nothing here ever takes a new cap slot or mints a new purchase id.
    */
-  private async classifyStale(workspaceId: string, staleIds: readonly string[]): Promise<readonly string[] | null> {
-    const dead: string[] = [];
-    for (const id of staleIds) {
+  private async reconcileStale(workspaceId: string, referencePaymentIntentId: string, stale: readonly StalePurchase[]): Promise<AutoTopupTriggerOutcome> {
+    let outcome: AutoTopupTriggerOutcome = "in_flight";
+    let method: SavedPaymentMethod | null | undefined;
+    for (const row of stale) {
       try {
-        const state = await this.gateway.findOffSessionPayment(id);
+        const state = await this.gateway.findOffSessionPayment(row.id);
         incrementCounter("nominara_billing_auto_topup_stale_lookup_total", { state });
-        if (state === "none" || state === "failed") dead.push(id);
+        if (state === "failed") {
+          await this.declined(workspaceId, row.id);
+          return "declined";
+        }
+        if (state !== "none") continue; // in_progress / succeeded: the webhook settles it.
+
+        // `none` from Search proves nothing. Replay the SAME charge under its own key — or fail closed.
+        if (row.pastRetention || row.replay === null) {
+          this.unreconcilable(workspaceId, row.id, row.pastRetention ? "past_idempotency_retention" : "pack_unavailable");
+          continue;
+        }
+        method ??= await this.gateway.findSavedPaymentMethod(referencePaymentIntentId);
+        if (method === null) {
+          this.unreconcilable(workspaceId, row.id, "no_payment_method");
+          continue;
+        }
+        const result = await this.gateway.createOffSessionPayment({ ...row.replay, customerId: method.customerId, paymentMethodId: method.paymentMethodId });
+        incrementCounter("nominara_billing_auto_topup_stale_replay_total", { outcome: result.outcome });
+        if (result.outcome === "declined") {
+          await this.declined(workspaceId, row.id);
+          return "declined";
+        }
+        outcome = "charge_submitted";
       } catch (error) {
         if (!(error instanceof StripeUpstreamError)) throw error;
         incrementCounter("nominara_billing_auto_topup_stale_lookup_total", { state: "error" });
-        this.logger.error({ message: "auto-top-up could not ask the provider about a stale pending purchase", workspace_id: workspaceId, purchase_id: id, status: error.statusCode });
-        return null;
+        this.logger.error({ message: "auto-top-up could not reconcile a stale pending purchase with the provider", workspace_id: workspaceId, purchase_id: row.id, status: error.statusCode });
+        return "upstream_error";
       }
     }
-    return dead;
+    return outcome;
   }
 
-  /** Fails (and audits) the stale pending purchases Stripe said are dead. Runs under the wallet lock, before the claim; a row that settled meanwhile is not pending and is left alone. */
-  private async expireStalePending(tx: ClientBase, workspaceId: string, deadIds: readonly string[]): Promise<void> {
-    if (deadIds.length === 0) return;
-    const stale = await tx.query<{ id: string }>(
-      `UPDATE credit_purchases SET status = 'failed'
-        WHERE workspace_id = $1 AND source = 'auto_topup' AND status = 'pending' AND id = ANY($3::uuid[])
-          AND created_at < now() - make_interval(mins => $2::int)
-        RETURNING id`,
-      [workspaceId, STALE_PENDING_MINUTES, deadIds],
-    );
-    for (const row of stale.rows) {
-      await this.writeAudit(tx, workspaceId, "billing.auto_topup.pending_expired", "credit_purchase", row.id, { status: "pending" }, { status: "failed", reason: "provider_reports_no_live_charge" });
-      incrementCounter("nominara_billing_auto_topup_pending_expired_total", {});
-      this.logger.warn({ message: "auto-top-up purchase expired: the provider reports no live charge", workspace_id: workspaceId, purchase_id: row.id });
-    }
+  /** A stale charge that cannot be reconciled safely stays pending (the in-flight guard stays closed) and raises an alert. */
+  private unreconcilable(workspaceId: string, purchaseId: string, reason: string): void {
+    incrementCounter("nominara_billing_auto_topup_stale_unreconcilable_total", { reason });
+    this.logger.error({ message: "ALERT auto-top-up stale pending purchase cannot be reconciled and stays pending", workspace_id: workspaceId, purchase_id: purchaseId, reason });
   }
 
-  private async claim(tx: ClientBase, workspaceId: string, packKey: string, deadIds: readonly string[]): Promise<{ claimed: Claimed } | { outcome: AutoTopupTriggerOutcome }> {
+  /** The decline path, shared by the synchronous decline, a failed PaymentIntent found on reconcile, and a declined replay. */
+  private async declined(workspaceId: string, purchaseId: string): Promise<void> {
+    await this.inTx(workspaceId, async (tx) => {
+      await this.markFailed(tx, purchaseId);
+      await this.disableAfterFailure(tx, workspaceId, purchaseId);
+    });
+    await this.notifyDisabled(workspaceId);
+  }
+
+  private async claim(tx: ClientBase, workspaceId: string, packKey: string): Promise<{ claimed: Claimed } | { outcome: AutoTopupTriggerOutcome }> {
     // The row lock serialises concurrent triggers; the next statement then sees the winner's committed purchase.
     if (!(await lockWallet(tx, workspaceId))) return { outcome: "not_enabled" };
-    await this.expireStalePending(tx, workspaceId, deadIds);
     const pack = (await purchasableOptions(tx, workspaceId)).find((o) => o.key === packKey);
     if (pack === undefined) return { outcome: "pack_unavailable" };
 
