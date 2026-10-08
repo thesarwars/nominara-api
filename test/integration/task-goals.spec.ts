@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { Logger } from "@nestjs/common";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { RUNTIME_ROLES, BREAKGLASS_ROLE } from "../../src/db/conventions.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
@@ -184,6 +185,25 @@ describe("STORY-065-A · goals — real SQL", () => {
     await client.query("UPDATE goals SET status = 'achieved', achieved_at = now() WHERE id = $1", [goal.id]);
     await expect(abandon(CTX(ws, actor), p, goal.id)).rejects.toBeInstanceOf(ConflictError);
   });
+
+  it("[STORY-065 #7] 20 concurrent abandons of one goal: exactly one succeeds, the rest are ConflictError(current_state=abandoned), and the abandoned metric moves once (FOR UPDATE)", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+    const goal = await create(CTX(ws, actor), p);
+    const spy = vi.spyOn(Logger.prototype, "log");
+    try {
+      const results = await Promise.allSettled(Array.from({ length: 20 }, () => abandon(CTX(ws, actor), p, goal.id)));
+      const ok = results.filter((r) => r.status === "fulfilled");
+      const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+      expect(ok).toHaveLength(1);
+      expect(rejected).toHaveLength(19);
+      for (const r of rejected) {
+        expect(r.reason).toBeInstanceOf(ConflictError);
+        expect((r.reason as ConflictError).details).toMatchObject({ current_state: "abandoned" });
+      }
+      const abandonedMetric = spy.mock.calls.filter(([m]) => (m as { metric?: string } | undefined)?.metric === "nominara_goals_abandoned_total");
+      expect(abandonedMetric).toHaveLength(1);
+    } finally { spy.mockRestore(); }
+  }, 60_000);
 
   it("[STORY-065 #8] two goals on one project both persist and both list", async () => {
     const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
