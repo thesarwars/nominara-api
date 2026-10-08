@@ -26,7 +26,7 @@ import { readLedgerPage } from "./credit-ledger.reader.js";
 // export".
 
 /** The plan from which auto top-up is available (plans-and-entitlements.md: "Growth+"). */
-const AUTO_TOPUP_MIN_PLAN = "growth";
+export const AUTO_TOPUP_MIN_PLAN = "growth";
 
 /** OFF by default: what a workspace with no wallet row reads, and what a new wallet's column defaults give. */
 const AUTO_TOPUP_OFF: AutoTopupConfig = {

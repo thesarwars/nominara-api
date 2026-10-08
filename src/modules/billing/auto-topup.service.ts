@@ -5,6 +5,7 @@ import { PG_POOL } from "../../db/pg-pool.js";
 import { STRIPE_GATEWAY, StripeUpstreamError, type SavedPaymentMethod, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { lockWallet, purchasableOptions, type PurchasableOption } from "../../lib/credits/wallet.js";
+import { AUTO_TOPUP_MIN_PLAN } from "./billing.service.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -39,6 +40,15 @@ import { EMAIL_SENDER, type EmailSender } from "../identity/ports/email-sender.j
 // NOT YET CALLED FROM THE DEBIT PATH. Nothing invokes `trigger` on a balance
 // drop yet: doing it inside the request would put these network calls on the
 // request path (KAD-06). See docs/plans/evidence/NEW-D-7.md.
+
+/**
+ * A `pending` auto-top-up purchase older than this no longer counts as a charge
+ * in flight. An off-session charge settles or fails within seconds, and the
+ * Stripe idempotency key for it expires at 24 h, so an hour-old pending row is a
+ * charge that will never be confirmed: it is failed (a failed row still settles
+ * if the payment turns out to have been taken) so it cannot block auto-top-up forever.
+ */
+const STALE_PENDING_MINUTES = 60;
 
 export const AUTO_TOPUP_TRIGGERED_SUBJECT = "Nominara auto top-up triggered";
 export const AUTO_TOPUP_DISABLED_SUBJECT = "Nominara auto top-up disabled after a failed payment";
@@ -150,8 +160,9 @@ export class AutoTopupService {
       return "charge_submitted";
     } catch (error) {
       if (!(error instanceof StripeUpstreamError)) throw error;
-      // A timeout does not prove the charge did not happen: `failed` still settles if it was paid.
-      await this.inTx(workspaceId, (tx) => this.markFailed(tx, purchaseId));
+      // A timeout does not prove the charge did not happen, so the purchase STAYS pending: the in-flight
+      // guard stays closed (no second charge), the webhook settles it if the payment was taken, and
+      // `expireStalePending` frees the slot if it never is.
       this.logger.error({ message: "auto-top-up charge request failed", workspace_id: workspaceId, purchase_id: purchaseId, status: error.statusCode });
       return "upstream_error";
     }
@@ -197,20 +208,52 @@ export class AutoTopupService {
     if (row === undefined || !row.auto_topup_enabled || row.auto_topup_pack_key === null || row.auto_topup_threshold === null || row.auto_topup_max_per_cycle === null) {
       return { stop: "not_enabled" };
     }
+    if (!(await this.planAllows(tx, workspaceId))) return { stop: "not_in_plan" };
     if (row.available >= row.auto_topup_threshold) return { stop: "above_threshold" };
     if (row.auto_topup_count_cycle >= row.auto_topup_max_per_cycle) return { stop: "cap_reached" };
     if (await this.chargeInFlight(tx, workspaceId)) return { stop: "in_flight" };
     return { stop: null, packKey: row.auto_topup_pack_key };
   }
 
+  /** Growth+ — the same comparison `BillingService.setAutoTopup` makes, re-asked at trigger time: a downgrade turns it off. */
+  private async planAllows(tx: ClientBase, workspaceId: string): Promise<boolean> {
+    const plan = await tx.query<{ eligible: boolean }>(
+      `SELECT (p.sort_order >= g.sort_order) AS eligible
+         FROM workspaces w JOIN plans p ON p.key = w.plan_key JOIN plans g ON g.key = $2
+        WHERE w.id = $1`,
+      [workspaceId, AUTO_TOPUP_MIN_PLAN],
+    );
+    return plan.rows[0]?.eligible === true;
+  }
+
   private async chargeInFlight(tx: ClientBase, workspaceId: string): Promise<boolean> {
-    const pending = await tx.query("SELECT 1 FROM credit_purchases WHERE workspace_id = $1 AND source = 'auto_topup' AND status = 'pending' LIMIT 1", [workspaceId]);
+    const pending = await tx.query(
+      `SELECT 1 FROM credit_purchases
+        WHERE workspace_id = $1 AND source = 'auto_topup' AND status = 'pending' AND created_at >= now() - make_interval(mins => $2::int) LIMIT 1`,
+      [workspaceId, STALE_PENDING_MINUTES],
+    );
     return (pending.rowCount ?? 0) > 0;
+  }
+
+  /** Fails (and audits) pending auto-top-up purchases past the stale window. Runs under the wallet lock, before the claim. */
+  private async expireStalePending(tx: ClientBase, workspaceId: string): Promise<void> {
+    const stale = await tx.query<{ id: string }>(
+      `UPDATE credit_purchases SET status = 'failed'
+        WHERE workspace_id = $1 AND source = 'auto_topup' AND status = 'pending' AND created_at < now() - make_interval(mins => $2::int)
+        RETURNING id`,
+      [workspaceId, STALE_PENDING_MINUTES],
+    );
+    for (const row of stale.rows) {
+      await this.writeAudit(tx, workspaceId, "billing.auto_topup.pending_expired", "credit_purchase", row.id, { status: "pending" }, { status: "failed", reason: "no_confirmation" });
+      incrementCounter("nominara_billing_auto_topup_pending_expired_total", {});
+      this.logger.warn({ message: "auto-top-up purchase expired without a payment confirmation", workspace_id: workspaceId, purchase_id: row.id });
+    }
   }
 
   private async claim(tx: ClientBase, workspaceId: string, packKey: string): Promise<{ claimed: Claimed } | { outcome: AutoTopupTriggerOutcome }> {
     // The row lock serialises concurrent triggers; the next statement then sees the winner's committed purchase.
     if (!(await lockWallet(tx, workspaceId))) return { outcome: "not_enabled" };
+    await this.expireStalePending(tx, workspaceId);
     const pack = (await purchasableOptions(tx, workspaceId)).find((o) => o.key === packKey);
     if (pack === undefined) return { outcome: "pack_unavailable" };
 
@@ -221,9 +264,11 @@ export class AutoTopupService {
           AND auto_topup_enabled
           AND auto_topup_pack_key = $2
           AND auto_topup_count_cycle < auto_topup_max_per_cycle
+          AND EXISTS (SELECT 1 FROM workspaces w JOIN plans p ON p.key = w.plan_key JOIN plans g ON g.key = $3
+                       WHERE w.id = $1 AND p.sort_order >= g.sort_order)
           AND (included_balance + purchased_balance - reserved) < auto_topup_threshold
           AND NOT EXISTS (SELECT 1 FROM credit_purchases p WHERE p.workspace_id = $1 AND p.source = 'auto_topup' AND p.status = 'pending')`,
-      [workspaceId, packKey],
+      [workspaceId, packKey, AUTO_TOPUP_MIN_PLAN],
     );
     if ((claimed.rowCount ?? 0) === 0) {
       const why = await this.verdict(tx, workspaceId);

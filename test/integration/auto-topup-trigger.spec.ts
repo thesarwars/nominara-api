@@ -307,11 +307,14 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: true, auto_topup_count_cycle: 1 });
   });
 
-  it("NEW-D-7 · a pack the workspace's tier can no longer buy is pack_unavailable: nothing charged, no slot consumed", async () => {
+  it("NEW-D-7 · a pack the catalog no longer sells to this workspace is pack_unavailable: nothing charged, no slot consumed", async () => {
     const { workspaceId } = await armed({ plan: "growth" });
-    await harness.db().query("UPDATE credit_wallets SET auto_topup_pack_key = 'agency_vault' WHERE workspace_id = $1", [workspaceId]);
-    await harness.db().query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [workspaceId]);
-    expect(await service.trigger(workspaceId)).toBe("pack_unavailable");
+    await harness.db().query("UPDATE credit_packs SET is_public = false WHERE key = 'starter_vault'");
+    try {
+      expect(await service.trigger(workspaceId)).toBe("pack_unavailable");
+    } finally {
+      await harness.db().query("UPDATE credit_packs SET is_public = true WHERE key = 'starter_vault'");
+    }
     expect(gateway.offSessionCharges).toHaveLength(0);
     expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(0);
   });
