@@ -219,3 +219,33 @@ describe("STORY-064-C · route wiring and contracts", () => {
     expect(JSON.stringify(logs)).not.toContain("SECRET TITLE");
   });
 });
+
+// STORY-064-D checkpoint-2 — the decorators on POST /tasks/{id}/complete were
+// correct but unguarded: removing @Idempotent() or weakening task:move to
+// task:read left every test green. Each assertion below is pinned to one of
+// those mutations.
+describe("STORY-064-D · complete route wiring", () => {
+  const reflector = new Reflector();
+  const proto = TasksController.prototype as unknown as Record<string, () => void>;
+
+  it("STORY-064-D AC6 · complete requires task:move", () => {
+    expect(reflector.get(REQUIRE_PERMISSION_KEY, proto.complete!)).toBe("task:move");
+  });
+
+  it("STORY-064-D AC6 · complete is @Idempotent", () => {
+    expect(reflector.get(IDEMPOTENT_KEY, proto.complete!)).toBe(true);
+  });
+
+  it("STORY-064-D AC6 · complete enforces project scope in the service (ScopedByQuery) and is audited as task.completed", () => {
+    const h = proto.complete!;
+    expect(reflector.get(SCOPED_BY_QUERY_KEY, h)).toBe(true);
+    expect(reflector.get(AUDIT_METADATA_KEY, h)).toMatchObject({ action: "task.completed", resourceType: "task" });
+  });
+
+  it("STORY-064-D AC1 · complete publishes the completeTask operation with a response schema and no request body", () => {
+    const contract = reflector.get(API_CONTRACT_KEY, proto.complete!) as { operationId: string; requestSchema?: unknown; responseSchema?: unknown };
+    expect(contract.operationId).toBe("completeTask");
+    expect(contract.responseSchema).toBeDefined();
+    expect(contract.requestSchema).toBeUndefined();
+  });
+});
