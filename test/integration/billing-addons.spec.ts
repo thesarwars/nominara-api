@@ -362,6 +362,65 @@ describe("STORY-076b · add-ons", () => {
     expect((await resolved(workspaceId)).entitlements["seats.max"]!.source).not.toBe("add_on");
   });
 
+  it("audit · concurrent POSTs with DISTINCT Idempotency-Keys and different totals create exactly ONE Stripe item and end at the largest total (the workspace row lock)", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, { held: [] });
+    const key = `subscription:${subIdOf(workspaceId)}`;
+    // Stripe applies a change after a delay, so an unserialised second request has already read held=0.
+    vi.spyOn(gateway, "changeAddonQuantity").mockImplementation(async (input) => {
+      gateway.addonChanges.push(input);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const raw = gateway.objects.get(key)!.raw as { items: { data: Array<Record<string, unknown>> } };
+      const existing = raw.items.data.find((line) => line.id === input.existingItemId);
+      if (existing !== undefined) existing.quantity = input.quantity;
+      else
+        raw.items.data.push({
+          id: `si_${input.kind}_${randomUUID()}`,
+          quantity: input.quantity,
+          current_period_start: T0,
+          current_period_end: PERIOD_END,
+          price: { id: "price_seat", unit_amount: input.unitAmountCents, currency: "usd", recurring: { interval: "month" }, product: { metadata: { nominara_kind: input.kind } } },
+        });
+    });
+    const totals = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+    const responses = await Promise.all(totals.map((quantity) => post(owner, "/billing/addons", { kind: "extra_seat", quantity })));
+
+    expect(responses.map((r) => r.statusCode).every((code) => code === 202 || code === 409), responses.map((r) => r.body).join("\n")).toBe(true);
+    expect(responses.some((r) => r.statusCode === 202)).toBe(true);
+    // The hazard: two unserialised requests both create an item, and the customer pays for both.
+    expect(gateway.addonChanges.filter((change) => change.existingItemId === null)).toHaveLength(1);
+    const lines = (gateway.objects.get(key)!.raw as { items: { data: Array<{ quantity: number; price: { product: { metadata: { nominara_kind: string } } } }> } }).items.data.filter(
+      (line) => line.price.product.metadata.nominara_kind === "extra_seat",
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.quantity).toBe(13);
+  });
+
+  it("audit · a late event for an OLD, ended subscription leaves the CURRENT subscription's add-ons active (the reconcile filter binds the event's subscription)", async () => {
+    const { workspaceId } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 2 }, { kind: "extra_project", quantity: 1 }] });
+    expect((await reconcile(workspaceId)).statusCode).toBe(200);
+    const before = { rows: await addonRows(workspaceId), version: await versionOf(workspaceId), sub: await localSub(workspaceId) };
+    expect(before.rows.filter((r) => r.active_until === null)).toHaveLength(2);
+
+    // An earlier subscription of the same workspace, ended in Stripe: it fetches as `canceled` with no items.
+    const oldId = `sub_old_${workspaceId}`;
+    gateway.putObject("subscription", oldId, { workspace_id: workspaceId, plan_key: "growth", billing_interval: "monthly" }, {
+      customer: "cus_1",
+      status: "canceled",
+      cancel_at_period_end: false,
+      trial_end: null,
+      items: { data: [] },
+    });
+    const res = await deliver(eventBody(`evt_${randomUUID()}`, "customer.subscription.deleted", oldId));
+    expect(res.statusCode, res.body).toBe(200);
+
+    const after = await addonRows(workspaceId);
+    expect(after.filter((r) => r.active_until === null).map((r) => [r.kind, r.quantity]).sort()).toEqual([["extra_project", 1], ["extra_seat", 2]]);
+    expect(await localSub(workspaceId)).toEqual(before.sub);
+    expect(await versionOf(workspaceId)).toBe(before.version);
+  });
+
   // ---- AC2 (STORY-076 AC11 / scenarios 10 and 11) --------------------------------------------------
 
   it("AC2 · scenario 10 · after an extra_project lands, projects.max is +1 AND the prompt slots are granted", async () => {

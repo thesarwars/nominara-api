@@ -396,3 +396,49 @@ describe("STORY-076b audit · an add-on change is refused while a removal is sch
     expect(state.changes).toEqual([]);
   });
 });
+
+describe("STORY-076b audit · the two money guards have a test that fails without them", () => {
+  it("lock · add() takes the workspace row lock BEFORE the subscription read and the Stripe fetch (two POSTs must not both see held=0)", async () => {
+    const c = client([
+      [/FROM workspaces w JOIN plans/u, planRow("growth")],
+      [/FROM subscriptions WHERE workspace_id/u, subRow()],
+    ]);
+    let lockedAtFetch: boolean | undefined;
+    const gw = gateway({
+      fetchObject: (kind: string, id: string) => {
+        lockedAtFetch = c.calls.some(({ sql }) => /FROM workspaces WHERE id = \$1 FOR UPDATE/u.test(sql));
+        return Promise.resolve({ kind, id, metadata: {}, raw: { items: { data: [] } } });
+      },
+    } as never);
+    await inTenant(c, () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 1 }, "k"));
+    const lock = c.calls.findIndex(({ sql }) => /FROM workspaces WHERE id = \$1 FOR UPDATE/u.test(sql));
+    const read = c.calls.findIndex(({ sql }) => /FROM subscriptions WHERE workspace_id/u.test(sql));
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(lock).toBeLessThan(read);
+    expect(lockedAtFetch).toBe(true);
+  });
+
+  it("reconcile filter · an event for an OLD subscription id matches no live row (the filter is on the event's subscription, not just the workspace's)", async () => {
+    // A database in which the workspace's only live subscription is `sub_current`: a query that
+    // does not bind the event's subscription id to the row would find it for ANY id.
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const c = {
+      query: (sql: string, params: unknown[] = []) => {
+        calls.push({ sql, params });
+        if (/FROM subscriptions WHERE workspace_id/u.test(sql)) {
+          const bound = /stripe_subscription_id = \$2/u.test(sql);
+          const rows = bound && params[1] !== "sub_current" ? [] : [{ id: "s_current" }];
+          return Promise.resolve({ rows, rowCount: rows.length });
+        }
+        if (/FROM subscription_addons WHERE workspace_id/u.test(sql)) {
+          const rows = [{ id: "row_seat", kind: "extra_seat", quantity: 2, unit_price_usd: "15.00", stripe_subscription_item_id: "si_seat", subscription_id: "s_current" }];
+          return Promise.resolve({ rows, rowCount: 1 });
+        }
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      },
+    } as unknown as ClientBase;
+    const out = await new BillingAddonsService(gateway()).reconcile(c, { workspaceId: WS, stripeSubscriptionId: "sub_old", items: [], eventId: "evt_old", eventType: "customer.subscription.deleted", versionAlreadyBumped: false });
+    expect(out).toEqual({ changed: false });
+    expect(calls.some(({ sql }) => /^\s*UPDATE subscription_addons/u.test(sql))).toBe(false);
+  });
+});
