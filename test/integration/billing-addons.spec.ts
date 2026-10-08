@@ -263,6 +263,26 @@ describe("STORY-076b · add-ons", () => {
     expect(gateway.addonChanges).toHaveLength(0);
   });
 
+  it("AC1 retry · a create that FAILS without changing Stripe is retried under the SAME derived Stripe key; a different Idempotency-Key derives a different one", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const key = randomUUID();
+    gateway.addonAttempts.length = 0;
+    gateway.failAddonWith = new StripeUpstreamError(504);
+    // Stripe state is NOT changed: the retry's fresh fetch still shows nothing held, so it sends a second create.
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(503);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(503);
+    expect(gateway.addonAttempts).toHaveLength(2);
+    const [first, retry] = gateway.addonAttempts;
+    expect(first!.idempotencyKey).toBeTruthy();
+    expect(retry!.idempotencyKey).toBe(first!.idempotencyKey);
+
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, randomUUID())).statusCode).toBe(503);
+    expect(gateway.addonAttempts).toHaveLength(3);
+    expect(gateway.addonAttempts[2]!.idempotencyKey).not.toBe(first!.idempotencyKey);
+    expect(gateway.addonChanges).toHaveLength(0);
+  });
+
   it("AC1 · request validation: quantity 0, 101, a fractional quantity and an unknown kind are 400s; the Idempotency-Key is required", async () => {
     const { owner } = await newWorkspace("growth");
     for (const payload of [{ kind: "extra_seat", quantity: 0 }, { kind: "extra_seat", quantity: 101 }, { kind: "extra_seat", quantity: 1.5 }, { kind: "extra_gpu", quantity: 1 }, { kind: "extra_seat" }]) {

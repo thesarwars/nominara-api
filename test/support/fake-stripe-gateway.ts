@@ -121,7 +121,11 @@ export class FakeStripeGateway implements StripeGateway {
   /** Set to make the next add-on call fail like an upstream outage. */
   failAddonWith: Error | undefined;
 
+  /** Every change ATTEMPTED, recorded before a failure is raised: a timed-out call that Stripe may still apply is still an attempt. */
+  readonly addonAttempts: AddonChangeInput[] = [];
+
   changeAddonQuantity(input: AddonChangeInput): Promise<void> {
+    this.addonAttempts.push(input);
     if (this.failAddonWith !== undefined) return Promise.reject(this.failAddonWith);
     this.addonChanges.push(input);
     return Promise.resolve();
@@ -143,6 +147,7 @@ export class FakeStripeGateway implements StripeGateway {
     this.completedSessions.clear();
     this.packCheckouts.length = 0;
     this.addonChanges.length = 0;
+    this.addonAttempts.length = 0;
     this.addonRemovals.length = 0;
     this.configured = true;
     this.failFetchWith = undefined;
