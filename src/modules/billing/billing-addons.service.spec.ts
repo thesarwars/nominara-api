@@ -333,3 +333,66 @@ describe("STORY-076b audit · a retried POST charges once (the quantity is a tot
     expect(state.quantity).toBe(3);
   });
 });
+
+describe("STORY-076b audit · an add-on change is refused while a removal is scheduled (phase 2 is frozen at DELETE time)", () => {
+  const projectRow = [/FROM subscription_addons WHERE kind/u, [{ id: "a1", kind: "extra_project", quantity: 1, unit_price_usd: "49.00", stripe_subscription_item_id: "si_project", subscription_id: "s1" }]] as Script[number];
+  const removeScript: Script = [
+    [/jsonb_object_agg/u, [{ plan_key: "growth", entitlement_version: 1, entitlement_overrides: {}, plan_entitlements: PLAN_ENTITLEMENTS.growth, addons: {} }]],
+    [/count\(\*\)::int AS n FROM workspace_members/u, [{ n: 1 }]],
+    [/FROM workspaces w JOIN plans/u, planRow("growth")],
+    [/FROM subscriptions WHERE workspace_id/u, subRow()],
+  ];
+  const addScript: Script = [
+    [/FROM workspaces w JOIN plans/u, planRow("growth")],
+    [/FROM subscriptions WHERE workspace_id/u, subRow()],
+  ];
+
+  /** A Stripe whose subscription grows a schedule the moment a removal is scheduled, and keeps it. */
+  function stripe() {
+    const state = { schedule: null as string | null, changes: [] as unknown[], removals: [] as unknown[] };
+    const gw = gateway({
+      fetchObject: (kind: string, id: string) =>
+        Promise.resolve({
+          kind,
+          id,
+          metadata: {},
+          raw: { schedule: state.schedule, items: { data: [{ id: "si_project", quantity: 1, price: { unit_amount: 4900, currency: "usd", product: { metadata: { nominara_kind: "extra_project" } } } }, { id: "si_seat", quantity: 1, price: { unit_amount: 1500, currency: "usd", product: { metadata: { nominara_kind: "extra_seat" } } } }] } },
+        }),
+      scheduleAddonRemoval: (input: unknown) => {
+        state.schedule = "sub_sched_1";
+        state.removals.push(input);
+        return Promise.resolve();
+      },
+      changeAddonQuantity: (input: unknown) => {
+        state.changes.push(input);
+        return Promise.resolve();
+      },
+    } as never);
+    return { state, gw };
+  }
+
+  it("AC13 · DELETE extra_project then POST extra_seat {3} is a 409 naming the scheduled removal: Stripe is NOT changed and the frozen phase 2 is not touched", async () => {
+    const { state, gw } = stripe();
+    const svc = new BillingAddonsService(gw);
+    await inTenant(client([projectRow, ...removeScript]), () => svc.remove("extra_project"));
+    expect(state.removals).toHaveLength(1);
+    expect(state.schedule).toBe("sub_sched_1");
+    await expect(inTenant(client(addScript), () => svc.add({ kind: "extra_seat", quantity: 3 }, "k1"))).rejects.toMatchObject({ code: "conflict", message: expect.stringMatching(/removal.*scheduled/iu) });
+    expect(state.changes).toEqual([]);
+    expect(state.removals).toHaveLength(1);
+  });
+
+  it("AC13 · with no schedule attached the same POST goes through", async () => {
+    const { state, gw } = stripe();
+    await inTenant(client(addScript), () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 3 }, "k1"));
+    expect(state.changes).toHaveLength(1);
+  });
+
+  it("AC13 · a total already held is still a no-op while a removal is scheduled (a retry of a POST that landed first)", async () => {
+    const { state, gw } = stripe();
+    state.schedule = "sub_sched_1";
+    const out = await inTenant(client(addScript), () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 1 }, "k1"));
+    expect(out).toMatchObject({ status: "pending", quantity_requested: 1 });
+    expect(state.changes).toEqual([]);
+  });
+});
