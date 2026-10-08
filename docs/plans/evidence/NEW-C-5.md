@@ -55,3 +55,17 @@ The HTTP-level 403/409/404 envelope for the three routes, and the `audit_log` ro
 - **Frontend** (app-fnt-dev-main, outside this lane's worktree): `Displacement.kind` -> DB vocabulary, `restoreDisplacement()`, Restore control, four async states.
 - `recovery_task_count` counts from the gaps alone; it does not drop to 0 once `task_id` is set. NEW-C-6 decides what an existing plan means (its 409).
 - Docs to carry to the docs repo: `api-specification.md` §3 needs `POST /displacements/{id}/dismiss` and `/restore` and the `task:create` choice; `schemas/captures-and-facts.md` needs `dismissed_at`, `dismissed_by` on `displacement_events`.
+
+## Checkpoint-3 fix pass (branch 7day/c-comp-4 from integration/7day fee788e)
+
+The CP3 QA failed this item because "contracts/analytics/displacement-response.schema.ts, src/modules/displacement/, the GET route, migration 0099 and test/integration/displacement-feed.spec.ts are missing from the merged tree".
+That finding is STALE: all of them are in fee788e (`ls src/modules/displacement` -> controller, module, service, spec; `src/db/migrations/sql/0099_displacement_dismissal.{up,down}.sql`; `contracts/analytics/displacement-response.schema.ts`;
+`test/integration/displacement-feed.spec.ts`). Re-run here: `vitest run --config vitest.integration.config.ts test/integration/displacement-feed.spec.ts` exit 0 (17 tests, in a batch of 11 files / 176 tests, exit 0).
+
+**Dismiss/restore permission: DECIDED, `task:create`** (owner decisions 2026-10-08, "NEW-C-5 dismiss/restore permission: task:create"). The code already uses it (`RequirePermission("task:create")` on `dismiss` and `restore`),
+pinned by `src/modules/displacement/displacement.spec.ts` > "AC3/AC4 - dismiss needs task:create ..." and "AC3/AC4 - restore needs task:create ...". The "proposed, raised with the owner" wording is now a decision, not an open question.
+The restore endpoint's existence is likewise accepted by that decision; the frontend half (Displacement.kind vocabulary, restoreDisplacement(), Restore control, four async states) is in app-fnt-dev-main and is not done here.
+
+Change in this pass: `recovery_task_count` now counts DISTINCT seedable domains (see NEW-C-6), so the count the feed shows is the number of tasks the plan creates. The existing unit test
+"the domain match ignores case; two gaps on one domain are two tasks" in `src/lib/analytics/displacement-recovery.spec.ts` asserted the old per-gap count; the owner's fingerprint
+`sha256('authority:{project_id}:{domain}')` makes two URLs on one domain ONE task, so the assertion was changed to 1 (and renamed). It still proves the property it was written for (the feed count equals what the plan makes); the old number was outdated by that decision, not relaxed.

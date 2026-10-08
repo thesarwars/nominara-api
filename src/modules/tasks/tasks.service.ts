@@ -42,6 +42,25 @@ export interface PortalTasksRead {
   open: PortalOpenRow[];
 }
 
+/** What `insertTask` writes. `goalId` is only ever set by a manual create. */
+interface TaskInsert {
+  kind: "content" | "technical" | "authority" | "monitoring";
+  origin: "auto" | "manual" | "command_bar";
+  ruleCode: string | null;
+  fingerprint: Buffer;
+  title: string;
+  description: string;
+  goalId?: string | null;
+  sourceDisplacementId: string | null;
+  sourceDomainId: string | null;
+  affectedUrl: string | null;
+}
+
+/** NEW-C-6 — the input of `TasksService.createGeneratedTask`: a generated task is never a goal task and always carries a deterministic fingerprint. */
+export interface GeneratedTaskInput extends Omit<TaskInsert, "goalId"> {
+  projectId: string;
+}
+
 /** schemas/tasks-and-goals.md: a dismissed task re-surfaces after 180 days. */
 export const TASK_RESURFACE_DAYS = 180;
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -409,13 +428,76 @@ export class TasksService {
 
     if (body.goal_id !== undefined) await this.assertGoalOfProject(client, body.goal_id, projectId);
 
-    const shortRef = await nextShortRef(client, store.context.workspaceId, shortRefPrefix(found.name));
-    const fingerprint = createHash("sha256").update(`manual:${randomUUID()}`).digest();
+    return this.insertTask(client, projectId, found.name, {
+      kind: body.kind ?? "content",
+      origin: "manual",
+      ruleCode: null,
+      fingerprint: createHash("sha256").update(`manual:${randomUUID()}`).digest(),
+      title: body.title,
+      description: "",
+      goalId: body.goal_id ?? null,
+      sourceDisplacementId: null,
+      sourceDomainId: null,
+      affectedUrl: null,
+    });
+  }
+
+  /**
+   * NEW-C-6 — the SHARED task-insert method for generated (non-manual) tasks. A module that turns its own
+   * finding into a task (the displacement recovery plan today, the STORY-063 generator next) calls this; it
+   * never writes `INSERT INTO tasks` itself, because `tasks` has one owning service.
+   *
+   * IDEMPOTENT BY FINGERPRINT. If an open (not done, not deleted) task already has this project + fingerprint
+   * - the `ux_tasks_dedupe` partial index - it is returned with `created: false` and NOTHING is written: no
+   * row, no reference consumed (references are gapless), no event. A transaction-scoped advisory lock keyed on
+   * the fingerprint serialises two concurrent callers, so the loser finds the winner's row rather than
+   * burning a reference on an insert that would conflict.
+   *
+   * Runs in the ambient tenant transaction; a failure after the insert rolls the task back with the caller.
+   */
+  async createGeneratedTask(input: GeneratedTaskInput): Promise<{ task: Task; created: boolean }> {
+    const store = currentTenantStore()!;
+    const client = store.client;
+
+    const project = await client.query<{ id: string; name: string; in_scope: boolean }>(
+      `SELECT id, name,
+              (cardinality(app.current_scope_projects()) = 0 OR id = ANY(app.current_scope_projects())) AS in_scope
+         FROM projects WHERE id = $1 AND deleted_at IS NULL`,
+      [input.projectId],
+    );
+    const found = project.rows[0];
+    if (found === undefined) throw new NotFoundError({ message: "no such project" });
+    if (!found.in_scope) throw new ProjectOutOfScopeException();
+
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `${input.projectId}:${input.fingerprint.toString("hex")}`,
+    ]);
+    const existing = await client.query<{ id: string }>(
+      `SELECT id FROM tasks
+        WHERE project_id = $1 AND dedupe_fingerprint = $2 AND status <> 'done' AND deleted_at IS NULL`,
+      [input.projectId, input.fingerprint],
+    );
+    if (existing.rows[0] !== undefined) {
+      incrementCounter("nominara_tasks_generated_deduplicated_total", { origin: input.origin });
+      return { task: await this.readTask(client, existing.rows[0].id), created: false };
+    }
+    const task = await this.insertTask(client, input.projectId, found.name, input);
+    return { task, created: true };
+  }
+
+  /** The one `INSERT INTO tasks` for new tasks: reference, row, `created` event, open counts, metric, log, realtime. */
+  private async insertTask(client: ClientBase, projectId: string, projectName: string, input: TaskInsert): Promise<Task> {
+    const store = currentTenantStore()!;
+    const shortRef = await nextShortRef(client, store.context.workspaceId, shortRefPrefix(projectName));
     const inserted = await client.query<{ id: string }>(
-      `INSERT INTO tasks (workspace_id, project_id, short_ref, kind, origin, dedupe_fingerprint, title, description, goal_id)
-       VALUES (app.current_workspace(), $1, $2, $3, 'manual', $4, $5, '', $6)
+      `INSERT INTO tasks (workspace_id, project_id, short_ref, kind, origin, rule_code, dedupe_fingerprint, title, description,
+                          goal_id, source_displacement_id, source_domain_id, affected_url)
+       VALUES (app.current_workspace(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id`,
-      [projectId, shortRef, body.kind ?? "content", fingerprint, body.title, body.goal_id ?? null],
+      [
+        projectId, shortRef, input.kind, input.origin, input.ruleCode, input.fingerprint, input.title, input.description,
+        input.goalId ?? null, input.sourceDisplacementId, input.sourceDomainId, input.affectedUrl,
+      ],
     );
     const taskId = inserted.rows[0]!.id;
     await client.query(
@@ -425,7 +507,7 @@ export class TasksService {
     );
     await refreshProjectTaskCounts(client, projectId);
 
-    incrementCounter("nominara_tasks_created_total", { origin: "manual" });
+    incrementCounter("nominara_tasks_created_total", { origin: input.origin });
     incrementCounter("nominara_tasks_events_written_total", { event: "created" });
     // Workspace/task/project IDs only — never the title.
     this.logger.log({ message: "task created", workspace_id: store.context.workspaceId, task_id: taskId, project_id: projectId });

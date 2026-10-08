@@ -12,7 +12,9 @@ import { Page, pageFrom } from "../../api/pagination/page.js";
 import { ConflictError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
 import { dataSourceOf } from "../../lib/analytics/data-source.js";
-import { recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
+import { authorityTargets, authorityTaskFingerprint, recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
+import type { Task } from "../../../contracts/tasks/index.js";
+import { TasksService } from "../tasks/tasks.service.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -61,12 +63,18 @@ interface FeedRow {
 
 interface StateRow {
   id: string;
+  project_id: string;
   dismissed_at: Date | null;
+  citation_gap: unknown;
+  task_id: string | null;
   in_scope: boolean;
 }
 
 @Injectable()
 export class DisplacementService {
+  // `tasks` has ONE owning service (coding-standards §1): the recovery plan inserts through it, never into the table.
+  constructor(private readonly tasks: TasksService) {}
+
   async feed(projectId: string, query: DisplacementFeedQuery): Promise<Page<DisplacementItem>> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("DisplacementService requires an active tenant context");
@@ -195,6 +203,69 @@ export class DisplacementService {
     return { id: state.id, dismissed_at: null };
   }
 
+  /**
+   * NEW-C-6 — `POST /displacements/{id}/recovery-plan` (STORY-057 AC6-AC9). One authority task per SEEDABLE
+   * citation gap, through `TasksService.createGeneratedTask`; a non-seedable gap stays on the record and in the
+   * feed but makes no task. Concept tasks are zero until STORY-058 stores concepts.
+   *
+   * IDEMPOTENT. The fingerprint is `sha256('authority:{project_id}:{domain}')`, so a repeat call (or a second
+   * displacement on the same domain) finds the open task and returns it: no duplicate, no consumed reference.
+   * The displacement row is locked FOR UPDATE first, so concurrent plans for it run one after the other.
+   * Everything runs in the request's tenant transaction: a task that fails to insert rolls the whole plan back.
+   */
+  async recoveryPlan(displacementId: string): Promise<Task[]> {
+    const { client, context } = this.store();
+    const state = await this.lock(displacementId);
+    const gap = citationGapSchema.parse(state.citation_gap);
+
+    const domains = [...new Set(gap.map((g) => g.domain.toLowerCase()))];
+    const seedable = new Map<string, string>();
+    if (domains.length > 0) {
+      const seeds = await client.query<{ id: string; domain: string }>(
+        "SELECT id, lower(domain) AS domain FROM source_domains WHERE workspace_id = $1 AND is_seedable AND lower(domain) = ANY($2::text[])",
+        [context.workspaceId, domains],
+      );
+      for (const seed of seeds.rows) seedable.set(seed.domain, seed.id);
+    }
+
+    const tasks: Task[] = [];
+    let created = 0;
+    for (const entry of authorityTargets(gap, new Set(seedable.keys()))) {
+      const domain = entry.domain.toLowerCase();
+      const result = await this.tasks.createGeneratedTask({
+        projectId: state.project_id,
+        kind: "authority",
+        origin: "auto",
+        ruleCode: null,
+        fingerprint: authorityTaskFingerprint(state.project_id, domain),
+        title: `Earn a citation on ${domain}`,
+        description: `${entry.held_by.join(", ")} ${entry.held_by.length === 1 ? "is" : "are"} cited at ${entry.url}; your brand is not. Get cited on ${domain}.`,
+        sourceDisplacementId: displacementId,
+        sourceDomainId: seedable.get(domain) ?? null,
+        affectedUrl: entry.url,
+      });
+      tasks.push(result.task);
+      if (result.created) created += 1;
+    }
+
+    // The displacement's `task_id` is the plan's first task, set once and never replaced.
+    if (tasks.length > 0 && state.task_id === null) {
+      await client.query("UPDATE displacement_events SET task_id = $3 WHERE id = $1 AND workspace_id = $2 AND task_id IS NULL", [
+        displacementId, context.workspaceId, tasks[0]!.id,
+      ]);
+    }
+
+    incrementCounter("nominara_displacement_recovery_plans_total", { outcome: created > 0 ? "created" : "unchanged" });
+    logger.log({
+      message: "displacement recovery plan",
+      workspace_id: context.workspaceId,
+      displacement_id: displacementId,
+      tasks_created: created,
+      tasks_existing: tasks.length - created,
+    });
+    return tasks;
+  }
+
   private store() {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("DisplacementService requires an active tenant context");
@@ -205,7 +276,7 @@ export class DisplacementService {
   private async lock(displacementId: string): Promise<StateRow> {
     const { client, context } = this.store();
     const found = await client.query<StateRow>(
-      `SELECT id, dismissed_at,
+      `SELECT id, project_id, dismissed_at, citation_gap, task_id,
               (cardinality(app.current_scope_projects()) = 0 OR project_id = ANY(app.current_scope_projects())) AS in_scope
          FROM displacement_events WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
       [displacementId, context.workspaceId],

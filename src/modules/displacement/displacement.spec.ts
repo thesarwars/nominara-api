@@ -9,21 +9,30 @@ import {
   displacementItemSchema,
 } from "../../../contracts/analytics/index.js";
 import { API_CONTRACT_KEY } from "../../api/decorators/api-contract.decorator.js";
+import { IDEMPOTENT_KEY } from "../../api/decorators/idempotent.decorator.js";
+import { recoveryPlanResponseSchema } from "../../../contracts/analytics/index.js";
 import { AUDIT_METADATA_KEY } from "../../api/decorators/audit.decorator.js";
 import { PROJECT_PARAM_KEY } from "../../api/decorators/project-param.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.decorator.js";
 import { SCOPED_BY_QUERY_KEY } from "../../api/decorators/scoped-by-query.decorator.js";
+import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { DisplacementController } from "./displacement.controller.js";
 import { DisplacementModule } from "./displacement.module.js";
 import { DisplacementService } from "./displacement.service.js";
+import { TasksService } from "../tasks/tasks.service.js";
+import { NoopRealtimePublisher } from "../../lib/cache/realtime-publisher.js";
 
 // STORY-022 — one compiles-test per scaffolded module.
 describe("STORY-022 · DisplacementModule compiles", () => {
   it("resolves in a Nest testing module", async () => {
+    // NEW-C-6: DisplacementModule imports TasksModule, which builds the realtime publisher and validates the env eagerly.
+    const originalEnv = { ...process.env };
+    applyFakeApiEnv();
     const moduleRef = await Test.createTestingModule({ imports: [DisplacementModule] }).compile();
     expect(moduleRef.get(DisplacementController)).toBeInstanceOf(DisplacementController);
     await moduleRef.close();
+    process.env = originalEnv;
   });
 });
 
@@ -134,7 +143,7 @@ const ctx = { workspaceId: "ws-1", actorId: "actor-1" };
 const run = <T>(client: ClientBase, fn: () => Promise<T>) => withTenantContext(client, ctx, fn);
 
 describe("NEW-C-5 · dismiss and restore (AC3, AC5)", () => {
-  const service = new DisplacementService();
+  const service = new DisplacementService(new TasksService(new NoopRealtimePublisher()));
   const live = { id: ID, dismissed_at: null, in_scope: true };
   const dismissed = { id: ID, dismissed_at: new Date("2026-10-01T00:00:00Z"), in_scope: true };
 
@@ -185,12 +194,32 @@ describe("NEW-C-5 · dismiss and restore (AC3, AC5)", () => {
 });
 
 describe("NEW-C-5 · feed (AC2, AC5)", () => {
-  const service = new DisplacementService();
+  const service = new DisplacementService(new TasksService(new NoopRealtimePublisher()));
 
   it("AC5 — a project RLS hides is 404 before any feed query runs", async () => {
     const seen: string[] = [];
     const query = displacementFeedQuerySchema.parse({});
     await expect(run(fakeClient({}, seen), () => service.feed(uuid(9), query))).rejects.toMatchObject({ code: "not_found" });
     expect(seen.some((s) => /FROM displacement_events/i.test(s))).toBe(false);
+  });
+});
+
+describe("NEW-C-6 · route wiring and contract", () => {
+  const reflector = new Reflector();
+  const proto = DisplacementController.prototype as unknown as Record<string, () => void>;
+
+  it("AC3 — the recovery plan needs task:create, requires Idempotency-Key, is scoped by the displacement and audited", () => {
+    const h = proto.recoveryPlan!;
+    expect(h).toBeTypeOf("function");
+    expect(reflector.get(REQUIRE_PERMISSION_KEY, h)).toBe("task:create");
+    expect(reflector.get(IDEMPOTENT_KEY, h)).toBe(true);
+    expect(reflector.get(SCOPED_BY_QUERY_KEY, h)).toBe(true);
+    expect(reflector.get(AUDIT_METADATA_KEY, h)).toMatchObject({ action: "displacement.recovery_planned", resourceType: "displacement" });
+    expect(reflector.get(API_CONTRACT_KEY, h)).toMatchObject({ operationId: "createDisplacementRecoveryPlan", responseSchema: recoveryPlanResponseSchema });
+  });
+
+  it("AC1 — the response is an array of the task schema; an empty plan is valid, an unknown task key is refused", () => {
+    expect(recoveryPlanResponseSchema.safeParse([]).success).toBe(true);
+    expect(recoveryPlanResponseSchema.safeParse([{ id: "not-a-task" }]).success).toBe(false);
   });
 });
