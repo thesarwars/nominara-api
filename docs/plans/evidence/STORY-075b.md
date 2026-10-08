@@ -67,3 +67,8 @@ Option (a) of the finding. RED `fa98660` (`vitest run src/lib/billing/stripe/inv
 - Known limits, stated: (1) the invoice gateway fetch does NOT expand line products (an unverified expand path against live Stripe would risk every invoice webhook), so add-on lines are recognised by the fixed product id, which is how our gateway creates them; credit-pack lines are recognised only when a product object with the marker is present, which Checkout payment mode does not produce on subscription invoices. Confirming both against the sandbox is NEW-A-17. (2) A category netting below zero (proration credit) publishes 0.00 because the money contract has no negative amount.
 - Gates: `pnpm lint` 0; `pnpm typecheck` 0; `pnpm test:unit` 0 (282 files passed, 1 skipped; 3416 tests passed); `pnpm contracts:check` 0 (no contract change).
 - NOT RUN: the integration spec. `df -h /System/Volumes/Data` shows 7.7 GiB free (< 8 GiB rule), so no testcontainers. The new integration case and its edit of the existing GET test are unrun and must be run before merge.
+
+
+## Checkpoint-3 fix pass (2026-10-08, lane d-billing)
+
+`test/integration/billing-invoices.spec.ts` ran on the merged tree `fee788e` (it had only run on the lane tip): `vitest run --config vitest.integration.config.ts test/integration/billing-invoices.spec.ts test/integration/billing-addons.spec.ts`, exit 0, 65 passed. It also passes after the STORY-076b changes (14-file area run, exit 0, 331 passed; see STORY-076b.md). No change to the invoices code in this pass.

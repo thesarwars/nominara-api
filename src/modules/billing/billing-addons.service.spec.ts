@@ -339,6 +339,7 @@ describe("STORY-076b audit · a retried POST charges once (Idempotency-Key -> st
     expect(retry).toMatchObject({ status: "pending", quantity_requested: 1 });
     expect(state.quantity).toBe(1);
     expect(state.calls).toHaveLength(1); // the retry asked Stripe for nothing
+    expect(counter).toHaveBeenCalledWith("nominara_billing_addon_change_total", { kind: "extra_seat", outcome: "replayed_applied" });
   });
 
   it("AC1 retry . a DIFFERENT Idempotency-Key is a different purchase and adds again", async () => {
@@ -512,6 +513,7 @@ describe("STORY-076b audit · the two money guards have a test that fails withou
     await expect(inTenant(c, () => new BillingAddonsService(gw, store.pool).add({ kind: "extra_seat", quantity: 1 }, "k"))).rejects.toMatchObject({ code: "conflict", message: expect.stringMatching(/in progress/u) });
     const timeout = c.calls.find(({ sql }) => /set_config\('lock_timeout', \$1, true\)/u.test(sql));
     expect(timeout?.params).toEqual(["3000"]);
+    expect(counter).toHaveBeenCalledWith("nominara_billing_addon_change_total", { kind: "extra_seat", outcome: "lock_wait_exceeded" });
     expect(gw.fetches).toEqual([]);
     expect(store.state.writes).toEqual([]);
   });
