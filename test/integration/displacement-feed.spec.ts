@@ -7,6 +7,8 @@ import { displacementFeedQuerySchema, displacementItemSchema } from "../../contr
 import { DEMO_SEED_MARKER } from "../../src/db/seed/demo/constants.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { DisplacementService } from "../../src/modules/displacement/displacement.service.js";
+import { TasksService } from "../../src/modules/tasks/tasks.service.js";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // NEW-C-5 — GET /v1/projects/{id}/displacements, POST /v1/displacements/{id}/dismiss and /restore.
@@ -24,7 +26,7 @@ describe("NEW-C-5 · displacement feed, dismiss and restore", () => {
   let projectId: string;
   let promptId: string;
   let actorId: string;
-  const service = new DisplacementService();
+  const service = new DisplacementService(new TasksService(new NoopRealtimePublisher()));
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18")

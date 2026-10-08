@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { CitationGapEntry, ConceptGapEntry } from "../../../contracts/analytics/index.js";
 
 // NEW-C-5 AC1 — how many tasks a recovery plan would create for a displacement.
@@ -14,6 +15,31 @@ export function recoveryTaskCount(
   conceptGap: readonly Pick<ConceptGapEntry, "concept">[],
   seedableDomains: ReadonlySet<string>,
 ): number {
-  const authority = citationGap.filter((entry) => seedableDomains.has(entry.domain.toLowerCase())).length;
-  return authority + conceptGap.length;
+  return authorityTargets(citationGap, seedableDomains).length + conceptGap.length;
+}
+
+/**
+ * NEW-C-6 — the authority tasks a plan makes: the FIRST gap entry of each seedable domain, in gap order.
+ * The task fingerprint is per project + domain (owner decision 2026-10-08), so two URLs on one domain are
+ * one task; counting them as two would make the feed's count promise a task the plan cannot create. The plan
+ * and `recoveryTaskCount` both go through this function, so they cannot disagree.
+ */
+export function authorityTargets<T extends Pick<CitationGapEntry, "domain">>(
+  citationGap: readonly T[],
+  seedableDomains: ReadonlySet<string>,
+): T[] {
+  const seen = new Set<string>();
+  const targets: T[] = [];
+  for (const entry of citationGap) {
+    const domain = entry.domain.toLowerCase();
+    if (!seedableDomains.has(domain) || seen.has(domain)) continue;
+    seen.add(domain);
+    targets.push(entry);
+  }
+  return targets;
+}
+
+/** NEW-C-6 — `sha256('authority:{project_id}:{domain}')`, the domain lower-cased (owner decision 2026-10-08). */
+export function authorityTaskFingerprint(projectId: string, domain: string): Buffer {
+  return createHash("sha256").update(`authority:${projectId}:${domain.toLowerCase()}`).digest();
 }
