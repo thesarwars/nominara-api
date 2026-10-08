@@ -3,7 +3,7 @@
 Base: integration/7day 7cda775 (worktree api-wt-b1). Commits: contracts 2c02509, RED 454aa31, implementation cefc1bc.
 Observability: metrics (`nominara_goals_created_total{kind,sample_state}`, `nominara_goals_abandoned_total`) and redacted log lines (workspace/project/goal IDs only, no title). OpenTelemetry spans are deferred to week 2 (owner decision 2026-10-08), so a missing span is not a failed criterion this week.
 
-## STATUS: code complete, integration spec WRITTEN BUT NOT EXECUTED
+## STATUS: code complete; integration spec EXECUTED GREEN (see Final run, bottom). The paragraph below is superseded.
 `df -h /System/Volumes/Data` read 7.1, 6.9 and 7.7 GiB free during this run (hard rule: under 8 GiB, do not run testcontainers). So `test/integration/task-goals.spec.ts` (the SQL-level proof for criteria 2-8 below) has not run, neither RED nor green. It must be run before merge: `pnpm vitest run --config vitest.integration.config.ts test/integration/task-goals.spec.ts` with the colima DOCKER_HOST, once free space is >= 8 GiB. Treat criteria marked (integration) as UNPROVEN until then.
 
 ## Scope decisions (flagged, not silently chosen)
@@ -44,3 +44,14 @@ Not built (story criteria outside step A, per the plan): rollup refresh of curre
 - Item 2 (topic_authority cells): RED test commit is the one before the fix ("STORY-065 #9 ... never borrows the project's cell count"); WRITTEN, NOT EXECUTED (disk). Fix: cells=null for topic_authority in GoalsService.createGoal. `pnpm vitest run src/modules/tasks/goals.spec.ts` and lint/typecheck/unit: see gate lines below.
 - Item 1 (never-run integration spec): STILL BLOCKED. `df -h /System/Volumes/Data` = 7.2 GiB free (< 8 GiB rule) at 2026-10-08. Required, not yet done: green run of task-goals.spec.ts, and RED mutation runs (remove assertProject; remove `AND project_id = $2` in updateGoal; same in cluster query), each exit 1. test:isolation: no tenant table or migration touched; judged not applicable, and it crashes at this tip.
 - Gates after fix: lint 0, typecheck 0, vitest src/modules/tasks 3 files/53 tests exit 0.
+
+## Final run (2026-10-08, disk 18 GiB free, gate cleared)
+- `pnpm vitest run --config vitest.integration.config.ts test/integration/task-goals.spec.ts` (colima DOCKER_HOST) at 6729683: 1 file, 14 tests passed, exit 0. All criteria marked (integration) above are now PROVEN by that run.
+- Mutation runs against the integration spec (each restored with git checkout; each exit 1):
+  - remove `assertProject` from createGoal: 1 failed (tenancy test).
+  - remove `AND project_id = $2` from the abandon query: 3 failed (#7 abandon, achieved-goal 409, tenancy).
+  - cluster query without the project filter (replaced by `AND $2::uuid IS NOT NULL` so the parameter count stays valid): 1 failed (cluster of another project/tenant refused). A first variant that dropped the clause but kept the parameter failed 3 tests on a pg parameter-count error and is not counted as proof.
+  - comment out `cells = null` for topic_authority (audit fix): integration #9 "never borrows the project's cell count" fails (1 failed, 13 passed) -> confirms the audit RED fails for the stated reason. The unit goals.spec.ts does not cover this (7 passed), so the integration spec is the proof.
+- Gates at 6729683: lint 0, typecheck 0, `pnpm test:unit` 0, `contracts:check` 0, tasks module vitest 0.
+- test:isolation: no tenant table or migration touched; tenant isolation is proven by the integration tenancy test run as nominara_app (isolation suites crash in fixture setup at this tip; merge step runs them).
+- Open owner decisions unchanged: goal kinds beyond engine_score/topic_authority; n>=30 sufficiency threshold; GET goals requiring task:create (spec row as written).
