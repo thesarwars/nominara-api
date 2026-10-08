@@ -13,7 +13,7 @@ Note: every permission in the published grantable set is held by both roles that
 | AC | Proof (test/integration/api-keys-http.spec.ts unless stated) | Status |
 |---|---|---|
 | AC1 step-up, 401 step_up_required with methods | "NEW-D-4 AC1 · an admin with a fresh step-up may create; one without is 401" | met |
-| AC2 secret once; absent from later responses, audit and logs | "AC2/AC3 · create returns the secret once...", "AC2 · the secret is absent from every later response and from the audit trail", "AC2 · the secret never appears at ANY log level or on stdout/stderr..." (new this run; mutation: a `logger.warn` of the secret makes it fail, the old Logger.log-only test would not) , "observability · ... never the secret, prefix or name" | met |
+| AC2 secret once; absent from later responses, audit and logs | "AC2/AC3 · create returns the secret once...", "AC2 · the secret is absent from every later response and from the audit trail", "AC2 · the secret never appears at ANY log level, on console.* or on stdout/stderr..." (spies on Logger.prototype.{log,warn,error,debug,verbose,fatal}, console.{log,info,warn,error,debug,trace} and process.stdout/stderr.write; audit fix: vitest replaces the global console, so the console spies are required and stdout.write alone does not see console.*. Mutations inserted after `const row = inserted.rows[0]!` in ApiKeysService.create, all KILLED: `console.log(secret)`, `console.error(secret)`, `this.logger.warn(secret)`, `process.stdout.write(secret)`; clean run passes, exit 0. Not covered: output written by a child process or a stream other than console/process.stdout/stderr; no `no-console` lint rule exists) , "observability · ... never the secret, prefix or name" | met |
 | AC3 hash only, prefix stored, unique | "AC2/AC3 · ... only sha256(secret) and a 12-char prefix are stored" | met |
 | AC4 api.keys_max enforced | api-keys-rls.spec.ts "AC4 · concurrent creates at the limit..." and "AC4 · an expired or revoked key does not count" | met |
 | AC5 revoke soft + idempotent, other workspace is 404 under RLS | api-keys-rls.spec.ts "AC5 · workspace B cannot list or revoke workspace A's key (404...)"; http "AC5 · an unknown key id is 404..." | met |
@@ -22,3 +22,5 @@ Note: every permission in the published grantable set is held by both roles that
 
 Frontend half (lib/api/settings.ts createApiKey sends no permissions, 401 step_up_required retry in TeamSettings.tsx): fe-2 lane, not in this repo.
 Real-API evidence (a running API): collected in NEW-A-17.
+
+Audit fix (console.* coverage): RED was the pre-fix spec at 00667ba, where the `console.log(secret)` and `console.error(secret)` mutations SURVIVED (test passed, exit 0). After the fix all four mutations fail the test (exit 1). Gates: lint 0, typecheck 0, api-keys-http integration 16/16 exit 0.

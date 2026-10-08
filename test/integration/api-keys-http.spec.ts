@@ -297,13 +297,15 @@ describe("NEW-D-4 · API keys over HTTP", () => {
     }
   });
 
-  it("NEW-D-4 AC2 · the secret never appears at ANY log level or on stdout/stderr across create, list, revoke and a refused create", async () => {
+  it("NEW-D-4 AC2 · the secret never appears at ANY log level, on console.* or on stdout/stderr across create, list, revoke and a refused create", async () => {
     const out: string[] = [];
     const capture = (m: unknown): void => {
       out.push(typeof m === "string" ? m : m instanceof Uint8Array ? Buffer.from(m).toString() : JSON.stringify(m));
     };
     const levels = ["log", "warn", "error", "debug", "verbose", "fatal"] as const;
     const spies = levels.map((lvl) => vi.spyOn(Logger.prototype, lvl).mockImplementation((m: unknown, ...rest: unknown[]) => capture([m, ...rest])));
+    const consoleLevels = ["log", "info", "warn", "error", "debug", "trace"] as const;
+    const cspies = consoleLevels.map((lvl) => vi.spyOn(console, lvl).mockImplementation((...args: unknown[]) => capture(args)));
     const so = vi.spyOn(process.stdout, "write").mockImplementation((m: unknown) => (capture(m), true));
     const se = vi.spyOn(process.stderr, "write").mockImplementation((m: unknown) => (capture(m), true));
     try {
@@ -318,7 +320,7 @@ describe("NEW-D-4 · API keys over HTTP", () => {
       expect(all).not.toContain(c.secret.slice(12));
       expect(all).not.toContain(createHash("sha256").update(c.secret).digest("hex"));
     } finally {
-      for (const s of [...spies, so, se]) s.mockRestore();
+      for (const s of [...spies, ...cspies, so, se]) s.mockRestore();
     }
   });
 });
