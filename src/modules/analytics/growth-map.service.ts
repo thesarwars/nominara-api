@@ -20,6 +20,7 @@ import {
   type DailySeriesRow,
   type FailureDay,
 } from "../../lib/analytics/growth-map.js";
+import { narrowToEntitled, parseEngineFilter } from "../../lib/analytics/engine-filter.js";
 import { combineDataSources, engineDataSourcesForDates, recordDemoDataServed } from "../../lib/analytics/data-source.js";
 import { CROSS_ENGINE_KEY } from "../../lib/rollup/roll-up-day.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
@@ -66,10 +67,15 @@ export class GrowthMapService {
     const wantBrand = wanted.has("brand");
     const wantCompetitors = wanted.has("competitors");
 
-    const rows = await this.seriesRows(tx, projectId, from, to);
+    // NEW-A-14 — `engines` narrows the entitled set; null means no narrowing.
+    const requested = parseEngineFilter(query.engines);
+    const selected = requested === null ? null : narrowToEntitled(requested, await this.entitledEngines(tx, projectId));
+
+    const rows = await this.seriesRows(tx, projectId, from, to, selected);
     // NEW-A-5 — the series are the cross-engine blend, so each one carries the
     // combination of every measured engine's provenance in the window.
-    const engineSources = await engineDataSourcesForDates(tx, projectId, from, to, timezone);
+    const allSources = await engineDataSourcesForDates(tx, projectId, from, to, timezone);
+    const engineSources = new Map([...allSources].filter(([engine]) => selected === null || selected.includes(engine)));
     const blendSource: DataSource | null = combineDataSources([...engineSources.values()]);
     recordDemoDataServed("growth_map", store.context.workspaceId, [...engineSources.values()]);
     const series: GrowthMapSeries[] = [];
@@ -121,7 +127,9 @@ export class GrowthMapService {
       }
     }
 
-    const failures = await this.failureDays(tx, projectId, from, to, timezone);
+    const failures = (await this.failureDays(tx, projectId, from, to, timezone)).filter(
+      (failure) => selected === null || selected.includes(failure.engineKey),
+    );
     const baseline = series.find((entry) => entry.series_id === "competitor_baseline");
     const brandEnds = firstAndLastScored(brandPoints);
     const baselineEnds = baseline === undefined ? { start: null, end: null } : firstAndLastScored(baseline.points);
@@ -145,7 +153,7 @@ export class GrowthMapService {
         visibility_start: brandEnds.start,
         visibility_end: brandEnds.end,
         visibility_delta: brandEnds.start === null || brandEnds.end === null ? null : brandEnds.end - brandEnds.start,
-        ...(await this.bestAndWorstEngine(tx, projectId, from, to)),
+        ...(await this.bestAndWorstEngine(tx, projectId, from, to, selected)),
         competitor_gap_start: gapBetween(brandEnds.start, baselineEnds.start),
         competitor_gap_end: gapBetween(brandEnds.end, baselineEnds.end),
       },
@@ -187,7 +195,14 @@ export class GrowthMapService {
    * and re-blending them here would recompute, per day, what the rollup
    * already computed and stored.
    */
-  private async seriesRows(tx: ClientBase, projectId: string, from: string, to: string): Promise<SeriesRow[]> {
+  private async seriesRows(
+    tx: ClientBase,
+    projectId: string,
+    from: string,
+    to: string,
+    selected: readonly string[] | null,
+  ): Promise<SeriesRow[]> {
+    if (selected !== null) return this.narrowedSeriesRows(tx, projectId, from, to, selected);
     const result = await tx.query<{
       entity_type: "brand" | "competitor";
       entity_id: string;
@@ -217,6 +232,73 @@ export class GrowthMapService {
       [projectId, CROSS_ENGINE_KEY, SCORING_VERSION, from, to],
     );
 
+    return result.rows.map((row) => ({
+      entityType: row.entity_type,
+      entityId: row.entity_id,
+      label: row.label ?? row.entity_id,
+      metricDate: row.metric_date,
+      visibilityScore: Number(row.visibility_score),
+      sov: Number(row.sov),
+      cellsTotal: Number(row.cells_total),
+      liveCaptureRatio: Number(row.live_capture_ratio),
+    }));
+  }
+
+  /** The engines the project is entitled to and has enabled — the set `engines` may narrow. */
+  private async entitledEngines(tx: ClientBase, projectId: string): Promise<string[]> {
+    const result = await tx.query<{ engine_key: string }>(
+      "SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 AND enabled = true",
+      [projectId],
+    );
+    return result.rows.map((row) => row.engine_key);
+  }
+
+  /**
+   * The cross-engine blend over ONLY the selected engines.
+   *
+   * The same weights the rollup's second pass uses (`project_engines.weight`,
+   * 1.0 where unset), applied to the per-engine rows, so a narrowing to every
+   * engine reproduces the stored `all` row. An empty selection reads nothing:
+   * every day is a gap, and the filter has not widened.
+   */
+  private async narrowedSeriesRows(
+    tx: ClientBase,
+    projectId: string,
+    from: string,
+    to: string,
+    selected: readonly string[],
+  ): Promise<SeriesRow[]> {
+    if (selected.length === 0) return [];
+    const result = await tx.query<{
+      entity_type: "brand" | "competitor";
+      entity_id: string;
+      label: string | null;
+      metric_date: string;
+      visibility_score: string;
+      sov: string;
+      cells_total: string;
+      live_capture_ratio: string;
+    }>(
+      `SELECT md.entity_type,
+              md.entity_id::text,
+              COALESCE(max(c.name), max(p.name)) AS label,
+              to_char(md.metric_date, 'YYYY-MM-DD') AS metric_date,
+              (sum(md.visibility_score * COALESCE(pe.weight, 1.0)) / NULLIF(sum(COALESCE(pe.weight, 1.0)), 0))::text AS visibility_score,
+              (sum(md.sov * COALESCE(pe.weight, 1.0)) / NULLIF(sum(COALESCE(pe.weight, 1.0)), 0))::text AS sov,
+              sum(md.cells_total)::text AS cells_total,
+              COALESCE(sum(md.live_capture_ratio * md.cells_total) / NULLIF(sum(md.cells_total), 0), 1)::text AS live_capture_ratio
+         FROM metric_daily md
+         JOIN projects p        ON p.id = md.project_id
+         LEFT JOIN competitors c ON c.id = md.entity_id AND md.entity_type = 'competitor'
+         LEFT JOIN project_engines pe ON pe.project_id = md.project_id AND pe.engine_key = md.engine_key
+        WHERE md.project_id = $1
+          AND md.engine_key = ANY($2::text[])
+          AND md.scoring_version = $3
+          AND md.metric_date BETWEEN $4::date AND $5::date
+        GROUP BY md.entity_type, md.entity_id, md.metric_date
+        ORDER BY md.metric_date ASC`,
+      [projectId, selected, SCORING_VERSION, from, to],
+    );
     return result.rows.map((row) => ({
       entityType: row.entity_type,
       entityId: row.entity_id,
@@ -260,19 +342,21 @@ export class GrowthMapService {
     projectId: string,
     from: string,
     to: string,
+    selected: readonly string[] | null,
   ): Promise<{ best_engine: string | null; worst_engine: string | null }> {
     const result = await tx.query<{ engine_key: string }>(
       `SELECT engine_key
          FROM metric_daily
         WHERE project_id = $1
           AND engine_key <> $2
+          AND ($6::text[] IS NULL OR engine_key = ANY($6::text[]))
           AND entity_type = 'brand'
           AND scoring_version = $3
           AND metric_date BETWEEN $4::date AND $5::date
         GROUP BY engine_key
        HAVING sum(cells_total) > 0
         ORDER BY sum(visibility_score * cells_total) / sum(cells_total) DESC, engine_key ASC`,
-      [projectId, CROSS_ENGINE_KEY, SCORING_VERSION, from, to],
+      [projectId, CROSS_ENGINE_KEY, SCORING_VERSION, from, to, selected],
     );
     const engines = result.rows.map((row) => row.engine_key);
     // ONE ENGINE IS NEITHER BEST NOR WORST. Naming it both would put the same

@@ -336,7 +336,7 @@ describe("STORY-137 · growth map", () => {
     const all = await read("7d", "brand");
     const narrowed = await read("7d", "brand", "chatgpt");
     const lastScored = (r: typeof all) => r.series[0]!.points.filter((p) => p.visibility_score !== null).at(-1)!;
-    expect(narrowed.engines.map((e) => e.engine_key)).toEqual(["chatgpt"]);
+    expect((narrowed.engines ?? []).map((e) => e.engine_key)).toEqual(["chatgpt"]);
     expect(lastScored(narrowed).cells).toBe(1);
     expect(lastScored(all).cells).toBe(2);
     expect(lastScored(narrowed).visibility_score).not.toBe(lastScored(all).visibility_score);
@@ -357,7 +357,7 @@ describe("STORY-137 · growth map", () => {
     expect(none.series[0]!.points.every((p) => p.visibility_score === null && p.cells === 0)).toBe(true);
     expect(none.summary.visibility_end).toBeNull();
     const mixed = await read("7d", "brand", "chatgpt,claude");
-    expect(mixed.engines.map((e) => e.engine_key)).toEqual(["chatgpt"]);
+    expect((mixed.engines ?? []).map((e) => e.engine_key)).toEqual(["chatgpt"]);
   });
 
   it("names a best and a worst engine only when there are two to compare", async () => {
