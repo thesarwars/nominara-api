@@ -2009,7 +2009,7 @@
                         "properties": {
                           "id": {
                             "type": "string",
-                            "pattern": "^[0-9a-f]{64}$"
+                            "pattern": "^[0-9]{1,18}$"
                           },
                           "occurred_at": {
                             "type": "string",
