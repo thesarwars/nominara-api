@@ -167,6 +167,26 @@ describe("NEW-C-11 · RenderingQualityService - real SQL under RLS", () => {
     expect(attr(find(own.engines, "google_ai_mode"), "price").cause).toBeNull();
   });
 
+  // The test above passes on the project predicate alone (wsA's finding is on
+  // project a, the read is for b). These rows carry wsB's project id but wsA's
+  // workspace id, so the project predicate MATCHES and only RLS excludes them.
+  // Planted as the owner (no composite workspace/project FK on these tables).
+  it("[NEW-C-11 AC1] RLS alone hides another workspace's finding and mentions that carry this project's id", async () => {
+    const wsA = await workspace(); const wsB = await workspace();
+    const b = await project(wsB);
+    await mention(wsB, b, "google_ai_mode", [], 0.1);
+    await finding(wsA, b, "AUX-R-012"); // open, mapped to price, wsA-owned, project b
+    await mention(wsA, b, "google_ai_mode", ["price"], 0.28); // wsA-owned, project b
+    await mention(wsA, b, "google_ai_mode", ["price"], 0.28);
+    const out = await read(wsB, b.id);
+    const mode = find(out.engines, "google_ai_mode");
+    expect(attr(mode, "price").cause).toBeNull();
+    expect(attr(out.blended, "price").cause).toBeNull();
+    expect(mode.mentions_counted).toBe(1);
+    expect(attr(mode, "price").coverage).toBe(0);
+    expect(mode.score).toBeCloseTo(10, 4);
+  });
+
   // Cause link and mention counting are per PROJECT. The tests above put the
   // other project in another workspace, where RLS hides it whatever the
   // predicate says; these two projects share ONE workspace, so only the

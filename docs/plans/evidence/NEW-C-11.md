@@ -63,3 +63,23 @@ Each mutant was restored (git checkout) after its run. A first M5 attempt that l
 Fixture change: `workspace(timezone)` and `mention(..., capturedAt)` take optional arguments; existing callers unchanged.
 
 Gates: pnpm lint exit 0; pnpm typecheck exit 0; unit (rendering-quality specs) exit 0, 21 passed; integration (`DOCKER_HOST=unix://$HOME/.colima/default/docker.sock TESTCONTAINERS_RYUK_DISABLED=true pnpm vitest run --config vitest.integration.config.ts rendering-quality`) exit 0, 8 passed (was 5), disk 14 GiB free.
+
+## Audit fixes (checkpoint-3 audit, finding 4 / blocker: the isolation test could not fail)
+The test "tenant isolation as nominara_app ..." passed only because of the `project_id = $1` predicate (wsA's finding is on project a, the read is for b), so removing RLS went unnoticed. A new test, "[NEW-C-11 AC1] RLS alone hides another workspace's finding and mentions that carry this project's id", plants rows as the owner that carry wsB's project id but wsA's workspace id (aux_findings and the capture/mention tables have no composite workspace/project FK, so the rows are legal): one open mapped finding (AUX-R-012) and two priced brand mentions. The project predicate matches them; only RLS excludes them. wsB reads b as nominara_app and must see cause null (engine and blended), mentions_counted 1, price coverage 0, score 10. The old test keeps its name (it still proves the 404 across workspaces). No production code changed, so the "red" is each RLS mutation below. Disk 18 GiB free.
+
+Mutation = `ALTER TABLE .. NO FORCE ROW LEVEL SECURITY; ALTER TABLE .. DISABLE ROW LEVEL SECURITY` right after migrateUp, in a scratch copy of the spec (deleted afterwards):
+
+| RLS disabled on | Result |
+|---|---|
+| aux_findings | exit 1, 1 failed / 8 passed (the new test: cause not null) |
+| mention_facts alone | 9 passed. answer_captures' RLS still hides wsA's captures through the join |
+| answer_captures alone | 9 passed. mention_facts' RLS still hides wsA's mentions |
+| mention_facts + answer_captures | 1 failed / 8 passed (the new test: mentions_counted 3, expected 1) |
+| all three | 1 failed / 8 passed (the new test) |
+
+The mention query reads both tables in one join, so each table's policy covers the other: a single-table removal is correctly invisible at the endpoint, and removing both is caught. That is defense in depth, not a test gap; the per-table guarantee is the generic RLS suite's job (test:isolation), see below.
+
+Gates: pnpm lint exit 0; pnpm typecheck exit 0; integration rendering-quality (colima env) exit 0, 9 passed (was 8).
+
+## Open: test:isolation (audit finding, major) - not fixable in this lane
+`pnpm test:isolation` crashes in its fixture on the base: migrations 0085/0086 (NEW-D-5 audit, cdc2766) cap support_grants TTL at 4 hours (ck_support_ttl_max) and the isolation global-setup fixture inserts a ~24 hour grant. This lane touches no migration and nothing under test/isolation; the fix belongs to the NEW-D-5 owner on the base. Until it lands and test:isolation (plus breakers for aux_findings) is green on the merged tip, the generic RLS proof for these tables is the table above, not the isolation suite.
