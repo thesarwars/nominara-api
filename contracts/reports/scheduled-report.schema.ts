@@ -89,3 +89,11 @@ export type CreateScheduledReportRequest = z.infer<typeof createScheduledReportR
 export type UpdateScheduledReportRequest = z.infer<typeof updateScheduledReportRequestSchema>;
 export type ScheduledReport = z.infer<typeof scheduledReportSchema>;
 export type ScheduledReportDelivery = z.infer<typeof scheduledReportDeliverySchema>;
+
+// NEW-E-100c — POST /v1/scheduled-reports/{id}/send-now returns the delivery
+// attempt it produced. A cap skip is a 200 whose status is `skipped_cap` and
+// whose `reason` names the cap and the reset date: the skip is an outcome the
+// caller is told about, never an error and never silent. A tier with no export
+// allowance is NOT an attempt: it is the 403 feature_not_in_plan refusal.
+export const sendScheduledReportNowResponseSchema = scheduledReportDeliverySchema;
+export type SendScheduledReportNowResponse = z.infer<typeof sendScheduledReportNowResponseSchema>;
