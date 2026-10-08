@@ -52,8 +52,21 @@ async function readAutoTopup(client: ClientBase, workspaceId: string): Promise<A
   );
   const row = result.rows[0];
   if (row === undefined) return null;
+  // NEW-D-7 — why it is OFF, when the system switched it off: the newest of the
+  // two audit actions says whether the last change was a failure or the customer's own.
+  let disabledReason: AutoTopupConfig["disabled_reason"];
+  if (!row.auto_topup_enabled) {
+    const last = await client.query<{ action: string; reason: string | null }>(
+      `SELECT action, after_state->>'reason' AS reason FROM audit_log
+        WHERE workspace_id = $1 AND action IN ('billing.auto_topup.disabled', 'billing.auto_topup.updated')
+        ORDER BY seq DESC LIMIT 1`,
+      [workspaceId],
+    );
+    if (last.rows[0]?.action === "billing.auto_topup.disabled" && last.rows[0].reason === "payment_failed") disabledReason = "payment_failed";
+  }
   return {
     enabled: row.auto_topup_enabled,
+    ...(disabledReason === undefined ? {} : { disabled_reason: disabledReason }),
     pack_key: row.auto_topup_pack_key,
     threshold: row.auto_topup_threshold,
     max_per_cycle: row.auto_topup_max_per_cycle,

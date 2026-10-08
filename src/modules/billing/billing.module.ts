@@ -2,6 +2,8 @@ import { Module } from "@nestjs/common";
 import { loadEnv } from "../../config/env.js";
 import { STRIPE_GATEWAY, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
 import { StripeHttpGateway } from "../../lib/billing/stripe/stripe-http.gateway.js";
+import { IdentityModule } from "../identity/identity.module.js";
+import { AutoTopupService } from "./auto-topup.service.js";
 import { BillingSubscriptionController } from "./billing-subscription.controller.js";
 import { BillingSubscriptionService } from "./billing-subscription.service.js";
 import { CreditPacksController } from "./credit-packs.controller.js";
@@ -18,11 +20,13 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
 // STORY-022 — system-architecture.md §5 module inventory. Registration
 // only — no logic here (coding-standards.md §1's module layout).
 @Module({
+  imports: [IdentityModule],
   controllers: [BillingController, BillingUsageController, CreditPacksController, BillingSubscriptionController, StripeWebhookController],
   providers: [
     BillingService,
     BillingSubscriptionService,
     CreditPacksService,
+    AutoTopupService,
     StripeSubscriptionHandler,
     StripeCreditPackHandler,
     StripeWebhookService,
@@ -40,6 +44,6 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
       inject: [StripeSubscriptionHandler, StripeCreditPackHandler],
     },
   ],
-  exports: [BillingService, STRIPE_GATEWAY],
+  exports: [BillingService, AutoTopupService, STRIPE_GATEWAY],
 })
 export class BillingModule {}

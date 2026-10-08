@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { z } from "zod";
+import { AutoTopupService } from "./auto-topup.service.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { provisionWalletWithGrant, recordPurchase } from "../../lib/credits/balance.js";
 import { readWallet } from "../../lib/credits/wallet.js";
@@ -39,6 +40,7 @@ interface PurchaseRow {
   credits: number;
   amount_usd: string;
   pack_key: string;
+  source: "manual" | "auto_topup" | "sales_grant";
 }
 
 @Injectable()
@@ -48,7 +50,9 @@ export class StripeCreditPackHandler implements StripeEventHandler {
   private readonly logger = new Logger(StripeCreditPackHandler.name);
   private readonly audit = new AuditChainService();
 
-  async handle({ tx, workspaceId, event, object }: StripeEventContext): Promise<void> {
+  constructor(private readonly autoTopup: AutoTopupService) {}
+
+  async handle({ tx, workspaceId, event, object, afterCommit }: StripeEventContext): Promise<void> {
     const purchaseId = uuid.safeParse(object.metadata.purchase_id);
     if (!purchaseId.success) return; // not a credit-pack object (subscription invoices, plan checkouts)
 
@@ -84,7 +88,7 @@ export class StripeCreditPackHandler implements StripeEventHandler {
     // RLS scopes it to the workspace, so another tenant's purchase id finds nothing.
     const purchase = (
       await tx.query<PurchaseRow>(
-        "SELECT id, status, credits, amount_usd::text, pack_key FROM credit_purchases WHERE id = $1 AND workspace_id = $2 FOR UPDATE",
+        "SELECT id, status, credits, amount_usd::text, pack_key, source FROM credit_purchases WHERE id = $1 AND workspace_id = $2 FOR UPDATE",
         [purchaseId.data, workspaceId],
       )
     ).rows[0];
@@ -115,6 +119,12 @@ export class StripeCreditPackHandler implements StripeEventHandler {
       }
       await tx.query("UPDATE credit_purchases SET status = 'failed' WHERE id = $1", [purchase.id]);
       await this.writeAudit(tx, workspaceId, purchase, "billing.credit_purchase.failed", event.id);
+      if (purchase.source === "auto_topup") {
+        // NEW-D-7 / STORY-076 scenario 9 — a failed automatic charge switches the
+        // feature off (never retried) and tells the billing contact, after commit.
+        await this.autoTopup.disableAfterFailure(tx, workspaceId, purchase.id);
+        afterCommit.push(() => this.autoTopup.notifyDisabled(workspaceId));
+      }
       this.record(workspaceId, purchase.id, event.id, "failed");
       return;
     }

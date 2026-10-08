@@ -18,6 +18,13 @@ export interface StripeEventContext {
   readonly object: FetchedStripeObject;
   /** When the fetch that produced `object` STARTED. A write whose fetch began before a newer committed one is stale. */
   readonly fetchStartedAt: Date;
+  /**
+   * NEW-D-7 — work to run AFTER the transaction commits (a notification email):
+   * it must not hold the claim's transaction open across a call to an external
+   * service, and it must not run if the transaction rolls back. A failure here
+   * is logged by the caller and never fails the event: the effect is committed.
+   */
+  readonly afterCommit: Array<() => Promise<void>>;
 }
 
 export interface StripeEventHandler {

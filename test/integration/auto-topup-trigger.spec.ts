@@ -298,7 +298,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     const purchase = (await autoPurchases(workspaceId))[0]!;
     const pi = piOf(purchase.id as string);
     expect((await stripeSays(workspaceId, purchase.id as string, pi, "succeeded", "evt_ok_1")).statusCode).toBe(200);
-    expect((await stripeSays(workspaceId, purchase.id as string, pi, "succeeded", "evt_ok_1")).json<{ data: { outcome: string } }>().data.outcome).toBe("duplicate");
+    expect(dataOf<{ outcome: string }>(await stripeSays(workspaceId, purchase.id as string, pi, "succeeded", "evt_ok_1")).outcome).toBe("duplicate");
     expect((await stripeSays(workspaceId, purchase.id as string, pi, "succeeded", "evt_ok_2")).statusCode).toBe(200);
     expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "succeeded", stripe_payment_intent_id: pi });
     expect(await ledger(workspaceId)).toEqual([expect.objectContaining({ entry_type: "purchase", credits: 1000, idempotency_key: pi })]);
@@ -455,7 +455,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     try {
       await client.query("BEGIN");
       await client.query("SET LOCAL ROLE nominara_app");
-      await client.query("SELECT set_config('app.workspace_id', $1, true)", [b.workspaceId]);
+      await client.query("SELECT set_config('app.current_workspace_id', $1, true)", [b.workspaceId]);
       const seen = await client.query("SELECT 1 FROM credit_purchases WHERE workspace_id = $1", [a.workspaceId]);
       expect(seen.rowCount).toBe(0);
       await client.query("ROLLBACK");

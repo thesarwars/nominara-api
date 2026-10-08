@@ -6,6 +6,9 @@ import {
   type CreditPackCheckoutInput,
   type FetchedStripeObject,
   type HostedSession,
+  type OffSessionPaymentInput,
+  type OffSessionPaymentResult,
+  type SavedPaymentMethod,
   type StripeGateway,
   type StripeObjectKind,
   type SubscriptionCheckoutInput,
@@ -132,7 +135,10 @@ export class StripeHttpGateway implements StripeGateway {
           ],
           // Both objects carry the ids, so payment_intent.* events resolve the
           // purchase from their own fresh fetch.
-          payment_intent_data: { metadata },
+          // NEW-D-7 — the card is saved under a customer for off-session reuse
+          // (auto-top-up). Checkout shows Stripe's own reuse notice.
+          customer_creation: "always",
+          payment_intent_data: { metadata, setup_future_usage: "off_session" },
           metadata,
           success_url: input.successUrl,
           cancel_url: input.cancelUrl,
@@ -142,6 +148,44 @@ export class StripeHttpGateway implements StripeGateway {
       if (typeof session.url !== "string") throw new StripeUpstreamError(undefined);
       return { id: session.id, url: session.url };
     } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async findSavedPaymentMethod(referencePaymentIntentId: string): Promise<SavedPaymentMethod | null> {
+    const client = this.requireClient();
+    try {
+      const intent = await client.paymentIntents.retrieve(referencePaymentIntentId);
+      const customerId = typeof intent.customer === "string" ? intent.customer : intent.customer?.id;
+      const paymentMethodId = typeof intent.payment_method === "string" ? intent.payment_method : intent.payment_method?.id;
+      if (intent.setup_future_usage !== "off_session" || customerId === undefined || paymentMethodId === undefined) return null;
+      return { customerId, paymentMethodId };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async createOffSessionPayment(input: OffSessionPaymentInput): Promise<OffSessionPaymentResult> {
+    const client = this.requireClient();
+    try {
+      const intent = await client.paymentIntents.create(
+        {
+          amount: input.unitAmountCents,
+          currency: input.currency.toLowerCase(),
+          customer: input.customerId,
+          payment_method: input.paymentMethodId,
+          off_session: true,
+          confirm: true,
+          description: input.productName,
+          metadata: { workspace_id: input.workspaceId, purchase_id: input.purchaseId, pack_key: input.packKey, source: "auto_topup" },
+        },
+        { idempotencyKey: `auto-topup-${input.purchaseId}` },
+      );
+      // `requires_action` / `requires_payment_method`: the customer is needed. Never retried.
+      if (intent.status === "succeeded" || intent.status === "processing") return { outcome: "submitted", paymentIntentId: intent.id };
+      return { outcome: "declined" };
+    } catch (error) {
+      if (error instanceof Stripe.errors.StripeCardError) return { outcome: "declined" };
       throw this.asUpstream(error);
     }
   }

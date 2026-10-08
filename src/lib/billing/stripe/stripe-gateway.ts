@@ -86,6 +86,35 @@ export interface CreditPackCheckoutInput {
   readonly cancelUrl: string;
 }
 
+/** NEW-D-7 — a card the customer agreed to have reused off-session (a Checkout with `setup_future_usage`). */
+export interface SavedPaymentMethod {
+  readonly customerId: string;
+  readonly paymentMethodId: string;
+}
+
+/**
+ * NEW-D-7 — one auto-top-up charge. The amount is the integer-cents price of
+ * the pack frozen on OUR `credit_purchases` row; nothing here comes from the
+ * client. `purchaseId` travels as metadata and keys Stripe's Idempotency-Key.
+ */
+export interface OffSessionPaymentInput {
+  readonly workspaceId: string;
+  readonly purchaseId: string;
+  readonly packKey: string;
+  readonly productName: string;
+  readonly unitAmountCents: number;
+  readonly currency: string;
+  readonly customerId: string;
+  readonly paymentMethodId: string;
+}
+
+/**
+ * `declined`: the card was refused, or the charge needs the customer present
+ * (3-D Secure) — neither can succeed without them, so neither is retried.
+ * `submitted`: Stripe accepted the charge; credits still land only on the webhook.
+ */
+export type OffSessionPaymentResult = { readonly outcome: "submitted"; readonly paymentIntentId: string } | { readonly outcome: "declined" };
+
 export interface HostedSession {
   readonly id: string;
   readonly url: string;
@@ -125,6 +154,21 @@ export interface StripeGateway {
    * Throws `StripeUpstreamError`.
    */
   createCreditPackCheckout(input: CreditPackCheckoutInput): Promise<HostedSession>;
+
+  /**
+   * NEW-D-7 — the card a PREVIOUS pack purchase saved for off-session reuse, or
+   * `null` when that PaymentIntent was not saved (no customer, no method, or no
+   * `setup_future_usage=off_session`). Throws `StripeUpstreamError`.
+   */
+  findSavedPaymentMethod(referencePaymentIntentId: string): Promise<SavedPaymentMethod | null>;
+
+  /**
+   * NEW-D-7 — an off-session, immediately confirmed charge of the saved method,
+   * with `workspace_id`, `purchase_id`, `pack_key` and `source=auto_topup` as
+   * PaymentIntent metadata so the webhook's re-fetch finds the purchase. The
+   * Idempotency-Key is the purchase id. Throws `StripeUpstreamError`.
+   */
+  createOffSessionPayment(input: OffSessionPaymentInput): Promise<OffSessionPaymentResult>;
 
   /**
    * Makes a Checkout session unpayable, or reports that it already was paid.
