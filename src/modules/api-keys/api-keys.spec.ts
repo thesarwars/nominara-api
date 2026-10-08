@@ -96,7 +96,7 @@ describe("NEW-D-4 audit · grantable permissions", () => {
     const { PERMISSION_MATRIX, ROLES } = await import("../../tenancy/permission-matrix.js");
     const { GRANTABLE_API_KEY_PERMISSIONS } = await import("../../../contracts/workspaces/api-key.schema.js");
     for (const p of GRANTABLE_API_KEY_PERMISSIONS) {
-      for (const r of ROLES) expect(PERMISSION_MATRIX[p as keyof typeof PERMISSION_MATRIX][r].stepUp, `${p}/${r}`).toBe(false);
+      for (const r of ROLES) expect(PERMISSION_MATRIX[p as keyof typeof PERMISSION_MATRIX][r].stepUp, `${p} held by ${r}`).toBe(false);
     }
   });
 });

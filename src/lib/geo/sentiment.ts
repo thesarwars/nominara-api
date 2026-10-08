@@ -217,7 +217,7 @@ export function buildSentiment(input: SentimentInput): { write: GeoAnalysisWrite
     findings = reasonClasses.map((rc, i) => ({
       id: `sentiment-reason-${rc.reason}`,
       severity: "medium" as const,
-      headline: `${String(rc.mention_count)} mention${rc.mention_count === 1 ? " frames" : "s frame"} the brand through ${reasonLabel(rc.reason)}.${i === 0 ? topNote : ""}`,
+      headline: `${String(rc.mention_count)} ${rc.mention_count === 1 ? "mention frames" : "mentions frame"} the brand through ${reasonLabel(rc.reason)}.` + (i === 0 ? topNote : ""),
       evidence: evidenceFor(recentFirst.find((x) => x.reason === rc.reason), "No evidence span."),
       metric: { name: "reason_class_mentions", value: rc.mention_count },
       task_rule_code: SENTIMENT_TASK_RULE,
