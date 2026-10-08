@@ -192,7 +192,7 @@ describe("STORY-064-D · complete / realtime publish — real SQL", () => {
     publisher.published.length = 0;
     await complete(CTX(ws, actor), t.id);
     expect(publisher.published).toEqual([
-      { workspaceId: ws, event: "task.moved", payload: { task_id: t.id, project_id: p, from_status: "todo", to_status: "done", actor_id: actor } },
+      { workspaceId: ws, event: "task.moved", payload: { task_id: t.id, project_id: p } },
     ]);
   });
 
@@ -223,7 +223,7 @@ describe("STORY-064-D · complete / realtime publish — real SQL", () => {
     expect(publisher.published).toEqual([]);
     await patch(CTX(ws, actor), t.id, { status: "in_progress" });
     expect(publisher.published).toEqual([
-      { workspaceId: ws, event: "task.moved", payload: { task_id: t.id, project_id: p, from_status: "todo", to_status: "in_progress", actor_id: actor } },
+      { workspaceId: ws, event: "task.moved", payload: { task_id: t.id, project_id: p } },
     ]);
     publisher.published.length = 0;
     await expect(inTenant(CTX(ws, actor), async () => {

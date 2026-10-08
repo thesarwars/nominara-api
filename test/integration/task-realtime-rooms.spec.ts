@@ -125,7 +125,7 @@ describe("STORY-064-D · task events are delivered to the workspace room only", 
 
     await settle(1_500);
     expect(myCreated).toEqual([{ task_id: task.id, project_id: mine.projectId }]);
-    expect(myMoved).toEqual([{ task_id: task.id, project_id: mine.projectId, from_status: "todo", to_status: "done", actor_id: mine.userId }]);
+    expect(myMoved).toEqual([{ task_id: task.id, project_id: mine.projectId }]);
     expect(theirCreated, "another workspace's socket must receive nothing").toEqual([]);
     expect(theirMoved, "another workspace's socket must receive nothing").toEqual([]);
   }, 60_000);

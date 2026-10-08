@@ -223,9 +223,12 @@ describe("STORY-064-D · task.created and task.moved carry ids only (owner decis
     expect(Object.keys((schema as unknown as { shape: object }).shape).sort()).toEqual(["project_id", "task_id"]);
   });
 
-  it("[STORY-064-D realtime ids-only] task.moved declares no free-text field: ids, the two enumerated statuses, no title", () => {
+  it("[STORY-064-D realtime ids-only] task.moved is exactly {task_id, project_id}: no statuses, no actor, no title", () => {
     const schema = REALTIME_EVENT_PAYLOADS["task.moved"];
-    expect(Object.keys((schema as unknown as { shape: object }).shape).sort()).toEqual(["actor_id", "from_status", "project_id", "task_id", "to_status"]);
-    expect(schema.safeParse({ ...ids, from_status: "todo", to_status: "done", actor_id: ids.task_id, title: "leak" }).success).toBe(false);
+    expect(Object.keys((schema as unknown as { shape: object }).shape).sort()).toEqual(["project_id", "task_id"]);
+    expect(schema.safeParse(ids).success).toBe(true);
+    expect(schema.safeParse({ ...ids, title: "leak" }).success).toBe(false);
+    expect(schema.safeParse({ ...ids, from_status: "todo", to_status: "done" }).success).toBe(false);
+    expect(schema.safeParse({ ...ids, actor_id: ids.task_id }).success).toBe(false);
   });
 });

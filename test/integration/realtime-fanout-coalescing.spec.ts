@@ -541,10 +541,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
       publisher.toWorkspace(workspaceId, "task.moved", {
         task_id: randomUUID(),
         project_id: randomUUID(),
-        from_status: "todo",
-        to_status: "doing",
-        actor_id: randomUUID(),
-      } as never);
+      });
     }
     await settle(900);
 
