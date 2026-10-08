@@ -56,3 +56,8 @@ Finding: `geo_analyses.project_id` was a single-column FK (0004). FK checks bypa
 | integration: generated-rls-and-tenant-context, geo-*, seed-demo | 6 files passed; seed-demo.spec.ts: 9 failed (NEW-A-8 x8, NEW-C-15 audit seed-then-verify) |
 
 The 9 seed-demo failures are NOT from 0072: the identical 9 fail with 0072 removed (run on the RED commit 52830e6, exit 1, 9 failed / 30 passed). They are assertions about NEW-A-8 and NEW-C-15 behaviour that belong to other lanes and are not in this lane's code; to be resolved at the merge step.
+
+## Checkpoint-3 fix pass (branch 7day/c-geo-4, from integration/7day fee788e)
+Finding: the isolation test must reach the `geo_analyses` policy. Already on the merged tree: `test/integration/geo-insights.spec.ts` "STORY-062 isolation · geo_analyses itself, read and written directly as the application role ..." (direct SQL, not through the service, so the `projects` 404 cannot mask it). No code change was needed.
+- Mutation re-run on this tree (temporary `ALTER TABLE geo_analyses DISABLE ROW LEVEL SECURITY` at the start of that test, restored after): FAIL, "expected 1 to be +0". Unmutated: passes (geo-insights.spec.ts full file, 14 passed, in the 3-file run below).
+- Gates: see the NEW-C-15 checkpoint-3 section of NEW-C-15.md (one run covers the lane).
