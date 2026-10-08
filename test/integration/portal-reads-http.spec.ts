@@ -191,6 +191,21 @@ describe("NEW-E-099a · portal read endpoints", () => {
     }
   });
 
+  it("NEW-E-099a owner decision 2026-10-08 · hide_costs: the methodology footer carries no sample_size on the wire; with costs visible it does", async () => {
+    const w = await world();
+    const hidden = await token(w, { scope: [w.p1], hideCosts: true });
+    const hiddenRes = await get(hidden.cookie, "/portal/overview");
+    expect(hiddenRes.statusCode, hiddenRes.body).toBe(200);
+    expect(hiddenRes.body).not.toContain("sample_size");
+    const hiddenFooter = portalOverviewResponseSchema.parse((hiddenRes.json() as { data: unknown }).data).projects[0]!.footer;
+    expect(hiddenFooter.note.length).toBeGreaterThan(0);
+    expect(hiddenFooter.live_capture_ratio).not.toBeUndefined();
+    const open = await token(w, { scope: [w.p1] });
+    const openFooter = portalOverviewResponseSchema.parse(((await get(open.cookie, "/portal/overview")).json() as { data: unknown }).data).projects[0]!.footer;
+    // The world seeds no per-engine rows, so the value is 0; what matters is that it is PRESENT (0, not absent).
+    expect(openFooter.sample_size).toBe(0);
+  });
+
   it("STORY-098 s13 · a locked timeframe cannot be widened by ?timeframe=; the lock is what is served and reported", async () => {
     const w = await world();
     const t = await token(w, { scope: [w.p1], lock: "7d" });

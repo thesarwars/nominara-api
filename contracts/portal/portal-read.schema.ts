@@ -29,6 +29,16 @@ export const portalProjectQuerySchema = z
 
 export const portalTasksQuerySchema = z.object({ project: z.uuid() }).strict();
 
+/**
+ * Owner decision 2026-10-08: when costs are hidden the footer drops `sample_size` (a figure derived from the capture
+ * count). The footer itself stays, unremovable (NFR-AGY-05). So `sample_size` is OPTIONAL in the published schema: a
+ * token with costs visible gets it, a hide_costs token does not. The two strict shapes the server enforces on the way
+ * out are below; this one is what a client types against.
+ */
+export const portalMethodologyFooterSchema = methodologyFooterSchema.extend({ sample_size: methodologyFooterSchema.shape.sample_size.optional() }).strict();
+/** The footer served under hide_costs: exactly the methodology footer without `sample_size`. */
+export const portalHiddenCostsFooterSchema = methodologyFooterSchema.omit({ sample_size: true }).strict();
+
 export const portalOverviewProjectSchema = z
   .object({
     id: z.uuid(),
@@ -40,7 +50,7 @@ export const portalOverviewProjectSchema = z
     sentiment: z.number().nullable(),
     citations: z.number().int().nonnegative(),
     /** The footer cannot be removed by theme (NFR-AGY-05). */
-    footer: methodologyFooterSchema,
+    footer: portalMethodologyFooterSchema,
   })
   .strict();
 
@@ -57,6 +67,14 @@ export const portalOverviewResponseSchema = z
     projects: z.array(portalOverviewProjectSchema),
   })
   .strict();
+
+/** The two strict overview shapes the server enforces: costs visible (footer has sample_size) and hide_costs (it does not). */
+export const portalOverviewCostsVisibleSchema = portalOverviewResponseSchema.extend({
+  projects: z.array(portalOverviewProjectSchema.extend({ footer: methodologyFooterSchema })),
+}).strict();
+export const portalOverviewCostsHiddenSchema = portalOverviewResponseSchema.extend({
+  projects: z.array(portalOverviewProjectSchema.extend({ footer: portalHiddenCostsFooterSchema })),
+}).strict();
 
 /**
  * The agency chart payload with ONE field removed from every point: `cells`, the per-day capture count. A capture count
