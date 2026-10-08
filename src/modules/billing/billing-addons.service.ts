@@ -8,7 +8,7 @@ import { Page, pageFrom } from "../../api/pagination/page.js";
 import type { Entitlement } from "../../db/seed/plan-entitlements.js";
 import { ADDON_CATALOG, addonGrant } from "../../lib/billing/addon-catalog.js";
 import { STRIPE_GATEWAY, StripeUpstreamError, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
-import { addonItemsFromSubscription, type AddonItem } from "../../lib/billing/stripe/addon-items.js";
+import { addonItemsFromSubscription, duplicatedAddonKinds, type AddonItem } from "../../lib/billing/stripe/addon-items.js";
 import { centsToDecimal } from "../../lib/billing/stripe/invoice-state.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { isFeatureGranted } from "../../lib/entitlements/classification.js";
@@ -159,6 +159,7 @@ export class BillingAddonsService {
     try {
       const fetched = await this.gateway.fetchObject("subscription", subscription.stripe_subscription_id);
       if (fetched === null) throw new PreconditionUnmetError({ message: "the payment provider has no such subscription" });
+      this.refuseDuplicateLines(fetched.raw, request.kind, workspaceId);
       const held = addonItemsFromSubscription(fetched.raw).find((item) => item.kind === request.kind);
       const heldQuantity = held?.quantity ?? 0;
       const total = request.quantity;
@@ -225,6 +226,10 @@ export class BillingAddonsService {
 
     const [plan, subscription] = [await this.plan(client, workspaceId), await this.liveSubscription(client, workspaceId)];
     try {
+      // A fresh fetch: the local row lags the webhook and cannot show a second Stripe line.
+      const fetched = await this.gateway.fetchObject("subscription", subscription.stripe_subscription_id);
+      if (fetched === null) throw new PreconditionUnmetError({ message: "the payment provider has no such subscription" });
+      this.refuseDuplicateLines(fetched.raw, kind, workspaceId);
       await this.gateway.scheduleAddonRemoval({
         subscriptionId: subscription.stripe_subscription_id,
         itemId: held.stripe_subscription_item_id,
@@ -333,6 +338,20 @@ export class BillingAddonsService {
     incrementCounter("nominara_billing_addon_reconcile_total", { outcome: "changed" });
     this.logger.log({ message: "add-ons reconciled from stripe", event_id: input.eventId, workspace_id: input.workspaceId, addons: after });
     return { changed: true };
+  }
+
+  /**
+   * ⚠ MONEY ALARM. Two Stripe lines of one kind (a create that timed out but was applied, then
+   * retried under a new Idempotency-Key) make "the" item ambiguous: a quantity sent to one leaves
+   * the customer billed for both, and a removal of one leaves the other billing forever. Neither
+   * is guessed at: 409, an alarm metric and a redacted log line, for a human to reconcile in Stripe.
+   */
+  private refuseDuplicateLines(raw: Readonly<Record<string, unknown>>, kind: AddonKind, workspaceId: string): void {
+    if (!duplicatedAddonKinds(raw).includes(kind)) return;
+    incrementCounter("nominara_billing_addon_duplicate_lines_total", { kind });
+    incrementCounter("nominara_billing_addon_change_total", { kind, outcome: "duplicate_lines" });
+    this.logger.error({ message: "MONEY ALARM: stripe holds more than one line of an add-on kind; change refused", workspace_id: workspaceId, kind });
+    throw new ConflictError({ message: "this add-on is held on more than one billing line: it cannot be changed until support reconciles it" });
   }
 
   private async refuseIfMembersWouldExceed(client: ClientBase, workspaceId: string, removing: number): Promise<void> {

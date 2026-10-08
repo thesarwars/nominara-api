@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addonItemsFromSubscription } from "./addon-items.js";
+import { addonItemsFromSubscription, duplicatedAddonKinds } from "./addon-items.js";
 
 // STORY-076b — the pure half of add-on reconciliation: a FRESHLY FETCHED
 // subscription in, the add-on items it holds out. No database, no clock.
@@ -50,5 +50,23 @@ describe("STORY-076b · addonItemsFromSubscription", () => {
   it("two lines of one kind are summed into one add-on, keeping the first item id", () => {
     const out = addonItemsFromSubscription(sub(item("extra_seat", { id: "si_a", quantity: 2 }), item("extra_seat", { id: "si_b", quantity: 3 })));
     expect(out).toEqual([{ kind: "extra_seat", quantity: 5, itemId: "si_a", unitAmountCents: 4900, currency: "usd" }]);
+  });
+});
+
+describe("STORY-076b audit · duplicatedAddonKinds", () => {
+  it("names a kind held on two lines, in catalog order, and no other", () => {
+    expect(duplicatedAddonKinds(sub(item("plan"), item("extra_seat", { id: "si_a" }), item("extra_seat", { id: "si_b" }), item("extra_project")))).toEqual(["extra_seat"]);
+    expect(duplicatedAddonKinds(sub(item("extra_seat", { id: "si_a" }), item("extra_seat", { id: "si_b" }), item("extra_project", { id: "p1" }), item("extra_project", { id: "p2" })))).toEqual(["extra_project", "extra_seat"]);
+  });
+
+  it("one line per kind, no lines, and malformed subscriptions are not duplicates", () => {
+    expect(duplicatedAddonKinds(sub(item("plan"), item("extra_seat"), item("extra_project")))).toEqual([]);
+    expect(duplicatedAddonKinds(sub())).toEqual([]);
+    expect(duplicatedAddonKinds({})).toEqual([]);
+    expect(duplicatedAddonKinds({ items: { data: [null, 3, {}] } })).toEqual([]);
+  });
+
+  it("a second line too malformed to mirror (quantity 0) still counts: it is still a line in Stripe", () => {
+    expect(duplicatedAddonKinds(sub(item("extra_seat", { id: "si_a" }), item("extra_seat", { id: "si_b", quantity: 0 })))).toEqual(["extra_seat"]);
   });
 });

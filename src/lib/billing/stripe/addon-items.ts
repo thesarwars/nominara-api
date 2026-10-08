@@ -51,3 +51,24 @@ export function addonItemsFromSubscription(raw: Readonly<Record<string, unknown>
   }
   return ADDON_KINDS.flatMap((kind) => byKind.get(kind) ?? []);
 }
+
+/**
+ * STORY-076b audit — the add-on kinds Stripe holds on MORE THAN ONE line. A
+ * kind has one line by construction; two means a create was applied twice (a
+ * timed-out request retried under a new Idempotency-Key). `addonItemsFromSubscription`
+ * sums the quantities but keeps one item id, so a change or removal addressed to
+ * it would over-charge or leave the other line billing: callers refuse instead.
+ * Any line carrying a recognised `nominara_kind` counts, even one too malformed
+ * to mirror: a line that bills is a line.
+ */
+export function duplicatedAddonKinds(raw: Readonly<Record<string, unknown>>): AddonKind[] {
+  const container = raw.items;
+  if (!isRecord(container) || !Array.isArray(container.data)) return [];
+  const counts = new Map<string, number>();
+  for (const line of container.data) {
+    if (!isRecord(line) || !isRecord(line.price) || !isRecord(line.price.product) || !isRecord(line.price.product.metadata)) continue;
+    const kind = line.price.product.metadata.nominara_kind;
+    if (typeof kind === "string" && KINDS.has(kind)) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  return ADDON_KINDS.filter((kind) => (counts.get(kind) ?? 0) > 1);
+}

@@ -172,3 +172,27 @@ Run with the disk rule satisfied. `billing-addons` + `stripe-subscriptions` + `s
 | reconcile filter `stripe_subscription_id = $2` -> `$2::text IS NOT NULL` | SURVIVED the first time: the test's old-subscription fixture carried no billing period, so the handler ignored the event ("carries no billing period") and `reconcile` was never reached (a debug print confirmed). Fixture fixed (`current_period_start/end` added); the mutant is now KILLED (`expected [] to deeply equal [[extra_project,1],[extra_seat,2]]`, exit 1) and the unmutated test passes |
 
 Final gates on this tip: `pnpm lint` 0, `pnpm typecheck` 0, `pnpm test:unit` 0 (3401 passed, 1 skipped, before the fixture-only change). `test:isolation` / `:breakers` not run: known fixture crash at this tip; isolation proved under `nominara_app` in the integration spec (3 tests, passing).
+
+
+## Audit round 4 (2026-10-08): two Stripe lines of one add-on kind
+
+Finding: `addonItemsFromSubscription` sums the quantities of every line of a kind but keeps the first item id, so `add()` (total sent to one item) over-charged and `remove()` (one item dropped) left the other line billing. Rule applied: when more than one line of a kind is held, REFUSE with 409 and raise a money alarm, in both `add()` and `remove()`. Cause window: a create that times out at the gateway but is applied by Stripe, then a retry under a NEW Idempotency-Key.
+
+| Criterion | Proof |
+|---|---|
+| AC1 add: two held lines, POST {3} is 409, Stripe not changed, alarm fires | `billing-addons.service.spec.ts` "AC1 . POST extra_seat {3} with two held lines is a 409 ..." (asserts no `changeAddonQuantity` and counter `nominara_billing_addon_duplicate_lines_total{kind}`) |
+| the state is refused even when the total equals the sum | "AC1 . even a total EQUAL to the summed quantity is refused ..." |
+| another kind is unaffected | "AC1 . a duplicate of ANOTHER kind does not block this kind ..." |
+| AC4 remove: two held lines, DELETE is 409, no removal scheduled, alarm fires | "AC4 . DELETE extra_seat with two held lines is a 409 ..." (asserts no `scheduleAddonRemoval`) |
+| pure detection | `addon-items.spec.ts` "STORY-076b audit . duplicatedAddonKinds" (3 tests: catalog order, no false positives/empty/malformed, a malformed second line still counts) |
+| integration (fake gateway holding two lines, real API, real Postgres, nominara_app) | `test/integration/billing-addons.spec.ts` "audit . Stripe holding TWO extra_seat lines ...": POST 409, DELETE 409, no `addonChanges`/`addonRemovals`, local rows and entitlement_version unchanged |
+| RED | `e8f66e6`: unit `vitest run billing-addons.service.spec.ts` exit 1, 3 failed / 28 passed (the 4th, other-kind, is a control that passes by design); integration `-t "TWO extra_seat"` exit 1, "expected 202 to be 409" (a first attempt failed with 401 entitlement_stale, a fixture error, fixed before the commit) |
+| GREEN | `vitest run src/modules/billing src/lib/billing` exit 0, 161 passed; integration `billing-addons` + `stripe-webhook` + `stripe-subscriptions` exit 0, 119 passed |
+| metric / log | counter `nominara_billing_addon_duplicate_lines_total` (+ `nominara_billing_addon_change_total{outcome=duplicate_lines}`); `logger.error` carries workspace ID and kind only. OpenTelemetry spans deferred to week 2 by owner decision |
+| Gates | `pnpm lint` 0 · `pnpm typecheck` 0 · `pnpm test:unit` 0 (282 files passed, 1 skipped; 3408 passed, 1 skipped). Disk 9.4 GiB free before the integration run |
+
+Known remaining: `reconcile` still mirrors a duplicated kind as ONE row (summed quantity, first item id). That mirrors what Stripe bills, which is the honest quantity; the alarm and the 409 stop any change through the API until support removes the extra line in Stripe. The real-API behaviour (does Stripe really apply a timed-out create) is NEW-A-17.
+
+### Not done in this round (decisions needed, see the report)
+- Finding 2 (quantity semantics: the recorded call says ADD, the code and contract say TOTAL; catalog listing with prices): NOT changed. It reverses a recorded lead decision and changes the wire contract; the lead/owner must write the decision into `plans-7day/decisions-2026-10-08.md` and the story first.
+- Finding 3 (isolation gates): lane touches no tenant table; `test/isolation/support/three-tenant-fixture.ts` belongs to the d-admin fix. Not touched; the merge step must run `test:isolation` and `:breakers` after it lands.
