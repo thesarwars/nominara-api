@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { inspect } from "node:util";
 import { Pool } from "pg";
 import { Logger } from "@nestjs/common";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -294,6 +295,41 @@ describe("NEW-D-4 · API keys over HTTP", () => {
       expect(lines.join("\n")).not.toContain(c.secret);
     } finally {
       spy.mockRestore();
+    }
+  });
+
+  it("NEW-D-4 AC2 · the secret never appears at ANY log level, on console.* or on stdout/stderr across create, list, revoke and a refused create", async () => {
+    const out: string[] = [];
+    // Render every argument so an Error (message + stack), a Buffer (decoded as text; util.inspect only
+    // shows hex bytes) and nested values are visible. JSON.stringify gave "{}" for an Error.
+    const render = (m: unknown, depth = 0): string => {
+      if (typeof m === "string") return m;
+      if (m instanceof Uint8Array) return `${Buffer.from(m).toString()} ${inspect(m)}`;
+      if (Array.isArray(m) && depth < 5) return m.map((x) => render(x, depth + 1)).join(" ");
+      return inspect(m, { depth: 5 });
+    };
+    const capture = (m: unknown): void => {
+      out.push(render(m));
+    };
+    const levels = ["log", "warn", "error", "debug", "verbose", "fatal"] as const;
+    const spies = levels.map((lvl) => vi.spyOn(Logger.prototype, lvl).mockImplementation((m: unknown, ...rest: unknown[]) => capture([m, ...rest])));
+    const consoleLevels = ["log", "info", "warn", "error", "debug", "trace"] as const;
+    const cspies = consoleLevels.map((lvl) => vi.spyOn(console, lvl).mockImplementation((...args: unknown[]) => capture(args)));
+    const so = vi.spyOn(process.stdout, "write").mockImplementation((m: unknown) => (capture(m), true));
+    const se = vi.spyOn(process.stderr, "write").mockImplementation((m: unknown) => (capture(m), true));
+    try {
+      const a = await owner("business");
+      const c = data<Created>(await create(a));
+      await list(a);
+      await revoke(a, c.key.id);
+      await revoke(a, c.key.id);
+      await create(a, payload({ permissions: ["workspace:delete"] }));
+      const all = out.join("\n");
+      expect(all).not.toContain(c.secret);
+      expect(all).not.toContain(c.secret.slice(12));
+      expect(all).not.toContain(createHash("sha256").update(c.secret).digest("hex"));
+    } finally {
+      for (const s of [...spies, ...cspies, so, se]) s.mockRestore();
     }
   });
 });
