@@ -229,7 +229,7 @@ describe("STORY-076b · add-ons", () => {
     stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 3 }] });
     expect(await addonRows(workspaceId)).toEqual([]);
 
-    const res = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 });
+    const res = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 5 });
     expect(res.statusCode, res.body).toBe(202);
     expect(gateway.fetches).toContain(`subscription:${subIdOf(workspaceId)}`);
     expect(gateway.addonChanges[0]).toMatchObject({ kind: "extra_seat", quantity: 5, existingItemId: "si_extra_seat" });
@@ -239,10 +239,28 @@ describe("STORY-076b · add-ons", () => {
   it("AC1 boundary · a total above the cap is a 400 before Stripe; the cap itself is allowed", async () => {
     const { workspaceId, owner } = await newWorkspace("growth");
     stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 99 }] });
-    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 })).statusCode).toBe(400);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 101 })).statusCode).toBe(400);
     expect(gateway.addonChanges).toHaveLength(0);
-    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(202);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 100 })).statusCode).toBe(202);
     expect(gateway.addonChanges[0]).toMatchObject({ quantity: 100 });
+  });
+
+  it("AC1 retry · Stripe applied the change but the reply was lost: the same Idempotency-Key retried adds nothing more, and a lower total is a 409", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const key = randomUUID();
+    gateway.failAddonWith = new StripeUpstreamError(504);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(503);
+    // Stripe did apply it (the reply, not the change, was lost).
+    gateway.failAddonWith = undefined;
+    stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 1 }] });
+    const retry = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key);
+    expect(retry.statusCode, retry.body).toBe(202);
+    expect(dataOf<{ quantity_requested: number }>(retry).quantity_requested).toBe(1);
+    expect(gateway.addonChanges).toHaveLength(0);
+    stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 3 }] });
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 })).statusCode).toBe(409);
+    expect(gateway.addonChanges).toHaveLength(0);
   });
 
   it("AC1 · request validation: quantity 0, 101, a fractional quantity and an unknown kind are 400s; the Idempotency-Key is required", async () => {

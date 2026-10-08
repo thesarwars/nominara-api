@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { ADDON_MAX_QUANTITY, type Addon, type AddonChangeResponse, type AddonCreateRequest, type AddonListQuery } from "../../../contracts/billing/index.js";
@@ -28,10 +29,15 @@ import { AuditChainService } from "../audit/audit-chain.service.js";
 // (STORY-075), so an add-on is never granted on a say-so and never lost to an
 // event arriving out of order.
 //
-// ⚠ A QUANTITY IS A SET, NOT AN INCREMENT. Stripe has no atomic increment, so
-// `add` reads the item's quantity from a FRESH fetch (never the local row, which
-// lags the webhook) and sets the item to current + requested. Two requests are
-// serialised by the workspace row lock.
+// ⚠ A QUANTITY IS A SET, NOT AN INCREMENT, AND THE REQUEST IS THE TOTAL. The
+// request's `quantity` is the desired total, fixed by the caller, so a retry
+// after Stripe applied the change (reply lost, timeout, a later commit failure)
+// asks for the same number and cannot add a second unit. The held quantity is
+// read from a FRESH fetch (never the local row, which lags the webhook); a total
+// equal to it is a no-op and a lower one is a 409 (removal is DELETE). The Stripe
+// idempotency key is derived from the workspace and the request's Idempotency-Key,
+// so a retry replays Stripe's own answer. Two requests are serialised by the
+// workspace row lock.
 //
 // ⚠ REMOVAL FOLLOWS THE PERIOD-END POLICY (AC13), AND STORY-077 IS NOT BUILT.
 // With no downgrade/retention machinery to call, the removal is scheduled at the
@@ -128,8 +134,8 @@ export class BillingAddonsService {
     );
   }
 
-  /** `POST /v1/billing/addons` — adds `quantity` units; pro-rated by Stripe. */
-  async add(request: AddonCreateRequest): Promise<AddonChangeResponse> {
+  /** `POST /v1/billing/addons` — sets the add-on to the requested total; pro-rated by Stripe. */
+  async add(request: AddonCreateRequest, idempotencyKey: string): Promise<AddonChangeResponse> {
     this.requireConfigured();
     const { client, workspaceId } = this.tenant();
     const entry = ADDON_CATALOG[request.kind];
@@ -154,7 +160,8 @@ export class BillingAddonsService {
       const fetched = await this.gateway.fetchObject("subscription", subscription.stripe_subscription_id);
       if (fetched === null) throw new PreconditionUnmetError({ message: "the payment provider has no such subscription" });
       const held = addonItemsFromSubscription(fetched.raw).find((item) => item.kind === request.kind);
-      const total = (held?.quantity ?? 0) + request.quantity;
+      const heldQuantity = held?.quantity ?? 0;
+      const total = request.quantity;
       if (total > ADDON_MAX_QUANTITY) {
         incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "over_cap" });
         throw new ValidationFailedError({
@@ -162,18 +169,25 @@ export class BillingAddonsService {
           details: { issues: [{ path: ["quantity"], message: `a workspace can hold at most ${String(ADDON_MAX_QUANTITY)} of one add-on` }] },
         });
       }
-      await this.gateway.changeAddonQuantity({
-        subscriptionId: subscription.stripe_subscription_id,
-        kind: request.kind,
-        quantity: total,
-        existingItemId: held?.itemId ?? null,
-        productName: `Nominara ${entry.displayName}`,
-        unitAmountCents: toCents(entry.monthlyUsd),
-        currency: "usd",
-        interval: "month",
-        proration: "create_prorations",
-        idempotencyKey: `addon-${uuidV7()}`,
-      });
+      if (total < heldQuantity) {
+        incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "below_held" });
+        throw new ConflictError({ message: "the requested total is below what this workspace holds: remove the add-on instead" });
+      }
+      // Already at the total (a retry whose first attempt landed): nothing to ask of Stripe, nothing to charge.
+      if (total > heldQuantity) {
+        await this.gateway.changeAddonQuantity({
+          subscriptionId: subscription.stripe_subscription_id,
+          kind: request.kind,
+          quantity: total,
+          existingItemId: held?.itemId ?? null,
+          productName: `Nominara ${entry.displayName}`,
+          unitAmountCents: toCents(entry.monthlyUsd),
+          currency: "usd",
+          interval: "month",
+          proration: "create_prorations",
+          idempotencyKey: addonIdempotencyKey(workspaceId, request.kind, idempotencyKey),
+        });
+      }
       incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "requested" });
       this.logger.log({ message: "add-on change requested", workspace_id: workspaceId, kind: request.kind, quantity_requested: total });
       return { kind: request.kind, status: "pending", quantity_requested: total, effective: "immediate", effective_at: null, grant: addonGrant(plan.entitlements, request.kind) };
@@ -381,6 +395,11 @@ export class BillingAddonsService {
     if (store === undefined) throw new Error("BillingAddonsService requires an active tenant context");
     return { client: store.client, workspaceId: store.context.workspaceId, actorId: store.context.actorId };
   }
+}
+
+/** Stripe keys are <= 255 chars: hash the caller's key so its length and content never reach Stripe. */
+function addonIdempotencyKey(workspaceId: string, kind: AddonKind, requestKey: string): string {
+  return `addon-${workspaceId}-${kind}-${createHash("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
 }
 
 function afterKind(cursor: string): AddonKind {

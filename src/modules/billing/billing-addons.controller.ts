@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Headers, HttpCode, Param, Post, Query } from "@nestjs/common";
 import {
   addonChangeResponseSchema,
   addonCreateRequestSchema,
@@ -39,8 +39,12 @@ export class BillingAddonsController {
   @RequirePermission("billing:write")
   @Audit({ action: "billing.addon.change_requested", resourceType: "workspace", resourceIdFrom: "workspace" })
   @ApiContract({ operationId: "addAddon", requestSchema: addonCreateRequestSchema, responseSchema: addonChangeResponseSchema })
-  add(@Body(new ZodValidationPipe(addonCreateRequestSchema)) body: AddonCreateRequest): Promise<AddonChangeResponse> {
-    return this.service.add(body);
+  add(
+    @Body(new ZodValidationPipe(addonCreateRequestSchema)) body: AddonCreateRequest,
+    // @Idempotent() has already refused a missing or malformed key.
+    @Headers("idempotency-key") idempotencyKey: string,
+  ): Promise<AddonChangeResponse> {
+    return this.service.add(body, idempotencyKey);
   }
 
   @Delete(":kind")
