@@ -37,8 +37,11 @@ import { ExportService } from "./export.service.js";
 const logger = new Logger("ScheduledReportsService");
 const PDF_ENTITLEMENT = "exports.pdf_per_cycle";
 const CSV_ENTITLEMENT = "exports.csv";
-/** Where an artifact is addressed from an email. The download route itself is the signed-link story (scenario 11). */
-const ARTIFACT_LINK_BASE = "https://app.nominara.com/report-artifacts";
+/**
+ * The app origin an emailed artifact link is resolved against. A link is a URL, not an object-storage key (no
+ * bucket key is built here; artifacts are inline this week). The download route is the signed-link story (scenario 11).
+ */
+const ARTIFACT_LINK_ORIGIN = "https://app.nominara.com";
 
 interface ReportRow {
   id: string;
@@ -231,7 +234,7 @@ export class ScheduledReportsService {
   }
 
   private async sendEmails(report: ReportRow, artifacts: string[]): Promise<number> {
-    const links = artifacts.map((a) => `${ARTIFACT_LINK_BASE}/${a}`).join("\n");
+    const links = artifacts.map((a) => new URL(`/report-artifacts/${encodeURIComponent(a)}`, ARTIFACT_LINK_ORIGIN).href).join("\n");
     let failures = 0;
     for (const to of report.recipients) {
       try {

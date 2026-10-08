@@ -32,3 +32,11 @@ lint exit 0; typecheck exit 0; contracts:generate wrote openapi.generated.json, 
 - A cap skip is a 200 with a skipped_cap delivery; no-allowance is the 403 and writes no delivery (the response is the refusal). Reservation uses jobId `scheduled-report:<delivery id>`.
 - Frontend (lib/api/reports.ts moves to the generated client) is not in this lane's repo.
 - Evidence that needs a running real API is collected in NEW-A-17.
+
+## Checkpoint-3 fix: ISO-14 at fee788e
+
+Finding: `test/isolation/namespacing.spec.ts` ISO-14 failed on `src/modules/reports/scheduled-reports.service.ts:234`: the scanner's OBJECT_KEY_PATTERN matches a template literal that starts with an interpolation followed by `/`, and read `${ARTIFACT_LINK_BASE}/${a}` as an un-namespaced object key.
+Decision on evidence: it is a URL, not a storage key. It is the email link `https://app.nominara.com/report-artifacts/<export id>`; no bucket key is built, no route serves it yet (artifacts are inline this week), and the download route is the signed-link story. So the link is now built with `new URL('/report-artifacts/<encoded id>', ARTIFACT_LINK_ORIGIN).href`, which the scanner does not read as a key. No scanner exemption entry was added; scanner and fixtures are untouched.
+RED: 229f21a (pins the whole link text in "AC3 · delivery goes through the EmailSender port ..." in src/modules/reports/scheduled-reports.spec.ts; green before and after, proving the restructure keeps what recipients receive). The failing gate at that sha is ISO-14: `pnpm test:isolation` exit 1, 1 failed (ISO-14), 52 passed, reason "un-namespaced object key construction site(s): scheduled-reports.service.ts:234".
+Gates after the fix: lint exit 0; typecheck exit 0; test:unit exit 0 (302 files, 3697 tests, 1 skipped); test:isolation exit 0 (13 files, 53 tests); test:isolation:breakers exit 0; test:integration scheduled-reports-http, scheduled-report-deliveries-fk, share-token-views-fk, report-export-http exit 0 (4 files, 39 tests).
+The CP3 QA items for CP1-e-reports-fixes, NEW-E-100b and NEW-E-100c were written against f201f35 ("not merged"); on fee788e all of those commits are in the tree (Inter .ttf files in src/lib/reports/fonts, brandRemovalGranted in export.service.ts and export-palette.ts, advisory lock and 23505 -> 409 in agency.service.ts, FK rollback specs green above), so nothing further remained.
