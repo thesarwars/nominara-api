@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { ZodError } from "zod";
 import type { GrowthMapResponse } from "../../../contracts/analytics/index.js";
 import { portalGrowthMapResponseSchema } from "../../../contracts/portal/index.js";
 import { ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
-import { assertPortalTab, competitorLabel, findCostFields, PORTAL_DEFAULT_TIMEFRAME, portalTimeframeDays, resolvePortalTimeframe, toPortalGrowthMap } from "./portal-view.js";
+import { assertPortalTab, competitorLabel, findCostFields, parsePortalPayload, PORTAL_DEFAULT_TIMEFRAME, portalTimeframeDays, resolvePortalTimeframe, toPortalGrowthMap } from "./portal-view.js";
 
 // NEW-E-099a — the pure rules of the portal read model. Scenario IDs are STORY-098 / STORY-099's.
 const point = (d: string, v: number | null) => ({ d, visibility_score: v, sov: v === null ? null : 0.1, cells: v === null ? 0 : 12, live_ratio: v === null ? null : 1 });
@@ -115,5 +116,43 @@ describe("NEW-E-099a · findCostFields (the hide_costs key scan)", () => {
   it("an empty payload and a null value find nothing", () => {
     expect(findCostFields({})).toEqual([]);
     expect(findCostFields(null)).toEqual([]);
+  });
+});
+
+// NEW-E-099a audit finding 3 — the cost-key scan is a denylist; the response schemas are the allow-list. A key no
+// schema names (captures, n_captures, runs_used, capture_total ...) must fail closed on the way out.
+describe("NEW-E-099a audit · parsePortalPayload (strict allow-list on the way out)", () => {
+  const footer = { data_through: "2026-10-01", engines: ["gemini"], engine_data_sources: ["live"], timeframe: "30d", sample_size: 3, live_capture_ratio: 1, scoring_version: "v1", weight_overrides: null, note: "n" } as const;
+  const theme = { theme_id: null, name: "Default", primary: null, accent: null, background: null, text: null, font_family: "Inter", logo_url: null, hide_nominara_brand: false, is_default: true } as const;
+  const overview = (extra: Record<string, unknown> = {}, projectExtra: Record<string, unknown> = {}) => ({
+    agency: "A", theme, label: "L", tabs: ["overview"], hide_competitors: false, hide_costs: true, timeframe: "30d", timeframe_locked: false,
+    projects: [{ id: "0198f6a0-0000-7000-8000-00000000000a", name: "P", visibility: 1, delta: null, confidence: "high", sentiment: null, citations: 0, footer, ...projectExtra }],
+    ...extra,
+  });
+
+  it("an overview that matches its schema passes", () => {
+    expect(() => parsePortalPayload("overview", overview())).not.toThrow();
+  });
+
+  it.each(["captures", "n_captures", "runs_used", "capture_total"])("an unknown key %s on an overview project fails closed", (key) => {
+    expect(() => parsePortalPayload("overview", overview({}, { [key]: 4 }))).toThrow(ZodError);
+  });
+
+  it("an unknown top-level key on an overview fails closed", () => {
+    expect(() => parsePortalPayload("overview", overview({ runs_used: 1 }))).toThrow(ZodError);
+  });
+
+  it("an unknown key on a matrix engine fails closed", () => {
+    expect(() => parsePortalPayload("matrix", { engines: [{ engine_key: "gemini", data_source: "live", visibility_score: 1, presence_rate: 1, share_of_voice: 1, captures: 9 }] })).toThrow(ZodError);
+  });
+
+  it("a growth-map point that still carries cells fails closed", () => {
+    const withCells = { ...growth(), series: growth().series.map((s) => ({ ...s })) };
+    expect(() => parsePortalPayload("growth_map", withCells)).toThrow(ZodError);
+    expect(() => parsePortalPayload("growth_map", toPortalGrowthMap(growth(), { hideCompetitors: false }))).not.toThrow();
+  });
+
+  it("an unknown key on a task row fails closed", () => {
+    expect(() => parsePortalPayload("tasks", { completed: [], open: [{ title: "t", severity: null, status: "todo", credits_spent: 3 }] })).toThrow(ZodError);
   });
 });
