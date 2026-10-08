@@ -552,22 +552,65 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     },
   );
 
-  it.each(["none", "failed"] as const)(
-    "NEW-D-7 audit F6 · a stale pending purchase that Stripe says is %s is failed and audited, and exactly one new charge is made under a NEW purchase id",
-    async (state) => {
-      const { workspaceId, stuck } = await stuckPending();
-      if (state === "failed") gateway.offSessionStates.set(stuck.id as string, "failed");
-      expect(await service.trigger(workspaceId)).toBe("charge_submitted");
-      expect(gateway.offSessionStateLookups).toEqual([stuck.id]);
-      const purchases = await autoPurchases(workspaceId);
-      expect(purchases).toHaveLength(2);
-      expect(purchases.find((p) => p.id === stuck.id)).toMatchObject({ status: "failed" });
-      expect(purchases.filter((p) => p.status === "pending")).toHaveLength(1);
-      expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([expect.objectContaining({ resource_type: "credit_purchase", resource_id: stuck.id })]);
-      expect(gateway.offSessionCharges).toHaveLength(1);
-      expect(gateway.offSessionCharges[0]!.purchaseId).not.toBe(stuck.id);
-    },
-  );
+  it("NEW-D-7 checkpoint-3 F1 · a stale pending purchase that Stripe says FAILED (the card declined) goes down the decline path: failed, disabled, notified, and NO new charge in that run", async () => {
+    const { workspaceId, stuck } = await stuckPending();
+    gateway.offSessionStates.set(stuck.id as string, "failed");
+    expect(await service.trigger(workspaceId)).toBe("declined");
+    expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: false, auto_topup_count_cycle: 1 });
+    const purchases = await autoPurchases(workspaceId);
+    expect(purchases).toHaveLength(1);
+    expect(purchases[0]).toMatchObject({ id: stuck.id, status: "failed" });
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(email.sent.map((m) => m.subject)).toEqual(["Nominara auto top-up triggered", "Nominara auto top-up disabled after a failed payment"]);
+    expect(await audit(workspaceId, "billing.auto_topup.disabled")).toHaveLength(1);
+    expect(await service.trigger(workspaceId)).toBe("not_enabled");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+  });
+
+  it("NEW-D-7 checkpoint-3 F2 · Search saying `none` proves nothing (Search lags in an outage): the SAME purchase is replayed under its own idempotency key, and no new purchase, slot or purchase id is taken", async () => {
+    const { workspaceId, stuck } = await stuckPending();
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    expect(gateway.offSessionStateLookups).toEqual([stuck.id]);
+    expect(gateway.offSessionCharges).toHaveLength(1);
+    expect(gateway.offSessionCharges[0]!.purchaseId).toBe(stuck.id);
+    const purchases = await autoPurchases(workspaceId);
+    expect(purchases).toHaveLength(1);
+    expect(purchases[0]).toMatchObject({ id: stuck.id, status: "pending" });
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
+    expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([]);
+    expect(email.sent.filter((m) => m.subject === "Nominara auto top-up triggered")).toHaveLength(1);
+  });
+
+  it("NEW-D-7 checkpoint-3 F2 · when the replay of the same purchase comes back declined it takes the decline path (disabled, notified, failed), still with no second purchase", async () => {
+    const { workspaceId, stuck } = await stuckPending();
+    gateway.offSessionOutcome = "declined";
+    expect(await service.trigger(workspaceId)).toBe("declined");
+    expect(gateway.offSessionCharges.map((c) => c.purchaseId)).toEqual([stuck.id]);
+    expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: false, auto_topup_count_cycle: 1 });
+    const purchases = await autoPurchases(workspaceId);
+    expect(purchases).toHaveLength(1);
+    expect(purchases[0]).toMatchObject({ id: stuck.id, status: "failed" });
+    expect(email.sent.map((m) => m.subject)).toContain("Nominara auto top-up disabled after a failed payment");
+  });
+
+  it("NEW-D-7 checkpoint-3 F2 · when the replay itself cannot be answered the purchase stays pending: nothing expired, no second charge, no slot taken", async () => {
+    const { workspaceId, stuck } = await stuckPending();
+    gateway.failChargeWith = new StripeUpstreamError(503);
+    expect(await service.trigger(workspaceId)).toBe("upstream_error");
+    gateway.failChargeWith = undefined;
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(await autoPurchases(workspaceId)).toEqual([expect.objectContaining({ id: stuck.id, status: "pending" })]);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
+  });
+
+  it("NEW-D-7 checkpoint-3 F2 · past Stripe's idempotency-key retention a replay would be a NEW charge, so it fails closed: stays pending, no charge, no lookup-driven expiry", async () => {
+    const { workspaceId, stuck } = await stuckPending(25 * 60);
+    expect(await service.trigger(workspaceId)).toBe("in_flight");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(await autoPurchases(workspaceId)).toEqual([expect.objectContaining({ id: stuck.id, status: "pending" })]);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
+    expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([]);
+  });
 
   it("NEW-D-7 audit F6 · when Stripe cannot be asked about a stale pending purchase it stays pending: nothing expired, nothing charged, no slot taken", async () => {
     const { workspaceId, stuck } = await stuckPending();
