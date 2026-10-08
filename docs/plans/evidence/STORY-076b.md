@@ -203,3 +203,64 @@ Known remaining: `reconcile` still mirrors a duplicated kind as ONE row (summed 
 - Finding 3 (ADD vs TOTAL, catalog read): NOT changed; stopped on a decision (see the report). Code and contract still say TOTAL.
 - Finding 4 (isolation gate): not a lane defect, the lane adds no tenant table and touches none of the failing files; the merge step runs `test:isolation` and `:breakers` after the d-admin fixture fix and the c-src, c-geo, d-admin namespacing fixes land.
 - Gates after this round: lint 0, typecheck 0, test:unit 0 (3416 passed, 1 skipped).
+
+
+## Checkpoint-3 fix pass (2026-10-08, branch `7day/d-billing-4` from `integration/7day` @ fee788e)
+
+Commits: contract `425f498` · RED `5a4bbe5` · fix `fb15bcf` (a follow-up commit adds two metric assertions to the unit spec).
+Migration `0122_subscriptions_pending_addon_changes` (additive nullable jsonb on `subscriptions`; same precedent as 0077's `pending_checkout`; the existing RLS policy covers it). The task named the stored intent, so the column is named by it.
+Base run first: `billing-invoices.spec.ts` + `billing-addons.spec.ts` on the merged tree, `vitest run --config vitest.integration.config.ts`, exit 0, 65 passed (the two specs now have run).
+
+### Decisions applied (decisions-2026-10-08.md, STORY-076b line)
+POST `quantity` ADDS to the held quantity (the previous contract made it a total). Annual add-ons 409 (unchanged, test "AC1 · an annual subscription is refused (409)"). `GET /billing/addons` lists the purchasable catalog with prices: one item per kind (`addonListItemSchema`), `quantity` 0 and `id`/`active_from`/`active_until` null when not held, `purchasable` from the plan flag.
+Docs carry: STORY-076 should state "POST adds; retry safety is the Idempotency-Key -> stored intent -> Stripe key chain; GET returns the catalog". The docs repo has no .git here.
+
+### Audit finding: a retried POST charged twice (the idempotency chain)
+Chain: `Idempotency-Key` -> sha256 (32 hex) map key in `subscriptions.pending_addon_changes` -> intent `{id, kind, quantity, target_total, stripe_idempotency_key: "addon-<intent id>", created_at}` committed on its OWN pooled connection BEFORE Stripe is asked -> that stored key and stored total are what `changeAddonQuantity` receives, on the first attempt and on every retry. A retry whose stored total Stripe already holds asks Stripe for nothing. Same key + different kind/quantity is 409 `idempotency_conflict`. At most 20 intents are kept.
+
+| Criterion | Test (file > name) |
+|---|---|
+| Stripe applied, reply lost, same key retried: exactly one unit, one Stripe change; a new key adds | `test/integration/billing-addons.spec.ts` > "AC1 retry · Stripe APPLIED the change and the reply was lost: ..." (uses the new `FakeStripeGateway.failAfterApplyingAddon`: applies, then loses the reply, and replays a key it has seen); unit `billing-addons.service.spec.ts` > "AC1 retry . Stripe applies the change and the reply is lost ..." |
+| Intent committed before Stripe, survives the failed request, key stored hashed | integration "AC1 retry · the intent is COMMITTED before Stripe is asked ..."; unit "AC1 retry . the intent is committed BEFORE Stripe is asked ..." (call order `["intent","stripe"]`) |
+| Retry replays the STORED total and STORED Stripe key | integration "AC1 retry · a retry replays the STORED total and the STORED Stripe key ..."; unit "AC1 retry . a retry that Stripe did NOT apply replays ..." |
+| Same key, different request: 409 idempotency_conflict | integration "AC1 retry · the same Idempotency-Key with a DIFFERENT request is 409 idempotency_conflict ..."; unit "AC1 retry . the same Idempotency-Key with a different kind or quantity ..." |
+| Different key = different purchase | unit "AC1 retry . a DIFFERENT Idempotency-Key is a different purchase and adds again" |
+| Bounded intent store; refused requests leave no intent | unit "keeps at most 20 intents ...", "a request refused for any reason leaves no intent behind" |
+| POST adds (3 held + 2 = 5); cap on held + added | integration "AC1 · POST ADDS to the held quantity ...", "AC1 boundary · held plus added above the cap is a 400 ..."; unit "AC1 · ADDS the requested units ...", "AC1 boundary · held plus added of exactly the cap ..." |
+| Catalog on GET (empty, plan-dependent, held beside not-held, tenant isolation) | integration "AC2 · catalog · a workspace holding nothing ...", "AC2 · catalog · purchasable follows the plan ...", "AC2 · catalog · a held add-on shows ...", "tenant isolation · the list returns only the caller's add-ons" |
+| Annual 409 | integration "AC1 · an annual subscription is refused (409) ..." |
+
+Tests whose setup the ADD decision outdated and that were rewritten to prove the same property (not weakened): the held-add test (3 held +2 = 5, was "5 total"), the cap test (99 held +2 is a 400, +1 is allowed), the concurrency test, the extra_project-beside-duplicate-seat unit case (1 held + 2 = 3), the tenant-isolation list test (A now also sees `extra_project:0`; B's 4 projects stay invisible), and the empty-list test (now the catalog test).
+
+### A defect the new design exposed, found by the integration run, and fixed
+The first full run HUNG: 12 concurrent POSTs queued on the workspace row lock, each holding a pooled connection, while the lock holder needed a SECOND pooled connection for its intent; the pool was empty and nothing could proceed (pg_stat_activity showed the waiters on `FOR UPDATE` and the holder `idle in transaction`). Fix: the lock wait is bounded (`lock_timeout` 3 s, transaction-local via `set_config(..., true)`, then reset); exceeding it is a retryable 409 "another billing change for this workspace is in progress" (counter `outcome=lock_wait_exceeded`). Consequence for the concurrency test: under saturation some requests are 409 instead of queueing, so it now asserts every status is 202 or 409 (it already allowed 409), at least one 202, exactly one Stripe create, one line, and a final quantity equal to the SUM OF THE ACCEPTED adds. The invariant (no lost update, no second item) is unchanged. Unit: "lock wait · the workspace lock is waited for at most 3 s ...". The same hold-and-wait shape exists in checkout's two short writes (billing-subscription.service.ts); not touched here, flagged.
+
+### Mutants (integration, `billing-addons.spec.ts`, each reverted; `git diff` clean afterwards)
+| Mutant | Result |
+|---|---|
+| ignore the stored total (`target = held + quantity` on retry) | KILLED, exit 1 (1 failed: the applied-then-lost retry test) |
+| Idempotency-Key cut at the controller (`${key}-${Math.random()}`) | KILLED, exit 1 (4 failed) |
+| intent written on the request's own connection (rolls back with the 503) | KILLED, exit 1 (5 failed) |
+| workspace row lock removed (`FOR UPDATE` dropped) | KILLED, exit 1 (the concurrency test) |
+
+### Observability
+Metrics: `nominara_billing_addon_change_total{kind,outcome}` gains `replayed_applied`, `idempotency_conflict`, `lock_wait_exceeded` (the first and last asserted in the unit spec). Log: "add-on change already applied; retry answered without a Stripe call" carries `workspace_id` and `kind` only. OpenTelemetry spans deferred to week 2 (decision R3); a missing span is not a failed criterion.
+
+### Gates (worktree api-wt-d1, exit codes read)
+| Command | Exit | Result |
+|---|---|---|
+| `pnpm lint` | 0 | clean |
+| `pnpm typecheck` | 0 | clean |
+| `pnpm contracts:generate`, `pnpm contracts:check` | 0 | no drift |
+| `pnpm contracts:diff` vs `integration/7day` | 0 | `major`: the add-on route is not in `contracts/baseline/openapi.previous-minor.json` (never released), so no breaking-changes.json entry; the diff against that baseline is `major` before and after this change |
+| `pnpm test:unit` | 0 | 302 files passed, 1 skipped; 3701 passed, 1 skipped |
+| RED (`5a4bbe5`) unit `billing-addons.service.spec.ts` | 1 | 8 failed / 26 passed |
+| RED (`5a4bbe5`) integration `billing-addons.spec.ts` | 1 | 10 failed / 30 passed |
+| GREEN integration `billing-addons.spec.ts` | 0 | 40 passed |
+| integration: billing-addons, billing-invoices, billing-usage-auto-topup, credit-ledger-schema, credit-packs, drizzle-schema-and-service, entitlement-guard, entitlement-resolution, identity-tenancy-billing, migrations, openapi-route-and-strictness, rls-check, stripe-subscriptions, stripe-webhook | 0 | 14 files, 331 passed |
+| `pnpm test:isolation:breakers` | 0 | 1 file, 24 passed |
+| `pnpm test:isolation` | 1 | 52 passed, 1 failed: ISO-14 `namespacing.spec.ts` flags `src/modules/reports/scheduled-reports.service.ts:234` (`${ARTIFACT_LINK_BASE}/${a}`). NOT this lane: the file is untouched (`git diff integration/7day -- src/modules/reports test/isolation` is empty) and the scanner reads source, so it fails identically on the base. Belongs to e-reports; the billing tables' isolation assertions all pass (12 other files) |
+| `db:rls-check` / `db:schema-check` / `db:drift-check` | not run as CLIs | they need a DATABASE_URL and the lane must not use 55432; their content is covered by the integration specs `rls-check.spec.ts` and `drizzle-schema-and-service.spec.ts` (both passed with the migration applied) |
+
+### Not done / stated
+`src/db/schema/billing.ts` got the one-line `pendingAddonChanges` column by hand because `pnpm db:schema-generate` needs a shadow database URL; `drizzle-schema-and-service.spec.ts` (generated schema == migrated DB) passes, and the next regeneration will reproduce it. Real Stripe behaviour (a key replay with identical params) is NEW-A-17.

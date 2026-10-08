@@ -223,44 +223,96 @@ describe("STORY-076b · add-ons", () => {
     expect(gateway.addonChanges).toHaveLength(1);
   });
 
-  it("AC1 · adding to a held add-on updates the SAME item to the total taken from a FRESH Stripe fetch, not from the local row", async () => {
+  it("AC1 · POST ADDS to the held quantity: Stripe holds 3 seats (webhook not landed), +2 sets the SAME item to 5, from a FRESH fetch and not the local row", async () => {
     const { workspaceId, owner } = await newWorkspace("growth");
     // Stripe already holds 3 seats; the webhook that would tell us has not landed (local rows: none).
     stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 3 }] });
     expect(await addonRows(workspaceId)).toEqual([]);
 
-    const res = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 5 });
+    const res = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 });
     expect(res.statusCode, res.body).toBe(202);
     expect(gateway.fetches).toContain(`subscription:${subIdOf(workspaceId)}`);
     expect(gateway.addonChanges[0]).toMatchObject({ kind: "extra_seat", quantity: 5, existingItemId: "si_extra_seat" });
     expect(dataOf<{ quantity_requested: number }>(res).quantity_requested).toBe(5);
   });
 
-  it("AC1 boundary · a total above the cap is a 400 before Stripe; the cap itself is allowed", async () => {
+  it("AC1 boundary · held plus added above the cap is a 400 before Stripe; held plus added AT the cap is allowed", async () => {
     const { workspaceId, owner } = await newWorkspace("growth");
     stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 99 }] });
-    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 101 })).statusCode).toBe(400);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 })).statusCode).toBe(400);
     expect(gateway.addonChanges).toHaveLength(0);
-    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 100 })).statusCode).toBe(202);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(202);
     expect(gateway.addonChanges[0]).toMatchObject({ quantity: 100 });
   });
 
-  it("AC1 retry · Stripe applied the change but the reply was lost: the same Idempotency-Key retried adds nothing more, and a lower total is a 409", async () => {
+  const intentsOf = async (workspaceId: string) =>
+    (await harness.db().query<{ pending_addon_changes: Record<string, { kind: string; quantity: number; target_total: number; stripe_idempotency_key: string }> | null }>(
+      "SELECT pending_addon_changes FROM subscriptions WHERE workspace_id = $1",
+      [workspaceId],
+    )).rows[0]!.pending_addon_changes;
+
+  it("AC1 retry · Stripe APPLIED the change and the reply was lost: the same Idempotency-Key retried adds NOTHING more (one unit, one Stripe change), and a new key adds again", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const key = randomUUID();
+    gateway.failAfterApplyingAddon = new StripeUpstreamError(504);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(503);
+    gateway.failAfterApplyingAddon = undefined;
+    const item = () => (gateway.objects.get(`subscription:${subIdOf(workspaceId)}`)!.raw as { items: { data: Array<{ id: string; quantity: number }> } }).items.data.find((l) => l.id === "si_extra_seat");
+    expect(item()?.quantity).toBe(1); // Stripe did apply it
+
+    const retry = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key);
+    expect(retry.statusCode, retry.body).toBe(202);
+    expect(dataOf<{ quantity_requested: number }>(retry).quantity_requested).toBe(1);
+    expect(item()?.quantity).toBe(1);
+    expect(gateway.addonChanges).toHaveLength(1);
+    expect(gateway.addonAttempts.filter((a) => a.quantity !== 1)).toEqual([]);
+
+    // A DIFFERENT Idempotency-Key is a different purchase: it adds.
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, randomUUID())).statusCode).toBe(202);
+    expect(gateway.addonChanges).toHaveLength(2);
+    expect(gateway.addonChanges[1]).toMatchObject({ kind: "extra_seat", quantity: 2, existingItemId: "si_extra_seat" }); // 1 held + 1 added
+  });
+
+  it("AC1 retry · the intent is COMMITTED before Stripe is asked: it survives the failed request and carries the target total and the Stripe key", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 2 }] });
+    const key = randomUUID();
+    gateway.failAddonWith = new StripeUpstreamError(504);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(503);
+    const intents = Object.values((await intentsOf(workspaceId)) ?? {});
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toMatchObject({ kind: "extra_seat", quantity: 1, target_total: 3 });
+    expect(gateway.addonAttempts[0]!.idempotencyKey).toBe(intents[0]!.stripe_idempotency_key);
+    expect(JSON.stringify(intents)).not.toContain(key); // the caller's key is stored hashed only
+  });
+
+  it("AC1 retry · a retry replays the STORED total and the STORED Stripe key even if Stripe has moved on (the key is not re-derived from fresh arithmetic)", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 2 }] });
+    const key = randomUUID();
+    gateway.failAddonWith = new StripeUpstreamError(504);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(503); // not applied; target 3
+    gateway.failAddonWith = undefined;
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(202);
+    expect(gateway.addonAttempts).toHaveLength(2);
+    expect(gateway.addonAttempts[1]).toMatchObject({ quantity: 3, idempotencyKey: gateway.addonAttempts[0]!.idempotencyKey });
+  });
+
+  it("AC1 retry · the same Idempotency-Key with a DIFFERENT request is 409 idempotency_conflict and Stripe is not called", async () => {
     const { workspaceId, owner } = await newWorkspace("growth");
     stripeSubscription(workspaceId, {});
     const key = randomUUID();
     gateway.failAddonWith = new StripeUpstreamError(504);
     expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(503);
-    // Stripe did apply it (the reply, not the change, was lost).
     gateway.failAddonWith = undefined;
-    stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 1 }] });
-    const retry = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key);
-    expect(retry.statusCode, retry.body).toBe(202);
-    expect(dataOf<{ quantity_requested: number }>(retry).quantity_requested).toBe(1);
-    expect(gateway.addonChanges).toHaveLength(0);
-    stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 3 }] });
-    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 })).statusCode).toBe(409);
-    expect(gateway.addonChanges).toHaveLength(0);
+    const before = gateway.addonAttempts.length;
+    for (const payload of [{ kind: "extra_seat", quantity: 2 }, { kind: "extra_project", quantity: 1 }]) {
+      const res = await post(owner, "/billing/addons", payload, key);
+      expect(res.statusCode, res.body).toBe(409);
+      expect(res.json<{ error: { code: string } }>().error.code).toBe("idempotency_conflict");
+    }
+    expect(gateway.addonAttempts).toHaveLength(before);
   });
 
   it("AC1 retry · a create that FAILS without changing Stripe is retried under the SAME derived Stripe key; a different Idempotency-Key derives a different one", async () => {
@@ -277,10 +329,123 @@ describe("STORY-076b · add-ons", () => {
     expect(first!.idempotencyKey).toBeTruthy();
     expect(retry!.idempotencyKey).toBe(first!.idempotencyKey);
 
-    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, randomUUID())).statusCode).toBe(503);
-    expect(gateway.addonAttempts).toHaveLength(3);
-    expect(gateway.addonAttempts[2]!.idempotencyKey).not.toBe(first!.idempotencyKey);
+    // The first attempt's outcome is still unknown, so a DIFFERENT Idempotency-Key is refused (ADV-1) rather than
+    // sent: it would otherwise have to guess whether the first attempt is in Stripe. Its Stripe key can only be
+    // different once the first is resolved; the ADV-1 "REJECTED outright" case proves that.
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, randomUUID())).statusCode).toBe(409);
+    expect(gateway.addonAttempts).toHaveLength(2);
     expect(gateway.addonChanges).toHaveLength(0);
+  });
+
+  // ---- checkpoint-3 ADV-1: applied-ness is decided from a marker, never from comparing quantities ------
+
+  const seatQuantity = (workspaceId: string): number => {
+    const raw = gateway.objects.get(`subscription:${subIdOf(workspaceId)}`)!.raw as { items: { data: Array<{ id: string; quantity: number }> } };
+    return raw.items.data.find((l) => l.id === "si_extra_seat")?.quantity ?? 0;
+  };
+  /** The Stripe fake applying a change the way Stripe does, replaying a repeated idempotency key. */
+  function stripeApplies(workspaceId: string): void {
+    const seen = new Set<string>();
+    vi.spyOn(gateway, "changeAddonQuantity").mockImplementation((input) => {
+      gateway.addonAttempts.push(input);
+      if (seen.has(input.idempotencyKey)) return Promise.resolve();
+      seen.add(input.idempotencyKey);
+      gateway.addonChanges.push(input);
+      const raw = gateway.objects.get(`subscription:${subIdOf(workspaceId)}`)!.raw as { items: { data: Array<Record<string, unknown>> } };
+      const existing = raw.items.data.find((line) => line.id === input.existingItemId);
+      if (existing !== undefined) existing.quantity = input.quantity;
+      else
+        raw.items.data.push({
+          id: `si_${input.kind}`,
+          quantity: input.quantity,
+          current_period_start: T0,
+          current_period_end: PERIOD_END,
+          price: { id: "price_seat", unit_amount: input.unitAmountCents, currency: "usd", recurring: { interval: "month" }, product: { metadata: { nominara_kind: input.kind } } },
+        });
+      return Promise.resolve();
+    });
+  }
+
+  it("ADV-1 · a retried purchase whose first attempt failed is never answered 202 unsent: every ACCEPTED +1 lands once (two accepted +1 purchases, two seats)", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const keyA = randomUUID();
+    const keyB = randomUUID();
+    gateway.failAddonWith = new StripeUpstreamError(504); // applies nothing
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA)).statusCode).toBe(503);
+    gateway.failAddonWith = undefined;
+    stripeApplies(workspaceId);
+
+    const b = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyB);
+    const retryA = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA);
+    const accepted = [b, retryA].filter((r) => r.statusCode === 202).length;
+    expect([b.statusCode, retryA.statusCode].every((code) => code === 202 || code === 409), `${b.body} ${retryA.body}`).toBe(true);
+    expect(retryA.statusCode, retryA.body).toBe(202);
+    expect(seatQuantity(workspaceId), "the retried purchase was answered 202 but never sent to Stripe").toBe(accepted);
+  });
+
+  it("ADV-1 · A asks +2, B adds +1, A retries: A never sets a stale lower total, and the final quantity is the SUM of the accepted adds", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const keyA = randomUUID();
+    gateway.failAddonWith = new StripeUpstreamError(504);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 }, keyA)).statusCode).toBe(503);
+    gateway.failAddonWith = undefined;
+    stripeApplies(workspaceId);
+
+    const b = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 });
+    const retryA = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 2 }, keyA);
+    expect(retryA.statusCode, retryA.body).toBe(202);
+    const acceptedUnits = (b.statusCode === 202 ? 1 : 0) + 2;
+    expect(seatQuantity(workspaceId)).toBe(acceptedUnits);
+    // Stripe's quantity never moves DOWN across the sequence.
+    const sent = gateway.addonChanges.map((c) => c.quantity);
+    expect(sent).toEqual([...sent].sort((x, y) => x - y));
+  });
+
+  it("ADV-1 · a new purchase while an earlier one for the same kind is unresolved is a 409 and Stripe is not called; the earlier one's retry then lands", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const keyA = randomUUID();
+    gateway.failAddonWith = new StripeUpstreamError(504);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA)).statusCode).toBe(503);
+    gateway.failAddonWith = undefined;
+    stripeApplies(workspaceId);
+
+    const b = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 });
+    expect(b.statusCode, b.body).toBe(409);
+    expect(gateway.addonChanges).toEqual([]);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA)).statusCode).toBe(202);
+    expect(seatQuantity(workspaceId)).toBe(1);
+    // Resolved: a new purchase is accepted again and adds on top.
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(202);
+    expect(seatQuantity(workspaceId)).toBe(2);
+  });
+
+  it("ADV-1 · a SETTLED purchase retried after another purchase moved the quantity is answered without a Stripe call and does not lower the total", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    stripeApplies(workspaceId);
+    const keyA = randomUUID();
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA)).statusCode).toBe(202);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(202);
+    const calls = gateway.addonAttempts.length;
+    const retry = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, keyA);
+    expect(retry.statusCode, retry.body).toBe(202);
+    expect(gateway.addonAttempts).toHaveLength(calls);
+    expect(seatQuantity(workspaceId)).toBe(2);
+  });
+
+  it("ADV-1 · a purchase Stripe REJECTED outright (4xx) is released: it does not block the next purchase, which derives a different Stripe key", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    gateway.failAddonWith = new StripeUpstreamError(400);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(503);
+    gateway.failAddonWith = undefined;
+    stripeApplies(workspaceId);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 })).statusCode).toBe(202);
+    expect(seatQuantity(workspaceId)).toBe(1);
+    expect(gateway.addonAttempts[0]!.idempotencyKey).not.toBe(gateway.addonAttempts[1]!.idempotencyKey);
   });
 
   it("AC1 · request validation: quantity 0, 101, a fractional quantity and an unknown kind are 400s; the Idempotency-Key is required", async () => {
@@ -382,7 +547,7 @@ describe("STORY-076b · add-ons", () => {
     expect((await resolved(workspaceId)).entitlements["seats.max"]!.source).not.toBe("add_on");
   });
 
-  it("audit · concurrent POSTs with DISTINCT Idempotency-Keys and different totals create exactly ONE Stripe item and end at the largest total (the workspace row lock)", async () => {
+  it("audit · concurrent POSTs with DISTINCT Idempotency-Keys create exactly ONE Stripe item and every ACCEPTED add lands once: the final quantity is the SUM of the accepted adds (the workspace row lock; a request that waits too long gets a retryable 409, never a hang)", async () => {
     const { workspaceId, owner } = await newWorkspace("growth");
     stripeSubscription(workspaceId, { held: [] });
     const key = `subscription:${subIdOf(workspaceId)}`;
@@ -402,18 +567,21 @@ describe("STORY-076b · add-ons", () => {
           price: { id: "price_seat", unit_amount: input.unitAmountCents, currency: "usd", recurring: { interval: "month" }, product: { metadata: { nominara_kind: input.kind } } },
         });
     });
-    const totals = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
-    const responses = await Promise.all(totals.map((quantity) => post(owner, "/billing/addons", { kind: "extra_seat", quantity })));
+    const adds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    const responses = await Promise.all(adds.map((quantity) => post(owner, "/billing/addons", { kind: "extra_seat", quantity })));
 
+    // A request that cannot get the workspace lock within its bounded wait is a retryable 409 (the pool is
+    // finite: waiters hold connections the lock holder needs for its intent), never a hang and never a lost add.
     expect(responses.map((r) => r.statusCode).every((code) => code === 202 || code === 409), responses.map((r) => r.body).join("\n")).toBe(true);
     expect(responses.some((r) => r.statusCode === 202)).toBe(true);
+    const accepted = adds.filter((_, i) => responses[i]!.statusCode === 202);
     // The hazard: two unserialised requests both create an item, and the customer pays for both.
     expect(gateway.addonChanges.filter((change) => change.existingItemId === null)).toHaveLength(1);
     const lines = (gateway.objects.get(key)!.raw as { items: { data: Array<{ quantity: number; price: { product: { metadata: { nominara_kind: string } } } }> } }).items.data.filter(
       (line) => line.price.product.metadata.nominara_kind === "extra_seat",
     );
     expect(lines).toHaveLength(1);
-    expect(lines[0]!.quantity).toBe(13);
+    expect(lines[0]!.quantity).toBe(accepted.reduce((sum, n) => sum + n, 0));
   });
 
   it("audit · a late event for an OLD, ended subscription leaves the CURRENT subscription's add-ons active (the reconcile filter binds the event's subscription)", async () => {
@@ -479,11 +647,33 @@ describe("STORY-076b · add-ons", () => {
     expect(res.json<{ pagination: { has_more: boolean } }>().pagination.has_more).toBe(false);
   });
 
-  it("AC2 · a workspace with no add-ons gets an empty list, not an error", async () => {
+  it("AC2 · catalog · a workspace holding nothing still sees BOTH add-ons with their prices, grants and quantity 0 (owner decision 2026-10-08)", async () => {
     const { owner } = await newWorkspace("growth");
     const res = await get(owner, "/billing/addons");
-    expect(res.statusCode).toBe(200);
-    expect(dataOf<unknown[]>(res)).toEqual([]);
+    expect(res.statusCode, res.body).toBe(200);
+    const list = addonListResponseSchema.parse(dataOf(res));
+    expect(list.map((a) => a.kind)).toEqual(["extra_project", "extra_seat"]);
+    expect(list[0]).toMatchObject({ unit_price_usd: "49.00", display_name: "Extra project", purchasable: true, quantity: 0, id: null, active_from: null, active_until: null });
+    expect(list[0]!.grant).toMatchObject({ projects: 1, prompt_slots: 40 });
+    expect(list[1]).toMatchObject({ unit_price_usd: "15.00", display_name: "Extra seat", purchasable: true, quantity: 0, id: null });
+  });
+
+  it("AC2 · catalog · purchasable follows the plan: free buys neither, starter buys a seat but not a project", async () => {
+    const free = await newWorkspace("free");
+    expect(addonListResponseSchema.parse(dataOf(await get(free.owner, "/billing/addons"))).map((a) => [a.kind, a.purchasable])).toEqual([["extra_project", false], ["extra_seat", false]]);
+    const starter = await newWorkspace("starter");
+    expect(addonListResponseSchema.parse(dataOf(await get(starter.owner, "/billing/addons"))).map((a) => [a.kind, a.purchasable])).toEqual([["extra_project", false], ["extra_seat", true]]);
+  });
+
+  it("AC2 · catalog · a held add-on shows its quantity and id beside the catalog entry of the one not held", async () => {
+    const { workspaceId, ownerId } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 4 }] });
+    await reconcile(workspaceId);
+    const owner = await enter(ownerId, workspaceId);
+    const list = addonListResponseSchema.parse(dataOf(await get(owner, "/billing/addons")));
+    expect(list.map((a) => [a.kind, a.quantity])).toEqual([["extra_project", 0], ["extra_seat", 4]]);
+    expect(list[1]!.id).not.toBeNull();
+    expect(list[0]!.id).toBeNull();
   });
 
   it("AC2 · the list excludes closed add-ons and cursor-pages the rest", async () => {
@@ -665,7 +855,7 @@ describe("STORY-076b · add-ons", () => {
     await reconcile(a.workspaceId);
     await reconcile(b.workspaceId);
     const owner = await enter(a.ownerId, a.workspaceId);
-    expect(dataOf<Array<{ kind: string; quantity: number }>>(await get(owner, "/billing/addons")).map((r) => `${r.kind}:${String(r.quantity)}`)).toEqual(["extra_seat:1"]);
+    expect(dataOf<Array<{ kind: string; quantity: number }>>(await get(owner, "/billing/addons")).map((r) => `${r.kind}:${String(r.quantity)}`)).toEqual(["extra_project:0", "extra_seat:1"]); // B's 4 projects are invisible: A sees quantity 0
   });
 
   it("tenant isolation · as nominara_app, an unfiltered read in A's context sees none of B's add-ons and cannot write one for B", async () => {

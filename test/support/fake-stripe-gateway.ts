@@ -184,11 +184,46 @@ export class FakeStripeGateway implements StripeGateway {
   /** Every change ATTEMPTED, recorded before a failure is raised: a timed-out call that Stripe may still apply is still an attempt. */
   readonly addonAttempts: AddonChangeInput[] = [];
 
+  /**
+   * STORY-076b checkpoint-3 — set to model the hazard the audit named: Stripe APPLIES the change
+   * to the subscription (the fetched state moves) and the reply is then lost. Honours Stripe's own
+   * idempotency: a key it has already applied is replayed, not applied twice.
+   */
+  failAfterApplyingAddon: Error | undefined;
+  private readonly appliedAddonKeys = new Set<string>();
+
   changeAddonQuantity(input: AddonChangeInput): Promise<void> {
     this.addonAttempts.push(input);
+    if (this.failAfterApplyingAddon !== undefined) {
+      if (!this.appliedAddonKeys.has(input.idempotencyKey)) {
+        this.appliedAddonKeys.add(input.idempotencyKey);
+        this.addonChanges.push(input);
+        this.applyAddonToObject(input);
+      }
+      return Promise.reject(this.failAfterApplyingAddon);
+    }
     if (this.failAddonWith !== undefined) return Promise.reject(this.failAddonWith);
+    // Stripe replays the stored answer for a repeated idempotency key instead of applying the change again.
+    if (this.appliedAddonKeys.has(input.idempotencyKey)) return Promise.resolve();
+    this.appliedAddonKeys.add(input.idempotencyKey);
     this.addonChanges.push(input);
     return Promise.resolve();
+  }
+
+  /** Moves the stored subscription's add-on line to `input.quantity`, as Stripe does when it applies the change. */
+  private applyAddonToObject(input: AddonChangeInput): void {
+    const raw = this.objects.get(`subscription:${input.subscriptionId}`)?.raw as { items: { data: Array<Record<string, unknown>> } } | undefined;
+    if (raw === undefined) return;
+    const existing = raw.items.data.find((line) => line.id === input.existingItemId);
+    if (existing !== undefined) {
+      existing.quantity = input.quantity;
+      return;
+    }
+    raw.items.data.push({
+      id: `si_${input.kind}`,
+      quantity: input.quantity,
+      price: { id: `price_${input.kind}`, unit_amount: input.unitAmountCents, currency: input.currency, recurring: { interval: input.interval }, product: { metadata: { nominara_kind: input.kind } } },
+    });
   }
 
   scheduleAddonRemoval(input: AddonRemovalInput): Promise<void> {
@@ -212,6 +247,8 @@ export class FakeStripeGateway implements StripeGateway {
     this.configured = true;
     this.failFetchWith = undefined;
     this.failAddonWith = undefined;
+    this.failAfterApplyingAddon = undefined;
+    this.appliedAddonKeys.clear();
     this.onSessionCreated = undefined;
   }
 
