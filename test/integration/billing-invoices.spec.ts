@@ -467,7 +467,7 @@ describe("STORY-075b · invoices", () => {
 
     // The same invoice re-fetched with the add-on line gone: the stored figure follows Stripe.
     stripeInvoice(workspaceId, { status: "open", subtotal: 12_900, total: 12_900, lines: { data: [planLine] }, number: "NOM-0002" });
-    expect(outcomeOf(await deliver(eventBody("evt_addon_2", "invoice.updated", "in_1")))).toBe("processed");
+    expect(outcomeOf(await deliver(eventBody("evt_addon_2", "invoice.payment_failed", "in_1")))).toBe("processed");
     const second = dataOf<Array<Record<string, unknown>>>(await get(owner, "/billing/invoices"));
     expect(second[0]).toMatchObject({ addon_amount: "0.00", total: "129.00" });
   });
