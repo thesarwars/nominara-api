@@ -23,7 +23,9 @@ Also unanswered for AC1 (O4): mechanism and role. Intended, unless told otherwis
 the owner connection (`DATABASE_URL`, as credit.reconcile / identity.sweep_unverified use), so no migration and no new role. Tick = hourly at :05 UTC
 (references/system-architecture.md section 4, ci-cd-and-environments.md "hourly at :05"). "Within one tick" locally therefore means up to the next :05 UTC.
 
-## Blocker 2 — disk gate
+## Blocker 2 — disk gate (CLEARED 2026-10-08: `df -h /System/Volumes/Data` now shows 18 GiB free)
+
+Historical text follows; only Blocker 1 still stops the story.
 
 `df -h /System/Volumes/Data` shows 7.4 GiB free (7.1 GiB earlier), under the 8 GiB floor for testcontainers specs. Every behaviour this story is about
 (SKIP LOCKED under two concurrent ticks, soft_capped/suspended skipped, signed jobs per workspace) needs a real Postgres, so the RED tests cannot be run
@@ -40,3 +42,8 @@ and confirmed failing for the stated reason. Not worked around.
 | 5 dangerous-area-auditor review | Not run; nothing to review. |
 
 RED commit: none. Gates: none run for this story (no change). Metrics/log/span: none; spans deferred to week 2 by decision.
+
+
+## Re-check 2026-10-08 (days 5-6 run)
+
+Blocker 2 is cleared. Blocker 1 stands and is NOT covered by the owner decisions of 2026-10-08 or by a planner recommendation (track-plans.json O4 asks only mechanism and role, not the advance-order conflict). tracking-engine.md section 5 and system-architecture.md 6.1 both say advance-then-enqueue; the merged, audited capture.plan handler requires the project to still be due. Implementing either option without a decision would silently pick a side, so nothing was built. Needed from the owner: option A (sweep claims + enqueues with dedup key run:{project}:{next_run_at}, handler stays the only advancer; reference and AC2 reworded) or option B (reopen the audited handler). Plus O4 confirmation (in-process runtime in the capture worker, owner connection, hourly :05 UTC, no migration). Once answered the story is about one day of work.
