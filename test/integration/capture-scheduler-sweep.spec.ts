@@ -15,6 +15,7 @@ import {
   sweepIdempotencyKey,
   type SweepJob,
 } from "../../src/lib/capture/scheduler-sweep.js";
+import { claimDueProject } from "../../src/lib/capture/scheduler.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
 import { createCapturePlanHandler } from "../../src/lib/queue/handlers/capture-plan.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
@@ -153,17 +154,30 @@ describe("NEW-A-13 · the scheduler sweep claims due projects and enqueues signe
     const suspended = await addWorkspace("suspended");
     const due = await addProject(active);
     const dueTrial = await addProject(trialing);
-    await addProject(softCapped);
-    await addProject(suspended);
-    await addProject(active, { status: "paused" });
-    await addProject(active, { deleted: true });
-    await addProject(active, { dueMinutesAgo: -30 }); // due in the future
-    await addProject(active, { dueMinutesAgo: null }); // never scheduled
+    const everyProject = [
+      due,
+      dueTrial,
+      await addProject(softCapped),
+      await addProject(suspended),
+      await addProject(active, { status: "paused" }),
+      await addProject(active, { deleted: true }),
+      await addProject(active, { dueMinutesAgo: -30 }), // due in the future
+      await addProject(active, { dueMinutesAgo: null }), // never scheduled
+    ];
 
+    const now = new Date();
     const { jobs, enqueue } = collector();
-    await runSchedulerSweep(sweepA, enqueue, new Date());
+    await runSchedulerSweep(sweepA, enqueue, now);
 
     expect(new Set(jobs.map((job) => job.projectId))).toEqual(new Set([due, dueTrial]));
+
+    // The per-project claim the capture.plan handler uses must call exactly the same projects due.
+    for (const id of everyProject) {
+      await sweepB.query("BEGIN");
+      const one = await claimDueProject(sweepB, id, now);
+      await sweepB.query("ROLLBACK");
+      expect(one !== null, `claimDueProject agrees with the sweep for ${id}`).toBe(id === due || id === dueTrial);
+    }
   }, 60_000);
 
   it("NEW-A-13 AC2 · an empty tick enqueues nothing and is complete, not an error", async () => {
@@ -252,17 +266,19 @@ describe("NEW-A-13 · the scheduler sweep claims due projects and enqueues signe
       }),
     });
 
-    await runSchedulerSweep(
-      sweepA,
-      async (job) => {
-        const envelope = signQueueJobPayload(
-          { workspaceId: job.workspaceId, kid: TEST_SIGNING_KEYS.current.kid, projectId: job.projectId, trigger: "scheduled" },
-          TEST_SIGNING_KEYS.current.key,
-        );
-        await processor({ data: envelope } as unknown as Job);
-      },
-      new Date(),
-    );
+    // The handler runs AFTER the sweep commits, as it does in production (the
+    // job travels through the queue): the sweep holds the project row lock until
+    // then, and the handler's FOR UPDATE claim would wait on it.
+    const { jobs, enqueue } = collector();
+    await runSchedulerSweep(sweepA, enqueue, new Date());
+    expect(jobs).toHaveLength(1);
+    for (const job of jobs) {
+      const envelope = signQueueJobPayload(
+        { workspaceId: job.workspaceId, kid: TEST_SIGNING_KEYS.current.kid, projectId: job.projectId, trigger: "scheduled" },
+        TEST_SIGNING_KEYS.current.key,
+      );
+      await processor({ data: envelope } as unknown as Job);
+    }
 
     expect((await schedule(project)).next_run_at!.getTime()).toBeGreaterThan(Date.now());
     const again = collector();
@@ -296,7 +312,7 @@ describe("NEW-A-13 · the scheduler sweep claims due projects and enqueues signe
       const verify = rotatingHmacJobVerifier(TEST_SIGNING_KEYS);
       const byProject = new Map<string, string>();
       for (const job of jobs) {
-        const envelope = job.data as { payload: Record<string, unknown>; signature: string };
+        const envelope = job.data as { payload: Record<string, unknown> & { workspaceId: string }; signature: string };
         expect(() => verify({ data: envelope.payload, signature: envelope.signature })).not.toThrow();
         const payload = capturePlanJobSchema.parse(envelope.payload);
         byProject.set(payload.projectId, payload.workspaceId);
@@ -343,9 +359,18 @@ describe("NEW-A-13 · the scheduler sweep claims due projects and enqueues signe
   it("NEW-A-13 AC4 · a project whose next_run_at is now() is enqueued by the next tick", async () => {
     const ws = await addWorkspace();
     const project = await addProject(ws, { dueMinutesAgo: 0 });
-    await db.query("UPDATE projects SET next_run_at = now() WHERE id = $1", [project]);
+    // next_run_at is the DATABASE's now(); the tick reads the host clock. The colima VM and the host
+    // drift by milliseconds, so the tick's clock is anchored just after the value the DB wrote.
+    const set = await db.query<{ next_run_at: Date }>(
+      "UPDATE projects SET next_run_at = now() WHERE id = $1 RETURNING next_run_at",
+      [project],
+    );
     const { jobs, enqueue } = collector();
-    const runtime = new SchedulerSweepRuntime({ connect: () => connect(), enqueue });
+    const runtime = new SchedulerSweepRuntime({
+      connect: () => connect(),
+      enqueue,
+      clock: () => new Date(set.rows[0]!.next_run_at.getTime() + 1),
+    });
 
     const result = await runtime.tick();
 
