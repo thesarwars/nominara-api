@@ -35,3 +35,7 @@ Pick one:
 Then the work is about a day: the contract (`recoveryPlanResponseSchema = z.array(taskSchema)`), RED for scenarios 9, 10, 12 (one task per seedable gap using the same `source_domains.is_seedable` read as `recoveryTaskCount`; none for a non-seedable gap; repeat call returns the same tasks with no duplicates; concept tasks zero until STORY-058), then `POST /displacements/:id/recovery-plan` with `Idempotency-Key`, `task:create`, `@Audit`, and a 409 carrying the existing task ids for a plan that already exists.
 
 Spans: OpenTelemetry deferred to week 2 (owner decision 3).
+
+## Re-check (2026-10-08, days 5-6 run)
+
+Re-checked integration/7day (f201f35), 7day/b-tasks-3 (e32ffe9) and 7day/b-ws-3: none contains a task-insert helper with origin, rule_code, deterministic fingerprint or source_displacement_id; `git grep -i fingerprint -- src` finds only the idempotency fingerprint. The blocking condition still holds, so the item stays cut. No code, no contract, no RED commit.
