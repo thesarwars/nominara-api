@@ -143,6 +143,44 @@ describe("NEW-B-2 · WorkspaceSummaryService — real SQL", () => {
     expect(none.engines).toEqual([]);
   });
 
+  // NEW-B-2 remaining audit item: a scoped member's summary covers ONLY their
+  // projects, including the provenance that colours the engine filter list. A
+  // demo capture in a project they cannot read must not turn their "live" into
+  // "mixed" (that would be a hint of an unreadable project's contents).
+  it("NEW-B-2 scoping: a scoped member's summary, counts and engine provenance cover only their projects", async () => {
+    const ws = await createWorkspace();
+    const inScope = await createProject(ws);
+    const hidden = await createProject(ws);
+    await client.query("INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,cache_ttl_seconds,volatility_band,min_plan_key,status) VALUES ('gemini','g','v','api','1.0.0',86400,'medium','free','active') ON CONFLICT DO NOTHING");
+    for (const [projectId, normalizer] of [[inScope, "v1"], [hidden, DEMO_SEED_MARKER]] as const) {
+      const prompt = await client.query<{ id: string }>(
+        `INSERT INTO tracked_prompts (workspace_id,project_id,text,text_hash,intent_archetype,funnel_stage,is_priority,status)
+         VALUES ($1,$2,'q',sha256('q'::bytea),'recommendation','consideration',false,'active') RETURNING id`,
+        [ws, projectId],
+      );
+      const id = randomUUID();
+      await client.query(
+        `INSERT INTO answer_captures
+           (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present)
+         VALUES ($1,$2,$3,$4,$5,'gemini', now() - interval '2 hours','api','1.0.0',$6,$7,'{}'::jsonb,'{}','live','parsed',true)`,
+        [id, ws, projectId, uuidV7(), prompt.rows[0]!.id, normalizer, createHash("sha256").update(id).digest()],
+      );
+    }
+    await client.query(
+      "UPDATE projects SET visibility_by_engine = '{\"gemini\":{\"score\":50,\"delta_30d\":null}}'::jsonb WHERE workspace_id = $1",
+      [ws],
+    );
+    const scoped = await inTenant(CTX(ws, [inScope]), () => summary.summary(ws));
+    expect(scoped.projects.map((p) => p.id)).toEqual([inScope]);
+    expect(scoped.health.projects_used).toBe(1);
+    expect(scoped.health.prompts_used).toBe(4);
+    expect(scoped.engines.find((e) => e.engine_key === "gemini")?.data_source).toBe("live");
+    expect(JSON.stringify(scoped)).not.toContain(hidden);
+    // The unscoped caller sees both, and the engine is "mixed": the difference is exactly the hidden project.
+    const all = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(all.engines.find((e) => e.engine_key === "gemini")?.data_source).toBe("mixed");
+  });
+
   it("tenancy: another workspace's projects are never returned", async () => {
     const mine = await createWorkspace();
     const theirs = await createWorkspace();

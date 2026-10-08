@@ -220,6 +220,40 @@ describe("STORY-085-A audit · POST /v1/command/parse over the real guard/interc
     expect(dispatch).not.toHaveBeenCalled();
   });
 
+  // STORY-085 scenario 11, as amended by the owner (2026-10-08): "the only row a
+  // parse writes is the outcome-only audit row". This ties the two halves
+  // together for EVERY phrase: the single appended audit_log row is the
+  // command.parsed row, its after_state is exactly the outcome, and no word of
+  // the phrase survives anywhere in it.
+  it("STORY-085 #11: across every phrase, the one row a parse writes is the outcome-only command.parsed audit row", async () => {
+    const ownerId = await createUser();
+    const workspace = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
+    const token = await tokenForRole(workspace.id, ownerId, "owner");
+    const seen = async () =>
+      (await db.query<{ id: string }>("SELECT seq::text AS id FROM audit_log WHERE workspace_id = $1", [workspace.id])).rows.map((row) => row.id);
+    for (const phrase of PHRASES) {
+      const known = new Set(await seen());
+      const res = await parse(token, phrase);
+      expect(res.statusCode, phrase).toBe(200);
+      const fresh = (await seen()).filter((id) => !known.has(id));
+      expect(fresh, phrase).toHaveLength(1);
+      const row = await db.query<{ action: string; before_state: unknown; after_state: Record<string, unknown> }>(
+        "SELECT * FROM audit_log WHERE seq = $1::bigint",
+        [fresh[0]],
+      );
+      const stored = row.rows[0]!;
+      expect(stored.action, phrase).toBe("command.parsed");
+      expect(stored.before_state, phrase).toBeNull();
+      expect(Object.keys(stored.after_state).sort(), phrase).toEqual(["cached", "confidence", "intent", "resolved_by"]);
+      // The phrase's own words (longer than 3 chars) never reach the row. The
+      // intent NAME is outcome, not customer text, so it is blanked first.
+      const body = JSON.stringify({ ...stored, after_state: { ...stored.after_state, intent: null } }).toLowerCase();
+      for (const word of phrase.toLowerCase().split(/\s+/).filter((w) => w.length > 3)) {
+        expect(body, `${phrase} -> ${word}`).not.toContain(word);
+      }
+    }
+  });
+
   it("STORY-085-A audit #1: the audit row is command.parsed on the caller's workspace", async () => {
     const ownerId = await createUser();
     const workspace = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
