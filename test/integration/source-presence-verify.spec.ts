@@ -86,7 +86,7 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
   }
 
   const verify = (fetch: (url: string) => Promise<GuardedResponse>, now = NOW) =>
-    withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) => verifyProjectSourcePresence(tx, projectId, { fetch, now }));
+    withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) => verifyProjectSourcePresence(tx, projectId, { fetch, now, today: TODAY }));
 
   async function rows(domain?: string): Promise<Presence[]> {
     return (
@@ -174,7 +174,7 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
     const fetch = vi.fn();
     const summary = await verify(fetch);
     expect(fetch).not.toHaveBeenCalled();
-    expect(summary.skipped.demo).toBe(1);
+    expect(summary?.skipped.demo).toBe(1);
     for (const r of await rows()) expect(r.brand_present_on_domain).toBeNull();
   });
 
@@ -212,7 +212,7 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
     await db.query("SET ROLE nominara_app");
     try {
       const result = await withTenantContext(db, { workspaceId: otherWorkspace, actorId: randomUUID() }, (tx) =>
-        verifyProjectSourcePresence(tx, projectId, { fetch, now: NOW }),
+        verifyProjectSourcePresence(tx, projectId, { fetch, now: NOW, today: TODAY }),
       );
       expect(result).toBeNull();
       expect(fetch).not.toHaveBeenCalled();
