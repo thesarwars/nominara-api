@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { inspect } from "node:util";
 import { Pool } from "pg";
 import { Logger } from "@nestjs/common";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -299,8 +300,16 @@ describe("NEW-D-4 · API keys over HTTP", () => {
 
   it("NEW-D-4 AC2 · the secret never appears at ANY log level, on console.* or on stdout/stderr across create, list, revoke and a refused create", async () => {
     const out: string[] = [];
+    // Render every argument so an Error (message + stack), a Buffer (decoded as text; util.inspect only
+    // shows hex bytes) and nested values are visible. JSON.stringify gave "{}" for an Error.
+    const render = (m: unknown, depth = 0): string => {
+      if (typeof m === "string") return m;
+      if (m instanceof Uint8Array) return `${Buffer.from(m).toString()} ${inspect(m)}`;
+      if (Array.isArray(m) && depth < 5) return m.map((x) => render(x, depth + 1)).join(" ");
+      return inspect(m, { depth: 5 });
+    };
     const capture = (m: unknown): void => {
-      out.push(typeof m === "string" ? m : m instanceof Uint8Array ? Buffer.from(m).toString() : JSON.stringify(m));
+      out.push(render(m));
     };
     const levels = ["log", "warn", "error", "debug", "verbose", "fatal"] as const;
     const spies = levels.map((lvl) => vi.spyOn(Logger.prototype, lvl).mockImplementation((m: unknown, ...rest: unknown[]) => capture([m, ...rest])));
