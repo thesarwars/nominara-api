@@ -52,3 +52,9 @@ The mutation was reverted (git checkout); the tree is clean and the spec passes 
 - A real running API with a real queue and the real Gemini: collected in NEW-A-17.
 - Capture/scheduling failures in checkpoint-2-gates.md: none. The 17 listed integration failures belong to other lanes (seed-demo to a-api, the rest to b-ws, d-billing, c-src, e-reports). The capture specs touched here pass.
 - Other QA notes for this lane (NEW-A-10 AC2 cache-hit reservation, the unstubbed GEMINI_API_KEY in three specs, documenting the per-run rollup key) were not part of this task and are open.
+
+## Audit finding: isolation suite (major) - AC3 "isolation suite is green" is NOT met
+- Status: OPEN, blocked on the d-admin lane. Not fixed in this lane, deliberately.
+- Cause: the support_grants fixture in the isolation suite inserts a 24 h TTL, which violates ck_support_ttl_max (4 h ceiling, migrations 0085/0086). test:isolation and test:isolation:breakers exit 1 in fixture setup. The defect is in the d-admin fixture, not in NEW-A-7 code; fixing it here would touch files outside this story.
+- What this lane does have: a cross-tenant proof under SET LOCAL ROLE nominara_app in the integration spec (capture-parse-rollup.spec.ts, AC3 tests). That is NOT a substitute for the isolation suite and is not claimed as one.
+- Merge condition (from the audit): NEW-A-7 is not accepted until d-admin fixes the fixture and test:isolation plus test:isolation:breakers exit 0 on the merged tree. The merge step must run both and record exit codes here.
