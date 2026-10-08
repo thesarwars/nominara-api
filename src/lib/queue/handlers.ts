@@ -10,6 +10,7 @@ import { createMaintenancePartitionHandler } from "./handlers/maintenance-partit
 import { createCrawlAuditHandler } from "./handlers/crawl-audit.handler.js";
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { createRollupMetricDailyHandler } from "./handlers/rollup-metric-daily.handler.js";
+import { createSourceVerifyPresenceHandler } from "./handlers/source-verify-presence.handler.js";
 import { QUEUE_TOPOLOGY } from "./topology.js";
 import type { JobProcessor } from "./worker-factory.js";
 
@@ -91,6 +92,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "maintenance.partition": (context) => createMaintenancePartitionHandler(context),
   "audit.verify": (context) => createAuditVerifyHandler(context),
   "identity.sweep_unverified": (context) => createIdentitySweepUnverifiedHandler(context),
+  "source.verify_presence": (context) => createSourceVerifyPresenceHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */

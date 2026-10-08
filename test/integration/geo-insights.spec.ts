@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -161,5 +162,100 @@ describe("STORY-062 · GEO insights persistence and read", () => {
   it("404s for a project that does not exist, on read and on write", async () => {
     await expect(ctx((s) => s.digest(randomUUID(), { timeframe: "30d" }))).rejects.toMatchObject({ code: "not_found" });
     await expect(ctx((s) => s.persistAnalysis(randomUUID(), write("structure")))).rejects.toMatchObject({ code: "not_found" });
+  });
+  it("STORY-062 isolation · under the application role, another workspace gets 404 on the digest, the analysis and a write; the owner still reads its own", async () => {
+    await ctx((s) => s.persistAnalysis(projectId, write("structure")));
+    const other = randomUUID();
+    await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'W2',$2,'growth','UTC')", [other, `w-${randomUUID().slice(0, 8)}`]);
+    const as = <T>(workspace: string, fn: (s: GeoService) => Promise<T>) =>
+      withTenantContext(db, { workspaceId: workspace, actorId: randomUUID() }, () => fn(new GeoService())) as Promise<T>;
+    // The owning role bypasses RLS and would pass this for the wrong reason.
+    await db.query("SET ROLE nominara_app");
+    try {
+      await expect(as(other, (s) => s.digest(projectId, { timeframe: "30d" }))).rejects.toMatchObject({ code: "not_found" });
+      await expect(as(other, (s) => s.analysis(projectId, "structure", { timeframe: "30d" }))).rejects.toMatchObject({ code: "not_found" });
+      await expect(as(other, (s) => s.persistAnalysis(projectId, write("sentiment")))).rejects.toMatchObject({ code: "not_found" });
+      const own = await as(workspaceId, (s) => s.analysis(projectId, "structure", { timeframe: "30d" }));
+      expect(own.summary.status).not.toBe("insufficient");
+    } finally {
+      await db.query("RESET ROLE");
+    }
+    expect(await count()).toBe(1);
+  });
+
+  it("STORY-062 isolation · geo_analyses itself, read and written directly as the application role under another tenant's context: 0 rows seen, 0 rows updated, 0 deleted, INSERT for the victim violates WITH CHECK", async () => {
+    // Direct SQL on purpose: GeoService first looks the project up, and that lookup
+    // 404s on the `projects` policy before `geo_analyses` is ever read — a test through
+    // the service proves nothing about this table's own policy.
+    await ctx((s) => s.persistAnalysis(projectId, write("structure")));
+    const other = randomUUID();
+    await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'W3',$2,'growth','UTC')", [other, `w-${randomUUID().slice(0, 8)}`]);
+    const attacker = <T>(fn: (c: Client) => Promise<T>) =>
+      withTenantContext(db, { workspaceId: other, actorId: randomUUID() }, () => fn(db)) as Promise<T>;
+    await db.query("SET ROLE nominara_app");
+    try {
+      const seen = await attacker((c) => c.query("SELECT 1 FROM geo_analyses WHERE project_id = $1", [projectId]));
+      expect(seen.rowCount).toBe(0);
+      const updated = await attacker((c) => c.query("UPDATE geo_analyses SET score = 0, lever_rank = 1 WHERE project_id = $1", [projectId]));
+      expect(updated.rowCount).toBe(0);
+      const deleted = await attacker((c) => c.query("DELETE FROM geo_analyses WHERE project_id = $1", [projectId]));
+      expect(deleted.rowCount).toBe(0);
+      await expect(
+        attacker((c) =>
+          c.query(
+            `INSERT INTO geo_analyses (workspace_id, project_id, analysis, window_start, window_days)
+             VALUES ($1, $2, 'sentiment', '2026-09-08', 30)`,
+            [workspaceId, projectId],
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "42501", message: expect.stringContaining("row-level security") });
+      // The owner still reads its own row.
+      const own = await withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
+        db.query("SELECT score FROM geo_analyses WHERE project_id = $1", [projectId]),
+      );
+      expect(own.rowCount).toBe(1);
+      expect(Number(own.rows[0].score)).toBe(61.5);
+    } finally {
+      await db.query("RESET ROLE");
+    }
+    expect(await count()).toBe(1);
+  });
+  it("STORY-062 isolation · an attacker-workspace row against the victim's project is rejected by the composite FK, is indistinguishable from an unknown project, and cannot block the victim's rollup write", async () => {
+    // The FK check runs without RLS, so before 0072 `workspace_id = attacker` with
+    // `project_id = victim` passed WITH CHECK and the single-column FK: an existence
+    // oracle, and a row that made the victim's ON CONFLICT hit an invisible row.
+    const other = randomUUID();
+    await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'W4',$2,'growth','UTC')", [other, `w-${randomUUID().slice(0, 8)}`]);
+    const attacker = <T>(fn: (c: Client) => Promise<T>) =>
+      withTenantContext(db, { workspaceId: other, actorId: randomUUID() }, () => fn(db)) as Promise<T>;
+    const insertFor = (project: string) => (c: Client) =>
+      c.query(
+        `INSERT INTO geo_analyses (workspace_id, project_id, analysis, window_start, window_days, sufficient, score)
+         VALUES ($1, $2, 'structure', '2026-09-08', 30, true, 99)`,
+        [other, project],
+      );
+    await db.query("SET ROLE nominara_app");
+    try {
+      const real = await attacker((c) => insertFor(projectId)(c).then(() => null, (e: { code?: string; constraint?: string }) => e));
+      const unknown = await attacker((c) => insertFor(randomUUID())(c).then(() => null, (e: { code?: string; constraint?: string }) => e));
+      expect(real, "the victim's project id must be rejected").not.toBeNull();
+      expect(real).toMatchObject({ code: "23503" });
+      expect(unknown).toMatchObject({ code: "23503" });
+      expect(real?.constraint).toBe(unknown?.constraint);
+      // The victim's own write for that window still succeeds.
+      await expect(ctx((s) => s.persistAnalysis(projectId, write("structure")))).resolves.not.toThrow();
+    } finally {
+      await db.query("RESET ROLE");
+    }
+    expect(await count()).toBe(1);
+  });
+  it("STORY-062 migration 0072 · the down file restores the single-column FK and the up file reapplies the composite one", async () => {
+    const sql = (f: string) => readFileSync(new URL(`../../src/db/migrations/sql/0072_geo_analyses_tenant_fk.${f}.sql`, import.meta.url), "utf8");
+    const fks = async () => (await db.query("SELECT conname FROM pg_constraint WHERE conrelid = 'geo_analyses'::regclass AND contype = 'f'")).rows.map((r) => r.conname);
+    expect(await fks()).toEqual(["geo_analyses_project_fkey"]);
+    await db.query(sql("down"));
+    expect(await fks()).toEqual(["geo_analyses_project_id_fkey"]);
+    await db.query(sql("up"));
+    expect(await fks()).toEqual(["geo_analyses_project_fkey"]);
   });
 });

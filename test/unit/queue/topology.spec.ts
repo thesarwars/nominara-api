@@ -283,6 +283,14 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "accumulate or stay squatted. The sweep (workers/rollup/unverified-sweep.ts) is a job §4 never allocated a queue; the owner decided it runs " +
       "daily on this system rather than by hand. A queue of its own so a DLQ entry names the job that failed. STORY-173.",
   },
+  "source.verify_presence": {
+    workerGroup: "crawl",
+    because:
+      "STORY-054 AC4/AC11: brand presence on a cited domain is verified by FETCHING the cited URL through the guarded fetcher and matching it, " +
+      "cached 30 days (scoring-models.md §5). §4's table allocates no queue to that fetch, and a fetch of a third-party site must never run on a " +
+      "request path (KAD-06) nor inside the rollup transaction. A queue of its own, in the crawl group with the other outbound fetchers, so a DLQ " +
+      "entry names the job that failed. NEW-C-15.",
+  },
 };
 
 describe("STORY-030 · queue topology declares §4's 21 queues, plus what we have added on purpose", () => {

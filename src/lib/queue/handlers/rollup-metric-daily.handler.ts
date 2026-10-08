@@ -8,9 +8,13 @@ import { datesWithFacts } from "../../rollup/aggregate-day.js";
 import { refreshProjectDisplacements } from "../../rollup/refresh-project-displacements.js";
 import { refreshProjectSourceIndex } from "../../rollup/refresh-project-source-index.js";
 import { rollUpDay } from "../../rollup/roll-up-day.js";
+import { afterCommit, currentTenantStore } from "../../../tenancy/tenant-context.js";
+import { incrementCounter } from "../../telemetry/metrics.js";
 import { withProjectQueueLock } from "../locks.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
+import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
-import type { JobProcessor } from "../worker-factory.js";
+import { signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
 
 // STORY-042 — `rollup.metric_daily`.
 //
@@ -41,8 +45,30 @@ const payloadSchema = z
   })
   .strict();
 
-export function createRollupMetricDailyHandler(_context: QueueHandlerContext): JobProcessor {
+/** Enqueues one `source.verify_presence` job. Injected in tests; production builds a producer from env on first use. */
+export type EnqueueVerifyPresence = (workspaceId: string, payload: { projectId: string }, idempotencyKey: string) => Promise<unknown>;
+
+export interface RollupMetricDailyDeps {
+  readonly enqueueVerifyPresence?: EnqueueVerifyPresence;
+}
+
+export function createRollupMetricDailyHandler(context: QueueHandlerContext, deps?: RollupMetricDailyDeps): JobProcessor {
   const logger = new Logger("rollup.metric_daily");
+
+  // Built on the first job, inside the promise: constructing a producer at registration would open a
+  // connection in every process that merely imports the registry, and a synchronous throw here would
+  // escape the caller's `.catch`.
+  let producer: QueueProducer | undefined;
+  const enqueueVerifyPresence: EnqueueVerifyPresence =
+    deps?.enqueueVerifyPresence ??
+    (async (workspaceId, payload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob("source.verify_presence", workspaceId, payload, { idempotencyKey });
+    });
 
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
@@ -92,10 +118,38 @@ export function createRollupMetricDailyHandler(_context: QueueHandlerContext): J
       // reads only this database: no network call.
       await refreshProjectSourceIndex(tx, payload.projectId, await localToday(tx, timezone));
 
-      // STORY-060 — A3 answer structure, persisted to geo_analyses so the
-      // read endpoints only read. Same transaction and lock; reads only this
+      // STORY-060 / STORY-061 — the persisted GEO analyses (A3 structure, A6
+      // sentiment), each over the 7/30/90-day windows, written to geo_analyses
+      // so the read endpoints only read. Same transaction and lock; reads only this
       // database (no network call), free and unmetered.
       await refreshProjectGeoWindows(tx, payload.projectId);
+
+      // NEW-C-15 — owner decision 2026-10-08: brand presence is verified AFTER the rollup. The verify
+      // job fetches third-party pages, so it may not run inside this transaction (KAD-06); it is queued
+      // once this one has committed, so it sees the index this run wrote. One key per project and
+      // workspace-local day, so a replay or a second rollup the same day queues nothing more. A failed
+      // enqueue is logged, never thrown: the rollup is durable and the next day's run asks again.
+      // No ambient tenant transaction (a direct call outside the worker) means no commit to wait for.
+      if (currentTenantStore() !== undefined) {
+        const today = await localToday(tx, timezone);
+        const { projectId, workspaceId } = payload;
+        afterCommit(() => {
+          void enqueueVerifyPresence(workspaceId, { projectId }, `srcver:${projectId}:${today}`)
+            .then(() => {
+              incrementCounter("nominara_sources_presence_requested_total");
+              logger.log({ event: "source.presence_requested", workspace_id: workspaceId, project_id: projectId });
+            })
+            .catch((error: unknown) => {
+              incrementCounter("nominara_sources_presence_request_failed_total");
+              logger.error({
+                event: "source.presence_request_failed",
+                workspace_id: workspaceId,
+                project_id: projectId,
+                error: error instanceof Error ? error.name : "unknown",
+              });
+            });
+        });
+      }
     });
   };
 }

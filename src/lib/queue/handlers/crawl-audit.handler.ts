@@ -95,10 +95,10 @@ export function createCrawlAuditHandler(_context: QueueHandlerContext, deps: Cra
     }
     const origin = `https://${project.rows[0]!.root_domain}`;
     const urls = {
-      robots: `${origin}/robots.txt`,
-      llms: `${origin}/llms.txt`,
-      llmsWellKnown: `${origin}/.well-known/llms.txt`,
-      sitemap: `${origin}/sitemap.xml`,
+      robots: new URL("/robots.txt", origin).href,
+      llms: new URL("/llms.txt", origin).href,
+      llmsWellKnown: new URL("/.well-known/llms.txt", origin).href,
+      sitemap: new URL("/sitemap.xml", origin).href,
     };
 
     // The catalog is versioned data: assert its weights on every load (NFR-AUX-03).

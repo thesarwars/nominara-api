@@ -319,6 +319,26 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "unvsweep:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // ⚠ THE THIRD QUEUE §4 DOES NOT CONTAIN (after `audit.verify` and
+  // `identity.sweep_unverified`), added by the same precedent. NEW-C-15 /
+  // STORY-054 AC4: brand presence on a cited domain is verified by FETCHING the
+  // cited URL through the guarded fetcher and matching it, cached 30 days. §4
+  // allocates no queue to that fetch, and it may not run on a request path
+  // (KAD-06) nor inside the rollup transaction, which reads only this database.
+  // The `crawl` group because it is an outbound fetcher of third-party pages,
+  // like `crawl.audit`; a queue of its own so a DLQ entry names the job that
+  // failed. Tenant-scoped (signed payload, RLS context). Its producer is
+  // `rollup.metric_daily`, which enqueues it after its own transaction commits.
+  {
+    name: "source.verify_presence",
+    producer: "API, rollup (STORY-054; not in §4)",
+    workerGroup: "crawl",
+    concurrency: 2,
+    retry: { delaysMs: doubling(2) },
+    priority: 7,
+    idempotencyKeyPattern: "srcver:{project}:{yyyy_mm_dd}",
+    tenantScoped: true,
+  },
   {
     name: "deploy.cms",
     producer: "API",

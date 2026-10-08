@@ -148,7 +148,7 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
   for (let i = 0; i < R; i++) {
     await client.query(
       `INSERT INTO support_grants (workspace_id, requested_by, approved_by, scope, justification, ticket_ref, expires_at)
-       VALUES ($1, $2, $3, 'metadata', 'debug', $4, now() + interval '1 day')`,
+       VALUES ($1, $2, $3, 'metadata', 'debug', $4, now() + interval '3 hours')`,
       [workspaceId, userIds[i], userIds[(i + 1) % R], `TICKET-${label}-${i}`],
     );
   }

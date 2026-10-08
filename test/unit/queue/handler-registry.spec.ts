@@ -70,6 +70,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "identity.sweep_unverified",
       "maintenance.partition",
       "rollup.metric_daily",
+      "source.verify_presence",
     ]);
     // Topology order, not alphabetical — `liveQueueNames` filters
     // QUEUE_TOPOLOGY, and the capture queues are declared before the crawl
@@ -89,6 +90,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "audit.verify",
       // STORY-173 — added after audit.verify in topology.ts.
       "identity.sweep_unverified",
+      // NEW-C-15 — declared after identity.sweep_unverified in topology.ts.
+      "source.verify_presence",
     ]);
   });
 
