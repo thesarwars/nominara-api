@@ -10,6 +10,9 @@ import { z } from "zod";
 export const AUTO_TOPUP_MAX_PER_CYCLE_MIN = 1;
 export const AUTO_TOPUP_MAX_PER_CYCLE_MAX = 20;
 
+/** Why auto-top-up was switched off by the system (never by the customer). */
+export const AUTO_TOPUP_DISABLED_REASONS = ["payment_failed"] as const;
+
 const maxPerCycle = z
   .number()
   .int()
@@ -46,8 +49,38 @@ export const autoTopupConfigSchema = z
     used_this_cycle: z.number().int().nonnegative(),
     /** False in week 1: the configuration ships, the off-session trigger does not. */
     trigger_active: z.boolean(),
+    /**
+     * NEW-D-7 — present only while auto-top-up is OFF because a charge failed
+     * (STORY-076 scenario 9). Absent otherwise: a workspace that simply never
+     * enabled it, or has since re-enabled it, has no failure to explain.
+     */
+    disabled_reason: z.enum(AUTO_TOPUP_DISABLED_REASONS).optional(),
   })
   .strict();
+
+/**
+ * NEW-D-7 — the outcome of one trigger evaluation (`AutoTopupService.trigger`).
+ * Internal: no route returns it. `charge_submitted` is the only outcome that
+ * consumed a cap slot and reached the provider; credits still land only on the
+ * webhook. `declined` and `email_failed` consumed a slot and charged nothing.
+ * `not_in_plan`: the workspace was downgraded below Growth after enabling it.
+ */
+export const AUTO_TOPUP_TRIGGER_OUTCOMES = [
+  "not_enabled",
+  "not_in_plan",
+  "above_threshold",
+  "cap_reached",
+  "in_flight",
+  "pack_unavailable",
+  "no_billing_contact",
+  "no_payment_method",
+  "email_failed",
+  "declined",
+  "upstream_error",
+  "charge_submitted",
+] as const;
+export const autoTopupTriggerOutcomeSchema = z.enum(AUTO_TOPUP_TRIGGER_OUTCOMES);
+export type AutoTopupTriggerOutcome = z.infer<typeof autoTopupTriggerOutcomeSchema>;
 
 export type AutoTopupRequest = z.infer<typeof autoTopupRequestSchema>;
 export type AutoTopupConfig = z.infer<typeof autoTopupConfigSchema>;

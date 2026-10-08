@@ -1,13 +1,18 @@
-import { Controller, Get, Query } from "@nestjs/common";
+import { Body, Controller, Get, Put, Query } from "@nestjs/common";
 import {
+  autoTopupConfigSchema,
+  autoTopupRequestSchema,
   creditLedgerListResponseSchema,
   creditLedgerQuerySchema,
   walletResponseSchema,
+  type AutoTopupConfig,
+  type AutoTopupRequest,
   type CreditLedgerEntry,
   type CreditLedgerQuery,
   type WalletResponse,
 } from "../../../contracts/billing/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import type { Page } from "../../api/pagination/page.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
@@ -49,6 +54,19 @@ export class BillingController {
   @ApiContract({ operationId: "getWallet", responseSchema: walletResponseSchema })
   wallet(): Promise<WalletResponse> {
     return this.service.wallet();
+  }
+
+  // NEW-D-6 / STORY-076 AC6 — `billing:write`, Growth+; the cap is the schema's.
+  @Put("auto-topup")
+  @RequirePermission("billing:write")
+  @Audit({ action: "billing.auto_topup.updated", resourceType: "credit_wallet", resourceIdFrom: "workspace" })
+  @ApiContract({
+    operationId: "setAutoTopup",
+    requestSchema: autoTopupRequestSchema,
+    responseSchema: autoTopupConfigSchema,
+  })
+  setAutoTopup(@Body(new ZodValidationPipe(autoTopupRequestSchema)) body: AutoTopupRequest): Promise<AutoTopupConfig> {
+    return this.service.setAutoTopup(body);
   }
 
   @Get("ledger")

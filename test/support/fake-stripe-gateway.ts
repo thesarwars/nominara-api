@@ -8,6 +8,10 @@ import {
   type AddonRemovalInput,
   type CreditPackCheckoutInput,
   type HostedSession,
+  type OffSessionPaymentInput,
+  type OffSessionPaymentResult,
+  type OffSessionPaymentState,
+  type SavedPaymentMethod,
   type StripeObjectKind,
   type SubscriptionCheckoutInput,
   type VerifiedStripeEvent,
@@ -107,6 +111,62 @@ export class FakeStripeGateway implements StripeGateway {
     const session = { id: `cs_pack_${String(this.packCheckouts.length)}`, url: `https://checkout.stripe.test/c/pay/cs_pack_${String(this.packCheckouts.length)}` };
     await this.onSessionCreated?.();
     return session;
+  }
+
+  /** NEW-D-7 — payment methods Stripe holds for a reference PaymentIntent (one saved with setup_future_usage). */
+  readonly savedMethods = new Map<string, SavedPaymentMethod>();
+  readonly savedMethodLookups: string[] = [];
+  /** NEW-D-7 — off-session charges submitted, in call order. */
+  readonly offSessionCharges: OffSessionPaymentInput[] = [];
+  /** `declined` makes the next charges come back as a card decline. */
+  offSessionOutcome: "submitted" | "declined" = "submitted";
+  /** Makes only the charge (not the lookup) fail like an upstream outage. */
+  failChargeWith: Error | undefined;
+
+  /**
+   * The lookups sit between the trigger's read-only PLAN and its CLAIM. Holding
+   * them open lets a test interleave two triggers that both planned against the
+   * same state. Returns `release` (also stops holding later lookups).
+   */
+  private lookupGate: Promise<void> | undefined;
+  holdLookups(): () => void {
+    let release!: () => void;
+    this.lookupGate = new Promise<void>((resolve) => (release = resolve));
+    return () => {
+      this.lookupGate = undefined;
+      release();
+    };
+  }
+  /** Stops holding NEW lookups without releasing the ones already held. */
+  stopHoldingNewLookups(): void {
+    this.lookupGate = undefined;
+  }
+
+  async findSavedPaymentMethod(referencePaymentIntentId: string): Promise<SavedPaymentMethod | null> {
+    if (this.failFetchWith !== undefined) throw this.failFetchWith;
+    this.savedMethodLookups.push(referencePaymentIntentId);
+    const gate = this.lookupGate;
+    if (gate !== undefined) await gate;
+    return this.savedMethods.get(referencePaymentIntentId) ?? null;
+  }
+
+  createOffSessionPayment(input: OffSessionPaymentInput): Promise<OffSessionPaymentResult> {
+    if (this.failChargeWith !== undefined) return Promise.reject(this.failChargeWith);
+    this.offSessionCharges.push(input);
+    if (this.offSessionOutcome === "declined") return Promise.resolve({ outcome: "declined" });
+    return Promise.resolve({ outcome: "submitted", paymentIntentId: `pi_auto_${input.purchaseId.slice(0, 8)}` });
+  }
+
+  /** What Stripe holds per purchase id; a missing key is `none`. A test sets it to model a charge the trigger never saw answered. */
+  readonly offSessionStates = new Map<string, OffSessionPaymentState>();
+  readonly offSessionStateLookups: string[] = [];
+  /** Makes only the by-purchase lookup fail like an upstream outage. */
+  failStateLookupWith: Error | undefined;
+
+  findOffSessionPayment(purchaseId: string): Promise<OffSessionPaymentState> {
+    if (this.failStateLookupWith !== undefined) return Promise.reject(this.failStateLookupWith);
+    this.offSessionStateLookups.push(purchaseId);
+    return Promise.resolve(this.offSessionStates.get(purchaseId) ?? "none");
   }
 
   createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }> {

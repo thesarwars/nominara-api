@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { autoTopupConfigSchema } from "./auto-topup.schema.js";
 
 // STORY-096 — `GET /v1/billing/wallet`. `FR-CRD-10`: "Wallet state —
 // available, reserved, expiring-soon, per-project spend, and daily remaining
@@ -60,6 +61,18 @@ export const walletResponseSchema = z
     lifetime_granted: z.number().int().nonnegative(),
     lifetime_purchased: z.number().int().nonnegative(),
     lifetime_spent: z.number().int().nonnegative(),
+
+    /**
+     * The auto-top-up configuration (api-specification.md §3: the wallet
+     * carries "auto-top-up config"). OFF by default; `used_this_cycle` is the
+     * schema counter that only a cycle roll resets (NEW-D-6).
+     * KNOWN LIMITATION (NEW-D-7 audit 4): no cycle roll exists yet - nothing
+     * writes wallet.cycle_end after provisioning (STORY-075/076) - so today
+     * the counter never resets and `max_per_cycle` behaves as a lifetime cap
+     * (cap_reached forever; fails closed). Wiring the trigger
+     * (`trigger_active` -> true) is gated on landing the roll plus its test.
+     */
+    auto_topup: autoTopupConfigSchema,
   })
   .strict();
 

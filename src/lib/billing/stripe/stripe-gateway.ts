@@ -84,6 +84,8 @@ export interface CreditPackCheckoutInput {
   readonly currency: string;
   readonly successUrl: string;
   readonly cancelUrl: string;
+  /** Owner decision 4 — save the card for off-session reuse only when the workspace has auto-top-up enabled. */
+  readonly saveCard: boolean;
 }
 
 /**
@@ -114,6 +116,42 @@ export interface AddonRemovalInput {
   readonly itemId: string;
   readonly idempotencyKey: string;
 }
+/** NEW-D-7 — a card the customer agreed to have reused off-session (a Checkout with `setup_future_usage`). */
+export interface SavedPaymentMethod {
+  readonly customerId: string;
+  readonly paymentMethodId: string;
+}
+
+/**
+ * NEW-D-7 — one auto-top-up charge. The amount is the integer-cents price of
+ * the pack frozen on OUR `credit_purchases` row; nothing here comes from the
+ * client. `purchaseId` travels as metadata and keys Stripe's Idempotency-Key.
+ */
+export interface OffSessionPaymentInput {
+  readonly workspaceId: string;
+  readonly purchaseId: string;
+  readonly packKey: string;
+  readonly productName: string;
+  readonly unitAmountCents: number;
+  readonly currency: string;
+  readonly customerId: string;
+  readonly paymentMethodId: string;
+}
+
+/**
+ * `declined`: the card was refused, or the charge needs the customer present
+ * (3-D Secure) — neither can succeed without them, so neither is retried.
+ * `submitted`: Stripe accepted the charge; credits still land only on the webhook.
+ */
+export type OffSessionPaymentResult = { readonly outcome: "submitted"; readonly paymentIntentId: string } | { readonly outcome: "declined" };
+
+/**
+ * NEW-D-7 audit 1 — what Stripe holds for one auto-top-up purchase id.
+ * `none`: no PaymentIntent exists. `in_progress`: one exists and may still be
+ * taken (processing — a bank debit stays so for days). `succeeded`: taken.
+ * `failed`: every PaymentIntent ended without taking money.
+ */
+export type OffSessionPaymentState = "none" | "in_progress" | "succeeded" | "failed";
 
 export interface HostedSession {
   readonly id: string;
@@ -154,6 +192,31 @@ export interface StripeGateway {
    * Throws `StripeUpstreamError`.
    */
   createCreditPackCheckout(input: CreditPackCheckoutInput): Promise<HostedSession>;
+
+  /**
+   * NEW-D-7 — the card a PREVIOUS pack purchase saved for off-session reuse, or
+   * `null` when that PaymentIntent was not saved (no customer, no method, or no
+   * `setup_future_usage=off_session`). Throws `StripeUpstreamError`.
+   */
+  findSavedPaymentMethod(referencePaymentIntentId: string): Promise<SavedPaymentMethod | null>;
+
+  /**
+   * NEW-D-7 — an off-session, immediately confirmed charge of the saved method,
+   * with `workspace_id`, `purchase_id`, `pack_key` and `source=auto_topup` as
+   * PaymentIntent metadata so the webhook's re-fetch finds the purchase. The
+   * Idempotency-Key is the purchase id. Throws `StripeUpstreamError`.
+   */
+  createOffSessionPayment(input: OffSessionPaymentInput): Promise<OffSessionPaymentResult>;
+
+  /**
+   * NEW-D-7 audit 1 — asks Stripe whether the charge for this purchase id exists
+   * and how it ended (PaymentIntent search on `metadata.purchase_id`). A
+   * purchase may be expired ONLY on `none` or `failed`; `in_progress` and
+   * `succeeded` mean the money may be taken. Search is eventually consistent
+   * (about a minute), so ask only about a purchase older than that. Throws
+   * `StripeUpstreamError` — and the caller must then leave the purchase pending.
+   */
+  findOffSessionPayment(purchaseId: string): Promise<OffSessionPaymentState>;
 
   /**
    * Makes a Checkout session unpayable, or reports that it already was paid.

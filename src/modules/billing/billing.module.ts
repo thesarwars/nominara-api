@@ -6,10 +6,13 @@ import { BillingAddonsController } from "./billing-addons.controller.js";
 import { BillingAddonsService } from "./billing-addons.service.js";
 import { BillingInvoicesController } from "./billing-invoices.controller.js";
 import { BillingInvoicesService } from "./billing-invoices.service.js";
+import { IdentityModule } from "../identity/identity.module.js";
+import { AutoTopupService } from "./auto-topup.service.js";
 import { BillingSubscriptionController } from "./billing-subscription.controller.js";
 import { BillingSubscriptionService } from "./billing-subscription.service.js";
 import { CreditPacksController } from "./credit-packs.controller.js";
 import { CreditPacksService } from "./credit-packs.service.js";
+import { BillingUsageController } from "./billing-usage.controller.js";
 import { BillingController } from "./billing.controller.js";
 import { BillingService } from "./billing.service.js";
 import { STRIPE_EVENT_HANDLERS, type StripeEventHandler } from "./stripe-event-handler.js";
@@ -22,7 +25,8 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
 // STORY-022 — system-architecture.md §5 module inventory. Registration
 // only — no logic here (coding-standards.md §1's module layout).
 @Module({
-  controllers: [BillingController, CreditPacksController, BillingSubscriptionController, BillingInvoicesController, BillingAddonsController, StripeWebhookController],
+  imports: [IdentityModule],
+  controllers: [BillingController, BillingUsageController, CreditPacksController, BillingSubscriptionController, BillingInvoicesController, BillingAddonsController, StripeWebhookController],
   providers: [
     BillingService,
     BillingSubscriptionService,
@@ -30,6 +34,7 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
     BillingInvoicesService,
     BillingAddonsService,
     StripeInvoiceHandler,
+    AutoTopupService,
     StripeSubscriptionHandler,
     StripeCreditPackHandler,
     StripeWebhookService,
@@ -51,6 +56,6 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
       inject: [StripeSubscriptionHandler, StripeCreditPackHandler, StripeInvoiceHandler],
     },
   ],
-  exports: [BillingService, STRIPE_GATEWAY],
+  exports: [BillingService, AutoTopupService, STRIPE_GATEWAY],
 })
 export class BillingModule {}

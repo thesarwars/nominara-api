@@ -117,9 +117,11 @@ export class StripeWebhookService {
     if (!parsed.success) return await this.acknowledgeOnly(event, "object carries no resolvable workspace_id");
     const workspaceId = parsed.data;
 
+    const afterCommit: Array<() => Promise<void>> = [];
     const client = await this.pool.connect();
+    let response: StripeWebhookResponse;
     try {
-      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+      response = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
         if (!(await claimWebhookEvent(tx, event.id, event.type))) return { received: true, outcome: "duplicate" } as const;
 
         // RLS answers "does this workspace exist": `workspaces` is scoped by
@@ -130,12 +132,21 @@ export class StripeWebhookService {
           return { received: true, outcome: "ignored" } as const;
         }
 
-        for (const handler of handlers) await handler.handle({ tx, workspaceId, event, object, fetchStartedAt });
+        for (const handler of handlers) await handler.handle({ tx, workspaceId, event, object, fetchStartedAt, afterCommit });
         return { received: true, outcome: "processed" } as const;
       });
     } finally {
       client.release();
     }
+    // Committed. A notification that fails now must not undo or fail the event.
+    for (const effect of afterCommit) {
+      try {
+        await effect();
+      } catch {
+        this.logger.error({ message: "stripe webhook post-commit effect failed", event_id: event.id, event_type: event.type, workspace_id: workspaceId });
+      }
+    }
+    return response;
   }
 
   /** The re-fetch. A Stripe outage is a real failure: nothing is recorded and Stripe retries. */

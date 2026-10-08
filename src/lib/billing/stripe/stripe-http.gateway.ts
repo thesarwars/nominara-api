@@ -8,6 +8,10 @@ import {
   type CreditPackCheckoutInput,
   type FetchedStripeObject,
   type HostedSession,
+  type OffSessionPaymentInput,
+  type OffSessionPaymentState,
+  type OffSessionPaymentResult,
+  type SavedPaymentMethod,
   type StripeGateway,
   type StripeObjectKind,
   type SubscriptionCheckoutInput,
@@ -29,6 +33,11 @@ export interface StripeHttpGatewayConfig {
   readonly secretKey: string | undefined;
   readonly webhookSecret: string | undefined;
 }
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** PaymentIntent statuses that took no money and will not: the charge was refused, abandoned or cancelled. */
+const DEAD_INTENT_STATUSES: ReadonlySet<string> = new Set(["requires_payment_method", "requires_action", "canceled"]);
 
 function stringMetadata(value: unknown): Record<string, string> {
   const out: Record<string, string> = {};
@@ -134,7 +143,10 @@ export class StripeHttpGateway implements StripeGateway {
           ],
           // Both objects carry the ids, so payment_intent.* events resolve the
           // purchase from their own fresh fetch.
-          payment_intent_data: { metadata },
+          // NEW-D-7 — only when the workspace has auto-top-up enabled, the card is saved
+          // under a customer for off-session reuse. Checkout shows Stripe's own reuse notice.
+          ...(input.saveCard ? { customer_creation: "always" as const } : {}),
+          payment_intent_data: { metadata, ...(input.saveCard ? { setup_future_usage: "off_session" as const } : {}) },
           metadata,
           success_url: input.successUrl,
           cancel_url: input.cancelUrl,
@@ -143,6 +155,61 @@ export class StripeHttpGateway implements StripeGateway {
       );
       if (typeof session.url !== "string") throw new StripeUpstreamError(undefined);
       return { id: session.id, url: session.url };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async findSavedPaymentMethod(referencePaymentIntentId: string): Promise<SavedPaymentMethod | null> {
+    const client = this.requireClient();
+    try {
+      const intent = await client.paymentIntents.retrieve(referencePaymentIntentId);
+      const customerId = typeof intent.customer === "string" ? intent.customer : intent.customer?.id;
+      const paymentMethodId = typeof intent.payment_method === "string" ? intent.payment_method : intent.payment_method?.id;
+      if (intent.setup_future_usage !== "off_session" || customerId === undefined || paymentMethodId === undefined) return null;
+      return { customerId, paymentMethodId };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async createOffSessionPayment(input: OffSessionPaymentInput): Promise<OffSessionPaymentResult> {
+    const client = this.requireClient();
+    try {
+      const intent = await client.paymentIntents.create(
+        {
+          amount: input.unitAmountCents,
+          currency: input.currency.toLowerCase(),
+          customer: input.customerId,
+          payment_method: input.paymentMethodId,
+          off_session: true,
+          confirm: true,
+          description: input.productName,
+          metadata: { workspace_id: input.workspaceId, purchase_id: input.purchaseId, pack_key: input.packKey, source: "auto_topup" },
+        },
+        { idempotencyKey: `auto-topup-${input.purchaseId}` },
+      );
+      // `requires_action` / `requires_payment_method`: the customer is needed. Never retried.
+      if (intent.status === "succeeded" || intent.status === "processing") return { outcome: "submitted", paymentIntentId: intent.id };
+      return { outcome: "declined" };
+    } catch (error) {
+      if (error instanceof Stripe.errors.StripeCardError) return { outcome: "declined" };
+      throw this.asUpstream(error);
+    }
+  }
+
+  async findOffSessionPayment(purchaseId: string): Promise<OffSessionPaymentState> {
+    const client = this.requireClient();
+    // The id is interpolated into a search query: only a UUID may be.
+    if (!UUID.test(purchaseId)) throw new StripeUpstreamError(undefined);
+    try {
+      const found = await client.paymentIntents.search({ query: `metadata['purchase_id']:'${purchaseId}' AND metadata['source']:'auto_topup'`, limit: 10 });
+      const statuses = found.data.map((intent) => intent.status as string);
+      if (statuses.length === 0) return "none";
+      if (statuses.includes("succeeded")) return "succeeded";
+      // Doubt blocks: anything not known to be dead is still in progress.
+      if (statuses.some((s) => !DEAD_INTENT_STATUSES.has(s))) return "in_progress";
+      return "failed";
     } catch (error) {
       throw this.asUpstream(error);
     }

@@ -54,7 +54,8 @@ import { SessionService } from "./session.service.js";
     // "production", and its own constructor refuses production as well.
     { provide: EMAIL_SENDER, useFactory: selectEmailSender },
   ],
-  exports: [SessionService],
+  // NEW-D-7 — billing sends the auto-top-up emails through the same port.
+  exports: [SessionService, EMAIL_SENDER],
 })
 export class IdentityModule {}
 
