@@ -8,6 +8,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { assertDemoSeedAllowed, DemoSeedRefusedError } from "../../src/db/seed/demo/guard.js";
 import { runSeedDemo, type SeedDemoPool, type SeedDemoPoolClient } from "../../src/db/seed-demo.js";
 import { readWallet } from "../../src/lib/credits/wallet.js";
+import { refreshProjectSourceIndex } from "../../src/lib/rollup/refresh-project-source-index.js";
 import { verifyProjectSourcePresence } from "../../src/lib/sources/verify-presence.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
@@ -371,8 +372,15 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
   }, 120_000);
 
   it("NEW-C-15 audit · seed, then verify: no seeded domain is fetched and no index row carries a verified absence", async () => {
-    const workspaceId = await createWorkspace("growth");
+    const workspaceId = await createWorkspace("business");
     await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    // The seed writes only the `all`-scope index rows itself; per-engine rows come from the rollup
+    // handler's index refresh. Run that same step over the seeded facts, so the live engine's
+    // (demo-marked) citations are indexed and the assertion below is not vacuous.
+    const today = (await client.query<{ d: string }>(`SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d`)).rows[0]!.d;
+    for (const project of await projectsOf(workspaceId)) {
+      await withTenantContext(client, { workspaceId, actorId: randomUUID() }, (tx) => refreshProjectSourceIndex(tx, project.id as string, today));
+    }
     const indexed = await client.query<{ engine_key: string }>(
       `SELECT DISTINCT engine_key FROM project_source_index WHERE workspace_id = $1`,
       [workspaceId],
