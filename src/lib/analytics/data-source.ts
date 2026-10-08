@@ -91,9 +91,11 @@ export async function engineDataSourcesForDates(
 }
 
 /**
- * `engineDataSourcesForDates` for MANY projects in ONE statement (the
- * workspace summary's "no per-project query" rule, NEW-B-2). A project with
- * nothing measured has an empty map, never a missing key.
+ * `engineDataSourcesForDates` for MANY projects in one statement (NEW-B-2: the
+ * Command Center matrix must not cost a query per project). Same predicate and
+ * date boundary; a project with nothing measured maps to an empty Map, never
+ * absent, so the caller can index every id it passed. Runs on the caller's
+ * tenant transaction, so RLS bounds which projects can contribute.
  */
 export async function engineDataSourcesForProjects(
   tx: ClientBase,
@@ -102,7 +104,7 @@ export async function engineDataSourcesForProjects(
   to: string,
   timezone: string,
 ): Promise<Map<string, Map<string, DataSource>>> {
-  const result = new Map<string, Map<string, DataSource>>(projectIds.map((id) => [id, new Map<string, DataSource>()]));
+  const result = new Map<string, Map<string, DataSource>>(projectIds.map((id) => [id, new Map()]));
   if (projectIds.length === 0) return result;
   const rows = await tx.query<CountRow & { project_id: string }>(
     `SELECT c.project_id, c.engine_key,

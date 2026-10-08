@@ -20,6 +20,7 @@ import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { RATE_LIMIT_HEADERS } from "../../contracts/common/rate-limit.schema.js";
 import { COMMAND_INTENTS } from "../../contracts/command/command-intent.schema.js";
+import { RATE_LIMIT_DEFAULTS } from "../../src/api/rate-limit/defaults.js";
 import { QueueProducer } from "../../src/lib/queue/queue-producer.js";
 
 
@@ -132,16 +133,24 @@ describe("STORY-085-A audit · POST /v1/command/parse over the real guard/interc
     return workspaces.switchTo(userId, tokens.sid, workspaceId, meta);
   }
 
-  /** Row count of every public table, so a write to ANY table shows up. */
-  async function tableCounts(): Promise<Record<string, number>> {
+  /**
+   * A content fingerprint of every public table, so an UPDATE or a DELETE+INSERT
+   * of the same count shows up, not only a row-count change. audit_log is
+   * measured separately: it is the one table a parse may append to.
+   */
+  async function tableState(): Promise<Record<string, { rows: number; digest: string }>> {
     const tables = await db.query<{ tablename: string }>("SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY 1");
-    const counts: Record<string, number> = {};
+    const state: Record<string, { rows: number; digest: string }> = {};
     for (const { tablename } of tables.rows) {
-      const result = await db.query<{ n: string }>(`SELECT count(*)::text AS n FROM "${tablename}"`);
-      counts[tablename] = Number(result.rows[0]!.n);
+      const result = await db.query<{ n: string; digest: string }>(
+        `SELECT count(*)::text AS n, md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), '')) AS digest FROM "${tablename}" t`,
+      );
+      state[tablename] = { rows: Number(result.rows[0]!.n), digest: result.rows[0]!.digest };
     }
-    return counts;
+    return state;
   }
+
+  const commandParse = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "command_parse")!;
 
   const PHRASES = [
     "filter prompts about pricing",
@@ -171,7 +180,7 @@ describe("STORY-085-A audit · POST /v1/command/parse over the real guard/interc
     });
   }
 
-  it("STORY-085-A audit #1: every role gets 200 with the envelope, the 120/min bucket and a 0-credit answer", async () => {
+  it("STORY-085-A audit #1: every role gets 200 with the envelope, the command_parse bucket (120/min, burst 30) and a 0-credit answer", async () => {
     const ownerId = await createUser();
     const workspace = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
     for (const role of ROLES) {
@@ -181,11 +190,13 @@ describe("STORY-085-A audit · POST /v1/command/parse over the real guard/interc
       expect(body.meta.request_id, role).toBeTruthy();
       expect(body.data.intent, role).toBe("run_deep_scan");
       expect(body.data.cost, role).toEqual({ credits: 0 });
-      expect(res.headers[RATE_LIMIT_HEADERS.limit.toLowerCase()], role).toBe("120");
+      // The header advertises the bucket's CAPACITY in tokens (buckets.ts: the
+      // burst), alongside `remaining`; the 120/min is its refill rate.
+      expect(res.headers[RATE_LIMIT_HEADERS.limit.toLowerCase()], role).toBe(String(commandParse.burst));
     }
   });
 
-  it("STORY-085-A audit #1: across every intent plus unresolved and ambiguous input, a parse writes ONLY its audit row and enqueues nothing", async () => {
+  it("STORY-085-A audit #1: across every intent plus unresolved and ambiguous input, no table's CONTENT changes except audit_log's one appended row, and nothing is enqueued", async () => {
     const ownerId = await createUser();
     const workspace = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
     const token = await tokenForRole(workspace.id, ownerId, "owner");
@@ -196,14 +207,14 @@ describe("STORY-085-A audit · POST /v1/command/parse over the real guard/interc
     const dispatch = vi.spyOn(producer, "dispatchPlannedCells");
 
     for (const phrase of PHRASES) {
-      const before = await tableCounts();
+      const before = await tableState();
       const res = await parse(token, phrase);
       expect(res.statusCode, phrase).toBe(200);
-      const after = await tableCounts();
-      const changed = Object.keys(after)
-        .filter((table) => after[table] !== before[table])
-        .map((table) => `${table}:${before[table]}->${after[table]}`);
-      expect(changed, phrase).toEqual([`audit_log:${before.audit_log}->${before.audit_log! + 1}`]);
+      const after = await tableState();
+      const changed = Object.keys(after).filter((table) => after[table]!.digest !== before[table]!.digest);
+      // Exactly one table changed, it is audit_log, and it only gained one row.
+      expect(changed, phrase).toEqual(["audit_log"]);
+      expect(after.audit_log!.rows, phrase).toBe(before.audit_log!.rows + 1);
     }
     expect(enqueue).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
@@ -220,5 +231,30 @@ describe("STORY-085-A audit · POST /v1/command/parse over the real guard/interc
     );
     expect(rows.rows).toHaveLength(1);
     expect(rows.rows[0]).toMatchObject({ resource_type: "workspace", resource_id: workspace.id, before_state: null });
+  });
+
+  // The phrases are deliberately SHORT and low-entropy: redactState only strips
+  // long high-entropy strings, so these survive it unless the row never holds
+  // them. (The earlier long address passed this test vacuously.)
+  it.each([
+    ["invite jo@acme.io as viewer", ["jo@acme.io", "acme.io"]],
+    ["create a task to fire jane doe for misconduct", ["jane doe", "misconduct"]],
+    ["compare acme with globex", ["acme", "globex"]],
+    ["order me a pizza", ["pizza"]],
+  ] as const)("STORY-085-A CP2 audit: the audit row for %j holds the outcome only, none of the customer's text", async (phrase, secrets) => {
+    const ownerId = await createUser();
+    const workspace = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
+    const res = await parse(await tokenForRole(workspace.id, ownerId, "owner"), phrase);
+    expect(res.statusCode).toBe(200);
+    const rows = await db.query<{ before_state: unknown; after_state: Record<string, unknown> }>(
+      "SELECT before_state, after_state FROM audit_log WHERE workspace_id = $1 AND action = 'command.parsed'",
+      [workspace.id],
+    );
+    expect(rows.rows).toHaveLength(1);
+    const { before_state, after_state } = rows.rows[0]!;
+    expect(before_state).toBeNull();
+    expect(Object.keys(after_state).sort()).toEqual(["cached", "confidence", "intent", "resolved_by"]);
+    const stored = JSON.stringify(rows.rows[0]);
+    for (const secret of secrets) expect(stored, secret).not.toContain(secret);
   });
 });

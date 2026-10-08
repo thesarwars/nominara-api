@@ -69,13 +69,11 @@ export class WorkspaceSummaryService {
     // local window the matrix columns cover — never "does the engine have an
     // API key". Nothing measured is null, not demo.
     const window = await this.window(workspaceId, store.client);
-    const perProject = await engineDataSourcesForProjects(
-      store.client,
-      projects.map((project) => project.id),
-      window.from,
-      window.to,
-      window.timezone,
-    );
+    // ONE statement for every project in the matrix (AC: no per-project query).
+    const perProject =
+      projects.length === 0
+        ? new Map<string, Map<string, DataSource>>()
+        : await engineDataSourcesForProjects(store.client, projects.map((project) => project.id), window.from, window.to, window.timezone);
     const workspaceSource = (engineKey: string): DataSource | null =>
       combineDataSources([...perProject.values()].map((sources) => sources.get(engineKey) ?? null));
 

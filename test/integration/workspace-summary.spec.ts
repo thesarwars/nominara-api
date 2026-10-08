@@ -2,6 +2,9 @@ import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { DEMO_SEED_MARKER } from "../../src/db/seed/demo/constants.js";
+import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { RUNTIME_ROLES, BREAKGLASS_ROLE } from "../../src/db/conventions.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
@@ -166,6 +169,48 @@ describe("NEW-B-2 · WorkspaceSummaryService — real SQL", () => {
       return n();
     });
     expect(bigCount).toBe(smallCount);
+  });
+
+  // NEW-B-2 CP2 — the batched provenance read must keep projects apart: a demo
+  // capture in one project may not colour another project's engine, and a
+  // project another workspace owns is never read.
+  it("data_source is per project and per engine under RLS: live, demo and nothing-measured never bleed across projects or workspaces", async () => {
+    const ws = await createWorkspace();
+    const other = await createWorkspace();
+    const liveProject = await createProject(ws);
+    const demoProject = await createProject(ws);
+    const emptyProject = await createProject(ws);
+    const foreignProject = await createProject(other);
+    await client.query("INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,cache_ttl_seconds,volatility_band,min_plan_key,status) VALUES ('gemini','g','v','api','1.0.0',86400,'medium','free','active') ON CONFLICT DO NOTHING");
+    async function capture(workspaceId: string, projectId: string, normalizer: string): Promise<void> {
+      const prompt = await client.query<{ id: string }>(
+        `INSERT INTO tracked_prompts (workspace_id,project_id,text,text_hash,intent_archetype,funnel_stage,is_priority,status)
+         VALUES ($1,$2,'q',sha256('q'::bytea),'recommendation','consideration',false,'active') RETURNING id`,
+        [workspaceId, projectId],
+      );
+      const id = randomUUID();
+      await client.query(
+        `INSERT INTO answer_captures
+           (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present)
+         VALUES ($1,$2,$3,$4,$5,'gemini', now() - interval '2 hours','api','1.0.0',$6,$7,'{}'::jsonb,'{}','live','parsed',true)`,
+        [id, workspaceId, projectId, uuidV7(), prompt.rows[0]!.id, normalizer, createHash("sha256").update(id).digest()],
+      );
+    }
+    await capture(ws, liveProject, "v1");
+    await capture(ws, demoProject, DEMO_SEED_MARKER);
+    await capture(other, foreignProject, DEMO_SEED_MARKER);
+    await client.query(
+      "UPDATE projects SET visibility_by_engine = '{\"gemini\":{\"score\":50,\"delta_30d\":null}}'::jsonb WHERE workspace_id = $1",
+      [ws],
+    );
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    const sourceOf = (id: string) => out.projects.find((p) => p.id === id)!.engine_scores?.[0]?.data_source;
+    expect(sourceOf(liveProject)).toBe("live");
+    expect(sourceOf(demoProject)).toBe("demo");
+    expect(sourceOf(emptyProject)).toBeNull();
+    expect(out.projects).toHaveLength(3);
+    // The workspace-level filter list combines the three: live + demo = mixed. The foreign demo capture changes nothing.
+    expect(out.engines.find((e) => e.engine_key === "gemini")?.data_source).toBe("mixed");
   });
 
   it("the tenant connection is the RLS-bound runtime role, and RLS alone hides another workspace's rows", async () => {

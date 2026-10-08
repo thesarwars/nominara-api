@@ -18,9 +18,10 @@ import {
 // It IS @Audit()ed: AuditInterceptor fails closed on any POST without audit
 // metadata (the same finding as `POST runs/estimate`), so an unaudited parse
 // answers 500. The audit row is the ONLY row a parse writes — "never mutates"
-// means no domain state, no credits, no queue — and it carries the parse
-// response, never the query text. The resource is the workspace itself. `workspace:read` because every role may ask what a
-// phrase means; whether it may then DO it is execute's guard, and
+// means no domain state, no credits, no queue — and it records the OUTCOME
+// only (intent, resolved_by, cached, confidence): the response's `slots` are
+// verbatim customer text and never reach audit_log. The resource is the
+// workspace itself. `workspace:read` because every role may ask what a phrase means; whether it may then DO it is execute's guard, and
 // `actions[].required_permission` tells the client which.
 @Controller("command")
 export class CommandController {
@@ -30,7 +31,15 @@ export class CommandController {
   @HttpCode(200)
   @RequirePermission("workspace:read")
   @RateLimitClass("command_parse")
-  @Audit({ action: "command.parsed", resourceType: "workspace", resourceIdFrom: "workspace" })
+  @Audit({
+    action: "command.parsed",
+    resourceType: "workspace",
+    resourceIdFrom: "workspace",
+    afterState: (body) => {
+      const { intent, resolved_by, cached, confidence } = body as CommandParseResponse;
+      return { intent, resolved_by, cached, confidence };
+    },
+  })
   @ApiContract({
     operationId: "parseCommand",
     requestSchema: commandParseRequestSchema,

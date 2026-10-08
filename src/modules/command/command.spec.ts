@@ -1,10 +1,11 @@
 import { readFileSync, readdirSync } from "node:fs";
-import { Global, Module } from "@nestjs/common";
+import { Global, Logger, Module } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { describe, expect, it, vi } from "vitest";
 import { COMMAND_INTENTS, UNRESOLVED_INTENT, type CommandIntent } from "../../../contracts/command/command-intent.schema.js";
 import { commandParseRequestSchema } from "../../../contracts/command/parse-request.schema.js";
 import { commandParseResponseSchema } from "../../../contracts/command/parse-response.schema.js";
+import { AUDIT_METADATA_KEY, type AuditOptions } from "../../api/decorators/audit.decorator.js";
 import { API_CONTRACT_KEY } from "../../api/decorators/api-contract.decorator.js";
 import { CREDITS_KEY } from "../../api/decorators/credits.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.decorator.js";
@@ -259,5 +260,69 @@ describe("STORY-085-A audit · every intent's action flags and permission are pi
       requires_confirmation: expected.mutating,
       required_permission: expected.permission,
     });
+  });
+});
+
+// STORY-085-A CP2 audit — the parse's one audited row must not copy customer
+// text. `slots` and `candidates[].slots` are verbatim input (an invitee's
+// email, a task title); `redactState` only catches long high-entropy strings,
+// so the row is built from a closed list of outcome fields instead.
+describe("STORY-085-A CP2 · the audit row carries the outcome, never the customer's text", () => {
+  const options = Reflect.getMetadata(AUDIT_METADATA_KEY, CommandController.prototype.parse) as AuditOptions;
+
+  it("declares an afterState selector on the parse route", () => {
+    expect(typeof options.afterState).toBe("function");
+  });
+
+  it.each([
+    ["invite jo@acme.io as viewer", "jo@acme.io"],
+    ["create a task to fire jane doe for misconduct", "jane doe"],
+    ["compare acme with globex", "globex"],
+    ["order me a pizza", "pizza"],
+  ])("%s: the selected state holds intent, resolved_by, cached and confidence only", async (phrase, secret) => {
+    const response = await makeService().parse(WS_A, phrase);
+    const state = options.afterState!(response) as Record<string, unknown>;
+    expect(Object.keys(state).sort()).toEqual(["cached", "confidence", "intent", "resolved_by"]);
+    expect(state).toEqual({
+      intent: response.intent,
+      resolved_by: response.resolved_by,
+      cached: response.cached,
+      confidence: response.confidence,
+    });
+    expect(JSON.stringify(state)).not.toContain(secret);
+  });
+
+  it("keeps null distinct from a value: an unresolved parse has resolved_by null, not absent", async () => {
+    const state = options.afterState!(await makeService().parse(WS_A, "order me a pizza")) as Record<string, unknown>;
+    expect(state).toHaveProperty("resolved_by", null);
+    expect(state).toHaveProperty("confidence", 0);
+  });
+});
+
+describe("STORY-085-A CP2 · metric and log are asserted directly", () => {
+  it("emits nominara_command_parse_total with outcome and cached, and a log line with the workspace ID and no query text", async () => {
+    const log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    try {
+      const service = makeService();
+      const phrase = "invite secret.person@example.com as viewer";
+      await service.parse(WS_A, phrase);
+      await service.parse(WS_A, phrase);
+      await service.parse(WS_A, "order me a pizza");
+      const lines = log.mock.calls.map((call) => call[0] as Record<string, unknown>);
+      const metrics = lines.filter((line) => line.metric === "nominara_command_parse_total");
+      expect(metrics.map((m) => [m.outcome, m.cached])).toEqual([
+        ["resolved", "false"],
+        ["resolved", "true"],
+        ["unresolved", "false"],
+      ]);
+      const parseLines = lines.filter((line) => line.event === "command.parse");
+      expect(parseLines).toHaveLength(3);
+      for (const line of parseLines) expect(line.workspace_id).toBe(WS_A);
+      const everything = JSON.stringify(lines);
+      expect(everything).not.toContain("secret.person");
+      expect(everything).not.toContain("pizza");
+    } finally {
+      log.mockRestore();
+    }
   });
 });

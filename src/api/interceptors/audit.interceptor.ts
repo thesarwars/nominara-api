@@ -217,7 +217,7 @@ export class AuditInterceptor implements NestInterceptor {
       resourceType: options.resourceType,
       resourceId,
       beforeState: req.auditBeforeState ?? null,
-      afterState: responseBody ?? null,
+      afterState: (options.afterState !== undefined ? options.afterState(responseBody) : responseBody) ?? null,
       requestId: req.id !== undefined ? String(req.id) : "",
       supportGrantId: req.supportGrant?.id ?? null,
       severity: options.severity ?? "info",

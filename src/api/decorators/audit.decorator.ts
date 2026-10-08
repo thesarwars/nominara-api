@@ -25,6 +25,12 @@ export interface AuditOptions {
   readonly paramName?: string;
   /** The row's severity. Defaults to "info"; a credential being minted or revoked declares a higher one (NEW-D-4). */
   readonly severity?: AuditSeverity;
+  /**
+   * Picks what `after_state` records from the handler's response. Absent, the whole response is recorded. A route whose
+   * response carries verbatim customer text (STORY-085-A: a parse echoes the typed query's slots) names a CLOSED list of
+   * outcome fields here, because `redactState` only strips long high-entropy strings and cannot be relied on for short text.
+   */
+  readonly afterState?: (responseBody: unknown) => unknown;
 }
 
 export const AUDIT_METADATA_KEY = "auditOptions";
