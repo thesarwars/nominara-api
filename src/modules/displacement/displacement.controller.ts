@@ -72,7 +72,7 @@ export class DisplacementController {
   @RequirePermission("task:create")
   @ScopedByQuery()
   @Audit({ action: "displacement.recovery_planned", resourceType: "displacement" })
-  @ApiContract({ operationId: "createDisplacementRecoveryPlan", responseSchema: recoveryPlanResponseSchema })
+  @ApiContract({ operationId: "createDisplacementRecoveryPlan", requiresIdempotencyKey: true, responseSchema: recoveryPlanResponseSchema })
   recoveryPlan(@Param("id") id: string): Promise<RecoveryPlanResponse> {
     return this.service.recoveryPlan(id);
   }

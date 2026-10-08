@@ -44,3 +44,9 @@ Verified by `test/integration/displacement-recovery-plan.spec.ts` > "NEW-C-6 obs
 
 ## Not done
 Frontend (`lib/api/competitors.ts` already matches; the control showing `recovery_task_count` is app-side). Docs to carry: api-specification.md section 3 needs `POST /displacements/{id}/recovery-plan` (201, Task[], `task:create`, Idempotency-Key) and the per-domain fingerprint.
+
+## Checkpoint 4 - Idempotency-Key declared in the operation
+Branch 7day/c-comp-5 from integration/7day 74e4b2f. `POST /v1/displacements/{id}/recovery-plan` now publishes a required `Idempotency-Key` header parameter (new `ApiContract.requiresIdempotencyKey`, emitted by `src/contracts/generate.ts` like `If-Match`); the controller sets it. openapi and the generated client regenerated.
+- AC3 (header in the published operation + contract flag) -> `displacement.spec.ts` "AC3 - the published operation declares a required Idempotency-Key header so the generated client carries it". RED sha b2b0313 (1 failed / 19 passed, exit 1).
+- Gates: lint 0, typecheck 0, test:unit 0 (306 files, 3756 tests), contracts:check 0, integration displacement-recovery-plan + displacement-feed 0 (30 tests). No tenant table touched, isolation not needed.
+- `contracts:diff` against the base openapi reports **none**, not minor: diff.ts compares bodies and responses only, never `parameters`. Not changed (gate logic is out of scope); flagged for the owner.
