@@ -6,6 +6,9 @@ import {
   type StripeGateway,
   type CreditPackCheckoutInput,
   type HostedSession,
+  type OffSessionPaymentInput,
+  type OffSessionPaymentResult,
+  type SavedPaymentMethod,
   type StripeObjectKind,
   type SubscriptionCheckoutInput,
   type VerifiedStripeEvent,
@@ -105,6 +108,29 @@ export class FakeStripeGateway implements StripeGateway {
     const session = { id: `cs_pack_${String(this.packCheckouts.length)}`, url: `https://checkout.stripe.test/c/pay/cs_pack_${String(this.packCheckouts.length)}` };
     await this.onSessionCreated?.();
     return session;
+  }
+
+  /** NEW-D-7 — payment methods Stripe holds for a reference PaymentIntent (one saved with setup_future_usage). */
+  readonly savedMethods = new Map<string, SavedPaymentMethod>();
+  readonly savedMethodLookups: string[] = [];
+  /** NEW-D-7 — off-session charges submitted, in call order. */
+  readonly offSessionCharges: OffSessionPaymentInput[] = [];
+  /** `declined` makes the next charges come back as a card decline. */
+  offSessionOutcome: "submitted" | "declined" = "submitted";
+  /** Makes only the charge (not the lookup) fail like an upstream outage. */
+  failChargeWith: Error | undefined;
+
+  findSavedPaymentMethod(referencePaymentIntentId: string): Promise<SavedPaymentMethod | null> {
+    if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
+    this.savedMethodLookups.push(referencePaymentIntentId);
+    return Promise.resolve(this.savedMethods.get(referencePaymentIntentId) ?? null);
+  }
+
+  createOffSessionPayment(input: OffSessionPaymentInput): Promise<OffSessionPaymentResult> {
+    if (this.failChargeWith !== undefined) return Promise.reject(this.failChargeWith);
+    this.offSessionCharges.push(input);
+    if (this.offSessionOutcome === "declined") return Promise.resolve({ outcome: "declined" });
+    return Promise.resolve({ outcome: "submitted", paymentIntentId: `pi_auto_${input.purchaseId.slice(0, 8)}` });
   }
 
   createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }> {

@@ -1,0 +1,487 @@
+import { randomUUID } from "node:crypto";
+import { Logger } from "@nestjs/common";
+import { Pool } from "pg";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import { autoTopupConfigSchema } from "../../contracts/billing/index.js";
+import { resolvePassword } from "../../src/db/dev-credentials.js";
+import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
+import { STRIPE_GATEWAY, StripeUpstreamError } from "../../src/lib/billing/stripe/stripe-gateway.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
+import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
+import { AutoTopupService } from "../../src/modules/billing/auto-topup.service.js";
+import { SessionService } from "../../src/modules/identity/session.service.js";
+import { EMAIL_SENDER, type EmailMessage, type EmailSender } from "../../src/modules/identity/ports/email-sender.js";
+import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
+import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
+import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
+import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
+import { apiUrl } from "../support/api-url.js";
+import { useApiHarness } from "../support/api-harness.js";
+import { dataOf } from "../support/envelope.js";
+import { FakeStripeGateway, signFakeStripePayload } from "../support/fake-stripe-gateway.js";
+
+// NEW-D-7 — the auto-top-up trigger. Real ApiModule, real Postgres, requests
+// served as `nominara_app` (RLS in force). Stripe is the fake gateway; the
+// email port is a recording fake. STORY-076 scenarios 7 and 9.
+
+const gateway = new FakeStripeGateway();
+
+class RecordingEmail implements EmailSender {
+  readonly sent: EmailMessage[] = [];
+  failNext = false;
+  send(message: EmailMessage): Promise<void> {
+    if (this.failNext) {
+      this.failNext = false;
+      return Promise.reject(new Error("smtp down"));
+    }
+    this.sent.push(message);
+    return Promise.resolve();
+  }
+}
+const email = new RecordingEmail();
+const meta = { ip: "127.0.0.1", ua: "vitest", requestId: randomUUID() };
+const BILLING_EMAIL = "billing-contact@example.com";
+
+describe("NEW-D-7 · auto-top-up trigger", () => {
+  const harness = useApiHarness({
+    env: () => {
+      const url = new URL(process.env.DATABASE_URL!);
+      url.username = "nominara_app";
+      url.password = resolvePassword("nominara_app", {});
+      return { DATABASE_URL_POOLED: url.toString() };
+    },
+    configure: (builder) => {
+      builder.overrideProvider(STRIPE_GATEWAY).useValue(gateway);
+      builder.overrideProvider(EMAIL_SENDER).useValue(email);
+    },
+  });
+
+  let pool: Pool;
+  let sessions: SessionService;
+  let workspaces: WorkspacesService;
+  let log: MockInstance<(...args: unknown[]) => void>;
+  let service: AutoTopupService;
+
+  beforeEach(async () => {
+    vi.restoreAllMocks();
+    await harness.db().query(`ALTER ROLE nominara_app PASSWORD '${resolvePassword("nominara_app", {})}'`);
+    gateway.objects.clear();
+    gateway.savedMethods.clear();
+    gateway.savedMethodLookups.length = 0;
+    gateway.offSessionCharges.length = 0;
+    gateway.offSessionOutcome = "submitted";
+    gateway.failChargeWith = undefined;
+    gateway.failFetchWith = undefined;
+    gateway.configured = true;
+    email.sent.length = 0;
+    email.failNext = false;
+    pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    const membership = new MembershipService(new MembershipCacheService());
+    sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
+    workspaces = new WorkspacesService(pool, new LocalDekProvisioner(Buffer.alloc(32, 7), "local:dev"), new AuditChainService(), membership, sessions, new NoopRealtimePublisher());
+    log = vi.spyOn(Logger.prototype, "log") as unknown as typeof log;
+    service = harness.app().get(AutoTopupService, { strict: false });
+  });
+  afterEach(async () => {
+    await pool.end();
+  });
+
+  interface Actor {
+    readonly accessToken: string;
+    readonly csrfToken: string;
+    readonly userId: string;
+  }
+  async function createUser(): Promise<string> {
+    const r = await harness.db().query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`u-${randomUUID()}@example.com`]);
+    return r.rows[0]!.id;
+  }
+  const cookies = (a: Actor) => ({ [ACCESS_COOKIE_NAME]: a.accessToken, [CSRF_COOKIE_NAME]: a.csrfToken });
+  const put = (a: Actor, payload: unknown) =>
+    harness.app().inject({
+      method: "PUT",
+      url: apiUrl("/billing/wallet/auto-topup"),
+      cookies: cookies(a),
+      headers: { [CSRF_HEADER_NAME]: a.csrfToken, "content-type": "application/json", "idempotency-key": randomUUID() },
+      payload: payload as object,
+    });
+  const getWallet = (a: Actor) => harness.app().inject({ method: "GET", url: apiUrl("/billing/wallet"), cookies: cookies(a) });
+
+  interface Armed {
+    workspaceId: string;
+    owner: Actor;
+    referencePi: string;
+  }
+  /** A Growth workspace with auto-top-up on (starter_vault, below 100, cap `max`), a low balance, a billing contact and a saved card. */
+  async function armed(over: { max?: number; saved?: boolean; plan?: string; billingEmail?: string | null; reference?: boolean } = {}): Promise<Armed> {
+    const ownerId = await createUser();
+    const ws = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
+    await harness.db().query("UPDATE workspaces SET plan_key = $2, billing_email = $3 WHERE id = $1", [ws.id, over.plan ?? "growth", over.billingEmail === undefined ? BILLING_EMAIL : over.billingEmail]);
+    const tokens = await sessions.createSession(ownerId);
+    const entered = await workspaces.switchTo(ownerId, tokens.sid, ws.id, meta);
+    const owner: Actor = { ...entered, userId: ownerId };
+    const res = await put(owner, { enabled: true, pack_key: "starter_vault", threshold: 100, max_per_cycle: over.max ?? 3 });
+    expect(res.statusCode, res.body).toBe(200);
+    await setBalance(ws.id, 50);
+    const referencePi = `pi_ref_${ws.id.slice(0, 8)}`;
+    if (over.reference !== false) {
+      await harness.db().query(
+        `INSERT INTO credit_purchases (workspace_id, pack_key, credits, amount_usd, source, status, stripe_payment_intent_id, expires_at, purchased_by)
+         VALUES ($1,'starter_vault',1000,15.00,'manual','succeeded',$2, now() + interval '12 months', $3)`,
+        [ws.id, referencePi, ownerId],
+      );
+    }
+    if (over.saved !== false) gateway.savedMethods.set(referencePi, { customerId: "cus_saved_1", paymentMethodId: "pm_saved_1" });
+    return { workspaceId: ws.id, owner, referencePi };
+  }
+  const setBalance = (workspaceId: string, available: number, reserved = 0) =>
+    harness.db().query("UPDATE credit_wallets SET included_balance = $2, purchased_balance = 0, reserved = $3 WHERE workspace_id = $1", [workspaceId, available + reserved, reserved]);
+
+  const autoPurchases = async (workspaceId: string) =>
+    (await harness.db().query("SELECT id, status, source, pack_key, credits, amount_usd::text AS amount_usd, purchased_by, stripe_payment_intent_id FROM credit_purchases WHERE workspace_id = $1 AND source = 'auto_topup' ORDER BY created_at, id", [workspaceId])).rows;
+  const wallet = async (workspaceId: string) =>
+    (await harness.db().query("SELECT included_balance, purchased_balance, auto_topup_enabled, auto_topup_count_cycle FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rows[0];
+  const ledger = async (workspaceId: string) => (await harness.db().query("SELECT entry_type, credits, idempotency_key FROM credit_ledger WHERE workspace_id = $1 ORDER BY seq", [workspaceId])).rows;
+  const audit = async (workspaceId: string, like: string) =>
+    (await harness.db().query("SELECT action, resource_type, resource_id, after_state FROM audit_log WHERE workspace_id = $1 AND action LIKE $2 ORDER BY seq", [workspaceId, like])).rows;
+
+  const eventBody = (id: string, type: string, objectId: string): string => JSON.stringify({ id, object: "event", type, data: { object: { id: objectId } } });
+  const deliver = (body: string) =>
+    harness.app().inject({ method: "POST", url: apiUrl("/webhooks/stripe"), headers: { "content-type": "application/json", "stripe-signature": signFakeStripePayload(body) }, payload: body });
+  /** Stripe's CURRENT state of the auto-top-up PaymentIntent, then the event that points at it. */
+  async function stripeSays(workspaceId: string, purchaseId: string, pi: string, kind: "succeeded" | "failed", eventId = `evt_${randomUUID()}`, cents = 1500) {
+    const metadata = { workspace_id: workspaceId, purchase_id: purchaseId, source: "auto_topup" };
+    gateway.putObject("payment_intent", pi, metadata, kind === "succeeded" ? { status: "succeeded", amount_received: cents, currency: "usd" } : { status: "requires_payment_method", amount_received: 0, currency: "usd" });
+    return deliver(eventBody(eventId, kind === "succeeded" ? "payment_intent.succeeded" : "payment_intent.payment_failed", pi));
+  }
+  const piOf = (purchaseId: string) => `pi_auto_${purchaseId.slice(0, 8)}`;
+
+  // ---- STORY-076 scenario 7 --------------------------------------------------------------------
+
+  it("STORY-076 scenario 7 · firing repeatedly stops at the cap, and every one of those triggers was emailed", async () => {
+    const { workspaceId } = await armed({ max: 3 });
+    const outcomes: string[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      outcomes.push(await service.trigger(workspaceId));
+      const pending = (await autoPurchases(workspaceId)).find((p) => p.status === "pending");
+      if (pending !== undefined) {
+        expect((await stripeSays(workspaceId, pending.id as string, piOf(pending.id as string), "succeeded")).statusCode).toBe(200);
+      }
+      await setBalance(workspaceId, 50);
+    }
+    expect(outcomes).toEqual(["charge_submitted", "charge_submitted", "charge_submitted", "cap_reached", "cap_reached"]);
+    expect(gateway.offSessionCharges).toHaveLength(3);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(3);
+    expect(await autoPurchases(workspaceId)).toHaveLength(3);
+    const triggered = email.sent.filter((m) => m.subject === "Nominara auto top-up triggered");
+    expect(triggered).toHaveLength(3);
+    expect(triggered.every((m) => m.to === BILLING_EMAIL)).toBe(true);
+  });
+
+  it("STORY-076 scenario 7 · concurrent triggers cannot exceed the cap: eight at once against one slot left charge exactly once", async () => {
+    const { workspaceId } = await armed({ max: 2 });
+    await harness.db().query("UPDATE credit_wallets SET auto_topup_count_cycle = 1 WHERE workspace_id = $1", [workspaceId]);
+    const outcomes = await Promise.all(Array.from({ length: 8 }, () => service.trigger(workspaceId)));
+    expect(outcomes.filter((o) => o === "charge_submitted")).toHaveLength(1);
+    expect(outcomes.filter((o) => o !== "charge_submitted").every((o) => o === "in_flight" || o === "cap_reached")).toBe(true);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(2);
+    expect(gateway.offSessionCharges).toHaveLength(1);
+    expect(email.sent).toHaveLength(1);
+  });
+
+  it("STORY-076 scenario 7 · with a charge still in flight a further trigger charges nothing, even with cap left (in_flight)", async () => {
+    const { workspaceId } = await armed({ max: 5 });
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    expect(await service.trigger(workspaceId)).toBe("in_flight");
+    expect(await service.trigger(workspaceId)).toBe("in_flight");
+    expect(gateway.offSessionCharges).toHaveLength(1);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
+  });
+
+  it("STORY-076 scenario 7 · the threshold boundary: available equal to the threshold does not fire, one below does; reserved credits are not available", async () => {
+    const { workspaceId } = await armed();
+    await setBalance(workspaceId, 100);
+    expect(await service.trigger(workspaceId)).toBe("above_threshold");
+    await setBalance(workspaceId, 99);
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    const second = await armed();
+    await setBalance(second.workspaceId, 90, 20); // 110 on hand, 20 reserved -> 90 available
+    expect(await service.trigger(second.workspaceId)).toBe("charge_submitted");
+  });
+
+  it("STORY-076 scenario 7 · a disabled configuration never fires, and nothing is emailed or charged", async () => {
+    const { workspaceId, owner } = await armed();
+    expect((await put(owner, { enabled: false, pack_key: null, threshold: null, max_per_cycle: null })).statusCode).toBe(200);
+    expect(await service.trigger(workspaceId)).toBe("not_enabled");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(email.sent).toHaveLength(0);
+    expect(gateway.savedMethodLookups).toHaveLength(0);
+  });
+
+  it("NEW-D-7 · a workspace with no wallet at all is not_enabled, not an error", async () => {
+    const ownerId = await createUser();
+    const ws = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
+    expect(await service.trigger(ws.id)).toBe("not_enabled");
+  });
+
+  it("STORY-076 scenario 7 · the charge is the pack's own price from the catalog, to the saved customer and method, keyed on the purchase", async () => {
+    const { workspaceId } = await armed();
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    const [row] = await autoPurchases(workspaceId);
+    expect(row).toMatchObject({ status: "pending", source: "auto_topup", pack_key: "starter_vault", credits: 1000, amount_usd: "15.00", purchased_by: null, stripe_payment_intent_id: null });
+    expect(gateway.offSessionCharges[0]).toMatchObject({
+      workspaceId,
+      purchaseId: row!.id,
+      packKey: "starter_vault",
+      unitAmountCents: 1500,
+      currency: "USD",
+      customerId: "cus_saved_1",
+      paymentMethodId: "pm_saved_1",
+    });
+  });
+
+  it("STORY-076 scenario 7 · the email names the pack and amount, goes to the billing contact, and an owner's address is the fallback when there is none", async () => {
+    const { workspaceId } = await armed();
+    await service.trigger(workspaceId);
+    expect(email.sent[0]).toMatchObject({ to: BILLING_EMAIL, subject: "Nominara auto top-up triggered" });
+    expect(email.sent[0]!.textBody).toContain("1000");
+    expect(email.sent[0]!.textBody).toContain("15.00");
+
+    const noContact = await armed({ billingEmail: null });
+    const ownerEmail = (await harness.db().query<{ email: string }>("SELECT email FROM users WHERE id = $1", [noContact.owner.userId])).rows[0]!.email;
+    email.sent.length = 0;
+    expect(await service.trigger(noContact.workspaceId)).toBe("charge_submitted");
+    expect(email.sent.map((m) => m.to)).toEqual([ownerEmail]);
+  });
+
+  it("NEW-D-7 · nobody to email means nobody is charged: no_billing_contact consumes no cap slot and creates no purchase", async () => {
+    const { workspaceId } = await armed({ billingEmail: null });
+    await harness.db().query("DELETE FROM workspace_members WHERE workspace_id = $1", [workspaceId]);
+    expect(await service.trigger(workspaceId)).toBe("no_billing_contact");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(await autoPurchases(workspaceId)).toHaveLength(0);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(0);
+  });
+
+  it("NEW-D-7 · if the email cannot be sent the card is not charged (fail closed): the purchase is failed and auto-top-up stays on", async () => {
+    const { workspaceId } = await armed();
+    email.failNext = true;
+    expect(await service.trigger(workspaceId)).toBe("email_failed");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "failed" });
+    expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: true, auto_topup_count_cycle: 1 });
+  });
+
+  it("NEW-D-7 · a pack the workspace's tier can no longer buy is pack_unavailable: nothing charged, no slot consumed", async () => {
+    const { workspaceId } = await armed({ plan: "growth" });
+    await harness.db().query("UPDATE credit_wallets SET auto_topup_pack_key = 'agency_vault' WHERE workspace_id = $1", [workspaceId]);
+    await harness.db().query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [workspaceId]);
+    expect(await service.trigger(workspaceId)).toBe("pack_unavailable");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(0);
+  });
+
+  // ---- credits land through the webhook ---------------------------------------------------------
+
+  it("STORY-076a path · a trigger moves no credit: the purchase is pending and the ledger and wallet are unchanged until the webhook", async () => {
+    const { workspaceId } = await armed();
+    const before = { ledger: await ledger(workspaceId), wallet: await wallet(workspaceId) };
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    expect(await ledger(workspaceId)).toEqual(before.ledger);
+    expect((await wallet(workspaceId))?.purchased_balance).toBe(before.wallet?.purchased_balance);
+    expect((await wallet(workspaceId))?.included_balance).toBe(before.wallet?.included_balance);
+  });
+
+  it("STORY-076a path · payment_intent.succeeded lands the credits through credit_purchases (source auto_topup), keyed on the PaymentIntent, and a redelivery adds nothing", async () => {
+    const { workspaceId } = await armed();
+    await service.trigger(workspaceId);
+    const purchase = (await autoPurchases(workspaceId))[0]!;
+    const pi = piOf(purchase.id as string);
+    expect((await stripeSays(workspaceId, purchase.id as string, pi, "succeeded", "evt_ok_1")).statusCode).toBe(200);
+    expect((await stripeSays(workspaceId, purchase.id as string, pi, "succeeded", "evt_ok_1")).json<{ data: { outcome: string } }>().data.outcome).toBe("duplicate");
+    expect((await stripeSays(workspaceId, purchase.id as string, pi, "succeeded", "evt_ok_2")).statusCode).toBe(200);
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "succeeded", stripe_payment_intent_id: pi });
+    expect(await ledger(workspaceId)).toEqual([expect.objectContaining({ entry_type: "purchase", credits: 1000, idempotency_key: pi })]);
+    expect((await wallet(workspaceId))?.purchased_balance).toBe(1000);
+  });
+
+  it("STORY-076a path · a charge whose amount differs from the purchase row credits nothing", async () => {
+    const { workspaceId } = await armed();
+    await service.trigger(workspaceId);
+    const purchase = (await autoPurchases(workspaceId))[0]!;
+    await stripeSays(workspaceId, purchase.id as string, piOf(purchase.id as string), "succeeded", `evt_${randomUUID()}`, 100);
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "pending" });
+    expect(await ledger(workspaceId)).toEqual([]);
+  });
+
+  // ---- STORY-076 scenario 9 ---------------------------------------------------------------------
+
+  it("STORY-076 scenario 9 · a payment that fails at the webhook disables auto-top-up, notifies the billing contact, and records why", async () => {
+    const { workspaceId, owner } = await armed();
+    await service.trigger(workspaceId);
+    const purchase = (await autoPurchases(workspaceId))[0]!;
+    email.sent.length = 0;
+    expect((await stripeSays(workspaceId, purchase.id as string, piOf(purchase.id as string), "failed")).statusCode).toBe(200);
+    expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: false, auto_topup_count_cycle: 1 });
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "failed" });
+    expect(email.sent).toHaveLength(1);
+    expect(email.sent[0]).toMatchObject({ to: BILLING_EMAIL, subject: "Nominara auto top-up disabled after a failed payment" });
+    expect(await audit(workspaceId, "billing.auto_topup.disabled")).toEqual([
+      expect.objectContaining({ resource_type: "credit_wallet", after_state: expect.objectContaining({ reason: "payment_failed", purchase_id: purchase.id }) }),
+    ]);
+    const config = autoTopupConfigSchema.parse(dataOf<{ auto_topup: unknown }>(await getWallet(owner)).auto_topup);
+    expect(config).toMatchObject({ enabled: false, used_this_cycle: 1, disabled_reason: "payment_failed" });
+  });
+
+  it("STORY-076 scenario 9 · it never retries: after the failure further triggers are not_enabled and no second charge is made", async () => {
+    const { workspaceId } = await armed({ max: 5 });
+    await service.trigger(workspaceId);
+    const purchase = (await autoPurchases(workspaceId))[0]!;
+    await stripeSays(workspaceId, purchase.id as string, piOf(purchase.id as string), "failed");
+    expect(await service.trigger(workspaceId)).toBe("not_enabled");
+    expect(await service.trigger(workspaceId)).toBe("not_enabled");
+    expect(gateway.offSessionCharges).toHaveLength(1);
+  });
+
+  it("STORY-076 scenario 9 · a redelivered failure, and a second event for the same failed purchase, notify only once", async () => {
+    const { workspaceId } = await armed();
+    await service.trigger(workspaceId);
+    const purchase = (await autoPurchases(workspaceId))[0]!;
+    email.sent.length = 0;
+    await stripeSays(workspaceId, purchase.id as string, piOf(purchase.id as string), "failed", "evt_f_1");
+    await stripeSays(workspaceId, purchase.id as string, piOf(purchase.id as string), "failed", "evt_f_1");
+    await stripeSays(workspaceId, purchase.id as string, piOf(purchase.id as string), "failed", "evt_f_2");
+    expect(email.sent).toHaveLength(1);
+    expect(await audit(workspaceId, "billing.auto_topup.disabled")).toHaveLength(1);
+  });
+
+  it("STORY-076 scenario 9 · a decline answered synchronously by the provider takes the same path: disabled, notified, failed, never retried", async () => {
+    const { workspaceId } = await armed({ max: 5 });
+    gateway.offSessionOutcome = "declined";
+    expect(await service.trigger(workspaceId)).toBe("declined");
+    expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: false, auto_topup_count_cycle: 1 });
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "failed" });
+    expect(email.sent.map((m) => m.subject)).toEqual(["Nominara auto top-up triggered", "Nominara auto top-up disabled after a failed payment"]);
+    expect(await service.trigger(workspaceId)).toBe("not_enabled");
+    expect(gateway.offSessionCharges).toHaveLength(1);
+  });
+
+  it("STORY-076 scenario 9 · a customer who turns it back on clears the reason, and the cycle counter is not reset by doing so", async () => {
+    const { workspaceId, owner } = await armed({ max: 5 });
+    gateway.offSessionOutcome = "declined";
+    await service.trigger(workspaceId);
+    expect((await put(owner, { enabled: true, pack_key: "starter_vault", threshold: 100, max_per_cycle: 5 })).statusCode).toBe(200);
+    const config = autoTopupConfigSchema.parse(dataOf<{ auto_topup: unknown }>(await getWallet(owner)).auto_topup);
+    expect(config.enabled).toBe(true);
+    expect(config.disabled_reason).toBeUndefined();
+    expect(config.used_this_cycle).toBe(1);
+  });
+
+  it("STORY-076 scenario 9 · a failed MANUAL purchase does not touch the auto-top-up setting", async () => {
+    const { workspaceId } = await armed();
+    const manual = (
+      await harness.db().query<{ id: string }>(
+        "INSERT INTO credit_purchases (workspace_id, pack_key, credits, amount_usd, source, status) VALUES ($1,'starter_vault',1000,15.00,'manual','pending') RETURNING id",
+        [workspaceId],
+      )
+    ).rows[0]!.id;
+    gateway.putObject("payment_intent", "pi_manual_fail", { workspace_id: workspaceId, purchase_id: manual }, { status: "requires_payment_method", amount_received: 0, currency: "usd" });
+    expect((await deliver(eventBody("evt_manual_fail", "payment_intent.payment_failed", "pi_manual_fail"))).statusCode).toBe(200);
+    expect((await wallet(workspaceId))?.auto_topup_enabled).toBe(true);
+    expect(email.sent).toHaveLength(0);
+  });
+
+  it("NEW-D-7 · a provider outage on the charge fails the purchase (a failed purchase still settles if it turns out paid) and does not disable the setting", async () => {
+    const { workspaceId } = await armed();
+    gateway.failChargeWith = new StripeUpstreamError(503);
+    expect(await service.trigger(workspaceId)).toBe("upstream_error");
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "failed" });
+    expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: true, auto_topup_count_cycle: 1 });
+    // The charge may have gone through: its webhook still settles the failed row.
+    const purchase = (await autoPurchases(workspaceId))[0]!;
+    await stripeSays(workspaceId, purchase.id as string, piOf(purchase.id as string), "succeeded");
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "succeeded" });
+  });
+
+  // ---- AC4: no saved payment method ------------------------------------------------------------
+
+  it("NEW-D-7 AC4 · without a saved payment method the trigger is a no-op that records why: no purchase, no slot, no email, no charge", async () => {
+    const { workspaceId } = await armed({ saved: false });
+    expect(await service.trigger(workspaceId)).toBe("no_payment_method");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(await autoPurchases(workspaceId)).toHaveLength(0);
+    expect(email.sent).toHaveLength(0);
+    expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: true, auto_topup_count_cycle: 0 });
+    expect(await audit(workspaceId, "billing.auto_topup.skipped")).toEqual([
+      expect.objectContaining({ resource_type: "credit_wallet", after_state: expect.objectContaining({ reason: "no_payment_method" }) }),
+    ]);
+  });
+
+  it("NEW-D-7 AC4 · with no completed pack purchase at all there is nothing to look up: no_payment_method without asking Stripe", async () => {
+    const { workspaceId } = await armed({ reference: false });
+    expect(await service.trigger(workspaceId)).toBe("no_payment_method");
+    expect(gateway.savedMethodLookups).toHaveLength(0);
+    expect(await audit(workspaceId, "billing.auto_topup.skipped")).toHaveLength(1);
+  });
+
+  it("NEW-D-7 AC4 · only a manual purchase can be the reference: an earlier auto-top-up purchase is not a source of a saved card", async () => {
+    const { workspaceId } = await armed({ reference: false });
+    await harness.db().query(
+      `INSERT INTO credit_purchases (workspace_id, pack_key, credits, amount_usd, source, status, stripe_payment_intent_id, expires_at)
+       VALUES ($1,'starter_vault',1000,15.00,'auto_topup','succeeded','pi_auto_old', now() + interval '12 months')`,
+      [workspaceId],
+    );
+    gateway.savedMethods.set("pi_auto_old", { customerId: "cus_x", paymentMethodId: "pm_x" });
+    expect(await service.trigger(workspaceId)).toBe("no_payment_method");
+  });
+
+  // ---- tenancy, audit, observability -----------------------------------------------------------
+
+  it("NEW-D-7 · tenant isolation: triggering one workspace touches no other workspace's wallet, purchases or mail", async () => {
+    const a = await armed();
+    const b = await armed({ billingEmail: "other-billing@example.com" });
+    expect(await service.trigger(a.workspaceId)).toBe("charge_submitted");
+    expect(await autoPurchases(b.workspaceId)).toHaveLength(0);
+    expect((await wallet(b.workspaceId))?.auto_topup_count_cycle).toBe(0);
+    expect(email.sent.every((m) => m.to === BILLING_EMAIL)).toBe(true);
+    expect(gateway.offSessionCharges.every((c) => c.workspaceId === a.workspaceId)).toBe(true);
+  });
+
+  it("NEW-D-7 · the trigger itself runs as nominara_app (RLS in force): a purchase row it wrote is invisible from another workspace's context", async () => {
+    const a = await armed();
+    const b = await armed();
+    await service.trigger(a.workspaceId);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL ROLE nominara_app");
+      await client.query("SELECT set_config('app.workspace_id', $1, true)", [b.workspaceId]);
+      const seen = await client.query("SELECT 1 FROM credit_purchases WHERE workspace_id = $1", [a.workspaceId]);
+      expect(seen.rowCount).toBe(0);
+      await client.query("ROLLBACK");
+    } finally {
+      client.release();
+    }
+  });
+
+  it("STORY-076 AC · a trigger writes an audit row naming the purchase", async () => {
+    const { workspaceId } = await armed();
+    await service.trigger(workspaceId);
+    const purchase = (await autoPurchases(workspaceId))[0]!;
+    expect(await audit(workspaceId, "billing.auto_topup.triggered")).toEqual([
+      expect.objectContaining({ resource_type: "credit_purchase", resource_id: purchase.id, after_state: expect.objectContaining({ pack_key: "starter_vault", credits: 1000 }) }),
+    ]);
+  });
+
+  it("NEW-D-7 · observability: a trigger emits nominara_billing_auto_topup_trigger_total by outcome, and its log lines carry the workspace id but no address, card or customer id", async () => {
+    const { workspaceId } = await armed({ max: 1 });
+    await service.trigger(workspaceId);
+    await service.trigger(workspaceId);
+    const metrics = log.mock.calls.map((c) => c[0] as Record<string, unknown>).filter((c) => typeof c === "object" && typeof c?.metric === "string");
+    expect(metrics).toContainEqual({ metric: "nominara_billing_auto_topup_trigger_total", value: 1, outcome: "charge_submitted" });
+    expect(metrics).toContainEqual({ metric: "nominara_billing_auto_topup_trigger_total", value: 1, outcome: "in_flight" });
+    const emitted = JSON.stringify(log.mock.calls);
+    expect(emitted).toContain(workspaceId);
+    for (const secret of [BILLING_EMAIL, "cus_saved_1", "pm_saved_1"]) expect(emitted).not.toContain(secret);
+  });
+});
