@@ -253,4 +253,33 @@ describe("NEW-D-7 · the saved payment method and the off-session charge (HTTP a
     expect(await withClient({ paymentIntents: { create: vi.fn().mockResolvedValue({ id: "pi_x", status: "requires_action" }) } }).createOffSessionPayment(charge)).toEqual({ outcome: "declined" });
     await expect(withClient({ paymentIntents: { create: vi.fn().mockRejectedValue(Object.assign(new Error("boom sk_test_secret"), { statusCode: 503 })) } }).createOffSessionPayment(charge)).rejects.toMatchObject({ name: "StripeUpstreamError", statusCode: 503 });
   });
+  it("NEW-D-7 audit 1 · findOffSessionPayment asks Stripe by purchase id and reports in_progress / succeeded / failed / none, most-live state first", async () => {
+    const search = vi.fn();
+    const gw = withClient({ paymentIntents: { search } });
+    const run = async (data: Array<{ status: string }>) => {
+      search.mockResolvedValueOnce({ data });
+      return gw.findOffSessionPayment(charge.purchaseId);
+    };
+    expect(await run([])).toBe("none");
+    expect(await run([{ status: "processing" }])).toBe("in_progress");
+    expect(await run([{ status: "succeeded" }])).toBe("succeeded");
+    expect(await run([{ status: "requires_payment_method" }])).toBe("failed");
+    expect(await run([{ status: "canceled" }])).toBe("failed");
+    expect(await run([{ status: "requires_action" }])).toBe("failed");
+    // Doubt blocks: any live or settled intent wins over a failed one, and an unknown status is live.
+    expect(await run([{ status: "canceled" }, { status: "processing" }])).toBe("in_progress");
+    expect(await run([{ status: "canceled" }, { status: "succeeded" }])).toBe("succeeded");
+    expect(await run([{ status: "some_new_status" }])).toBe("in_progress");
+    const [params] = search.mock.calls[0] as [{ query: string }];
+    expect(params.query).toContain(`metadata['purchase_id']:'${charge.purchaseId}'`);
+    expect(params.query).toContain("metadata['source']:'auto_topup'");
+  });
+
+  it("NEW-D-7 audit 1 · findOffSessionPayment refuses a purchase id that is not a UUID (no query injection) and maps an outage to an upstream error", async () => {
+    const search = vi.fn();
+    await expect(withClient({ paymentIntents: { search } }).findOffSessionPayment("x' OR metadata['a']:'b")).rejects.toMatchObject({ name: "StripeUpstreamError" });
+    expect(search).not.toHaveBeenCalled();
+    const down = vi.fn().mockRejectedValue(Object.assign(new Error("boom sk_test_secret"), { statusCode: 503 }));
+    await expect(withClient({ paymentIntents: { search: down } }).findOffSessionPayment(charge.purchaseId)).rejects.toMatchObject({ name: "StripeUpstreamError", statusCode: 503 });
+  });
 });
