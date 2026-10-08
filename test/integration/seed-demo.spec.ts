@@ -8,6 +8,8 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { assertDemoSeedAllowed, DemoSeedRefusedError } from "../../src/db/seed/demo/guard.js";
 import { runSeedDemo, type SeedDemoPool, type SeedDemoPoolClient } from "../../src/db/seed-demo.js";
 import { readWallet } from "../../src/lib/credits/wallet.js";
+import { verifyProjectSourcePresence } from "../../src/lib/sources/verify-presence.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-169 (API step 3/3) — `pnpm db:seed-demo`, end to end, as a real
 // tenant-scoped `nominara_app` connection. RLS and tenant context are one of
@@ -367,6 +369,34 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     const stale = await client.query(`SELECT 1 FROM geo_analyses WHERE workspace_id = $1 AND sufficient`, [workspaceId]);
     expect(stale.rowCount).toBe(0);
   }, 120_000);
+
+  it("NEW-C-15 audit · seed, then verify: no seeded domain is fetched and no index row carries a verified absence", async () => {
+    const workspaceId = await createWorkspace("growth");
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    const indexed = await client.query<{ engine_key: string }>(
+      `SELECT DISTINCT engine_key FROM project_source_index WHERE workspace_id = $1`,
+      [workspaceId],
+    );
+    expect(indexed.rows.map((r) => r.engine_key), "the seed indexed a live engine's citations, so this test is not vacuous").toContain("gemini");
+
+    const fetch = vi.fn().mockResolvedValue({
+      status: 200,
+      headers: { "content-type": "text/html" },
+      body: Buffer.from("<html><body>nothing relevant</body></html>"),
+      finalUrl: "https://x.example.com/",
+    });
+    for (const project of await projectsOf(workspaceId)) {
+      await withTenantContext(client, { workspaceId, actorId: randomUUID() }, (tx) =>
+        verifyProjectSourcePresence(tx, project.id as string, { fetch }),
+      );
+    }
+    expect(fetch, "a demo domain is never fetched").not.toHaveBeenCalled();
+    const stamped = await client.query(
+      `SELECT 1 FROM project_source_index WHERE workspace_id = $1 AND (brand_present_on_domain IS NOT NULL OR verified_at IS NOT NULL)`,
+      [workspaceId],
+    );
+    expect(stamped.rowCount, "no verified_at on fabricated data").toBe(0);
+  }, 180_000);
 
   it("STORY-060 audit · --purge on a LATER day deletes the seed's geo_analyses rows outright: none survives under an older window_start", async () => {
     const workspaceId = await createWorkspace("growth");
