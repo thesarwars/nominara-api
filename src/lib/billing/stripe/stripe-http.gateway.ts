@@ -7,6 +7,7 @@ import {
   type FetchedStripeObject,
   type HostedSession,
   type OffSessionPaymentInput,
+  type OffSessionPaymentState,
   type OffSessionPaymentResult,
   type SavedPaymentMethod,
   type StripeGateway,
@@ -30,6 +31,11 @@ export interface StripeHttpGatewayConfig {
   readonly secretKey: string | undefined;
   readonly webhookSecret: string | undefined;
 }
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** PaymentIntent statuses that took no money and will not: the charge was refused, abandoned or cancelled. */
+const DEAD_INTENT_STATUSES: ReadonlySet<string> = new Set(["requires_payment_method", "requires_action", "canceled"]);
 
 function stringMetadata(value: unknown): Record<string, string> {
   const out: Record<string, string> = {};
@@ -186,6 +192,23 @@ export class StripeHttpGateway implements StripeGateway {
       return { outcome: "declined" };
     } catch (error) {
       if (error instanceof Stripe.errors.StripeCardError) return { outcome: "declined" };
+      throw this.asUpstream(error);
+    }
+  }
+
+  async findOffSessionPayment(purchaseId: string): Promise<OffSessionPaymentState> {
+    const client = this.requireClient();
+    // The id is interpolated into a search query: only a UUID may be.
+    if (!UUID.test(purchaseId)) throw new StripeUpstreamError(undefined);
+    try {
+      const found = await client.paymentIntents.search({ query: `metadata['purchase_id']:'${purchaseId}' AND metadata['source']:'auto_topup'`, limit: 10 });
+      const statuses = found.data.map((intent) => intent.status as string);
+      if (statuses.length === 0) return "none";
+      if (statuses.includes("succeeded")) return "succeeded";
+      // Doubt blocks: anything not known to be dead is still in progress.
+      if (statuses.some((s) => !DEAD_INTENT_STATUSES.has(s))) return "in_progress";
+      return "failed";
+    } catch (error) {
       throw this.asUpstream(error);
     }
   }

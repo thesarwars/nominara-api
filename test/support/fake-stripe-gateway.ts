@@ -8,6 +8,7 @@ import {
   type HostedSession,
   type OffSessionPaymentInput,
   type OffSessionPaymentResult,
+  type OffSessionPaymentState,
   type SavedPaymentMethod,
   type StripeObjectKind,
   type SubscriptionCheckoutInput,
@@ -152,6 +153,18 @@ export class FakeStripeGateway implements StripeGateway {
     this.offSessionCharges.push(input);
     if (this.offSessionOutcome === "declined") return Promise.resolve({ outcome: "declined" });
     return Promise.resolve({ outcome: "submitted", paymentIntentId: `pi_auto_${input.purchaseId.slice(0, 8)}` });
+  }
+
+  /** What Stripe holds per purchase id; a missing key is `none`. A test sets it to model a charge the trigger never saw answered. */
+  readonly offSessionStates = new Map<string, OffSessionPaymentState>();
+  readonly offSessionStateLookups: string[] = [];
+  /** Makes only the by-purchase lookup fail like an upstream outage. */
+  failStateLookupWith: Error | undefined;
+
+  findOffSessionPayment(purchaseId: string): Promise<OffSessionPaymentState> {
+    if (this.failStateLookupWith !== undefined) return Promise.reject(this.failStateLookupWith);
+    this.offSessionStateLookups.push(purchaseId);
+    return Promise.resolve(this.offSessionStates.get(purchaseId) ?? "none");
   }
 
   createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }> {

@@ -117,6 +117,14 @@ export interface OffSessionPaymentInput {
  */
 export type OffSessionPaymentResult = { readonly outcome: "submitted"; readonly paymentIntentId: string } | { readonly outcome: "declined" };
 
+/**
+ * NEW-D-7 audit 1 — what Stripe holds for one auto-top-up purchase id.
+ * `none`: no PaymentIntent exists. `in_progress`: one exists and may still be
+ * taken (processing — a bank debit stays so for days). `succeeded`: taken.
+ * `failed`: every PaymentIntent ended without taking money.
+ */
+export type OffSessionPaymentState = "none" | "in_progress" | "succeeded" | "failed";
+
 export interface HostedSession {
   readonly id: string;
   readonly url: string;
@@ -171,6 +179,16 @@ export interface StripeGateway {
    * Idempotency-Key is the purchase id. Throws `StripeUpstreamError`.
    */
   createOffSessionPayment(input: OffSessionPaymentInput): Promise<OffSessionPaymentResult>;
+
+  /**
+   * NEW-D-7 audit 1 — asks Stripe whether the charge for this purchase id exists
+   * and how it ended (PaymentIntent search on `metadata.purchase_id`). A
+   * purchase may be expired ONLY on `none` or `failed`; `in_progress` and
+   * `succeeded` mean the money may be taken. Search is eventually consistent
+   * (about a minute), so ask only about a purchase older than that. Throws
+   * `StripeUpstreamError` — and the caller must then leave the purchase pending.
+   */
+  findOffSessionPayment(purchaseId: string): Promise<OffSessionPaymentState>;
 
   /**
    * Makes a Checkout session unpayable, or reports that it already was paid.

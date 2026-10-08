@@ -99,3 +99,28 @@ tests were added.)
   gateway interface (`saveCard`), `test/support/fake-stripe-gateway.ts`.
 - Frontend (used/cap and the disabled-with-reason state): not in this API-only item; the API returns
   `auto_topup.disabled_reason`.
+
+## Audit (checkpoint 3 re-audit) — status as of this commit
+
+**NEW-D-7 REMAINS PARTIAL. It is not done and must not be marked done.**
+
+| # | Audit finding | Status |
+|---|---|---|
+| 1 (blocker) | F6 stale-pending expiry reopens the F2 double charge after 60 min | **PARTLY ADDRESSED, STILL OPEN.** Done: the gateway can now ask Stripe about the original charge, `StripeGateway.findOffSessionPayment(purchaseId)` (PaymentIntent search on `metadata.purchase_id`; states `none` / `in_progress` / `succeeded` / `failed`; `in_progress` for anything not known dead; a non-UUID id is refused before it reaches the query). RED `1a8e1e2` (unit: 2 failed / 26 passed, `findOffSessionPayment is not a function`), GREEN in the next commit (28/28). **NOT done: `AutoTopupService.expireStalePending` still expires without asking, and the F6 integration test still asserts the second charge.** `trigger` has no caller, so nothing can double-charge today; it must not be wired until this lands. |
+| 2 (major) | trigger not wired; cycle roll missing; customer not told of an expired purchase | **NOT STARTED.** Needs the `billing.auto_topup` topology entry (spec section 4 + the topology pin test), an HMAC-verified handler that verifies BEFORE `withTenantContext`, a producer on the debit path (credit ledger, dangerous area), and the cycle roll with its own test in the same change. |
+| 3 | integration/isolation never re-run on this branch | **NOT RUN.** `/System/Volumes/Data` had 3.2 GiB free (floor 8 GiB) when this was attempted, so no testcontainers spec was run. The merge step must run `pnpm test:isolation`, `pnpm test:isolation:breakers`, `auto-topup-trigger.spec.ts` and `billing-usage-auto-topup.spec.ts` and record exit codes. |
+
+Why the service change was not made: it is money logic whose proof is the integration spec (the F6 test must be
+rewritten red-first, then mutation-tested), and that spec cannot run at 3.2 GiB free. Writing it unrun would be
+the unverified claim this audit objects to.
+
+The remaining change for finding 1, ready to apply when disk allows: in `claim`, before `expireStalePending`
+frees a row, `findOffSessionPayment(id)` for each stale pending row OUTSIDE a transaction (KAD-06: no network call
+inside the tenant tx, so this moves to the plan phase). `none`/`failed` -> expire. `in_progress`/`succeeded`/lookup
+error -> leave it pending (in flight, no new charge). Rewrite F6: 503 on charge, +61 min, `offSessionStates`
+= `in_progress` -> no second charge; = `none` -> expired and charged once more with a NEW purchase id; lookup
+failing -> still pending. The `FakeStripeGateway` already supports this (`offSessionStates`, `failStateLookupWith`).
+Also decide: email the customer on expiry (needs a decision on the disabled-reason enum).
+
+Gates for this commit (`7day/d-usage-3`): `pnpm lint` exit 0, `pnpm typecheck` exit 0, unit subset
+`src/lib/billing src/modules/billing contracts` exit 0 (26 files / 331 tests). Full `test:unit` not re-run here.
