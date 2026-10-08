@@ -195,6 +195,7 @@ describe("STORY-073 · reading the credit ledger", () => {
         lifetime_granted: 1_200,
         lifetime_purchased: 1_000,
         lifetime_spent: 600,
+        auto_topup: { enabled: false, pack_key: null, threshold: null, max_per_cycle: null, used_this_cycle: 0, trigger_active: false }, // NEW-D-6: off by default
       });
     });
 
@@ -261,6 +262,7 @@ describe("STORY-073 · reading the credit ledger", () => {
         lifetime_granted: 0,
         lifetime_purchased: 0,
         lifetime_spent: 0,
+        auto_topup: { enabled: false, pack_key: null, threshold: null, max_per_cycle: null, used_this_cycle: 0, trigger_active: false }, // NEW-D-6: off by default
       });
     });
 

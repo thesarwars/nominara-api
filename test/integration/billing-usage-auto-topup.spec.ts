@@ -92,7 +92,15 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
     (await harness.db().query("SELECT auto_topup_enabled, auto_topup_pack_key, auto_topup_threshold, auto_topup_max_per_cycle, auto_topup_count_cycle FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rows[0];
   const audit = async (workspaceId: string) =>
     (await harness.db().query("SELECT action, resource_type, actor_id FROM audit_log WHERE workspace_id = $1 AND action LIKE 'billing.auto_topup.%' ORDER BY seq", [workspaceId])).rows;
-  const periodStart = async () => (await harness.db().query<{ d: string }>("SELECT date_trunc('month', now() AT TIME ZONE 'UTC')::date::text AS d")).rows[0]!.d;
+  // The counters roll WITH the wallet's cycle, then the live subscription's period, then the calendar month (billing-period.ts).
+  const periodStart = async (workspaceId: string) =>
+    (await harness.db().query<{ d: string }>(
+      `SELECT COALESCE(
+         (SELECT cycle_start FROM credit_wallets WHERE workspace_id = $1),
+         (SELECT current_period_start::date FROM subscriptions WHERE workspace_id = $1 AND status IN ('trialing','active','past_due') ORDER BY current_period_start DESC LIMIT 1),
+         date_trunc('month', now() AT TIME ZONE 'UTC')::date)::text AS d`,
+      [workspaceId],
+    )).rows[0]!.d;
 
   // ---- STORY-076 AC6 / scenario 6 --------------------------------------------------------------
 
@@ -223,7 +231,7 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
 
   it("NEW-D-6 · GET /billing/usage reads the current period's counter in the usage contract", async () => {
     const { workspaceId, owner } = await newWorkspace();
-    const start = await periodStart();
+    const start = await periodStart(workspaceId);
     await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'pdf_exports',$2,25,7)", [workspaceId, start]);
     const res = await get(owner, "/billing/usage");
     expect(res.statusCode, res.body).toBe(200);
@@ -232,11 +240,11 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
 
   it("NEW-D-6 · cap null means unlimited and cap 0 means the tier has none: they are different answers", async () => {
     const unlimited = await newWorkspace("business");
-    await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'pdf_exports',$2,-1,4)", [unlimited.workspaceId, await periodStart()]);
+    await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'pdf_exports',$2,-1,4)", [unlimited.workspaceId, await periodStart(unlimited.workspaceId)]);
     expect(dataOf<{ pdf_exports: unknown }>(await get(unlimited.owner, "/billing/usage")).pdf_exports).toEqual({ used: 4, cap: null });
 
     const none = await newWorkspace("starter");
-    await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'pdf_exports',$2,0,0)", [none.workspaceId, await periodStart()]);
+    await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'pdf_exports',$2,0,0)", [none.workspaceId, await periodStart(none.workspaceId)]);
     expect(dataOf<{ pdf_exports: unknown }>(await get(none.owner, "/billing/usage")).pdf_exports).toEqual({ used: 0, cap: 0 });
   });
 
@@ -249,7 +257,7 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
   it("NEW-D-6 · only the current period's counter is read, and the unpublished metrics never appear", async () => {
     const { workspaceId, owner } = await newWorkspace();
     await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'pdf_exports','2020-01-01',25,24)", [workspaceId]);
-    await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'fair_use_captures',$2,500,321)", [workspaceId, await periodStart()]);
+    await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'fair_use_captures',$2,500,321)", [workspaceId, await periodStart(workspaceId)]);
     const res = await get(owner, "/billing/usage");
     expect(dataOf<{ pdf_exports: unknown }>(res).pdf_exports).toEqual({ used: 0, cap: 25 });
     expect(res.body).not.toContain("fair_use");
@@ -284,7 +292,7 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
   it("NEW-D-6 · usage and auto-top-up are tenant-isolated: another workspace's counters, tokens and config never appear", async () => {
     const a = await newWorkspace();
     const b = await newWorkspace();
-    await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'pdf_exports',$2,25,19)", [b.workspaceId, await periodStart()]);
+    await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'pdf_exports',$2,25,19)", [b.workspaceId, await periodStart(b.workspaceId)]);
     await put(b.owner, CONFIG);
     expect(dataOf<{ pdf_exports: unknown }>(await get(a.owner, "/billing/usage")).pdf_exports).toEqual({ used: 0, cap: 25 });
     expect((await walletOf(a.owner)).auto_topup.enabled).toBe(false);
