@@ -116,3 +116,8 @@ Why I did not choose: both ways to read domain names change a security boundary 
 Also decide: portal `gap_severity` non-null and no `other` class in the contract versus the agency read (null while unverified; has `other`).
 Decision 9 (unverified domains keep NULL coverage) points to nullable. Once decided this is about half a day.
 Until then the sources criterion and the "no fact tables" criterion for sources are NOT MET.
+
+## Audit round 3 status (2026-10-08): PARTIAL
+
+NEW-E-099b is **partial**, not done: \`GET /portal/sources\` is not built (criterion "Sources is read from project_source_index
+only" is NOT MET, blocked on the owner decision above). The portal frontend's sources tab must stay on demo data.

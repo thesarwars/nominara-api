@@ -137,3 +137,19 @@ Every row of the Criteria table that read "integration NOT RUN" is now **integra
 - Finding 3b (footer `sample_size` under hide_costs): still needs the owner ruling stated above; unchanged.
 - "Rollups only" tension (Decision 1 above): unchanged and still the owner's call.
 - Evidence needing a running real API (live portal against a real stack) is collected in NEW-A-17.
+
+## Audit round 3 (2026-10-08): leak on growth-map, 0112 operator note
+
+- Finding 1 [blocker], hide_competitors leak through a task_completed milestone: fixed at `eba7de6`
+  (`GrowthMapService.milestones`: NOT EXISTS over tasks by source_type='task' AND source_id with source_displacement_id set;
+  the dead `source_type IS DISTINCT FROM 'competitor'` predicate is removed). Test:
+  `test/integration/portal-reads-http.spec.ts` "STORY-098 s11 · hide_competitors: a task_completed milestone of a
+  displacement-born task ..." (asserts tasks and growth-map bodies both lack "Globex", plus the unhidden control).
+  RED commit `e181a1c`. **NOT RUN, so NOT OBSERVED RED OR GREEN**: `df -h /System/Volumes/Data` showed 6.3 GiB free (rule: stop
+  under 8 GiB), so no testcontainers spec was run. Needs: free the disk to 8 GiB, then run
+  `pnpm exec vitest run --config vitest.integration.config.ts test/integration/portal-reads-http.spec.ts` at `e181a1c`
+  (expect the new test red) and at `eba7de6` (expect green).
+- Finding 2 [major], 0112 / README G-4 / ADR-0002 wording: now state a SUPERUSER migration identity is required and a
+  non-superuser path is not designed (no test added, since none is claimed). 0112 edit is comment-only; the runner keeps no checksum.
+- Gates at `eba7de6`: `pnpm lint` exit 0, `pnpm typecheck` exit 0, `pnpm test:unit` exit 0 (283 files passed, 1 skipped; 3370 tests).
+  Isolation suites are run at merge. Real-API evidence is collected in NEW-A-17.
