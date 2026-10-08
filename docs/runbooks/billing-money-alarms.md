@@ -23,7 +23,7 @@ unreachable. If it fires, money was taken and no credits were granted.
 **Act.**
 1. Look the `payment_intent_id` up in Stripe. Confirm `metadata.workspace_id` equals the logged workspace.
 2. If the purchase row exists under another workspace, the metadata was forged or mis-set: do not credit. Refund.
-3. If the row is truly missing, decide with the customer: refund at Stripe, or have an operator insert the `credit_purchases` row (`status='pending'`, the pack's frozen credits and price) and replay the event from the Stripe dashboard. The handler then settles it, keyed by the PaymentIntent id, so a replay cannot credit twice.
+3. If the row is truly missing, decide with the customer: refund at Stripe, or have an operator insert the `credit_purchases` row with `id` = the logged `purchase_id` (`status='pending'`, the pack's credits and price as sold) and replay the event from the Stripe dashboard. The handler then settles it, keyed by the PaymentIntent id, so a replay cannot credit twice.
 4. Never insert a ledger row by hand.
 
 ## 2. `nominara_billing_plan_price_mismatch_total`
