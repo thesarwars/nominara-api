@@ -130,14 +130,19 @@ describe("STORY-072 · rolling 0022 back", () => {
   const TARGET = "0022_credit_ledger_attempt";
 
   async function rollBackToTwentyTwo(): Promise<void> {
-    for (let popped = 0; popped < 20; popped += 1) {
+    // The bound is the number of migrations actually applied, not a guess:
+    // a fixed ceiling broke once already when the stack above 0022 grew past
+    // it. The loop still terminates (each pass pops one), and it still fails
+    // loudly if 0022 is never reached.
+    const applied = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM _migrations.applied");
+    for (let popped = 0; popped <= Number(applied.rows[0]?.n ?? 0); popped += 1) {
       const head = await db.query<{ name: string }>(
         "SELECT name FROM _migrations.applied ORDER BY name DESC LIMIT 1",
       );
       if (head.rows[0]?.name === TARGET) return;
       await rollbackLast(db);
     }
-    throw new Error(`rolled back twenty migrations without reaching ${TARGET}`);
+    throw new Error(`rolled back every applied migration without reaching ${TARGET}`);
   }
 
   it("rolls back cleanly when no request key has more than one attempt", async () => {
