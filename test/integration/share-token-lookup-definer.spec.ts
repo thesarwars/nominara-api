@@ -56,9 +56,9 @@ describe("CP2 decision 1 · app.share_token_by_hash is owned by a dedicated, nar
   }
 
   it("DEF-1 · the function's owner is the dedicated role: NOLOGIN, NOSUPERUSER, NOINHERIT, no CREATEROLE/CREATEDB/REPLICATION, and neither nominara_app nor the migration identity", async () => {
-    const r = await admin.query<{ owner: string; login: boolean; super: boolean; inherit: boolean; createrole: boolean; createdb: boolean; repl: boolean; migrator: string }>(
+    const r = await admin.query<{ owner: string; login: boolean; super: boolean; inherit: boolean; createrole: boolean; bypass: boolean; createdb: boolean; repl: boolean; migrator: string }>(
       `SELECT o.rolname AS owner, o.rolcanlogin AS login, o.rolsuper AS super, o.rolinherit AS inherit,
-              o.rolcreaterole AS createrole, o.rolcreatedb AS createdb, o.rolreplication AS repl, current_user AS migrator
+              o.rolcreaterole AS createrole, o.rolbypassrls AS bypass, o.rolcreatedb AS createdb, o.rolreplication AS repl, current_user AS migrator
          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_roles o ON o.oid = p.proowner
         WHERE n.nspname = 'app' AND p.proname = 'share_token_by_hash'`,
     );
@@ -67,7 +67,9 @@ describe("CP2 decision 1 · app.share_token_by_hash is owned by a dedicated, nar
     expect(row.owner).toBe(LOOKUP_ROLE);
     expect(row.owner).not.toBe("nominara_app");
     expect(row.owner).not.toBe(row.migrator);
-    expect([row.login, row.super, row.inherit, row.createrole, row.createdb, row.repl]).toEqual([false, false, false, false, false, false]);
+    // NOBYPASSRLS: ISO-07 and ADR-0001 reserve BYPASSRLS for nominara_breakglass alone. The owner reads FORCE-RLS
+    // share_tokens through ONE role-targeted SELECT policy instead (DEF-8), never through the attribute.
+    expect([row.login, row.super, row.inherit, row.createrole, row.createdb, row.repl, row.bypass]).toEqual([false, false, false, false, false, false, false]);
   });
 
   it("DEF-2 · the owner's table rights are column-level SELECT on share_tokens only: it cannot read the token label, prefix or creator, cannot write, and sees no other table", async () => {
@@ -202,5 +204,23 @@ describe("CP2 decision 1 · app.share_token_by_hash is owned by a dedicated, nar
       [LOOKUP_ROLE],
     );
     expect(create.rows[0]).toEqual({ app: false, pub: false });
+  });
+
+  it("DEF-8 · ISO-07 holds on the fully migrated schema: across the WHOLE cluster only nominara_breakglass has rolbypassrls", async () => {
+    const r = await admin.query<{ rolname: string }>("SELECT rolname FROM pg_roles WHERE rolbypassrls AND NOT rolsuper ORDER BY rolname");
+    expect(r.rows.map((x) => x.rolname)).toEqual([BREAKGLASS_ROLE]);
+  });
+
+  it("DEF-9 · share_tokens carries exactly ONE policy for the owner role: FOR SELECT, TO nominara_share_lookup only, USING (true), no WITH CHECK; the ws_isolation policy is unchanged", async () => {
+    const r = await admin.query<{ policyname: string; cmd: string; roles: string; qual: string | null; with_check: string | null }>(
+      `SELECT policyname, cmd, roles::text AS roles, qual, with_check FROM pg_policies WHERE schemaname = 'public' AND tablename = 'share_tokens' ORDER BY policyname`,
+    );
+    const mine = r.rows.filter((p) => p.roles.includes(LOOKUP_ROLE));
+    expect(mine).toHaveLength(1);
+    expect(mine[0]).toMatchObject({ policyname: "share_token_gate_lookup", cmd: "SELECT", roles: `{${LOOKUP_ROLE}}`, qual: "true", with_check: null });
+    const iso = r.rows.filter((p) => p.policyname === "ws_isolation_share_tokens");
+    expect(iso).toHaveLength(1);
+    expect(iso[0]!.roles).not.toContain(LOOKUP_ROLE);
+    expect(iso[0]!.qual).toContain("app.current_workspace()");
   });
 });
