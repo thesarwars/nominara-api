@@ -3,7 +3,7 @@ import { deriveSemverBump, type OpenApiDocumentLike } from "../../src/contracts/
 
 // STORY-023 T2 (RED step) — Test scenarios 4-7 (STORY-023.md "Test scenarios
 // — write these first"):
-//   4  Add a field                -> patch-level publish
+//   4  Add a field                -> minor-level publish (owner decision 5: an added optional field is minor at any depth)
 //   5  Add an endpoint            -> minor-level publish
 //   6  Remove a field             -> major-level publish
 //   7  Narrow a type              -> major-level publish
@@ -74,7 +74,7 @@ function deepClone<T>(value: T): T {
 }
 
 describe("STORY-023 · contracts:diff — semver derived from the specification diff (AC5, NFR-REPO-02)", () => {
-  it("scenario 4 — adding an OPTIONAL field to an existing request/response schema is a patch-level bump", async () => {
+  it("scenario 4 — adding an OPTIONAL field to an existing request/response schema is a minor-level bump (owner decision 5: one rule at any depth)", async () => {
     const previous = baseDocument();
     const current = deepClone(previous);
     // Additive and optional — current.paths[...].post.requestBody... — NOT
@@ -83,7 +83,7 @@ describe("STORY-023 · contracts:diff — semver derived from the specification 
       type: "string",
     };
 
-    expect(deriveSemverBump(previous, current)).toBe("patch");
+    expect(deriveSemverBump(previous, current)).toBe("minor");
   });
 
   it("scenario 5 — adding a whole new endpoint is a minor-level bump", async () => {
@@ -239,8 +239,8 @@ describe("STORY-023 · contracts:diff — semver derived from the specification 
 // change under a shared property that was not an enum move fell through to
 // `major`, so adding one optional field inside a response's nested object
 // published a breaking version for a change no client can break on. The
-// owner's rule: a nested ADDED OPTIONAL field is `minor` (a top-level one
-// stays `patch`, scenario 4). Everything breaking stays `major` at depth.
+// owner's rule: an ADDED OPTIONAL field is `minor` at ANY depth, the top
+// level included (decision 5, 2026-10-08: one rule; scenario 4). Everything breaking stays `major` at depth.
 function nestedDocument(): OpenApiDocumentLike {
   return {
     openapi: "3.1.0",
@@ -316,7 +316,7 @@ describe("NEW-A-5 · contracts:diff recurses into nested object and array-item s
     expect(deriveSemverBump(previous, current)).toBe("minor");
   });
 
-  it("NEW-A-5 · a new OPTIONAL property on the response body's data object (one level down) is minor, while the same at the root stays patch", () => {
+  it("NEW-A-5 · a new OPTIONAL property on the response body's data object (one level down) is minor, and so is the same at the root (one rule at any depth)", () => {
     const previous = nestedDocument();
     const nested = deepClone(previous);
     dataSchema(nested).properties.blend = { type: "object", properties: {}, additionalProperties: false };
@@ -326,7 +326,7 @@ describe("NEW-A-5 · contracts:diff recurses into nested object and array-item s
     ((root.paths["/v1/scores"]!.get!.responses["200"]!.content!["application/json"]!.schema as Loose).properties as Loose).note = {
       type: "string",
     };
-    expect(deriveSemverBump(previous, root)).toBe("patch");
+    expect(deriveSemverBump(previous, root)).toBe("minor");
   });
 
   it("NEW-A-5 · a nested object gaining a REQUIRED field is major", () => {
