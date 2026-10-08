@@ -75,6 +75,7 @@ export class BillingController {
     operationId: "listCreditLedger",
     querySchema: creditLedgerQuerySchema,
     responseSchema: creditLedgerListResponseSchema,
+    listOf: true,
   })
   ledger(
     @Query(new ZodValidationPipe(creditLedgerQuerySchema)) query: CreditLedgerQuery,
