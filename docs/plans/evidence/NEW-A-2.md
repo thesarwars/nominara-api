@@ -1,6 +1,6 @@
 # NEW-A-2 evidence (checkpoint 2, lane 7day/a-api-3)
 
-Observability: spans deferred to week 2 (owner decision 3). Unchanged this checkpoint: no code in this item changed.
+Observability: spans deferred to week 2 (owner decision R3). Unchanged this checkpoint: no code in this item changed.
 
 ## What checkpoint 2 failed, and why it cannot be closed here
 The single failed criterion is AC4, "Frontend `useMe()` works in api mode; the app shell resolves the active workspace from it".
@@ -34,3 +34,5 @@ All run in /Users/sarwaralam/Desktop/Projects/ElegantTech/nominara/api-wt-a2 on 
 - `pnpm test:isolation` / `test:isolation:breakers`: not run; they crash in fixture setup at this tip (`ck_support_ttl_max`, d-admin lane).
   No tenant table, migration or RLS policy was touched by this lane (no db:rls-generate needed). The merge step runs the isolation suites.
 - Evidence that needs a running real API (session -> GET /v1/me, data_source on live responses) is collected in NEW-A-17.
+
+- Audit 4: NEW-A-2 is NOT closed from this lane. The failed criterion (frontend useMe() in api mode) is the fe lane's and NEW-A-17's; the item stays FAILED / reassigned to fe + NEW-A-17.

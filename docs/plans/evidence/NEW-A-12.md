@@ -1,11 +1,11 @@
 # NEW-A-12 evidence (checkpoint 2, lane 7day/a-api-3)
 
 QA passed this item at checkpoint 2. Recorded here for completeness; no code changed this checkpoint.
-Spans deferred to week 2 (owner decision 3); the revoke metric and redacted log line are in code and in the tests below.
+Spans deferred to week 2 (owner decision R3); the revoke metric and redacted log line are in code and in the tests below.
 
 | # | Criterion | Proof |
 |---|---|---|
-| 1 | Contract first; member name/email additive; workspace-detail and invitation-revoke schemas | cae4ff1 (contracts alone). cae4ff1 did not regenerate openapi (QA gap); 37edfd6 regenerated it and made `name`/`email` optional so the diff is minor (RED d3e9c89, 1 RED). Under decision 5 an added optional field is minor everywhere. |
+| 1 | Contract first; member name/email additive; workspace-detail and invitation-revoke schemas | cae4ff1 (contracts alone). cae4ff1 did not regenerate openapi (QA gap); 37edfd6 regenerated it and made `name`/`email` optional so the diff is minor (RED d3e9c89, 1 RED). Under decision R5 an added optional field is minor everywhere. |
 | 2 | Isolation as `nominara_app`: members of A never include a B-only user; path id != token ws claim is 403 | `test/integration/workspace-members-detail-revoke.spec.ts` (9 tests; runs as nominara_app). RED 2721836: 7 of 9 failed for the right reasons (404 / missing name,email). |
 | 3 | Revoke needs `member:invite`, writes an audit event, 404 for another tenant's invitation | same spec; QA mutations killed: drop @Audit (4 fail), weaker permission (1), drop pending-only predicate (1), drop path==claim check (1). |
 | 4 | dangerous-area-auditor second engineer | The single finding (major contract bump) is fixed (37edfd6). No formal re-approval is recorded; a re-audit must be run by the auditor, not by this lane. |

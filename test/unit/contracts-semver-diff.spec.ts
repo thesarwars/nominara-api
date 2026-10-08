@@ -3,7 +3,7 @@ import { deriveSemverBump, type OpenApiDocumentLike } from "../../src/contracts/
 
 // STORY-023 T2 (RED step) — Test scenarios 4-7 (STORY-023.md "Test scenarios
 // — write these first"):
-//   4  Add a field                -> minor-level publish (owner decision 5: an added optional field is minor at any depth)
+//   4  Add a field                -> minor-level publish (owner decision R5: an added optional field is minor at any depth)
 //   5  Add an endpoint            -> minor-level publish
 //   6  Remove a field             -> major-level publish
 //   7  Narrow a type              -> major-level publish
@@ -74,7 +74,7 @@ function deepClone<T>(value: T): T {
 }
 
 describe("STORY-023 · contracts:diff — semver derived from the specification diff (AC5, NFR-REPO-02)", () => {
-  it("scenario 4 — adding an OPTIONAL field to an existing request/response schema is a minor-level bump (owner decision 5: one rule at any depth)", async () => {
+  it("scenario 4 — adding an OPTIONAL field to an existing request/response schema is a minor-level bump (owner decision R5: one rule at any depth)", async () => {
     const previous = baseDocument();
     const current = deepClone(previous);
     // Additive and optional — current.paths[...].post.requestBody... — NOT
@@ -240,7 +240,7 @@ describe("STORY-023 · contracts:diff — semver derived from the specification 
 // `major`, so adding one optional field inside a response's nested object
 // published a breaking version for a change no client can break on. The
 // owner's rule: an ADDED OPTIONAL field is `minor` at ANY depth, the top
-// level included (decision 5, 2026-10-08: one rule; scenario 4). Everything breaking stays `major` at depth.
+// level included (decision R5, 2026-10-08: one rule; scenario 4). Everything breaking stays `major` at depth.
 function nestedDocument(): OpenApiDocumentLike {
   return {
     openapi: "3.1.0",

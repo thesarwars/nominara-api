@@ -2,7 +2,7 @@
 
 Tip: see `git log` on 7day/a-api-3. Fix commit for this item: 4b1e129 (test fixture). Tenant isolation here is proved by the
 seed running through the pooled `nominara_app` connection (`assertPooledConnectionIsRuntimeApp`) in every test of the spec.
-OpenTelemetry spans are deferred to week 2 (owner decision 3, 2026-10-08): a missing span is not a failed criterion this week.
+OpenTelemetry spans are deferred to week 2 (owner decision R3, 2026-10-08): a missing span is not a failed criterion this week.
 The seed is a CLI, not a request path, so its observability is the redacted log lines it already writes (workspace ID only).
 
 ## Why QA failed it, and the fix

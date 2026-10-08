@@ -192,7 +192,7 @@ function compareObjectSchema(
     }
     if (!inPrevious && inCurrent) {
       // field added: required is breaking; optional is `minor` at ANY depth,
-      // the top level of a body included (owner decision 5, 2026-10-08: one rule).
+      // the top level of a body included (owner decision R5, 2026-10-08: one rule).
       bump = mostSevere(bump, currentRequired.has(name) ? "major" : "minor");
       continue;
     }
@@ -266,7 +266,7 @@ function compareOperation(previous: OperationLike, current: OperationLike): Semv
 
 /**
  * AC5/NFR-REPO-02 — minor for an added optional field (any depth, owner
- * decision 5) and for new endpoints, major for any removal or type narrowing. The MOST SEVERE change across
+ * decision R5) and for new endpoints, major for any removal or type narrowing. The MOST SEVERE change across
  * every path/method/field wins; nothing here reports "the last change it
  * happened to look at" (the whole reason this walk always takes the
  * running max rather than returning early).
