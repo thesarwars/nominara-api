@@ -42,11 +42,13 @@ import { EMAIL_SENDER, type EmailSender } from "../identity/ports/email-sender.j
 // request path (KAD-06). See docs/plans/evidence/NEW-D-7.md.
 
 /**
- * A `pending` auto-top-up purchase older than this no longer counts as a charge
- * in flight. An off-session charge settles or fails within seconds, and the
- * Stripe idempotency key for it expires at 24 h, so an hour-old pending row is a
- * charge that will never be confirmed: it is failed (a failed row still settles
- * if the payment turns out to have been taken) so it cannot block auto-top-up forever.
+ * A `pending` auto-top-up purchase older than this is CHECKED WITH STRIPE. The
+ * clock alone proves nothing about the money: a 503 or a timeout on the charge
+ * request says nothing about whether Stripe took it, and a bank debit can stay
+ * `processing` for days. Only Stripe saying `none` or `failed` frees the slot
+ * (the row is failed); `in_progress`, `succeeded`, or a lookup that errors leave
+ * it pending, which keeps the in-flight guard closed — no second charge — until
+ * the webhook settles it. A failed row still settles if the payment is taken.
  */
 const STALE_PENDING_MINUTES = 60;
 
@@ -68,6 +70,8 @@ interface Ready {
   readonly packKey: string;
   readonly contact: string;
   readonly referencePaymentIntentId: string | null;
+  /** Pending auto-top-up purchases past the stale window, to be asked about at Stripe (never inside a transaction). */
+  readonly staleIds: readonly string[];
 }
 
 interface Claimed {
@@ -98,9 +102,13 @@ export class AutoTopupService {
     // 1. PLAN — cheap checks that need no network, so a workspace at its cap costs one read.
     const planned = await this.inTx(workspaceId, (tx) => this.plan(tx, workspaceId));
     if ("outcome" in planned) return planned.outcome;
-    const { packKey, contact, referencePaymentIntentId } = planned.ready;
+    const { packKey, contact, referencePaymentIntentId, staleIds } = planned.ready;
 
-    // 2. THE SAVED CARD — outside any transaction.
+    // 2a. STALE PENDING CHARGES — ask Stripe, outside any transaction (KAD-06). Only `none` / `failed` may be expired.
+    const expirable = await this.classifyStale(workspaceId, staleIds);
+    if (expirable === null) return "upstream_error";
+
+    // 2b. THE SAVED CARD — outside any transaction.
     let method: SavedPaymentMethod | null = null;
     if (referencePaymentIntentId !== null) {
       try {
@@ -117,7 +125,7 @@ export class AutoTopupService {
     }
 
     // 3. CLAIM — the conditional UPDATE, the pending purchase and the audit row commit together.
-    const claim = await this.inTx(workspaceId, (tx) => this.claim(tx, workspaceId, packKey));
+    const claim = await this.inTx(workspaceId, (tx) => this.claim(tx, workspaceId, packKey, expirable));
     if ("outcome" in claim) return claim.outcome;
     const { purchaseId, pack } = claim.claimed;
 
@@ -162,7 +170,7 @@ export class AutoTopupService {
       if (!(error instanceof StripeUpstreamError)) throw error;
       // A timeout does not prove the charge did not happen, so the purchase STAYS pending: the in-flight
       // guard stays closed (no second charge), the webhook settles it if the payment was taken, and
-      // `expireStalePending` frees the slot if it never is.
+      // `expireStalePending` frees the slot once Stripe confirms nothing is live.
       this.logger.error({ message: "auto-top-up charge request failed", workspace_id: workspaceId, purchase_id: purchaseId, status: error.statusCode });
       return "upstream_error";
     }
@@ -192,7 +200,13 @@ export class AutoTopupService {
       await this.recordSkipped(tx, workspaceId, "no_payment_method");
       return { outcome: "no_payment_method" };
     }
-    return { ready: { packKey: verdict.packKey, contact, referencePaymentIntentId } };
+    const stale = await tx.query<{ id: string }>(
+      `SELECT id FROM credit_purchases
+        WHERE workspace_id = $1 AND source = 'auto_topup' AND status = 'pending' AND created_at < now() - make_interval(mins => $2::int)
+        ORDER BY created_at, id`,
+      [workspaceId, STALE_PENDING_MINUTES],
+    );
+    return { ready: { packKey: verdict.packKey, contact, referencePaymentIntentId, staleIds: stale.rows.map((r) => r.id) } };
   }
 
   /** Why a trigger would not fire right now, or the pack it would buy. A read: the claim below is the authority. */
@@ -235,25 +249,49 @@ export class AutoTopupService {
     return (pending.rowCount ?? 0) > 0;
   }
 
-  /** Fails (and audits) pending auto-top-up purchases past the stale window. Runs under the wallet lock, before the claim. */
-  private async expireStalePending(tx: ClientBase, workspaceId: string): Promise<void> {
+  /**
+   * Asks Stripe about each stale pending purchase. Returns the ids Stripe says are dead (`none` / `failed`),
+   * or null when ANY lookup could not be answered: an unclassifiable row is a possible live charge, so
+   * nothing is expired and nothing is charged (fail closed).
+   */
+  private async classifyStale(workspaceId: string, staleIds: readonly string[]): Promise<readonly string[] | null> {
+    const dead: string[] = [];
+    for (const id of staleIds) {
+      try {
+        const state = await this.gateway.findOffSessionPayment(id);
+        incrementCounter("nominara_billing_auto_topup_stale_lookup_total", { state });
+        if (state === "none" || state === "failed") dead.push(id);
+      } catch (error) {
+        if (!(error instanceof StripeUpstreamError)) throw error;
+        incrementCounter("nominara_billing_auto_topup_stale_lookup_total", { state: "error" });
+        this.logger.error({ message: "auto-top-up could not ask the provider about a stale pending purchase", workspace_id: workspaceId, purchase_id: id, status: error.statusCode });
+        return null;
+      }
+    }
+    return dead;
+  }
+
+  /** Fails (and audits) the stale pending purchases Stripe said are dead. Runs under the wallet lock, before the claim; a row that settled meanwhile is not pending and is left alone. */
+  private async expireStalePending(tx: ClientBase, workspaceId: string, deadIds: readonly string[]): Promise<void> {
+    if (deadIds.length === 0) return;
     const stale = await tx.query<{ id: string }>(
       `UPDATE credit_purchases SET status = 'failed'
-        WHERE workspace_id = $1 AND source = 'auto_topup' AND status = 'pending' AND created_at < now() - make_interval(mins => $2::int)
+        WHERE workspace_id = $1 AND source = 'auto_topup' AND status = 'pending' AND id = ANY($3::uuid[])
+          AND created_at < now() - make_interval(mins => $2::int)
         RETURNING id`,
-      [workspaceId, STALE_PENDING_MINUTES],
+      [workspaceId, STALE_PENDING_MINUTES, deadIds],
     );
     for (const row of stale.rows) {
-      await this.writeAudit(tx, workspaceId, "billing.auto_topup.pending_expired", "credit_purchase", row.id, { status: "pending" }, { status: "failed", reason: "no_confirmation" });
+      await this.writeAudit(tx, workspaceId, "billing.auto_topup.pending_expired", "credit_purchase", row.id, { status: "pending" }, { status: "failed", reason: "provider_reports_no_live_charge" });
       incrementCounter("nominara_billing_auto_topup_pending_expired_total", {});
-      this.logger.warn({ message: "auto-top-up purchase expired without a payment confirmation", workspace_id: workspaceId, purchase_id: row.id });
+      this.logger.warn({ message: "auto-top-up purchase expired: the provider reports no live charge", workspace_id: workspaceId, purchase_id: row.id });
     }
   }
 
-  private async claim(tx: ClientBase, workspaceId: string, packKey: string): Promise<{ claimed: Claimed } | { outcome: AutoTopupTriggerOutcome }> {
+  private async claim(tx: ClientBase, workspaceId: string, packKey: string, deadIds: readonly string[]): Promise<{ claimed: Claimed } | { outcome: AutoTopupTriggerOutcome }> {
     // The row lock serialises concurrent triggers; the next statement then sees the winner's committed purchase.
     if (!(await lockWallet(tx, workspaceId))) return { outcome: "not_enabled" };
-    await this.expireStalePending(tx, workspaceId);
+    await this.expireStalePending(tx, workspaceId, deadIds);
     const pack = (await purchasableOptions(tx, workspaceId)).find((o) => o.key === packKey);
     if (pack === undefined) return { outcome: "pack_unavailable" };
 
