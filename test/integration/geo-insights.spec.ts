@@ -219,4 +219,33 @@ describe("STORY-062 · GEO insights persistence and read", () => {
     }
     expect(await count()).toBe(1);
   });
+  it("STORY-062 isolation · an attacker-workspace row against the victim's project is rejected by the composite FK, is indistinguishable from an unknown project, and cannot block the victim's rollup write", async () => {
+    // The FK check runs without RLS, so before 0072 `workspace_id = attacker` with
+    // `project_id = victim` passed WITH CHECK and the single-column FK: an existence
+    // oracle, and a row that made the victim's ON CONFLICT hit an invisible row.
+    const other = randomUUID();
+    await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'W4',$2,'growth','UTC')", [other, `w-${randomUUID().slice(0, 8)}`]);
+    const attacker = <T>(fn: (c: Client) => Promise<T>) =>
+      withTenantContext(db, { workspaceId: other, actorId: randomUUID() }, () => fn(db)) as Promise<T>;
+    const insertFor = (project: string) => (c: Client) =>
+      c.query(
+        `INSERT INTO geo_analyses (workspace_id, project_id, analysis, window_start, window_days, sufficient, score)
+         VALUES ($1, $2, 'structure', '2026-09-08', 30, true, 99)`,
+        [other, project],
+      );
+    await db.query("SET ROLE nominara_app");
+    try {
+      const real = await attacker((c) => insertFor(projectId)(c).then(() => null, (e: { code?: string; constraint?: string }) => e));
+      const unknown = await attacker((c) => insertFor(randomUUID())(c).then(() => null, (e: { code?: string; constraint?: string }) => e));
+      expect(real, "the victim's project id must be rejected").not.toBeNull();
+      expect(real).toMatchObject({ code: "23503" });
+      expect(unknown).toMatchObject({ code: "23503" });
+      expect(real?.constraint).toBe(unknown?.constraint);
+      // The victim's own write for that window still succeeds.
+      await expect(ctx((s) => s.persistAnalysis(projectId, write("structure")))).resolves.not.toThrow();
+    } finally {
+      await db.query("RESET ROLE");
+    }
+    expect(await count()).toBe(1);
+  });
 });
