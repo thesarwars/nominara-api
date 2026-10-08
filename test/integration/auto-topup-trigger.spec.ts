@@ -73,6 +73,9 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     gateway.offSessionOutcome = "submitted";
     gateway.failChargeWith = undefined;
     gateway.failFetchWith = undefined;
+    gateway.offSessionStates.clear();
+    gateway.offSessionStateLookups.length = 0;
+    gateway.failStateLookupWith = undefined;
     gateway.configured = true;
     email.sent.length = 0;
     email.failNext = false;
@@ -469,22 +472,125 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(0);
   });
 
+  // ---- NEW-D-7 audit: every guard in the claim UPDATE has a test that fails without it -------------
+
+  it("NEW-D-7 audit · the claim re-checks `enabled`: opting out between plan and claim is refused at the UPDATE: not_enabled, no charge, no email, no slot", async () => {
+    const { workspaceId, owner } = await armed({ max: 5 });
+    const release = gateway.holdLookups();
+    const stale = service.trigger(workspaceId); // planned while enabled, parked in the card lookup
+    await lookupsReached(1);
+    expect((await put(owner, { enabled: false, pack_key: null, threshold: null, max_per_cycle: null })).statusCode).toBe(200);
+    release();
+    expect(await stale).toBe("not_enabled");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(email.sent).toHaveLength(0);
+    expect(await autoPurchases(workspaceId)).toHaveLength(0);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(0);
+  });
+
+  it("NEW-D-7 audit · the claim re-checks the threshold: a balance that recovered between plan and claim is above_threshold at the UPDATE, nothing charged", async () => {
+    const { workspaceId } = await armed({ max: 5 });
+    const release = gateway.holdLookups();
+    const stale = service.trigger(workspaceId); // planned at 50 of 100
+    await lookupsReached(1);
+    await setBalance(workspaceId, 500); // a manual pack settled
+    release();
+    expect(await stale).toBe("above_threshold");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(email.sent).toHaveLength(0);
+    expect(await autoPurchases(workspaceId)).toHaveLength(0);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(0);
+  });
+
+  it("NEW-D-7 audit · the claim re-checks the pack: a pack switched between plan and claim is not charged at the stale pack's price", async () => {
+    const { workspaceId, owner } = await armed({ max: 5 });
+    expect((await put(owner, { enabled: true, pack_key: "agency_vault", threshold: 100, max_per_cycle: 5 })).statusCode).toBe(200);
+    const release = gateway.holdLookups();
+    const stale = service.trigger(workspaceId); // planned for agency_vault ($50)
+    await lookupsReached(1);
+    expect((await put(owner, { enabled: true, pack_key: "starter_vault", threshold: 100, max_per_cycle: 5 })).statusCode).toBe(200);
+    release();
+    expect(await stale).not.toBe("charge_submitted");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(email.sent).toHaveLength(0);
+    expect(await autoPurchases(workspaceId)).toHaveLength(0);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(0);
+  });
+
   // ---- NEW-D-7 audit F6: a stuck pending purchase ----------------------------------------------
 
-  it("NEW-D-7 audit F6 · a pending auto-top-up purchase older than an hour no longer blocks: it is failed, audited, and a new trigger can charge", async () => {
-    const { workspaceId } = await armed({ max: 5 });
+  /** An auto-top-up charge whose answer never came back (503) and whose purchase is now `minutes` old. */
+  async function stuckPending(minutes = 61) {
+    const armedWs = await armed({ max: 5 });
     gateway.failChargeWith = new StripeUpstreamError(503);
-    expect(await service.trigger(workspaceId)).toBe("upstream_error");
+    expect(await service.trigger(armedWs.workspaceId)).toBe("upstream_error");
     gateway.failChargeWith = undefined;
-    const stuck = (await autoPurchases(workspaceId))[0]!;
-    await harness.db().query("UPDATE credit_purchases SET created_at = now() - interval '61 minutes' WHERE id = $1", [stuck.id]);
-    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
-    const purchases = await autoPurchases(workspaceId);
-    expect(purchases).toHaveLength(2);
-    expect(purchases.find((p) => p.id === stuck.id)).toMatchObject({ status: "failed" });
-    expect(purchases.filter((p) => p.status === "pending")).toHaveLength(1);
-    expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([expect.objectContaining({ resource_type: "credit_purchase", resource_id: stuck.id })]);
-    expect(gateway.offSessionCharges).toHaveLength(1);
+    const stuck = (await autoPurchases(armedWs.workspaceId))[0]!;
+    await harness.db().query("UPDATE credit_purchases SET created_at = now() - make_interval(mins => $2::int) WHERE id = $1", [stuck.id, minutes]);
+    return { workspaceId: armedWs.workspaceId, stuck };
+  }
+
+  it.each(["in_progress", "succeeded"] as const)(
+    "NEW-D-7 audit F6 · a stale pending purchase that Stripe says is %s is NOT expired and is NOT charged again (a clock alone proves nothing about the money)",
+    async (state) => {
+      const { workspaceId, stuck } = await stuckPending();
+      gateway.offSessionStates.set(stuck.id as string, state);
+      expect(await service.trigger(workspaceId)).toBe("in_flight");
+      expect(gateway.offSessionStateLookups).toEqual([stuck.id]);
+      expect(gateway.offSessionCharges).toHaveLength(0);
+      expect(email.sent.filter((m) => m.subject === "Nominara auto top-up triggered")).toHaveLength(1);
+      const purchases = await autoPurchases(workspaceId);
+      expect(purchases).toHaveLength(1);
+      expect(purchases[0]).toMatchObject({ id: stuck.id, status: "pending" });
+      expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
+      expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([]);
+    },
+  );
+
+  it.each(["none", "failed"] as const)(
+    "NEW-D-7 audit F6 · a stale pending purchase that Stripe says is %s is failed and audited, and exactly one new charge is made under a NEW purchase id",
+    async (state) => {
+      const { workspaceId, stuck } = await stuckPending();
+      if (state === "failed") gateway.offSessionStates.set(stuck.id as string, "failed");
+      expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+      expect(gateway.offSessionStateLookups).toEqual([stuck.id]);
+      const purchases = await autoPurchases(workspaceId);
+      expect(purchases).toHaveLength(2);
+      expect(purchases.find((p) => p.id === stuck.id)).toMatchObject({ status: "failed" });
+      expect(purchases.filter((p) => p.status === "pending")).toHaveLength(1);
+      expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([expect.objectContaining({ resource_type: "credit_purchase", resource_id: stuck.id })]);
+      expect(gateway.offSessionCharges).toHaveLength(1);
+      expect(gateway.offSessionCharges[0]!.purchaseId).not.toBe(stuck.id);
+    },
+  );
+
+  it("NEW-D-7 audit F6 · when Stripe cannot be asked about a stale pending purchase it stays pending: nothing expired, nothing charged, no slot taken", async () => {
+    const { workspaceId, stuck } = await stuckPending();
+    gateway.failStateLookupWith = new StripeUpstreamError(503);
+    expect(await service.trigger(workspaceId)).toBe("upstream_error");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(email.sent.filter((m) => m.subject === "Nominara auto top-up triggered")).toHaveLength(1);
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ id: stuck.id, status: "pending" });
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
+    expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([]);
+  });
+
+  it("NEW-D-7 audit F6 · a stale purchase that settles between the Stripe lookup and the claim is not failed over (the webhook wins): it stays succeeded and no expiry is audited", async () => {
+    const { workspaceId, stuck } = await stuckPending();
+    // Stripe says `none`; the late success webhook then lands before the claim: the row is succeeded, not pending.
+    const original = gateway.findOffSessionPayment.bind(gateway);
+    gateway.findOffSessionPayment = async (id: string) => {
+      const state = await original(id);
+      await harness.db().query("UPDATE credit_purchases SET status = 'succeeded' WHERE id = $1", [id]);
+      return state;
+    };
+    try {
+      await service.trigger(workspaceId);
+    } finally {
+      gateway.findOffSessionPayment = original;
+    }
+    expect((await autoPurchases(workspaceId)).find((p) => p.id === stuck.id)).toMatchObject({ status: "succeeded" });
+    expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([]);
   });
 
   it("NEW-D-7 audit F6 · a pending purchase younger than an hour still blocks (in_flight): the sweep never reopens a live charge", async () => {
