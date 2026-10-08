@@ -252,7 +252,7 @@
       "to": "the purchasable catalog, one item per add-on kind: { kind, display_name, unit_price_usd, purchasable, quantity (0 when none held), grant, id|null, active_from|null, active_until|null }",
       "breaking": true,
       "previous_minor_baseline_rewritten": false,
-      "reason": "Owner decision of 2026-10-08 (decisions-2026-10-08.md, STORY-076b line): GET /billing/addons also lists the purchasable catalog with prices. A workspace holding nothing must read the $49 and $15 prices before it buys, and check:no-cost-literals forbids the control from carrying them. The item gains required members (display_name, purchasable) and id, active_from and quantity become nullable or zero for a kind not held, so a typed consumer of the held-only list breaks; this is not additive. Recorded at checkpoint-4 because it was missing from this file. The previous-minor proxy does not cover this route.",
+      "reason": "Owner decision of 2026-10-08 (decisions-2026-10-08.md, STORY-076b line): GET /billing/addons also lists the purchasable catalog with prices. A workspace holding nothing must read the unit prices before it buys, and check:no-cost-literals forbids the control from carrying them. The item gains required members (display_name, purchasable) and id, active_from and quantity become nullable or zero for a kind not held, so a typed consumer of the held-only list breaks; this is not additive. Recorded at checkpoint-4 because it was missing from this file. The previous-minor proxy does not cover this route.",
       "assert": {
         "operation": "listAddons",
         "path": "/v1/billing/addons",
