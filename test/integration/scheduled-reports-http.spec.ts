@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-import { scheduledReportDeliverySchema, scheduledReportSchema } from "../../contracts/reports/index.js";
+import { createScheduledReportRequestSchema, scheduledReportDeliverySchema, scheduledReportSchema } from "../../contracts/reports/index.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
@@ -7,6 +7,7 @@ import { applyPlanChange, planKeyOnly } from "../../src/lib/billing/apply-plan.j
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { SessionService, type SessionTokens } from "../../src/modules/identity/session.service.js";
+import { ScheduledReportsService } from "../../src/modules/reports/scheduled-reports.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
@@ -79,7 +80,8 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     } finally {
       client.release();
     }
-    const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, 2);
+    const version = ((await harness.db().query(`SELECT entitlement_version AS v FROM workspaces WHERE id = $1`, [workspaceId])).rows[0] as { v: number }).v;
+    const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, version);
     return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken };
   }
 
@@ -116,7 +118,7 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     harness.app().inject({
       method,
       url: apiUrl(path),
-      headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json" },
+      headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, ...(payload === undefined ? {} : { "content-type": "application/json" }) },
       ...(payload === undefined ? {} : { payload: payload as object }),
     });
   const data = <T>(res: { json(): unknown }): T => (res.json() as { data: T }).data;
@@ -170,16 +172,32 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     expect((await call(a, "POST", "/scheduled-reports", create([p], { workspace_id: a.workspaceId }))).statusCode).toBe(400);
   }, 120_000);
 
-  it("AC2 · another workspace's project is refused as unreadable, and its report is invisible (404 on PATCH/DELETE/send-now)", async () => {
+  it("AC2 · under SET ROLE nominara_app a project of another workspace is refused as unreadable (400) and another workspace's report is invisible (404)", async () => {
     const one = await seeded();
     const two = await seeded();
-    const refused = await call(one.a, "POST", "/scheduled-reports", create([two.p]));
-    expect(refused.statusCode).toBe(400);
-    const mine = scheduledReportSchema.parse(data(await call(two.a, "POST", "/scheduled-reports", create([two.p]))));
-    expect((await call(one.a, "PATCH", `/scheduled-reports/${mine.id}`, { paused: true })).statusCode).toBe(404);
-    expect((await call(one.a, "DELETE", `/scheduled-reports/${mine.id}`)).statusCode).toBe(404);
-    expect((await call(one.a, "POST", `/scheduled-reports/${mine.id}/send-now`)).statusCode).toBe(404);
-    expect(data<unknown[]>(await call(one.a, "GET", "/scheduled-reports"))).toEqual([]);
+    const service = new ScheduledReportsService(null as never, null as never, null as never, null as never);
+    const client = await pool.connect();
+    try {
+      await expect(
+        withTenantContext(client, { workspaceId: one.a.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+          await tx.query("SET LOCAL ROLE nominara_app");
+          return service.create(createScheduledReportRequestSchema.parse(create([two.p])));
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      const mine = await withTenantContext(client, { workspaceId: two.a.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await tx.query("SET LOCAL ROLE nominara_app");
+        return service.create(createScheduledReportRequestSchema.parse(create([two.p])));
+      });
+      // another workspace's report is invisible: not listed, and 404 on update and delete
+      await withTenantContext(client, { workspaceId: one.a.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await tx.query("SET LOCAL ROLE nominara_app");
+        expect(await service.list()).toEqual([]);
+        await expect(service.remove(mine.id)).rejects.toMatchObject({ status: 404 });
+        await expect(service.update(mine.id, { paused: true } as never)).rejects.toMatchObject({ status: 404 });
+      });
+    } finally {
+      client.release();
+    }
   }, 120_000);
 
   it("AC4 · pause clears next_run_at, resume recomputes it, delete removes the report; each is audited", async () => {
@@ -190,7 +208,7 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     const resumed = scheduledReportSchema.parse(data(await call(a, "PATCH", `/scheduled-reports/${made.id}`, { paused: false })));
     expect(resumed.next_run_at).not.toBeNull();
     expect((await call(a, "DELETE", `/scheduled-reports/${made.id}`)).statusCode).toBe(204);
-    const actions = (await harness.db().query(`SELECT action FROM audit_log WHERE workspace_id = $1 AND action LIKE 'scheduled_report.%' ORDER BY created_at`, [a.workspaceId])).rows.map((r: { action: string }) => r.action);
+    const actions = (await harness.db().query(`SELECT action FROM audit_log WHERE workspace_id = $1 AND action LIKE 'scheduled_report.%' ORDER BY seq`, [a.workspaceId])).rows.map((r: { action: string }) => r.action);
     expect(actions).toEqual(["scheduled_report.created", "scheduled_report.updated", "scheduled_report.updated", "scheduled_report.deleted"]);
   }, 120_000);
 
@@ -212,7 +230,9 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
   it("STORY-100 s9 · send-now on a tier with ZERO allowance is 403 feature_not_in_plan, with no delivery and no unit", async () => {
     const a = await owner("free");
     const p = await project(a.workspaceId);
-    const made = scheduledReportSchema.parse(data(await call(a, "POST", "/scheduled-reports", create([p]))));
+    const createdRes = await call(a, "POST", "/scheduled-reports", create([p]));
+    expect(createdRes.statusCode, createdRes.body).toBe(201);
+    const made = scheduledReportSchema.parse(data(createdRes));
     const res = await call(a, "POST", `/scheduled-reports/${made.id}/send-now`);
     expect(res.statusCode).toBe(403);
     expect(errorOf(res).code).toBe("feature_not_in_plan");
@@ -247,6 +267,7 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     const client = await pool.connect();
     try {
       await withTenantContext(client, { workspaceId: one.a.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await tx.query("SET LOCAL ROLE nominara_app");
         expect((await tx.query(`SELECT 1 FROM scheduled_reports`)).rowCount).toBe(0);
         expect((await tx.query(`SELECT 1 FROM scheduled_report_deliveries`)).rowCount).toBe(0);
       });
