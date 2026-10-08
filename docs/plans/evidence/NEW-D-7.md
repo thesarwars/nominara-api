@@ -57,3 +57,18 @@ the four acceptance criteria was WRITTEN BUT NOT RUN, because `/System/Volumes/D
 - Files outside the story's literal list touched, all needed: `identity.module.ts` (export `EMAIL_SENDER`),
   `billing.module.ts`, `stripe-event-handler.ts` + `stripe-webhook.service.ts` (the `afterCommit` hook),
   `billing.service.ts` (`disabled_reason`), `test/support/fake-stripe-gateway.ts`.
+
+## Audit findings (round 1) - status
+
+Disk at this round: 6.6 GiB free on /System/Volumes/Data, below the 8 GiB testcontainers floor. Per the
+lane rule, NO integration spec was run, so no finding that needs a run is claimed as fixed.
+
+- Finding 4 (cap never resets): handled by STATING THE LIMITATION, the option the finding allows. The
+  `auto_topup` comment in `contracts/billing/wallet-response.schema.ts` now says `max_per_cycle` is a
+  lifetime cap until a cycle roll (STORY-075/076) writes `cycle_end` and resets
+  `auto_topup_count_cycle`. GATE: `trigger_active` must not become true, and nothing may call
+  `AutoTopupService.trigger`, until that roll and its test land. Fails closed, no money at risk.
+  Comment-only contract change; no openapi diff expected.
+- Findings 1, 2, 3, 5, 6: NOT STARTED, blocked on disk (see the lane report). Required when disk allows:
+  run the five specs (exit 0); RED spec against 0ad4fe1 src (record the count); mutate (a) lockWallet,
+  (b) NOT EXISTS pending, (c) the auto_topup branch, (d) markFailed on decline; then fix 2/3/5/6 red-first.
