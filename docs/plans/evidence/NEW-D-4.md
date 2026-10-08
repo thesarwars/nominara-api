@@ -1,0 +1,24 @@
+# NEW-D-4 API keys — checkpoint-2 evidence (lane 7day/d-admin-3, API half)
+
+Gates on 7day/d-admin-3 (colima env: DOCKER_HOST, TESTCONTAINERS_RYUK_DISABLED=true):
+- `pnpm lint` exit 0 · `pnpm typecheck` exit 0 · `pnpm test:unit` exit 0 (277 files passed, 3313 tests passed, 1 skipped)
+- `vitest run --config vitest.integration.config.ts` on api-keys-http, api-keys-rls, support-grants-http, support-grants-rls: exit 0, 4 files / 38 tests
+- `pnpm test:isolation` exit 0 (13 files / 53 tests) · `pnpm test:isolation:breakers` exit 0 (24 tests)
+- Spans: OpenTelemetry spans are DEFERRED to week 2 by owner decision (2026-10-08); a missing span is not a failed criterion. Metrics (`nominara_api_key_creations_total`, `nominara_api_key_revocations_total`) and a redacted log line exist and are asserted.
+
+RED history: cdbc553 (original RED: spec fails to load, module missing, "no tests"), 6e3c90e (audit RED, run again for this report: 1 failed / 16 passed, the grantable-set assertion). The creator-role unit test was added together with its fix (c911a38). Proven RED after the fact by mutation (checking the caller role disabled in the service): `src/modules/api-keys/api-keys.spec.ts` "the service refuses a permission the caller's role is denied" fails (1 failed / 7 passed).
+
+Note: every permission in the published grantable set is held by both roles that may create keys (owner, admin), so the creator-role check is unreachable over HTTP today. The HTTP-level mutation with that check disabled still passes; the check is defence in depth, proven only by the unit test. The escalation that was reproduced (admin mints workspace:delete) is closed by the grantable set, which has HTTP tests ("an admin cannot mint a key holding owner-only permissions" and "nobody, owner included, can put a step-up-gated permission on a key").
+
+| AC | Proof (test/integration/api-keys-http.spec.ts unless stated) | Status |
+|---|---|---|
+| AC1 step-up, 401 step_up_required with methods | "NEW-D-4 AC1 · an admin with a fresh step-up may create; one without is 401" | met |
+| AC2 secret once; absent from later responses, audit and logs | "AC2/AC3 · create returns the secret once...", "AC2 · the secret is absent from every later response and from the audit trail", "AC2 · the secret never appears at ANY log level or on stdout/stderr..." (new this run; mutation: a `logger.warn` of the secret makes it fail, the old Logger.log-only test would not) , "observability · ... never the secret, prefix or name" | met |
+| AC3 hash only, prefix stored, unique | "AC2/AC3 · ... only sha256(secret) and a 12-char prefix are stored" | met |
+| AC4 api.keys_max enforced | api-keys-rls.spec.ts "AC4 · concurrent creates at the limit..." and "AC4 · an expired or revoked key does not count" | met |
+| AC5 revoke soft + idempotent, other workspace is 404 under RLS | api-keys-rls.spec.ts "AC5 · workspace B cannot list or revoke workspace A's key (404...)"; http "AC5 · an unknown key id is 404..." | met |
+| AC6 audit rows warning/notice | "AC6 · create is audited at warning and revoke at notice" | met |
+| AC7 apiKey-auth path out of scope, stated in the PR | No PR exists (branches merge locally into integration/7day, nothing is pushed). The exclusion is stated here, in the service and the spec header: authenticating requests WITH an API key (AuthGuard's apiKey path) is NOT part of NEW-D-4. Carry this paragraph into the PR description. | stated here |
+
+Frontend half (lib/api/settings.ts createApiKey sends no permissions, 401 step_up_required retry in TeamSettings.tsx): fe-2 lane, not in this repo.
+Real-API evidence (a running API): collected in NEW-A-17.
