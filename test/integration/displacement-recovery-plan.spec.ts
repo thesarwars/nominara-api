@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { Logger } from "@nestjs/common";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
 import { displacementFeedQuerySchema, recoveryPlanResponseSchema } from "../../contracts/analytics/index.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
@@ -231,5 +232,23 @@ describe("NEW-C-6 · displacement recovery plan", () => {
     }
     expect(await taskRows()).toHaveLength(0);
     expect((await db.query("SELECT task_id FROM displacement_events WHERE id = $1", [id])).rows[0].task_id).toBeNull();
+  });
+
+  it("NEW-C-6 observability - counts the plan and logs workspace and displacement IDs plus counts only, never a title, URL or competitor", async () => {
+    await seedable("seed.com");
+    const id = await displacement({ citationGap: [gapEntry("seed.com")] });
+    const logs: unknown[] = [];
+    const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void logs.push(m));
+    try {
+      await plan(id);
+      await plan(id);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(logs).toContainEqual({ metric: "nominara_displacement_recovery_plans_total", value: 1, outcome: "created" });
+    expect(logs).toContainEqual({ metric: "nominara_displacement_recovery_plans_total", value: 1, outcome: "unchanged" });
+    expect(logs).toContainEqual({ message: "displacement recovery plan", workspace_id: workspaceId, displacement_id: id, tasks_created: 1, tasks_existing: 0 });
+    expect(logs).toContainEqual({ message: "displacement recovery plan", workspace_id: workspaceId, displacement_id: id, tasks_created: 0, tasks_existing: 1 });
+    expect(JSON.stringify(logs)).not.toMatch(/Rival|seed\.com\/x|Earn a citation/);
   });
 });

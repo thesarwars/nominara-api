@@ -5,7 +5,7 @@ method), fingerprint `sha256('authority:{project_id}:{domain}')`.
 
 Commits: contract `785d6ee` - RED `a86c10a` - fix `10e5787`.
 RED: `vitest run src/modules/displacement src/lib/analytics/displacement-recovery.spec.ts` -> **4 failed / 22 passed, exit 1** (`recoveryPlan` not a function on the controller; `authorityTaskFingerprint` not exported; the per-domain count);
-`vitest run --config vitest.integration.config.ts test/integration/displacement-recovery-plan.spec.ts` -> **11 failed / 1 passed, exit 1** (`service.recoveryPlan` is not a function; the 1 pass is the empty-table setup case).
+`vitest run --config vitest.integration.config.ts test/integration/displacement-recovery-plan.spec.ts` -> **11 failed / 1 passed, exit 1** (the observability test was added after the fix; the integration spec is now 13 tests, all passing, exit 0) (`service.recoveryPlan` is not a function; the 1 pass is the empty-table setup case).
 
 ## What was built
 - `TasksService.createGeneratedTask(input)` (exported via TasksModule): the shared task-insert method. Inputs: projectId, kind, origin, ruleCode, fingerprint, title, description, sourceDisplacementId, sourceDomainId, affectedUrl. Returns `{task, created}`.
@@ -40,7 +40,7 @@ Compile-test setup: `DisplacementModule` now imports `TasksModule` (which builds
 
 ## Observability
 Metrics `nominara_displacement_recovery_plans_total{outcome}` and `nominara_tasks_generated_deduplicated_total{origin}`; log "displacement recovery plan" with workspace_id, displacement_id and counts only (never a title, URL or competitor name). OpenTelemetry span: deferred to week 2 (decision R3).
-Not unit-asserted: a test of the two new metric lines was not written (the existing task-created metric/log path is shared and covered). Real-API evidence (HTTP 201 envelope, `audit_log` row): collected in NEW-A-17.
+Verified by `test/integration/displacement-recovery-plan.spec.ts` > "NEW-C-6 observability - counts the plan and logs workspace and displacement IDs plus counts only ..." (created and unchanged outcomes; no title/URL/competitor in the log). The deduplicated-task metric is emitted on the repeat path of the same run but not separately asserted. Real-API evidence (HTTP 201 envelope, `audit_log` row): collected in NEW-A-17.
 
 ## Not done
 Frontend (`lib/api/competitors.ts` already matches; the control showing `recovery_task_count` is app-side). Docs to carry: api-specification.md section 3 needs `POST /displacements/{id}/recovery-plan` (201, Task[], `task:create`, Idempotency-Key) and the per-domain fingerprint.
