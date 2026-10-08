@@ -42,7 +42,7 @@ describe("NEW-C-11 · RenderingQualityService - real SQL under RLS", () => {
     for (const engine of ["google_ai_mode", "google_aio", "gemini"]) {
       await db.query(
         `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,cache_ttl_seconds,volatility_band,min_plan_key,status)
-         VALUES ($1,$1,'v','api','1.0.0',86400,'medium','free','active')`, [engine]);
+         VALUES ($1,$1,'v','api','1.0.0',86400,'medium','free','active') ON CONFLICT DO NOTHING`, [engine]);
     }
   });
   afterEach(async () => { await db.end(); });
@@ -116,7 +116,7 @@ describe("NEW-C-11 · RenderingQualityService - real SQL under RLS", () => {
     const out = await read(ws, p.id);
     expect(renderingQualityResponseSchema.safeParse(out).success).toBe(true);
     const mode = find(out.engines, "google_ai_mode");
-    expect(mode.score).toBeCloseTo(41, 9); // (0.66 + 0.16) / 2 * 100
+    expect(mode.score).toBeCloseTo(41, 4); // render_score is float4 (real); (0.66 + 0.16) / 2 * 100
     expect(mode.data_source).toBe("demo");
     expect(attr(mode, "price").coverage).toBe(0.5);
     expect(attr(mode, "image").coverage).toBe(1);
@@ -124,7 +124,7 @@ describe("NEW-C-11 · RenderingQualityService - real SQL under RLS", () => {
     expect(gemini).toMatchObject({ renders_attributes: false, score: null, mentions_counted: 0, data_source: "live" });
     expect(out.rich_rendering_engines.sort()).toEqual(["google_ai_mode", "google_aio"]);
     expect(out.blended.mentions_counted).toBe(3);
-    expect(out.blended.score).toBeCloseTo(31.5, 9); // engine-weighted mean of 41 and 22 (equal weights), the scorecards blend
+    expect(out.blended.score).toBeCloseTo(31.5, 4); // float4 storage; engine-weighted mean of 41 and 22 (equal weights), the scorecards blend
   });
 
   it("[NEW-C-11 AC2] a project with no mentions reads score null (not 0) and null coverage", async () => {
