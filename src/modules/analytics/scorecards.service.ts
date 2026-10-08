@@ -2,6 +2,7 @@ import { Injectable } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import type { DataSource, ScorecardsQuery, ScorecardsResponse, ScorecardEntry } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { parseEngineFilter } from "../../lib/analytics/engine-filter.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import {
   blendScorecards,
@@ -49,7 +50,7 @@ export class ScorecardsService {
     const tx = store.client;
 
     const window = await resolveWindow(tx, projectId, TIMEFRAME_DAYS[query.timeframe]);
-    const requested = query.engines?.split(",").map((key) => key.trim()).filter((key) => key.length > 0) ?? null;
+    const requested = parseEngineFilter(query.engines);
     // ⚠ `priorFrom`, NOT `from` — THE MEMBERSHIP SPAN COVERS BOTH LEGS.
     //
     // `blendScorecards` builds the current AND prior blends from this one

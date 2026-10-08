@@ -8,11 +8,30 @@ import { dataSourceSchema, engineDataSourceSchema } from "./data-source.schema.j
 // misses the paint budget and produces a chart that assembles itself
 // visibly."
 
+/** `all`, or a comma list of engine keys. `all` beside a key is ambiguous, so it is a 400. */
+export const engineFilterSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => {
+      const keys = value.split(",").map((key) => key.trim());
+      if (keys.some((key) => !/^[a-z0-9_]+$/.test(key))) return false;
+      return !keys.includes("all") || keys.length === 1;
+    },
+    { message: "engines is `all` or a comma list of engine keys" },
+  );
+
 export const growthMapQuerySchema = z
   .object({
     timeframe: z.enum(["7d", "30d", "90d"]).default("90d"),
     /** `brand`, `competitors`, or both — §7's own query string. */
     entities: z.string().min(1).optional(),
+    /**
+     * api-specification §7 — a comma list of engine keys, or `all`. NARROWING
+     * ONLY: it can drop engines from the project's entitled set, never add
+     * one. `all` means the entitled set and stands alone.
+     */
+    engines: engineFilterSchema.optional(),
     granularity: z.enum(["day"]).default("day"),
   })
   .strict();
