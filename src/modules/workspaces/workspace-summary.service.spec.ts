@@ -15,7 +15,10 @@ vi.mock("../../lib/engines/registry.js", () => ({ captureReadyEngineKeys: () => 
 const engineSources = vi.fn<(tx: unknown, projectId: string, from: string, to: string, tz: string) => Map<string, DataSource>>(() => new Map());
 vi.mock("../../lib/analytics/data-source.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../lib/analytics/data-source.js")>()),
-  engineDataSourcesForDates: async (...a: Parameters<typeof engineSources>) => engineSources(...a),
+  // The service reads every project's provenance in ONE batched call; this
+  // double answers it from the per-project fixture below.
+  engineDataSourcesForProjects: async (tx: unknown, ids: readonly string[], from: string, to: string, tz: string) =>
+    new Map(ids.map((id) => [id, engineSources(tx, id, from, to, tz)] as const)),
 }));
 
 import { WorkspaceSummaryService } from "./workspace-summary.service.js";
@@ -166,7 +169,7 @@ describe("NEW-B-2 · WorkspaceSummaryService", () => {
     expect(out.engines).toEqual([{ engine_key: "gemini", data_source: "mixed" }]);
   });
 
-  it("NEW-B-2 audit · provenance is read over the 30-day workspace-local window, once per project, in the workspace timezone", async () => {
+  it("NEW-B-2 audit · provenance is read over the 30-day workspace-local window, in one batched read for all projects, in the workspace timezone", async () => {
     const { service, client } = setup({ projects: [project()], engines: ["gemini"] });
     await service.summary(WS);
     expect(engineSources).toHaveBeenCalledTimes(1);

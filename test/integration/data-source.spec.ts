@@ -10,6 +10,7 @@ import { matrixResponseSchema } from "../../contracts/tracking/index.js";
 import { GrowthMapService } from "../../src/modules/analytics/growth-map.service.js";
 import { ScorecardsService } from "../../src/modules/analytics/scorecards.service.js";
 import { MatrixService } from "../../src/modules/tracking/matrix.service.js";
+import { engineDataSourcesForProjects } from "../../src/lib/analytics/data-source.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 
@@ -218,5 +219,90 @@ describe("NEW-A-5 · data_source provenance", () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  describe("NEW-A-5 · engineDataSourcesForProjects — real SQL over several projects", () => {
+    const WINDOW = { from: "2026-03-10", to: "2026-03-12" } as const;
+    let p1: string;
+    let p2: string;
+    let p3: string;
+
+    async function addProject(): Promise<string> {
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO projects (id,workspace_id,name,slug,root_url,root_domain)
+         VALUES ($1,$2,'P',$3,'https://e.test','e.test')`,
+        [id, workspaceId, `p-${randomUUID().slice(0, 8)}`],
+      );
+      return id;
+    }
+
+    async function captureIn(project: string, engine: string, normalizer: string, at: string, status = "parsed"): Promise<void> {
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO answer_captures
+           (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,
+            capture_mode,adapter_version,normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,'api','1.0.0',$8,$9,'{}'::jsonb,'{}','live',$10,true)`,
+        [id, workspaceId, project, uuidV7(), promptId, engine, at, normalizer, createHash("sha256").update(id).digest(), status],
+      );
+    }
+
+    beforeEach(async () => {
+      for (const engine of ["copilot", "deepseek"]) {
+        await db.query(
+          `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                                cache_ttl_seconds,volatility_band,min_plan_key,status)
+           VALUES ($1,$1,'v','api','1.0.0',86400,'medium','free','active')`,
+          [engine],
+        );
+      }
+      p1 = projectId;
+      p2 = await addProject();
+      p3 = await addProject();
+      // p1: gemini live, chatgpt demo, perplexity live AND demo, copilot only FAILED (live-stamped),
+      // deepseek only OUTSIDE the window (live-stamped).
+      await captureIn(p1, "gemini", "n1", "2026-03-11T10:00:00Z");
+      await captureIn(p1, "chatgpt", DEMO_SEED_MARKER, "2026-03-11T10:00:00Z");
+      await captureIn(p1, "perplexity", "n1", "2026-03-11T10:00:00Z");
+      await captureIn(p1, "perplexity", DEMO_SEED_MARKER, "2026-03-12T10:00:00Z");
+      await captureIn(p1, "copilot", "n1", "2026-03-11T10:00:00Z", "failed");
+      await captureIn(p1, "deepseek", "n1", "2026-03-01T10:00:00Z");
+      // p2: the opposite labels, so a project filter or a label swap cannot hide behind p1.
+      await captureIn(p2, "gemini", DEMO_SEED_MARKER, "2026-03-11T10:00:00Z");
+      await captureIn(p2, "chatgpt", "n1", "2026-03-11T10:00:00Z");
+      await captureIn(p2, "perplexity", "n1", "2026-03-11T10:00:00Z", "blocked");
+      // p3: nothing at all.
+    });
+
+    const run = (ids: string[], timezone = "UTC", window: { from: string; to: string } = WINDOW) =>
+      engineDataSourcesForProjects(db, ids, window.from, window.to, timezone);
+    const entries = (map: Map<string, string> | undefined) => [...(map ?? new Map<string, string>()).entries()].sort();
+
+    it("NEW-A-5 AC2 — live, demo and mixed are labelled per project and per engine; failed and out-of-window captures make an engine null", async () => {
+      const result = await run([p1, p2, p3]);
+      expect(entries(result.get(p1))).toEqual([["chatgpt", "demo"], ["gemini", "live"], ["perplexity", "mixed"]]);
+      expect(entries(result.get(p2))).toEqual([["chatgpt", "live"], ["gemini", "demo"]]);
+    });
+
+    it("NEW-A-5 AC2 — a project with no captures is an empty map (null stays null, never demo), and an unrequested project is absent", async () => {
+      const result = await run([p1, p3]);
+      expect(result.get(p3)).toEqual(new Map());
+      expect(result.has(p2)).toBe(false);
+      expect(await run([])).toEqual(new Map());
+    });
+
+    it("NEW-A-5 AC2 — the window is a workspace-local DATE range: the last day is inclusive, the day before the first is out", async () => {
+      expect(entries((await run([p1], "UTC", { from: "2026-03-12", to: "2026-03-12" })).get(p1))).toEqual([["perplexity", "demo"]]);
+      expect(entries((await run([p1], "UTC", { from: "2026-03-01", to: "2026-03-01" })).get(p1))).toEqual([["deepseek", "live"]]);
+      expect((await run([p1], "UTC", { from: "2026-03-13", to: "2026-03-20" })).get(p1)).toEqual(new Map());
+    });
+
+    it("NEW-A-5 AC2 — the window uses the workspace timezone, not UTC", async () => {
+      await captureIn(p3, "gemini", "n1", "2026-04-10T23:30:00Z");
+      const day = { from: "2026-04-11", to: "2026-04-11" };
+      expect((await run([p3], "UTC", day)).get(p3)).toEqual(new Map());
+      expect(entries((await run([p3], "Pacific/Auckland", day)).get(p3))).toEqual([["gemini", "live"]]);
+    });
   });
 });

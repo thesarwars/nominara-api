@@ -90,6 +90,38 @@ export async function engineDataSourcesForDates(
   return toMap(result.rows);
 }
 
+/**
+ * `engineDataSourcesForDates` for MANY projects in ONE statement (the
+ * workspace summary's "no per-project query" rule, NEW-B-2). A project with
+ * nothing measured has an empty map, never a missing key.
+ */
+export async function engineDataSourcesForProjects(
+  tx: ClientBase,
+  projectIds: readonly string[],
+  from: string,
+  to: string,
+  timezone: string,
+): Promise<Map<string, Map<string, DataSource>>> {
+  const result = new Map<string, Map<string, DataSource>>(projectIds.map((id) => [id, new Map<string, DataSource>()]));
+  if (projectIds.length === 0) return result;
+  const rows = await tx.query<CountRow & { project_id: string }>(
+    `SELECT c.project_id, c.engine_key,
+            count(*) FILTER (WHERE c.normalizer_version <> $5)::text AS live,
+            count(*) FILTER (WHERE c.normalizer_version = $5)::text  AS demo
+       FROM answer_captures c
+      WHERE c.project_id = ANY($1::uuid[])
+        AND ${measurementStatusSql()}
+        AND (c.captured_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
+      GROUP BY c.project_id, c.engine_key`,
+    [projectIds, from, to, timezone, DEMO_SEED_MARKER],
+  );
+  for (const row of rows.rows) {
+    const source = dataSourceOf(Number(row.live), Number(row.demo));
+    if (source !== null) result.get(row.project_id)?.set(row.engine_key, source);
+  }
+  return result;
+}
+
 /** Per-engine provenance over a trailing window of whole days — the matrix's window. */
 export async function engineDataSourcesForDays(
   tx: ClientBase,

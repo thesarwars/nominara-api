@@ -80,6 +80,56 @@
           "expires_in_ms"
         ]
       }
+    },
+    {
+      "id": "2026-10-08-summary-data-source-vocabulary",
+      "recorded": "2026-10-08",
+      "story": "STORY-169",
+      "task": "NEW-A-5 / NEW-B-2",
+      "scope": "getWorkspaceSummary (GET /v1/workspaces/{id}/summary): engines[].data_source and projects[].engine_scores[].data_source",
+      "from": "data_source: a required enum live|demo",
+      "to": "data_source: live|demo|mixed or null, where null means nothing was measured",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2 of 2026-10-08 (plans-7day/decisions-2026-10-08.md) approved this as a breaking change. The workspace summary used a two-value live|demo marker while the per-project surfaces (matrix, scorecards, growth map) use the single vocabulary live|demo|mixed|null, and the two could not both stay: a figure backed by both real and demo captures was forced into one label, and an engine with nothing measured was reported as demo. One vocabulary everywhere was the owner's call. A typed consumer that switched exhaustively on live|demo now has two more cases, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "getWorkspaceSummary",
+        "path": "/v1/workspaces/{id}/summary",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "meta"
+        ],
+        "data_properties": [
+          "workspace_id",
+          "plan_key",
+          "window_days",
+          "projects",
+          "engines",
+          "health"
+        ],
+        "data_nested": [
+          {
+            "path": "engines.items.data_source",
+            "enum": [
+              "live",
+              "demo",
+              "mixed"
+            ],
+            "nullable": true
+          },
+          {
+            "path": "projects.items.engine_scores.items.data_source",
+            "enum": [
+              "live",
+              "demo",
+              "mixed"
+            ],
+            "nullable": true
+          }
+        ]
+      }
     }
   ]
 }
