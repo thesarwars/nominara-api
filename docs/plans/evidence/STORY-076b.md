@@ -129,3 +129,34 @@ Two defects in `test/integration/billing-addons.spec.ts` itself (written without
 | `pnpm test:isolation`, `pnpm test:isolation:breakers` | 1 | still crash in `seedTenant` (`three-tenant-fixture.ts:149`, `support_grants` INSERT, check violation 23514) at this tip even though `3871292` (d-admin-2) is an ancestor. Not caused by this story (no tenant table touched; `subscription_addons` has its generated policy). Tenant isolation is proved in the integration spec under `nominara_app` (3 tests, passing). Disk fell to 7.4 GiB during these runs; no further testcontainers runs were started |
 
 Still deferred: real-API / Stripe sandbox evidence (NEW-A-17), the PlanSettings frontend (app repo), spans (week 2).
+
+
+## Audit round 3 (2026-10-08): scheduled-removal freeze, and the two money guards
+
+Disk check before any testcontainers run: `df -h /System/Volumes/Data` = 5.4 GiB free (< 8 GiB). By the hard rule NO integration/isolation suite was run in this round. Everything below marked UNRUN needs a run once the owner frees disk.
+
+### Finding 1 (major): a scheduled removal froze phase 2
+
+Rule chosen: REFUSE. `add()` returns 409 ("an add-on removal is scheduled for the end of this billing period ...") when the fetched subscription has a `schedule` attached and the request would change Stripe (total > held). A total already held stays a no-op (retry safety). The other option (rebuild phase 2 on every change) depends on whether Stripe accepts direct item changes on a scheduled subscription, which is unverified: that is NEW-A-17 (sandbox), and must be confirmed before go-live. Known cost of this rule: the schedule stays attached through the period end AND the one-cycle phase 2, so add-on purchases are refused for up to two cycles after a DELETE; the owner may prefer rebuild-phase-2 once the sandbox answer is known. Second DELETE compounding is not a problem under this rule (no add can intervene, so `keep(next.items)` is still correct).
+
+| Criterion | Proof |
+|---|---|
+| DELETE kind A then POST kind B: assert what phase 2 contains | `billing-addons.service.spec.ts` "AC13 . DELETE extra_project then POST extra_seat {3} is a 409 ...": one removal recorded, POST 409, no `changeAddonQuantity`, no second schedule write (phase 2 untouched) |
+| no schedule: POST proceeds | "AC13 . with no schedule attached the same POST goes through" |
+| held total retry is still a no-op under a schedule | "AC13 . a total already held is still a no-op ..." |
+| RED | `1b7ebc3`: `vitest run billing-addons.service.spec.ts` exit 1, 1 failed / 24 passed ("promise resolved ... instead of rejecting") |
+| GREEN | fix commit after it; `vitest run src/modules/billing src/lib/billing` exit 0, 152 passed |
+| Sandbox confirmation | NEW-A-17, NOT collected (needs the real API/sandbox) |
+| Integration form of the DELETE-then-POST case | NOT written: `FakeStripeGateway` does not model schedules; unit proof only |
+
+### Finding 2 (major): the two guards now have tests
+
+| Guard | Test | Mutant | Result |
+|---|---|---|---|
+| workspace row lock in `add()` | unit "lock . add() takes the workspace row lock BEFORE the subscription read and the Stripe fetch"; integration "audit . concurrent POSTs with DISTINCT Idempotency-Keys ..." (12 parallel POSTs, totals 2..13, Stripe applies after 50 ms; asserts exactly one create, one line, final quantity 13) | lock `SELECT ... FOR UPDATE` deleted from `add()` (scratch edit, restored; `git diff` clean after) | unit: KILLED (1 failed / 26 passed, exit 1). Integration: UNRUN |
+| reconcile filter `AND stripe_subscription_id = $2` | unit "reconcile filter . an event for an OLD subscription id matches no live row" (a DB whose only live subscription is `sub_current`); integration "audit . a late event for an OLD, ended subscription leaves the CURRENT subscription's add-ons active" | replaced by `$2::text IS NOT NULL` | unit: KILLED (1 failed / 26 passed, exit 1). Integration: UNRUN |
+
+Honest limit: the unit lock test proves ORDER (lock before the read and the fetch), not mutual exclusion; only the integration concurrency test proves the latter, and it has never been executed. The unit reconcile test is a scripted DB that models the filter, so it too is weaker than the integration case. Neither integration test has been run, so their assertions (notably the 200 on the old-subscription webhook, and that 12 parallel requests fit the harness pool) are unverified, and the integration mutant runs are owed.
+
+### Gates (exit codes)
+`pnpm lint` 0 · `pnpm typecheck` 0 · `pnpm test:unit` 0 (282 files passed, 1 skipped; 3401 passed, 1 skipped). `test:integration` / `test:isolation`: not run (disk).
