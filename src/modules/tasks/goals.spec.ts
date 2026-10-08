@@ -55,6 +55,13 @@ describe("STORY-065-A · goal contracts", () => {
     expect(createGoalRequestSchema.safeParse({ ...ok, target: { ...ok.target, engine_key: "gemini" } }).success).toBe(false);
   });
 
+  it("[STORY-065-A kinds] only engine_score and topic_authority are creatable: each of the other five kinds in the table's CHECK is refused (owner decision 2026-10-08)", () => {
+    for (const kind of ["prompt_recommendation", "citation_presence", "rendering_quality", "sentiment_recovery", "custom"]) {
+      expect(createGoalRequestSchema.safeParse({ ...ok, kind }).success, kind).toBe(false);
+      expect(createGoalRequestSchema.safeParse({ ...ok, kind, target: { ...ok.target, prompt_cluster_id: CLUSTER } }).success, `${kind} with a cluster`).toBe(false);
+    }
+  });
+
   it("abandon is the only caller transition: achieved, an empty body and extra keys are refused", () => {
     expect(updateGoalRequestSchema.safeParse({ status: "abandoned" }).success).toBe(true);
     expect(updateGoalRequestSchema.safeParse({ status: "achieved" }).success).toBe(false);

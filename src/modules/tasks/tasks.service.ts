@@ -333,7 +333,7 @@ export class TasksService {
       }
       const moved = events.find((e) => e.event === "dismissed" || e.event === "reopened" || e.event === "status_changed");
       if (moved !== undefined && actorId !== undefined) {
-        this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id, from_status: current.status, to_status: body.status as string, actor_id: actorId });
+        this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id });
       }
     }
 
@@ -432,15 +432,9 @@ export class TasksService {
     const created = await this.readTask(client, taskId);
     const workspaceId = store.context.workspaceId;
     afterCommit(() => {
-      this.realtime.toWorkspace(workspaceId, "task.created", {
-        task_id: created.id,
-        project_id: created.project_id,
-        status: created.status,
-        title: created.title,
-        priority: String(created.priority),
-        impact_score: created.impact_score,
-        rule_code: created.rule_code,
-      });
+      // IDs only: the workspace room includes members scoped away from this
+      // project, so no title or other task content may ride the event.
+      this.realtime.toWorkspace(workspaceId, "task.created", { task_id: created.id, project_id: created.project_id });
     });
     return created;
   }
@@ -511,7 +505,7 @@ export class TasksService {
     incrementCounter("nominara_tasks_completed_total", {});
     // IDs only — never the title.
     this.logger.log({ message: "task completed", workspace_id: store.context.workspaceId, task_id: taskId, project_id: current.project_id, milestone_id: pinned.id });
-    this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id, from_status: current.status, to_status: "done", actor_id: actorId });
+    this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id });
 
     return {
       task: await this.readTask(client, taskId),

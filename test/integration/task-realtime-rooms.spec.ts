@@ -124,8 +124,8 @@ describe("STORY-064-D · task events are delivered to the workspace room only", 
     await inTenant(mine.workspaceId, mine.userId, () => tasks.completeTask(task.id));
 
     await settle(1_500);
-    expect(myCreated).toEqual([{ task_id: task.id, project_id: mine.projectId, status: "todo", title: "Room test", priority: String(task.priority), impact_score: task.impact_score, rule_code: null }]);
-    expect(myMoved).toEqual([{ task_id: task.id, project_id: mine.projectId, from_status: "todo", to_status: "done", actor_id: mine.userId }]);
+    expect(myCreated).toEqual([{ task_id: task.id, project_id: mine.projectId }]);
+    expect(myMoved).toEqual([{ task_id: task.id, project_id: mine.projectId }]);
     expect(theirCreated, "another workspace's socket must receive nothing").toEqual([]);
     expect(theirMoved, "another workspace's socket must receive nothing").toEqual([]);
   }, 60_000);

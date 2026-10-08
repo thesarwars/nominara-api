@@ -70,9 +70,9 @@ describe("STORY-065-A · goals — real SQL", () => {
       [workspaceId, `Project ${seq}`, `project-${seq}`, `example-${seq}.com`, blended, cells]);
     return r.rows[0]!.id;
   }
-  async function createCluster(workspaceId: string, projectId: string, score: number | null = 31.25): Promise<string> {
+  async function createCluster(workspaceId: string, projectId: string, score: number | null = 31.25, label = "CRM"): Promise<string> {
     const r = await client.query<{ id: string }>(
-      `INSERT INTO topic_clusters (workspace_id, project_id, label, visibility_score) VALUES ($1, $2, 'CRM', $3) RETURNING id`, [workspaceId, projectId, score]);
+      `INSERT INTO topic_clusters (workspace_id, project_id, label, visibility_score) VALUES ($1, $2, $3, $4) RETURNING id`, [workspaceId, projectId, label, score]);
     return r.rows[0]!.id;
   }
   const CTX = (workspaceId: string, actorId: string, scope?: readonly string[]): TenantContext => ({
@@ -115,6 +115,23 @@ describe("STORY-065-A · goals — real SQL", () => {
     expect(goal.current).toMatchObject({ value: 31.25, cells: null });
     expect(goal.sample_state).toBe("insufficient");
     expect(goal.progress_pct).toBeNull();
+  });
+
+  it("[STORY-065 #1] topic_authority baseline fix: the baseline is the CLUSTER's score, never the project's — an unscored cluster under a measured project (42.5 / n=500) is value=null, insufficient, and a cluster scored higher than the project keeps its own number", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 500);
+    const unscored = await createCluster(ws, p, null, "Unscored");
+    const scored = await createCluster(ws, p, 77.5, "Scored");
+    const mk = (c: string) => createGoalRequestSchema.parse({ title: "Own CRM", kind: "topic_authority", target: { metric: "visibility_score", target_value: 90, prompt_cluster_id: c } });
+    const a = await create(CTX(ws, actor), p, mk(unscored));
+    expect(a.baseline).toMatchObject({ value: null, cells: null });
+    expect(a.current).toMatchObject({ value: null, cells: null });
+    expect(a.sample_state).toBe("insufficient");
+    expect(a.progress_pct).toBeNull();
+    const b = await create(CTX(ws, actor), p, mk(scored));
+    expect(b.baseline).toMatchObject({ value: 77.5, cells: null });
+    // The engine_score goal on the same project still reads the project's own figure.
+    const e = await create(CTX(ws, actor), p);
+    expect(e.baseline).toMatchObject({ value: 42.5, cells: 500 });
   });
 
   it("[STORY-065 #1] a cluster of another project, a foreign tenant's cluster and an unknown cluster are refused (400), never a goal with a made-up baseline", async () => {
