@@ -48,8 +48,10 @@ import { AuditChainService } from "../audit/audit-chain.service.js";
 // time a key is seen, the target total (held + quantity) and a fresh Stripe
 // idempotency key are committed to `subscriptions.pending_addon_changes` in their
 // own short transaction BEFORE Stripe is asked; a retry under the same key reads
-// that intent and re-asks for the STORED total with the STORED key. If Stripe
-// already holds the stored total there is nothing to ask. The same key with a
+// that intent and re-asks for the STORED total with the STORED key (Stripe replays
+// its own answer for a key it has seen). Once Stripe accepts a change the intent is marked
+// `settled_at`, and only that marker, never a comparison of quantities, makes a retry a no-op.
+// While an earlier intent of the same kind is unresolved, a new purchase is a 409. The same key with a
 // different kind or quantity is 409 idempotency_conflict. Two requests are
 // serialised by the workspace row lock.
 //
@@ -80,6 +82,9 @@ interface SubscriptionRow {
 
 /** The most intents kept per subscription; the oldest are dropped. Stripe forgets a key after 24 hours. */
 const MAX_PENDING_INTENTS = 20;
+
+/** Stripe forgets an idempotency key after this long: an unresolved intent older than it can neither block nor be retried. */
+const INTENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 /** The longest `add` waits for the workspace row lock before answering a retryable 409. */
 const ADD_LOCK_WAIT_MS = 3_000;
@@ -203,6 +208,30 @@ export class BillingAddonsService {
       });
     }
 
+    // ⚠ APPLIED-NESS IS A MARKER, NEVER A COMPARISON OF QUANTITIES. `settled_at` is written only after
+    // Stripe accepted this very change, so a settled retry is answered without a call. Comparing the held
+    // quantity to the stored total cannot tell whose change moved it: another purchase landing in between
+    // made a retry look applied when it never reached Stripe (checkpoint-3 ADV-1).
+    if (stored?.settled_at !== undefined) {
+      incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "replayed_applied" });
+      this.logger.log({ message: "add-on change already applied; retry answered without a Stripe call", workspace_id: workspaceId, kind: request.kind });
+      return { kind: request.kind, status: "pending", quantity_requested: stored.target_total, effective: "immediate", effective_at: null, grant: addonGrant(plan.entitlements, request.kind) };
+    }
+    const now = Date.now();
+    const live = (intent: PendingAddonChange): boolean => now - Date.parse(intent.created_at) < INTENT_RETENTION_MS;
+    if (stored !== undefined && !live(stored)) {
+      // Stripe has forgotten the key: re-sending could apply the change a second time, and nothing says whether it was applied.
+      incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "intent_expired" });
+      throw new ConflictError({ message: "this request is too old to retry: check the current quantity and submit again under a new Idempotency-Key" });
+    }
+    // ⚠ ONE UNRESOLVED PURCHASE PER KIND. An earlier attempt whose outcome is unknown may or may not be in
+    // Stripe; a new purchase computed from "held + quantity" could neither include it nor be told apart
+    // from it. The earlier request is retried first (or ages out); never guess.
+    if (stored === undefined && Object.values(intents).some((other) => other.kind === request.kind && other.settled_at === undefined && live(other))) {
+      incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "earlier_change_unresolved" });
+      throw new ConflictError({ message: "an earlier purchase of this add-on has not been confirmed yet: retry it first, or wait for it to expire" });
+    }
+
     try {
       const fetched = await this.gateway.fetchObject("subscription", subscription.stripe_subscription_id);
       if (fetched === null) throw new PreconditionUnmetError({ message: "the payment provider has no such subscription" });
@@ -218,12 +247,6 @@ export class BillingAddonsService {
           details: { issues: [{ path: ["quantity"], message: `a workspace can hold at most ${String(ADDON_MAX_QUANTITY)} of one add-on` }] },
         });
       }
-      // Stripe already holds the total (the first attempt landed): nothing to ask of Stripe, nothing to charge.
-      if (heldQuantity >= target) {
-        incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "replayed_applied" });
-        this.logger.log({ message: "add-on change already applied; retry answered without a Stripe call", workspace_id: workspaceId, kind: request.kind });
-        return { kind: request.kind, status: "pending", quantity_requested: target, effective: "immediate", effective_at: null, grant: addonGrant(plan.entitlements, request.kind) };
-      }
       // ⚠ A SCHEDULED REMOVAL FREEZES THE NEXT PHASE'S ITEMS (audit). The schedule's second phase was
       // built from the items as they were at DELETE time; a quantity changed now would be silently
       // reverted at renewal (and the seat check of AC12 never runs for it). Refuse, with the reason,
@@ -237,19 +260,32 @@ export class BillingAddonsService {
       // ⚠ COMMITTED BEFORE STRIPE IS ASKED, on its own connection: the request's transaction commits
       // only after the response is built, and a request that dies after Stripe applied the change
       // must not take the record of what it asked for with it.
-      const intent = stored ?? (await this.recordIntent(workspaceId, mapKey, intents, { kind: request.kind, quantity: request.quantity, target }));
-      await this.gateway.changeAddonQuantity({
-        subscriptionId: subscription.stripe_subscription_id,
-        kind: request.kind,
-        quantity: intent.target_total,
-        existingItemId: held?.itemId ?? null,
-        productName: `Nominara ${entry.displayName}`,
-        unitAmountCents: toCents(entry.monthlyUsd),
-        currency: "usd",
-        interval: "month",
-        proration: "create_prorations",
-        idempotencyKey: intent.stripe_idempotency_key,
-      });
+      const recorded: PendingAddonChanges = stored !== undefined ? intents : await this.recordIntent(workspaceId, mapKey, intents, { kind: request.kind, quantity: request.quantity, target });
+      const intent = recorded[mapKey]!;
+      try {
+        await this.gateway.changeAddonQuantity({
+          subscriptionId: subscription.stripe_subscription_id,
+          kind: request.kind,
+          quantity: intent.target_total,
+          existingItemId: held?.itemId ?? null,
+          productName: `Nominara ${entry.displayName}`,
+          unitAmountCents: toCents(entry.monthlyUsd),
+          currency: "usd",
+          interval: "month",
+          proration: "create_prorations",
+          idempotencyKey: intent.stripe_idempotency_key,
+        });
+      } catch (error) {
+        // A definite rejection (4xx other than a timeout, conflict or rate limit) means Stripe applied nothing:
+        // release the intent so it neither blocks the next purchase nor is retried against a stale total.
+        if (error instanceof StripeUpstreamError && isDefiniteRejection(error.statusCode)) {
+          const rest = { ...recorded };
+          delete rest[mapKey];
+          await this.persistIntents(workspaceId, rest);
+        }
+        throw error;
+      }
+      await this.persistIntents(workspaceId, { ...recorded, [mapKey]: { ...intent, settled_at: new Date().toISOString() } });
       incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "requested" });
       this.logger.log({ message: "add-on change requested", workspace_id: workspaceId, kind: request.kind, quantity_requested: intent.target_total });
       return { kind: request.kind, status: "pending", quantity_requested: intent.target_total, effective: "immediate", effective_at: null, grant: addonGrant(plan.entitlements, request.kind) };
@@ -420,8 +456,7 @@ export class BillingAddonsService {
     mapKey: string,
     current: PendingAddonChanges,
     change: { readonly kind: AddonKind; readonly quantity: number; readonly target: number },
-  ): Promise<PendingAddonChange> {
-    const { actorId } = this.tenant();
+  ): Promise<PendingAddonChanges> {
     const id = uuidV7();
     const intent: PendingAddonChange = {
       id,
@@ -435,6 +470,13 @@ export class BillingAddonsService {
       .sort(([, x], [, y]) => (x.created_at < y.created_at ? -1 : x.created_at > y.created_at ? 1 : 0))
       .slice(-(MAX_PENDING_INTENTS - 1));
     const next: PendingAddonChanges = { ...Object.fromEntries(kept), [mapKey]: intent };
+    await this.persistIntents(workspaceId, next);
+    return next;
+  }
+
+  /** Writes the whole intent map in its own short transaction (the request holds the workspace row lock). */
+  private async persistIntents(workspaceId: string, next: PendingAddonChanges): Promise<void> {
+    const { actorId } = this.tenant();
     const client = await this.pool.connect();
     try {
       await withTenantContext(client, { workspaceId, actorId }, async (tx) => {
@@ -448,7 +490,6 @@ export class BillingAddonsService {
     } finally {
       client.release();
     }
-    return intent;
   }
 
   /**
@@ -535,6 +576,11 @@ export class BillingAddonsService {
     if (store === undefined) throw new Error("BillingAddonsService requires an active tenant context");
     return { client: store.client, workspaceId: store.context.workspaceId, actorId: store.context.actorId };
   }
+}
+
+/** Stripe answered and did not apply the change: a 4xx that is not a timeout (408), an in-flight conflict (409) or a rate limit (429). */
+function isDefiniteRejection(statusCode: number | undefined): boolean {
+  return statusCode !== undefined && statusCode >= 400 && statusCode < 500 && statusCode !== 408 && statusCode !== 409 && statusCode !== 429;
 }
 
 /** The map key an Idempotency-Key is stored under: hashed, so the caller's key (and its length) is never persisted. */

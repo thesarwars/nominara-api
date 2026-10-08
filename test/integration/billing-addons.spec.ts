@@ -329,9 +329,11 @@ describe("STORY-076b · add-ons", () => {
     expect(first!.idempotencyKey).toBeTruthy();
     expect(retry!.idempotencyKey).toBe(first!.idempotencyKey);
 
-    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, randomUUID())).statusCode).toBe(503);
-    expect(gateway.addonAttempts).toHaveLength(3);
-    expect(gateway.addonAttempts[2]!.idempotencyKey).not.toBe(first!.idempotencyKey);
+    // The first attempt's outcome is still unknown, so a DIFFERENT Idempotency-Key is refused (ADV-1) rather than
+    // sent: it would otherwise have to guess whether the first attempt is in Stripe. Its Stripe key can only be
+    // different once the first is resolved; the ADV-1 "REJECTED outright" case proves that.
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, randomUUID())).statusCode).toBe(409);
+    expect(gateway.addonAttempts).toHaveLength(2);
     expect(gateway.addonChanges).toHaveLength(0);
   });
 

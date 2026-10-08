@@ -203,6 +203,9 @@ export class FakeStripeGateway implements StripeGateway {
       return Promise.reject(this.failAfterApplyingAddon);
     }
     if (this.failAddonWith !== undefined) return Promise.reject(this.failAddonWith);
+    // Stripe replays the stored answer for a repeated idempotency key instead of applying the change again.
+    if (this.appliedAddonKeys.has(input.idempotencyKey)) return Promise.resolve();
+    this.appliedAddonKeys.add(input.idempotencyKey);
     this.addonChanges.push(input);
     return Promise.resolve();
   }

@@ -338,7 +338,23 @@ describe("STORY-076b audit · a retried POST charges once (Idempotency-Key -> st
     const retry = await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-1"));
     expect(retry).toMatchObject({ status: "pending", quantity_requested: 1 });
     expect(state.quantity).toBe(1);
-    expect(state.calls).toHaveLength(1); // the retry asked Stripe for nothing
+    // The outcome of the lost reply is unknown (no settled marker), so the retry re-asks under the SAME Stripe key
+    // and Stripe replays its own answer: still one unit. Only a SETTLED intent is answered without a call (ADV-1).
+    expect(state.calls).toHaveLength(2);
+    expect(state.calls[1]).toEqual(state.calls[0]);
+  });
+
+  it("ADV-1 . a SETTLED intent retried is answered with NO Stripe call, whatever the held quantity is now", async () => {
+    const store = intents();
+    const { state, gw } = stripe(0, false);
+    const svc = new BillingAddonsService(gw, store.pool);
+    await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-1"));
+    expect(Object.values(store.state.value!)[0]).toMatchObject({ settled_at: expect.any(String) });
+    state.quantity = 5; // another source moved the quantity
+    const retry = await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-1"));
+    expect(retry).toMatchObject({ status: "pending", quantity_requested: 1 });
+    expect(state.calls).toHaveLength(1);
+    expect(state.quantity).toBe(5);
     expect(counter).toHaveBeenCalledWith("nominara_billing_addon_change_total", { kind: "extra_seat", outcome: "replayed_applied" });
   });
 
@@ -361,7 +377,7 @@ describe("STORY-076b audit · a retried POST charges once (Idempotency-Key -> st
       return inner(input);
     };
     await inTenant(client(scriptWith(store)), () => new BillingAddonsService(gw, store.pool).add({ kind: "extra_seat", quantity: 1 }, "client-key-1"));
-    expect(log).toEqual(["intent", "stripe"]);
+    expect(log).toEqual(["intent", "stripe", "intent"]); // recorded before Stripe is asked, settled after it accepts
     const [intent] = Object.values(store.state.value!) as Array<{ kind: string; quantity: number; target_total: number; stripe_idempotency_key: string }>;
     expect(intent).toMatchObject({ kind: "extra_seat", quantity: 1, target_total: 3 });
     expect(state.calls[0]).toEqual({ key: intent!.stripe_idempotency_key, quantity: 3 });
@@ -472,7 +488,7 @@ describe("STORY-076b audit · an add-on change is refused while a removal is sch
     const { state, gw } = stripe();
     state.schedule = "sub_sched_1";
     // Stripe holds 1 seat; the stored intent for this key asked for a total of 1.
-    const stored = { [keyHash("k1")]: { id: "0198f2c0-0000-7000-8000-000000000001", kind: "extra_seat", quantity: 1, target_total: 1, stripe_idempotency_key: "addon-0198f2c0-0000-7000-8000-000000000001", created_at: new Date().toISOString() } };
+    const stored = { [keyHash("k1")]: { id: "0198f2c0-0000-7000-8000-000000000001", kind: "extra_seat", quantity: 1, target_total: 1, stripe_idempotency_key: "addon-0198f2c0-0000-7000-8000-000000000001", created_at: new Date().toISOString(), settled_at: new Date().toISOString() } };
     const withIntent: Script = [[/FROM workspaces w JOIN plans/u, planRow("growth")], [/FROM subscriptions WHERE workspace_id/u, subRow({ pending_addon_changes: stored })]];
     const out = await inTenant(client(withIntent), () => new BillingAddonsService(gw, intents().pool).add({ kind: "extra_seat", quantity: 1 }, "k1"));
     expect(out).toMatchObject({ status: "pending", quantity_requested: 1 });
