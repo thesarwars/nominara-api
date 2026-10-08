@@ -162,4 +162,23 @@ describe("STORY-062 · GEO insights persistence and read", () => {
     await expect(ctx((s) => s.digest(randomUUID(), { timeframe: "30d" }))).rejects.toMatchObject({ code: "not_found" });
     await expect(ctx((s) => s.persistAnalysis(randomUUID(), write("structure")))).rejects.toMatchObject({ code: "not_found" });
   });
+  it("STORY-062 isolation · under the application role, another workspace gets 404 on the digest, the analysis and a write; the owner still reads its own", async () => {
+    await ctx((s) => s.persistAnalysis(projectId, write("structure")));
+    const other = randomUUID();
+    await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'W2',$2,'growth','UTC')", [other, `w-${randomUUID().slice(0, 8)}`]);
+    const as = <T>(workspace: string, fn: (s: GeoService) => Promise<T>) =>
+      withTenantContext(db, { workspaceId: workspace, actorId: randomUUID() }, () => fn(new GeoService())) as Promise<T>;
+    // The owning role bypasses RLS and would pass this for the wrong reason.
+    await db.query("SET ROLE nominara_app");
+    try {
+      await expect(as(other, (s) => s.digest(projectId, { timeframe: "30d" }))).rejects.toMatchObject({ code: "not_found" });
+      await expect(as(other, (s) => s.analysis(projectId, "structure", { timeframe: "30d" }))).rejects.toMatchObject({ code: "not_found" });
+      await expect(as(other, (s) => s.persistAnalysis(projectId, write("sentiment")))).rejects.toMatchObject({ code: "not_found" });
+      const own = await as(workspaceId, (s) => s.analysis(projectId, "structure", { timeframe: "30d" }));
+      expect(own.summary.status).not.toBe("insufficient");
+    } finally {
+      await db.query("RESET ROLE");
+    }
+    expect(await count()).toBe(1);
+  });
 });
