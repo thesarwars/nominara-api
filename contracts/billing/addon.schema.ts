@@ -108,6 +108,11 @@ export const pendingAddonChangeSchema = z
     /** The key sent to Stripe, fixed at first sight so every retry replays Stripe's own answer. */
     stripe_idempotency_key: z.string().min(1).max(255),
     created_at: z.iso.datetime(),
+    /**
+     * Set once Stripe has ACCEPTED this change. Applied-ness is read from this marker, never inferred from
+     * comparing quantities (another purchase can move the held quantity). Absent: the outcome is unknown.
+     */
+    settled_at: z.iso.datetime().optional(),
   })
   .strict();
 
