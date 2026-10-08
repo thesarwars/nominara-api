@@ -455,6 +455,23 @@ describe("STORY-075b · invoices", () => {
     expect(data[0]).toMatchObject({ currency: "USD", pdf_url: null, paid_at: null, addon_amount: "0.00", credit_pack_amount: "0.00" });
   });
 
+  it("STORY-075b audit · an invoice that charged for an add-on publishes addon_amount from its lines (49.00), and an update rewrites it", async () => {
+    const { workspaceId, owner } = await newWorkspace();
+    const planLine = { amount: 12_900, pricing: { price_details: { product: "prod_plan" } } };
+    const addonLine = { amount: 4_900, pricing: { price_details: { product: { id: "nominara_addon_extra_project", metadata: { nominara_kind: "extra_project" } } } } };
+    stripeInvoice(workspaceId, { status: "open", subtotal: 17_800, total: 17_800, lines: { data: [planLine, addonLine] } });
+    expect(outcomeOf(await deliver(eventBody("evt_addon_1", "invoice.finalized", "in_1")))).toBe("processed");
+    const first = dataOf<Array<Record<string, unknown>>>(await get(owner, "/billing/invoices"));
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({ subtotal: "178.00", total: "178.00", addon_amount: "49.00", credit_pack_amount: "0.00" });
+
+    // The same invoice re-fetched with the add-on line gone: the stored figure follows Stripe.
+    stripeInvoice(workspaceId, { status: "open", subtotal: 12_900, total: 12_900, lines: { data: [planLine] }, number: "NOM-0002" });
+    expect(outcomeOf(await deliver(eventBody("evt_addon_2", "invoice.updated", "in_1")))).toBe("processed");
+    const second = dataOf<Array<Record<string, unknown>>>(await get(owner, "/billing/invoices"));
+    expect(second[0]).toMatchObject({ addon_amount: "0.00", total: "129.00" });
+  });
+
   it("GET /billing/invoices · the cursor walks every invoice exactly once, including rows that share a period_start", async () => {
     const { workspaceId, owner } = await newWorkspace();
     const same = new Date(T0 * 1000);

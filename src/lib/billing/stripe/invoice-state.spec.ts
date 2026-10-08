@@ -130,3 +130,60 @@ describe("INVOICE_STATUS_RANK · a late event can never walk an invoice backward
     expect(INVOICE_STATUS_RANK.void).toBe(INVOICE_STATUS_RANK.paid);
   });
 });
+
+// STORY-075b audit finding 1 — `addon_amount` and `credit_pack_amount` are
+// published money figures; they are the sum of the invoice's OWN line amounts
+// (Stripe's integer cents) for lines whose product is an add-on / a credit pack.
+describe("STORY-075b audit · addon_amount and credit_pack_amount come from the invoice lines", () => {
+  const T = { subtotal: 20_400, total: 20_400 };
+  const planLine = { amount: 15_500, pricing: { price_details: { product: "prod_plan" } } };
+  const addonLine = { amount: 4_900, pricing: { price_details: { product: { id: "nominara_addon_extra_project", metadata: { nominara_kind: "extra_project" } } } } };
+  const seatLine = { amount: 1_500, pricing: { price_details: { product: { id: "x", metadata: { nominara_kind: "extra_seat" } } } } };
+  const packLine = { amount: 1_500, pricing: { price_details: { product: { id: "p", metadata: { nominara_kind: "credit_pack" } } } } };
+  const write = (lines: unknown[], over: Record<string, unknown> = {}) => {
+    const out = desiredFromStripeInvoice(invoice({ ...T, lines: { data: lines }, ...over }));
+    if (out.kind !== "write") throw new Error("expected a write");
+    return out.invoice;
+  };
+
+  it("an invoice with a $49 extra_project line publishes addon_amount 49.00 and credit_pack_amount 0.00", () => {
+    const inv = write([planLine, addonLine]);
+    expect(inv.addonAmount).toBe("49.00");
+    expect(inv.creditPackAmount).toBe("0.00");
+  });
+
+  it("two add-on kinds sum; a credit-pack line goes to credit_pack_amount only", () => {
+    const inv = write([planLine, addonLine, seatLine, packLine]);
+    expect(inv.addonAmount).toBe("64.00");
+    expect(inv.creditPackAmount).toBe("15.00");
+  });
+
+  it("an add-on line whose product is only an id is recognised by the fixed add-on product id", () => {
+    const inv = write([{ amount: 4_900, pricing: { price_details: { product: "nominara_addon_extra_project" } } }]);
+    expect(inv.addonAmount).toBe("49.00");
+  });
+
+  it("the legacy line shape (price.product) is read too", () => {
+    const inv = write([{ amount: 1_500, price: { product: { metadata: { nominara_kind: "extra_seat" } } } }]);
+    expect(inv.addonAmount).toBe("15.00");
+  });
+
+  it("an invoice with no lines, or only unmarked lines, has 0.00 for both (a measured zero)", () => {
+    expect(write([])).toMatchObject({ addonAmount: "0.00", creditPackAmount: "0.00" });
+    expect(write([planLine, { amount: 100 }])).toMatchObject({ addonAmount: "0.00", creditPackAmount: "0.00" });
+  });
+
+  it("a proration credit that nets an add-on below zero publishes 0.00, not a negative money string", () => {
+    const credit = { ...addonLine, amount: -2_000 };
+    expect(write([credit]).addonAmount).toBe("0.00");
+  });
+
+  it("a line with a non-integer amount is not counted (fail closed on the figure, not on the invoice)", () => {
+    expect(write([{ ...addonLine, amount: 49.5 }]).addonAmount).toBe("0.00");
+  });
+
+  it("the totals are still Stripe's, untouched by the line classification", () => {
+    const inv = write([addonLine], { subtotal: 1, total: 2 });
+    expect(inv).toMatchObject({ subtotal: "0.01", total: "0.02", addonAmount: "49.00" });
+  });
+});
