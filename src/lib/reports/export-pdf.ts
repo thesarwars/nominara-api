@@ -1,20 +1,25 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import PDFDocument from "pdfkit";
 import type { ExportDocument, MetricSummary } from "./export-document.js";
 
 // NEW-E-100b — the PDF rendering of an ExportDocument, with pdfkit (pure JS,
 // no headless browser, no network).
 //
-// NOTHING HERE FETCHES. Colours come from the stored theme (via the palette); the font is
-// pdfkit's built-in Helvetica, whose metrics ship inside the package, so no
-// font file is read or embedded and nothing is requested at render time. The
-// theme's `font_family` (Inter / Geist) is NOT drawn: the API ships no font
-// file for either yet (see the ticket note) - the document is Helvetica until
-// the curated files are added to the API.
+// NOTHING HERE FETCHES. Colours come from the stored theme (via the palette). The font is Inter
+// (SIL OFL 1.1), regular and bold, bundled as .ttf files in ./fonts beside this file and embedded
+// (subset) by pdfkit: the only files read at render time are those two, from the application's own
+// directory, and nothing is requested over the network. Owner decision 4 (2026-10-08): every PDF is
+// Inter whatever the theme's `font_family` says; per-theme fonts are a later story.
 //
 // THE FOOTER IS DRAWN THREE WAYS, none conditional on the theme or the
 // sections: a strip on EVERY page, a closing Methodology block, and the PDF
 // information dictionary (plain text in the file, so the artifact describes
 // itself even to a tool that never renders a page).
+
+const FONT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fonts");
+const INTER_REGULAR = "Inter";
+const INTER_BOLD = "Inter-Bold";
 
 const MARGIN = 50;
 const STRIP_HEIGHT = 46;
@@ -62,6 +67,8 @@ export function renderPdf(doc: ExportDocument, options: RenderPdfOptions = {}): 
       margins: { top: MARGIN, left: MARGIN, right: MARGIN, bottom: MARGIN + STRIP_HEIGHT },
       bufferPages: true,
       compress: options.compress ?? true,
+      // The document's default font is the bundled file, so pdfkit never falls back to (or embeds) a built-in one.
+      font: path.join(FONT_DIR, "Inter-Regular.ttf"),
       info: {
         Title: printable(`${doc.projectName} - visibility report`),
         Subject: printable(footer.note),
@@ -69,6 +76,8 @@ export function renderPdf(doc: ExportDocument, options: RenderPdfOptions = {}): 
         CreationDate: new Date(doc.generatedAt),
       },
     });
+    pdf.registerFont(INTER_REGULAR, path.join(FONT_DIR, "Inter-Regular.ttf"));
+    pdf.registerFont(INTER_BOLD, path.join(FONT_DIR, "Inter-Bold.ttf"));
     const chunks: Buffer[] = [];
     pdf.on("data", (chunk: Buffer) => chunks.push(chunk));
     pdf.on("end", () => resolve(Buffer.concat(chunks)));
@@ -87,21 +96,21 @@ export function renderPdf(doc: ExportDocument, options: RenderPdfOptions = {}): 
         if (pdf.y + height > maxY()) pdf.addPage();
       };
       const text = (value: string, size: number, bold = false, color: string = palette.foreground): void => {
-        pdf.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(size).fillColor(color).text(printable(value), MARGIN, pdf.y, { width });
+        pdf.font(bold ? INTER_BOLD : INTER_REGULAR).fontSize(size).fillColor(color).text(printable(value), MARGIN, pdf.y, { width });
       };
 
       // Header band
       pdf.save().rect(0, 0, pdf.page.width, 74).fill(palette.primary).restore();
       const onPrimary = onColour(palette.primary);
-      pdf.font("Helvetica-Bold").fontSize(18).fillColor(onPrimary).text(printable(doc.projectName), MARGIN, 22, { width });
-      pdf.font("Helvetica").fontSize(9).fillColor(onPrimary).text(
+      pdf.font(INTER_BOLD).fontSize(18).fillColor(onPrimary).text(printable(doc.projectName), MARGIN, 22, { width });
+      pdf.font(INTER_REGULAR).fontSize(9).fillColor(onPrimary).text(
         printable(`Visibility report - ${doc.window.from} to ${doc.window.to} (${doc.timeframe})`),
         MARGIN,
         48,
         { width },
       );
       if (palette.showBrandLine) {
-        pdf.font("Helvetica").fontSize(8).fillColor(onPrimary).text("Powered by Nominara", MARGIN, 48, { width, align: "right" });
+        pdf.font(INTER_REGULAR).fontSize(8).fillColor(onPrimary).text("Powered by Nominara", MARGIN, 48, { width, align: "right" });
       }
       pdf.y = 92;
 
@@ -118,7 +127,7 @@ export function renderPdf(doc: ExportDocument, options: RenderPdfOptions = {}): 
           ensure(16);
           const y = pdf.y;
           let x = MARGIN;
-          pdf.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(8).fillColor(color);
+          pdf.font(bold ? INTER_BOLD : INTER_REGULAR).fontSize(8).fillColor(color);
           columns.forEach((column, index) => {
             pdf.text(printable(cells[index] ?? ""), x, y, { width: column.width - 4, height: 11, lineBreak: false, ellipsis: true });
             x += column.width;
@@ -209,7 +218,7 @@ export function renderPdf(doc: ExportDocument, options: RenderPdfOptions = {}): 
         pdf.page.margins.bottom = 0;
         pdf.save();
         pdf.moveTo(MARGIN, pdf.page.height - STRIP_HEIGHT).lineTo(pdf.page.width - MARGIN, pdf.page.height - STRIP_HEIGHT).lineWidth(0.5).stroke(palette.accent);
-        pdf.font("Helvetica").fontSize(6.5).fillColor(palette.foreground).text(
+        pdf.font(INTER_REGULAR).fontSize(6.5).fillColor(palette.foreground).text(
           printable(`Methodology: ${footer.note} Scoring version ${footer.scoring_version}; data through ${footer.data_through ?? DASH}.`),
           MARGIN,
           pdf.page.height - STRIP_HEIGHT + 6,
