@@ -45,6 +45,20 @@ export const SCHEDULER_BATCH_SIZE = 500;
  */
 export const CAPTURABLE_WORKSPACE_STATUSES: readonly string[] = ["trialing", "active"];
 
+/**
+ * The ONE definition of "due" for a sweep claim ($1 = now, $2 = capturable
+ * workspace statuses). `claimDueProjects` and `claimDueProjectRefs` both embed
+ * it, so the full claim and the sweep's lean claim cannot disagree about which
+ * projects are due. `claimDueProject`, the per-id form, restates it with its
+ * own parameter positions; capture-scheduler-sweep.spec.ts checks the two agree.
+ */
+const DUE_PROJECTS_WHERE = `WHERE p.status = 'active'
+       AND p.deleted_at IS NULL
+       AND p.next_run_at IS NOT NULL
+       AND p.next_run_at <= $1
+       AND w.status = ANY($2::text[])
+       AND w.deleted_at IS NULL`;
+
 export interface DueProject {
   readonly projectId: string;
   readonly workspaceId: string;
@@ -85,12 +99,7 @@ export async function claimDueProjects(
            p.locale, w.plan_key
       FROM projects p
       JOIN workspaces w ON w.id = p.workspace_id
-     WHERE p.status = 'active'
-       AND p.deleted_at IS NULL
-       AND p.next_run_at IS NOT NULL
-       AND p.next_run_at <= $1
-       AND w.status = ANY($2::text[])
-       AND w.deleted_at IS NULL
+     ${DUE_PROJECTS_WHERE}
      ORDER BY p.next_run_at ASC
      LIMIT $3
        FOR UPDATE OF p SKIP LOCKED
@@ -106,6 +115,49 @@ export async function claimDueProjects(
     nextRunAt: row.next_run_at,
     planKey: row.plan_key,
     locale: row.locale,
+  }));
+}
+
+/** What the NEW-A-13 sweep reads about a due project: identifiers, cadence and the due time, never tenant content. */
+export interface DueProjectRef {
+  readonly projectId: string;
+  readonly workspaceId: string;
+  readonly cadence: ProjectCadence;
+  readonly nextRunAt: Date;
+}
+
+/**
+ * NEW-A-13 — `claimDueProjects` narrowed to the four columns the sweep needs to
+ * enqueue a `capture.plan` job. Same due predicate, same fairness order, same
+ * FOR UPDATE SKIP LOCKED; it just does not read the project's prompt limit,
+ * locale or the workspace's plan, because the sweep decides nothing about what
+ * a run covers (the handler re-derives all of that inside the tenant context).
+ *
+ * The caller must hold a transaction open, for the reason `claimDueProjects`
+ * gives.
+ */
+export async function claimDueProjectRefs(
+  tx: ClientBase,
+  now: Date,
+  limit: number = SCHEDULER_BATCH_SIZE,
+): Promise<DueProjectRef[]> {
+  const result = await tx.query<{ id: string; workspace_id: string; cadence: ProjectCadence; next_run_at: Date }>(
+    `
+    SELECT p.id, p.workspace_id, p.cadence, p.next_run_at
+      FROM projects p
+      JOIN workspaces w ON w.id = p.workspace_id
+     ${DUE_PROJECTS_WHERE}
+     ORDER BY p.next_run_at ASC
+     LIMIT $3
+       FOR UPDATE OF p SKIP LOCKED
+    `,
+    [now, [...CAPTURABLE_WORKSPACE_STATUSES], limit],
+  );
+  return result.rows.map((row) => ({
+    projectId: row.id,
+    workspaceId: row.workspace_id,
+    cadence: row.cadence,
+    nextRunAt: row.next_run_at,
   }));
 }
 

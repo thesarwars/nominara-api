@@ -69,3 +69,17 @@ The mutation was reverted (git checkout); the tree is clean and the spec passes 
   - M6 (M3 plus capture.parse's request turned into a no-op): exit 1, 2 failed / 1 passed. Main test fails: "the rollup was requested by parse, not by capture.execute: expected [ 'execute' ] to deeply equal [ 'parse' ]". Before this fix the AC4 spec passed 3 of 3 under M6.
 - Green on the unmutated tree: integration spec exit 0, 3 passed. pnpm lint exit 0, pnpm typecheck exit 0, pnpm test:unit exit 0 (278 files passed, 1 skipped; 3317 tests passed).
 - Not run: test:isolation (red at this tip, see above). OpenTelemetry spans are deferred to week 2 by owner decision.
+
+
+## Checkpoint-3 fix pass, 2026-10-08: AC3 "the isolation suite is green" re-checked (tree of 7day/a-gemini-4 after ed2fbec, base integration/7day fee788e)
+
+| Command | Exit | Result |
+|---|---|---|
+| pnpm test:isolation | 1 | 12 files passed, 1 failed; 52 tests passed, 1 failed |
+| pnpm test:isolation:breakers | 0 | 24 of 24 |
+
+- The d-admin support_grants fixture no longer breaks fixture setup: the suite now runs to completion.
+- ISO-13 (cache keys): PASSES ("ISO-13 · cache keys namespaced ... scanner self-tests clean and finds no un-namespaced key in src/", verbose run). The earlier sentiment.ts finding is gone from this tip.
+- ISO-14 (object-storage prefixes): FAILS, one site, src/modules/reports/scheduled-reports.service.ts:234 (e-reports lane, being fixed there; the earlier crawl-audit and api-keys sites no longer fail). Nothing in this lane's files is named.
+- So AC3 is NOT yet confirmed green: it holds the moment e-reports' ISO-14 fix is merged. This lane's added code (scheduler-sweep.ts, worker.ts) passes ISO-13 and every other isolation assertion; the run-keyed dedup key `run:${projectId}:${...}` was not flagged.
+- Re-run on the merged tree and record the exit codes here.
