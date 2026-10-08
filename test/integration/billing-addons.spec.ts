@@ -698,4 +698,29 @@ describe("STORY-076b · add-ons", () => {
     expect(gateway.addonRemovals).toHaveLength(1);
     expect(gateway.addonRemovals[0]!.subscriptionId).toBe(subIdOf(a.workspaceId));
   });
+
+  it("audit · Stripe holding TWO extra_seat lines (a timed-out create, retried under a new key): POST {3} and DELETE are both 409, and Stripe is never changed", async () => {
+    const { workspaceId, ownerId } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 1 }] });
+    expect((await reconcile(workspaceId)).statusCode).toBe(200);
+    // The reconcile bumped entitlement_version: a session minted before it is stale.
+    const owner = await enter(ownerId, workspaceId);
+    // The second line: Stripe applied the first request's create after its gateway timeout.
+    const raw = gateway.objects.get(`subscription:${subIdOf(workspaceId)}`)!.raw as { items: { data: Array<Record<string, unknown>> } };
+    const first = raw.items.data.find((line) => line.id === "si_extra_seat")!;
+    raw.items.data.push({ ...first, id: "si_extra_seat_dup" });
+    const rowsBefore = await addonRows(workspaceId);
+    const versionBefore = await versionOf(workspaceId);
+
+    const add = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 3 });
+    expect(add.statusCode, add.body).toBe(409);
+    const remove = await del(owner, "/billing/addons/extra_seat");
+    expect(remove.statusCode, remove.body).toBe(409);
+
+    expect(gateway.addonChanges).toEqual([]);
+    expect(gateway.addonRemovals).toEqual([]);
+    // Nothing local moved either: the handlers write nothing.
+    expect(await addonRows(workspaceId)).toEqual(rowsBefore);
+    expect(await versionOf(workspaceId)).toBe(versionBefore);
+  });
 });

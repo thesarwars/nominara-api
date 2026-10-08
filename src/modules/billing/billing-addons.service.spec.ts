@@ -11,6 +11,8 @@ import { BillingAddonsService } from "./billing-addons.service.js";
 // same criteria is test/integration/billing-addons.spec.ts.
 
 const append = vi.hoisted(() => vi.fn((..._args: unknown[]) => Promise.resolve()));
+const counter = vi.hoisted(() => vi.fn((..._args: unknown[]) => undefined));
+vi.mock("../../lib/telemetry/metrics.js", () => ({ incrementCounter: counter }));
 vi.mock("../audit/audit-chain.service.js", () => ({ AuditChainService: class { append = append; } }));
 
 type Script = Array<[RegExp, unknown[] | ((params: unknown[]) => unknown[])]>;
@@ -440,5 +442,53 @@ describe("STORY-076b audit · the two money guards have a test that fails withou
     const out = await new BillingAddonsService(gateway()).reconcile(c, { workspaceId: WS, stripeSubscriptionId: "sub_old", items: [], eventId: "evt_old", eventType: "customer.subscription.deleted", versionAlreadyBumped: false });
     expect(out).toEqual({ changed: false });
     expect(calls.some(({ sql }) => /^\s*UPDATE subscription_addons/u.test(sql))).toBe(false);
+  });
+});
+
+describe("STORY-076b audit · two Stripe lines of one add-on kind are refused (409) and raise a money alarm", () => {
+  const line = (id: string, quantity: number, kind = "extra_seat") => ({ id, quantity, price: { unit_amount: 1500, currency: "usd", product: { metadata: { nominara_kind: kind } } } });
+  /** A Stripe that holds si_a=1 and si_b=1 of extra_seat (a timed-out create that Stripe applied, then a retry under a NEW key). */
+  const twoLines = () =>
+    gateway({
+      fetchObject: (kind: string, id: string) => Promise.resolve({ kind, id, metadata: {}, raw: { items: { data: [line("si_a", 1), line("si_b", 1), line("si_p", 1, "extra_project")] } } }),
+    } as never);
+  const addScript: Script = [
+    [/FROM workspaces w JOIN plans/u, planRow("growth")],
+    [/FROM subscriptions WHERE workspace_id/u, subRow()],
+  ];
+  const removeScript: Script = [
+    [/FROM subscription_addons WHERE kind/u, [{ id: "a1", kind: "extra_seat", quantity: 2, unit_price_usd: "15.00", stripe_subscription_item_id: "si_a", subscription_id: "s1" }]],
+    [/jsonb_object_agg/u, [{ plan_key: "growth", entitlement_version: 1, entitlement_overrides: {}, plan_entitlements: PLAN_ENTITLEMENTS.growth, addons: {} }]],
+    [/count\(\*\)::int AS n FROM workspace_members/u, [{ n: 1 }]],
+    [/FROM workspaces w JOIN plans/u, planRow("growth")],
+    [/FROM subscriptions WHERE workspace_id/u, subRow()],
+  ];
+
+  it("AC1 · POST extra_seat {3} with two held lines is a 409, Stripe is NOT changed (the total would be 4), and the money alarm fires", async () => {
+    counter.mockClear();
+    const gw = twoLines();
+    await expect(inTenant(client(addScript), () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 3 }, "key-dup"))).rejects.toMatchObject({ code: "conflict" });
+    expect(gw.changes).toEqual([]);
+    expect(counter).toHaveBeenCalledWith("nominara_billing_addon_duplicate_lines_total", expect.objectContaining({ kind: "extra_seat" }));
+  });
+
+  it("AC1 · even a total EQUAL to the summed quantity is refused: the state is unsafe, not just the arithmetic", async () => {
+    const gw = twoLines();
+    await expect(inTenant(client(addScript), () => new BillingAddonsService(gw).add({ kind: "extra_seat", quantity: 2 }, "key-dup"))).rejects.toMatchObject({ code: "conflict" });
+    expect(gw.changes).toEqual([]);
+  });
+
+  it("AC1 · a duplicate of ANOTHER kind does not block this kind (one line of extra_project still changes)", async () => {
+    const gw = twoLines();
+    await inTenant(client(addScript), () => new BillingAddonsService(gw).add({ kind: "extra_project", quantity: 2 }, "key-ok"));
+    expect(gw.changes).toEqual([expect.objectContaining({ kind: "extra_project", quantity: 2, existingItemId: "si_p" })]);
+  });
+
+  it("AC4 · DELETE extra_seat with two held lines is a 409, NO removal is scheduled (it would leave si_b billing), and the money alarm fires", async () => {
+    counter.mockClear();
+    const gw = twoLines();
+    await expect(inTenant(client(removeScript), () => new BillingAddonsService(gw).remove("extra_seat"))).rejects.toMatchObject({ code: "conflict" });
+    expect(gw.removals).toEqual([]);
+    expect(counter).toHaveBeenCalledWith("nominara_billing_addon_duplicate_lines_total", expect.objectContaining({ kind: "extra_seat" }));
   });
 });
