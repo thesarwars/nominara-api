@@ -136,8 +136,36 @@ describe("NEW-C-10 · AuxService — real SQL under RLS", () => {
     const ws = await createWorkspace(); const actor = await createUser(); const p = await createProject(ws);
     const f = await createFinding(ws, p, await createAudit(ws, p));
     const out = await patch(CTX(ws, actor), f, { status: "wont_fix", reason: "Staging only" });
-    expect(out.wont_fix).toEqual({ reason: "Staging only" });
+    expect(out.wont_fix).toMatchObject({ reason: "Staging only" });
     expect(await statusOf(f)).toMatchObject({ status: "wont_fix", wont_fix_reason: "Staging only" });
+  });
+
+  const wontFixAt = async (id: string) => (await client.query<{ at: string | null; resurfaces: string | null }>(
+    "SELECT wont_fix_at::text AS at, (wont_fix_at + interval '180 days')::text AS resurfaces FROM aux_findings WHERE id = $1", [id])).rows[0]!;
+
+  it("[NEW-C-10 AC2] wont_fix records wont_fix_at and the read resurfaces it exactly 180 days later; a fresh finding has none", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(); const p = await createProject(ws);
+    const f = await createFinding(ws, p, await createAudit(ws, p));
+    expect((await wontFixAt(f)).at).toBeNull();
+    const before = Date.now();
+    const out = await patch(CTX(ws, actor), f, { status: "wont_fix", reason: "Staging only" });
+    const row = await client.query<{ at: Date }>("SELECT wont_fix_at AS at FROM aux_findings WHERE id = $1", [f]);
+    const at = row.rows[0]!.at;
+    expect(at.getTime()).toBeGreaterThanOrEqual(before - 5_000);
+    expect(at.getTime()).toBeLessThanOrEqual(Date.now() + 5_000);
+    expect(out.wont_fix).toEqual({ reason: "Staging only", resurfaces_at: new Date(at.getTime() + 180 * 86_400_000).toISOString() });
+  });
+
+  it("[NEW-C-10 AC2] a re-detection by the crawler does not move wont_fix_at, and acknowledging records none", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(); const p = await createProject(ws);
+    const f = await createFinding(ws, p, await createAudit(ws, p));
+    await patch(CTX(ws, actor), f, { status: "wont_fix", reason: "Staging only" });
+    const stamped = (await wontFixAt(f)).at;
+    await client.query("UPDATE aux_findings SET last_detected_at = now() + interval '1 day', occurrence_count = occurrence_count + 1, updated_at = now() + interval '1 day' WHERE id = $1", [f]);
+    expect((await wontFixAt(f)).at).toBe(stamped);
+    const g = await createFinding(ws, p, await createAudit(ws, p));
+    await patch(CTX(ws, actor), g, { status: "acknowledged" });
+    expect((await wontFixAt(g)).at).toBeNull();
   });
 
   it("[NEW-C-10 AC2] resolved is a 422 and the row is untouched", async () => {

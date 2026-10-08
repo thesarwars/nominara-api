@@ -104,6 +104,35 @@ describe("NEW-C-11 · RenderingQualityService", () => {
     expect(finding.params.flat()).toEqual(expect.arrayContaining([PROJECT_ID, "AUX-R-012", "AUX-R-013", "AUX-R-015"]));
   });
 
+  it("[NEW-C-11 AC1] BOTH new queries carry a bound project_id predicate (RLS is the guarantee; this is the sibling-project guard)", async () => {
+    const service = serviceWith(scorecardsFake([entry("google_ai_mode", 1, "demo")], 1));
+    await service.renderingQuality(PROJECT_ID, { timeframe: "30d" });
+    const counts = calls.find((c) => isCounts(c.sql))!;
+    const findings = calls.find((c) => isFindings(c.sql))!;
+    expect(counts.sql).toMatch(/c\.project_id = \$1\b/);
+    expect(findings.sql).toMatch(/f\.project_id = \$1\b/);
+    expect(counts.params[0]).toBe(PROJECT_ID);
+    expect(findings.params[0]).toBe(PROJECT_ID);
+  });
+
+  it("[NEW-C-11 AC2] the window and the workspace timezone are bound parameters ($2 from, $3 to, $4 zone), never literals", async () => {
+    const scorecards = scorecardsFake([entry("google_ai_mode", 1, "demo")], 1);
+    (scorecards.scorecards as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      project_id: PROJECT_ID, timeframe: "30d",
+      window: { from: "2026-09-09", to: "2026-10-08", timezone: "Pacific/Kiritimati" },
+      engines: [entry("google_ai_mode", 1, "demo")],
+      blended: { engine_key: "all", data_source: "mixed", metrics: { rendering_quality: 1 } },
+    });
+    const service = serviceWith(scorecards);
+    await service.renderingQuality(PROJECT_ID, { timeframe: "30d" });
+    const counts = calls.find((c) => isCounts(c.sql))!;
+    expect(counts.sql).toMatch(/\(c\.captured_at AT TIME ZONE \$4\)::date BETWEEN \$2::date AND \$3::date/);
+    expect(counts.sql).not.toMatch(/AT TIME ZONE '/);
+    expect(counts.sql).not.toContain("Pacific/Kiritimati");
+    expect(counts.sql).not.toContain("2026-09-09");
+    expect(counts.params.slice(0, 4)).toEqual([PROJECT_ID, "2026-09-09", "2026-10-08", "Pacific/Kiritimati"]);
+  });
+
   it("[NEW-C-11 AC3] an open price finding becomes the cause of a missing price", async () => {
     const service = serviceWith(
       scorecardsFake([entry("google_ai_mode", 10, "demo")], 10),

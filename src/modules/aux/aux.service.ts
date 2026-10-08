@@ -37,6 +37,9 @@ const SCOPE_OK = `(cardinality(app.current_scope_projects()) = 0 OR %P% = ANY(ap
 const ACKNOWLEDGE_FROM: ReadonlySet<string> = new Set(["open", "regressed"]);
 const WONT_FIX_FROM: ReadonlySet<string> = new Set(["open", "acknowledged", "in_progress", "regressed"]);
 
+/** aux-and-geo-analysis.md §3: a will-not-fix finding is due back for review this many days after it was set. */
+const WONT_FIX_RESURFACE_DAYS = 180;
+
 const AUDIT_SELECT = `
   SELECT a.id, a.project_id, a.trigger, a.scope, a.status, a.started_at, a.finished_at, a.created_at,
          a.created_at::text AS created_at_key,
@@ -59,7 +62,7 @@ const AUDIT_SELECT = `
 const FINDING_SELECT = `
   SELECT f.id, f.audit_id, f.project_id, f.rule_code, f.title, c.category, f.severity, f.status,
          c.rationale AS consequence, f.url, f.affected_pages, f.measured_value, f.threshold_value, f.evidence,
-         COALESCE(c.auto_fixable, false) AS auto_fixable, f.requires_human_review, f.wont_fix_reason,
+         COALESCE(c.auto_fixable, false) AS auto_fixable, f.requires_human_review, f.wont_fix_reason, f.wont_fix_at,
          f.first_detected_at, f.last_detected_at, f.resolved_at, f.regressed_at, f.occurrence_count, f.rule_version,
          (SELECT t.id FROM tasks t WHERE t.source_finding_id = f.id AND t.deleted_at IS NULL
            ORDER BY t.created_at DESC LIMIT 1) AS task_id,
@@ -133,10 +136,10 @@ export class AuxService {
    * The row is locked FOR UPDATE: two concurrent PATCHes serialise and the loser
    * is judged against the winner's state.
    *
-   * The 180-day re-surface of a will-not-fix finding is NOT implemented: no
-   * column records when the finding was set will-not-fix (`updated_at` moves on
-   * every re-detection), and the story names no schema change. See the evidence
-   * file for the decision needed.
+   * Moving to will-not-fix stamps `wont_fix_at` from the database clock (never a
+   * client date); the read reports `resurfaces_at` 180 days later. The crawler's
+   * re-detection never touches `wont_fix_at`. The automatic review transition on
+   * a later audit belongs to the crawl.audit handler (STORY-052), not here.
    */
   async updateFinding(findingId: string, body: UpdateAuxFindingRequest): Promise<AuxFinding> {
     const store = currentTenantStore()!;
@@ -168,7 +171,10 @@ export class AuxService {
       throw new ConflictError({ message: `a ${current.status} finding cannot be moved to ${body.status}`, details: { current_state: current.status } });
     }
 
-    await client.query(`UPDATE aux_findings SET status = $2, wont_fix_reason = $3 WHERE id = $1`, [
+    await client.query(`UPDATE aux_findings
+          SET status = $2, wont_fix_reason = $3,
+              wont_fix_at = CASE WHEN $2 = 'wont_fix' THEN now() ELSE NULL END
+        WHERE id = $1`, [
       findingId,
       body.status,
       body.status === "wont_fix" ? body.reason : null,
@@ -237,6 +243,7 @@ interface FindingRow {
   auto_fixable: boolean;
   requires_human_review: boolean;
   wont_fix_reason: string | null;
+  wont_fix_at: Date | null;
   first_detected_at: Date;
   last_detected_at: Date;
   resolved_at: Date | null;
@@ -299,7 +306,10 @@ function toFinding(row: FindingRow): AuxFinding {
     evidence: row.evidence,
     auto_fixable: row.auto_fixable,
     requires_human_review: row.requires_human_review,
-    wont_fix: row.status === "wont_fix" && row.wont_fix_reason !== null ? { reason: row.wont_fix_reason } : null,
+    wont_fix:
+      row.status === "wont_fix" && row.wont_fix_reason !== null
+        ? { reason: row.wont_fix_reason, resurfaces_at: row.wont_fix_at === null ? null : new Date(row.wont_fix_at.getTime() + WONT_FIX_RESURFACE_DAYS * 86_400_000).toISOString() }
+        : null,
     first_detected_at: row.first_detected_at.toISOString(),
     last_detected_at: row.last_detected_at.toISOString(),
     resolved_at: iso(row.resolved_at),

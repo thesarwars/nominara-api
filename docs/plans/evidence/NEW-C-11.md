@@ -83,3 +83,25 @@ Gates: pnpm lint exit 0; pnpm typecheck exit 0; integration rendering-quality (c
 
 ## Open: test:isolation (audit finding, major) - not fixable in this lane
 `pnpm test:isolation` crashes in its fixture on the base: migrations 0085/0086 (NEW-D-5 audit, cdc2766) cap support_grants TTL at 4 hours (ck_support_ttl_max) and the isolation global-setup fixture inserts a ~24 hour grant. This lane touches no migration and nothing under test/isolation; the fix belongs to the NEW-D-5 owner on the base. Until it lands and test:isolation (plus breakers for aux_findings) is green on the merged tip, the generic RLS proof for these tables is the table above, not the isolation suite.
+
+## Checkpoint-3 fix: predicate-removal tests (branch 7day/c-src-4, a451b93)
+
+The integration proofs for the sibling-project and window predicates already existed (above); this pass re-ran them on the merged tip and added the missing cheap layer: unit tests that read the SQL and its parameters, so a removed `project_id` predicate or an unbound window/zone fails in `test:unit`, not only in a container. Production code unchanged, so no RED commit; the "red" is each mutation.
+
+| Criterion | Test |
+|---|---|
+| AC1 BOTH new queries carry a bound project_id predicate | rendering-quality.spec.ts "[NEW-C-11 AC1] BOTH new queries carry a bound project_id predicate ..." (`c.project_id = $1`, `f.project_id = $1`, `params[0]` = project) |
+| AC2 window and timezone are bound, never literals | rendering-quality.spec.ts "[NEW-C-11 AC2] the window and the workspace timezone are bound parameters ($2 from, $3 to, $4 zone), never literals" (zone Pacific/Kiritimati; params[0..3] = project, from, to, zone; no zone/date text in the SQL) |
+| Same, against real SQL as nominara_app | integration "a sibling project's mentions in the SAME workspace ...", "a sibling project's open mapped finding in the SAME workspace ...", "only mentions inside the window, in the window's timezone, are counted" |
+
+Mutations on the current tip (each restored with git checkout):
+
+| Mutation | Unit result | Integration result |
+|---|---|---|
+| counts: `WHERE c.project_id = $1` -> `WHERE $1::uuid IS NOT NULL` | 1 failed / 10 passed | 1 failed / 8 passed (sibling mentions test) |
+| cause: `WHERE f.project_id = $1` -> `WHERE $1::uuid IS NOT NULL` | 1 failed / 10 passed | 1 failed / 8 passed (sibling finding test) |
+| window predicate dropped | (covered by the BETWEEN mutation below) | 1 failed / 8 passed (window/timezone test) |
+| `BETWEEN $2 AND $3` -> `BETWEEN $2 AND $2` | 1 failed / 10 passed | not run |
+| `AT TIME ZONE $4` -> literal `'UTC'` | 1 failed / 10 passed | `$4` kept bound inside a CASE, then 1 failed / 8 passed |
+
+Gates: unit rendering-quality 11 passed; lint 0; typecheck 0; test:unit 0 (302 files / 3703 passed, 1 skipped); integration rendering-quality exit 0 (9 passed at the tip); contracts unchanged. `test:isolation` ran on this branch: all of this lane's specs pass; the one failure is ISO-14 in `src/modules/reports/scheduled-reports.service.ts:234`, identical on `fee788e` (see NEW-C-10 evidence). The earlier "test:isolation crashes in its fixture" note no longer applies: the suite runs (12 of 13 files pass).

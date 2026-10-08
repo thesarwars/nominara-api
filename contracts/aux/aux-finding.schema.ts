@@ -55,7 +55,17 @@ export const auxFindingSchema = z
     auto_fixable: z.boolean(),
     requires_human_review: z.boolean(),
     /** Present exactly when status is wont_fix; the annotation the score exclusion must show. */
-    wont_fix: z.object({ reason: z.string() }).strict().nullable(),
+    wont_fix: z
+      .object({
+        reason: z.string(),
+        /**
+         * When the finding is due back for review: wont_fix_at plus 180 days (aux-and-geo-analysis.md §3).
+         * null = the finding was set will-not-fix before wont_fix_at was recorded, so no date is known.
+         */
+        resurfaces_at: z.string().nullable().optional(),
+      })
+      .strict()
+      .nullable(),
     first_detected_at: z.string(),
     last_detected_at: z.string(),
     resolved_at: z.string().nullable(),

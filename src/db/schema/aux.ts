@@ -70,6 +70,7 @@ export const auxFindings = pgTable("aux_findings", {
   ruleVersion: text("rule_version").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  wontFixAt: timestamp("wont_fix_at", { withTimezone: true }),
 });
 
 export const auxRuleCatalog = pgTable("aux_rule_catalog", {

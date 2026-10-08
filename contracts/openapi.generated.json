@@ -5981,6 +5981,16 @@
                               "properties": {
                                 "reason": {
                                   "type": "string"
+                                },
+                                "resurfaces_at": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
                                 }
                               },
                               "required": [
@@ -23432,6 +23442,16 @@
                               "properties": {
                                 "reason": {
                                   "type": "string"
+                                },
+                                "resurfaces_at": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
                                 }
                               },
                               "required": [

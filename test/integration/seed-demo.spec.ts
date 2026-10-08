@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,7 @@ import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { assertDemoSeedAllowed, DemoSeedRefusedError } from "../../src/db/seed/demo/guard.js";
 import { runSeedDemo, type SeedDemoPool, type SeedDemoPoolClient } from "../../src/db/seed-demo.js";
+import { refreshProjectSourceIndex } from "../../src/lib/rollup/refresh-project-source-index.js";
 import { readWallet } from "../../src/lib/credits/wallet.js";
 import { verifyProjectSourcePresence } from "../../src/lib/sources/verify-presence.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
@@ -373,6 +374,31 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
   it("NEW-C-15 audit · seed, then verify: no seeded domain is fetched and no index row carries a verified absence", async () => {
     const workspaceId = await createWorkspace("growth");
     await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    // NEW-A-8 keeps Gemini real: the seed writes no Gemini citations. So setup plays the live adapter: one REAL
+    // Gemini capture per project that cites a domain the seed fabricated (a competitor's demo `<name>.example.com`; the seed's other domains are real-looking and a real citation of one is rightly fetchable), then the
+    // source index is rebuilt. Verification must still refuse to fetch it, which is the property under test.
+    for (const project of await projectsOf(workspaceId)) {
+      const projectId = project.id as string;
+      const seededDomains = await client.query<{ domain: string }>(
+        `SELECT DISTINCT domain FROM citation_facts WHERE project_id = $1 AND engine_key <> 'gemini' AND domain LIKE '%.example.com' ORDER BY domain LIMIT 3`,
+        [projectId],
+      );
+      if (seededDomains.rowCount === 0) continue;
+      const realId = await insertRealGeminiCapture(workspaceId, projectId);
+      for (const [i, row] of seededDomains.rows.entries()) {
+        const url = `https://${row.domain}/gemini-cited-${i}`;
+        await client.query(
+          `INSERT INTO citation_facts
+             (workspace_id, project_id, result_id, prompt_id, engine_key, captured_at, slot_index, raw_url, normalized_url,
+              url_hash, domain, is_owned, is_competitor, source_class, http_status, position_weight)
+           VALUES ($1,$2,$3,$4,'gemini', now() - interval '1 hour', $5,$6,$6,$8,$7,false,false,'community_forum',200,1)`,
+          [workspaceId, projectId, realId, randomUUID(), i + 1, url, row.domain, createHash("sha256").update(url).digest()],
+        );
+      }
+      await client.query("BEGIN");
+      await refreshProjectSourceIndex(client, projectId);
+      await client.query("COMMIT");
+    }
     const indexed = await client.query<{ engine_key: string }>(
       `SELECT DISTINCT engine_key FROM project_source_index WHERE workspace_id = $1`,
       [workspaceId],
@@ -390,7 +416,7 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
         verifyProjectSourcePresence(tx, project.id as string, { fetch }),
       );
     }
-    expect(fetch, "a demo domain is never fetched").not.toHaveBeenCalled();
+    expect(fetch.mock.calls.map((c) => String(c[0]?.url ?? c[0])), "a demo domain is never fetched").toEqual([]);
     const stamped = await client.query(
       `SELECT 1 FROM project_source_index WHERE workspace_id = $1 AND (brand_present_on_domain IS NOT NULL OR verified_at IS NOT NULL)`,
       [workspaceId],
