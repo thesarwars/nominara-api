@@ -119,5 +119,5 @@ Until then the sources criterion and the "no fact tables" criterion for sources 
 
 ## Audit round 3 status (2026-10-08): PARTIAL
 
-NEW-E-099b is **partial**, not done: \`GET /portal/sources\` is not built (criterion "Sources is read from project_source_index
+NEW-E-099b is **partial**, not done: `GET /portal/sources` is not built (criterion "Sources is read from project_source_index
 only" is NOT MET, blocked on the owner decision above). The portal frontend's sources tab must stay on demo data.
