@@ -27,8 +27,8 @@ import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 //
 // BOTH WRITE A MILESTONE, because the share-of-voice denominator moves with
 // the tracked set and an unannotated move reads as performance (FR-CO-06).
-// `competitor_added` is the only competitor kind the CHECK allows; a removal
-// carries it with a title that says so, as the demo seed does.
+// A removal is its own kind, `competitor_removed` (owner decision 8, migration
+// 0098), so the growth map never has to read a title to tell the two apart.
 const COMPETITOR_CAP_KEY = "competitors.max_per_project";
 
 interface BackfillSpan {
@@ -146,6 +146,7 @@ export class CompetitorTrackingService {
       workspaceId,
       projectId,
       actorId,
+      "competitor_added",
       `Competitor added: ${input.name}`,
       `Tracked set is now ${String(live.rows.length + 1)}. Share-of-voice moves from this point are a configuration change, not performance.`,
     );
@@ -188,6 +189,7 @@ export class CompetitorTrackingService {
       workspaceId,
       projectId,
       actorId,
+      "competitor_removed",
       `Competitor removed: ${name}`,
       `Tracked set is now ${String(remaining.rows[0]!.n)}. Share-of-voice moves from this point are a configuration change, not performance.`,
     );
@@ -201,13 +203,14 @@ export class CompetitorTrackingService {
     workspaceId: string,
     projectId: string,
     actorId: string,
+    kind: "competitor_added" | "competitor_removed",
     title: string,
     detail: string,
   ): Promise<void> {
     await tx.query(
       `INSERT INTO milestones (id, workspace_id, project_id, occurred_at, kind, title, detail, source_type, created_by)
-       VALUES ($1,$2,$3,now(),'competitor_added',$4,$5,'user',$6)`,
-      [uuidV7(), workspaceId, projectId, title, detail, actorId],
+       VALUES ($1,$2,$3,now(),$7,$4,$5,'user',$6)`,
+      [uuidV7(), workspaceId, projectId, title, detail, actorId, kind],
     );
   }
 

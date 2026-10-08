@@ -348,17 +348,24 @@ async function verifiedBrandPresence(tx: ClientBase, workspaceId: string, domain
   return row?.present ?? null;
 }
 
+/**
+ * SPEC READING, FLAGGED FOR THE OWNER (CP2 QA, STORY-056 criterion 4).
+ * scoring-models.md section 9 uses `rank_of_topic_by_intent` and defines no
+ * ordering rule for it. This takes the plan's reading: rank 1 for EVERY prompt,
+ * so `1 / rank` is 1 and prompt_weight is `0.5 * commercial_intent + 0.5`.
+ * Ranking `topic_clusters` by their commercial_intent is the alternative; it is
+ * not taken because the spec does not say to, and a silent invention would move
+ * every stored impact score. Pinned by the CP2 STORY-056 rank test.
+ *
+ * GOLDEN-SET GATE: there is no golden-set runner for the D1 scoring change, so
+ * that gate is UNAVAILABLE for STORY-056 and was not run. `scoring_version` is
+ * stamped on each row but was not bumped and there is no dual-compute.
+ */
+const TOPIC_RANK_BY_INTENT = 1;
+
 async function cellContext(tx: ClientBase, projectId: string, cell: CaptureRow, maxEngineWeight: number): Promise<CellContext> {
   const prompt = (
-    await tx.query<{ funnel_stage: FunnelStage; rank: number }>(
-      `SELECT p.funnel_stage,
-              CASE WHEN tc.id IS NULL THEN 1
-                   ELSE 1 + (SELECT count(*)::int FROM topic_clusters o WHERE o.project_id = p.project_id AND o.commercial_intent > tc.commercial_intent)
-              END AS rank
-         FROM tracked_prompts p LEFT JOIN topic_clusters tc ON tc.id = p.cluster_id
-        WHERE p.id = $1`,
-      [cell.prompt_id],
-    )
+    await tx.query<{ funnel_stage: FunnelStage }>(`SELECT funnel_stage FROM tracked_prompts WHERE id = $1`, [cell.prompt_id])
   ).rows[0];
   const weight = (
     await tx.query<{ weight: number }>(`SELECT weight::float8 AS weight FROM project_engines WHERE project_id = $1 AND engine_key = $2`, [
@@ -369,7 +376,7 @@ async function cellContext(tx: ClientBase, projectId: string, cell: CaptureRow, 
   const engineWeight = weight ?? 1;
   return {
     funnelStage: prompt?.funnel_stage ?? "consideration",
-    topicRankByIntent: prompt?.rank ?? 1,
+    topicRankByIntent: TOPIC_RANK_BY_INTENT,
     engineWeight,
     maxEngineWeight: Math.max(maxEngineWeight, engineWeight),
   };
