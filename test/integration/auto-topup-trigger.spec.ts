@@ -123,7 +123,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     const res = await put(owner, { enabled: true, pack_key: "starter_vault", threshold: 100, max_per_cycle: over.max ?? 3 });
     expect(res.statusCode, res.body).toBe(200);
     await setBalance(ws.id, 50);
-    const referencePi = `pi_ref_${ws.id.slice(0, 8)}`;
+    const referencePi = `pi_ref_${ws.id}`;
     if (over.reference !== false) {
       await harness.db().query(
         `INSERT INTO credit_purchases (workspace_id, pack_key, credits, amount_usd, source, status, stripe_payment_intent_id, expires_at, purchased_by)
@@ -141,7 +141,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     (await harness.db().query("SELECT id, status, source, pack_key, credits, amount_usd::text AS amount_usd, purchased_by, stripe_payment_intent_id FROM credit_purchases WHERE workspace_id = $1 AND source = 'auto_topup' ORDER BY created_at, id", [workspaceId])).rows;
   const wallet = async (workspaceId: string) =>
     (await harness.db().query("SELECT included_balance, purchased_balance, auto_topup_enabled, auto_topup_count_cycle FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rows[0];
-  const ledger = async (workspaceId: string) => (await harness.db().query("SELECT entry_type, credits, idempotency_key FROM credit_ledger WHERE workspace_id = $1 ORDER BY seq", [workspaceId])).rows;
+  const ledger = async (workspaceId: string) => (await harness.db().query("SELECT entry_type, credits, idempotency_key FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'purchase' ORDER BY seq", [workspaceId])).rows;
   const audit = async (workspaceId: string, like: string) =>
     (await harness.db().query("SELECT action, resource_type, resource_id, after_state FROM audit_log WHERE workspace_id = $1 AND action LIKE $2 ORDER BY seq", [workspaceId, like])).rows;
 
@@ -187,6 +187,41 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(2);
     expect(gateway.offSessionCharges).toHaveLength(1);
     expect(email.sent).toHaveLength(1);
+  });
+
+  const lookupsReached = async (n: number) => {
+    for (let i = 0; i < 200 && gateway.savedMethodLookups.length < n; i += 1) await new Promise((r) => setTimeout(r, 25));
+    expect(gateway.savedMethodLookups.length).toBeGreaterThanOrEqual(n);
+  };
+
+  it("STORY-076 scenario 7 · the cap is enforced by the claim itself: a trigger that planned before the cap was spent is refused at the UPDATE", async () => {
+    const { workspaceId } = await armed({ max: 1 });
+    const release = gateway.holdLookups();
+    const stale = service.trigger(workspaceId); // planned with count 0 of 1, parked before its claim
+    await lookupsReached(1);
+    gateway.stopHoldingNewLookups();
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    const purchase = (await autoPurchases(workspaceId))[0]!;
+    expect((await stripeSays(workspaceId, purchase.id as string, piOf(purchase.id as string), "succeeded")).statusCode).toBe(200);
+    await setBalance(workspaceId, 50);
+    release();
+    expect(await stale).toBe("cap_reached");
+    expect(gateway.offSessionCharges).toHaveLength(1);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
+    expect(email.sent.filter((m) => m.subject === "Nominara auto top-up triggered")).toHaveLength(1);
+  });
+
+  it("STORY-076 scenario 7 · two triggers that both planned with nothing in flight charge once, with cap left (the claim serialises on the wallet row)", async () => {
+    const { workspaceId } = await armed({ max: 5 });
+    const release = gateway.holdLookups();
+    const both = Promise.all([service.trigger(workspaceId), service.trigger(workspaceId)]);
+    await lookupsReached(2);
+    release();
+    const outcomes = (await both).sort();
+    expect(outcomes).toEqual(["charge_submitted", "in_flight"]);
+    expect(gateway.offSessionCharges).toHaveLength(1);
+    expect(await autoPurchases(workspaceId)).toHaveLength(1);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
   });
 
   it("STORY-076 scenario 7 · with a charge still in flight a further trigger charges nothing, even with cap left (in_flight)", async () => {
@@ -327,7 +362,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect(email.sent).toHaveLength(1);
     expect(email.sent[0]).toMatchObject({ to: BILLING_EMAIL, subject: "Nominara auto top-up disabled after a failed payment" });
     expect(await audit(workspaceId, "billing.auto_topup.disabled")).toEqual([
-      expect.objectContaining({ resource_type: "credit_wallet", after_state: expect.objectContaining({ reason: "payment_failed", purchase_id: purchase.id }) }),
+      expect.objectContaining({ resource_type: "credit_wallet", after_state: expect.objectContaining({ reason: "payment_failed", enabled: false }) }),
     ]);
     const config = autoTopupConfigSchema.parse(dataOf<{ auto_topup: unknown }>(await getWallet(owner)).auto_topup);
     expect(config).toMatchObject({ enabled: false, used_this_cycle: 1, disabled_reason: "payment_failed" });
@@ -391,16 +426,72 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect(email.sent).toHaveLength(0);
   });
 
-  it("NEW-D-7 · a provider outage on the charge fails the purchase (a failed purchase still settles if it turns out paid) and does not disable the setting", async () => {
-    const { workspaceId } = await armed();
+  it("NEW-D-7 audit F2 · a provider outage on the charge leaves the purchase pending: the in-flight guard stays closed, so the card is never charged twice and a late success still settles", async () => {
+    const { workspaceId } = await armed({ max: 5 });
     gateway.failChargeWith = new StripeUpstreamError(503);
     expect(await service.trigger(workspaceId)).toBe("upstream_error");
-    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "failed" });
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "pending" });
     expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: true, auto_topup_count_cycle: 1 });
-    // The charge may have gone through: its webhook still settles the failed row.
+    // The charge may have gone through. Provider recovered: a further trigger must NOT charge again.
+    gateway.failChargeWith = undefined;
+    expect(await service.trigger(workspaceId)).toBe("in_flight");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(await autoPurchases(workspaceId)).toHaveLength(1);
     const purchase = (await autoPurchases(workspaceId))[0]!;
     await stripeSays(workspaceId, purchase.id as string, piOf(purchase.id as string), "succeeded");
     expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "succeeded" });
+  });
+
+  // ---- NEW-D-7 audit F3: a downgrade ------------------------------------------------------------
+
+  it("NEW-D-7 audit F3 · a workspace downgraded below Growth after enabling auto-top-up is not_in_plan: nothing charged, emailed or counted", async () => {
+    const { workspaceId } = await armed({ plan: "growth" });
+    await harness.db().query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [workspaceId]);
+    expect(await service.trigger(workspaceId)).toBe("not_in_plan");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect(email.sent).toHaveLength(0);
+    expect(await autoPurchases(workspaceId)).toHaveLength(0);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(0);
+  });
+
+  it("NEW-D-7 audit F3 · the claim re-checks the plan: a downgrade between plan and claim is refused at the UPDATE", async () => {
+    const { workspaceId } = await armed({ plan: "growth" });
+    const release = gateway.holdLookups();
+    const stale = service.trigger(workspaceId);
+    await lookupsReached(1);
+    await harness.db().query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [workspaceId]);
+    release();
+    expect(await stale).toBe("not_in_plan");
+    expect(gateway.offSessionCharges).toHaveLength(0);
+    expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(0);
+  });
+
+  // ---- NEW-D-7 audit F6: a stuck pending purchase ----------------------------------------------
+
+  it("NEW-D-7 audit F6 · a pending auto-top-up purchase older than an hour no longer blocks: it is failed, audited, and a new trigger can charge", async () => {
+    const { workspaceId } = await armed({ max: 5 });
+    gateway.failChargeWith = new StripeUpstreamError(503);
+    expect(await service.trigger(workspaceId)).toBe("upstream_error");
+    gateway.failChargeWith = undefined;
+    const stuck = (await autoPurchases(workspaceId))[0]!;
+    await harness.db().query("UPDATE credit_purchases SET created_at = now() - interval '61 minutes' WHERE id = $1", [stuck.id]);
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    const purchases = await autoPurchases(workspaceId);
+    expect(purchases).toHaveLength(2);
+    expect(purchases.find((p) => p.id === stuck.id)).toMatchObject({ status: "failed" });
+    expect(purchases.filter((p) => p.status === "pending")).toHaveLength(1);
+    expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([expect.objectContaining({ resource_type: "credit_purchase", resource_id: stuck.id })]);
+    expect(gateway.offSessionCharges).toHaveLength(1);
+  });
+
+  it("NEW-D-7 audit F6 · a pending purchase younger than an hour still blocks (in_flight): the sweep never reopens a live charge", async () => {
+    const { workspaceId } = await armed({ max: 5 });
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    const live = (await autoPurchases(workspaceId))[0]!;
+    await harness.db().query("UPDATE credit_purchases SET created_at = now() - interval '59 minutes' WHERE id = $1", [live.id]);
+    expect(await service.trigger(workspaceId)).toBe("in_flight");
+    expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "pending" });
+    expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([]);
   });
 
   // ---- AC4: no saved payment method ------------------------------------------------------------
@@ -474,7 +565,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
   });
 
   it("NEW-D-7 · observability: a trigger emits nominara_billing_auto_topup_trigger_total by outcome, and its log lines carry the workspace id but no address, card or customer id", async () => {
-    const { workspaceId } = await armed({ max: 1 });
+    const { workspaceId } = await armed({ max: 3 });
     await service.trigger(workspaceId);
     await service.trigger(workspaceId);
     const metrics = log.mock.calls.map((c) => c[0] as Record<string, unknown>).filter((c) => typeof c === "object" && typeof c?.metric === "string");

@@ -120,10 +120,31 @@ export class FakeStripeGateway implements StripeGateway {
   /** Makes only the charge (not the lookup) fail like an upstream outage. */
   failChargeWith: Error | undefined;
 
-  findSavedPaymentMethod(referencePaymentIntentId: string): Promise<SavedPaymentMethod | null> {
-    if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
+  /**
+   * The lookups sit between the trigger's read-only PLAN and its CLAIM. Holding
+   * them open lets a test interleave two triggers that both planned against the
+   * same state. Returns `release` (also stops holding later lookups).
+   */
+  private lookupGate: Promise<void> | undefined;
+  holdLookups(): () => void {
+    let release!: () => void;
+    this.lookupGate = new Promise<void>((resolve) => (release = resolve));
+    return () => {
+      this.lookupGate = undefined;
+      release();
+    };
+  }
+  /** Stops holding NEW lookups without releasing the ones already held. */
+  stopHoldingNewLookups(): void {
+    this.lookupGate = undefined;
+  }
+
+  async findSavedPaymentMethod(referencePaymentIntentId: string): Promise<SavedPaymentMethod | null> {
+    if (this.failFetchWith !== undefined) throw this.failFetchWith;
     this.savedMethodLookups.push(referencePaymentIntentId);
-    return Promise.resolve(this.savedMethods.get(referencePaymentIntentId) ?? null);
+    const gate = this.lookupGate;
+    if (gate !== undefined) await gate;
+    return this.savedMethods.get(referencePaymentIntentId) ?? null;
   }
 
   createOffSessionPayment(input: OffSessionPaymentInput): Promise<OffSessionPaymentResult> {
