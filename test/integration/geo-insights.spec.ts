@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -247,5 +248,14 @@ describe("STORY-062 · GEO insights persistence and read", () => {
       await db.query("RESET ROLE");
     }
     expect(await count()).toBe(1);
+  });
+  it("STORY-062 migration 0072 · the down file restores the single-column FK and the up file reapplies the composite one", async () => {
+    const sql = (f: string) => readFileSync(new URL(`../../src/db/migrations/sql/0072_geo_analyses_tenant_fk.${f}.sql`, import.meta.url), "utf8");
+    const fks = async () => (await db.query("SELECT conname FROM pg_constraint WHERE conrelid = 'geo_analyses'::regclass AND contype = 'f'")).rows.map((r) => r.conname);
+    expect(await fks()).toEqual(["geo_analyses_project_fkey"]);
+    await db.query(sql("down"));
+    expect(await fks()).toEqual(["geo_analyses_project_id_fkey"]);
+    await db.query(sql("up"));
+    expect(await fks()).toEqual(["geo_analyses_project_fkey"]);
   });
 });
