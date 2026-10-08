@@ -1,5 +1,11 @@
+import { Logger } from "@nestjs/common";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SchedulerSweepRuntime, nextSweepAfter, sweepIdempotencyKey } from "../../src/lib/capture/scheduler-sweep.js";
+import {
+  SchedulerSweepRuntime,
+  nextSweepAfter,
+  runSchedulerSweep,
+  sweepIdempotencyKey,
+} from "../../src/lib/capture/scheduler-sweep.js";
 
 // NEW-A-13 — the sweep's clock and its dedup identity, with no database.
 
@@ -85,5 +91,194 @@ describe("NEW-A-13 · the in-process runtime", () => {
     await vi.advanceTimersByTimeAsync(65 * 60_000);
     expect(connects.length).toBeGreaterThanOrEqual(2); // the direct tick, then the :05 one
     runtime.stop();
+  });
+});
+
+// CHECKPOINT-3 blocker — the sweep held up to 500 project row locks across a
+// Valkey call with no time limit; a stalled Valkey stopped scheduling for good.
+// Every wait the sweep makes is now bounded, and the tick as a whole is bounded
+// so arm() always runs again.
+describe("NEW-A-13 checkpoint-3 · every wait the sweep makes is bounded", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const NEXT_RUN = new Date("2026-10-08T09:00:00.000Z");
+
+  /** A client that answers the sweep's statements and records them; `hang` makes the named statement never answer. */
+  function fakeClient(options: { rows?: number; hang?: "claim" | "any" } = {}) {
+    const statements: Array<{ sql: string; params: unknown[] | undefined }> = [];
+    let ended = 0;
+    const rows = Array.from({ length: options.rows ?? 1 }, (_, i) => ({
+      id: `project-${i}`,
+      workspace_id: `workspace-${i}`,
+      cadence: "daily",
+      next_run_at: NEXT_RUN,
+    }));
+    const client = {
+      query: async (sql: string, params?: unknown[]) => {
+        statements.push({ sql, params });
+        if (options.hang === "any") return new Promise(() => undefined);
+        if (sql.includes("pg_roles")) return { rows: [{ can_see: true, who: "owner" }] };
+        if (sql.includes("FOR UPDATE OF p")) {
+          if (options.hang === "claim") return new Promise(() => undefined);
+          return { rows };
+        }
+        return { rows: [] };
+      },
+      end: async () => {
+        ended += 1;
+      },
+    };
+    return { client, statements, ended: () => ended };
+  }
+
+  const never = () => new Promise<void>(() => undefined);
+
+  it("NEW-A-13 CP3-1a · an enqueue that never resolves is abandoned after enqueueTimeoutMs and counted as a failed enqueue (partial)", async () => {
+    const { client } = fakeClient();
+    const promise = runSchedulerSweep(client as never, never, new Date("2026-10-08T10:00:00.000Z"), {
+      enqueueTimeoutMs: 500,
+      transactionBudgetMs: 10_000,
+      lockTimeoutMs: 1_000,
+      idleInTransactionTimeoutMs: 2_000,
+    });
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(promise).resolves.toEqual({ status: "partial", claimed: 1, enqueued: 0, failed: 1 });
+  });
+
+  it("NEW-A-13 CP3-1b · the transaction sets lock_timeout and idle_in_transaction_session_timeout transaction-locally, after BEGIN and before the claim", async () => {
+    const { client, statements } = fakeClient();
+    await runSchedulerSweep(client as never, async () => undefined, new Date("2026-10-08T10:00:00.000Z"), {
+      enqueueTimeoutMs: 500,
+      transactionBudgetMs: 10_000,
+      lockTimeoutMs: 1_234,
+      idleInTransactionTimeoutMs: 5_678,
+    });
+    const sqls = statements.map((s) => s.sql);
+    const begin = sqls.findIndex((sql) => sql.trim() === "BEGIN");
+    const claim = sqls.findIndex((sql) => sql.includes("FOR UPDATE OF p"));
+    const setConfigs = statements
+      .map((s, index) => ({ ...s, index }))
+      .filter((s) => /set_config/i.test(s.sql));
+    expect(setConfigs).toHaveLength(2);
+    for (const call of setConfigs) {
+      expect(call.index).toBeGreaterThan(begin);
+      expect(call.index).toBeLessThan(claim);
+      expect(call.sql, "is_local => true: a session-level setting would leak (KAD-03)").toMatch(/set_config\(\$1,\s*\$2,\s*true\)/i);
+    }
+    expect(setConfigs.map((c) => c.params)).toEqual([
+      ["lock_timeout", "1234ms"],
+      ["idle_in_transaction_session_timeout", "5678ms"],
+    ]);
+    expect(sqls.some((sql) => /^\s*SET\s/i.test(sql))).toBe(false);
+  });
+
+  it("NEW-A-13 CP3-1c · the transaction as a whole is budgeted: once transactionBudgetMs is spent no further row is attempted, and every unsent row is counted failed", async () => {
+    const { client } = fakeClient({ rows: 5 });
+    const attempts: string[] = [];
+    const promise = runSchedulerSweep(
+      client as never,
+      (job) => {
+        attempts.push(job.projectId);
+        return never();
+      },
+      new Date("2026-10-08T10:00:00.000Z"),
+      { enqueueTimeoutMs: 50, transactionBudgetMs: 80, lockTimeoutMs: 1_000, idleInTransactionTimeoutMs: 2_000 },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await expect(promise).resolves.toEqual({ status: "partial", claimed: 5, enqueued: 0, failed: 5 });
+    expect(attempts, "t=0 and t=50 are inside the 80 ms budget; t=100 is not").toEqual(["project-0", "project-1"]);
+  });
+
+  function runtimeWith(connect: () => Promise<never>, extra: Record<string, number> = {}) {
+    vi.setSystemTime(new Date("2026-10-08T10:00:00.000Z"));
+    return new SchedulerSweepRuntime({
+      connect,
+      enqueue: never,
+      limits: {
+        enqueueTimeoutMs: 60_000,
+        transactionBudgetMs: 60_000,
+        lockTimeoutMs: 5_000,
+        idleInTransactionTimeoutMs: 15_000,
+        tickTimeoutMs: 1_000,
+        connectTimeoutMs: 500,
+        ...extra,
+      },
+    } as never);
+  }
+
+  it("NEW-A-13 CP3-3a · a connect that never answers (blackholed Postgres) is abandoned, and the next :05 tick still fires", async () => {
+    const connects: string[] = [];
+    const runtime = runtimeWith(() => {
+      connects.push(new Date().toISOString());
+      return new Promise<never>(() => undefined);
+    });
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 2_000);
+    expect(connects).toEqual(["2026-10-08T10:05:00.000Z"]);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(connects).toEqual(["2026-10-08T10:05:00.000Z", "2026-10-08T11:05:00.000Z"]);
+    runtime.stop();
+  });
+
+  it("NEW-A-13 CP3-3b · a tick that stalls on Postgres is abandoned at tickTimeoutMs, its connection is ended (releasing the row locks), and the next :05 tick still fires", async () => {
+    const clients: Array<ReturnType<typeof fakeClient>> = [];
+    const runtime = runtimeWith(async () => {
+      const made = fakeClient({ hang: "claim" });
+      clients.push(made);
+      return made.client as never;
+    });
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 2_000);
+    expect(clients).toHaveLength(1);
+    expect(clients[0]!.ended(), "the stalled tick's connection is ended so Postgres drops its locks").toBeGreaterThanOrEqual(1);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(clients).toHaveLength(2);
+    runtime.stop();
+  });
+
+  it("NEW-A-13 CP3-3c · tick() resolves null (never pends forever) when the sweep stalls, and ends its connection", async () => {
+    const made = fakeClient({ hang: "any" });
+    const runtime = runtimeWith(async () => made.client as never);
+    const promise = runtime.tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(promise).resolves.toBeNull();
+    expect(made.ended()).toBeGreaterThanOrEqual(1);
+  });
+
+  it("NEW-A-13 CP3-obs · a timed-out tick and a timed-out enqueue are counted and logged with ids only", async () => {
+    const lines: unknown[] = [];
+    for (const level of ["log", "warn", "error"] as const) {
+      vi.spyOn(Logger.prototype, level).mockImplementation((message: unknown) => void lines.push(message));
+    }
+    const made = fakeClient({ hang: "any" });
+    const runtime = runtimeWith(async () => made.client as never);
+    const promise = runtime.tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await promise;
+    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_capture_scheduler_sweeps_total")).toMatchObject({
+      status: "timed_out",
+    });
+    expect(lines.find((l) => (l as { event?: string }).event === "capture.scheduler.tick_timed_out")).toBeDefined();
+
+    lines.length = 0;
+    const other = fakeClient();
+    const swept = runSchedulerSweep(other.client as never, never, new Date("2026-10-08T10:00:00.000Z"), {
+      enqueueTimeoutMs: 100,
+      transactionBudgetMs: 10_000,
+      lockTimeoutMs: 1_000,
+      idleInTransactionTimeoutMs: 2_000,
+    });
+    await vi.advanceTimersByTimeAsync(100);
+    await swept;
+    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_capture_scheduler_enqueue_failures_total")).toBeDefined();
+    expect(lines.find((l) => (l as { event?: string }).event === "capture.scheduler.enqueue_failed")).toMatchObject({
+      workspace_id: "workspace-0",
+      project_id: "project-0",
+      error: "EnqueueTimeoutError",
+    });
   });
 });

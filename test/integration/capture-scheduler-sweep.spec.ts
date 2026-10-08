@@ -394,4 +394,77 @@ describe("NEW-A-13 · the scheduler sweep claims due projects and enqueues signe
     expect(event).toMatchObject({ workspace_id: ws, project_id: project });
     expect(JSON.stringify(lines)).not.toContain("Secret Co Name");
   }, 60_000);
+
+  // CHECKPOINT-3 blocker. The sweep holds FOR UPDATE on up to 500 project rows
+  // across the enqueue; a Valkey that stops answering must not keep them.
+  const noLocksHeld = async (projectId: string): Promise<boolean> => {
+    const probe = await connect();
+    try {
+      await probe.query("BEGIN");
+      await probe.query("SELECT id FROM projects WHERE id = $1 FOR UPDATE NOWAIT", [projectId]);
+      await probe.query("ROLLBACK");
+      return true;
+    } catch {
+      await probe.query("ROLLBACK").catch(() => undefined);
+      return false;
+    } finally {
+      await probe.end();
+    }
+  };
+  const eventually = async (check: () => Promise<boolean>, withinMs: number): Promise<boolean> => {
+    const deadline = Date.now() + withinMs;
+    while (Date.now() < deadline) {
+      if (await check()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return check();
+  };
+  const bounds = { enqueueTimeoutMs: 400, transactionBudgetMs: 5_000, lockTimeoutMs: 1_000, idleInTransactionTimeoutMs: 5_000 };
+
+  it("NEW-A-13 CP3-1d · an enqueue that never resolves: the sweep returns partial within the bound and the project row locks are released (a second connection's FOR UPDATE NOWAIT succeeds)", async () => {
+    const ws = await addWorkspace();
+    const project = await addProject(ws);
+    const started = Date.now();
+    const result = await Promise.race([
+      runSchedulerSweep(sweepA, () => new Promise<void>(() => undefined), new Date(), bounds),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 8_000)),
+    ]);
+    expect(result, "the sweep must not pend on a stalled queue").toEqual({ status: "partial", claimed: 1, enqueued: 0, failed: 1 });
+    expect(Date.now() - started).toBeLessThan(8_000);
+    expect(await noLocksHeld(project)).toBe(true);
+  }, 30_000);
+
+  it("NEW-A-13 CP3-2 · Postgres bounds the transaction itself: past idle_in_transaction_session_timeout the server ends the session and drops the row locks, even if the process never lets go", async () => {
+    const ws = await addWorkspace();
+    const project = await addProject(ws);
+    const lonely = await connect();
+    lonely.on("error", () => undefined);
+    const sweep = runSchedulerSweep(lonely, () => new Promise<void>(() => undefined), new Date(), {
+      ...bounds,
+      enqueueTimeoutMs: 60_000,
+      transactionBudgetMs: 60_000,
+      idleInTransactionTimeoutMs: 400,
+    });
+    sweep.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(await noLocksHeld(project), "the lock is held while the enqueue is pending").toBe(false);
+    expect(await eventually(() => noLocksHeld(project), 5_000), "released by the server, not by the client").toBe(true);
+    await lonely.end().catch(() => undefined);
+  }, 30_000);
+
+  it("NEW-A-13 CP3-3d · a tick whose enqueue never resolves is abandoned at tickTimeoutMs, its connection is ended, the row locks are released, and tick() settles so the runtime can re-arm", async () => {
+    const ws = await addWorkspace();
+    const project = await addProject(ws);
+    const runtime = new SchedulerSweepRuntime({
+      connect: () => connect(),
+      enqueue: () => new Promise<void>(() => undefined),
+      limits: { ...bounds, enqueueTimeoutMs: 60_000, transactionBudgetMs: 60_000, idleInTransactionTimeoutMs: 60_000, tickTimeoutMs: 700, connectTimeoutMs: 2_000 },
+    } as never);
+    const settled = await Promise.race([
+      runtime.tick().then(() => "settled" as const),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 8_000)),
+    ]);
+    expect(settled).toBe("settled");
+    expect(await eventually(() => noLocksHeld(project), 5_000)).toBe(true);
+  }, 30_000);
 });
