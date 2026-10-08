@@ -3,6 +3,18 @@ import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { MIGRATIONS_DIR, migrateUp, rollbackLast } from "../../src/db/migrate-runner.js";
 
+const MIGRATION = "0079_scheduled_report_deliveries_tenant_fk";
+
+/** Rolls back newest-first until `name` itself has been rolled back; returns the last name rolled back. */
+async function rollBackThrough(client: Client, name: string): Promise<string> {
+  for (;;) {
+    const rolled = await rollbackLast(client, MIGRATIONS_DIR);
+    if (rolled === null) throw new Error(`${name} was never applied`);
+    if (rolled === name) return rolled;
+    if (rolled < name) throw new Error(`rolled back ${rolled} without meeting ${name}`);
+  }
+}
+
 // CP1 re-audit (e-reports MAJOR) — scheduled_report_deliveries must not be able
 // to reference another tenant's scheduled report or artifact. Postgres checks FKs
 // without RLS, so a single-column FK accepted a foreign id and let tenant B's
@@ -128,7 +140,9 @@ describe("CP1 e-reports · scheduled_report_deliveries foreign keys are tenant-c
   });
 
   it("CP1-E-FK-6 · the new migration rolls back and re-applies cleanly", async () => {
-    expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe("0079_scheduled_report_deliveries_tenant_fk");
+    // Roll back every migration newer than this one, then this one: the test pins
+    // this migration's own down, not its position in the chain.
+    expect(await rollBackThrough(client, MIGRATION)).toBe(MIGRATION);
     const a = await tenant("a");
     const b = await tenant("b");
     // single-column FKs are back: the cross-tenant row is accepted again
