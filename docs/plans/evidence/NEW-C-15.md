@@ -55,3 +55,18 @@ No endpoint, no migration (uses NEW-C-4's `verified_at`, migration 0044), no fro
 - RED for 34bc60a, observed: with `src/` restored to 4e808c1 (pre-fix), `pnpm test:integration test/integration/source-presence-verify.spec.ts` -> **exit 1, 4 failed | 14 passed (18)**. `src/` then restored to 34bc60a.
 - GREEN with 34bc60a: `pnpm test:integration test/integration/source-presence-verify.spec.ts test/integration/seed-demo.spec.ts` -> **exit 0**, 4 files / 136 tests passed (the runner's file filter also picked up two further specs, all green).
 - Acceptance criteria 1-3 are therefore proven at unit and integration level; criterion 4 is "built, not cut". An end-to-end fetch of a real Gemini-cited domain needs a running real API and is collected in NEW-A-17.
+
+## Checkpoint-3 fix (branch 7day/c-src-4, base integration/7day fee788e)
+
+Failure: `test/integration/seed-demo.spec.ts` "NEW-C-15 audit · seed, then verify" asserted the seed itself indexed a live (Gemini) engine. NEW-A-8 keeps Gemini real (`excludeEngines`), so the seed writes no Gemini citations and the index held only `all`. RED at base: `AssertionError: the seed indexed a live engine's citations ... expected [ 'all' ] to include 'gemini'` (1 failed, 38 skipped, run of `-t "NEW-C-15 audit"`).
+
+Fix (a61a7e0, test only, no production change): the test now plays the live adapter as setup, as the NEW-A-8 tests do. After the seed it inserts one REAL Gemini capture per project (`insertRealGeminiCapture`, normalizer_version not `demo-seed`) with `citation_facts` on the competitor demo domains the seed fabricated (`<name>.example.com`), then rebuilds the source index (`refreshProjectSourceIndex`). The same two assertions remain unchanged in strength: gemini is indexed (non-vacuous) and `verifyProjectSourcePresence` fetches nothing and stamps no `verified_at`. Setup cites only `.example.com` domains because the seed's other domains are real-looking (hubspot.com): a real Gemini citation of one is rightly fetchable, so it is not the property under test. The fetch assertion now compares the called URLs with `[]` so a failure names them.
+
+| Criterion | Test |
+|---|---|
+| Seeded demo domains are never fetched, even when a live engine cites them | seed-demo.spec.ts "NEW-C-15 audit · seed, then verify: no seeded domain is fetched and no index row carries a verified absence" |
+| No verified_at / verified absence on fabricated data | same test, `stamped` rowCount 0 |
+
+Mutation: `isDemoDomain` forced to `return false` -> that test fails ("a demo domain is never fetched: expected [ ...(8) ] to equal []"); restored.
+
+Gates: seed-demo + source-presence-verify + aux-reads-and-actions + rendering-quality integration (`DOCKER_HOST=unix://$HOME/.colima/default/docker.sock TESTCONTAINERS_RYUK_DISABLED=true pnpm vitest run --config vitest.integration.config.ts aux-reads rendering-quality source-presence-verify seed-demo`): exit 0, 4 files / 76 tests passed. lint 0, typecheck 0, test:unit 0 (302 files / 3703 tests passed, 1 skipped). One earlier unit run timed out `test/unit/audit-coverage.spec.ts` at 5 s under machine load; it passed alone and in the next full run (not touched by this change).
