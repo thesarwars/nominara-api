@@ -121,3 +121,15 @@ Until then the sources criterion and the "no fact tables" criterion for sources 
 
 NEW-E-099b is **partial**, not done: `GET /portal/sources` is not built (criterion "Sources is read from project_source_index
 only" is NOT MET, blocked on the owner decision above). The portal frontend's sources tab must stay on demo data.
+
+## Checkpoint-3: GET /portal/sources DEFERRED to week 2 (recorded 2026-10-08, branch `7day/e-portal-4`)
+
+Instruction from the lane brief: if sources needs `source_domains` (not portal-readable), defer it and record why; do not widen
+`PORTAL_READABLE_TABLES`. It does need it: `project_source_index` holds only `source_domain_id`, the domain name and `source_class`
+live in `source_domains`, which has no `project_id`, so no project-scoped portal policy can be written for it (a workspace-wide one would
+let a project-scoped token enumerate every domain in the workspace). Nothing is built or changed for it; `PORTAL_READABLE_TABLES` and
+`conventions.ts` are untouched. Week-2 options remain (a) denormalise domain/source_class/is_seedable onto `project_source_index` by an
+additive migration (recommended) or (c) read names on the app pool. The portal sources contract (`portalSourcesResponseSchema`) stays as a
+shape only. `schemas/README.md` line 48 still lists `source_domains` as portal-readable and should be corrected when the docs are next carried.
+The tasks tab and the first-view notification of this item are unchanged by this pass; `portal-tasks-http` re-run on the merged tip: 14 passed, exit 0
+(so the "never run" note above is superseded for the integration spec; its RED was still never observed).
