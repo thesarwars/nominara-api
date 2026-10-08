@@ -107,8 +107,10 @@ export const portalTasksResponseSchema = z
       z
         .object({
           title: z.string(),
-          severity: z.enum(["critical", "high", "medium", "low"]),
-          status: z.enum(["todo", "in_progress", "done", "dismissed"]),
+          /** Null when the task has no measured severity (a manual task, or a gap not yet verified) — never invented. */
+          severity: z.enum(["critical", "high", "medium", "low"]).nullable(),
+          /** Open means not yet done and not dismissed. */
+          status: z.enum(["todo", "in_progress"]),
         })
         .strict(),
     ),
@@ -156,5 +158,6 @@ export type PortalGrowthMapResponse = z.infer<typeof portalGrowthMapResponseSche
 export type PortalGrowthMapQuery = z.infer<typeof portalProjectQuerySchema>;
 export type PortalOverviewQuery = z.infer<typeof portalOverviewQuerySchema>;
 export type PortalMatrixResponse = z.infer<typeof portalMatrixResponseSchema>;
+export type PortalTasksQuery = z.infer<typeof portalTasksQuerySchema>;
 export type PortalTasksResponse = z.infer<typeof portalTasksResponseSchema>;
 export type PortalSourcesResponse = z.infer<typeof portalSourcesResponseSchema>;
