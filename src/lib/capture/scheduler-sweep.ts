@@ -29,9 +29,22 @@ import { claimDueProjectRefs } from "./scheduler.js";
 // THE TRANSACTION IS HELD ACROSS AN AWAIT ON THE QUEUE (Valkey), deliberately,
 // and only here: this is a background sweep, not a request handler (KAD-06 is
 // about request handlers), and it holds row locks on `projects`, not a tenant
-// context. A bounded batch (SCHEDULER_BATCH_SIZE) bounds the time. A failed
-// enqueue does not roll anything back — nothing was written — it is counted,
-// logged with ids, and reported as `partial`.
+// context. A bounded batch (SCHEDULER_BATCH_SIZE) bounds how many rows are
+// locked, NOT how long: a queue that stops answering would hold up to 500
+// `projects` row locks forever, block every tenant `UPDATE projects`, and — the
+// timer re-arming only once a tick settles — stop scheduling for good with no
+// metric and no log (checkpoint-3). So every wait is bounded, in three layers:
+//   1. each enqueue is raced against `enqueueTimeoutMs`; a timeout is a failed
+//      enqueue, and the whole claim transaction has a `transactionBudgetMs`
+//      after which no further row is attempted (the unsent rows are failed);
+//   2. Postgres bounds the transaction itself, transaction-locally
+//      (`set_config(..., is_local => true)`, KAD-03): `lock_timeout` and
+//      `idle_in_transaction_session_timeout`, so even a process that never lets
+//      go loses its locks to the server;
+//   3. the tick as a whole (connect included) is raced against `tickTimeoutMs`;
+//      on expiry its connection is ended and arm() runs regardless.
+// A failed enqueue does not roll anything back — nothing was written — it is
+// counted, logged with ids, and reported as `partial`.
 //
 // A BACKLOG LARGER THAN ONE BATCH drains oldest-first as the handler advances
 // projects between ticks. Until it does, the same oldest rows are re-claimed
@@ -59,6 +72,70 @@ export class SchedulerBlindError extends Error {
     );
     this.name = "SchedulerBlindError";
   }
+}
+
+/** Every wait the sweep makes, in milliseconds. Defaults are conservative: 5 s per enqueue, 30 s per transaction. */
+export interface SweepLimits {
+  /** One enqueue (a Valkey round trip). */
+  readonly enqueueTimeoutMs: number;
+  /** The claim transaction as a whole: once spent, no further row is attempted. */
+  readonly transactionBudgetMs: number;
+  /** Postgres `lock_timeout` for the transaction. */
+  readonly lockTimeoutMs: number;
+  /** Postgres `idle_in_transaction_session_timeout` for the transaction (it idles while the queue answers). */
+  readonly idleInTransactionTimeoutMs: number;
+}
+
+export interface RuntimeLimits extends SweepLimits {
+  /** connect + sweep + close, as a whole. Must exceed transactionBudgetMs. */
+  readonly tickTimeoutMs: number;
+  readonly connectTimeoutMs: number;
+}
+
+export const DEFAULT_SWEEP_LIMITS: SweepLimits = {
+  enqueueTimeoutMs: 5_000,
+  transactionBudgetMs: 30_000,
+  lockTimeoutMs: 5_000,
+  idleInTransactionTimeoutMs: 15_000,
+};
+
+export const DEFAULT_RUNTIME_LIMITS: RuntimeLimits = {
+  ...DEFAULT_SWEEP_LIMITS,
+  tickTimeoutMs: 60_000,
+  connectTimeoutMs: 10_000,
+};
+
+export class EnqueueTimeoutError extends Error {
+  constructor() {
+    super("the enqueue did not settle within its bound");
+    this.name = "EnqueueTimeoutError";
+  }
+}
+
+class ConnectTimeoutError extends Error {
+  constructor() {
+    super("the sweep's database connection did not open within its bound");
+    this.name = "ConnectTimeoutError";
+  }
+}
+
+/** Settles with `fn`'s result, or rejects with `onTimeout()` after `ms`. The loser's late outcome is swallowed. */
+function withTimeout<T>(fn: () => Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(onTimeout()), ms);
+    Promise.resolve()
+      .then(fn)
+      .then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+  });
 }
 
 export interface SweepJob {
@@ -107,6 +184,7 @@ export async function runSchedulerSweep(
   client: ClientBase,
   enqueue: SweepEnqueue,
   now: Date,
+  limits: SweepLimits = DEFAULT_SWEEP_LIMITS,
 ): Promise<SchedulerSweepResult> {
   await assertSweepCanSee(client);
 
@@ -115,15 +193,35 @@ export async function runSchedulerSweep(
   let claimed: number;
   await client.query("BEGIN");
   try {
+    // Transaction-local (is_local => true): never a session-level SET (KAD-03).
+    await client.query("SELECT set_config($1, $2, true)", ["lock_timeout", `${limits.lockTimeoutMs}ms`]);
+    await client.query("SELECT set_config($1, $2, true)", [
+      "idle_in_transaction_session_timeout",
+      `${limits.idleInTransactionTimeoutMs}ms`,
+    ]);
     const due = await claimDueProjectRefs(client, now);
     claimed = due.length;
-    for (const project of due) {
+    const startedAt = Date.now();
+    for (const [index, project] of due.entries()) {
+      if (Date.now() - startedAt >= limits.transactionBudgetMs) {
+        // The budget is spent: stop holding the locks. The rest stay due and the next tick retries them.
+        const unsent = due.length - index;
+        failed += unsent;
+        for (let i = 0; i < unsent; i += 1) incrementCounter("nominara_capture_scheduler_enqueue_failures_total");
+        logger.error({ event: "capture.scheduler.budget_exhausted", unsent, claimed });
+        break;
+      }
       try {
-        await enqueue({
-          workspaceId: project.workspaceId,
-          projectId: project.projectId,
-          idempotencyKey: sweepIdempotencyKey(project.projectId, project.nextRunAt),
-        });
+        await withTimeout(
+          () =>
+            enqueue({
+              workspaceId: project.workspaceId,
+              projectId: project.projectId,
+              idempotencyKey: sweepIdempotencyKey(project.projectId, project.nextRunAt),
+            }),
+          limits.enqueueTimeoutMs,
+          () => new EnqueueTimeoutError(),
+        );
         enqueued += 1;
         incrementCounter("nominara_capture_scheduler_jobs_enqueued_total");
         // IDs only — never a workspace name or any tenant content.
@@ -151,11 +249,19 @@ export async function runSchedulerSweep(
   return { status, claimed, enqueued, failed };
 }
 
+type SweepClient = ClientBase & { end(): Promise<void> };
+interface TickState {
+  client?: SweepClient;
+  abandoned: boolean;
+}
+
 export interface SweepRuntimeOptions {
   /** A NEW owner-role connection per tick (closed by the runtime). */
   readonly connect: () => Promise<ClientBase & { end(): Promise<void> }>;
   readonly enqueue: SweepEnqueue;
   readonly clock?: () => Date;
+  /** Overrides for DEFAULT_RUNTIME_LIMITS. */
+  readonly limits?: Partial<RuntimeLimits>;
 }
 
 /**
@@ -168,22 +274,61 @@ export class SchedulerSweepRuntime {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running = false;
   private readonly clock: () => Date;
+  private readonly limits: RuntimeLimits;
+  /** The enqueue the runtime ticks with (exposed so the worker's production closure can be tested). */
+  readonly enqueue: SweepEnqueue;
 
   constructor(private readonly options: SweepRuntimeOptions) {
     this.clock = options.clock ?? (() => new Date());
+    this.limits = { ...DEFAULT_RUNTIME_LIMITS, ...options.limits };
+    this.enqueue = options.enqueue;
   }
 
+  /** True between start() and stop(): the timer is armed (momentarily unset only while a tick runs). */
+  get armed(): boolean {
+    return this.running;
+  }
+
+  /**
+   * One tick, bounded as a whole: it ALWAYS settles within `tickTimeoutMs`, so
+   * arm() always runs again. On expiry the connection is ended, which makes
+   * Postgres drop the row locks; the abandoned work is left to fail on its own.
+   */
   async tick(): Promise<SchedulerSweepResult | null> {
-    let client: Awaited<ReturnType<SweepRuntimeOptions["connect"]>>;
+    const state: TickState = { abandoned: false };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        state.abandoned = true;
+        incrementCounter("nominara_capture_scheduler_sweeps_total", { status: "timed_out" });
+        logger.error({ event: "capture.scheduler.tick_timed_out", timeout_ms: this.limits.tickTimeoutMs });
+        if (state.client !== undefined) void state.client.end().catch(() => undefined);
+        resolve(null);
+      }, this.limits.tickTimeoutMs);
+    });
     try {
-      client = await this.options.connect();
+      return await Promise.race([this.runTick(state), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async runTick(state: TickState): Promise<SchedulerSweepResult | null> {
+    let client: SweepClient;
+    const opening = this.options.connect();
+    try {
+      client = await withTimeout(() => opening, this.limits.connectTimeoutMs, () => new ConnectTimeoutError());
     } catch (error) {
+      // A connection that opens after we gave up must not be left open.
+      opening.then((late) => late.end()).catch(() => undefined);
       incrementCounter("nominara_capture_scheduler_sweeps_total", { status: "connect_failed" });
       logger.warn({ event: "capture.scheduler.connect_failed", error: error instanceof Error ? error.name : "unknown" });
       return null;
     }
+    state.client = client;
     try {
-      return await runSchedulerSweep(client, this.options.enqueue, this.clock());
+      if (state.abandoned) return null;
+      return await runSchedulerSweep(client, this.options.enqueue, this.clock(), this.limits);
     } catch (error) {
       logger.error({ event: "capture.scheduler.sweep_failed", error: error instanceof Error ? error.name : "unknown" });
       return null;

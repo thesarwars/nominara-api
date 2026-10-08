@@ -63,6 +63,13 @@ describe("NEW-A-13 · bootstrapWorker wires the scheduler sweep ONLY for WORKER_
     const connection = createQueueWorkerConnection(fixture.connectionString);
     const reader = new Queue("capture.plan", { connection, prefix: queueKeyPrefix(loadEnv().NODE_ENV) });
     try {
+      // The capture group's own worker consumes capture.plan in this process (and
+      // fails it against the fake database, then retries), so a job moves between
+      // states. Count it wherever it is, by id.
+      const allJobs = async () => {
+        const found = await reader.getJobs(["waiting", "prioritized", "delayed", "active", "completed", "failed"]);
+        return [...new Map(found.map((job) => [job.id, job])).values()];
+      };
       const holder = app.get(CAPTURE_SCHEDULER_SWEEP) as {
         runtime: { enqueue: (job: { workspaceId: string; projectId: string; idempotencyKey: string }) => Promise<void> };
       };
@@ -72,7 +79,7 @@ describe("NEW-A-13 · bootstrapWorker wires the scheduler sweep ONLY for WORKER_
       await holder.runtime.enqueue(job);
       await holder.runtime.enqueue(job);
 
-      const jobs = await reader.getJobs(["waiting", "prioritized", "delayed"]);
+      const jobs = await allJobs();
       expect(jobs, "one job on capture.plan; a per-call random key would make two").toHaveLength(1);
       const envelope = jobs[0]!.data as { payload: Record<string, unknown>; signature: string };
       expect(typeof envelope.signature).toBe("string");
@@ -80,7 +87,7 @@ describe("NEW-A-13 · bootstrapWorker wires the scheduler sweep ONLY for WORKER_
       expect(capturePlanJobSchema.parse(envelope.payload)).toMatchObject({ workspaceId, projectId, trigger: "scheduled" });
 
       await holder.runtime.enqueue({ ...job, idempotencyKey: `run:${projectId}:2026-10-08T11:00:00.000Z` });
-      expect(await reader.getJobs(["waiting", "prioritized", "delayed"]), "a new next_run_at is a new key").toHaveLength(2);
+      expect(await allJobs(), "a new next_run_at is a new key").toHaveLength(2);
     } finally {
       await reader.close();
       connection.disconnect();
