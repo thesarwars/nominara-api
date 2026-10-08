@@ -1,8 +1,11 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
+import { addonItemsFromSubscription } from "../../lib/billing/stripe/addon-items.js";
 import { applyPlanChange, type SubscriptionReconciler } from "../../lib/billing/apply-plan.js";
 import { desiredFromStripeSubscription, toCents, type ClaimedPlanPrice } from "../../lib/billing/stripe/subscription-state.js";
+import { syncWorkspaceBillingStatus } from "../../lib/billing/workspace-billing-status.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { BillingAddonsService } from "./billing-addons.service.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
 
 // STORY-075a / STORY-075 AC4 — the ONLY customer-reachable path to
@@ -33,6 +36,8 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
   ] as const;
 
   private readonly logger = new Logger(StripeSubscriptionHandler.name);
+
+  constructor(private readonly addons: BillingAddonsService) {}
 
   async handle({ tx, workspaceId, event, object, fetchStartedAt }: StripeEventContext): Promise<void> {
     // checkout.session.completed is also the credit-pack event (mode=payment,
@@ -141,6 +146,26 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       });
       return;
     }
+
+    // STORY-075b — a past_due subscription takes the workspace out of the
+    // capture scheduler's reach; recovery (or the end of the subscription) puts
+    // it back. Idempotent: an unchanged status writes nothing.
+    const billingStatus = await syncWorkspaceBillingStatus(tx, workspaceId, { eventId: event.id, eventType: event.type });
+    if (billingStatus?.changed === true) {
+      incrementCounter("nominara_billing_workspace_status_changes_total", { to: billingStatus.to });
+      this.logger.warn({ message: "workspace billing status changed", event_id: event.id, workspace_id: workspaceId, from: billingStatus.from, to: billingStatus.to });
+    }
+
+    // STORY-076b — the add-on items of THIS fresh fetch, mirrored wholesale (the
+    // only writer of `subscription_addons`). An ended subscription holds none.
+    await this.addons.reconcile(tx, {
+      workspaceId,
+      stripeSubscriptionId: desired.state.providerSubscriptionId,
+      items: desired.state.planKey === "free" ? [] : addonItemsFromSubscription(object.raw),
+      eventId: event.id,
+      eventType: event.type,
+      versionAlreadyBumped: outcome.changed,
+    });
 
     // The charge this subscription was verified at is frozen on the row, so a
     // later catalog price change cannot turn it into a "mismatch". Only the

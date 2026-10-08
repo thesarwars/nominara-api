@@ -4,6 +4,8 @@ import {
   StripeUpstreamError,
   type FetchedStripeObject,
   type StripeGateway,
+  type AddonChangeInput,
+  type AddonRemovalInput,
   type CreditPackCheckoutInput,
   type HostedSession,
   type StripeObjectKind,
@@ -111,6 +113,46 @@ export class FakeStripeGateway implements StripeGateway {
     if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
     this.portals.push(input);
     return Promise.resolve({ url: `https://billing.stripe.test/p/session_${input.customerId}` });
+  }
+
+  /** STORY-076b — add-on quantity changes and scheduled removals sent to Stripe, in call order. */
+  readonly addonChanges: AddonChangeInput[] = [];
+  readonly addonRemovals: AddonRemovalInput[] = [];
+  /** Set to make the next add-on call fail like an upstream outage. */
+  failAddonWith: Error | undefined;
+
+  /** Every change ATTEMPTED, recorded before a failure is raised: a timed-out call that Stripe may still apply is still an attempt. */
+  readonly addonAttempts: AddonChangeInput[] = [];
+
+  changeAddonQuantity(input: AddonChangeInput): Promise<void> {
+    this.addonAttempts.push(input);
+    if (this.failAddonWith !== undefined) return Promise.reject(this.failAddonWith);
+    this.addonChanges.push(input);
+    return Promise.resolve();
+  }
+
+  scheduleAddonRemoval(input: AddonRemovalInput): Promise<void> {
+    if (this.failAddonWith !== undefined) return Promise.reject(this.failAddonWith);
+    this.addonRemovals.push(input);
+    return Promise.resolve();
+  }
+
+  /** Back to a clean slate between tests (the instance is shared by a whole spec file). */
+  reset(): void {
+    this.objects.clear();
+    this.fetches.length = 0;
+    this.checkouts.length = 0;
+    this.portals.length = 0;
+    this.expired.length = 0;
+    this.completedSessions.clear();
+    this.packCheckouts.length = 0;
+    this.addonChanges.length = 0;
+    this.addonAttempts.length = 0;
+    this.addonRemovals.length = 0;
+    this.configured = true;
+    this.failFetchWith = undefined;
+    this.failAddonWith = undefined;
+    this.onSessionCreated = undefined;
   }
 
   /** Fetches held open by `holdNextFetch`, keyed `${kind}:${id}`. */

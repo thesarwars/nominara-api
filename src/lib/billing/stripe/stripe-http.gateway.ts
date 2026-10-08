@@ -2,6 +2,8 @@ import Stripe from "stripe";
 import {
   StripeSignatureError,
   StripeUpstreamError,
+  type AddonChangeInput,
+  type AddonRemovalInput,
   type ClosedCheckoutSession,
   type CreditPackCheckoutInput,
   type FetchedStripeObject,
@@ -179,6 +181,97 @@ export class StripeHttpGateway implements StripeGateway {
     try {
       const session = await client.billingPortal.sessions.create({ customer: input.customerId, return_url: input.returnUrl });
       return { url: session.url };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async changeAddonQuantity(input: AddonChangeInput): Promise<void> {
+    const client = this.requireClient();
+    try {
+      if (input.existingItemId !== null) {
+        await client.subscriptionItems.update(
+          input.existingItemId,
+          { quantity: input.quantity, proration_behavior: input.proration },
+          { idempotencyKey: input.idempotencyKey },
+        );
+        return;
+      }
+      // A subscription item's inline price_data needs a Product ID (only Checkout
+      // accepts product_data), so the add-on's product is created once under a
+      // fixed id and reused. `nominara_kind` is how the reconciler finds the line.
+      const product = await this.addonProductId(client, input);
+      await client.subscriptionItems.create(
+        {
+          subscription: input.subscriptionId,
+          quantity: input.quantity,
+          proration_behavior: input.proration,
+          price_data: {
+            currency: input.currency.toLowerCase(),
+            product,
+            unit_amount: input.unitAmountCents,
+            recurring: { interval: input.interval },
+          },
+        },
+        { idempotencyKey: input.idempotencyKey },
+      );
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  private async addonProductId(client: Stripe, input: AddonChangeInput): Promise<string> {
+    const id = `nominara_addon_${input.kind}`;
+    try {
+      await client.products.create({ id, name: input.productName, metadata: { nominara_kind: input.kind } });
+    } catch (error) {
+      // Already created by an earlier purchase (or a concurrent one): that is the product we want.
+      if (!(error instanceof Stripe.errors.StripeInvalidRequestError && error.code === "resource_already_exists")) throw error;
+    }
+    return id;
+  }
+
+  async scheduleAddonRemoval(input: AddonRemovalInput): Promise<void> {
+    const client = this.requireClient();
+    try {
+      const subscription = await client.subscriptions.retrieve(input.subscriptionId);
+      const item = subscription.items.data.find((line) => line.id === input.itemId);
+      // Already gone from the subscription: nothing to schedule (a redelivered DELETE).
+      if (item === undefined) return;
+      const removedPrice = item.price.id;
+      // One more billing cycle, then the schedule is released and the subscription carries on as normal.
+      const cycle = item.price.recurring?.interval === "year" ? "year" : "month";
+
+      const existing = subscription.schedule;
+      const scheduleId =
+        typeof existing === "string"
+          ? existing
+          : existing !== null && existing !== undefined
+            ? existing.id
+            : (await client.subscriptionSchedules.create({ from_subscription: input.subscriptionId }, { idempotencyKey: `${input.idempotencyKey}-schedule` })).id;
+      const schedule = await client.subscriptionSchedules.retrieve(scheduleId);
+
+      const priceOf = (line: { price: string | Stripe.Price | Stripe.DeletedPrice }): string => (typeof line.price === "string" ? line.price : line.price.id);
+      const current = schedule.phases[0];
+      if (current === undefined) throw new StripeUpstreamError(undefined);
+      const asItems = (lines: typeof current.items) => lines.map((line) => ({ price: priceOf(line), ...(line.quantity === undefined ? {} : { quantity: line.quantity }) }));
+      const keep = (lines: typeof current.items) => asItems(lines.filter((line) => priceOf(line) !== removedPrice));
+
+      // The current phase runs to the period end unchanged; the phase after it
+      // is the same items without the add-on (the second one, if a removal is
+      // already scheduled, is rewritten rather than appended to).
+      const next = schedule.phases[1];
+      await client.subscriptionSchedules.update(
+        scheduleId,
+        {
+          end_behavior: "release",
+          phases: [
+            { items: asItems(current.items), start_date: current.start_date, end_date: current.end_date },
+            { items: keep(next?.items ?? current.items), duration: { interval: cycle, interval_count: 1 } },
+          ],
+        },
+        { idempotencyKey: input.idempotencyKey },
+      );
     } catch (error) {
       throw this.asUpstream(error);
     }

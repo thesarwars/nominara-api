@@ -496,7 +496,11 @@ describe("STORY-072 · settlement through the real guard and interceptor", () =>
         required: PRICE,
         available: 7,
         wallet: { included_balance: 5, purchased_balance: 2, reserved: 0 },
-        packs: [],
+        // A free workspace sees exactly the packs open to every tier
+        // (migration 0076 seeds starter_vault, min_plan_key NULL) and NOT
+        // agency_vault (growth and above). toMatchObject compares arrays by
+        // length, so a leaked above-tier pack fails this.
+        packs: [{ key: "starter_vault", credits: 1000, price_usd: "15.00" }],
       },
     });
   });
