@@ -87,7 +87,7 @@ describe("STORY-061 · A6 sentiment drivers (pure)", () => {
     expect(detail!.clusters.map((c) => c.domain)).toEqual(["reddit.com", "g2.com"]);
   });
 
-  it("clusters with equal reach and size order by domain, never by input order", () => {
+  it("AC1 · clusters with equal reach and size order by domain, never by input order", () => {
     const other = m({ resultId: "z", text: "Acme is slow [g](https://a.com/p) x", evidenceStart: 0, evidenceEnd: 13, citations: [{ slotIndex: 1, url: "https://a.com/p", domain: "a.com" }] });
     const a = buildSentiment(input({ mentions: [m(), other] })).detail!;
     const b = buildSentiment(input({ mentions: [other, m()] })).detail!;
@@ -120,14 +120,14 @@ describe("STORY-061 · A6 sentiment drivers (pure)", () => {
     expect(geoAnalysisWriteSchema.safeParse(write).success).toBe(true);
   });
 
-  it("the detail rides on exactly one finding, so a read returns the stored object", () => {
+  it("AC1 · the detail rides on exactly one finding, so a read returns the stored object", () => {
     const { write, detail } = buildSentiment(input({ mentions: [m({ reasons: ["pricing_objection"] }), m({ resultId: "c", reasons: ["missing_feature"] })] }));
     const carriers = write.findings.filter((f) => f.sentiment !== undefined);
     expect(carriers).toHaveLength(1);
     expect(carriers[0]!.sentiment).toEqual(detail);
   });
 
-  it("no discernible reason: reason is null (not invented), no task, an explicit no_action verdict with its evidence", () => {
+  it("AC3 · no discernible reason: reason is null (not invented), no task, an explicit no_action verdict with its evidence", () => {
     const { write, detail } = buildSentiment(input({ mentions: [m({ reasons: [] })] }));
     expect(detail!.mentions[0]).toMatchObject({ reason: null, cues: [] });
     expect(detail!.reason_classes).toEqual([]);
@@ -137,7 +137,7 @@ describe("STORY-061 · A6 sentiment drivers (pure)", () => {
     expect(geoAnalysisWriteSchema.safeParse(write).success).toBe(true);
   });
 
-  it("no non-positive mention at all: sufficient, no_action, empty lists (absent is not a cluster)", () => {
+  it("AC3 · no non-positive mention at all: sufficient, no_action, empty lists (absent is not a cluster)", () => {
     const { write, detail } = buildSentiment(input({ mentions: [] }));
     expect(write.sufficient).toBe(true);
     expect(detail).toMatchObject({ mentions: [], clusters: [], reason_classes: [], non_positive_mentions: 0 });
@@ -155,17 +155,17 @@ describe("STORY-061 · A6 sentiment drivers (pure)", () => {
     expect(buildSentiment(input({ brandMentions: 0 })).write.suppression_reason).toMatch(/0/);
   });
 
-  it("publishes no score and promotes no lever", () => {
+  it("AC4 · publishes no score and promotes no lever", () => {
     const { write } = buildSentiment(input());
     expect(write).toMatchObject({ analysis: "sentiment", score: null, lever_rank: null, evidence_cells: 40 });
   });
 
-  it("data_source passes through, and null stays null (nothing measured is not demo)", () => {
+  it("AC4 · data_source passes through, and null stays null (nothing measured is not demo)", () => {
     expect(buildSentiment(input({ dataSource: "mixed" })).detail!.data_source).toBe("mixed");
     expect(buildSentiment(input({ dataSource: null })).detail!.data_source).toBeNull();
   });
 
-  it("the listed mentions are capped and most recent first while the count stays whole", () => {
+  it("AC1 · the listed mentions are capped and most recent first while the count stays whole", () => {
     const many = Array.from({ length: 60 }, (_, i) => m({ resultId: `r${String(i)}`, capturedAt: new Date(Date.UTC(2026, 8, 1, 0, i)).toISOString() }));
     const { detail } = buildSentiment(input({ mentions: many }));
     expect(detail!.non_positive_mentions).toBe(60);
@@ -174,7 +174,7 @@ describe("STORY-061 · A6 sentiment drivers (pure)", () => {
     expect(detail!.clusters[0]!.mention_count).toBe(60);
   });
 
-  it("a mention whose stored text is gone still lists its span, with evidence_text null", () => {
+  it("AC1 · a mention whose stored text is gone still lists its span, with evidence_text null", () => {
     const { detail, write } = buildSentiment(input({ mentions: [m({ text: null, citations: [] })] }));
     expect(detail!.mentions[0]).toMatchObject({ evidence_text: null, evidence_start: SPAN_START, citation: null });
     expect(geoAnalysisWriteSchema.safeParse(write).success).toBe(true);

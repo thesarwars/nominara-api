@@ -92,8 +92,9 @@ export function createRollupMetricDailyHandler(_context: QueueHandlerContext): J
       // reads only this database: no network call.
       await refreshProjectSourceIndex(tx, payload.projectId, await localToday(tx, timezone));
 
-      // STORY-060 — A3 answer structure, persisted to geo_analyses so the
-      // read endpoints only read. Same transaction and lock; reads only this
+      // STORY-060 / STORY-061 — the persisted GEO analyses (A3 structure, A6
+      // sentiment), each over the 7/30/90-day windows, written to geo_analyses
+      // so the read endpoints only read. Same transaction and lock; reads only this
       // database (no network call), free and unmetered.
       await refreshProjectGeoWindows(tx, payload.projectId);
     });

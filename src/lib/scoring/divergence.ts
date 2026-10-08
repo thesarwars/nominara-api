@@ -6,6 +6,8 @@
 //   divergence(p)      (max_e o(e) − min_e o(e)) · (1 − stability_penalty)
 //   stability_penalty  1 − stability_score(p)      so the factor is stability_score(p)
 //   project_divergence mean over prompts with >= 2 engines returning a result
+//                      (owner decision 7: a prompt with a null stability_score is
+//                      excluded and counted in `excluded.noStability`, never assumed stable)
 //   attribution        citation-domain SET DIFFERENCE, winner minus loser,
 //                      ranked by each domain's context_weight
 
@@ -96,8 +98,9 @@ export interface DivergenceResult {
   readonly projectDivergence: number | null;
   readonly qualifyingPrompts: number;
   /**
-   * Reference §10 A4 says "live" results. Whether seeded demo results may count is an OPEN
-   * owner decision, so the live-only mean is exposed for any alert to gate on:
+   * Reference §10 A4 says "live" results. The headline mean counts seeded demo results and
+   * labels them (planner recommendation, applied by the owner's "anything else" rule), so
+   * the live-only mean is exposed for any alert to gate on:
    * `null` = no prompt with >= 2 live results; `0` = those engines agree.
    */
   readonly projectDivergenceLive: number | null;

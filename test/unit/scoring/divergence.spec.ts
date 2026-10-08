@@ -250,7 +250,7 @@ describe("NEW-C-12 audit · the stored position_class domain maps to o(e) in the
   });
 });
 
-describe("NEW-C-12 audit · live-only divergence for the alert (owner decision on demo-as-live is open)", () => {
+describe("NEW-C-12 audit · live-only divergence for the alert (demo results count and are labelled; the alert gates on live)", () => {
   it("[A4-29] the live-only mean uses prompts with >= 2 LIVE results, computed over the live results", () => {
     const out = run([
       prompt("liveLive", 1, [r("a", "recommendation"), r("b", "absent")]),
