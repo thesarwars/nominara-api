@@ -1,7 +1,9 @@
 // NEW-C-7 / STORY-055 — versioned seeding-playbook templates, one per SEEDABLE
 // source class (`aux-and-geo-analysis.md` §10), selected by the gap's class.
 //
-// Shipped as constant data keyed by `source_domains.seeding_playbook_slug`
+// Shipped as constant data, looked up by the gap's `source_class`
+// (`playbookTemplateFor`); the slug is `playbook-<source_class>`, not read from
+// `source_domains.seeding_playbook_slug`
 // (no table: NEW-C-7 plan, "migrations: none"). A rules change is a new
 // version appended here, so the prior version stays retrievable by
 // (slug, version).
