@@ -84,6 +84,8 @@ export interface CreditPackCheckoutInput {
   readonly currency: string;
   readonly successUrl: string;
   readonly cancelUrl: string;
+  /** Owner decision 4 — save the card for off-session reuse only when the workspace has auto-top-up enabled. */
+  readonly saveCard: boolean;
 }
 
 /** NEW-D-7 — a card the customer agreed to have reused off-session (a Checkout with `setup_future_usage`). */

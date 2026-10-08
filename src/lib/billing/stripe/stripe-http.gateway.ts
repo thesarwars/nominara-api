@@ -135,10 +135,10 @@ export class StripeHttpGateway implements StripeGateway {
           ],
           // Both objects carry the ids, so payment_intent.* events resolve the
           // purchase from their own fresh fetch.
-          // NEW-D-7 — the card is saved under a customer for off-session reuse
-          // (auto-top-up). Checkout shows Stripe's own reuse notice.
-          customer_creation: "always",
-          payment_intent_data: { metadata, setup_future_usage: "off_session" },
+          // NEW-D-7 — only when the workspace has auto-top-up enabled, the card is saved
+          // under a customer for off-session reuse. Checkout shows Stripe's own reuse notice.
+          ...(input.saveCard ? { customer_creation: "always" as const } : {}),
+          payment_intent_data: { metadata, ...(input.saveCard ? { setup_future_usage: "off_session" as const } : {}) },
           metadata,
           success_url: input.successUrl,
           cancel_url: input.cancelUrl,

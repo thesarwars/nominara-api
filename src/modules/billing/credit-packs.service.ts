@@ -82,6 +82,10 @@ export class CreditPacksService {
       throw new FeatureNotInPlanError({ details: { key: `credit_pack.${pack.key}`, min_plan: pack.min_plan_key ?? "starter" } });
     }
 
+    // Owner decision 4: the card is kept for off-session reuse only for a workspace that has switched auto-top-up on.
+    const saveCard =
+      (await client.query<{ auto_topup_enabled: boolean }>("SELECT auto_topup_enabled FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rows[0]?.auto_topup_enabled === true;
+
     // Committed on its OWN connection before Stripe is called (see the header).
     const purchaseId = await this.inOwnTransaction(workspaceId, actorId, async (tx) => {
       const inserted = await tx.query<{ id: string }>(
@@ -110,6 +114,7 @@ export class CreditPacksService {
         currency: pack.currency.trim(),
         successUrl: withState("success"),
         cancelUrl: withState("cancel"),
+        saveCard,
       });
       incrementCounter("nominara_billing_credit_pack_purchase_total", { outcome: "created" });
       this.logger.log({ message: "credit pack purchase created", workspace_id: workspaceId, purchase_id: purchaseId, pack_key: pack.key });
