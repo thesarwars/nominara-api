@@ -31,6 +31,8 @@ describe("STORY-075 AC9 · an invoice is copied as Stripe issued it", () => {
         status: "paid",
         subtotal: "129.00",
         total: "116.10",
+        addonAmount: "0.00",
+        creditPackAmount: "0.00",
         currency: "USD",
         periodStart: new Date(T0 * 1000),
         periodEnd: new Date((T0 + 30 * 86_400) * 1000),

@@ -23,6 +23,8 @@ interface StoredInvoice {
   status: InvoiceStatus;
   subtotal: string;
   total: string;
+  addon_amount: string;
+  credit_pack_amount: string;
   currency: string;
   period_start: Date;
   period_end: Date;
@@ -58,6 +60,8 @@ function same(stored: StoredInvoice, desired: DesiredInvoice): boolean {
     stored.status === desired.status &&
     stored.subtotal === desired.subtotal &&
     stored.total === desired.total &&
+    stored.addon_amount === desired.addonAmount &&
+    stored.credit_pack_amount === desired.creditPackAmount &&
     stored.currency === desired.currency &&
     stored.period_start.getTime() === desired.periodStart.getTime() &&
     stored.period_end.getTime() === desired.periodEnd.getTime() &&
@@ -91,7 +95,7 @@ export class BillingInvoicesService {
     provenance: { readonly eventId: string; readonly eventType: string },
   ): Promise<InvoiceRecordOutcome> {
     const existing = await tx.query<StoredInvoice>(
-      `SELECT id, number, status, subtotal::text, total::text, currency, period_start, period_end, hosted_invoice_url, pdf_url, paid_at
+      `SELECT id, number, status, subtotal::text, total::text, addon_amount::text, credit_pack_amount::text, currency, period_start, period_end, hosted_invoice_url, pdf_url, paid_at
          FROM invoices WHERE stripe_invoice_id = $1 FOR UPDATE`,
       [desired.stripeInvoiceId],
     );
@@ -101,8 +105,8 @@ export class BillingInvoicesService {
     let outcome: InvoiceRecordOutcome;
     if (stored === undefined) {
       const inserted = await tx.query<{ id: string }>(
-        `INSERT INTO invoices (workspace_id, stripe_invoice_id, number, status, subtotal, total, currency, period_start, period_end, hosted_invoice_url, pdf_url, paid_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+        `INSERT INTO invoices (workspace_id, stripe_invoice_id, number, status, subtotal, total, addon_amount, credit_pack_amount, currency, period_start, period_end, hosted_invoice_url, pdf_url, paid_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
         [
           workspaceId,
           desired.stripeInvoiceId,
@@ -110,6 +114,8 @@ export class BillingInvoicesService {
           desired.status,
           desired.subtotal,
           desired.total,
+          desired.addonAmount,
+          desired.creditPackAmount,
           desired.currency,
           desired.periodStart,
           desired.periodEnd,
@@ -127,8 +133,8 @@ export class BillingInvoicesService {
     } else {
       invoiceId = stored.id;
       await tx.query(
-        `UPDATE invoices SET number = $2, status = $3, subtotal = $4, total = $5, currency = $6, period_start = $7, period_end = $8,
-                hosted_invoice_url = $9, pdf_url = $10, paid_at = $11
+        `UPDATE invoices SET number = $2, status = $3, subtotal = $4, total = $5, addon_amount = $6, credit_pack_amount = $7, currency = $8,
+                period_start = $9, period_end = $10, hosted_invoice_url = $11, pdf_url = $12, paid_at = $13
           WHERE id = $1`,
         [
           invoiceId,
@@ -136,6 +142,8 @@ export class BillingInvoicesService {
           desired.status,
           desired.subtotal,
           desired.total,
+          desired.addonAmount,
+          desired.creditPackAmount,
           desired.currency,
           desired.periodStart,
           desired.periodEnd,

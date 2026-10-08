@@ -20,6 +20,10 @@ export interface DesiredInvoice {
   /** `numeric(12,2)` text, e.g. "116.10". */
   readonly subtotal: string;
   readonly total: string;
+  /** Sum of the invoice's own add-on line amounts (Stripe's cents, as text). "0.00" is a measured zero. */
+  readonly addonAmount: string;
+  /** Sum of the invoice's own credit-pack line amounts. */
+  readonly creditPackAmount: string;
   /** ISO 4217, upper case (the column is `char(3)` and the contract is `^[A-Z]{3}$`). */
   readonly currency: string;
   readonly periodStart: Date;
@@ -82,6 +86,49 @@ function link(value: unknown): string | null {
   return protocol === "https:" || protocol === "http:" ? candidate : null;
 }
 
+const ADDON_KIND_VALUES: ReadonlySet<string> = new Set(["extra_project", "extra_seat"]);
+const ADDON_PRODUCT_PREFIX = "nominara_addon_";
+
+/** The line's product: an expanded object (`pricing.price_details.product` or legacy `price.product`) or a bare id. */
+function lineProduct(line: Record<string, unknown>): unknown {
+  const pricing = isRecord(line.pricing) ? line.pricing : undefined;
+  const details = pricing !== undefined && isRecord(pricing.price_details) ? pricing.price_details : undefined;
+  if (details !== undefined && details.product !== undefined) return details.product;
+  return isRecord(line.price) ? line.price.product : undefined;
+}
+
+function lineCategory(line: Record<string, unknown>): "addon" | "credit_pack" | null {
+  const product = lineProduct(line);
+  if (typeof product === "string") {
+    // Add-on products are created by our gateway under this fixed id.
+    return product.startsWith(ADDON_PRODUCT_PREFIX) && ADDON_KIND_VALUES.has(product.slice(ADDON_PRODUCT_PREFIX.length)) ? "addon" : null;
+  }
+  if (!isRecord(product)) return null;
+  const kind = isRecord(product.metadata) ? product.metadata.nominara_kind : undefined;
+  if (kind === "credit_pack") return "credit_pack";
+  if (typeof kind === "string" && ADDON_KIND_VALUES.has(kind)) return "addon";
+  if (typeof product.id === "string") return lineCategory({ pricing: { price_details: { product: product.id } } });
+  return null;
+}
+
+/**
+ * Integer cents of the lines in each category, as the two text figures. Only
+ * Stripe's own line `amount`s are added; a line without an integer amount is
+ * not counted, and a category netting below zero (a proration credit) is
+ * published as 0.00 because the money contract carries no negative amount.
+ */
+function categoryAmounts(lines: readonly unknown[]): { addon: string; creditPack: string } {
+  let addon = 0;
+  let creditPack = 0;
+  for (const line of lines) {
+    if (!isRecord(line) || typeof line.amount !== "number" || !Number.isSafeInteger(line.amount)) continue;
+    const category = lineCategory(line);
+    if (category === "addon") addon += line.amount;
+    else if (category === "credit_pack") creditPack += line.amount;
+  }
+  return { addon: centsToDecimal(Math.max(0, addon)), creditPack: centsToDecimal(Math.max(0, creditPack)) };
+}
+
 function isStatus(value: unknown): value is InvoiceStatus {
   return typeof value === "string" && (INVOICE_STATUSES as readonly string[]).includes(value);
 }
@@ -111,6 +158,14 @@ export function desiredFromStripeInvoice(raw: Readonly<Record<string, unknown>>)
   const periodEnd = seconds(raw.period_end) ?? seconds(linePeriod?.end);
   if (periodStart === null || periodEnd === null) return { kind: "ignore", reason: "invoice carries no billing period" };
 
+  const lines = isRecord(raw.lines) && Array.isArray(raw.lines.data) ? raw.lines.data : [];
+  let amounts: { addon: string; creditPack: string };
+  try {
+    amounts = categoryAmounts(lines);
+  } catch {
+    return { kind: "ignore", reason: "invoice line amounts are not representable" };
+  }
+
   const transitions = isRecord(raw.status_transitions) ? raw.status_transitions : undefined;
   return {
     kind: "write",
@@ -120,6 +175,8 @@ export function desiredFromStripeInvoice(raw: Readonly<Record<string, unknown>>)
       status: raw.status,
       subtotal,
       total,
+      addonAmount: amounts.addon,
+      creditPackAmount: amounts.creditPack,
       currency: currency.toUpperCase(),
       periodStart,
       periodEnd,
