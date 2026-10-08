@@ -474,12 +474,17 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
 
   // ---- NEW-D-7 audit: every guard in the claim UPDATE has a test that fails without it -------------
 
-  it("NEW-D-7 audit · the claim re-checks `enabled`: opting out between plan and claim is refused at the UPDATE: not_enabled, no charge, no email, no slot", async () => {
+  // The second shape is the realistic one (the settings page flips the switch and keeps the rest), and the
+  // only one that isolates the `enabled` predicate: with pack_key kept, the pack predicate cannot refuse it.
+  it.each([
+    ["clears the configuration", { enabled: false, pack_key: null, threshold: null, max_per_cycle: null }],
+    ["keeps pack, threshold and cap", { enabled: false, pack_key: "starter_vault", threshold: 100, max_per_cycle: 5 }],
+  ] as const)("NEW-D-7 audit · the claim re-checks `enabled`: opting out between plan and claim (switch off, %s) is refused at the UPDATE: not_enabled, no charge, no email, no slot", async (_shape, off) => {
     const { workspaceId, owner } = await armed({ max: 5 });
     const release = gateway.holdLookups();
     const stale = service.trigger(workspaceId); // planned while enabled, parked in the card lookup
     await lookupsReached(1);
-    expect((await put(owner, { enabled: false, pack_key: null, threshold: null, max_per_cycle: null })).statusCode).toBe(200);
+    expect((await put(owner, off)).statusCode).toBe(200);
     release();
     expect(await stale).toBe("not_enabled");
     expect(gateway.offSessionCharges).toHaveLength(0);
@@ -573,6 +578,22 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect((await autoPurchases(workspaceId))[0]).toMatchObject({ id: stuck.id, status: "pending" });
     expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
     expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([]);
+  });
+
+  it("NEW-D-7 audit F6 · KAD-06: the Stripe lookup for a stale purchase is made with no transaction open on the database", async () => {
+    const { workspaceId } = await stuckPending();
+    let open = -1;
+    const original = gateway.findOffSessionPayment.bind(gateway);
+    gateway.findOffSessionPayment = async (id: string) => {
+      open = Number((await harness.db().query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() AND state LIKE 'idle in transaction%'")).rows[0].n);
+      return original(id);
+    };
+    try {
+      await service.trigger(workspaceId);
+    } finally {
+      gateway.findOffSessionPayment = original;
+    }
+    expect(open).toBe(0);
   });
 
   it("NEW-D-7 audit F6 · a stale purchase that settles between the Stripe lookup and the claim is not failed over (the webhook wins): it stays succeeded and no expiry is audited", async () => {
