@@ -30,7 +30,9 @@ Observability: pure function, no I/O; its counter/log arrive when it is wired.
 | `pnpm test:unit` | 0 (277 files passed, 1 skipped; 3313 tests passed, 1 skipped) |
 | `pnpm exec vitest run --config vitest.integration.config.ts test/integration/geo- test/integration/seed-demo.spec.ts -t "STORY-06\|geo\|GEO"` (colima env, testcontainers) | 0 (5 files, 39 passed, 34 skipped by the filter) |
 | `pnpm contracts:check` | 0 (no contract changed in this lane work) |
-| `pnpm test:isolation` | NOT RUN: crashes in fixture setup at this tip (support_grants TTL, d-admin lane). Tenant isolation proven instead in `test/integration/geo-insights.spec.ts` "STORY-062 isolation" under `SET ROLE nominara_app` (mutation: dropping the SET ROLE makes it fail, "promise resolved ... instead of rejecting"). |
+| `pnpm test:isolation` | 0 (13 files, 53 tests) at 91c9d9c, after cherry-picking the d-admin fixture fixes d25c2cb (as 8e96983) and 1d97921 (as 91c9d9c). The generic suite discovers `geo_analyses` from `tenant-tables.generated.ts`. |
+| `pnpm test:isolation:breakers` | 0 (1 file, 24 tests) at 91c9d9c |
+| `geo_analyses` policy, directly | `test/integration/geo-insights.spec.ts` "STORY-062 isolation · geo_analyses itself ..." (3f00708): as `nominara_app` under another tenant, SELECT 0 rows, UPDATE 0, DELETE 0, INSERT for the victim fails 42501. Fails under three policy mutations: RLS disabled ("expected 1 to be +0"), USING/WITH CHECK (true) ("expected 1 to be +0"), WITH CHECK (true) only ("promise resolved ... instead of rejecting"). |
 
 Spans: OpenTelemetry spans are DEFERRED to week 2 (owner, 2026-10-08); a missing span is not a failed criterion. Metrics and redacted logs are present (see each section).
 Anything needing a running real API (HTTP-level permission, 0-credit header) is collected in NEW-A-17.

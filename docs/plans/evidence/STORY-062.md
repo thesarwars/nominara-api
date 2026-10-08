@@ -13,7 +13,8 @@ Reads never recompute. `GeoService.detailFor` (src/modules/geo/geo.service.ts) r
 4. At most three levers; evidence-free finding never persisted. "S8 · promotes at most three levers" (unit) and "S8/S9" (integration); "S6 · an evidence-free finding is rejected and nothing is persisted" (integration), "S6" (unit).
 
 ## Checkpoint-2 additions
-- Tenant isolation: "STORY-062 isolation · under the application role, another workspace gets 404 on the digest, the analysis and a write" (commit 26a2dd9). Mutation-proven.
+- Tenant isolation, via the service: "STORY-062 isolation · under the application role, another workspace gets 404 ..." (26a2dd9). CORRECTION (audit): this test only proves RLS on `projects` (the service looks the project up first and 404s before `geo_analyses` is read); it passed with RLS disabled on `geo_analyses`. It is NOT the isolation proof for that table. The proof is the direct test below.
+- Tenant isolation, `geo_analyses` itself: "STORY-062 isolation · geo_analyses itself, read and written directly as the application role ..." (3f00708); see the gate table.
 - Observability: counters `nominara_geo_digest_read_total`, `nominara_geo_analysis_read_total`; redacted log `geo_analysis_persisted` (analysis, window, finding count; no workspace name).
 
 ## Gates (worktree api-wt-c3, branch 7day/c-geo-3, tip before this doc: cb327d1)
@@ -25,7 +26,9 @@ Reads never recompute. `GeoService.detailFor` (src/modules/geo/geo.service.ts) r
 | `pnpm test:unit` | 0 (277 files passed, 1 skipped; 3313 tests passed, 1 skipped) |
 | `pnpm exec vitest run --config vitest.integration.config.ts test/integration/geo- test/integration/seed-demo.spec.ts -t "STORY-06\|geo\|GEO"` (colima env, testcontainers) | 0 (5 files, 39 passed, 34 skipped by the filter) |
 | `pnpm contracts:check` | 0 (no contract changed in this lane work) |
-| `pnpm test:isolation` | NOT RUN: crashes in fixture setup at this tip (support_grants TTL, d-admin lane). Tenant isolation proven instead in `test/integration/geo-insights.spec.ts` "STORY-062 isolation" under `SET ROLE nominara_app` (mutation: dropping the SET ROLE makes it fail, "promise resolved ... instead of rejecting"). |
+| `pnpm test:isolation` | 0 (13 files, 53 tests) at 91c9d9c, after cherry-picking the d-admin fixture fixes d25c2cb (as 8e96983) and 1d97921 (as 91c9d9c). The generic suite discovers `geo_analyses` from `tenant-tables.generated.ts`. |
+| `pnpm test:isolation:breakers` | 0 (1 file, 24 tests) at 91c9d9c |
+| `geo_analyses` policy, directly | `test/integration/geo-insights.spec.ts` "STORY-062 isolation · geo_analyses itself ..." (3f00708): as `nominara_app` under another tenant, SELECT 0 rows, UPDATE 0, DELETE 0, INSERT for the victim fails 42501. Fails under three policy mutations: RLS disabled ("expected 1 to be +0"), USING/WITH CHECK (true) ("expected 1 to be +0"), WITH CHECK (true) only ("promise resolved ... instead of rejecting"). |
 
 Spans: OpenTelemetry spans are DEFERRED to week 2 (owner, 2026-10-08); a missing span is not a failed criterion. Metrics and redacted logs are present (see each section).
 Anything needing a running real API (HTTP-level permission, 0-credit header) is collected in NEW-A-17.

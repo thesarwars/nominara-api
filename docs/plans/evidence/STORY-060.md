@@ -25,7 +25,14 @@ Observability: counters `nominara_geo_structure_recompute_total`, duration log l
 | `pnpm test:unit` | 0 (277 files passed, 1 skipped; 3313 tests passed, 1 skipped) |
 | `pnpm exec vitest run --config vitest.integration.config.ts test/integration/geo- test/integration/seed-demo.spec.ts -t "STORY-06\|geo\|GEO"` (colima env, testcontainers) | 0 (5 files, 39 passed, 34 skipped by the filter) |
 | `pnpm contracts:check` | 0 (no contract changed in this lane work) |
-| `pnpm test:isolation` | NOT RUN: crashes in fixture setup at this tip (support_grants TTL, d-admin lane). Tenant isolation proven instead in `test/integration/geo-insights.spec.ts` "STORY-062 isolation" under `SET ROLE nominara_app` (mutation: dropping the SET ROLE makes it fail, "promise resolved ... instead of rejecting"). |
+| `pnpm test:isolation` | 0 (13 files, 53 tests) at 91c9d9c, after cherry-picking the d-admin fixture fixes d25c2cb (as 8e96983) and 1d97921 (as 91c9d9c). The generic suite discovers `geo_analyses` from `tenant-tables.generated.ts`. |
+| `pnpm test:isolation:breakers` | 0 (1 file, 24 tests) at 91c9d9c |
+| `geo_analyses` policy, directly | `test/integration/geo-insights.spec.ts` "STORY-062 isolation · geo_analyses itself ..." (3f00708): as `nominara_app` under another tenant, SELECT 0 rows, UPDATE 0, DELETE 0, INSERT for the victim fails 42501. Fails under three policy mutations: RLS disabled ("expected 1 to be +0"), USING/WITH CHECK (true) ("expected 1 to be +0"), WITH CHECK (true) only ("promise resolved ... instead of rejecting"). |
 
 Spans: OpenTelemetry spans are DEFERRED to week 2 (owner, 2026-10-08); a missing span is not a failed criterion. Metrics and redacted logs are present (see each section).
 Anything needing a running real API (HTTP-level permission, 0-credit header) is collected in NEW-A-17.
+
+## Audit fixes (checkpoint-2 audit)
+- Isolation claim corrected: the earlier "tenant isolation proven instead" line is replaced by the real `test:isolation` / `test:isolation:breakers` runs and the direct `geo_analyses` RLS test (see the gate table; STORY-062.md has the correction).
+- Purge on a later day (finding 3). RED a358317: "STORY-060 audit · --purge on a LATER day deletes the seed's geo_analyses rows outright" on a PRE-EXISTING project (a seed-created one is deleted with its rows, which hides the defect), Date faked +24 h: exit 1, 1 failed, "no sufficient (demo-derived) row survives: expected 6 to be +0". Fix 4179d3b: `purgeOneProject` deletes the project's `geo_analyses` rows before `refreshProjectGeoWindows`. Green re-run and mutation check (remove the DELETE, expect the same failure): NOT RUN, the disk gate stopped container specs (see "Disk gate" in NEW-C-15.md). Re-run `pnpm exec vitest run --config vitest.integration.config.ts test/integration/seed-demo.spec.ts -t "STORY-060 audit"` before merge.
+- Judgement to confirm: the DELETE is unconditional per project listed by `listSeededProjects`; a purge of a project that is no longer listed (no marker, no demo capture) never reaches it.

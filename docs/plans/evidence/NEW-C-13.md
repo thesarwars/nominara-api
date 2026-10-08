@@ -35,4 +35,16 @@ RED: 2804d73 (unit + integration specs, no implementation). Run on that tree: `p
 | same config, test/integration/geo- (all geo specs) + rollups-aux-tasks-geo-tools.spec.ts | 0 for those; 6 of 7 files passed |
 | same config, test/integration/seed-demo.spec.ts | 1 (8 failed, 29 passed). PROVEN PRE-EXISTING: the identical 8 fail with this change stashed, on the base commit 2804d73 (the RED commit, which adds only tests). They are the NEW-A-8 --facts-only cases (e.g. "#1 expected [] to deeply equal [chatgpt, claude, ...]": no demo facts written). Not touched by this story; belongs to the seed lane. A first full run showed a 9th ("UTC+14 re-audit") that passed on re-run. |
 | pnpm contracts:check | 0 |
-| pnpm test:isolation | NOT RUN: crashes in fixture setup at this tip (support_grants TTL, d-admin lane). Isolation proven in [C13-7]. |
+| `pnpm test:isolation` | 0 (13 files, 53 tests) at 91c9d9c, after cherry-picking the d-admin fixture fixes d25c2cb (as 8e96983) and 1d97921 (as 91c9d9c). The generic suite discovers `geo_analyses` from `tenant-tables.generated.ts`. |
+| `pnpm test:isolation:breakers` | 0 (1 file, 24 tests) at 91c9d9c |
+| `geo_analyses` policy, directly | `test/integration/geo-insights.spec.ts` "STORY-062 isolation · geo_analyses itself ..." (3f00708): as `nominara_app` under another tenant, SELECT 0 rows, UPDATE 0, DELETE 0, INSERT for the victim fails 42501. Fails under three policy mutations: RLS disabled ("expected 1 to be +0"), USING/WITH CHECK (true) ("expected 1 to be +0"), WITH CHECK (true) only ("promise resolved ... instead of rejecting"). |
+
+## Audit fixes (checkpoint-2 audit, finding 5)
+- "rank by impact" had no test: replacing `impact(b) - impact(a) ||` with `0 ||` survived every spec because the fixtures' severity order matched slug order.
+- Added `test/unit/geo/lever-rank.spec.ts` "[L12] severity outranks slug order ..." (a later slug with higher severity beats earlier slugs; four candidates so the cut-off follows severity) and "[L13] at equal severity the larger evidence base wins even against slug order; slug order only breaks an exact tie". Commit 8f30ba2.
+- Mutations re-run on `rankLevers` (`pnpm exec vitest run test/unit/geo/lever-rank.spec.ts`; 13 pass unmutated):
+  - severity term -> `0 ||`: 1 failed ([L12]). Previously 0 failed.
+  - evidence term -> `0 ||`: 2 failed ([L6], [L13]).
+  - slug term -> `0`: 2 failed ([L6], [L13]).
+  - severity comparison reversed: 3 failed ([L1], [L12], [L7]).
+- The impact formula (severity, then evidence_cells, then slug) is the owner-accepted list; no change.
