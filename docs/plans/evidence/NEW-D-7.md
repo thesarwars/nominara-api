@@ -3,14 +3,131 @@
 Lane `7day/d-usage-3`, base `integration/7day`. Migrations: none (columns, `ck_autotopup_bounded` and
 `credit_purchases.source='auto_topup'` all shipped in 0002).
 
-**STATUS: PARTIAL, NOT DONE. The four acceptance criteria and the re-audit's findings 1-3 (stale-pending double
-charge; the `enabled`, threshold and pack guards) are fixed and proven below. NOT WIRED to a balance drop: the
-cycle roll and the signed `billing.auto_topup` queue handler (re-audit finding 4) are NOT built, so
-`trigger_active` stays `false`, and the lane must not be marked done. See "Re-audit round 2" at the end.**
+**STATUS (checkpoint-3 fix pass, lane `7day/d-usage-4`): the four acceptance criteria and all five audit findings are
+now fixed and proven; the trigger IS wired. One KAD-06 point is NOT closed and is stated as an open decision (see
+"Checkpoint-3 fix pass", "Open decision"). Sections below this one are the history of the earlier rounds and are
+superseded where they say "NOT WIRED".**
 
 Integration specs now RAN (Docker/colima healthy; 18 GiB free at the start of the run). OpenTelemetry spans are deferred
 to week 2 by owner decision: a missing span is not a failed criterion. Evidence that needs a running real API
 (HTTP against a live Stripe sandbox) is collected in NEW-A-17.
+
+## Checkpoint-3 fix pass — `7day/d-usage-4` (base `integration/7day` at `fee788e`)
+
+Task items: (1) a Stripe timeout reopening the in-flight guard, (2) kept firing after a downgrade, (3) the counter never
+resetting, (4) trigger via a new signed `billing.auto_topup` queue, (5) card saved only when auto-top-up is enabled,
+plus: run the NEW-D-7 and NEW-D-6 integration specs, record the wallet `auto_topup` breaking change.
+
+Items (1), (2) and (5) were already built and mutation-tested in `7day/d-usage-3` (see "Acceptance criteria", findings 2 and
+3, and "Re-audit round 2" below); their specs are re-run here and pass. What this pass added is (3), (4), the wiring that
+(4) needs, and the contract record.
+
+| sha | what | RED/GREEN |
+|---|---|---|
+| `90b8a28` | `contracts/baseline/breaking-changes.json`: `2026-10-08-wallet-auto-topup-required` (getWallet, required `data.auto_topup`) | `contract-breaking-changes.spec.ts` 22/22, exit 0 |
+| `f3bea3c` | RED: `test/integration/auto-topup-cycle-reset.spec.ts` | **2 failed / 6 passed (8), exit 1**: CYC-1 and CYC-6 `expected 3 to be 0` (the counter stays at 3 after a renewal). The other six are guards (no reset inside a period, on replay, on a stale event, config kept, other tenant untouched, no wallet) that hold trivially before the fix and are proven by mutation below. |
+| `94a58d1` | RED: `topology.spec.ts` pin, `billing-auto-topup.handler.test.ts`, `auto-topup-request.spec.ts`, `test/integration/auto-topup-enqueue.spec.ts` | topology **2 failed**; handler + key specs **cannot load their module** (not yet written); enqueue spec **3 failed / 6 passed (9), exit 1** (ENQ-1/2/5: `expected [] to have a length of 1`, no job is ever enqueued). |
+| `397cc40` | GREEN (all of it) | gates below |
+
+### What was built
+
+- **Finding 3, the cycle reset** (`src/lib/billing/apply-plan.ts`, step 6b). `applyPlanChange` is the only writer of
+  `subscriptions.current_period_start`; a reconciled period that starts STRICTLY LATER than the one on file is the billing
+  cycle roll, and in that transaction `credit_wallets.auto_topup_count_cycle` is set to 0 (only the counter: enabled, pack,
+  threshold and cap are untouched). A redelivery of the same period, a stale event for an earlier one and a reconcile inside
+  the period (seats, an add-on, a cancel flag) change nothing. No migration. **Why the billing cycle and not
+  `credit_wallets.cycle_*`**: nothing in `src/` ever advances the wallet's `cycle_start/cycle_end` after provisioning
+  (wallet.ts `cycleHasLapsed`; the wallet roll / included-grant refresh of STORY-072 scenario 14 is not built), so there is
+  no wallet roll to hang a reset on. Whoever builds that roll must zero this counter in the same statement. If the owner
+  wants the reset tied to the wallet cycle instead, that is a decision, and it needs the wallet roll first.
+- **Finding 4, the queue.** `billing.auto_topup` in `src/lib/queue/topology.ts` (tenant-scoped, `rollup` group, concurrency
+  2, ladder 2000/4000 ms, key `autotopup:{workspace}:{yyyy_mm_dd_hh_mm}`), registered in `handlers.ts`. It is not in
+  system-architecture.md section 4; it follows the `audit.verify` / `source.verify_presence` precedent
+  (`ADDED_BEYOND_REFERENCE` in `topology.spec.ts`). Docs carry: section 4's table needs one row.
+  - **Producer** (`src/lib/credits/auto-topup-request.ts`, called from `CreditInterceptor.commit` after the ledger commit
+    entry): inside the debit's transaction, when auto-top-up is enabled with a threshold and
+    `included + purchased - reserved < threshold`, an `afterCommit` hook enqueues the signed tenant job (payload carries only
+    `workspaceId`/`kid`, never an amount or a card). A failed enqueue is logged and counted, never thrown.
+    The interceptor takes `QueueProducer` as `@Optional()`. **No Stripe call, no charge, on the request path.**
+  - **Consumer** (`src/lib/queue/handlers/billing-auto-topup.handler.ts`): the payload schema is `.strict()`
+    (`workspaceId` uuid + `kid`); `workspaceId` comes only from the payload `createJobProcessor` verified before any client
+    was acquired (ISO-11); it calls `AutoTopupService.trigger` once, which re-decides everything under the wallet lock.
+    The Stripe gateway and email port are built on the first job, so a worker without a Stripe key still boots.
+  - `trigger_active` in the wallet/PUT response is now `true` (it was a literal `false` "until wired"); three test
+    expectations of that literal were updated for that reason, nothing else about them changed.
+  - The gate `auto-topup-unwired.spec.ts` became `auto-topup-wiring.spec.ts`: only the queue handler may call `.trigger(`
+    (exactly once), and no controller/guard/interceptor/`src/api` file may reference the service.
+- **Pins updated because the topology gained a queue**: `topology.spec.ts` (ADDED_BEYOND_REFERENCE), `group.spec.ts`,
+  `handler-registry.spec.ts`, `worker-group-bootstrap.spec.ts`. Each adds the new queue to an exact-list pin; no assertion
+  was loosened.
+
+### Acceptance criteria -> proof
+
+| Criterion | Test file | Test names |
+|---|---|---|
+| AC finding 3: the counter resets per billing cycle | `test/integration/auto-topup-cycle-reset.spec.ts` | `NEW-D-7-CYC-1` (renewal zeroes it), `-2` (config kept), `-3` (reconcile inside the period does not), `-4` (replay does not zero the new period's count), `-5` (stale earlier period never resets), `-6` (renewal + plan change), `-7` (other tenant untouched), `-8` (no wallet) |
+| STORY-076 AC8: a mid-cycle config change does not reset it | `test/integration/billing-usage-auto-topup.spec.ts` | the existing "config change does not reset auto_topup_count_cycle" test (re-run, passes) |
+| AC finding 4: signed `billing.auto_topup` queue, enqueued after a debit crosses the threshold | `test/integration/auto-topup-enqueue.spec.ts` | `NEW-D-7-ENQ-1` (one signed tenant job for that workspace), `-2` (only after the request transaction committed, seen from a second connection), `-3` (off: none), `-4` (unconfigured: none), `-5` (boundary: equal does not, one below does), `-6` (above: none), `-7` (failed request: none), `-8` (enqueue failure never fails the request), `-9` (no producer wired) |
+| Never on the request path | `test/unit/billing/auto-topup-wiring.spec.ts` | "only the billing.auto_topup queue handler calls AutoTopupService.trigger, and it does so exactly once"; "no request-path code ... references the service" |
+| Signed tenant job: verify before context; workspace only from the verified payload | `src/lib/queue/handlers/billing-auto-topup.handler.test.ts` | `NEW-D-7-Q-1` .. `-9` (through the real `createJobProcessor`: a redirected workspace, a forged key and an unsigned job are rejected with no client acquired and no `trigger` call) |
+| Dedup key | `src/lib/credits/auto-topup-request.spec.ts` | `NEW-D-7-KEY-1` .. `-3` |
+| Topology entry | `test/unit/queue/topology.spec.ts`, `group.spec.ts`, `handler-registry.spec.ts`; `test/integration/worker-group-bootstrap.spec.ts` | the exact-list pins |
+| Finding 1 (timeout keeps the attempt pending, reconcile from Stripe) | `test/integration/auto-topup-trigger.spec.ts` | "a provider outage on the charge leaves the purchase pending ... never charged twice"; the F6 tests (in_progress/succeeded stay pending, none/failed expire, a lookup error stays pending) |
+| Finding 2 (entitlement at trigger time) | same | "the claim re-checks the plan" and the two F3 tests |
+| Finding 5 / owner decision 4 (card saved only with auto-top-up on) | same, `credit-packs.spec.ts`, `stripe-gateway.spec.ts` | the owner-decision-4 tests of `25ae315`/`0d9e419` |
+| Breaking change recorded | `test/unit/contract-breaking-changes.spec.ts` | the `2026-10-08-wallet-auto-topup-required` entry's three auditable-field/visibility tests |
+| Observability | metrics `nominara_billing_auto_topup_enqueued_total`, `_enqueue_failed_total`; redacted log lines `billing.auto_topup.enqueued` / `.enqueue_failed` / `.job_done` (workspace id and outcome only). Spans deferred to week 2 (R3): a missing span is not a failure. The two new counters are not asserted by name (gap, minor); the log shape is covered by the existing leak test on the trigger itself. |
+
+### Mutations (source restored with `git checkout` after each; counts are failed tests across `auto-topup-cycle-reset` + `auto-topup-enqueue`, 17 tests)
+
+| mutation | result |
+|---|---|
+| reset when the period is `>=` the one on file (also on replay) | killed: 1 failed |
+| reset when the period merely differs (`!==`, also on a stale event) | killed: 1 failed |
+| the reset also switches auto-top-up off | killed: 1 failed (config kept) |
+| the reset UPDATE without the workspace predicate | killed: 7 failed |
+| `< threshold` -> `<= threshold` | killed: 1 failed (boundary) |
+| drop `auto_topup_enabled` from the below-threshold query | killed: 1 failed |
+| enqueue immediately instead of `afterCommit` | killed: 1 failed (ENQ-2) |
+| make the enqueue `.catch` rethrow | all 17 assertions pass; the run exits 1 on Vitest's unhandled-rejection error. Caught by the exit code, NOT by an assertion: ENQ-8 should assert that nothing is unhandled. Flagged, not hidden. |
+| handler payload `.strict()` -> `.passthrough()`; `z.string().uuid()` -> `z.string()` | each killed: 1 failed (Q-3) |
+
+### Gates (tip `397cc40`, this worktree)
+
+- `pnpm lint` exit 0. `pnpm typecheck` exit 0. `pnpm contracts:check` exit 0 (no schema shape changed; comments and the
+  `trigger_active` value only; `openapi.generated.json` unchanged).
+- `pnpm test:unit` exit 0: 304 files passed, 1 skipped; 3714 passed, 1 skipped.
+- Integration (`vitest --config vitest.integration.config.ts`): `auto-topup-cycle-reset`, `auto-topup-enqueue`,
+  `auto-topup-trigger`, `billing-usage-auto-topup` (NEW-D-6), `credit-packs`, `stripe-webhook`, `credit-ledger-read`,
+  `credit-guard-settlement`, `plan-change-service`, `stripe-subscriptions`, `billing-addons`, `billing-invoices`: 12 files,
+  340 tests, exit 0. Queue wiring: `worker-group-bootstrap`, `queue-handler-registry`, `queue-topology`,
+  `queue-signing-rotation`, `queue-idempotency`: 5 files, 100 tests; the first run had 1 failure (the rollup pin missing the
+  new queue, fixed as above), re-run `worker-group-bootstrap` 16/16 exit 0. The NEW-D-6 and NEW-D-7 specs, which "never ran" at
+  the checkpoint, run and pass.
+- `pnpm test:isolation`: exit 1, 12 files / 52 tests pass, 1 fails: `ISO-14` `namespacing.spec.ts`, "un-namespaced object
+  key construction site" at `src/modules/reports/scheduled-reports.service.ts:234`. That file is the e-reports lane's, and
+  `git diff integration/7day -- src/modules/reports test/isolation` is empty, so the failure is the base's, not this
+  change's. No table, policy or migration was touched here. The tampered-signature assertion (ISO-11) is in the 12 passing.
+
+### Open decision (not closed, per the task's own rule: stated, not decided)
+
+**KAD-06 and the job's transaction.** `createJobProcessor` opens the tenant transaction for every tenant-scoped handler and
+holds it until the handler returns. `AutoTopupService.trigger` awaits Stripe and the mail port, so the job's transaction
+sits idle (it has run only `set_config`: no locks, no snapshot) across those awaits. The service does its money work on
+three short transactions of its own, never inside that one, and the handler does not touch it. This is the same shape
+`crawl.audit` and `source.verify_presence` already have, but the rule says no handler holds a transaction open across an
+external await. Closing it means a processor mode that verifies the signature and then runs the handler without a held
+transaction. That changes `worker-factory.ts` (the ISO-11 file) and is a new pattern, so it needs an ADR and an owner
+decision; I did not make it. Cost today: one extra pooled connection per in-flight job (concurrency 2).
+
+### Other open items
+
+- A balance that stays low with no saved card still writes one `billing.auto_topup.skipped` audit row per evaluation; the
+  one-job-per-minute key bounds it to one a minute while debits continue. A proper throttle is not built.
+- A customer-visible notice for an expired stale purchase: still undecided (see earlier rounds).
+- The enqueue is evaluated at the commit of a debit only (`CreditInterceptor`), which is the only code that commits one. A
+  workspace whose balance is already low when it ENABLES auto-top-up gets its first evaluation at its next debit.
+- Docs carry (the docs repo has no `.git` here): system-architecture.md section 4 needs a row for `billing.auto_topup`.
 
 ## Commits (oldest first)
 

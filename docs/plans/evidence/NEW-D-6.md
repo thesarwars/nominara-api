@@ -80,3 +80,14 @@ replaced by `true`; expiry clause removed from `share_links_active`; `-1 -> null
 | integration: `billing-usage-auto-topup.spec.ts` | 0 (19 passed) |
 | integration: `credit-ledger-read.spec.ts` | 0 (37 passed) |
 | integration: `estimates-and-confirmation.spec.ts`, `credit-packs.spec.ts` | 0 (with the above: 102 tests, the 2 failures were the exact-equality wallet assertions fixed above) |
+
+## Checkpoint-3 fix pass (lane `7day/d-usage-4`)
+
+- The wallet's required `auto_topup` member is recorded as an approved breaking change: `contracts/baseline/breaking-changes.json`
+  entry `2026-10-08-wallet-auto-topup-required` (commit `90b8a28`), asserted by `test/unit/contract-breaking-changes.spec.ts`.
+- `trigger_active` is now `true` (the trigger is wired by NEW-D-7); the three expectations of the old literal in
+  `billing-usage-auto-topup.spec.ts` and `credit-ledger-read.spec.ts` were updated for that and nothing else changed in them.
+- STORY-076 AC8 (a mid-cycle configuration change does not reset `auto_topup_count_cycle`) still holds and is re-run:
+  `billing-usage-auto-topup.spec.ts` passes (it never ran at checkpoint 3). The counter now resets only when the billing
+  period rolls (NEW-D-7 evidence, finding 3).
+- Gates for this pass are in `NEW-D-7.md`.
