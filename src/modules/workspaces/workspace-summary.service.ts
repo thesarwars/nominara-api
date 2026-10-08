@@ -6,7 +6,7 @@ import type {
 } from "../../../contracts/workspaces/workspace-summary-response.schema.js";
 import { FeatureNotInPlanError } from "../../api/errors/domain-errors.js";
 import type { DataSource } from "../../../contracts/analytics/index.js";
-import { combineDataSources, engineDataSourcesForDates } from "../../lib/analytics/data-source.js";
+import { combineDataSources, engineDataSourcesForProjects } from "../../lib/analytics/data-source.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -69,13 +69,11 @@ export class WorkspaceSummaryService {
     // local window the matrix columns cover — never "does the engine have an
     // API key". Nothing measured is null, not demo.
     const window = await this.window(workspaceId, store.client);
-    const perProject = new Map<string, Map<string, DataSource>>();
-    for (const project of projects) {
-      perProject.set(
-        project.id,
-        await engineDataSourcesForDates(store.client, project.id, window.from, window.to, window.timezone),
-      );
-    }
+    // ONE statement for every project in the matrix (AC: no per-project query).
+    const perProject =
+      projects.length === 0
+        ? new Map<string, Map<string, DataSource>>()
+        : await engineDataSourcesForProjects(store.client, projects.map((project) => project.id), window.from, window.to, window.timezone);
     const workspaceSource = (engineKey: string): DataSource | null =>
       combineDataSources([...perProject.values()].map((sources) => sources.get(engineKey) ?? null));
 
