@@ -49,8 +49,18 @@ export const addonSchema = z
 export const addonCreateRequestSchema = z
   .object({
     kind: addonKindSchema,
-    /** Units to ADD to what the workspace already holds (not the new total). */
-    quantity: z.number().int().min(1).max(ADDON_MAX_QUANTITY),
+    /**
+     * The DESIRED TOTAL of this add-on after the change (not an increment).
+     * A total is fixed by the request, so a retry after Stripe applied the
+     * change sets the same number and charges nothing twice. A total below what
+     * the workspace holds is a 409: removal is `DELETE /billing/addons/{kind}`.
+     */
+    quantity: z
+      .number()
+      .int()
+      .min(1)
+      .max(ADDON_MAX_QUANTITY)
+      .describe("Desired total units of this add-on after the change; not an increment"),
   })
   .strict();
 

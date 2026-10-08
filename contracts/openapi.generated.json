@@ -6020,7 +6020,8 @@
                   "quantity": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 100
+                    "maximum": 100,
+                    "description": "Desired total units of this add-on after the change; not an increment"
                   }
                 },
                 "required": [
