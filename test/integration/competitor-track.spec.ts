@@ -199,7 +199,7 @@ describe("NEW-C-2 · track and untrack a competitor", () => {
     expect(result.entity_id).toBeDefined();
   });
 
-  it("STORY-092 #6 — removing a competitor soft-deletes it, inserts a milestone, and re-tags nothing", async () => {
+  it("STORY-092 #6 — removing a competitor soft-deletes it, inserts a competitor_removed milestone (owner decision 8), and re-tags nothing", async () => {
     const { entity_id } = await track({ name: "Pipedrive" });
     await addFact("Pipedrive", { type: "competitor", entityId: entity_id });
     await db.query("DELETE FROM milestones");
@@ -212,7 +212,7 @@ describe("NEW-C-2 · track and untrack a competitor", () => {
     expect(fact.rows).toEqual([{ entity_type: "competitor", entity_id }]);
     const milestones = await db.query("SELECT kind, title FROM milestones");
     expect(milestones.rows).toHaveLength(1);
-    expect(milestones.rows[0].kind).toBe("competitor_added");
+    expect(milestones.rows[0].kind).toBe("competitor_removed");
     expect(milestones.rows[0].title.toLowerCase()).toContain("removed");
     expect(milestones.rows[0].title).toContain("Pipedrive");
     expect(await counts()).toEqual({ ledger: 0, captures: 0 });
@@ -265,6 +265,23 @@ describe("NEW-C-2 · track and untrack a competitor", () => {
     const second = await track({ name: "Pipedrive" });
     expect(second.entity_id).toBe(first.entity_id);
     expect((await db.query("SELECT deleted_at FROM competitors")).rows).toEqual([{ deleted_at: null }]);
+  });
+
+  // CP2 QA (CP1 c-comp MINOR): the recompute key carries a nonce, and nothing
+  // proved it. A revive reuses the competitor's id; without the nonce the queue's
+  // dedup window would swallow the second recompute while its dates are stale.
+  it("CP1 c-comp — re-tracking a revived competitor enqueues a SECOND recompute under a different idempotency key", async () => {
+    await addFact("Pipedrive", { daysAgo: 3 });
+    const first = await track({ name: "Pipedrive" });
+    await untrack(first.entity_id);
+    await addFact("Pipedrive", { daysAgo: 2 }); // new `other` facts arrive while it is removed
+    const second = await track({ name: "Pipedrive" });
+    expect(second.entity_id).toBe(first.entity_id);
+    expect(second.backfilled_days).toBe(1);
+    expect(enqueued).toHaveLength(2);
+    const keys = enqueued.map((job) => job.options.idempotencyKey);
+    expect(new Set(keys).size).toBe(2);
+    for (const key of keys) expect(key).toContain(first.entity_id);
   });
 
   it("tracking into a project the caller cannot see is 404", async () => {

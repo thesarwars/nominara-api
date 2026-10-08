@@ -245,6 +245,28 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect((await events())[0]!.impact_score).toBeCloseTo(98, 4);
   });
 
+  // CP2 QA, STORY-056 criterion 4. scoring-models.md section 9 names
+  // `rank_of_topic_by_intent` but defines no ordering rule. The plan's reading,
+  // FLAGGED as a spec question for the owner: rank 1 for EVERY prompt, whether or
+  // not it sits in a topic cluster. The earlier code ranked clusters by
+  // commercial_intent without saying so; this pins the stated reading.
+  it("CP2 STORY-056 · rank_of_topic_by_intent is 1 for every prompt, even one in a lower-intent cluster (flagged spec reading)", async () => {
+    const high = randomUUID();
+    const low = randomUUID();
+    await db.query(
+      `INSERT INTO topic_clusters (id, workspace_id, project_id, label, commercial_intent)
+       VALUES ($1,$3,$4,'High intent',0.9), ($2,$3,$4,'Low intent',0.4)`,
+      [high, low, workspaceId, projectId],
+    );
+    await db.query(`UPDATE tracked_prompts SET cluster_id = $1 WHERE id = $2`, [low, promptId]);
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1, cls: "recommendation" });
+    const after = await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
+    await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/best" });
+    await run(D2);
+    // Same hand computation as #6: 1 / rank = 1, so 98. Ranking the clusters would give rank 2 and 93.
+    expect((await events())[0]!.impact_score).toBeCloseTo(98, 4);
+  });
+
   it("STORY-056 #7 · a smaller citation gap scores higher than a larger one", async () => {
     await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1, cls: "recommendation" });
     const small = await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
