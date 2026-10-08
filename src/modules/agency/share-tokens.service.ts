@@ -465,11 +465,15 @@ export class ShareTokensService {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ShareTokensService requires an active tenant context");
     const scope = store.context.scopeProjectIds;
+    // undefined = unrestricted. A scope that is PRESENT but empty is a member scoped to nothing: it is never
+    // "unrestricted" (the tenant context collapses it before this point, and RbacGuard refuses it first; this
+    // is the second line, for a context built any other way).
+    if (scope !== undefined && scope.length === 0) throw new ProjectOutOfScopeError();
     return {
       client: store.client,
       workspaceId: store.context.workspaceId,
       actorId: store.context.actorId,
-      actorScope: scope !== undefined && scope.length > 0 ? scope : null,
+      actorScope: scope ?? null,
     };
   }
 }
