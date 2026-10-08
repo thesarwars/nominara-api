@@ -109,3 +109,23 @@ Run against `billing-addons.service.spec.ts`, `addon-grant.spec.ts`, `addon-item
 ## Audit items 2 and 3: NOT DONE, blocked on disk
 
 `df -h /System/Volumes/Data` showed 4.7 GiB free at the start and 6.3 GiB at the end; the hard rule is 8 GiB before testcontainers. So the STORY-075b / 076b integration specs, `stripe-subscriptions`, `stripe-webhook`, the M1-M6 mutation re-run, `pnpm test:isolation` and `pnpm test:isolation:breakers` were NOT run on this tip. Nothing was removed to make room (the free space is not this lane's to reclaim). Needed: the owner frees disk (>= 8 GiB), then run those suites, record RED against the parent of `c279f9b` / `28ea168`, and re-apply M1-M6.
+
+
+## Integration run (2026-10-08, disk 12 GiB free at start; closes "NOT RUN" above)
+
+Two defects in `test/integration/billing-addons.spec.ts` itself (written without a database) were found by the first run and fixed in the spec; no implementation change:
+1. `subIdOf` used the first 8 hex of a UUIDv7 workspace id (a millisecond timestamp prefix), so two workspaces created in one test collided on `ux_subscriptions_stripe` (3 tests, webhook 500). Now `sub_<full workspace id>`.
+2. The "cannot write one for B" assertion inserted via `SELECT ... FROM subscriptions WHERE workspace_id = B` under A's context; RLS hid the row, so a zero-row INSERT succeeded and the `rejects` was vacuous. It now inserts B's real subscription id (read as superuser) so RLS WITH CHECK must refuse it.
+
+| Run | Exit | Result |
+|---|---|---|
+| `billing-addons.spec.ts` first run | 1 | 3 failed / 28 passed (defect 1), then 1 failed / 30 (defect 2) |
+| `billing-addons.spec.ts` + `stripe-subscriptions` + `stripe-webhook` + `entitlement-resolution` after the fixes | 0 | 4 files, 134 tests passed |
+| RED (integration): `BillingAddonsController` removed from `billing.module.ts` (temporary, reverted), same spec | 1 | 21 failed / 10 passed (the 10 are reconciler/webhook rows that need no endpoint). The spec could not be run at `235e0ab` itself: it needs the fake gateway methods added in `c279f9b` |
+| Mutation: `reconcile` locks closed rows (`AND active_until IS NULL` dropped, `billing-addons.service.ts` FOR UPDATE read) | 1 | KILLED by "AC1 . an add-on that left Stripe's subscription is closed..." (the mutation that survived the unit specs) |
+| `pnpm lint` | 0 | clean |
+| `pnpm typecheck` | 0 | clean |
+| `pnpm test:unit` | 0 | 282 files passed, 1 skipped; 3396 passed, 1 skipped |
+| `pnpm test:isolation`, `pnpm test:isolation:breakers` | 1 | still crash in `seedTenant` (`three-tenant-fixture.ts:149`, `support_grants` INSERT, check violation 23514) at this tip even though `3871292` (d-admin-2) is an ancestor. Not caused by this story (no tenant table touched; `subscription_addons` has its generated policy). Tenant isolation is proved in the integration spec under `nominara_app` (3 tests, passing). Disk fell to 7.4 GiB during these runs; no further testcontainers runs were started |
+
+Still deferred: real-API / Stripe sandbox evidence (NEW-A-17), the PlanSettings frontend (app repo), spans (week 2).

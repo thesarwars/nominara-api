@@ -126,7 +126,7 @@ describe("STORY-076b · add-ons", () => {
   const reconcile = (workspaceId: string, eventId = `evt_${randomUUID()}`) =>
     deliver(eventBody(eventId, "customer.subscription.updated", subIdOf(workspaceId)));
 
-  const subIdOf = (workspaceId: string): string => `sub_${workspaceId.slice(0, 8)}`;
+  const subIdOf = (workspaceId: string): string => `sub_${workspaceId}`;
   const PRICES: Record<string, Record<string, number>> = { starter: { monthly: 4_900, annual: 49_000 }, growth: { monthly: 12_900, annual: 129_000 } };
 
   /** Stripe's CURRENT state of a workspace's subscription, as the gateway will fetch it. */
@@ -594,6 +594,8 @@ describe("STORY-076b · add-ons", () => {
     stripeSubscription(b.workspaceId, { held: [{ kind: "extra_seat", quantity: 1 }] });
     await reconcile(a.workspaceId);
     await reconcile(b.workspaceId);
+    // B's real subscription id, read as the superuser: the forged INSERT must be refused by RLS WITH CHECK, not be a vacuous zero-row INSERT.
+    const bSubscriptionId = (await harness.db().query<{ id: string }>("SELECT id FROM subscriptions WHERE workspace_id = $1", [b.workspaceId])).rows[0]!.id;
     const url = new URL(process.env.DATABASE_URL!);
     url.username = "nominara_app";
     url.password = resolvePassword("nominara_app", {});
@@ -609,8 +611,8 @@ describe("STORY-076b · add-ons", () => {
           withTenantContext(client, { workspaceId: a.workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
             tx.query(
               `INSERT INTO subscription_addons (workspace_id, subscription_id, kind, quantity, unit_price_usd, stripe_subscription_item_id)
-               SELECT $1, id, 'extra_seat', 1, 15, 'si_forged' FROM subscriptions WHERE workspace_id = $1`,
-              [b.workspaceId],
+               VALUES ($1, $2, 'extra_seat', 1, 15, 'si_forged')`,
+              [b.workspaceId, bSubscriptionId],
             ),
           ),
         ).rejects.toThrow();
