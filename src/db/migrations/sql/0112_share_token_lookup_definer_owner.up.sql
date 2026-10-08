@@ -25,8 +25,14 @@
 --     catalog name. Every relation is schema-qualified anyway.
 --   * EXECUTE revoked from PUBLIC and granted to nominara_app ONLY, as in 0080.
 --
--- OPERATOR NOTE: the migration identity needs CREATEROLE (or superuser) to create the role and ownership of the
--- function it hands over; the same identity that applied 0005. No BYPASSRLS attribute is involved.
+-- OPERATOR NOTE: the migration identity must be a SUPERUSER, like the one that applied 0005. CREATEROLE is NOT enough
+-- (reproduced on PG 17.6 as a LOGIN CREATEROLE NOSUPERUSER identity owning the schema, table and 0080 function):
+--   * ALTER ROLE ... NOSUPERUSER fails: "Only roles with the SUPERUSER attribute may change the SUPERUSER attribute".
+--   * ALTER FUNCTION ... OWNER TO nominara_share_lookup fails: "must be able to SET ROLE nominara_share_lookup" (on
+--     PG16+ the creator of a role receives ADMIN on it, not SET).
+-- Either way the migration aborts and the owner stays the migrator: it fails closed (the lookup returns no rows), never
+-- open. The role itself carries NO BYPASSRLS and NO SUPERUSER; only the migration identity needs it. A non-superuser
+-- path is not designed or tested.
 
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nominara_share_lookup') THEN

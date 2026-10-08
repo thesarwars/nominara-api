@@ -420,8 +420,12 @@ can't be done locally. Each is disclosed here rather than faked:
   `app.share_token_by_hash` is owned by a dedicated role,
   `nominara_share_lookup` (NOLOGIN, NOINHERIT, NOSUPERUSER, **NOBYPASSRLS**),
   admitted to `share_tokens` by one `FOR SELECT` policy and limited to a
-  14-column `SELECT` grant. The migration identity needs `CREATEROLE`; no
-  superuser or BYPASSRLS attribute is involved, and ISO-07 still holds.
+  14-column `SELECT` grant. The migration identity must be a **superuser**, as for `0005`:
+  `CREATEROLE` is not enough (`ALTER ROLE ... NOSUPERUSER` and `ALTER FUNCTION
+  ... OWNER TO` both fail for a non-superuser, reproduced on PG 17.6), and the
+  migration then aborts with the owner unchanged, which fails closed. The
+  `nominara_share_lookup` role itself has no superuser or BYPASSRLS
+  attribute, and ISO-07 still holds. A non-superuser path is not designed.
 
 **Rollback of migration `0005` does not remove the six roles.** This is
 deliberate, not a bug: `CREATE ROLE` is cluster-scoped (shared across every

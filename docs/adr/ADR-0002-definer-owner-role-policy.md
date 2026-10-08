@@ -36,7 +36,9 @@ ADR-0001 already rejected "give the definer `BYPASSRLS`", and `ISO-07` states th
 ## Consequences
 
 - `ISO-07` holds unchanged on the fully migrated schema (asserted by `DEF-8`).
-- No superuser or BYPASSRLS attribute is needed in any environment; the migration identity needs `CREATEROLE`.
+- The definer-owner role has no superuser or BYPASSRLS attribute. The migration identity must be a SUPERUSER, as for
+  `0005`: `CREATEROLE` is not enough (`ALTER ROLE ... NOSUPERUSER` and `ALTER FUNCTION ... OWNER TO` fail for a
+  non-superuser; reproduced on PG 17.6). A failed apply aborts and fails closed. A non-superuser path is undesigned.
 - The policy is a second policy class on `share_tokens`. Any further definer-owner needs its own ADR; this one does not
   generalise.
 - `DATABASE_ROLES` (the drift-check registry) does not list the role, because `database-roles-and-grants.spec.ts`

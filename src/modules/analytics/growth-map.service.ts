@@ -326,7 +326,13 @@ export class GrowthMapService {
         WHERE project_id = $1
           AND (occurred_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
           AND ($5::boolean = false OR visible_in_portal = true)
-          AND ($6::boolean = false OR (kind NOT LIKE 'competitor%' AND source_type IS DISTINCT FROM 'competitor'))
+          AND ($6::boolean = false OR (
+                kind NOT LIKE 'competitor%'
+                -- A completed task born of a displacement names a competitor by construction (the tasks tab drops
+                -- the task; its milestone carries the task's title). Deleted tasks count: the title is still there.
+                AND NOT (source_type = 'task' AND EXISTS (
+                  SELECT 1 FROM tasks t WHERE t.id = milestones.source_id AND t.source_displacement_id IS NOT NULL))
+              ))
         ORDER BY occurred_at ASC`,
       [projectId, from, to, timezone, portal !== undefined, portal?.hideCompetitors === true],
     );
