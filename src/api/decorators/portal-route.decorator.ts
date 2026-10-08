@@ -1,5 +1,6 @@
 import { applyDecorators, createParamDecorator, SetMetadata, UseInterceptors, type ExecutionContext } from "@nestjs/common";
 import type { PortalSessionPolicy } from "../../modules/agency/share-tokens.service.js";
+import type { PortalFacts } from "../../lib/portal/portal-facts.js";
 import { ProjectOutOfScopeError } from "../errors/domain-errors.js";
 import { PortalContextInterceptor } from "../interceptors/portal-context.interceptor.js";
 import { Public } from "./public.decorator.js";
@@ -26,6 +27,8 @@ export interface PortalSessionContext {
   readonly themeId: string | null;
   /** NEW-E-099a — the token row's serving policy, re-read on every request (never from the cookie or the request). */
   readonly policy: PortalSessionPolicy;
+  /** NEW-E-099a — workspace facts read on the app pool in the same per-request step (the portal role cannot read them). */
+  readonly facts: PortalFacts;
 }
 
 export interface PortalRequest {

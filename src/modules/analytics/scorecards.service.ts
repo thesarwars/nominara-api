@@ -14,6 +14,7 @@ import {
 import { blendDisclosure, combineDataSources, engineDataSourcesForDates, recordDemoDataServed } from "../../lib/analytics/data-source.js";
 import { aggregateRange, answeredStatusSql, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
+import type { PortalProjectEngines, PortalProjectFacts } from "../../lib/portal/portal-facts.js";
 import { resolveWindow, TIMEFRAME_DAYS } from "../../lib/analytics/window.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`.
@@ -43,13 +44,17 @@ const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
 
 @Injectable()
 export class ScorecardsService {
-  /** `opts.days` overrides the query's window — the portal serves a 24h window the agency query has no spelling for. */
-  async scorecards(projectId: string, query: ScorecardsQuery, opts: { readonly days?: number } = {}): Promise<ScorecardsResponse> {
+  /**
+   * `opts.days` overrides the query's window — the portal serves a 24h window the agency query has no spelling for.
+   * `opts.portal` carries what `nominara_portal` cannot read (the workspace timezone and the project's engine rows,
+   * read on the app pool by the portal interceptor); the facts and the arithmetic below are the same code.
+   */
+  async scorecards(projectId: string, query: ScorecardsQuery, opts: { readonly days?: number; readonly portal?: PortalProjectFacts } = {}): Promise<ScorecardsResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ScorecardsService requires an active tenant context");
     const tx = store.client;
 
-    const window = await resolveWindow(tx, projectId, opts.days ?? TIMEFRAME_DAYS[query.timeframe]);
+    const window = await resolveWindow(tx, projectId, opts.days ?? TIMEFRAME_DAYS[query.timeframe], opts.portal?.workspace.timezone);
     const requested = query.engines?.split(",").map((key) => key.trim()).filter((key) => key.length > 0) ?? null;
     // ⚠ `priorFrom`, NOT `from` — THE MEMBERSHIP SPAN COVERS BOTH LEGS.
     //
@@ -72,7 +77,7 @@ export class ScorecardsService {
     // response for up to one further window, which is correct — an engine
     // that stopped being measured is a thing the screen should show, not
     // hide.
-    const engines = await this.engineConfig(tx, projectId, requested, window.priorFrom, window.to, window.timezone);
+    const engines = await this.engineConfig(tx, projectId, requested, window.priorFrom, window.to, window.timezone, opts.portal?.engines);
 
     // TWO RANGE AGGREGATIONS, not 2 × N. `aggregateRange` groups by engine, so
     // the whole window costs one scan per period however many engines the
@@ -142,7 +147,22 @@ export class ScorecardsService {
     /** The current window's end. `measuredFrom … measuredTo` covers both legs. */
     measuredTo: string,
     timezone: string,
+    /** NEW-E-099a — the portal's pre-read engine rows; absent on the agency path, which reads the view and the table. */
+    portalEngines?: PortalProjectEngines,
   ): Promise<EngineConfig[]> {
+    // The two relations the query reads that `nominara_portal` cannot: the entitled view and the override table. On the
+    // portal path the same columns come from the rows the interceptor read on the app pool; nothing else changes.
+    const entitledSource =
+      portalEngines === undefined
+        ? "project_entitled_engines"
+        : `(SELECT $1::uuid AS project_id, x.engine_key, true AS enabled, x.display_name, x.weight::real AS weight,
+                   CASE WHEN x.runs_per_cycle IS NULL THEN NULL ELSE jsonb_build_object('full', x.runs_per_cycle) END AS cadence
+              FROM jsonb_to_recordset($6::jsonb) AS x(engine_key text, display_name text, runs_per_cycle int, weight text))`;
+    const overrideSource =
+      portalEngines === undefined
+        ? "project_engines"
+        : `(SELECT $1::uuid AS project_id, x.engine_key, x.weight::real AS weight FROM jsonb_to_recordset($7::jsonb) AS x(engine_key text, weight text))`;
+    const portalParams = portalEngines === undefined ? [] : [JSON.stringify(portalEngines.entitled), JSON.stringify(portalEngines.overrides)];
     const result = await tx.query<{
       engine_key: string;
       display_name: string | null;
@@ -240,7 +260,7 @@ export class ScorecardsService {
             AND (c.captured_at AT TIME ZONE $5)::date BETWEEN $3::date AND $4::date
        ),
        engine_keys AS (
-         SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 AND enabled = true
+         SELECT e0.engine_key FROM ${entitledSource} e0 WHERE e0.project_id = $1 AND e0.enabled = true
          UNION
          SELECT engine_key FROM measured
        )
@@ -256,10 +276,10 @@ export class ScorecardsService {
               COALESCE(pes.weight, ov.weight, 1.0::real)::text AS weight,
               last_capture.captured_at AS last_captured_at
          FROM engine_keys k
-         LEFT JOIN project_entitled_engines pes
+         LEFT JOIN ${entitledSource} pes
                 ON pes.project_id = $1 AND pes.engine_key = k.engine_key AND pes.enabled = true
          LEFT JOIN engines cat ON cat.key = k.engine_key
-         LEFT JOIN project_engines ov ON ov.project_id = $1 AND ov.engine_key = k.engine_key
+         LEFT JOIN ${overrideSource} ov ON ov.project_id = $1 AND ov.engine_key = k.engine_key
          -- NOT WINDOWED, deliberately. An engine that last answered before
          -- the window is exactly the one worth surfacing, and clamping this
          -- to the window would report null for the engine that has been
@@ -273,7 +293,7 @@ export class ScorecardsService {
          ) last_capture ON true
         WHERE ($2::text[] IS NULL OR k.engine_key = ANY($2::text[]))
         ORDER BY k.engine_key ASC`,
-      [projectId, requested, measuredFrom, measuredTo, timezone],
+      [projectId, requested, measuredFrom, measuredTo, timezone, ...portalParams],
     );
 
     if (result.rows.length === 0) await this.assertProjectExists(tx, projectId);

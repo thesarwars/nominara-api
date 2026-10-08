@@ -18,6 +18,7 @@ import {
   WorkspaceSuspendedException,
 } from "../../tenancy/errors.js";
 import { afterCommit, currentTenantStore, withActorContext, withTenantContext } from "../../tenancy/tenant-context.js";
+import type { PortalWorkspaceFacts } from "../../lib/portal/portal-facts.js";
 import { SessionService } from "../identity/session.service.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { isWorkspaceUsable, MembershipService } from "./membership.service.js";
@@ -445,12 +446,21 @@ export class WorkspacesService {
     return toWorkspaceResponse(result.rows[0]!);
   }
 
-  /** NEW-E-099a — the workspace's display name (the portal's `agency`). One column, on the ambient transaction. */
-  async displayName(): Promise<string> {
+  /**
+   * NEW-E-099a — the workspace-level facts a portal read needs (the portal's `agency`, the window's timezone, the scoring
+   * version and the weight overrides). Read on the APP pool, workspace-scoped, because `nominara_portal` has no policy on
+   * `workspaces`; the portal interceptor hands the result to the portal services as data.
+   */
+  async portalFacts(): Promise<PortalWorkspaceFacts> {
     const store = currentTenantStore();
-    if (store === undefined) throw new Error("WorkspacesService.displayName requires an active tenant context");
-    const result = await store.client.query<{ name: string }>("SELECT name FROM workspaces WHERE id = $1", [store.context.workspaceId]);
-    return result.rows[0]?.name ?? "";
+    if (store === undefined) throw new Error("WorkspacesService.portalFacts requires an active tenant context");
+    const result = await store.client.query<{ name: string; timezone: string; scoring_version: string; entitlement_overrides: unknown }>(
+      "SELECT name, timezone, scoring_version, entitlement_overrides FROM workspaces WHERE id = $1",
+      [store.context.workspaceId],
+    );
+    const row = result.rows[0];
+    if (row === undefined) throw new NotFoundException();
+    return { name: row.name, timezone: row.timezone, scoringVersion: row.scoring_version, entitlementOverrides: row.entitlement_overrides };
   }
 
   /**

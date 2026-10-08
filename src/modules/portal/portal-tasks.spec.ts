@@ -27,7 +27,7 @@ const measured = { visibility_before: 40, visibility_after_14d: 44.2, delta: 4.2
 function build(completed: unknown[] = [], open: unknown[] = []) {
   const portalTasks = vi.fn(async () => ({ completed, open }));
   const tasks = { portalTasks };
-  const svc = new PortalReadsService({} as never, {} as never, {} as never, {} as never, {} as never, {} as never, tasks as never);
+  const svc = new PortalReadsService({} as never, {} as never, {} as never, {} as never, tasks as never);
   return { svc, portalTasks };
 }
 

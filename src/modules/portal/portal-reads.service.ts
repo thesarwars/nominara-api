@@ -13,14 +13,13 @@ import type { ReportTimeframe } from "../../../contracts/reports/index.js";
 import { selectPortalProject, type PortalSessionContext } from "../../api/decorators/portal-route.decorator.js";
 import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
 import { assertPortalTab, findCostFields, parsePortalPayload, portalTimeframeDays, resolvePortalTimeframe, toPortalGrowthMap } from "../../lib/portal/portal-view.js";
+import { projectFacts } from "../../lib/portal/portal-facts.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { AgencyService } from "../agency/agency.service.js";
 import { GrowthMapService, toMeasuredImpact } from "../analytics/growth-map.service.js";
 import { ScorecardsService } from "../analytics/scorecards.service.js";
 import { ProjectsService } from "../projects/projects.service.js";
 import { TasksService } from "../tasks/tasks.service.js";
 import { MethodologyService } from "../reports/methodology.service.js";
-import { WorkspacesService } from "../workspaces/workspaces.service.js";
 import { PortalCache, portalCacheKey } from "./portal-cache.js";
 
 // NEW-E-099a — the portal's three read endpoints (STORY-099 part A).
@@ -52,8 +51,6 @@ export class PortalReadsService {
     private readonly scorecards: ScorecardsService,
     private readonly growthMaps: GrowthMapService,
     private readonly methodology: MethodologyService,
-    private readonly agency: AgencyService,
-    private readonly workspaces: WorkspacesService,
     private readonly projects: ProjectsService,
     private readonly taskReads: TasksService,
   ) {}
@@ -69,7 +66,7 @@ export class PortalReadsService {
       for (const id of session.scopeProjectIds) {
         const name = names.get(id);
         if (name === undefined) continue;
-        const cards = await this.scorecards.scorecards(id, { timeframe: WINDOW_PLACEHOLDER }, { days });
+        const cards = await this.scorecards.scorecards(id, { timeframe: WINDOW_PLACEHOLDER }, { days, portal: projectFacts(session.facts, id) });
         const blended = cards.blended;
         projects.push({
           id,
@@ -80,12 +77,12 @@ export class PortalReadsService {
           sentiment: blended.metrics.sentiment_score,
           citations: blended.metrics.citations_total,
           // The footer is built here, unconditionally, from the same builder the export uses: no theme or token setting reaches it.
-          footer: await this.methodology.footer(id, { timeframe }),
+          footer: await this.methodology.footer(id, { timeframe }, session.facts.workspace),
         });
       }
       return {
-        agency: await this.workspaces.displayName(),
-        theme: await this.agency.themeForPortal(session.themeId),
+        agency: session.facts.workspace.name,
+        theme: session.facts.theme,
         label: session.policy.label,
         tabs: session.scopeTabs as PortalOverviewResponse["tabs"],
         hide_competitors: session.policy.hideCompetitors,
@@ -105,7 +102,7 @@ export class PortalReadsService {
       const source = await this.growthMaps.growthMap(
         project,
         { timeframe: WINDOW_PLACEHOLDER, granularity: "day" },
-        { days: portalTimeframeDays(timeframe), portal: { hideCompetitors: session.policy.hideCompetitors } },
+        { days: portalTimeframeDays(timeframe), portal: { hideCompetitors: session.policy.hideCompetitors, timezone: session.facts.workspace.timezone } },
       );
       return toPortalGrowthMap(source, { hideCompetitors: session.policy.hideCompetitors });
     });
@@ -116,7 +113,7 @@ export class PortalReadsService {
     const project = selectPortalProject(session, query.project);
     const timeframe = resolvePortalTimeframe(query.timeframe, session.policy.timeframeLock);
     return this.cached(session, "matrix", project, timeframe, async () => {
-      const cards = await this.scorecards.scorecards(project, { timeframe: WINDOW_PLACEHOLDER }, { days: portalTimeframeDays(timeframe) });
+      const cards = await this.scorecards.scorecards(project, { timeframe: WINDOW_PLACEHOLDER }, { days: portalTimeframeDays(timeframe), portal: projectFacts(session.facts, project) });
       return { engines: cards.engines.map(toMatrixEngine) };
     });
   }

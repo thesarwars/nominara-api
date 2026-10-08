@@ -1,3 +1,4 @@
+import type { PortalWorkspaceFacts } from "../../lib/portal/portal-facts.js";
 import { Injectable, Logger } from "@nestjs/common";
 import { z } from "zod";
 import type { MethodologyFooter, MethodologyQuery, ReportTimeframe } from "../../../contracts/reports/index.js";
@@ -29,7 +30,11 @@ interface EngineRow {
 
 @Injectable()
 export class MethodologyService {
-  async footer(projectId: string, query: MethodologyQuery): Promise<MethodologyFooter> {
+  /**
+   * `portal` (NEW-E-099a) carries the workspace facts `nominara_portal` cannot read; the footer is the same builder over
+   * the same fact reads.
+   */
+  async footer(projectId: string, query: MethodologyQuery, portal?: PortalWorkspaceFacts): Promise<MethodologyFooter> {
     const started = Date.now();
     const store = currentTenantStore();
     if (store === undefined) throw new Error("MethodologyService requires an active tenant context");
@@ -38,12 +43,19 @@ export class MethodologyService {
     // RLS hides another workspace's project (the workspace filter is for the
     // planner, not for correctness): it is indistinguishable from one that does
     // not exist, and both are a 404.
-    const project = await tx.query<{ timezone: string; scoring_version: string; entitlement_overrides: unknown }>(
-      `SELECT w.timezone, w.scoring_version, w.entitlement_overrides
+    const project =
+      portal === undefined
+        ? await tx.query<{ timezone: string; scoring_version: string; entitlement_overrides: unknown }>(
+            `SELECT w.timezone, w.scoring_version, w.entitlement_overrides
          FROM projects p JOIN workspaces w ON w.id = p.workspace_id
         WHERE p.id = $1 AND p.workspace_id = $2 AND p.deleted_at IS NULL`,
-      [projectId, store.context.workspaceId],
-    );
+            [projectId, store.context.workspaceId],
+          )
+        : await tx.query<{ timezone: string; scoring_version: string; entitlement_overrides: unknown }>(
+            `SELECT $3::text AS timezone, $4::text AS scoring_version, $5::jsonb AS entitlement_overrides
+         FROM projects p WHERE p.id = $1 AND p.workspace_id = $2 AND p.deleted_at IS NULL`,
+            [projectId, store.context.workspaceId, portal.timezone, portal.scoringVersion, JSON.stringify(portal.entitlementOverrides ?? {})],
+          );
     const settings = project.rows[0];
     if (settings === undefined) throw new NotFoundError({ message: "no such project" });
 

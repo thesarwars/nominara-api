@@ -6,7 +6,9 @@ import { PortalRoute, PortalSession, selectPortalProject, type PortalSessionCont
 import { PortalContextInterceptor } from "../../src/api/interceptors/portal-context.interceptor.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { loadPortalCookieKey, PORTAL_COOKIE_NAME, sealPortalCookie } from "../../src/modules/portal/portal-cookie.js";
-import { ShareTokensService } from "../../src/modules/agency/share-tokens.service.js";
+import { AgencyModule } from "../../src/modules/agency/agency.module.js";
+import { ProjectsModule } from "../../src/modules/projects/projects.module.js";
+import { WorkspacesModule } from "../../src/modules/workspaces/workspaces.module.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { currentTenantStore } from "../../src/tenancy/tenant-context.js";
 import { apiUrl } from "../support/api-url.js";
@@ -58,7 +60,7 @@ describe("STORY-098 part B · PortalContext (nominara_portal pool, scope from th
         DATABASE_URL_PORTAL: u.toString(),
       };
     },
-    extras: { controllers: [ProbeController], providers: [PortalContextInterceptor, ShareTokensService, AuditChainService] },
+    extras: { controllers: [ProbeController], imports: [WorkspacesModule, ProjectsModule, AgencyModule], providers: [PortalContextInterceptor, AuditChainService] },
   });
 
   beforeAll(async () => {

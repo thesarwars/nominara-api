@@ -79,7 +79,10 @@ export function findCostFields(value: unknown, path = ""): string[] {
   if (Array.isArray(value)) return value.flatMap((item, i) => findCostFields(item, `${path}[${String(i)}]`));
   return Object.entries(value).flatMap(([key, child]) => {
     const here = path === "" ? key : `${path}.${key}`;
-    return [...(COST_KEY.test(key) ? [here] : []), ...findCostFields(child, here)];
+    // The overview echoes the token's own policy flag, `hide_costs: boolean`, at the top level. That is a switch, not a
+    // cost; the exemption is that exact key, at the top, holding a boolean, so a figure under the same name still trips.
+    const isPolicyFlag = path === "" && key === "hide_costs" && typeof child === "boolean";
+    return [...(COST_KEY.test(key) && !isPolicyFlag ? [here] : []), ...findCostFields(child, here)];
   });
 }
 

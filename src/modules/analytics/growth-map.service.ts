@@ -47,7 +47,7 @@ export const MILESTONE_IMPACT_CAVEAT = "Observational; concurrent changes are no
 
 export interface GrowthMapOptions {
   readonly days?: number;
-  readonly portal?: { readonly hideCompetitors: boolean };
+  readonly portal?: { readonly hideCompetitors: boolean; /** The workspace timezone, which `nominara_portal` cannot read. */ readonly timezone: string };
 }
 
 interface SeriesRow extends DailySeriesRow {
@@ -67,7 +67,7 @@ export class GrowthMapService {
     if (store === undefined) throw new Error("GrowthMapService requires an active tenant context");
     const tx = store.client;
 
-    const { from, to, timezone, brandLabel } = await this.resolveWindow(tx, projectId, opts.days ?? TIMEFRAME_DAYS[query.timeframe]);
+    const { from, to, timezone, brandLabel } = await this.resolveWindow(tx, projectId, opts.days ?? TIMEFRAME_DAYS[query.timeframe], opts.portal?.timezone);
     const days = calendarDays(from, to);
 
     const wanted = new Set(
@@ -167,16 +167,24 @@ export class GrowthMapService {
     tx: ClientBase,
     projectId: string,
     days: number,
+    knownTimezone?: string,
   ): Promise<{ from: string; to: string; timezone: string; brandLabel: string }> {
     // The project's own timezone, for the reason the rollup gives: a project
     // in a distant zone has a different "today" than the server, and a
     // server-local window would put its captures on the wrong day.
-    const settings = await tx.query<{ timezone: string; name: string }>(
-      `SELECT w.timezone, p.name
+    // NEW-E-099a — the portal supplies the timezone (its role cannot read `workspaces`) and reads only the project's name.
+    const settings =
+      knownTimezone === undefined
+        ? await tx.query<{ timezone: string; name: string }>(
+            `SELECT w.timezone, p.name
          FROM projects p JOIN workspaces w ON w.id = p.workspace_id
         WHERE p.id = $1 AND p.deleted_at IS NULL`,
-      [projectId],
-    );
+            [projectId],
+          )
+        : await tx.query<{ timezone: string; name: string }>(
+            "SELECT $2::text AS timezone, p.name FROM projects p WHERE p.id = $1 AND p.deleted_at IS NULL",
+            [projectId, knownTimezone],
+          );
     const row = settings.rows[0];
     if (row === undefined) throw new NotFoundError({ message: "no such project" });
 
