@@ -863,4 +863,18 @@ describe("STORY-075a · subscriptions", () => {
     expect((await deliver(eventBody("evt_f1", "customer.subscription.created", "sub_f"))).statusCode).toBe(200);
     expect(await row(workspaceId)).toEqual(before);
   });
+  it("AUDIT MAJOR · the frozen price of a pending checkout is honoured only for the subscription that checkout named: another subscription charged that same price is refused once the catalog has moved", async () => {
+    const { workspaceId, owner } = await newWorkspace();
+    expect((await post(owner, "/billing/checkout-session", { plan_key: "growth", billing_interval: "monthly" })).statusCode).toBe(200);
+    expect(gateway.checkouts[0]!.unitAmountCents).toBe(12_900);
+    const before = await row(workspaceId);
+    await whileGrowthCosts139(async () => {
+      const alarm = vi.spyOn(Logger.prototype, "error");
+      // Charged exactly the pending intent's frozen $129, but naming an intent that is NOT the workspace's own.
+      stripeSubscription(workspaceId, { id: "sub_x", plan: "growth", amount: 12_900, intentId: randomUUID() });
+      expect((await deliver(eventBody("evt_x1", "customer.subscription.created", "sub_x"))).statusCode).toBe(200);
+      expect(await row(workspaceId), "the catalog (now $139) decides for a stranger, so $129 buys nothing").toEqual(before);
+      expect(alarm).toHaveBeenCalled();
+    });
+  });
 });
