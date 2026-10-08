@@ -105,6 +105,17 @@ describe("STORY-065-A · goals — real SQL", () => {
     expect(goal.target).toMatchObject({ target_value: 50, prompt_cluster_id: c });
   });
 
+  it("[STORY-065 #9] a topic_authority goal never borrows the project's cell count: project n=500 with a cluster value is cells=null and sample_state=insufficient", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 500);
+    const c = await createCluster(ws, p, 31.25);
+    const goal = await create(CTX(ws, actor), p, createGoalRequestSchema.parse({
+      title: "Own CRM", kind: "topic_authority", target: { metric: "visibility_score", target_value: 50, prompt_cluster_id: c } }));
+    expect(goal.baseline).toMatchObject({ value: 31.25, cells: null });
+    expect(goal.current).toMatchObject({ value: 31.25, cells: null });
+    expect(goal.sample_state).toBe("insufficient");
+    expect(goal.progress_pct).toBeNull();
+  });
+
   it("[STORY-065 #1] a cluster of another project, a foreign tenant's cluster and an unknown cluster are refused (400), never a goal with a made-up baseline", async () => {
     const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws); const q = await createProject(ws);
     const other = await createWorkspace(); const otherP = await createProject(other);
