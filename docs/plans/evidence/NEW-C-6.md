@@ -39,3 +39,5 @@ Spans: OpenTelemetry deferred to week 2 (owner decision 3).
 ## Re-check (2026-10-08, days 5-6 run)
 
 Re-checked integration/7day (f201f35), 7day/b-tasks-3 (e32ffe9) and 7day/b-ws-3: none contains a task-insert helper with origin, rule_code, deterministic fingerprint or source_displacement_id; `git grep -i fingerprint -- src` finds only the idempotency fingerprint. The blocking condition still holds, so the item stays cut. No code, no contract, no RED commit.
+
+Re-check (resume run, 2026-10-08): integration/7day still f201f35, already merged here; 7day/b-tasks-3 and 7day/b-ws-3 still have no task-insert helper (only the schema columns). Blocking condition unchanged; item stays cut.
