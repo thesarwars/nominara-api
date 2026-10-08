@@ -302,11 +302,22 @@ describe("NEW-D-4 · API keys over HTTP", () => {
     const out: string[] = [];
     // Render every argument so an Error (message + stack), a Buffer (decoded as text; util.inspect only
     // shows hex bytes) and nested values are visible. JSON.stringify gave "{}" for an Error.
-    const render = (m: unknown, depth = 0): string => {
+    // Walk the value so a Buffer nested inside an object, Map, Set, Error cause or own property is decoded
+    // as text too (util.inspect shows only hex bytes for a nested Buffer). Depth-bounded and cycle-safe.
+    const render = (m: unknown, depth = 0, seen = new Set<unknown>()): string => {
       if (typeof m === "string") return m;
       if (m instanceof Uint8Array) return `${Buffer.from(m).toString()} ${inspect(m)}`;
-      if (Array.isArray(m) && depth < 5) return m.map((x) => render(x, depth + 1)).join(" ");
-      return inspect(m, { depth: 5 });
+      if (m === null || typeof m !== "object" || depth >= 6 || seen.has(m)) return inspect(m, { depth: 5 });
+      seen.add(m);
+      const parts: unknown[] = [];
+      if (Array.isArray(m)) parts.push(...m);
+      else if (m instanceof Map) for (const [k, v] of m) parts.push(k, v);
+      else if (m instanceof Set) parts.push(...m);
+      else {
+        if (m instanceof Error) parts.push(m.message, m.stack, (m as { cause?: unknown }).cause);
+        parts.push(...Object.values(m));
+      }
+      return `${inspect(m, { depth: 5 })} ${parts.map((x) => render(x, depth + 1, seen)).join(" ")}`;
     };
     const capture = (m: unknown): void => {
       out.push(render(m));
