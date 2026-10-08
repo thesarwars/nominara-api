@@ -339,6 +339,24 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "srcver:{project}:{yyyy_mm_dd}",
     tenantScoped: true,
   },
+  // ⚠ THE FOURTH QUEUE §4 DOES NOT CONTAIN, added by the same precedent. NEW-D-7 / owner decision 4 of
+  // 2026-10-08: an auto top-up charges a saved card, which may never happen on a request path (KAD-06). A
+  // debit that leaves a workspace below its threshold enqueues one signed tenant job (the credit interceptor,
+  // after commit); the worker verifies the signature before any context is set, then
+  // the auto-top-up service's `trigger` evaluates and charges. Tenant-scoped, the `rollup` group with the other
+  // billing-adjacent workers. The ladder is short because `trigger` is idempotent under redelivery (a
+  // conditional claim under the wallet lock) and a top-up that never ran is simply asked for again by the
+  // next debit; the idempotency key is one job per workspace per UTC minute.
+  {
+    name: "billing.auto_topup",
+    producer: "credit interceptor, after a debit below the threshold (NEW-D-7; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 2,
+    retry: { delaysMs: doubling(2) },
+    priority: 3,
+    idempotencyKeyPattern: "autotopup:{workspace}:{yyyy_mm_dd_hh_mm}",
+    tenantScoped: true,
+  },
   {
     name: "deploy.cms",
     producer: "API",

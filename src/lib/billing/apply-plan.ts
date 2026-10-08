@@ -304,6 +304,21 @@ export async function applyPlanChange(
     ],
   );
 
+  // 6b. THE BILLING CYCLE ROLLED: auto-top-up's per-cycle counter starts again (EC-48 "the counter resets
+  //     only at cycle roll"; NEW-D-7 checkpoint-3 finding 3). This statement is the only writer of
+  //     `current_period_start`, so a period that starts LATER than the one on file IS the roll. Strictly later:
+  //     a redelivery of the same period and a stale event for an earlier one change nothing, and a reconcile
+  //     inside the period (seats, an add-on, a cancel flag) never reaches here with a new start. Only the
+  //     counter moves: the configuration is the customer's and a roll does not touch it. (`credit_wallets.cycle_*`
+  //     is rolled by nothing in src/ — see wallet.ts `cycleHasLapsed` — so it cannot be the trigger; whatever
+  //     eventually rolls it must zero this counter in the same statement.) No wallet yet: zero rows, no error.
+  if (desired.currentPeriodStart.getTime() > currentRow.current_period_start.getTime()) {
+    await tx.query(
+      "UPDATE credit_wallets SET auto_topup_count_cycle = 0, updated_at = now() WHERE workspace_id = $1 AND auto_topup_count_cycle <> 0",
+      [workspaceId],
+    );
+  }
+
   // 7. ⚠ ONE STATEMENT, AND THIS IS THE ONLY CORRECTNESS-CRITICAL CO-CHANGE.
   //    `entitlementsKey(env, ws, version)` puts the version IN the cache key,
   //    so the bump IS the invalidation — there is no invalidate() to call or

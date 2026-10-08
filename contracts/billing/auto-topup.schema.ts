@@ -47,7 +47,7 @@ export const autoTopupConfigSchema = z
     max_per_cycle: maxPerCycle.nullable(),
     /** `auto_topup_count_cycle`: fires so far this cycle. Not reset by a config change. */
     used_this_cycle: z.number().int().nonnegative(),
-    /** False in week 1: the configuration ships, the off-session trigger does not. */
+    /** Whether the off-session trigger is wired (NEW-D-7: a debit below the threshold enqueues a signed billing.auto_topup job). */
     trigger_active: z.boolean(),
     /**
      * NEW-D-7 — present only while auto-top-up is OFF because a charge failed

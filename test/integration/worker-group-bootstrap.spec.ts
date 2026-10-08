@@ -32,6 +32,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "audit.verify",
     // STORY-173 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "identity.sweep_unverified",
+    // NEW-D-7 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "billing.auto_topup",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],

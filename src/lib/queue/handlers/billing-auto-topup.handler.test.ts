@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
+import type { AutoTopupTriggerOutcome } from "../../../../contracts/billing/index.js";
 import { handlerFor, liveQueueNames, type QueueHandlerContext } from "../handlers.js";
 import { signQueueJobPayload } from "../envelope.js";
 import { topologyFor } from "../topology.js";
@@ -57,7 +58,7 @@ describe("NEW-D-7 checkpoint-3 · billing.auto_topup handler", () => {
     const entry = topologyFor("billing.auto_topup");
     const keys = { current: { kid: "k1", key: KEY } };
 
-    function processor(trigger: ReturnType<typeof vi.fn>) {
+    function processor(trigger: (workspaceId: string) => Promise<AutoTopupTriggerOutcome>) {
       const getClient = vi.fn(() => tx().client);
       const run = createJobProcessor(entry, {
         keys,
