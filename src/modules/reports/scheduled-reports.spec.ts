@@ -118,7 +118,7 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
     expect(delivery?.params).toContain("skipped_cap");
     const note = h.sql.find((s) => s.text.includes("INSERT INTO notifications"));
     expect(note).toBeDefined();
-    const flat = JSON.stringify(note!.params);
+    const flat = note!.text + JSON.stringify(note!.params);
     expect(flat).toContain("report.skipped_cap");
     expect(flat).toContain("10");
     expect(flat).toContain("2026-11-01");

@@ -88,3 +88,9 @@ describe("NEW-E-100c · STORY-100 s7 · next_send_at at each cadence", () => {
     expect([isDayValidFor("monthly", 28), isDayValidFor("monthly", 29), isDayValidFor("quarterly", 1), isDayValidFor("quarterly", 0)]).toEqual([true, false, true, false]);
   });
 });
+
+describe("NEW-E-100c · s7 · half-hour zones", () => {
+  it("s7 · Asia/Kolkata (UTC+5:30) fires at the local hour, not an hour off", () => {
+    expect(iso(nextSendAt(spec({ day: 1, hour: 9, timezone: "Asia/Kolkata" }), at("2026-10-05T00:00:00Z")))).toBe("2026-10-05T03:30:00.000Z");
+  });
+});
