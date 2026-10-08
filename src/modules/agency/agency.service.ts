@@ -5,7 +5,7 @@ import {
   type AgencyTheme,
   type UpdateAgencyThemeRequest,
 } from "../../../contracts/agency/index.js";
-import { FeatureNotInPlanError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { ConflictError, FeatureNotInPlanError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import {
   CURATED_FONT_FAMILIES,
@@ -97,6 +97,11 @@ export class AgencyService {
       });
     }
 
+    // Saves are serialised per workspace for the rest of this transaction. Without it two concurrent FIRST
+    // saves both read "no default yet" and both insert a default; the second dies on ux_brand_themes_default
+    // (a raw 23505 -> 500). Same primitive as the share-link cap.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`brand_themes:${workspaceId}`]);
+
     const existing = await this.loadForUpdate(client, body.theme_id);
     const colors = mergedColors(existing, body);
 
@@ -137,6 +142,29 @@ export class AgencyService {
     }
 
     let row: ThemeRow;
+    try {
+      row = await this.write(client, workspaceId, existing, { name, makeDefault, colors, font, hide });
+    } catch (error) {
+      // The lock above makes this unreachable between our own requests; if the index still fires (a writer that
+      // bypassed this service) it is a conflict the caller can retry, never a 500.
+      if (isUniqueViolation(error, "ux_brand_themes_default")) {
+        throw new ConflictError({ message: "another request changed the default theme at the same time; retry" });
+      }
+      throw error;
+    }
+    incrementCounter("nominara_theme_saves_total", { outcome: existing === undefined ? "created" : "updated" });
+    this.logger.log(`theme saved workspace_id=${workspaceId} theme_id=${row.id}`);
+    return toTheme(row);
+  }
+
+  private async write(
+    client: ClientBase,
+    workspaceId: string,
+    existing: ThemeRow | undefined,
+    v: { name: string; makeDefault: boolean; colors: ThemeColors; font: string; hide: boolean },
+  ): Promise<ThemeRow> {
+    const { name, makeDefault, colors, font, hide } = v;
+    let row: ThemeRow;
     if (existing === undefined) {
       const inserted = await client.query<ThemeRow>(
         `INSERT INTO brand_themes (workspace_id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand)
@@ -156,9 +184,7 @@ export class AgencyService {
       );
       row = updated.rows[0]!;
     }
-    incrementCounter("nominara_theme_saves_total", { outcome: existing === undefined ? "created" : "updated" });
-    this.logger.log(`theme saved workspace_id=${workspaceId} theme_id=${row.id}`);
-    return toTheme(row);
+    return row;
   }
 
   private async loadForUpdate(client: ClientBase, themeId: string | undefined): Promise<ThemeRow | undefined> {
@@ -189,6 +215,11 @@ export class AgencyService {
     if (store === undefined) throw new Error("AgencyService requires an active tenant context");
     return { client: store.client, workspaceId: store.context.workspaceId };
   }
+}
+
+function isUniqueViolation(error: unknown, constraint: string): boolean {
+  const pg = error as { code?: string; constraint?: string } | null;
+  return pg?.code === "23505" && pg.constraint === constraint;
 }
 
 function platformDefaultTheme(): AgencyTheme {

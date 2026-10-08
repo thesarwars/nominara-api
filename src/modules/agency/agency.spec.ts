@@ -1,5 +1,7 @@
 import { Test } from "@nestjs/testing";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as tenantContext from "../../tenancy/tenant-context.js";
+import { AgencyService } from "./agency.service.js";
 import { AgencyModule } from "./agency.module.js";
 import { AgencyController } from "./agency.controller.js";
 
@@ -11,5 +13,43 @@ describe("STORY-022 · AgencyModule compiles", () => {
     const moduleRef = await Test.createTestingModule({ imports: [AgencyModule] }).compile();
     expect(moduleRef.get(AgencyController)).toBeInstanceOf(AgencyController);
     await moduleRef.close();
+  });
+});
+
+// CP1 minor (carried through checkpoint 2) — the concurrent FIRST save of a workspace's theme.
+describe("CP1 e-reports · AgencyService.saveTheme first-theme race", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function setup(insertError?: unknown) {
+    const sqls: string[] = [];
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        sqls.push(sql);
+        if (sql.includes("INSERT INTO brand_themes") && insertError !== undefined) throw insertError;
+        if (sql.includes("count(*)")) return { rows: [{ n: 0 }] };
+        return { rows: [] };
+      }),
+    };
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client, context: { workspaceId: "ws-1", actorId: "a" } } as never);
+    return { service: new AgencyService(), sqls };
+  }
+
+  it("CP1 first-theme race · the per-workspace advisory lock is the first statement of a save, before the default is read", async () => {
+    const { service, sqls } = setup(Object.assign(new Error("stop here"), { code: "XX000" }));
+    await expect(service.saveTheme({ name: "A" })).rejects.toThrow("stop here");
+    expect(sqls[0]).toContain("pg_advisory_xact_lock");
+    expect(sqls.findIndex((q) => q.includes("count(*)"))).toBeGreaterThan(0);
+  });
+
+  it("CP1 first-theme race · a 23505 on ux_brand_themes_default is a 409 conflict, never a raw database error", async () => {
+    const { service } = setup(Object.assign(new Error("duplicate key"), { code: "23505", constraint: "ux_brand_themes_default" }));
+    await expect(service.saveTheme({ name: "A" })).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("CP1 first-theme race · a 23505 on any OTHER constraint is not swallowed into a conflict", async () => {
+    const { service } = setup(Object.assign(new Error("duplicate key"), { code: "23505", constraint: "some_other_index" }));
+    await expect(service.saveTheme({ name: "A" })).rejects.toMatchObject({ code: "23505" });
   });
 });
