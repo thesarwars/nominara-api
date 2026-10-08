@@ -46,3 +46,13 @@ All run in /Users/sarwaralam/Desktop/Projects/ElegantTech/nominara/api-wt-a2 on 
 - Audit 3: row 3 cites the recorded lead's call; track-plans.json O1 not edited from this lane (owner confirmation needed only if O1 must be an owner decision).
 
 - Audit 4: decision citations renamed R3/R5 and recorded in docs/plans/decisions-2026-10-08.md (versioned); STORY-023/NFR-REPO-02 edits carried to docs/plans/docs-carry/. RED 795aa9a (3 failed, exit 1) -> green (`test/unit/decision-citations.spec.ts`, 3 passed). AC3 (O1 blend): the lead's call is now accepted in the decisions file and annotated in track-plans.json O1; owner may still overrule.
+
+## Fix pass (branch 7day/a-api-4 from integration/7day fee788e)
+Owed item closed: the `engineDataSourcesForProjects` behavioural spec now RUNS (disk 23 GiB free).
+- `npx vitest run --config vitest.integration.config.ts test/integration/data-source.spec.ts` -> exit 0, 12/12 passed.
+- Live/demo swap property (the test that "fails when live/demo labels are swapped"): "NEW-A-5 · engineDataSourcesForProjects — real SQL over several projects" > "NEW-A-5 AC2 — live, demo and mixed are labelled per project and per engine; failed and out-of-window captures make an engine null". No code change was needed; the test already existed and is proven by mutation, not by claim:
+  - Mutant A: swap the two FILTER predicates (`<> $5` / `= $5`) inside `engineDataSourcesForProjects` only -> 3 failed / 9 passed (the labelling test, the inclusive-window test and the timezone test), exit 1. Restored -> 12/12.
+  - Mutant B: widen the date predicate (`... OR true`) -> 3 failed / 9 passed. Restored.
+  - Mutant C: map a null source to "demo" (`?? "demo"`, drop the null guard) survives, 12/12. It is an EQUIVALENT mutant for this query: the SQL only returns groups with at least one measured capture, so live+demo > 0 always and `dataSourceOf` never returns null there; null-stays-null for engines with no rows is asserted by the empty-project test. Stated, not hidden.
+- AC3 (O1 blend): policy `all_measured_engines` is the owner-approved O1 policy per `plans-7day/decisions-2026-10-08.md` ("NEW-A-5 AC3 (O1 blend policy)": all measured engines in the blend, demo count disclosed). Code matches: `blendDisclosure` in `src/lib/analytics/data-source.ts`; tests as in AC3 row above.
+- Gates (all exit codes read): `pnpm lint` 0; `pnpm typecheck` 0; `pnpm test:unit` 0 (302 files passed / 1 skipped, 3697 tests passed / 1 skipped); integration identity-me + data-source + workspace-summary: 3 files / 34 tests passed, exit 0. No tenant table or migration touched, so test:isolation is not required for this item.

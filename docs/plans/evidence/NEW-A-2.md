@@ -36,3 +36,8 @@ All run in /Users/sarwaralam/Desktop/Projects/ElegantTech/nominara/api-wt-a2 on 
 - Evidence that needs a running real API (session -> GET /v1/me, data_source on live responses) is collected in NEW-A-17.
 
 - Audit 4: NEW-A-2 is NOT closed from this lane. The failed criterion (frontend useMe() in api mode) is the fe lane's and NEW-A-17's; the item stays FAILED / reassigned to fe + NEW-A-17.
+
+## Fix pass (branch 7day/a-api-4 from integration/7day fee788e): API half
+No code changed. API-half criteria 1-3 above re-verified at fee788e: `npx vitest run --config vitest.integration.config.ts test/integration/identity-me.spec.ts test/integration/data-source.spec.ts test/integration/workspace-summary.spec.ts` -> 3 files / 34 tests passed, exit 0.
+Gates: `pnpm lint` 0, `pnpm typecheck` 0, `pnpm test:unit` 0 (3697 passed / 1 skipped).
+AC4 (frontend `useMe()` in api mode) is the fe lane's (NEW-A-14 frontend half) and NEW-A-17's; this lane makes no claim on it.
