@@ -2,7 +2,7 @@ import { z } from "zod";
 import { agencyThemeSchema } from "../agency/theme.schema.js";
 import { portalTabSchema } from "../agency/share-token.schema.js";
 import { confidenceSchema } from "../analytics/scorecards-response.schema.js";
-import { growthMapResponseSchema } from "../analytics/growth-map-response.schema.js";
+import { growthMapPointSchema, growthMapResponseSchema, growthMapSeriesSchema } from "../analytics/growth-map-response.schema.js";
 import { methodologyFooterSchema } from "../reports/methodology-footer.schema.js";
 import { dataSourceSchema } from "../analytics/data-source.schema.js";
 import { reportTimeframeSchema } from "../reports/report-shared.schema.js";
@@ -58,8 +58,16 @@ export const portalOverviewResponseSchema = z
   })
   .strict();
 
-/** Same chart payload as the agency side; milestones with visible_in_portal=false are filtered in SQL. */
-export const portalGrowthMapResponseSchema = growthMapResponseSchema;
+/**
+ * The agency chart payload with ONE field removed from every point: `cells`, the per-day capture count. A capture count
+ * is a cost-side figure (hide_costs, STORY-098 s12) and the portal chart never needs it, so it is absent for every
+ * token rather than conditionally stripped. Milestones with visible_in_portal=false are filtered in SQL.
+ */
+export const portalGrowthMapPointSchema = growthMapPointSchema.omit({ cells: true });
+export const portalGrowthMapSeriesSchema = growthMapSeriesSchema.extend({ points: z.array(portalGrowthMapPointSchema) }).strict();
+export const portalGrowthMapResponseSchema = growthMapResponseSchema
+  .extend({ series: z.array(portalGrowthMapSeriesSchema) })
+  .strict();
 
 export const portalMatrixEngineSchema = z
   .object({
@@ -99,8 +107,10 @@ export const portalTasksResponseSchema = z
       z
         .object({
           title: z.string(),
-          severity: z.enum(["critical", "high", "medium", "low"]),
-          status: z.enum(["todo", "in_progress", "done", "dismissed"]),
+          /** Null when the task has no measured severity (a manual task, or a gap not yet verified) — never invented. */
+          severity: z.enum(["critical", "high", "medium", "low"]).nullable(),
+          /** Open means not yet done and not dismissed. */
+          status: z.enum(["todo", "in_progress"]),
         })
         .strict(),
     ),
@@ -144,6 +154,10 @@ export const portalSourcesResponseSchema = z
   .strict();
 
 export type PortalOverviewResponse = z.infer<typeof portalOverviewResponseSchema>;
+export type PortalGrowthMapResponse = z.infer<typeof portalGrowthMapResponseSchema>;
+export type PortalGrowthMapQuery = z.infer<typeof portalProjectQuerySchema>;
+export type PortalOverviewQuery = z.infer<typeof portalOverviewQuerySchema>;
 export type PortalMatrixResponse = z.infer<typeof portalMatrixResponseSchema>;
+export type PortalTasksQuery = z.infer<typeof portalTasksQuerySchema>;
 export type PortalTasksResponse = z.infer<typeof portalTasksResponseSchema>;
 export type PortalSourcesResponse = z.infer<typeof portalSourcesResponseSchema>;

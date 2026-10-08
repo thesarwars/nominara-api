@@ -21,6 +21,13 @@ describe("STORY-098 · app.share_token_by_hash is a pinned SECURITY DEFINER func
       expect(r.rows[0]!.secdef).toBe(true);
       expect((r.rows[0]!.config ?? []).join(",")).toMatch(/search_path=/);
       expect(r.rows[0]!.roles).toEqual(["nominara_app"]);
+      // CP2 decision 1 — the owner is the dedicated role: not a superuser, not nominara_app, not the migration identity.
+      const owner = await client.query<{ owner: string; super: boolean; login: boolean; bypass: boolean }>(
+        `SELECT o.rolname AS owner, o.rolsuper AS super, o.rolcanlogin AS login, o.rolbypassrls AS bypass
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_roles o ON o.oid = p.proowner
+          WHERE n.nspname = 'app' AND p.proname = 'share_token_by_hash'`,
+      );
+      expect(owner.rows[0]).toEqual({ owner: "nominara_share_lookup", super: false, login: false, bypass: false });
       const pub = await client.query<{ ok: boolean }>(
         `SELECT has_function_privilege('public', 'app.share_token_by_hash(bytea)', 'EXECUTE') AS ok`,
       );

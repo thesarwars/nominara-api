@@ -24,6 +24,7 @@ import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import type { PortalProjectEngines } from "../../lib/portal/portal-facts.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
 import { handlerFor } from "../../lib/queue/handlers.js";
@@ -237,6 +238,38 @@ export class ProjectsService {
     );
 
     return pageFrom(result.rows, pagination.limit, toProjectListItem, (row) => [row.created_at_key, row.id]);
+  }
+
+  /** NEW-E-099a — display names for a set of project ids, on the ambient transaction (RLS and the portal scope narrow it). */
+  async namesFor(ids: readonly string[]): Promise<Map<string, string>> {
+    const client = currentTenantStore()!.client;
+    const result = await client.query<{ id: string; name: string }>("SELECT id, name FROM projects WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL", [ids]);
+    return new Map(result.rows.map((row) => [row.id, row.name]));
+  }
+
+  /**
+   * NEW-E-099a — the engine rows a portal read needs per project: the entitled, enabled rows of
+   * `project_entitled_engines` and the `project_engines` overrides. Read on the APP pool, because `nominara_portal` has
+   * no grant on the view and no policy on the override table; the portal interceptor hands them to the services as data.
+   */
+  async portalEngines(ids: readonly string[]): Promise<Map<string, PortalProjectEngines>> {
+    const client = currentTenantStore()!.client;
+    const [entitled, overrides] = await Promise.all([
+      client.query<{ project_id: string; engine_key: string; display_name: string | null; runs_per_cycle: number | null; weight: string }>(
+        `SELECT project_id, engine_key, display_name, (cadence ->> 'full')::int AS runs_per_cycle, weight::text AS weight
+           FROM project_entitled_engines WHERE project_id = ANY($1::uuid[]) AND enabled = true ORDER BY engine_key`,
+        [ids],
+      ),
+      client.query<{ project_id: string; engine_key: string; weight: string }>(
+        "SELECT project_id, engine_key, weight::text AS weight FROM project_engines WHERE project_id = ANY($1::uuid[]) ORDER BY engine_key",
+        [ids],
+      ),
+    ]);
+    const out = new Map<string, { entitled: PortalProjectEngines["entitled"][number][]; overrides: PortalProjectEngines["overrides"][number][] }>();
+    const slot = (id: string) => out.get(id) ?? out.set(id, { entitled: [], overrides: [] }).get(id)!;
+    for (const row of entitled.rows) slot(row.project_id).entitled.push({ engine_key: row.engine_key, display_name: row.display_name, runs_per_cycle: row.runs_per_cycle, weight: row.weight });
+    for (const row of overrides.rows) slot(row.project_id).overrides.push({ engine_key: row.engine_key, weight: row.weight });
+    return out;
   }
 
   /**

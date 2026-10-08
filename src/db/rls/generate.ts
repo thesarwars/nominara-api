@@ -8,6 +8,7 @@ import {
   POLICY_IN_OWN_MIGRATION,
   PORTAL_SELF_SCOPED_TABLES,
   RLS_POLICY_ROLES,
+  SHARE_LOOKUP_ROLE,
   TENANT_SCOPE_COLUMN,
 } from "../conventions.js";
 import { connect, requireDatabaseUrl } from "../client.js";
@@ -383,6 +384,29 @@ export function computeActorSelfScopedPolicies(tables: readonly TableDescriptor[
       using:
         "app.current_workspace() IS NULL AND EXISTS (SELECT 1 FROM workspace_members m " +
         "WHERE m.workspace_id = workspaces.id AND m.user_id = app.current_actor() AND m.status = 'active'::text)",
+      withCheck: null,
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0002 — the definer-owner policy. ONE hand-written policy (migration 0112, like 0051/0074's POLICY_IN_OWN_MIGRATION
+// precedent) that lets app.share_token_by_hash's dedicated owner read FORCE-RLS share_tokens. It is declared here, as
+// structured data, ONLY so src/db/rls/rls-check.ts expects it: without this entry rls-check would report it as an
+// unexpected policy, which is exactly the alarm it exists to raise for any policy nobody declared.
+// ---------------------------------------------------------------------------
+
+export function computeDefinerOwnerPolicies(tables: readonly TableDescriptor[]): ExpectedPolicy[] {
+  if (!tables.some((t) => t.name === "share_tokens")) {
+    throw new Error('src/db/rls/generate.ts: the definer-owner policy targets "share_tokens", which is not present in the introspected schema.');
+  }
+  return [
+    {
+      table: "share_tokens",
+      policyName: "share_token_gate_lookup",
+      cmd: "SELECT",
+      roles: [SHARE_LOOKUP_ROLE],
+      using: "true",
       withCheck: null,
     },
   ];

@@ -5,7 +5,11 @@ import { from, lastValueFrom, type Observable } from "rxjs";
 import { loadEnv } from "../../config/env.js";
 import { PG_POOL, PORTAL_PG_POOL } from "../../db/pg-pool.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { ShareTokensService } from "../../modules/agency/share-tokens.service.js";
+import type { PortalFacts } from "../../lib/portal/portal-facts.js";
+import { AgencyService } from "../../modules/agency/agency.service.js";
+import { ProjectsService } from "../../modules/projects/projects.service.js";
+import { WorkspacesService } from "../../modules/workspaces/workspaces.service.js";
+import { ShareTokensService, type PortalSessionPolicy } from "../../modules/agency/share-tokens.service.js";
 import { loadPortalCookieKey, openPortalCookie, PORTAL_COOKIE_NAME } from "../../modules/portal/portal-cookie.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -46,6 +50,9 @@ export class PortalContextInterceptor implements NestInterceptor {
     @Inject(PG_POOL) private readonly appPool: Pool,
     @Inject(PORTAL_PG_POOL) private readonly portalPool: Pool | null,
     private readonly shareTokens: ShareTokensService,
+    private readonly workspaces: WorkspacesService,
+    private readonly projects: ProjectsService,
+    private readonly agency: AgencyService,
   ) {}
 
   async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<unknown>> {
@@ -67,8 +74,8 @@ export class PortalContextInterceptor implements NestInterceptor {
       throw new UnauthenticatedError({ message: "no portal session" });
     }
 
-    const live = await this.checkLive(payload.workspace_id, payload.token_id);
-    if (!live) {
+    const resolved = await this.resolveOnAppPool(payload.workspace_id, payload.token_id, payload.scope_project_ids, payload.theme_id);
+    if (resolved === null) {
       incrementCounter("nominara_portal_request_refusals_total", { reason: "token_not_live" });
       logger.log(`portal request refused workspace_id=${payload.workspace_id} reason=token_not_live`);
       throw new TokenRevokedError({ message: "this link is no longer available" });
@@ -80,6 +87,8 @@ export class PortalContextInterceptor implements NestInterceptor {
       scopeProjectIds: payload.scope_project_ids,
       scopeTabs: payload.scope_tabs,
       themeId: payload.theme_id,
+      policy: resolved.policy,
+      facts: resolved.facts,
     };
     req.portal = session;
 
@@ -97,10 +106,27 @@ export class PortalContextInterceptor implements NestInterceptor {
     );
   }
 
-  private async checkLive(workspaceId: string, tokenId: string): Promise<boolean> {
+  // Everything the portal reads need that `nominara_portal` has no policy on, read on the APP pool in the same short
+  // workspace-scoped transaction as the liveness check (NEW-E-099a): the workspace's timezone, name, scoring version and
+  // overrides, the theme, and the scoped projects' engine rows. A dead token ends here, before any of it is read.
+  private async resolveOnAppPool(
+    workspaceId: string,
+    tokenId: string,
+    scopeProjectIds: readonly string[],
+    themeId: string | null,
+  ): Promise<{ policy: PortalSessionPolicy; facts: PortalFacts } | null> {
     const client = await this.appPool.connect();
     try {
-      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => this.shareTokens.isSessionLive(tokenId));
+      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async () => {
+        const policy = await this.shareTokens.resolveSession(tokenId);
+        if (policy === null) return null;
+        const [workspace, theme, engines] = await Promise.all([
+          this.workspaces.portalFacts(),
+          this.agency.themeForPortal(themeId),
+          this.projects.portalEngines(scopeProjectIds),
+        ]);
+        return { policy, facts: { workspace, theme, engines } };
+      });
     } finally {
       client.release();
     }

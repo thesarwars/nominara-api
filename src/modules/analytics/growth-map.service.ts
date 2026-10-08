@@ -46,6 +46,11 @@ const TIMEFRAME_DAYS: Readonly<Record<GrowthMapQuery["timeframe"], number>> = Ob
  */
 export const MILESTONE_IMPACT_CAVEAT = "Observational; concurrent changes are not controlled for.";
 
+export interface GrowthMapOptions {
+  readonly days?: number;
+  readonly portal?: { readonly hideCompetitors: boolean; /** The workspace timezone, which `nominara_portal` cannot read. */ readonly timezone: string };
+}
+
 interface SeriesRow extends DailySeriesRow {
   entityType: "brand" | "competitor";
   label: string;
@@ -53,12 +58,17 @@ interface SeriesRow extends DailySeriesRow {
 
 @Injectable()
 export class GrowthMapService {
-  async growthMap(projectId: string, query: GrowthMapQuery): Promise<GrowthMapResponse> {
+  /**
+   * `opts.days` overrides the query's window (the portal serves a 24h window the agency query has no spelling for).
+   * `opts.portal` is the portal's read: milestones with `visible_in_portal=false` are excluded in the SQL, and under
+   * `hideCompetitors` so are the milestones that name a competitor.
+   */
+  async growthMap(projectId: string, query: GrowthMapQuery, opts: GrowthMapOptions = {}): Promise<GrowthMapResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("GrowthMapService requires an active tenant context");
     const tx = store.client;
 
-    const { from, to, timezone, brandLabel } = await this.resolveWindow(tx, projectId, TIMEFRAME_DAYS[query.timeframe]);
+    const { from, to, timezone, brandLabel } = await this.resolveWindow(tx, projectId, opts.days ?? TIMEFRAME_DAYS[query.timeframe], opts.portal?.timezone);
     const days = calendarDays(from, to);
 
     const wanted = new Set(
@@ -139,7 +149,7 @@ export class GrowthMapService {
       timeframe: { from, to, timezone },
       series,
       engines: [...engineSources].sort(([a], [b]) => a.localeCompare(b)).map(([engine_key, data_source]) => ({ engine_key, data_source })),
-      milestones: await this.milestones(tx, projectId, from, to, timezone),
+      milestones: await this.milestones(tx, projectId, from, to, timezone, opts.portal),
       annotations: {
         // The gaps are the BRAND's. A competitor absent from an answer is not
         // a gap in the measurement — it is the measurement.
@@ -165,16 +175,24 @@ export class GrowthMapService {
     tx: ClientBase,
     projectId: string,
     days: number,
+    knownTimezone?: string,
   ): Promise<{ from: string; to: string; timezone: string; brandLabel: string }> {
     // The project's own timezone, for the reason the rollup gives: a project
     // in a distant zone has a different "today" than the server, and a
     // server-local window would put its captures on the wrong day.
-    const settings = await tx.query<{ timezone: string; name: string }>(
-      `SELECT w.timezone, p.name
+    // NEW-E-099a — the portal supplies the timezone (its role cannot read `workspaces`) and reads only the project's name.
+    const settings =
+      knownTimezone === undefined
+        ? await tx.query<{ timezone: string; name: string }>(
+            `SELECT w.timezone, p.name
          FROM projects p JOIN workspaces w ON w.id = p.workspace_id
         WHERE p.id = $1 AND p.deleted_at IS NULL`,
-      [projectId],
-    );
+            [projectId],
+          )
+        : await tx.query<{ timezone: string; name: string }>(
+            "SELECT $2::text AS timezone, p.name FROM projects p WHERE p.id = $1 AND p.deleted_at IS NULL",
+            [projectId, knownTimezone],
+          );
     const row = settings.rows[0];
     if (row === undefined) throw new NotFoundError({ message: "no such project" });
 
@@ -371,6 +389,7 @@ export class GrowthMapService {
     from: string,
     to: string,
     timezone: string,
+    portal?: { readonly hideCompetitors: boolean },
   ): Promise<Milestone[]> {
     const result = await tx.query<{
       id: string;
@@ -390,8 +409,16 @@ export class GrowthMapService {
          FROM milestones
         WHERE project_id = $1
           AND (occurred_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
+          AND ($5::boolean = false OR visible_in_portal = true)
+          AND ($6::boolean = false OR (
+                kind NOT LIKE 'competitor%'
+                -- A completed task born of a displacement names a competitor by construction (the tasks tab drops
+                -- the task; its milestone carries the task's title). Deleted tasks count: the title is still there.
+                AND NOT (source_type = 'task' AND EXISTS (
+                  SELECT 1 FROM tasks t WHERE t.id = milestones.source_id AND t.source_displacement_id IS NOT NULL))
+              ))
         ORDER BY occurred_at ASC`,
-      [projectId, from, to, timezone],
+      [projectId, from, to, timezone, portal !== undefined, portal?.hideCompetitors === true],
     );
 
     return result.rows.map((row) => ({
@@ -422,7 +449,7 @@ function gapBetween(brand: number | null, baseline: number | null): number | nul
  * screen with no window, no method and no confidence beside it, which is the
  * shape of the causal claim `NFR-ANL-05` exists to prevent.
  */
-function toMeasuredImpact(stored: Record<string, unknown> | null): MeasuredImpact | null {
+export function toMeasuredImpact(stored: Record<string, unknown> | null): MeasuredImpact | null {
   if (stored === null) return null;
   const num = (key: string): number | null => (typeof stored[key] === "number" ? (stored[key] as number) : null);
   const before = num("visibility_before");

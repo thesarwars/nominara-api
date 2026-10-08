@@ -128,7 +128,12 @@ describe("CP1 e-reports · scheduled_report_deliveries foreign keys are tenant-c
   });
 
   it("CP1-E-FK-6 · the new migration rolls back and re-applies cleanly", async () => {
-    expect(await rollbackLast(client, MIGRATIONS_DIR)).toBe("0079_scheduled_report_deliveries_tenant_fk");
+    // Roll back UNTIL this migration rather than assuming it is the newest (later lanes add migrations).
+    let rolledBack: string | null = null;
+    for (let step = 0; step < 200 && rolledBack !== "0079_scheduled_report_deliveries_tenant_fk" && (step === 0 || rolledBack !== null); step += 1) {
+      rolledBack = await rollbackLast(client, MIGRATIONS_DIR);
+    }
+    expect(rolledBack).toBe("0079_scheduled_report_deliveries_tenant_fk");
     const a = await tenant("a");
     const b = await tenant("b");
     // single-column FKs are back: the cross-tenant row is accepted again

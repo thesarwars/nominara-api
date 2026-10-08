@@ -3,6 +3,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
 import type { MintedShareToken, MintShareTokenRequest, ShareToken, ShareTokenView } from "../../../contracts/agency/index.js";
 import { EntitlementExceededError, NotFoundError, ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { hash as argon2idHash } from "../../lib/crypto/argon2id.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -52,6 +53,14 @@ export const PASSWORD_FAILURE_LIMIT = 5;
 export const PASSWORD_LOCK_MS = 15 * 60 * 1000;
 
 /** What the portal gate is allowed to know about a token before it has authenticated anyone. */
+/** NEW-E-099a — what a live portal session is served with; read from the token row on every request. */
+export interface PortalSessionPolicy {
+  readonly label: string;
+  readonly hideCompetitors: boolean;
+  readonly hideCosts: boolean;
+  readonly timeframeLock: "24h" | "7d" | "30d" | "90d" | null;
+}
+
 export interface GateRow {
   readonly id: string;
   readonly workspaceId: string;
@@ -364,14 +373,15 @@ export class ShareTokensService {
    */
   async consumeView(id: string, view: ViewFacts): Promise<boolean> {
     const { client, workspaceId } = this.store();
-    const updated = await client.query(
+    const updated = await client.query<{ view_count: number; label: string }>(
       `UPDATE share_tokens
           SET view_count = view_count + 1, last_viewed_at = now(), failed_attempts = 0, locked_until = NULL
         WHERE id = $1
           AND revoked_at IS NULL
           AND (expires_at IS NULL OR expires_at > now())
           AND (max_views IS NULL OR view_count < max_views)
-          AND (locked_until IS NULL OR locked_until <= now())`,
+          AND (locked_until IS NULL OR locked_until <= now())
+        RETURNING view_count, label`,
       [id],
     );
     if (updated.rowCount !== 1) return false;
@@ -379,6 +389,19 @@ export class ShareTokensService {
       `INSERT INTO share_token_views (workspace_id, share_token_id, ip, user_agent, authenticated) VALUES ($1, $2, $3::inet, $4, $5)`,
       [workspaceId, id, view.ip, view.userAgent, view.authenticated],
     );
+    // FR-AGY-01o — the FIRST view notifies the agency. "First" is decided by the same atomic UPDATE that took the view
+    // (the row lock serialises parallel mints, so exactly one of them sees view_count = 1), and the notification commits
+    // or rolls back with it. In-app only (the column default): email is deferred. No visitor address, agent or secret.
+    const taken = updated.rows[0];
+    if (taken !== undefined && taken.view_count === 1) {
+      await client.query(
+        `INSERT INTO notifications (id, workspace_id, kind, severity, title, payload)
+         VALUES ($1, $2, 'portal.first_view', 'info', $3, $4::jsonb)`,
+        [uuidV7(), workspaceId, `${taken.label} was opened for the first time`, JSON.stringify({ share_token_id: id })],
+      );
+      incrementCounter("nominara_portal_first_view_notifications_total", {});
+      this.logger.log({ message: "portal first view notified", workspace_id: workspaceId, share_token_id: id });
+    }
     return true;
   }
 
@@ -389,17 +412,44 @@ export class ShareTokensService {
    * refused here, as defence in depth. Scoped to the context's workspace by RLS, so another workspace's id is false.
    */
   async isSessionLive(id: string): Promise<boolean> {
+    return (await this.resolveSession(id)) !== null;
+  }
+
+  /**
+   * NEW-E-099a — the token's LIVE state and its serving policy in ONE read, per request: `null` when the session is
+   * not live (same predicate as before), else the label and the three settings the portal reads must honour. They are
+   * read from the token row on every request and never from the cookie or the request, so editing or tightening a link
+   * applies to the very next read.
+   */
+  async resolveSession(id: string): Promise<PortalSessionPolicy | null> {
     const { client, workspaceId } = this.store();
     // RLS already hides another workspace's row; the explicit predicate keeps the answer right on a connection that is
     // not subject to RLS (a superuser test harness), where a cookie naming the wrong workspace must still be refused.
-    const result = await client.query<{ revoked_at: Date | null; expires_at: Date | null; max_views: number | null; view_count: number }>(
-      `SELECT revoked_at, expires_at, max_views, view_count FROM share_tokens WHERE id = $1 AND workspace_id = $2`,
+    const result = await client.query<{
+      revoked_at: Date | null;
+      expires_at: Date | null;
+      max_views: number | null;
+      view_count: number;
+      label: string;
+      hide_competitors: boolean;
+      hide_costs: boolean;
+      timeframe_lock: string | null;
+    }>(
+      `SELECT revoked_at, expires_at, max_views, view_count, label, hide_competitors, hide_costs, timeframe_lock
+         FROM share_tokens WHERE id = $1 AND workspace_id = $2`,
       [id, workspaceId],
     );
     const row = result.rows[0];
-    if (row === undefined) return false;
+    if (row === undefined) return null;
     const refusal = gateRefusal({ revokedAt: row.revoked_at, expiresAt: row.expires_at, maxViews: row.max_views, viewCount: row.view_count - 1 /* gateRefusal is >=; this makes it > */ }, new Date());
-    return refusal === null;
+    if (refusal !== null) return null;
+    return {
+      label: row.label,
+      hideCompetitors: row.hide_competitors,
+      hideCosts: row.hide_costs,
+      // `custom` is a database value the portal contracts exclude; a locked token that holds it serves its default window.
+      timeframeLock: row.timeframe_lock === "24h" || row.timeframe_lock === "7d" || row.timeframe_lock === "30d" || row.timeframe_lock === "90d" ? row.timeframe_lock : null,
+    };
   }
 
   private async loadVisible(client: ClientBase, id: string): Promise<TokenRow> {

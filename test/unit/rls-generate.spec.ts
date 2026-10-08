@@ -9,6 +9,7 @@ import {
 } from "../../src/db/conventions.js";
 import {
   computeActorSelfScopedPolicies,
+  computeDefinerOwnerPolicies,
   generateActorSelfScopedRlsSql,
   generateRlsSql,
   resolveProjectPredicate,
@@ -399,5 +400,28 @@ describe("STORY-021 · src/db/rls/generate.ts — generateActorSelfScopedRlsSql 
   it("propagates computeActorSelfScopedPolicies' own fail-loud throw when a table is missing", () => {
     const withoutWorkspaces = REAL_SCHEMA_TABLES.filter((table) => table.name !== "workspaces");
     expect(() => generateActorSelfScopedRlsSql(withoutWorkspaces)).toThrow(/ACTOR_SELF_SCOPED_TABLES names "workspaces"/);
+  });
+});
+
+// ---- CP2 decision 1 · ADR-0002 — computeDefinerOwnerPolicies --------------------------------------
+
+describe("CP2 decision 1 · src/db/rls/generate.ts — computeDefinerOwnerPolicies (ADR-0002)", () => {
+  it("DEF-U1 · returns exactly one policy: share_tokens, FOR SELECT, TO nominara_share_lookup only, USING (true), no WITH CHECK", () => {
+    expect(computeDefinerOwnerPolicies(REAL_SCHEMA_TABLES)).toEqual([
+      { table: "share_tokens", policyName: "share_token_gate_lookup", cmd: "SELECT", roles: ["nominara_share_lookup"], using: "true", withCheck: null },
+    ]);
+  });
+
+  it("DEF-U2 · fails loud when share_tokens is absent from the introspected schema, rather than expecting a policy on nothing", () => {
+    const without = REAL_SCHEMA_TABLES.filter((x) => x.name !== "share_tokens");
+    expect(() => computeDefinerOwnerPolicies(without)).toThrow(/share_tokens/);
+  });
+
+  it("DEF-U3 · the owner role is not one of the runtime roles and appears in no other policy bucket", () => {
+    expect(RUNTIME_ROLES as readonly string[]).not.toContain("nominara_share_lookup");
+    for (const bucket of [RLS_POLICY_ROLES.forAll, RLS_POLICY_ROLES.actorSelfScoped] as readonly (readonly string[])[]) {
+      expect(bucket).not.toContain("nominara_share_lookup");
+    }
+    expect(RLS_POLICY_ROLES.portal).not.toBe("nominara_share_lookup");
   });
 });

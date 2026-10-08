@@ -61,7 +61,7 @@ export interface ApiHarnessOptions {
    * NEW-E-098b — test-only controllers/providers added beside ApiModule in the root testing module (the
    * `ThrowingController` pattern in problem.filter.http.spec.ts). Global guards, interceptors and the filter still apply.
    */
-  readonly extras?: Pick<ModuleMetadata, "controllers" | "providers">;
+  readonly extras?: Pick<ModuleMetadata, "controllers" | "providers" | "imports">;
 }
 
 /** Call inside a `describe`. Registers the container/app lifecycle hooks and returns accessors. */
@@ -107,7 +107,7 @@ export function useApiHarness(options: ApiHarnessOptions = {}): ApiHarness {
     await db.query("CREATE SCHEMA public");
     await migrateUp(db);
 
-    const builder = Test.createTestingModule({ imports: [ApiModule], ...options.extras });
+    const builder = Test.createTestingModule({ ...options.extras, imports: [ApiModule, ...(options.extras?.imports ?? [])] });
     if (options.cache !== undefined) builder.overrideProvider(CACHE).useValue(options.cache());
     options.configure?.(builder);
     const moduleRef = await builder.compile();
