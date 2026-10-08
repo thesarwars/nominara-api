@@ -63,3 +63,9 @@ Not built (story criteria outside step A, per the plan): rollup refresh of curre
   - remove `AND deleted_at IS NULL` from assertProject: exit 1, "1 failed | 14 passed (15)", the new test.
   - remove the `assertProject` call from updateGoal: exit 1, "1 failed | 14 passed (15)", the new test.
 - Unmutated: `pnpm vitest run --config vitest.integration.config.ts test/integration/task-goals.spec.ts` exit 0, 15 passed (15). Disk free 8.7 GiB at start (gate is 8).
+
+## Audit fix (round 5): FOR UPDATE on abandon was untested
+- Finding: dropping `FOR UPDATE` from `GoalsService.updateGoal` left task-goals.spec.ts green (15/15); 20 concurrent abandons gave ok=3 (three audit rows, three metric increments for one transition).
+- Test added (commit 81345fc, type fix after): test/integration/task-goals.spec.ts "[STORY-065 #7] 20 concurrent abandons of one goal: exactly one succeeds, the rest are ConflictError(current_state=abandoned), and the abandoned metric moves once (FOR UPDATE)". 20 separate nominara_app connections via withTenantContext; asserts 1 fulfilled, 19 ConflictError with details.current_state='abandoned', and exactly one `nominara_goals_abandoned_total` metric log line.
+- RED (mutation; the lock already existed, so the test passes on unmutated code): service with ` FOR UPDATE` removed -> `pnpm vitest run --config vitest.integration.config.ts test/integration/task-goals.spec.ts` exit 1, "1 failed | 15 passed (16)", "expected [...] to have a length of 1 but got 10" (10 of 20 abandons succeeded). Restored with git checkout.
+- Unmutated: same command exit 0, 16 passed (16). Gates: lint 0, typecheck 0.

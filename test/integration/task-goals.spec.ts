@@ -198,7 +198,7 @@ describe("STORY-065-A · goals — real SQL", () => {
       expect(rejected).toHaveLength(19);
       for (const r of rejected) {
         expect(r.reason).toBeInstanceOf(ConflictError);
-        expect((r.reason as ConflictError).details).toMatchObject({ current_state: "abandoned" });
+        expect((r.reason as { details: unknown }).details).toMatchObject({ current_state: "abandoned" });
       }
       const abandonedMetric = spy.mock.calls.filter(([m]) => (m as { metric?: string } | undefined)?.metric === "nominara_goals_abandoned_total");
       expect(abandonedMetric).toHaveLength(1);
