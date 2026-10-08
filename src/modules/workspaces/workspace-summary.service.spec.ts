@@ -13,9 +13,17 @@ vi.mock("../../lib/engines/registry.js", () => ({ captureReadyEngineKeys: () => 
 
 // NEW-B-2 audit — provenance is read from the captures, never from adapter readiness.
 const engineSources = vi.fn<(tx: unknown, projectId: string, from: string, to: string, tz: string) => Map<string, DataSource>>(() => new Map());
+// NEW-B-2 CP2 — provenance is ONE batched read for every project in the matrix
+// (AC "no per-project query"); the per-project answer is still driven through
+// `engineSources` so each case below states what each project reads.
+const batch = vi.fn(async (tx: unknown, projectIds: readonly string[], from: string, to: string, tz: string) => {
+  const result = new Map<string, Map<string, DataSource>>();
+  for (const id of projectIds) result.set(id, engineSources(tx, id, from, to, tz));
+  return result;
+});
 vi.mock("../../lib/analytics/data-source.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../lib/analytics/data-source.js")>()),
-  engineDataSourcesForDates: async (...a: Parameters<typeof engineSources>) => engineSources(...a),
+  engineDataSourcesForProjects: (...a: Parameters<typeof batch>) => batch(...a),
 }));
 
 import { WorkspaceSummaryService } from "./workspace-summary.service.js";
@@ -91,6 +99,7 @@ describe("NEW-B-2 · WorkspaceSummaryService", () => {
     captureReady.mockReturnValue(["gemini"]);
     engineSources.mockReset();
     engineSources.mockReturnValue(new Map());
+    batch.mockClear();
   });
 
   it("FR-DASH-01: one projects read serves the whole matrix, and the response satisfies the contract", async () => {
@@ -166,11 +175,23 @@ describe("NEW-B-2 · WorkspaceSummaryService", () => {
     expect(out.engines).toEqual([{ engine_key: "gemini", data_source: "mixed" }]);
   });
 
-  it("NEW-B-2 audit · provenance is read over the 30-day workspace-local window, once per project, in the workspace timezone", async () => {
+  it("NEW-B-2 audit · provenance is read over the 30-day workspace-local window in the workspace timezone", async () => {
     const { service, client } = setup({ projects: [project()], engines: ["gemini"] });
     await service.summary(WS);
-    expect(engineSources).toHaveBeenCalledTimes(1);
     expect(engineSources).toHaveBeenCalledWith(client, "22222222-2222-7222-8222-222222222222", "2026-09-08", "2026-10-07", "Asia/Dhaka");
+  });
+
+  it("NEW-B-2 CP2 · AC no per-project query: ONE batched provenance read serves every project, however many", async () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `00000000-0000-7000-8000-${String(i).padStart(12, "0")}`);
+    const { service, client } = setup({ projects: ids.map((id) => project({ id })), engines: ["gemini"] });
+    await service.summary(WS);
+    expect(batch).toHaveBeenCalledTimes(1);
+    expect(batch).toHaveBeenCalledWith(client, ids, "2026-09-08", "2026-10-07", "Asia/Dhaka");
+  });
+
+  it("NEW-B-2 CP2 · an empty matrix makes no provenance read at all", async () => {
+    await setup({ engines: ["gemini"] }).service.summary(WS);
+    expect(batch).not.toHaveBeenCalled();
   });
 
   it("with no captures anywhere everything is null (nothing measured is never folded into demo)", async () => {
