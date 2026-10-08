@@ -48,3 +48,18 @@ src/lib/parser/rendering.ts: PRICED_ATTRS exported (one keyword, no behaviour ch
 - Mutations on the scoring-adjacent logic: 4 mutants (null->0, exclusion off, cause when nothing missing, blend dilution), each killed (1-2 tests fail); restored, 12/12 green.
 - Integration: `pnpm vitest run --config vitest.integration.config.ts rendering-quality` (colima env, disk 17 GiB free) -> exit 0, 5 passed (5), real Postgres 18, nominara_app role, including the tenant-isolation test. Run after fixing two fixture faults in the spec (engines already seeded by migrations -> ON CONFLICT DO NOTHING; render_score is a float4 column, so the seeded 0.66/0.16 read back as 41.0000025 -> toBeCloseTo precision 9 -> 4, a storage-precision correction, no formula or threshold change). A stray file `0` committed by mutation scripting was removed.
 - test:isolation not run (known fixture crash at this tip; merge step runs it).
+
+## Audit fixes (checkpoint-2 audit, three majors: M1, M2, M3/M5)
+The service code was correct; the missing piece was tests that fail when a predicate is removed. Three integration tests were added to test/integration/rendering-quality.spec.ts, as nominara_app, with projects in ONE workspace (so RLS cannot hide the sibling). No production code changed, so there is no separate RED commit: the "red" is each mutation below failing its test.
+
+| Finding | Test | Mutation | Result |
+|---|---|---|---|
+| 1 cause link crosses projects | "a sibling project's open mapped finding in the SAME workspace is never this project's cause" (sibling has an open critical AUX-R-012; read project's cause must be null, then its own low finding wins) | M1 `WHERE f.project_id = $1` -> `WHERE $1::uuid IS NOT NULL` | 1 failed, 7 passed, exit 1 (that test) |
+| 2 mention counting crosses projects | "a sibling project's mentions in the SAME workspace are not counted into this project's coverage" (sibling has 2 priced mentions; read project must show mentions_counted 1, price coverage 0) | M2 `WHERE c.project_id = $1` -> `WHERE $1::uuid IS NOT NULL` | 1 failed, 7 passed, exit 1 (that test) |
+| 3 window predicate | "only mentions inside the window, in the window's timezone, are counted" (workspace tz Pacific/Kiritimati UTC+14; one priced mention at local 00:01 on the first day = previous day in UTC, one at local 23:59 the day before the window, one 40 days ago; expects mentions_counted 1, price coverage 1) | M3 window predicate dropped | 1 failed, exit 1 |
+| 3 timezone pinning | same test | M5 `AT TIME ZONE $4` -> `AT TIME ZONE 'UTC'` | 1 failed, exit 1 |
+
+Each mutant was restored (git checkout) after its run. A first M5 attempt that left `$4` unbound failed all 8 tests on a SQL error and was discarded as proof; the valid M5 run keeps `$4` bound.
+Fixture change: `workspace(timezone)` and `mention(..., capturedAt)` take optional arguments; existing callers unchanged.
+
+Gates: pnpm lint exit 0; pnpm typecheck exit 0; unit (rendering-quality specs) exit 0, 21 passed; integration (`DOCKER_HOST=unix://$HOME/.colima/default/docker.sock TESTCONTAINERS_RYUK_DISABLED=true pnpm vitest run --config vitest.integration.config.ts rendering-quality`) exit 0, 8 passed (was 5), disk 14 GiB free.

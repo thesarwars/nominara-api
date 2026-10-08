@@ -56,11 +56,11 @@ describe("NEW-C-11 · RenderingQualityService - real SQL under RLS", () => {
     try { return await withTenantContext(app, context, fn); } finally { await app.end(); }
   }
 
-  async function workspace(): Promise<string> {
+  async function workspace(timezone = "UTC"): Promise<string> {
     seq += 1;
     return (await db.query<{ id: string }>(
-      "INSERT INTO workspaces (name, slug, plan_key, timezone) VALUES ($1,$2,'growth','UTC') RETURNING id",
-      [`W${seq}`, `w-${seq}-${randomUUID()}`])).rows[0]!.id;
+      "INSERT INTO workspaces (name, slug, plan_key, timezone) VALUES ($1,$2,'growth',$3) RETURNING id",
+      [`W${seq}`, `w-${seq}-${randomUUID()}`, timezone])).rows[0]!.id;
   }
   async function project(ws: string): Promise<{ id: string; prompt: string }> {
     seq += 1;
@@ -76,12 +76,12 @@ describe("NEW-C-11 · RenderingQualityService - real SQL under RLS", () => {
     return { id, prompt };
   }
   /** One captured answer with one brand mention carrying `attrs` and `score`. */
-  async function mention(ws: string, p: { id: string; prompt: string }, engine: string, attrs: string[], score: number, normalizer = DEMO_SEED_MARKER, status = "parsed", entity = "brand"): Promise<void> {
+  async function mention(ws: string, p: { id: string; prompt: string }, engine: string, attrs: string[], score: number, normalizer = DEMO_SEED_MARKER, status = "parsed", entity = "brand", capturedAt: Date | null = null): Promise<void> {
     const id = randomUUID();
     await db.query(
       `INSERT INTO answer_captures (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present)
-       VALUES ($1,$2,$3,$4,$5,$6, now() - interval '2 hours','api','1.0.0',$7,$8,'{}'::jsonb,'{}','live',$9,true)`,
-      [id, ws, p.id, uuidV7(), p.prompt, engine, normalizer, createHash("sha256").update(id).digest(), status]);
+       VALUES ($1,$2,$3,$4,$5,$6, coalesce($10::timestamptz, now() - interval '2 hours'),'api','1.0.0',$7,$8,'{}'::jsonb,'{}','live',$9,true)`,
+      [id, ws, p.id, uuidV7(), p.prompt, engine, normalizer, createHash("sha256").update(id).digest(), status, capturedAt]);
     await db.query(
       `INSERT INTO mention_facts (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,entity_type,entity_id,entity_label,matched_alias,occurrence_index,
           char_start,char_end,first_token_index,prominence,sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,render_attrs,render_score)
@@ -165,5 +165,56 @@ describe("NEW-C-11 · RenderingQualityService - real SQL under RLS", () => {
     await expect(read(wsB, a.id)).rejects.toBeInstanceOf(NotFoundError);
     const own = await read(wsB, b.id);
     expect(attr(find(own.engines, "google_ai_mode"), "price").cause).toBeNull();
+  });
+
+  // Cause link and mention counting are per PROJECT. The tests above put the
+  // other project in another workspace, where RLS hides it whatever the
+  // predicate says; these two projects share ONE workspace, so only the
+  // project predicate separates them.
+  it("[NEW-C-11 AC3] a sibling project's open mapped finding in the SAME workspace is never this project's cause", async () => {
+    const ws = await workspace();
+    const a = await project(ws); const b = await project(ws);
+    await mention(ws, a, "google_ai_mode", [], 0.1); // price missing on A
+    await finding(ws, b, "AUX-R-012", "open", "critical");
+    const own = await read(ws, a.id);
+    expect(attr(find(own.engines, "google_ai_mode"), "price").cause).toBeNull();
+    expect(attr(own.blended, "price").cause).toBeNull();
+    const mineId = await finding(ws, a, "AUX-R-012", "open", "low");
+    const withOwn = await read(ws, a.id);
+    expect(attr(find(withOwn.engines, "google_ai_mode"), "price").cause?.finding_id).toBe(mineId);
+  });
+
+  it("[NEW-C-11 AC2] a sibling project's mentions in the SAME workspace are not counted into this project's coverage", async () => {
+    const ws = await workspace();
+    const a = await project(ws); const b = await project(ws);
+    await mention(ws, a, "google_ai_mode", [], 0.1);
+    await mention(ws, b, "google_ai_mode", ["price"], 0.28);
+    await mention(ws, b, "google_ai_mode", ["price"], 0.28);
+    const mode = find((await read(ws, a.id)).engines, "google_ai_mode");
+    expect(mode.mentions_counted).toBe(1);
+    expect(attr(mode, "price").coverage).toBe(0);
+  });
+
+  it("[NEW-C-11 AC2] only mentions inside the window, in the window's timezone, are counted", async () => {
+    const tz = "Pacific/Kiritimati"; // UTC+14: its calendar date runs ahead of UTC's
+    const ws = await workspace(tz);
+    const p = await project(ws);
+    const first = await read(ws, p.id);
+    const { from } = first.window;
+    expect(first.window.timezone).toBe(tz);
+    const at = async (sql: string) =>
+      (await db.query<{ t: Date }>(`SELECT ${sql} AS t`, sql.includes("$1") ? [from, tz] : [])).rows[0]!.t;
+    // Local 00:01 on the first day: inside by the window's timezone, but the
+    // PREVIOUS calendar day in UTC.
+    const firstDayLocal = await at("(($1::date)::timestamp + interval '1 minute') AT TIME ZONE $2");
+    // Local 23:59 the day before the window: outside by any reading.
+    const dayBefore = await at("(($1::date)::timestamp - interval '1 minute') AT TIME ZONE $2");
+    const fortyDaysAgo = await at("now() - interval '40 days'");
+    await mention(ws, p, "google_ai_mode", ["price"], 0.28, DEMO_SEED_MARKER, "parsed", "brand", firstDayLocal);
+    await mention(ws, p, "google_ai_mode", [], 0.1, DEMO_SEED_MARKER, "parsed", "brand", dayBefore);
+    await mention(ws, p, "google_ai_mode", [], 0.1, DEMO_SEED_MARKER, "parsed", "brand", fortyDaysAgo);
+    const mode = find((await read(ws, p.id)).engines, "google_ai_mode");
+    expect(mode.mentions_counted).toBe(1);
+    expect(attr(mode, "price").coverage).toBe(1);
   });
 });
