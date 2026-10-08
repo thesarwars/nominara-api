@@ -84,3 +84,35 @@ hide_competitors clause neutralised; open status widened to `<> 'done'`; tab che
 - `pnpm contracts:generate` then `pnpm contracts:check` exit 0; `pnpm contracts:diff` against the previous file: `minor` (new endpoint)
 - `pnpm test:integration` for `portal-tasks-http.spec.ts`: **NOT RUN** (disk 6.4 GiB < 8 GiB)
 - `pnpm test:isolation`: not runnable at this tip (known support_grants fixture crash); merge step runs it
+
+## Update 2026-10-08 — integration spec now run and GREEN (supersedes every "integration NOT RUN" row above)
+
+Disk was 20 GiB free (rule: 8 GiB), so `test/integration/portal-tasks-http.spec.ts` was run on colima
+(`DOCKER_HOST` and `TESTCONTAINERS_RYUK_DISABLED` set), at tip `31d021c`:
+`pnpm exec vitest run --config vitest.integration.config.ts test/integration/portal-tasks-http.spec.ts` gave
+`Tests 14 passed (14)`, exit 0. The spec runs the real HTTP stack on the real `nominara_portal` role, so tenant isolation
+for tasks and the first-view row is proven under the portal role. Every row above that said "integration NOT RUN" is now
+unit pass + integration pass, with these caveats:
+
+- The spec was never observed RED (written and committed before the disk allowed a run; it was green on first run). The only
+  RED evidence is the unit RED at `cc42b96` (19 failed, 2 passed, exit 1).
+- "STORY-099 s14" in the integration spec still passes vacuously when `pg_stat_statements` is absent; the unit query trace
+  remains the real proof, and covers the TASKS read only.
+- The ERROR lines in the run output are the expected refusals the spec provokes (403, 404 on mutating verbs, 400, 401).
+- Real-API evidence is collected in NEW-A-17.
+
+## STILL BLOCKED: GET /portal/sources (needs an owner decision; nothing was built)
+
+Why I did not choose: both ways to read domain names change a security boundary or a schema the story did not name.
+- Spec: `schemas/README.md` lists `source_domains` as portal-readable "scoped to the share token's project allow-list", but the
+  table has no `project_id`, so that policy cannot be written as the README says. Code (`PORTAL_READABLE_TABLES`) excludes it on purpose.
+  The README sentence needs correcting in the docs repo whichever way this goes.
+- (a) additive migration (0112-0114 range, 0112 is used by the lookup owner, so 0113): denormalise `domain`, `source_class`,
+  `is_seedable` onto `project_source_index`, backfill, writer updated. Keeps project scoping in the database. Recommended.
+- (c) no migration: read `project_source_index` on the portal pool (project-scoped by RLS), then read the names from
+  `source_domains` by those ids on the app pool in the per-request step, as 099a does for workspace facts. No schema change, but
+  it departs from "read from project_source_index only" and the app-pool read is filtered by id in application code, not by RLS.
+- (b) workspace-wide policy on `source_domains`: leaks the domain list to every project-scoped token. Not recommended.
+Also decide: portal `gap_severity` non-null and no `other` class in the contract versus the agency read (null while unverified; has `other`).
+Decision 9 (unverified domains keep NULL coverage) points to nullable. Once decided this is about half a day.
+Until then the sources criterion and the "no fact tables" criterion for sources are NOT MET.
