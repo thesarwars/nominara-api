@@ -50,15 +50,28 @@ fix `8d3aeca`.
   db/credit/billing/queue/engine paths (test). The integration fingerprint covers every table, so any credit-ledger/wallet write would fail it.
 - Mutation evidence: removing `afterState` fails the new unit and integration cases (RED); the CP2 QA mutations M1-M8 are recorded in the QA report.
 
-## Owner decision still needed (not decided by this lane)
+## Owner decision (settled 2026-10-08)
 
-STORY-085 scenario 11 reads "Zero writes". The merged tip (`c661dc7`) chose to audit each parse (`command.parsed`), mirroring `POST /runs/estimate`,
-because `AuditInterceptor` fails closed on any POST. This pass keeps that choice and only removes the leak. If the owner prefers the other option
-(a narrow read-only POST marker honoured by the interceptor and the audit-coverage sweep, so a parse writes nothing), that is a gate change and needs
-a written decision; otherwise STORY-085 #11 should be amended to "the only row written is the outcome-only audit row". The docs repo has no `.git` here,
-so the amendment has to be carried over by hand.
+STORY-085 #11 is amended by the owner (lead's call, `decisions-2026-10-08.md`): "the only row a parse writes is the outcome-only audit row". The
+implementation already matched; the amended wording is in `docs/plans/docs-carry/STORY-085.md` for the docs repo (no `.git` here).
 
-Also open (not blocking): where the shared intent list lives for the frontend `lib/command/grammar.ts` (owner decision from the plan).
+## Checkpoint-3 fix pass (branch `7day/b-ws-4`, from integration/7day fee788e)
+
+At fee788e the CP2 fixes (`12b3619`, `8d3aeca`, `1237fe2`) ARE ancestors of the tip, and `command-parse-http` + `workspace-summary` are green there
+(15 passed), so the checkpoint-3 QA notes about an unmerged fix are stale. What was added:
+
+- Test commit (single commit, test-only): "STORY-085 #11: across every phrase, the one row a parse writes is the outcome-only command.parsed audit row"
+  in `test/integration/command-parse-http.spec.ts`. For each of the 16 phrases (all intents plus unresolved/ambiguous) it asserts exactly one new
+  `audit_log` row, action `command.parsed`, `before_state` null, `after_state` keys exactly `cached, confidence, intent, resolved_by`, and that no word
+  (>3 chars) of the phrase appears anywhere in the stored row (intent name blanked first, it is outcome).
+- RED: not possible as a failing-first test. It characterises behaviour that is already correct at the tip, so it passes on first run. It is proved to be
+  able to fail by mutation instead: returning `{...body}` in `CommandController.parse`'s `afterState` makes it fail
+  (`expected [ 'actions', 'cached', ...] to deeply equal [ 'cached', 'confidence', ...]`, exit 1); source restored afterwards.
+
+| Criterion | Proof | Result |
+|---|---|---|
+| Only row written is the outcome-only audit row, content level, every intent | `command-parse-http.spec.ts` > "STORY-085 #11: across every phrase, ..." and "STORY-085-A audit #1: across every intent ... no table's CONTENT changes except audit_log's one appended row" | met |
+| Independent dangerous-area-auditor verdict on ledger unreachability | not available to this lane | OPEN (merge step) |
 
 ## Tracing
 
@@ -80,3 +93,13 @@ The metric `nominara_command_parse_total` and the redacted log line (workspace I
 
 HTTP-level behaviour was proved here over the real guard/interceptor/handler chain in Nest (`app.inject`) against a real Postgres container.
 A check against a running deployed API (and the CommandBar showing `resolved_by` and cost) is collected in NEW-A-17.
+
+### Gates, checkpoint-3 pass (tip after the test commit `d2b55eb`)
+
+| Command | Exit |
+|---|---|
+| `pnpm lint` | 0 |
+| `pnpm typecheck` | 0 |
+| `pnpm test:unit` | 0 (302 files passed, 1 skipped; 3697 tests passed, 1 skipped) |
+| `vitest run --config vitest.integration.config.ts` command-parse-http + workspace-summary | 0 (2 files, 17 tests) |
+| `pnpm test:isolation` | not run: no tenant table or policy was touched |
