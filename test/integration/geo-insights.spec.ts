@@ -181,4 +181,42 @@ describe("STORY-062 · GEO insights persistence and read", () => {
     }
     expect(await count()).toBe(1);
   });
+
+  it("STORY-062 isolation · geo_analyses itself, read and written directly as the application role under another tenant's context: 0 rows seen, 0 rows updated, 0 deleted, INSERT for the victim violates WITH CHECK", async () => {
+    // Direct SQL on purpose: GeoService first looks the project up, and that lookup
+    // 404s on the `projects` policy before `geo_analyses` is ever read — a test through
+    // the service proves nothing about this table's own policy.
+    await ctx((s) => s.persistAnalysis(projectId, write("structure")));
+    const other = randomUUID();
+    await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'W3',$2,'growth','UTC')", [other, `w-${randomUUID().slice(0, 8)}`]);
+    const attacker = <T>(fn: (c: Client) => Promise<T>) =>
+      withTenantContext(db, { workspaceId: other, actorId: randomUUID() }, () => fn(db)) as Promise<T>;
+    await db.query("SET ROLE nominara_app");
+    try {
+      const seen = await attacker((c) => c.query("SELECT 1 FROM geo_analyses WHERE project_id = $1", [projectId]));
+      expect(seen.rowCount).toBe(0);
+      const updated = await attacker((c) => c.query("UPDATE geo_analyses SET score = 0, lever_rank = 1 WHERE project_id = $1", [projectId]));
+      expect(updated.rowCount).toBe(0);
+      const deleted = await attacker((c) => c.query("DELETE FROM geo_analyses WHERE project_id = $1", [projectId]));
+      expect(deleted.rowCount).toBe(0);
+      await expect(
+        attacker((c) =>
+          c.query(
+            `INSERT INTO geo_analyses (workspace_id, project_id, analysis, window_start, window_days)
+             VALUES ($1, $2, 'sentiment', '2026-09-08', 30)`,
+            [workspaceId, projectId],
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "42501", message: expect.stringContaining("row-level security") });
+      // The owner still reads its own row.
+      const own = await withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
+        db.query("SELECT score FROM geo_analyses WHERE project_id = $1", [projectId]),
+      );
+      expect(own.rowCount).toBe(1);
+      expect(Number(own.rows[0].score)).toBe(61.5);
+    } finally {
+      await db.query("RESET ROLE");
+    }
+    expect(await count()).toBe(1);
+  });
 });
