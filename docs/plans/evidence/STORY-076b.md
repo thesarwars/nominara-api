@@ -9,8 +9,8 @@ The implementation commit also adds the one-line `AddonListQuery` type export to
 
 `df -h /System/Volumes/Data` showed 6.1 GiB free (rule: under 8 GiB, do not start testcontainers). So:
 
-- RAN and green: the four unit specs below (43 tests), lint, typecheck, `contracts:generate`/`contracts:check`/`contracts:diff` (minor), the whole unit suite, 12 hand mutations.
-- NOT RUN: `test/integration/billing-addons.spec.ts` (28 tests, every row of the real-database proof below). Its RED state was therefore NOT observed against a database. To finish, free disk to 8 GiB, then
+- RAN and green: the four unit specs below (42 tests), lint, typecheck, `contracts:generate`/`contracts:check`/`contracts:diff` (minor), the whole unit suite, 12 hand mutations.
+- NOT RUN: `test/integration/billing-addons.spec.ts` (30 tests, every row of the real-database proof below). Its RED state was therefore NOT observed against a database. To finish, free disk to 8 GiB, then
   `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock TESTCONTAINERS_RYUK_DISABLED=true pnpm exec vitest run --config vitest.integration.config.ts test/integration/billing-addons.spec.ts test/integration/stripe-subscriptions.spec.ts test/integration/stripe-webhook.spec.ts test/integration/entitlement-resolution.spec.ts`
   and treat any failure as a defect in the implementation OR the spec (written without a database to check it against). One assertion was already adjusted once for a typed-error constraint (see "Decisions").
 - `test:isolation` not run (no tenant table touched; `subscription_addons` already has its generated RLS policy). Isolation is proved in the integration spec under `nominara_app` (not run, as above).
