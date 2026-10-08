@@ -23,68 +23,68 @@ function page(body: string, init: { status?: number; contentType?: string } = {}
     status: init.status ?? 200,
     headers: { "content-type": init.contentType ?? "text/html; charset=utf-8" },
     body: Buffer.from(body, "utf8"),
-    finalUrl: "https://reviews.test/best",
+    finalUrl: "https://reviews.dev/best",
   };
 }
 
 function candidate(over: Partial<PresenceCandidate> = {}): PresenceCandidate {
-  return { sourceDomainId: "sd-1", domain: "reviews.test", topUrl: "https://reviews.test/best", verifiedAt: null, ...over };
+  return { sourceDomainId: "sd-1", domain: "reviews.dev", topUrl: "https://reviews.dev/best", verifiedAt: null, ...over };
 }
 
 describe("NEW-C-15 · verifyUrlPresence — STORY-054 scenarios 5 and 6", () => {
   it("STORY-054 scenario 5: the brand is on the fetched page, so presence is recorded true", async () => {
     const fetch = vi.fn().mockResolvedValue(page("<html><body><h1>Best tools</h1><p>We rank Acme Analytics first.</p></body></html>"));
-    expect(await verifyUrlPresence("https://reviews.test/best", BRAND, fetch)).toEqual({ status: "present" });
+    expect(await verifyUrlPresence("https://reviews.dev/best", BRAND, fetch)).toEqual({ status: "present" });
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(fetch).toHaveBeenCalledWith("https://reviews.test/best");
+    expect(fetch).toHaveBeenCalledWith("https://reviews.dev/best");
   });
 
   it("STORY-054 scenario 5: an alias (not the display name) also counts", async () => {
     const fetch = vi.fn().mockResolvedValue(page("<p>Many teams pick acme for dashboards.</p>"));
-    expect(await verifyUrlPresence("https://reviews.test/best", BRAND, fetch)).toEqual({ status: "present" });
+    expect(await verifyUrlPresence("https://reviews.dev/best", BRAND, fetch)).toEqual({ status: "present" });
   });
 
   it("STORY-054 scenario 6: the page was fetched and the brand is not on it, so absence is VERIFIED false", async () => {
     const fetch = vi.fn().mockResolvedValue(page("<p>Only Globex and Initech are reviewed here.</p>"));
-    expect(await verifyUrlPresence("https://reviews.test/best", BRAND, fetch)).toEqual({ status: "absent" });
+    expect(await verifyUrlPresence("https://reviews.dev/best", BRAND, fetch)).toEqual({ status: "absent" });
   });
 
   it("STORY-054 scenario 6: a brand that appears only inside a link target or script is not a mention", async () => {
     const html =
       '<a href="https://acme.example/pricing">pricing</a><script>var x = "Acme Analytics";</script><style>.acme{}</style><p>Nothing here.</p>';
-    expect(await verifyUrlPresence("https://reviews.test/best", BRAND, vi.fn().mockResolvedValue(page(html)))).toEqual({
+    expect(await verifyUrlPresence("https://reviews.dev/best", BRAND, vi.fn().mockResolvedValue(page(html)))).toEqual({
       status: "absent",
     });
   });
 
   it("STORY-054 scenario 6: a negative alias suppresses the match (the common-word defence holds)", async () => {
     const fetch = vi.fn().mockResolvedValue(page("<p>The acme corporation of old went bankrupt.</p>"));
-    expect(await verifyUrlPresence("https://reviews.test/best", BRAND, fetch)).toEqual({ status: "absent" });
+    expect(await verifyUrlPresence("https://reviews.dev/best", BRAND, fetch)).toEqual({ status: "absent" });
   });
 
   it("STORY-054 scenario 6: a word boundary is required (Acmeville is not Acme)", async () => {
     const fetch = vi.fn().mockResolvedValue(page("<p>Visit Acmeville this summer.</p>"));
-    expect(await verifyUrlPresence("https://reviews.test/best", BRAND, fetch)).toEqual({ status: "absent" });
+    expect(await verifyUrlPresence("https://reviews.dev/best", BRAND, fetch)).toEqual({ status: "absent" });
   });
 
   it("STORY-054 AC4: a 404 is a FAILED fetch (null), never an asserted absence", async () => {
-    const outcome = await verifyUrlPresence("https://reviews.test/gone", BRAND, vi.fn().mockResolvedValue(page("not found", { status: 404 })));
+    const outcome = await verifyUrlPresence("https://reviews.dev/gone", BRAND, vi.fn().mockResolvedValue(page("not found", { status: 404 })));
     expect(outcome).toEqual({ status: "failed", reason: "http_status" });
   });
 
   it("STORY-054 AC4: a 500 is a failed fetch", async () => {
-    const outcome = await verifyUrlPresence("https://reviews.test/x", BRAND, vi.fn().mockResolvedValue(page("", { status: 500 })));
+    const outcome = await verifyUrlPresence("https://reviews.dev/x", BRAND, vi.fn().mockResolvedValue(page("", { status: 500 })));
     expect(outcome).toEqual({ status: "failed", reason: "http_status" });
   });
 
   it("STORY-054 AC4: a network error is a failed fetch, and does not throw", async () => {
-    const outcome = await verifyUrlPresence("https://reviews.test/x", BRAND, vi.fn().mockRejectedValue(new Error("ECONNRESET")));
+    const outcome = await verifyUrlPresence("https://reviews.dev/x", BRAND, vi.fn().mockRejectedValue(new Error("ECONNRESET")));
     expect(outcome).toEqual({ status: "failed", reason: "fetch_error" });
   });
 
   it("STORY-054 AC11: a refusal from the guarded fetcher is a failed fetch carrying only the refusal reason", async () => {
     const outcome = await verifyUrlPresence(
-      "https://internal.test/x",
+      "https://internal.dev/x",
       BRAND,
       vi.fn().mockRejectedValue(new GuardedFetchRefusal("address_not_global")),
     );
@@ -93,7 +93,7 @@ describe("NEW-C-15 · verifyUrlPresence — STORY-054 scenarios 5 and 6", () => 
 
   it("STORY-054 AC4: a non-text body (a PDF) cannot be matched, so it is failed rather than absent", async () => {
     const outcome = await verifyUrlPresence(
-      "https://reviews.test/x.pdf",
+      "https://reviews.dev/x.pdf",
       BRAND,
       vi.fn().mockResolvedValue(page("%PDF-1.7 Acme Analytics", { contentType: "application/pdf" })),
     );
@@ -101,12 +101,12 @@ describe("NEW-C-15 · verifyUrlPresence — STORY-054 scenarios 5 and 6", () => 
   });
 
   it("STORY-054 AC4: an empty 200 page is absent (it was fetched; nothing is on it)", async () => {
-    expect(await verifyUrlPresence("https://reviews.test/x", BRAND, vi.fn().mockResolvedValue(page("")))).toEqual({ status: "absent" });
+    expect(await verifyUrlPresence("https://reviews.dev/x", BRAND, vi.fn().mockResolvedValue(page("")))).toEqual({ status: "absent" });
   });
 
   it("STORY-054 AC4: a brand with no usable alias cannot be matched, so it is failed and never fetches", async () => {
     const fetch = vi.fn();
-    const outcome = await verifyUrlPresence("https://reviews.test/x", { name: "  ", aliases: [], negativeAliases: [] }, fetch);
+    const outcome = await verifyUrlPresence("https://reviews.dev/x", { name: "  ", aliases: [], negativeAliases: [] }, fetch);
     expect(outcome).toEqual({ status: "failed", reason: "no_aliases" });
     expect(fetch).not.toHaveBeenCalled();
   });
@@ -119,7 +119,7 @@ describe("NEW-C-15 · selectPresenceChecks — STORY-054 scenario 7 (cache windo
 
   it("STORY-054 scenario 7: a domain never verified is fetched", () => {
     const { check } = selectPresenceChecks([candidate()], NOW);
-    expect(check.map((c) => c.domain)).toEqual(["reviews.test"]);
+    expect(check.map((c) => c.domain)).toEqual(["reviews.dev"]);
   });
 
   it("STORY-054 scenario 7: a domain verified inside the window is NOT fetched again", () => {
@@ -167,16 +167,29 @@ describe("NEW-C-15 · selectPresenceChecks — STORY-054 scenario 7 (cache windo
 });
 
 describe("NEW-C-15 · isDemoDomain — only a real citation verifies", () => {
+  // RFC 2606 reserved names, which is also what the demo seed writes (`<name>.example.com`).
   it.each([
     ["reviews.example", true],
     ["acme-io.community-forum.example", true],
     ["REVIEWS.EXAMPLE", true],
     ["reviews.example.", true],
-    ["example.com", false],
-    ["reviews.example.com", false],
+    ["example.com", true],
+    ["Example.COM.", true],
+    ["reviews.example.com", true],
+    ["acme-io.example.com", true],
+    ["example.net", true],
+    ["www.example.org", true],
+    ["reviews.test", true],
+    ["thing.invalid", true],
+    ["app.localhost", true],
+    ["localhost", true],
     ["notexample", false],
+    ["notexample.com", false],
     ["myexample.org", false],
+    ["example.com.evil.io", false],
+    ["example.io", false],
     ["reddit.com", false],
+    ["reviews.dev", false],
   ])("%s -> %s", (domain, expected) => {
     expect(isDemoDomain(domain)).toBe(expected);
   });
