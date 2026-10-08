@@ -8,7 +8,7 @@ Observability: metrics (`nominara_goals_created_total{kind,sample_state}`, `nomi
 
 ## Scope decisions (flagged, not silently chosen)
 - Kinds: the plan says "for the kinds the owner approves". No approval is on record, so only the two kinds with a stored measured baseline are creatable: `engine_score` (projects.visibility_blended) and `topic_authority` (topic_clusters.visibility_score, needs `prompt_cluster_id`). The other five CHECK kinds, and `engine_key`, are a 400. Needs an owner decision to widen.
-- Sample sufficiency: `n >= 30` cells (scoring-models.md confidence band, low only when n < 30), n taken from projects.cells_30d at capture, stored with the snapshot. For a topic cluster the project's cells_30d is used (a cluster has no cell count of its own). `value` null or `cells` null => insufficient.
+- Sample sufficiency: `n >= 30` cells (scoring-models.md confidence band, low only when n < 30), n taken from projects.cells_30d at capture, stored with the snapshot. For a topic_authority goal `cells` is stored as null (audit fix: a cluster has no cell count of its own and the project's n is not the cluster's n), so it reads `insufficient` until a cluster-level n exists. Awaiting owner confirmation of this choice in the story. `value` null or `cells` null => insufficient.
 - `current` starts equal to the baseline snapshot (so all three numbers are present on read); only the rollup (deferred) moves it. `progress_pct` is the stored column (0 at creation), `null` when insufficient.
 - All three endpoints require `task:create` (api-specification section 3, as written, including GET). A viewer therefore cannot read goals; this is the spec's row, flagged for the docs owner.
 - No migration, no schema change.
@@ -39,3 +39,8 @@ Not built (story criteria outside step A, per the plan): rollup refresh of curre
 - integration `task-goals.spec.ts`: NOT RUN (disk < 8 GiB, see top).
 - test:isolation: not run (no tenant table or migration touched; known fixture crash at this tip).
 - Evidence needing a running real API (HTTP Idempotency-Key replay on POST goals, real audit rows): collected in NEW-A-17.
+
+## Audit fixes (round 3)
+- Item 2 (topic_authority cells): RED test commit is the one before the fix ("STORY-065 #9 ... never borrows the project's cell count"); WRITTEN, NOT EXECUTED (disk). Fix: cells=null for topic_authority in GoalsService.createGoal. `pnpm vitest run src/modules/tasks/goals.spec.ts` and lint/typecheck/unit: see gate lines below.
+- Item 1 (never-run integration spec): STILL BLOCKED. `df -h /System/Volumes/Data` = 7.2 GiB free (< 8 GiB rule) at 2026-10-08. Required, not yet done: green run of task-goals.spec.ts, and RED mutation runs (remove assertProject; remove `AND project_id = $2` in updateGoal; same in cluster query), each exit 1. test:isolation: no tenant table or migration touched; judged not applicable, and it crashes at this tip.
+- Gates after fix: lint 0, typecheck 0, vitest src/modules/tasks 3 files/53 tests exit 0.

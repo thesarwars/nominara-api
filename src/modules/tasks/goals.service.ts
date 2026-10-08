@@ -67,6 +67,7 @@ export class GoalsService {
       [projectId],
     );
     let value = project.rows[0]!.value;
+    let cells = project.rows[0]!.cells;
     if (body.kind === "topic_authority") {
       const cluster = await client.query<{ value: number | null }>(
         `SELECT visibility_score::float8 AS value FROM topic_clusters WHERE id = $1 AND project_id = $2`,
@@ -79,8 +80,11 @@ export class GoalsService {
         });
       }
       value = cluster.rows[0]!.value;
+      // A cluster has no cell count of its own; the project's n is NOT the
+      // cluster's n. null reads as `insufficient` until a cluster-level n exists.
+      cells = null;
     }
-    const snapshot: Measurement = { value, cells: project.rows[0]!.cells, at: new Date().toISOString() };
+    const snapshot: Measurement = { value, cells, at: new Date().toISOString() };
 
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO goals (workspace_id, project_id, title, kind, target, baseline, current, target_date, created_by)
