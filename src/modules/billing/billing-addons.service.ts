@@ -175,6 +175,16 @@ export class BillingAddonsService {
       }
       // Already at the total (a retry whose first attempt landed): nothing to ask of Stripe, nothing to charge.
       if (total > heldQuantity) {
+        // ⚠ A SCHEDULED REMOVAL FREEZES THE NEXT PHASE'S ITEMS (audit). The schedule's second phase was
+        // built from the items as they were at DELETE time; a quantity changed now would be silently
+        // reverted at renewal (and the seat check of AC12 never runs for it). Refuse, with the reason,
+        // until Stripe releases the schedule. Whether Stripe even accepts a direct item change on a
+        // scheduled subscription is collected against the sandbox (NEW-A-17).
+        const schedule = (fetched.raw as { schedule?: unknown }).schedule;
+        if (schedule !== null && schedule !== undefined) {
+          incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "removal_scheduled_conflict" });
+          throw new ConflictError({ message: "an add-on removal is scheduled for the end of this billing period: add-ons cannot be changed until it has taken effect" });
+        }
         await this.gateway.changeAddonQuantity({
           subscriptionId: subscription.stripe_subscription_id,
           kind: request.kind,
