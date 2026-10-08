@@ -410,6 +410,8 @@ describe("STORY-076b · add-ons", () => {
       status: "canceled",
       cancel_at_period_end: false,
       trial_end: null,
+      current_period_start: T0,
+      current_period_end: PERIOD_END,
       items: { data: [] },
     });
     const res = await deliver(eventBody(`evt_${randomUUID()}`, "customer.subscription.deleted", oldId));

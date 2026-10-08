@@ -160,3 +160,15 @@ Honest limit: the unit lock test proves ORDER (lock before the read and the fetc
 
 ### Gates (exit codes)
 `pnpm lint` 0 · `pnpm typecheck` 0 · `pnpm test:unit` 0 (282 files passed, 1 skipped; 3401 passed, 1 skipped). `test:integration` / `test:isolation`: not run (disk).
+
+
+## Audit round 3 follow-up (2026-10-08, disk 19 GiB free): the integration tests ran, and one did not discriminate
+
+Run with the disk rule satisfied. `billing-addons` + `stripe-subscriptions` + `stripe-webhook` + `entitlement-resolution`: exit 0, 4 files, 136 tests passed.
+
+| Mutant (integration, `billing-addons.spec.ts`) | Result |
+|---|---|
+| workspace row lock deleted from `add()` | exit 1, KILLED by "audit . concurrent POSTs with DISTINCT Idempotency-Keys ... (the workspace row lock)" (1 failed / 32 passed). Mutual exclusion is now proved, not just order |
+| reconcile filter `stripe_subscription_id = $2` -> `$2::text IS NOT NULL` | SURVIVED the first time: the test's old-subscription fixture carried no billing period, so the handler ignored the event ("carries no billing period") and `reconcile` was never reached (a debug print confirmed). Fixture fixed (`current_period_start/end` added); the mutant is now KILLED (`expected [] to deeply equal [[extra_project,1],[extra_seat,2]]`, exit 1) and the unmutated test passes |
+
+Final gates on this tip: `pnpm lint` 0, `pnpm typecheck` 0, `pnpm test:unit` 0 (3401 passed, 1 skipped, before the fixture-only change). `test:isolation` / `:breakers` not run: known fixture crash at this tip; isolation proved under `nominara_app` in the integration spec (3 tests, passing).
