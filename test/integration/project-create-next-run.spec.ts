@@ -4,6 +4,7 @@ import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { claimDueProject, nextRunAfter } from "../../src/lib/capture/scheduler.js";
+import { resolveEntitlements } from "../../src/lib/entitlements/resolution.js";
 import type { EntitlementResolver } from "../../src/lib/entitlements/entitlement-resolver.js";
 import type { UrlGuard } from "../../src/lib/net/url-guard.service.js";
 import type { QueueProducer } from "../../src/lib/queue/queue-producer.js";
@@ -21,9 +22,12 @@ describe("checkpoint-5 a-gemini · decision 2026-10-09 #2 · create seeds next_r
   let workspaceId: string;
   let actorId: string;
 
+  // The REAL plan table, resolved through the real pipeline: the starting
+  // cadence is asserted against what the plan's scan.cadence entitlement says,
+  // not against a stub that would make the mapping circular.
   const resolver = {
-    resolveForWorkspace: async () => ({ entitlements: {} }),
-    resolve: async () => ({ entitlements: {} }),
+    resolveForWorkspace: async (id: string) => resolveEntitlements(db, id),
+    resolve: async (id: string) => resolveEntitlements(db, id),
   } as unknown as EntitlementResolver;
   const queues = { enqueueTenantJob: async () => ({}) } as unknown as QueueProducer;
   const urls = { validateAndNormalize: async () => ({ rootDomain: "hubspot.com" }) } as unknown as UrlGuard;
@@ -57,6 +61,10 @@ describe("checkpoint-5 a-gemini · decision 2026-10-09 #2 · create seeds next_r
       `w-${randomUUID().slice(0, 8)}`,
     ]);
   });
+
+  async function setPlan(planKey: string): Promise<void> {
+    await db.query("UPDATE workspaces SET plan_key = $1 WHERE id = $2", [planKey, workspaceId]);
+  }
 
   async function create(): Promise<string> {
     const c = new Client({ connectionString: container.getConnectionUri() });
@@ -94,4 +102,26 @@ describe("checkpoint-5 a-gemini · decision 2026-10-09 #2 · create seeds next_r
     expect(await claimDueProject(db, id, new Date(slot.getTime() - 1000))).toBeNull();
     expect((await claimDueProject(db, id, new Date(slot.getTime() + 1000)))?.projectId).toBe(id);
   });
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  // CYCLE_DAYS = 30; runs per cycle: weekly 4, twice_weekly 8, daily 30.
+  it.each([
+    ["growth", "twice_weekly", (30 * DAY_MS) / 8],
+    ["starter", "weekly", (30 * DAY_MS) / 4],
+    ["business", "daily", DAY_MS],
+    ["enterprise", "daily", DAY_MS],
+  ])(
+    "CP6 a-gemini · decision 2026-10-09 pm #2 · a %s workspace's project starts on cadence %s, next_run_at one interval ahead",
+    async (plan, cadence, intervalMs) => {
+      await setPlan(plan);
+      const before = Date.now();
+      const id = await create();
+      const after = Date.now();
+      const row = (await db.query<{ cadence: string; next_run_at: Date }>("SELECT cadence, next_run_at FROM projects WHERE id = $1", [id])).rows[0]!;
+
+      expect(row.cadence).toBe(cadence);
+      expect(row.next_run_at.getTime()).toBeGreaterThanOrEqual(before + intervalMs);
+      expect(row.next_run_at.getTime()).toBeLessThanOrEqual(after + intervalMs);
+    },
+  );
 });
