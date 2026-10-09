@@ -1,8 +1,9 @@
 import { Logger } from "@nestjs/common";
-import type { Pool, PoolClient } from "pg";
+import type { ClientBase, Pool, PoolClient } from "pg";
 import { DegradedError } from "../../api/errors/domain-errors.js";
 import { createPgPool } from "../../db/pg-pool.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 
 // STORY-075a / STORY-076a / STORY-076b checkpoint-4 — the pool for a billing request's SHORT INDEPENDENT WRITES.
 //
@@ -45,5 +46,15 @@ export async function connectForWrite(pool: Pool): Promise<PoolClient> {
     incrementCounter("nominara_billing_write_pool_timeout_total", {});
     logger.error({ message: "no billing write connection within the bound; request refused as retryable" });
     throw new DegradedError({ message: "billing is busy: retry shortly" });
+  }
+}
+
+/** A short transaction on a connection of the write pool, committing independently of the request's. */
+export async function inBillingWriteTransaction<T>(pool: Pool, context: TenantContext, fn: (tx: ClientBase) => Promise<T>): Promise<T> {
+  const client = await connectForWrite(pool);
+  try {
+    return await withTenantContext(client, context, fn);
+  } finally {
+    client.release();
   }
 }
