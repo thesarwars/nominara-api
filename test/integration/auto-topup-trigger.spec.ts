@@ -712,10 +712,11 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
 
   // KAD-06 through the PRODUCTION entry: createJobProcessor -> withTenantJob -> BEGIN + set_config -> the handler -> trigger.
   // The processor passes every tenant handler a transaction and holds it (idle, having run only set_config) until the handler
-  // returns, i.e. across every Stripe and mail await. OPEN DECISION (docs/plans/evidence/NEW-D-7.md, "Checkpoint-4 fix pass"):
-  // either an ADR adds a processor mode that verifies the signature and runs the handler without holding the job
-  // transaction, or a bounded written exception is recorded in coding-standards/KAD-06. `it.fails` pins today's fact so the
-  // suite stays green AND flips to a failure the moment the fix lands (then change it to `it`); it does not weaken the assertion.
+  // returns, i.e. across every Stripe and mail await. DECIDED (owner, 2026-10-09 #3): a bounded KAD-06 exception for the
+  // billing.auto_topup job is recorded in docs/plans/evidence/NEW-D-7.md (concurrency 2 per replica, 10 s Stripe timeout, no
+  // row locks, no snapshot held under READ COMMITTED). MUST-FIX BEFORE LIVE STRIPE: week 2 adds a processor mode that verifies
+  // the signature and then runs the handler without holding the job transaction (with an ADR). Until then this stays `it.fails`
+  // with that reason; when the fix lands it flips to a failure, change it to `it`. The assertion is not weakened.
   it.fails("NEW-D-7 checkpoint-4 F7 · KAD-06: through createJobProcessor, no job transaction is open while the Stripe lookup is awaited", async () => {
     const { workspaceId } = await armed();
     const key = Buffer.from("kad06-processor-test-key");
