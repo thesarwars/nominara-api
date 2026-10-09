@@ -191,7 +191,7 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
       // another workspace's report is invisible: not listed, and 404 on update and delete
       await withTenantContext(client, { workspaceId: one.a.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
         await tx.query("SET LOCAL ROLE nominara_app");
-        expect(await service.list()).toEqual([]);
+        expect((await service.list({ limit: 50 })).items).toEqual([]);
         await expect(service.remove(mine.id)).rejects.toMatchObject({ status: 404 });
         await expect(service.update(mine.id, { paused: true } as never)).rejects.toMatchObject({ status: 404 });
       });

@@ -102,13 +102,13 @@ describe("STORY-098 ISO-09 · ShareTokensService under RLS, as nominara_app", ()
     const minted = await inTenant(a, () => service.mint(request({ scope_project_ids: [a.projectId] }), meta));
     await admin.query("INSERT INTO share_token_views (workspace_id, share_token_id) VALUES ($1,$2)", [a.workspaceId, minted.token.id]);
 
-    expect(await inTenant(b, () => service.list())).toEqual([]);
+    expect((await inTenant(b, () => service.list({ limit: 50 }))).items).toEqual([]);
     await expect(inTenant(b, () => service.revoke(minted.token.id))).rejects.toBeInstanceOf(NotFoundError);
-    await expect(inTenant(b, () => service.views(minted.token.id))).rejects.toBeInstanceOf(NotFoundError);
+    await expect(inTenant(b, () => service.views(minted.token.id, { limit: 50 }))).rejects.toBeInstanceOf(NotFoundError);
     const stored = await admin.query("SELECT revoked_at FROM share_tokens WHERE id = $1", [minted.token.id]);
     expect((stored.rows[0] as { revoked_at: unknown }).revoked_at).toBeNull();
-    expect((await inTenant(a, () => service.list())).map((t) => t.id)).toEqual([minted.token.id]);
-    expect(await inTenant(a, () => service.views(minted.token.id))).toHaveLength(1);
+    expect((await inTenant(a, () => service.list({ limit: 50 }))).items.map((t) => t.id)).toEqual([minted.token.id]);
+    expect((await inTenant(a, () => service.views(minted.token.id, { limit: 50 }))).items).toHaveLength(1);
   });
 
   it("a project or theme of another workspace is not readable, so naming it in a mint is a validation failure that stores nothing", async () => {

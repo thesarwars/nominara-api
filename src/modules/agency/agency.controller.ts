@@ -1,14 +1,17 @@
-import { Body, Controller, Get, HttpCode, Put } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Put, Query } from "@nestjs/common";
 import {
+  agencyThemeListQuerySchema,
   agencyThemeListResponseSchema,
   agencyThemeSchema,
   updateAgencyThemeRequestSchema,
   type AgencyTheme,
+  type AgencyThemeListQuery,
   type UpdateAgencyThemeRequest,
 } from "../../../contracts/agency/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import type { Page } from "../../api/pagination/page.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { AgencyService } from "./agency.service.js";
 
@@ -21,9 +24,9 @@ export class AgencyController {
 
   @Get("theme")
   @RequirePermission("agency:branding")
-  @ApiContract({ operationId: "listAgencyThemes", responseSchema: agencyThemeListResponseSchema })
-  list(): Promise<AgencyTheme[]> {
-    return this.service.listThemes();
+  @ApiContract({ operationId: "listAgencyThemes", querySchema: agencyThemeListQuerySchema, responseSchema: agencyThemeListResponseSchema, listOf: true })
+  list(@Query(new ZodValidationPipe(agencyThemeListQuerySchema)) query: AgencyThemeListQuery): Promise<Page<AgencyTheme>> {
+    return this.service.listThemes(query);
   }
 
   // Every theme write is audited (FR-AGY-01 / scenario 16). The audit row is

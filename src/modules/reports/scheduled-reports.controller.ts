@@ -1,7 +1,8 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query } from "@nestjs/common";
 import { z } from "zod";
 import {
   createScheduledReportRequestSchema,
+  scheduledReportListQuerySchema,
   scheduledReportListResponseSchema,
   scheduledReportSchema,
   sendScheduledReportNowResponseSchema,
@@ -9,11 +10,13 @@ import {
   type CreateScheduledReportRequest,
   type ScheduledReport,
   type ScheduledReportDelivery,
+  type ScheduledReportListQuery,
   type UpdateScheduledReportRequest,
 } from "../../../contracts/reports/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import type { Page } from "../../api/pagination/page.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { ScheduledReportsService } from "./scheduled-reports.service.js";
 
@@ -27,9 +30,9 @@ export class ScheduledReportsController {
 
   @Get()
   @RequirePermission("agency:branding")
-  @ApiContract({ operationId: "listScheduledReports", responseSchema: scheduledReportListResponseSchema })
-  list(): Promise<ScheduledReport[]> {
-    return this.service.list();
+  @ApiContract({ operationId: "listScheduledReports", querySchema: scheduledReportListQuerySchema, responseSchema: scheduledReportListResponseSchema, listOf: true })
+  list(@Query(new ZodValidationPipe(scheduledReportListQuerySchema)) query: ScheduledReportListQuery): Promise<Page<ScheduledReport>> {
+    return this.service.list(query);
   }
 
   @Post()
