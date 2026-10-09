@@ -107,7 +107,7 @@ describe("STORY-022 · ProblemFilter over real HTTP", () => {
       // failing for an unrelated connection-refused reason that would
       // coincidentally produce the same 500 body.
       .overrideProvider(PG_POOL)
-      .useValue({ query: async () => ({ rows: [{ revoked_at: null }] }), end: async () => {} })
+      .useValue({ query: async () => ({ rows: [{ revoked_at: null, user_status: "active", user_deleted_at: null }] }), end: async () => {} })
       .compile();
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
     await configureApp(app);

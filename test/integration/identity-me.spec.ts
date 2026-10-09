@@ -207,4 +207,55 @@ describe("NEW-A-2 · /v1/me", () => {
     const me = dataOf<MeBody>(await get(after, `?workspace_id=${other}`));
     expect(me.active_workspace_id).toBe(workspaceId);
   });
+
+  // NEW-B-1 checkpoint-4 — a live session must not outlive the user's standing. Suspended is 403 (the account exists and is
+  // forbidden; STORY-173 AC5 already pins 403 for a suspended account), erased/missing is 401.
+  it("NEW-B-1 · a suspended user with a live session is refused on GET /me and nothing is returned", async () => {
+    const user = await createUser();
+    const tokens = await signIn(user.id);
+    expect((await get(tokens)).statusCode).toBe(200);
+    await harness.db().query(`UPDATE users SET status = 'suspended' WHERE id = $1`, [user.id]);
+    const res = await get(tokens);
+    expect(res.statusCode, res.body).toBe(403);
+    expect(res.body).not.toContain(user.email);
+  });
+
+  it("NEW-B-1 · a suspended user with a live session is refused on PATCH /me and the row is not written", async () => {
+    const user = await createUser();
+    const tokens = await signIn(user.id);
+    await harness.db().query(`UPDATE users SET status = 'suspended' WHERE id = $1`, [user.id]);
+    const res = await patch(tokens, { persona });
+    expect(res.statusCode, res.body).toBe(403);
+    const row = await harness.db().query(`SELECT persona_org_type FROM users WHERE id = $1`, [user.id]);
+    expect(row.rows[0].persona_org_type).toBeNull();
+  });
+
+  it("NEW-B-1 · a suspended user is refused on another authenticated route (GET /workspaces), not only /me", async () => {
+    const user = await createUser();
+    const tokens = await signIn(user.id);
+    await harness.db().query(`UPDATE users SET status = 'suspended' WHERE id = $1`, [user.id]);
+    const res = await harness.app().inject({
+      method: "GET",
+      url: apiUrl("/workspaces"),
+      cookies: { [ACCESS_COOKIE_NAME]: tokens.access, [CSRF_COOKIE_NAME]: tokens.csrf },
+    });
+    expect(res.statusCode, res.body).toBe(403);
+  });
+
+  it("NEW-B-1 · an erased user (deleted_at set) with a live session is refused on GET and PATCH /me", async () => {
+    const user = await createUser();
+    const tokens = await signIn(user.id);
+    await harness.db().query(`UPDATE users SET deleted_at = now() WHERE id = $1`, [user.id]);
+    expect((await get(tokens)).statusCode).toBe(401);
+    expect((await patch(tokens, { persona })).statusCode).toBe(401);
+  });
+
+  it("NEW-B-1 · reinstating a suspended user (status back to active) restores access on the same session", async () => {
+    const user = await createUser();
+    const tokens = await signIn(user.id);
+    await harness.db().query(`UPDATE users SET status = 'suspended' WHERE id = $1`, [user.id]);
+    expect((await get(tokens)).statusCode).toBe(403);
+    await harness.db().query(`UPDATE users SET status = 'active' WHERE id = $1`, [user.id]);
+    expect((await get(tokens)).statusCode).toBe(200);
+  });
 });

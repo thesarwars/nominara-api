@@ -104,9 +104,33 @@ export class AuthGuard implements CanActivate {
       revoked_at: Date | null;
       last_strong_auth_at: Date | null;
       last_strong_auth_method: string | null;
-    }>("SELECT revoked_at, last_strong_auth_at, last_strong_auth_method FROM sessions WHERE id = $1", [claims.sid]);
+      user_status: string | null;
+      user_deleted_at: Date | null;
+    }>(
+      `SELECT s.revoked_at, s.last_strong_auth_at, s.last_strong_auth_method,
+              u.status AS user_status, u.deleted_at AS user_deleted_at
+         FROM sessions s LEFT JOIN users u ON u.id = s.user_id
+        WHERE s.id = $1`,
+      [claims.sid],
+    );
     const session = sessionResult.rows[0];
     if (!session || session.revoked_at !== null) {
+      throw new UnauthorizedException("session revoked");
+    }
+    // NEW-B-1 — a live session does not outlive the user's standing. A
+    // suspended, deleted or erased user, or a session whose user row is gone,
+    // is refused (401 like a revoked session; a suspended account is 403, matching
+    // STORY-173 AC5). 'unverified' is deliberately NOT refused: such a user holds a
+    // session to finish proving the address (STORY-173).
+    if (session.user_status === "suspended" && session.user_deleted_at === null) {
+      throw new ForbiddenException("account suspended");
+    }
+    if (
+      session.user_status === null ||
+      session.user_status === "suspended" ||
+      session.user_status === "deleted" ||
+      session.user_deleted_at !== null
+    ) {
       throw new UnauthorizedException("session revoked");
     }
 
