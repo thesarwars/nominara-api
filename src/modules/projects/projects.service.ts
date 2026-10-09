@@ -30,6 +30,8 @@ import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
 import { handlerFor } from "../../lib/queue/handlers.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
+import { nextRunAfter } from "../../lib/capture/scheduler.js";
+import type { ProjectCadence } from "../../lib/capture/dispatch-cells.js";
 import { confidenceFor, sentimentBand } from "../../lib/scoring/index.js";
 
 // STORY-043 — URL-only project creation. api-specification.md §4.
@@ -49,6 +51,9 @@ import { confidenceFor, sentimentBand } from "../../lib/scoring/index.js";
 // that should have succeeded. afterCommit() exists for exactly this.
 
 const DISCOVERY_EXPECTED_MS = 20_000;
+
+/** The cadence a new project starts on — the column's own DEFAULT, written out so `next_run_at` is derived from it. Cadence is not accepted at creation (STORY-043 AC2). */
+const DEFAULT_PROJECT_CADENCE: ProjectCadence = "weekly";
 
 // The matrix row's columns. Shared by `list` and `listForSummary` so the two
 // readers of the denormalised columns cannot drift apart.
@@ -123,8 +128,8 @@ export class ProjectsService {
       `INSERT INTO projects
          (id, workspace_id, name, slug, kind, parent_project_id, root_url, root_domain,
           owned_domains, brand_aliases, negative_aliases, category_slug, verticals, locale,
-          description, prompts_cap, discovery_status, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending','initializing',$17)`,
+          description, prompts_cap, discovery_status, status, created_by, cadence, next_run_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending','initializing',$17,$18,$19)`,
       [
         projectId,
         workspaceId,
@@ -146,6 +151,11 @@ export class ProjectsService {
         input.description ?? null,
         promptsCap,
         actorId,
+        DEFAULT_PROJECT_CADENCE,
+        // Owner decision 2026-10-09 #2: a non-manual cadence seeds next_run_at
+        // with the NEXT cadence slot (never "now"), so the sweep has something
+        // to claim once the project is active. `manual` would store NULL.
+        nextRunAfter(DEFAULT_PROJECT_CADENCE, new Date()),
       ],
     ).catch((error: unknown) => {
       // `nextFreeSlug` picked a free one a moment ago, so reaching here means
