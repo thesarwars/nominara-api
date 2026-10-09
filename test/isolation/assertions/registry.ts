@@ -25,6 +25,7 @@ import { assertIso19NoGucsZeroRows, iso19Breaker } from "./iso-19-actor-scoped-n
 import { assertIso20ActorPolicyInertUnderTenantContext, iso20Breaker } from "./iso-20-actor-policy-inert-under-tenant-context.js";
 import { assertIso21ActorOnlyWritesDenied, assertIso21AgainstMissingReadOnly, iso21Breaker } from "./iso-21-actor-only-writes-denied.js";
 import { assertIso22ActorOnlyFuzzReplay, iso22Breaker } from "./iso-22-actor-only-fuzz-replay.js";
+import { assertIso26ShareLookupReturnsOnlyHashedRow, iso26Breaker } from "./iso-26-share-lookup-returns-only-hashed-row.js";
 import { assertIso24DefinerOwnerNoMembers, iso24Breaker } from "./iso-24-definer-owner-no-members.js";
 import { assertIso25ShareLookupDefinerShape, iso25Breaker } from "./iso-25-share-lookup-definer-shape.js";
 
@@ -200,6 +201,8 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
   // Both inspect the catalog only (no tenant rows), hence read-only and fixture-free.
   { id: "ISO-24", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso24DefinerOwnerNoMembers, assertUnderBreaker: assertIso24DefinerOwnerNoMembers, breaker: iso24Breaker },
   { id: "ISO-25", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso25ShareLookupDefinerShape, assertUnderBreaker: assertIso25ShareLookupDefinerShape, breaker: iso25Breaker },
+  // The lookup returns only the hashed token's row. Needs the three-tenant fixture (tokens to leak) and is read-only.
+  { id: "ISO-26", needsDatabase: true, readOnly: true, needsFixture: true, assert: assertIso26ShareLookupReturnsOnlyHashedRow, assertUnderBreaker: assertIso26ShareLookupReturnsOnlyHashedRow, breaker: iso26Breaker },
 ];
 
 // STORY-012 T24 · D-6 — ISOLATION_TARGET=staging runs ONLY the read-only,

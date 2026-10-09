@@ -160,3 +160,28 @@ growth-map reads (as NEW-E-100a did for engine_data_sources), the portal role ke
 (b) approve a rollup-only projection and state how window figures derive from `metric_daily` (and accept that they may
 differ from the agency's), plus whether to add window numerators to `metric_daily` (a schema change).
 RED test stays failing on this branch until one is chosen; do not merge it before then.
+
+## Checkpoint-5 (branch `7day/e-portal-6`, from integration/7day 71e13e9)
+
+### AC2 amended by owner decision 2026-10-09 #1 (week 1 only)
+STORY-099 s14 / NEW-E-099b AC2 now exempts exactly the portal overview, matrix and growth-map reads, as NEW-E-100a did for
+engine_data_sources. The exemption is a closed list in `test/integration/portal-fact-tables-http.spec.ts` (`EXEMPT_READS`),
+each entry matched by the statement's own start-anchored shape:
+1. engineDataSourcesForDates (NEW-E-100a, unchanged)
+2. ScorecardsService.engineConfig: the `WITH measured AS (SELECT DISTINCT c.engine_key FROM answer_captures c` statement (includes the `last_capture` lateral)
+3. aggregateRange: the `WITH day_cells AS (SELECT c.id, c.engine_key, c.status, c.cache_layer, c.brand_present, c.sov,` statement
+4. GrowthMapService.failureDays: `SELECT DISTINCT to_char((captured_at AT TIME ZONE $4)::date ...) ... FROM answer_captures`
+
+Every other statement naming answer_captures, mention_facts or citation_facts still fails the trace; tasks stays clean.
+Proof: `portal-fact-tables-http.spec.ts` 5 passed (was 3 failed); the new test "the exemption is narrow" asserts the list has exactly
+four entries and that a bare fact-table read, the competitor panel's `day_cells` CTE, an unanchored look-alike and an
+un-named `answer_captures` select are NOT exempt. Mutation: breaking the failureDays shape makes the growth-map trace fail
+(1 failed, 4 passed); restored. The portal role keeps its SELECT on the fact tables; a rollup-only projection is week 2.
+AC2 is therefore MET for week 1 under the amendment. Docs-carry: `docs/plans/docs-carry/STORY-099.md`.
+The auditor's blocker 2 is addressed by the owner decision; the auditor must re-verdict (AC5).
+
+### ISO-26 / ISO-24 (ADR-0002, audit findings 1 and 3)
+- Finding 1, "no runtime role is a member of nominara_share_lookup": already asserted by ISO-24 (pg_auth_members, plus pg_has_role MEMBER/USAGE/SET for EVERY non-superuser role, so nominara_app, _worker, _portal, _report all included), with breaker D2 (GRANT to nominara_worker). Isolation run: 12 files / 55 tests passed.
+- Finding 1, "the lookup returns only the hashed token row": new ISO-26 (`test/isolation/assertions/iso-26-share-lookup-returns-only-hashed-row.ts`), on the three-tenant fixture (150 tokens): as nominara_app with no context each tenant's hash returns exactly its own row, columns are exactly the 13 gate columns, an unknown hash returns 0, and share_tokens read directly returns 0.
+- Finding 3, breaker: ISO-26 is registered in `registry.ts` with a breaker that replaces the function with one that drops `WHERE token_hash = p_hash`. `pnpm test:isolation:breakers`: 1 file / 27 tests passed (was 26), i.e. the assertion throws with its own `ISO-26` message under the breaker; matrix completeness spec still passes.
+- Not RED-first in the strict sense: the assertion passes on the unbroken schema by design (behaviour already existed, DEF-3); its failing proof is the breaker.
