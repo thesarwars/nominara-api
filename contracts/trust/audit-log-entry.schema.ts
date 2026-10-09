@@ -15,11 +15,14 @@ export const AUDIT_SEVERITIES = ["info", "notice", "warning", "critical"] as con
 export const auditLogEntrySchema = z
   .object({
     /**
-     * The row hash, hex. `audit_log.seq` is not exposed, for the reason
-     * `credit-ledger-entry.schema.ts` gives: a global sequence is a thing
-     * customers could count to infer volume.
+     * The row's `audit_log.seq`, as a decimal string. NEVER a hash: row N's
+     * `prev_hash` is row N-1's `row_hash`, so exposing either leaks the chain
+     * (checkpoint-4). It is the same value the opaque cursor is keyed on, and
+     * it is stable. Trade-off, recorded: seq is a global sequence, so ids are
+     * monotonic across workspaces; the ledger avoids that with a uuid, but
+     * audit_log has no id column and a schema change is not part of NEW-D-3.
      */
-    id: z.string().regex(/^[0-9a-f]{64}$/u),
+    id: z.string().regex(/^[0-9]{1,18}$/u),
     occurred_at: z.iso.datetime(),
     actor_type: z.enum(AUDIT_ACTOR_TYPES),
     /** Null for `system`. No route returns member names, so a client shows type + id. */

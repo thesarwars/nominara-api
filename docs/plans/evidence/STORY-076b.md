@@ -264,3 +264,63 @@ Metrics: `nominara_billing_addon_change_total{kind,outcome}` gains `replayed_app
 
 ### Not done / stated
 `src/db/schema/billing.ts` got the one-line `pendingAddonChanges` column by hand because `pnpm db:schema-generate` needs a shadow database URL; `drizzle-schema-and-service.spec.ts` (generated schema == migrated DB) passes, and the next regeneration will reproduce it. Real Stripe behaviour (a key replay with identical params) is NEW-A-17.
+
+## Checkpoint-4, fix pass 2 (lane 7day/d-billing-5, base integration/7day 74e4b2f)
+Second-engineer findings 1 (blocker), 2 (major) and 3 (major). Items 2 and the checkout/credit-pack halves are also recorded in `STORY-075a.md` and `STORY-076a.md`.
+
+### Commits
+| Sha | What |
+|---|---|
+| `8976cd1` RED | add-on Stripe fake refuses a reused key whose call differs (`test/support/fake-stripe-gateway.ts`); unit `billing-addons.service.spec.ts` (3 failed / 52 passed of 55: the lost-reply create retried twice ends in a 400 `idempotency_error` then a second intent and `quantity` 2; `idempotency_error` deleted the intent; a legacy unsettled intent was replayed); unit `stripe-http.addons.spec.ts` (1 failed / 10 passed: `errorType` undefined); integration `billing-addons.spec.ts` (2 failed / 44 passed: the new create-retry test and the EXISTING "AC1 retry" test, which only passed because the fake replayed any repeated key); `billing-pool-contention.spec.ts` (each of its 3 tests: "did not finish within 25000 ms: the pool is deadlocked"); `billing-write-pool.spec.ts` (module absent). The two money-guard tests (intent expiry, in-flight statuses) PASS here by design: the guards exist, they were untested. RED typecheck is red only on the `StripeUpstreamError` arity the fix adds. |
+| `c901eac` contract | `pendingAddonChangeSchema.stripe_call` (discriminated: create/null item, update/item id), optional so an old row still parses. `contracts:check` 0. |
+| `eaf1971` RED | `billing-subscription.service.spec.ts`: the checkout lock wait is unbounded (1 failed / 1 passed: the raw 55P03 propagates). |
+| `bd443c2` fix | below |
+
+### Criteria
+| Finding / criterion | Proof (test name) |
+|---|---|
+| 1. Freeze the full Stripe call in the intent and replay it byte-identically | unit "STORY-076b AC-create-retry . the reply of an APPLIED create is lost twice: every retry replays the identical create under the identical key, and the third answer leaves ONE seat" (a Stripe fake that refuses a reused key with a different operation/item/quantity; 3 identical calls, 1 key, quantity 1, 4th answer is the settled replay); "AC-create-retry . the SECOND Stripe-accepted retry of an update is the same update under the same key"; integration "STORY-076b AC-create-retry · the reply of an applied CREATE is lost twice under one Idempotency-Key..." (real DB, real `IdempotencyInterceptor`, honest fake: 202, 1 seat, 3 attempts, all `existingItemId: null`) |
+| 1. A 400 `idempotency_error` is never a definite rejection; the gateway surfaces the type | unit "AC-idempotency-error . a 400 idempotency_error is NEVER a definite rejection: the intent is kept..." (and a plain 400 still releases it); gateway unit "AC-idempotency-error . Stripe's 400 idempotency_error reaches the service as a typed error" (a real `Stripe.errors.StripeIdempotencyError`; message carries no secret) and "an error with no Stripe type carries none" |
+| 1. The add-on fake refuses a reused key with different parameters | `FakeStripeGateway.changeAddonQuantity` (fingerprint of everything but the key); proven by the previously-passing "AC1 retry" integration test going red at `8976cd1` |
+| 1. Lost-reply create + retry-twice test | the unit and integration tests above |
+| 1. (added) an unsettled intent that froze no call is not replayed | unit "AC-legacy-intent": 409 `conflict`, Stripe not asked, counter `outcome=intent_unreplayable` |
+| 2. Short writes on a separate small pool built with `createPgPool`, bounded | `src/modules/billing/billing-write-pool.ts` (`max` 4, `connectionTimeoutMillis` 2000); unit `billing-write-pool.spec.ts` "AC-pool-bounds", "AC-pool-timeout" (a starved pool is a retryable 503 `degraded`, counted, no connection text) |
+| 2. Concurrency above the pool size finishes before a deadline | integration `billing-pool-contention.spec.ts`: "AC-pool-checkout" (20 concurrent checkouts, one workspace, distinct keys: 200 or 409, API still answers), "AC-pool-pack" (14 purchases, one per workspace), "AC-pool-mixed" (10 add-ons + 10 checkouts + 10 purchases across 30 workspaces: 202/200) |
+| 2. Checkout gets add()'s bounded lock wait | unit `billing-subscription.service.spec.ts` "AC-checkout-lock" (3000 ms, `set_config(..., true)` before the lock; 55P03 is a 409; any other code is not swallowed) |
+| 3a. Intent-expiry guard has a test that fails without it | unit "AC-intent-expiry . a retry older than Stripe's 24 h key retention is a 409 `too old`..." and its boundary (23 h 59 m replays) |
+| 3b. 408/409/429 are not definite rejections | unit "AC-in-flight . Stripe %i is NOT a definite rejection" for 408, 409, 429, 500, 502, 503, 504; "AC-in-flight boundary" for 400, 401, 402, 404, 422, 499 (released) |
+
+### What changed
+`StripeUpstreamError(statusCode, errorType?)` with a closed set of Stripe error types; `StripeHttpGateway.asUpstream` reads the SDK's `rawType`. `BillingAddonsService.add` records `stripe_call` with the intent (create, or update of the held item id at first sight) and sends `intent.stripe_call.item_id` on every attempt; `isDefiniteRejection` takes the error and excludes `idempotency_error`. A settle-persist failure after Stripe accepted a create is the same path and is covered by the same replay. `BillingAddonsService`, `BillingSubscriptionService` and `CreditPacksService` inject `BILLING_WRITE_POOL` (provided by `BillingModule`, ended in its `onModuleDestroy`) instead of `PG_POOL`, and take write connections through `connectForWrite`.
+
+### Mutation proofs (each reverted; run against the fixed code)
+| Mutation | Result |
+|---|---|
+| M9 remove the 24 h intent-expiry check | "AC-intent-expiry" fails (1 failed / 54 passed). Also run against the base before the fix: same single failure |
+| M11 count 409 as a definite rejection | "AC-in-flight . Stripe 409" fails (1 / 54). Also run against the base: same |
+| treat `idempotency_error` as definite | "AC-idempotency-error" fails (1 / 54) |
+| send `held?.itemId` instead of the frozen item id | "AC-create-retry . ... lost twice" fails (1 / 54) |
+| drop the legacy-intent refusal | "AC-legacy-intent" fails (1 / 54) |
+| drop the gateway's `errorType` | gateway "AC-idempotency-error" fails (1 / 10) |
+| drop checkout's `lock_timeout` | "AC-checkout-lock" fails (1 / 1 passed) |
+| bind `BILLING_WRITE_POOL` to `PG_POOL` | "AC-pool-mixed" fails: "30 concurrent requests did not finish within 25000 ms: the pool is deadlocked" |
+
+### Observability
+Metric `nominara_billing_write_pool_timeout_total` (asserted in `billing-write-pool.spec.ts`); `nominara_billing_addon_change_total{outcome=intent_unreplayable}` and `nominara_billing_checkout_session_total{outcome=lock_wait_exceeded}` (asserted); a redacted error log line in `connectForWrite` (no connection text, no workspace name). Spans deferred to week 2 (R3), as for the rest of the lane.
+
+### Gates (api-wt-d1, after `bd443c2`)
+| Gate | Exit | Result |
+|---|---|---|
+| `pnpm lint` | 0 | |
+| `pnpm typecheck` | 0 | |
+| `pnpm test:unit` | 0 | 309 files passed, 1 skipped; 3802 passed, 1 skipped |
+| `pnpm contracts:check` | 0 | no drift |
+| integration `billing-pool-contention`, `billing-addons`, `credit-packs`, `stripe-subscriptions`, `stripe-webhook`, `billing-invoices`, `auto-topup-trigger` | 0 | 7 files, 239 passed |
+| `pnpm test:isolation` | 0 | 13 files, 53 passed |
+
+### Not done / stated
+- The pool size (4) and wait (2 s) are engineering judgements; no reference gives them. Short writes hold a connection for one statement, so 4 serves the 10 main-pool connections; a larger deployment's main pool raises the question.
+- The 20-concurrent single-workspace tests are 20 because the `writes` class bursts 20 per user (the credit-pack purchase has a stricter class of its own, so that test uses one workspace per request). More concurrency from ONE tenant needs more members; the mixed test covers it across users.
+- Other holders of `PG_POOL` that take a second connection from it (the credit interceptor's reserve path was not audited here; it already uses its own settlement pool for release) are not covered by this change.
+- A legacy unsettled intent (written before `stripe_call` existed) now answers 409 until it ages out (24 h) rather than being replayed with a re-derived call. If any exist in a deployed environment this is the migration cost; none can in an unreleased route.
+- Real Stripe's key-reuse behaviour is still NEW-A-17 (sandbox).

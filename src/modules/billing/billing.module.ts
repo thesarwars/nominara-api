@@ -1,7 +1,9 @@
-import { Module } from "@nestjs/common";
+import { Inject, Module, type OnModuleDestroy } from "@nestjs/common";
+import type { Pool } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { STRIPE_GATEWAY, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
 import { StripeHttpGateway } from "../../lib/billing/stripe/stripe-http.gateway.js";
+import { BILLING_WRITE_POOL, createBillingWritePool } from "./billing-write-pool.js";
 import { BillingAddonsController } from "./billing-addons.controller.js";
 import { BillingAddonsService } from "./billing-addons.service.js";
 import { BillingInvoicesController } from "./billing-invoices.controller.js";
@@ -28,6 +30,9 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
   imports: [IdentityModule],
   controllers: [BillingController, BillingUsageController, CreditPacksController, BillingSubscriptionController, BillingInvoicesController, BillingAddonsController, StripeWebhookController],
   providers: [
+    // The short independent writes of checkout, the credit-pack purchase and add-ons run here, never on the
+    // main pool their request already holds a connection of (hold-and-wait).
+    { provide: BILLING_WRITE_POOL, useFactory: (): Pool => createBillingWritePool(loadEnv().DATABASE_URL_POOLED) },
     BillingService,
     BillingSubscriptionService,
     CreditPacksService,
@@ -58,4 +63,10 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
   ],
   exports: [BillingService, AutoTopupService, STRIPE_GATEWAY],
 })
-export class BillingModule {}
+export class BillingModule implements OnModuleDestroy {
+  constructor(@Inject(BILLING_WRITE_POOL) private readonly writePool: Pool) {}
+
+  async onModuleDestroy(): Promise<void> {
+    await this.writePool.end();
+  }
+}

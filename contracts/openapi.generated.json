@@ -2009,7 +2009,7 @@
                         "properties": {
                           "id": {
                             "type": "string",
-                            "pattern": "^[0-9a-f]{64}$"
+                            "pattern": "^[0-9]{1,18}$"
                           },
                           "occurred_at": {
                             "type": "string",
@@ -7895,6 +7895,36 @@
                         "additionalProperties": false
                       }
                     },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "cursor_next": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "has_more": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 200
+                        }
+                      },
+                      "required": [
+                        "cursor_next",
+                        "has_more",
+                        "limit"
+                      ],
+                      "additionalProperties": false
+                    },
                     "meta": {
                       "type": "object",
                       "properties": {
@@ -7922,6 +7952,7 @@
                   },
                   "required": [
                     "data",
+                    "pagination",
                     "meta"
                   ],
                   "additionalProperties": false
@@ -8147,7 +8178,29 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 200
+            }
+          }
+        ]
       }
     },
     "/v1/billing/credit-packs/{key}/purchase": {
@@ -11677,6 +11730,36 @@
                         "additionalProperties": false
                       }
                     },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "cursor_next": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "has_more": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 200
+                        }
+                      },
+                      "required": [
+                        "cursor_next",
+                        "has_more",
+                        "limit"
+                      ],
+                      "additionalProperties": false
+                    },
                     "meta": {
                       "type": "object",
                       "properties": {
@@ -11704,6 +11787,7 @@
                   },
                   "required": [
                     "data",
+                    "pagination",
                     "meta"
                   ],
                   "additionalProperties": false
@@ -13947,6 +14031,36 @@
                         "additionalProperties": false
                       }
                     },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "cursor_next": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "has_more": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 200
+                        }
+                      },
+                      "required": [
+                        "cursor_next",
+                        "has_more",
+                        "limit"
+                      ],
+                      "additionalProperties": false
+                    },
                     "meta": {
                       "type": "object",
                       "properties": {
@@ -13974,6 +14088,7 @@
                   },
                   "required": [
                     "data",
+                    "pagination",
                     "meta"
                   ],
                   "additionalProperties": false

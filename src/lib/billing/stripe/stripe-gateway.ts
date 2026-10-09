@@ -263,9 +263,22 @@ export class StripeSignatureError extends Error {
   }
 }
 
-/** Stripe answered, but not with an object (network, 5xx, auth). Retry-worthy; carries no Stripe text. */
+/** The error types of Stripe's API that this adapter passes on. Anything else is carried as no type at all. */
+export const STRIPE_ERROR_TYPES = ["api_error", "card_error", "idempotency_error", "invalid_request_error", "authentication_error", "rate_limit_error"] as const;
+export type StripeErrorType = (typeof STRIPE_ERROR_TYPES)[number];
+
+/**
+ * Stripe answered, but not with an object (network, 5xx, auth). Retry-worthy; carries no Stripe text.
+ *
+ * `errorType` is Stripe's own error type when it named one. A status code alone cannot tell a refusal that applied
+ * nothing from `idempotency_error` (400: the key was reused with a different call), after which the ORIGINAL call
+ * may well have been applied.
+ */
 export class StripeUpstreamError extends Error {
-  constructor(readonly statusCode: number | undefined) {
+  constructor(
+    readonly statusCode: number | undefined,
+    readonly errorType?: StripeErrorType,
+  ) {
     super(`stripe request failed${statusCode === undefined ? "" : ` (${statusCode})`}`);
     this.name = "StripeUpstreamError";
   }

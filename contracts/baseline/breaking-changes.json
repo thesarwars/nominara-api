@@ -164,6 +164,147 @@
           "auto_topup"
         ]
       }
+    },
+    {
+      "id": "2026-10-08-credit-packs-cursor-envelope",
+      "recorded": "2026-10-08",
+      "story": "STORY-076",
+      "task": "NEW-D-1 AC3 (checkpoint-4)",
+      "scope": "listCreditPacks (GET /v1/billing/credit-packs)",
+      "from": "{ data: CreditPack[], meta } with no pagination member and no cursor/limit query",
+      "to": "{ data: CreditPack[], pagination, meta } with the standard cursor and limit query; ordered by (sort_order, credits, key)",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner-approved under the NEW-D-1 cursor-envelope rule: NEW-D-1 AC3 in the signed-off plan (plans-7day/track-plans.json) says every list response uses the cursor envelope, matching api-specification.md section 3 and not the demo's bare arrays; the checkpoint-4 fix-pass task text restated it for this route. It is not a numbered item in plans-7day/decisions-2026-10-08.md. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, so this is not additive. The earlier comment arguing for a bare array because the catalog is a handful of rows reversed the criterion and is withdrawn. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listCreditPacks",
+        "path": "/v1/billing/credit-packs",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "key",
+          "display_name",
+          "credits",
+          "price_usd",
+          "currency",
+          "min_plan_key"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-invoices-published-pagination",
+      "recorded": "2026-10-08",
+      "story": "STORY-075",
+      "task": "STORY-075b AC3 (checkpoint-4)",
+      "scope": "listInvoices (GET /v1/billing/invoices)",
+      "from": "a published response of { data, meta }; the server nevertheless sent pagination on the wire",
+      "to": "a published response of { data, pagination, meta }, so a generated client can read cursor_next",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner-approved under the NEW-D-1 cursor-envelope rule: NEW-D-1 AC3 in the signed-off plan (plans-7day/track-plans.json) says every list response uses the cursor envelope, matching api-specification.md section 3 and not the demo's bare arrays; the checkpoint-4 fix-pass task text restated it for this route. It is not a numbered item in plans-7day/decisions-2026-10-08.md. The route lacked the listOf marker, so the published document omitted a member the wire always carried and a client generated from it could not page. Correcting the document adds a REQUIRED response member, which the contracts:diff classifies as major, so it is recorded rather than ignored. The wire is unchanged. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listInvoices",
+        "path": "/v1/billing/invoices",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-credit-ledger-published-pagination",
+      "recorded": "2026-10-08",
+      "story": "STORY-073",
+      "task": "STORY-075b AC3 sibling (checkpoint-4)",
+      "scope": "listCreditLedger (GET /v1/billing/wallet/ledger)",
+      "from": "a published response of { data, meta }; the server nevertheless sent pagination on the wire",
+      "to": "a published response of { data, pagination, meta }, so a generated client can read cursor_next",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner-approved under the NEW-D-1 cursor-envelope rule: NEW-D-1 AC3 in the signed-off plan (plans-7day/track-plans.json) says every list response uses the cursor envelope, matching api-specification.md section 3 and not the demo's bare arrays; the checkpoint-4 fix-pass task text restated it for this route. It is not a numbered item in plans-7day/decisions-2026-10-08.md. Same defect as listInvoices, found by the published-contract sweep added in checkpoint-4 (any GET that accepts a cursor must publish pagination): the route lacked the listOf marker. This was added by the lane on its own reading of the NEW-D-1 AC3 rule, not named in the fix-pass task, and needs the lead's confirmation. The wire is unchanged. The previous-minor proxy does not cover this route.",
+      "assert": {
+        "operation": "listCreditLedger",
+        "path": "/v1/billing/wallet/ledger",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-addons-list-is-catalog",
+      "recorded": "2026-10-08",
+      "story": "STORY-076",
+      "task": "STORY-076b (owner decision, checkpoint-3)",
+      "scope": "listAddons (GET /v1/billing/addons): data items",
+      "from": "the add-ons the workspace holds: { id, kind, quantity (positive), unit_price_usd, grant, active_from, active_until }",
+      "to": "the purchasable catalog, one item per add-on kind: { kind, display_name, unit_price_usd, purchasable, quantity (0 when none held), grant, id|null, active_from|null, active_until|null }",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision of 2026-10-08 (decisions-2026-10-08.md, STORY-076b line): GET /billing/addons also lists the purchasable catalog with prices. A workspace holding nothing must read the unit prices before it buys, and check:no-cost-literals forbids the control from carrying them. The item gains required members (display_name, purchasable) and id, active_from and quantity become nullable or zero for a kind not held, so a typed consumer of the held-only list breaks; this is not additive. Recorded at checkpoint-4 because it was missing from this file. The previous-minor proxy does not cover this route.",
+      "assert": {
+        "operation": "listAddons",
+        "path": "/v1/billing/addons",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "kind",
+          "display_name",
+          "unit_price_usd",
+          "purchasable",
+          "quantity",
+          "grant",
+          "id",
+          "active_from",
+          "active_until"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-addons-post-quantity-adds",
+      "recorded": "2026-10-08",
+      "story": "STORY-076",
+      "task": "STORY-076b (owner decision, checkpoint-3)",
+      "scope": "addAddon (POST /v1/billing/addons): the meaning of the request's quantity",
+      "from": "quantity is the desired TOTAL of the add-on after the change, not an increment",
+      "to": "quantity is the number of units to ADD to the held quantity; the held quantity plus quantity may not exceed 100; the response's quantity_requested is still the total the Stripe item was set to",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision of 2026-10-08 (decisions-2026-10-08.md, STORY-076b line): POST quantity ADDS to the held quantity. The request SHAPE is unchanged ({ kind, quantity }), so a client written for the total semantics still validates and silently buys the wrong number of units (holding 2 and sending 3 now yields 5, not 3); that silent change of meaning is why it is breaking and why it is recorded. The assertion below pins the operation's response shape; the changed meaning itself lives in the request schema's description and cannot be asserted from the document's property names. Retry safety is carried by the Idempotency-Key, not by the number. The previous-minor proxy does not cover this route.",
+      "assert": {
+        "operation": "addAddon",
+        "path": "/v1/billing/addons",
+        "method": "post",
+        "status": "202",
+        "response_properties": [
+          "data",
+          "meta"
+        ],
+        "data_properties": [
+          "kind",
+          "status",
+          "quantity_requested",
+          "effective",
+          "effective_at",
+          "grant"
+        ]
+      }
     }
   ]
 }

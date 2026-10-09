@@ -606,3 +606,160 @@ describe("STORY-076b audit · two Stripe lines of one add-on kind are refused (4
     expect(counter).toHaveBeenCalledWith("nominara_billing_addon_duplicate_lines_total", expect.objectContaining({ kind: "extra_seat" }));
   });
 });
+
+// ---- checkpoint-4 STORY-076b · the retry replays the SAME Stripe call, byte for byte -------------------------
+
+describe("STORY-076b checkpoint-4 · a lost-reply CREATE retried under the same key charges ONE unit", () => {
+  const scriptWith = (store: ReturnType<typeof intents>): Script => [
+    [/FROM workspaces w JOIN plans/u, planRow("growth")],
+    [/FROM subscriptions WHERE workspace_id/u, () => subRow({ pending_addon_changes: store.state.value })],
+  ];
+
+  /**
+   * A Stripe that behaves like the real one about a reused key: the first call is applied, a repeat of the SAME call
+   * is replayed, and a repeat with a different endpoint, item or quantity is refused (400 `idempotency_error`).
+   * It loses the reply of the first `lose` calls (the change is applied, the caller sees a 504).
+   */
+  function strictStripe(lose: number) {
+    const state = { item: null as { id: string; quantity: number } | null, calls: [] as Array<{ key: string; call: string }>, seen: new Map<string, string>(), lose };
+    const gw = gateway({
+      fetchObject: (kind: string, id: string) =>
+        Promise.resolve({
+          kind,
+          id,
+          metadata: {},
+          raw: { items: { data: state.item === null ? [] : [{ id: state.item.id, quantity: state.item.quantity, price: { unit_amount: 1500, currency: "usd", product: { metadata: { nominara_kind: "extra_seat" } } } }] } },
+        }),
+      changeAddonQuantity: (input: { idempotencyKey: string; quantity: number; existingItemId: string | null }) => {
+        const call = JSON.stringify({ operation: input.existingItemId === null ? "create" : "update", item: input.existingItemId, quantity: input.quantity });
+        state.calls.push({ key: input.idempotencyKey, call });
+        const earlier = state.seen.get(input.idempotencyKey);
+        if (earlier !== undefined && earlier !== call) return Promise.reject(new StripeUpstreamError(400, "idempotency_error"));
+        if (earlier === undefined) {
+          state.seen.set(input.idempotencyKey, call);
+          state.item = input.existingItemId === null ? { id: "si_new", quantity: input.quantity } : { id: input.existingItemId, quantity: input.quantity };
+        }
+        if (state.lose > 0) {
+          state.lose -= 1;
+          return Promise.reject(new StripeUpstreamError(504));
+        }
+        return Promise.resolve();
+      },
+    } as never);
+    return { state, gw };
+  }
+
+  it("STORY-076b AC-create-retry . the reply of an APPLIED create is lost twice: every retry replays the identical create under the identical key, and the third answer leaves ONE seat", async () => {
+    const store = intents();
+    const { state, gw } = strictStripe(2);
+    const svc = new BillingAddonsService(gw, store.pool);
+    const add = () => inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-1"));
+    await expect(add()).rejects.toMatchObject({ code: "degraded" });
+    expect(state.item?.quantity).toBe(1); // applied; the reply was lost
+    await expect(add()).rejects.toMatchObject({ code: "degraded" }); // the fresh fetch now shows the item: the call must STILL be the create
+    expect(await add()).toMatchObject({ status: "pending", quantity_requested: 1 });
+    expect(await add()).toMatchObject({ status: "pending", quantity_requested: 1 }); // settled: no call
+    expect(state.calls).toHaveLength(3);
+    expect(new Set(state.calls.map((c) => c.call)).size).toBe(1);
+    expect(new Set(state.calls.map((c) => c.key)).size).toBe(1);
+    expect(JSON.parse(state.calls[0]!.call)).toMatchObject({ operation: "create", item: null, quantity: 1 });
+    expect(state.item?.quantity).toBe(1);
+    expect(Object.values(store.state.value!)).toEqual([expect.objectContaining({ settled_at: expect.any(String) })]);
+  });
+
+  it("STORY-076b AC-create-retry . the SECOND Stripe-accepted retry of an update is the same update under the same key (the item id is frozen with the intent)", async () => {
+    const store = intents();
+    const { state, gw } = strictStripe(1);
+    state.item = { id: "si_held", quantity: 2 };
+    const svc = new BillingAddonsService(gw, store.pool);
+    const add = () => inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-2"));
+    await expect(add()).rejects.toMatchObject({ code: "degraded" });
+    expect(await add()).toMatchObject({ quantity_requested: 3 });
+    expect(state.calls.map((c) => c.call)).toEqual([expect.stringContaining('"operation":"update"'), expect.stringContaining('"operation":"update"')]);
+    expect(state.calls[1]).toEqual(state.calls[0]);
+    expect(state.item?.quantity).toBe(3);
+  });
+
+  it("STORY-076b AC-idempotency-error . a 400 idempotency_error is NEVER a definite rejection: the intent is kept, so a retry cannot recompute held+quantity and add a second unit", async () => {
+    const store = intents();
+    const refusing = gateway({ changeAddonQuantity: () => Promise.reject(new StripeUpstreamError(400, "idempotency_error")) } as never);
+    await expect(inTenant(client(scriptWith(store)), () => new BillingAddonsService(refusing, store.pool).add({ kind: "extra_seat", quantity: 1 }, "client-key-3"))).rejects.toMatchObject({ code: "degraded" });
+    expect(Object.keys(store.state.value!)).toHaveLength(1);
+    // ...and a plain 400 (no error type) IS a definite rejection and still releases the intent.
+    const plain = intents();
+    const rejecting = gateway({ changeAddonQuantity: () => Promise.reject(new StripeUpstreamError(400)) } as never);
+    await expect(inTenant(client(scriptWith(plain)), () => new BillingAddonsService(rejecting, plain.pool).add({ kind: "extra_seat", quantity: 1 }, "client-key-3"))).rejects.toMatchObject({ code: "degraded" });
+    expect(Object.keys(plain.state.value!)).toHaveLength(0);
+  });
+
+  it("STORY-076b AC-legacy-intent . an unsettled intent that froze no Stripe call cannot be replayed: 409, and Stripe is not asked", async () => {
+    const store = intents();
+    const { state, gw } = strictStripe(1);
+    const svc = new BillingAddonsService(gw, store.pool);
+    await expect(inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-4"))).rejects.toMatchObject({ code: "degraded" });
+    for (const intent of Object.values(store.state.value!) as Array<Record<string, unknown>>) delete intent.stripe_call;
+    const calls = state.calls.length;
+    await expect(inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-4"))).rejects.toMatchObject({ code: "conflict" });
+    expect(state.calls).toHaveLength(calls);
+  });
+});
+
+// ---- checkpoint-4 STORY-076b · the two money guards, each with a test that fails without it -------------------
+
+describe("STORY-076b checkpoint-4 · the intent-expiry guard and the in-flight statuses (mutation-tested)", () => {
+  const scriptWith = (store: ReturnType<typeof intents>): Script => [
+    [/FROM workspaces w JOIN plans/u, planRow("growth")],
+    [/FROM subscriptions WHERE workspace_id/u, () => subRow({ pending_addon_changes: store.state.value })],
+  ];
+  const HOUR = 3_600_000;
+
+  /** Leaves an unsettled intent behind (Stripe answers `status`), then ages it by `ageMs`. */
+  async function unsettled(status: number, ageMs = 0) {
+    const store = intents();
+    const changes: unknown[] = [];
+    const failing = gateway({
+      changeAddonQuantity: (input: unknown) => {
+        changes.push(input);
+        return Promise.reject(new StripeUpstreamError(status));
+      },
+    } as never);
+    await expect(inTenant(client(scriptWith(store)), () => new BillingAddonsService(failing, store.pool).add({ kind: "extra_seat", quantity: 1 }, "client-key-1"))).rejects.toMatchObject({ code: "degraded" });
+    for (const intent of Object.values(store.state.value!) as Array<{ created_at: string }>) intent.created_at = new Date(Date.now() - ageMs).toISOString();
+    return { store, changes };
+  }
+
+  it("STORY-076b AC-intent-expiry . a retry older than Stripe's 24 h key retention is a 409 `too old`, and Stripe is NOT asked (it forgot the key and could apply the stored total twice)", async () => {
+    const { store } = await unsettled(504, 24 * HOUR + 60_000);
+    const gw = gateway();
+    await expect(inTenant(client(scriptWith(store)), () => new BillingAddonsService(gw, store.pool).add({ kind: "extra_seat", quantity: 1 }, "client-key-1"))).rejects.toMatchObject({
+      code: "conflict",
+      message: expect.stringMatching(/too old/u),
+    });
+    expect(gw.changes).toEqual([]);
+    expect(gw.fetches).toEqual([]);
+    expect(counter).toHaveBeenCalledWith("nominara_billing_addon_change_total", { kind: "extra_seat", outcome: "intent_expired" });
+  });
+
+  it("STORY-076b AC-intent-expiry boundary . a retry just inside the 24 h window still replays the stored call", async () => {
+    const { store } = await unsettled(504, 24 * HOUR - 60_000);
+    const gw = gateway();
+    expect(await inTenant(client(scriptWith(store)), () => new BillingAddonsService(gw, store.pool).add({ kind: "extra_seat", quantity: 1 }, "client-key-1"))).toMatchObject({ quantity_requested: 1 });
+    expect(gw.changes).toHaveLength(1);
+  });
+
+  it.each([408, 409, 429, 500, 502, 503, 504])(
+    "STORY-076b AC-in-flight . Stripe %i is NOT a definite rejection: the intent is kept, and a purchase under a new key is refused as unresolved",
+    async (status) => {
+      const { store } = await unsettled(status);
+      expect(Object.keys(store.state.value!)).toHaveLength(1);
+      const gw = gateway();
+      await expect(inTenant(client(scriptWith(store)), () => new BillingAddonsService(gw, store.pool).add({ kind: "extra_seat", quantity: 1 }, "client-key-2"))).rejects.toMatchObject({ code: "conflict" });
+      expect(gw.changes).toEqual([]);
+    },
+  );
+
+  it.each([400, 401, 402, 404, 422, 499])("STORY-076b AC-in-flight boundary . Stripe %i is a definite rejection: the intent is released so the next purchase is not blocked", async (status) => {
+    const { store } = await unsettled(status);
+    expect(Object.keys(store.state.value!)).toHaveLength(0);
+  });
+});

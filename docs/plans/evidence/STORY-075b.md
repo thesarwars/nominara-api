@@ -72,3 +72,10 @@ Option (a) of the finding. RED `fa98660` (`vitest run src/lib/billing/stripe/inv
 ## Checkpoint-3 fix pass (2026-10-08, lane d-billing)
 
 `test/integration/billing-invoices.spec.ts` ran on the merged tree `fee788e` (it had only run on the lane tip): `vitest run --config vitest.integration.config.ts test/integration/billing-invoices.spec.ts test/integration/billing-addons.spec.ts`, exit 0, 65 passed. It also passes after the STORY-076b changes (14-file area run, exit 0, 331 passed; see STORY-076b.md). No change to the invoices code in this pass.
+
+## Checkpoint-4 (lane 7day/d-billing-5)
+
+QA found AC3 met on the wire but not in the published contract: `listInvoices` lacked `listOf: true`, so `openapi.generated.json` had no `pagination` member and a generated client could not read `cursor_next`.
+- RED `e2f1bd1`: `test/unit/pagination-published-contract.spec.ts` > "STORY-075b AC3 · listInvoices publishes a required `pagination` member and the cursor/limit parameters" (failed: no cursor/limit parameters, no pagination).
+- Fix `d6916d8`: `listOf: true` on the route; document regenerated; `contracts:check` 0. The correction is recorded in `contracts/baseline/breaking-changes.json` (`2026-10-08-invoices-published-pagination`, `1e06bf3`).
+- Mutation: removing `listOf: true` fails that test and the cursor sweep. Gates and detail: see `NEW-D-1.md`.

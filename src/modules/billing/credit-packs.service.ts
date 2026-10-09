@@ -1,14 +1,16 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
-import type { CreditPack, CreditPackPurchaseResponse } from "../../../contracts/billing/index.js";
-import { DegradedError, FeatureNotInPlanError, NotFoundError } from "../../api/errors/domain-errors.js";
+import type { CreditPack, CreditPackListQuery, CreditPackPurchaseResponse } from "../../../contracts/billing/index.js";
+import { DegradedError, FeatureNotInPlanError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { pageFrom, type Page } from "../../api/pagination/page.js";
 import { loadEnv } from "../../config/env.js";
-import { PG_POOL } from "../../db/pg-pool.js";
 import { STRIPE_GATEWAY, StripeUpstreamError, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { purchasableOptions } from "../../lib/credits/wallet.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
+import { BILLING_WRITE_POOL, connectForWrite } from "./billing-write-pool.js";
 
 // STORY-076a / STORY-076 AC1-AC2 — the credit-pack catalog and the purchase.
 //
@@ -38,21 +40,36 @@ export class CreditPacksService {
 
   constructor(
     @Inject(STRIPE_GATEWAY) private readonly gateway: StripeGateway,
-    @Inject(PG_POOL) private readonly pool: Pool,
+    @Inject(BILLING_WRITE_POOL) private readonly pool: Pool,
   ) {}
 
-  /** `GET /v1/billing/credit-packs` — already filtered to the caller's tier, in SQL. */
-  async list(): Promise<CreditPack[]> {
+  /**
+   * `GET /v1/billing/credit-packs` — already filtered to the caller's tier, in SQL, then paged
+   * by cursor (NEW-D-1 AC3). The tier-filtered set is a handful of rows, so the page is cut
+   * here rather than by a second query: the tier SQL stays the one definition of "purchasable".
+   * The sort key is the total order (sort_order, credits, key); `key` is unique, so a page
+   * boundary can neither skip nor repeat a pack.
+   */
+  async list(query: CreditPackListQuery): Promise<Page<CreditPack>> {
     const { client, workspaceId } = this.tenant();
-    const options = await purchasableOptions(client, workspaceId);
-    return options.map((o) => ({
-      key: o.key,
-      display_name: o.displayName,
-      credits: o.credits,
-      price_usd: o.priceUsd,
-      currency: o.currency,
-      min_plan_key: o.minPlanKey,
-    }));
+    const ordered = [...(await purchasableOptions(client, workspaceId))].sort((a, b) => comparePackKeys([a.sortOrder, a.credits, a.key], [b.sortOrder, b.credits, b.key]));
+    const after = query.cursor === undefined ? undefined : packKeyFrom(decodeCursor(query.cursor, 3));
+    const rows = ordered
+      .filter((o) => after === undefined || comparePackKeys([o.sortOrder, o.credits, o.key], after) > 0)
+      .slice(0, query.limit + 1);
+    return pageFrom(
+      rows,
+      query.limit,
+      (o): CreditPack => ({
+        key: o.key,
+        display_name: o.displayName,
+        credits: o.credits,
+        price_usd: o.priceUsd,
+        currency: o.currency,
+        min_plan_key: o.minPlanKey,
+      }),
+      (o) => [o.sortOrder, o.credits, o.key],
+    );
   }
 
   /** `POST /v1/billing/credit-packs/{key}/purchase`. */
@@ -141,9 +158,12 @@ export class CreditPacksService {
     }
   }
 
-  /** A short transaction on its own pooled connection, so it commits independently of the request's. */
+  /**
+   * A short transaction on a connection of the BILLING WRITE POOL (never the main pool the request already holds a
+   * connection of: that is hold-and-wait), so it commits independently of the request's.
+   */
   private async inOwnTransaction<T>(workspaceId: string, actorId: string, fn: (tx: ClientBase) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+    const client = await connectForWrite(this.pool);
     try {
       return await withTenantContext(client, { workspaceId, actorId }, fn);
     } finally {
@@ -156,4 +176,20 @@ export class CreditPacksService {
     if (store === undefined) throw new Error("CreditPacksService requires an active tenant context");
     return { client: store.client, workspaceId: store.context.workspaceId, actorId: store.context.actorId };
   }
+}
+
+function packKeyFrom(key: readonly (string | number | null)[]): [number, number, string] {
+  const [sortOrder, credits, packKey] = key;
+  if (typeof sortOrder !== "number" || typeof credits !== "number" || typeof packKey !== "string") {
+    throw new ValidationFailedError({
+      message: "invalid pagination cursor",
+      details: { issues: [{ path: ["cursor"], message: "cursor does not carry a credit-pack sort key" }] },
+    });
+  }
+  return [sortOrder, credits, packKey];
+}
+
+/** The catalog's total order: sort_order, then credits, then the unique key. */
+function comparePackKeys(a: readonly [number, number, string], b: readonly [number, number, string]): number {
+  return a[0] - b[0] || a[1] - b[1] || (a[2] < b[2] ? -1 : a[2] > b[2] ? 1 : 0);
 }

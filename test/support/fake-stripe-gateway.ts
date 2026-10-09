@@ -192,8 +192,23 @@ export class FakeStripeGateway implements StripeGateway {
   failAfterApplyingAddon: Error | undefined;
   private readonly appliedAddonKeys = new Set<string>();
 
+  /**
+   * What Stripe compares when a key is reused: the endpoint (create vs update), the item and the parameters.
+   * A reused key whose call differs is refused (400 `idempotency_error`), exactly as `createSubscriptionCheckout`
+   * does for checkout. Without this the fake replays ANY repeat of a key, which hid a retry that changed its call.
+   */
+  private readonly addonFingerprints = new Map<string, string>();
+  private static addonFingerprint(input: AddonChangeInput): string {
+    const { idempotencyKey: _key, ...call } = input;
+    return JSON.stringify(call);
+  }
+
   changeAddonQuantity(input: AddonChangeInput): Promise<void> {
     this.addonAttempts.push(input);
+    const fingerprint = FakeStripeGateway.addonFingerprint(input);
+    const earlier = this.addonFingerprints.get(input.idempotencyKey);
+    if (earlier !== undefined && earlier !== fingerprint) return Promise.reject(new StripeUpstreamError(400, "idempotency_error"));
+    this.addonFingerprints.set(input.idempotencyKey, fingerprint);
     if (this.failAfterApplyingAddon !== undefined) {
       if (!this.appliedAddonKeys.has(input.idempotencyKey)) {
         this.appliedAddonKeys.add(input.idempotencyKey);
@@ -249,6 +264,7 @@ export class FakeStripeGateway implements StripeGateway {
     this.failAddonWith = undefined;
     this.failAfterApplyingAddon = undefined;
     this.appliedAddonKeys.clear();
+    this.addonFingerprints.clear();
     this.onSessionCreated = undefined;
   }
 

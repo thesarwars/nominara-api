@@ -18,7 +18,7 @@ export class BillingInvoicesController {
 
   @Get("invoices")
   @RequirePermission("billing:read")
-  @ApiContract({ operationId: "listInvoices", querySchema: invoiceListQuerySchema, responseSchema: invoiceListResponseSchema })
+  @ApiContract({ operationId: "listInvoices", querySchema: invoiceListQuerySchema, responseSchema: invoiceListResponseSchema, listOf: true })
   list(@Query(new ZodValidationPipe(invoiceListQuerySchema)) query: InvoiceListQuery): Promise<Page<Invoice>> {
     return this.service.list(query);
   }

@@ -28,3 +28,9 @@ Subscription checkout, billing portal, and subscription state reconciled from a 
 | Docker env for the integration run | | `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock TESTCONTAINERS_RYUK_DISABLED=true` |
 
 No contract, schema or migration changed in this checkpoint-2 pass, so `contracts:generate`, `db:rls-generate` and the drift checks have nothing new to regenerate.
+
+## Checkpoint-4, fix pass 2 (lane 7day/d-billing-5)
+Checkout held the request's main-pool connection while taking a second one from the same pool for its two short writes, and waited on the workspace row lock without a bound: about 10 concurrent checkouts from one workspace emptied the pool and hung the API. Fix `bd443c2` (RED `8976cd1`, `eaf1971`): the writes use `BILLING_WRITE_POOL` (see `STORY-076b.md`, finding 2) and the lock wait is 3 s, then a retryable 409.
+- Pool: integration `billing-pool-contention.spec.ts` "STORY-075a AC-pool-checkout" and "AC-pool-mixed" (RED: "the pool is deadlocked"; GREEN: 0).
+- Bounded lock: unit `billing-subscription.service.spec.ts` "AC-checkout-lock" (RED 1 failed / 1 passed; mutation of dropping `lock_timeout` fails it).
+- Gates: lint 0, typecheck 0, test:unit 0 (3802), isolation 0, 7 integration files 0 (239 passed). Details and mutations in `STORY-076b.md`.

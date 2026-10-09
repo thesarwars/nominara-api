@@ -62,12 +62,12 @@ export const dayStart = (day: string): string => new Date(utcMidnight(day)).toIS
 export const dayAfter = (day: string): string => new Date(utcMidnight(day) + 86_400_000).toISOString();
 
 /**
- * Never exposes prev_hash/row_hash fields, before_state/after_state, or the IP.
- * The row hash is the opaque, stable `id`; `seq` stays internal (see the entry schema).
+ * Never exposes prev_hash/row_hash (as a field or as any value, e.g. the `id`),
+ * before_state/after_state, or the IP. The `id` is the row's seq (see the entry schema).
  */
 export function toAuditLogEntry(row: AuditChainRow): AuditLogEntry {
   return {
-    id: Buffer.from(row.row_hash).toString("hex"),
+    id: row.seq,
     occurred_at: row.occurred_at,
     actor_type: row.actor_type,
     actor_id: row.actor_id,

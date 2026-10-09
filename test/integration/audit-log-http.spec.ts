@@ -232,6 +232,28 @@ describe("NEW-D-3 · GET /v1/audit-log", () => {
     expect(body).not.toMatch(/prev_hash|row_hash|before_state|after_state|actor_ip|actor_ua/u);
   });
 
+  it("AC3 (checkpoint-4): no item id, cursor or other value in the response is any row's row_hash or prev_hash", async () => {
+    const { workspaceId, ownerToken } = await ownerWorkspace();
+    for (let i = 0; i < 4; i++) await seed(workspaceId, { action: "zzz.hash_probe" });
+    const hashes = (
+      await db.query<{ h: string }>(
+        "SELECT encode(row_hash,'hex') AS h FROM audit_log WHERE workspace_id = $1 UNION SELECT encode(prev_hash,'hex') FROM audit_log WHERE workspace_id = $1",
+        [workspaceId],
+      )
+    ).rows.map((r) => r.h);
+    // Anti-vacuity: there are real hashes to look for, more than the seeded four.
+    expect(hashes.length).toBeGreaterThan(4);
+
+    const first = await get(ownerToken, "?limit=2");
+    const second = (first.json() as { pagination: { cursor_next: string } }).pagination.cursor_next;
+    for (const res of [first, await get(ownerToken), await get(ownerToken, `?limit=2&cursor=${second}`)]) {
+      expect(res.statusCode).toBe(200);
+      const body = res.body.toLowerCase();
+      for (const hash of hashes) expect(body).not.toContain(hash);
+      for (const item of dataOf<AuditLogEntry[]>(res)) expect(item.id).not.toMatch(/^[0-9a-f]{64}$/u);
+    }
+  });
+
   it("AC4: pages across rows sharing one microsecond timestamp without skipping or repeating", async () => {
     const { workspaceId, ownerToken } = await ownerWorkspace();
     for (let i = 0; i < 7; i++) await seed(workspaceId, { action: "zzz.same_instant", occurredAt: "2026-04-01T10:00:00.123456Z" });
@@ -295,7 +317,7 @@ describe("NEW-D-3 · GET /v1/audit-log", () => {
     const res = await get(a.ownerToken, `?action=zzz.xcursor&cursor=${first.pagination.cursor_next}`);
     expect(res.statusCode).toBe(200);
     const ids = dataOf<AuditLogEntry[]>(res).map((i) => i.id);
-    const bIds = (await db.query<{ h: string }>("SELECT encode(row_hash,'hex') AS h FROM audit_log WHERE workspace_id = $1", [b.workspaceId])).rows.map((r) => r.h);
+    const bIds = (await db.query<{ h: string }>("SELECT seq::text AS h FROM audit_log WHERE workspace_id = $1", [b.workspaceId])).rows.map((r) => r.h);
     expect(ids.filter((id) => bIds.includes(id))).toEqual([]);
   });
 });

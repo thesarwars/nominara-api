@@ -107,6 +107,20 @@ export const pendingAddonChangeSchema = z
     target_total: z.number().int().min(1).max(ADDON_MAX_QUANTITY),
     /** The key sent to Stripe, fixed at first sight so every retry replays Stripe's own answer. */
     stripe_idempotency_key: z.string().min(1).max(255),
+    /**
+     * The Stripe call this intent makes, FROZEN at first sight: a create of a new subscription item, or an
+     * update of a named one. (The quantity of the call is `target_total`; its key is `stripe_idempotency_key`.)
+     * A retry replays exactly this call. Re-deriving it from a fresh fetch would turn a lost-reply create into an
+     * update under the same key, which Stripe refuses (400 `idempotency_error`) and which, mistaken for a
+     * rejection, released the intent and let the next retry add a second unit. Absent only on an intent written
+     * before this field existed: such an unsettled intent cannot be replayed and is refused.
+     */
+    stripe_call: z
+      .discriminatedUnion("operation", [
+        z.object({ operation: z.literal("create"), item_id: z.null() }).strict(),
+        z.object({ operation: z.literal("update"), item_id: z.string().min(1).max(255) }).strict(),
+      ])
+      .optional(),
     created_at: z.iso.datetime(),
     /**
      * Set once Stripe has ACCEPTED this change. Applied-ness is read from this marker, never inferred from

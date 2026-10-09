@@ -40,7 +40,7 @@ describe("NEW-D-3 · date range and entry shape", () => {
   it("AC-range: a calendar-impossible date is a validation error, not NaN reaching SQL", () => {
     expect(() => dayAfter("2026-02-31")).toThrow();
   });
-  it("AC-redaction: an entry exposes the row hash as id and never the hashes' fields or states", () => {
+  it("AC-redaction: an entry's id is the row seq, and no hash appears as a field or a value, and no state is exposed", () => {
     const entry = toAuditLogEntry({
       seq: "7",
       workspace_id: "11111111-1111-4111-8111-111111111111",
@@ -61,7 +61,9 @@ describe("NEW-D-3 · date range and entry shape", () => {
       row_hash: Buffer.alloc(32, 0xab),
     });
     expect(auditLogEntrySchema.parse(entry)).toEqual(entry);
-    expect(entry.id).toBe("ab".repeat(32));
+    expect(entry.id).toBe("7");
+    expect(JSON.stringify(entry)).not.toContain("ab".repeat(32));
+    expect(JSON.stringify(entry)).not.toContain("01".repeat(32));
     expect(entry.category).toBe("billing");
     expect(Object.keys(entry)).not.toEqual(expect.arrayContaining(["prev_hash"]));
     expect(JSON.stringify(entry)).not.toMatch(/secret|prev_hash|row_hash|before_state|after_state|actor_ip|10\.0\.0\.1/u);

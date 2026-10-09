@@ -160,6 +160,35 @@ describe("STORY-076a · credit packs", () => {
     ]);
   });
 
+  it("NEW-D-1 AC3 · the catalog uses the cursor envelope: pagination on the wire, a limit=1 walk visits each pack exactly once, in order, then ends", async () => {
+    const growth = await newWorkspace("growth");
+    const whole = (await get(growth.owner, "/billing/credit-packs")).json() as { pagination?: { cursor_next: string | null; has_more: boolean; limit: number } };
+    expect(whole.pagination).toEqual({ cursor_next: null, has_more: false, limit: 50 });
+
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const res = await get(growth.owner, `/billing/credit-packs?limit=1${cursor === null ? "" : `&cursor=${cursor}`}`);
+      expect(res.statusCode, res.body).toBe(200);
+      const body = res.json() as { data: Array<{ key: string }>; pagination: { cursor_next: string | null; has_more: boolean; limit: number } };
+      expect(body.data).toHaveLength(1);
+      expect(body.pagination.limit).toBe(1);
+      expect(body.pagination.has_more).toBe(body.pagination.cursor_next !== null);
+      seen.push(body.data[0]!.key);
+      cursor = body.pagination.cursor_next;
+      pages += 1;
+    } while (cursor !== null && pages < 5);
+    expect(seen).toEqual(["starter_vault", "agency_vault"]);
+    expect(pages).toBe(2);
+  });
+
+  it("NEW-D-1 AC3 · a malformed catalog cursor and an offset parameter are 400s, not a silent first page", async () => {
+    const growth = await newWorkspace("growth");
+    expect((await get(growth.owner, "/billing/credit-packs?cursor=not-a-cursor")).statusCode).toBe(400);
+    expect((await get(growth.owner, "/billing/credit-packs?offset=1")).statusCode).toBe(400);
+  });
+
   it("scenario 1 · a viewer may read the catalog (workspace:read) but not buy (403 naming billing:write)", async () => {
     const { workspaceId } = await newWorkspace();
     const viewer = await actorIn(workspaceId, "viewer");
