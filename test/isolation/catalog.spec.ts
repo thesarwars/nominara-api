@@ -4,6 +4,8 @@ import { assertIso05PolicyShape } from "./assertions/iso-05-policy-shape.js";
 import { assertIso07NoBypassRls } from "./assertions/iso-07-no-bypassrls.js";
 import { assertIso16NoMaterializedViews } from "./assertions/iso-16-no-matviews.js";
 import { assertIso23ViewsSecurityInvoker } from "./assertions/iso-23-views-security-invoker.js";
+import { assertIso24DefinerOwnerNoMembers } from "./assertions/iso-24-definer-owner-no-members.js";
+import { assertIso25ShareLookupDefinerShape } from "./assertions/iso-25-share-lookup-definer-shape.js";
 import { assertIso17PartitionRlsApplied } from "./assertions/iso-17-partition-rls-applied.js";
 import { getAssertionContext } from "./support/context.js";
 
@@ -45,5 +47,19 @@ describe("ISO-23 · every view in `public` carries security_invoker=true", () =>
 describe("ISO-17 · a partition the maintenance job creates carries app.apply_tenant_rls before it takes writes", () => {
   it("queried directly, with no tenant context, as nominara_app — zero rows", async () => {
     await expect(assertIso17PartitionRlsApplied(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+// ADR-0002 — the share-token lookup definer. ISO-24: nobody can assume the owner role whose policy admits every row.
+describe("ISO-24 · nobody is a member of nominara_share_lookup", () => {
+  it("holds in pg_auth_members and pg_has_role for every non-superuser role", async () => {
+    await expect(assertIso24DefinerOwnerNoMembers(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+// ISO-25 (formerly the standalone share-token-gate-lookup.spec.ts, which no breaker ever ran against).
+describe("ISO-25 · app.share_token_by_hash is a pinned SECURITY DEFINER function executable by nominara_app only", () => {
+  it("holds in pg_proc", async () => {
+    await expect(assertIso25ShareLookupDefinerShape(getAssertionContext())).resolves.toBeUndefined();
   });
 });

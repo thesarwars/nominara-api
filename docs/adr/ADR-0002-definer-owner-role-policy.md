@@ -22,6 +22,7 @@ ADR-0001 already rejected "give the definer `BYPASSRLS`", and `ISO-07` states th
 
 1. A new role `nominara_share_lookup`: `NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION`.
    No runtime role is a member of it. It owns exactly one object, the function.
+   Enforced, not assumed: ISO-24 (pg_auth_members and pg_has_role MEMBER/USAGE/SET; breaker = `GRANT nominara_share_lookup TO nominara_worker`), `DEFINER_OWNER_ROLES` + `db:drift-check`, and integration DEF-11. ISO-25 holds the function's shape (owner, EXECUTE, search_path). The status stays Proposed until the auditor signs off.
 2. It is admitted to `share_tokens` by **one** policy, `share_token_gate_lookup ... FOR SELECT TO nominara_share_lookup
    USING (true)`. The policy is inert for every other role (permissive policies combine per role) and
    `ws_isolation_share_tokens` is unchanged.

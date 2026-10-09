@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import type { Client } from "pg";
-import { DATABASE_ROLES, INTERNAL_SCHEMA, REQUIRED_EXTENSIONS, REQUIRED_INTERNAL_FUNCTIONS } from "./conventions.js";
+import { DATABASE_ROLES, DEFINER_OWNER_ROLES, INTERNAL_SCHEMA, REQUIRED_EXTENSIONS, REQUIRED_INTERNAL_FUNCTIONS } from "./conventions.js";
 import { MIGRATIONS_DIR, migrateUp } from "./migrate-runner.js";
 import { connect, requireDatabaseUrl } from "./client.js";
 
@@ -44,7 +44,8 @@ export async function checkDrift(client: Client, migrationsDir: string = MIGRATI
   const installedFunctions = new Set(fnResult.rows.map((row) => row.proname));
   const missingFunctions = REQUIRED_INTERNAL_FUNCTIONS.filter((fn) => !installedFunctions.has(fn));
 
-  const roleNames = Object.keys(DATABASE_ROLES);
+  const expectedRoles = { ...DATABASE_ROLES, ...DEFINER_OWNER_ROLES };
+  const roleNames = Object.keys(expectedRoles);
   const roleResult = await client.query<{
     rolname: string;
     rolcanlogin: boolean;
@@ -59,7 +60,7 @@ export async function checkDrift(client: Client, migrationsDir: string = MIGRATI
 
   const missingRoles = roleNames.filter((name) => !installedRoles.has(name));
   const roleAttributeMismatches: string[] = [];
-  for (const [name, spec] of Object.entries(DATABASE_ROLES)) {
+  for (const [name, spec] of Object.entries(expectedRoles)) {
     const actual = installedRoles.get(name);
     if (!actual) {
       continue; // already reported in missingRoles
@@ -84,6 +85,18 @@ export async function checkDrift(client: Client, migrationsDir: string = MIGRATI
         `${name}: expected inherit=${spec.inherit}, got ${actual.rolinherit}`,
       );
     }
+  }
+
+  // ADR-0002: nobody may be a member of a definer-owner role. A membership would let that member run SET ROLE and
+  // exercise the owner's policy and grants directly, not only through the function.
+  const members = await client.query<{ role: string; member: string }>(
+    `SELECT r.rolname AS role, m.rolname AS member
+       FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.roleid JOIN pg_roles m ON m.oid = am.member
+      WHERE r.rolname = ANY($1::text[])`,
+    [Object.keys(DEFINER_OWNER_ROLES)],
+  );
+  for (const row of members.rows) {
+    roleAttributeMismatches.push(`${row.role}: expected no members, got member ${row.member}`);
   }
 
   return { missingExtensions, missingFunctions, missingRoles, roleAttributeMismatches };
