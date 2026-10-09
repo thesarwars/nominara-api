@@ -4,12 +4,12 @@ import { pendingCheckoutSchema, type PendingCheckout } from "../../../contracts/
 import type { CheckoutSessionRequest, CheckoutSessionResponse, PortalSessionResponse, Subscription } from "../../../contracts/billing/index.js";
 import { ConflictError, DegradedError, NotFoundError, PreconditionUnmetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { loadEnv } from "../../config/env.js";
-import { PG_POOL } from "../../db/pg-pool.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { STRIPE_GATEWAY, StripeUpstreamError, type StripeGateway, type SubscriptionCheckoutInput } from "../../lib/billing/stripe/stripe-gateway.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
+import { BILLING_WRITE_POOL, connectForWrite } from "./billing-write-pool.js";
 
 // STORY-075a / STORY-075 AC1 — checkout, portal and the subscription read.
 //
@@ -41,8 +41,12 @@ import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-cont
 // route that opens its own short contexts for the whole request (the
 // @Streaming() precedent), which is a pattern decision for the owner, not
 // something to introduce silently. The two short writes above run on their own
-// pooled connections and touch only the `subscriptions` row (never `workspaces`),
-// so they cannot wait on the lock the request holds.
+// connections of the BILLING WRITE POOL (never the main pool the request already
+// holds a connection of: that is hold-and-wait, and it stopped the whole API) and touch only the `subscriptions`
+// row (never `workspaces`), so they cannot wait on the lock the request holds.
+
+/** The longest `checkout` waits for the workspace row lock before answering a retryable 409 (the same bound as an add-on purchase). */
+const CHECKOUT_LOCK_WAIT_MS = 3_000;
 
 interface SubscriptionRow {
   plan_key: string;
@@ -67,7 +71,7 @@ export class BillingSubscriptionService {
 
   constructor(
     @Inject(STRIPE_GATEWAY) private readonly gateway: StripeGateway,
-    @Inject(PG_POOL) private readonly pool: Pool,
+    @Inject(BILLING_WRITE_POOL) private readonly pool: Pool,
   ) {}
 
   /** `GET /v1/billing/subscription`. */
@@ -110,7 +114,7 @@ export class BillingSubscriptionService {
 
     // ⚠ SERIALISE CHECKOUTS PER WORKSPACE, THEN READ. A concurrent request
     // waits here until the first has recorded its session, so it sees it.
-    await client.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    await this.lockWorkspace(client, workspaceId);
     const current = await this.liveSubscription();
     // ⚠ A SECOND SUBSCRIPTION IS A DOUBLE CHARGE. A workspace already paying
     // through Stripe does not buy another; a comped (operator) plan at or above
@@ -222,14 +226,35 @@ export class BillingSubscriptionService {
     }
   }
 
+  /**
+   * ⚠ THE LOCK WAIT IS BOUNDED, like an add-on purchase's. A request queued behind the holder keeps its pooled
+   * connection while it waits; with enough of them queued the main pool is empty and the API answers nothing.
+   * A wait of at most `CHECKOUT_LOCK_WAIT_MS` makes that a retryable 409: the waiters give their connections
+   * back. The setting is transaction-local (never session-level).
+   */
+  private async lockWorkspace(client: ClientBase, workspaceId: string): Promise<void> {
+    await client.query("SELECT set_config('lock_timeout', $1, true)", [String(CHECKOUT_LOCK_WAIT_MS)]);
+    try {
+      await client.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    } catch (error) {
+      if ((error as { code?: string }).code !== "55P03") throw error;
+      incrementCounter("nominara_billing_checkout_session_total", { outcome: "lock_wait_exceeded" });
+      throw new ConflictError({ message: "another billing change for this workspace is in progress: retry shortly" });
+    }
+    await client.query("SELECT set_config('lock_timeout', '0', true)");
+  }
+
   /** The workspace's last intent, or null. Fails closed on a malformed column rather than guessing. */
   private pendingOf(row: SubscriptionRow): PendingCheckout | null {
     return row.pending_checkout === null || row.pending_checkout === undefined ? null : pendingCheckoutSchema.parse(row.pending_checkout);
   }
 
-  /** A short transaction on its own pooled connection, so it commits independently of the request's. */
+  /**
+   * A short transaction on a connection of the BILLING WRITE POOL (never the main pool the request already holds a
+   * connection of: that is hold-and-wait), so it commits independently of the request's.
+   */
   private async inOwnTransaction<T>(workspaceId: string, actorId: string, fn: (tx: ClientBase) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+    const client = await connectForWrite(this.pool);
     try {
       return await withTenantContext(client, { workspaceId, actorId }, fn);
     } finally {

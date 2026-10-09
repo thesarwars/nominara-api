@@ -1,5 +1,6 @@
 import Stripe from "stripe";
 import {
+  STRIPE_ERROR_TYPES,
   StripeSignatureError,
   StripeUpstreamError,
   type AddonChangeInput,
@@ -351,8 +352,9 @@ export class StripeHttpGateway implements StripeGateway {
 
   private asUpstream(error: unknown): StripeUpstreamError {
     if (error instanceof StripeUpstreamError) return error;
-    const status = (error as { statusCode?: unknown }).statusCode;
-    return new StripeUpstreamError(typeof status === "number" ? status : undefined);
+    const { statusCode, rawType } = error as { statusCode?: unknown; rawType?: unknown };
+    const errorType = STRIPE_ERROR_TYPES.find((type) => type === rawType);
+    return new StripeUpstreamError(typeof statusCode === "number" ? statusCode : undefined, errorType);
   }
 
   async fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null> {

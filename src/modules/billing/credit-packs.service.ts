@@ -5,12 +5,12 @@ import { DegradedError, FeatureNotInPlanError, NotFoundError, ValidationFailedEr
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { pageFrom, type Page } from "../../api/pagination/page.js";
 import { loadEnv } from "../../config/env.js";
-import { PG_POOL } from "../../db/pg-pool.js";
 import { STRIPE_GATEWAY, StripeUpstreamError, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { purchasableOptions } from "../../lib/credits/wallet.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
+import { BILLING_WRITE_POOL, connectForWrite } from "./billing-write-pool.js";
 
 // STORY-076a / STORY-076 AC1-AC2 — the credit-pack catalog and the purchase.
 //
@@ -40,7 +40,7 @@ export class CreditPacksService {
 
   constructor(
     @Inject(STRIPE_GATEWAY) private readonly gateway: StripeGateway,
-    @Inject(PG_POOL) private readonly pool: Pool,
+    @Inject(BILLING_WRITE_POOL) private readonly pool: Pool,
   ) {}
 
   /**
@@ -158,9 +158,12 @@ export class CreditPacksService {
     }
   }
 
-  /** A short transaction on its own pooled connection, so it commits independently of the request's. */
+  /**
+   * A short transaction on a connection of the BILLING WRITE POOL (never the main pool the request already holds a
+   * connection of: that is hold-and-wait), so it commits independently of the request's.
+   */
   private async inOwnTransaction<T>(workspaceId: string, actorId: string, fn: (tx: ClientBase) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+    const client = await connectForWrite(this.pool);
     try {
       return await withTenantContext(client, { workspaceId, actorId }, fn);
     } finally {

@@ -12,7 +12,6 @@ import {
   type PendingAddonChanges,
 } from "../../../contracts/billing/index.js";
 import { ConflictError, DegradedError, FeatureNotInPlanError, IdempotencyConflictError, NotFoundError, PreconditionUnmetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
-import { PG_POOL } from "../../db/pg-pool.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
 import type { Entitlement } from "../../db/seed/plan-entitlements.js";
@@ -28,6 +27,7 @@ import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
+import { BILLING_WRITE_POOL, connectForWrite } from "./billing-write-pool.js";
 
 // STORY-076b / STORY-076 AC10-AC13 — the one owner of `subscription_addons`.
 //
@@ -49,7 +49,11 @@ import { AuditChainService } from "../audit/audit-chain.service.js";
 // idempotency key are committed to `subscriptions.pending_addon_changes` in their
 // own short transaction BEFORE Stripe is asked; a retry under the same key reads
 // that intent and re-asks for the STORED total with the STORED key (Stripe replays
-// its own answer for a key it has seen). Once Stripe accepts a change the intent is marked
+// its own answer for a key it has seen). THE CALL ITSELF IS FROZEN WITH IT, not only its total: create versus
+// update, and the item id. Stripe refuses a key reused with a different endpoint or parameters (400
+// `idempotency_error`), so a lost-reply CREATE retried as an UPDATE (the fresh fetch now shows the item) would be
+// refused, and a refusal mistaken for a rejection would release the intent and let the next retry add a second
+// unit. A retry replays the stored call byte for byte. Once Stripe accepts a change the intent is marked
 // `settled_at`, and only that marker, never a comparison of quantities, makes a retry a no-op.
 // While an earlier intent of the same kind is unresolved, a new purchase is a 409. The same key with a
 // different kind or quantity is 409 idempotency_conflict. Two requests are
@@ -128,7 +132,7 @@ export class BillingAddonsService {
 
   constructor(
     @Inject(STRIPE_GATEWAY) private readonly gateway: StripeGateway,
-    @Inject(PG_POOL) private readonly pool: Pool,
+    @Inject(BILLING_WRITE_POOL) private readonly pool: Pool,
   ) {}
 
   /**
@@ -224,6 +228,12 @@ export class BillingAddonsService {
       incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "intent_expired" });
       throw new ConflictError({ message: "this request is too old to retry: check the current quantity and submit again under a new Idempotency-Key" });
     }
+    // An unsettled intent that froze no Stripe call (written before the field existed) cannot be replayed
+    // byte for byte, and re-deriving the call is the very hazard it exists to prevent: fail closed.
+    if (stored !== undefined && stored.stripe_call === undefined) {
+      incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "intent_unreplayable" });
+      throw new ConflictError({ message: "this request cannot be retried: check the current quantity and submit again under a new Idempotency-Key" });
+    }
     // ⚠ ONE UNRESOLVED PURCHASE PER KIND. An earlier attempt whose outcome is unknown may or may not be in
     // Stripe; a new purchase computed from "held + quantity" could neither include it nor be told apart
     // from it. The earlier request is retried first (or ages out); never guess.
@@ -260,14 +270,24 @@ export class BillingAddonsService {
       // ⚠ COMMITTED BEFORE STRIPE IS ASKED, on its own connection: the request's transaction commits
       // only after the response is built, and a request that dies after Stripe applied the change
       // must not take the record of what it asked for with it.
-      const recorded: PendingAddonChanges = stored !== undefined ? intents : await this.recordIntent(workspaceId, mapKey, intents, { kind: request.kind, quantity: request.quantity, target });
+      const recorded: PendingAddonChanges =
+        stored !== undefined
+          ? intents
+          : await this.recordIntent(workspaceId, mapKey, intents, {
+              kind: request.kind,
+              quantity: request.quantity,
+              target,
+              call: held === undefined ? { operation: "create", item_id: null } : { operation: "update", item_id: held.itemId },
+            });
       const intent = recorded[mapKey]!;
+      // The STORED call, never the fresh fetch's: a create whose reply was lost shows an item by now.
+      const call = intent.stripe_call!;
       try {
         await this.gateway.changeAddonQuantity({
           subscriptionId: subscription.stripe_subscription_id,
           kind: request.kind,
           quantity: intent.target_total,
-          existingItemId: held?.itemId ?? null,
+          existingItemId: call.item_id,
           productName: `Nominara ${entry.displayName}`,
           unitAmountCents: toCents(entry.monthlyUsd),
           currency: "usd",
@@ -276,9 +296,9 @@ export class BillingAddonsService {
           idempotencyKey: intent.stripe_idempotency_key,
         });
       } catch (error) {
-        // A definite rejection (4xx other than a timeout, conflict or rate limit) means Stripe applied nothing:
-        // release the intent so it neither blocks the next purchase nor is retried against a stale total.
-        if (error instanceof StripeUpstreamError && isDefiniteRejection(error.statusCode)) {
+        // A definite rejection (4xx other than a timeout, conflict, rate limit or idempotency_error) means Stripe
+        // applied nothing: release the intent so it neither blocks the next purchase nor is retried against a stale total.
+        if (error instanceof StripeUpstreamError && isDefiniteRejection(error)) {
           const rest = { ...recorded };
           delete rest[mapKey];
           await this.persistIntents(workspaceId, rest);
@@ -455,7 +475,7 @@ export class BillingAddonsService {
     workspaceId: string,
     mapKey: string,
     current: PendingAddonChanges,
-    change: { readonly kind: AddonKind; readonly quantity: number; readonly target: number },
+    change: { readonly kind: AddonKind; readonly quantity: number; readonly target: number; readonly call: NonNullable<PendingAddonChange["stripe_call"]> },
   ): Promise<PendingAddonChanges> {
     const id = uuidV7();
     const intent: PendingAddonChange = {
@@ -464,6 +484,7 @@ export class BillingAddonsService {
       quantity: change.quantity,
       target_total: change.target,
       stripe_idempotency_key: `addon-${id}`,
+      stripe_call: change.call,
       created_at: new Date().toISOString(),
     };
     const kept = Object.entries(current)
@@ -477,7 +498,7 @@ export class BillingAddonsService {
   /** Writes the whole intent map in its own short transaction (the request holds the workspace row lock). */
   private async persistIntents(workspaceId: string, next: PendingAddonChanges): Promise<void> {
     const { actorId } = this.tenant();
-    const client = await this.pool.connect();
+    const client = await connectForWrite(this.pool);
     try {
       await withTenantContext(client, { workspaceId, actorId }, async (tx) => {
         const result = await tx.query(
@@ -578,9 +599,14 @@ export class BillingAddonsService {
   }
 }
 
-/** Stripe answered and did not apply the change: a 4xx that is not a timeout (408), an in-flight conflict (409) or a rate limit (429). */
-function isDefiniteRejection(statusCode: number | undefined): boolean {
-  return statusCode !== undefined && statusCode >= 400 && statusCode < 500 && statusCode !== 408 && statusCode !== 409 && statusCode !== 429;
+/**
+ * Stripe answered and did not apply the change: a 4xx that is not a timeout (408), an in-flight conflict (409) or a
+ * rate limit (429), and not `idempotency_error`. That one is also a 400, but it says the key was reused with a
+ * DIFFERENT call, i.e. the original call under it may have been applied: it proves nothing about the change.
+ */
+function isDefiniteRejection(error: StripeUpstreamError): boolean {
+  const { statusCode, errorType } = error;
+  return statusCode !== undefined && statusCode >= 400 && statusCode < 500 && statusCode !== 408 && statusCode !== 409 && statusCode !== 429 && errorType !== "idempotency_error";
 }
 
 /** The map key an Idempotency-Key is stored under: hashed, so the caller's key (and its length) is never persisted. */
