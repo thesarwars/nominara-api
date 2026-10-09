@@ -299,6 +299,64 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "auditver:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // ⚠ THE SECOND QUEUE §4 DOES NOT CONTAIN (after `audit.verify`), added for the
+  // same reason and by the same precedent. STORY-173: an email-code request for an
+  // address with no account creates that account `unverified`, and the rows nobody
+  // came back for must not accumulate (or stay squatted). The sweep
+  // (`workers/rollup/unverified-sweep.ts`) has existed since that story; the owner
+  // decided it runs DAILY on this system rather than by hand. A queue of its own
+  // rather than folded into `maintenance.partition`, so a DLQ entry or boot line
+  // names the job that failed. Not tenant-scoped: `users` is global.
+  // Advisory-locked (`locks.ts`): concurrency 1 bounds one Worker instance, not
+  // the queue, and two replicas deleting the same rows is pure duplicated cost.
+  {
+    name: "identity.sweep_unverified",
+    producer: "cron daily (STORY-173; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "unvsweep:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
+  // ⚠ THE THIRD QUEUE §4 DOES NOT CONTAIN (after `audit.verify` and
+  // `identity.sweep_unverified`), added by the same precedent. NEW-C-15 /
+  // STORY-054 AC4: brand presence on a cited domain is verified by FETCHING the
+  // cited URL through the guarded fetcher and matching it, cached 30 days. §4
+  // allocates no queue to that fetch, and it may not run on a request path
+  // (KAD-06) nor inside the rollup transaction, which reads only this database.
+  // The `crawl` group because it is an outbound fetcher of third-party pages,
+  // like `crawl.audit`; a queue of its own so a DLQ entry names the job that
+  // failed. Tenant-scoped (signed payload, RLS context). Its producer is
+  // `rollup.metric_daily`, which enqueues it after its own transaction commits.
+  {
+    name: "source.verify_presence",
+    producer: "API, rollup (STORY-054; not in §4)",
+    workerGroup: "crawl",
+    concurrency: 2,
+    retry: { delaysMs: doubling(2) },
+    priority: 7,
+    idempotencyKeyPattern: "srcver:{project}:{yyyy_mm_dd}",
+    tenantScoped: true,
+  },
+  // ⚠ THE FOURTH QUEUE §4 DOES NOT CONTAIN, added by the same precedent. NEW-D-7 / owner decision 4 of
+  // 2026-10-08: an auto top-up charges a saved card, which may never happen on a request path (KAD-06). A
+  // debit that leaves a workspace below its threshold enqueues one signed tenant job (the credit interceptor,
+  // after commit); the worker verifies the signature before any context is set, then
+  // the auto-top-up service's `trigger` evaluates and charges. Tenant-scoped, the `rollup` group with the other
+  // billing-adjacent workers. The ladder is short because `trigger` is idempotent under redelivery (a
+  // conditional claim under the wallet lock) and a top-up that never ran is simply asked for again by the
+  // next debit; the idempotency key is one job per workspace per UTC minute.
+  {
+    name: "billing.auto_topup",
+    producer: "credit interceptor, after a debit below the threshold (NEW-D-7; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 2,
+    retry: { delaysMs: doubling(2) },
+    priority: 3,
+    idempotencyKeyPattern: "autotopup:{workspace}:{yyyy_mm_dd_hh_mm}",
+    tenantScoped: true,
+  },
   {
     name: "deploy.cms",
     producer: "API",

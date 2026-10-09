@@ -1,4 +1,6 @@
-import { Pool } from "pg";
+import { Logger } from "@nestjs/common";
+import { Pool, type PoolClient } from "pg";
+import { incrementCounter } from "../lib/telemetry/metrics.js";
 import { tenantAwarePool } from "../tenancy/query-guard.js";
 import { TENANT_TABLES } from "./rls/tenant-tables.generated.js";
 
@@ -9,6 +11,12 @@ import { TENANT_TABLES } from "./rls/tenant-tables.generated.js";
 // §2) is a later story's job; this is the minimal shared seam so neither
 // consumer defines its own competing token.
 export const PG_POOL = Symbol("PG_POOL");
+
+/**
+ * NEW-E-098b — the SECOND pool: logs in as `nominara_portal` (SELECT only, `portal_scope_*` policies). `null` when
+ * DATABASE_URL_PORTAL is unset, so the portal fails closed (503) instead of quietly serving from the app pool.
+ */
+export const PORTAL_PG_POOL = Symbol("PORTAL_PG_POOL");
 
 // STORY-118 — security-and-tenancy.md §4's NFR-SEC-01, in force.
 //
@@ -31,7 +39,47 @@ export const PG_POOL = Symbol("PG_POOL");
 // surfaces as a loud failure in the first test that touches the path,
 // instead of as zero rows that look like an empty list.
 export function createPgPool(connectionString: string, options: PoolTuning = {}): Pool {
-  return tenantAwarePool(new Pool({ connectionString, ...options }), TENANT_TABLES);
+  const pool = new Pool({ connectionString, ...options });
+  attachErrorListeners(pool);
+  return tenantAwarePool(pool, TENANT_TABLES);
+}
+
+const logger = new Logger("pg-pool");
+
+/**
+ * Checkpoint-6 — ⚠ A CHECKED-OUT CLIENT HAS NO ERROR LISTENER UNLESS WE LEAVE ONE.
+ *
+ * pg-pool removes its own idle listener when it hands a client out. With the pooler's `query_wait_timeout` set, a
+ * request whose BEGIN waits for a server connection has its connection closed by pgBouncer: the query rejects,
+ * and the socket's `end` then emits `error` on the Client. With no listener that is an uncaught exception and the
+ * process exits, taking every tenant's in-flight request with it. Every pool built here (main, settlement,
+ * portal, worker, write) therefore leaves a listener on every client it creates, and one on the pool. The query's
+ * own rejection is what the caller handles; this only keeps the event from being fatal. The error text is never
+ * logged: it can carry the connection string.
+ */
+function attachErrorListeners(pool: Pool): void {
+  pool.on("connect", (client: PoolClient) => {
+    client.on("error", () => {
+      incrementCounter("nominara_db_client_error_total", {});
+      logger.error({ message: "a pooled database client emitted an error event; the connection is unusable and is discarded on release" });
+    });
+  });
+  pool.on("error", () => {
+    incrementCounter("nominara_db_pool_error_total", {});
+    logger.error({ message: "an idle pooled database client failed; it is removed from the pool" });
+  });
+}
+
+/**
+ * A failure of the CONNECTION rather than of the statement: pgBouncer closing a waiting client
+ * (`query_wait_timeout`), a socket that ended, a server shutdown. The connection is unusable and must be destroyed
+ * (`release(error)`), and the request is a retryable 503, not a 500.
+ */
+export function isConnectionClassFailure(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const { code, message } = error as { code?: unknown; message?: unknown };
+  if (typeof code === "string" && (code.startsWith("08") || code.startsWith("57P0") || code === "ECONNRESET" || code === "EPIPE")) return true;
+  return typeof message === "string" && /query_wait_timeout|Connection terminated|server closed the connection|Client has encountered a connection error/u.test(message);
 }
 
 /**

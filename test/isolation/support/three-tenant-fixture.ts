@@ -148,7 +148,7 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
   for (let i = 0; i < R; i++) {
     await client.query(
       `INSERT INTO support_grants (workspace_id, requested_by, approved_by, scope, justification, ticket_ref, expires_at)
-       VALUES ($1, $2, $3, 'metadata', 'debug', $4, now() + interval '1 day')`,
+       VALUES ($1, $2, $3, 'metadata', 'debug', $4, now() + interval '3 hours')`,
       [workspaceId, userIds[i], userIds[(i + 1) % R], `TICKET-${label}-${i}`],
     );
   }
@@ -161,6 +161,10 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
       [workspaceId, `cus_${label}_${i}`, `sub_${label}_${i}`, i === 0 ? "active" : "canceled"],
     );
     subscriptionIds.push(result.rows[0]!.id);
+  }
+  // NEW-D-2 checkpoint-1 (migration 0074) — a stale-fetch mark per subscription.
+  for (let i = 0; i < R; i++) {
+    await client.query("INSERT INTO stripe_subscription_syncs (workspace_id, stripe_subscription_id, fetch_started_at) VALUES ($1, $2, now())", [workspaceId, `sub_${label}_${i}`]);
   }
   // credit_wallets: PRIMARY KEY (workspace_id) alone — structurally ONE row per tenant.
   await client.query("INSERT INTO credit_wallets (workspace_id, cycle_start, cycle_end) VALUES ($1, CURRENT_DATE, CURRENT_DATE + INTERVAL '30 days')", [
@@ -544,10 +548,19 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
   for (let i = 0; i < R; i++) {
     await client.query("INSERT INTO share_token_views (workspace_id, share_token_id) VALUES ($1, $2)", [workspaceId, shareTokenIds[i]]);
   }
+  const scheduledReportIds: string[] = [];
+  for (let i = 0; i < R; i++) {
+    const result = await client.query<{ id: string }>(
+      "INSERT INTO scheduled_reports (workspace_id, name, project_ids, cadence, recipients) VALUES ($1, $2, $3, 'weekly', ARRAY['owner@example.com']::citext[]) RETURNING id",
+      [workspaceId, `Report ${i}`, [projectIds[i]]],
+    );
+    scheduledReportIds.push(result.rows[0]!.id);
+  }
+  // NEW-E-1 (migration 0051) — delivery history, one row per scheduled report.
   for (let i = 0; i < R; i++) {
     await client.query(
-      "INSERT INTO scheduled_reports (workspace_id, name, project_ids, cadence, recipients) VALUES ($1, $2, $3, 'weekly', ARRAY['owner@example.com']::citext[])",
-      [workspaceId, `Report ${i}`, [projectIds[i]]],
+      "INSERT INTO scheduled_report_deliveries (workspace_id, scheduled_report_id, status, recipient_count) VALUES ($1, $2, 'delivered', 1)",
+      [workspaceId, scheduledReportIds[i]],
     );
   }
   for (let i = 0; i < R; i++) {

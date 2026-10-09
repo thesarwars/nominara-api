@@ -1,11 +1,12 @@
 import { CanActivate, ExecutionContext, Injectable } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
-import { ACCEPTABLE_STEP_UP_METHODS, STEP_UP_WINDOW_MS } from "../../tenancy/constants.js";
-import { PermissionDeniedException, ProjectOutOfScopeException, StepUpRequiredException } from "../../tenancy/errors.js";
+import { PermissionDeniedException, ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { evaluatePermission, type Permission } from "../../tenancy/permission-matrix.js";
+import { assertStepUpFresh } from "../../tenancy/step-up.js";
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
 import { PROJECT_PARAM_KEY } from "../decorators/project-param.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../decorators/require-permission.decorator.js";
+import { SCOPED_BY_QUERY_KEY } from "../decorators/scoped-by-query.decorator.js";
 import type { WorkspaceScopedRequest } from "./workspace.guard.js";
 
 // STORY-019 — security-and-tenancy.md §6/§7. Replaces the STORY-022 no-op:
@@ -90,19 +91,37 @@ export class RbacGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
-    const projectId = paramName ? req.params?.[paramName] : undefined;
-    if (!projectId || !scope.includes(projectId)) {
-      throw new ProjectOutOfScopeException();
+    if (paramName) {
+      const projectId = req.params?.[paramName];
+      if (!projectId || !scope.includes(projectId)) {
+        throw new ProjectOutOfScopeException();
+      }
+      return;
     }
+
+    // No `@ProjectParam()` — a single-project id to compare `scope` against
+    // does not exist on this route. `@ScopedByQuery()` is the one documented
+    // exception (see its own comment): the route's query narrows by
+    // `app.current_scope_projects()` itself, so a NON-EMPTY scope is let
+    // through here rather than refused. `scope.length === 0` is refused
+    // regardless — see `@ScopedByQuery()` for why that case must never
+    // reach the query.
+    //
+    // Read from the HANDLER ONLY, deliberately never `getAllAndOverride`
+    // against `[handler, class]` — see the decorator's own comment: this is
+    // the one metadata key on this guard's path that WIDENS access, so it
+    // must never be reachable by putting the decorator on a controller
+    // class, only on the one route that opts in.
+    const scopedByQuery = this.reflector.get<boolean>(SCOPED_BY_QUERY_KEY, context.getHandler());
+    if (scopedByQuery && scope.length > 0) {
+      return;
+    }
+    throw new ProjectOutOfScopeException();
   }
 
   private assertStepUp(req: RbacScopedRequest): void {
-    const lastStrongAuthAt = req.session?.lastStrongAuthAt ?? null;
-    const ageMs = lastStrongAuthAt ? Date.now() - lastStrongAuthAt.getTime() : Number.POSITIVE_INFINITY;
-    // Closed interval: exactly STEP_UP_WINDOW_MS old still passes, refused
-    // only once strictly older.
-    if (ageMs > STEP_UP_WINDOW_MS) {
-      throw new StepUpRequiredException(ACCEPTABLE_STEP_UP_METHODS);
-    }
+    // The window and its closed edge live in tenancy/step-up.ts (STORY-173
+    // moved them there so adding a passkey applies the same rule).
+    assertStepUpFresh(req.session?.lastStrongAuthAt ?? null);
   }
 }

@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { ConflictException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { ConflictException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
+import { DegradedError } from "../../api/errors/domain-errors.js";
 import { entityTagFor } from "../../api/etag/entity-tag.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -8,6 +9,8 @@ import { assertIfMatch } from "../../api/etag/if-match.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { REALTIME_PUBLISHER, type RealtimePublisher } from "../../lib/cache/realtime-publisher.js";
+import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import {
@@ -18,6 +21,7 @@ import {
   WorkspaceSuspendedException,
 } from "../../tenancy/errors.js";
 import { afterCommit, currentTenantStore, withActorContext, withTenantContext } from "../../tenancy/tenant-context.js";
+import type { PortalWorkspaceFacts } from "../../lib/portal/portal-facts.js";
 import { SessionService } from "../identity/session.service.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { isWorkspaceUsable, MembershipService } from "./membership.service.js";
@@ -28,6 +32,7 @@ import type {
   UpdateMemberRoleRequest,
   UpdateWorkspaceRequest,
   WorkspaceListItemWithRelationship,
+  WorkspaceDetailResponse,
   WorkspaceResponse,
 } from "./dto/index.js";
 
@@ -62,9 +67,11 @@ interface WorkspaceRow {
   updated_at: Date;
 }
 
-interface MemberRow {
+export interface MemberRow {
   id: string;
   user_id: string;
+  name: string | null;
+  email: string;
   role: string;
   project_scope: string[] | null;
   status: string;
@@ -75,7 +82,14 @@ interface MemberRow {
 const MAX_SLUG_ATTEMPTS = 5;
 const WORKSPACE_COLUMNS =
   "id, name, slug, org_type, region, timezone, plan_key, entitlement_version, status, created_at, updated_at";
-const MEMBER_COLUMNS = "id, user_id, role, project_scope, status, joined_at, last_active_at";
+// NEW-A-12 — the member list item carries the person's name and address.
+// `users` has no RLS (it is global), so the ONLY safe way to reach it is a join
+// that starts from the RLS-scoped `workspace_members` row: the tenant filter
+// on `m` decides which users are visible, never a filter on `users`.
+export const MEMBER_JOINED_COLUMNS =
+  "m.id, m.user_id, u.full_name AS name, u.email::text AS email, m.role, m.project_scope, m.status, m.joined_at, m.last_active_at";
+export const MEMBER_JOINED_FROM = "FROM workspace_members m JOIN users u ON u.id = m.user_id";
+const MEMBER_JOINED_SELECT = `SELECT ${MEMBER_JOINED_COLUMNS} ${MEMBER_JOINED_FROM}`;
 
 function kebabCase(name: string): string {
   const base = name
@@ -104,16 +118,27 @@ function toWorkspaceResponse(row: WorkspaceRow): WorkspaceResponse {
   };
 }
 
-function toMemberResponse(row: MemberRow): MemberResponse {
+export function toMemberResponse(row: MemberRow): MemberResponse {
   return {
     id: row.id,
     user_id: row.user_id,
+    name: row.name,
+    email: row.email,
     role: row.role as MemberResponse["role"],
     project_scope: row.project_scope ?? null,
     status: row.status as MemberResponse["status"],
     joined_at: row.joined_at.toISOString(),
     last_active_at: row.last_active_at ? row.last_active_at.toISOString() : null,
   };
+}
+
+const lockLogger = new Logger("workspaces-lock");
+
+/** The retryable 503 for a writer that could not take the workspace row within the bound. The log line carries the workspace ID only. */
+function workspaceBusy(path: string, workspaceId: string): Error {
+  incrementCounter("nominara_workspace_lock_wait_exceeded_total", { path });
+  lockLogger.warn({ message: "a workspace write was refused as retryable: the row lock was not available within the bound", path, workspace_id: workspaceId });
+  return new DegradedError({ message: "the workspace is being changed: retry shortly" });
 }
 
 @Injectable()
@@ -132,6 +157,7 @@ export class WorkspacesService {
     const client = await pool.connect();
     try {
       await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await lockWorkspaceBounded(tx, workspaceId, () => workspaceBusy("suspend", workspaceId));
         await tx.query("UPDATE workspaces SET status = 'suspended', updated_at = now() WHERE id = $1", [
           workspaceId,
         ]);
@@ -146,6 +172,7 @@ export class WorkspacesService {
     const client = await pool.connect();
     try {
       await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await lockWorkspaceBounded(tx, workspaceId, () => workspaceBusy("bump_entitlement_version", workspaceId));
         await tx.query(
           "UPDATE workspaces SET entitlement_version = entitlement_version + 1, updated_at = now() WHERE id = $1",
           [workspaceId],
@@ -401,6 +428,9 @@ export class WorkspacesService {
   ): Promise<WorkspaceResponse> {
     const client = currentTenantStore()!.client;
 
+    // Checkpoint-6 — bounded: a billing change holds this row across Stripe calls, and a PATCH burst queued
+    // behind it would hold every main-pool connection.
+    await lockWorkspaceBounded(client, workspaceId, () => workspaceBusy("update", workspaceId));
     const current = await client.query<WorkspaceRow>(
       `SELECT ${WORKSPACE_COLUMNS} FROM workspaces WHERE id = $1 FOR UPDATE`,
       [workspaceId],
@@ -431,6 +461,47 @@ export class WorkspacesService {
       [workspaceId, input.name ?? null, input.timezone ?? null],
     );
     return toWorkspaceResponse(result.rows[0]!);
+  }
+
+  /**
+   * NEW-E-099a — the workspace-level facts a portal read needs (the portal's `agency`, the window's timezone, the scoring
+   * version and the weight overrides). Read on the APP pool, workspace-scoped, because `nominara_portal` has no policy on
+   * `workspaces`; the portal interceptor hands the result to the portal services as data.
+   */
+  async portalFacts(): Promise<PortalWorkspaceFacts> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("WorkspacesService.portalFacts requires an active tenant context");
+    const result = await store.client.query<{ name: string; timezone: string; scoring_version: string; entitlement_overrides: unknown }>(
+      "SELECT name, timezone, scoring_version, entitlement_overrides FROM workspaces WHERE id = $1",
+      [store.context.workspaceId],
+    );
+    const row = result.rows[0];
+    if (row === undefined) throw new NotFoundException();
+    return { name: row.name, timezone: row.timezone, scoringVersion: row.scoring_version, entitlementOverrides: row.entitlement_overrides };
+  }
+
+  /**
+   * NEW-A-12 — GET /workspaces/{id}. Ambient transaction: RLS scopes the read
+   * to the token's workspace, and the controller has already refused a path id
+   * that is not it. `deletion_scheduled_at` is `deletion_execute_at` (null =
+   * not scheduled). `entityTag` is derived from the PATCH response shape, so a
+   * tag taken from this GET is accepted by `If-Match` on the PATCH.
+   */
+  async getDetail(workspaceId: string): Promise<{ detail: WorkspaceDetailResponse; entityTag: WorkspaceResponse }> {
+    const client = currentTenantStore()!.client;
+    const result = await client.query<WorkspaceRow & { deletion_execute_at: Date | null }>(
+      `SELECT ${WORKSPACE_COLUMNS}, deletion_execute_at FROM workspaces WHERE id = $1`,
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new NotFoundException();
+    }
+    const base = toWorkspaceResponse(row);
+    return {
+      detail: { ...base, deletion_scheduled_at: row.deletion_execute_at ? row.deletion_execute_at.toISOString() : null },
+      entityTag: base,
+    };
   }
 
   /**
@@ -512,11 +583,10 @@ export class WorkspacesService {
     const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
     const client = currentTenantStore()!.client;
     const result = await client.query<MemberRow & { joined_at_key: string }>(
-      `SELECT ${MEMBER_COLUMNS}, joined_at::text AS joined_at_key
-       FROM workspace_members
-       WHERE status <> 'removed'
-         AND ($1::timestamptz IS NULL OR (joined_at, id) > ($1::timestamptz, $2::uuid))
-       ORDER BY joined_at ASC, id ASC
+      `SELECT ${MEMBER_JOINED_COLUMNS}, m.joined_at::text AS joined_at_key ${MEMBER_JOINED_FROM}
+       WHERE m.status <> 'removed'
+         AND ($1::timestamptz IS NULL OR (m.joined_at, m.id) > ($1::timestamptz, $2::uuid))
+       ORDER BY m.joined_at ASC, m.id ASC
        LIMIT $3`,
       [after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
     );
@@ -536,9 +606,10 @@ export class WorkspacesService {
   ): Promise<MemberResponse> {
     const client = currentTenantStore()!.client;
 
-    const target = await client.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE id = $1`, [
-      memberId,
-    ]);
+    const target = await client.query<{ user_id: string; role: string }>(
+      "SELECT user_id, role FROM workspace_members WHERE id = $1",
+      [memberId],
+    );
     const targetRow = target.rows[0];
     if (!targetRow) {
       throw new NotFoundException();
@@ -577,9 +648,7 @@ export class WorkspacesService {
       ]);
     }
 
-    const updated = await client.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE id = $1`, [
-      memberId,
-    ]);
+    const updated = await client.query<MemberRow>(`${MEMBER_JOINED_SELECT} WHERE m.id = $1`, [memberId]);
     const response = toMemberResponse(updated.rows[0]!);
 
     // STORY-026 T22, decision D7 — `member.changed`. §11 lists `api` as its
@@ -609,9 +678,10 @@ export class WorkspacesService {
   async removeMemberById(workspaceId: string, memberId: string): Promise<void> {
     const client = currentTenantStore()!.client;
 
-    const target = await client.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members WHERE id = $1`, [
-      memberId,
-    ]);
+    const target = await client.query<{ user_id: string; role: string }>(
+      "SELECT user_id, role FROM workspace_members WHERE id = $1",
+      [memberId],
+    );
     const targetRow = target.rows[0];
     if (!targetRow) {
       throw new NotFoundException();

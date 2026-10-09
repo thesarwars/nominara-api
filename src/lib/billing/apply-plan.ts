@@ -8,7 +8,9 @@ import {
   NoActiveSubscriptionError,
   PlanChangeTargetMissingError,
   UnknownPlanError,
+  WorkspaceLockBusyError,
 } from "./errors.js";
+import { lockWorkspaceBounded } from "./workspace-lock.js";
 import { proRataTopUp, utcMidnight } from "./plan-grant.js";
 
 // STORY-151 — a workspace's plan can change. Nothing in this product could do
@@ -110,6 +112,16 @@ export interface ApplyPlanOptions {
   readonly allowNegotiatedTier?: boolean;
   /** Injected so the pro-rata boundary is testable; never read from the clock here. */
   readonly now?: Date;
+  /**
+   * STORY-075 AC8 — accept a move to a LOWER plan. Off unless the writer is the
+   * signature-verified webhook reconciler: there the provider has already
+   * ended or reduced the subscription, so refusing would leave the workspace
+   * on a plan nobody is paying for. It changes FEATURE ACCESS only; the
+   * structural reductions (pausing excess projects and prompts, the retention
+   * tier) are STORY-077's period-end policy and are recorded on the audit row
+   * as deferred, never performed here.
+   */
+  readonly allowDowngrade?: boolean;
 }
 
 /** The only reconciler STORY-151 ships: change the plan, carry everything else forward. */
@@ -195,6 +207,8 @@ export async function applyPlanChange(
   // 1. The workspace, locked. Its pre-image is the audit row's before_state —
   //    the first populated one in this repo: `auditBeforeState` is declared on
   //    the interceptor and read by it, and set by nothing.
+  //    The wait is bounded (checkpoint-6): the holder of this row may be inside a Stripe call.
+  await lockWorkspaceBounded(tx, workspaceId, () => new WorkspaceLockBusyError(workspaceId));
   const workspace = await tx.query<WorkspaceRow>(
     "SELECT plan_key, entitlement_version, status, deleted_at FROM workspaces WHERE id = $1 FOR UPDATE",
     [workspaceId],
@@ -257,7 +271,8 @@ export async function applyPlanChange(
 
   // 5. DIRECTION, then the negotiated tier by name — the order matters,
   //    because `sort_order` can never refuse enterprise (it is the maximum).
-  if (targetPlan.sort_order < currentPlan.sort_order) {
+  const isDowngrade = targetPlan.sort_order < currentPlan.sort_order;
+  if (isDowngrade && options.allowDowngrade !== true) {
     throw new DowngradeNotSupportedError(before.plan_key, desired.planKey);
   }
   if (NEGOTIATED_TIERS.has(desired.planKey) && options.allowNegotiatedTier !== true) {
@@ -292,6 +307,21 @@ export async function applyPlanChange(
       desired.provider,
     ],
   );
+
+  // 6b. THE BILLING CYCLE ROLLED: auto-top-up's per-cycle counter starts again (EC-48 "the counter resets
+  //     only at cycle roll"; NEW-D-7 checkpoint-3 finding 3). This statement is the only writer of
+  //     `current_period_start`, so a period that starts LATER than the one on file IS the roll. Strictly later:
+  //     a redelivery of the same period and a stale event for an earlier one change nothing, and a reconcile
+  //     inside the period (seats, an add-on, a cancel flag) never reaches here with a new start. Only the
+  //     counter moves: the configuration is the customer's and a roll does not touch it. (`credit_wallets.cycle_*`
+  //     is rolled by nothing in src/ — see wallet.ts `cycleHasLapsed` — so it cannot be the trigger; whatever
+  //     eventually rolls it must zero this counter in the same statement.) No wallet yet: zero rows, no error.
+  if (desired.currentPeriodStart.getTime() > currentRow.current_period_start.getTime()) {
+    await tx.query(
+      "UPDATE credit_wallets SET auto_topup_count_cycle = 0, updated_at = now() WHERE workspace_id = $1 AND auto_topup_count_cycle <> 0",
+      [workspaceId],
+    );
+  }
 
   // 7. ⚠ ONE STATEMENT, AND THIS IS THE ONLY CORRECTNESS-CRITICAL CO-CHANGE.
   //    `entitlementsKey(env, ws, version)` puts the version IN the cache key,
@@ -405,6 +435,7 @@ export async function applyPlanChange(
       operator: provenance.operator,
       reason: provenance.reason,
       credits_topped_up: creditsToppedUp,
+      ...(isDowngrade ? { downgrade: { feature_access: "applied", structural_reductions: "deferred_to_story_077" } } : {}),
       ...(creditsNote === undefined ? {} : { credits_note: creditsNote }),
     },
     requestId: provenance.requestId,

@@ -8,22 +8,31 @@ import { entityTagFor, formatEntityTag } from "../../api/etag/entity-tag.js";
 import { parseIfMatch } from "../../api/etag/if-match.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
 import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { REFRESH_COOKIE_NAME, setAuthCookies } from "../../lib/auth/cookies.js";
-import { assertMatchesTenant } from "../../tenancy/assert-matches-tenant.js";
+import { assertMatchesTenant, assertPathIsTokenWorkspace } from "../../tenancy/assert-matches-tenant.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import {
+  acceptInvitationParamsSchema,
   acceptInvitationRequestSchema,
   createInvitationRequestSchema,
   createWorkspaceRequestSchema,
   invitationResponseSchema,
+  invitationRevokeParamsSchema,
+  workspaceDetailResponseSchema,
+  type InvitationRevokeParams,
+  type WorkspaceDetailResponse,
   memberResponseSchema,
   updateMemberRoleRequestSchema,
   updateWorkspaceRequestSchema,
   workspaceListResponseSchema,
   workspaceResponseSchema,
+  workspaceSummaryResponseSchema,
+  type WorkspaceSummaryResponse,
+  type AcceptInvitationParams,
   type AcceptInvitationRequest,
   type CreateInvitationRequest,
   type CreateWorkspaceRequest,
@@ -34,8 +43,11 @@ import {
   type WorkspaceListItemWithRelationship,
   type WorkspaceResponse,
 } from "./dto/index.js";
+import { actionItemListResponseSchema, type ActionItem } from "../tasks/dto/index.js";
 import { InvitationsService } from "./invitations.service.js";
+import { TasksService } from "../tasks/tasks.service.js";
 import { WorkspacesService, type AuditRequestMeta } from "./workspaces.service.js";
+import { WorkspaceSummaryService } from "./workspace-summary.service.js";
 
 // STORY-021 — thin HTTP surface only (coding-standards.md §1: a conditional
 // here is a smell). Flattened @Controller() (no path prefix) because
@@ -57,6 +69,8 @@ export class WorkspacesController {
   constructor(
     private readonly service: WorkspacesService,
     private readonly invitations: InvitationsService,
+    private readonly tasks: TasksService,
+    private readonly summaries: WorkspaceSummaryService,
   ) {}
 
   @Post("workspaces")
@@ -120,6 +134,21 @@ export class WorkspacesController {
     return workspace;
   }
 
+  // NEW-A-12 — api-specification.md §3: "GET /workspaces/{id} — workspace:read".
+  @Get("workspaces/:id")
+  @RequirePermission("workspace:read")
+  @ApiContract({ operationId: "getWorkspace", responseSchema: workspaceDetailResponseSchema, emitsEntityTag: true })
+  async getOne(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ): Promise<WorkspaceDetailResponse> {
+    assertPathIsTokenWorkspace(id, req.tenant!.workspaceId);
+    const { detail, entityTag } = await this.service.getDetail(id);
+    reply.header("ETag", formatEntityTag(entityTagFor(entityTag)));
+    return detail;
+  }
+
   @Post("workspaces/:id/switch")
   @SkipTenantContext()
   @HttpCode(200)
@@ -150,7 +179,7 @@ export class WorkspacesController {
     @Param("id") id: string,
     @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
   ): Promise<Page<MemberResponse>> {
-    assertMatchesTenant(id, req.tenant!.workspaceId);
+    assertPathIsTokenWorkspace(id, req.tenant!.workspaceId);
     return this.service.listMembers(pagination);
   }
 
@@ -204,13 +233,82 @@ export class WorkspacesController {
     return this.invitations.list(id, pagination);
   }
 
+  // NEW-A-12 — revoke a pending invitation. Same permission as creating one.
+  @Delete("workspaces/:id/invitations/:invitationId")
+  @RequirePermission("member:invite")
+  @Audit({ action: "member.invitation_revoked", resourceType: "invitation", paramName: "invitationId" })
+  @ApiContract({ operationId: "revokeInvitation", paramsSchema: invitationRevokeParamsSchema, voidResponse: true })
+  revokeInvitation(
+    @Req() req: RbacScopedRequest,
+    @Param(new ZodValidationPipe(invitationRevokeParamsSchema)) { id, invitationId }: InvitationRevokeParams,
+  ): Promise<void> {
+    assertPathIsTokenWorkspace(id, req.tenant!.workspaceId);
+    return this.invitations.revoke(id, invitationId);
+  }
+
+  // NEW-B-2 — api-specification.md §3: "GET /workspaces/{id}/summary —
+  // project:read — Command Center matrix". `@ScopedByQuery()` for the reason
+  // given on `listActionItems` below: the route names a workspace, and the
+  // project scope is applied inside `ProjectsService.listForSummary`.
+  // `assertMatchesTenant` first, so another workspace's id is refused.
+  @Get("workspaces/:id/summary")
+  @RequirePermission("project:read")
+  @ScopedByQuery()
+  @ApiContract({ operationId: "getWorkspaceSummary", responseSchema: workspaceSummaryResponseSchema })
+  summary(@Req() req: RbacScopedRequest, @Param("id") id: string): Promise<WorkspaceSummaryResponse> {
+    assertMatchesTenant(id, req.tenant!.workspaceId);
+    return this.summaries.summary(id);
+  }
+
+  // STORY-169 (API step 2/3) — api-specification.md §3: "GET /workspaces/
+  // {id}/summary · /action-items — project:read / task:read — Command
+  // Center matrix; cross-project queue." Lives HERE, not on
+  // TasksController: this controller already owns every other
+  // `workspaces/:id/*` cross-resource route (members, invitations above),
+  // flattened for exactly that reason (see the top-of-file comment);
+  // TasksController's own `@Controller("tasks")` prefix cannot serve a
+  // `workspaces/:id/...` path. `tasks` is TasksService's table
+  // (coding-standards.md §1), so the query lives there and this method
+  // only resolves the request, calls it, and returns.
+  // STORY-169 review — `@ScopedByQuery()`: same reasoning as `ProjectsController
+  // .list` — this route names a WORKSPACE, not a project, so `@ProjectParam()`
+  // has nothing to point at, and `TasksService.listActionItems`'s own query
+  // already narrows by `app.current_scope_projects()` (copied from
+  // `ProjectsService.list` for exactly this reason). Without this, a
+  // project-scoped manager or viewer was refused this route outright,
+  // regardless of how many projects they were scoped to (FR-DASH-04 was not
+  // actually served for that population — `rbac.guard.spec.ts`'s "STORY-169
+  // review" scenarios reproduce it against this exact handler).
+  @Get("workspaces/:id/action-items")
+  @RequirePermission("task:read")
+  @ScopedByQuery()
+  @ApiContract({
+    operationId: "listActionItems",
+    querySchema: paginationRequestSchema,
+    responseSchema: actionItemListResponseSchema,
+    listOf: true,
+  })
+  listActionItems(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<ActionItem>> {
+    assertMatchesTenant(id, req.tenant!.workspaceId);
+    return this.tasks.listActionItems(pagination);
+  }
+
   @Post("workspaces/:id/invitations/accept")
   @SkipTenantContext()
   @HttpCode(200)
-  @ApiContract({ operationId: "acceptInvitation", requestSchema: acceptInvitationRequestSchema, responseSchema: memberResponseSchema })
+  @ApiContract({
+    operationId: "acceptInvitation",
+    paramsSchema: acceptInvitationParamsSchema,
+    requestSchema: acceptInvitationRequestSchema,
+    responseSchema: memberResponseSchema,
+  })
   acceptInvitation(
     @Req() req: AuditableRequest,
-    @Param("id") id: string,
+    @Param(new ZodValidationPipe(acceptInvitationParamsSchema)) { id }: AcceptInvitationParams,
     @Body(new ZodValidationPipe(acceptInvitationRequestSchema)) body: AcceptInvitationRequest,
   ): Promise<MemberResponse> {
     return this.invitations.accept(id, req.auth!.sub, body.token, auditMeta(req));

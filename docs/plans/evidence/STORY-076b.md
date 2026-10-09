@@ -1,0 +1,326 @@
+# STORY-076b evidence
+
+Add-ons as Stripe subscription items: `GET|POST /v1/billing/addons`, `DELETE /v1/billing/addons/{kind}`, and the webhook reconciler for `subscription_addons`. Branch `7day/d-billing-3`, base `integration/7day`.
+
+Commits: contract `e112523` · RED `235e0ab` · implementation `c279f9b` (this file follows).
+The implementation commit also adds the one-line `AddonListQuery` type export to `contracts/billing/addon.schema.ts` that the contract commit omitted (no schema change).
+
+## STATUS: PARTIAL — the integration spec is written and typechecks, but it has NOT been run
+
+`df -h /System/Volumes/Data` showed 6.1 GiB free (rule: under 8 GiB, do not start testcontainers). So:
+
+- RAN and green: the four unit specs below (42 tests), lint, typecheck, `contracts:generate`/`contracts:check`/`contracts:diff` (minor), the whole unit suite, 12 hand mutations.
+- NOT RUN: `test/integration/billing-addons.spec.ts` (30 tests, every row of the real-database proof below). Its RED state was therefore NOT observed against a database. To finish, free disk to 8 GiB, then
+  `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock TESTCONTAINERS_RYUK_DISABLED=true pnpm exec vitest run --config vitest.integration.config.ts test/integration/billing-addons.spec.ts test/integration/stripe-subscriptions.spec.ts test/integration/stripe-webhook.spec.ts test/integration/entitlement-resolution.spec.ts`
+  and treat any failure as a defect in the implementation OR the spec (written without a database to check it against). One assertion was already adjusted once for a typed-error constraint (see "Decisions").
+- `test:isolation` not run (no tenant table touched; `subscription_addons` already has its generated RLS policy). Isolation is proved in the integration spec under `nominara_app` (not run, as above).
+
+## RED
+
+| Commit | What | Result |
+|---|---|---|
+| `235e0ab` | `src/lib/billing/addon-grant.spec.ts` and `src/lib/billing/stripe/addon-items.spec.ts` against missing `addon-catalog.ts` / `addon-items.ts` | `vitest run` exit 1: "Failed to resolve import", 2 files failed, 0 tests ran (the stated reason) |
+| `235e0ab` | `test/integration/billing-addons.spec.ts` | NOT run (disk). It does not typecheck at that commit (the fake gateway had no `addonChanges`/`reset`); after `c279f9b` it does. Its RED would be a 404 on `/billing/addons` and no reconciler rows |
+
+After `c279f9b`: the two RED specs pass (15 tests). The service spec (18) and the gateway spec (9) were written with the implementation, not RED-first; they were mutation-tested instead (below).
+
+## Acceptance criteria
+
+| Criterion | Proof | Status |
+|---|---|---|
+| AC1 (STORY-076 AC10): add/remove changes the Stripe item quantity with proration | U `billing-addons.service.spec.ts` > "AC1 · sets the item to current + requested from a FRESH fetch, and issues no INSERT/UPDATE of its own"; U `stripe-http.addons.spec.ts` > "a new item is created from inline price_data on a fixed product, with proration…", "an existing item is updated to the TOTAL with proration"; S `billing-addons.spec.ts` > "AC1 · POST adds a NEW subscription item in Stripe with proration and writes NOTHING local" | unit met; S not run |
+| AC1: local `subscription_addons`, `seats_purchased`, `projects_purchased` written ONLY by the fresh-fetch reconciler, never by POST | U "…issues no INSERT/UPDATE of its own" (asserts no write SQL in the POST path); S "POST … writes NOTHING local" (rows, counters and entitlement_version unchanged); S "AC1 + AC5 · the fresh-fetch reconciler writes the add-on row, seats_purchased and projects_purchased…"; the only writer is `BillingAddonsService.reconcile`, called from `StripeSubscriptionHandler` after the signature, fetch and workspace lock | unit met; S not run |
+| AC1 robustness: total comes from a FRESH fetch, not the stale local row; cap; price from OUR catalog | S "adding to a held add-on updates the SAME item to the total taken from a FRESH Stripe fetch"; U "AC1 boundary · exactly the cap is accepted, one over is a 400"; S "the price and currency come from OUR catalog… a forged `unit_price_usd` is a 400"; U `addon-grant.spec.ts` > "the owner-approved prices, as numeric(12,2) text" | unit met; S not run |
+| AC1 redelivery / removal: unchanged event writes nothing; an item that left Stripe is closed, not deleted | U "idempotent · an identical set writes nothing, bumps nothing and audits nothing", "an add-on missing from the fetch is closed with active_until, not deleted", "a changed quantity, price or item id updates the row in place"; S "a redelivered or unchanged event writes nothing…", "an add-on that left Stripe's subscription is closed…and buying it again opens a NEW active row", "an ended subscription closes every add-on" | unit met; S not run |
+| AC2 (AC11 / scenario 10): extra_project shows projects.max+1 AND the prompt slots | U `addon-grant.spec.ts` > "scenario 10 · an extra project grants a project slot AND its prompt slots", "the grant equals what the resolver actually adds for one unit (they cannot disagree)" (the grant is derived from `addonContributions`, `src/lib/entitlements/resolution.ts`, which is unchanged); S "AC2 · scenario 10 · after an extra_project lands, projects.max is +1 AND the prompt slots are granted" (resolves entitlements after the webhook) | unit met; S not run |
+| AC2 (scenario 11): GET returns the grant statement | U "scenario 11 · the statement names BOTH halves of the grant"; S "AC2 · scenario 11 · GET /billing/addons returns the grant statement, the price and the cursor envelope" (growth: "1 project", "40 prompt slots"); S empty list; S cursor paging and forged cursor 400 | unit met; S not run |
+| AC3 (AC12 / scenario 12): removing a seat while members exceed the reduced limit is 409 BEFORE any Stripe call | U "AC3 · scenario 12 · members over the reduced limit is a 409 and NO Stripe call of any kind" (no remove, fetch or change); U boundary at the limit; U "an override is absolute"; S "AC3 · scenario 12" (asserts `gateway.fetches` unchanged) and S "AC3 boundary" incl. a removed member freeing the seat. The count is the same `status <> 'removed'` the seat ceiling uses | unit met; S not run |
+| AC4 (AC13 / scenario 13): removal follows the period-end policy; deferral stated if STORY-077 is not built | STORY-077 is NOT built (no code names it beyond comments). DELETE schedules the item's removal at the current period end (`scheduleAddonRemoval`); U "AC4 · scenario 13 · schedules at the CURRENT PERIOD END against the held item and writes nothing local", U `stripe-http.addons.spec.ts` > "AC4 · keeps the current phase to the period end and drops ONLY the add-on's price from the phase after it, then releases"; S "AC4 · scenario 13 …", "once Stripe applies the removal … the reconciler closes the add-on". **Deferred and stated** (header of `billing-addons.service.ts`): the structural follow-through (pausing projects, prompts and seats that no longer fit) is STORY-077's | unit met; S not run; deferral stated |
+| AC5: any add-on change bumps entitlement_version | U "AC1 · opens a row per new add-on … bumps the version once", "AC5 · does not bump a second time when applyPlanChange already did"; S "AC5 · a change that moves ONLY the add-on rows (not the counters) still bumps entitlement_version" | unit met; S not run |
+| AC6: free or ineligible tiers get 403 feature_not_in_plan with min_plan | U "AC6 · a plan that does not grant the flag is feature_not_in_plan naming the tier from `plans`, before any lock or Stripe call"; S "AC6 · free is refused … for both kinds" (`min_plan` growth for a project, starter for a seat), S "starter may buy a seat but not a project". `min_plan` is read from `plans`, never named in code | unit met; S not run |
+| AC7: every change writes an audit row | S "AC7 · every change writes an audit row: the request, the removal, and the reconciliation" (`billing.addon.change_requested`, `billing.addon.removal_scheduled` via `@Audit`; `billing.addons_reconciled` inside the webhook transaction via `AuditChainService`, so an audit failure rolls the change back); U asserts the reconcile audit call (actor system, event id as `requestId`, before/after quantities); S "a refused change writes no change audit row" | unit met (reconcile); S not run |
+| Permissions | S "GET is billing:read and POST/DELETE are billing:write: a manager and a viewer are refused with a 403 naming the permission" (`@RequirePermission`) | S not run |
+| Tenant isolation, RLS only | S "tenant isolation" x3 (list scoped; unfiltered read as `nominara_app` sees only A and cannot insert for B; an event for A writes nothing in B). The list/reconcile queries carry no `workspace_id` predicate where RLS applies | S not run |
+| Request validation (`.strict()`, bounds) | S "request validation: quantity 0, 101, fractional, unknown kind, missing quantity are 400s; the Idempotency-Key is required"; unknown key 400 | S not run |
+| Failure modes | U/S Stripe unavailable and unconfigured are 503 `degraded`, no local change, no Stripe text; S annual subscription is 409; U no Stripe subscription is `precondition_unmet` | unit met; S not run |
+| Metric | `nominara_billing_addon_change_total{kind,outcome}`, `nominara_billing_addon_reconcile_total{outcome}` — emitted (visible in the unit run's metric log lines); no separate assertion on the counters | emitted |
+| Redacted log | `add-on change requested` / `removal scheduled` / `add-ons reconciled from stripe` carry `workspace_id`, kind and quantities only; Stripe failure logs a status code only. S "redaction · the audit rows and responses carry no Stripe ids beyond the item id, and no secrets" | S not run |
+| Spans | deferred to week 2 by owner decision (2026-10-08) | deferred |
+| Frontend (PlanSettings add-on controls) | **not done**: the app repo is outside this API lane. Contract it maps to: `addonSchema` (`grant.statement`, `unit_price_usd`), `addonChangeResponseSchema` (`status: "pending"`) | not met this week |
+| Real-API evidence (sandbox Checkout item add, proration, schedule release) | collected in NEW-A-17 (needs a running real API and Stripe sandbox); Stripe is the fake gateway in every test | deferred |
+
+## Mutation results (hand-applied, reverted)
+
+Run against `billing-addons.service.spec.ts`, `addon-grant.spec.ts`, `addon-items.spec.ts`, `stripe-http.addons.spec.ts`.
+
+| Mutation | Result |
+|---|---|
+| seat refusal skipped | KILLED (2 tests) |
+| reconcile always bumps the version | KILLED |
+| reconcile has no unchanged short-circuit | KILLED |
+| grant without prompt slots | KILLED |
+| extra_project price 49.00 -> 49.50 | KILLED |
+| extractor accepts non-USD | KILLED |
+| cap boundary `>` -> `>=` | KILLED |
+| member boundary `>` -> `>=` | KILLED |
+| override not respected on removal | KILLED (after the first test was found not to discriminate and was fixed) |
+| no proration on update | KILLED |
+| removal drops nothing from the next phase | KILLED |
+| reconcile reads closed rows (`AND active_until IS NULL` dropped) | SURVIVED the unit specs — a scripted client cannot see SQL semantics. Covered only by the (unrun) integration test "buying it again opens a NEW active row" |
+
+## Decisions and known gaps (for the reviewer / owner)
+
+1. **RESOLVED by the audit fix (contract commit, RED `ab787a1`, impl `fdf92e2`): `quantity` on POST is the DESIRED TOTAL.** The owner chose neither reading before the audit; the audit allowed "quantity = desired total" or a committed intent, and the total needs no schema change. Consequences the owner/app must carry: (a) the wire meaning changed (the openapi diff tool classes it `major`); the app must send the total it wants, not an increment; (b) a total below what Stripe holds is a 409 (removal is DELETE, whole add-on); a total equal to it is a 202 no-op with no Stripe call; (c) the Stripe idempotency key is `addon-<workspace>-<kind>-<sha256(Idempotency-Key)[0:32]>`. STORY-076 in the docs hub should state this (the docs repo has no .git here; carry it over).
+2. **Annual subscriptions are refused (409).** Stripe needs every item on one interval and only a monthly add-on price ($49, $15) is decided. An annual price is an owner decision.
+3. **Pre-purchase price display.** `GET /billing/addons` lists only add-ons in force; a workspace with none cannot read the $49/$15 from the API before buying, which `check:no-cost-literals` needs on the control. No endpoint for it is named in the story; a catalog read is a story/contract decision.
+4. **While a removal is scheduled, Stripe may refuse direct item changes** (a subscription attached to a schedule). A later POST then returns 503 `degraded` until the schedule releases. Needs sandbox confirmation (NEW-A-17); not handled specially.
+5. **A scheduled removal is not visible in `GET`** (the row keeps `active_until: null` until Stripe drops the item), so `addonSchema.active_until`'s comment ("set to the period end by a removal") is not what happens. Making it so needs the resolver to honour a future `active_until` and `ux_addons_active` to allow a re-add: a schema/resolver change the story did not name. The `DELETE` response carries `effective_at`.
+6. **`ConflictError`'s typed details carry no `limit`/`current`**, so the seat refusal states the figures in its message ("8 members are active but the reduced seat limit would be 7"). The integration assertion was changed from `seats.max` to that message before any run.
+7. **Add-on removal of `extra_project` is not refused for projects already over the reduced limit** — the story only requires the seat refusal; excess projects are STORY-077's.
+8. **Stripe product:** the inline `price_data` of a subscription item needs a Product id (only Checkout accepts `product_data`), so the gateway creates one product per kind under the fixed id `nominara_addon_<kind>` and reuses it. No catalog to keep in step with ours, but the product exists in the Stripe account.
+9. **`scheduleAddonRemoval`** uses a subscription schedule (current phase to the period end unchanged, a second phase without the add-on's price, `end_behavior: release`). Request shape is unit-tested against a stubbed SDK; that Stripe accepts it is unverified until NEW-A-17.
+10. No migration, no new dependency, no new vocabulary. `db:rls-generate` not applicable.
+
+## Gate commands (worktree api-wt-d1)
+
+| Command | Exit | Result |
+|---|---|---|
+| `pnpm lint` | 0 | clean |
+| `pnpm typecheck` | 0 | clean (includes `test/integration/billing-addons.spec.ts`) |
+| `pnpm contracts:generate` then `pnpm contracts:check` | 0 | no drift; `/billing/addons` and `/billing/addons/{kind}` present |
+| `pnpm contracts:diff <integration/7day openapi> <current>` | 0 | `minor` |
+| `pnpm test:unit` | 0 | 282 files passed, 1 skipped; 3392 tests passed, 1 skipped (was 3350; +42 from this story) |
+| `pnpm exec vitest run` of the RED specs at `235e0ab` | 1 | 2 files failed, 0 tests ran (missing modules) |
+| `test/integration/billing-addons.spec.ts` | not run | disk 6.1 GiB < 8 GiB |
+| `pnpm test:isolation` | not run | no tenant table touched; known fixture crash at this tip |
+
+
+## Audit fix: a retried POST charged twice (blocker 1)
+
+| Item | Proof |
+|---|---|
+| Stripe applies the change, the reply is lost, the same Idempotency-Key retried: exactly one unit | `src/modules/billing/billing-addons.service.spec.ts` > "AC1 retry . Stripe applies the change and the reply is lost ..."; HTTP form in `test/integration/billing-addons.spec.ts` "AC1 retry ..." (NOT RUN, see below) |
+| Key derived from workspace + Idempotency-Key (stable on retry, differs by key and by workspace, <= 255, key text not sent) | "AC1 retry . the Stripe key is derived ..." |
+| Total already held is a no-op; a lower total is a 409 | "a total already held is a no-op", "a total below what is held is a 409" |
+| RED | commit `ab787a1`: `vitest run billing-addons.service.spec.ts` exit 1, 6 failed / 16 passed (the old additive arithmetic and the random key) |
+| GREEN | 22 passed / 22. `pnpm lint` 0, `pnpm typecheck` 0, `pnpm test:unit` 0 (282 files passed, 3396 tests) |
+| Mutations on the fix | random key restored: 1 failed. Always-call-Stripe: 1 failed. 409 guard removed: 1 failed. Additive total restored: 5 failed. All killed |
+
+## Audit items 2 and 3: NOT DONE, blocked on disk
+
+`df -h /System/Volumes/Data` showed 4.7 GiB free at the start and 6.3 GiB at the end; the hard rule is 8 GiB before testcontainers. So the STORY-075b / 076b integration specs, `stripe-subscriptions`, `stripe-webhook`, the M1-M6 mutation re-run, `pnpm test:isolation` and `pnpm test:isolation:breakers` were NOT run on this tip. Nothing was removed to make room (the free space is not this lane's to reclaim). Needed: the owner frees disk (>= 8 GiB), then run those suites, record RED against the parent of `c279f9b` / `28ea168`, and re-apply M1-M6.
+
+
+## Integration run (2026-10-08, disk 12 GiB free at start; closes "NOT RUN" above)
+
+Two defects in `test/integration/billing-addons.spec.ts` itself (written without a database) were found by the first run and fixed in the spec; no implementation change:
+1. `subIdOf` used the first 8 hex of a UUIDv7 workspace id (a millisecond timestamp prefix), so two workspaces created in one test collided on `ux_subscriptions_stripe` (3 tests, webhook 500). Now `sub_<full workspace id>`.
+2. The "cannot write one for B" assertion inserted via `SELECT ... FROM subscriptions WHERE workspace_id = B` under A's context; RLS hid the row, so a zero-row INSERT succeeded and the `rejects` was vacuous. It now inserts B's real subscription id (read as superuser) so RLS WITH CHECK must refuse it.
+
+| Run | Exit | Result |
+|---|---|---|
+| `billing-addons.spec.ts` first run | 1 | 3 failed / 28 passed (defect 1), then 1 failed / 30 (defect 2) |
+| `billing-addons.spec.ts` + `stripe-subscriptions` + `stripe-webhook` + `entitlement-resolution` after the fixes | 0 | 4 files, 134 tests passed |
+| RED (integration): `BillingAddonsController` removed from `billing.module.ts` (temporary, reverted), same spec | 1 | 21 failed / 10 passed (the 10 are reconciler/webhook rows that need no endpoint). The spec could not be run at `235e0ab` itself: it needs the fake gateway methods added in `c279f9b` |
+| Mutation: `reconcile` locks closed rows (`AND active_until IS NULL` dropped, `billing-addons.service.ts` FOR UPDATE read) | 1 | KILLED by "AC1 . an add-on that left Stripe's subscription is closed..." (the mutation that survived the unit specs) |
+| `pnpm lint` | 0 | clean |
+| `pnpm typecheck` | 0 | clean |
+| `pnpm test:unit` | 0 | 282 files passed, 1 skipped; 3396 passed, 1 skipped |
+| `pnpm test:isolation`, `pnpm test:isolation:breakers` | 1 | still crash in `seedTenant` (`three-tenant-fixture.ts:149`, `support_grants` INSERT, check violation 23514) at this tip even though `3871292` (d-admin-2) is an ancestor. Not caused by this story (no tenant table touched; `subscription_addons` has its generated policy). Tenant isolation is proved in the integration spec under `nominara_app` (3 tests, passing). Disk fell to 7.4 GiB during these runs; no further testcontainers runs were started |
+
+Still deferred: real-API / Stripe sandbox evidence (NEW-A-17), the PlanSettings frontend (app repo), spans (week 2).
+
+
+## Audit round 3 (2026-10-08): scheduled-removal freeze, and the two money guards
+
+Disk check before any testcontainers run: `df -h /System/Volumes/Data` = 5.4 GiB free (< 8 GiB). By the hard rule NO integration/isolation suite was run in this round. Everything below marked UNRUN needs a run once the owner frees disk.
+
+### Finding 1 (major): a scheduled removal froze phase 2
+
+Rule chosen: REFUSE. `add()` returns 409 ("an add-on removal is scheduled for the end of this billing period ...") when the fetched subscription has a `schedule` attached and the request would change Stripe (total > held). A total already held stays a no-op (retry safety). The other option (rebuild phase 2 on every change) depends on whether Stripe accepts direct item changes on a scheduled subscription, which is unverified: that is NEW-A-17 (sandbox), and must be confirmed before go-live. Known cost of this rule: the schedule stays attached through the period end AND the one-cycle phase 2, so add-on purchases are refused for up to two cycles after a DELETE; the owner may prefer rebuild-phase-2 once the sandbox answer is known. Second DELETE compounding is not a problem under this rule (no add can intervene, so `keep(next.items)` is still correct).
+
+| Criterion | Proof |
+|---|---|
+| DELETE kind A then POST kind B: assert what phase 2 contains | `billing-addons.service.spec.ts` "AC13 . DELETE extra_project then POST extra_seat {3} is a 409 ...": one removal recorded, POST 409, no `changeAddonQuantity`, no second schedule write (phase 2 untouched) |
+| no schedule: POST proceeds | "AC13 . with no schedule attached the same POST goes through" |
+| held total retry is still a no-op under a schedule | "AC13 . a total already held is still a no-op ..." |
+| RED | `1b7ebc3`: `vitest run billing-addons.service.spec.ts` exit 1, 1 failed / 24 passed ("promise resolved ... instead of rejecting") |
+| GREEN | fix commit after it; `vitest run src/modules/billing src/lib/billing` exit 0, 152 passed |
+| Sandbox confirmation | NEW-A-17, NOT collected (needs the real API/sandbox) |
+| Integration form of the DELETE-then-POST case | NOT written: `FakeStripeGateway` does not model schedules; unit proof only |
+
+### Finding 2 (major): the two guards now have tests
+
+| Guard | Test | Mutant | Result |
+|---|---|---|---|
+| workspace row lock in `add()` | unit "lock . add() takes the workspace row lock BEFORE the subscription read and the Stripe fetch"; integration "audit . concurrent POSTs with DISTINCT Idempotency-Keys ..." (12 parallel POSTs, totals 2..13, Stripe applies after 50 ms; asserts exactly one create, one line, final quantity 13) | lock `SELECT ... FOR UPDATE` deleted from `add()` (scratch edit, restored; `git diff` clean after) | unit: KILLED (1 failed / 26 passed, exit 1). Integration: UNRUN |
+| reconcile filter `AND stripe_subscription_id = $2` | unit "reconcile filter . an event for an OLD subscription id matches no live row" (a DB whose only live subscription is `sub_current`); integration "audit . a late event for an OLD, ended subscription leaves the CURRENT subscription's add-ons active" | replaced by `$2::text IS NOT NULL` | unit: KILLED (1 failed / 26 passed, exit 1). Integration: UNRUN |
+
+Honest limit: the unit lock test proves ORDER (lock before the read and the fetch), not mutual exclusion; only the integration concurrency test proves the latter, and it has never been executed. The unit reconcile test is a scripted DB that models the filter, so it too is weaker than the integration case. Neither integration test has been run, so their assertions (notably the 200 on the old-subscription webhook, and that 12 parallel requests fit the harness pool) are unverified, and the integration mutant runs are owed.
+
+### Gates (exit codes)
+`pnpm lint` 0 · `pnpm typecheck` 0 · `pnpm test:unit` 0 (282 files passed, 1 skipped; 3401 passed, 1 skipped). `test:integration` / `test:isolation`: not run (disk).
+
+
+## Audit round 3 follow-up (2026-10-08, disk 19 GiB free): the integration tests ran, and one did not discriminate
+
+Run with the disk rule satisfied. `billing-addons` + `stripe-subscriptions` + `stripe-webhook` + `entitlement-resolution`: exit 0, 4 files, 136 tests passed.
+
+| Mutant (integration, `billing-addons.spec.ts`) | Result |
+|---|---|
+| workspace row lock deleted from `add()` | exit 1, KILLED by "audit . concurrent POSTs with DISTINCT Idempotency-Keys ... (the workspace row lock)" (1 failed / 32 passed). Mutual exclusion is now proved, not just order |
+| reconcile filter `stripe_subscription_id = $2` -> `$2::text IS NOT NULL` | SURVIVED the first time: the test's old-subscription fixture carried no billing period, so the handler ignored the event ("carries no billing period") and `reconcile` was never reached (a debug print confirmed). Fixture fixed (`current_period_start/end` added); the mutant is now KILLED (`expected [] to deeply equal [[extra_project,1],[extra_seat,2]]`, exit 1) and the unmutated test passes |
+
+Final gates on this tip: `pnpm lint` 0, `pnpm typecheck` 0, `pnpm test:unit` 0 (3401 passed, 1 skipped, before the fixture-only change). `test:isolation` / `:breakers` not run: known fixture crash at this tip; isolation proved under `nominara_app` in the integration spec (3 tests, passing).
+
+
+## Audit round 4 (2026-10-08): two Stripe lines of one add-on kind
+
+Finding: `addonItemsFromSubscription` sums the quantities of every line of a kind but keeps the first item id, so `add()` (total sent to one item) over-charged and `remove()` (one item dropped) left the other line billing. Rule applied: when more than one line of a kind is held, REFUSE with 409 and raise a money alarm, in both `add()` and `remove()`. Cause window: a create that times out at the gateway but is applied by Stripe, then a retry under a NEW Idempotency-Key.
+
+| Criterion | Proof |
+|---|---|
+| AC1 add: two held lines, POST {3} is 409, Stripe not changed, alarm fires | `billing-addons.service.spec.ts` "AC1 . POST extra_seat {3} with two held lines is a 409 ..." (asserts no `changeAddonQuantity` and counter `nominara_billing_addon_duplicate_lines_total{kind}`) |
+| the state is refused even when the total equals the sum | "AC1 . even a total EQUAL to the summed quantity is refused ..." |
+| another kind is unaffected | "AC1 . a duplicate of ANOTHER kind does not block this kind ..." |
+| AC4 remove: two held lines, DELETE is 409, no removal scheduled, alarm fires | "AC4 . DELETE extra_seat with two held lines is a 409 ..." (asserts no `scheduleAddonRemoval`) |
+| pure detection | `addon-items.spec.ts` "STORY-076b audit . duplicatedAddonKinds" (3 tests: catalog order, no false positives/empty/malformed, a malformed second line still counts) |
+| integration (fake gateway holding two lines, real API, real Postgres, nominara_app) | `test/integration/billing-addons.spec.ts` "audit . Stripe holding TWO extra_seat lines ...": POST 409, DELETE 409, no `addonChanges`/`addonRemovals`, local rows and entitlement_version unchanged |
+| RED | `e8f66e6`: unit `vitest run billing-addons.service.spec.ts` exit 1, 3 failed / 28 passed (the 4th, other-kind, is a control that passes by design); integration `-t "TWO extra_seat"` exit 1, "expected 202 to be 409" (a first attempt failed with 401 entitlement_stale, a fixture error, fixed before the commit) |
+| GREEN | `vitest run src/modules/billing src/lib/billing` exit 0, 161 passed; integration `billing-addons` + `stripe-webhook` + `stripe-subscriptions` exit 0, 119 passed |
+| metric / log | counter `nominara_billing_addon_duplicate_lines_total` (+ `nominara_billing_addon_change_total{outcome=duplicate_lines}`); `logger.error` carries workspace ID and kind only. OpenTelemetry spans deferred to week 2 by owner decision |
+| Gates | `pnpm lint` 0 · `pnpm typecheck` 0 · `pnpm test:unit` 0 (282 files passed, 1 skipped; 3408 passed, 1 skipped). Disk 9.4 GiB free before the integration run |
+
+Known remaining: `reconcile` still mirrors a duplicated kind as ONE row (summed quantity, first item id). That mirrors what Stripe bills, which is the honest quantity; the alarm and the 409 stop any change through the API until support removes the extra line in Stripe. The real-API behaviour (does Stripe really apply a timed-out create) is NEW-A-17.
+
+### Not done in this round (decisions needed, see the report)
+- Finding 2 (quantity semantics: the recorded call says ADD, the code and contract say TOTAL; catalog listing with prices): NOT changed. It reverses a recorded lead decision and changes the wire contract; the lead/owner must write the decision into `plans-7day/decisions-2026-10-08.md` and the story first.
+- Finding 3 (isolation gates): lane touches no tenant table; `test/isolation/support/three-tenant-fixture.ts` belongs to the d-admin fix. Not touched; the merge step must run `test:isolation` and `:breakers` after it lands.
+
+## Audit round 5
+
+- Finding 2 (Idempotency-Key mutant survived): commit `b58eb81`. The fake gateway now records `addonAttempts` BEFORE it rejects. S `billing-addons.spec.ts` > "AC1 retry · a create that FAILS without changing Stripe is retried under the SAME derived Stripe key; a different Idempotency-Key derives a different one" asserts equal keys across the retry and a different key for a different header. This is a test-only change over correct code, so there is no RED; its proof is the mutant (`${idempotencyKey}-${Math.random()}` in `BillingAddonsController.add`) which MUST now fail this test. **NOT RUN**: disk is 7.7 GiB (< 8 GiB rule), so neither the test nor the mutant was executed. Typecheck and lint pass. Run the integration spec and the mutant before merge.
+- Finding 3 (ADD vs TOTAL, catalog read): NOT changed; stopped on a decision (see the report). Code and contract still say TOTAL.
+- Finding 4 (isolation gate): not a lane defect, the lane adds no tenant table and touches none of the failing files; the merge step runs `test:isolation` and `:breakers` after the d-admin fixture fix and the c-src, c-geo, d-admin namespacing fixes land.
+- Gates after this round: lint 0, typecheck 0, test:unit 0 (3416 passed, 1 skipped).
+
+
+## Checkpoint-3 fix pass (2026-10-08, branch `7day/d-billing-4` from `integration/7day` @ fee788e)
+
+Commits: contract `425f498` · RED `5a4bbe5` · fix `fb15bcf` (a follow-up commit adds two metric assertions to the unit spec).
+Migration `0122_subscriptions_pending_addon_changes` (additive nullable jsonb on `subscriptions`; same precedent as 0077's `pending_checkout`; the existing RLS policy covers it). The task named the stored intent, so the column is named by it.
+Base run first: `billing-invoices.spec.ts` + `billing-addons.spec.ts` on the merged tree, `vitest run --config vitest.integration.config.ts`, exit 0, 65 passed (the two specs now have run).
+
+### Decisions applied (decisions-2026-10-08.md, STORY-076b line)
+POST `quantity` ADDS to the held quantity (the previous contract made it a total). Annual add-ons 409 (unchanged, test "AC1 · an annual subscription is refused (409)"). `GET /billing/addons` lists the purchasable catalog with prices: one item per kind (`addonListItemSchema`), `quantity` 0 and `id`/`active_from`/`active_until` null when not held, `purchasable` from the plan flag.
+Docs carry: STORY-076 should state "POST adds; retry safety is the Idempotency-Key -> stored intent -> Stripe key chain; GET returns the catalog". The docs repo has no .git here.
+
+### Audit finding: a retried POST charged twice (the idempotency chain)
+Chain: `Idempotency-Key` -> sha256 (32 hex) map key in `subscriptions.pending_addon_changes` -> intent `{id, kind, quantity, target_total, stripe_idempotency_key: "addon-<intent id>", created_at}` committed on its OWN pooled connection BEFORE Stripe is asked -> that stored key and stored total are what `changeAddonQuantity` receives, on the first attempt and on every retry. A retry whose stored total Stripe already holds asks Stripe for nothing. Same key + different kind/quantity is 409 `idempotency_conflict`. At most 20 intents are kept.
+
+| Criterion | Test (file > name) |
+|---|---|
+| Stripe applied, reply lost, same key retried: exactly one unit, one Stripe change; a new key adds | `test/integration/billing-addons.spec.ts` > "AC1 retry · Stripe APPLIED the change and the reply was lost: ..." (uses the new `FakeStripeGateway.failAfterApplyingAddon`: applies, then loses the reply, and replays a key it has seen); unit `billing-addons.service.spec.ts` > "AC1 retry . Stripe applies the change and the reply is lost ..." |
+| Intent committed before Stripe, survives the failed request, key stored hashed | integration "AC1 retry · the intent is COMMITTED before Stripe is asked ..."; unit "AC1 retry . the intent is committed BEFORE Stripe is asked ..." (call order `["intent","stripe"]`) |
+| Retry replays the STORED total and STORED Stripe key | integration "AC1 retry · a retry replays the STORED total and the STORED Stripe key ..."; unit "AC1 retry . a retry that Stripe did NOT apply replays ..." |
+| Same key, different request: 409 idempotency_conflict | integration "AC1 retry · the same Idempotency-Key with a DIFFERENT request is 409 idempotency_conflict ..."; unit "AC1 retry . the same Idempotency-Key with a different kind or quantity ..." |
+| Different key = different purchase | unit "AC1 retry . a DIFFERENT Idempotency-Key is a different purchase and adds again" |
+| Bounded intent store; refused requests leave no intent | unit "keeps at most 20 intents ...", "a request refused for any reason leaves no intent behind" |
+| POST adds (3 held + 2 = 5); cap on held + added | integration "AC1 · POST ADDS to the held quantity ...", "AC1 boundary · held plus added above the cap is a 400 ..."; unit "AC1 · ADDS the requested units ...", "AC1 boundary · held plus added of exactly the cap ..." |
+| Catalog on GET (empty, plan-dependent, held beside not-held, tenant isolation) | integration "AC2 · catalog · a workspace holding nothing ...", "AC2 · catalog · purchasable follows the plan ...", "AC2 · catalog · a held add-on shows ...", "tenant isolation · the list returns only the caller's add-ons" |
+| Annual 409 | integration "AC1 · an annual subscription is refused (409) ..." |
+
+Tests whose setup the ADD decision outdated and that were rewritten to prove the same property (not weakened): the held-add test (3 held +2 = 5, was "5 total"), the cap test (99 held +2 is a 400, +1 is allowed), the concurrency test, the extra_project-beside-duplicate-seat unit case (1 held + 2 = 3), the tenant-isolation list test (A now also sees `extra_project:0`; B's 4 projects stay invisible), and the empty-list test (now the catalog test).
+
+### A defect the new design exposed, found by the integration run, and fixed
+The first full run HUNG: 12 concurrent POSTs queued on the workspace row lock, each holding a pooled connection, while the lock holder needed a SECOND pooled connection for its intent; the pool was empty and nothing could proceed (pg_stat_activity showed the waiters on `FOR UPDATE` and the holder `idle in transaction`). Fix: the lock wait is bounded (`lock_timeout` 3 s, transaction-local via `set_config(..., true)`, then reset); exceeding it is a retryable 409 "another billing change for this workspace is in progress" (counter `outcome=lock_wait_exceeded`). Consequence for the concurrency test: under saturation some requests are 409 instead of queueing, so it now asserts every status is 202 or 409 (it already allowed 409), at least one 202, exactly one Stripe create, one line, and a final quantity equal to the SUM OF THE ACCEPTED adds. The invariant (no lost update, no second item) is unchanged. Unit: "lock wait · the workspace lock is waited for at most 3 s ...". The same hold-and-wait shape exists in checkout's two short writes (billing-subscription.service.ts); not touched here, flagged.
+
+### Mutants (integration, `billing-addons.spec.ts`, each reverted; `git diff` clean afterwards)
+| Mutant | Result |
+|---|---|
+| ignore the stored total (`target = held + quantity` on retry) | KILLED, exit 1 (1 failed: the applied-then-lost retry test) |
+| Idempotency-Key cut at the controller (`${key}-${Math.random()}`) | KILLED, exit 1 (4 failed) |
+| intent written on the request's own connection (rolls back with the 503) | KILLED, exit 1 (5 failed) |
+| workspace row lock removed (`FOR UPDATE` dropped) | KILLED, exit 1 (the concurrency test) |
+
+### Observability
+Metrics: `nominara_billing_addon_change_total{kind,outcome}` gains `replayed_applied`, `idempotency_conflict`, `lock_wait_exceeded` (the first and last asserted in the unit spec). Log: "add-on change already applied; retry answered without a Stripe call" carries `workspace_id` and `kind` only. OpenTelemetry spans deferred to week 2 (decision R3); a missing span is not a failed criterion.
+
+### Gates (worktree api-wt-d1, exit codes read)
+| Command | Exit | Result |
+|---|---|---|
+| `pnpm lint` | 0 | clean |
+| `pnpm typecheck` | 0 | clean |
+| `pnpm contracts:generate`, `pnpm contracts:check` | 0 | no drift |
+| `pnpm contracts:diff` vs `integration/7day` | 0 | `major`: the add-on route is not in `contracts/baseline/openapi.previous-minor.json` (never released), so no breaking-changes.json entry; the diff against that baseline is `major` before and after this change |
+| `pnpm test:unit` | 0 | 302 files passed, 1 skipped; 3701 passed, 1 skipped |
+| RED (`5a4bbe5`) unit `billing-addons.service.spec.ts` | 1 | 8 failed / 26 passed |
+| RED (`5a4bbe5`) integration `billing-addons.spec.ts` | 1 | 10 failed / 30 passed |
+| GREEN integration `billing-addons.spec.ts` | 0 | 40 passed |
+| integration: billing-addons, billing-invoices, billing-usage-auto-topup, credit-ledger-schema, credit-packs, drizzle-schema-and-service, entitlement-guard, entitlement-resolution, identity-tenancy-billing, migrations, openapi-route-and-strictness, rls-check, stripe-subscriptions, stripe-webhook | 0 | 14 files, 331 passed |
+| `pnpm test:isolation:breakers` | 0 | 1 file, 24 passed |
+| `pnpm test:isolation` | 1 | 52 passed, 1 failed: ISO-14 `namespacing.spec.ts` flags `src/modules/reports/scheduled-reports.service.ts:234` (`${ARTIFACT_LINK_BASE}/${a}`). NOT this lane: the file is untouched (`git diff integration/7day -- src/modules/reports test/isolation` is empty) and the scanner reads source, so it fails identically on the base. Belongs to e-reports; the billing tables' isolation assertions all pass (12 other files) |
+| `db:rls-check` / `db:schema-check` / `db:drift-check` | not run as CLIs | they need a DATABASE_URL and the lane must not use 55432; their content is covered by the integration specs `rls-check.spec.ts` and `drizzle-schema-and-service.spec.ts` (both passed with the migration applied) |
+
+### Not done / stated
+`src/db/schema/billing.ts` got the one-line `pendingAddonChanges` column by hand because `pnpm db:schema-generate` needs a shadow database URL; `drizzle-schema-and-service.spec.ts` (generated schema == migrated DB) passes, and the next regeneration will reproduce it. Real Stripe behaviour (a key replay with identical params) is NEW-A-17.
+
+## Checkpoint-4, fix pass 2 (lane 7day/d-billing-5, base integration/7day 74e4b2f)
+Second-engineer findings 1 (blocker), 2 (major) and 3 (major). Items 2 and the checkout/credit-pack halves are also recorded in `STORY-075a.md` and `STORY-076a.md`.
+
+### Commits
+| Sha | What |
+|---|---|
+| `8976cd1` RED | add-on Stripe fake refuses a reused key whose call differs (`test/support/fake-stripe-gateway.ts`); unit `billing-addons.service.spec.ts` (3 failed / 52 passed of 55: the lost-reply create retried twice ends in a 400 `idempotency_error` then a second intent and `quantity` 2; `idempotency_error` deleted the intent; a legacy unsettled intent was replayed); unit `stripe-http.addons.spec.ts` (1 failed / 10 passed: `errorType` undefined); integration `billing-addons.spec.ts` (2 failed / 44 passed: the new create-retry test and the EXISTING "AC1 retry" test, which only passed because the fake replayed any repeated key); `billing-pool-contention.spec.ts` (each of its 3 tests: "did not finish within 25000 ms: the pool is deadlocked"); `billing-write-pool.spec.ts` (module absent). The two money-guard tests (intent expiry, in-flight statuses) PASS here by design: the guards exist, they were untested. RED typecheck is red only on the `StripeUpstreamError` arity the fix adds. |
+| `c901eac` contract | `pendingAddonChangeSchema.stripe_call` (discriminated: create/null item, update/item id), optional so an old row still parses. `contracts:check` 0. |
+| `eaf1971` RED | `billing-subscription.service.spec.ts`: the checkout lock wait is unbounded (1 failed / 1 passed: the raw 55P03 propagates). |
+| `bd443c2` fix | below |
+
+### Criteria
+| Finding / criterion | Proof (test name) |
+|---|---|
+| 1. Freeze the full Stripe call in the intent and replay it byte-identically | unit "STORY-076b AC-create-retry . the reply of an APPLIED create is lost twice: every retry replays the identical create under the identical key, and the third answer leaves ONE seat" (a Stripe fake that refuses a reused key with a different operation/item/quantity; 3 identical calls, 1 key, quantity 1, 4th answer is the settled replay); "AC-create-retry . the SECOND Stripe-accepted retry of an update is the same update under the same key"; integration "STORY-076b AC-create-retry · the reply of an applied CREATE is lost twice under one Idempotency-Key..." (real DB, real `IdempotencyInterceptor`, honest fake: 202, 1 seat, 3 attempts, all `existingItemId: null`) |
+| 1. A 400 `idempotency_error` is never a definite rejection; the gateway surfaces the type | unit "AC-idempotency-error . a 400 idempotency_error is NEVER a definite rejection: the intent is kept..." (and a plain 400 still releases it); gateway unit "AC-idempotency-error . Stripe's 400 idempotency_error reaches the service as a typed error" (a real `Stripe.errors.StripeIdempotencyError`; message carries no secret) and "an error with no Stripe type carries none" |
+| 1. The add-on fake refuses a reused key with different parameters | `FakeStripeGateway.changeAddonQuantity` (fingerprint of everything but the key); proven by the previously-passing "AC1 retry" integration test going red at `8976cd1` |
+| 1. Lost-reply create + retry-twice test | the unit and integration tests above |
+| 1. (added) an unsettled intent that froze no call is not replayed | unit "AC-legacy-intent": 409 `conflict`, Stripe not asked, counter `outcome=intent_unreplayable` |
+| 2. Short writes on a separate small pool built with `createPgPool`, bounded | `src/modules/billing/billing-write-pool.ts` (`max` 4, `connectionTimeoutMillis` 2000); unit `billing-write-pool.spec.ts` "AC-pool-bounds", "AC-pool-timeout" (a starved pool is a retryable 503 `degraded`, counted, no connection text) |
+| 2. Concurrency above the pool size finishes before a deadline | integration `billing-pool-contention.spec.ts`: "AC-pool-checkout" (20 concurrent checkouts, one workspace, distinct keys: 200 or 409, API still answers), "AC-pool-pack" (14 purchases, one per workspace), "AC-pool-mixed" (10 add-ons + 10 checkouts + 10 purchases across 30 workspaces: 202/200) |
+| 2. Checkout gets add()'s bounded lock wait | unit `billing-subscription.service.spec.ts` "AC-checkout-lock" (3000 ms, `set_config(..., true)` before the lock; 55P03 is a 409; any other code is not swallowed) |
+| 3a. Intent-expiry guard has a test that fails without it | unit "AC-intent-expiry . a retry older than Stripe's 24 h key retention is a 409 `too old`..." and its boundary (23 h 59 m replays) |
+| 3b. 408/409/429 are not definite rejections | unit "AC-in-flight . Stripe %i is NOT a definite rejection" for 408, 409, 429, 500, 502, 503, 504; "AC-in-flight boundary" for 400, 401, 402, 404, 422, 499 (released) |
+
+### What changed
+`StripeUpstreamError(statusCode, errorType?)` with a closed set of Stripe error types; `StripeHttpGateway.asUpstream` reads the SDK's `rawType`. `BillingAddonsService.add` records `stripe_call` with the intent (create, or update of the held item id at first sight) and sends `intent.stripe_call.item_id` on every attempt; `isDefiniteRejection` takes the error and excludes `idempotency_error`. A settle-persist failure after Stripe accepted a create is the same path and is covered by the same replay. `BillingAddonsService`, `BillingSubscriptionService` and `CreditPacksService` inject `BILLING_WRITE_POOL` (provided by `BillingModule`, ended in its `onModuleDestroy`) instead of `PG_POOL`, and take write connections through `connectForWrite`.
+
+### Mutation proofs (each reverted; run against the fixed code)
+| Mutation | Result |
+|---|---|
+| M9 remove the 24 h intent-expiry check | "AC-intent-expiry" fails (1 failed / 54 passed). Also run against the base before the fix: same single failure |
+| M11 count 409 as a definite rejection | "AC-in-flight . Stripe 409" fails (1 / 54). Also run against the base: same |
+| treat `idempotency_error` as definite | "AC-idempotency-error" fails (1 / 54) |
+| send `held?.itemId` instead of the frozen item id | "AC-create-retry . ... lost twice" fails (1 / 54) |
+| drop the legacy-intent refusal | "AC-legacy-intent" fails (1 / 54) |
+| drop the gateway's `errorType` | gateway "AC-idempotency-error" fails (1 / 10) |
+| drop checkout's `lock_timeout` | "AC-checkout-lock" fails (1 / 1 passed) |
+| bind `BILLING_WRITE_POOL` to `PG_POOL` | "AC-pool-mixed" fails: "30 concurrent requests did not finish within 25000 ms: the pool is deadlocked" |
+
+### Observability
+Metric `nominara_billing_write_pool_timeout_total` (asserted in `billing-write-pool.spec.ts`); `nominara_billing_addon_change_total{outcome=intent_unreplayable}` and `nominara_billing_checkout_session_total{outcome=lock_wait_exceeded}` (asserted); a redacted error log line in `connectForWrite` (no connection text, no workspace name). Spans deferred to week 2 (R3), as for the rest of the lane.
+
+### Gates (api-wt-d1, after `bd443c2`)
+| Gate | Exit | Result |
+|---|---|---|
+| `pnpm lint` | 0 | |
+| `pnpm typecheck` | 0 | |
+| `pnpm test:unit` | 0 | 309 files passed, 1 skipped; 3802 passed, 1 skipped |
+| `pnpm contracts:check` | 0 | no drift |
+| integration `billing-pool-contention`, `billing-addons`, `credit-packs`, `stripe-subscriptions`, `stripe-webhook`, `billing-invoices`, `auto-topup-trigger` | 0 | 7 files, 239 passed |
+| `pnpm test:isolation` | 0 | 13 files, 53 passed |
+
+### Not done / stated
+- The pool size (4) and wait (2 s) are engineering judgements; no reference gives them. Short writes hold a connection for one statement, so 4 serves the 10 main-pool connections; a larger deployment's main pool raises the question.
+- The 20-concurrent single-workspace tests are 20 because the `writes` class bursts 20 per user (the credit-pack purchase has a stricter class of its own, so that test uses one workspace per request). More concurrency from ONE tenant needs more members; the mixed test covers it across users.
+- Other holders of `PG_POOL` that take a second connection from it (the credit interceptor's reserve path was not audited here; it already uses its own settlement pool for release) are not covered by this change.
+- A legacy unsettled intent (written before `stripe_call` existed) now answers 409 until it ages out (24 h) rather than being replayed with a re-derived call. If any exist in a deployed environment this is the migration cost; none can in an unreleased route.
+- Real Stripe's key-reuse behaviour is still NEW-A-17 (sandbox).

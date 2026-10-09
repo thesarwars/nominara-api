@@ -34,6 +34,12 @@ export interface SpendMeterResult {
 export interface SpendMeterStore {
   /** Atomically adds `usd` to the running total for `engineKey`'s `cycleKey` and returns the new total. */
   incrementAndRead(engineKey: EngineKey, usd: number, cycleKey: string): Promise<number>;
+  /**
+   * The running total WITHOUT adding to it. ABSENT is 0 (nothing recorded yet this cycle, which is
+   * legitimate at the start of a period). UNREADABLE is not 0: the store being unreachable or holding
+   * a value that is not a finite non-negative number THROWS, so the pre-call gate can fail closed.
+   */
+  readTotal(engineKey: EngineKey, cycleKey: string): Promise<number>;
   readAlertsFired(engineKey: EngineKey, cycleKey: string): Promise<Set<SpendAlertLevel>>;
   markAlertFired(engineKey: EngineKey, cycleKey: string, level: SpendAlertLevel): Promise<void>;
 }
@@ -85,6 +91,12 @@ export class ValkeySpendMeterStore implements SpendMeterStore {
     return Number(raw);
   }
 
+  async readTotal(engineKey: EngineKey, cycleKey: string): Promise<number> {
+    const raw = await this.redis.get(this.totalKey(engineKey, cycleKey));
+    if (raw === null) return 0;
+    return parseStoredTotal(raw);
+  }
+
   async readAlertsFired(engineKey: EngineKey, cycleKey: string): Promise<Set<SpendAlertLevel>> {
     const members = await this.redis.smembers(this.alertsKey(engineKey, cycleKey));
     return new Set(members as SpendAlertLevel[]);
@@ -101,6 +113,27 @@ export class ValkeySpendMeterStore implements SpendMeterStore {
   }
 }
 
+/** A stored total that is not a finite, non-negative decimal is corrupt: it must never read as "nothing spent". */
+function parseStoredTotal(raw: string): number {
+  const trimmed = raw.trim();
+  const total = trimmed === "" ? Number.NaN : Number(trimmed);
+  if (!Number.isFinite(total) || total < 0) throw new SpendMeterUnreadableError("stored total is not a finite non-negative number");
+  return total;
+}
+
+/** The meter cannot say how much has been spent. The pre-call gate treats this as "do not spend". */
+export class SpendMeterUnreadableError extends Error {
+  constructor(reason: string) {
+    super(`spend meter unreadable: ${reason}`);
+    this.name = "SpendMeterUnreadableError";
+  }
+}
+
+/** A configured ceiling that is zero, negative or not a number can never be "room to spend". */
+function isDegenerateCeiling(ceilingUsd: number): boolean {
+  return !Number.isFinite(ceilingUsd) || ceilingUsd <= 0;
+}
+
 export class SpendMeter {
   constructor(
     private readonly store: SpendMeterStore,
@@ -113,6 +146,31 @@ export class SpendMeter {
   private cycleKey(nowMs: number): string {
     const d = new Date(nowMs);
     return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+
+  /**
+   * The PRE-CALL gate (EC-08's "hard stop"): true when this month's recorded
+   * spend for the engine has reached (>=) its ceiling, so the caller must not
+   * make another vendor call. False when the engine has no ceiling (D13).
+   *
+   * FAILS CLOSED, unlike `recordCost`. Recording happens after the money is
+   * spent, so failing open there loses a data point; here, failing open would
+   * spend with no upper bound exactly when the control cannot be seen. For an
+   * engine WITH a ceiling a store failure therefore THROWS, and the caller
+   * treats it as retryable. An engine without a ceiling never reads the store.
+   *
+   * ABSENT is not UNREADABLE: a missing total is 0 spent (start of a period);
+   * a corrupt or non-finite one throws. A zero, negative or non-finite
+   * CEILING is a misconfiguration and blocks (fail closed) rather than being
+   * read as "no ceiling".
+   */
+  async isCeilingReached(engineKey: EngineKey): Promise<boolean> {
+    const ceilingUsd = this.ceilingsUsd[engineKey];
+    if (ceilingUsd === undefined) return false;
+    if (isDegenerateCeiling(ceilingUsd)) return true;
+    const totalUsd = await this.store.readTotal(engineKey, this.cycleKey(this.clock()));
+    if (!Number.isFinite(totalUsd) || totalUsd < 0) throw new SpendMeterUnreadableError("store returned a non-finite or negative total");
+    return totalUsd >= ceilingUsd;
   }
 
   /**
@@ -137,7 +195,7 @@ export class SpendMeter {
     const ceilingUsd = this.ceilingsUsd[engineKey] ?? null;
 
     const newAlerts: SpendAlertLevel[] = [];
-    if (ceilingUsd !== null && ceilingUsd > 0) {
+    if (ceilingUsd !== null && !isDegenerateCeiling(ceilingUsd)) {
       try {
         const ratio = totalUsd / ceilingUsd;
         const alreadyFired = await this.store.readAlertsFired(engineKey, cycleKey);
@@ -156,7 +214,7 @@ export class SpendMeter {
       }
     }
 
-    const hardStopped = ceilingUsd !== null && ceilingUsd > 0 && totalUsd >= ceilingUsd;
+    const hardStopped = ceilingUsd !== null && (isDegenerateCeiling(ceilingUsd) || totalUsd >= ceilingUsd);
 
     return { totalUsd, ceilingUsd, newAlerts, hardStopped };
   }

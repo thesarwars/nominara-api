@@ -8,6 +8,10 @@ import { IdentityService } from "../../src/modules/identity/identity.service.js"
 import { OauthService } from "../../src/modules/identity/oauth.service.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 
+// STORY-173 — unlinking needs a fresh step-up; these service-level scenarios are
+// about the last-credential rule, not step-up (identity-oauth-proves-email.spec.ts).
+const FRESH_STEP_UP = { lastStrongAuthAt: new Date(), lastStrongAuthMethod: "email_otp" } as const;
+
 // STORY-096 slice C — `GET /me/oauth`, the state BETWEEN link and unlink.
 //
 // `POST /auth/oauth/{provider}/link/start` and `DELETE /me/oauth/{provider}`
@@ -256,7 +260,7 @@ describe("STORY-096C · a person cannot be locked out by removing their last two
       [id, randomUUID()],
     );
 
-    await expect(oauth.unlink(id, "google")).resolves.toBeUndefined();
+    await expect(oauth.unlink(id, "google", FRESH_STEP_UP)).resolves.toBeUndefined();
 
     const left = await pool.query<{ n: string }>(
       `SELECT count(*)::text AS n FROM user_credentials WHERE user_id = $1 AND revoked_at IS NULL`,
@@ -273,7 +277,7 @@ describe("STORY-096C · a person cannot be locked out by removing their last two
       [id, randomUUID()],
     );
 
-    await expect(oauth.unlink(id, "github")).rejects.toThrow(/last remaining credential/i);
+    await expect(oauth.unlink(id, "github", FRESH_STEP_UP)).rejects.toThrow(/last remaining credential/i);
   });
 
   it("⚠ one of the two concurrent removals is refused, every time", async () => {
@@ -295,8 +299,8 @@ describe("STORY-096C · a person cannot be locked out by removing their last two
 
       // Fired together: one removes the last passkey, the other the last link.
       const [a, b] = await Promise.allSettled([
-        identity.revokePasskey(id, passkey.rows[0]!.id),
-        oauth.unlink(id, "google"),
+        identity.revokePasskey(id, passkey.rows[0]!.id, FRESH_STEP_UP),
+        oauth.unlink(id, "google", FRESH_STEP_UP),
       ]);
 
       const left = await pool.query<{ n: string }>(

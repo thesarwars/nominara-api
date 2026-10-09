@@ -17,7 +17,7 @@ import { queueKeyPrefix } from "../../src/lib/queue/connection.js";
 const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
   capture: ["capture.plan", "capture.execute", "lookup.execute"],
   parse: ["capture.parse", "capture.arbitrate"],
-  crawl: ["crawl.discover", "crawl.fingerprint", "crawl.audit", "gsc.sync"],
+  crawl: ["crawl.discover", "crawl.fingerprint", "crawl.audit", "gsc.sync", "source.verify_presence"],
   embed: ["embed.batch", "topic.cluster"],
   rollup: [
     "rollup.metric_daily",
@@ -30,6 +30,10 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "maintenance.partition",
     // STORY-143 — not in §4; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "audit.verify",
+    // STORY-173 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "identity.sweep_unverified",
+    // NEW-D-7 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "billing.auto_topup",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],
@@ -242,6 +246,36 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
         const next = new Date(Number(found[0]!.next));
         expect(next.getUTCHours()).toBe(2);
         expect(next.getUTCMinutes()).toBe(40);
+      } finally {
+        await probe.close();
+      }
+    } finally {
+      await app.close();
+    }
+  }, 20_000);
+
+  it("⚠ WORKER_GROUP=rollup schedules identity.sweep_unverified daily at 02:50 UTC", async () => {
+    // STORY-173, owner decision: the stale-unverified-account sweep runs daily on
+    // this system. Asserted against the real Valkey, because a handler and a cron
+    // are worth nothing if the boot does not register the repeatable.
+    await mockConnectionSpy();
+    process.env.WORKER_GROUP = "rollup";
+    const { bootstrapWorker } = await import("../../src/worker.js");
+    const app = await bootstrapWorker();
+    try {
+      const probe = new Queue("identity.sweep_unverified", {
+        connection: { url: fixture.connectionString },
+        prefix: queueKeyPrefix(process.env.NODE_ENV ?? "test"),
+      });
+      try {
+        const found = await probe.getJobSchedulers();
+        expect(found).toHaveLength(1);
+        expect(found[0]!.key).toBe("cron:identity.sweep_unverified");
+        expect(found[0]!.pattern).toBe("50 2 * * *");
+        expect((found[0] as { tz?: string }).tz).toBe("UTC");
+        const next = new Date(Number(found[0]!.next));
+        expect(next.getUTCHours()).toBe(2);
+        expect(next.getUTCMinutes()).toBe(50);
       } finally {
         await probe.close();
       }

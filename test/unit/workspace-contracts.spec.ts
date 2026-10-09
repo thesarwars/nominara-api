@@ -143,6 +143,8 @@ describe("STORY-021 · memberResponseSchema", () => {
   const valid = {
     id: VALID_WORKSPACE_ID,
     user_id: VALID_USER_ID,
+    name: null,
+    email: "member@example.com",
     role: "manager",
     project_scope: null,
     status: "active",

@@ -80,6 +80,490 @@
           "expires_in_ms"
         ]
       }
+    },
+    {
+      "id": "2026-10-08-summary-data-source-vocabulary",
+      "recorded": "2026-10-08",
+      "story": "STORY-169",
+      "task": "NEW-A-5 / NEW-B-2",
+      "scope": "getWorkspaceSummary (GET /v1/workspaces/{id}/summary): engines[].data_source and projects[].engine_scores[].data_source",
+      "from": "data_source: a required enum live|demo",
+      "to": "data_source: live|demo|mixed or null, where null means nothing was measured",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2 of 2026-10-08 (plans-7day/decisions-2026-10-08.md) approved this as a breaking change. The workspace summary used a two-value live|demo marker while the per-project surfaces (matrix, scorecards, growth map) use the single vocabulary live|demo|mixed|null, and the two could not both stay: a figure backed by both real and demo captures was forced into one label, and an engine with nothing measured was reported as demo. One vocabulary everywhere was the owner's call. A typed consumer that switched exhaustively on live|demo now has two more cases, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "getWorkspaceSummary",
+        "path": "/v1/workspaces/{id}/summary",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "meta"
+        ],
+        "data_properties": [
+          "workspace_id",
+          "plan_key",
+          "window_days",
+          "projects",
+          "engines",
+          "health"
+        ],
+        "data_nested": [
+          {
+            "path": "engines.items.data_source",
+            "enum": [
+              "live",
+              "demo",
+              "mixed"
+            ],
+            "nullable": true
+          },
+          {
+            "path": "projects.items.engine_scores.items.data_source",
+            "enum": [
+              "live",
+              "demo",
+              "mixed"
+            ],
+            "nullable": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-wallet-auto-topup-required",
+      "recorded": "2026-10-08",
+      "story": "STORY-076",
+      "task": "NEW-D-6",
+      "scope": "getWallet (GET /v1/billing/wallet): data.auto_topup",
+      "from": "a wallet response with no auto-top-up member",
+      "to": "a wallet response whose REQUIRED data.auto_topup carries { enabled, pack_key, threshold, max_per_cycle, used_this_cycle, disabled_reason }",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision of 2026-10-08 (relayed in the checkpoint-3 fix-pass task text) approved making auto_topup a REQUIRED member of the wallet response as a breaking change. api-specification.md section 3 says the wallet carries the auto-top-up config, and a response that sometimes omits it would force every client to guess between off and unknown, so the field is required rather than optional. A consumer generated from the previous contract and a strict response validator would reject the new body, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "getWallet",
+        "path": "/v1/billing/wallet",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "meta"
+        ],
+        "data_properties": [
+          "available",
+          "included_balance",
+          "purchased_balance",
+          "reserved",
+          "expiring_soon",
+          "cycle_end",
+          "lifetime_granted",
+          "lifetime_purchased",
+          "lifetime_spent",
+          "auto_topup"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-credit-packs-cursor-envelope",
+      "recorded": "2026-10-08",
+      "story": "STORY-076",
+      "task": "NEW-D-1 AC3 (checkpoint-4)",
+      "scope": "listCreditPacks (GET /v1/billing/credit-packs)",
+      "from": "{ data: CreditPack[], meta } with no pagination member and no cursor/limit query",
+      "to": "{ data: CreditPack[], pagination, meta } with the standard cursor and limit query; ordered by (sort_order, credits, key)",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner-approved under the NEW-D-1 cursor-envelope rule: NEW-D-1 AC3 in the signed-off plan (plans-7day/track-plans.json) says every list response uses the cursor envelope, matching api-specification.md section 3 and not the demo's bare arrays; the checkpoint-4 fix-pass task text restated it for this route. It is not a numbered item in plans-7day/decisions-2026-10-08.md. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, so this is not additive. The earlier comment arguing for a bare array because the catalog is a handful of rows reversed the criterion and is withdrawn. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listCreditPacks",
+        "path": "/v1/billing/credit-packs",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "key",
+          "display_name",
+          "credits",
+          "price_usd",
+          "currency",
+          "min_plan_key"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-invoices-published-pagination",
+      "recorded": "2026-10-08",
+      "story": "STORY-075",
+      "task": "STORY-075b AC3 (checkpoint-4)",
+      "scope": "listInvoices (GET /v1/billing/invoices)",
+      "from": "a published response of { data, meta }; the server nevertheless sent pagination on the wire",
+      "to": "a published response of { data, pagination, meta }, so a generated client can read cursor_next",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner-approved under the NEW-D-1 cursor-envelope rule: NEW-D-1 AC3 in the signed-off plan (plans-7day/track-plans.json) says every list response uses the cursor envelope, matching api-specification.md section 3 and not the demo's bare arrays; the checkpoint-4 fix-pass task text restated it for this route. It is not a numbered item in plans-7day/decisions-2026-10-08.md. The route lacked the listOf marker, so the published document omitted a member the wire always carried and a client generated from it could not page. Correcting the document adds a REQUIRED response member, which the contracts:diff classifies as major, so it is recorded rather than ignored. The wire is unchanged. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listInvoices",
+        "path": "/v1/billing/invoices",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-credit-ledger-published-pagination",
+      "recorded": "2026-10-08",
+      "story": "STORY-073",
+      "task": "STORY-075b AC3 sibling (checkpoint-4)",
+      "scope": "listCreditLedger (GET /v1/billing/wallet/ledger)",
+      "from": "a published response of { data, meta }; the server nevertheless sent pagination on the wire",
+      "to": "a published response of { data, pagination, meta }, so a generated client can read cursor_next",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner-approved under the NEW-D-1 cursor-envelope rule: NEW-D-1 AC3 in the signed-off plan (plans-7day/track-plans.json) says every list response uses the cursor envelope, matching api-specification.md section 3 and not the demo's bare arrays; the checkpoint-4 fix-pass task text restated it for this route. It is not a numbered item in plans-7day/decisions-2026-10-08.md. Same defect as listInvoices, found by the published-contract sweep added in checkpoint-4 (any GET that accepts a cursor must publish pagination): the route lacked the listOf marker. This was added by the lane on its own reading of the NEW-D-1 AC3 rule, not named in the fix-pass task, and needs the lead's confirmation. The wire is unchanged. The previous-minor proxy does not cover this route.",
+      "assert": {
+        "operation": "listCreditLedger",
+        "path": "/v1/billing/wallet/ledger",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-addons-list-is-catalog",
+      "recorded": "2026-10-08",
+      "story": "STORY-076",
+      "task": "STORY-076b (owner decision, checkpoint-3)",
+      "scope": "listAddons (GET /v1/billing/addons): data items",
+      "from": "the add-ons the workspace holds: { id, kind, quantity (positive), unit_price_usd, grant, active_from, active_until }",
+      "to": "the purchasable catalog, one item per add-on kind: { kind, display_name, unit_price_usd, purchasable, quantity (0 when none held), grant, id|null, active_from|null, active_until|null }",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision of 2026-10-08 (decisions-2026-10-08.md, STORY-076b line): GET /billing/addons also lists the purchasable catalog with prices. A workspace holding nothing must read the unit prices before it buys, and check:no-cost-literals forbids the control from carrying them. The item gains required members (display_name, purchasable) and id, active_from and quantity become nullable or zero for a kind not held, so a typed consumer of the held-only list breaks; this is not additive. Recorded at checkpoint-4 because it was missing from this file. The previous-minor proxy does not cover this route.",
+      "assert": {
+        "operation": "listAddons",
+        "path": "/v1/billing/addons",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "kind",
+          "display_name",
+          "unit_price_usd",
+          "purchasable",
+          "quantity",
+          "grant",
+          "id",
+          "active_from",
+          "active_until"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-08-addons-post-quantity-adds",
+      "recorded": "2026-10-08",
+      "story": "STORY-076",
+      "task": "STORY-076b (owner decision, checkpoint-3)",
+      "scope": "addAddon (POST /v1/billing/addons): the meaning of the request's quantity",
+      "from": "quantity is the desired TOTAL of the add-on after the change, not an increment",
+      "to": "quantity is the number of units to ADD to the held quantity; the held quantity plus quantity may not exceed 100; the response's quantity_requested is still the total the Stripe item was set to",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision of 2026-10-08 (decisions-2026-10-08.md, STORY-076b line): POST quantity ADDS to the held quantity. The request SHAPE is unchanged ({ kind, quantity }), so a client written for the total semantics still validates and silently buys the wrong number of units (holding 2 and sending 3 now yields 5, not 3); that silent change of meaning is why it is breaking and why it is recorded. The assertion below pins the operation's response shape; the changed meaning itself lives in the request schema's description and cannot be asserted from the document's property names. Retry safety is carried by the Idempotency-Key, not by the number. The previous-minor proxy does not cover this route.",
+      "assert": {
+        "operation": "addAddon",
+        "path": "/v1/billing/addons",
+        "method": "post",
+        "status": "202",
+        "response_properties": [
+          "data",
+          "meta"
+        ],
+        "data_properties": [
+          "kind",
+          "status",
+          "quantity_requested",
+          "effective",
+          "effective_at",
+          "grant"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-api-keys-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-076",
+      "task": "NEW-D-1 AC3 (checkpoint-5)",
+      "scope": "listApiKeys (GET /v1/api-keys)",
+      "from": "{ data: ApiKey[], meta } with no pagination member and no cursor/limit query; every key in one response, ordered by created_at DESC, id",
+      "to": "{ data: ApiKey[], pagination, meta } with the standard cursor and limit query; ordered by (created_at DESC, id DESC) with a microsecond-precision cursor key",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Lead's call of 2026-10-09 (decisions-2026-10-08.md, section after checkpoint 5): GET /v1/api-keys moves to the cursor envelope under NEW-D-1 AC3, which in the signed-off plan (plans-7day/track-plans.json) says every list response uses the cursor envelope, matching api-specification.md section 3; the same decision says to record it as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every key now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listApiKeys",
+        "path": "/v1/api-keys",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "name",
+          "key_prefix",
+          "permissions",
+          "project_scope",
+          "created_by",
+          "last_used_at",
+          "expires_at",
+          "revoked_at",
+          "created_at"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-audit-log-id-is-row-seq",
+      "recorded": "2026-10-09",
+      "story": "STORY-076",
+      "task": "NEW-D-3 / NEW-D-1 (checkpoint-4 audit-log id, recorded at checkpoint-5)",
+      "scope": "listAuditLog (GET /v1/audit-log): the item's id",
+      "from": "an id derived from the row's hash material, which would leak the audit chain (row N's prev_hash is row N-1's row_hash)",
+      "to": "the row's audit_log.seq as a decimal string matching ^[0-9]{1,18}$, the same value the opaque cursor is keyed on",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Lead's call of 2026-10-09, approved by the owner (decisions-2026-10-08.md, section after checkpoint 5): the audit-log id becomes the row seq. Exposing either hash would leak the chain, and audit_log has no per-row uuid column; adding one is a schema change deferred to week 2. The id's value and format change (a hash-like string becomes a short decimal string), so a client that stored or pattern-matched old ids breaks, and seq is a global sequence so ids are monotonic across workspaces, a trade-off accepted for week 1. The request and envelope shapes are unchanged; the assertion pins the item's property names and the id pattern lives in the schema. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listAuditLog",
+        "path": "/v1/audit-log",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "occurred_at",
+          "actor_type",
+          "actor_id",
+          "action",
+          "category",
+          "resource_type",
+          "resource_id",
+          "severity",
+          "request_id",
+          "support_grant_id"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-themes-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-097",
+      "task": "NEW-E-7 (checkpoint-6)",
+      "scope": "listAgencyThemes (GET /v1/agency/theme)",
+      "from": "{ data: Item[], meta } with no pagination member and no cursor/limit query; every theme in one response, default first then created_at, id",
+      "to": "{ data: Item[], pagination, meta } with the standard cursor and limit query; default first, then (created_at, id); the unsaved platform default is still the single item of the first page of a workspace with no stored theme; cursor key [is_default, created_at microseconds, id]",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2026-10-09 pm #3 (decisions-2026-10-09-pm.md): all bare lists move to the cursor envelope, matching api-specification.md section 3 and the signed-off plan's rule that every list response uses it; the decision says to record each as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every row now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listAgencyThemes",
+        "path": "/v1/agency/theme",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "theme_id",
+          "name",
+          "is_default",
+          "color_primary",
+          "color_accent",
+          "color_bg",
+          "color_fg",
+          "font_family",
+          "logo_url",
+          "hide_nominara_brand"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-scheduled-reports-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-100",
+      "task": "NEW-E-7 (checkpoint-6)",
+      "scope": "listScheduledReports (GET /v1/scheduled-reports)",
+      "from": "{ data: Item[], meta } with no pagination member and no cursor/limit query; every report in one response, ordered by created_at DESC, id",
+      "to": "{ data: Item[], pagination, meta } with the standard cursor and limit query; ordered by (created_at DESC, id DESC) with a microsecond-precision cursor key; each page carries the deliveries of its own reports",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2026-10-09 pm #3 (decisions-2026-10-09-pm.md): all bare lists move to the cursor envelope, matching api-specification.md section 3 and the signed-off plan's rule that every list response uses it; the decision says to record each as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every row now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listScheduledReports",
+        "path": "/v1/scheduled-reports",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "label",
+          "project_ids",
+          "sections",
+          "cadence",
+          "day",
+          "hour",
+          "format",
+          "recipients",
+          "timeframe",
+          "theme_id",
+          "paused",
+          "next_run_at",
+          "deliveries"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-share-tokens-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-098",
+      "task": "NEW-E-7 (checkpoint-6)",
+      "scope": "listShareTokens (GET /v1/share-tokens)",
+      "from": "{ data: Item[], meta } with no pagination member and no cursor/limit query; every visible token in one response, ordered by created_at DESC, id",
+      "to": "{ data: Item[], pagination, meta } with the standard cursor and limit query; ordered by (created_at DESC, id DESC) with a microsecond-precision cursor key; a scoped member still sees only tokens inside their scope",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2026-10-09 pm #3 (decisions-2026-10-09-pm.md): all bare lists move to the cursor envelope, matching api-specification.md section 3 and the signed-off plan's rule that every list response uses it; the decision says to record each as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every row now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listShareTokens",
+        "path": "/v1/share-tokens",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "label",
+          "token_prefix",
+          "scope_project_ids",
+          "scope_tabs",
+          "hide_competitors",
+          "hide_costs",
+          "timeframe_lock",
+          "theme_id",
+          "password_required",
+          "allowed_email_domains",
+          "max_views",
+          "view_count",
+          "expires_at",
+          "revoked_at",
+          "created_at",
+          "last_viewed_at"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-share-token-views-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-098",
+      "task": "NEW-E-7 (checkpoint-6)",
+      "scope": "listShareTokenViews (GET /v1/share-tokens/{id}/views)",
+      "from": "{ data: Item[], meta } with no pagination member and no cursor/limit query; at most 500 views in one response, ordered by viewed_at DESC, id, with no way to read past the 500th",
+      "to": "{ data: Item[], pagination, meta } with the standard cursor and limit query; every view reachable by cursor, ordered by (viewed_at DESC, id DESC) with a microsecond-precision cursor key; the 500-row cap is removed",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2026-10-09 pm #3 (decisions-2026-10-09-pm.md): all bare lists move to the cursor envelope, matching api-specification.md section 3 and the signed-off plan's rule that every list response uses it; the decision says to record each as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every row now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listShareTokenViews",
+        "path": "/v1/share-tokens/{id}/views",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "at",
+          "ip",
+          "geo",
+          "user_agent",
+          "authenticated",
+          "pages",
+          "duration_s"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-project-goals-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-065",
+      "task": "NEW-B checkpoint-6 (owner decision 2026-10-09 pm #3)",
+      "scope": "listProjectGoals (GET /v1/projects/{id}/goals)",
+      "from": "{ data: Goal[], meta } with no pagination member and no cursor/limit query; every goal of the project in one response, ordered by created_at DESC, id",
+      "to": "{ data: Goal[], pagination, meta } with the standard cursor and limit query; ordered by (created_at DESC, id DESC) with a microsecond-precision cursor key",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner-approved 2026-10-09 pm decision #3: paginate all bare lists with the cursor envelope (api-specification.md section 3). Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every goal now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listProjectGoals",
+        "path": "/v1/projects/{id}/goals",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "project_id",
+          "title",
+          "kind",
+          "target",
+          "baseline",
+          "current",
+          "progress_pct",
+          "sample_state",
+          "status",
+          "target_date",
+          "achieved_at",
+          "tasks_done",
+          "tasks_total",
+          "created_at"
+        ]
+      }
     }
   ]
 }

@@ -39,9 +39,13 @@ import { applyFakeApiEnv } from "../support/fake-env.js";
  */
 const EXEMPT: Readonly<Record<string, string>> = Object.freeze({
   "IdentityController.logout": "ends the caller's OWN session; there is no workspace role to check",
+  "IdentityController.getMe": "GET /me — the caller's OWN identity (NEW-A-2); the workspace returned is the token's ws claim",
+  "IdentityController.updateMe": "PATCH /me — writes the caller's OWN persona row (NEW-A-2), keyed on the token's sub",
   "IdentityController.list": "GET /me/passkeys — the caller's own credentials, scoped by actor_id",
   "IdentityController.rename": "PATCH /me/passkeys/:id — the caller's own credential",
   "IdentityController.revoke": "DELETE /me/passkeys/:id — the caller's own credential",
+  "IdentityController.addOptions": "POST /me/passkeys/options — adds a credential to the caller's OWN account (STORY-173); gated by step-up and proof of the address in IdentityService, not by a workspace role",
+  "IdentityController.addVerify": "POST /me/passkeys/verify — completes the caller's OWN registration ceremony (STORY-173); same gates",
   "OauthController.linkStart": "links a provider to the CALLER's identity, not to a workspace",
   "OauthController.listLinks": "GET /me/oauth — which providers can sign the CALLER in; a credential belongs to a person",
   "OauthController.unlink": "DELETE /me/oauth/:provider — the caller's own identity link",
@@ -49,6 +53,20 @@ const EXEMPT: Readonly<Record<string, string>> = Object.freeze({
   "WorkspacesController.list": "lists the caller's OWN memberships; runs before a workspace is chosen",
   "WorkspacesController.switchWorkspace": "chooses the workspace the rest of the session is scoped to",
   "WorkspacesController.acceptInvitation": "the caller is not yet a member, so they hold no role to require",
+});
+
+/**
+ * `@Public()` routes whose absence of a permission is a decision, each with the
+ * reason. `@Public()` already skips the gate above; this list exists so the
+ * decision is written down, and the test below fails if one is no longer public
+ * (a route that quietly gained a session requirement would lose its reason) or
+ * if the list names a route that does not exist.
+ */
+const PUBLIC_WITH_REASON: Readonly<Record<string, string>> = Object.freeze({
+  "PortalController.createSession":
+    "POST /v1/portal/session (NEW-E-098b) — the visitor has no Nominara session or membership; the caller is authenticated by the token secret (sha256 lookup) plus the per-token Argon2id password, rate-limited 10/hour per address with a 5-failure/15-minute lock per token, and the workspace and scope come from the token row, never from the request",
+  "StripeWebhookController.receive":
+    "POST /v1/webhooks/stripe (NEW-D-2) — Stripe has no session; the caller is authenticated by an HMAC over the raw body (Stripe-Signature, 300 s tolerance), and the workspace is resolved from the re-fetched Stripe object, never from the caller",
 });
 
 describe("STORY-096A · every workspace-scoped route states the permission it needs", () => {
@@ -104,6 +122,19 @@ describe("STORY-096A · every workspace-scoped route states the permission it ne
     expect(billingRead.admin.access).toBe("allow");
     for (const role of ["manager", "analyst", "viewer"] as const) {
       expect(billingRead[role].access, `${role} must not hold billing:read`).toBe("deny");
+    }
+  });
+});
+
+describe("NEW-D-2 · every deliberately public, permission-less route states why", () => {
+  it("each PUBLIC_WITH_REASON entry names a real route that is still @Public()", async () => {
+    applyFakeApiEnv();
+    const routes = await discoverRealRoutes();
+    for (const [id, reason] of Object.entries(PUBLIC_WITH_REASON)) {
+      const route = routes.find((r) => `${r.controllerName}.${r.methodName}` === id);
+      expect(route, `${id} is listed but no such route is registered`).toBeDefined();
+      expect(Reflect.getMetadata(IS_PUBLIC_KEY, route!.handler), `${id} (${reason})`).toBe(true);
+      expect(Reflect.getMetadata(REQUIRE_PERMISSION_KEY, route!.handler), `${id} must not also claim a permission`).toBeUndefined();
     }
   });
 });

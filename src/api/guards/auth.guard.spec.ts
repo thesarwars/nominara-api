@@ -10,6 +10,7 @@ import { computeCsrfToken } from "../../lib/auth/csrf.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../lib/auth/cookies.js";
 import { Public } from "../decorators/public.decorator.js";
 import { AuthGuard, type AuthenticatedRequest } from "./auth.guard.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../../../test/support/test-valkey.js";
 
 const PRIVATE_KEY_DER = "MC4CAQAwBQYDK2VwBCIEIDBtSyhPpdvfpMewjjRZhs0QItLs53aiIaned1RhI6d1";
 const PUBLIC_KEY_DER = "MCowBQYDK2VwAyEAYbvU26OMhfsHxRMPLxXokTTSWtx06/lxhf1L0gnFBoM=";
@@ -35,7 +36,13 @@ function makeContext(ctor: new () => object, req: AuthenticatedRequest): Executi
   } as unknown as ExecutionContext;
 }
 
-function fakePool(rows: Array<{ revoked_at: Date | null }>): Pool {
+// A live session row carries the owning user's standing (NEW-B-1).
+interface FakeSessionRow {
+  revoked_at: Date | null;
+  user_status?: string | null;
+  user_deleted_at?: Date | null;
+}
+function fakePool(rows: FakeSessionRow[]): Pool {
   return { query: vi.fn().mockResolvedValue({ rows }) } as unknown as Pool;
 }
 
@@ -72,8 +79,8 @@ describe("STORY-017 · AuthGuard", () => {
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
+    process.env.QUEUE_REDIS_URL = testQueueRedisUrl();
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 1).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
@@ -101,7 +108,7 @@ describe("STORY-017 · AuthGuard", () => {
 
   it("STORY-017 · scenario 1 — accepts a validly signed, unexpired token, loads the live session, and attaches claims to the request", async () => {
     const token = await mintToken();
-    const pool = fakePool([{ revoked_at: null }]);
+    const pool = fakePool([{ revoked_at: null, user_status: "active", user_deleted_at: null }]);
     const guard = new AuthGuard(new Reflector(), pool);
     const req: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" };
     const context = makeContext(PrivateController, req);
@@ -114,7 +121,7 @@ describe("STORY-017 · AuthGuard", () => {
 
   it("STORY-017 · scenario 2 — rejects an expired token with a distinguishable expiry message", async () => {
     const token = await mintToken({ now: new Date("2020-01-01T00:00:00.000Z") });
-    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null, user_status: "active", user_deleted_at: null }]));
     const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
 
     await expect(guard.canActivate(context)).rejects.toThrow("access token expired");
@@ -127,7 +134,7 @@ describe("STORY-017 · AuthGuard", () => {
       foreignPrivateKey,
       KID,
     );
-    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null, user_status: "active", user_deleted_at: null }]));
     const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
 
     await expect(guard.canActivate(context)).rejects.toThrow(UnauthorizedException);
@@ -141,6 +148,30 @@ describe("STORY-017 · AuthGuard", () => {
     await expect(guard.canActivate(context)).rejects.toThrow("session revoked");
   });
 
+  it("NEW-B-1 · refuses a live session whose user is suspended (403), erased, deleted or missing (401)", async () => {
+    const token = await mintToken();
+    const cases: Array<[FakeSessionRow, new (...a: never[]) => Error, string]> = [
+      [{ revoked_at: null, user_status: "suspended", user_deleted_at: null }, ForbiddenException, "account suspended"],
+      [{ revoked_at: null, user_status: "active", user_deleted_at: new Date() }, UnauthorizedException, "session revoked"],
+      [{ revoked_at: null, user_status: "deleted", user_deleted_at: null }, UnauthorizedException, "session revoked"],
+      [{ revoked_at: null, user_status: null, user_deleted_at: null }, UnauthorizedException, "session revoked"],
+    ];
+    for (const [row, type, message] of cases) {
+      const guard = new AuthGuard(new Reflector(), fakePool([row]));
+      const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
+      const err = await guard.canActivate(context).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(type);
+      expect((err as Error).message).toBe(message);
+    }
+  });
+
+  it("NEW-B-1 · an unverified user's session is still admitted (STORY-173 finishes proving the address on it)", async () => {
+    const token = await mintToken();
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null, user_status: "unverified", user_deleted_at: null }]));
+    const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
+    await expect(guard.canActivate(context)).resolves.toBe(true);
+  });
+
   it("STORY-017 · refuses via the deny list when the session row no longer exists at all", async () => {
     const token = await mintToken();
     const guard = new AuthGuard(new Reflector(), fakePool([]));
@@ -151,7 +182,7 @@ describe("STORY-017 · AuthGuard", () => {
 
   it("STORY-017 · scenario 6 — a mutating request with the session cookie but no double-submit token is refused", async () => {
     const token = await mintToken();
-    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null, user_status: "active", user_deleted_at: null }]));
     const req: AuthenticatedRequest = { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "POST", headers: {} };
     const context = makeContext(PrivateController, req);
 
@@ -161,7 +192,7 @@ describe("STORY-017 · AuthGuard", () => {
   it("STORY-017 · a mutating request carrying a matching double-submit cookie and header is permitted", async () => {
     const token = await mintToken();
     const csrfToken = computeCsrfToken(SID, CSRF_SECRET);
-    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null, user_status: "active", user_deleted_at: null }]));
     const req: AuthenticatedRequest = {
       cookies: { [ACCESS_COOKIE_NAME]: token, [CSRF_COOKIE_NAME]: csrfToken },
       headers: { [CSRF_HEADER_NAME]: csrfToken },
@@ -176,7 +207,7 @@ describe("STORY-017 · AuthGuard", () => {
     process.env.AUTH_TOKEN_ED25519_PREVIOUS_KID = "previous-kid";
     process.env.AUTH_TOKEN_ED25519_PREVIOUS_PUBLIC_KEY = PUBLIC_KEY_DER;
     const token = await mintToken({ kid: "previous-kid" });
-    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null, user_status: "active", user_deleted_at: null }]));
     const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
 
     await expect(guard.canActivate(context)).resolves.toBe(true);
@@ -184,7 +215,7 @@ describe("STORY-017 · AuthGuard", () => {
 
   it("rejects a token whose kid the guard's key map does not recognize", async () => {
     const token = await mintToken({ kid: "unknown-kid" });
-    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null }]));
+    const guard = new AuthGuard(new Reflector(), fakePool([{ revoked_at: null, user_status: "active", user_deleted_at: null }]));
     const context = makeContext(PrivateController, { cookies: { [ACCESS_COOKIE_NAME]: token }, method: "GET" });
 
     await expect(guard.canActivate(context)).rejects.toThrow(UnauthorizedException);

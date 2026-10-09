@@ -16,6 +16,11 @@
 export * from "./prominence.js";
 export * from "./aggregate.js";
 export * from "./visibility.js";
+export * from "./aux.js";
+export * from "./source-coverage.js";
+export * from "./source-index.js";
+export * from "./displacement-impact.js";
+export * from "./divergence.js";
 
 /**
  * `scoring_version` — stamped on every fact row and every rollup.

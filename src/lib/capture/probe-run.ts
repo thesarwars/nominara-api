@@ -57,15 +57,31 @@ export interface ProbedRun {
 }
 
 /**
+ * The cells a run would contain BEFORE either cache layer is asked — engines
+ * resolved, prompts selected, fanned out. Reads two tables and touches no
+ * cache, so it is cheap enough to answer "is there anything to capture" ahead
+ * of a reservation (CreditGuard does) without a cache round trip.
+ *
+ * `probeRunCells` starts here, so the count a guard sees and the cells the
+ * estimate and the planner then probe cannot come from two different readings.
+ */
+export async function resolveRunCells(
+  tx: ClientBase,
+  context: Pick<ProbeRunContext, "projectId" | "scope" | "engineKeys" | "captureReadyEngineKeys">,
+): Promise<{ readonly engines: readonly ResolvedEngine[]; readonly cells: readonly PlannedCell[] }> {
+  const engines = await resolveEnabledEngines(tx, context.projectId, context.engineKeys, context.captureReadyEngineKeys);
+  const prompts = await selectPrompts(tx, context.projectId, context.scope);
+  return { engines, cells: fanOutCells(prompts, engines) };
+}
+
+/**
  * Resolve, fan out, and ask each cache layer in turn. Writes nothing.
  *
  * Safe to call outside a transaction, which is the point: the estimate route
  * has no transaction to offer and must not open one to answer a question.
  */
 export async function probeRunCells(tx: ClientBase, cache: Cache, context: ProbeRunContext): Promise<ProbedRun> {
-  const engines = await resolveEnabledEngines(tx, context.projectId, context.engineKeys, context.captureReadyEngineKeys);
-  const prompts = await selectPrompts(tx, context.projectId, context.scope);
-  const cells = fanOutCells(prompts, engines);
+  const { engines, cells } = await resolveRunCells(tx, context);
 
   // L1 FIRST, AND ONLY THEN L2. Not interchangeable:
   //

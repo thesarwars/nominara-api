@@ -88,12 +88,12 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | **403** | **`entitlement_exceeded`** | A **structural** plan limit is reached — projects, prompts, seats, competitors, share tokens, API keys. `details.{key, limit, current}` plus upgrade/add-on remediation |
 | **403** | **`feature_not_in_plan`** | A **feature flag** entitlement is absent — white-label, Search Console, SSO, CSV export, share links, drift sampling. `details.{key, min_plan}` |
 | 404 | `not_found` | Resource absent **within the caller's tenant** |
-| 409 | `conflict` | `If-Match` mismatch, unique violation, or state-machine violation (`details.current_state`) |
+| 409 | `conflict` | `If-Match` mismatch, unique violation, or state-machine violation (`details.current_state`). Accepting an invitation as an existing member carries `details.reason` — `already_member` or `member_suspended` — and consumes nothing |
 | 409 | `idempotency_conflict` | Same key, different body |
 | **409** | **`workspace_limit_reached`** | A user may own only one workspace. `details.{owned_workspace_id, owned_workspace_name}` plus the transfer path. **Joining by invitation never hits this** |
 | **409** | **`price_changed`** | `X-Nominara-Confirmed-Credits` does not match the server's current price. `details.{shown, recomputed, reason}`; the client re-presents the modal |
 | 422 | `domain_not_verified` | Audit requested beyond public-surface scope on an unverified domain |
-| 422 | `precondition_unmet` | e.g. a patch whose `content_before_hash` no longer matches |
+| 422 | `precondition_unmet` | e.g. a patch whose `content_before_hash` no longer matches. When a manual deep scan is refused, `details.reason` says which precondition failed: `price_not_agreed` (the plan's deep-scan price is negotiated and none has been agreed) or `no_capturable_scope` (the scope plans no cells — no capture-ready engine the project is entitled to, or no active prompts). A deep scan refused either way reserves and charges nothing. An absent `reason` is an unclassified refusal |
 | **422** | **`unsafe_target`** | A well-formed URL the **guarded fetcher** refuses — internal or loopback address, disallowed port, unsupported scheme, or a redirect landing on any of those. The canonical code for all three user-supplied URL surfaces: project root URL, audit target, and beacon origin. `details.reason` names the check that refused it, **never the resolved address** |
 | 429 | `rate_limited` | `details.retry_after_ms`; `Retry-After` set |
 | 429 | `quota_exceeded` | A non-credit **tier cap** is exhausted |
@@ -116,14 +116,16 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 
 | Method | Path | Permission | Notes |
 |---|---|---|---|
-| `POST` | `/auth/passkey/options` · `/auth/passkey/verify` | public | WebAuthn registration and assertion |
-| `POST` | `/auth/oauth/{provider}/start` · `/callback` | public | PKCE |
-| `POST` | `/auth/otp/request` · `/auth/otp/verify` | public | rate-limited 3/h/email, uniform response and timing |
+| `POST` | `/auth/passkey/options` · `/auth/passkey/verify` | public | WebAuthn **assertion (sign-in) only**. `purpose` is `assertion`; a `registration` body is `400 validation_failed` for every address (STORY-173) |
+| `POST` | `/auth/oauth/{provider}/start` · `/callback` | public | PKCE. A provider that did **not** verify the address binds nothing: `403 forbidden`, `details.reason = email_not_verified`, message pointing at the email code (STORY-173). A verified address with no account creates one; with an unproved account, claims it as a first proof; with a proved account, `400` (never an auto-link) |
+| `POST` | `/auth/oauth/{provider}/link/start` ↑ · `DELETE` `/me/oauth/{provider}` ↑ | session | connecting or disconnecting a provider needs a proved address and a fresh step-up (STORY-173): `401 step_up_required`, or `403 forbidden` / `email_not_verified` |
+| `POST` | `/auth/otp/request` · `/auth/otp/verify` | public | rate-limited 3/h/email, uniform response and timing. A request for an unknown address creates it `unverified` and mails a code (STORY-173); a verified code proves the address and stamps the session as strongly authenticated (`email_otp`) |
 | `POST` | `/auth/sso/{workspace_slug}/start` · `/callback` | public | **OIDC** in v1. `/acs` (SAML) is enabled per connection only after the security review |
 | `GET`/`POST`/`PATCH`/`DELETE` | `/scim/v2/Users` · `/scim/v2/Groups` | SCIM bearer token | RFC 7644; workspace-scoped; **cannot authenticate an interactive session** |
 | `POST` | `/auth/token/refresh` · `/auth/logout` | session | rotating refresh with reuse detection |
 | `GET`/`PATCH` | `/me` | session | user, memberships, active entitlements; persona, locale, timezone |
 | `GET` | `/me/passkeys` | session | the caller's own registered passkeys; **never `public_key`, `credential_id` or `sign_count`**. `PATCH`/`DELETE` `/me/passkeys/{id}` rename and revoke |
+| `POST` | `/me/passkeys/options` · `/me/passkeys/verify` ↑ | session | **the only way a passkey is added** (STORY-173). Body of `options` is `{display_name?}` — no email, `.strict()`; the account is the session's. `401 step_up_required` without a fresh WebAuthn or OTP (`details.methods`: `webauthn`, `email_otp`); `403 forbidden` while the account's address is unproved. A ceremony is claimed by purpose and owner; `verify` returns `200` with no body and mints no session |
 | `POST` | `/workspaces` ✚ | session | creates the tenant, its DEK, the owner membership, and a trial subscription |
 | `GET` | `/workspaces` | session | memberships only, one flat cursor-paginated list; each entry carries `relationship: owned\|joined` so a switcher can group them |
 | `GET`/`PATCH` | `/workspaces/{id}` | `workspace:read` / `:update` | |

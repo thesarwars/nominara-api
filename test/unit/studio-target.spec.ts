@@ -51,4 +51,27 @@ describe("STORY-128 · assertLocalTarget", () => {
       NonLocalStudioTargetError,
     );
   });
+
+  it("is not fooled by a `?host=` query parameter overriding a `localhost` authority", () => {
+    // node-postgres (via pg-connection-string) lets a `host` query parameter
+    // override the URL's own authority entirely: `new URL(...).hostname`
+    // reports "localhost" here, but node-postgres actually opens a socket to
+    // the query-param host. `assertLocalTarget` must check the host
+    // node-postgres itself resolves to, not the bare URL authority.
+    expect(() =>
+      assertLocalTarget("postgres://nominara:pw@localhost:5432/nominara?host=prod-db.internal.example.com"),
+    ).toThrow(NonLocalStudioTargetError);
+  });
+
+  it("is not fooled by the Cloud SQL Unix-socket `?host=/cloudsql/...` form", () => {
+    expect(() => assertLocalTarget("postgres://u:p@localhost/db?host=/cloudsql/proj:region:inst")).toThrow(
+      NonLocalStudioTargetError,
+    );
+  });
+
+  it("is not fooled by a `?host=` query parameter naming a raw IP", () => {
+    expect(() => assertLocalTarget("postgres://nominara:pw@localhost:5432/nominara?host=10.0.0.5")).toThrow(
+      NonLocalStudioTargetError,
+    );
+  });
 });

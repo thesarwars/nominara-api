@@ -8,6 +8,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { createCaptureParseHandler } from "../../src/lib/queue/handlers/capture-parse.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { testCacheRedisUrl } from "../support/test-valkey.js";
 
 // STORY-135 — the parse stage, end to end against a real database.
 //
@@ -110,7 +111,7 @@ describe("STORY-135 · capture.parse", () => {
   }
 
   function handler() {
-    const context = { pool: undefined, env: { VALKEY_CACHE_URL: "unused" } } as unknown as QueueHandlerContext;
+    const context = { pool: undefined, env: { VALKEY_CACHE_URL: testCacheRedisUrl() } } as unknown as QueueHandlerContext;
     // No arbiter — production has none bound either, so every in-band mention
     // finalises deterministically. See STORY-038.
     return createCaptureParseHandler(context);

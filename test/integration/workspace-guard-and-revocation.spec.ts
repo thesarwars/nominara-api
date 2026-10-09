@@ -10,6 +10,7 @@ import { MembershipService } from "../../src/modules/workspaces/membership.servi
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import type { DekProvisioner } from "../../src/modules/workspaces/ports/dek-provisioner.js";
 import { WORKSPACE_HEADER_NAME } from "../../src/tenancy/constants.js";
@@ -19,6 +20,7 @@ import { Reflector } from "@nestjs/core";
 import { ACCESS_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 import * as metrics from "../../src/lib/telemetry/metrics.js";
 import { IS_PUBLIC_KEY } from "../../src/api/decorators/public.decorator.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
 // STORY-018 — security-and-tenancy.md §7. Real Postgres (testcontainers,
 // testing-strategy.md §1): the membership re-check runs through the SAME
@@ -106,11 +108,11 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
     // STORY-030 — DbModule's PG_POOL factory calls loadEnv(), which (since
     // Phase B) also requires the queue-signing env vars even though this
     // file never signs a job payload itself.
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.QUEUE_REDIS_URL = testQueueRedisUrl();
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
@@ -141,7 +143,7 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
       unusedDekProvisioner,
       new AuditChainService(),
       membership,
-      new SessionService(pool), new NoopRealtimePublisher());
+      new SessionService(pool, membership, new InMemoryCacheAdapter()), new NoopRealtimePublisher());
     guard = new WorkspaceGuard(pool, membership, new Reflector());
   });
 
@@ -444,7 +446,7 @@ describe("STORY-018 · workspace guard, membership cache, revocation, freshness"
     const workspaceId = await createWorkspace();
     await addMember(workspaceId, userId, "owner");
 
-    const sessions = new SessionService(pool);
+    const sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
     const tokens = await sessions.createSession(userId);
     await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, 1);
     await sessions.logout(tokens.sid);

@@ -1,12 +1,17 @@
 import { Logger } from "@nestjs/common";
 import { nonMeasurementStatusSql } from "../../rollup/aggregate-day.js";
 import type { Job } from "bullmq";
+import { Redis } from "ioredis";
 import type { ClientBase } from "pg";
 import { z } from "zod";
 import type { Cache } from "../../cache/cache.port.js";
 import { ValkeyCacheAdapter } from "../../cache/valkey-cache.adapter.js";
 import type { RealtimePublisher } from "../../cache/realtime-publisher.js";
 import { ValkeyRealtimePublisher } from "../../cache/realtime-publisher.js";
+import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
+import { incrementCounter } from "../../telemetry/metrics.js";
+import { engineKeySchema } from "../../engines/contract.js";
+import { SpendMeter, ValkeySpendMeterStore } from "../../engines/spend-meter.js";
 import { captureCell } from "../../capture/execute-cell.js";
 import { readRunProgress } from "../../capture/run-progress.js";
 import { resolveRunOutcome } from "../../engines/run-outcome.js";
@@ -16,6 +21,7 @@ import { QueueProducer } from "../queue-producer.js";
 import { signingKeysFromEnv } from "../worker-factory.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
+import { requestRollupIfRunComplete, type EnqueueRollup } from "./run-rollup-request.js";
 
 // STORY-034 — `capture.execute`, the handler STORY-124's registry named:
 // "the capture queues with STORY-034".
@@ -50,6 +56,10 @@ export interface CaptureExecuteDeps {
   readonly realtime: RealtimePublisher;
   /** Injected in tests; production builds a producer from env on first use. */
   readonly enqueueParse?: (payload: ParseJobPayload) => Promise<unknown>;
+  /** Injected in tests; production builds a producer from env on first use. */
+  readonly enqueueRollup?: EnqueueRollup;
+  /** Injected in tests; production builds the Valkey-backed meter from env on first use. */
+  readonly spendMeter?: SpendMeter;
 }
 
 /** What `capture.parse` needs to find and re-read the row this handler wrote. */
@@ -60,6 +70,21 @@ export interface ParseJobPayload {
   readonly promptId: string;
   readonly engineKey: string;
   readonly capturedAt: string;
+}
+
+/**
+ * The platform spend meter, on the QUEUE instance (QUEUE_REDIS_URL: noeviction, AOF on) and NEVER the
+ * cache instance (allkeys-lru, no persistence): an absent total reads as 0 spent, so an LRU eviction or a
+ * cache restart would reopen a closed gate. usage_ledger cannot reseed it (D12: it is RLS-forced and
+ * workspace-scoped). Ceilings are the configured JSON over the defaults.
+ */
+export function buildSpendMeter(
+  env: { readonly QUEUE_REDIS_URL: string; readonly ENGINE_SPEND_CEILINGS_USD?: string | undefined },
+  onError: (message: string) => void = () => undefined,
+): SpendMeter {
+  const redis = new Redis(env.QUEUE_REDIS_URL, { maxRetriesPerRequest: 1 });
+  redis.on("error", (error) => onError(`spend meter connection error: ${error.message}`));
+  return new SpendMeter(new ValkeySpendMeterStore(redis), resolveEngineSpendCeilings(env.ENGINE_SPEND_CEILINGS_USD));
 }
 
 export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?: CaptureExecuteDeps): JobProcessor {
@@ -77,6 +102,44 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     cache ??= new ValkeyCacheAdapter(context.env.VALKEY_CACHE_URL);
     realtime ??= new ValkeyRealtimePublisher(context.env.VALKEY_CACHE_URL);
     return { cache, realtime };
+  };
+
+  // E2E-B6 — the platform spend meter (EC-08), built on first use. RECORDING fails open inside the
+  // meter (the money is already spent); the PRE-CALL gate below fails closed on an unreadable or corrupt
+  // total (an absent total is zero spent, which is why the meter must live where a key cannot vanish).
+  let spendMeter: SpendMeter | undefined = deps?.spendMeter;
+  const meter = (): SpendMeter => (spendMeter ??= buildSpendMeter(context.env, (message) => logger.warn(message)));
+  const ceilingReached = async (engineKey: string): Promise<boolean> => {
+    const key = engineKeySchema.safeParse(engineKey);
+    if (!key.success) return false;
+    let reached: boolean;
+    try {
+      reached = await meter().isCeilingReached(key.data);
+    } catch (error) {
+      // FAIL CLOSED: the meter cannot say how much was spent (Valkey down, or a corrupt total), so the
+      // vendor is not called. Rethrown into the retry ladder; the job is retried when the meter reads again.
+      incrementCounter("nominara_capture_spend_gate_unreadable_total", { engine_key: key.data });
+      logger.error(`engine spend gate unreadable for ${key.data}; vendor call blocked (failing closed): ${error instanceof Error ? error.message : "unknown error"}`);
+      throw error;
+    }
+    if (reached) {
+      incrementCounter("nominara_capture_spend_ceiling_blocked_total", { engine_key: key.data });
+      logger.error(`engine spend ceiling reached for ${key.data}; cell blocked before the vendor call`);
+    }
+    return reached;
+  };
+  const recordSpend = async (engineKey: string, usd: number): Promise<void> => {
+    const key = engineKeySchema.safeParse(engineKey);
+    if (!key.success) return;
+    const result = await meter().recordCost(key.data, usd);
+    incrementCounter("nominara_capture_cost_recorded_total", { engine_key: key.data });
+    for (const level of result.newAlerts) {
+      logger.warn(`engine spend alert ${level} for ${key.data}: ${result.totalUsd.toFixed(2)} of ${String(result.ceilingUsd)} USD this month`);
+    }
+    if (result.hardStopped) {
+      // Enforced by `ceilingReached` on the NEXT cell; this is the crossing itself.
+      logger.error(`engine spend ceiling crossed for ${key.data}: ${result.totalUsd.toFixed(2)} of ${String(result.ceilingUsd)} USD this month`);
+    }
   };
 
   // `async`, so that BUILDING the producer is inside the promise too.
@@ -100,6 +163,17 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
         // row rather than queueing a second pass over it.
         idempotencyKey: `parse:${payload.resultId}`,
       });
+    });
+
+  const enqueueRollup: EnqueueRollup =
+    deps?.enqueueRollup ??
+    (async (queue, workspaceId, rollupPayload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob(queue, workspaceId, rollupPayload, { idempotencyKey });
     });
 
   return async (tx: ClientBase, job: Job): Promise<void> => {
@@ -128,6 +202,15 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       logger.log(`run ${payload.runId} was cancelled; skipping cell`);
       return;
     }
+    // A `failed` run is terminal too, and cells can outlive it: capture.plan
+    // fails a run whose dispatch REJECTED, but a rejection is ambiguous (the
+    // addBulk may have landed with only the reply lost), and the fair-use
+    // reservation was released with it. A late cell would call the vendor and
+    // write a capture under a run that holds no reservation (checkpoint-4).
+    if (runRow.status === "failed") {
+      logger.log(`run ${payload.runId} has failed; skipping cell`);
+      return;
+    }
 
     // First cell to arrive moves the run to `running` and stamps the clock the
     // ETA is extrapolated from. The predicate makes it idempotent: whichever
@@ -150,7 +233,17 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       locale: payload.locale,
       personaHint: payload.personaHint,
       normalizerVersion: NORMALIZER_VERSION,
-    });
+    }, undefined, recordSpend, ceilingReached);
+
+    // E2E-B6a — `captured_cells` counts LIVE captures only (captures-and-facts.md).
+    // An atomic increment, not a recount: concurrent cells each run in their own
+    // transaction and cannot see each other's uncommitted rows. Suppressed cells
+    // never reach this handler (they are written by the planner), and a cell
+    // that ended blocked or failed is not a capture.
+    // A replayed cell (already settled by an earlier delivery) is not counted twice.
+    if (outcome.kind === "captured" && outcome.replayed !== true) {
+      await tx.query("UPDATE capture_runs SET captured_cells = captured_cells + 1 WHERE id = $1", [payload.runId]);
+    }
 
     // STORY-135 — hand the capture to the parser.
     //
@@ -186,6 +279,30 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
           logger.error(`failed to enqueue parse for capture ${target.id}: ${String(error)}`);
         });
       }
+    }
+
+    // NEW-A-7 — a cell that ends in a terminal failure or a block is never
+    // parsed, so if it is the LAST to settle no parse follows to request the
+    // rollup. Ask here; the request checks the run is complete and has nothing
+    // left to parse, so it is a no-op while any parse is still to come.
+    if (outcome.kind !== "captured") {
+      const settled = await tx.query<{ captured_at: Date }>(
+        `SELECT captured_at FROM answer_captures
+          WHERE run_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = $4
+          ORDER BY captured_at DESC LIMIT 1`,
+        [payload.runId, payload.promptId, payload.engineKey, payload.sampleIndex],
+      );
+      await requestRollupIfRunComplete(
+        tx,
+        {
+          runId: payload.runId,
+          projectId: payload.projectId,
+          workspaceId: payload.workspaceId,
+          capturedAt: settled.rows[0]?.captured_at ?? new Date(),
+        },
+        enqueueRollup,
+        logger,
+      );
     }
 
     const progress = await readRunProgress(tx, payload.runId);

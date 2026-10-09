@@ -1,7 +1,8 @@
 import { Injectable } from "@nestjs/common";
 import type { ClientBase } from "pg";
-import type { ScorecardsQuery, ScorecardsResponse, ScorecardEntry } from "../../../contracts/analytics/index.js";
+import type { DataSource, ScorecardsQuery, ScorecardsResponse, ScorecardEntry } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { parseEngineFilter } from "../../lib/analytics/engine-filter.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import {
   blendScorecards,
@@ -11,20 +12,17 @@ import {
   type Scorecard,
   type WindowMetrics,
 } from "../../lib/analytics/scorecard.js";
+import { blendDisclosure, combineDataSources, engineDataSourcesForDates, recordDemoDataServed } from "../../lib/analytics/data-source.js";
 import { aggregateRange, answeredStatusSql, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
+import type { PortalProjectEngines, PortalProjectFacts } from "../../lib/portal/portal-facts.js";
+import { resolveWindow, TIMEFRAME_DAYS } from "../../lib/analytics/window.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`.
 //
 // Every figure on the Project Overview screen, from one request. The
 // arithmetic lives in `src/lib/analytics/scorecard.ts`; this resolves the
 // window, reads the facts, and joins the engine configuration onto them.
-
-const TIMEFRAME_DAYS: Readonly<Record<ScorecardsQuery["timeframe"], number>> = Object.freeze({
-  "7d": 7,
-  "30d": 30,
-  "90d": 90,
-});
 
 interface EngineConfig {
   engine_key: string;
@@ -45,23 +43,20 @@ interface EngineConfig {
  */
 const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
 
-interface ResolvedWindow {
-  from: string;
-  to: string;
-  priorFrom: string;
-  priorTo: string;
-  timezone: string;
-}
-
 @Injectable()
 export class ScorecardsService {
-  async scorecards(projectId: string, query: ScorecardsQuery): Promise<ScorecardsResponse> {
+  /**
+   * `opts.days` overrides the query's window — the portal serves a 24h window the agency query has no spelling for.
+   * `opts.portal` carries what `nominara_portal` cannot read (the workspace timezone and the project's engine rows,
+   * read on the app pool by the portal interceptor); the facts and the arithmetic below are the same code.
+   */
+  async scorecards(projectId: string, query: ScorecardsQuery, opts: { readonly days?: number; readonly portal?: PortalProjectFacts } = {}): Promise<ScorecardsResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ScorecardsService requires an active tenant context");
     const tx = store.client;
 
-    const window = await this.resolveWindow(tx, projectId, TIMEFRAME_DAYS[query.timeframe]);
-    const requested = query.engines?.split(",").map((key) => key.trim()).filter((key) => key.length > 0) ?? null;
+    const window = await resolveWindow(tx, projectId, opts.days ?? TIMEFRAME_DAYS[query.timeframe], opts.portal?.workspace.timezone);
+    const requested = parseEngineFilter(query.engines);
     // ⚠ `priorFrom`, NOT `from` — THE MEMBERSHIP SPAN COVERS BOTH LEGS.
     //
     // `blendScorecards` builds the current AND prior blends from this one
@@ -83,7 +78,7 @@ export class ScorecardsService {
     // response for up to one further window, which is correct — an engine
     // that stopped being measured is a thing the screen should show, not
     // hide.
-    const engines = await this.engineConfig(tx, projectId, requested, window.priorFrom, window.to, window.timezone);
+    const engines = await this.engineConfig(tx, projectId, requested, window.priorFrom, window.to, window.timezone, opts.portal?.engines);
 
     // TWO RANGE AGGREGATIONS, not 2 × N. `aggregateRange` groups by engine, so
     // the whole window costs one scan per period however many engines the
@@ -113,47 +108,21 @@ export class ScorecardsService {
       })),
     );
 
+    // NEW-A-5 — provenance over the SAME span as the blend's membership
+    // (prior window start to current end), so the marker describes every
+    // capture that can move the score or its delta.
+    const sources = await engineDataSourcesForDates(tx, projectId, window.priorFrom, window.to, window.timezone);
+    const perEngine = entries.map((entry) => sources.get(entry.engine.engine_key) ?? null);
+    recordDemoDataServed("scorecards", store.context.workspaceId, perEngine);
+
     return {
       project_id: projectId,
       timeframe: query.timeframe,
       window: { from: window.from, to: window.to, timezone: window.timezone },
-      engines: entries.map((entry) => toEntry(entry.scorecard, entry.engine)),
-      blended: toEntry(blended, null),
+      engines: entries.map((entry, index) => toEntry(entry.scorecard, entry.engine, perEngine[index]!)),
+      blended: toEntry(blended, null, combineDataSources(perEngine)),
+      blend: blendDisclosure(perEngine),
     };
-  }
-
-  /**
-   * The window, in the PROJECT'S WORKSPACE TIMEZONE.
-   *
-   * Asked of Postgres rather than computed in Node, so the conversion uses
-   * the same tz database `aggregateRange` does — a rollup bucketing a capture
-   * into one day while this window excludes it would make the scorecard and
-   * the chart disagree at every DST boundary.
-   *
-   * The prior window is the SAME LENGTH immediately before, which is what
-   * §3's delta compares. An unaligned prior window would make the delta a
-   * comparison of a month against a fortnight.
-   */
-  private async resolveWindow(tx: ClientBase, projectId: string, days: number): Promise<ResolvedWindow> {
-    const settings = await tx.query<{ timezone: string }>(
-      `SELECT w.timezone
-         FROM projects p JOIN workspaces w ON w.id = p.workspace_id
-        WHERE p.id = $1 AND p.deleted_at IS NULL`,
-      [projectId],
-    );
-    const timezone = settings.rows[0]?.timezone;
-    if (timezone === undefined) throw new NotFoundError({ message: "no such project" });
-
-    const bounds = await tx.query<{ from: string; to: string; prior_from: string; prior_to: string }>(
-      `SELECT to_char(today - make_interval(days => $1::int - 1), 'YYYY-MM-DD') AS from,
-              to_char(today, 'YYYY-MM-DD')                                      AS to,
-              to_char(today - make_interval(days => $1::int * 2 - 1), 'YYYY-MM-DD') AS prior_from,
-              to_char(today - make_interval(days => $1::int), 'YYYY-MM-DD')     AS prior_to
-         FROM (SELECT (now() AT TIME ZONE $2)::date AS today) t`,
-      [days, timezone],
-    );
-    const row = bounds.rows[0]!;
-    return { from: row.from, to: row.to, priorFrom: row.prior_from, priorTo: row.prior_to, timezone };
   }
 
   /**
@@ -179,7 +148,22 @@ export class ScorecardsService {
     /** The current window's end. `measuredFrom … measuredTo` covers both legs. */
     measuredTo: string,
     timezone: string,
+    /** NEW-E-099a — the portal's pre-read engine rows; absent on the agency path, which reads the view and the table. */
+    portalEngines?: PortalProjectEngines,
   ): Promise<EngineConfig[]> {
+    // The two relations the query reads that `nominara_portal` cannot: the entitled view and the override table. On the
+    // portal path the same columns come from the rows the interceptor read on the app pool; nothing else changes.
+    const entitledSource =
+      portalEngines === undefined
+        ? "project_entitled_engines"
+        : `(SELECT $1::uuid AS project_id, x.engine_key, true AS enabled, x.display_name, x.weight::real AS weight,
+                   CASE WHEN x.runs_per_cycle IS NULL THEN NULL ELSE jsonb_build_object('full', x.runs_per_cycle) END AS cadence
+              FROM jsonb_to_recordset($6::jsonb) AS x(engine_key text, display_name text, runs_per_cycle int, weight text))`;
+    const overrideSource =
+      portalEngines === undefined
+        ? "project_engines"
+        : `(SELECT $1::uuid AS project_id, x.engine_key, x.weight::real AS weight FROM jsonb_to_recordset($7::jsonb) AS x(engine_key text, weight text))`;
+    const portalParams = portalEngines === undefined ? [] : [JSON.stringify(portalEngines.entitled), JSON.stringify(portalEngines.overrides)];
     const result = await tx.query<{
       engine_key: string;
       display_name: string | null;
@@ -277,7 +261,7 @@ export class ScorecardsService {
             AND (c.captured_at AT TIME ZONE $5)::date BETWEEN $3::date AND $4::date
        ),
        engine_keys AS (
-         SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 AND enabled = true
+         SELECT e0.engine_key FROM ${entitledSource} e0 WHERE e0.project_id = $1 AND e0.enabled = true
          UNION
          SELECT engine_key FROM measured
        )
@@ -293,10 +277,10 @@ export class ScorecardsService {
               COALESCE(pes.weight, ov.weight, 1.0::real)::text AS weight,
               last_capture.captured_at AS last_captured_at
          FROM engine_keys k
-         LEFT JOIN project_entitled_engines pes
+         LEFT JOIN ${entitledSource} pes
                 ON pes.project_id = $1 AND pes.engine_key = k.engine_key AND pes.enabled = true
          LEFT JOIN engines cat ON cat.key = k.engine_key
-         LEFT JOIN project_engines ov ON ov.project_id = $1 AND ov.engine_key = k.engine_key
+         LEFT JOIN ${overrideSource} ov ON ov.project_id = $1 AND ov.engine_key = k.engine_key
          -- NOT WINDOWED, deliberately. An engine that last answered before
          -- the window is exactly the one worth surfacing, and clamping this
          -- to the window would report null for the engine that has been
@@ -310,7 +294,7 @@ export class ScorecardsService {
          ) last_capture ON true
         WHERE ($2::text[] IS NULL OR k.engine_key = ANY($2::text[]))
         ORDER BY k.engine_key ASC`,
-      [projectId, requested, measuredFrom, measuredTo, timezone],
+      [projectId, requested, measuredFrom, measuredTo, timezone, ...portalParams],
     );
 
     if (result.rows.length === 0) await this.assertProjectExists(tx, projectId);
@@ -372,8 +356,9 @@ function nextRunAt(engine: EngineConfig): string | null {
 }
 
 /** `null` config marks the blended entry — it has no engine to name or schedule. */
-function toEntry(scorecard: Scorecard, engine: EngineConfig | null): ScorecardEntry {
+function toEntry(scorecard: Scorecard, engine: EngineConfig | null, dataSource: DataSource | null): ScorecardEntry {
   return {
+    data_source: dataSource,
     engine_key: scorecard.engineKey,
     display_name: engine?.display_name ?? null,
     cadence_runs_per_cycle: engine?.cadenceRunsPerCycle ?? null,

@@ -15,6 +15,7 @@ import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../sr
 import { computeCsrfToken } from "../../src/lib/auth/csrf.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
 import { apiUrl } from "../support/api-url.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
 // STORY-023 T2 (RED step) — Test scenario 8 ("Send an unknown key to any
 // endpoint -> validation failure") and AC8 ("The specification is served
@@ -89,8 +90,8 @@ describe("STORY-023 · GET /v1/openapi.json and the real POST /v1/workspaces str
     // STORY-030 — DbModule's PG_POOL factory calls loadEnv(), which (since
     // Phase B) also requires the queue-signing env vars even though this
     // file never signs a job payload itself.
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    process.env.QUEUE_REDIS_URL = testQueueRedisUrl();
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";

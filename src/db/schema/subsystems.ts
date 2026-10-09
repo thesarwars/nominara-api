@@ -42,6 +42,8 @@ export const SCHEMA_SUBSYSTEMS = {
     "usage_ledger",
     "usage_reservations",
     "invoices",
+    "stripe_webhook_events",
+    "stripe_subscription_syncs",
   ],
   projects: ["projects", "project_engines", "competitors", "domain_verifications"],
   prompts: ["tracked_prompts", "prompt_stability", "topic_clusters"],
@@ -79,6 +81,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "share_token_views",
     "scheduled_reports",
     "report_artifacts",
+    "scheduled_report_deliveries",
   ],
   platform: ["audit_log", "purge_failures"],
 } as const satisfies Record<string, readonly string[]>;

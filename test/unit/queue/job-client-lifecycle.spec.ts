@@ -136,3 +136,22 @@ describe("STORY-124 · the client is released on every exit path", () => {
     await expect(processor(signedJob())).resolves.toBe("ok");
   });
 });
+
+describe("checkpoint-6 · a lost connection is destroyed, not returned", () => {
+  it("D-1 AC-worker-release-err . the failure that ended the job is handed to releaseClient, so the worker can release(err)", async () => {
+    const failure = Object.assign(new Error("Connection terminated unexpectedly"), { code: "08P01" });
+    const seen: unknown[] = [];
+    const client = fakeClient();
+    const processor = createJobProcessor(TENANT_ENTRY, {
+      keys: TEST_SIGNING_KEYS,
+      getClient: () => client,
+      releaseClient: (_c: ClientBase, ...rest: unknown[]) => void seen.push(...rest),
+      process: async () => {
+        throw failure;
+      },
+    });
+
+    await expect(processor(signedJob())).rejects.toBe(failure);
+    expect(seen).toEqual([failure]);
+  });
+});

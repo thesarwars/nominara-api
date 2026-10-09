@@ -15,6 +15,7 @@ import { SessionService } from "../../src/modules/identity/session.service.js";
 import { verifyAllChains } from "../../src/workers/rollup/audit-verify.js";
 import { computeCsrfToken } from "../../src/lib/auth/csrf.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME, REFRESH_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
 // STORY-020 pattern (test/integration/audit-verify.spec.ts) — a notifier
 // that just records rather than actually paging anyone.
@@ -80,11 +81,11 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
     // STORY-030 — DbModule's PG_POOL factory calls loadEnv(), which (since
     // Phase B) also requires the queue-signing env vars even though this
     // file never signs a job payload itself.
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.QUEUE_REDIS_URL = testQueueRedisUrl();
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
@@ -134,9 +135,12 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
   }
 
   /** Mints a session and its deterministic CSRF token, no workspace claimed yet. */
-  async function newSession() {
+  async function newSession(email?: string, verified = false) {
     const sessions = app.get(SessionService);
-    const userId = await createUser();
+    const userId = await createUser(email);
+    if (verified) {
+      await db.query("UPDATE users SET email_verified_at = now(), status = 'active' WHERE id = $1", [userId]);
+    }
     const tokens = await sessions.createSession(userId);
     const csrf = computeCsrfToken(tokens.sid, CSRF_SECRET);
     return { userId, ...tokens, csrf };
@@ -235,12 +239,15 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     expect(removed).toEqual({ actor_id: owner.userId, resource_id: removeTargetId });
 
     // ---- (6) POST /workspaces/:id/invitations -> member.invited -------------
+    // STORY-172 — only the account whose VERIFIED email is the invited
+    // address can accept (step 7), so the invitee is created to match.
+    const inviteeEmail = `invitee-${randomUUID()}@example.com`;
     const inviteRes = await app.inject({
       method: "POST",
       url: apiUrl(`/workspaces/${workspace.id}/invitations`),
       cookies: scoped,
       headers: csrfHeader,
-      payload: { email: `invitee-${randomUUID()}@example.com`, role: "viewer" },
+      payload: { email: inviteeEmail, role: "viewer" },
     });
     expect(inviteRes.statusCode).toBe(201);
     const invitation = dataOf<{ id: string; token: string }>(inviteRes);
@@ -248,7 +255,7 @@ describe("STORY-021 · every mutating workspace/member/invitation route writes a
     expect(invited).toEqual({ actor_id: owner.userId, resource_id: invitation.id });
 
     // ---- (7) POST /workspaces/:id/invitations/accept -> member.invitation_accepted
-    const invitee = await newSession();
+    const invitee = await newSession(inviteeEmail, true);
     const acceptRes = await app.inject({
       method: "POST",
       url: apiUrl(`/workspaces/${workspace.id}/invitations/accept`),

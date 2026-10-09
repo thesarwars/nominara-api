@@ -10,6 +10,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { DbModule } from "../../src/db/db.module.js";
 import { IdentityModule } from "../../src/modules/identity/identity.module.js";
 import { IdentityService } from "../../src/modules/identity/identity.service.js";
+import { SessionService } from "../../src/modules/identity/session.service.js";
 import { AuthGuard } from "../../src/api/guards/auth.guard.js";
 import { ProblemFilter } from "../../src/api/filters/problem.filter.js";
 import { ApiModule } from "../../src/api/api.module.js";
@@ -19,6 +20,7 @@ import { apiUrl } from "../support/api-url.js";
 import { eachRequestFromItsOwnClient } from "../support/distinct-source.js";
 import { dataOf } from "../support/envelope.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME, REFRESH_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
 // STORY-014 — real Postgres (testcontainers, testing-strategy.md §1: never
 // mock the database). @simplewebauthn/server's verify* functions ARE
@@ -33,6 +35,13 @@ import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME, REFRESH_COOKIE_
 // captures Set-Cookie from /auth/passkey/verify and replays the
 // __Host-nominara-access cookie (plus, for mutating requests, the CSRF
 // double-submit cookie/header pair) instead.
+//
+// STORY-173 — registration is no longer anonymous. Every credential here is
+// added from a SIGNED-IN session that has stepped up, because that is the only
+// way a passkey can be added (POST /me/passkeys/{options,verify}); the helpers
+// below seed an account whose address is proved and open such a session. The
+// takeover and pre-hijack cases, uniform-response properties and step-up edges
+// live in identity-passkey-registration-proves-email.spec.ts.
 vi.mock("@simplewebauthn/server", async () => {
   const actual = await vi.importActual<typeof import("@simplewebauthn/server")>("@simplewebauthn/server");
   return { ...actual, verifyRegistrationResponse: vi.fn(), verifyAuthenticationResponse: vi.fn() };
@@ -40,6 +49,9 @@ vi.mock("@simplewebauthn/server", async () => {
 
 const verifyRegistrationMock = verifyRegistrationResponse as unknown as Mock;
 const verifyAuthenticationMock = verifyAuthenticationResponse as unknown as Mock;
+
+// STORY-173 — revoking a passkey needs a fresh step-up; the race below drives the service directly.
+const FRESH_STEP_UP = { lastStrongAuthAt: new Date(), lastStrongAuthMethod: "email_otp" } as const;
 
 interface AuthCookies {
   access: string;
@@ -148,11 +160,11 @@ describe("STORY-014 · passkey registration and assertion", () => {
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
     // STORY-030 — DbModule's PG_POOL factory calls loadEnv(), which (since
     // Phase B) also requires the queue-signing env vars even though this
     // file never signs a job payload itself.
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.QUEUE_REDIS_URL = testQueueRedisUrl();
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
@@ -202,25 +214,50 @@ describe("STORY-014 · passkey registration and assertion", () => {
 
   // ---- helpers ----------------------------------------------------------
 
+  // Seeds (once) an account whose address is proved, opens a session as if by a
+  // fresh email one-time code, and adds the credential through the real
+  // authenticated routes. Each call is a new session for the same account, so
+  // a second call for the same email adds a second credential.
+  async function signedInSession(email: string): Promise<{ cookies: AuthCookies; sub: string }> {
+    const user = await db.query<{ id: string }>(
+      `INSERT INTO users (email, status, email_verified_at) VALUES ($1, 'active', now())
+       ON CONFLICT (email) WHERE deleted_at IS NULL DO UPDATE SET email = users.email RETURNING id`,
+      [email],
+    );
+    const sub = user.rows[0]!.id;
+    const tokens = await app.get(SessionService).createSession(sub, new Date(), "email_otp");
+    return { cookies: { access: tokens.accessToken, refresh: tokens.refreshToken, csrf: tokens.csrfToken }, sub };
+  }
+
+  async function beginRegistration(cookies: AuthCookies): Promise<string> {
+    const optionsRes = await app.inject({
+      method: "POST",
+      url: apiUrl("/me/passkeys/options"),
+      payload: {},
+      ...mutatingHeaders(cookies),
+    });
+    expect(optionsRes.statusCode).toBe(201);
+    return dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
+  }
+
+  function finishRegistration(cookies: AuthCookies, ceremonyId: string, credentialIdB64url: string, counter = 0) {
+    mockRegistration(credentialIdB64url, counter);
+    return app.inject({
+      method: "POST",
+      url: apiUrl("/me/passkeys/verify"),
+      payload: { ceremony_id: ceremonyId, response: credentialResponse(credentialIdB64url) },
+      ...mutatingHeaders(cookies),
+    });
+  }
+
   async function registerPasskey(
     email: string,
     credentialIdB64url: string,
     counter = 0,
   ): Promise<{ cookies: AuthCookies; sub: string }> {
-    const optionsRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email },
-    });
-    expect(optionsRes.statusCode).toBe(201);
-    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
-
-    mockRegistration(credentialIdB64url, counter);
-    const verifyRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/verify"),
-      payload: { ceremony_id: ceremonyId, response: credentialResponse(credentialIdB64url) },
-    });
+    const { cookies, sub } = await signedInSession(email);
+    const ceremonyId = await beginRegistration(cookies);
+    const verifyRes = await finishRegistration(cookies, ceremonyId, credentialIdB64url, counter);
     expect(verifyRes.statusCode).toBe(200);
     // Proves the service threads the CURRENT env config into the library
     // call, rather than a stale or hardcoded value (Test Scenario 7
@@ -228,8 +265,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
     expect(verifyRegistrationMock).toHaveBeenCalledWith(
       expect.objectContaining({ expectedRPID: process.env.WEBAUTHN_RP_ID, expectedOrigin: process.env.WEBAUTHN_ORIGIN }),
     );
-    const cookies = extractAuthCookies(verifyRes);
-    return { cookies, sub: decodeClaims(cookies.access).sub };
+    return { cookies, sub };
   }
 
   async function assertPasskey(credentialIdB64url: string, reportedCounter: number) {
@@ -264,20 +300,26 @@ describe("STORY-014 · passkey registration and assertion", () => {
     expect(decodeClaims(extractAuthCookies(assertRes).access).sub).toBe(sub);
   });
 
-  it("STORY-014 · scenario 2 — register a second credential: both usable", async () => {
-    await registerPasskey("bob@example.com", credId("cred-a"), 0);
-    const optionsRes = await app.inject({
+  // STORY-173 — this scenario used to register the second credential with NO
+  // session, by naming the same address anonymously. That is the account
+  // takeover (anyone knowing an address could attach their own passkey to it
+  // and receive a session), so the old behaviour is now asserted REFUSED, and
+  // the second credential is added the only way it can be: from the signed-in
+  // account, after step-up.
+  it("STORY-014 · scenario 2 — register a second credential: both usable (and never anonymously)", async () => {
+    const { cookies } = await registerPasskey("bob@example.com", credId("cred-a"), 0);
+
+    const anonymous = await app.inject({
       method: "POST",
       url: apiUrl("/auth/passkey/options"),
       payload: { purpose: "registration", email: "bob@example.com" },
     });
-    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
-    mockRegistration(credId("cred-b"), 0);
-    const verifyRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/verify"),
-      payload: { ceremony_id: ceremonyId, response: credentialResponse(credId("cred-b")) },
-    });
+    expect(anonymous.statusCode).toBe(400);
+    const none = await app.inject({ method: "POST", url: apiUrl("/me/passkeys/options"), payload: {} });
+    expect(none.statusCode).toBe(401);
+
+    const ceremonyId = await beginRegistration(cookies);
+    const verifyRes = await finishRegistration(cookies, ceremonyId, credId("cred-b"), 0);
     expect(verifyRes.statusCode).toBe(200);
 
     const first = await assertPasskey(credId("cred-a"), 1);
@@ -287,19 +329,13 @@ describe("STORY-014 · passkey registration and assertion", () => {
   });
 
   it("STORY-014 · scenario 3 — replaying a used challenge is rejected", async () => {
-    const optionsRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email: "carol@example.com" },
-    });
-    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
-    mockRegistration(credId("cred-carol"), 0);
-    const body = { ceremony_id: ceremonyId, response: credentialResponse(credId("cred-carol")) };
+    const { cookies } = await signedInSession("carol@example.com");
+    const ceremonyId = await beginRegistration(cookies);
 
-    const first = await app.inject({ method: "POST", url: apiUrl("/auth/passkey/verify"), payload: body });
+    const first = await finishRegistration(cookies, ceremonyId, credId("cred-carol"), 0);
     expect(first.statusCode).toBe(200);
 
-    const replay = await app.inject({ method: "POST", url: apiUrl("/auth/passkey/verify"), payload: body });
+    const replay = await finishRegistration(cookies, ceremonyId, credId("cred-carol"), 0);
     expect(replay.statusCode).toBe(400);
   });
 
@@ -416,17 +452,8 @@ describe("STORY-014 · passkey registration and assertion", () => {
 
   it("STORY-014 · revoking a non-last credential succeeds", async () => {
     const { cookies, sub } = await registerPasskey("judy@example.com", credId("cred-judy-1"), 0);
-    const optionsRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email: "judy@example.com" },
-    });
-    mockRegistration(credId("cred-judy-2"), 0);
-    await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/verify"),
-      payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id, response: credentialResponse(credId("cred-judy-2")) },
-    });
+    const ceremonyId = await beginRegistration(cookies);
+    expect((await finishRegistration(cookies, ceremonyId, credId("cred-judy-2"), 0)).statusCode).toBe(200);
 
     const list = dataOf<{ id: string }[]>(
       await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) }),
@@ -449,17 +476,7 @@ describe("STORY-014 · passkey registration and assertion", () => {
 
   it("STORY-014 · ownership isolation — one user cannot rename or revoke another user's credential", async () => {
     const { cookies: cookiesA } = await registerPasskey("kim@example.com", credId("cred-kim"), 0);
-    const optionsRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email: "leo@example.com" },
-    });
-    mockRegistration(credId("cred-leo"), 0);
-    await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/verify"),
-      payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id, response: credentialResponse(credId("cred-leo")) },
-    });
+    await registerPasskey("leo@example.com", credId("cred-leo"), 0);
     const { cookies: cookiesB } = await registerPasskey("leo2@example.com", credId("cred-leo2"), 0);
 
     const kimCredentialId = dataOf<{ id: string }[]>(
@@ -483,39 +500,25 @@ describe("STORY-014 · passkey registration and assertion", () => {
   });
 
   it("STORY-014 · an expired, unconsumed challenge is rejected", async () => {
-    const optionsRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email: "mia@example.com" },
-    });
-    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
+    const { cookies } = await signedInSession("mia@example.com");
+    const ceremonyId = await beginRegistration(cookies);
     await db.query("UPDATE webauthn_challenges SET expires_at = now() - interval '1 minute' WHERE id = $1", [
       ceremonyId,
     ]);
 
-    mockRegistration(credId("cred-mia"), 0);
-    const res = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/verify"),
-      payload: { ceremony_id: ceremonyId, response: credentialResponse(credId("cred-mia")) },
-    });
+    const res = await finishRegistration(cookies, ceremonyId, credId("cred-mia"), 0);
     expect(res.statusCode).toBe(400);
   });
 
   it("STORY-014 · a concurrent verify race on the same ceremony has exactly one winner", async () => {
-    const optionsRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email: "nate@example.com" },
-    });
-    const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
+    const { cookies } = await signedInSession("nate@example.com");
+    const ceremonyId = await beginRegistration(cookies);
     mockRegistration(credId("cred-nate"), 0);
     const body = { ceremony_id: ceremonyId, response: credentialResponse(credId("cred-nate")) };
+    const send = () =>
+      app.inject({ method: "POST", url: apiUrl("/me/passkeys/verify"), payload: body, ...mutatingHeaders(cookies) });
 
-    const [first, second] = await Promise.all([
-      app.inject({ method: "POST", url: apiUrl("/auth/passkey/verify"), payload: body }),
-      app.inject({ method: "POST", url: apiUrl("/auth/passkey/verify"), payload: body }),
-    ]);
+    const [first, second] = await Promise.all([send(), send()]);
 
     const statuses = [first.statusCode, second.statusCode].sort();
     expect(statuses).toEqual([200, 400]);
@@ -542,17 +545,8 @@ describe("STORY-014 · passkey registration and assertion", () => {
   // exercised for real.
   it("STORY-014 · a concurrent revoke race on a user's last two credentials has exactly one winner, never zero remaining", async () => {
     const { cookies, sub } = await registerPasskey("tina@example.com", credId("cred-tina-1"), 0);
-    const secondOptionsRes = await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/options"),
-      payload: { purpose: "registration", email: "tina@example.com" },
-    });
-    mockRegistration(credId("cred-tina-2"), 0);
-    await app.inject({
-      method: "POST",
-      url: apiUrl("/auth/passkey/verify"),
-      payload: { ceremony_id: dataOf<{ ceremony_id: string }>(secondOptionsRes).ceremony_id, response: credentialResponse(credId("cred-tina-2")) },
-    });
+    const secondCeremony = await beginRegistration(cookies);
+    expect((await finishRegistration(cookies, secondCeremony, credId("cred-tina-2"), 0)).statusCode).toBe(200);
 
     const list = dataOf<{ id: string }[]>(
       await app.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) }),
@@ -608,8 +602,8 @@ describe("STORY-014 · passkey registration and assertion", () => {
     let outcomes: PromiseSettledResult<void>[];
     try {
       outcomes = await Promise.allSettled([
-        service.revokePasskey(sub, list[0]!.id),
-        service.revokePasskey(sub, list[1]!.id),
+        service.revokePasskey(sub, list[0]!.id, FRESH_STEP_UP),
+        service.revokePasskey(sub, list[1]!.id, FRESH_STEP_UP),
       ]);
     } finally {
       querySpy.mockRestore();
@@ -680,45 +674,44 @@ describe("STORY-014 · passkey registration and assertion", () => {
       await apiApp.close();
     });
 
-    it("registers a passkey and then lists/renames/revokes it end to end through the full guard/interceptor chain", async () => {
+    // STORY-173 — sessions here come from SessionService (as an OTP sign-in
+    // would mint them) and every credential is added through the real
+    // authenticated routes of the full ApiModule.
+    async function apiSignedIn(email: string): Promise<AuthCookies> {
+      const user = await db.query<{ id: string }>(
+        `INSERT INTO users (email, status, email_verified_at) VALUES ($1, 'active', now())
+         ON CONFLICT (email) WHERE deleted_at IS NULL DO UPDATE SET email = users.email RETURNING id`,
+        [email],
+      );
+      const tokens = await apiApp.get(SessionService).createSession(user.rows[0]!.id, new Date(), "email_otp");
+      return { access: tokens.accessToken, refresh: tokens.refreshToken, csrf: tokens.csrfToken };
+    }
+
+    async function apiAddPasskey(cookies: AuthCookies, label: string) {
       const optionsRes = await apiApp.inject({
         method: "POST",
-        url: apiUrl("/auth/passkey/options"),
-        payload: { purpose: "registration", email: "sam@example.com" },
+        url: apiUrl("/me/passkeys/options"),
+        payload: {},
+        ...mutatingHeaders(cookies),
       });
       expect(optionsRes.statusCode).toBe(201);
-      const ceremonyId = dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id;
-
-      mockRegistration(credId("cred-sam"), 0);
-      const verifyRes = await apiApp.inject({
+      mockRegistration(credId(label), 0);
+      return apiApp.inject({
         method: "POST",
-        url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: ceremonyId, response: credentialResponse(credId("cred-sam")) },
+        url: apiUrl("/me/passkeys/verify"),
+        payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id, response: credentialResponse(credId(label)) },
+        ...mutatingHeaders(cookies),
       });
-      expect(verifyRes.statusCode).toBe(200);
-      const cookies = extractAuthCookies(verifyRes);
+    }
 
+    it("registers a passkey and then lists/renames/revokes it end to end through the full guard/interceptor chain", async () => {
+      const cookies = await apiSignedIn("sam@example.com");
+      expect((await apiAddPasskey(cookies, "cred-sam")).statusCode).toBe(200);
       // Register a second credential so revoking the first isn't refused as
       // the last-remaining-credential case (unrelated to this test's point).
-      const secondOptionsRes = await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/options"),
-        payload: { purpose: "registration", email: "sam@example.com" },
-      });
-      mockRegistration(credId("cred-sam-2"), 0);
-      const secondVerifyRes = await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/verify"),
-        payload: {
-          ceremony_id: dataOf<{ ceremony_id: string }>(secondOptionsRes).ceremony_id,
-          response: credentialResponse(credId("cred-sam-2")),
-        },
-      });
-      // Asserted rather than assumed: this registration was previously
-      // fire-and-forget, so when it silently stopped working the failure
-      // surfaced further down as "expected 2 credentials, got 1" instead of
-      // here, where the cause is.
-      expect(secondVerifyRes.statusCode).toBe(200);
+      // Asserted rather than assumed: when this silently stopped working the
+      // failure surfaced further down as "expected 2 credentials, got 1".
+      expect((await apiAddPasskey(cookies, "cred-sam-2")).statusCode).toBe(200);
 
       const listRes = await apiApp.inject({
         method: "GET",
@@ -748,46 +741,17 @@ describe("STORY-014 · passkey registration and assertion", () => {
     it("rejects /me/passkeys with no session cookie (AuthGuard still runs — this route is not @Public())", async () => {
       const res = await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys") });
       expect(res.statusCode).toBe(401);
+      const add = await apiApp.inject({ method: "POST", url: apiUrl("/me/passkeys/options"), payload: {} });
+      expect(add.statusCode).toBe(401);
     });
 
     it("STORY-014 · GET /me/passkeys never includes another user's credentials", async () => {
-      const optionsA = await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/options"),
-        payload: { purpose: "registration", email: "paul@example.com" },
-      });
-      mockRegistration(credId("cred-paul"), 0);
-      const verifyA = await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsA).ceremony_id, response: credentialResponse(credId("cred-paul")) },
-      });
-      const cookiesA = extractAuthCookies(verifyA);
-
-      const optionsQuinn = await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/options"),
-        payload: { purpose: "registration", email: "quinn@example.com" },
-      });
-      mockRegistration(credId("cred-quinn"), 0);
-      await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsQuinn).ceremony_id, response: credentialResponse(credId("cred-quinn")) },
-      });
-
-      const optionsB = await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/options"),
-        payload: { purpose: "registration", email: "quinn2@example.com" },
-      });
-      mockRegistration(credId("cred-quinn2"), 0);
-      const verifyB = await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsB).ceremony_id, response: credentialResponse(credId("cred-quinn2")) },
-      });
-      const cookiesB = extractAuthCookies(verifyB);
+      const cookiesA = await apiSignedIn("paul@example.com");
+      expect((await apiAddPasskey(cookiesA, "cred-paul")).statusCode).toBe(200);
+      const cookiesQuinn = await apiSignedIn("quinn@example.com");
+      expect((await apiAddPasskey(cookiesQuinn, "cred-quinn")).statusCode).toBe(200);
+      const cookiesB = await apiSignedIn("quinn2@example.com");
+      expect((await apiAddPasskey(cookiesB, "cred-quinn2")).statusCode).toBe(200);
 
       const listA = dataOf<{ id: string }[]>(
         await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookiesA) }),
@@ -796,6 +760,8 @@ describe("STORY-014 · passkey registration and assertion", () => {
         await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookiesB) }),
       );
 
+      expect(listA).toHaveLength(1);
+      expect(listB).toHaveLength(1);
       expect(listA.map((c: { id: string }) => c.id)).not.toEqual(
         expect.arrayContaining(listB.map((c: { id: string }) => c.id)),
       );
@@ -805,18 +771,8 @@ describe("STORY-014 · passkey registration and assertion", () => {
     });
 
     it("STORY-014 · rejects an unknown key on a real production contract (passkeyRenameRequestSchema) through the real endpoint", async () => {
-      const optionsRes = await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/options"),
-        payload: { purpose: "registration", email: "rex@example.com" },
-      });
-      mockRegistration(credId("cred-rex"), 0);
-      const verifyRes = await apiApp.inject({
-        method: "POST",
-        url: apiUrl("/auth/passkey/verify"),
-        payload: { ceremony_id: dataOf<{ ceremony_id: string }>(optionsRes).ceremony_id, response: credentialResponse(credId("cred-rex")) },
-      });
-      const cookies = extractAuthCookies(verifyRes);
+      const cookies = await apiSignedIn("rex@example.com");
+      expect((await apiAddPasskey(cookies, "cred-rex")).statusCode).toBe(200);
       const { id } = dataOf<{ id: string }[]>(
         await apiApp.inject({ method: "GET", url: apiUrl("/me/passkeys"), cookies: sessionCookieHeader(cookies) }),
       )[0]!;

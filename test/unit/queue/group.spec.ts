@@ -13,7 +13,7 @@ import { QUEUE_TOPOLOGY, QUEUE_WORKER_GROUPS } from "../../../src/lib/queue/topo
 const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
   capture: ["capture.plan", "capture.execute", "lookup.execute"],
   parse: ["capture.parse", "capture.arbitrate"],
-  crawl: ["crawl.discover", "crawl.fingerprint", "crawl.audit", "gsc.sync"],
+  crawl: ["crawl.discover", "crawl.fingerprint", "crawl.audit", "gsc.sync", "source.verify_presence"],
   embed: ["embed.batch", "topic.cluster"],
   rollup: [
     "rollup.metric_daily",
@@ -26,6 +26,10 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "maintenance.partition",
     // STORY-143 — not in §4; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "audit.verify",
+    // STORY-173 — not in §4 either; see ADDED_BEYOND_REFERENCE.
+    "identity.sweep_unverified",
+    // NEW-D-7 — not in §4 either; see ADDED_BEYOND_REFERENCE.
+    "billing.auto_topup",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],

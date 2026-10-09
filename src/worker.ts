@@ -5,9 +5,11 @@ import { NestFactory } from "@nestjs/core";
 import type { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 import type { ClientBase, PoolClient } from "pg";
-import { engineSpendCeilingsSchema } from "./config/env.schema.js";
+import { resolveEngineSpendCeilings } from "./config/env.schema.js";
 import { loadEnv } from "./config/env.js";
-import { createPgPool } from "./db/pg-pool.js";
+import { connect, withKeepalives } from "./db/client.js";
+import { createPgPool, isConnectionClassFailure } from "./db/pg-pool.js";
+import { SchedulerSweepRuntime } from "./lib/capture/scheduler-sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
 import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
@@ -16,6 +18,7 @@ import { attachDeadLetterHandler, buildDlqQueue } from "./lib/queue/dead-letter.
 import { queuesForGroup } from "./lib/queue/group.js";
 import { handlerFor } from "./lib/queue/handlers.js";
 import { buildQueue } from "./lib/queue/queue-factory.js";
+import { QueueProducer } from "./lib/queue/queue-producer.js";
 import { describeSchedules, reconcileSchedules } from "./lib/queue/schedule-registrar.js";
 import { buildWorker, signingKeysFromEnv } from "./lib/queue/worker-factory.js";
 
@@ -56,6 +59,9 @@ export const WORKER_GROUP_WORKERS = "WORKER_GROUP_WORKERS";
 
 /** DI token for the capture group's canary (Phase F) — only ever registered when WORKER_GROUP === "capture"; absent for every other group. */
 export const CAPTURE_CANARY_RUNTIME = "CAPTURE_CANARY_RUNTIME";
+
+/** NEW-A-13 — DI token for the capture group's scheduler sweep (hourly at :05 UTC). Capture group only. */
+export const CAPTURE_SCHEDULER_SWEEP = "CAPTURE_SCHEDULER_SWEEP";
 
 class WorkerGroupRuntime implements OnModuleDestroy {
   constructor(
@@ -163,6 +169,21 @@ class CaptureCanaryRuntimeHolder implements OnModuleDestroy {
   }
 }
 
+/** NEW-A-13 — owns the sweep's timer and the producer it enqueues through. */
+class CaptureSchedulerSweepHolder implements OnModuleDestroy {
+  constructor(
+    public readonly runtime: SchedulerSweepRuntime,
+    private readonly producer: QueueProducer,
+  ) {}
+
+  async onModuleDestroy(): Promise<void> {
+    this.runtime.stop();
+    // Closes the producer's Queues only. The connection is the group's shared
+    // producer-side one, which WorkerGroupRuntime closes.
+    await this.producer.onModuleDestroy();
+  }
+}
+
 function notImplementedHandler(queueName: string): never {
   throw new Error(`queue "${queueName}": no handler wired yet — business logic lands in a later story`);
 }
@@ -233,7 +254,7 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
         // exactOptionalPropertyTypes an absent option and one explicitly set
         // to undefined are different things, and an unhandled queue has no
         // client to give back — its getClient throws first.
-        ...(handler ? { releaseClient: (client: ClientBase) => (client as PoolClient).release() } : {}),
+        ...(handler ? { releaseClient: (client: ClientBase, failure?: unknown) => (client as PoolClient).release(isConnectionClassFailure(failure) ? (failure as Error) : undefined) } : {}),
         process: handler ? handler({ pool, env }) : () => notImplementedHandler(entry.name),
       });
       attachDeadLetterHandler(worker, dlqQueue, entry);
@@ -273,13 +294,11 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   // capture-group concern only. Nothing else touches an engine at all.
   const providers: Array<{ provide: string; useValue: unknown }> = [{ provide: WORKER_GROUP_WORKERS, useValue: runtime }];
   if (env.WORKER_GROUP === "capture") {
-    // D13 — a boot-time disclosure, not a fabricated default: every active
-    // engine missing an ENGINE_SPEND_CEILINGS_USD entry logs exactly one
+    // D13 — a boot-time disclosure: every active
+    // engine (gemini aside, which has a documented default) missing an ENGINE_SPEND_CEILINGS_USD entry logs exactly one
     // warning here, matching where ENGINE_TOKEN_BUCKETS's config-shaped
     // sibling is already read from env for this same worker group.
-    const ceilingsUsd = env.ENGINE_SPEND_CEILINGS_USD
-      ? engineSpendCeilingsSchema.parse(JSON.parse(env.ENGINE_SPEND_CEILINGS_USD))
-      : {};
+    const ceilingsUsd = resolveEngineSpendCeilings(env.ENGINE_SPEND_CEILINGS_USD);
     warnMissingSpendCeilings(ceilingsUsd, ACTIVE_ENGINE_KEYS);
 
     // lazyConnect: a fake/unreachable VALKEY_CACHE_URL (e.g. in a unit test)
@@ -294,6 +313,31 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
     const canaryRuntime = new CanaryRuntime({ pool, cacheRedis });
     canaryRuntime.start();
     providers.push({ provide: CAPTURE_CANARY_RUNTIME, useValue: new CaptureCanaryRuntimeHolder(canaryRuntime, cacheRedis) });
+
+    // NEW-A-13 — the scheduler sweep, in-process in the capture worker, hourly
+    // at :05 UTC. It enqueues signed `capture.plan` jobs (consumed by this same
+    // group) on the owner connection, so it can see across tenants. It enqueues
+    // through the group's ONE shared producer-side connection (the bounded reader
+    // factory, an ordinary-command producer is what that connection is for) and
+    // opens no connection of its own.
+    if (scheduleConnection === undefined) throw new WorkerGroupError("scheduler sweep: the producer-side connection was not built");
+    const sweepProducer = new QueueProducer(scheduleConnection, prefix, keys);
+    const sweepRuntime = new SchedulerSweepRuntime({
+      connect: () => connect(withKeepalives(env.DATABASE_URL)),
+      enqueue: async (job) => {
+        await sweepProducer.enqueueTenantJob(
+          "capture.plan",
+          job.workspaceId,
+          { projectId: job.projectId, trigger: "scheduled" },
+          { idempotencyKey: job.idempotencyKey },
+        );
+      },
+    });
+    sweepRuntime.start();
+    providers.push({
+      provide: CAPTURE_SCHEDULER_SWEEP,
+      useValue: new CaptureSchedulerSweepHolder(sweepRuntime, sweepProducer),
+    });
   }
 
   @Module({ providers })

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { EnvValidationError, loadEnv } from "../../src/config/env.js";
 import { KNOWN_KEYS } from "../../src/config/env.js";
 import { envSchema } from "../../src/config/env.schema.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
 // STORY-022 scenario 6 — "Start with a required configuration value missing
 // → Refuses to start, naming the value." Config validation lives at boot
@@ -32,12 +33,12 @@ const VALID: NodeJS.ProcessEnv = {
   // STORY-025 — the Valkey CACHE instance. Required, with no default: a
   // default connection string is how a service silently talks to the wrong
   // cache, and this schema exists to make that a failed boot instead.
-  VALKEY_CACHE_URL: "redis://localhost:6379",
+  VALKEY_CACHE_URL: testCacheRedisUrl(),
   // STORY-030 — the queue instance's connection, and the rotating
   // HMAC-SHA256 key that signs every tenant-scoped job payload
   // (src/lib/queue/signing.ts). QUEUE_JOB_SIGNING_PREVIOUS_KEY/_KID are
   // optional — set only during a rotation's overlap window.
-  QUEUE_REDIS_URL: "redis://localhost:6380",
+  QUEUE_REDIS_URL: testQueueRedisUrl(),
   QUEUE_JOB_SIGNING_KEY: Buffer.alloc(32, 1).toString("base64"),
   QUEUE_JOB_SIGNING_KID: "test-queue-kid-1",
   // STORY-031 D7 — per-engine token-bucket capacity/refill JSON, on the
@@ -74,6 +75,52 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
       /WORKSPACE_DEK_WRAPPING_KEY/,
     );
   });
+
+  it("STORY-170 · the grace window needs no new secret — a pre-STORY-170 environment still loads", () => {
+    // The successor is encrypted under a key derived from the predecessor
+    // token (refresh-token.ts), so an existing deployment's configuration
+    // is unchanged by this feature.
+    expect(() => loadEnv(VALID)).not.toThrow();
+  });
+
+  it("STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS is optional and defaults to 2000", () => {
+    const env = loadEnv(VALID);
+    expect(env.REFRESH_TOKEN_GRACE_WINDOW_MS).toBe(2000);
+  });
+
+  it("STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS above the hard maximum (5000) throws, naming that exact key", () => {
+    expect(() => loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "5001" })).toThrow(/REFRESH_TOKEN_GRACE_WINDOW_MS/);
+  });
+
+  it("STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS accepts 0 — the documented way to disable the grace window without a redeploy", () => {
+    const env = loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "0" });
+    expect(env.REFRESH_TOKEN_GRACE_WINDOW_MS).toBe(0);
+  });
+
+  // "0" is the switch that DISABLES grace, and z.coerce.number() turns ""
+  // (and any whitespace) into 0. `REFRESH_TOKEN_GRACE_WINDOW_MS=` in a deploy
+  // template must therefore mean "not set", or it silently turns the feature
+  // off with no error and no log line.
+  it.each([["an empty string", ""], ["a single space", " "], ["tabs and newlines", "\t \n"]])(
+    "STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS as %s is UNSET (the 2000 default), never 0 — it must not silently disable grace",
+    (_label, value) => {
+      const env = loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: value });
+      expect(env.REFRESH_TOKEN_GRACE_WINDOW_MS).toBe(2000);
+    },
+  );
+
+  it("STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS accepts exactly the hard maximum (5000) and rejects 5001 — the cap is rejected at boot, not clamped", () => {
+    expect(loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "5000" }).REFRESH_TOKEN_GRACE_WINDOW_MS).toBe(5000);
+    expect(() => loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "5001" })).toThrow(/REFRESH_TOKEN_GRACE_WINDOW_MS/);
+    expect(() => loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: "60000" })).toThrow(/REFRESH_TOKEN_GRACE_WINDOW_MS/);
+  });
+
+  it.each([["negative", "-1"], ["fractional", "2000.5"], ["not a number", "two seconds"]])(
+    "STORY-170 · REFRESH_TOKEN_GRACE_WINDOW_MS that is %s throws, naming that exact key",
+    (_label, value) => {
+      expect(() => loadEnv({ ...VALID, REFRESH_TOKEN_GRACE_WINDOW_MS: value })).toThrow(/REFRESH_TOKEN_GRACE_WINDOW_MS/);
+    },
+  );
 
   it("a MISSING required var throws EnvValidationError naming that exact key", () => {
     const { DATABASE_URL: _drop, ...rest } = VALID;
@@ -256,3 +303,22 @@ describe("STORY-127 · KNOWN_KEYS covers the schema", () => {
     expect(stale, "in KNOWN_KEYS but not declared by envSchema").toEqual([]);
   });
 });
+
+describe("NEW-D-2 · Stripe configuration is optional — the API boots without a payment provider", () => {
+  it("loads with none of the three Stripe variables set, and leaves them undefined", () => {
+    const env = loadEnv(VALID);
+    expect(env.STRIPE_SECRET_KEY).toBeUndefined();
+    expect(env.STRIPE_WEBHOOK_SECRET).toBeUndefined();
+    expect(env.STRIPE_PUBLISHABLE_KEY).toBeUndefined();
+  });
+
+  it("reads all three when present", () => {
+    const env = loadEnv({ ...VALID, STRIPE_SECRET_KEY: "sk_test_x", STRIPE_WEBHOOK_SECRET: "whsec_x", STRIPE_PUBLISHABLE_KEY: "pk_test_x" });
+    expect([env.STRIPE_SECRET_KEY, env.STRIPE_WEBHOOK_SECRET, env.STRIPE_PUBLISHABLE_KEY]).toEqual(["sk_test_x", "whsec_x", "pk_test_x"]);
+  });
+
+  it("a blank value is refused rather than read as 'configured' — a blank secret would verify nothing", () => {
+    expect(() => loadEnv({ ...VALID, STRIPE_WEBHOOK_SECRET: "  " })).toThrow(/STRIPE_WEBHOOK_SECRET/);
+  });
+});
+

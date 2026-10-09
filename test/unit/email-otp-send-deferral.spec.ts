@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EmailOtpService } from "../../src/modules/identity/email-otp.service.js";
 import type { EmailMessage, EmailSender } from "../../src/modules/identity/ports/email-sender.js";
 import type { SessionService } from "../../src/modules/identity/session.service.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
 // STORY-016 fix 2 (code-reviewer finding) — requestCode's
 // `this.emailSender.send(...)` call is fire-and-forget, but calling an
@@ -31,8 +32,8 @@ describe("STORY-016 · EmailOtpService.requestCode defers the email-send call pa
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
+    process.env.QUEUE_REDIS_URL = testQueueRedisUrl();
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 1).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
@@ -59,6 +60,11 @@ describe("STORY-016 · EmailOtpService.requestCode defers the email-send call pa
     const pool = {
       connect: vi.fn().mockResolvedValue(client),
       query: vi.fn(async (sql: string) => {
+        // STORY-173 — the request now creates the account for an unknown
+        // address (DO NOTHING when it exists) before looking it up.
+        if (sql.includes("INSERT INTO users")) {
+          return { rows: [] };
+        }
         if (sql.startsWith("SELECT id FROM users")) {
           return { rows: [{ id: "01926a1e-0000-7000-8000-000000000001" }] };
         }

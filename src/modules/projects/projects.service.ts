@@ -11,10 +11,12 @@ import type {
 } from "../../../contracts/projects/index.js";
 import { COLUMN_FOR_FIELD, LIST_VALUED_FIELDS } from "../../../contracts/projects/index.js";
 import { OPTIONAL_PROJECT_FIELDS } from "../../../contracts/projects/index.js";
+import { openTasksBySeveritySchema, visibilityByEngineSchema } from "../../../contracts/projects/index.js";
 import { ConflictError, EntitlementExceededError, NotFoundError, UnsafeTargetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { GuardedFetchRefusal } from "../../lib/net/guarded-fetch.js";
 import { UrlGuard } from "../../lib/net/url-guard.service.js";
 import { UnparsableHostError } from "../../lib/net/registrable-domain.js";
+import { lockProjectCompetitors } from "./competitor-cap-lock.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { insertPromptStatement, manualPromptRow } from "../../lib/promptgen/persist.js";
@@ -22,11 +24,15 @@ import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import type { PortalProjectEngines } from "../../lib/portal/portal-facts.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
 import { handlerFor } from "../../lib/queue/handlers.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
+import { nextRunAfter } from "../../lib/capture/scheduler.js";
+import { startingCadenceFor } from "../../lib/capture/starting-cadence.js";
+import { confidenceFor, sentimentBand } from "../../lib/scoring/index.js";
 
 // STORY-043 — URL-only project creation. api-specification.md §4.
 //
@@ -45,6 +51,17 @@ import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 // that should have succeeded. afterCommit() exists for exactly this.
 
 const DISCOVERY_EXPECTED_MS = 20_000;
+
+// The matrix row's columns. Shared by `list` and `listForSummary` so the two
+// readers of the denormalised columns cannot drift apart.
+const PROJECT_LIST_SELECT = `SELECT id, name, slug::text AS slug, root_domain, kind, status, discovery_status,
+              prompts_active, prompts_cap, open_task_count, open_tasks_by_severity,
+              domain_verified_at, created_at,
+              visibility_blended, visibility_delta_30d, rendering_quality, rendering_delta_30d,
+              source_coverage, aux_score_current, sentiment_score, sentiment_delta_30d, cells_30d,
+              visibility_by_engine, sparkline_30d, demo_seeded_at,
+              created_at::text AS created_at_key
+         FROM projects`;
 
 @Injectable()
 export class ProjectsService {
@@ -102,14 +119,19 @@ export class ProjectsService {
       await assertParentExists(client, input.parent_project_id!);
     }
 
+    // Owner decision 2026-10-09 pm #2: the starting cadence is the plan's
+    // scan.cadence entitlement (cadence is still not accepted at creation,
+    // STORY-043 AC2), mapped onto what projects.cadence allows.
+    const startingCadence = startingCadenceFor(resolved.entitlements["scan.cadence"]?.value);
+
     const projectId = uuidV7();
     const slug = await nextFreeSlug(client, rootDomain);
     await client.query(
       `INSERT INTO projects
          (id, workspace_id, name, slug, kind, parent_project_id, root_url, root_domain,
           owned_domains, brand_aliases, negative_aliases, category_slug, verticals, locale,
-          description, prompts_cap, discovery_status, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending','initializing',$17)`,
+          description, prompts_cap, discovery_status, status, created_by, cadence, next_run_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending','initializing',$17,$18,$19)`,
       [
         projectId,
         workspaceId,
@@ -131,6 +153,11 @@ export class ProjectsService {
         input.description ?? null,
         promptsCap,
         actorId,
+        startingCadence,
+        // Owner decision 2026-10-09 #2: a non-manual cadence seeds next_run_at
+        // with the NEXT cadence slot (never "now"), so the sweep has something
+        // to claim once the project is active. `manual` would store NULL.
+        nextRunAfter(startingCadence, new Date()),
       ],
     ).catch((error: unknown) => {
       // `nextFreeSlug` picked a free one a moment ago, so reaching here means
@@ -212,12 +239,7 @@ export class ProjectsService {
     const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
 
     const result = await client.query<ProjectRow>(
-      `SELECT id, name, slug::text AS slug, root_domain, kind, status, discovery_status,
-              prompts_active, prompts_cap, open_task_count,
-              domain_verified_at, created_at,
-              visibility_blended, visibility_delta_30d, aux_score_current, sparkline_30d,
-              created_at::text AS created_at_key
-         FROM projects
+      `${PROJECT_LIST_SELECT}
         WHERE deleted_at IS NULL
           AND (cardinality(app.current_scope_projects()) = 0
                OR id = ANY(app.current_scope_projects()))
@@ -228,6 +250,74 @@ export class ProjectsService {
     );
 
     return pageFrom(result.rows, pagination.limit, toProjectListItem, (row) => [row.created_at_key, row.id]);
+  }
+
+  /** NEW-E-099a — display names for a set of project ids, on the ambient transaction (RLS and the portal scope narrow it). */
+  async namesFor(ids: readonly string[]): Promise<Map<string, string>> {
+    const client = currentTenantStore()!.client;
+    const result = await client.query<{ id: string; name: string }>("SELECT id, name FROM projects WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL", [ids]);
+    return new Map(result.rows.map((row) => [row.id, row.name]));
+  }
+
+  /**
+   * NEW-E-099a — the engine rows a portal read needs per project: the entitled, enabled rows of
+   * `project_entitled_engines` and the `project_engines` overrides. Read on the APP pool, because `nominara_portal` has
+   * no grant on the view and no policy on the override table; the portal interceptor hands them to the services as data.
+   */
+  async portalEngines(ids: readonly string[]): Promise<Map<string, PortalProjectEngines>> {
+    const client = currentTenantStore()!.client;
+    const [entitled, overrides] = await Promise.all([
+      client.query<{ project_id: string; engine_key: string; display_name: string | null; runs_per_cycle: number | null; weight: string }>(
+        `SELECT project_id, engine_key, display_name, (cadence ->> 'full')::int AS runs_per_cycle, weight::text AS weight
+           FROM project_entitled_engines WHERE project_id = ANY($1::uuid[]) AND enabled = true ORDER BY engine_key`,
+        [ids],
+      ),
+      client.query<{ project_id: string; engine_key: string; weight: string }>(
+        "SELECT project_id, engine_key, weight::text AS weight FROM project_engines WHERE project_id = ANY($1::uuid[]) ORDER BY engine_key",
+        [ids],
+      ),
+    ]);
+    const out = new Map<string, { entitled: PortalProjectEngines["entitled"][number][]; overrides: PortalProjectEngines["overrides"][number][] }>();
+    const slot = (id: string) => out.get(id) ?? out.set(id, { entitled: [], overrides: [] }).get(id)!;
+    for (const row of entitled.rows) slot(row.project_id).entitled.push({ engine_key: row.engine_key, display_name: row.display_name, runs_per_cycle: row.runs_per_cycle, weight: row.weight });
+    for (const row of overrides.rows) slot(row.project_id).overrides.push({ engine_key: row.engine_key, weight: row.weight });
+    return out;
+  }
+
+  /**
+   * NEW-B-2 — the Command Center's matrix, whole, for `GET /workspaces/{id}/
+   * summary`. FR-DASH-01: one request, no per-project query — this is TWO
+   * statements however many projects there are.
+   *
+   * Scoped exactly as `list` is (see its comment): RLS gives the workspace,
+   * `app.current_scope_projects()` gives the project scope, and the second
+   * statement re-uses the SAME scoped set so the engine filter cannot name an
+   * engine only an out-of-scope project is entitled to. Not paginated — the
+   * matrix is bounded by the plan's `projects.max`.
+   */
+  async listForSummary(): Promise<{ projects: ProjectListItem[]; engineKeys: string[] }> {
+    const client = currentTenantStore()!.client;
+
+    const result = await client.query<ProjectRow>(
+      `${PROJECT_LIST_SELECT}
+        WHERE deleted_at IS NULL
+          AND (cardinality(app.current_scope_projects()) = 0
+               OR id = ANY(app.current_scope_projects()))
+        ORDER BY created_at ASC, id ASC`,
+    );
+
+    // The entitled set is DERIVED (STORY-152), never stored. `enabled` honours
+    // a project's own narrowing; the view is security_invoker, so RLS applies.
+    const engines = await client.query<{ engine_key: string }>(
+      `SELECT DISTINCT engine_key
+         FROM project_entitled_engines
+        WHERE enabled
+          AND (cardinality(app.current_scope_projects()) = 0
+               OR project_id = ANY(app.current_scope_projects()))
+        ORDER BY engine_key`,
+    );
+
+    return { projects: result.rows.map(toProjectListItem), engineKeys: engines.rows.map((row) => row.engine_key) };
   }
 
   /**
@@ -368,6 +458,9 @@ export class ProjectsService {
     competitors: NonNullable<ConfirmDiscoveryRequest["competitors"]>,
     entitlementVersion: number | undefined,
   ): Promise<void> {
+    // Serialise with `CompetitorTrackingService.track` BEFORE counting.
+    await lockProjectCompetitors(client, projectId);
+
     const resolved =
       entitlementVersion === undefined
         ? await this.entitlements.resolveForWorkspace(workspaceId)
@@ -375,8 +468,8 @@ export class ProjectsService {
     const cap = resolveCap(resolved.entitlements["competitors.max_per_project"]?.value);
 
     const existing = await client.query(
-      "SELECT name FROM competitors WHERE project_id = $1 AND deleted_at IS NULL",
-      [projectId],
+      "SELECT name FROM competitors WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+      [projectId, workspaceId],
     );
     const present = new Set(existing.rows.map((row) => row.name.toLowerCase()));
     // AC7 — re-confirming a competitor already tracked is a no-op, not a
@@ -387,8 +480,8 @@ export class ProjectsService {
 
     for (const competitor of toInsert) {
       await client.query(
-        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, origin)
-         VALUES ($1,$2,$3,$4,$5,$6,'user_authored')`,
+        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source)
+         VALUES ($1,$2,$3,$4,$5,$6,'user')`,
         [uuidV7(), workspaceId, projectId, competitor.name, competitor.root_domain ?? null, competitor.aliases ?? []],
       );
     }
@@ -522,12 +615,29 @@ interface ProjectRow {
   prompts_active: number;
   prompts_cap: number;
   open_task_count: number;
+  /**
+   * STORY-169 review — `unknown`, not a hand-written interface: this is a
+   * jsonb column, and `coding-standards.md` requires a zod schema for every
+   * one, parsed at read time (`toProjectListItem` does, via
+   * `openTasksBySeveritySchema` — the SAME schema the wire contract already
+   * declares, since the stored and wire shapes are identical here).
+   */
+  open_tasks_by_severity: unknown;
   domain_verified_at: Date | null;
   created_at: Date;
   visibility_blended: string | null;
   visibility_delta_30d: string | null;
+  rendering_quality: string | null;
+  rendering_delta_30d: string | null;
+  source_coverage: string | null;
   aux_score_current: string | null;
+  sentiment_score: string | null;
+  sentiment_delta_30d: string | null;
+  cells_30d: number | null;
+  /** STORY-169 review — jsonb; parsed via `visibilityByEngineSchema` (its STORED shape, `toEngineScores` converts to the wire's sorted array). */
+  visibility_by_engine: unknown;
   sparkline_30d: unknown;
+  demo_seeded_at: Date | null;
   created_at_key: string;
 }
 
@@ -545,6 +655,7 @@ function numericOrNull(value: string | null): number | null {
 }
 
 function toProjectListItem(row: ProjectRow): ProjectListItem {
+  const sentimentScore = numericOrNull(row.sentiment_score);
   return {
     id: row.id,
     name: row.name,
@@ -556,13 +667,45 @@ function toProjectListItem(row: ProjectRow): ProjectListItem {
     prompts_active: row.prompts_active,
     prompts_cap: row.prompts_cap,
     open_task_count: row.open_task_count,
+    open_tasks_by_severity: openTasksBySeveritySchema.parse(row.open_tasks_by_severity),
     domain_verified_at: row.domain_verified_at?.toISOString() ?? null,
     created_at: row.created_at.toISOString(),
     visibility_blended: numericOrNull(row.visibility_blended),
     visibility_delta_30d: numericOrNull(row.visibility_delta_30d),
+    rendering_quality: numericOrNull(row.rendering_quality),
+    rendering_delta_30d: numericOrNull(row.rendering_delta_30d),
+    source_coverage: numericOrNull(row.source_coverage),
     aux_score_current: numericOrNull(row.aux_score_current),
+    sentiment_score: sentimentScore,
+    sentiment_delta_30d: numericOrNull(row.sentiment_delta_30d),
+    // Read-time classification, not stored: the band is a rendering of the
+    // score, and storing it would let the two disagree after a rounding
+    // change. Null exactly when the score itself is — never "positive" for
+    // no data, matching how the score's own null already refuses 50.
+    sentiment_band: sentimentBand(sentimentScore),
+    // Read-time, from the cell count denormalizeProject already wrote — no
+    // second query over metric_daily. Null when cells_30d is null: nothing
+    // has been measured at all, which is a different fact from "low".
+    confidence: row.cells_30d === null ? null : confidenceFor(row.cells_30d),
+    engine_scores: toEngineScores(row.visibility_by_engine),
     sparkline_30d: row.sparkline_30d ?? null,
+    demo_seeded: row.demo_seeded_at !== null,
   };
+}
+
+/**
+ * `projects.visibility_by_engine`'s stored object, as the sorted array the
+ * wire contract wants. Parses through `visibilityByEngineSchema` FIRST
+ * (STORY-169 review — a jsonb column read with no runtime check at all
+ * before this) — `null` is the honest "no per-engine data" case and is
+ * never itself a validation failure.
+ */
+function toEngineScores(byEngine: unknown): ProjectListItem["engine_scores"] {
+  if (byEngine === null) return null;
+  const parsed = visibilityByEngineSchema.parse(byEngine);
+  return Object.entries(parsed)
+    .map(([engineKey, value]) => ({ engine_key: engineKey, score: value.score, delta_30d: value.delta_30d }))
+    .sort((a, b) => b.score - a.score);
 }
 
 /** The honest empty payload for a project whose discovery has written nothing yet. */

@@ -103,7 +103,7 @@ export interface RenderingResult {
   readonly derivedFrom: "element" | "markdown";
 }
 
-const PRICED_ATTRS: readonly RenderAttr[] = ["price", "rating", "review_count", "availability"];
+export const PRICED_ATTRS: readonly RenderAttr[] = ["price", "rating", "review_count", "availability"];
 
 /**
  * Attributes from a typed element — the ONLY place they can come from.

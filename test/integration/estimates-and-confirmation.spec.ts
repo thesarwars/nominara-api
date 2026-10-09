@@ -152,6 +152,14 @@ describe("STORY-074 · estimates, confirmation and price-changed", () => {
     expect(result.credits_charged).toBe(0);
   });
 
+  it("⚠ STORY-034 — says the scan cannot run when the trigger would refuse it (no engine is capture-ready yet)", async () => {
+    // Production resolves no capture-ready engine until STORY-001, so this
+    // is every estimate today: the price is real, but POST /runs answers
+    // 422 precondition_unmet, and an API consumer must be able to tell.
+    await fundWallet(2_400);
+    expect((await estimate()).capturable).toBe(false);
+  });
+
   it("satisfies the published contract", async () => {
     await fundWallet(2_400);
     expect(runEstimateResponseSchema.safeParse(await estimate()).success).toBe(true);

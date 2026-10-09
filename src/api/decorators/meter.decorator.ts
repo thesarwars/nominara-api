@@ -19,6 +19,17 @@ export interface MeterSpec {
   readonly metric: UsageMetric;
   /** How many units this route consumes. §5's `n`. */
   readonly quantity: number;
+  /**
+   * NEW-E-100b — an optional condition on the REQUEST for the cap to apply.
+   *
+   * For a route whose one path serves a metered and an unmetered variant
+   * (the on-demand export: a PDF consumes a `pdf_exports` unit, a CSV does
+   * not). Absent = always metered, which is every other route. It reads the
+   * request BEFORE the validation pipe runs, so a predicate must be total and
+   * must agree with the route's own schema: it answers "is this a request
+   * the handler will treat as the metered variant?", never "is it valid".
+   */
+  readonly when?: (request: unknown) => boolean;
 }
 
 export const METER_KEY = "meter";
@@ -28,5 +39,9 @@ export const METER_KEY = "meter";
  * not known until the handler runs should reserve inside the handler rather
  * than declare a number here that is a guess.
  */
-export const Meter = (metric: UsageMetric, quantity = 1): MethodDecorator & ClassDecorator =>
-  SetMetadata(METER_KEY, { metric, quantity } satisfies MeterSpec);
+export const Meter = (
+  metric: UsageMetric,
+  quantity = 1,
+  when?: (request: unknown) => boolean,
+): MethodDecorator & ClassDecorator =>
+  SetMetadata(METER_KEY, (when === undefined ? { metric, quantity } : { metric, quantity, when }) satisfies MeterSpec);

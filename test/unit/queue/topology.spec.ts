@@ -276,6 +276,28 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "§4's table never allocated it a queue, so STORY-020 wrote the job (workers/rollup/audit-verify.ts) with nowhere to run it — " +
       "no handler, no schedule, and not even a pnpm script, while two comments in this repo claimed it ran daily. STORY-143.",
   },
+  "identity.sweep_unverified": {
+    workerGroup: "rollup",
+    because:
+      "An email-code request for an unknown address creates that account unverified (STORY-173), and the rows nobody came back for must not " +
+      "accumulate or stay squatted. The sweep (workers/rollup/unverified-sweep.ts) is a job §4 never allocated a queue; the owner decided it runs " +
+      "daily on this system rather than by hand. A queue of its own so a DLQ entry names the job that failed. STORY-173.",
+  },
+  "source.verify_presence": {
+    workerGroup: "crawl",
+    because:
+      "STORY-054 AC4/AC11: brand presence on a cited domain is verified by FETCHING the cited URL through the guarded fetcher and matching it, " +
+      "cached 30 days (scoring-models.md §5). §4's table allocates no queue to that fetch, and a fetch of a third-party site must never run on a " +
+      "request path (KAD-06) nor inside the rollup transaction. A queue of its own, in the crawl group with the other outbound fetchers, so a DLQ " +
+      "entry names the job that failed. NEW-C-15.",
+  },
+  "billing.auto_topup": {
+    workerGroup: "rollup",
+    because:
+      "NEW-D-7 / owner decision 4 of 2026-10-08: an auto top-up charges a saved card through Stripe, which may never happen on a request path (KAD-06). " +
+      "A balance debit that leaves a workspace below its threshold enqueues one signed tenant job; the worker verifies the signature before any context is " +
+      "set, then evaluates and charges. §4's table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed. STORY-076.",
+  },
 };
 
 describe("STORY-030 · queue topology declares §4's 21 queues, plus what we have added on purpose", () => {
@@ -319,7 +341,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     }
   });
 
-  it("has the documented per-worker-group queue counts (rollup carries the one added queue)", () => {
+  it("has the documented per-worker-group queue counts (rollup carries the added queues)", () => {
     const actualCounts: Record<string, number> = {};
     for (const entry of QUEUE_TOPOLOGY) {
       actualCounts[entry.workerGroup] = (actualCounts[entry.workerGroup] ?? 0) + 1;
@@ -359,7 +381,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     }
   });
 
-  it("marks tenantScoped=false only for the three cross-tenant system jobs; true for every other queue", () => {
+  it("marks tenantScoped=false only for the four cross-tenant system jobs; true for every other queue", () => {
     // ⚠ THE SHORT LIST IS THE ASSERTION. A tenant-scoped queue cannot be
     // driven by a bare cron tick — `createJobProcessor` verifies a signature
     // before the handler is reached — so this set is exactly the set of
@@ -367,7 +389,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     // the rest. `audit.verify` joins it because a verifier that could only see
     // one workspace would not be a verifier.
     const systemScoped = QUEUE_TOPOLOGY.filter((entry) => !entry.tenantScoped).map((entry) => entry.name).sort();
-    expect(systemScoped).toEqual(["audit.verify", "credit.reconcile", "maintenance.partition"]);
+    expect(systemScoped).toEqual(["audit.verify", "credit.reconcile", "identity.sweep_unverified", "maintenance.partition"]);
   });
 
   it("configures deploy.cms with an empty retry ladder — a single attempt, no automatic retry", () => {

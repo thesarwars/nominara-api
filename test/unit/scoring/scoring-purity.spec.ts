@@ -66,6 +66,15 @@ describe("STORY-041 AC1 · the scoring library is pure", () => {
   });
 });
 
+describe("STORY-056 · the displacement comparison imports nothing", () => {
+  it("src/lib/analytics/displacement.ts has an empty import list and reads no clock", () => {
+    const source = readFileSync(join(SCORING_DIR, "../analytics/displacement.ts"), "utf8");
+    const code = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/^\s*\/\/.*$/gmu, "");
+    expect([...code.matchAll(/^\s*import\s.*?from\s+["']([^"']+)["']/gmu)]).toEqual([]);
+    expect(/\bDate\s*\./u.test(code) || /\bnew\s+Date\b/u.test(code) || /\bMath\s*\.\s*random\b/u.test(code)).toBe(false);
+  });
+});
+
 describe("STORY-041 · determinism, which is what purity buys", () => {
   it("gives byte-identical results across repeated calls", () => {
     const input = {

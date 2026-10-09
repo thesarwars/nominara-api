@@ -15,6 +15,14 @@ export interface AuditQueryFilter {
   readonly actorId?: string;
   readonly occurredFrom?: string;
   readonly occurredTo?: string;
+  /** Exclusive upper bound — `occurredTo` is inclusive, so a whole-day range cannot be expressed with it. */
+  readonly occurredBefore?: string;
+  readonly severity?: string;
+  /** NEW-D-3 — keyset: only rows with `seq` strictly below this (the list is newest-first). */
+  readonly beforeSeq?: string;
+  /** NEW-D-3 — namespace prefixes (`billing.`), matched with starts_with(), never LIKE. */
+  readonly actionPrefixes?: readonly string[];
+  readonly excludeActionPrefixes?: readonly string[];
   readonly limit?: number;
 }
 
@@ -42,6 +50,30 @@ export class AuditQueryService {
     if (filter.occurredTo !== undefined) {
       params.push(filter.occurredTo);
       conditions.push(`occurred_at <= $${params.length}`);
+    }
+
+    if (filter.occurredBefore !== undefined) {
+      params.push(filter.occurredBefore);
+      conditions.push(`occurred_at < $${params.length}::timestamptz`);
+    }
+    if (filter.severity !== undefined) {
+      params.push(filter.severity);
+      conditions.push(`severity = $${params.length}`);
+    }
+    if (filter.beforeSeq !== undefined) {
+      params.push(filter.beforeSeq);
+      conditions.push(`audit_log.seq < $${params.length}::int8`);
+    }
+    if (filter.actionPrefixes !== undefined && filter.actionPrefixes.length > 0) {
+      const tests = filter.actionPrefixes.map((prefix) => {
+        params.push(prefix);
+        return `starts_with(action, $${params.length})`;
+      });
+      conditions.push(`(${tests.join(" OR ")})`);
+    }
+    for (const prefix of filter.excludeActionPrefixes ?? []) {
+      params.push(prefix);
+      conditions.push(`NOT starts_with(action, $${params.length})`);
     }
 
     const limit = Math.min(filter.limit ?? DEFAULT_LIMIT, MAX_LIMIT);

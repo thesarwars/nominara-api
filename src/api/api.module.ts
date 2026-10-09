@@ -9,6 +9,7 @@ import { WorkspacesModule } from "../modules/workspaces/workspaces.module.js";
 import { ProjectsModule } from "../modules/projects/projects.module.js";
 import { PromptsModule } from "../modules/prompts/prompts.module.js";
 import { TrackingModule } from "../modules/tracking/tracking.module.js";
+import { ReportsModule } from "../modules/reports/reports.module.js";
 import { AnalyticsModule } from "../modules/analytics/analytics.module.js";
 import { AuxModule } from "../modules/aux/aux.module.js";
 import { TasksModule } from "../modules/tasks/tasks.module.js";
@@ -16,6 +17,9 @@ import { GeoModule } from "../modules/geo/geo.module.js";
 import { DisplacementModule } from "../modules/displacement/displacement.module.js";
 import { IntegrationsModule } from "../modules/integrations/integrations.module.js";
 import { AgencyModule } from "../modules/agency/agency.module.js";
+import { ApiKeysModule } from "../modules/api-keys/api-keys.module.js";
+import { TrustModule } from "../modules/trust/trust.module.js";
+import { PortalModule } from "../modules/portal/portal.module.js";
 import { ToolsModule } from "../modules/tools/tools.module.js";
 import { BillingModule } from "../modules/billing/billing.module.js";
 import { CreditsModule } from "../modules/credits/credits.module.js";
@@ -71,6 +75,10 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     DisplacementModule,
     IntegrationsModule,
     AgencyModule,
+    ApiKeysModule,
+    TrustModule,
+    ReportsModule,
+    PortalModule,
     ToolsModule,
     BillingModule,
     CreditsModule,

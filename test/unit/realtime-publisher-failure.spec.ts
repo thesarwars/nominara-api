@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ValkeyRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { socketIoChannelPrefix } from "../../src/lib/cache/key-namespace.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
+import { DEAD_VALKEY_URL } from "../support/test-valkey.js";
 
 // STORY-026 G26 — the publisher is FIRE AND FORGET by design: a realtime event
 // is a hint, and awaiting delivery would make a committed workspace mutation
@@ -34,7 +35,7 @@ const PAYLOAD = {
 /** A client that fails every publish, which is what an unreachable Valkey looks like. */
 function failingPublisher(): ValkeyRealtimePublisher {
   applyFakeApiEnv();
-  const publisher = new ValkeyRealtimePublisher("redis://127.0.0.1:1");
+  const publisher = new ValkeyRealtimePublisher(DEAD_VALKEY_URL);
   const client = (publisher as unknown as { client: { publish: unknown } }).client;
   // A PLAIN rejecting function, not `vi.fn().mockRejectedValue(...)`. The mock
   // helper retains the promise it produced in order to report it in
@@ -73,7 +74,7 @@ describe("STORY-026 · a failed publish never escapes as an unhandled rejection"
     // now be false for a correct implementation and true for one that handed
     // over the raw client and reintroduced the unhandled rejection.
     applyFakeApiEnv();
-    const publisher = new ValkeyRealtimePublisher("redis://127.0.0.1:1");
+    const publisher = new ValkeyRealtimePublisher(DEAD_VALKEY_URL);
     const channels: string[] = [];
     const client = (publisher as unknown as { client: { publish: unknown } }).client;
     client.publish = (channel: string): Promise<number> => {
@@ -98,7 +99,7 @@ describe("STORY-026 · realtime pub/sub channels carry the deployment namespace"
     // constructors, and these channels never pass through them.
     applyFakeApiEnv();
     process.env.CACHE_KEY_NAMESPACE = "staging-42";
-    const publisher = new ValkeyRealtimePublisher("redis://127.0.0.1:1");
+    const publisher = new ValkeyRealtimePublisher(DEAD_VALKEY_URL);
     const channels: string[] = [];
     const client = (publisher as unknown as { client: { publish: unknown } }).client;
     client.publish = (channel: string): Promise<number> => {

@@ -22,6 +22,17 @@ class ProjectController {
   @Audit({ action: "project.update.alt", resourceType: "project", paramName: "projectId" })
   updateWithAltParam(): void {}
 
+  @Audit({ action: "billing.portal_session.created", resourceType: "workspace", resourceIdFrom: "workspace" })
+  workspaceSingleton(): void {}
+
+  @Audit({
+    action: "command.parsed",
+    resourceType: "workspace",
+    resourceIdFrom: "workspace",
+    afterState: (body) => ({ intent: (body as { intent: string }).intent }),
+  })
+  selectiveState(): void {}
+
   unannotatedMutation(): void {}
 
   @Audit({ action: "project.read_ignored", resourceType: "project" })
@@ -394,5 +405,57 @@ describe("STORY-020 · AuditInterceptor", () => {
 
     const [, input] = (auditChain.append as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, Record<string, unknown>];
     expect(input.resourceId).toBe("55555555-5555-5555-5555-555555555555");
+  });
+
+  // STORY-075a — a workspace-singleton mutation (a billing-portal session) has
+  // no id in its params or its response. The resource IS the caller's
+  // workspace, and the id comes from the tenant context, never the request.
+  it("resourceIdFrom: 'workspace' audits against the tenant's workspace id, ignoring any params the caller sent", async () => {
+    const auditChain = fakeAuditChain();
+    const interceptor = new AuditInterceptor(new Reflector(), auditChain);
+    const { client } = fakePoolClient();
+    const req: Partial<AuditableRequest> = { method: "POST", id: "req-1", headers: {}, params: { id: "99999999-9999-9999-9999-999999999999" } };
+
+    await withTenantContext(client, { workspaceId: "11111111-2222-3333-4444-555555555555", actorId: "user-1" }, async () => {
+      await firstValueFrom(interceptor.intercept(makeContext("workspaceSingleton", req), { handle: () => of({ ok: true }) }));
+    });
+
+    const [, input] = (auditChain.append as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(input.resourceId).toBe("11111111-2222-3333-4444-555555555555");
+    expect(input.resourceType).toBe("workspace");
+  });
+});
+
+describe("STORY-085-A CP2 · AuditOptions.afterState", () => {
+  const req: Partial<AuditableRequest> = {
+    method: "POST",
+    id: "req-9",
+    headers: { "user-agent": "vitest-ua" },
+    params: {},
+    ip: "203.0.113.9",
+    authMethod: "session",
+  };
+
+  it("records what the selector returns, not the response body", async () => {
+    const auditChain = fakeAuditChain();
+    const interceptor = new AuditInterceptor(new Reflector(), auditChain);
+    const { client } = fakePoolClient();
+    const body = { intent: "invite_member", slots: { email: "jo@acme.io" } };
+    await withTenantContext(client, { workspaceId: "ws-1", actorId: "user-1" }, async () => {
+      await expect(firstValueFrom(interceptor.intercept(makeContext("selectiveState", req), { handle: () => of(body) }))).resolves.toBe(body);
+    });
+    const [, input] = (auditChain.append as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(input.afterState).toEqual({ intent: "invite_member" });
+  });
+
+  it("without a selector the full body is still recorded (no behaviour change for other routes)", async () => {
+    const auditChain = fakeAuditChain();
+    const interceptor = new AuditInterceptor(new Reflector(), auditChain);
+    const { client } = fakePoolClient();
+    await withTenantContext(client, { workspaceId: "ws-1", actorId: "user-1" }, async () => {
+      await firstValueFrom(interceptor.intercept(makeContext("update", { ...req, method: "PUT", params: { id: "11111111-1111-1111-1111-111111111111" } }), { handle: () => of({ ok: true }) }));
+    });
+    const [, input] = (auditChain.append as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(input.afterState).toEqual({ ok: true });
   });
 });

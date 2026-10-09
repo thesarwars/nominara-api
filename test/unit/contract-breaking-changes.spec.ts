@@ -39,6 +39,11 @@ interface RecordedChange {
     readonly response_properties: string[];
     /** For a change INSIDE `data` — the envelope is unchanged, so top-level properties cannot show it. */
     readonly data_properties?: string[];
+    /**
+     * For a change DEEPER inside `data` (a nested field's type). `path` is dot-separated from
+     * `data`; `items` steps into an array's element schema.
+     */
+    readonly data_nested?: { path: string; enum: string[]; nullable: boolean }[];
   };
 }
 
@@ -135,5 +140,27 @@ describe("NFR-API-04 · every recorded breaking change stays visible in the cont
     const data = schema?.properties?.data;
     const properties = data?.properties ?? data?.items?.properties ?? {};
     expect(Object.keys(properties).sort()).toEqual([...change.assert.data_properties!].sort());
+  });
+
+  // A change to a NESTED field's type (the summary's data_source) is invisible to
+  // both assertions above. Walk to the field and compare its exact union.
+  it.each(
+    record.changes
+      .filter((change) => change.assert.data_nested !== undefined)
+      .flatMap((c) => c.assert.data_nested!.map((n) => [`${c.id} @ ${n.path}`, c, n] as const)),
+  )("%s has exactly the recorded type in the CURRENT document", (_label, change, nested) => {
+    type Node = { properties?: Record<string, Node>; items?: Node; anyOf?: Node[]; enum?: string[]; type?: string };
+    const root = (responseSchemaOf(document, change) as Node | undefined)?.properties?.data;
+    let node: Node | undefined = root;
+    for (const step of nested.path.split(".")) {
+      // An `anyOf [array, null]` wrapper (a nullable array) is stepped through to its array branch.
+      const concrete: Node | undefined = node?.anyOf ? node.anyOf.find((branch) => branch.type !== "null") : node;
+      node = step === "items" ? concrete?.items : concrete?.properties?.[step];
+    }
+    expect(node, `${nested.path} is missing from ${change.assert.operation}`).toBeDefined();
+    const branches = node!.anyOf ?? [node!];
+    const values = branches.filter((branch) => branch.enum !== undefined).flatMap((branch) => branch.enum!);
+    expect(values.sort()).toEqual([...nested.enum].sort());
+    expect(branches.some((branch) => branch.type === "null")).toBe(nested.nullable);
   });
 });

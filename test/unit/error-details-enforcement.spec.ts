@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { errorDetailsSchemaByCode } from "../../contracts/common/error-details.schema.js";
+import {
+  PRECONDITION_UNMET_REASONS,
+  errorDetailsSchemaByCode,
+  preconditionUnmetDetailsSchema,
+} from "../../contracts/common/error-details.schema.js";
 import { errorCodeSchema } from "../../contracts/common/error-code.schema.js";
 import {
   ConflictError,
@@ -46,8 +50,10 @@ describe("STORY-024 · AC2 — a code's details shape is enforced at compile tim
   it("a code with no details shape in §2 cannot be given details at all", () => {
     // @ts-expect-error AC2 — §2 defines no details for not_found
     expect(() => new NotFoundError({ details: { id: "x" } })).toBeDefined();
-    // @ts-expect-error AC2 — §2 illustrates precondition_unmet with "e.g.", which is not a committed shape
+    // @ts-expect-error AC2 — precondition_unmet's one committed member is `reason`, and "stale" is not one of its values
     expect(() => new PreconditionUnmetError({ details: { reason: "stale" } })).toBeDefined();
+    // @ts-expect-error AC2 — and it commits nothing else: an invented member is still a type error
+    expect(() => new PreconditionUnmetError({ details: { patch: "x" } })).toBeDefined();
   });
 
   // The positive controls. Without these the assertions above would be
@@ -61,6 +67,22 @@ describe("STORY-024 · AC2 — a code's details shape is enforced at compile tim
     expect(() => new ConflictError()).not.toThrow();
     expect(() => new ConflictError({ details: { current_state: "archived" } })).not.toThrow();
     expect(() => new NotFoundError()).not.toThrow();
+  });
+
+  // STORY-034 — `precondition_unmet` now covers two deep-scan refusals a client
+  // must tell apart, and gets a shape for exactly that. `reason` is OPTIONAL
+  // because four other throw sites (a missing If-Match, prompt generation not
+  // ready, a result document with no parse, ...) belong to other stories and
+  // commit no reason; they must keep compiling untouched.
+  it("STORY-034 · precondition_unmet takes an optional `details.reason` of exactly the two deep-scan values", () => {
+    expect(() => new PreconditionUnmetError()).not.toThrow();
+    expect(() => new PreconditionUnmetError({ message: "no reason given" })).not.toThrow();
+    expect(() => new PreconditionUnmetError({ details: { reason: "price_not_agreed" } })).not.toThrow();
+    expect(() => new PreconditionUnmetError({ details: { reason: "no_capturable_scope" } })).not.toThrow();
+    expect(PRECONDITION_UNMET_REASONS).toEqual(["price_not_agreed", "no_capturable_scope"]);
+    expect(preconditionUnmetDetailsSchema.safeParse({}).success, "reason is optional").toBe(true);
+    expect(preconditionUnmetDetailsSchema.safeParse({ reason: "stale" }).success).toBe(false);
+    expect(errorDetailsSchemaByCode.precondition_unmet).toBe(preconditionUnmetDetailsSchema);
   });
 });
 
@@ -81,6 +103,14 @@ describe("STORY-024 · AC2 — domainErrorFor validates what the type system can
       domainErrorFor("step_up_required", { details: { methods: ["passkey"] } }),
     ).not.toThrow();
     expect(() => domainErrorFor("not_found")).not.toThrow();
+  });
+
+  it("STORY-034 · refuses a precondition_unmet reason the shape does not commit, and accepts the two it does", () => {
+    expect(() => domainErrorFor("precondition_unmet", { details: { reason: "stale" } })).toThrow(/do not satisfy/);
+    expect(() => domainErrorFor("precondition_unmet", { details: { reason: "price_not_agreed" } })).not.toThrow();
+    expect(() => domainErrorFor("precondition_unmet", { details: { reason: "no_capturable_scope" } })).not.toThrow();
+    expect(() => domainErrorFor("precondition_unmet", { details: { reason: "no_capturable_scope", extra: 1 } })).toThrow(/do not satisfy/);
+    expect(() => domainErrorFor("precondition_unmet")).not.toThrow();
   });
 
   // Guards the wiring itself: if a fifteenth shape is added to

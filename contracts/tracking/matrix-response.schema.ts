@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dataSourceSchema, engineDataSourceSchema } from "../analytics/data-source.schema.js";
 
 // STORY-034 AC8 — `GET /projects/{id}/matrix`.
 //
@@ -82,6 +83,8 @@ export const matrixCellSchema = z
      * Null on a live cell, which has no age to report.
      */
     cache_age_ms: z.number().int().nonnegative().nullable(),
+    /** NEW-A-5 — null on a pending, failed or blocked cell: nothing was measured. */
+    data_source: dataSourceSchema.nullable().optional(),
   })
   .strict();
 
@@ -114,6 +117,8 @@ export const matrixResponseSchema = z
     timeframe: z.enum(["7d", "30d", "90d"]),
     /** The column order every row's `cells` follows, so a client need not sort. */
     engine_keys: z.array(z.string().min(1)),
+    /** NEW-A-5 — provenance per column, in `engine_keys` order. */
+    engines: z.array(engineDataSourceSchema).optional(),
     prompts: z.array(matrixRowSchema),
   })
   .strict();

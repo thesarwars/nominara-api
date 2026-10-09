@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dataSourceSchema, engineDataSourceSchema } from "./data-source.schema.js";
 
 // STORY-137 — `GET /v1/projects/{id}/growth-map`, `api-specification.md` §7.
 //
@@ -7,11 +8,30 @@ import { z } from "zod";
 // misses the paint budget and produces a chart that assembles itself
 // visibly."
 
+/** `all`, or a comma list of engine keys. `all` beside a key is ambiguous, so it is a 400. */
+export const engineFilterSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => {
+      const keys = value.split(",").map((key) => key.trim());
+      if (keys.some((key) => !/^[a-z0-9_]+$/.test(key))) return false;
+      return !keys.includes("all") || keys.length === 1;
+    },
+    { message: "engines is `all` or a comma list of engine keys" },
+  );
+
 export const growthMapQuerySchema = z
   .object({
     timeframe: z.enum(["7d", "30d", "90d"]).default("90d"),
     /** `brand`, `competitors`, or both — §7's own query string. */
     entities: z.string().min(1).optional(),
+    /**
+     * api-specification §7 — a comma list of engine keys, or `all`. NARROWING
+     * ONLY: it can drop engines from the project's entitled set, never add
+     * one. `all` means the entitled set and stands alone.
+     */
+    engines: engineFilterSchema.optional(),
     granularity: z.enum(["day"]).default("day"),
   })
   .strict();
@@ -46,6 +66,8 @@ export const growthMapSeriesSchema = z
     entity_type: z.enum(["brand", "competitor", "derived"]),
     color_role: z.enum(["primary", "comparison", "baseline"]),
     points: z.array(growthMapPointSchema),
+    /** NEW-A-5 — provenance of the captures in the window; null when none were measured. */
+    data_source: dataSourceSchema.nullable().optional(),
   })
   .strict();
 
@@ -108,6 +130,8 @@ export const growthMapResponseSchema = z
     granularity: z.literal("day"),
     timeframe: z.object({ from: z.string(), to: z.string(), timezone: z.string() }).strict(),
     series: z.array(growthMapSeriesSchema),
+    /** NEW-A-5 — per-engine provenance over the window, one entry per engine measured. */
+    engines: z.array(engineDataSourceSchema).optional(),
     milestones: z.array(milestoneSchema),
     annotations: z
       .object({

@@ -63,6 +63,7 @@ export const sessions = pgTable("sessions", {
   lastUsedAt: timestamp("last_used_at", { withTimezone: true }).notNull().default(sql`now()`),
   lastStrongAuthAt: timestamp("last_strong_auth_at", { withTimezone: true }),
   lastStrongAuthMethod: text("last_strong_auth_method"),
+  activeWorkspaceId: uuid("active_workspace_id"),
 });
 
 export const userCredentials = pgTable("user_credentials", {
@@ -80,6 +81,7 @@ export const userCredentials = pgTable("user_credentials", {
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   authenticatorAttachment: text("authenticator_attachment"),
+  revokedReason: text("revoked_reason"),
 });
 
 export const users = pgTable("users", {
@@ -99,6 +101,7 @@ export const users = pgTable("users", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  personaSkipped: boolean("persona_skipped").default(sql`false`),
 });
 
 export const webauthnChallenges = pgTable("webauthn_challenges", {

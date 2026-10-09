@@ -7,6 +7,9 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
+import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
+import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { AuthGuard, type AuthenticatedRequest } from "../../src/api/guards/auth.guard.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
@@ -17,7 +20,22 @@ import {
   CSRF_HEADER_NAME,
   REFRESH_COOKIE_NAME,
 } from "../../src/lib/auth/cookies.js";
+import { REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS } from "../../src/lib/auth/refresh-token.js";
 import * as metrics from "../../src/lib/telemetry/metrics.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
+
+// STORY-170 — this file's env block sets no REFRESH_TOKEN_GRACE_WINDOW_MS,
+// so SessionService.refresh uses the schema's own default. The window is a
+// TTL on the grace slot in the cache, so it runs on the CACHE'S clock, not on
+// refresh()'s `now` argument: the cache handed to `sessions` below is an
+// InMemoryCacheAdapter whose clock this file owns, and "a replay presented
+// this far after the rotation that consumed it" is that clock advanced past
+// the default window with a full second to spare, so it is unambiguously
+// OUTSIDE the window however the default ever changes.
+let cacheClockMs = Date.now();
+function afterGraceWindow(): void {
+  cacheClockMs += REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS + 1_000;
+}
 
 interface ParsedCookie {
   name: string;
@@ -89,11 +107,11 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     process.env.OAUTH_STATE_SECRET = "test-oauth-state-secret";
     process.env.OTP_EMAIL_HASH_PEPPER = "test-otp-email-hash-pepper";
     process.env.OTP_EMAIL_FROM = "Nominara <no-reply@nominara.test>";
-    process.env.VALKEY_CACHE_URL = "redis://localhost:6379";
+    process.env.VALKEY_CACHE_URL = testCacheRedisUrl();
     // STORY-030 — DbModule's PG_POOL factory calls loadEnv(), which (since
     // Phase B) also requires the queue-signing env vars even though this
     // file never signs a job payload itself.
-    process.env.QUEUE_REDIS_URL = "redis://localhost:6380";
+    process.env.QUEUE_REDIS_URL = testQueueRedisUrl();
     process.env.ENGINE_TOKEN_BUCKETS = '{"google_aio":{"capacity":10,"refillPerSecond":1},"google_ai_mode":{"capacity":10,"refillPerSecond":1},"perplexity":{"capacity":10,"refillPerSecond":1},"chatgpt":{"capacity":10,"refillPerSecond":1},"gemini":{"capacity":10,"refillPerSecond":1},"claude":{"capacity":10,"refillPerSecond":1}}';
     process.env.QUEUE_JOB_SIGNING_KEY = Buffer.alloc(32, 3).toString("base64");
     process.env.QUEUE_JOB_SIGNING_KID = "test-queue-kid-1";
@@ -114,7 +132,12 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     userId = userRow.rows[0]!.id;
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
-    sessions = new SessionService(pool);
+    cacheClockMs = Date.now();
+    sessions = new SessionService(
+      pool,
+      new MembershipService(new MembershipCacheService()),
+      new InMemoryCacheAdapter(() => cacheClockMs),
+    );
   });
 
   afterEach(async () => {
@@ -132,7 +155,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     expect(req.auth?.sid).toBe(tokens.sid);
   });
 
-  it("STORY-017 · scenario 3 — refresh rotates: a new access and refresh token are issued, and the old refresh token is dead", async () => {
+  it("STORY-017 · scenario 3 — refresh rotates: a new access and refresh token are issued, and the old refresh token is dead once its STORY-170 grace window has closed", async () => {
     const initial = await sessions.createSession(userId);
 
     const rotated = await sessions.refresh(initial.refreshToken);
@@ -141,14 +164,25 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     expect(rotated.accessToken).not.toBe(initial.accessToken);
     expect(rotated.refreshToken).not.toBe(initial.refreshToken);
 
+    // STORY-170 — an IMMEDIATE replay is now the grace-window case
+    // (session-refresh-grace-window.spec.ts owns that behaviour); this
+    // scenario's own assertion — the old refresh token is genuinely dead —
+    // is presented OUTSIDE the (default 2s) window: the cache's clock has
+    // moved past it.
+    afterGraceWindow();
     await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow(UnauthorizedException);
   });
 
-  it("STORY-017 · scenario 4 — presenting a consumed refresh token revokes the whole family and raises a security event", async () => {
+  it("STORY-017 · scenario 4 — presenting a consumed refresh token OUTSIDE its STORY-170 grace window revokes the whole family and raises a security event", async () => {
     const counterSpy = vi.spyOn(metrics, "incrementCounter");
     const initial = await sessions.createSession(userId);
     await sessions.refresh(initial.refreshToken);
 
+    // STORY-170 — an immediate replay is grace-eligible
+    // (session-refresh-grace-window.spec.ts's own scenario for that); this
+    // scenario is specifically the reuse case that still revokes — the
+    // SAME consumed token, presented once the window has closed.
+    afterGraceWindow();
     await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
 
     const sessionRow = await db.query<{ revoked_at: Date | null; revoked_reason: string | null }>(
@@ -191,7 +225,9 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
   it("STORY-017 · scenario 5 — a previously-issued access token is refused via the deny list once family revocation has happened", async () => {
     const initial = await sessions.createSession(userId);
     const rotated = await sessions.refresh(initial.refreshToken);
-    // Reuse of the now-consumed original refresh token revokes the family.
+    // Reuse of the now-consumed original refresh token, OUTSIDE its
+    // STORY-170 grace window, revokes the family.
+    afterGraceWindow();
     await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
 
     const guard = new AuthGuard(new Reflector(), pool);
@@ -204,6 +240,14 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
     const initial = await sessions.createSession(userId);
     const initialClaims = decodeClaims(initial.accessToken);
     expect(initialClaims.ws).toBeNull();
+
+    // STORY-170 — sessions.active_workspace_id now FK-references workspaces
+    // (migration 0029), so switchWorkspace's own UPDATE needs a real row to
+    // point at, not just a plausible-looking uuid literal.
+    await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'Test Workspace', $2, 'free')", [
+      "0192f1a0-aaaa-7000-8000-000000000001",
+      "test-workspace-scenario-8",
+    ]);
 
     const switched = await sessions.switchWorkspace(
       initial.sid,
@@ -237,6 +281,11 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
 
   it("STORY-017 · scenario 10 (narrowed) — AuthGuard authorises identical requests regardless of the role claim's value", async () => {
     const ownerTokens = await sessions.createSession(userId);
+    // STORY-170 — see scenario 8's own comment: a real row, not a bare uuid.
+    await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'Test Workspace', $2, 'free')", [
+      "0192f1a0-aaaa-7000-8000-000000000001",
+      "test-workspace-scenario-10",
+    ]);
     const asOwner = await sessions.switchWorkspace(
       ownerTokens.sid,
       userId,
@@ -290,7 +339,7 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
       await app.close();
     });
 
-    it("POST /auth/refresh with a valid refresh cookie returns 200, sets new access/refresh/csrf cookies, and kills the old refresh token", async () => {
+    it("POST /auth/refresh with a valid refresh cookie returns 200, sets new access/refresh/csrf cookies, and an immediate replay (STORY-170 grace window) converges on the SAME refresh token rather than dying", async () => {
       const sessionService = app.get(SessionService);
       const initial = await sessionService.createSession(userId);
 
@@ -310,12 +359,24 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
       expect(csrf?.value).toBeTruthy();
       expect(refresh?.value).not.toBe(initial.refreshToken);
 
+      // STORY-170 — this replay lands well inside the default 2s grace
+      // window (real elapsed wall-clock time between two `app.inject()`
+      // calls in the same test), so it is a grace-window hit, not reuse:
+      // 200, the SAME successor cookie, session still alive.
+      // session-refresh-grace-window.spec.ts owns proving the OUTSIDE-window
+      // and two-back cases still revoke.
       const replay = await app.inject({
         method: "POST",
         url: apiUrl("/auth/refresh"),
         cookies: { [REFRESH_COOKIE_NAME]: initial.refreshToken },
       });
-      expect(replay.statusCode).toBe(401);
+      expect(replay.statusCode).toBe(200);
+      expect(cookiesByName(replay).get(REFRESH_COOKIE_NAME)?.value).toBe(refresh?.value);
+
+      const sessionRow = await pool.query<{ revoked_at: Date | null }>("SELECT revoked_at FROM sessions WHERE id = $1", [
+        initial.sid,
+      ]);
+      expect(sessionRow.rows[0]!.revoked_at).toBeNull();
     });
 
     it("POST /auth/refresh with no refresh cookie is refused", async () => {
@@ -336,10 +397,11 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
       expect(logoutRes.statusCode).toBe(200);
 
       // clearAuthCookies (src/lib/auth/cookies.ts) calls reply.clearCookie
-      // for each of the three cookies with `{ path: "/" }` only — @fastify/
-      // cookie's clearCookie forces `value: ""`, `maxAge: 0`, and
-      // `expires: new Date(0)` regardless of what's passed, so THAT is the
-      // wire behavior to assert, not made-up flags the code never sets.
+      // for each of the three cookies with the same HARDENED_* options the
+      // setters use — @fastify/cookie's clearCookie forces `value: ""`,
+      // `maxAge: 0`, and `expires: new Date(0)` regardless of what's passed.
+      // STORY-171 — and a browser ignores a `__Host-` deletion that lacks
+      // Secure, so the raw header must carry Secure + Path=/ and no Domain.
       const byName = cookiesByName(logoutRes);
       for (const name of [ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, CSRF_COOKIE_NAME]) {
         const cleared = byName.get(name);
@@ -347,6 +409,13 @@ describe("STORY-017 · session model, rotating refresh, reuse detection", () => 
         expect(cleared?.value).toBe("");
         expect(cleared?.maxAge).toBe(0);
         expect(cleared?.expires && cleared.expires.getTime()).toBe(0);
+      }
+      const rawSetCookie = ([] as string[]).concat(logoutRes.headers["set-cookie"] ?? []);
+      for (const name of [ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, CSRF_COOKIE_NAME]) {
+        const raw = rawSetCookie.find((h) => h.startsWith(`${name}=`));
+        expect(raw, name).toMatch(/;\s*Secure(;|$)/);
+        expect(raw, name).toMatch(/;\s*Path=\/(;|$)/);
+        expect(raw, name).not.toMatch(/;\s*Domain=/i);
       }
 
       const refreshAttempt = await app.inject({

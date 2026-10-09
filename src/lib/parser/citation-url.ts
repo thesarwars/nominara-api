@@ -296,3 +296,12 @@ export function positionWeight(slotIndex: number): number {
   }
   return 1 / Math.sqrt(slotIndex);
 }
+
+/**
+ * NEW-C-4 — the class of a bare registrable domain, for the Source Citation
+ * Index: the curated list first, then the heuristic fallback, then `other`.
+ * Ownership is not known here; callers handle competitor/owned separately.
+ */
+export function classifyDomain(domain: string): SourceClass {
+  return classifyCitation({ host: domain, domain, isOwned: false, competitorDomains: [] }).sourceClass;
+}

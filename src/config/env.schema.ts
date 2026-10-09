@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { engineKeySchema } from "../lib/engines/contract.js";
+import { REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS, REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS } from "../lib/auth/refresh-token.js";
 
 // STORY-022-E-4 — configuration validation lives here, as zod (already a
 // dependency), NOT Joi/class-validator/@nestjs/config. coding-standards.md
@@ -41,6 +42,20 @@ export type EngineTokenBuckets = z.infer<typeof engineTokenBucketsSchema>;
 // against a Valkey-metered running total (src/lib/engines/spend-meter.ts).
 export const engineSpendCeilingsSchema = z.partialRecord(engineKeySchema, z.number().positive());
 export type EngineSpendCeilings = z.infer<typeof engineSpendCeilingsSchema>;
+
+/**
+ * E2E-B6 — the ceilings that apply when ENGINE_SPEND_CEILINGS_USD does not name an engine. Only
+ * gemini has one: it is the sole engine with a real adapter, so it is the only one that spends
+ * real money (NEW-A-4; USD/month, 100 is the dev placeholder pending owner decision O9). A
+ * configured entry always wins; engines without a default keep D13's ceiling-absent posture.
+ */
+export const DEFAULT_ENGINE_SPEND_CEILINGS_USD: EngineSpendCeilings = { gemini: 100 };
+
+/** The effective ceilings: defaults, overridden per engine by the configured JSON (already validated at boot). */
+export function resolveEngineSpendCeilings(configuredJson: string | undefined): EngineSpendCeilings {
+  const configured = configuredJson ? engineSpendCeilingsSchema.parse(JSON.parse(configuredJson)) : {};
+  return { ...DEFAULT_ENGINE_SPEND_CEILINGS_USD, ...configured };
+}
 
 /** Well-formed JSON parsing against `schema` — used by refine() below since a refine can only report true/false, never transform. */
 function parsesAgainst(schema: z.ZodTypeAny, value: string): boolean {
@@ -124,6 +139,34 @@ export const envSchema = z
     // exists yet, so "local:dev" is the honest default rather than a
     // fabricated ARN shape.
     WORKSPACE_KMS_KEY_ARN: requiredString.default("local:dev"),
+
+    // STORY-170 — the refresh-token reuse grace window
+    // (security-and-tenancy.md §5 "Session model"). A refresh presenting a
+    // token consumed by the session's own immediately-preceding rotation,
+    // within this window, gets the identical successor back instead of
+    // being treated as reuse. No secret is needed: the successor is held
+    // encrypted under a key derived from the predecessor token itself
+    // (src/lib/auth/refresh-token.ts), in a Valkey slot whose TTL is this
+    // window.
+    // How long a consumed token stays grace-eligible. Configurable so an
+    // operator can shrink or disable it (0) without a redeploy; capped at
+    // REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS (src/lib/auth/refresh-token.ts)
+    // so it can never be turned into a de-facto non-rotating token. A value
+    // above the cap is REJECTED at boot, never clamped: a clamp would run the
+    // process on a window nobody configured.
+    // An empty or whitespace-only value is UNSET, not 0. `z.coerce.number()`
+    // turns "" into 0, and 0 is the switch that disables grace outright, so
+    // `REFRESH_TOKEN_GRACE_WINDOW_MS=` in a deploy template would have turned
+    // the feature off with no error and no log line.
+    REFRESH_TOKEN_GRACE_WINDOW_MS: z.preprocess(
+      (value) => (typeof value === "string" && value.trim().length === 0 ? undefined : value),
+      z.coerce
+        .number()
+        .int()
+        .nonnegative()
+        .max(REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS)
+        .default(REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS),
+    ),
 
     // STORY-015 — OAuth 2.1 + PKCE (Google, GitHub, Microsoft), via
     // `openid-client`. Provider credentials are OPTIONAL config: every test
@@ -304,13 +347,37 @@ export const envSchema = z
       message: "must be a JSON object mapping engine keys to { capacity: positive int, refillPerSecond: positive number }",
     }),
     // STORY-031 D13 — optional: undocumented dollar ceilings, injected only
-    // when known. Absent entirely (or absent for one engine key) disables
-    // ONLY that engine's 100% hard stop; 80%/95% alerting still runs.
+    // when known. Absent for an engine key disables ONLY that engine's 100%
+    // hard stop; 80%/95% alerting still runs. E2E-B6: gemini alone has a
+    // default (DEFAULT_ENGINE_SPEND_CEILINGS_USD) that an entry here overrides.
     ENGINE_SPEND_CEILINGS_USD: requiredString
       .refine((value) => parsesAgainst(engineSpendCeilingsSchema, value), {
         message: "must be a JSON object mapping engine keys to a positive USD ceiling",
       })
       .optional(),
+    // NEW-A-4 — optional: absent leaves Gemini honestly not capture-ready (registry.ts), it
+    // does not fail boot. Never logged, never echoed in an error.
+    GEMINI_API_KEY: requiredString.optional(),
+
+    // NEW-D-2 — Stripe (SANDBOX keys in every environment this week). All three
+    // are OPTIONAL, deliberately: the API must boot without a payment provider,
+    // and every Stripe route then answers 503 `degraded` instead of the process
+    // refusing to start. The secret key and the webhook signing secret are
+    // credentials — they are never logged, never put in an error, and never
+    // returned (src/lib/billing/stripe/stripe-http.gateway.ts). The publishable
+    // key is public by design but is carried here so the one place that names
+    // Stripe configuration names all three.
+    STRIPE_SECRET_KEY: requiredString.optional(),
+    STRIPE_WEBHOOK_SECRET: requiredString.optional(),
+    STRIPE_PUBLISHABLE_KEY: requiredString.optional(),
+
+    // NEW-E-098b — the share-token portal. BOTH optional, deliberately, like Stripe: the API boots without them and
+    // POST /portal/session then answers 503 `degraded` (and every portal route 503), failing CLOSED rather than
+    // refusing to start. PORTAL_COOKIE_KEY is 32 random bytes, base64url (43 characters): the root of both the
+    // signing and the encryption key of the portal session cookie. DATABASE_URL_PORTAL logs in as `nominara_portal`
+    // (SELECT only, portal_scope_* policies) and is a DIFFERENT pool from DATABASE_URL_POOLED. Credentials: never logged.
+    PORTAL_COOKIE_KEY: requiredString.optional(),
+    DATABASE_URL_PORTAL: requiredString.optional(),
   })
   .strict()
   // STORY-127 — the first of the two checks that keep plaintext one-time

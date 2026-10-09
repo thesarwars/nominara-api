@@ -74,10 +74,10 @@ export const brandThemes = pgTable("brand_themes", {
   logoLightKey: text("logo_light_key"),
   logoDarkKey: text("logo_dark_key"),
   faviconKey: text("favicon_key"),
-  colorPrimary: text("color_primary").notNull().default(sql`'#4f46e5'::text`),
-  colorAccent: text("color_accent").notNull().default(sql`'#0ea5e9'::text`),
-  colorBg: text("color_bg").notNull().default(sql`'#ffffff'::text`),
-  colorFg: text("color_fg").notNull().default(sql`'#0f172a'::text`),
+  colorPrimary: text("color_primary"),
+  colorAccent: text("color_accent"),
+  colorBg: text("color_bg"),
+  colorFg: text("color_fg"),
   fontFamily: text("font_family").notNull().default(sql`'Inter'::text`),
   customCss: text("custom_css"),
   emailFromName: text("email_from_name"),
@@ -165,6 +165,17 @@ export const reportArtifacts = pgTable("report_artifacts", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
 });
 
+export const scheduledReportDeliveries = pgTable("scheduled_report_deliveries", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: uuid("workspace_id").notNull(),
+  scheduledReportId: uuid("scheduled_report_id").notNull(),
+  attemptedAt: timestamp("attempted_at", { withTimezone: true }).notNull().default(sql`now()`),
+  status: text("status").notNull(),
+  reason: text("reason"),
+  recipientCount: integer("recipient_count").notNull().default(sql`0`),
+  reportArtifactId: uuid("report_artifact_id"),
+});
+
 export const scheduledReports = pgTable("scheduled_reports", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   workspaceId: uuid("workspace_id").notNull(),
@@ -223,6 +234,8 @@ export const shareTokens = pgTable("share_tokens", {
   createdBy: uuid("created_by").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  failedAttempts: integer("failed_attempts").default(sql`0`),
+  lockedUntil: timestamp("locked_until", { withTimezone: true }),
 });
 
 export const toolRuns = pgTable("tool_runs", {

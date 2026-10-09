@@ -129,6 +129,19 @@ export const plans = pgTable("plans", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
 });
 
+export const stripeSubscriptionSyncs = pgTable("stripe_subscription_syncs", {
+  workspaceId: uuid("workspace_id").notNull(),
+  stripeSubscriptionId: text("stripe_subscription_id").notNull(),
+  fetchStartedAt: timestamp("fetch_started_at", { withTimezone: true }).notNull(),
+}, (table) => [primaryKey({ columns: [table.workspaceId, table.stripeSubscriptionId] })]);
+
+export const stripeWebhookEvents = pgTable("stripe_webhook_events", {
+  eventId: text("event_id").primaryKey(),
+  type: text("type").notNull(),
+  receivedAt: timestamp("received_at", { withTimezone: true }).notNull().default(sql`now()`),
+  processedAt: timestamp("processed_at", { withTimezone: true }).notNull().default(sql`now()`),
+});
+
 export const subscriptionAddons = pgTable("subscription_addons", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   workspaceId: uuid("workspace_id").notNull(),
@@ -161,6 +174,13 @@ export const subscriptions = pgTable("subscriptions", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
   provider: text("provider").notNull().default(sql`'none'::text`),
+  providerSyncedAt: timestamp("provider_synced_at", { withTimezone: true }),
+  openCheckoutSessionId: text("open_checkout_session_id"),
+  pendingCheckout: jsonb("pending_checkout"),
+  chargedUnitAmountCents: integer("charged_unit_amount_cents"),
+  chargedCurrency: char("charged_currency", { length: 3 }),
+  chargedInterval: text("charged_interval"),
+  pendingAddonChanges: jsonb("pending_addon_changes"),
 });
 
 export const usageCounters = pgTable("usage_counters", {

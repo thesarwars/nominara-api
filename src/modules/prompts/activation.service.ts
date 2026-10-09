@@ -5,6 +5,8 @@ import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { nextRunAfter } from "../../lib/capture/scheduler.js";
+import type { ProjectCadence } from "../../lib/capture/dispatch-cells.js";
 import { canonicalUuid } from "../../api/canonical-uuid.js";
 
 // STORY-046 — `POST /v1/projects/{id}/prompts/activate`.
@@ -151,6 +153,13 @@ export class PromptActivationService {
     }
 
     const activeAfter = activeBefore + toActivate.length;
+
+    // Owner decision 2026-10-09 pm #1: confirming the prompt set is the
+    // activation event. Only an `initializing` project moves (a paused or
+    // already-active one is left alone), and next_run_at is ALWAYS re-seeded
+    // from now — a stale seed from creation time must never become an
+    // immediate burst of overdue runs. `manual` stores NULL.
+    if (activeAfter > 0) await this.activateProject(client, projectId);
     const coverage = await this.coverageFor(client, projectId);
 
     return {
@@ -166,6 +175,22 @@ export class PromptActivationService {
       prompts_cap: cap,
       credits_charged: 0,
     };
+  }
+
+  private async activateProject(client: TenantClient, projectId: string): Promise<void> {
+    const found = await client.query<{ cadence: ProjectCadence }>(
+      "SELECT cadence FROM projects WHERE id = $1 AND status = 'initializing' AND deleted_at IS NULL",
+      [projectId],
+    );
+    const cadence = found.rows[0]?.cadence;
+    if (cadence === undefined) return;
+    // The status guard is repeated in the UPDATE so a concurrent pause or a
+    // concurrent confirmation cannot be overwritten.
+    await client.query(
+      `UPDATE projects SET status = 'active', next_run_at = $2, updated_at = now()
+        WHERE id = $1 AND status = 'initializing' AND deleted_at IS NULL`,
+      [projectId, nextRunAfter(cadence, new Date())],
+    );
   }
 
   private async assertProjectExists(client: TenantClient, projectId: string): Promise<void> {

@@ -91,6 +91,12 @@ export class QuotaGuard implements CanActivate {
     }
 
     const request = context.switchToHttp().getRequest<WorkspaceScopedRequest>();
+    // NEW-E-100b — a route may meter only one variant of itself (a PDF export,
+    // not a CSV one). The condition is the route's; the cap logic below is
+    // unchanged and still the single place that evaluates a tier cap.
+    if (spec.when !== undefined && !spec.when(request)) {
+      return true;
+    }
     // ⚠ NO `?? request.auth?.ws` FALLBACK, AND ITS REMOVAL IS STORY-153's ONE
     // MECHANICAL FIX. That arm was DEAD on every route that should reach here:
     // on a tenant-scoped route carrying a `ws` claim, WorkspaceGuard has

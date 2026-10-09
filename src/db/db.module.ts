@@ -1,7 +1,7 @@
 import { Global, Inject, Module, type OnModuleDestroy } from "@nestjs/common";
 import type { Pool } from "pg";
 import { loadEnv } from "../config/env.js";
-import { createPgPool, PG_POOL } from "./pg-pool.js";
+import { createPgPool, PG_POOL, PORTAL_PG_POOL } from "./pg-pool.js";
 
 // STORY-022 — the pooled Postgres connection (through pgBouncer, per
 // .env.example's DATABASE_URL_POOLED), provided once and exported globally
@@ -16,16 +16,26 @@ import { createPgPool, PG_POOL } from "./pg-pool.js";
       provide: PG_POOL,
       useFactory: (): Pool => createPgPool(loadEnv().DATABASE_URL_POOLED),
     },
+    {
+      provide: PORTAL_PG_POOL,
+      useFactory: (): Pool | null => {
+        const url = loadEnv().DATABASE_URL_PORTAL;
+        return url === undefined ? null : createPgPool(url, { max: 20 });
+      },
+    },
   ],
-  exports: [PG_POOL],
+  exports: [PG_POOL, PORTAL_PG_POOL],
 })
 export class DbModule implements OnModuleDestroy {
-  constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+  constructor(
+    @Inject(PG_POOL) private readonly pool: Pool,
+    @Inject(PORTAL_PG_POOL) private readonly portalPool: Pool | null,
+  ) {}
 
   // Runs as part of app.close() during graceful shutdown (src/main.ts's
   // enableShutdownHooks), AFTER in-flight requests have drained — never
   // abruptly under a request.
   async onModuleDestroy(): Promise<void> {
-    await this.pool.end();
+    await Promise.all([this.pool.end(), this.portalPool?.end()]);
   }
 }

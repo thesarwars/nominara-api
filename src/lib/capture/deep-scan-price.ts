@@ -85,6 +85,10 @@ export async function deepScanPriceOrThrow(
   }
   throw new PreconditionUnmetError({
     message: `this workspace's deep-scan price resolves to "${String(value)}", which is not a credit figure`,
+    // The discriminator a client reads instead of this message — the same
+    // endpoint also refuses with `no_capturable_scope`. See
+    // contracts/common/error-details.schema.ts.
+    details: { reason: "price_not_agreed" },
   });
 }
 

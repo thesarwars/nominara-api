@@ -1,10 +1,6 @@
 // DTOs are z.infer<> re-exports of contracts/ schemas (coding-standards.md
 // §2) — never hand-written. STORY-014 fills this in for the first time.
 export {
-  registrationOptionsRequestSchema,
-  type RegistrationOptionsRequest,
-} from "../../../../contracts/identity/registration-options-request.schema.js";
-export {
   assertionOptionsRequestSchema,
   type AssertionOptionsRequest,
 } from "../../../../contracts/identity/assertion-options-request.schema.js";
@@ -12,6 +8,10 @@ export {
   passkeyOptionsRequestSchema,
   type PasskeyOptionsRequest,
 } from "../../../../contracts/identity/passkey-options-request.schema.js";
+export {
+  passkeyAddOptionsRequestSchema,
+  type PasskeyAddOptionsRequest,
+} from "../../../../contracts/identity/passkey-add-options-request.schema.js";
 export {
   passkeyOptionsResponseSchema,
   type PasskeyOptionsResponse,
@@ -76,3 +76,6 @@ export {
   emailOtpRequestResponseSchema,
   type EmailOtpRequestResponse,
 } from "../../../../contracts/identity/email-otp-request-response.schema.js";
+export { personaSchema, type Persona } from "../../../../contracts/identity/persona.schema.js";
+export { meResponseSchema, type MeResponse } from "../../../../contracts/identity/me-response.schema.js";
+export { meUpdateRequestSchema, type MeUpdateRequest } from "../../../../contracts/identity/me-update-request.schema.js";

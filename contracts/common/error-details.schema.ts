@@ -22,10 +22,23 @@ import { MONEY_AMOUNT_USD_PATTERN } from "./money.schema.js";
 // the reset time." A story asking for a shape is not the same as inventing
 // one, and `NFR-API-13` needs "wait for the cycle" to be actionable, which it
 // is not without saying when the cycle ends. See the 429 section.
-// `precondition_unmet` is also absent: §2 illustrates it with "e.g. a patch
-// whose `content_before_hash` no longer matches" — an example, not a
-// committed shape, and "e.g." is not something to freeze into a published
-// client.
+// `precondition_unmet` WAS ALSO IN THAT LIST and no longer is, for the same
+// reason and by the same precedent. §2 illustrates it with "e.g. a patch whose
+// `content_before_hash` no longer matches" — an example, not a committed shape,
+// and "e.g." is not something to freeze into a published client. But STORY-034
+// then made ONE endpoint (`POST /projects/{id}/runs`) refuse for two different
+// reasons under that single code — an enterprise workspace whose negotiated
+// deep-scan price was never written down, and a scope with nothing to capture —
+// and the remedies do not overlap (tell the operator to finish setup, versus
+// add prompts or wait for an engine that can capture). A client that can only
+// read the `message` string would have to pattern-match prose to choose
+// between them, and prose is not a contract. So the shape is exactly ONE
+// member, `reason`, naming the check that refused — and it is OPTIONAL, because
+// the other `precondition_unmet` sites (a missing `If-Match`, prompt
+// generation not yet available, a result with no parsed document) belong to
+// other stories, commit no reason, and must keep compiling untouched; a client
+// treats an absent `reason` as "unclassified". A later story that classifies
+// one of those adds its value to PRECONDITION_UNMET_REASONS here first.
 
 // ---------------------------------------------------------------------------
 // Remediation (decision D11)
@@ -184,7 +197,17 @@ export const featureNotInPlanDetailsSchema = z
 // §2: "`If-Match` mismatch, unique violation, or state-machine violation
 // (`details.current_state`)" — three conditions under one code, and only the
 // third carries a state, hence optional.
-export const conflictDetailsSchema = z.object({ current_state: z.string().min(1).optional() }).strict();
+//
+// STORY-172 — `reason` names WHICH state conflict an invitation acceptance hit,
+// and is reachable only by the invited, verified account (see
+// security-and-tenancy.md, "Forwarded invitation link"). Closed enum: a new
+// reason is a contract change, not a free-form string.
+export const conflictDetailsSchema = z
+  .object({
+    current_state: z.string().min(1).optional(),
+    reason: z.enum(["member_suspended", "already_member"]).optional(),
+  })
+  .strict();
 
 // §2: "A user may own only one workspace. `details.{owned_workspace_id,
 // owned_workspace_name}` plus the transfer path." The NAME is included on
@@ -219,6 +242,23 @@ export const priceChangedDetailsSchema = z
 // resolved internal address echoed back to the caller is an SSRF
 // reconnaissance oracle. One field, and it names a CHECK.
 export const unsafeTargetDetailsSchema = z.object({ reason: z.string().min(1) }).strict();
+
+// STORY-034 — `precondition_unmet`'s one member. See the header for why it
+// exists and why it is optional. Each value names the CHECK that refused, in
+// the way `unsafeTargetDetailsSchema.reason` does, never a resolved value:
+//
+//   price_not_agreed      the plan's deep-scan price resolves to something that
+//                         is not a credit figure (enterprise, `"negotiated"`,
+//                         no workspace override written) — an operator's
+//                         unfinished setup, not the customer's doing
+//   no_capturable_scope   the scan would plan zero cells: no engine this
+//                         project is entitled to can capture yet, or it has no
+//                         active prompts — nothing was started, nothing charged
+export const PRECONDITION_UNMET_REASONS = ["price_not_agreed", "no_capturable_scope"] as const;
+
+export const preconditionUnmetDetailsSchema = z
+  .object({ reason: z.enum(PRECONDITION_UNMET_REASONS).optional() })
+  .strict();
 
 // ---------------------------------------------------------------------------
 // 429
@@ -308,6 +348,7 @@ export const errorDetailsSchemaByCode = {
   idempotency_conflict: idempotencyConflictDetailsSchema,
   workspace_limit_reached: workspaceLimitReachedDetailsSchema,
   price_changed: priceChangedDetailsSchema,
+  precondition_unmet: preconditionUnmetDetailsSchema,
   unsafe_target: unsafeTargetDetailsSchema,
   rate_limited: rateLimitedDetailsSchema,
   daily_limit_reached: dailyLimitReachedDetailsSchema,
@@ -348,6 +389,8 @@ export type QuotaExceededDetails = z.infer<typeof quotaExceededDetailsSchema>;
 export type ConflictDetails = z.infer<typeof conflictDetailsSchema>;
 export type WorkspaceLimitReachedDetails = z.infer<typeof workspaceLimitReachedDetailsSchema>;
 export type PriceChangedDetails = z.infer<typeof priceChangedDetailsSchema>;
+export type PreconditionUnmetReason = (typeof PRECONDITION_UNMET_REASONS)[number];
+export type PreconditionUnmetDetails = z.infer<typeof preconditionUnmetDetailsSchema>;
 export type UnsafeTargetDetails = z.infer<typeof unsafeTargetDetailsSchema>;
 export type RateLimitedDetails = z.infer<typeof rateLimitedDetailsSchema>;
 export type DailyLimitReachedDetails = z.infer<typeof dailyLimitReachedDetailsSchema>;

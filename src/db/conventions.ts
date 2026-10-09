@@ -98,6 +98,12 @@ export const GLOBAL_TABLES = [
   // 0014_email_otp.up.sql.
   "email_otp_codes",
   "email_otp_requests",
+  // NEW-D-2 — Stripe webhook de-duplication ledger (event id PK). Global
+  // because an event is deduplicated BEFORE its workspace is known, and an
+  // event for an unknown subject is recorded too; it holds no tenant data.
+  // GRANT-protected like the auth tables: only the API's webhook route
+  // (nominara_app) writes it. Migration 0048_stripe_webhook_events.up.sql.
+  "stripe_webhook_events",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -141,6 +147,11 @@ export const WIDE_ORDER_COLUMN_PATTERN =
 export const MIGRATION_OWNER_ROLE = "nominara_owner";
 export const BREAKGLASS_ROLE = "nominara_breakglass";
 
+// CP2 decision 1 (migration 0112, ADR-0002) — the dedicated, NOLOGIN owner of app.share_token_by_hash. Not a runtime
+// role: nobody connects as it and no runtime role is a member of it. NOBYPASSRLS (ISO-07 stands): it reads FORCE-RLS
+// share_tokens through one role-targeted SELECT policy, and its reach is bounded by a 14-column SELECT grant.
+export const SHARE_LOOKUP_ROLE = "nominara_share_lookup";
+
 // Ordered src/api, src/gateway, src/workers/*, replica-only reporting,
 // share-token portal — matches the comments in security-and-tenancy.md §2.
 export const RUNTIME_ROLES = ["nominara_app", "nominara_worker", "nominara_report", "nominara_portal"] as const;
@@ -171,6 +182,17 @@ export const DATABASE_ROLES: Record<string, DatabaseRoleSpec> = {
   nominara_report: { login: true, bypassrls: false, connectionLimit: 40, inherit: false },
   nominara_portal: { login: true, bypassrls: false, connectionLimit: 60, inherit: false },
   [BREAKGLASS_ROLE]: { login: true, bypassrls: true, connectionLimit: 2, inherit: false },
+};
+
+/**
+ * ADR-0002 / migration 0112 — roles that exist only to OWN a SECURITY DEFINER function. Kept apart from
+ * DATABASE_ROLES because those are all created by 0005 (database-roles-and-grants.spec.ts migrates 0001-0005 only).
+ * drift-check verifies the same attributes AND that no role is a member: nominara_share_lookup's policy
+ * (share_token_gate_lookup, USING (true)) admits every share_tokens row to whoever holds the role, so an empty
+ * pg_auth_members entry for it is the control, not a detail.
+ */
+export const DEFINER_OWNER_ROLES: Record<string, DatabaseRoleSpec> = {
+  nominara_share_lookup: { login: false, bypassrls: false, connectionLimit: -1, inherit: false },
 };
 
 // STORY-120 — the migration ledger (src/db/migrate-runner.ts's BOOTSTRAP_SQL)
@@ -289,6 +311,10 @@ export const ACTOR_SELF_SCOPED_TABLES = ["workspaces", "workspace_members"] as c
 export const POLICY_IN_OWN_MIGRATION: readonly string[] = [
   // 0019_usage_reservations.up.sql
   "usage_reservations",
+  // 0051_track_e_sharing.up.sql — NEW-E-1; tenant-scoped, NOT portal-readable.
+  "scheduled_report_deliveries",
+  // 0074_stripe_subscription_syncs.up.sql — NEW-D-2 checkpoint-1; tenant-scoped, NOT portal-readable.
+  "stripe_subscription_syncs",
 ];
 
 // STORY-011 — which runtime roles receive which generated policy. Every
@@ -388,7 +414,8 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
     table === "refresh_tokens" ||
     table === "oauth_authorization_requests" ||
     table === "email_otp_codes" ||
-    table === "email_otp_requests"
+    table === "email_otp_requests" ||
+    table === "stripe_webhook_events"
   ) {
     return role === "nominara_app" ? FULL_WRITE : NO_PRIVILEGES;
   }

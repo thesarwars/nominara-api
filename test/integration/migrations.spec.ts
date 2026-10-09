@@ -494,4 +494,34 @@ describe("STORY-006 · extensions, conventions & migration tooling", () => {
       await client.query("ALTER ROLE nominara_worker NOINHERIT");
     }
   });
+  // ADR-0002 Decision 1 / checkpoint-4 finding 1 — nominara_share_lookup is not in DATABASE_ROLES (the roles spec
+  // migrates 0001-0005 only), so drift-check was blind to it. Its policy admits every row (USING true); the only thing
+  // keeping that inert is that nobody is a member of the role.
+  it("DEF-D1 · a hand-added MEMBERSHIP in nominara_share_lookup is caught by checkDrift, naming the role and the member", async () => {
+    await migrateUp(client);
+    await client.query("GRANT nominara_share_lookup TO nominara_worker");
+    try {
+      const result = await checkDrift(client);
+      expect(isClean(result)).toBe(false);
+      expect(
+        result.roleAttributeMismatches.some((m) => m.includes("nominara_share_lookup") && /member/i.test(m) && m.includes("nominara_worker")),
+      ).toBe(true);
+    } finally {
+      await client.query("REVOKE nominara_share_lookup FROM nominara_worker");
+    }
+  });
+
+  it("DEF-D2 · a hand-altered BYPASSRLS on nominara_share_lookup is caught by checkDrift as a roleAttributeMismatch", async () => {
+    await migrateUp(client);
+    await client.query("ALTER ROLE nominara_share_lookup BYPASSRLS");
+    try {
+      const result = await checkDrift(client);
+      expect(isClean(result)).toBe(false);
+      expect(
+        result.roleAttributeMismatches.some((m) => m.includes("nominara_share_lookup") && /bypassrls/i.test(m)),
+      ).toBe(true);
+    } finally {
+      await client.query("ALTER ROLE nominara_share_lookup NOBYPASSRLS");
+    }
+  });
 });

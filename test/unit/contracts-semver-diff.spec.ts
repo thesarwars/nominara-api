@@ -3,7 +3,7 @@ import { deriveSemverBump, type OpenApiDocumentLike } from "../../src/contracts/
 
 // STORY-023 T2 (RED step) — Test scenarios 4-7 (STORY-023.md "Test scenarios
 // — write these first"):
-//   4  Add a field                -> patch-level publish
+//   4  Add a field                -> minor-level publish (owner decision R5: an added optional field is minor at any depth)
 //   5  Add an endpoint            -> minor-level publish
 //   6  Remove a field             -> major-level publish
 //   7  Narrow a type              -> major-level publish
@@ -74,7 +74,7 @@ function deepClone<T>(value: T): T {
 }
 
 describe("STORY-023 · contracts:diff — semver derived from the specification diff (AC5, NFR-REPO-02)", () => {
-  it("scenario 4 — adding an OPTIONAL field to an existing request/response schema is a patch-level bump", async () => {
+  it("scenario 4 — adding an OPTIONAL field to an existing request/response schema is a minor-level bump (owner decision R5: one rule at any depth)", async () => {
     const previous = baseDocument();
     const current = deepClone(previous);
     // Additive and optional — current.paths[...].post.requestBody... — NOT
@@ -83,7 +83,7 @@ describe("STORY-023 · contracts:diff — semver derived from the specification 
       type: "string",
     };
 
-    expect(deriveSemverBump(previous, current)).toBe("patch");
+    expect(deriveSemverBump(previous, current)).toBe("minor");
   });
 
   it("scenario 5 — adding a whole new endpoint is a minor-level bump", async () => {
@@ -231,5 +231,276 @@ describe("STORY-023 · contracts:diff — semver derived from the specification 
     };
 
     expect(deriveSemverBump(previous, current)).toBe("minor");
+  });
+});
+
+// --- NEW-A-5 Option A (owner) -----------------------------------------------
+// Nested object and array-item schemas are RECURSED INTO. Before this, any
+// change under a shared property that was not an enum move fell through to
+// `major`, so adding one optional field inside a response's nested object
+// published a breaking version for a change no client can break on. The
+// owner's rule: an ADDED OPTIONAL field is `minor` at ANY depth, the top
+// level included (decision R5, 2026-10-08: one rule; scenario 4). Everything breaking stays `major` at depth.
+function nestedDocument(): OpenApiDocumentLike {
+  return {
+    openapi: "3.1.0",
+    info: { title: "Nominara API (fixture)", version: "1.0.0" },
+    paths: {
+      "/v1/scores": {
+        get: {
+          operationId: "getScores",
+          responses: {
+            "200": {
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      data: {
+                        type: "object",
+                        properties: {
+                          blended: {
+                            type: "object",
+                            properties: { score: { type: "number" } },
+                            required: ["score"],
+                            additionalProperties: false,
+                          },
+                          engines: {
+                            type: "array",
+                            items: {
+                              type: "object",
+                              properties: { engine_key: { type: "string" }, label: { type: "string" } },
+                              required: ["engine_key", "label"],
+                              additionalProperties: false,
+                            },
+                          },
+                        },
+                        required: ["blended", "engines"],
+                        additionalProperties: false,
+                      },
+                    },
+                    required: ["data"],
+                    additionalProperties: false,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+type Loose = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+
+function dataSchema(doc: OpenApiDocumentLike): Loose {
+  const root = doc.paths["/v1/scores"]!.get!.responses["200"]!.content!["application/json"]!.schema as Loose;
+  return root.properties.data as Loose;
+}
+
+describe("NEW-A-5 · contracts:diff recurses into nested object and array-item schemas", () => {
+  it("NEW-A-5 · a nested object gaining an OPTIONAL field is a minor bump", () => {
+    const previous = nestedDocument();
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.data_source = { type: "string" };
+
+    expect(deriveSemverBump(previous, current)).toBe("minor");
+  });
+
+  it("NEW-A-5 · an array-item schema gaining an OPTIONAL field is a minor bump", () => {
+    const previous = nestedDocument();
+    const current = deepClone(previous);
+    dataSchema(current).properties.engines.items.properties.data_source = { type: "string" };
+
+    expect(deriveSemverBump(previous, current)).toBe("minor");
+  });
+
+  it("NEW-A-5 · a new OPTIONAL property on the response body's data object (one level down) is minor, and so is the same at the root (one rule at any depth)", () => {
+    const previous = nestedDocument();
+    const nested = deepClone(previous);
+    dataSchema(nested).properties.blend = { type: "object", properties: {}, additionalProperties: false };
+    expect(deriveSemverBump(previous, nested)).toBe("minor");
+
+    const root = deepClone(previous);
+    ((root.paths["/v1/scores"]!.get!.responses["200"]!.content!["application/json"]!.schema as Loose).properties as Loose).note = {
+      type: "string",
+    };
+    expect(deriveSemverBump(previous, root)).toBe("minor");
+  });
+
+  it("NEW-A-5 · a nested object gaining a REQUIRED field is major", () => {
+    const previous = nestedDocument();
+    const current = deepClone(previous);
+    const blended = dataSchema(current).properties.blended;
+    blended.properties.data_source = { type: "string" };
+    blended.required = ["score", "data_source"];
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 · a field REMOVED from an array-item schema is major", () => {
+    const previous = nestedDocument();
+    const current = deepClone(previous);
+    const items = dataSchema(current).properties.engines.items;
+    delete items.properties.label;
+    items.required = ["engine_key"];
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 · a nested optional field becoming required is major", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.note = { type: "string" };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.required = ["score", "note"];
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 · a nested field's TYPE narrowing is major", () => {
+    const previous = nestedDocument();
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.score = { type: "string" };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 · a nested required field becoming optional is patch (widening)", () => {
+    const previous = nestedDocument();
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.required = [];
+
+    expect(deriveSemverBump(previous, current)).toBe("patch");
+  });
+
+  it("NEW-A-5 · an array whose own constraint moved (not just its items) is still major", () => {
+    const previous = nestedDocument();
+    const current = deepClone(previous);
+    dataSchema(current).properties.engines.maxItems = 3;
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 · a nested change an additive field cannot excuse: the most severe wins", () => {
+    const previous = nestedDocument();
+    const current = deepClone(previous);
+    const items = dataSchema(current).properties.engines.items;
+    items.properties.data_source = { type: "string" }; // minor-shaped
+    delete dataSchema(current).properties.blended.properties.score; // major-shaped
+    dataSchema(current).properties.blended.required = [];
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 · a NULLABLE field (anyOf with null) whose enum gains a value is patch, like a bare enum", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo", "mixed"] }, { type: "null" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("patch");
+  });
+
+  it("NEW-A-5 · a nullable field's enum LOSING a value is major", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo", "mixed"] }, { type: "null" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 checkpoint-2 · a union that GAINS a branch (same leading branches) is major: the arity guard", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }, { type: "number" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 checkpoint-2 · a union that LOSES a branch is major: the arity guard, the other direction", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }, { type: "number" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 checkpoint-2 · identical branches with a changed SIBLING key (a default appears) is major: the sibling-keys guard", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+      default: null,
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 · a field that becomes nullable (a branch appears) stays major", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.blended.properties.source = { type: "string", enum: ["live", "demo"] };
+    const current = deepClone(previous);
+    dataSchema(current).properties.blended.properties.source = {
+      anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }],
+    };
+
+    expect(deriveSemverBump(previous, current)).toBe("major");
+  });
+
+  it("NEW-A-5 · a RECORD (additionalProperties is a schema) whose value enum gains a value is patch", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.sources = {
+      type: "object",
+      propertyNames: { type: "string" },
+      additionalProperties: { anyOf: [{ type: "string", enum: ["live", "demo"] }, { type: "null" }] },
+    };
+    const current = deepClone(previous);
+    dataSchema(current).properties.sources.additionalProperties.anyOf[0].enum = ["live", "demo", "mixed"];
+
+    expect(deriveSemverBump(previous, current)).toBe("patch");
+  });
+
+  it("NEW-A-5 · a record value whose enum LOSES a value, or a closed object that opens up, is major", () => {
+    const previous = nestedDocument();
+    dataSchema(previous).properties.sources = {
+      type: "object",
+      propertyNames: { type: "string" },
+      additionalProperties: { type: "string", enum: ["live", "demo", "mixed"] },
+    };
+    const narrowed = deepClone(previous);
+    dataSchema(narrowed).properties.sources.additionalProperties.enum = ["live"];
+    expect(deriveSemverBump(previous, narrowed)).toBe("major");
+
+    const closed = deepClone(previous);
+    dataSchema(closed).properties.sources.additionalProperties = false;
+    expect(deriveSemverBump(previous, closed)).toBe("major");
+  });
+
+  it("NEW-A-5 · an unchanged nested document is none", () => {
+    const previous = nestedDocument();
+    expect(deriveSemverBump(previous, deepClone(previous))).toBe("none");
   });
 });

@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url";
 import type { ClientBase } from "pg";
 import type { PurgeFailureDetail } from "../../../contracts/ops/purge-failure-detail.schema.js";
 import { connect, requireDatabaseUrl } from "../../db/client.js";
+import { WorkspaceLockBusyError } from "../../lib/billing/errors.js";
+import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { RECHAINED_MARKER_ACTION } from "../../lib/crypto/audit-chain.js";
 import { pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
@@ -179,6 +181,8 @@ export async function requestWorkspaceDeletion(
 ): Promise<void> {
   const executeAt = new Date(referenceDate.getTime() + WORKSPACE_DELETION_GRACE_DAYS * 86_400_000);
   await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+    // Checkpoint-6 — bounded: a billing change may hold this row across a Stripe call.
+    await lockWorkspaceBounded(tx, workspaceId, () => new WorkspaceLockBusyError(workspaceId));
     await tx.query(
       `UPDATE workspaces
           SET status = 'pending_deletion', deletion_requested_at = $2, deletion_execute_at = $3

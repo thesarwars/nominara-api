@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, Logger } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, Logger, UnauthorizedException } from "@nestjs/common";
 import {
   generateAuthenticationOptions,
   generateRegistrationOptions,
@@ -20,13 +20,17 @@ import { PG_POOL } from "../../db/pg-pool.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { nextCounter } from "../../lib/webauthn/sign-counter-policy.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import type { SessionStrongAuth } from "../../api/guards/auth.guard.js";
+import { refuse, requireFreshStrongAuth, requireProvedAccount } from "./account-proof.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
 import type {
+  MeResponse,
+  Persona,
   AssertionOptionsRequest,
+  PasskeyAddOptionsRequest,
   PasskeyListItem,
-  PasskeyOptionsRequest,
   PasskeyVerifyRequest,
-  RegistrationOptionsRequest,
+  RegistrationVerifyRequest,
 } from "./dto/index.js";
 
 // STORY-014 — ceremony validation (attestation, clientDataJSON, signature)
@@ -34,6 +38,57 @@ import type {
 // logic is challenge lifecycle (single-use, short-lived, atomic claim),
 // persistence, and the sign-counter accept/clone-signal policy
 // (src/lib/webauthn/sign-counter-policy.ts).
+//
+// STORY-173 — dangerous area (identity). A passkey is added to an account
+// ONLY from a session that belongs to it and has stepped up, and only while
+// the account's address is proved (users.email_verified_at). There is no
+// anonymous registration: the public options/verify pair serves sign-in
+// (assertions) alone. The earlier shape — an anonymous caller naming an
+// address and being handed that account's id, a credential and a session —
+// was an account takeover for every existing address, and (the "pre-hijack")
+// a way to plant a working credential on an address before its owner
+// arrived. Do not reintroduce a path that finds-or-creates a user from a
+// typed address and binds a credential to it.
+
+const ME_COLUMNS =
+  "id, email, full_name, locale, timezone, persona_org_type, persona_volume_band, persona_focus, persona_skipped";
+
+interface MeRow {
+  id: string;
+  email: string;
+  full_name: string | null;
+  locale: string;
+  timezone: string;
+  persona_org_type: Persona["org_type"];
+  persona_volume_band: string | null;
+  persona_focus: Persona["focus"];
+  persona_skipped: boolean | null;
+}
+
+const BRAND_COUNTS: ReadonlySet<string> = new Set(["one", "2_5", "6_20", "gt_20"]);
+
+// A person who never answered and never skipped has no persona at all (null),
+// which the client reads as "ask them". A value from the retired lt_1k..gt_100k
+// vocabulary is not a brand count, so it reads as unanswered rather than being
+// passed through to a client that cannot render it.
+function toMe(row: MeRow, activeWorkspaceId: string | null): MeResponse {
+  const volume = row.persona_volume_band !== null && BRAND_COUNTS.has(row.persona_volume_band) ? (row.persona_volume_band as Persona["volume"]) : null;
+  const skipped = row.persona_skipped === true;
+  const answered = row.persona_org_type !== null || volume !== null || row.persona_focus !== null || skipped;
+  return {
+    user: {
+      user_id: row.id,
+      // The address's local part when the person never gave a name, so the
+      // shell never renders an empty greeting.
+      name: row.full_name !== null && row.full_name.trim() !== "" ? row.full_name : row.email.split("@")[0]!,
+      email: row.email,
+    },
+    active_workspace_id: activeWorkspaceId,
+    persona: answered ? { org_type: row.persona_org_type, volume, focus: row.persona_focus, skipped } : null,
+    locale: row.locale,
+    timezone: row.timezone,
+  };
+}
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
@@ -57,26 +112,24 @@ export class IdentityService {
     private readonly sessions: SessionService,
   ) {}
 
-  async createOptions(input: PasskeyOptionsRequest): Promise<PasskeyOptionsResult> {
-    if (input.purpose === "registration") {
-      return this.createRegistrationOptions(input);
-    }
-    return this.createAssertionOptions(input);
-  }
-
-  private async createRegistrationOptions(input: RegistrationOptionsRequest): Promise<PasskeyOptionsResult> {
+  /**
+   * STORY-173 — POST /me/passkeys/options. Session-authenticated; the account
+   * is the session's, never a typed address. Step-up first (a stale or absent
+   * strong re-authentication is refused before anything is read), then the
+   * address must be proved: a session can exist for an account whose address
+   * nobody has confirmed (an OAuth provider that did not verify it), and such
+   * an account must not accumulate credentials.
+   */
+  async createRegistrationOptions(
+    userId: string,
+    session: SessionStrongAuth | undefined,
+    input: PasskeyAddOptionsRequest,
+  ): Promise<PasskeyOptionsResult> {
+    requireFreshStrongAuth(userId, session, this.logger, "passkey_add");
     const env = loadEnv();
     const client = await this.pool.connect();
     try {
-      const userResult = await client.query<{ id: string; email: string }>(
-        `INSERT INTO users (id, email, status)
-         VALUES ($1, $2, 'unverified')
-         ON CONFLICT (email) WHERE deleted_at IS NULL
-         DO UPDATE SET email = EXCLUDED.email
-         RETURNING id, email`,
-        [uuidV7(), input.email],
-      );
-      const user = userResult.rows[0]!;
+      const user = await requireProvedAccount(client, userId, this.logger, "passkey_add");
 
       const existing = await client.query<{ credential_id: Buffer; transports: string[] | null }>(
         `SELECT credential_id, transports FROM user_credentials
@@ -107,7 +160,7 @@ export class IdentityService {
     }
   }
 
-  private async createAssertionOptions(_input: AssertionOptionsRequest): Promise<PasskeyOptionsResult> {
+  async createAssertionOptions(_input: AssertionOptionsRequest): Promise<PasskeyOptionsResult> {
     const env = loadEnv();
     const client = await this.pool.connect();
     try {
@@ -142,29 +195,31 @@ export class IdentityService {
     return ceremonyId;
   }
 
-  // Atomically claims a challenge row regardless of purpose — zero rows back
-  // is rejected uniformly whether the ceremony never existed, already ran,
-  // or expired (STORY-014 Technical Notes; do not differentiate the reason,
-  // it would leak which case applies to a caller probing ceremony ids).
+  // Atomically claims a challenge row of ONE purpose, and — for a registration
+  // — of ONE account. Zero rows back is rejected uniformly whether the
+  // ceremony never existed, already ran, expired, was begun for a different
+  // purpose, or belongs to another account (STORY-014 Technical Notes; do not
+  // differentiate the reason, it would leak which case applies to a caller
+  // probing ceremony ids).
+  //
+  // STORY-173 — purpose and owner are part of the claim, not checked after it.
+  // Checked after, a mismatched attempt would already have CONSUMED the row:
+  // anyone holding a leaked ceremony id could burn the rightful owner's
+  // ceremony, and the public verify route could redeem a registration. In the
+  // WHERE clause a mismatch changes nothing. `IS NOT DISTINCT FROM` so an
+  // assertion (stored with no owner) matches only a null owner.
   private async claimChallenge(
     client: { query: Pool["query"] },
     ceremonyId: string,
-  ): Promise<{
-    id: string;
-    purpose: "registration" | "assertion";
-    user_id: string | null;
-    challenge: Buffer;
-  }> {
-    const result = await client.query<{
-      id: string;
-      purpose: "registration" | "assertion";
-      user_id: string | null;
-      challenge: Buffer;
-    }>(
+    purpose: "registration" | "assertion",
+    ownerId: string | null,
+  ): Promise<{ challenge: Buffer }> {
+    const result = await client.query<{ challenge: Buffer }>(
       `UPDATE webauthn_challenges SET consumed_at = now()
-       WHERE id = $1 AND consumed_at IS NULL AND expires_at > now()
-       RETURNING id, purpose, user_id, challenge`,
-      [ceremonyId],
+       WHERE id = $1 AND purpose = $2 AND user_id IS NOT DISTINCT FROM $3
+         AND consumed_at IS NULL AND expires_at > now()
+       RETURNING challenge`,
+      [ceremonyId, purpose, ownerId],
     );
     if (result.rows.length === 0) {
       throw new BadRequestException("ceremony is unknown, already used, or expired");
@@ -172,17 +227,39 @@ export class IdentityService {
     return result.rows[0]!;
   }
 
+  // POST /auth/passkey/verify — public, sign-in only (STORY-173). It claims
+  // an ASSERTION ceremony and nothing else, so no anonymous request can
+  // complete a registration, with or without a leaked ceremony id.
   async verifyPasskey(input: PasskeyVerifyRequest): Promise<SessionTokens> {
     const env = loadEnv();
     const client = await this.pool.connect();
     try {
-      const challenge = await this.claimChallenge(client, input.ceremony_id);
-      const expectedChallenge = challenge.challenge.toString("base64url");
+      const challenge = await this.claimChallenge(client, input.ceremony_id, "assertion", null);
+      return await this.finishAssertion(client, challenge.challenge.toString("base64url"), input, env);
+    } finally {
+      client.release();
+    }
+  }
 
-      if (challenge.purpose === "registration") {
-        return await this.finishRegistration(client, challenge.user_id!, expectedChallenge, input, env);
-      }
-      return await this.finishAssertion(client, expectedChallenge, input, env);
+  /**
+   * STORY-173 — POST /me/passkeys/verify. Completes a registration ceremony
+   * begun by THIS account, from a session that has (still) stepped up. No
+   * session is minted and no status changes: the caller already has a
+   * session, and adding a credential proves nothing about the address — only
+   * the email one-time code does.
+   */
+  async verifyRegistration(
+    userId: string,
+    session: SessionStrongAuth | undefined,
+    input: RegistrationVerifyRequest,
+  ): Promise<void> {
+    // Before the claim: a stale session must not consume the ceremony.
+    requireFreshStrongAuth(userId, session, this.logger, "passkey_add");
+    const env = loadEnv();
+    const client = await this.pool.connect();
+    try {
+      const challenge = await this.claimChallenge(client, input.ceremony_id, "registration", userId);
+      await this.finishRegistration(client, userId, challenge.challenge.toString("base64url"), input, env);
     } finally {
       client.release();
     }
@@ -192,9 +269,9 @@ export class IdentityService {
     client: { query: Pool["query"] },
     userId: string,
     expectedChallenge: string,
-    input: PasskeyVerifyRequest,
+    input: RegistrationVerifyRequest,
     env: { WEBAUTHN_RP_ID: string; WEBAUTHN_ORIGIN: string },
-  ): Promise<SessionTokens> {
+  ): Promise<void> {
     // The library throws on a bad attestation, a wrong origin, or an RP ID
     // hash mismatch (the last of which is what makes a credential minted in
     // one environment unusable in another — STORY-014 test scenario 7).
@@ -247,12 +324,12 @@ export class IdentityService {
     const { credential } = verification.registrationInfo;
     const attachment = (input.response as { authenticatorAttachment?: string }).authenticatorAttachment ?? null;
 
-    // Same explicit BEGIN/COMMIT/ROLLBACK shape as revokePasskey/
-    // OauthService.unlink() — a crash between the insert and the status
-    // promotion below can't leave a credential inserted with the user
-    // still stuck 'unverified'.
+    // The proof of the address is re-read INSIDE the transaction that inserts
+    // the credential (FOR SHARE), not trusted from the options call minutes
+    // ago: the account must be proved at the moment the credential is bound.
     try {
       await client.query("BEGIN");
+      await requireProvedAccount(client, userId, this.logger, "passkey_add");
       await client.query(
         `INSERT INTO user_credentials
            (id, user_id, kind, credential_id, public_key, sign_count, transports, authenticator_attachment, device_label)
@@ -267,24 +344,22 @@ export class IdentityService {
           attachment,
         ],
       );
-
-      // STORY-015 (approved fix, bundled here) — createRegistrationOptions
-      // always creates the users row 'unverified'; a completed, verified
-      // attestation is exactly the "confirmed the address is reachable and
-      // controlled" signal that promotes it. Without this, every passkey
-      // user would silently lose STORY-015's workspace-create right on
-      // merge, since that gate reads users.status.
-      await client.query(`UPDATE users SET status = 'active' WHERE id = $1 AND status = 'unverified'`, [userId]);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
+      // A credential id that is already registered (to this account or to
+      // another) violates the unique index on credential_id. It is the same
+      // uniform 400 as a bad attestation — never a 500, and never a message
+      // that tells the caller another account holds that credential.
+      if ((error as { code?: string }).code === "23505") {
+        refuse(this.logger, userId, "passkey_add", "credential_id_taken");
+        throw new BadRequestException("passkey registration could not be verified");
+      }
       throw error;
     }
 
     this.logger.log(`passkey registered user_id=${userId}`);
     incrementCounter("nominara_identity_passkey_registered_total", { user_id: userId });
-
-    return await this.sessions.createSession(userId);
   }
 
   private async finishAssertion(
@@ -302,9 +377,18 @@ export class IdentityService {
       sign_count: string;
       transports: string[] | null;
     }>(
-      `SELECT id, user_id, credential_id, public_key, sign_count, transports
-       FROM user_credentials
-       WHERE credential_id = $1 AND revoked_at IS NULL`,
+      // STORY-173 — a credential signs in only if its account's address is
+      // proved. Rows from before the fix can hold a passkey on an address
+      // nobody ever confirmed (and an attacker may have put it there); until
+      // the address is proved that credential yields no session. Likewise a
+      // suspended or erased account (STORY-173 review): its passkeys do not
+      // sign in. Same uniform refusal as an unknown credential, so which
+      // case applies is not observable.
+      `SELECT c.id, c.user_id, c.credential_id, c.public_key, c.sign_count, c.transports
+       FROM user_credentials c
+       JOIN users u ON u.id = c.user_id
+       WHERE c.credential_id = $1 AND c.revoked_at IS NULL
+         AND u.email_verified_at IS NOT NULL AND u.status = 'active' AND u.deleted_at IS NULL`,
       [Buffer.from(rawId, "base64url")],
     );
     if (credentialResult.rows.length === 0) {
@@ -368,12 +452,40 @@ export class IdentityService {
       throw new ForbiddenException("sign counter did not advance — possible cloned authenticator");
     }
 
-    await client.query(`UPDATE user_credentials SET sign_count = $1, last_used_at = now() WHERE id = $2`, [
-      reported.toString(),
-      row.id,
-    ]);
-
-    return await this.sessions.createSession(row.user_id);
+    // The session is minted in the SAME transaction that re-reads, under lock,
+    // that this credential is still live and its account still proved and
+    // active (users first, then the credential — the order every first-proof
+    // writer takes). Decided on the lookup above and minted afterwards, the
+    // first proof of the address could land in between: its revocation would
+    // miss a session that did not exist yet.
+    try {
+      await client.query("BEGIN");
+      const account = await client.query(
+        `SELECT 1 FROM users
+         WHERE id = $1 AND email_verified_at IS NOT NULL AND status = 'active' AND deleted_at IS NULL
+         FOR SHARE`,
+        [row.user_id],
+      );
+      const live = await client.query(
+        `SELECT 1 FROM user_credentials WHERE id = $1 AND revoked_at IS NULL FOR UPDATE`,
+        [row.id],
+      );
+      if (account.rows.length === 0 || live.rows.length === 0) {
+        throw new BadRequestException("unknown or revoked credential");
+      }
+      await client.query(`UPDATE user_credentials SET sign_count = $1, last_used_at = now() WHERE id = $2`, [
+        reported.toString(),
+        row.id,
+      ]);
+      // A WebAuthn assertion is itself a fresh strong authentication: stamp the
+      // session so this sign-in satisfies step-up for the next five minutes.
+      const tokens = await this.sessions.createSessionOn(client, row.user_id, new Date(), "webauthn");
+      await client.query("COMMIT");
+      return tokens;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    }
   }
 
   /**
@@ -412,6 +524,55 @@ export class IdentityService {
     }
   }
 
+  /**
+   * NEW-A-2 — GET /me. The caller's own row, keyed on the session's `sub`; the
+   * active workspace is the verified token's `ws` claim handed in by the
+   * controller, never read from a query or body. `users` has no RLS (identity
+   * is person state, not tenant data), so the WHERE on id is the control.
+   */
+  async getMe(userId: string, activeWorkspaceId: string | null): Promise<MeResponse> {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<MeRow>(`SELECT ${ME_COLUMNS} FROM users WHERE id = $1 AND deleted_at IS NULL`, [userId]);
+      return toMe(this.requireRow(result.rows[0], userId), activeWorkspaceId);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * NEW-A-2 — PATCH /me. Replaces the whole persona on the caller's own row
+   * (a person who changes their answer to "agency / 6-20 brands" must not keep
+   * a stale focus). One statement, so there is no read-modify-write to race.
+   */
+  async updatePersona(userId: string, activeWorkspaceId: string | null, persona: Persona): Promise<MeResponse> {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<MeRow>(
+        `UPDATE users
+            SET persona_org_type = $2, persona_volume_band = $3, persona_focus = $4,
+                persona_skipped = $5, updated_at = now()
+          WHERE id = $1 AND deleted_at IS NULL
+      RETURNING ${ME_COLUMNS}`,
+        [userId, persona.org_type, persona.volume, persona.focus, persona.skipped],
+      );
+      incrementCounter("nominara_identity_persona_updated_total", { skipped: String(persona.skipped) });
+      this.logger.log(`persona updated user_id=${userId} skipped=${persona.skipped}`);
+      return toMe(this.requireRow(result.rows[0], userId), activeWorkspaceId);
+    } finally {
+      client.release();
+    }
+  }
+
+  private requireRow(row: MeRow | undefined, userId: string): MeRow {
+    if (row === undefined) {
+      // A valid token for a deleted account: fail closed rather than invent an identity.
+      this.logger.warn(`me for missing user user_id=${userId}`);
+      throw new UnauthorizedException("account no longer exists");
+    }
+    return row;
+  }
+
   async renamePasskey(userId: string, credentialId: string, deviceLabel: string): Promise<void> {
     const client = await this.pool.connect();
     try {
@@ -429,7 +590,11 @@ export class IdentityService {
     }
   }
 
-  async revokePasskey(userId: string, credentialId: string): Promise<void> {
+  async revokePasskey(userId: string, credentialId: string, session?: SessionStrongAuth): Promise<void> {
+    // STORY-173 (audit) — removing a credential is as sensitive as adding one: a
+    // stolen session must not strip the owner's other methods to lock them out,
+    // or leave the thief's as the only one. The same rule as OAuth unlink.
+    requireFreshStrongAuth(userId, session, this.logger, "passkey_revoke");
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -458,7 +623,7 @@ export class IdentityService {
         throw new ConflictException("cannot revoke the last remaining credential with no alternative auth method");
       }
 
-      await client.query(`UPDATE user_credentials SET revoked_at = now() WHERE id = $1`, [credentialId]);
+      await client.query(`UPDATE user_credentials SET revoked_at = now(), revoked_reason = 'user' WHERE id = $1`, [credentialId]);
       await client.query("COMMIT");
 
       this.logger.log(`passkey revoked user_id=${userId} credential_id=${credentialId}`);

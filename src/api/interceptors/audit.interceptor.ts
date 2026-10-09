@@ -67,8 +67,16 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
  * saying its identifier is a project id, and a third spelling would be a new
  * convention rather than a new option.
  */
-function resourceIdFromResponse(body: unknown, resourceType: string): string | null {
+function resourceIdFromResponse(body: unknown, resourceType: string, idPath?: string): string | null {
   if (body === null || typeof body !== "object") return null;
+  if (idPath !== undefined) {
+    let cursor: unknown = body;
+    for (const segment of idPath.split(".")) {
+      if (cursor === null || typeof cursor !== "object") return null;
+      cursor = (cursor as Record<string, unknown>)[segment];
+    }
+    return typeof cursor === "string" ? cursor : null;
+  }
   const record = body as Record<string, unknown>;
   for (const key of ["id", `${resourceType}_id`]) {
     const value = record[key];
@@ -88,8 +96,16 @@ function resourceIdFromResponse(body: unknown, resourceType: string): string | n
 function resolveResourceId(req: AuditableRequest, options: AuditOptions, responseBody: unknown): string {
   const routeLabel = `action "${options.action}" (resourceType "${options.resourceType}")`;
 
+  if (options.resourceIdFrom === "workspace") {
+    const workspaceId = currentTenantStore()?.context.workspaceId;
+    if (workspaceId === undefined) {
+      throw new AuditResourceIdUnresolvedError(`AuditInterceptor: ${routeLabel} declares resourceIdFrom: "workspace" but no tenant context is active`);
+    }
+    return workspaceId;
+  }
+
   if (options.resourceIdFrom === "response") {
-    const raw = resourceIdFromResponse(responseBody, options.resourceType);
+    const raw = resourceIdFromResponse(responseBody, options.resourceType, options.responseIdPath);
     if (raw === null) {
       throw new AuditResourceIdUnresolvedError(
         `AuditInterceptor: ${routeLabel} declares resourceIdFrom: "response" but the handler's response body had no usable string "id" or "${options.resourceType}_id" field`,
@@ -201,10 +217,10 @@ export class AuditInterceptor implements NestInterceptor {
       resourceType: options.resourceType,
       resourceId,
       beforeState: req.auditBeforeState ?? null,
-      afterState: responseBody ?? null,
+      afterState: (options.afterState !== undefined ? options.afterState(responseBody) : responseBody) ?? null,
       requestId: req.id !== undefined ? String(req.id) : "",
       supportGrantId: req.supportGrant?.id ?? null,
-      severity: "info",
+      severity: options.severity ?? "info",
     });
   }
 }

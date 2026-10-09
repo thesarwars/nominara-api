@@ -12,6 +12,7 @@ import { readRunProgress } from "../../src/lib/capture/run-progress.js";
 import { createCaptureExecuteHandler } from "../../src/lib/queue/handlers/capture-execute.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
 // STORY-034 — the handler STORY-124's registry held a slot open for.
 //
@@ -143,7 +144,7 @@ describe("STORY-034 · capture.execute moves a cell", () => {
   });
 
   function handler() {
-    const context = { pool: undefined, env: { VALKEY_CACHE_URL: "unused" } } as unknown as QueueHandlerContext;
+    const context = { pool: undefined, env: { VALKEY_CACHE_URL: testCacheRedisUrl(), QUEUE_REDIS_URL: testQueueRedisUrl() } } as unknown as QueueHandlerContext;
     // STORY-135 — the parse enqueue is stubbed and RECORDED. This suite is
     // about the capture handler, and the env above has no queue in it; what
     // matters here is that a captured cell hands its row on, which

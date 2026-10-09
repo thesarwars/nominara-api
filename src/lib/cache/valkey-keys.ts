@@ -187,3 +187,19 @@ export function hashIdempotencyKey(key: string): string {
 export function entitlementsKey(env: string, workspaceId: string, entitlementVersion: number): string {
   return tenantKey(env, workspaceId, "ent", String(entitlementVersion));
 }
+
+/**
+ * `{env}:global:refresh-grace:{session_id}` — the refresh-token reuse grace
+ * slot (STORY-170, security-and-tenancy.md §5 "Session model").
+ *
+ * `global`, not tenant-scoped, and deliberately so: `sessions` is a global
+ * table (session identity state, not tenant data — src/db/conventions.ts), a
+ * session has no workspace of its own (`ws` is only the ACTIVE one and changes
+ * on a switch), and the session id is what identifies the slot. The id is the
+ * only thing that can select it, and the value inside is sealed under a key
+ * derived from the predecessor token (src/lib/auth/refresh-token.ts), so
+ * guessing or reading a key yields nothing without that token.
+ */
+export function refreshGraceSlotKey(env: string, sessionId: string): string {
+  return globalKey(env, "refresh-grace", sessionId);
+}

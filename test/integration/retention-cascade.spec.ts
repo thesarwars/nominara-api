@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { Client } from "pg";
+import { Client, Pool } from "pg";
 import { z } from "zod";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RECHAINED_MARKER_ACTION } from "../../src/lib/crypto/audit-chain.js";
@@ -8,6 +8,13 @@ import { pseudonymiseWorkspaceId } from "../../src/lib/crypto/pseudonymise.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
+import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
+import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
+import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
+import { importEd25519PublicKeyFromDer, verifyAccessToken } from "../../src/lib/auth/access-token.js";
+import { applyFakeApiEnv } from "../support/fake-env.js";
+import { HARNESS_PUBLIC_KEY_DER } from "../support/api-harness.js";
 import {
   collectComplianceExport,
   executeWorkspaceHardDelete,
@@ -870,6 +877,60 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
 
     const live = await client.query("SELECT 1 FROM audit_log WHERE workspace_id = $1", [workspaceId]);
     expect(live.rowCount).toBe(0);
+  });
+
+  // STORY-170 review finding [minor] — migration 0029's `sessions
+  // .active_workspace_id uuid REFERENCES workspaces(id) ON DELETE SET NULL`
+  // is load-bearing for this exact function: with a plain `REFERENCES
+  // workspaces(id)` (no action), hard-deleting ANY workspace a session had
+  // ever switched into would raise a foreign-key violation on
+  // `DELETE FROM workspaces` and fail the whole retention purge — nothing in
+  // this file exercised that until now.
+  it("STORY-170 · executeWorkspaceHardDelete on a workspace a live session switched into: the delete succeeds, active_workspace_id is cleared (ON DELETE SET NULL), and the next SessionService.refresh mints ws:null", async () => {
+    const originalEnv = { ...process.env };
+    // SessionService.mintAccessAndCsrf calls loadEnv() for the Ed25519
+    // signing key and CSRF secret only — this file's own `client`/`pool`
+    // stay pointed at the real container regardless of what this sets.
+    applyFakeApiEnv();
+
+    const pool = new Pool({ connectionString: container.getConnectionUri() });
+    try {
+      const sessionService = new SessionService(pool, new MembershipService(new MembershipCacheService()), new InMemoryCacheAdapter());
+
+      const workspaceId = await createWorkspace();
+      const userId = await createUser();
+      await addOwner(workspaceId, userId);
+
+      const session = await sessionService.createSession(userId);
+      await client.query("UPDATE sessions SET active_workspace_id = $2 WHERE id = $1", [session.sid, workspaceId]);
+
+      const before = await client.query<{ active_workspace_id: string | null }>(
+        "SELECT active_workspace_id FROM sessions WHERE id = $1",
+        [session.sid],
+      );
+      expect(before.rows[0]!.active_workspace_id).toBe(workspaceId);
+
+      await executeWorkspaceHardDelete(client, workspaceId, {
+        exportComplianceRecords: async () => {},
+      });
+
+      const workspaceRow = await client.query("SELECT 1 FROM workspaces WHERE id = $1", [workspaceId]);
+      expect(workspaceRow.rowCount).toBe(0);
+
+      const after = await client.query<{ active_workspace_id: string | null }>(
+        "SELECT active_workspace_id FROM sessions WHERE id = $1",
+        [session.sid],
+      );
+      expect(after.rows[0]!.active_workspace_id).toBeNull();
+
+      const refreshed = await sessionService.refresh(session.refreshToken);
+      const publicKey = importEd25519PublicKeyFromDer(HARNESS_PUBLIC_KEY_DER);
+      const claims = await verifyAccessToken(refreshed.accessToken, () => publicKey);
+      expect(claims.ws).toBeNull();
+    } finally {
+      await pool.end();
+      process.env = originalEnv;
+    }
   });
 
   // collectComplianceExport, like the cross-tenant discovery functions

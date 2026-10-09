@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
-import { EngineRefusalError, healthProbeEngine, resolveEngine } from "../../../src/lib/engines/registry.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { captureReadyEngineKeys, EngineRefusalError, healthProbeEngine, resolveEngine } from "../../../src/lib/engines/registry.js";
 import type { EngineKey } from "../../../src/lib/engines/contract.js";
 import { BaseCaptureAdapter } from "../../../src/lib/engines/base-adapter.js";
 import { FIXTURE_ADAPTERS } from "../../../src/lib/engines/fixtures/index.js";
@@ -28,6 +28,31 @@ function readEngineKeysFromDdl(): string[] {
 }
 
 const RESERVED_KEYS: readonly EngineKey[] = ["grok", "copilot", "meta_ai", "deepseek"];
+
+describe("NEW-A-4 · gemini is the only capture-ready engine, and only with a key", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("no key: nothing is capture-ready and gemini resolves to the fixture adapter", () => {
+    vi.stubEnv("GEMINI_API_KEY", "");
+    expect(captureReadyEngineKeys()).toEqual([]);
+    expect(resolveEngine("gemini")).toBe(FIXTURE_ADAPTERS.gemini);
+  });
+
+  it("with a key: exactly gemini is capture-ready, bound to the real adapter; the other five stay fixtures", () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-key-not-a-secret");
+    expect(captureReadyEngineKeys()).toEqual(["gemini"]);
+    expect(resolveEngine("gemini")).not.toBe(FIXTURE_ADAPTERS.gemini);
+    expect(resolveEngine("gemini").constructor.name).toBe("GeminiApiAdapter");
+    for (const key of ["google_aio", "google_ai_mode", "perplexity", "chatgpt", "claude"] as const) {
+      expect(resolveEngine(key)).toBe(FIXTURE_ADAPTERS[key]);
+    }
+  });
+
+  it("the real adapter does not override capture()", () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-key-not-a-secret");
+    expect(Object.getPrototypeOf(resolveEngine("gemini")).capture).toBe(BaseCaptureAdapter.prototype.capture);
+  });
+});
 
 describe("STORY-027 · scenario 1 · the registry resolves each engine key or refuses it clearly", () => {
   const ddlKeys = readEngineKeysFromDdl();

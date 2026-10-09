@@ -28,8 +28,11 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 COPY tsconfig.json tsconfig.build.json ./
 COPY contracts ./contracts
 COPY src ./src
+COPY scripts/copy-build-assets.mjs ./scripts/copy-build-assets.mjs
 # rootDir is ".", so output lands at dist/src/** and dist/contracts/**.
-RUN pnpm exec tsc -p tsconfig.build.json
+# `pnpm build` = tsc + scripts/copy-build-assets.mjs, which also lays the three
+# non-TypeScript run-time assets into dist (fonts, migration SQL, OpenAPI doc).
+RUN pnpm build
 
 # ---- production dependencies only ------------------------------------------
 FROM base AS deps
@@ -45,20 +48,9 @@ COPY --from=deps  /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 
-# `tsc` emits .js and copies NOTHING else, but two non-TypeScript assets are
-# read from disk at run time, both at paths resolved relative to the compiled
-# file's own location. Neither is optional and neither fails at build time:
-#
-#   migrations/sql  migrate-runner.js does readdir(__dirname/migrations/sql).
-#                   Without it `migrate` exits 1 on ENOENT and the stack never
-#                   starts, which is exactly how this was found.
-#   openapi.generated.json
-#                   serve.js reads dist/contracts/openapi.generated.json to
-#                   serve the spec — deliberately the COMMITTED document
-#                   rather than a boot-time regeneration, so it has to travel
-#                   with the build.
-COPY --from=build /app/src/db/migrations/sql ./dist/src/db/migrations/sql
-COPY --from=build /app/contracts/openapi.generated.json ./dist/contracts/openapi.generated.json
+# dist already carries the non-TypeScript assets (migrations/sql, the OpenAPI
+# document, the report fonts): `pnpm build` copies them, see
+# scripts/copy-build-assets.mjs. Do not re-add per-asset COPY lines here.
 
 # Unprivileged, and it matters more than usual here: this process holds the
 # unwrapped DEK-wrapping key and the token-signing private key in memory.
