@@ -94,11 +94,15 @@ describe("STORY-027 · scenario 2 · a payload failing validation is classified 
     });
   });
 
-  it("recordCost is NOT called on a malformed response — validation happens before cost recording", async () => {
+  // SUPERSEDED by the E2E-B6 audit (finding 5): this used to assert recordCost is never called on a
+  // malformed response. A billed call is spend whether or not the answer is usable, so the readable
+  // costUsd IS metered; a payload with no readable cost still records nothing (see the audit block below).
+  it("a malformed response still rejects, and meters only the payload's own readable costUsd", async () => {
     const ctx = makeContext();
     const adapter = new FakeVendorAdapter({ ...VALID_PAYLOAD, format: "json" });
     await expect(adapter.capture(makeInput(), ctx)).rejects.toThrow();
-    expect(ctx.recordCost).not.toHaveBeenCalled();
+    expect(ctx.recordCost).toHaveBeenCalledTimes(1);
+    expect(ctx.recordCost).toHaveBeenCalledWith(VALID_PAYLOAD.costUsd);
   });
 
   it("positive control: a valid payload resolves — validation is the default path, no subclass opt-in needed", async () => {

@@ -142,6 +142,21 @@ export async function captureCell(
   // again, write a second capture and ledger row, and double-count the cell.
   // Any existing live row means the cell is settled; a retryable failure
   // throws and rolls back, so it never leaves a row to find here.
+  //
+  // CHECK-THEN-INSERT ALONE IS NOT ENOUGH, so the check is made under a lock.
+  // A redelivery that starts while the original is still in flight would find
+  // no row and pay for the cell twice. `answer_captures` is partitioned on
+  // `captured_at`, so no unique index on the cell can exist (every unique
+  // index must include the partition key, and `captured_at` differs between
+  // attempts); the database-enforced mutual exclusion is a transaction-scoped
+  // advisory lock on the cell's identity. The second delivery blocks here
+  // until the first commits (then finds its row and replays) or rolls back
+  // (then proceeds as the one real attempt). The lock is released at COMMIT
+  // or ROLLBACK, never leaked. A hash collision only serialises two unrelated
+  // cells; it can never let two attempts at one cell through.
+  await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    ["capture.cell", input.runId, input.promptId, input.engineKey, String(input.sampleIndex)].join("|"),
+  ]);
   const existing = await tx.query<{ status: string; error_code: string | null }>(
     `SELECT status, error_code FROM answer_captures
       WHERE run_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = $4
@@ -178,6 +193,19 @@ export async function captureCell(
 
   const controller = new AbortController();
   const costs = { usd: 0 };
+  // METERING ORDER, PINNED (E2E-B6 audit): the Valkey spend meter is charged the moment the vendor call
+  // RETURNS (or throws), before any database write and independent of the job's commit. The money is
+  // spent when the vendor answers; a rollback or a crash afterwards does not un-spend it, and the retry
+  // will pay again. So a rollback leaves the meter ahead of `usage_ledger`, which errs toward blocking
+  // sooner. Charging after the commit would instead lose the spend of every call whose commit never
+  // happens, which errs toward overspend. `usage_ledger` is written with the cell, so it commits or
+  // rolls back with it.
+  const meterSpend = async (): Promise<void> => {
+    if (costs.usd > 0) await recordSpend?.(input.engineKey, costs.usd).catch(() => undefined);
+  };
+  const ledgerCost = async (): Promise<void> => {
+    if (costs.usd > 0) await recordUsageCost(tx, input, costs.usd);
+  };
   let raw: RawCapture;
   try {
     raw = await adapter.capture(
@@ -191,11 +219,14 @@ export async function captureCell(
       captureContext(controller.signal, costs),
     );
   } catch (error) {
+    // A call the vendor billed is spend even when its answer is unusable or the call failed after billing.
+    await meterSpend();
     if (!(error instanceof CaptureFailureError)) throw error;
     const classification = classifyCaptureFailure(error.code);
     if (classification === "retryable") throw error;
     if (classification === "terminal") {
       await writeCell(tx, input, now, { status: "failed", errorCode: error.code });
+      await ledgerCost();
       return { kind: "failed", errorCode: error.code };
     }
     // `content_policy_refusal` — the engine answered, and the answer was a
@@ -216,14 +247,13 @@ export async function captureCell(
         flags: ["engine_refused_to_answer"],
       },
     });
+    await ledgerCost();
     return { kind: "captured", latencyMs: 0 };
   }
 
+  await meterSpend();
   await writeCell(tx, input, now, { status: "captured", adapter, raw });
-  if (costs.usd > 0) {
-    await recordUsageCost(tx, input, costs.usd);
-    await recordSpend?.(input.engineKey, costs.usd).catch(() => undefined);
-  }
+  await ledgerCost();
 
   // SEED L1 ONLY AFTER THE ROW IS WRITTEN, and only on a real answer.
   //

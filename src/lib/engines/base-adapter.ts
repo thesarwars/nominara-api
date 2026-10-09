@@ -34,6 +34,10 @@ export abstract class BaseCaptureAdapter implements CaptureAdapter {
         engine_key: this.engineKey,
         adapter_version: this.adapterVersion,
       });
+      // The vendor billed this call whether or not the payload is usable, and the spend meter is the
+      // control that stops runaway spend: meter the cost the payload itself reports, when it is readable.
+      const billed = (vendorPayload as { costUsd?: unknown } | null | undefined)?.costUsd;
+      if (typeof billed === "number" && Number.isFinite(billed) && billed >= 0) await ctx.recordCost(billed);
       const failure = new CaptureFailureError("malformed_response", this.engineKey);
       ctx.span.recordException(failure);
       throw failure;
