@@ -94,11 +94,15 @@ describe("STORY-027 · scenario 2 · a payload failing validation is classified 
     });
   });
 
-  it("recordCost is NOT called on a malformed response — validation happens before cost recording", async () => {
+  // SUPERSEDED by the E2E-B6 audit (finding 5): this used to assert recordCost is never called on a
+  // malformed response. A billed call is spend whether or not the answer is usable, so the readable
+  // costUsd IS metered; a payload with no readable cost still records nothing (see the audit block below).
+  it("a malformed response still rejects, and meters only the payload's own readable costUsd", async () => {
     const ctx = makeContext();
     const adapter = new FakeVendorAdapter({ ...VALID_PAYLOAD, format: "json" });
     await expect(adapter.capture(makeInput(), ctx)).rejects.toThrow();
-    expect(ctx.recordCost).not.toHaveBeenCalled();
+    expect(ctx.recordCost).toHaveBeenCalledTimes(1);
+    expect(ctx.recordCost).toHaveBeenCalledWith(VALID_PAYLOAD.costUsd);
   });
 
   it("positive control: a valid payload resolves — validation is the default path, no subclass opt-in needed", async () => {
@@ -129,5 +133,24 @@ describe("STORY-027 · scenario 2 · a payload failing validation is classified 
     const adapter = new FakeVendorAdapter(VALID_PAYLOAD);
     await adapter.capture(makeInput(), ctx);
     expect(ctx.span.recordException).not.toHaveBeenCalled();
+  });
+});
+
+describe("E2E-B6 audit · a billed payload failing base validation is still metered", () => {
+  it("records the payload's own readable costUsd before throwing malformed_response", async () => {
+    const ctx = makeContext();
+    const adapter = new FakeVendorAdapter({ ...VALID_PAYLOAD, truncated: "yes", costUsd: 0.02 });
+    await expect(adapter.capture(makeInput(), ctx)).rejects.toMatchObject({ code: "malformed_response" });
+    expect(ctx.recordCost).toHaveBeenCalledTimes(1);
+    expect(ctx.recordCost).toHaveBeenCalledWith(0.02);
+  });
+
+  it("records nothing when the payload carries no readable non-negative costUsd", async () => {
+    for (const costUsd of [undefined, "0.02", -1, Number.NaN]) {
+      const ctx = makeContext();
+      const adapter = new FakeVendorAdapter({ ...VALID_PAYLOAD, truncated: "yes", costUsd });
+      await expect(adapter.capture(makeInput(), ctx)).rejects.toMatchObject({ code: "malformed_response" });
+      expect(ctx.recordCost).not.toHaveBeenCalled();
+    }
   });
 });

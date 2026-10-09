@@ -230,6 +230,21 @@ describe("STORY-028 · scenario 9 · malformed vendor payload", () => {
     expect(recordCost).not.toHaveBeenCalled();
   });
 
+  it("E2E-B6 audit · a BILLED response that fails validation is still metered from its readable usage", async () => {
+    // The vendor charged for these tokens whether or not we can use the answer.
+    const billedButMalformed = { candidates: "unexpected", usageMetadata: { promptTokenCount: 1000, candidatesTokenCount: 2000 } };
+    const { ctx, recordCost } = makeCtx();
+    await expect(makeAdapter(fetchReturning(billedButMalformed)).capture(input, ctx)).rejects.toMatchObject({ code: "malformed_response" });
+    expect(recordCost).toHaveBeenCalledTimes(1);
+    expect(recordCost.mock.calls[0]![0]).toBeCloseTo(1000 * (0.3 / 1_000_000) + 2000 * (2.5 / 1_000_000), 9);
+  });
+
+  it("E2E-B6 audit · a malformed response with unreadable usage records no cost (nothing to attribute)", async () => {
+    const { ctx, recordCost } = makeCtx();
+    await expect(makeAdapter(fetchReturning({ candidates: "x", usageMetadata: { promptTokenCount: "many" } })).capture(input, ctx)).rejects.toMatchObject({ code: "malformed_response" });
+    expect(recordCost).not.toHaveBeenCalled();
+  });
+
   it("a non-JSON 200 body is also malformed_response", async () => {
     const html = vi.fn<typeof fetch>(async () => new Response("<html>gateway</html>", { status: 200 }));
     const { ctx, recordCost } = makeCtx();

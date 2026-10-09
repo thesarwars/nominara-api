@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { BaseCaptureAdapter } from "../base-adapter.js";
 import type { CaptureContext, CaptureFlag, CaptureInput, CaptureMode, EngineKey } from "../contract.js";
@@ -6,7 +7,7 @@ import { geminiErrorResponseSchema, geminiGenerateContentResponseSchema } from "
 
 // NEW-A-4 (STORY-028, Gemini slice) — native fetch, no SDK, single turn, google_search always
 // set, hard per-capture timeout, modelVersion -> modelFingerprint. Cost is recorded by
-// BaseCaptureAdapter.capture() through ctx.recordCost(costUsd), exactly once, after validation.
+// BaseCaptureAdapter.capture() through ctx.recordCost(costUsd), exactly once, after validation. A response that fails validation but is readably billed is metered too (E2E-B6 audit).
 // Citation URLs are the vendor's grounding redirects, passed through UNRESOLVED: resolving them is
 // the parse stage's job (one network call per capture, here).
 
@@ -48,6 +49,36 @@ function modelUrl(model: string, suffix: string): string {
 const USD_PER_INPUT_TOKEN = 0.3 / 1_000_000;
 const USD_PER_OUTPUT_TOKEN = 2.5 / 1_000_000;
 const USD_PER_GROUNDED_PROMPT = 35 / 1_000;
+
+function costOf(inputTokens: number, outputTokens: number, grounded: boolean): number {
+  return inputTokens * USD_PER_INPUT_TOKEN + outputTokens * USD_PER_OUTPUT_TOKEN + (grounded ? USD_PER_GROUNDED_PROMPT : 0);
+}
+
+/**
+ * What a response we cannot use still cost. A body that fails the response schema may carry a perfectly
+ * readable `usageMetadata`, and the vendor bills the tokens either way. Only a non-negative integer token
+ * count is trusted; anything else yields null (nothing to attribute), never a guess.
+ */
+function billedCostOfUnusableBody(body: unknown): number | null {
+  const usage = z
+    .looseObject({
+      usageMetadata: z.looseObject({
+        promptTokenCount: z.number().int().min(0).optional(),
+        candidatesTokenCount: z.number().int().min(0).optional(),
+        thoughtsTokenCount: z.number().int().min(0).optional(),
+      }),
+      candidates: z.unknown().optional(),
+    })
+    .safeParse(body);
+  if (!usage.success) return null;
+  const u = usage.data.usageMetadata;
+  if (u.promptTokenCount === undefined && u.candidatesTokenCount === undefined && u.thoughtsTokenCount === undefined) return null;
+  const grounded = z
+    .array(z.looseObject({ groundingMetadata: z.looseObject({ webSearchQueries: z.array(z.string()).min(1) }) }))
+    .min(1)
+    .safeParse(usage.data.candidates).success;
+  return costOf(u.promptTokenCount ?? 0, (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0), grounded);
+}
 
 const REFUSAL_FINISH_REASONS: ReadonlySet<string> = new Set(["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION"]);
 
@@ -150,6 +181,8 @@ export class GeminiApiAdapter extends BaseCaptureAdapter {
         engine_key: this.engineKey,
         adapter_version: this.adapterVersion,
       });
+      const billed = billedCostOfUnusableBody(body);
+      if (billed !== null) await ctx.recordCost(billed);
       const malformed = failure("malformed_response");
       ctx.span.recordException(malformed);
       throw malformed;
@@ -184,7 +217,7 @@ export class GeminiApiAdapter extends BaseCaptureAdapter {
     const inputTokens = usage?.promptTokenCount ?? 0;
     const outputTokens = (usage?.candidatesTokenCount ?? 0) + (usage?.thoughtsTokenCount ?? 0);
     const grounded = (candidate?.groundingMetadata?.webSearchQueries?.length ?? 0) > 0 || chunks.length > 0;
-    const costUsd = inputTokens * USD_PER_INPUT_TOKEN + outputTokens * USD_PER_OUTPUT_TOKEN + (grounded ? USD_PER_GROUNDED_PROMPT : 0);
+    const costUsd = costOf(inputTokens, outputTokens, grounded);
 
     ctx.span.setAttribute("engine.key", this.engineKey);
     ctx.span.setAttribute("engine.latency_ms", latencyMs);

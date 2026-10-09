@@ -72,6 +72,21 @@ export interface ParseJobPayload {
   readonly capturedAt: string;
 }
 
+/**
+ * The platform spend meter, on the QUEUE instance (QUEUE_REDIS_URL: noeviction, AOF on) and NEVER the
+ * cache instance (allkeys-lru, no persistence): an absent total reads as 0 spent, so an LRU eviction or a
+ * cache restart would reopen a closed gate. usage_ledger cannot reseed it (D12: it is RLS-forced and
+ * workspace-scoped). Ceilings are the configured JSON over the defaults.
+ */
+export function buildSpendMeter(
+  env: { readonly QUEUE_REDIS_URL: string; readonly ENGINE_SPEND_CEILINGS_USD?: string | undefined },
+  onError: (message: string) => void = () => undefined,
+): SpendMeter {
+  const redis = new Redis(env.QUEUE_REDIS_URL, { maxRetriesPerRequest: 1 });
+  redis.on("error", (error) => onError(`spend meter connection error: ${error.message}`));
+  return new SpendMeter(new ValkeySpendMeterStore(redis), resolveEngineSpendCeilings(env.ENGINE_SPEND_CEILINGS_USD));
+}
+
 export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?: CaptureExecuteDeps): JobProcessor {
   const logger = new Logger("capture.execute");
 
@@ -89,23 +104,24 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     return { cache, realtime };
   };
 
-  // E2E-B6 — the platform spend meter (EC-08), built on first use like the
-  // cache. Its own Valkey connection; ceilings are the configured JSON over the
-  // defaults (gemini has one). RECORDING fails open inside the meter (the money
-  // is already spent); the PRE-CALL gate below fails closed.
+  // E2E-B6 — the platform spend meter (EC-08), built on first use. RECORDING fails open inside the
+  // meter (the money is already spent); the PRE-CALL gate below fails closed on an unreadable or corrupt
+  // total (an absent total is zero spent, which is why the meter must live where a key cannot vanish).
   let spendMeter: SpendMeter | undefined = deps?.spendMeter;
-  const meter = (): SpendMeter => {
-    if (spendMeter === undefined) {
-      const redis = new Redis(context.env.VALKEY_CACHE_URL, { maxRetriesPerRequest: 1 });
-      redis.on("error", (error) => logger.warn(`spend meter connection error: ${error.message}`));
-      spendMeter = new SpendMeter(new ValkeySpendMeterStore(redis), resolveEngineSpendCeilings(context.env.ENGINE_SPEND_CEILINGS_USD));
-    }
-    return spendMeter;
-  };
+  const meter = (): SpendMeter => (spendMeter ??= buildSpendMeter(context.env, (message) => logger.warn(message)));
   const ceilingReached = async (engineKey: string): Promise<boolean> => {
     const key = engineKeySchema.safeParse(engineKey);
     if (!key.success) return false;
-    const reached = await meter().isCeilingReached(key.data);
+    let reached: boolean;
+    try {
+      reached = await meter().isCeilingReached(key.data);
+    } catch (error) {
+      // FAIL CLOSED: the meter cannot say how much was spent (Valkey down, or a corrupt total), so the
+      // vendor is not called. Rethrown into the retry ladder; the job is retried when the meter reads again.
+      incrementCounter("nominara_capture_spend_gate_unreadable_total", { engine_key: key.data });
+      logger.error(`engine spend gate unreadable for ${key.data}; vendor call blocked (failing closed): ${error instanceof Error ? error.message : "unknown error"}`);
+      throw error;
+    }
     if (reached) {
       incrementCounter("nominara_capture_spend_ceiling_blocked_total", { engine_key: key.data });
       logger.error(`engine spend ceiling reached for ${key.data}; cell blocked before the vendor call`);

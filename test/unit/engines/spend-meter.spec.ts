@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { SpendMeter, warnMissingSpendCeilings, type SpendAlertLevel, type SpendMeterStore } from "../../../src/lib/engines/spend-meter.js";
+import type { Redis } from "ioredis";
+import { SpendMeter, ValkeySpendMeterStore, warnMissingSpendCeilings, type SpendAlertLevel, type SpendMeterStore } from "../../../src/lib/engines/spend-meter.js";
 
 // STORY-031 Phase H / D12 — THE security-relevant decision in this story:
 // per-engine spend is metered via Valkey counters fed by a `recordCost`
@@ -179,5 +180,45 @@ describe("E2E-B6e · SpendMeter.isCeilingReached — the pre-call gate", () => {
     broken.readTotal = async () => { throw new Error("down"); };
     await expect(new SpendMeter(broken, { gemini: 10 }, clock).isCeilingReached("gemini")).rejects.toThrow();
     expect(await new SpendMeter(broken, {}, clock).isCeilingReached("gemini")).toBe(false);
+  });
+});
+
+describe("E2E-B6 audit · the spend gate distinguishes an ABSENT total from an UNREADABLE one", () => {
+  const clock = () => Date.UTC(2026, 0, 15);
+  const storeOver = (get: () => Promise<string | null>): ValkeySpendMeterStore =>
+    new ValkeySpendMeterStore({ get } as unknown as Redis);
+
+  it("an absent key is legitimately zero spent (start of a period), so the gate is open", async () => {
+    const meter = new SpendMeter(storeOver(async () => null), { gemini: 10 }, clock);
+    expect(await meter.isCeilingReached("gemini")).toBe(false);
+  });
+
+  it.each(["not-a-number", "NaN", "Infinity", "-5", ""])("a CORRUPT stored total %j fails closed: the read throws", async (raw) => {
+    const meter = new SpendMeter(storeOver(async () => raw), { gemini: 10 }, clock);
+    await expect(meter.isCeilingReached("gemini")).rejects.toThrow();
+  });
+
+  it("an unreachable Valkey fails closed: the read throws", async () => {
+    const meter = new SpendMeter(storeOver(async () => { throw new Error("ECONNREFUSED"); }), { gemini: 10 }, clock);
+    await expect(meter.isCeilingReached("gemini")).rejects.toThrow();
+  });
+
+  it("a store that hands back a non-finite number (any implementation) also fails closed", async () => {
+    const store = new InMemorySpendMeterStore();
+    store.readTotal = async () => Number.NaN;
+    await expect(new SpendMeter(store, { gemini: 10 }, clock).isCeilingReached("gemini")).rejects.toThrow();
+  });
+});
+
+describe("E2E-B6 audit · a zero, negative or non-finite ceiling fails CLOSED", () => {
+  const clock = () => Date.UTC(2026, 0, 15);
+  it.each([0, -1, Number.NaN])("ceiling %s blocks the vendor call", async (ceiling) => {
+    const meter = new SpendMeter(new InMemorySpendMeterStore(), { gemini: ceiling }, clock);
+    expect(await meter.isCeilingReached("gemini")).toBe(true);
+  });
+
+  it("recordCost reports hardStopped for the same degenerate ceilings, so the two paths agree", async () => {
+    const meter = new SpendMeter(new InMemorySpendMeterStore(), { gemini: 0 }, clock);
+    expect((await meter.recordCost("gemini", 1)).hardStopped).toBe(true);
   });
 });
