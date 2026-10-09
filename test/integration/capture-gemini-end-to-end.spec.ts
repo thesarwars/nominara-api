@@ -1,4 +1,5 @@
 import type { Job } from "bullmq";
+import { Redis } from "ioredis";
 import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { growthMapResponseSchema, scorecardsResponseSchema } from "../../contracts/analytics/index.js";
@@ -8,6 +9,7 @@ import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapte
 import type { RealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { normalGrounded } from "../../src/lib/engines/gemini/fixtures/gemini-recorded.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { SpendMeter, type SpendMeterStore } from "../../src/lib/engines/spend-meter.js";
 import { createCaptureExecuteHandler, type ParseJobPayload } from "../../src/lib/queue/handlers/capture-execute.handler.js";
 import { createCaptureParseHandler } from "../../src/lib/queue/handlers/capture-parse.handler.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
@@ -185,7 +187,10 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
   }
 
   /** A deep scan: one run, one cell per prompt, driven to quiescence with no cron and no direct rollUpDay. */
-  async function deepScan(s: Scenario): Promise<{ runId: string; ran: string[]; rollupSources: string[] }> {
+  async function deepScan(
+    s: Scenario,
+    opts: { executions?: number; spendMeter?: SpendMeter } = {},
+  ): Promise<{ runId: string; ran: string[]; rollupSources: string[] }> {
     const runId = uuidV7();
     await harness.db().query(
       `INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys, planned_cells)
@@ -193,11 +198,17 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
       [runId, s.workspaceId, s.projectId, s.promptIds.length],
     );
     const queue: Queued[] = [];
-    const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
+    // VALKEY_CACHE_URL is what the production handler builds its spend meter on (E2E-B6).
+    const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
+    const parseSeen = new Set<string>();
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
       realtime: publisher,
+      ...(opts.spendMeter !== undefined ? { spendMeter: opts.spendMeter } : {}),
+      // The real queue dedupes on idempotencyKey `parse:<resultId>`; so does this one.
       enqueueParse: async (p: ParseJobPayload) => {
+        if (parseSeen.has(p.resultId)) return;
+        parseSeen.add(p.resultId);
         queue.push({ kind: "parse", source: "execute", workspaceId: p.workspaceId, payload: { ...p } });
       },
       enqueueRollup: async (_q, workspaceId, payload) => {
@@ -215,6 +226,8 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     const ran: string[] = [];
     const rollupSources: string[] = [];
     for (const [sampleIndex, promptId] of s.promptIds.entries()) {
+     // A redelivered job (stalled-job path) runs the SAME payload again.
+     for (let attempt = 0; attempt < (opts.executions ?? 1); attempt++) {
       await inTenant(s.workspaceId, (tx) =>
         execute(
           tx,
@@ -234,6 +247,7 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
         ),
       );
       ran.push("execute");
+     }
     }
     // The queue, drained in order. A job enqueued by another job is appended and runs after it.
     for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
@@ -325,7 +339,7 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
       [runId, s.workspaceId, s.projectId],
     );
     // Cells captured but never parsed (the parse queue is not drained): there are no facts, so no rollup can exist.
-    const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
+    const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
     const rollupRequests: Array<{ workspaceId: string; payload: Record<string, unknown> }> = [];
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
@@ -355,5 +369,123 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     expect(brand.points.every((p) => p.cells === 0 && p.visibility_score === null)).toBe(true);
     const rows = await harness.db().query("SELECT 1 FROM metric_daily WHERE project_id = $1", [s.projectId]);
     expect(rows.rowCount).toBe(0);
+  }, 120_000);
+
+  it("E2E-B6a · a live Gemini capture advances capture_runs.captured_cells, one per live cell, and only live ones", async () => {
+    const s = await scenario(2);
+    const { runId } = await deepScan(s);
+    const run = await harness.db().query<{ captured_cells: number; planned_cells: number }>(
+      "SELECT captured_cells, planned_cells FROM capture_runs WHERE id = $1",
+      [runId],
+    );
+    expect(run.rows[0]!.captured_cells).toBe(2);
+    expect(run.rows[0]!.captured_cells).toBeLessThanOrEqual(run.rows[0]!.planned_cells);
+  }, 120_000);
+
+  it("E2E-B6b · a live Gemini capture writes one usage_ledger row per cell with the adapter's cost", async () => {
+    const s = await scenario(2);
+    const { runId } = await deepScan(s);
+    const rows = await harness.db().query<{
+      metric: string; quantity: number; unit_cost_usd: string; engine_key: string; source: string;
+      credits_charged: number; cache_layer: string; reference_type: string; reference_id: string; project_id: string;
+    }>("SELECT * FROM usage_ledger WHERE workspace_id = $1", [s.workspaceId]);
+    expect(rows.rows).toHaveLength(2);
+    for (const row of rows.rows) {
+      expect(row).toMatchObject({
+        metric: "capture", quantity: 1, engine_key: "gemini", source: "manual_run", credits_charged: 0,
+        cache_layer: "live", reference_type: "capture_run", reference_id: runId, project_id: s.projectId,
+      });
+      expect(Number(row.unit_cost_usd), "a real capture has a cost; null/0 would hide it").toBeGreaterThan(0);
+    }
+  }, 120_000);
+
+  it("E2E-B6c · the Valkey spend meter total for gemini equals the usage_ledger cost of the same captures", async () => {
+    const redis = new Redis(cacheValkey.url);
+    try {
+      const before = await redis.keys("engine-spend:total:gemini-*");
+      await redis.del(...before);
+      const s = await scenario(2);
+      await deepScan(s);
+      const keys = await redis.keys("engine-spend:total:gemini-*");
+      expect(keys, "the meter wrote a gemini total for the month").toHaveLength(1);
+      const metered = Number(await redis.get(keys[0]!));
+      const ledger = await harness.db().query<{ total: string }>(
+        "SELECT sum(unit_cost_usd * quantity)::text AS total FROM usage_ledger WHERE workspace_id = $1",
+        [s.workspaceId],
+      );
+      expect(metered).toBeGreaterThan(0);
+      expect(metered).toBeCloseTo(Number(ledger.rows[0]!.total), 5);
+    } finally {
+      await redis.quit();
+    }
+  }, 120_000);
+
+  const currentMonthTotalKey = (): string => {
+    const d = new Date();
+    return `engine-spend:total:gemini-${String(d.getUTCFullYear())}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  };
+
+  it("E2E-B6e · at the gemini ceiling no cell reaches the vendor: zero fetches, no usage cost, cells recorded blocked with a terminal code", async () => {
+    const redis = new Redis(cacheValkey.url);
+    try {
+      await redis.set(currentMonthTotalKey(), "1000"); // ceiling is 100
+      const s = await scenario(2);
+      const { runId } = await deepScan(s);
+      expect(geminiRequests, "the ceiling must stop the vendor call itself").toBe(0);
+      const cells = await harness.db().query<{ status: string; error_code: string | null }>(
+        "SELECT status, error_code FROM answer_captures WHERE run_id = $1",
+        [runId],
+      );
+      expect(cells.rows).toHaveLength(2);
+      for (const cell of cells.rows) expect(cell).toEqual({ status: "blocked", error_code: "engine_spend_ceiling_reached" });
+      const usage = await harness.db().query("SELECT 1 FROM usage_ledger WHERE workspace_id = $1", [s.workspaceId]);
+      expect(usage.rowCount).toBe(0);
+      const run = await harness.db().query<{ captured_cells: number }>("SELECT captured_cells FROM capture_runs WHERE id = $1", [runId]);
+      expect(run.rows[0]!.captured_cells).toBe(0);
+    } finally {
+      await redis.del(currentMonthTotalKey());
+      await redis.quit();
+    }
+  }, 120_000);
+
+  it("E2E-B6e · just under the ceiling still captures (boundary: total < ceiling)", async () => {
+    const redis = new Redis(cacheValkey.url);
+    try {
+      await redis.set(currentMonthTotalKey(), "99.99");
+      const s = await scenario(1);
+      await deepScan(s);
+      expect(geminiRequests).toBe(1);
+    } finally {
+      await redis.del(currentMonthTotalKey());
+      await redis.quit();
+    }
+  }, 120_000);
+
+  it("E2E-B6e · a meter read failure FAILS CLOSED for an engine with a ceiling: zero fetches, the job throws into the retry ladder", async () => {
+    const broken: SpendMeterStore = {
+      incrementAndRead: async () => { throw new Error("valkey down"); },
+      readTotal: async () => { throw new Error("valkey down"); },
+      readAlertsFired: async () => new Set(),
+      markAlertFired: async () => undefined,
+    };
+    const s = await scenario(1);
+    await expect(deepScan(s, { spendMeter: new SpendMeter(broken, { gemini: 100 }) })).rejects.toThrow();
+    expect(geminiRequests).toBe(0);
+  }, 120_000);
+
+  it("E2E-B6f · the same cell job delivered twice is idempotent: captured_cells == planned, one capture row and one usage_ledger row per cell, one vendor call per cell", async () => {
+    const s = await scenario(2);
+    const { runId } = await deepScan(s, { executions: 2 });
+    const run = await harness.db().query<{ captured_cells: number; planned_cells: number }>(
+      "SELECT captured_cells, planned_cells FROM capture_runs WHERE id = $1",
+      [runId],
+    );
+    expect(run.rows[0]!.captured_cells).toBe(run.rows[0]!.planned_cells);
+    expect(run.rows[0]!.captured_cells).toBe(2);
+    const usage = await harness.db().query("SELECT 1 FROM usage_ledger WHERE workspace_id = $1", [s.workspaceId]);
+    expect(usage.rowCount).toBe(2);
+    const caps = await harness.db().query("SELECT 1 FROM answer_captures WHERE run_id = $1", [runId]);
+    expect(caps.rowCount).toBe(2);
+    expect(geminiRequests, "a redelivery must not pay for the cell again").toBe(2);
   }, 120_000);
 });

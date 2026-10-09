@@ -48,13 +48,12 @@ export interface CreditUsage {
   /**
    * What serving this action cost US, in USD.
    *
-   * ⚠ NOTHING SUPPLIES A NON-ZERO VALUE YET, and the reason is upstream:
-   * `execute-cell.ts`'s `recordCost` is a no-op and every fixture adapter
-   * reports `costUsd: 0`, because the real engine adapters are STORY-028 and
-   * STORY-029 and both are deferred. The column and the path exist now so
-   * that the story which lands a real adapter fills a field rather than
-   * inventing the accounting for it — "realised operating cost is measurable
-   * from data rather than modelled" is only true once something measures.
+   * ⚠ STILL NOTHING SUPPLIES A VALUE HERE, by construction: the commit is
+   * written at request time, before any cell is captured, and `credit_ledger`
+   * is append-only, so the cost cannot be added afterwards. Realised cost is
+   * measured in `usage_ledger` (one `capture` row per live cell, written by
+   * `execute-cell.ts`, E2E-B6) and the Valkey spend meter; join it to the
+   * run through `reference_id`.
    */
   readonly internalCostUsd?: string;
 }

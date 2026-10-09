@@ -5,7 +5,7 @@ import { NestFactory } from "@nestjs/core";
 import type { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 import type { ClientBase, PoolClient } from "pg";
-import { engineSpendCeilingsSchema } from "./config/env.schema.js";
+import { resolveEngineSpendCeilings } from "./config/env.schema.js";
 import { loadEnv } from "./config/env.js";
 import { connect, withKeepalives } from "./db/client.js";
 import { createPgPool, isConnectionClassFailure } from "./db/pg-pool.js";
@@ -294,13 +294,11 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   // capture-group concern only. Nothing else touches an engine at all.
   const providers: Array<{ provide: string; useValue: unknown }> = [{ provide: WORKER_GROUP_WORKERS, useValue: runtime }];
   if (env.WORKER_GROUP === "capture") {
-    // D13 — a boot-time disclosure, not a fabricated default: every active
-    // engine missing an ENGINE_SPEND_CEILINGS_USD entry logs exactly one
+    // D13 — a boot-time disclosure: every active
+    // engine (gemini aside, which has a documented default) missing an ENGINE_SPEND_CEILINGS_USD entry logs exactly one
     // warning here, matching where ENGINE_TOKEN_BUCKETS's config-shaped
     // sibling is already read from env for this same worker group.
-    const ceilingsUsd = env.ENGINE_SPEND_CEILINGS_USD
-      ? engineSpendCeilingsSchema.parse(JSON.parse(env.ENGINE_SPEND_CEILINGS_USD))
-      : {};
+    const ceilingsUsd = resolveEngineSpendCeilings(env.ENGINE_SPEND_CEILINGS_USD);
     warnMissingSpendCeilings(ceilingsUsd, ACTIVE_ENGINE_KEYS);
 
     // lazyConnect: a fake/unreachable VALKEY_CACHE_URL (e.g. in a unit test)
