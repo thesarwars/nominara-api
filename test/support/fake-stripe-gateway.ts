@@ -150,8 +150,40 @@ export class FakeStripeGateway implements StripeGateway {
     return this.savedMethods.get(referencePaymentIntentId) ?? null;
   }
 
+  /**
+   * EVERY off-session request the service MADE, recorded before any failure is raised: a charge that timed
+   * out is still an attempt, and its parameters are what a replay under the same key must repeat.
+   */
+  readonly offSessionAttempts: OffSessionPaymentInput[] = [];
+  /**
+   * Models the hazard of a lost reply: Stripe RECEIVED and recorded the request (so its idempotency key is held),
+   * and the answer never came back. Unlike `failChargeWith`, where the request never reached Stripe.
+   */
+  failChargeAfterReaching: Error | undefined;
+  /** The first request Stripe saw per idempotency key (`auto-topup-<purchaseId>`), canonicalised. */
+  private readonly offSessionByKey = new Map<string, string>();
+
+  /** Back to a clean off-session slate (the instance is shared by a whole spec file). */
+  resetOffSession(): void {
+    this.offSessionCharges.length = 0;
+    this.offSessionAttempts.length = 0;
+    this.offSessionByKey.clear();
+    this.offSessionOutcome = "submitted";
+    this.failChargeWith = undefined;
+    this.failChargeAfterReaching = undefined;
+  }
+
   createOffSessionPayment(input: OffSessionPaymentInput): Promise<OffSessionPaymentResult> {
+    this.offSessionAttempts.push(input);
     if (this.failChargeWith !== undefined) return Promise.reject(this.failChargeWith);
+    // Like Stripe: the same key with DIFFERENT parameters is refused (idempotency_error, HTTP 400); the same
+    // key with the same parameters is answered from the first request.
+    const key = `auto-topup-${input.purchaseId}`;
+    const body = JSON.stringify(Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b))));
+    const first = this.offSessionByKey.get(key);
+    if (first !== undefined && first !== body) return Promise.reject(new StripeUpstreamError(400));
+    this.offSessionByKey.set(key, body);
+    if (this.failChargeAfterReaching !== undefined) return Promise.reject(this.failChargeAfterReaching);
     this.offSessionCharges.push(input);
     if (this.offSessionOutcome === "declined") return Promise.resolve({ outcome: "declined" });
     return Promise.resolve({ outcome: "submitted", paymentIntentId: `pi_auto_${input.purchaseId.slice(0, 8)}` });
@@ -249,6 +281,7 @@ export class FakeStripeGateway implements StripeGateway {
     this.failAddonWith = undefined;
     this.failAfterApplyingAddon = undefined;
     this.appliedAddonKeys.clear();
+    this.resetOffSession();
     this.onSessionCreated = undefined;
   }
 
