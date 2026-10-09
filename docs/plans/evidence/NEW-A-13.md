@@ -99,3 +99,29 @@ Mutations on src/worker.ts (each reverted): delete `sweepRuntime.start();` -> CP
 | pnpm test:unit | 0 | 303 files passed, 1 skipped; 3710 tests passed, 1 skipped |
 | vitest integration: capture-scheduler-sweep, worker-scheduler-sweep-wiring, worker-canary-wiring, worker-group-bootstrap, capture-scheduler, capture-plan-handler | 0 | 6 files, 76 tests |
 | pnpm test:isolation | not run | no tenant table or RLS file touched |
+
+## Checkpoint-4 fix pass (second-engineer review, branch 7day/a-gemini-5, base 74e4b2f)
+
+Finding 1 (method/gates) is context only: the reviewer's mutants A, A3, B, C, D, E, F are all caught by the existing specs; no action.
+
+| Finding | Criterion -> test | RED sha | Fix sha |
+|---|---|---|---|
+| 5 `manual` cadence claimable, never advanced | capture-scheduler-sweep.spec.ts :: "NEW-A-13 AC2 · checkpoint-4 · a manual-cadence project with a past next_run_at is neither claimed by the sweep nor by the handler's claim"; capture-plan-handler.spec.ts :: "NEW-A-10 · checkpoint-4 · a manual-cadence project ... is not planned" | f183a18 (2 failed) | d53366b (`AND p.cadence <> 'manual'` in DUE_PROJECTS_WHERE and claimDueProject) |
+| 4 crash between COMMIT and dispatch leaves a run `queued` with fair-use reserved | test/integration/capture-stale-run-reaper.spec.ts :: CP4-4a (failed + stale_queued + release of planned-skipped), 4b (fresh / just-inside-bound / running / manual untouched), 4c (idempotent), 4d (two tenants, own counters), 4e (never below zero), 4f (SchedulerSweepRuntime.tick reaps), 4g (metric nominara_capture_stale_runs_reaped_total + log line with workspace_id and run_id, no workspace name) | 403c7e5 (6 failed, 1 vacuous pass on the stub) | 84ba61e |
+| 2, 3 | see NEW-A-10.md | | |
+
+Finding 4 design: src/lib/capture/stale-run-reaper.ts, called by the sweep runtime after the claim transaction commits (best-effort, never fails the tick). It fails a `scheduled` run still `queued` after STALE_QUEUED_RUN_BOUND_MS = 6 h, and releases planned_cells - skipped_cells (the figure planRun reserved) inside withTenantContext per run. The bound is mine: the longest cell jitter is 1 h (CADENCE_JITTER_MAX_MS), so 6 h is well past a healthy first delivery; the owner may change it. Manual runs are deliberately excluded (they debit credits; a refund path is not decided). The billing period is resolved at reap time; a run lost across a period roll releases against the wrong row, floored at zero (accepted edge). No schema change. No span (R3).
+Mutations on the reaper (each reverted): dropping the `trigger = 'scheduled'` predicate fails 4b; removing the release fails 4a, 4c, 4d, 4e, 4f.
+
+### Finding 6 — NOT FIXED here: the pipeline is inert in production (needs an owning story / decision)
+Nothing in src sets projects.next_run_at (projects.service inserts NULL and status 'initializing'; no path moves a project to 'active' or seeds next_run_at), so the sweep ticks with claimed=0 and reports `complete`. NEW-A-13 AC4 is proven only by setting next_run_at in SQL. Until a story seeds next_run_at on activation/confirmation, scheduled capture does not start for any real project; this is stated here as the inert state of NEW-A-13 and must be repeated in NEW-A-17 evidence. DECISION NEEDED from the owner: which event activates a project and seeds next_run_at (e.g. onboarding confirmation, first prompt set approved), and with what first-run offset. Touching projects.service is outside this item's files and the activation semantics are unspecified, so no code was written.
+
+### Gates (tree 84ba61e)
+| Command | Exit | Result |
+|---|---|---|
+| pnpm lint | 0 | |
+| pnpm typecheck | 0 | |
+| pnpm test:unit | 0 | 306 files passed, 1 skipped; 3755 tests passed, 1 skipped |
+| vitest integration: capture-scheduler-sweep, worker-scheduler-sweep-wiring, capture-plan-handler, capture-scheduler, capture-stale-run-reaper, capture-execute-handler, capture-execute-rollup, worker-group-bootstrap | 0 | 8 files, 92 tests |
+| pnpm test:isolation | 0 | 13 files, 53 tests |
+| pnpm test:isolation:breakers | 0 | 24 of 24 |

@@ -106,14 +106,22 @@ describe("NEW-A-13 · the scheduler sweep claims due projects and enqueues signe
 
   async function addProject(
     workspaceId: string,
-    options: { dueMinutesAgo?: number | null; status?: string; deleted?: boolean } = {},
+    options: { dueMinutesAgo?: number | null; status?: string; deleted?: boolean; cadence?: string } = {},
   ): Promise<string> {
     const id = randomUUID();
     const due = options.dueMinutesAgo === null ? null : new Date(Date.now() - (options.dueMinutesAgo ?? 10) * 60_000);
     await db.query(
-      `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, status, deleted_at, next_run_at)
-       VALUES ($1,$2,'P',$3,'https://e.test','e.test',$4,$5,$6)`,
-      [id, workspaceId, `p-${randomUUID().slice(0, 8)}`, options.status ?? "active", options.deleted ? new Date() : null, due],
+      `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, status, deleted_at, next_run_at, cadence)
+       VALUES ($1,$2,'P',$3,'https://e.test','e.test',$4,$5,$6,$7)`,
+      [
+        id,
+        workspaceId,
+        `p-${randomUUID().slice(0, 8)}`,
+        options.status ?? "active",
+        options.deleted ? new Date() : null,
+        due,
+        options.cadence ?? "daily",
+      ],
     );
     return id;
   }
@@ -178,6 +186,21 @@ describe("NEW-A-13 · the scheduler sweep claims due projects and enqueues signe
       await sweepB.query("ROLLBACK");
       expect(one !== null, `claimDueProject agrees with the sweep for ${id}`).toBe(id === due || id === dueTrial);
     }
+  }, 60_000);
+
+  it("NEW-A-13 AC2 · checkpoint-4 · a manual-cadence project with a past next_run_at is neither claimed by the sweep nor by the handler's claim", async () => {
+    const ws = await addWorkspace();
+    const manual = await addProject(ws, { cadence: "manual", dueMinutesAgo: 10 });
+    const now = new Date();
+    const { jobs, enqueue } = collector();
+    const result = await runSchedulerSweep(sweepA, enqueue, now);
+
+    expect(jobs.map((job) => job.projectId)).not.toContain(manual);
+    expect(result.claimed).toBe(0);
+    await sweepB.query("BEGIN");
+    const one = await claimDueProject(sweepB, manual, now);
+    await sweepB.query("ROLLBACK");
+    expect(one).toBeNull();
   }, 60_000);
 
   it("NEW-A-13 AC2 · an empty tick enqueues nothing and is complete, not an error", async () => {

@@ -10,6 +10,7 @@ import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapte
 import { FAIR_USE_METRIC } from "../../src/lib/capture/fair-use.js";
 import type { ScheduledRun } from "../../src/lib/capture/scheduler.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
+import { createCaptureExecuteHandler } from "../../src/lib/queue/handlers/capture-execute.handler.js";
 import { createCapturePlanHandler } from "../../src/lib/queue/handlers/capture-plan.handler.js";
 import { QUEUE_HANDLERS, type QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
@@ -310,6 +311,89 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
       [wsA, FAIR_USE_METRIC],
     );
     expect(counter.rows[0]!.reserved_value).toBe("0");
+  });
+
+  it("NEW-A-10 · checkpoint-4 · a manual-cadence project with a past next_run_at is not planned: no run, no fair-use reservation", async () => {
+    await db.query("UPDATE projects SET cadence = 'manual' WHERE id = $1", [projA]);
+    for (let i = 0; i < 3; i += 1) await processor()(signedJob(wsA, projA));
+    await settle();
+
+    expect(await runsFor(projA)).toEqual([]);
+    expect(dispatched).toHaveLength(0);
+    const counter = await db.query("SELECT 1 FROM usage_counters WHERE workspace_id = $1 AND metric = $2 AND reserved_value > 0", [
+      wsA,
+      FAIR_USE_METRIC,
+    ]);
+    expect(counter.rowCount).toBe(0);
+  });
+
+  const failingDispatchProcessor = (dispatch: (scheduled: ScheduledRun) => Promise<unknown>) => {
+    const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
+    const handler = createCapturePlanHandler(context, {
+      cache: new InMemoryCacheAdapter(),
+      dispatch,
+      withClient: (fn) => fn(appDb),
+    });
+    return createJobProcessor(ENTRY, { keys: TEST_SIGNING_KEYS, getClient: () => appDb, process: handler });
+  };
+
+  const reservedValue = async (workspaceId: string): Promise<string> =>
+    (await db.query<{ reserved_value: string }>(
+      "SELECT reserved_value::text FROM usage_counters WHERE workspace_id = $1 AND metric = $2",
+      [workspaceId, FAIR_USE_METRIC],
+    )).rows[0]!.reserved_value;
+
+  it("NEW-A-10 · checkpoint-4 · a dispatch that rejects after a cell has started leaves the run and its fair-use reservation alone", async () => {
+    // The compensation's `status = 'queued'` guard is the only thing standing
+    // between a partly-delivered run and a released reservation for cells that ran.
+    let live = 0;
+    const proc = failingDispatchProcessor(async (scheduled) => {
+      live = scheduled.plan.live;
+      await db.query("UPDATE capture_runs SET status = 'running', started_at = now() WHERE id = $1", [scheduled.runId]);
+      throw new Error("reply lost after the first cell started");
+    });
+    await expect(proc(signedJob(wsA, projA))).resolves.not.toThrow();
+    await settle();
+
+    expect(live).toBeGreaterThan(0);
+    expect((await runsFor(projA))[0]!.status).toBe("running");
+    expect(await reservedValue(wsA)).toBe(String(live));
+  });
+
+  it("NEW-A-10 · checkpoint-4 · cells that WERE enqueued before an ambiguous dispatch failure do not call the vendor or write a capture against the failed run", async () => {
+    const delivered: ScheduledRun[] = [];
+    const proc = failingDispatchProcessor(async (scheduled) => {
+      delivered.push(scheduled); // the addBulk landed; only the reply was lost
+      throw new Error("connection reset after MULTI applied");
+    });
+    await proc(signedJob(wsA, projA));
+    await settle();
+    expect((await runsFor(projA))[0]!.status).toBe("failed");
+
+    // The delayed cells now come due.
+    const fetchSpy = vi.fn(() => Promise.reject(new Error("the vendor must not be called")));
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      const execute = createCaptureExecuteHandler(
+        { pool: undefined, env: {} } as unknown as QueueHandlerContext,
+        {
+          cache: new InMemoryCacheAdapter(),
+          realtime: { toWorkspace: () => undefined, memberChanged: () => undefined },
+          enqueueParse: () => Promise.resolve(),
+          enqueueRollup: () => Promise.resolve(),
+        },
+      );
+      for (const cell of delivered[0]!.plan.cells) {
+        const job = { data: { payload: { ...(cell.payload as object), kid: "test-kid" } } } as unknown as Job;
+        await execute(db, job).catch(() => undefined);
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(delivered[0]!.plan.cells.length).toBeGreaterThan(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect((await db.query("SELECT 1 FROM answer_captures WHERE run_id = $1", [delivered[0]!.runId])).rowCount).toBe(0);
+    expect((await runsFor(projA))[0]!.status).toBe("failed");
   });
 
   it("NEW-A-10 · observability: emits the outcome metric and a log line carrying the workspace id, not its name or any prompt text", async () => {

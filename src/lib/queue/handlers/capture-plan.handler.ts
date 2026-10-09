@@ -187,7 +187,9 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
     record("planned", project.workspaceId, project.projectId, runId);
     // AFTER COMMIT, and never inside the transaction: dispatch is not
     // transactional, and a job for a run that rolled back is not recoverable
-    // while a lost one is compensated for (the run is failed, the reservation released).
+    // while a REJECTED one is compensated for (the run is failed, the reservation
+    // released). A process that dies between COMMIT and dispatch is not a rejection:
+    // the stale-run reaper (stale-run-reaper.ts, run by the sweep) covers it.
     afterCommit(() => {
       void dispatch(scheduled).catch((error: unknown) => {
         // The run row EXISTS. Failing the job would retry into a project that

@@ -2,6 +2,7 @@ import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { claimDueProjectRefs } from "./scheduler.js";
+import { reapStaleQueuedRuns } from "./stale-run-reaper.js";
 
 // NEW-A-13 — the scheduler sweep: the producer `capture.plan` has always
 // declared and nothing ran. OWNER DECISION 2026-10-08, "Option A".
@@ -328,7 +329,13 @@ export class SchedulerSweepRuntime {
     state.client = client;
     try {
       if (state.abandoned) return null;
-      return await runSchedulerSweep(client, this.options.enqueue, this.clock(), this.limits);
+      const result = await runSchedulerSweep(client, this.options.enqueue, this.clock(), this.limits);
+      // Best-effort and AFTER the claim transaction has committed: reaping lost
+      // `queued` runs (checkpoint-4) must never hold up, or fail, the sweep.
+      await reapStaleQueuedRuns(client, this.clock()).catch((error: unknown) => {
+        logger.error({ event: "capture.scheduler.reap_failed", error: error instanceof Error ? error.name : "unknown" });
+      });
+      return result;
     } catch (error) {
       logger.error({ event: "capture.scheduler.sweep_failed", error: error instanceof Error ? error.name : "unknown" });
       return null;

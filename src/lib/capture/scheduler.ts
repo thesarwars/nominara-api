@@ -56,6 +56,7 @@ const DUE_PROJECTS_WHERE = `WHERE p.status = 'active'
        AND p.deleted_at IS NULL
        AND p.next_run_at IS NOT NULL
        AND p.next_run_at <= $1
+       AND p.cadence <> 'manual'
        AND w.status = ANY($2::text[])
        AND w.deleted_at IS NULL`;
 
@@ -198,6 +199,7 @@ export async function claimDueProject(tx: ClientBase, projectId: string, now: Da
        AND p.deleted_at IS NULL
        AND p.next_run_at IS NOT NULL
        AND p.next_run_at <= $2
+       AND p.cadence <> 'manual'
        AND w.status = ANY($3::text[])
        AND w.deleted_at IS NULL
        FOR UPDATE OF p

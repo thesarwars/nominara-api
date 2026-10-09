@@ -142,6 +142,15 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       logger.log(`run ${payload.runId} was cancelled; skipping cell`);
       return;
     }
+    // A `failed` run is terminal too, and cells can outlive it: capture.plan
+    // fails a run whose dispatch REJECTED, but a rejection is ambiguous (the
+    // addBulk may have landed with only the reply lost), and the fair-use
+    // reservation was released with it. A late cell would call the vendor and
+    // write a capture under a run that holds no reservation (checkpoint-4).
+    if (runRow.status === "failed") {
+      logger.log(`run ${payload.runId} has failed; skipping cell`);
+      return;
+    }
 
     // First cell to arrive moves the run to `running` and stamps the clock the
     // ETA is extrapolated from. The predicate makes it idempotent: whichever
