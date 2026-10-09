@@ -131,3 +131,22 @@ describe("STORY-027 · scenario 2 · a payload failing validation is classified 
     expect(ctx.span.recordException).not.toHaveBeenCalled();
   });
 });
+
+describe("E2E-B6 audit · a billed payload failing base validation is still metered", () => {
+  it("records the payload's own readable costUsd before throwing malformed_response", async () => {
+    const ctx = makeContext();
+    const adapter = new FakeVendorAdapter({ ...VALID_PAYLOAD, truncated: "yes", costUsd: 0.02 });
+    await expect(adapter.capture(makeInput(), ctx)).rejects.toMatchObject({ code: "malformed_response" });
+    expect(ctx.recordCost).toHaveBeenCalledTimes(1);
+    expect(ctx.recordCost).toHaveBeenCalledWith(0.02);
+  });
+
+  it("records nothing when the payload carries no readable non-negative costUsd", async () => {
+    for (const costUsd of [undefined, "0.02", -1, Number.NaN]) {
+      const ctx = makeContext();
+      const adapter = new FakeVendorAdapter({ ...VALID_PAYLOAD, truncated: "yes", costUsd });
+      await expect(adapter.capture(makeInput(), ctx)).rejects.toMatchObject({ code: "malformed_response" });
+      expect(ctx.recordCost).not.toHaveBeenCalled();
+    }
+  });
+});

@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
 import { Redis } from "ioredis";
 import { Pool } from "pg";
@@ -71,6 +72,8 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
   let pool: Pool;
   let sessions: SessionService;
   let geminiRequests: number;
+  let vendorDelayMs: number;
+  let vendorBody: unknown;
   const originalFetch = globalThis.fetch;
 
   beforeAll(async () => {
@@ -84,13 +87,16 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
   beforeEach(() => {
     process.env.GEMINI_API_KEY = FAKE_KEY;
     geminiRequests = 0;
+    vendorDelayMs = 0;
+    vendorBody = normalGrounded;
     guarded.calls = 0;
     vi.stubGlobal("fetch", async (input: unknown): Promise<Response> => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
       // Only the vendor generate call is answered (matched by its method, not its host: the STORY-027 scenario 8 scanner bans live engine hostnames in test/**).
       if (!url.includes(":generateContent")) throw new Error(`unexpected network call: ${url}`);
       geminiRequests += 1;
-      return new Response(JSON.stringify(normalGrounded), { status: 200, headers: { "content-type": "application/json" } });
+      if (vendorDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, vendorDelayMs));
+      return new Response(JSON.stringify(vendorBody), { status: 200, headers: { "content-type": "application/json" } });
     });
     pool = new Pool({ connectionString: process.env.DATABASE_URL });
     sessions = new SessionService(pool, new MembershipService(new MembershipCacheService()), new InMemoryCacheAdapter());
@@ -189,7 +195,16 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
   /** A deep scan: one run, one cell per prompt, driven to quiescence with no cron and no direct rollUpDay. */
   async function deepScan(
     s: Scenario,
-    opts: { executions?: number; spendMeter?: SpendMeter } = {},
+    opts: {
+      executions?: number;
+      spendMeter?: SpendMeter;
+      /** `capture_runs.status` at the start: `running` means an earlier cell already flipped it, so no row lock serialises the cells. */
+      runStatus?: "queued" | "running";
+      /** Deliver the `executions` copies of each cell AT THE SAME TIME, each in its own transaction. */
+      concurrent?: boolean;
+      /** Roll the job's transaction back after `capture.execute` returned (a crash between the vendor call and the commit). */
+      rollbackAfterExecute?: boolean;
+    } = {},
   ): Promise<{ runId: string; ran: string[]; rollupSources: string[] }> {
     const runId = uuidV7();
     await harness.db().query(
@@ -197,6 +212,9 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
        VALUES ($1,$2,$3,'manual',ARRAY['gemini'],$4)`,
       [runId, s.workspaceId, s.projectId, s.promptIds.length],
     );
+    if (opts.runStatus === "running") {
+      await harness.db().query("UPDATE capture_runs SET status = 'running', started_at = now() WHERE id = $1", [runId]);
+    }
     const queue: Queued[] = [];
     // VALKEY_CACHE_URL is what the production handler builds its spend meter on (E2E-B6).
     const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
@@ -226,28 +244,34 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     const ran: string[] = [];
     const rollupSources: string[] = [];
     for (const [sampleIndex, promptId] of s.promptIds.entries()) {
-     // A redelivered job (stalled-job path) runs the SAME payload again.
-     for (let attempt = 0; attempt < (opts.executions ?? 1); attempt++) {
-      await inTenant(s.workspaceId, (tx) =>
-        execute(
-          tx,
-          asJob({
-            workspaceId: s.workspaceId,
-            projectId: s.projectId,
-            runId,
-            promptId,
-            promptText: `best crm for a 50 person startup ${String(sampleIndex)}`,
-            engineKey: "gemini",
-            sampleIndex,
-            adapterVersion: "1.0.0",
-            ttlSeconds: 3600,
-            locale: "en-US",
-            personaHint: null,
-          }),
-        ),
-      );
-      ran.push("execute");
-     }
+      // A redelivered job (stalled-job path) runs the SAME payload again.
+      const deliver = (): Promise<void> =>
+        inTenant(s.workspaceId, async (tx) => {
+          await execute(
+            tx,
+            asJob({
+              workspaceId: s.workspaceId,
+              projectId: s.projectId,
+              runId,
+              promptId,
+              promptText: `best crm for a 50 person startup ${String(sampleIndex)}`,
+              engineKey: "gemini",
+              sampleIndex,
+              adapterVersion: "1.0.0",
+              ttlSeconds: 3600,
+              locale: "en-US",
+              personaHint: null,
+            }),
+          );
+          ran.push("execute");
+          if (opts.rollbackAfterExecute === true) throw new Error("crash before commit");
+        });
+      const copies = opts.executions ?? 1;
+      if (opts.concurrent === true) {
+        await Promise.all(Array.from({ length: copies }, deliver));
+      } else {
+        for (let attempt = 0; attempt < copies; attempt++) await deliver();
+      }
     }
     // The queue, drained in order. A job enqueued by another job is appended and runs after it.
     for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
@@ -487,5 +511,102 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     const caps = await harness.db().query("SELECT 1 FROM answer_captures WHERE run_id = $1", [runId]);
     expect(caps.rowCount).toBe(2);
     expect(geminiRequests, "a redelivery must not pay for the cell again").toBe(2);
+  }, 120_000);
+
+  const meterTotal = async (): Promise<number> => {
+    const redis = new Redis(cacheValkey.url);
+    try {
+      const raw = await redis.get(currentMonthTotalKey());
+      return raw === null ? 0 : Number(raw);
+    } finally {
+      await redis.quit();
+    }
+  };
+  const clearMeter = async (): Promise<void> => {
+    const redis = new Redis(cacheValkey.url);
+    try {
+      await redis.del(currentMonthTotalKey());
+    } finally {
+      await redis.quit();
+    }
+  };
+
+  it("E2E-B6f · audit 1 · the SAME cell delivered twice AT THE SAME TIME is counted once: one vendor call, one capture, one usage row, captured_cells == 1, meter charged once", async () => {
+    await clearMeter();
+    vendorDelayMs = 400; // keeps the original in flight while the redelivery starts
+    const s = await scenario(1);
+    const { runId } = await deepScan(s, { executions: 2, concurrent: true, runStatus: "running" });
+    const run = await harness.db().query<{ captured_cells: number }>("SELECT captured_cells FROM capture_runs WHERE id = $1", [runId]);
+    expect(run.rows[0]!.captured_cells).toBe(1);
+    expect((await harness.db().query("SELECT 1 FROM answer_captures WHERE run_id = $1", [runId])).rowCount).toBe(1);
+    const usage = await harness.db().query<{ unit_cost_usd: string }>("SELECT unit_cost_usd FROM usage_ledger WHERE workspace_id = $1", [s.workspaceId]);
+    expect(usage.rowCount).toBe(1);
+    expect(geminiRequests, "the redelivery must not pay for the cell again").toBe(1);
+    expect(await meterTotal()).toBeCloseTo(Number(usage.rows[0]!.unit_cost_usd), 5);
+    await clearMeter();
+  }, 120_000);
+
+  it("E2E-B6e · audit 2 · an ABSENT meter total is zero spent: the cell is captured", async () => {
+    await clearMeter();
+    const s = await scenario(1);
+    await deepScan(s);
+    expect(geminiRequests).toBe(1);
+    await clearMeter();
+  }, 120_000);
+
+  it("E2E-B6e · audit 2 · a CORRUPT meter total FAILS CLOSED: zero fetches, the job throws, and the gate logs and counts it", async () => {
+    const redis = new Redis(cacheValkey.url);
+    const log = vi.spyOn(Logger.prototype, "log");
+    const error = vi.spyOn(Logger.prototype, "error");
+    try {
+      await redis.set(currentMonthTotalKey(), "garbage");
+      const s = await scenario(1);
+      await expect(deepScan(s)).rejects.toThrow();
+      expect(geminiRequests).toBe(0);
+      expect(log.mock.calls.some(([m]) => (m as { metric?: string }).metric === "nominara_capture_spend_gate_unreadable_total")).toBe(true);
+      const lines = error.mock.calls.map(([m]) => String(m));
+      expect(lines.some((l) => l.includes("spend gate unreadable"))).toBe(true);
+      expect(lines.join("\n"), "no credential in the log line").not.toContain(FAKE_KEY);
+    } finally {
+      log.mockRestore();
+      error.mockRestore();
+      await redis.del(currentMonthTotalKey());
+      await redis.quit();
+    }
+  }, 120_000);
+
+  it("E2E-B6e · audit 6 · a total EXACTLY at the ceiling blocks (>=): zero fetches, blocked with the terminal code", async () => {
+    const redis = new Redis(cacheValkey.url);
+    try {
+      await redis.set(currentMonthTotalKey(), "100"); // the gemini default ceiling
+      const s = await scenario(1);
+      const { runId } = await deepScan(s);
+      expect(geminiRequests).toBe(0);
+      const cells = await harness.db().query<{ status: string; error_code: string | null }>("SELECT status, error_code FROM answer_captures WHERE run_id = $1", [runId]);
+      expect(cells.rows).toEqual([{ status: "blocked", error_code: "engine_spend_ceiling_reached" }]);
+    } finally {
+      await redis.del(currentMonthTotalKey());
+      await redis.quit();
+    }
+  }, 120_000);
+
+  it("E2E-B6 · audit 4 · PINNED ORDERING: the meter records when the vendor call returns, so a rollback after it does not un-spend the money", async () => {
+    await clearMeter();
+    const s = await scenario(1);
+    await expect(deepScan(s, { rollbackAfterExecute: true })).rejects.toThrow("crash before commit");
+    expect((await harness.db().query("SELECT 1 FROM answer_captures WHERE workspace_id = $1", [s.workspaceId])).rowCount, "the transaction rolled back").toBe(0);
+    expect(geminiRequests).toBe(1);
+    expect(await meterTotal(), "but the vendor billed the call, so the meter keeps it").toBeGreaterThan(0);
+    await clearMeter();
+  }, 120_000);
+
+  it("E2E-B6 · audit 5 · a billed response that fails validation is still metered", async () => {
+    await clearMeter();
+    vendorBody = { candidates: "unexpected", usageMetadata: { promptTokenCount: 1000, candidatesTokenCount: 2000 } };
+    const s = await scenario(1);
+    await deepScan(s).catch(() => undefined); // malformed_response is retryable: the job throws into the ladder
+    expect(geminiRequests).toBe(1);
+    expect(await meterTotal()).toBeCloseTo(1000 * (0.3 / 1_000_000) + 2000 * (2.5 / 1_000_000), 9);
+    await clearMeter();
   }, 120_000);
 });
