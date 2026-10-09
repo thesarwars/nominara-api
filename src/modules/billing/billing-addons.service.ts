@@ -84,7 +84,7 @@ interface SubscriptionRow {
   pending_addon_changes: unknown;
 }
 
-/** The most intents kept per subscription; the oldest are dropped. Stripe forgets a key after 24 hours. */
+/** The most intents kept per subscription. Only intents past INTENT_RETENTION_MS are ever dropped to make room; a full map of live ones refuses (409). */
 const MAX_PENDING_INTENTS = 20;
 
 /** Stripe forgets an idempotency key after this long: an unresolved intent older than it can neither block nor be retried. */
@@ -487,10 +487,21 @@ export class BillingAddonsService {
       stripe_call: change.call,
       created_at: new Date().toISOString(),
     };
-    const kept = Object.entries(current)
-      .sort(([, x], [, y]) => (x.created_at < y.created_at ? -1 : x.created_at > y.created_at ? 1 : 0))
-      .slice(-(MAX_PENDING_INTENTS - 1));
-    const next: PendingAddonChanges = { ...Object.fromEntries(kept), [mapKey]: intent };
+    // ⚠ NEVER EVICT AN INTENT STRIPE STILL REMEMBERS. An unsettled one is the only record that makes its retry
+    // replay the stored call instead of recomputing "held + quantity" (a second unit); a settled one is what a
+    // different member reusing the key is answered from (the interceptor is scoped per user). Only an intent
+    // older than Stripe's key retention is of no further use, so room is made from those, oldest first, and
+    // only as far as needed. A map full of live intents refuses the purchase (retryable) rather than guess.
+    const now = Date.now();
+    const byAge = Object.entries(current).sort(([, x], [, y]) => (x.created_at < y.created_at ? -1 : x.created_at > y.created_at ? 1 : 0));
+    const expired = byAge.filter(([, other]) => now - Date.parse(other.created_at) >= INTENT_RETENTION_MS);
+    const surplus = byAge.length - (MAX_PENDING_INTENTS - 1);
+    if (surplus > expired.length) {
+      incrementCounter("nominara_billing_addon_change_total", { kind: change.kind, outcome: "intent_store_full" });
+      throw new ConflictError({ message: "too many recent add-on purchases are still being tracked: retry in a few minutes, or retry an earlier request first" });
+    }
+    const evict = new Set(expired.slice(0, Math.max(0, surplus)).map(([key]) => key));
+    const next: PendingAddonChanges = { ...Object.fromEntries(byAge.filter(([key]) => !evict.has(key))), [mapKey]: intent };
     await this.persistIntents(workspaceId, next);
     return next;
   }
