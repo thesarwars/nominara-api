@@ -208,14 +208,15 @@ describe("NEW-A-2 · /v1/me", () => {
     expect(me.active_workspace_id).toBe(workspaceId);
   });
 
-  // NEW-B-1 checkpoint-4 — a live session must not outlive the user's standing.
+  // NEW-B-1 checkpoint-4 — a live session must not outlive the user's standing. Suspended is 403 (the account exists and is
+  // forbidden; STORY-173 AC5 already pins 403 for a suspended account), erased/missing is 401.
   it("NEW-B-1 · a suspended user with a live session is refused on GET /me and nothing is returned", async () => {
     const user = await createUser();
     const tokens = await signIn(user.id);
     expect((await get(tokens)).statusCode).toBe(200);
     await harness.db().query(`UPDATE users SET status = 'suspended' WHERE id = $1`, [user.id]);
     const res = await get(tokens);
-    expect(res.statusCode, res.body).toBe(401);
+    expect(res.statusCode, res.body).toBe(403);
     expect(res.body).not.toContain(user.email);
   });
 
@@ -224,7 +225,7 @@ describe("NEW-A-2 · /v1/me", () => {
     const tokens = await signIn(user.id);
     await harness.db().query(`UPDATE users SET status = 'suspended' WHERE id = $1`, [user.id]);
     const res = await patch(tokens, { persona });
-    expect(res.statusCode, res.body).toBe(401);
+    expect(res.statusCode, res.body).toBe(403);
     const row = await harness.db().query(`SELECT persona_org_type FROM users WHERE id = $1`, [user.id]);
     expect(row.rows[0].persona_org_type).toBeNull();
   });
@@ -238,7 +239,7 @@ describe("NEW-A-2 · /v1/me", () => {
       url: apiUrl("/workspaces"),
       cookies: { [ACCESS_COOKIE_NAME]: tokens.access, [CSRF_COOKIE_NAME]: tokens.csrf },
     });
-    expect(res.statusCode, res.body).toBe(401);
+    expect(res.statusCode, res.body).toBe(403);
   });
 
   it("NEW-B-1 · an erased user (deleted_at set) with a live session is refused on GET and PATCH /me", async () => {
@@ -253,7 +254,7 @@ describe("NEW-A-2 · /v1/me", () => {
     const user = await createUser();
     const tokens = await signIn(user.id);
     await harness.db().query(`UPDATE users SET status = 'suspended' WHERE id = $1`, [user.id]);
-    expect((await get(tokens)).statusCode).toBe(401);
+    expect((await get(tokens)).statusCode).toBe(403);
     await harness.db().query(`UPDATE users SET status = 'active' WHERE id = $1`, [user.id]);
     expect((await get(tokens)).statusCode).toBe(200);
   });
