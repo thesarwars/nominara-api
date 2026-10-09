@@ -43,6 +43,20 @@ export type EngineTokenBuckets = z.infer<typeof engineTokenBucketsSchema>;
 export const engineSpendCeilingsSchema = z.partialRecord(engineKeySchema, z.number().positive());
 export type EngineSpendCeilings = z.infer<typeof engineSpendCeilingsSchema>;
 
+/**
+ * E2E-B6 — the ceilings that apply when ENGINE_SPEND_CEILINGS_USD does not name an engine. Only
+ * gemini has one: it is the sole engine with a real adapter, so it is the only one that spends
+ * real money (NEW-A-4; USD/month, 100 is the dev placeholder pending owner decision O9). A
+ * configured entry always wins; engines without a default keep D13's ceiling-absent posture.
+ */
+export const DEFAULT_ENGINE_SPEND_CEILINGS_USD: EngineSpendCeilings = { gemini: 100 };
+
+/** The effective ceilings: defaults, overridden per engine by the configured JSON (already validated at boot). */
+export function resolveEngineSpendCeilings(configuredJson: string | undefined): EngineSpendCeilings {
+  const configured = configuredJson ? engineSpendCeilingsSchema.parse(JSON.parse(configuredJson)) : {};
+  return { ...DEFAULT_ENGINE_SPEND_CEILINGS_USD, ...configured };
+}
+
 /** Well-formed JSON parsing against `schema` — used by refine() below since a refine can only report true/false, never transform. */
 function parsesAgainst(schema: z.ZodTypeAny, value: string): boolean {
   try {
@@ -333,8 +347,9 @@ export const envSchema = z
       message: "must be a JSON object mapping engine keys to { capacity: positive int, refillPerSecond: positive number }",
     }),
     // STORY-031 D13 — optional: undocumented dollar ceilings, injected only
-    // when known. Absent entirely (or absent for one engine key) disables
-    // ONLY that engine's 100% hard stop; 80%/95% alerting still runs.
+    // when known. Absent for an engine key disables ONLY that engine's 100%
+    // hard stop; 80%/95% alerting still runs. E2E-B6: gemini alone has a
+    // default (DEFAULT_ENGINE_SPEND_CEILINGS_USD) that an entry here overrides.
     ENGINE_SPEND_CEILINGS_USD: requiredString
       .refine((value) => parsesAgainst(engineSpendCeilingsSchema, value), {
         message: "must be a JSON object mapping engine keys to a positive USD ceiling",

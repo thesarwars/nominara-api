@@ -6,6 +6,7 @@
 //   contracts/openapi.generated.json   served as the committed spec document
 // Usage: node scripts/copy-build-assets.mjs [outDir]   (default: dist)
 import { cpSync, existsSync, mkdirSync } from "node:fs";
+import process from "node:process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -21,7 +22,7 @@ const ASSETS = [
 for (const [from, to] of ASSETS) {
   const source = resolve(root, from);
   if (!existsSync(source)) {
-    console.error(`copy-build-assets: missing ${from}`);
+    process.stderr.write(`copy-build-assets: missing ${from}\n`);
     process.exit(1);
   }
   const target = resolve(out, to);

@@ -327,7 +327,7 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
       [runId, s.workspaceId, s.projectId],
     );
     // Cells captured but never parsed (the parse queue is not drained): there are no facts, so no rollup can exist.
-    const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
+    const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
     const rollupRequests: Array<{ workspaceId: string; payload: Record<string, unknown> }> = [];
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),

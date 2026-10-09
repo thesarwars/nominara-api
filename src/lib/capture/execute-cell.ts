@@ -68,22 +68,40 @@ export type CaptureCellOutcome =
 const EXCERPT_CHARS = 280;
 
 /**
- * A capture context with no tracing and no cost ledger.
- *
- * BOTH ARE REAL GAPS, NAMED RATHER THAN FAKED. `CaptureSpan` is STORY-027's
- * structural stand-in for an OTel span that no dependency provides yet, and
- * `recordCost` is supposed to write `usage_ledger` — which EPIC-10 owns
- * alongside the wallet. The fixture adapters report `costUsd: 0`, so nothing
- * is being dropped today; the moment a real adapter lands, this is the line
- * that has to change, and it says so here rather than looking like a working
- * implementation.
+ * A capture context with no tracing (`CaptureSpan` is STORY-027's structural
+ * stand-in for an OTel span no dependency provides yet) whose `recordCost`
+ * collects what the adapter reports, so `captureCell` can write it to
+ * `usage_ledger` once the capture row exists (E2E-B6). The adapter calls it
+ * once per capture, after validation.
  */
-function captureContext(signal: AbortSignal): CaptureContext {
+function captureContext(signal: AbortSignal, costs: { usd: number }): CaptureContext {
   return {
     signal,
     span: { setAttribute: () => undefined, recordException: () => undefined, end: () => undefined },
-    recordCost: () => undefined,
+    recordCost: (usd: number) => {
+      costs.usd += usd;
+    },
   };
+}
+
+/**
+ * What serving this cell cost us (`usage_ledger`, billing-and-credits.md): one
+ * `capture` row per live cell, `credits_charged = 0` because the customer's
+ * debit is the run's own `credit_ledger` entry. `source` is derived from the
+ * run's trigger in SQL so the two cannot disagree. Written only for a real,
+ * non-zero cost; a zero-cost fixture capture has nothing to attribute.
+ */
+async function recordUsageCost(tx: ClientBase, input: CaptureCellInput, usd: number): Promise<void> {
+  await tx.query(
+    `INSERT INTO usage_ledger
+       (workspace_id, project_id, metric, quantity, unit_cost_usd, engine_key, source,
+        credits_charged, reference_type, reference_id, cache_layer)
+     SELECT $1, $2, 'capture', 1, $3::numeric, $4,
+            CASE r.trigger WHEN 'manual' THEN 'manual_run' WHEN 'scheduled' THEN 'scheduled_run' ELSE 'system' END,
+            0, 'capture_run', r.id, 'live'
+       FROM capture_runs r WHERE r.id = $5`,
+    [input.workspaceId, input.projectId, usd.toFixed(6), input.engineKey, input.runId],
+  );
 }
 
 /**
@@ -107,6 +125,8 @@ export async function captureCell(
   cache: Cache,
   input: CaptureCellInput,
   now: Date = new Date(),
+  /** Feeds the platform-wide spend meter (Valkey); fails open, so it can never fail a capture. */
+  recordSpend?: (engineKey: string, usd: number) => Promise<void>,
 ): Promise<CaptureCellOutcome> {
   let adapter: CaptureAdapter;
   try {
@@ -123,6 +143,7 @@ export async function captureCell(
   }
 
   const controller = new AbortController();
+  const costs = { usd: 0 };
   let raw: RawCapture;
   try {
     raw = await adapter.capture(
@@ -133,7 +154,7 @@ export async function captureCell(
         ...(input.personaHint !== null ? { personaHint: input.personaHint } : {}),
         requireCitations: adapter.supportsCitations,
       },
-      captureContext(controller.signal),
+      captureContext(controller.signal, costs),
     );
   } catch (error) {
     if (!(error instanceof CaptureFailureError)) throw error;
@@ -165,6 +186,10 @@ export async function captureCell(
   }
 
   await writeCell(tx, input, now, { status: "captured", adapter, raw });
+  if (costs.usd > 0) {
+    await recordUsageCost(tx, input, costs.usd);
+    await recordSpend?.(input.engineKey, costs.usd).catch(() => undefined);
+  }
 
   // SEED L1 ONLY AFTER THE ROW IS WRITTEN, and only on a real answer.
   //

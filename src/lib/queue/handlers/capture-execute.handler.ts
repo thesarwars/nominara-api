@@ -1,12 +1,17 @@
 import { Logger } from "@nestjs/common";
 import { nonMeasurementStatusSql } from "../../rollup/aggregate-day.js";
 import type { Job } from "bullmq";
+import { Redis } from "ioredis";
 import type { ClientBase } from "pg";
 import { z } from "zod";
 import type { Cache } from "../../cache/cache.port.js";
 import { ValkeyCacheAdapter } from "../../cache/valkey-cache.adapter.js";
 import type { RealtimePublisher } from "../../cache/realtime-publisher.js";
 import { ValkeyRealtimePublisher } from "../../cache/realtime-publisher.js";
+import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
+import { incrementCounter } from "../../telemetry/metrics.js";
+import { engineKeySchema } from "../../engines/contract.js";
+import { SpendMeter, ValkeySpendMeterStore } from "../../engines/spend-meter.js";
 import { captureCell } from "../../capture/execute-cell.js";
 import { readRunProgress } from "../../capture/run-progress.js";
 import { resolveRunOutcome } from "../../engines/run-outcome.js";
@@ -53,6 +58,8 @@ export interface CaptureExecuteDeps {
   readonly enqueueParse?: (payload: ParseJobPayload) => Promise<unknown>;
   /** Injected in tests; production builds a producer from env on first use. */
   readonly enqueueRollup?: EnqueueRollup;
+  /** Injected in tests; production builds the Valkey-backed meter from env on first use. */
+  readonly spendMeter?: SpendMeter;
 }
 
 /** What `capture.parse` needs to find and re-read the row this handler wrote. */
@@ -80,6 +87,28 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     cache ??= new ValkeyCacheAdapter(context.env.VALKEY_CACHE_URL);
     realtime ??= new ValkeyRealtimePublisher(context.env.VALKEY_CACHE_URL);
     return { cache, realtime };
+  };
+
+  // E2E-B6 — the platform spend meter (EC-08), built on first use like the
+  // cache. Its own Valkey connection; ceilings are the configured JSON over the
+  // defaults (gemini has one). Metering failures fail open inside the meter.
+  let spendMeter: SpendMeter | undefined = deps?.spendMeter;
+  const recordSpend = async (engineKey: string, usd: number): Promise<void> => {
+    const key = engineKeySchema.safeParse(engineKey);
+    if (!key.success) return;
+    if (spendMeter === undefined) {
+      const redis = new Redis(context.env.VALKEY_CACHE_URL, { maxRetriesPerRequest: 1 });
+      redis.on("error", (error) => logger.warn(`spend meter connection error: ${error.message}`));
+      spendMeter = new SpendMeter(new ValkeySpendMeterStore(redis), resolveEngineSpendCeilings(context.env.ENGINE_SPEND_CEILINGS_USD));
+    }
+    const result = await spendMeter.recordCost(key.data, usd);
+    incrementCounter("nominara_capture_cost_recorded_total", { engine_key: key.data });
+    for (const level of result.newAlerts) {
+      logger.warn(`engine spend alert ${level} for ${key.data}: ${result.totalUsd.toFixed(2)} of ${String(result.ceilingUsd)} USD this month`);
+    }
+    if (result.hardStopped) {
+      logger.error(`engine spend ceiling reached for ${key.data}: ${result.totalUsd.toFixed(2)} of ${String(result.ceilingUsd)} USD this month`);
+    }
   };
 
   // `async`, so that BUILDING the producer is inside the promise too.
@@ -173,7 +202,16 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       locale: payload.locale,
       personaHint: payload.personaHint,
       normalizerVersion: NORMALIZER_VERSION,
-    });
+    }, undefined, recordSpend);
+
+    // E2E-B6a — `captured_cells` counts LIVE captures only (captures-and-facts.md).
+    // An atomic increment, not a recount: concurrent cells each run in their own
+    // transaction and cannot see each other's uncommitted rows. Suppressed cells
+    // never reach this handler (they are written by the planner), and a cell
+    // that ended blocked or failed is not a capture.
+    if (outcome.kind === "captured") {
+      await tx.query("UPDATE capture_runs SET captured_cells = captured_cells + 1 WHERE id = $1", [payload.runId]);
+    }
 
     // STORY-135 — hand the capture to the parser.
     //
