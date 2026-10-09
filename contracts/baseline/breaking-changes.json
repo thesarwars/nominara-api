@@ -305,6 +305,77 @@
           "grant"
         ]
       }
+    },
+    {
+      "id": "2026-10-09-api-keys-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-076",
+      "task": "NEW-D-1 AC3 (checkpoint-5)",
+      "scope": "listApiKeys (GET /v1/api-keys)",
+      "from": "{ data: ApiKey[], meta } with no pagination member and no cursor/limit query; every key in one response, ordered by created_at DESC, id",
+      "to": "{ data: ApiKey[], pagination, meta } with the standard cursor and limit query; ordered by (created_at DESC, id DESC) with a microsecond-precision cursor key",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Lead's call of 2026-10-09 (decisions-2026-10-08.md, section after checkpoint 5): GET /v1/api-keys moves to the cursor envelope under NEW-D-1 AC3, which in the signed-off plan (plans-7day/track-plans.json) says every list response uses the cursor envelope, matching api-specification.md section 3; the same decision says to record it as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every key now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listApiKeys",
+        "path": "/v1/api-keys",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "name",
+          "key_prefix",
+          "permissions",
+          "project_scope",
+          "created_by",
+          "last_used_at",
+          "expires_at",
+          "revoked_at",
+          "created_at"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-audit-log-id-is-row-seq",
+      "recorded": "2026-10-09",
+      "story": "STORY-076",
+      "task": "NEW-D-3 / NEW-D-1 (checkpoint-4 audit-log id, recorded at checkpoint-5)",
+      "scope": "listAuditLog (GET /v1/audit-log): the item's id",
+      "from": "an id derived from the row's hash material, which would leak the audit chain (row N's prev_hash is row N-1's row_hash)",
+      "to": "the row's audit_log.seq as a decimal string matching ^[0-9]{1,18}$, the same value the opaque cursor is keyed on",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Lead's call of 2026-10-09, approved by the owner (decisions-2026-10-08.md, section after checkpoint 5): the audit-log id becomes the row seq. Exposing either hash would leak the chain, and audit_log has no per-row uuid column; adding one is a schema change deferred to week 2. The id's value and format change (a hash-like string becomes a short decimal string), so a client that stored or pattern-matched old ids breaks, and seq is a global sequence so ids are monotonic across workspaces, a trade-off accepted for week 1. The request and envelope shapes are unchanged; the assertion pins the item's property names and the id pattern lives in the schema. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listAuditLog",
+        "path": "/v1/audit-log",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "occurred_at",
+          "actor_type",
+          "actor_id",
+          "action",
+          "category",
+          "resource_type",
+          "resource_id",
+          "severity",
+          "request_id",
+          "support_grant_id"
+        ]
+      }
     }
   ]
 }

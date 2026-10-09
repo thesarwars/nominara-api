@@ -84,11 +84,36 @@ describe("NEW-D-4 · ApiKeysService under RLS, as nominara_app", () => {
     const b = await tenant();
     const created = await inTenant(a, () => service.create("owner", request()));
 
-    expect(await inTenant(b, () => service.list())).toEqual([]);
+    expect((await inTenant(b, () => service.list({ limit: 50 }))).items).toEqual([]);
     await expect(inTenant(b, () => service.revoke(created.key.id))).rejects.toBeInstanceOf(NotFoundError);
     const stored = await admin.query("SELECT revoked_at FROM api_keys WHERE id = $1", [created.key.id]);
     expect((stored.rows[0] as { revoked_at: unknown }).revoked_at).toBeNull();
-    expect((await inTenant(a, () => service.list())).map((k) => k.id)).toEqual([created.key.id]);
+    expect((await inTenant(a, () => service.list({ limit: 50 }))).items.map((k) => k.id)).toEqual([created.key.id]);
+  });
+
+  it("NEW-D-1 AC3 · the key list pages by keyset: no key skipped or repeated across pages, cursor_next null on the last", async () => {
+    const t = await tenant();
+    const made = [];
+    // The plan caps keys at 3, so the fourth and fifth rows are seeded directly, sharing a created_at
+    // with the third to exercise the (created_at, id) tie-break at a page boundary.
+    for (let i = 0; i < 3; i += 1) made.push((await inTenant(t, () => service.create("owner", request({ name: `k${i}` })))).key.id);
+    const seeded = await admin.query<{ id: string }>(
+      `INSERT INTO api_keys (workspace_id, name, key_prefix, key_hash, permissions, created_by, created_at)
+       SELECT $1, 'tie' || g, 'nk_live_tie' || g, decode(md5(random()::text), 'hex'), ARRAY['project:read'], $2, (SELECT created_at FROM api_keys WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 1)
+         FROM generate_series(1,2) g RETURNING id`,
+      [t.workspaceId, t.actorId],
+    );
+    made.push(...seeded.rows.map((r) => r.id));
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let guard = 0; guard < 10; guard += 1) {
+      const page = await inTenant(t, () => service.list({ limit: 2, ...(cursor === undefined ? {} : { cursor }) }));
+      seen.push(...page.items.map((k) => k.id));
+      expect(page.pagination.has_more).toBe(page.pagination.cursor_next !== null);
+      if (page.pagination.cursor_next === null) break;
+      cursor = page.pagination.cursor_next;
+    }
+    expect(seen.sort()).toEqual([...made].sort());
   });
 
   it("NEW-D-4 AC5 · a project_scope naming another workspace's project is a validation failure that stores nothing", async () => {

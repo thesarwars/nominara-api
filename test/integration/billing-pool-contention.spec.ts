@@ -86,7 +86,7 @@ describe("STORY-075a / STORY-076a / STORY-076b checkpoint-4 · a holder of the m
   const deliver = (body: string) =>
     harness.app().inject({ method: "POST", url: apiUrl("/webhooks/stripe"), headers: { "content-type": "application/json", "stripe-signature": signFakeStripePayload(body) }, payload: body });
 
-  async function newWorkspace(plan: "free" | "growth"): Promise<{ workspaceId: string; owner: Actor }> {
+  async function newWorkspace(plan: "free" | "growth", withProjectAddon = false): Promise<{ workspaceId: string; owner: Actor }> {
     const user = await harness.db().query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`u-${randomUUID()}@example.com`]);
     const ownerId = user.rows[0]!.id;
     const ws = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
@@ -103,7 +103,7 @@ describe("STORY-075a / STORY-076a / STORY-076b checkpoint-4 · a holder of the m
         status: "active",
         cancel_at_period_end: false,
         trial_end: null,
-        items: { data: [line("plan", "si_plan", 12_900)] },
+        items: { data: [line("plan", "si_plan", 12_900), ...(withProjectAddon ? [line("extra_project", "si_project", 4_900)] : [])] },
       });
       expect((await deliver(eventBody(`evt_${randomUUID()}`, "customer.subscription.created", subIdOf(ws.id)))).statusCode).toBe(200);
     }
@@ -158,5 +158,31 @@ describe("STORY-075a / STORY-076a / STORY-076b checkpoint-4 · a holder of the m
     expect(codes.slice(0, third), responses.map((r) => r.body).join("\n")).toEqual(Array.from({ length: third }, () => 202));
     expect(codes.slice(third), responses.map((r) => r.body).join("\n")).toEqual(Array.from({ length: 2 * third }, () => 200));
     expect((await get(packOwners[0]!.owner, "/billing/subscription")).statusCode).toBe(200);
+  }, 90_000);
+
+  it("checkpoint-5 AC-pool-remove . a DELETE burst behind a slow Stripe cannot starve another tenant: its request answers within the lock bound, not after the whole queue drains", async () => {
+    const a = await newWorkspace("growth", true);
+    const b = await newWorkspace("free");
+    // Workspace A holds an extra_project line (mirrored by the webhook before its session is entered), and Stripe takes 2.5 s to schedule a removal.
+    gateway.addonRemovalDelayMs = 2_500;
+
+    const del = (actor: Actor) =>
+      harness.app().inject({
+        method: "DELETE",
+        url: apiUrl("/billing/addons/extra_project"),
+        cookies: cookies(actor),
+        headers: { [CSRF_HEADER_NAME]: actor.csrfToken, "idempotency-key": randomUUID() },
+      });
+    const burst = Promise.all(Array.from({ length: 15 }, () => del(a.owner)));
+    await new Promise((resolve) => setTimeout(resolve, 500)); // the burst holds the main pool
+    const started = Date.now();
+    const other = await get(b.owner, "/billing/subscription");
+    const waited = Date.now() - started;
+    const responses = await allBeforeDeadline("delete burst", burst, 15);
+    expect(other.statusCode).toBe(200);
+    // The lock wait is 3 s: another tenant may queue for a connection that long, never for the queue's whole drain (15 x 2.5 s).
+    expect(waited, `another tenant waited ${String(waited)} ms behind the DELETE burst`).toBeLessThan(5_000);
+    expect(responses.map((r) => r.statusCode).every((code) => code === 202 || code === 409), responses.map((r) => r.body).join("\n")).toBe(true);
+    expect(responses.some((r) => r.statusCode === 202)).toBe(true);
   }, 90_000);
 });

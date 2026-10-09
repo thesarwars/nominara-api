@@ -9,8 +9,8 @@ import { STRIPE_GATEWAY, StripeUpstreamError, type StripeGateway } from "../../l
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { purchasableOptions } from "../../lib/credits/wallet.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
-import { BILLING_WRITE_POOL, connectForWrite } from "./billing-write-pool.js";
+import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { BILLING_WRITE_POOL, inBillingWriteTransaction } from "./billing-write-pool.js";
 
 // STORY-076a / STORY-076 AC1-AC2 — the credit-pack catalog and the purchase.
 //
@@ -163,12 +163,7 @@ export class CreditPacksService {
    * connection of: that is hold-and-wait), so it commits independently of the request's.
    */
   private async inOwnTransaction<T>(workspaceId: string, actorId: string, fn: (tx: ClientBase) => Promise<T>): Promise<T> {
-    const client = await connectForWrite(this.pool);
-    try {
-      return await withTenantContext(client, { workspaceId, actorId }, fn);
-    } finally {
-      client.release();
-    }
+    return await inBillingWriteTransaction(this.pool, { workspaceId, actorId }, fn);
   }
 
   private tenant() {

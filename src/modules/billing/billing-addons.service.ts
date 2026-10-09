@@ -25,9 +25,10 @@ import { ADDON_KINDS, resolveEntitlements, type AddonKind } from "../../lib/enti
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
-import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
+import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
-import { BILLING_WRITE_POOL, connectForWrite } from "./billing-write-pool.js";
+import { BILLING_WRITE_POOL, inBillingWriteTransaction } from "./billing-write-pool.js";
+import { lockWorkspaceBounded } from "./workspace-lock.js";
 
 // STORY-076b / STORY-076 AC10-AC13 — the one owner of `subscription_addons`.
 //
@@ -84,14 +85,11 @@ interface SubscriptionRow {
   pending_addon_changes: unknown;
 }
 
-/** The most intents kept per subscription; the oldest are dropped. Stripe forgets a key after 24 hours. */
+/** The most intents kept per subscription. Only intents past INTENT_RETENTION_MS are ever dropped to make room; a full map of live ones refuses (409). */
 const MAX_PENDING_INTENTS = 20;
 
 /** Stripe forgets an idempotency key after this long: an unresolved intent older than it can neither block nor be retried. */
 const INTENT_RETENTION_MS = 24 * 60 * 60 * 1000;
-
-/** The longest `add` waits for the workspace row lock before answering a retryable 409. */
-const ADD_LOCK_WAIT_MS = 3_000;
 
 interface AddonRow {
   id: string;
@@ -318,7 +316,7 @@ export class BillingAddonsService {
   async remove(kind: AddonKind): Promise<AddonChangeResponse> {
     this.requireConfigured();
     const { client, workspaceId } = this.tenant();
-    await client.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    await this.lockWorkspace(client, workspaceId, kind);
 
     const held = (
       await client.query<ActiveRow>(
@@ -449,21 +447,16 @@ export class BillingAddonsService {
 
   /**
    * ⚠ THE LOCK WAIT IS BOUNDED. `add` commits its intent on a SECOND pooled connection while it holds
-   * the lock; requests queued behind it each hold a connection of their own. With enough of them queued
+   * the lock (`add` and `remove` alike); requests queued behind it each hold a connection of their own. With enough of them queued
    * the pool is empty, the holder waits for a connection no waiter will give back, and every one of
-   * them hangs. A wait of at most `ADD_LOCK_WAIT_MS` makes that a retryable 409 instead of a hang: the
+   * them hangs. A wait of at most `WORKSPACE_LOCK_WAIT_MS` makes that a retryable 409 instead of a hang: the
    * waiters give their connections back and the holder proceeds. The setting is transaction-local.
    */
   private async lockWorkspace(client: ClientBase, workspaceId: string, kind: AddonKind): Promise<void> {
-    await client.query("SELECT set_config('lock_timeout', $1, true)", [String(ADD_LOCK_WAIT_MS)]);
-    try {
-      await client.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
-    } catch (error) {
-      if ((error as { code?: string }).code !== "55P03") throw error;
+    await lockWorkspaceBounded(client, workspaceId, () => {
       incrementCounter("nominara_billing_addon_change_total", { kind, outcome: "lock_wait_exceeded" });
-      throw new ConflictError({ message: "another billing change for this workspace is in progress: retry shortly" });
-    }
-    await client.query("SELECT set_config('lock_timeout', '0', true)");
+      return new ConflictError({ message: "another billing change for this workspace is in progress: retry shortly" });
+    });
   }
 
   /**
@@ -487,10 +480,21 @@ export class BillingAddonsService {
       stripe_call: change.call,
       created_at: new Date().toISOString(),
     };
-    const kept = Object.entries(current)
-      .sort(([, x], [, y]) => (x.created_at < y.created_at ? -1 : x.created_at > y.created_at ? 1 : 0))
-      .slice(-(MAX_PENDING_INTENTS - 1));
-    const next: PendingAddonChanges = { ...Object.fromEntries(kept), [mapKey]: intent };
+    // ⚠ NEVER EVICT AN INTENT STRIPE STILL REMEMBERS. An unsettled one is the only record that makes its retry
+    // replay the stored call instead of recomputing "held + quantity" (a second unit); a settled one is what a
+    // different member reusing the key is answered from (the interceptor is scoped per user). Only an intent
+    // older than Stripe's key retention is of no further use, so room is made from those, oldest first, and
+    // only as far as needed. A map full of live intents refuses the purchase (retryable) rather than guess.
+    const now = Date.now();
+    const byAge = Object.entries(current).sort(([, x], [, y]) => (x.created_at < y.created_at ? -1 : x.created_at > y.created_at ? 1 : 0));
+    const expired = byAge.filter(([, other]) => now - Date.parse(other.created_at) >= INTENT_RETENTION_MS);
+    const surplus = byAge.length - (MAX_PENDING_INTENTS - 1);
+    if (surplus > expired.length) {
+      incrementCounter("nominara_billing_addon_change_total", { kind: change.kind, outcome: "intent_store_full" });
+      throw new ConflictError({ message: "too many recent add-on purchases are still being tracked: retry in a few minutes, or retry an earlier request first" });
+    }
+    const evict = new Set(expired.slice(0, Math.max(0, surplus)).map(([key]) => key));
+    const next: PendingAddonChanges = { ...Object.fromEntries(byAge.filter(([key]) => !evict.has(key))), [mapKey]: intent };
     await this.persistIntents(workspaceId, next);
     return next;
   }
@@ -498,19 +502,14 @@ export class BillingAddonsService {
   /** Writes the whole intent map in its own short transaction (the request holds the workspace row lock). */
   private async persistIntents(workspaceId: string, next: PendingAddonChanges): Promise<void> {
     const { actorId } = this.tenant();
-    const client = await connectForWrite(this.pool);
-    try {
-      await withTenantContext(client, { workspaceId, actorId }, async (tx) => {
-        const result = await tx.query(
-          "UPDATE subscriptions SET pending_addon_changes = $2::jsonb, updated_at = now() WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')",
-          [workspaceId, JSON.stringify(next)],
-        );
-        // Fail closed: with no record committed, Stripe must not be asked.
-        if (result.rowCount !== 1) throw new PreconditionUnmetError({ message: "this workspace has no billing subscription yet: start one first" });
-      });
-    } finally {
-      client.release();
-    }
+    await inBillingWriteTransaction(this.pool, { workspaceId, actorId }, async (tx) => {
+      const result = await tx.query(
+        "UPDATE subscriptions SET pending_addon_changes = $2::jsonb, updated_at = now() WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')",
+        [workspaceId, JSON.stringify(next)],
+      );
+      // Fail closed: with no record committed, Stripe must not be asked.
+      if (result.rowCount !== 1) throw new PreconditionUnmetError({ message: "this workspace has no billing subscription yet: start one first" });
+    });
   }
 
   /**

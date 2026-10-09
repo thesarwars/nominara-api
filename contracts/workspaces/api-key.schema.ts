@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { PERMISSION_MATRIX, PERMISSIONS, ROLES } from "../../src/tenancy/permission-matrix.js";
 
 // NEW-D-4 — /v1/api-keys. api-specification.md §3: `GET`/`POST`/`DELETE`
@@ -46,6 +47,9 @@ export const apiKeySchema = z
   .strict();
 export type ApiKey = z.infer<typeof apiKeySchema>;
 
+// NEW-D-1 AC3 — the cursor envelope; `pagination` is published by the route's `listOf` marker.
+export const apiKeyListQuerySchema = paginationRequestSchema;
+export type ApiKeyListQuery = z.infer<typeof apiKeyListQuerySchema>;
 export const apiKeyListResponseSchema = z.array(apiKeySchema);
 export type ApiKeyListResponse = z.infer<typeof apiKeyListResponseSchema>;
 

@@ -273,10 +273,13 @@ export class FakeStripeGateway implements StripeGateway {
     });
   }
 
-  scheduleAddonRemoval(input: AddonRemovalInput): Promise<void> {
-    if (this.failAddonWith !== undefined) return Promise.reject(this.failAddonWith);
+  /** A slow Stripe: how long `scheduleAddonRemoval` takes to answer, in ms (0 = immediately). */
+  addonRemovalDelayMs = 0;
+
+  async scheduleAddonRemoval(input: AddonRemovalInput): Promise<void> {
+    if (this.addonRemovalDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, this.addonRemovalDelayMs));
+    if (this.failAddonWith !== undefined) throw this.failAddonWith;
     this.addonRemovals.push(input);
-    return Promise.resolve();
   }
 
   /** Back to a clean slate between tests (the instance is shared by a whole spec file). */
@@ -294,6 +297,7 @@ export class FakeStripeGateway implements StripeGateway {
     this.configured = true;
     this.failFetchWith = undefined;
     this.failAddonWith = undefined;
+    this.addonRemovalDelayMs = 0;
     this.failAfterApplyingAddon = undefined;
     this.appliedAddonKeys.clear();
     this.addonFingerprints.clear();
