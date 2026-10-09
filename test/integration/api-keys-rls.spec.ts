@@ -84,11 +84,27 @@ describe("NEW-D-4 · ApiKeysService under RLS, as nominara_app", () => {
     const b = await tenant();
     const created = await inTenant(a, () => service.create("owner", request()));
 
-    expect(await inTenant(b, () => service.list())).toEqual([]);
+    expect((await inTenant(b, () => service.list({ limit: 50 }))).items).toEqual([]);
     await expect(inTenant(b, () => service.revoke(created.key.id))).rejects.toBeInstanceOf(NotFoundError);
     const stored = await admin.query("SELECT revoked_at FROM api_keys WHERE id = $1", [created.key.id]);
     expect((stored.rows[0] as { revoked_at: unknown }).revoked_at).toBeNull();
-    expect((await inTenant(a, () => service.list())).map((k) => k.id)).toEqual([created.key.id]);
+    expect((await inTenant(a, () => service.list({ limit: 50 }))).items.map((k) => k.id)).toEqual([created.key.id]);
+  });
+
+  it("NEW-D-1 AC3 · the key list pages by keyset: no key skipped or repeated across pages, cursor_next null on the last", async () => {
+    const t = await tenant();
+    const made = [];
+    for (let i = 0; i < 5; i += 1) made.push((await inTenant(t, () => service.create("owner", request({ name: `k${i}` })))).key.id);
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let guard = 0; guard < 10; guard += 1) {
+      const page = await inTenant(t, () => service.list({ limit: 2, ...(cursor === undefined ? {} : { cursor }) }));
+      seen.push(...page.items.map((k) => k.id));
+      expect(page.pagination.has_more).toBe(page.pagination.cursor_next !== null);
+      if (page.pagination.cursor_next === null) break;
+      cursor = page.pagination.cursor_next;
+    }
+    expect(seen.sort()).toEqual([...made].sort());
   });
 
   it("NEW-D-4 AC5 · a project_scope naming another workspace's project is a validation failure that stores nothing", async () => {

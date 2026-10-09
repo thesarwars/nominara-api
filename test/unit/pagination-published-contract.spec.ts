@@ -40,11 +40,39 @@ describe("published pagination contract", () => {
     expect(okSchema(op)?.required).toContain("pagination");
   });
 
+  it("NEW-D-1 AC3 · listApiKeys is a cursor list: cursor/limit parameters and a required `pagination` member", () => {
+    const op = byId("listApiKeys");
+    expect(paramNames(op)).toEqual(expect.arrayContaining(["cursor", "limit"]));
+    expect(okSchema(op)?.required).toContain("pagination");
+  });
+
   it("every GET that accepts a `cursor` publishes a required `pagination` member (sweep from the hazard, no allow-list)", () => {
     const missing = getOperations
       .filter(({ op }) => paramNames(op).includes("cursor"))
       .filter(({ op }) => !(okSchema(op)?.required ?? []).includes("pagination") || okSchema(op)?.properties?.pagination === undefined)
       .map(({ op }) => op.operationId);
     expect(missing).toEqual([]);
+  });
+
+  // NEW-D-1 AC3, owner call of 2026-10-09: the sweep above only sees a list that ALREADY takes a
+  // `cursor`, so a list that forgot the parameter AND the envelope was invisible to it. Start
+  // from the other end: any GET whose published `data` is an array is a list. No allow-list.
+  it("every GET whose published `data` is an array publishes a required `pagination` member and the cursor/limit parameters", () => {
+    type Node = { type?: string; anyOf?: Node[] };
+    const isList = (op: Operation) => {
+      const data = (okSchema(op)?.properties as Record<string, Node> | undefined)?.data;
+      return data?.type === "array" || (data?.anyOf ?? []).some((branch) => branch.type === "array");
+    };
+    const offenders = getOperations
+      .filter(({ op }) => isList(op))
+      .filter(
+        ({ op }) =>
+          !(okSchema(op)?.required ?? []).includes("pagination") ||
+          okSchema(op)?.properties?.pagination === undefined ||
+          !paramNames(op).includes("cursor") ||
+          !paramNames(op).includes("limit"),
+      )
+      .map(({ op }) => op.operationId);
+    expect(offenders).toEqual([]);
   });
 });
