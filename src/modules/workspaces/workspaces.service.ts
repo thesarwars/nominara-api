@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { ConflictException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { ConflictException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
+import { DegradedError } from "../../api/errors/domain-errors.js";
 import { entityTagFor } from "../../api/etag/entity-tag.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -8,6 +9,8 @@ import { assertIfMatch } from "../../api/etag/if-match.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { REALTIME_PUBLISHER, type RealtimePublisher } from "../../lib/cache/realtime-publisher.js";
+import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import {
@@ -129,6 +132,15 @@ export function toMemberResponse(row: MemberRow): MemberResponse {
   };
 }
 
+const lockLogger = new Logger("workspaces-lock");
+
+/** The retryable 503 for a writer that could not take the workspace row within the bound. The log line carries the workspace ID only. */
+function workspaceBusy(path: string, workspaceId: string): Error {
+  incrementCounter("nominara_workspace_lock_wait_exceeded_total", { path });
+  lockLogger.warn({ message: "a workspace write was refused as retryable: the row lock was not available within the bound", path, workspace_id: workspaceId });
+  return new DegradedError({ message: "the workspace is being changed: retry shortly" });
+}
+
 @Injectable()
 export class WorkspacesService {
   constructor(
@@ -145,6 +157,7 @@ export class WorkspacesService {
     const client = await pool.connect();
     try {
       await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await lockWorkspaceBounded(tx, workspaceId, () => workspaceBusy("suspend", workspaceId));
         await tx.query("UPDATE workspaces SET status = 'suspended', updated_at = now() WHERE id = $1", [
           workspaceId,
         ]);
@@ -159,6 +172,7 @@ export class WorkspacesService {
     const client = await pool.connect();
     try {
       await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await lockWorkspaceBounded(tx, workspaceId, () => workspaceBusy("bump_entitlement_version", workspaceId));
         await tx.query(
           "UPDATE workspaces SET entitlement_version = entitlement_version + 1, updated_at = now() WHERE id = $1",
           [workspaceId],
@@ -414,6 +428,9 @@ export class WorkspacesService {
   ): Promise<WorkspaceResponse> {
     const client = currentTenantStore()!.client;
 
+    // Checkpoint-6 — bounded: a billing change holds this row across Stripe calls, and a PATCH burst queued
+    // behind it would hold every main-pool connection.
+    await lockWorkspaceBounded(client, workspaceId, () => workspaceBusy("update", workspaceId));
     const current = await client.query<WorkspaceRow>(
       `SELECT ${WORKSPACE_COLUMNS} FROM workspaces WHERE id = $1 FOR UPDATE`,
       [workspaceId],

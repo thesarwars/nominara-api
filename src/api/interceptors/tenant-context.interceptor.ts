@@ -2,8 +2,10 @@ import { CallHandler, ExecutionContext, Inject, Injectable, NestInterceptor } fr
 import { Reflector } from "@nestjs/core";
 import type { Pool, PoolClient } from "pg";
 import { from, lastValueFrom, type Observable } from "rxjs";
-import { PG_POOL } from "../../db/pg-pool.js";
+import { DegradedError } from "../errors/domain-errors.js";
+import { PG_POOL, isConnectionClassFailure } from "../../db/pg-pool.js";
 import { TenantContextMissingError } from "../../tenancy/errors.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
 import { SKIP_TENANT_CONTEXT_KEY } from "../decorators/skip-tenant-context.decorator.js";
@@ -85,8 +87,19 @@ export class TenantContextInterceptor implements NestInterceptor {
     }
 
     const client: PoolClient = await this.pool.connect();
+    // Checkpoint-6 — a connection-class failure (pgBouncer closing the connection of a request that waited past
+    // query_wait_timeout) destroys the connection (`release(error)`) and is a retryable 503. Anything else is
+    // the request's own failure and propagates unchanged; its connection is returned.
+    let lost: Error | undefined;
     return from(
-      withTenantContext(client, tenant, async () => lastValueFrom(next.handle())).finally(() => client.release()),
+      withTenantContext(client, tenant, async () => lastValueFrom(next.handle()))
+        .catch((error: unknown) => {
+          if (!isConnectionClassFailure(error)) throw error;
+          lost = error as Error;
+          incrementCounter("nominara_db_connection_lost_total", { stage: "request" });
+          throw new DegradedError({ message: "the database connection was lost: retry shortly" });
+        })
+        .finally(() => client.release(lost)),
     );
   }
 }

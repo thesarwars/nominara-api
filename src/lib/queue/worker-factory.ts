@@ -35,7 +35,7 @@ export interface JobProcessorOptions {
    * give it back leaks a connection per job — a defect that could not
    * exist before this story, since nothing had ever acquired one.
    */
-  readonly releaseClient?: (client: ClientBase) => void;
+  readonly releaseClient?: (client: ClientBase, failure?: unknown) => void;
   readonly process: JobProcessor;
 }
 
@@ -53,15 +53,19 @@ export function createJobProcessor(entry: QueueTopologyEntry, options: JobProces
   // STORY-124 — release on EVERY exit path, including a throwing handler.
   // A job that fails is exactly the job most likely to be retried, so a
   // connection lost here is lost once per attempt, not once per job.
-  const release = (client: ClientBase): void => options.releaseClient?.(client);
+  const release = (client: ClientBase, failure?: unknown): void => options.releaseClient?.(client, failure);
 
   return async (job: Job): Promise<unknown> => {
     if (!entry.tenantScoped) {
       const client = await options.getClient();
+      let failure: unknown;
       try {
         return await options.process(client, job);
+      } catch (error) {
+        failure = error;
+        throw error;
       } finally {
-        release(client);
+        release(client, failure);
       }
     }
 
@@ -76,10 +80,14 @@ export function createJobProcessor(entry: QueueTopologyEntry, options: JobProces
     verify(tenantJob);
 
     const client = await options.getClient();
+    let failure: unknown;
     try {
       return await withTenantJob(client, tenantJob, verify, (tx) => options.process(tx, job));
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
-      release(client);
+      release(client, failure);
     }
   };
 }

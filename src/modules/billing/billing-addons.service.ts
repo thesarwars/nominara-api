@@ -28,7 +28,7 @@ import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { BILLING_WRITE_POOL, inBillingWriteTransaction } from "./billing-write-pool.js";
-import { lockWorkspaceBounded } from "./workspace-lock.js";
+import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 
 // STORY-076b / STORY-076 AC10-AC13 — the one owner of `subscription_addons`.
 //

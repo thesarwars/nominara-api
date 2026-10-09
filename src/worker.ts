@@ -8,7 +8,7 @@ import type { ClientBase, PoolClient } from "pg";
 import { engineSpendCeilingsSchema } from "./config/env.schema.js";
 import { loadEnv } from "./config/env.js";
 import { connect, withKeepalives } from "./db/client.js";
-import { createPgPool } from "./db/pg-pool.js";
+import { createPgPool, isConnectionClassFailure } from "./db/pg-pool.js";
 import { SchedulerSweepRuntime } from "./lib/capture/scheduler-sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
@@ -254,7 +254,7 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
         // exactOptionalPropertyTypes an absent option and one explicitly set
         // to undefined are different things, and an unhandled queue has no
         // client to give back — its getClient throws first.
-        ...(handler ? { releaseClient: (client: ClientBase) => (client as PoolClient).release() } : {}),
+        ...(handler ? { releaseClient: (client: ClientBase, failure?: unknown) => (client as PoolClient).release(isConnectionClassFailure(failure) ? (failure as Error) : undefined) } : {}),
         process: handler ? handler({ pool, env }) : () => notImplementedHandler(entry.name),
       });
       attachDeadLetterHandler(worker, dlqQueue, entry);

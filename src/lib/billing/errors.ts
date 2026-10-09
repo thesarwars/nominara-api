@@ -19,6 +19,14 @@ export class UnknownPlanError extends Error {
   }
 }
 
+/** The workspace row is held by a billing change (it is inside a Stripe call): retry shortly. Thrown by writers that run outside a request (the plan-set worker, retention). */
+export class WorkspaceLockBusyError extends Error {
+  constructor(workspaceId: string) {
+    super(`workspace ${workspaceId} is locked by another change: retry shortly`);
+    this.name = "WorkspaceLockBusyError";
+  }
+}
+
 export class PlanChangeTargetMissingError extends Error {
   constructor(workspaceId: string, reason: string) {
     super(`workspace ${workspaceId} cannot take a plan change: ${reason}`);

@@ -185,4 +185,37 @@ describe("STORY-075a / STORY-076a / STORY-076b checkpoint-4 · a holder of the m
     expect(responses.map((r) => r.statusCode).every((code) => code === 202 || code === 409), responses.map((r) => r.body).join("\n")).toBe(true);
     expect(responses.some((r) => r.statusCode === 202)).toBe(true);
   }, 90_000);
+  it("checkpoint-6 AC-pool-patch . a PATCH /workspaces/:id burst behind a slow billing change cannot starve another tenant: the PATCHes give up at the lock bound with a retryable 503", async () => {
+    const a = await newWorkspace("growth", true);
+    const b = await newWorkspace("free");
+    // The billing change holds A's workspaces row across a Stripe call that takes 7 s (longer than any bound).
+    gateway.addonRemovalDelayMs = 7_000;
+    const slow = harness.app().inject({
+      method: "DELETE",
+      url: apiUrl("/billing/addons/extra_project"),
+      cookies: cookies(a.owner),
+      headers: { [CSRF_HEADER_NAME]: a.owner.csrfToken, "idempotency-key": randomUUID() },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500)); // the row is held
+    const patch = (n: number) =>
+      harness.app().inject({
+        method: "PATCH",
+        url: apiUrl(`/workspaces/${a.workspaceId}`),
+        cookies: cookies(a.owner),
+        headers: { [CSRF_HEADER_NAME]: a.owner.csrfToken, "content-type": "application/json", "if-match": "*" },
+        payload: { name: `Renamed ${String(n)}` },
+      });
+    const burst = Promise.all(Array.from({ length: 12 }, (_, n) => patch(n)));
+    await new Promise((resolve) => setTimeout(resolve, 500)); // the burst holds the main pool
+    const started = Date.now();
+    const other = await get(b.owner, "/billing/subscription");
+    const waited = Date.now() - started;
+    const responses = await allBeforeDeadline("patch burst", burst, 12);
+    await slow;
+    expect(other.statusCode).toBe(200);
+    // The lock wait is 3 s: another tenant may queue for a connection that long, never for the hold's 7 s.
+    expect(waited, `another tenant waited ${String(waited)} ms behind the PATCH burst`).toBeLessThan(5_000);
+    expect(responses.map((r) => r.statusCode).every((code) => code === 200 || code === 503), responses.map((r) => r.body).join("\n")).toBe(true);
+    expect(responses.some((r) => r.statusCode === 503)).toBe(true);
+  }, 90_000);
 });

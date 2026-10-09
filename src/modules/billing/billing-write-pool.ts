@@ -1,7 +1,7 @@
 import { Logger } from "@nestjs/common";
 import type { ClientBase, Pool, PoolClient } from "pg";
 import { DegradedError } from "../../api/errors/domain-errors.js";
-import { createPgPool } from "../../db/pg-pool.js";
+import { createPgPool, isConnectionClassFailure } from "../../db/pg-pool.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 
@@ -36,10 +36,14 @@ export function createBillingWritePool(connectionString: string): Pool {
 }
 
 /**
+ * MODULE-PRIVATE ON PURPOSE (checkpoint-6): `inBillingWriteTransaction` is the only way to a write-pool client, so
+ * no money path can run without the transaction-local timeouts, the client error listener and the 503 mapping.
+ * billing-write-pool-usage.spec.ts pins it.
+ *
  * A connection for one short write, or a retryable 503. The pool's own error text can carry the connection
  * string, so nothing of it is passed on: the cause is only counted.
  */
-export async function connectForWrite(pool: Pool): Promise<PoolClient> {
+async function connectForWrite(pool: Pool): Promise<PoolClient> {
   try {
     return await pool.connect();
   } catch {
@@ -62,9 +66,8 @@ export const BILLING_WRITE_LOCK_TIMEOUT_MS = 3_000;
  * resulting error, a statement timeout or a lock timeout is a retryable 503, never a 500 and never a hang.
  */
 function isBoundedWaitFailure(error: unknown): boolean {
-  const { code, message } = error as { code?: unknown; message?: unknown };
-  if (code === "08P01" || code === "57014" || code === "55P03") return true;
-  return typeof message === "string" && /query_wait_timeout|Connection terminated/u.test(message);
+  const { code } = error as { code?: unknown };
+  return code === "57014" || code === "55P03" || isConnectionClassFailure(error);
 }
 
 /**
