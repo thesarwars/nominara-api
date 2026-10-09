@@ -312,6 +312,20 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     expect(counter.rows[0]!.reserved_value).toBe("0");
   });
 
+  it("NEW-A-10 · checkpoint-4 · a manual-cadence project with a past next_run_at is not planned: no run, no fair-use reservation", async () => {
+    await db.query("UPDATE projects SET cadence = 'manual' WHERE id = $1", [projA]);
+    for (let i = 0; i < 3; i += 1) await processor()(signedJob(wsA, projA));
+    await settle();
+
+    expect(await runsFor(projA)).toEqual([]);
+    expect(dispatched).toHaveLength(0);
+    const counter = await db.query("SELECT 1 FROM usage_counters WHERE workspace_id = $1 AND metric = $2 AND reserved_value > 0", [
+      wsA,
+      FAIR_USE_METRIC,
+    ]);
+    expect(counter.rowCount).toBe(0);
+  });
+
   it("NEW-A-10 · observability: emits the outcome metric and a log line carrying the workspace id, not its name or any prompt text", async () => {
     const lines: unknown[] = [];
     vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
