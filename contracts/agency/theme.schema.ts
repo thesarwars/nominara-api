@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { validationFailedDetailsSchema } from "../common/error-details.schema.js";
 import { hexColorSchema } from "../reports/report-shared.schema.js";
 
@@ -35,6 +36,9 @@ export const agencyThemeSchema = z
   })
   .strict();
 
+// NEW-E-7 checkpoint-6 — the cursor envelope; `pagination` is published by the route's `listOf` marker.
+export const agencyThemeListQuerySchema = paginationRequestSchema;
+export type AgencyThemeListQuery = z.infer<typeof agencyThemeListQuerySchema>;
 export const agencyThemeListResponseSchema = z.array(agencyThemeSchema);
 
 export const updateAgencyThemeRequestSchema = z

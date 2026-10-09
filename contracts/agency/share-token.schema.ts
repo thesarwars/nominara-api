@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { reportTimeframeSchema } from "../reports/report-shared.schema.js";
 
 // NEW-E-0 — /v1/share-tokens. Permissions share_token:mint / share_token:revoke.
@@ -44,6 +45,9 @@ export const shareTokenSchema = z
   })
   .strict();
 
+// NEW-E-7 checkpoint-6 — the cursor envelope; `pagination` is published by the route's `listOf` marker.
+export const shareTokenListQuerySchema = paginationRequestSchema;
+export type ShareTokenListQuery = z.infer<typeof shareTokenListQuerySchema>;
 export const shareTokenListResponseSchema = z.array(shareTokenSchema);
 
 export const mintShareTokenRequestSchema = z
@@ -91,6 +95,8 @@ export const shareTokenViewSchema = z
   })
   .strict();
 
+export const shareTokenViewListQuerySchema = paginationRequestSchema;
+export type ShareTokenViewListQuery = z.infer<typeof shareTokenViewListQuerySchema>;
 export const shareTokenViewListResponseSchema = z.array(shareTokenViewSchema);
 
 export type ShareToken = z.infer<typeof shareTokenSchema>;

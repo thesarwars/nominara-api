@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { reportFormatSchema, reportSectionSchema, reportTimeframeSchema } from "./report-shared.schema.js";
 
 // NEW-E-0 — /v1/scheduled-reports (GET/POST/PATCH/DELETE) and
@@ -83,6 +84,9 @@ export const scheduledReportSchema = z
   })
   .strict();
 
+// NEW-E-7 checkpoint-6 — the cursor envelope; `pagination` is published by the route's `listOf` marker.
+export const scheduledReportListQuerySchema = paginationRequestSchema;
+export type ScheduledReportListQuery = z.infer<typeof scheduledReportListQuerySchema>;
 export const scheduledReportListResponseSchema = z.array(scheduledReportSchema);
 
 export type CreateScheduledReportRequest = z.infer<typeof createScheduledReportRequestSchema>;
