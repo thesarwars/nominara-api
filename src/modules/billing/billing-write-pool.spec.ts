@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { BILLING_WRITE_POOL_MAX, BILLING_WRITE_CONNECT_TIMEOUT_MS, connectForWrite, createBillingWritePool, inBillingWriteTransaction } from "./billing-write-pool.js";
+import { BILLING_WRITE_POOL_MAX, BILLING_WRITE_CONNECT_TIMEOUT_MS, createBillingWritePool, inBillingWriteTransaction } from "./billing-write-pool.js";
 
 // STORY-075a / STORY-076a / STORY-076b checkpoint-4 — the small, bounded pool a billing request uses for its short independent writes, so
 // the holder of a main-pool connection never waits on the main pool.
@@ -23,15 +23,18 @@ describe("STORY-076b checkpoint-4 · billing write pool", () => {
 
   it("AC-pool-timeout . a connection that cannot be had in time is a retryable 503 `degraded` (never a hang or a 500), counted, with no connection text", async () => {
     const starved = { connect: () => Promise.reject(new Error("timeout exceeded when trying to connect to postgres://u:secret@host/db")) } as never;
-    const err = await connectForWrite(starved).catch((e: unknown) => e);
+    const err = await inBillingWriteTransaction(starved, { workspaceId: "00000000-0000-7000-8000-000000000001", actorId: "00000000-0000-7000-8000-000000000001" }, async () => undefined).catch((e: unknown) => e);
     expect(err).toMatchObject({ code: "degraded" });
     expect(JSON.stringify(err)).not.toContain("secret");
     expect(counter).toHaveBeenCalledWith("nominara_billing_write_pool_timeout_total", {});
   });
 
   it("AC-pool-timeout . a connection that is available is returned as it is", async () => {
-    const client = { release: () => undefined };
-    expect(await connectForWrite({ connect: () => Promise.resolve(client) } as never)).toBe(client);
+    const released: unknown[] = [];
+    const client = { query: () => Promise.resolve({ rows: [] }), on: () => undefined, off: () => undefined, release: (arg?: unknown) => void released.push(arg) };
+    const ran = await inBillingWriteTransaction({ connect: () => Promise.resolve(client) } as never, { workspaceId: "00000000-0000-7000-8000-000000000001", actorId: "00000000-0000-7000-8000-000000000001" }, async (tx) => tx === (client as never));
+    expect(ran).toBe(true);
+    expect(released).toEqual([undefined]);
   });
 
   // Checkpoint-5 — the wait for a SERVER connection behind pgBouncer is not the pool's connect timeout.

@@ -36,10 +36,14 @@ export function createBillingWritePool(connectionString: string): Pool {
 }
 
 /**
+ * MODULE-PRIVATE ON PURPOSE (checkpoint-6): `inBillingWriteTransaction` is the only way to a write-pool client, so
+ * no money path can run without the transaction-local timeouts, the client error listener and the 503 mapping.
+ * billing-write-pool-usage.spec.ts pins it.
+ *
  * A connection for one short write, or a retryable 503. The pool's own error text can carry the connection
  * string, so nothing of it is passed on: the cause is only counted.
  */
-export async function connectForWrite(pool: Pool): Promise<PoolClient> {
+async function connectForWrite(pool: Pool): Promise<PoolClient> {
   try {
     return await pool.connect();
   } catch {
