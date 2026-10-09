@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { Logger } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import { Test } from "@nestjs/testing";
@@ -216,6 +217,16 @@ describe("NEW-C-6 · route wiring and contract", () => {
     expect(reflector.get(SCOPED_BY_QUERY_KEY, h)).toBe(true);
     expect(reflector.get(AUDIT_METADATA_KEY, h)).toMatchObject({ action: "displacement.recovery_planned", resourceType: "displacement" });
     expect(reflector.get(API_CONTRACT_KEY, h)).toMatchObject({ operationId: "createDisplacementRecoveryPlan", responseSchema: recoveryPlanResponseSchema });
+  });
+
+  it("AC3 — the published operation declares a required Idempotency-Key header so the generated client carries it", () => {
+    const doc = JSON.parse(readFileSync(new URL("../../../contracts/openapi.generated.json", import.meta.url), "utf8")) as {
+      paths: Record<string, Record<string, { operationId?: string; parameters?: Array<{ name: string; in: string; required?: boolean }> }>>;
+    };
+    const op = doc.paths["/v1/displacements/{id}/recovery-plan"]?.post;
+    expect(op?.operationId).toBe("createDisplacementRecoveryPlan");
+    expect(op?.parameters).toContainEqual(expect.objectContaining({ name: "Idempotency-Key", in: "header", required: true }));
+    expect(reflector.get(API_CONTRACT_KEY, proto.recoveryPlan!)).toMatchObject({ requiresIdempotencyKey: true });
   });
 
   it("AC1 — the response is an array of the task schema; an empty plan is valid, an unknown task key is refused", () => {

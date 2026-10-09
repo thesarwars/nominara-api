@@ -52,6 +52,12 @@ export interface ApiContractOptions {
    */
   readonly requiresIfMatch?: boolean;
   /**
+   * NEW-C-6 — the route is `@Idempotent()` and so refuses a request without
+   * `Idempotency-Key`. Declared so the header is a required parameter of the
+   * operation and `@nominara/client` carries it.
+   */
+  readonly requiresIdempotencyKey?: boolean;
+  /**
    * STORY-024 T11 — the route returns an `ETag` response header carrying the
    * concurrency tag for the representation in its body.
    */

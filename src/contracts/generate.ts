@@ -297,6 +297,14 @@ function buildOperation(route: DiscoveredContractRoute): OpenApiOperation {
       schema: { type: "string" },
     });
   }
+  if (contract.requiresIdempotencyKey) {
+    parameters.push({
+      name: "Idempotency-Key",
+      in: "header",
+      required: true,
+      schema: { type: "string" },
+    });
+  }
   if (parameters.length > 0) operation.parameters = parameters;
 
   const status = String(route.httpStatus);
