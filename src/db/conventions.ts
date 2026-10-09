@@ -184,6 +184,17 @@ export const DATABASE_ROLES: Record<string, DatabaseRoleSpec> = {
   [BREAKGLASS_ROLE]: { login: true, bypassrls: true, connectionLimit: 2, inherit: false },
 };
 
+/**
+ * ADR-0002 / migration 0112 — roles that exist only to OWN a SECURITY DEFINER function. Kept apart from
+ * DATABASE_ROLES because those are all created by 0005 (database-roles-and-grants.spec.ts migrates 0001-0005 only).
+ * drift-check verifies the same attributes AND that no role is a member: nominara_share_lookup's policy
+ * (share_token_gate_lookup, USING (true)) admits every share_tokens row to whoever holds the role, so an empty
+ * pg_auth_members entry for it is the control, not a detail.
+ */
+export const DEFINER_OWNER_ROLES: Record<string, DatabaseRoleSpec> = {
+  nominara_share_lookup: { login: false, bypassrls: false, connectionLimit: -1, inherit: false },
+};
+
 // STORY-120 — the migration ledger (src/db/migrate-runner.ts's BOOTSTRAP_SQL)
 // lives in its OWN schema, outside the `public` census that
 // expectedTablePrivileges below describes, so it needs its own declared

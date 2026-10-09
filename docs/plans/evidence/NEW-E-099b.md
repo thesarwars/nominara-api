@@ -133,3 +133,30 @@ additive migration (recommended) or (c) read names on the app pool. The portal s
 shape only. `schemas/README.md` line 48 still lists `source_domains` as portal-readable and should be corrected when the docs are next carried.
 The tasks tab and the first-view notification of this item are unchanged by this pass; `portal-tasks-http` re-run on the merged tip: 14 passed, exit 0
 (so the "never run" note above is superseded for the integration spec; its RED was still never observed).
+
+## Checkpoint 4 (branch `7day/e-portal-5`) — AC2 STILL NOT MET for overview, growth-map, matrix; BLOCKED on a decision
+
+RED `b39a110` (`test/integration/portal-fact-tables-http.spec.ts`): the trace is pg `Client.prototype.query`, in-process,
+so it sees every statement on every pool and has no co-filter. Result at RED: 3 failed, 1 passed (the passing one is the
+control proving the trace catches a fact-table statement); exit 1. Offenders found:
+
+| Route | Statements against fact tables |
+|---|---|
+| GET /portal/overview | `ScorecardsService.engineConfig` `measured` CTE (answer_captures) and `last_capture` lateral (answer_captures); `aggregateRange` day_cells x2 (answer_captures, mention_facts, citation_facts) |
+| GET /portal/matrix | the same four |
+| GET /portal/growth-map | `GrowthMapService.failureDays` (answer_captures) |
+
+The only exemption in the test is `engineDataSourcesForDates` (owner decision 2026-10-08, NEW-E-100a), matched by its own
+statement shape. Tasks: the real trace (same mechanism, no `tasks` co-filter) replaces the vacuous `pg_stat_statements`
+check in `portal-tasks-http.spec.ts` and passes: the tasks read touches no fact table.
+
+Why it is not fixed here (needs a decision, not a patch): the scorecard's window figures are not read from `metric_daily`;
+`aggregateRange` recomputes them from the fact tables, because `metric_daily` stores per-day ratios (sov, sentiment_score,
+presence_rate) whose window roll-up needs the numerators and weights (sovWeighted, prominenceSum, ...). A rollup-only portal
+projection is therefore a second window-aggregation rule that would put different figures on the portal than on the agency
+dashboard for multi-day windows. `last_captured_at` is not exposed by the portal and could be skipped; `failureDays` could
+drop to reason `no_capture`. Options for the owner: (a) amend STORY-099 s14 / 099b AC2 to exempt the scorecard and
+growth-map reads (as NEW-E-100a did for engine_data_sources), the portal role keeping SELECT on the fact tables;
+(b) approve a rollup-only projection and state how window figures derive from `metric_daily` (and accept that they may
+differ from the agency's), plus whether to add window numerators to `metric_daily` (a schema change).
+RED test stays failing on this branch until one is chosen; do not merge it before then.

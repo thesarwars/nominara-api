@@ -231,6 +231,21 @@ describe("CP2 decision 1 · app.share_token_by_hash is owned by a dedicated, nar
     expect(iso[0]!.qual).toContain("app.current_workspace()");
   });
 
+  it("DEF-11 · nobody is a member of nominara_share_lookup: no pg_auth_members row, and no non-superuser role can MEMBER/USAGE/SET it", async () => {
+    // The policy share_token_gate_lookup admits EVERY row to the role's privileges; the only thing keeping it inert is
+    // that no role can assume the role. Mutation D2 (GRANT nominara_share_lookup TO nominara_worker) used to pass.
+    const members = await admin.query<{ member: string }>(
+      `SELECT m.rolname AS member FROM pg_auth_members am JOIN pg_roles m ON m.oid = am.member
+        WHERE am.roleid = 'nominara_share_lookup'::regrole`,
+    );
+    expect(members.rows).toEqual([]);
+    const reach = await admin.query<{ rolname: string; kind: string }>(
+      `SELECT r.rolname, k.kind FROM pg_roles r CROSS JOIN (VALUES ('MEMBER'), ('USAGE'), ('SET')) AS k(kind)
+        WHERE NOT r.rolsuper AND r.rolname <> 'nominara_share_lookup' AND pg_has_role(r.oid, 'nominara_share_lookup'::regrole, k.kind)`,
+    );
+    expect(reach.rows).toEqual([]);
+  });
+
   it("DEF-10 · 0112 rolls back cleanly (owner returns to the migration identity, policy and grants gone, lookup still works) and re-applies", async () => {
     const s = await seedToken();
     for (let step = 0; step < 200; step += 1) {

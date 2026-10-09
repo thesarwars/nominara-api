@@ -25,6 +25,8 @@ import { assertIso19NoGucsZeroRows, iso19Breaker } from "./iso-19-actor-scoped-n
 import { assertIso20ActorPolicyInertUnderTenantContext, iso20Breaker } from "./iso-20-actor-policy-inert-under-tenant-context.js";
 import { assertIso21ActorOnlyWritesDenied, assertIso21AgainstMissingReadOnly, iso21Breaker } from "./iso-21-actor-only-writes-denied.js";
 import { assertIso22ActorOnlyFuzzReplay, iso22Breaker } from "./iso-22-actor-only-fuzz-replay.js";
+import { assertIso24DefinerOwnerNoMembers, iso24Breaker } from "./iso-24-definer-owner-no-members.js";
+import { assertIso25ShareLookupDefinerShape, iso25Breaker } from "./iso-25-share-lookup-definer-shape.js";
 
 // STORY-012 — the single place every registered assertion AND its paired
 // breaker are aggregated. test/isolation/meta/breaker-matrix.spec.ts (T27)
@@ -194,6 +196,10 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
     assertUnderBreaker: assertIso22ActorOnlyFuzzReplay,
     breaker: iso22Breaker,
   },
+  // ADR-0002 — the share-token lookup definer: nobody is a member of its owner role, and the function's shape holds.
+  // Both inspect the catalog only (no tenant rows), hence read-only and fixture-free.
+  { id: "ISO-24", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso24DefinerOwnerNoMembers, assertUnderBreaker: assertIso24DefinerOwnerNoMembers, breaker: iso24Breaker },
+  { id: "ISO-25", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso25ShareLookupDefinerShape, assertUnderBreaker: assertIso25ShareLookupDefinerShape, breaker: iso25Breaker },
 ];
 
 // STORY-012 T24 · D-6 — ISOLATION_TARGET=staging runs ONLY the read-only,
