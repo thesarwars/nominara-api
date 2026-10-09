@@ -342,3 +342,50 @@ A stale (> 60 min) pending auto-top-up purchase is no longer ever freed by a loo
 - `pnpm lint` exit 0; `pnpm typecheck` exit 0; `pnpm test:unit` exit 0.
 - Integration (auto-topup-cycle-reset, -trigger, -enqueue, billing-usage-auto-topup, credit-ledger-read, worker-group-bootstrap, identity-tenancy-billing): exit 0, 7 files / 163 tests.
 - `pnpm test:isolation`: exit 1, 1 failed / 52 passed — ISO-14 `namespacing.spec.ts` flags `src/modules/reports/scheduled-reports.service.ts:234` (the e-reports lane). Not touched by this branch (`git diff integration/7day -- src/modules/reports test/isolation` is empty), so it fails identically on the base; belongs to the e-reports lane.
+
+## Checkpoint-4 fix pass (second-engineer findings 1 and 2) — `7day/d-usage-5` (base `integration/7day` at `74e4b2f`)
+
+RED: `bb6d3ca` — `auto-topup-trigger.spec.ts`: **1 failed / 51 passed / 1 expected fail (53), exit 1**. The failure is the F2b test:
+`expected 'upstream_error' to be 'in_flight'` (a replay Stripe refused with 400 was a generic `upstream_error` with no alert).
+Fix: `f84fcdf`.
+
+### Finding 1 (major) — the replay must equal the original
+(a) Test side, `test/support/fake-stripe-gateway.ts` + `auto-topup-trigger.spec.ts`:
+- The fake records the first request per `auto-topup-<purchaseId>` key (canonicalised, key order does not matter) and rejects a later request with that key
+  and different parameters with `StripeUpstreamError(400)`; an identical one is answered. `offSessionAttempts` records EVERY request made, before a failure is
+  raised (the original of F2 fails before Stripe records it, so this is how its parameters are captured). `failChargeAfterReaching` models a lost reply
+  (Stripe holds the key, the caller sees a 503). `resetOffSession()` clears all of it.
+- F2 now compares replay to original field by field (same key set, each field `toBe`, plus absolute values 1500 / USD / cus_saved_1 / pm_saved_1).
+(b) Chosen: map Stripe's idempotency_error to `unreconcilable` with an immediate alert (no schema change, so no migration; storing the request on the row would be an unnamed schema change). In `AutoTopupService.reconcileStale`, an HTTP 400 on the REPLAY call raises
+`ALERT ... reason=replay_rejected` and `nominara_billing_auto_topup_stale_unreconcilable_total{reason="replay_rejected"}`; the row stays pending (fail closed), no slot, no second purchase.
+Any other upstream error is unchanged (`upstream_error`, row pending). A 400 cannot succeed on retry, so it is alerted on every run rather than at 23 h.
+If the original never reached Stripe, the replay is the first request Stripe sees and charges the CURRENT saved card for the ORIGINAL amount (tested).
+
+| criterion | test name (all in `test/integration/auto-topup-trigger.spec.ts`) |
+|---|---|
+| replay == original, every field | "NEW-D-7 checkpoint-3 F2 · Search saying `none` proves nothing ..." (extended) |
+| fake refuses reused key with other parameters | "NEW-D-7 checkpoint-4 F2a · the fake refuses a reused key whose parameters differ ..." |
+| original reached Stripe + card changed -> immediate alert, pending, metric | "NEW-D-7 checkpoint-4 F2b · the original reached Stripe (reply lost) and a manual purchase since then changed the saved card ..." |
+| original never reached Stripe + card changed -> charges current card once | "NEW-D-7 checkpoint-4 F2b · the original never reached Stripe and the saved card changed since ..." |
+| original reached Stripe, nothing changed -> identical replay, one charge | "NEW-D-7 checkpoint-4 F2b · the original reached Stripe (reply lost) and nothing changed ..." |
+
+Mutations on `auto-topup-trigger.spec.ts` (source restored after each, `diff` clean): amount `+ 100` **3 failed** (the reported M1, was 48/48 passing);
+currency `"EUR"` **3 failed**; productName `"x"` **2 failed**; packKey `"other"` **2 failed**; replay paymentMethodId `"pm_x"` **3 failed**;
+`statusCode === 400` -> `499` **1 failed**.
+
+### Finding 2 (major) — KAD-06 through the real processor: NOT FIXED, decision needed
+The old test called `service.trigger` directly and so recorded 0 idle-in-transaction backends where production has 1. It is retitled to say what it proves
+(the SERVICE opens no transaction of its own across the lookup). New test "NEW-D-7 checkpoint-4 F7 · KAD-06: through createJobProcessor, no job transaction
+is open while the Stripe lookup is awaited" builds the real `createJobProcessor` (signed job, `billing.auto_topup` topology entry, real
+`createBillingAutoTopupHandler`, real service) and counts `idle in transaction` backends from inside the first Stripe call. Run as a plain `it` against the
+current code it **fails: `expected 1 to be +0`**. It is committed as `it.fails` so the suite is green and so it FAILS the moment the fix lands (then switch it to `it`).
+The assertion is not weakened.
+
+What is needed (a decision, not code): per the finding, either (i) an ADR adding a processor mode that verifies the signature and runs the handler without holding the
+job transaction (`worker-factory.ts`; a new pattern, default no), or (ii) a bounded written exception in coding-standards / KAD-06 (concurrency 2 per rollup replica, 10 s Stripe
+timeout, no row locks taken, no snapshot held under READ COMMITTED). Per the finding this does NOT block merging into `integration/7day`; it DOES block enabling auto-top-up against live Stripe.
+
+### Gates
+- `pnpm lint` exit 0; `pnpm typecheck` exit 0; `pnpm test:unit` exit 0 (306 files passed, 3755 tests).
+- Integration (auto-topup-cycle-reset, -trigger, -enqueue, billing-usage-auto-topup, worker-group-bootstrap): exit 0, 5 files, 104 passed / 1 expected fail.
+- `pnpm test:isolation`: exit 0, 13 files / 53 tests.
