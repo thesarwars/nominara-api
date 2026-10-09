@@ -225,6 +225,24 @@ describe("STORY-076b · remove (period-end policy, seat refusal first)", () => {
     expect(c.calls.filter(({ sql }) => /^\s*(INSERT|UPDATE|DELETE)/iu.test(sql))).toEqual([]);
   });
 
+  it("checkpoint-5 · remove waits for the workspace lock at most 3 s (transaction-local), and exceeding it is a retryable 409 with no Stripe call", async () => {
+    const c = client([
+      [/FROM workspaces WHERE id = \$1 FOR UPDATE/u, () => {
+        throw Object.assign(new Error("canceling statement due to lock timeout"), { code: "55P03" });
+      }],
+    ]);
+    const gw = gateway();
+    await expect(inTenant(c, () => new BillingAddonsService(gw, intents().pool).remove("extra_seat"))).rejects.toMatchObject({ code: "conflict", message: expect.stringMatching(/in progress/u) });
+    const timeout = c.calls.findIndex(({ sql }) => /set_config\('lock_timeout', \$1, true\)/u.test(sql));
+    const lock = c.calls.findIndex(({ sql }) => /FROM workspaces WHERE id = \$1 FOR UPDATE/u.test(sql));
+    expect(timeout).toBeGreaterThanOrEqual(0);
+    expect(timeout).toBeLessThan(lock);
+    expect(c.calls[timeout]!.params).toEqual(["3000"]);
+    expect(counter).toHaveBeenCalledWith("nominara_billing_addon_change_total", { kind: "extra_seat", outcome: "lock_wait_exceeded" });
+    expect(gw.fetches).toEqual([]);
+    expect(gw.removals).toEqual([]);
+  });
+
   it("removing an add-on that is not held is a 404 and calls nothing", async () => {
     const gw = gateway();
     await expect(inTenant(client([]), () => new BillingAddonsService(gw, intents().pool).remove("extra_project"))).rejects.toMatchObject({ code: "not_found" });
