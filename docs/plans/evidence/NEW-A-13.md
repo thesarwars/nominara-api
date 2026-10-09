@@ -159,3 +159,29 @@ NEEDED FROM THE OWNER: (a) the event that moves initializing -> active (e.g. onb
 DEFAULT_PROJECT_CADENCE = 'weekly' regardless of plan; entitlements give scan.cadence weekly (starter), twice_weekly (growth), daily_priority (business), hourly_priority (enterprise). Only projects.cadence sets wake frequency, so a Growth project gets ~4 runs per cycle against 8 allowed. NEEDED FROM THE OWNER: does the starting cadence come from the workspace's scan.cadence entitlement (and the mapping daily_priority -> daily, hourly_priority -> ?, twice_weekly -> ?, given the cadence values the column CHECK allows), or does it stay weekly by policy? Once decided, the test is: create a project in a growth workspace and assert the exact interval of next_run_at (the current spec only checks cadence <> 'manual' and would pass with any cadence). Not written, because the expected value is the decision.
 
 Gates: see the final report of this pass.
+
+## Checkpoint-6 fix pass 4 (lane a-gemini, branch 7day/a-gemini-7, base 9b03547)
+
+Owner decisions 2026-10-09 pm #1 and #2. Checkpoint-5 findings 1 (activation event) and 2 (starting cadence) are now FIXED.
+
+### #1 Activation event
+Event: `POST /v1/projects/{id}/prompts/activate` (PromptActivationService.activate), the prompt-set confirmation. After the activation UPDATE, if the project has at least one occupying prompt and is still `initializing`, one guarded UPDATE sets `status = 'active'` and `next_run_at = nextRunAfter(cadence, now)` (NULL for `manual`). The `status = 'initializing'` guard is repeated in the UPDATE, so a paused or already-active project is never touched and its next_run_at never moves; a replay is a no-op. A long-past next_run_at is always overwritten with a fresh slot, so there is no burst (asserted: `claimDueProject(now)` returns null).
+Demo seed: `ensureDemoProjects` inserts status `active`, the starting cadence and `next_run_at = nextRunAfter(cadence, now)`.
+Tests (test/integration/project-activation.spec.ts, 5; seed-demo.spec.ts, 2 via it.each growth/business): initializing -> active with next slot; 40-day-past next_run_at gets a fresh slot and is not claimable; manual stays NULL; paused untouched; already-active untouched.
+
+### #2 Starting cadence mapping (src/lib/capture/starting-cadence.ts)
+projects.cadence CHECK allows hourly, daily, twice_weekly, weekly, manual. twice_weekly IS allowed, so no rounding up was needed.
+| scan.cadence | projects.cadence |
+|---|---|
+| weekly (starter) | weekly |
+| twice_weekly (growth) | twice_weekly |
+| daily_priority (business) | daily |
+| hourly_priority (enterprise) | daily (capped until the hourly tier exists) |
+| absent / null / unknown (e.g. free) | weekly (column default; an unknown entitlement buys no extra runs) |
+Applied in ProjectsService.create and ensureDemoProjects. Tests in project-create-next-run.spec.ts use the real plan table through resolveEntitlements: growth asserts cadence twice_weekly and next_run_at = now + 30d/8 (3.75 days), plus starter, business, enterprise.
+
+### RED -> GREEN
+RED commit: 6 failed in project-activation + project-create-next-run (cadence 'weekly' != expected; status stayed initializing) and 2 failed in seed-demo. GREEN: project-activation, project-create-next-run, seed-demo: 3 files, 52 tests pass.
+
+### Gates
+lint 0, typecheck 0. test:unit: 1 failed file, test/unit/pagination-published-contract.spec.ts (the five bare lists, decision #3, another lane's RED test already in base; untouched by this change); 309 passed otherwise. test:isolation not run (no tenant table or policy touched). Cadence CHANGE path still has no code (unchanged note).

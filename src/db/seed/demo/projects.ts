@@ -4,6 +4,8 @@ import { structuralLimitFrom } from "../../../lib/entitlements/classification.js
 import { resolveEntitlements } from "../../../lib/entitlements/resolution.js";
 import { SYSTEM_ACTOR_ID } from "../../../tenancy/constants.js";
 import type { EntitlementValue } from "../plan-entitlements.js";
+import { nextRunAfter } from "../../../lib/capture/scheduler.js";
+import { startingCadenceFor } from "../../../lib/capture/starting-cadence.js";
 import { DEMO_PROJECT_CREATED_KEY, DEMO_PROJECT_FIXTURES } from "./constants.js";
 
 // STORY-169 — which projects the seed targets, and creating the fixture
@@ -108,6 +110,10 @@ export async function ensureDemoProjects(tx: ClientBase, workspaceId: string): P
   const existing = await listNonDeletedProjects(tx, workspaceId);
   const cap = await projectsMaxCap(tx, workspaceId);
   const target = Math.min(3, cap);
+  // Owner decision 2026-10-09 pm #1/#2: a seed-created project is active on the
+  // plan's starting cadence with next_run_at = the NEXT slot, never "now".
+  const resolved = await resolveEntitlements(tx, workspaceId);
+  const cadence = startingCadenceFor(resolved.entitlements["scan.cadence"]?.value);
   if (existing.length >= target) return [];
 
   const created: TargetProject[] = [];
@@ -121,9 +127,9 @@ export async function ensureDemoProjects(tx: ClientBase, workspaceId: string): P
     const slug = await freeSlug(tx, workspaceId, slugFromDomain(fixture.rootDomain));
     await tx.query(
       `INSERT INTO projects
-         (id, workspace_id, name, slug, root_url, root_domain, status, fingerprint, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,'active',$7::jsonb,$8)`,
-      [id, workspaceId, fixture.name, slug, `https://${fixture.rootDomain}`, fixture.rootDomain, JSON.stringify({ [DEMO_PROJECT_CREATED_KEY]: true }), SYSTEM_ACTOR_ID],
+         (id, workspace_id, name, slug, root_url, root_domain, status, fingerprint, created_by, cadence, next_run_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'active',$7::jsonb,$8,$9,$10)`,
+      [id, workspaceId, fixture.name, slug, `https://${fixture.rootDomain}`, fixture.rootDomain, JSON.stringify({ [DEMO_PROJECT_CREATED_KEY]: true }), SYSTEM_ACTOR_ID, cadence, nextRunAfter(cadence, new Date())],
     );
     created.push({ id, workspaceId, name: fixture.name, slug, rootDomain: fixture.rootDomain });
   }

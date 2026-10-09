@@ -177,6 +177,30 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     }
   }, 120_000);
 
+  it.each([
+    ["growth", "twice_weekly", (30 * 24 * 60 * 60 * 1000) / 8],
+    ["business", "daily", 24 * 60 * 60 * 1000],
+  ])(
+    "CP6 a-gemini · decision 2026-10-09 pm #1/#2 · a seed-created project on a %s workspace is active on cadence %s with next_run_at one interval ahead",
+    async (plan, cadence, intervalMs) => {
+      const workspaceId = await createWorkspace(plan);
+      const before = Date.now();
+      await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+      const after = Date.now();
+
+      const projects = await projectsOf(workspaceId);
+      expect(projects.length).toBeGreaterThan(0);
+      for (const project of projects) {
+        expect(project.status).toBe("active");
+        expect(project.cadence).toBe(cadence);
+        const next = (project.next_run_at as Date).getTime();
+        expect(next).toBeGreaterThanOrEqual(before + intervalMs);
+        expect(next).toBeLessThanOrEqual(after + intervalMs);
+      }
+    },
+    120_000,
+  );
+
   it("STORY-169 review · a critical AUX-finding task (AUX-R-001) carries no fabricated playbook_slug, so it resolves to copy_patch, not open_playbook", async () => {
     // The exact review violation: the seed used to set `playbook_slug =
     // fix-aux-r-001` on EVERY AUX-finding task, and `derivePrimaryAction`
