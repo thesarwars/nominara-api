@@ -1,7 +1,9 @@
 import type { ClientBase } from "pg";
 
-// Checkpoint-5 — the ONE bounded wait for the workspace row lock, shared by every billing path that takes it
-// on a MAIN-POOL connection (add, remove, checkout, and the Stripe webhook handlers).
+// Checkpoint-5/6 — the ONE bounded wait for the workspace row lock, shared by EVERY writer of that row that
+// takes it on a pooled connection: the billing paths (add, remove, checkout, the Stripe webhook handlers) and, from
+// checkpoint-6, the others (PATCH /workspaces/:id, suspend, the entitlement bump, the plan-set worker, retention).
+// A writer that does not bound its wait queues behind a billing holder that is inside a Stripe call.
 //
 // ⚠ AN UNBOUNDED `FOR UPDATE` IS A POOL DRAIN. The holder of this lock calls Stripe (up to five calls of 10 s
 // each) while it holds it, and every request queued behind it keeps a main-pool connection checked out while it

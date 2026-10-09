@@ -3,7 +3,7 @@ import { desiredFromStripeInvoice } from "../../lib/billing/stripe/invoice-state
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { BillingInvoicesService } from "./billing-invoices.service.js";
 import { DegradedError } from "../../api/errors/domain-errors.js";
-import { lockWorkspaceBounded } from "./workspace-lock.js";
+import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
 
 // STORY-075b / STORY-075 AC9 — invoices as a READ MODEL. The event only says

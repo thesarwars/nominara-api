@@ -8,7 +8,9 @@ import {
   NoActiveSubscriptionError,
   PlanChangeTargetMissingError,
   UnknownPlanError,
+  WorkspaceLockBusyError,
 } from "./errors.js";
+import { lockWorkspaceBounded } from "./workspace-lock.js";
 import { proRataTopUp, utcMidnight } from "./plan-grant.js";
 
 // STORY-151 — a workspace's plan can change. Nothing in this product could do
@@ -205,6 +207,8 @@ export async function applyPlanChange(
   // 1. The workspace, locked. Its pre-image is the audit row's before_state —
   //    the first populated one in this repo: `auditBeforeState` is declared on
   //    the interceptor and read by it, and set by nothing.
+  //    The wait is bounded (checkpoint-6): the holder of this row may be inside a Stripe call.
+  await lockWorkspaceBounded(tx, workspaceId, () => new WorkspaceLockBusyError(workspaceId));
   const workspace = await tx.query<WorkspaceRow>(
     "SELECT plan_key, entitlement_version, status, deleted_at FROM workspaces WHERE id = $1 FOR UPDATE",
     [workspaceId],

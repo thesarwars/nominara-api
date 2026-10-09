@@ -7,7 +7,7 @@ import { syncWorkspaceBillingStatus } from "../../lib/billing/workspace-billing-
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { BillingAddonsService } from "./billing-addons.service.js";
 import { DegradedError } from "../../api/errors/domain-errors.js";
-import { lockWorkspaceBounded } from "./workspace-lock.js";
+import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
 
 // STORY-075a / STORY-075 AC4 — the ONLY customer-reachable path to
