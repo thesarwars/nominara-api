@@ -6,7 +6,11 @@ import type { Client } from "pg";
 // from contract by content, only by whether the author explicitly said so.
 export const CONTRACT_PHASE_ANNOTATION = "-- @contract-phase";
 
-const DESTRUCTIVE_PATTERNS: Array<{ regex: RegExp; extractTable: (match: RegExpMatchArray) => string }> = [
+const DESTRUCTIVE_PATTERNS: Array<{
+  regex: RegExp;
+  extractTable: (match: RegExpMatchArray) => string;
+  isSafe?: (sql: string, match: RegExpMatchArray) => boolean;
+}> = [
   {
     regex: /drop\s+table\s+(?:if\s+exists\s+)?([a-zA-Z0-9_."]+)/gi,
     extractTable: (m) => normalizeIdentifier(m[1]!),
@@ -27,10 +31,58 @@ const DESTRUCTIVE_PATTERNS: Array<{ regex: RegExp; extractTable: (match: RegExpM
   },
   {
     regex:
-      /alter\s+table\s+(?:if\s+exists\s+)?([a-zA-Z0-9_."]+)\s+add\s+column\s+(?:if\s+not\s+exists\s+)?[a-zA-Z0-9_"]+[^,;]*?\bnot\s+null\b/gis,
+      /alter\s+table\s+(?:if\s+exists\s+)?([a-zA-Z0-9_."]+)\s+add\s+column\s+(?:if\s+not\s+exists\s+)?[a-zA-Z0-9_"]+(?:[^,;(]|\([^)]*\))*?\bnot\s+null\b/gis,
     extractTable: (m) => normalizeIdentifier(m[1]!),
+    // ADD COLUMN ... NOT NULL DEFAULT <constant> is metadata-only on Postgres 11+
+    // (existing rows read the default; no rewrite, no failure on a populated
+    // table). It is not the hazard the rule exists for. NOT NULL with no default
+    // fails outright on a populated table, and a volatile default rewrites it.
+    isSafe: (sql, m) => isSafeConstantDefaultAdd(sql, m),
   },
 ];
+
+// Fail closed: a default is accepted only if it is recognisably a constant or
+// a transaction-stable timestamp. Anything else — any other function call,
+// a subquery, a sequence — is reported, so an unknown form is never waved through.
+const SAFE_DEFAULT_EXPR = new RegExp(
+  "^(?:" +
+    [
+      "'(?:[^']|'')*'", // string literal
+      "[+-]?\\d+(?:\\.\\d+)?", // number
+      "true|false",
+      "now\\(\\)|current_timestamp|current_date",
+    ].join("|") +
+    ")(?:::[a-z_][a-z0-9_ ]*(?:\\(\\d+(?:,\\s*\\d+)?\\))?(?:\\[\\])?)*$",
+  "i",
+);
+
+function isSafeConstantDefaultAdd(sql: string, match: RegExpMatchArray): boolean {
+  const start = match.index ?? 0;
+  const afterMatch = sql.slice(start + match[0].length);
+  // The column definition runs to the next top-level `,` or `;`.
+  let end = afterMatch.length;
+  let depth = 0;
+  let quoted = false;
+  for (let i = 0; i < afterMatch.length; i++) {
+    const c = afterMatch[i]!;
+    if (c === "'") quoted = !quoted;
+    else if (!quoted && c === "(") depth++;
+    else if (!quoted && c === ")") depth--;
+    else if (!quoted && depth <= 0 && (c === "," || c === ";")) {
+      end = i;
+      break;
+    }
+  }
+  const definition = (match[0] + afterMatch.slice(0, end)).replace(/--[^\n]*/g, " ");
+  const defaults = [...definition.matchAll(/\bdefault\s+/gi)];
+  if (defaults.length !== 1) return false;
+  const exprStart = defaults[0]!.index! + defaults[0]![0].length;
+  const expr = definition
+    .slice(exprStart)
+    .replace(/\s+(?:not\s+null|null|constraint\b|check\b|references\b|unique\b|primary\b|collate\b)[\s\S]*$/i, "")
+    .trim();
+  return SAFE_DEFAULT_EXPR.test(expr);
+}
 
 const SAFE_IDENTIFIER = /^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)?$/;
 
@@ -52,8 +104,9 @@ export interface DestructiveStep {
 
 export function findDestructiveSteps(sql: string): DestructiveStep[] {
   const steps: DestructiveStep[] = [];
-  for (const { regex, extractTable } of DESTRUCTIVE_PATTERNS) {
+  for (const { regex, extractTable, isSafe } of DESTRUCTIVE_PATTERNS) {
     for (const match of sql.matchAll(regex)) {
+      if (isSafe?.(sql, match)) continue;
       steps.push({ statementKind: match[0], table: extractTable(match) });
     }
   }

@@ -40,17 +40,58 @@ describe("STORY-006 · additive-guard pure logic", () => {
       expect(steps.map((s) => s.table)).toEqual(["probe_not_null"]);
     });
 
-    it("detects ALTER TABLE ... ADD COLUMN ... NOT NULL, with or without a DEFAULT", () => {
+    it("detects ALTER TABLE ... ADD COLUMN ... NOT NULL with no DEFAULT (fails outright on a populated table)", () => {
       expect(
-        findDestructiveSteps("ALTER TABLE probe_not_null ADD COLUMN note text NOT NULL DEFAULT '';").map(
-          (s) => s.table,
-        ),
+        findDestructiveSteps("ALTER TABLE probe_not_null ADD COLUMN note text NOT NULL;").map((s) => s.table),
       ).toEqual(["probe_not_null"]);
+    });
+
+    it("detects NOT NULL with no DEFAULT on a parameterised type such as numeric(12,2)", () => {
       expect(
-        findDestructiveSteps("ALTER TABLE probe_not_null ADD COLUMN note text DEFAULT '' NOT NULL;").map(
-          (s) => s.table,
-        ),
+        findDestructiveSteps("ALTER TABLE probe_not_null ADD COLUMN amount numeric(12,2) NOT NULL;").map((s) => s.table),
       ).toEqual(["probe_not_null"]);
+    });
+
+    describe("ADD COLUMN ... NOT NULL DEFAULT <constant> is metadata-only and accepted", () => {
+      it.each([
+        ["string, default before NOT NULL", "note text DEFAULT '' NOT NULL"],
+        ["string, default after NOT NULL", "note text NOT NULL DEFAULT 'v1'"],
+        ["boolean", "flag boolean NOT NULL DEFAULT false"],
+        ["number", "n integer NOT NULL DEFAULT 0"],
+        ["negative decimal", "n numeric(12,2) NOT NULL DEFAULT -1.50"],
+        ["cast jsonb literal", "j jsonb NOT NULL DEFAULT '{}'::jsonb"],
+        ["cast array literal", "a text[] NOT NULL DEFAULT '{}'::text[]"],
+        ["string containing a comma", "note text NOT NULL DEFAULT 'a,b'"],
+        ["now() (stable, evaluated once)", "at timestamptz NOT NULL DEFAULT now()"],
+        ["current_timestamp", "at timestamptz NOT NULL DEFAULT current_timestamp"],
+        ["with a trailing CHECK", "n integer NOT NULL DEFAULT 0 CHECK (n >= 0)"],
+      ])("%s", (_label, column) => {
+        expect(findDestructiveSteps(`ALTER TABLE probe_not_null ADD COLUMN ${column};`)).toEqual([]);
+        expect(findDestructiveSteps(`ALTER TABLE probe_not_null ADD COLUMN IF NOT EXISTS ${column};`)).toEqual([]);
+      });
+    });
+
+    describe("ADD COLUMN ... NOT NULL with a non-constant default is still flagged (volatile = table rewrite)", () => {
+      it.each([
+        ["random()", "r double precision NOT NULL DEFAULT random()"],
+        ["gen_random_uuid()", "id uuid NOT NULL DEFAULT gen_random_uuid()"],
+        ["clock_timestamp()", "at timestamptz NOT NULL DEFAULT clock_timestamp()"],
+        ["nextval", "n bigint NOT NULL DEFAULT nextval('probe_seq')"],
+        ["subexpression with a call", "n integer NOT NULL DEFAULT (1 + floor(random() * 3))"],
+        ["a column reference-looking expression", "n integer NOT NULL DEFAULT other_col"],
+        ["a user function", "n integer NOT NULL DEFAULT app.next_value()"],
+      ])("%s", (_label, column) => {
+        expect(findDestructiveSteps(`ALTER TABLE probe_not_null ADD COLUMN ${column};`).map((s) => s.table)).toEqual([
+          "probe_not_null",
+        ]);
+      });
+    });
+
+    it("does not exempt a NOT NULL default on one column from a second NOT NULL-without-default column", () => {
+      const steps = findDestructiveSteps(
+        "ALTER TABLE probe_not_null ADD COLUMN a text NOT NULL DEFAULT 'x'; ALTER TABLE probe_other ADD COLUMN b text NOT NULL;",
+      );
+      expect(steps.map((s) => s.table)).toEqual(["probe_other"]);
     });
 
     it("does not flag a nullable ADD COLUMN", () => {
