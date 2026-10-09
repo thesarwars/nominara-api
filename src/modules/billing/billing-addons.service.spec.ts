@@ -412,12 +412,89 @@ describe("STORY-076b audit · a retried POST charges once (Idempotency-Key -> st
     expect(state.calls).toHaveLength(calls);
   });
 
-  it("AC1 retry . the intent store keeps at most 20 intents, dropping the oldest, so the column cannot grow without bound", async () => {
+  it("AC1 retry . the intent store never holds more than 20 intents; a full map of LIVE intents refuses the next purchase with a retryable 409 instead of evicting one", async () => {
+    const store = intents();
+    const { state, gw } = stripe(0, false);
+    const svc = new BillingAddonsService(gw, store.pool);
+    for (let i = 0; i < 20; i += 1) await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, `client-key-${String(i)}`));
+    expect(Object.keys(store.state.value!)).toHaveLength(20);
+    const calls = state.calls.length;
+    await expect(inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-21"))).rejects.toMatchObject({ code: "conflict", message: expect.stringMatching(/retry/u) });
+    expect(state.calls).toHaveLength(calls); // Stripe was not asked
+    expect(Object.keys(store.state.value!)).toHaveLength(20);
+    expect(Object.keys(store.state.value!)).toContain(keyHash("client-key-0")); // nothing was evicted
+  });
+
+  it("AC1 retry . an intent older than Stripe's 24 h key retention is evicted to make room, and the map stays at 20", async () => {
     const store = intents();
     const { gw } = stripe(0, false);
     const svc = new BillingAddonsService(gw, store.pool);
-    for (let i = 0; i < 25; i += 1) await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, `client-key-${String(i)}`));
-    expect(Object.keys(store.state.value!)).toHaveLength(20);
+    for (let i = 0; i < 20; i += 1) await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, `client-key-${String(i)}`));
+    const map = store.state.value as Record<string, { created_at: string }>;
+    map[keyHash("client-key-0")]!.created_at = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-new"));
+    const keys = Object.keys(store.state.value!);
+    expect(keys).toHaveLength(20);
+    expect(keys).not.toContain(keyHash("client-key-0"));
+    expect(keys).toContain(keyHash("client-key-new"));
+  });
+
+  it("checkpoint-5 BLOCKER . 20 settled purchases of ANOTHER kind cannot evict an unsettled seat intent: its retry still charges ONE seat", async () => {
+    const store = intents();
+    // A Stripe holding one quantity per kind, honouring its own idempotency keys, losing the reply of the first call.
+    const held: Record<string, number> = {};
+    const seen = new Set<string>();
+    const calls: Array<{ key: string; kind: string; quantity: number }> = [];
+    let lost = true;
+    const gw = gateway({
+      fetchObject: (kind: string, id: string) =>
+        Promise.resolve({
+          kind,
+          id,
+          metadata: {},
+          raw: { items: { data: Object.entries(held).map(([k, quantity]) => ({ id: `si_${k}`, quantity, price: { unit_amount: 1500, currency: "usd", product: { metadata: { nominara_kind: k } } } })) } },
+        }),
+      changeAddonQuantity: (input: { idempotencyKey: string; kind: string; quantity: number }) => {
+        calls.push({ key: input.idempotencyKey, kind: input.kind, quantity: input.quantity });
+        if (!seen.has(input.idempotencyKey)) {
+          seen.add(input.idempotencyKey);
+          held[input.kind] = input.quantity;
+        }
+        if (lost) {
+          lost = false;
+          return Promise.reject(new StripeUpstreamError(504));
+        }
+        return Promise.resolve();
+      },
+    } as never);
+    const svc = new BillingAddonsService(gw, store.pool);
+    await expect(inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "key-A"))).rejects.toMatchObject({ code: "degraded" });
+    expect(held.extra_seat).toBe(1);
+    // Twenty settled purchases of another kind under new keys, within 24 h. The map holds 20: some are refused (409), none may evict A.
+    for (let i = 0; i < 20; i += 1) {
+      await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_project", quantity: 1 }, `other-${String(i)}`)).catch((e: unknown) => {
+        expect(e).toMatchObject({ code: "conflict" });
+      });
+    }
+    expect(Object.keys(store.state.value!)).toContain(keyHash("key-A"));
+    const retry = await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "key-A"));
+    expect(retry).toMatchObject({ kind: "extra_seat", quantity_requested: 1 });
+    expect(held.extra_seat).toBe(1); // the customer is billed for ONE seat
+    const seatCalls = calls.filter((c) => c.kind === "extra_seat");
+    expect(seatCalls).toHaveLength(2);
+    expect(seatCalls[1]).toEqual(seatCalls[0]); // the same stored call under the same Stripe key
+  });
+
+  it("checkpoint-5 . a SETTLED live intent is not evicted either: another member reusing its key is still answered without a Stripe call", async () => {
+    const store = intents();
+    const { state, gw } = stripe(0, false);
+    const svc = new BillingAddonsService(gw, store.pool);
+    for (let i = 0; i < 25; i += 1) await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, `client-key-${String(i)}`)).catch(() => undefined);
+    expect(Object.keys(store.state.value!)).toContain(keyHash("client-key-0"));
+    const calls = state.calls.length;
+    const again = await inTenant(client(scriptWith(store)), () => svc.add({ kind: "extra_seat", quantity: 1 }, "client-key-0"));
+    expect(again).toMatchObject({ quantity_requested: 1 });
+    expect(state.calls).toHaveLength(calls);
   });
 
   it("AC1 boundary . a request refused for any reason leaves no intent behind (annual, over the cap, duplicate lines, not in plan)", async () => {
