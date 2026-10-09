@@ -81,7 +81,7 @@ describe("STORY-065-A · goals — real SQL", () => {
   const engineGoal = (extra: Record<string, unknown> = {}) =>
     createGoalRequestSchema.parse({ title: "Lift visibility", kind: "engine_score", target: { metric: "visibility_score", target_value: 60 }, ...extra });
   const create = (ctx: TenantContext, projectId: string, body = engineGoal()) => inTenant(ctx, () => service.createGoal(projectId, body));
-  const list = (ctx: TenantContext, projectId: string) => inTenant(ctx, () => service.listGoals(projectId));
+  const list = (ctx: TenantContext, projectId: string) => inTenant(ctx, async () => (await service.listGoals(projectId, { limit: 200 })).items);
   const abandon = (ctx: TenantContext, projectId: string, goalId: string) =>
     inTenant(ctx, () => service.updateGoal(projectId, goalId, updateGoalRequestSchema.parse({ status: "abandoned" })));
 
