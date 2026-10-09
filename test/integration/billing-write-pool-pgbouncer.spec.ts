@@ -29,7 +29,7 @@ describe("checkpoint-5 · the billing write pool's wait for a pgBouncer server c
   });
 
   function writePool() {
-    const { host, port, user, password, database } = fixture.connectThroughPooler("nominara_app").connectionParameters;
+    const { host, port, user, password, database } = (fixture.connectThroughPooler("nominara_app") as unknown as { connectionParameters: Record<string, unknown> }).connectionParameters;
     return createBillingWritePool(`postgres://${String(user)}:${encodeURIComponent(String(password))}@${String(host)}:${String(port)}/${String(database)}`);
   }
 

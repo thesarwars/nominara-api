@@ -46,6 +46,8 @@ describe("STORY-076b checkpoint-4 · billing write pool", () => {
         const error = fail?.(sql);
         return error === undefined ? Promise.resolve({ rows: [], rowCount: 1 }) : Promise.reject(error);
       },
+      on: () => undefined,
+      off: () => undefined,
       release: (arg?: unknown) => released.push(arg),
     };
     return { calls, released, pool: { connect: () => Promise.resolve(client) } as never };

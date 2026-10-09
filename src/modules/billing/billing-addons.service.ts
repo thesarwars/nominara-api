@@ -25,9 +25,9 @@ import { ADDON_KINDS, resolveEntitlements, type AddonKind } from "../../lib/enti
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
-import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
+import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
-import { BILLING_WRITE_POOL, connectForWrite } from "./billing-write-pool.js";
+import { BILLING_WRITE_POOL, inBillingWriteTransaction } from "./billing-write-pool.js";
 import { lockWorkspaceBounded } from "./workspace-lock.js";
 
 // STORY-076b / STORY-076 AC10-AC13 — the one owner of `subscription_addons`.
@@ -502,19 +502,14 @@ export class BillingAddonsService {
   /** Writes the whole intent map in its own short transaction (the request holds the workspace row lock). */
   private async persistIntents(workspaceId: string, next: PendingAddonChanges): Promise<void> {
     const { actorId } = this.tenant();
-    const client = await connectForWrite(this.pool);
-    try {
-      await withTenantContext(client, { workspaceId, actorId }, async (tx) => {
-        const result = await tx.query(
-          "UPDATE subscriptions SET pending_addon_changes = $2::jsonb, updated_at = now() WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')",
-          [workspaceId, JSON.stringify(next)],
-        );
-        // Fail closed: with no record committed, Stripe must not be asked.
-        if (result.rowCount !== 1) throw new PreconditionUnmetError({ message: "this workspace has no billing subscription yet: start one first" });
-      });
-    } finally {
-      client.release();
-    }
+    await inBillingWriteTransaction(this.pool, { workspaceId, actorId }, async (tx) => {
+      const result = await tx.query(
+        "UPDATE subscriptions SET pending_addon_changes = $2::jsonb, updated_at = now() WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')",
+        [workspaceId, JSON.stringify(next)],
+      );
+      // Fail closed: with no record committed, Stripe must not be asked.
+      if (result.rowCount !== 1) throw new PreconditionUnmetError({ message: "this workspace has no billing subscription yet: start one first" });
+    });
   }
 
   /**

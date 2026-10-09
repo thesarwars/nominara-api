@@ -75,6 +75,8 @@ function intents(log: string[] = []) {
           }
           return Promise.resolve({ rows: [], rowCount: 1 });
         },
+        on: () => undefined,
+        off: () => undefined,
         release: () => undefined,
       }),
   } as never;
