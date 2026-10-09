@@ -2,6 +2,8 @@ import { Injectable, Logger } from "@nestjs/common";
 import { desiredFromStripeInvoice } from "../../lib/billing/stripe/invoice-state.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { BillingInvoicesService } from "./billing-invoices.service.js";
+import { DegradedError } from "../../api/errors/domain-errors.js";
+import { lockWorkspaceBounded } from "./workspace-lock.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
 
 // STORY-075b / STORY-075 AC9 — invoices as a READ MODEL. The event only says
@@ -21,7 +23,12 @@ export class StripeInvoiceHandler implements StripeEventHandler {
 
     // The workspace row is the serialiser (as in the subscription handler): two
     // events for one invoice take turns instead of racing on ux_invoices_stripe.
-    await tx.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    await lockWorkspaceBounded(tx, workspaceId, () => {
+      // Nothing is recorded (the claim rolls back with the transaction), so Stripe redelivers the event.
+      incrementCounter("nominara_billing_webhook_lock_wait_exceeded_total", {});
+      this.logger.warn({ message: "stripe webhook refused as retryable: the workspace is busy with another billing change", event_id: event.id, workspace_id: workspaceId });
+      return new DegradedError({ message: "billing is busy: retry shortly" });
+    });
 
     const desired = desiredFromStripeInvoice(object.raw);
     if (desired.kind === "ignore") {

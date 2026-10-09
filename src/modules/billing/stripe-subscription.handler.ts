@@ -6,6 +6,8 @@ import { desiredFromStripeSubscription, toCents, type ClaimedPlanPrice } from ".
 import { syncWorkspaceBillingStatus } from "../../lib/billing/workspace-billing-status.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { BillingAddonsService } from "./billing-addons.service.js";
+import { DegradedError } from "../../api/errors/domain-errors.js";
+import { lockWorkspaceBounded } from "./workspace-lock.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
 
 // STORY-075a / STORY-075 AC4 — the ONLY customer-reachable path to
@@ -50,7 +52,12 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     // charge, or the intent of the checkout that bought it), and a concurrent
     // adoption writes both; reading them unlocked could compare against the
     // catalog instead and refuse a customer who paid the price they were shown.
-    await tx.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    await lockWorkspaceBounded(tx, workspaceId, () => {
+      // Nothing is recorded (the claim rolls back with the transaction), so Stripe redelivers the event.
+      incrementCounter("nominara_billing_webhook_lock_wait_exceeded_total", {});
+      this.logger.warn({ message: "stripe webhook refused as retryable: the workspace is busy with another billing change", event_id: event.id, workspace_id: workspaceId });
+      return new DegradedError({ message: "billing is busy: retry shortly" });
+    });
     const claimedPlan = await this.claimedPlanPrice(tx, workspaceId, object.metadata, object.id);
     const desired = desiredFromStripeSubscription(object.raw, object.metadata, claimedPlan);
     if (desired.kind === "ignore") {

@@ -28,6 +28,7 @@ import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { BILLING_WRITE_POOL, connectForWrite } from "./billing-write-pool.js";
+import { lockWorkspaceBounded } from "./workspace-lock.js";
 
 // STORY-076b / STORY-076 AC10-AC13 — the one owner of `subscription_addons`.
 //
@@ -89,9 +90,6 @@ const MAX_PENDING_INTENTS = 20;
 
 /** Stripe forgets an idempotency key after this long: an unresolved intent older than it can neither block nor be retried. */
 const INTENT_RETENTION_MS = 24 * 60 * 60 * 1000;
-
-/** The longest `add` waits for the workspace row lock before answering a retryable 409. */
-const ADD_LOCK_WAIT_MS = 3_000;
 
 interface AddonRow {
   id: string;
@@ -318,7 +316,7 @@ export class BillingAddonsService {
   async remove(kind: AddonKind): Promise<AddonChangeResponse> {
     this.requireConfigured();
     const { client, workspaceId } = this.tenant();
-    await client.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    await this.lockWorkspace(client, workspaceId, kind);
 
     const held = (
       await client.query<ActiveRow>(
@@ -449,21 +447,16 @@ export class BillingAddonsService {
 
   /**
    * ⚠ THE LOCK WAIT IS BOUNDED. `add` commits its intent on a SECOND pooled connection while it holds
-   * the lock; requests queued behind it each hold a connection of their own. With enough of them queued
+   * the lock (`add` and `remove` alike); requests queued behind it each hold a connection of their own. With enough of them queued
    * the pool is empty, the holder waits for a connection no waiter will give back, and every one of
-   * them hangs. A wait of at most `ADD_LOCK_WAIT_MS` makes that a retryable 409 instead of a hang: the
+   * them hangs. A wait of at most `WORKSPACE_LOCK_WAIT_MS` makes that a retryable 409 instead of a hang: the
    * waiters give their connections back and the holder proceeds. The setting is transaction-local.
    */
   private async lockWorkspace(client: ClientBase, workspaceId: string, kind: AddonKind): Promise<void> {
-    await client.query("SELECT set_config('lock_timeout', $1, true)", [String(ADD_LOCK_WAIT_MS)]);
-    try {
-      await client.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
-    } catch (error) {
-      if ((error as { code?: string }).code !== "55P03") throw error;
+    await lockWorkspaceBounded(client, workspaceId, () => {
       incrementCounter("nominara_billing_addon_change_total", { kind, outcome: "lock_wait_exceeded" });
-      throw new ConflictError({ message: "another billing change for this workspace is in progress: retry shortly" });
-    }
-    await client.query("SELECT set_config('lock_timeout', '0', true)");
+      return new ConflictError({ message: "another billing change for this workspace is in progress: retry shortly" });
+    });
   }
 
   /**
