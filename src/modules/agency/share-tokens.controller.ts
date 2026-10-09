@@ -1,21 +1,26 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Post, Req } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query, Req } from "@nestjs/common";
 import { z } from "zod";
 import {
   mintedShareTokenSchema,
   mintShareTokenRequestSchema,
+  shareTokenListQuerySchema,
   shareTokenListResponseSchema,
   shareTokenSchema,
+  shareTokenViewListQuerySchema,
   shareTokenViewListResponseSchema,
   type MintedShareToken,
   type MintShareTokenRequest,
   type ShareToken,
+  type ShareTokenListQuery,
   type ShareTokenView,
+  type ShareTokenViewListQuery,
 } from "../../../contracts/agency/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequireFeature } from "../../api/decorators/require-entitlement.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
+import type { Page } from "../../api/pagination/page.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { ShareTokensService, type AuditRequestMeta } from "./share-tokens.service.js";
 
@@ -44,9 +49,9 @@ export class ShareTokensController {
   @Get()
   @RequirePermission("share_token:mint")
   @ScopedByQuery()
-  @ApiContract({ operationId: "listShareTokens", responseSchema: shareTokenListResponseSchema })
-  list(): Promise<ShareToken[]> {
-    return this.service.list();
+  @ApiContract({ operationId: "listShareTokens", querySchema: shareTokenListQuerySchema, responseSchema: shareTokenListResponseSchema, listOf: true })
+  list(@Query(new ZodValidationPipe(shareTokenListQuerySchema)) query: ShareTokenListQuery): Promise<Page<ShareToken>> {
+    return this.service.list(query);
   }
 
   @Post()
@@ -76,8 +81,8 @@ export class ShareTokensController {
   @Get(":id/views")
   @RequirePermission("share_token:mint")
   @ScopedByQuery()
-  @ApiContract({ operationId: "listShareTokenViews", responseSchema: shareTokenViewListResponseSchema })
-  views(@Param("id", idPipe) id: string): Promise<ShareTokenView[]> {
-    return this.service.views(id);
+  @ApiContract({ operationId: "listShareTokenViews", querySchema: shareTokenViewListQuerySchema, responseSchema: shareTokenViewListResponseSchema, listOf: true })
+  views(@Param("id", idPipe) id: string, @Query(new ZodValidationPipe(shareTokenViewListQuerySchema)) query: ShareTokenViewListQuery): Promise<Page<ShareTokenView>> {
+    return this.service.views(id, query);
   }
 }

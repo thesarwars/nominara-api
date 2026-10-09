@@ -191,7 +191,7 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
       // another workspace's report is invisible: not listed, and 404 on update and delete
       await withTenantContext(client, { workspaceId: one.a.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
         await tx.query("SET LOCAL ROLE nominara_app");
-        expect(await service.list()).toEqual([]);
+        expect((await service.list({ limit: 50 })).items).toEqual([]);
         await expect(service.remove(mine.id)).rejects.toMatchObject({ status: 404 });
         await expect(service.update(mine.id, { paused: true } as never)).rejects.toMatchObject({ status: 404 });
       });
@@ -275,4 +275,63 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
       client.release();
     }
   }, 180_000);
+
+  // NEW-E-7 checkpoint-6 (owner 2026-10-09 pm #3) — walks a list by cursor at limit 2 and returns the ids seen, per page.
+  async function walk(a: Actor, path: string, idOf: (row: Record<string, unknown>) => string): Promise<string[][]> {
+    const pages: string[][] = [];
+    let cursor: string | undefined;
+    for (let guard = 0; guard < 12; guard += 1) {
+      const res = await harness.app().inject({ method: "GET", url: apiUrl(`${path}?limit=2${cursor === undefined ? "" : `&cursor=${cursor}`}`), headers: { cookie: a.cookie } });
+      expect(res.statusCode, res.body).toBe(200);
+      const body = res.json() as { data: Record<string, unknown>[]; pagination: { cursor_next: string | null; has_more: boolean; limit: number } };
+      expect(body.pagination.limit).toBe(2);
+      expect(body.pagination.has_more).toBe(body.pagination.cursor_next !== null);
+      pages.push(body.data.map(idOf));
+      if (body.pagination.cursor_next === null) return pages;
+      cursor = body.pagination.cursor_next;
+    }
+    throw new Error("cursor walk did not terminate");
+  }
+  async function rejectsBadCursors(a: Actor, path: string, foreign: string): Promise<void> {
+    for (const cursor of ["not-a-cursor", foreign]) {
+      const res = await harness.app().inject({ method: "GET", url: apiUrl(`${path}?cursor=${cursor}`), headers: { cookie: a.cookie } });
+      expect(res.statusCode, res.body).toBe(400);
+      expect((res.json() as { error: { code: string } }).error.code).toBe("validation_failed");
+    }
+    const offset = await harness.app().inject({ method: "GET", url: apiUrl(`${path}?offset=2`), headers: { cookie: a.cookie } });
+    expect(offset.statusCode, offset.body).toBe(400);
+  }
+
+  it("NEW-E-7 checkpoint-6 · listScheduledReports pages by keyset: a created_at tie at the page boundary is neither skipped nor repeated, deliveries ride on their own report, cursor_next null on the last", async () => {
+    const { a, p } = await seeded();
+    await harness.db().query(
+      `INSERT INTO scheduled_reports (workspace_id, name, project_ids, cadence, recipients, created_at)
+       SELECT $1, 'r' || g, ARRAY[$2::uuid], 'monthly', ARRAY['c@example.test']::citext[], '2026-10-01T10:00:00.000001Z' FROM generate_series(1,5) g`,
+      [a.workspaceId, p],
+    );
+    const expected = (
+      await harness.db().query<{ id: string }>(`SELECT id FROM scheduled_reports WHERE workspace_id = $1 ORDER BY created_at DESC, id DESC`, [a.workspaceId])
+    ).rows.map((r) => r.id);
+    await harness.db().query(
+      `INSERT INTO scheduled_report_deliveries (workspace_id, scheduled_report_id, status, recipient_count) VALUES ($1,$2,'logged',1)`,
+      [a.workspaceId, expected[2]],
+    );
+    const pages = await walk(a, "/scheduled-reports", (r) => r.id as string);
+    expect(pages.map((x) => x.length)).toEqual([2, 2, 1]);
+    expect(pages.flat()).toEqual(expected);
+    const third = await harness.app().inject({ method: "GET", url: apiUrl("/scheduled-reports?limit=2"), headers: { cookie: a.cookie } });
+    const cursor = (third.json() as { pagination: { cursor_next: string } }).pagination.cursor_next;
+    const next = await harness.app().inject({ method: "GET", url: apiUrl(`/scheduled-reports?limit=2&cursor=${cursor}`), headers: { cookie: a.cookie } });
+    const rows = (next.json() as { data: { id: string; deliveries: unknown[] }[] }).data;
+    expect(rows.find((r) => r.id === expected[2])?.deliveries).toHaveLength(1);
+  }, 120_000);
+
+  it("NEW-E-7 checkpoint-6 · listScheduledReports: an empty list is an empty page with the envelope; a malformed or foreign cursor and an offset are 400", async () => {
+    const { a } = await seeded();
+    const res = await harness.app().inject({ method: "GET", url: apiUrl("/scheduled-reports"), headers: { cookie: a.cookie } });
+    expect(res.json()).toMatchObject({ data: [], pagination: { cursor_next: null, has_more: false } });
+    const foreign = Buffer.from(JSON.stringify({ v: 1, k: ["x"] })).toString("base64url");
+    await rejectsBadCursors(a, "/scheduled-reports", foreign);
+  }, 120_000);
+
 });

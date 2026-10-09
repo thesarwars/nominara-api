@@ -169,7 +169,7 @@ describe("NEW-E-100c · STORY-100 s15 · delivery history", () => {
       { id: "0190aaaa-0000-7000-8000-0000000000d1", scheduled_report_id: REPORT_ID, attempted_at: "2026-10-01T08:00:00.000Z", status: "logged", reason: null, recipient_count: 2 },
     ];
     const h = harness({ deliveries });
-    const [report] = await h.service.list();
+    const [report] = (await h.service.list({ limit: 50 })).items;
     expect(report!.deliveries.map((d) => [d.status, d.reason, d.recipients])).toEqual([
       ["skipped_cap", "cap of 10 reached; resets 2026-11-01", 0],
       ["failed", "render exploded", 0],

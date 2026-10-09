@@ -376,6 +376,154 @@
           "support_grant_id"
         ]
       }
+    },
+    {
+      "id": "2026-10-09-themes-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-097",
+      "task": "NEW-E-7 (checkpoint-6)",
+      "scope": "listAgencyThemes (GET /v1/agency/theme)",
+      "from": "{ data: Item[], meta } with no pagination member and no cursor/limit query; every theme in one response, default first then created_at, id",
+      "to": "{ data: Item[], pagination, meta } with the standard cursor and limit query; default first, then (created_at, id); the unsaved platform default is still the single item of the first page of a workspace with no stored theme; cursor key [is_default, created_at microseconds, id]",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2026-10-09 pm #3 (decisions-2026-10-09-pm.md): all bare lists move to the cursor envelope, matching api-specification.md section 3 and the signed-off plan's rule that every list response uses it; the decision says to record each as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every row now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listAgencyThemes",
+        "path": "/v1/agency/theme",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "theme_id",
+          "name",
+          "is_default",
+          "color_primary",
+          "color_accent",
+          "color_bg",
+          "color_fg",
+          "font_family",
+          "logo_url",
+          "hide_nominara_brand"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-scheduled-reports-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-100",
+      "task": "NEW-E-7 (checkpoint-6)",
+      "scope": "listScheduledReports (GET /v1/scheduled-reports)",
+      "from": "{ data: Item[], meta } with no pagination member and no cursor/limit query; every report in one response, ordered by created_at DESC, id",
+      "to": "{ data: Item[], pagination, meta } with the standard cursor and limit query; ordered by (created_at DESC, id DESC) with a microsecond-precision cursor key; each page carries the deliveries of its own reports",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2026-10-09 pm #3 (decisions-2026-10-09-pm.md): all bare lists move to the cursor envelope, matching api-specification.md section 3 and the signed-off plan's rule that every list response uses it; the decision says to record each as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every row now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listScheduledReports",
+        "path": "/v1/scheduled-reports",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "label",
+          "project_ids",
+          "sections",
+          "cadence",
+          "day",
+          "hour",
+          "format",
+          "recipients",
+          "timeframe",
+          "theme_id",
+          "paused",
+          "next_run_at",
+          "deliveries"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-share-tokens-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-098",
+      "task": "NEW-E-7 (checkpoint-6)",
+      "scope": "listShareTokens (GET /v1/share-tokens)",
+      "from": "{ data: Item[], meta } with no pagination member and no cursor/limit query; every visible token in one response, ordered by created_at DESC, id",
+      "to": "{ data: Item[], pagination, meta } with the standard cursor and limit query; ordered by (created_at DESC, id DESC) with a microsecond-precision cursor key; a scoped member still sees only tokens inside their scope",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2026-10-09 pm #3 (decisions-2026-10-09-pm.md): all bare lists move to the cursor envelope, matching api-specification.md section 3 and the signed-off plan's rule that every list response uses it; the decision says to record each as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every row now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listShareTokens",
+        "path": "/v1/share-tokens",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "label",
+          "token_prefix",
+          "scope_project_ids",
+          "scope_tabs",
+          "hide_competitors",
+          "hide_costs",
+          "timeframe_lock",
+          "theme_id",
+          "password_required",
+          "allowed_email_domains",
+          "max_views",
+          "view_count",
+          "expires_at",
+          "revoked_at",
+          "created_at",
+          "last_viewed_at"
+        ]
+      }
+    },
+    {
+      "id": "2026-10-09-share-token-views-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-098",
+      "task": "NEW-E-7 (checkpoint-6)",
+      "scope": "listShareTokenViews (GET /v1/share-tokens/{id}/views)",
+      "from": "{ data: Item[], meta } with no pagination member and no cursor/limit query; at most 500 views in one response, ordered by viewed_at DESC, id, with no way to read past the 500th",
+      "to": "{ data: Item[], pagination, meta } with the standard cursor and limit query; every view reachable by cursor, ordered by (viewed_at DESC, id DESC) with a microsecond-precision cursor key; the 500-row cap is removed",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner decision 2026-10-09 pm #3 (decisions-2026-10-09-pm.md): all bare lists move to the cursor envelope, matching api-specification.md section 3 and the signed-off plan's rule that every list response uses it; the decision says to record each as a breaking change. Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every row now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listShareTokenViews",
+        "path": "/v1/share-tokens/{id}/views",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "at",
+          "ip",
+          "geo",
+          "user_agent",
+          "authenticated",
+          "pages",
+          "duration_s"
+        ]
+      }
     }
   ]
 }

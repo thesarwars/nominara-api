@@ -4,9 +4,12 @@ import type {
   CreateScheduledReportRequest,
   ScheduledReport,
   ScheduledReportDelivery,
+  ScheduledReportListQuery,
   UpdateScheduledReportRequest,
 } from "../../../contracts/reports/index.js";
 import { DomainError, FeatureNotInPlanError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { pageFrom, Page } from "../../api/pagination/page.js";
+import { decodeTimestampIdCursor, MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import { isFeatureGranted, type FeatureFlagKey } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { StructuralUsage } from "../../lib/entitlements/structural-usage.js";
@@ -110,16 +113,26 @@ export class ScheduledReportsService {
     @Inject(EMAIL_SENDER) private readonly email: EmailSender,
   ) {}
 
-  async list(): Promise<ScheduledReport[]> {
+  /** NEW-E-7 checkpoint-6 — keyset page ordered (created_at DESC, id DESC); the cursor key carries the microsecond created_at. */
+  async list(query: ScheduledReportListQuery): Promise<Page<ScheduledReport>> {
     const { client } = this.store();
-    const reports = await client.query<ReportRow>(`SELECT ${COLUMNS} FROM scheduled_reports ORDER BY created_at DESC, id`);
-    if (reports.rows.length === 0) return [];
+    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor);
+    const reports = await client.query<ReportRow & { created_at_key: string }>(
+      `SELECT ${COLUMNS}, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_at_key
+         FROM scheduled_reports
+        WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1::timestamptz, $2::uuid))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $3`,
+      [after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
+    );
+    const page = pageFrom(reports.rows, query.limit, (r) => r, (r) => [r.created_at_key, r.id]);
+    if (page.items.length === 0) return new Page<ScheduledReport>([], page.pagination);
     const deliveries = await client.query<DeliveryRow>(
       `SELECT id, scheduled_report_id, attempted_at, status, reason, recipient_count
          FROM scheduled_report_deliveries WHERE scheduled_report_id = ANY($1::uuid[]) ORDER BY attempted_at DESC, id DESC`,
-      [reports.rows.map((r) => r.id)],
+      [page.items.map((r) => r.id)],
     );
-    return reports.rows.map((r) => toReport(r, deliveries.rows));
+    return new Page(page.items.map((r) => toReport(r, deliveries.rows)), page.pagination);
   }
 
   async create(body: CreateScheduledReportRequest): Promise<ScheduledReport> {

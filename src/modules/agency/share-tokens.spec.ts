@@ -53,7 +53,7 @@ describe("CP1 e-reports · ShareTokensService treats an empty scope as scoped to
 
   it("CP1 zero-scope · list() with a present-but-empty scope is refused (project_out_of_scope) and reads nothing", async () => {
     const { service, query } = serviceWithScope([]);
-    await expect(service.list()).rejects.toMatchObject({ code: "project_out_of_scope" });
+    await expect(service.list({ limit: 50 })).rejects.toMatchObject({ code: "project_out_of_scope" });
     expect(query).not.toHaveBeenCalled();
   });
 
@@ -61,16 +61,16 @@ describe("CP1 e-reports · ShareTokensService treats an empty scope as scoped to
     const { service, query } = serviceWithScope([]);
     await expect(service.mint({} as never, {} as never)).rejects.toMatchObject({ code: "project_out_of_scope" });
     await expect(service.revoke("t")).rejects.toMatchObject({ code: "project_out_of_scope" });
-    await expect(service.views("t")).rejects.toMatchObject({ code: "project_out_of_scope" });
+    await expect(service.views("t", { limit: 50 })).rejects.toMatchObject({ code: "project_out_of_scope" });
     expect(query).not.toHaveBeenCalled();
   });
 
   it("CP1 zero-scope · an UNRESTRICTED member (scope undefined) still lists, and a narrowed one filters by scope", async () => {
     const free = serviceWithScope(undefined);
-    await expect(free.service.list()).resolves.toEqual([]);
+    await expect(free.service.list({ limit: 50 })).resolves.toMatchObject({ items: [] });
     expect(String((free.query.mock.calls[0] as unknown[])[0])).not.toContain("<@");
     const scoped = serviceWithScope(["00000000-0000-7000-8000-000000000001"]);
-    await expect(scoped.service.list()).resolves.toEqual([]);
+    await expect(scoped.service.list({ limit: 50 })).resolves.toMatchObject({ items: [] });
     expect(String((scoped.query.mock.calls[0] as unknown[])[0])).toContain("<@");
   });
 });

@@ -267,4 +267,61 @@ describe("STORY-097 · agency theme over HTTP", () => {
       }
     }
   });
+
+  // NEW-E-7 checkpoint-6 (owner 2026-10-09 pm #3) — walks a list by cursor at limit 2 and returns the ids seen, per page.
+  async function walk(a: Actor, path: string, idOf: (row: Record<string, unknown>) => string): Promise<string[][]> {
+    const pages: string[][] = [];
+    let cursor: string | undefined;
+    for (let guard = 0; guard < 12; guard += 1) {
+      const res = await harness.app().inject({ method: "GET", url: apiUrl(`${path}?limit=2${cursor === undefined ? "" : `&cursor=${cursor}`}`), headers: { cookie: a.cookie } });
+      expect(res.statusCode, res.body).toBe(200);
+      const body = res.json() as { data: Record<string, unknown>[]; pagination: { cursor_next: string | null; has_more: boolean; limit: number } };
+      expect(body.pagination.limit).toBe(2);
+      expect(body.pagination.has_more).toBe(body.pagination.cursor_next !== null);
+      pages.push(body.data.map(idOf));
+      if (body.pagination.cursor_next === null) return pages;
+      cursor = body.pagination.cursor_next;
+    }
+    throw new Error("cursor walk did not terminate");
+  }
+  async function rejectsBadCursors(a: Actor, path: string, foreign: string): Promise<void> {
+    for (const cursor of ["not-a-cursor", foreign]) {
+      const res = await harness.app().inject({ method: "GET", url: apiUrl(`${path}?cursor=${cursor}`), headers: { cookie: a.cookie } });
+      expect(res.statusCode, res.body).toBe(400);
+      expect((res.json() as { error: { code: string } }).error.code).toBe("validation_failed");
+    }
+    const offset = await harness.app().inject({ method: "GET", url: apiUrl(`${path}?offset=2`), headers: { cookie: a.cookie } });
+    expect(offset.statusCode, offset.body).toBe(400);
+  }
+
+  it("NEW-E-7 checkpoint-6 · listAgencyThemes pages by keyset: default first, a created_at tie at the page boundary is neither skipped nor repeated, cursor_next null on the last", async () => {
+    const a = await owner("growth");
+    await harness.db().query(`INSERT INTO brand_themes (workspace_id, name, is_default, created_at) VALUES ($1,'D',true,'2026-10-01T10:00:00.000001Z')`, [a.workspaceId]);
+    await harness.db().query(
+      `INSERT INTO brand_themes (workspace_id, name, is_default, created_at) SELECT $1, 'T' || g, false, '2026-10-01T10:00:00.000001Z' FROM generate_series(1,4) g`,
+      [a.workspaceId],
+    );
+    const expected = (
+      await harness.db().query<{ id: string }>(`SELECT id FROM brand_themes WHERE workspace_id = $1 ORDER BY is_default DESC, created_at, id`, [a.workspaceId])
+    ).rows.map((r) => r.id);
+    const pages = await walk(a, "/agency/theme", (r) => r.theme_id as string);
+    expect(pages.map((p) => p.length)).toEqual([2, 2, 1]);
+    expect(pages.flat()).toEqual(expected);
+    expect(new Set(pages.flat()).size).toBe(5);
+  });
+
+  it("NEW-E-7 checkpoint-6 · listAgencyThemes: the unsaved platform default is still the single item of an empty first page, with the envelope", async () => {
+    const a = await owner("growth");
+    const res = await get(a);
+    const body = res.json() as { data: unknown[]; pagination: { cursor_next: string | null; has_more: boolean } };
+    expect(body.data).toHaveLength(1);
+    expect(body.pagination).toMatchObject({ cursor_next: null, has_more: false });
+  });
+
+  it("NEW-E-7 checkpoint-6 · listAgencyThemes: a malformed or foreign cursor and an offset are 400, not a silent first page", async () => {
+    const a = await owner("growth");
+    const foreign = Buffer.from(JSON.stringify({ v: 1, k: ["x"] })).toString("base64url");
+    await rejectsBadCursors(a, "/agency/theme", foreign);
+  });
+
 });

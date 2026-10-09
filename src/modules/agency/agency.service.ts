@@ -3,9 +3,13 @@ import type { ClientBase } from "pg";
 import {
   contrastRejectionDetailsSchema,
   type AgencyTheme,
+  type AgencyThemeListQuery,
   type UpdateAgencyThemeRequest,
 } from "../../../contracts/agency/index.js";
 import { ConflictError, FeatureNotInPlanError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { pageFrom, Page } from "../../api/pagination/page.js";
+import { invalidCursor, MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import {
   CURATED_FONT_FAMILIES,
@@ -42,6 +46,17 @@ interface ThemeRow {
 
 const COLUMNS = "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand";
 
+const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+function themeCursorKeyOf(cursor: string): [number, string, string] {
+  const [isDefault, createdAt, id] = decodeCursor(cursor, 3);
+  if ((isDefault !== 0 && isDefault !== 1) || typeof createdAt !== "string" || !ISO_MICROS.test(createdAt) || typeof id !== "string" || !UUID.test(id)) {
+    throw invalidCursor();
+  }
+  return [isDefault, createdAt, id];
+}
+
 /** Contrast ratios are written "N:1"; built by concatenation so the text is not a key-shaped template. */
 function ratioText(n: number): string {
   return String(n) + ":1";
@@ -75,11 +90,27 @@ export class AgencyService {
   private readonly logger = new Logger(AgencyService.name);
 
   /** All of the workspace's themes, the default first. With none stored, the unsaved platform default. */
-  async listThemes(): Promise<AgencyTheme[]> {
+  /**
+   * NEW-E-7 checkpoint-6 — keyset page ordered (is_default DESC, created_at, id). The cursor key is
+   * [is_default as 1/0, created_at at microsecond precision, id]; the default is first, so the mixed direction is
+   * an explicit two-branch predicate rather than a row comparison. A workspace with no stored theme still gets the
+   * unsaved platform default as the one item of its first page.
+   */
+  async listThemes(query: AgencyThemeListQuery): Promise<Page<AgencyTheme>> {
     const { client } = this.store();
-    const result = await client.query<ThemeRow>(`SELECT ${COLUMNS} FROM brand_themes ORDER BY is_default DESC, created_at, id`);
-    if (result.rows.length === 0) return [platformDefaultTheme()];
-    return result.rows.map(toTheme);
+    const after = query.cursor === undefined ? undefined : themeCursorKeyOf(query.cursor);
+    const result = await client.query<ThemeRow & { created_at_key: string }>(
+      `SELECT ${COLUMNS}, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_at_key
+         FROM brand_themes
+        WHERE $1::int IS NULL
+           OR is_default::int < $1::int
+           OR (is_default::int = $1::int AND (created_at, id) > ($2::timestamptz, $3::uuid))
+        ORDER BY is_default DESC, created_at, id
+        LIMIT $4`,
+      [after?.[0] ?? null, after?.[1] ?? null, after?.[2] ?? null, query.limit + 1],
+    );
+    if (result.rows.length === 0 && after === undefined) return new Page([platformDefaultTheme()], { cursor_next: null, has_more: false, limit: query.limit });
+    return pageFrom(result.rows, query.limit, toTheme, (row) => [row.is_default ? 1 : 0, row.created_at_key, row.id]);
   }
 
   /**

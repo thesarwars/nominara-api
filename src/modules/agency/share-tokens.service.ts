@@ -1,8 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
-import type { MintedShareToken, MintShareTokenRequest, ShareToken, ShareTokenView } from "../../../contracts/agency/index.js";
+import type { MintedShareToken, MintShareTokenRequest, ShareToken, ShareTokenListQuery, ShareTokenView, ShareTokenViewListQuery } from "../../../contracts/agency/index.js";
 import { EntitlementExceededError, NotFoundError, ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { pageFrom, type Page } from "../../api/pagination/page.js";
+import { decodeTimestampIdCursor, MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { hash as argon2idHash } from "../../lib/crypto/argon2id.js";
@@ -15,7 +17,6 @@ const PORTAL_BASE_URL = "https://portal.nominara.com";
 const ENTITLEMENT_KEY = "share_links.enabled";
 const SECRET_BYTES = 32;
 const PREFIX_LENGTH = 8;
-const VIEWS_PAGE_LIMIT = 500;
 
 /** The request facts the notice-severity audit row needs; the interceptor reads the same fields for its own row. */
 export interface AuditRequestMeta {
@@ -191,13 +192,32 @@ export class ShareTokensService {
 
   constructor(private readonly audit: AuditChainService) {}
 
-  async list(): Promise<ShareToken[]> {
+  /** NEW-E-7 checkpoint-6 — pageAfter page ordered (created_at DESC, id DESC); the cursor key carries the microsecond created_at. */
+  async list(query: ShareTokenListQuery): Promise<Page<ShareToken>> {
     const { client, actorScope } = this.store();
+    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor);
+    const afterArgs = [after?.[0] ?? null, after?.[1] ?? null, query.limit + 1];
+    // Two static statements: an unrestricted member must not carry the scope predicate at all.
     const result =
       actorScope === null
-        ? await client.query<TokenRow>(`SELECT ${COLUMNS} FROM share_tokens ORDER BY created_at DESC, id`)
-        : await client.query<TokenRow>(`SELECT ${COLUMNS} FROM share_tokens WHERE scope_project_ids <@ $1::uuid[] ORDER BY created_at DESC, id`, [actorScope]);
-    return result.rows.map(toShareToken);
+        ? await client.query<TokenRow & { created_at_key: string }>(
+            `SELECT ${COLUMNS}, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_at_key
+               FROM share_tokens
+              WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1::timestamptz, $2::uuid))
+              ORDER BY created_at DESC, id DESC
+              LIMIT $3`,
+            afterArgs,
+          )
+        : await client.query<TokenRow & { created_at_key: string }>(
+            `SELECT ${COLUMNS}, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_at_key
+               FROM share_tokens
+              WHERE scope_project_ids <@ $4::uuid[]
+                AND ($1::timestamptz IS NULL OR (created_at, id) < ($1::timestamptz, $2::uuid))
+              ORDER BY created_at DESC, id DESC
+              LIMIT $3`,
+            [...afterArgs, actorScope],
+          );
+    return pageFrom(result.rows, query.limit, toShareToken, (row) => [row.created_at_key, row.id]);
   }
 
   async mint(body: MintShareTokenRequest, meta: AuditRequestMeta): Promise<MintedShareToken> {
@@ -282,10 +302,13 @@ export class ShareTokensService {
   }
 
   /** Telemetry, newest first. `pages`, `duration_s` and `geo` are null (not recorded), never 0, until a source exists. */
-  async views(id: string): Promise<ShareTokenView[]> {
+  async views(id: string, query: ShareTokenViewListQuery): Promise<Page<ShareTokenView>> {
     const { client } = this.store();
     await this.loadVisible(client, id);
+    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor);
     const result = await client.query<{
+      id: string;
+      viewed_at_key: string;
       viewed_at: Date;
       ip: string | null;
       country: string | null;
@@ -294,24 +317,30 @@ export class ShareTokensService {
       pages: number | null;
       duration_s: number | null;
     }>(
-      `SELECT viewed_at, host(ip) AS ip, country, user_agent, authenticated,
+      `SELECT id, to_char(viewed_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS viewed_at_key, viewed_at, host(ip) AS ip, country, user_agent, authenticated,
               NULLIF(cardinality(pages_viewed), 0) AS pages,
               duration_ms::float8 / 1000 AS duration_s
          FROM share_token_views
         WHERE share_token_id = $1
-        ORDER BY viewed_at DESC, id
-        LIMIT ${String(VIEWS_PAGE_LIMIT)}`,
-      [id],
+          AND ($2::timestamptz IS NULL OR (viewed_at, id) < ($2::timestamptz, $3::uuid))
+        ORDER BY viewed_at DESC, id DESC
+        LIMIT $4`,
+      [id, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
-    return result.rows.map((r) => ({
-      at: r.viewed_at.toISOString(),
-      ip: r.ip,
-      geo: r.country,
-      user_agent: r.user_agent,
-      authenticated: r.authenticated,
-      pages: r.pages,
-      duration_s: r.duration_s,
-    }));
+    return pageFrom(
+      result.rows,
+      query.limit,
+      (r) => ({
+        at: r.viewed_at.toISOString(),
+        ip: r.ip,
+        geo: r.country,
+        user_agent: r.user_agent,
+        authenticated: r.authenticated,
+        pages: r.pages,
+        duration_s: r.duration_s,
+      }),
+      (r) => [r.viewed_at_key, r.id],
+    );
   }
 
   // ---- STORY-098 part B: the portal gate. Called by PortalSessionService / PortalContextInterceptor, never by a controller of ours.

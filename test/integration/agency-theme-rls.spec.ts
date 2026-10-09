@@ -72,8 +72,8 @@ describe("STORY-097 · AgencyService under RLS, as nominara_app", () => {
     const b = await workspace("growth");
     const theirs = await inTenant(b, () => service.saveTheme({ name: "Theirs" }));
 
-    const mine = await inTenant(a, () => service.listThemes());
-    expect(mine.map((t) => t.theme_id)).not.toContain(theirs.theme_id);
+    const mine = await inTenant(a, () => service.listThemes({ limit: 50 }));
+    expect(mine.items.map((t) => t.theme_id)).not.toContain(theirs.theme_id);
 
     await expect(inTenant(a, () => service.saveTheme({ theme_id: theirs.theme_id, name: "Hijack" }))).rejects.toBeInstanceOf(NotFoundError);
     const stored = await admin.query("SELECT name FROM brand_themes WHERE id = $1", [theirs.theme_id]);
