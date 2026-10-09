@@ -46,6 +46,30 @@ describe("published pagination contract", () => {
     expect(okSchema(op)?.required).toContain("pagination");
   });
 
+  it("NEW-E-7 checkpoint-6 · listAgencyThemes is a cursor list: cursor/limit parameters and a required `pagination` member", () => {
+    const op = byId("listAgencyThemes");
+    expect(paramNames(op)).toEqual(expect.arrayContaining(["cursor", "limit"]));
+    expect(okSchema(op)?.required).toContain("pagination");
+  });
+
+  it("NEW-E-7 checkpoint-6 · listScheduledReports is a cursor list: cursor/limit parameters and a required `pagination` member", () => {
+    const op = byId("listScheduledReports");
+    expect(paramNames(op)).toEqual(expect.arrayContaining(["cursor", "limit"]));
+    expect(okSchema(op)?.required).toContain("pagination");
+  });
+
+  it("NEW-E-7 checkpoint-6 · listShareTokens is a cursor list: cursor/limit parameters and a required `pagination` member", () => {
+    const op = byId("listShareTokens");
+    expect(paramNames(op)).toEqual(expect.arrayContaining(["cursor", "limit"]));
+    expect(okSchema(op)?.required).toContain("pagination");
+  });
+
+  it("NEW-E-7 checkpoint-6 · listShareTokenViews is a cursor list: cursor/limit parameters and a required `pagination` member", () => {
+    const op = byId("listShareTokenViews");
+    expect(paramNames(op)).toEqual(expect.arrayContaining(["cursor", "limit"]));
+    expect(okSchema(op)?.required).toContain("pagination");
+  });
+
   it("every GET that accepts a `cursor` publishes a required `pagination` member (sweep from the hazard, no allow-list)", () => {
     const missing = getOperations
       .filter(({ op }) => paramNames(op).includes("cursor"))

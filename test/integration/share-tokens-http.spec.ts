@@ -420,4 +420,102 @@ describe("STORY-098 · share tokens (agency side) over HTTP", () => {
       spy.mockRestore();
     }
   });
+
+  // NEW-E-7 checkpoint-6 (owner 2026-10-09 pm #3) — walks a list by cursor at limit 2 and returns the ids seen, per page.
+  async function walk(a: Actor, path: string, idOf: (row: Record<string, unknown>) => string): Promise<string[][]> {
+    const pages: string[][] = [];
+    let cursor: string | undefined;
+    for (let guard = 0; guard < 12; guard += 1) {
+      const res = await harness.app().inject({ method: "GET", url: apiUrl(`${path}?limit=2${cursor === undefined ? "" : `&cursor=${cursor}`}`), headers: { cookie: a.cookie } });
+      expect(res.statusCode, res.body).toBe(200);
+      const body = res.json() as { data: Record<string, unknown>[]; pagination: { cursor_next: string | null; has_more: boolean; limit: number } };
+      expect(body.pagination.limit).toBe(2);
+      expect(body.pagination.has_more).toBe(body.pagination.cursor_next !== null);
+      pages.push(body.data.map(idOf));
+      if (body.pagination.cursor_next === null) return pages;
+      cursor = body.pagination.cursor_next;
+    }
+    throw new Error("cursor walk did not terminate");
+  }
+  async function rejectsBadCursors(a: Actor, path: string, foreign: string): Promise<void> {
+    for (const cursor of ["not-a-cursor", foreign]) {
+      const res = await harness.app().inject({ method: "GET", url: apiUrl(`${path}?cursor=${cursor}`), headers: { cookie: a.cookie } });
+      expect(res.statusCode, res.body).toBe(400);
+      expect((res.json() as { error: { code: string } }).error.code).toBe("validation_failed");
+    }
+    const offset = await harness.app().inject({ method: "GET", url: apiUrl(`${path}?offset=2`), headers: { cookie: a.cookie } });
+    expect(offset.statusCode, offset.body).toBe(400);
+  }
+
+  it("NEW-E-7 checkpoint-6 · listShareTokens pages by keyset: a created_at tie at the page boundary is neither skipped nor repeated, cursor_next null on the last", async () => {
+    const a = await owner("growth");
+    const p = await project(a.workspaceId);
+    await harness.db().query(
+      `INSERT INTO share_tokens (workspace_id, label, token_hash, token_prefix, scope_project_ids, created_by, created_at)
+       SELECT $1, 't' || g, decode(md5(random()::text), 'hex'), 'nkshr_' || g, ARRAY[$2::uuid], $3, '2026-10-01T10:00:00.000001Z' FROM generate_series(1,5) g`,
+      [a.workspaceId, p, a.userId],
+    );
+    const expected = (await harness.db().query<{ id: string }>(`SELECT id FROM share_tokens WHERE workspace_id = $1 ORDER BY created_at DESC, id DESC`, [a.workspaceId])).rows.map((r) => r.id);
+    const pages = await walk(a, "/share-tokens", (r) => r.id as string);
+    expect(pages.map((x) => x.length)).toEqual([2, 2, 1]);
+    expect(pages.flat()).toEqual(expected);
+  }, 120_000);
+
+  it("NEW-E-7 checkpoint-6 · listShareTokens: a scoped manager's pages hold only tokens inside the scope, with no gap or repeat across pages", async () => {
+    const a = await owner("growth");
+    const inside = await project(a.workspaceId);
+    const outside = await project(a.workspaceId);
+    const m = await member(a.workspaceId, "manager", [inside]);
+    await harness.db().query(
+      `INSERT INTO share_tokens (workspace_id, label, token_hash, token_prefix, scope_project_ids, created_by, created_at)
+       SELECT $1, 't' || g, decode(md5(random()::text), 'hex'), 'nkshr_' || g, ARRAY[(CASE WHEN g % 2 = 0 THEN $2 ELSE $3 END)::uuid], $4, '2026-10-01T10:00:00.000001Z' FROM generate_series(1,6) g`,
+      [a.workspaceId, inside, outside, a.userId],
+    );
+    const expected = (
+      await harness.db().query<{ id: string }>(`SELECT id FROM share_tokens WHERE workspace_id = $1 AND scope_project_ids = ARRAY[$2::uuid] ORDER BY created_at DESC, id DESC`, [a.workspaceId, inside])
+    ).rows.map((r) => r.id);
+    const pages = await walk(m, "/share-tokens", (r) => r.id as string);
+    expect(pages.map((x) => x.length)).toEqual([2, 1]);
+    expect(pages.flat()).toEqual(expected);
+  }, 120_000);
+
+  it("NEW-E-7 checkpoint-6 · listShareTokens: an empty list is an empty page with the envelope; a malformed or foreign cursor and an offset are 400", async () => {
+    const a = await owner("growth");
+    const res = await list(a);
+    expect(res.json()).toMatchObject({ data: [], pagination: { cursor_next: null, has_more: false } });
+    const foreign = Buffer.from(JSON.stringify({ v: 1, k: ["x"] })).toString("base64url");
+    await rejectsBadCursors(a, "/share-tokens", foreign);
+  }, 120_000);
+
+  it("NEW-E-7 checkpoint-6 · listShareTokenViews pages by keyset: a viewed_at tie at the page boundary is neither skipped nor repeated, null telemetry stays null, cursor_next null on the last", async () => {
+    const a = await owner("growth");
+    const p = await project(a.workspaceId);
+    const m = data<Minted>(await mint(a, body([p])));
+    await harness.db().query(
+      `INSERT INTO share_token_views (workspace_id, share_token_id, ip, user_agent, authenticated, viewed_at)
+       SELECT $1, $2, '203.0.113.9', 'UA/' || g, true, '2026-10-01T10:00:00.000001Z' FROM generate_series(1,5) g`,
+      [a.workspaceId, m.token.id],
+    );
+    const expected = (
+      await harness.db().query<{ user_agent: string }>(`SELECT user_agent FROM share_token_views WHERE share_token_id = $1 ORDER BY viewed_at DESC, id DESC`, [m.token.id])
+    ).rows.map((r) => r.user_agent);
+    const pages = await walk(a, `/share-tokens/${m.token.id}/views`, (r) => r.user_agent as string);
+    expect(pages.map((x) => x.length)).toEqual([2, 2, 1]);
+    expect(pages.flat()).toEqual(expected);
+    expect(new Set(pages.flat()).size).toBe(5);
+    const first = await harness.app().inject({ method: "GET", url: apiUrl(`/share-tokens/${m.token.id}/views?limit=1`), headers: { cookie: a.cookie } });
+    expect(data<{ pages: unknown; duration_s: unknown; geo: unknown }[]>(first)[0]).toMatchObject({ pages: null, duration_s: null, geo: null });
+  }, 120_000);
+
+  it("NEW-E-7 checkpoint-6 · listShareTokenViews: an empty list is an empty page with the envelope; a malformed or foreign cursor, an offset, and an unknown token are refused", async () => {
+    const a = await owner("growth");
+    const p = await project(a.workspaceId);
+    const m = data<Minted>(await mint(a, body([p])));
+    const res = await views(a, m.token.id);
+    expect(res.json()).toMatchObject({ data: [], pagination: { cursor_next: null, has_more: false } });
+    const foreign = Buffer.from(JSON.stringify({ v: 1, k: ["x"] })).toString("base64url");
+    await rejectsBadCursors(a, `/share-tokens/${m.token.id}/views`, foreign);
+    expect((await views(a, uuidV7())).statusCode).toBe(404);
+  }, 120_000);
+
 });
