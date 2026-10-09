@@ -125,3 +125,37 @@ Nothing in src sets projects.next_run_at (projects.service inserts NULL and stat
 | vitest integration: capture-scheduler-sweep, worker-scheduler-sweep-wiring, capture-plan-handler, capture-scheduler, capture-stale-run-reaper, capture-execute-handler, capture-execute-rollup, worker-group-bootstrap | 0 | 8 files, 92 tests |
 | pnpm test:isolation | 0 | 13 files, 53 tests |
 | pnpm test:isolation:breakers | 0 | 24 of 24 |
+
+## Checkpoint-5 fix pass (lane a-gemini, branch 7day/a-gemini-6, base 71e13e9)
+
+Owner decision 2026-10-09 #2: a project created with a non-manual cadence gets next_run_at = the next cadence slot; manual is never claimable.
+
+| Item | Test | RED | Fix |
+|---|---|---|---|
+| Finding 6 (nothing seeds next_run_at) | test/integration/project-create-next-run.spec.ts: "a project created with the default (non-manual) cadence gets next_run_at = the next cadence slot"; "the seeded project is claimable once active and its slot has passed, and not before" (real ProjectsService.create against migrations, then claimDueProject) | 2 failed (next_run_at null) | ProjectsService.create inserts cadence (DEFAULT_PROJECT_CADENCE = 'weekly', the column default) and next_run_at = nextRunAfter(cadence, now) |
+| manual claimable | already fixed at d53366b (`p.cadence <> 'manual'` in DUE_PROJECTS_WHERE and claimDueProject), tests in capture-scheduler-sweep.spec.ts and capture-plan-handler.spec.ts, in the base | n/a | n/a |
+| `status = 'queued'` guard in failUndispatchedRun untested | capture-plan-handler.spec.ts "a dispatch that rejects after a cell has started leaves the run and its fair-use reservation alone" | n/a (already in base) | Mutation re-run this pass: removing the guard fails exactly that test (1 failed, 17 passed); reverted |
+| ambiguous dispatch failure vs running cells | base behaviour: the run is failed and capture.execute skips cells of a failed run (test "cells that WERE enqueued before an ambiguous dispatch failure do not call the vendor or write a capture"), so no cell runs against a released reservation | n/a | unchanged, see note |
+| crash between COMMIT and dispatch | stale-run reaper, capture-stale-run-reaper.spec.ts 4a-4g, run by the sweep tick | n/a | in base (84ba61e) |
+
+Notes:
+- Cadence CHANGE: no code path changes projects.cadence today (no settings endpoint; STORY-043 AC2 says cadence is a settings change). The rule "on cadence change next_run_at = next slot" has nowhere to be applied yet; whichever story adds the change must call nextRunAfter in the same UPDATE. Not invented here.
+- Seeding next_run_at does not make the sweep claim a project until it is status 'active' (the claim requires it); the create path leaves 'initializing' and the activation event is still not in any story. The claim test above sets status in SQL.
+- Ambiguous dispatch: the instruction was "release only when no cell was enqueued, otherwise let the run finalise". The code cannot tell the two apart after a rejection, and fails the run + releases while making cells inert, which satisfies the stated hazard (no cell runs against a released reservation). Leaving the run queued instead would delay a genuine rejection to the 6 h reaper. Left as is; flagged for the lead.
+
+Gates: lint 0, typecheck 0, test:unit 0 (309 files passed; a first run showed 3 failed files while integration containers were running, a rerun was clean twice), vitest integration: project-create-next-run, project-seeds, competitor-confirm-cap, capture-plan-handler, capture-scheduler-sweep, capture-stale-run-reaper: 6 files, 52 tests, all pass. test:isolation not run (no tenant table or policy touched).
+
+## Checkpoint-5 fix pass 3 (lane a-gemini, branch 7day/a-gemini-6, base 71e13e9)
+
+### Second-engineer finding 3 — reaper `status = 'queued'` mutant: FIXED (test gap)
+Test: capture-stale-run-reaper.spec.ts :: "NEW-A-13 CP5-3 · a run that starts between the stale SELECT and the UPDATE stays running and its reservation is untouched". The client is wrapped in a Proxy; right after the stale SELECT returns, a second connection runs UPDATE capture_runs SET status='running'. Asserts reaped 0, status running, error_summary null, reserved_value unchanged.
+No product change: the guard was already correct; the test was missing. The test commit is therefore green on the real code (it cannot be RED against correct code); its value was proved by mutation: removing `AND status = 'queued'` from the per-run UPDATE makes it fail (exit 1, "expected { reaped: 1 } to deeply equal { reaped: +0 }"), the other 7 tests still pass. Mutation reverted.
+
+### Second-engineer finding 1 — activation event missing: STILL OPEN (blocked on an owner decision)
+Checkpoint-5 finding 6 is NOT closed. ProjectsService.create now seeds next_run_at, but the INSERT writes status 'initializing', and DUE_PROJECTS_WHERE and claimDueProject require status = 'active'. No UPDATE projects in src sets status. The claim test only passes because it runs UPDATE projects SET status='active' in SQL. Inert state: the sweep still schedules nothing for any real project; repeat this in NEW-A-17 evidence.
+NEEDED FROM THE OWNER: (a) the event that moves initializing -> active (e.g. onboarding confirmation, first prompt set approved); (b) when that happens with a long-past next_run_at: claim immediately, or reseed with a fresh nextRunAfter? The story that adds the event must test the chosen behaviour.
+
+### Second-engineer finding 2 — starting cadence hard-coded 'weekly': STOPPED (blocked on an owner decision)
+DEFAULT_PROJECT_CADENCE = 'weekly' regardless of plan; entitlements give scan.cadence weekly (starter), twice_weekly (growth), daily_priority (business), hourly_priority (enterprise). Only projects.cadence sets wake frequency, so a Growth project gets ~4 runs per cycle against 8 allowed. NEEDED FROM THE OWNER: does the starting cadence come from the workspace's scan.cadence entitlement (and the mapping daily_priority -> daily, hourly_priority -> ?, twice_weekly -> ?, given the cadence values the column CHECK allows), or does it stay weekly by policy? Once decided, the test is: create a project in a growth workspace and assert the exact interval of next_run_at (the current spec only checks cadence <> 'manual' and would pass with any cadence). Not written, because the expected value is the decision.
+
+Gates: see the final report of this pass.

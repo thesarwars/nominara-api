@@ -126,6 +126,35 @@ describe("NEW-A-13 checkpoint-4 · the stale queued-run reaper", () => {
     expect(await reserved(tenant.ws)).toBe("40");
   });
 
+  it("NEW-A-13 CP5-3 · a run that starts between the stale SELECT and the UPDATE stays running and its reservation is untouched", async () => {
+    const tenant = await addTenant(10);
+    const run = await addRun(tenant, { ageHours: 7, planned: 10 });
+
+    // Right after the stale SELECT returns, a capture.execute cell moves the run to running.
+    let raced = false;
+    const racing = new Proxy(owner, {
+      get(target, prop, receiver) {
+        if (prop !== "query") return Reflect.get(target, prop, receiver) as unknown;
+        return async (...args: unknown[]) => {
+          const result = await (target.query as (...a: unknown[]) => Promise<unknown>)(...args);
+          if (!raced && typeof args[0] === "string" && /FROM capture_runs/.test(args[0]) && /^\s*SELECT/.test(args[0])) {
+            raced = true;
+            await db.query("UPDATE capture_runs SET status = 'running' WHERE id = $1", [run]);
+          }
+          return result;
+        };
+      },
+    });
+
+    const result = await reapStaleQueuedRuns(racing, new Date());
+
+    expect(raced).toBe(true);
+    expect(result).toEqual({ reaped: 0 });
+    expect((await runRow(run)).status).toBe("running");
+    expect((await runRow(run)).error_summary).toBeNull();
+    expect(await reserved(tenant.ws)).toBe("10");
+  });
+
   it("NEW-A-13 CP4-4c · reaping twice releases once", async () => {
     const tenant = await addTenant(20);
     await addRun(tenant, { ageHours: 8, planned: 10 });
