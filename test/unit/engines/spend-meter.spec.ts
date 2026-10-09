@@ -37,6 +37,10 @@ class InMemorySpendMeterStore implements SpendMeterStore {
     return next;
   }
 
+  async readTotal(engineKey: string, cycleKey: string): Promise<number> {
+    return this.totals.get(`${engineKey}:${cycleKey}`) ?? 0;
+  }
+
   async readAlertsFired(engineKey: string, cycleKey: string): Promise<Set<SpendAlertLevel>> {
     return this.alertsFired.get(`${engineKey}:${cycleKey}`) ?? new Set();
   }
@@ -146,5 +150,31 @@ describe("STORY-031 D13 · warnMissingSpendCeilings — boot-time disclosure, ne
 
   it("returns an empty array when every active engine has a ceiling configured", () => {
     expect(warnMissingSpendCeilings({ chatgpt: 100, claude: 50 }, ["chatgpt", "claude"])).toEqual([]);
+  });
+});
+
+describe("E2E-B6e · SpendMeter.isCeilingReached — the pre-call gate", () => {
+  const clock = () => Date.UTC(2026, 0, 15);
+  it("is false below the ceiling, true at it (>=) and above it", async () => {
+    const store = new InMemorySpendMeterStore();
+    const meter = new SpendMeter(store, { gemini: 10 }, clock);
+    expect(await meter.isCeilingReached("gemini")).toBe(false);
+    await meter.recordCost("gemini", 9.99);
+    expect(await meter.isCeilingReached("gemini")).toBe(false);
+    await meter.recordCost("gemini", 0.01);
+    expect(await meter.isCeilingReached("gemini")).toBe(true);
+  });
+
+  it("is always false for an engine with no ceiling (D13), however much it has spent", async () => {
+    const meter = new SpendMeter(new InMemorySpendMeterStore(), {}, clock);
+    await meter.recordCost("chatgpt", 1_000_000);
+    expect(await meter.isCeilingReached("chatgpt")).toBe(false);
+  });
+
+  it("fails CLOSED when the store cannot be read and the engine has a ceiling; open when it has none", async () => {
+    const broken = new InMemorySpendMeterStore();
+    broken.readTotal = async () => { throw new Error("down"); };
+    await expect(new SpendMeter(broken, { gemini: 10 }, clock).isCeilingReached("gemini")).rejects.toThrow();
+    expect(await new SpendMeter(broken, {}, clock).isCeilingReached("gemini")).toBe(false);
   });
 });

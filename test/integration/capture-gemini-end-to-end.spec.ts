@@ -9,6 +9,7 @@ import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapte
 import type { RealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { normalGrounded } from "../../src/lib/engines/gemini/fixtures/gemini-recorded.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { SpendMeter, type SpendMeterStore } from "../../src/lib/engines/spend-meter.js";
 import { createCaptureExecuteHandler, type ParseJobPayload } from "../../src/lib/queue/handlers/capture-execute.handler.js";
 import { createCaptureParseHandler } from "../../src/lib/queue/handlers/capture-parse.handler.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
@@ -186,7 +187,10 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
   }
 
   /** A deep scan: one run, one cell per prompt, driven to quiescence with no cron and no direct rollUpDay. */
-  async function deepScan(s: Scenario): Promise<{ runId: string; ran: string[]; rollupSources: string[] }> {
+  async function deepScan(
+    s: Scenario,
+    opts: { executions?: number; spendMeter?: SpendMeter } = {},
+  ): Promise<{ runId: string; ran: string[]; rollupSources: string[] }> {
     const runId = uuidV7();
     await harness.db().query(
       `INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys, planned_cells)
@@ -196,10 +200,15 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     const queue: Queued[] = [];
     // VALKEY_CACHE_URL is what the production handler builds its spend meter on (E2E-B6).
     const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
+    const parseSeen = new Set<string>();
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
       realtime: publisher,
+      ...(opts.spendMeter !== undefined ? { spendMeter: opts.spendMeter } : {}),
+      // The real queue dedupes on idempotencyKey `parse:<resultId>`; so does this one.
       enqueueParse: async (p: ParseJobPayload) => {
+        if (parseSeen.has(p.resultId)) return;
+        parseSeen.add(p.resultId);
         queue.push({ kind: "parse", source: "execute", workspaceId: p.workspaceId, payload: { ...p } });
       },
       enqueueRollup: async (_q, workspaceId, payload) => {
@@ -217,6 +226,8 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     const ran: string[] = [];
     const rollupSources: string[] = [];
     for (const [sampleIndex, promptId] of s.promptIds.entries()) {
+     // A redelivered job (stalled-job path) runs the SAME payload again.
+     for (let attempt = 0; attempt < (opts.executions ?? 1); attempt++) {
       await inTenant(s.workspaceId, (tx) =>
         execute(
           tx,
@@ -236,6 +247,7 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
         ),
       );
       ran.push("execute");
+     }
     }
     // The queue, drained in order. A job enqueued by another job is appended and runs after it.
     for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
@@ -406,5 +418,74 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     } finally {
       await redis.quit();
     }
+  }, 120_000);
+
+  const currentMonthTotalKey = (): string => {
+    const d = new Date();
+    return `engine-spend:total:gemini-${String(d.getUTCFullYear())}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  };
+
+  it("E2E-B6e · at the gemini ceiling no cell reaches the vendor: zero fetches, no usage cost, cells recorded blocked with a terminal code", async () => {
+    const redis = new Redis(cacheValkey.url);
+    try {
+      await redis.set(currentMonthTotalKey(), "1000"); // ceiling is 100
+      const s = await scenario(2);
+      const { runId } = await deepScan(s);
+      expect(geminiRequests, "the ceiling must stop the vendor call itself").toBe(0);
+      const cells = await harness.db().query<{ status: string; error_code: string | null }>(
+        "SELECT status, error_code FROM answer_captures WHERE run_id = $1",
+        [runId],
+      );
+      expect(cells.rows).toHaveLength(2);
+      for (const cell of cells.rows) expect(cell).toEqual({ status: "blocked", error_code: "engine_spend_ceiling_reached" });
+      const usage = await harness.db().query("SELECT 1 FROM usage_ledger WHERE workspace_id = $1", [s.workspaceId]);
+      expect(usage.rowCount).toBe(0);
+      const run = await harness.db().query<{ captured_cells: number }>("SELECT captured_cells FROM capture_runs WHERE id = $1", [runId]);
+      expect(run.rows[0]!.captured_cells).toBe(0);
+    } finally {
+      await redis.del(currentMonthTotalKey());
+      await redis.quit();
+    }
+  }, 120_000);
+
+  it("E2E-B6e · just under the ceiling still captures (boundary: total < ceiling)", async () => {
+    const redis = new Redis(cacheValkey.url);
+    try {
+      await redis.set(currentMonthTotalKey(), "99.99");
+      const s = await scenario(1);
+      await deepScan(s);
+      expect(geminiRequests).toBe(1);
+    } finally {
+      await redis.del(currentMonthTotalKey());
+      await redis.quit();
+    }
+  }, 120_000);
+
+  it("E2E-B6e · a meter read failure FAILS CLOSED for an engine with a ceiling: zero fetches, the job throws into the retry ladder", async () => {
+    const broken: SpendMeterStore = {
+      incrementAndRead: async () => { throw new Error("valkey down"); },
+      readTotal: async () => { throw new Error("valkey down"); },
+      readAlertsFired: async () => new Set(),
+      markAlertFired: async () => undefined,
+    };
+    const s = await scenario(1);
+    await expect(deepScan(s, { spendMeter: new SpendMeter(broken, { gemini: 100 }) })).rejects.toThrow();
+    expect(geminiRequests).toBe(0);
+  }, 120_000);
+
+  it("E2E-B6f · the same cell job delivered twice is idempotent: captured_cells == planned, one capture row and one usage_ledger row per cell, one vendor call per cell", async () => {
+    const s = await scenario(2);
+    const { runId } = await deepScan(s, { executions: 2 });
+    const run = await harness.db().query<{ captured_cells: number; planned_cells: number }>(
+      "SELECT captured_cells, planned_cells FROM capture_runs WHERE id = $1",
+      [runId],
+    );
+    expect(run.rows[0]!.captured_cells).toBe(run.rows[0]!.planned_cells);
+    expect(run.rows[0]!.captured_cells).toBe(2);
+    const usage = await harness.db().query("SELECT 1 FROM usage_ledger WHERE workspace_id = $1", [s.workspaceId]);
+    expect(usage.rowCount).toBe(2);
+    const caps = await harness.db().query("SELECT 1 FROM answer_captures WHERE run_id = $1", [runId]);
+    expect(caps.rowCount).toBe(2);
+    expect(geminiRequests, "a redelivery must not pay for the cell again").toBe(2);
   }, 120_000);
 });
