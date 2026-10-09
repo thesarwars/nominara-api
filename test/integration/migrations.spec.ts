@@ -369,7 +369,7 @@ describe("STORY-006 · extensions, conventions & migration tooling", () => {
     ).resolves.toBeDefined();
   });
 
-  it("scenario 4b — rejects a NOT NULL add on a populated table without the annotation", async () => {
+  it("scenario 4b — rejects a NOT NULL add with a volatile default (table rewrite) on a populated table without the annotation", async () => {
     await migrateUp(client);
     await client.query("CREATE TABLE probe_not_null (id integer PRIMARY KEY)");
     await client.query("INSERT INTO probe_not_null (id) VALUES (1)");
@@ -378,7 +378,7 @@ describe("STORY-006 · extensions, conventions & migration tooling", () => {
     try {
       await writeFile(
         path.join(tempDir, "0002_add_required_note.up.sql"),
-        "ALTER TABLE probe_not_null ADD COLUMN note text NOT NULL DEFAULT '';\n",
+        "ALTER TABLE probe_not_null ADD COLUMN note text NOT NULL DEFAULT gen_random_uuid()::text;\n",
       );
       await writeFile(path.join(tempDir, "0002_add_required_note.down.sql"), "-- irreversible in this test\n");
 
@@ -393,6 +393,27 @@ describe("STORY-006 · extensions, conventions & migration tooling", () => {
     }
   });
 
+  it("scenario 4d — permits a NOT NULL add with a constant default on a populated table without the annotation", async () => {
+    await migrateUp(client);
+    await client.query("CREATE TABLE probe_not_null (id integer PRIMARY KEY)");
+    await client.query("INSERT INTO probe_not_null (id) VALUES (1), (2)");
+
+    const tempDir = await mkdtemp(path.join(tmpdir(), "nominara-guard-notnull-const-"));
+    try {
+      await writeFile(
+        path.join(tempDir, "0002_add_required_note.up.sql"),
+        "ALTER TABLE probe_not_null ADD COLUMN note text NOT NULL DEFAULT 'v1';\n",
+      );
+      await writeFile(path.join(tempDir, "0002_add_required_note.down.sql"), "-- irreversible in this test\n");
+
+      expect(await migrateUp(client, tempDir)).toEqual(["0002_add_required_note"]);
+      const rows = await client.query("SELECT note FROM probe_not_null");
+      expect(rows.rows.map((r) => r.note)).toEqual(["v1", "v1"]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("scenario 5b — permits a NOT NULL add on a populated table when annotated", async () => {
     await migrateUp(client);
     await client.query("CREATE TABLE probe_not_null (id integer PRIMARY KEY)");
@@ -402,7 +423,7 @@ describe("STORY-006 · extensions, conventions & migration tooling", () => {
     try {
       await writeFile(
         path.join(tempDir, "0002_add_required_note.up.sql"),
-        `${CONTRACT_PHASE_ANNOTATION}\nALTER TABLE probe_not_null ADD COLUMN note text NOT NULL DEFAULT '';\n`,
+        `${CONTRACT_PHASE_ANNOTATION}\nALTER TABLE probe_not_null ADD COLUMN note text NOT NULL DEFAULT gen_random_uuid()::text;\n`,
       );
       await writeFile(path.join(tempDir, "0002_add_required_note.down.sql"), "-- irreversible in this test\n");
 
