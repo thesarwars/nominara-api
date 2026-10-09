@@ -60,9 +60,12 @@ export interface CaptureCellInput {
 }
 
 export type CaptureCellOutcome =
-  | { readonly kind: "captured"; readonly latencyMs: number }
+  | { readonly kind: "captured"; readonly latencyMs: number; /** True when the cell already had a row and nothing was done: the caller must not count it again. */ readonly replayed?: true }
   | { readonly kind: "blocked"; readonly errorCode: string }
   | { readonly kind: "failed"; readonly errorCode: string };
+
+/** The `error_code` of a cell refused because its engine's monthly spend ceiling is reached. */
+export const ENGINE_SPEND_CEILING_REACHED = "engine_spend_ceiling_reached";
 
 /** `response_excerpt` is a preview, not a copy of the answer. */
 const EXCERPT_CHARS = 280;
@@ -127,7 +130,31 @@ export async function captureCell(
   now: Date = new Date(),
   /** Feeds the platform-wide spend meter (Valkey); fails open, so it can never fail a capture. */
   recordSpend?: (engineKey: string, usd: number) => Promise<void>,
+  /**
+   * The pre-call spend gate: true means the engine's monthly ceiling is
+   * reached and the vendor must not be called. It may THROW (meter
+   * unreadable) — that fails closed and reaches the retry ladder.
+   */
+  ceilingReached?: (engineKey: string) => Promise<boolean>,
 ): Promise<CaptureCellOutcome> {
+  // IDEMPOTENT PER CELL, BEFORE ANY VENDOR CALL. A job redelivered after its
+  // transaction committed (stalled-job path) would otherwise call the engine
+  // again, write a second capture and ledger row, and double-count the cell.
+  // Any existing live row means the cell is settled; a retryable failure
+  // throws and rolls back, so it never leaves a row to find here.
+  const existing = await tx.query<{ status: string; error_code: string | null }>(
+    `SELECT status, error_code FROM answer_captures
+      WHERE run_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = $4
+      ORDER BY captured_at DESC LIMIT 1`,
+    [input.runId, input.promptId, input.engineKey, input.sampleIndex],
+  );
+  const prior = existing.rows[0];
+  if (prior !== undefined) {
+    if (prior.status === "blocked") return { kind: "blocked", errorCode: prior.error_code ?? "blocked" };
+    if (prior.status === "failed") return { kind: "failed", errorCode: prior.error_code ?? "failed" };
+    return { kind: "captured", latencyMs: 0, replayed: true };
+  }
+
   let adapter: CaptureAdapter;
   try {
     adapter = resolveEngine(input.engineKey);
@@ -140,6 +167,13 @@ export async function captureCell(
     // ladder does not chase a configuration state.
     await writeCell(tx, input, now, { status: "blocked", errorCode: `engine_${error.reason}` });
     return { kind: "blocked", errorCode: `engine_${error.reason}` };
+  }
+
+  // THE HARD STOP (EC-08). Terminal and distinct: a `blocked` row with its own
+  // code, returned not thrown, so the ceiling is not chased by the retry ladder.
+  if ((await ceilingReached?.(input.engineKey)) === true) {
+    await writeCell(tx, input, now, { status: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED });
+    return { kind: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED };
   }
 
   const controller = new AbortController();

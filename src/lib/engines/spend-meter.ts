@@ -34,6 +34,8 @@ export interface SpendMeterResult {
 export interface SpendMeterStore {
   /** Atomically adds `usd` to the running total for `engineKey`'s `cycleKey` and returns the new total. */
   incrementAndRead(engineKey: EngineKey, usd: number, cycleKey: string): Promise<number>;
+  /** The running total WITHOUT adding to it; 0 when nothing has been recorded this cycle. Throws when the store is unreachable. */
+  readTotal(engineKey: EngineKey, cycleKey: string): Promise<number>;
   readAlertsFired(engineKey: EngineKey, cycleKey: string): Promise<Set<SpendAlertLevel>>;
   markAlertFired(engineKey: EngineKey, cycleKey: string, level: SpendAlertLevel): Promise<void>;
 }
@@ -85,6 +87,11 @@ export class ValkeySpendMeterStore implements SpendMeterStore {
     return Number(raw);
   }
 
+  async readTotal(engineKey: EngineKey, cycleKey: string): Promise<number> {
+    const raw = await this.redis.get(this.totalKey(engineKey, cycleKey));
+    return raw === null ? 0 : Number(raw);
+  }
+
   async readAlertsFired(engineKey: EngineKey, cycleKey: string): Promise<Set<SpendAlertLevel>> {
     const members = await this.redis.smembers(this.alertsKey(engineKey, cycleKey));
     return new Set(members as SpendAlertLevel[]);
@@ -113,6 +120,24 @@ export class SpendMeter {
   private cycleKey(nowMs: number): string {
     const d = new Date(nowMs);
     return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+
+  /**
+   * The PRE-CALL gate (EC-08's "hard stop"): true when this month's recorded
+   * spend for the engine has reached (>=) its ceiling, so the caller must not
+   * make another vendor call. False when the engine has no ceiling (D13).
+   *
+   * FAILS CLOSED, unlike `recordCost`. Recording happens after the money is
+   * spent, so failing open there loses a data point; here, failing open would
+   * spend with no upper bound exactly when the control cannot be seen. For an
+   * engine WITH a ceiling a store failure therefore THROWS, and the caller
+   * treats it as retryable. An engine without a ceiling never reads the store.
+   */
+  async isCeilingReached(engineKey: EngineKey): Promise<boolean> {
+    const ceilingUsd = this.ceilingsUsd[engineKey];
+    if (ceilingUsd === undefined || ceilingUsd <= 0) return false;
+    const totalUsd = await this.store.readTotal(engineKey, this.cycleKey(this.clock()));
+    return totalUsd >= ceilingUsd;
   }
 
   /**

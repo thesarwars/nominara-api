@@ -126,6 +126,9 @@ describe("STORY-031 Phase J · SpendMeter — D19's spirit extended: a store fai
     async incrementAndRead(): Promise<number> {
       throw new Error("cache instance unreachable");
     }
+    async readTotal(): Promise<number> {
+      throw new Error("cache instance unreachable");
+    }
     async readAlertsFired(): Promise<Set<SpendAlertLevel>> {
       throw new Error("cache instance unreachable");
     }

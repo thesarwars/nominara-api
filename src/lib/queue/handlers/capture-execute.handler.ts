@@ -91,23 +91,38 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
 
   // E2E-B6 — the platform spend meter (EC-08), built on first use like the
   // cache. Its own Valkey connection; ceilings are the configured JSON over the
-  // defaults (gemini has one). Metering failures fail open inside the meter.
+  // defaults (gemini has one). RECORDING fails open inside the meter (the money
+  // is already spent); the PRE-CALL gate below fails closed.
   let spendMeter: SpendMeter | undefined = deps?.spendMeter;
-  const recordSpend = async (engineKey: string, usd: number): Promise<void> => {
-    const key = engineKeySchema.safeParse(engineKey);
-    if (!key.success) return;
+  const meter = (): SpendMeter => {
     if (spendMeter === undefined) {
       const redis = new Redis(context.env.VALKEY_CACHE_URL, { maxRetriesPerRequest: 1 });
       redis.on("error", (error) => logger.warn(`spend meter connection error: ${error.message}`));
       spendMeter = new SpendMeter(new ValkeySpendMeterStore(redis), resolveEngineSpendCeilings(context.env.ENGINE_SPEND_CEILINGS_USD));
     }
-    const result = await spendMeter.recordCost(key.data, usd);
+    return spendMeter;
+  };
+  const ceilingReached = async (engineKey: string): Promise<boolean> => {
+    const key = engineKeySchema.safeParse(engineKey);
+    if (!key.success) return false;
+    const reached = await meter().isCeilingReached(key.data);
+    if (reached) {
+      incrementCounter("nominara_capture_spend_ceiling_blocked_total", { engine_key: key.data });
+      logger.error(`engine spend ceiling reached for ${key.data}; cell blocked before the vendor call`);
+    }
+    return reached;
+  };
+  const recordSpend = async (engineKey: string, usd: number): Promise<void> => {
+    const key = engineKeySchema.safeParse(engineKey);
+    if (!key.success) return;
+    const result = await meter().recordCost(key.data, usd);
     incrementCounter("nominara_capture_cost_recorded_total", { engine_key: key.data });
     for (const level of result.newAlerts) {
       logger.warn(`engine spend alert ${level} for ${key.data}: ${result.totalUsd.toFixed(2)} of ${String(result.ceilingUsd)} USD this month`);
     }
     if (result.hardStopped) {
-      logger.error(`engine spend ceiling reached for ${key.data}: ${result.totalUsd.toFixed(2)} of ${String(result.ceilingUsd)} USD this month`);
+      // Enforced by `ceilingReached` on the NEXT cell; this is the crossing itself.
+      logger.error(`engine spend ceiling crossed for ${key.data}: ${result.totalUsd.toFixed(2)} of ${String(result.ceilingUsd)} USD this month`);
     }
   };
 
@@ -202,14 +217,15 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       locale: payload.locale,
       personaHint: payload.personaHint,
       normalizerVersion: NORMALIZER_VERSION,
-    }, undefined, recordSpend);
+    }, undefined, recordSpend, ceilingReached);
 
     // E2E-B6a — `captured_cells` counts LIVE captures only (captures-and-facts.md).
     // An atomic increment, not a recount: concurrent cells each run in their own
     // transaction and cannot see each other's uncommitted rows. Suppressed cells
     // never reach this handler (they are written by the planner), and a cell
     // that ended blocked or failed is not a capture.
-    if (outcome.kind === "captured") {
+    // A replayed cell (already settled by an earlier delivery) is not counted twice.
+    if (outcome.kind === "captured" && outcome.replayed !== true) {
       await tx.query("UPDATE capture_runs SET captured_cells = captured_cells + 1 WHERE id = $1", [payload.runId]);
     }
 
