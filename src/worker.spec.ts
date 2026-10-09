@@ -71,6 +71,22 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     }
   }, 15_000);
 
+  it("E2E-B6d: gemini has a safe default spend ceiling, so no boot warning names it; other engines still warn", async () => {
+    process.env.WORKER_GROUP = "capture";
+    delete process.env.ENGINE_SPEND_CEILINGS_USD;
+    const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+
+    const app = await bootstrapWorker();
+    try {
+      const messages = warnSpy.mock.calls.map((call) => String(call[0]));
+      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'gemini'"))).toBe(false);
+      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'chatgpt'"))).toBe(true);
+    } finally {
+      await app.close();
+      warnSpy.mockRestore();
+    }
+  }, 15_000);
+
   it("does not log a spend-ceiling boot warning for a non-capture group", async () => {
     process.env.WORKER_GROUP = "parse";
     delete process.env.ENGINE_SPEND_CEILINGS_USD;

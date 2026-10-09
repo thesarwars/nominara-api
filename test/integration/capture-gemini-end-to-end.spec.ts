@@ -1,4 +1,5 @@
 import type { Job } from "bullmq";
+import { Redis } from "ioredis";
 import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { growthMapResponseSchema, scorecardsResponseSchema } from "../../contracts/analytics/index.js";
@@ -193,7 +194,8 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
       [runId, s.workspaceId, s.projectId, s.promptIds.length],
     );
     const queue: Queued[] = [];
-    const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
+    // VALKEY_CACHE_URL is what the production handler builds its spend meter on (E2E-B6).
+    const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
       realtime: publisher,
@@ -355,5 +357,54 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     expect(brand.points.every((p) => p.cells === 0 && p.visibility_score === null)).toBe(true);
     const rows = await harness.db().query("SELECT 1 FROM metric_daily WHERE project_id = $1", [s.projectId]);
     expect(rows.rowCount).toBe(0);
+  }, 120_000);
+
+  it("E2E-B6a · a live Gemini capture advances capture_runs.captured_cells, one per live cell, and only live ones", async () => {
+    const s = await scenario(2);
+    const { runId } = await deepScan(s);
+    const run = await harness.db().query<{ captured_cells: number; planned_cells: number }>(
+      "SELECT captured_cells, planned_cells FROM capture_runs WHERE id = $1",
+      [runId],
+    );
+    expect(run.rows[0]!.captured_cells).toBe(2);
+    expect(run.rows[0]!.captured_cells).toBeLessThanOrEqual(run.rows[0]!.planned_cells);
+  }, 120_000);
+
+  it("E2E-B6b · a live Gemini capture writes one usage_ledger row per cell with the adapter's cost", async () => {
+    const s = await scenario(2);
+    const { runId } = await deepScan(s);
+    const rows = await harness.db().query<{
+      metric: string; quantity: number; unit_cost_usd: string; engine_key: string; source: string;
+      credits_charged: number; cache_layer: string; reference_type: string; reference_id: string; project_id: string;
+    }>("SELECT * FROM usage_ledger WHERE workspace_id = $1", [s.workspaceId]);
+    expect(rows.rows).toHaveLength(2);
+    for (const row of rows.rows) {
+      expect(row).toMatchObject({
+        metric: "capture", quantity: 1, engine_key: "gemini", source: "manual_run", credits_charged: 0,
+        cache_layer: "live", reference_type: "capture_run", reference_id: runId, project_id: s.projectId,
+      });
+      expect(Number(row.unit_cost_usd), "a real capture has a cost; null/0 would hide it").toBeGreaterThan(0);
+    }
+  }, 120_000);
+
+  it("E2E-B6c · the Valkey spend meter total for gemini equals the usage_ledger cost of the same captures", async () => {
+    const redis = new Redis(cacheValkey.url);
+    try {
+      const before = await redis.keys("engine-spend:total:gemini-*");
+      await redis.del(...before);
+      const s = await scenario(2);
+      await deepScan(s);
+      const keys = await redis.keys("engine-spend:total:gemini-*");
+      expect(keys, "the meter wrote a gemini total for the month").toHaveLength(1);
+      const metered = Number(await redis.get(keys[0]!));
+      const ledger = await harness.db().query<{ total: string }>(
+        "SELECT sum(unit_cost_usd * quantity)::text AS total FROM usage_ledger WHERE workspace_id = $1",
+        [s.workspaceId],
+      );
+      expect(metered).toBeGreaterThan(0);
+      expect(metered).toBeCloseTo(Number(ledger.rows[0]!.total), 5);
+    } finally {
+      await redis.quit();
+    }
   }, 120_000);
 });
