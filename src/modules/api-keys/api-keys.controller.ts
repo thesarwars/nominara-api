@@ -1,11 +1,13 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Post, Req } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query, Req } from "@nestjs/common";
 import { z } from "zod";
 import {
+  apiKeyListQuerySchema,
   apiKeyListResponseSchema,
   apiKeySchema,
   createApiKeyRequestSchema,
   createdApiKeySchema,
   type ApiKey,
+  type ApiKeyListQuery,
   type CreateApiKeyRequest,
   type CreatedApiKey,
 } from "../../../contracts/workspaces/api-key.schema.js";
@@ -13,6 +15,7 @@ import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequireEntitlement } from "../../api/decorators/require-entitlement.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import type { Page } from "../../api/pagination/page.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { ApiKeysService } from "./api-keys.service.js";
@@ -25,9 +28,9 @@ export class ApiKeysController {
 
   @Get()
   @RequirePermission("apikey:create")
-  @ApiContract({ operationId: "listApiKeys", responseSchema: apiKeyListResponseSchema })
-  list(): Promise<ApiKey[]> {
-    return this.service.list();
+  @ApiContract({ operationId: "listApiKeys", querySchema: apiKeyListQuerySchema, responseSchema: apiKeyListResponseSchema, listOf: true })
+  list(@Query(new ZodValidationPipe(apiKeyListQuerySchema)) query: ApiKeyListQuery): Promise<Page<ApiKey>> {
+    return this.service.list(query);
   }
 
   @Post()

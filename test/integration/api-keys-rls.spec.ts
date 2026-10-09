@@ -94,7 +94,16 @@ describe("NEW-D-4 · ApiKeysService under RLS, as nominara_app", () => {
   it("NEW-D-1 AC3 · the key list pages by keyset: no key skipped or repeated across pages, cursor_next null on the last", async () => {
     const t = await tenant();
     const made = [];
-    for (let i = 0; i < 5; i += 1) made.push((await inTenant(t, () => service.create("owner", request({ name: `k${i}` })))).key.id);
+    // The plan caps keys at 3, so the fourth and fifth rows are seeded directly, sharing a created_at
+    // with the third to exercise the (created_at, id) tie-break at a page boundary.
+    for (let i = 0; i < 3; i += 1) made.push((await inTenant(t, () => service.create("owner", request({ name: `k${i}` })))).key.id);
+    const seeded = await admin.query<{ id: string }>(
+      `INSERT INTO api_keys (workspace_id, name, key_prefix, key_hash, permissions, created_by, created_at)
+       SELECT $1, 'tie' || g, 'nk_live_tie' || g, decode(md5(random()::text), 'hex'), ARRAY['project:read'], $2, (SELECT created_at FROM api_keys WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 1)
+         FROM generate_series(1,2) g RETURNING id`,
+      [t.workspaceId, t.actorId],
+    );
+    made.push(...seeded.rows.map((r) => r.id));
     const seen: string[] = [];
     let cursor: string | undefined;
     for (let guard = 0; guard < 10; guard += 1) {

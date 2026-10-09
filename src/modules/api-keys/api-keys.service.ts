@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
-import type { ApiKey, CreateApiKeyRequest, CreatedApiKey } from "../../../contracts/workspaces/api-key.schema.js";
+import type { ApiKey, ApiKeyListQuery, CreateApiKeyRequest, CreatedApiKey } from "../../../contracts/workspaces/api-key.schema.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { pageFrom, type Page } from "../../api/pagination/page.js";
 import { EntitlementExceededError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { structuralLimitFrom, wouldExceed } from "../../lib/entitlements/classification.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
@@ -66,10 +68,23 @@ function toApiKey(row: KeyRow): ApiKey {
 export class ApiKeysService {
   private readonly logger = new Logger(ApiKeysService.name);
 
-  async list(): Promise<ApiKey[]> {
+  /**
+   * NEW-D-1 AC3 — keyset page ordered (created_at DESC, id DESC). The cursor key carries the
+   * FULL-PRECISION created_at (microseconds), not the published millisecond one: a truncated key
+   * would skip rows created within the same millisecond.
+   */
+  async list(query: ApiKeyListQuery): Promise<Page<ApiKey>> {
     const { client } = this.store();
-    const result = await client.query<KeyRow>(`SELECT ${COLUMNS} FROM api_keys ORDER BY created_at DESC, id`);
-    return result.rows.map(toApiKey);
+    const after = query.cursor === undefined ? undefined : cursorKeyOf(query.cursor);
+    const result = await client.query<KeyRow & { created_at_key: string }>(
+      `SELECT ${COLUMNS}, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_key
+         FROM api_keys
+        WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1::timestamptz, $2::uuid))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $3`,
+      [after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
+    );
+    return pageFrom(result.rows, query.limit, toApiKey, (row) => [row.created_at_key, row.id]);
   }
 
   async create(callerRole: string, body: CreateApiKeyRequest): Promise<CreatedApiKey> {
@@ -152,4 +167,18 @@ export class ApiKeysService {
     if (store === undefined) throw new Error("ApiKeysService requires an active tenant context");
     return { client: store.client, workspaceId: store.context.workspaceId, actorId: store.context.actorId };
   }
+}
+
+const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+function cursorKeyOf(cursor: string): [string, string] {
+  const [createdAt, id] = decodeCursor(cursor, 2);
+  if (typeof createdAt !== "string" || !ISO_MICROS.test(createdAt) || typeof id !== "string" || !UUID.test(id)) {
+    throw new ValidationFailedError({
+      message: "invalid pagination cursor",
+      details: { issues: [{ path: ["cursor"], message: "cursor was not issued for this list" }] },
+    });
+  }
+  return [createdAt, id];
 }

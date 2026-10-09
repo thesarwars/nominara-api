@@ -38,3 +38,11 @@ No new behaviour on a new path beyond the existing list handlers; no metric was 
 
 ## Gates (api-wt-d1)
 `pnpm lint` 0 · `pnpm typecheck` 0 · `pnpm test:unit` 0 (3776 passed, 1 skipped) · `pnpm contracts:check` 0 · `pnpm test:isolation` 0 (13 / 53) · integration (`audit-log-http`, `auto-topup-trigger`, `billing-addons`, `billing-invoices`, `billing-usage-auto-topup`, `credit-ledger-read`, `credit-packs`, `credit-guard-settlement`, `auto-topup-enqueue`, `auto-topup-cycle-reset`) 0: 10 files / 267 tests.
+
+## Checkpoint-5 fix pass 3 (lane d-billing)
+
+- AC3: `GET /v1/api-keys` now uses the cursor envelope (`querySchema` + `listOf`; keyset on `(created_at DESC, id DESC)`, microsecond cursor key, cursor validated for this list). Recorded in `contracts/baseline/breaking-changes.json` as `2026-10-09-api-keys-cursor-envelope`. RED d5ff3bd, then the fix; `test/integration/api-keys-rls.spec.ts` pages 5 keys with a created_at tie across a page boundary (no skip, no repeat).
+- The audit-log item id being the row `seq` (lead's call, owner-approved 2026-10-09) is recorded as `2026-10-09-audit-log-id-is-row-seq`; both entries are asserted by `test/unit/contract-breaking-changes.spec.ts`.
+- List sweep (`test/unit/pagination-published-contract.spec.ts`) now also starts from the response: any GET whose published `data` is an array must publish `pagination` and take `cursor`/`limit`. No allow-list. It is RED on five operations outside this lane's task: `listAgencyThemes`, `listProjectGoals`, `listScheduledReports`, `listShareTokens`, `listShareTokenViews`. Each needs a decision (paginate, with a breaking-change record, or an owner-approved named exemption); none is taken here.
+- Dead duplicate `contracts/trust/api-key.schema.ts` deleted (nothing imported its symbols; its re-export in `contracts/trust/index.ts` removed).
+- Checkpoint-4 fix2 commits (add-on retry replays the frozen Stripe call, bounded checkout lock wait / own billing pool, intent-expiry and in-flight-status guard tests: bd443c2, 8976cd1, baf39d1) are already in integration/7day via the d-billing-5 merge (0eed31b); nothing cherry-picked.
