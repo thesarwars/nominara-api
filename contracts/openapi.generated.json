@@ -29738,6 +29738,36 @@
                         "additionalProperties": false
                       }
                     },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "cursor_next": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "has_more": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 200
+                        }
+                      },
+                      "required": [
+                        "cursor_next",
+                        "has_more",
+                        "limit"
+                      ],
+                      "additionalProperties": false
+                    },
                     "meta": {
                       "type": "object",
                       "properties": {
@@ -29765,6 +29795,7 @@
                   },
                   "required": [
                     "data",
+                    "pagination",
                     "meta"
                   ],
                   "additionalProperties": false
@@ -29990,7 +30021,29 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 200
+            }
+          }
+        ]
       },
       "post": {
         "operationId": "createProjectGoal",

@@ -81,7 +81,7 @@ describe("STORY-065-A · goals — real SQL", () => {
   const engineGoal = (extra: Record<string, unknown> = {}) =>
     createGoalRequestSchema.parse({ title: "Lift visibility", kind: "engine_score", target: { metric: "visibility_score", target_value: 60 }, ...extra });
   const create = (ctx: TenantContext, projectId: string, body = engineGoal()) => inTenant(ctx, () => service.createGoal(projectId, body));
-  const list = (ctx: TenantContext, projectId: string) => inTenant(ctx, () => service.listGoals(projectId));
+  const list = (ctx: TenantContext, projectId: string) => inTenant(ctx, async () => (await service.listGoals(projectId, { limit: 200 })).items);
   const abandon = (ctx: TenantContext, projectId: string, goalId: string) =>
     inTenant(ctx, () => service.updateGoal(projectId, goalId, updateGoalRequestSchema.parse({ status: "abandoned" })));
 
@@ -271,5 +271,31 @@ describe("STORY-065-A · goals — real SQL", () => {
        VALUES ($1, $2, 'PRO-1', 'content', 'manual', '\\x01', 'a', '', $3)`, [ws, p, goal.id]);
     await client.query("UPDATE tasks SET goal_id = NULL WHERE project_id = $1", [p]);
     expect((await client.query("SELECT 1 FROM tasks")).rowCount).toBe(1);
+  });
+
+  it("[decision 2026-10-09 pm #3] listProjectGoals is cursor-paginated: a page boundary neither skips nor repeats, and the last page has no cursor", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+    for (const t of ["a", "b", "c", "d", "e"]) await create(CTX(ws, actor), p, engineGoal({ title: t }));
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    const sizes: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const page = await inTenant(CTX(ws, actor), () => service.listGoals(p, { limit: 2, ...(cursor === undefined ? {} : { cursor }) }));
+      expect(page.items).toBeDefined();
+      sizes.push(page.items.length);
+      seen.push(...page.items.map((g) => g.title));
+      expect(page.pagination.has_more).toBe(page.pagination.cursor_next !== null);
+      if (page.pagination.cursor_next === null) break;
+      cursor = page.pagination.cursor_next;
+    }
+    expect(sizes).toEqual([2, 2, 1]);
+    expect(seen.slice().sort()).toEqual(["a", "b", "c", "d", "e"]);
+    expect(new Set(seen).size).toBe(5);
+  });
+
+  it("[decision 2026-10-09 pm #3] a foreign or malformed cursor is a validation failure, not a silent first page", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+    await create(CTX(ws, actor), p, engineGoal({ title: "a" }));
+    await expect(inTenant(CTX(ws, actor), () => service.listGoals(p, { limit: 2, cursor: "bm90LWEtY3Vyc29y" }))).rejects.toBeInstanceOf(ValidationFailedError);
   });
 });

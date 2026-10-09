@@ -1,16 +1,19 @@
-import { Body, Controller, Get, HttpCode, Param, Patch, Post } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from "@nestjs/common";
 import {
   createGoalRequestSchema,
+  goalListQuerySchema,
   goalListResponseSchema,
   goalSchema,
   updateGoalRequestSchema,
   type CreateGoalRequest,
   type Goal,
+  type GoalListQuery,
   type UpdateGoalRequest,
 } from "../../../contracts/tasks/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
+import { Page } from "../../api/pagination/page.js";
 import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
@@ -25,9 +28,9 @@ export class GoalsController {
   @Get("projects/:id/goals")
   @RequirePermission("task:create")
   @ProjectParam("id")
-  @ApiContract({ operationId: "listProjectGoals", responseSchema: goalListResponseSchema })
-  list(@Param("id") id: string): Promise<Goal[]> {
-    return this.service.listGoals(id);
+  @ApiContract({ operationId: "listProjectGoals", querySchema: goalListQuerySchema, responseSchema: goalListResponseSchema, listOf: true })
+  list(@Param("id") id: string, @Query(new ZodValidationPipe(goalListQuerySchema)) query: GoalListQuery): Promise<Page<Goal>> {
+    return this.service.listGoals(id, query);
   }
 
   @Post("projects/:id/goals")

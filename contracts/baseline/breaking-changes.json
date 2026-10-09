@@ -524,6 +524,46 @@
           "duration_s"
         ]
       }
+    },
+    {
+      "id": "2026-10-09-project-goals-cursor-envelope",
+      "recorded": "2026-10-09",
+      "story": "STORY-065",
+      "task": "NEW-B checkpoint-6 (owner decision 2026-10-09 pm #3)",
+      "scope": "listProjectGoals (GET /v1/projects/{id}/goals)",
+      "from": "{ data: Goal[], meta } with no pagination member and no cursor/limit query; every goal of the project in one response, ordered by created_at DESC, id",
+      "to": "{ data: Goal[], pagination, meta } with the standard cursor and limit query; ordered by (created_at DESC, id DESC) with a microsecond-precision cursor key",
+      "breaking": true,
+      "previous_minor_baseline_rewritten": false,
+      "reason": "Owner-approved 2026-10-09 pm decision #3: paginate all bare lists with the cursor envelope (api-specification.md section 3). Making pagination a REQUIRED response member and accepting cursor/limit (the request schema is strict) means a strict response validator built from the old contract rejects the new body, and a client that relied on one response carrying every goal now sees at most the page limit, so this is not additive. The previous-minor proxy does not cover this route, so there is no baseline to rewrite.",
+      "assert": {
+        "operation": "listProjectGoals",
+        "path": "/v1/projects/{id}/goals",
+        "method": "get",
+        "status": "200",
+        "response_properties": [
+          "data",
+          "pagination",
+          "meta"
+        ],
+        "data_properties": [
+          "id",
+          "project_id",
+          "title",
+          "kind",
+          "target",
+          "baseline",
+          "current",
+          "progress_pct",
+          "sample_state",
+          "status",
+          "target_date",
+          "achieved_at",
+          "tasks_done",
+          "tasks_total",
+          "created_at"
+        ]
+      }
     }
   ]
 }

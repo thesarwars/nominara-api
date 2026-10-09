@@ -1,6 +1,8 @@
 import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
-import type { CreateGoalRequest, Goal, UpdateGoalRequest } from "../../../contracts/tasks/index.js";
+import type { CreateGoalRequest, Goal, GoalListQuery, UpdateGoalRequest } from "../../../contracts/tasks/index.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { pageFrom, type Page } from "../../api/pagination/page.js";
 import { ConflictError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -32,6 +34,7 @@ interface GoalRow {
   status: Goal["status"];
   achieved_at: Date | null;
   created_at: Date;
+  created_at_key: string;
   tasks_done: string;
   tasks_total: string;
 }
@@ -44,12 +47,24 @@ interface GoalRow {
 export class GoalsService {
   private readonly logger = new Logger(GoalsService.name);
 
-  /** `GET /v1/projects/{id}/goals`. Read-only; newest first. */
-  async listGoals(projectId: string): Promise<Goal[]> {
+  /**
+   * `GET /v1/projects/{id}/goals`. Read-only; newest first, keyset-paginated on
+   * (created_at DESC, id DESC). The cursor carries the FULL-PRECISION
+   * (microsecond) created_at, not the published millisecond one: a truncated
+   * key would skip rows created within the same millisecond.
+   */
+  async listGoals(projectId: string, query: GoalListQuery): Promise<Page<Goal>> {
     const client = currentTenantStore()!.client;
     await this.assertProject(client, projectId);
-    const result = await client.query<GoalRow>(`${SELECT_GOALS} WHERE g.project_id = $1 ORDER BY g.created_at DESC, g.id`, [projectId]);
-    return result.rows.map(toGoal);
+    const after = query.cursor === undefined ? undefined : cursorKeyOf(query.cursor);
+    const result = await client.query<GoalRow>(
+      `${SELECT_GOALS}
+        WHERE g.project_id = $1 AND ($2::timestamptz IS NULL OR (g.created_at, g.id) < ($2::timestamptz, $3::uuid))
+        ORDER BY g.created_at DESC, g.id DESC
+        LIMIT $4`,
+      [projectId, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
+    );
+    return pageFrom(result.rows, query.limit, toGoal, (row) => [row.created_at_key, row.id]);
   }
 
   /**
@@ -145,6 +160,7 @@ export class GoalsService {
 const SELECT_GOALS = `
   SELECT g.id, g.project_id, g.title, g.kind, g.target, g.baseline, g.current, g.progress_pct,
          to_char(g.target_date, 'YYYY-MM-DD') AS target_date, g.status, g.achieved_at, g.created_at,
+         to_char(g.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_key,
          (SELECT count(*) FROM tasks t WHERE t.goal_id = g.id AND t.deleted_at IS NULL AND t.status = 'done') AS tasks_done,
          (SELECT count(*) FROM tasks t WHERE t.goal_id = g.id AND t.deleted_at IS NULL) AS tasks_total
     FROM goals g`;
@@ -170,4 +186,18 @@ function toGoal(row: GoalRow): Goal {
     tasks_total: Number(row.tasks_total),
     created_at: row.created_at.toISOString(),
   };
+}
+
+const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+function cursorKeyOf(cursor: string): [string, string] {
+  const [createdAt, id] = decodeCursor(cursor, 2);
+  if (typeof createdAt !== "string" || !ISO_MICROS.test(createdAt) || typeof id !== "string" || !UUID.test(id)) {
+    throw new ValidationFailedError({
+      message: "invalid pagination cursor",
+      details: { issues: [{ path: ["cursor"], message: "cursor was not issued for this list" }] },
+    });
+  }
+  return [createdAt, id];
 }

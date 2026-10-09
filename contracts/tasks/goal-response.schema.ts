@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { goalMetricSchema } from "./create-goal-request.schema.js";
 
 // STORY-065 (step A) — one goal on the wire.
@@ -62,6 +63,10 @@ export const goalSchema = z
   .strict();
 
 export type Goal = z.infer<typeof goalSchema>;
+
+// Decision 2026-10-09 pm #3 — the cursor envelope; `pagination` is published by the route's `listOf` marker.
+export const goalListQuerySchema = paginationRequestSchema;
+export type GoalListQuery = z.infer<typeof goalListQuerySchema>;
 
 export const goalListResponseSchema = z.array(goalSchema);
 export type GoalListResponse = z.infer<typeof goalListResponseSchema>;
