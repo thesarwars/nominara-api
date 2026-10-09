@@ -1,7 +1,7 @@
 import { Logger } from "@nestjs/common";
 import type { ClientBase, Pool, PoolClient } from "pg";
 import { DegradedError } from "../../api/errors/domain-errors.js";
-import { createPgPool } from "../../db/pg-pool.js";
+import { createPgPool, isConnectionClassFailure } from "../../db/pg-pool.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 
@@ -62,9 +62,8 @@ export const BILLING_WRITE_LOCK_TIMEOUT_MS = 3_000;
  * resulting error, a statement timeout or a lock timeout is a retryable 503, never a 500 and never a hang.
  */
 function isBoundedWaitFailure(error: unknown): boolean {
-  const { code, message } = error as { code?: unknown; message?: unknown };
-  if (code === "08P01" || code === "57014" || code === "55P03") return true;
-  return typeof message === "string" && /query_wait_timeout|Connection terminated/u.test(message);
+  const { code } = error as { code?: unknown };
+  return code === "57014" || code === "55P03" || isConnectionClassFailure(error);
 }
 
 /**
