@@ -216,8 +216,8 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
       await harness.db().query("UPDATE capture_runs SET status = 'running', started_at = now() WHERE id = $1", [runId]);
     }
     const queue: Queued[] = [];
-    // VALKEY_CACHE_URL is what the production handler builds its spend meter on (E2E-B6).
-    const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
+    // QUEUE_REDIS_URL is what the production handler builds its spend meter on (E2E-B6).
+    const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
     const parseSeen = new Set<string>();
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
@@ -363,7 +363,7 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
       [runId, s.workspaceId, s.projectId],
     );
     // Cells captured but never parsed (the parse queue is not drained): there are no facts, so no rollup can exist.
-    const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
+    const context = { pool: undefined, env: { VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: cacheValkey.url } } as unknown as QueueHandlerContext;
     const rollupRequests: Array<{ workspaceId: string; payload: Record<string, unknown> }> = [];
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),

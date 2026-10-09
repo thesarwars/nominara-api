@@ -53,8 +53,9 @@ test:isolation 12 files / 55 passed (no table changed; no migration; db:rls-gene
 - The pre-call check-then-act overrun: N cells that pass the gate together can all call the vendor; the
   overshoot is bounded by in-flight concurrency (queue concurrency x workers), not by the ceiling.
 - The meter is float USD (INCRBYFLOAT, `numeric(10,6)` ledger). Kept; ledger cost is written at 6 decimals.
-- A meter key that disappears mid-period (eviction, FLUSH) is indistinguishable from the start of a period
-  and reads as 0 spent. Only unreadable and corrupt values fail closed.
+- The meter lives on the queue instance (noeviction, AOF), not the allkeys-lru cache, so eviction and cache restarts
+  cannot reset it (pinned by test/unit/engines/spend-meter-instance.spec.ts). A manual FLUSH of the queue instance, or
+  loss of its volume, still reads as 0 spent; usage_ledger cannot reseed it (D12, RLS-forced).
 - A retryable failure that was billed is metered, and its retry will be metered again (each call is a real
   charge); its `usage_ledger` row is rolled back with the transaction, so the ledger undercounts the meter.
 - There is no tracing SDK yet (`CaptureSpan` is a structural stand-in), so no real span was added; the
