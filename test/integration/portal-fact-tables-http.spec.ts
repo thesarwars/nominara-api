@@ -13,8 +13,11 @@ import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture
 // in-process, so it sees the portal pool AND the app pool, and a separate fact-table statement cannot hide behind a
 // co-filter. (An earlier version of this check used pg_stat_statements, which no test container loads: it passed vacuously.)
 //
-// The ONE exemption is owner decision 2026-10-08 (NEW-E-100a): engine_data_sources may be read from answer_captures because
-// the rollup has no such column. It is matched by the statement's own shape, so any other fact-table read still fails.
+// EXEMPTIONS (a closed, named list; each is matched by the statement's own shape, so any other fact-table read still fails):
+//   - engine_data_sources: owner decision 2026-10-08 (NEW-E-100a), the rollup has no such column.
+//   - owner decision 2026-10-09 #1 (week 1 only; rollup-only portal projection is week 2): the portal overview, matrix and
+//     growth-map reads, namely ScorecardsService.engineConfig (the `measured` CTE and the `last_capture` lateral, one
+//     statement), aggregateRange's `day_cells` statement, and GrowthMapService.failureDays.
 const COOKIE_KEY_B64 = randomBytes(32).toString("base64url");
 const KEY = loadPortalCookieKey(COOKIE_KEY_B64);
 
@@ -89,7 +92,13 @@ describe("NEW-E-099b · portal reads touch no fact tables", () => {
 
 
   const FACT_TABLES = /\b(answer_captures|mention_facts|citation_facts)\b/i;
-  const ENGINE_DATA_SOURCES = /count\(\*\) FILTER \(WHERE c\.normalizer_version/;
+  const EXEMPT_READS: ReadonlyArray<{ name: string; shape: RegExp }> = [
+    { name: "engineDataSourcesForDates (NEW-E-100a)", shape: /count\(\*\) FILTER \(WHERE c\.normalizer_version/ },
+    { name: "ScorecardsService.engineConfig (2026-10-09 #1)", shape: /^\s*WITH measured AS \(\s*SELECT DISTINCT c\.engine_key\s+FROM answer_captures c\b/ },
+    { name: "aggregateRange day_cells (2026-10-09 #1)", shape: /^\s*WITH day_cells AS \(\s*SELECT c\.id, c\.engine_key, c\.status, c\.cache_layer, c\.brand_present, c\.sov,/ },
+    { name: "GrowthMapService.failureDays (2026-10-09 #1)", shape: /^\s*SELECT DISTINCT to_char\(\(captured_at AT TIME ZONE \$4\)::date, 'YYYY-MM-DD'\) AS metric_date, engine_key\s+FROM answer_captures\b/ },
+  ];
+  const isExempt = (sql: string): boolean => EXEMPT_READS.some((e) => e.shape.test(sql));
 
   async function factStatementsFor(cookie: string, path: string): Promise<string[]> {
     const seen: string[] = [];
@@ -106,7 +115,7 @@ describe("NEW-E-099b · portal reads touch no fact tables", () => {
       spy.mockRestore();
     }
     expect(seen.length, "the trace must have seen the request's statements").toBeGreaterThan(0);
-    return seen.filter((sql) => FACT_TABLES.test(sql) && !ENGINE_DATA_SOURCES.test(sql));
+    return seen.filter((sql) => FACT_TABLES.test(sql) && !isExempt(sql));
   }
 
   for (const route of ["overview", "growth-map", "matrix"] as const) {
@@ -134,5 +143,21 @@ describe("NEW-E-099b · portal reads touch no fact tables", () => {
       spy.mockRestore();
     }
     expect(seen.some((sql) => FACT_TABLES.test(sql))).toBe(true);
+  });
+
+  it("NEW-E-099b AC2 · the exemption is narrow: it names exactly four reads, and a look-alike or any other fact-table statement is NOT exempt", () => {
+    expect(EXEMPT_READS).toHaveLength(4);
+    for (const other of [
+      "SELECT count(*) FROM answer_captures",
+      "SELECT * FROM mention_facts",
+      "SELECT * FROM citation_facts WHERE project_id = $1",
+      // the competitor panel's own day_cells CTE (same table, different statement) is not the aggregateRange read
+      "WITH day_cells AS (\n SELECT c.id, c.engine_key, (c.captured_at AT TIME ZONE $4)::date AS day FROM answer_captures c) SELECT 1",
+      // an exempt shape that does not START the statement
+      "SELECT 1 FROM mention_facts; WITH measured AS ( SELECT DISTINCT c.engine_key FROM answer_captures c )",
+      "SELECT DISTINCT engine_key FROM answer_captures WHERE project_id = $1",
+    ]) {
+      expect(FACT_TABLES.test(other) && !isExempt(other), other).toBe(true);
+    }
   });
 });
