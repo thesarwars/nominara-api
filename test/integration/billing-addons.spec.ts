@@ -274,6 +274,30 @@ describe("STORY-076b · add-ons", () => {
     expect(gateway.addonChanges[1]).toMatchObject({ kind: "extra_seat", quantity: 2, existingItemId: "si_extra_seat" }); // 1 held + 1 added
   });
 
+  it("STORY-076b AC-create-retry · the reply of an applied CREATE is lost twice under one Idempotency-Key: every retry replays the same create under the same Stripe key (Stripe refuses a changed call), and exactly ONE seat is billed", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    stripeSubscription(workspaceId, {});
+    const key = randomUUID();
+    const item = () => (gateway.objects.get(`subscription:${subIdOf(workspaceId)}`)!.raw as { items: { data: Array<{ id: string; quantity: number }> } }).items.data.filter((l) => l.id.startsWith("si_extra_seat"));
+    gateway.failAfterApplyingAddon = new StripeUpstreamError(504);
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(503);
+    expect(item().map((l) => l.quantity)).toEqual([1]); // Stripe applied the create; the fetch now shows the item
+    expect((await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key)).statusCode).toBe(503); // second lost reply
+    gateway.failAfterApplyingAddon = undefined;
+    const third = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key);
+    expect(third.statusCode, third.body).toBe(202);
+    expect(dataOf<{ quantity_requested: number }>(third).quantity_requested).toBe(1);
+    const fourth = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 }, key);
+    expect(fourth.statusCode, fourth.body).toBe(202);
+
+    expect(item().map((l) => l.quantity)).toEqual([1]);
+    expect(gateway.addonChanges).toHaveLength(1);
+    expect(gateway.addonAttempts).toHaveLength(3); // the fourth was answered from the settled marker
+    for (const attempt of gateway.addonAttempts) {
+      expect(attempt).toMatchObject({ existingItemId: null, quantity: 1, idempotencyKey: gateway.addonAttempts[0]!.idempotencyKey });
+    }
+  });
+
   it("AC1 retry · the intent is COMMITTED before Stripe is asked: it survives the failed request and carries the target total and the Stripe key", async () => {
     const { workspaceId, owner } = await newWorkspace("growth");
     stripeSubscription(workspaceId, { held: [{ kind: "extra_seat", quantity: 2 }] });

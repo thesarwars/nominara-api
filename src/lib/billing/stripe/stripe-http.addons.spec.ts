@@ -62,6 +62,25 @@ describe("STORY-076b · changeAddonQuantity", () => {
   });
 });
 
+describe("STORY-076b checkpoint-4 · the error type survives the gateway", () => {
+  it("STORY-076b AC-idempotency-error . Stripe's 400 idempotency_error reaches the service as a typed error, not only as a 400 status", async () => {
+    const refused = new Stripe.errors.StripeIdempotencyError({ type: "idempotency_error", message: `reused ${SECRET}`, statusCode: 400 } as never);
+    const err = await gatewayWith({ subscriptionItems: { update: () => Promise.reject(refused) } })
+      .changeAddonQuantity({ ...input, existingItemId: "si_9" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StripeUpstreamError);
+    expect(err).toMatchObject({ statusCode: 400, errorType: "idempotency_error" });
+    expect((err as Error).message).not.toContain(SECRET);
+  });
+
+  it("STORY-076b AC-idempotency-error . an error with no Stripe type carries none (the status alone is what it was)", async () => {
+    const err = await gatewayWith({ subscriptionItems: { create: () => Promise.reject(Object.assign(new Error("x"), { statusCode: 400 })) }, products: { create: () => Promise.resolve({}) } })
+      .changeAddonQuantity(input)
+      .catch((e: unknown) => e);
+    expect((err as StripeUpstreamError).errorType).toBeUndefined();
+  });
+});
+
 describe("STORY-076b · scheduleAddonRemoval", () => {
   const phaseItems = [{ price: "price_plan", quantity: 1 }, { price: { id: "price_proj" }, quantity: 2 }];
   const stubs = (over: { schedule?: unknown; phases?: unknown[]; items?: unknown[] } = {}) => {
