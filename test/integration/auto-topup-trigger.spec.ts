@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { Logger } from "@nestjs/common";
-import { Pool } from "pg";
+import type { Job } from "bullmq";
+import { Pool, type PoolClient } from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { autoTopupConfigSchema } from "../../contracts/billing/index.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
-import { STRIPE_GATEWAY, StripeUpstreamError } from "../../src/lib/billing/stripe/stripe-gateway.js";
+import { STRIPE_GATEWAY, StripeUpstreamError, type OffSessionPaymentInput } from "../../src/lib/billing/stripe/stripe-gateway.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
+import { createBillingAutoTopupHandler } from "../../src/lib/queue/handlers/billing-auto-topup.handler.js";
+import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
+import { topologyFor } from "../../src/lib/queue/topology.js";
+import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { AutoTopupService } from "../../src/modules/billing/auto-topup.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
@@ -69,9 +74,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     gateway.objects.clear();
     gateway.savedMethods.clear();
     gateway.savedMethodLookups.length = 0;
-    gateway.offSessionCharges.length = 0;
-    gateway.offSessionOutcome = "submitted";
-    gateway.failChargeWith = undefined;
+    gateway.resetOffSession();
     gateway.failFetchWith = undefined;
     gateway.offSessionStates.clear();
     gateway.offSessionStateLookups.length = 0;
@@ -525,11 +528,13 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
   // ---- NEW-D-7 audit F6: a stuck pending purchase ----------------------------------------------
 
   /** An auto-top-up charge whose answer never came back (503) and whose purchase is now `minutes` old. */
-  async function stuckPending(minutes = 61) {
+  async function stuckPending(minutes = 61, how: "never_reached" | "reached" = "never_reached") {
     const armedWs = await armed({ max: 5 });
-    gateway.failChargeWith = new StripeUpstreamError(503);
+    if (how === "reached") gateway.failChargeAfterReaching = new StripeUpstreamError(503);
+    else gateway.failChargeWith = new StripeUpstreamError(503);
     expect(await service.trigger(armedWs.workspaceId)).toBe("upstream_error");
     gateway.failChargeWith = undefined;
+    gateway.failChargeAfterReaching = undefined;
     const stuck = (await autoPurchases(armedWs.workspaceId))[0]!;
     await harness.db().query("UPDATE credit_purchases SET created_at = now() - make_interval(mins => $2::int) WHERE id = $1", [stuck.id, minutes]);
     return { workspaceId: armedWs.workspaceId, stuck };
@@ -573,6 +578,15 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect(gateway.offSessionStateLookups).toEqual([stuck.id]);
     expect(gateway.offSessionCharges).toHaveLength(1);
     expect(gateway.offSessionCharges[0]!.purchaseId).toBe(stuck.id);
+    // The replay is only safe if it is IDENTICAL to the original request: if the original never reached Stripe
+    // (the timeout / 503 that sent this row down this path) the replay IS the charge. Field by field, against
+    // the original attempt (which failed before Stripe recorded it) and against absolute values.
+    expect(gateway.offSessionAttempts).toHaveLength(2);
+    const [original, replay] = gateway.offSessionAttempts as [OffSessionPaymentInput, OffSessionPaymentInput];
+    expect(Object.keys(replay).sort()).toEqual(Object.keys(original).sort());
+    for (const field of Object.keys(original) as Array<keyof OffSessionPaymentInput>) expect(replay[field], `replay.${field}`).toBe(original[field]);
+    expect(replay).toMatchObject({ unitAmountCents: 1500, currency: "USD", customerId: "cus_saved_1", paymentMethodId: "pm_saved_1", packKey: "starter_vault", workspaceId });
+    expect(replay.productName).toBe(original.productName);
     const purchases = await autoPurchases(workspaceId);
     expect(purchases).toHaveLength(1);
     expect(purchases[0]).toMatchObject({ id: stuck.id, status: "pending" });
@@ -603,6 +617,60 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect((await wallet(workspaceId))?.auto_topup_count_cycle).toBe(1);
   });
 
+  /** A later manual pack purchase: Checkout (`customer_creation: "always"`) leaves a NEW customer and payment method. */
+  async function manualPurchaseWithNewCard(workspaceId: string) {
+    const pi = `pi_ref2_${workspaceId}`;
+    await harness.db().query(
+      `INSERT INTO credit_purchases (workspace_id, pack_key, credits, amount_usd, source, status, stripe_payment_intent_id, expires_at)
+       VALUES ($1,'starter_vault',1000,15.00,'manual','succeeded',$2, now() + interval '12 months')`,
+      [workspaceId, pi],
+    );
+    gateway.savedMethods.set(pi, { customerId: "cus_saved_2", paymentMethodId: "pm_saved_2" });
+  }
+
+  it("NEW-D-7 checkpoint-4 F2b · the original reached Stripe (reply lost) and a manual purchase since then changed the saved card: Stripe refuses the replay (idempotency_error 400) and that is ALERTED NOW as unreconcilable, not logged as a generic upstream_error until the 23 h alert", async () => {
+    const { workspaceId, stuck } = await stuckPending(61, "reached");
+    await manualPurchaseWithNewCard(workspaceId);
+    const alert = vi.spyOn(Logger.prototype, "error");
+    expect(await service.trigger(workspaceId)).toBe("in_flight");
+    expect(gateway.offSessionAttempts).toHaveLength(2);
+    expect(gateway.offSessionAttempts[1]).toMatchObject({ customerId: "cus_saved_2" });
+    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining("ALERT"), workspace_id: workspaceId, purchase_id: stuck.id, reason: "replay_rejected" }));
+    alert.mockRestore();
+    const metrics = log.mock.calls.map((c) => c[0] as Record<string, unknown>).filter((c) => typeof c === "object" && typeof c?.metric === "string");
+    expect(metrics).toContainEqual({ metric: "nominara_billing_auto_topup_stale_unreconcilable_total", value: 1, reason: "replay_rejected" });
+    // Fails closed: the row stays pending (the in-flight guard stays closed), no slot, no second purchase, nothing disabled.
+    expect(await autoPurchases(workspaceId)).toEqual([expect.objectContaining({ id: stuck.id, status: "pending" })]);
+    expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: true, auto_topup_count_cycle: 1 });
+    expect(gateway.offSessionCharges).toHaveLength(0);
+  });
+
+  it("NEW-D-7 checkpoint-4 F2b · the original never reached Stripe and the saved card changed since: the replay is the first request Stripe sees, so it charges the CURRENT card for the original amount, once", async () => {
+    const { workspaceId, stuck } = await stuckPending();
+    await manualPurchaseWithNewCard(workspaceId);
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    expect(gateway.offSessionCharges).toHaveLength(1);
+    expect(gateway.offSessionCharges[0]).toMatchObject({ purchaseId: stuck.id, unitAmountCents: 1500, currency: "USD", customerId: "cus_saved_2", paymentMethodId: "pm_saved_2" });
+    expect(await autoPurchases(workspaceId)).toEqual([expect.objectContaining({ id: stuck.id, status: "pending" })]);
+  });
+
+  it("NEW-D-7 checkpoint-4 F2b · the original reached Stripe (reply lost) and nothing changed: the replay is identical, Stripe answers from the first request, one charge", async () => {
+    const { workspaceId, stuck } = await stuckPending(61, "reached");
+    expect(await service.trigger(workspaceId)).toBe("charge_submitted");
+    expect(gateway.offSessionAttempts).toHaveLength(2);
+    expect(gateway.offSessionAttempts[1]).toEqual(gateway.offSessionAttempts[0]);
+    expect(gateway.offSessionCharges.map((c) => c.purchaseId)).toEqual([stuck.id]);
+  });
+
+  it("NEW-D-7 checkpoint-4 F2a · the fake refuses a reused key whose parameters differ, like Stripe (idempotency_error 400), and answers an identical one", async () => {
+    const base: OffSessionPaymentInput = { workspaceId: "w", purchaseId: "p1", packKey: "k", productName: "n", unitAmountCents: 1500, currency: "USD", customerId: "c", paymentMethodId: "m" };
+    await expect(gateway.createOffSessionPayment(base)).resolves.toMatchObject({ outcome: "submitted" });
+    await expect(gateway.createOffSessionPayment({ ...base })).resolves.toMatchObject({ outcome: "submitted" });
+    for (const changed of [{ unitAmountCents: 1600 }, { currency: "EUR" }, { customerId: "c2" }, { paymentMethodId: "m2" }, { productName: "x" }, { packKey: "k2" }, { workspaceId: "w2" }]) {
+      await expect(gateway.createOffSessionPayment({ ...base, ...changed })).rejects.toMatchObject({ name: "StripeUpstreamError", statusCode: 400 });
+    }
+  });
+
   it("NEW-D-7 checkpoint-3 F2 · past Stripe's idempotency-key retention a replay would be a NEW charge, so it fails closed: stays pending, no charge, no lookup-driven expiry", async () => {
     const { workspaceId, stuck } = await stuckPending(25 * 60);
     const alert = vi.spyOn(Logger.prototype, "error");
@@ -626,7 +694,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect(await audit(workspaceId, "billing.auto_topup.pending_expired")).toEqual([]);
   });
 
-  it("NEW-D-7 audit F6 · KAD-06: the Stripe lookup for a stale purchase is made with no transaction open on the database", async () => {
+  it("NEW-D-7 audit F6 · KAD-06: the SERVICE opens no transaction of its own across the Stripe lookup for a stale purchase (called directly; production reaches it through the job processor, see the checkpoint-4 KAD-06 test below)", async () => {
     const { workspaceId } = await stuckPending();
     let open = -1;
     const original = gateway.findOffSessionPayment.bind(gateway);
@@ -639,6 +707,36 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     } finally {
       gateway.findOffSessionPayment = original;
     }
+    expect(open).toBe(0);
+  });
+
+  // KAD-06 through the PRODUCTION entry: createJobProcessor -> withTenantJob -> BEGIN + set_config -> the handler -> trigger.
+  // The processor passes every tenant handler a transaction and holds it (idle, having run only set_config) until the handler
+  // returns, i.e. across every Stripe and mail await. OPEN DECISION (docs/plans/evidence/NEW-D-7.md, "Checkpoint-4 fix pass"):
+  // either an ADR adds a processor mode that verifies the signature and runs the handler without holding the job
+  // transaction, or a bounded written exception is recorded in coding-standards/KAD-06. `it.fails` pins today's fact so the
+  // suite stays green AND flips to a failure the moment the fix lands (then change it to `it`); it does not weaken the assertion.
+  it.fails("NEW-D-7 checkpoint-4 F7 · KAD-06: through createJobProcessor, no job transaction is open while the Stripe lookup is awaited", async () => {
+    const { workspaceId } = await armed();
+    const key = Buffer.from("kad06-processor-test-key");
+    const run = createJobProcessor(topologyFor("billing.auto_topup"), {
+      keys: { current: { kid: "k1", key } },
+      getClient: () => pool.connect(),
+      releaseClient: (client) => (client as PoolClient).release(),
+      process: createBillingAutoTopupHandler({ pool, env: {} as never }, { service }),
+    });
+    let open = -1;
+    const original = gateway.findSavedPaymentMethod.bind(gateway);
+    gateway.findSavedPaymentMethod = async (ref: string) => {
+      open = Number((await harness.db().query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() AND state LIKE 'idle in transaction%'")).rows[0].n);
+      return original(ref);
+    };
+    try {
+      await run({ data: signQueueJobPayload({ workspaceId, kid: "k1" }, key) } as unknown as Job);
+    } finally {
+      gateway.findSavedPaymentMethod = original;
+    }
+    expect(gateway.savedMethodLookups).toHaveLength(1); // the probe ran inside the real flow
     expect(open).toBe(0);
   });
 

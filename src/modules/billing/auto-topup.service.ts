@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
 import type { AutoTopupTriggerOutcome } from "../../../contracts/billing/index.js";
 import { PG_POOL } from "../../db/pg-pool.js";
-import { STRIPE_GATEWAY, StripeUpstreamError, type OffSessionPaymentInput, type SavedPaymentMethod, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
+import { STRIPE_GATEWAY, StripeUpstreamError, type OffSessionPaymentInput, type OffSessionPaymentResult, type SavedPaymentMethod, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { lockWallet, purchasableOptions, type PurchasableOption } from "../../lib/credits/wallet.js";
 import { AUTO_TOPUP_MIN_PLAN } from "./billing.service.js";
@@ -54,7 +54,9 @@ import { EMAIL_SENDER, type EmailSender } from "../identity/ports/email-sender.j
  *     Stripe returns the original PaymentIntent, or creates the charge for this same purchase — never a
  *     second one. Past the key retention a replay would be a NEW charge, so it fails closed: the row stays
  *     pending and an alert is raised.
- *   - a lookup or replay that errors leaves the row pending.
+ *   - a replay Stripe REFUSES with HTTP 400 (idempotency_error: the original reached Stripe with other parameters, e.g.
+ *     the saved card moved since) can never succeed: the row stays pending and the alert fires NOW, not at 23 h.
+ *   - any other lookup or replay error leaves the row pending.
  */
 const STALE_PENDING_MINUTES = 60;
 
@@ -316,7 +318,19 @@ export class AutoTopupService {
           this.unreconcilable(workspaceId, row.id, "no_payment_method");
           continue;
         }
-        const result = await this.gateway.createOffSessionPayment({ ...row.replay, customerId: method.customerId, paymentMethodId: method.paymentMethodId });
+        let result: OffSessionPaymentResult;
+        try {
+          result = await this.gateway.createOffSessionPayment({ ...row.replay, customerId: method.customerId, paymentMethodId: method.paymentMethodId });
+        } catch (error) {
+          // HTTP 400 on a replay is Stripe's idempotency_error: the original request DID reach Stripe and differs from
+          // this one (the saved card moved when a later manual purchase created a new customer). It can never succeed
+          // on retry, so waiting for the 23 h mark would hide it: alert now. The row stays pending (fail closed).
+          if (error instanceof StripeUpstreamError && error.statusCode === 400) {
+            this.unreconcilable(workspaceId, row.id, "replay_rejected");
+            continue;
+          }
+          throw error;
+        }
         incrementCounter("nominara_billing_auto_topup_stale_replay_total", { outcome: result.outcome });
         if (result.outcome === "declined") {
           await this.declined(workspaceId, row.id);
