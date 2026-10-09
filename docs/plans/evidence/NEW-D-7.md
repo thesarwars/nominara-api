@@ -389,3 +389,17 @@ timeout, no row locks taken, no snapshot held under READ COMMITTED). Per the fin
 - `pnpm lint` exit 0; `pnpm typecheck` exit 0; `pnpm test:unit` exit 0 (306 files passed, 3755 tests).
 - Integration (auto-topup-cycle-reset, -trigger, -enqueue, billing-usage-auto-topup, worker-group-bootstrap): exit 0, 5 files, 104 passed / 1 expected fail.
 - `pnpm test:isolation`: exit 0, 13 files / 53 tests.
+
+## Checkpoint-5 fix pass (lane d-usage, branch 7day/d-usage-6)
+
+### KAD-06: bounded written exception for the `billing.auto_topup` job (owner decision 2026-10-09 #3)
+Status: **EXCEPTION IN FORCE. MUST-FIX BEFORE LIVE STRIPE.** The proper fix is week 2 and must land before auto-top-up is switched on against live Stripe.
+
+Text to carry into `references/coding-standards.md` section 4 (the docs repo has no `.git` here; this is the carry-ready paragraph), directly under "No handler holds a database transaction open across an `await` on an external service":
+
+> **Bounded exception (owner, 2026-10-09): the `billing.auto_topup` job.** `createJobProcessor` holds the tenant job transaction (BEGIN + `set_config`, idle) while the handler awaits Stripe and mail. Allowed for this one job only, and only while all of these hold: concurrency 2 per replica; a 10 s timeout on every Stripe call; no row locks taken before or during the external awaits (the claim is one conditional UPDATE, committed with the job); no snapshot held, the transaction runs under READ COMMITTED. **MUST-FIX before live Stripe:** a worker mode that verifies the signature and then runs the handler without holding the job transaction, with an ADR (week 2). Until then the F7 test stays `it.fails`.
+
+The F7 test (`test/integration/auto-topup-trigger.spec.ts`, "NEW-D-7 checkpoint-4 F7 · KAD-06 ...") is kept as `it.fails`, its comment now naming this decision and the MUST-FIX. Not weakened; when the processor mode lands it fails and must be switched to `it`.
+
+### Audit finding: replay must send the same charge as the original (mutation M1)
+Already covered on the base commit by "NEW-D-7 checkpoint-3 F2 · Search saying `none` ..." (field-by-field replay vs original) and the three checkpoint-4 F2b tests. Re-verified on 71e13e9: mutating the replay `unitAmountCents` (`toCents(r.amount_usd) + 100`, `auto-topup.service.ts`) gives **3 failed / 49 passed / 1 expected fail**, so M1 is killed. Source restored (`git diff` clean). No new test was needed; the checkpoint-5 finding describes the pre-checkpoint-4 state.
