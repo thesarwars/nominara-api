@@ -42,3 +42,6 @@ Evidence that needs a running real API (a real signed Stripe delivery against a 
 | Docker env for the integration run | | `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock TESTCONTAINERS_RYUK_DISABLED=true` |
 
 No contract, schema or migration changed in this checkpoint-2 pass, so `contracts:generate`, `db:rls-generate` and the drift checks have nothing new to regenerate.
+
+## Checkpoint-4, fix pass 2 (lane 7day/d-billing-5)
+The credit-pack purchase takes no lock but shared checkout's hold-and-wait shape (main-pool connection held while `pool.connect()` on the same pool for the pending-row insert): about 10 concurrent purchases from different workspaces deadlocked the pool. Fix `bd443c2` (RED `8976cd1`): the insert and the `failed` mark run on `BILLING_WRITE_POOL`. Proof: integration `billing-pool-contention.spec.ts` "STORY-076a AC-pool-pack" (14 concurrent purchases; RED: "the pool is deadlocked") and "AC-pool-mixed". `credit-packs.spec.ts` (incl. the killed-connection test) passes unchanged. Gates and mutations in `STORY-076b.md`.
