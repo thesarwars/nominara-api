@@ -11,6 +11,8 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { BillingService } from "../../src/modules/billing/billing.service.js";
 import { ProjectsService } from "../../src/modules/projects/projects.service.js";
 import { WorkspaceSummaryService } from "../../src/modules/workspaces/workspace-summary.service.js";
+import * as metrics from "../../src/lib/telemetry/metrics.js";
+import { vi } from "vitest";
 import { withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
 
 // NEW-B-2 — GET /v1/workspaces/{id}/summary, real SQL as `nominara_app`.
@@ -309,8 +311,8 @@ describe("NEW-B-2 · WorkspaceSummaryService — real SQL", () => {
     const big = await createWorkspace();
     for (let i = 0; i < 12; i += 1) {
       const p = await createProject(big);
-      await createRun(big, p, { status: "completed", planned: 3, captured: 3, finishedAt: "2026-10-12T13:08:00Z" });
-      await createRun(big, p, { status: "running", planned: 3 });
+      await createRun(big, p, { status: "completed", planned: 3, captured: 3, createdAt: "2026-10-12T13:00:00Z", finishedAt: "2026-10-12T13:08:00Z" });
+      await createRun(big, p, { status: "running", planned: 3, createdAt: "2026-10-12T14:00:00Z" });
     }
     const smallCount = await inTenant(CTX(small), async (n) => {
       await summary.summary(small);
@@ -342,6 +344,19 @@ describe("NEW-B-2 · WorkspaceSummaryService — real SQL", () => {
       expect(by(none)).toBeNull();
       expect(by(live)).toMatchObject({ run_id: liveRun, status: "running", planned_cells: 17, settled_cells: 11, rolled_up: false });
       expect(by(done)).toMatchObject({ status: "completed", rolled_up: true });
+    });
+
+    it("STORY-175 observability: the list counts rows served by last-scan state, labels carry no identifiers", async () => {
+      const spy = vi.spyOn(metrics, "incrementCounter");
+      const ws = await createWorkspace();
+      await createProject(ws);
+      const p = await createProject(ws);
+      await createRun(ws, p, { status: "running" });
+      await inTenant(CTX(ws), () => page());
+      const calls = spy.mock.calls.filter(([name]) => name === "nominara_projects_last_scan_rows_total").map(([, labels]) => labels);
+      spy.mockRestore();
+      expect(calls.map((l) => l?.state).sort()).toEqual(["none", "running"]);
+      expect(calls.every((l) => Object.keys(l ?? {}).join() === "state")).toBe(true);
     });
 
     it("STORY-175 scenario 6 (AC3): another workspace's run, even one cross-wired onto this workspace's project, never shows in the list", async () => {
