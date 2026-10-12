@@ -1,6 +1,7 @@
 import { DelayedError, type Job } from "bullmq";
-import type { EngineTokenBuckets } from "../../config/env.schema.js";
-import type { EngineKey } from "./contract.js";
+import { engineTokenBucketsSchema, type EngineTokenBuckets } from "../../config/env.schema.js";
+import { engineKeySchema, type EngineKey } from "./contract.js";
+import { CaptureFailureError } from "./failure-taxonomy.js";
 import type { TokenBucket, TokenBucketConfig } from "./token-bucket.js";
 
 // STORY-031 Phase B — D17: this wraps the FUNCTION `createJobProcessor`
@@ -42,12 +43,33 @@ export function geminiPacingConfig(requestsPerMinute: number): TokenBucketConfig
   return { capacity: 1, refillPerSecond: requestsPerMinute / 60 };
 }
 
-/** SCANFIX D3 - the lease the capture worker wires. */
+/**
+ * SCANFIX D3 - the lease the capture worker wires onto `capture.execute`.
+ *
+ * Until this the bucket (STORY-031) was built, configured and tested and NEVER WIRED: nothing in
+ * `src/` called `withEngineLease`, so a 51-cell scan reached the vendor all at once, 39 of the
+ * calls were 429'd, and every cell spent its five attempts.
+ *
+ * `GEMINI_REQUESTS_PER_MINUTE` (default 10 = the free tier of gemini-2.5-flash) decides gemini's
+ * bucket, and wins over `ENGINE_TOKEN_BUCKETS.gemini`: the vendor's quota is one number an operator
+ * knows, and a capacity-10 burst bucket cannot honour "10 a minute". Other engines still come from
+ * `ENGINE_TOKEN_BUCKETS`, and a missing entry still fails loud (EngineLeaseConfigError).
+ *
+ * `resolveEngineKey` reads the UNVERIFIED payload - the lease runs before the signature check by
+ * design (see the header). It can only choose which bucket to spend a token from, never which
+ * tenant a job runs as; a payload with no valid engine key fails the job here, before any context.
+ */
 export function captureEngineLeaseOptions(
-  _env: { readonly ENGINE_TOKEN_BUCKETS: string; readonly GEMINI_REQUESTS_PER_MINUTE: number },
-  _tokenBucket: TokenBucket,
+  env: { readonly ENGINE_TOKEN_BUCKETS: string; readonly GEMINI_REQUESTS_PER_MINUTE: number },
+  tokenBucket: TokenBucket,
 ): EngineLeaseOptions {
-  throw new Error("SCANFIX D3: not implemented");
+  const buckets = engineTokenBucketsSchema.parse(JSON.parse(env.ENGINE_TOKEN_BUCKETS));
+  return {
+    tokenBucket,
+    configFor: configForFromEnv(buckets, env.GEMINI_REQUESTS_PER_MINUTE),
+    resolveEngineKey: (job) => engineKeySchema.parse((job.data as { payload?: { engineKey?: unknown } }).payload?.engineKey),
+    rateLimitDeferral: { maxDeferrals: MAX_RATE_LIMIT_DEFERRALS },
+  };
 }
 
 /**
@@ -73,13 +95,30 @@ export function withEngineLease(
       throw new DelayedError();
     }
 
-    return processor(job);
+    if (options.rateLimitDeferral === undefined) return processor(job);
+
+    try {
+      return await processor(job);
+    } catch (error) {
+      // SCANFIX D3 - A 429 IS "COME BACK LATER", NOT A FAILED ATTEMPT. Defer the job by the vendor's own
+      // Retry-After (or one quota window when it named none) through the same DelayedError path a denied
+      // lease takes: no DLQ entry, `attemptsMade` untouched. Bounded - the count rides in `job.progress`
+      // (not in `job.data`, which is HMAC-signed) - so a key whose quota is gone for the day eventually
+      // falls through to the ordinary ladder and then to the terminal `failed` record.
+      if (!(error instanceof CaptureFailureError) || error.code !== "rate_limited") throw error;
+      const deferrals = typeof job.progress === "number" ? job.progress : 0;
+      if (deferrals >= options.rateLimitDeferral.maxDeferrals) throw error;
+      await job.updateProgress(deferrals + 1);
+      await job.moveToDelayed(clock() + (error.retryAfterMs ?? DEFAULT_RATE_LIMIT_DEFER_MS), token);
+      throw new DelayedError();
+    }
   };
 }
 
 /** Adapts the parsed ENGINE_TOKEN_BUCKETS (D7) into a `configFor` callback. A missing entry is a config defect — fails loud (EngineLeaseConfigError), never a silent default (distinct from D19's store-outage fail-open, which is about the STORE being unreachable, not the config being absent). */
-export function configForFromEnv(buckets: EngineTokenBuckets, _geminiRequestsPerMinute?: number): (engineKey: EngineKey) => TokenBucketConfig {
+export function configForFromEnv(buckets: EngineTokenBuckets, geminiRequestsPerMinute?: number): (engineKey: EngineKey) => TokenBucketConfig {
   return (engineKey: EngineKey): TokenBucketConfig => {
+    if (engineKey === "gemini" && geminiRequestsPerMinute !== undefined) return geminiPacingConfig(geminiRequestsPerMinute);
     const config = buckets[engineKey];
     if (!config) {
       throw new EngineLeaseConfigError(engineKey);

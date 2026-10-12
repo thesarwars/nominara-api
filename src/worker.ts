@@ -11,6 +11,8 @@ import { connect, withKeepalives } from "./db/client.js";
 import { createPgPool, isConnectionClassFailure } from "./db/pg-pool.js";
 import { SchedulerSweepRuntime } from "./lib/capture/scheduler-sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
+import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
+import { TokenBucket } from "./lib/engines/token-bucket.js";
 import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
 import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
 import { createQueueReaderConnection, createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
@@ -75,6 +77,8 @@ class WorkerGroupRuntime implements OnModuleDestroy {
     // of. Closed AFTER the workers, so a job still draining keeps the
     // connection it is holding.
     private readonly pool: ReturnType<typeof createPgPool>,
+    // SCANFIX D3 - the cache-instance connection the capture.execute token bucket spends from.
+    private readonly leaseConnections: readonly Redis[] = [],
   ) {}
 
   async onModuleDestroy(): Promise<void> {
@@ -84,6 +88,7 @@ class WorkerGroupRuntime implements OnModuleDestroy {
     // The one connection every schedule Queue shares. Closing a Queue does
     // not close a connection it was handed rather than asked to create.
     await this.scheduleConnection?.quit().catch(() => undefined);
+    await Promise.all(this.leaseConnections.map((connection) => connection.quit().catch(() => undefined)));
     await this.pool.end().catch(() => undefined);
   }
 }
@@ -231,6 +236,7 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   // checked out), so a group whose queues are all still inert pays nothing
   // for holding one.
   const pool = createPgPool(env.DATABASE_URL_POOLED);
+  const leaseConnections: Redis[] = [];
   const live: string[] = [];
   const inert: string[] = [];
 
@@ -242,6 +248,19 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       const handler = handlerFor(entry.name);
       (handler ? live : inert).push(entry.name);
 
+      // SCANFIX D3 - capture.execute is paced per engine. The bucket lives on the CACHE instance (STORY-031
+      // D6), over a connection that rejects rather than blocks: TokenBucket fails OPEN on a store error
+      // (D19), so an unreachable cache means unpaced, never stuck.
+      let engineLease: ReturnType<typeof captureEngineLeaseOptions> | undefined;
+      if (entry.name === "capture.execute") {
+        const leaseRedis = new Redis(env.VALKEY_CACHE_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
+        leaseRedis.on("error", (error) => {
+          new Logger("bootstrap").warn(`capture.execute engine lease: cache Valkey connection error: ${error.message}`);
+        });
+        leaseConnections.push(leaseRedis);
+        engineLease = captureEngineLeaseOptions(env, new TokenBucket(leaseRedis));
+      }
+
       const worker = buildWorker(entry, {
         connection: createQueueWorkerConnection(env.QUEUE_REDIS_URL),
         prefix,
@@ -249,6 +268,7 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
         // Derived, never declared twice: a registered handler is exactly
         // what makes a queue safe to pull from.
         autorun: handler !== undefined,
+        ...(engineLease ? { engineLease } : {}),
         getClient: handler ? () => pool.connect() : () => notImplementedHandler(entry.name),
         // Spread rather than a ternary to `undefined`: under
         // exactOptionalPropertyTypes an absent option and one explicitly set
@@ -283,12 +303,13 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       ...dlqQueues.map((queue) => queue.close()),
       ...[...scheduleQueues.values()].map((queue) => queue.close()),
       ...(scheduleConnection ? [scheduleConnection.quit().catch(() => undefined)] : []),
+      ...leaseConnections.map((connection) => connection.quit().catch(() => undefined)),
     ]);
     await pool.end().catch(() => undefined);
     throw error;
   }
 
-  const runtime = new WorkerGroupRuntime(workers, dlqQueues, [...scheduleQueues.values()], scheduleConnection, pool);
+  const runtime = new WorkerGroupRuntime(workers, dlqQueues, [...scheduleQueues.values()], scheduleConnection, pool, leaseConnections);
 
   // STORY-031 Phase F — D2/EC-06: the 5-minute engine-health canary is a
   // capture-group concern only. Nothing else touches an engine at all.
@@ -332,6 +353,9 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
           { idempotencyKey: job.idempotencyKey },
         );
       },
+      // SCANFIX D4 - the stuck-run reaper asks for the rollup of a run it finishes.
+      enqueueRollup: (queue, workspaceId, payload, idempotencyKey) =>
+        sweepProducer.enqueueTenantJob(queue, workspaceId, payload, { idempotencyKey }),
     });
     sweepRuntime.start();
     providers.push({

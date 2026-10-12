@@ -99,8 +99,33 @@ export function assertGrounded(request: GeminiRequest): void {
 /** SCANFIX D3 - the longest Retry-After honoured; a vendor (or a hostile proxy) cannot park a cell for a day. */
 export const MAX_RETRY_AFTER_MS = 10 * 60 * 1000;
 
-function failure(code: CaptureFailureCode): CaptureFailureError {
-  return new CaptureFailureError(code, "gemini");
+function failure(code: CaptureFailureCode, retryAfterMs?: number): CaptureFailureError {
+  return new CaptureFailureError(code, "gemini", undefined, retryAfterMs === undefined ? {} : { retryAfterMs });
+}
+
+/**
+ * The vendor's own "come back in N" for a 429: the standard `Retry-After` header (delta-seconds or an
+ * HTTP date) first, else the `google.rpc.RetryInfo` detail Google puts in the error body
+ * (`"retryDelay": "17s"`). `undefined` when neither is present or readable - nothing is invented
+ * here - and `0` is kept as `0`. Clamped to MAX_RETRY_AFTER_MS.
+ */
+export function retryAfterMsOf(headers: Headers, body: unknown, nowMs: number = Date.now()): number | undefined {
+  const clamp = (ms: number): number => Math.min(MAX_RETRY_AFTER_MS, Math.max(0, Math.round(ms)));
+  const header = headers.get("retry-after")?.trim();
+  if (header !== undefined && header !== "") {
+    if (/^\d+(\.\d+)?$/.test(header)) return clamp(Number(header) * 1000);
+    // An HTTP date has letters ("Wed, 21 Oct 2026 ..."); "-4" parses as a year, and must not become "now".
+    const at = /[a-zA-Z]/.test(header) ? Date.parse(header) : Number.NaN;
+    if (!Number.isNaN(at)) return clamp(at - nowMs);
+  }
+  const details = (body as { error?: { details?: unknown } } | undefined)?.error?.details;
+  if (Array.isArray(details)) {
+    for (const detail of details) {
+      const delay = (detail as { retryDelay?: unknown } | null)?.retryDelay;
+      if (typeof delay === "string" && /^\d+(\.\d+)?s$/.test(delay)) return clamp(Number(delay.slice(0, -1)) * 1000);
+    }
+  }
+  return undefined;
 }
 
 function codeForStatus(status: number, body: unknown): CaptureFailureCode {
@@ -158,7 +183,8 @@ export class GeminiApiAdapter extends BaseCaptureAdapter {
         body = undefined;
       }
       if (!response.ok) {
-        throw failure(codeForStatus(response.status, body));
+        const code = codeForStatus(response.status, body);
+        throw failure(code, code === "rate_limited" ? retryAfterMsOf(response.headers, body) : undefined);
       }
       if (body === undefined) {
         throw failure("malformed_response");
