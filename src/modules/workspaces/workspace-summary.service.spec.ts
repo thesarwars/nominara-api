@@ -61,6 +61,7 @@ function project(overrides: Partial<ProjectListItem> = {}): ProjectListItem {
     engine_scores: null,
     sparkline_30d: null,
     demo_seeded: false,
+    last_scan: null,
     ...overrides,
   } as ProjectListItem;
 }
@@ -107,6 +108,25 @@ describe("NEW-B-2 · WorkspaceSummaryService", () => {
     const out = await service.summary(WS);
     expect(projects.listForSummary).toHaveBeenCalledTimes(1);
     expect(out.window_days).toBe(30);
+    expect(workspaceSummaryResponseSchema.safeParse(out).success).toBe(true);
+  });
+
+  it("STORY-175 AC1: last_scan passes through to the row untouched, null stays null", async () => {
+    const scan = {
+      run_id: "33333333-3333-7333-8333-333333333333",
+      status: "running" as const,
+      trigger: "manual" as const,
+      planned_cells: 17,
+      settled_cells: 11,
+      captured_cells: 11,
+      started_at: "2026-10-12T13:00:00.000Z",
+      completed_at: null,
+      rolled_up: false,
+    };
+    const { service } = setup({ projects: [project({ last_scan: scan }), project({ id: "44444444-4444-7444-8444-444444444444" })] });
+    const out = await service.summary(WS);
+    expect(out.projects[0]!.last_scan).toEqual(scan);
+    expect(out.projects[1]!.last_scan).toBeNull();
     expect(workspaceSummaryResponseSchema.safeParse(out).success).toBe(true);
   });
 
