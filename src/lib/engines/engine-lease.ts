@@ -28,6 +28,26 @@ export interface EngineLeaseOptions {
    */
   readonly resolveEngineKey: (job: Job) => EngineKey;
   readonly clock?: () => number;
+  /** SCANFIX D3 - when set, a rate_limited failure is deferred by the vendor's Retry-After instead of spending an attempt. */
+  readonly rateLimitDeferral?: { readonly maxDeferrals: number };
+}
+
+/** SCANFIX D3 - how long a 429 that named no Retry-After is deferred: one vendor quota window. */
+export const DEFAULT_RATE_LIMIT_DEFER_MS = 60_000;
+/** SCANFIX D3 - deferrals per job before a 429 is treated as an ordinary failed attempt. */
+export const MAX_RATE_LIMIT_DEFERRALS = 20;
+
+/** SCANFIX D3 - GEMINI_REQUESTS_PER_MINUTE as a bucket. */
+export function geminiPacingConfig(requestsPerMinute: number): TokenBucketConfig {
+  return { capacity: 1, refillPerSecond: requestsPerMinute / 60 };
+}
+
+/** SCANFIX D3 - the lease the capture worker wires. */
+export function captureEngineLeaseOptions(
+  _env: { readonly ENGINE_TOKEN_BUCKETS: string; readonly GEMINI_REQUESTS_PER_MINUTE: number },
+  _tokenBucket: TokenBucket,
+): EngineLeaseOptions {
+  throw new Error("SCANFIX D3: not implemented");
 }
 
 /**
@@ -58,7 +78,7 @@ export function withEngineLease(
 }
 
 /** Adapts the parsed ENGINE_TOKEN_BUCKETS (D7) into a `configFor` callback. A missing entry is a config defect — fails loud (EngineLeaseConfigError), never a silent default (distinct from D19's store-outage fail-open, which is about the STORE being unreachable, not the config being absent). */
-export function configForFromEnv(buckets: EngineTokenBuckets): (engineKey: EngineKey) => TokenBucketConfig {
+export function configForFromEnv(buckets: EngineTokenBuckets, _geminiRequestsPerMinute?: number): (engineKey: EngineKey) => TokenBucketConfig {
   return (engineKey: EngineKey): TokenBucketConfig => {
     const config = buckets[engineKey];
     if (!config) {

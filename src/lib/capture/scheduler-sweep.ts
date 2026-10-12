@@ -2,6 +2,7 @@ import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { claimDueProjectRefs } from "./scheduler.js";
+import type { EnqueueRollup } from "../queue/handlers/run-rollup-request.js";
 import { reapStaleQueuedRuns } from "./stale-run-reaper.js";
 
 // NEW-A-13 — the scheduler sweep: the producer `capture.plan` has always
@@ -260,6 +261,8 @@ export interface SweepRuntimeOptions {
   /** A NEW owner-role connection per tick (closed by the runtime). */
   readonly connect: () => Promise<ClientBase & { end(): Promise<void> }>;
   readonly enqueue: SweepEnqueue;
+  /** SCANFIX D4 - requests `rollup.metric_daily`; without it the stuck-run reaper does not run. */
+  readonly enqueueRollup?: EnqueueRollup;
   readonly clock?: () => Date;
   /** Overrides for DEFAULT_RUNTIME_LIMITS. */
   readonly limits?: Partial<RuntimeLimits>;

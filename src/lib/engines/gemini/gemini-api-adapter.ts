@@ -96,6 +96,9 @@ export function assertGrounded(request: GeminiRequest): void {
   }
 }
 
+/** SCANFIX D3 - the longest Retry-After honoured; a vendor (or a hostile proxy) cannot park a cell for a day. */
+export const MAX_RETRY_AFTER_MS = 10 * 60 * 1000;
+
 function failure(code: CaptureFailureCode): CaptureFailureError {
   return new CaptureFailureError(code, "gemini");
 }

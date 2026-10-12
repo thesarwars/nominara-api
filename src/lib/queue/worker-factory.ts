@@ -4,6 +4,7 @@ import type { Redis } from "ioredis";
 import type { ClientBase } from "pg";
 import type { Env } from "../../config/env.schema.js";
 import { withTenantJob } from "../../tenancy/with-tenant-job.js";
+import type { EngineLeaseOptions } from "../engines/engine-lease.js";
 import { createBackoffStrategy } from "./backoff.js";
 import { toTenantJob, type QueueJobEnvelope, type TenantScopedPayload } from "./envelope.js";
 import { rotatingHmacJobVerifier, type RotatingSigningKeys, type SigningKey } from "./signing.js";
@@ -113,6 +114,8 @@ export interface BuildWorkerOptions extends JobProcessorOptions {
   readonly prefix: string;
   /** Defaults to BullMQ's own default (true). Placeholder workers with no real handler wired yet pass false so no job is ever pulled. */
   readonly autorun?: boolean;
+  /** SCANFIX D3 - when set, every job first acquires a per-engine token-bucket lease. */
+  readonly engineLease?: EngineLeaseOptions;
 }
 
 /** Builds a real BullMQ Worker for `entry`, running every job through `createJobProcessor`'s verify-before-context ordering. */
