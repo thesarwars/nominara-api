@@ -23039,6 +23039,94 @@
                           },
                           "demo_seeded": {
                             "type": "boolean"
+                          },
+                          "last_scan": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "run_id": {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                  },
+                                  "status": {
+                                    "type": "string",
+                                    "enum": [
+                                      "queued",
+                                      "running",
+                                      "completed",
+                                      "partial",
+                                      "failed",
+                                      "canceled"
+                                    ]
+                                  },
+                                  "trigger": {
+                                    "type": "string",
+                                    "enum": [
+                                      "scheduled",
+                                      "manual",
+                                      "verification",
+                                      "drift_sample",
+                                      "conversion_backfill"
+                                    ]
+                                  },
+                                  "planned_cells": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "settled_cells": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "captured_cells": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "started_at": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "completed_at": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "rolled_up": {
+                                    "type": "boolean"
+                                  }
+                                },
+                                "required": [
+                                  "run_id",
+                                  "status",
+                                  "trigger",
+                                  "planned_cells",
+                                  "settled_cells",
+                                  "captured_cells",
+                                  "started_at",
+                                  "completed_at",
+                                  "rolled_up"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
                           }
                         },
                         "required": [
@@ -54030,6 +54118,94 @@
                               },
                               "demo_seeded": {
                                 "type": "boolean"
+                              },
+                              "last_scan": {
+                                "anyOf": [
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "run_id": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                      },
+                                      "status": {
+                                        "type": "string",
+                                        "enum": [
+                                          "queued",
+                                          "running",
+                                          "completed",
+                                          "partial",
+                                          "failed",
+                                          "canceled"
+                                        ]
+                                      },
+                                      "trigger": {
+                                        "type": "string",
+                                        "enum": [
+                                          "scheduled",
+                                          "manual",
+                                          "verification",
+                                          "drift_sample",
+                                          "conversion_backfill"
+                                        ]
+                                      },
+                                      "planned_cells": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      },
+                                      "settled_cells": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      },
+                                      "captured_cells": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      },
+                                      "started_at": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "completed_at": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "rolled_up": {
+                                        "type": "boolean"
+                                      }
+                                    },
+                                    "required": [
+                                      "run_id",
+                                      "status",
+                                      "trigger",
+                                      "planned_cells",
+                                      "settled_cells",
+                                      "captured_cells",
+                                      "started_at",
+                                      "completed_at",
+                                      "rolled_up"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
                               },
                               "engine_scores": {
                                 "anyOf": [

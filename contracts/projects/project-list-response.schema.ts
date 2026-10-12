@@ -48,6 +48,30 @@ export const openTasksBySeveritySchema = z
 export const storedEngineScoreSchema = projectEngineScoreSchema.omit({ engine_key: true });
 export const visibilityByEngineSchema = z.record(z.string(), storedEngineScoreSchema);
 
+// STORY-175 AC1 - the state of the project's LATEST capture run, so a card can
+// tell "never measured" (null) from "measuring right now" (queued/running) from
+// "measured, scores not written yet" (terminal, rolled_up false).
+//
+// `completed_at` is the run's `finished_at`; every terminal status has one, a
+// failed or canceled run included. `rolled_up` is true once the project's
+// denormalised block was rewritten at or after the run finished (see
+// ProjectsService.LAST_SCAN_JOIN); it is meaningful for a terminal run only.
+// Counts are never null: 0 is a real count, and "no run" is `last_scan: null`.
+export const lastScanSchema = z
+  .object({
+    run_id: z.string().uuid(),
+    status: z.enum(["queued", "running", "completed", "partial", "failed", "canceled"]),
+    trigger: z.enum(["scheduled", "manual", "verification", "drift_sample", "conversion_backfill"]),
+    planned_cells: z.number().int().nonnegative(),
+    /** captured + failed + skipped. */
+    settled_cells: z.number().int().nonnegative(),
+    captured_cells: z.number().int().nonnegative(),
+    started_at: z.string().nullable(),
+    completed_at: z.string().nullable(),
+    rolled_up: z.boolean(),
+  })
+  .strict();
+
 export const projectListItemSchema = z
   .object({
     id: z.string().uuid(),
@@ -92,9 +116,15 @@ export const projectListItemSchema = z
     sparkline_30d: z.unknown().nullable(),
     /** STORY-169 — true only for the dev-only demo seed's rows. Never true on data the real pipeline produced. */
     demo_seeded: z.boolean(),
+    /**
+     * STORY-175 - the latest capture run. Always emitted (null = never scanned); OPTIONAL in the schema so
+     * publishing it is the additive change `contracts:diff` rates minor, not a new required field (major).
+     */
+    last_scan: lastScanSchema.nullable().optional(),
   })
   .strict();
 
 export const projectListResponseSchema = z.array(projectListItemSchema);
 
+export type LastScan = z.infer<typeof lastScanSchema>;
 export type ProjectListItem = z.infer<typeof projectListItemSchema>;
