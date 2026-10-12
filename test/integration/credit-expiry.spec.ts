@@ -115,8 +115,8 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
 
   it("[AC4] leaves a lot that has not yet elapsed untouched — a second before expiry is not expired", async () => {
     await provision(workspaceId);
-    await lot(workspaceId, 1000, "1 minute");
-    expect(await sweep()).toMatchObject({ workspacesExpired: 0, creditsExpired: 0 });
+    await lot(workspaceId, 1000, "1 hour");
+    expect(await sweep()).toMatchObject({ workspacesChecked: 0, workspacesExpired: 0, creditsExpired: 0 });
     expect(await purchased()).toBe(1000);
     expect(await expireEntries()).toEqual([]);
   });
@@ -134,6 +134,44 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
     await lot(workspaceId, 500, "-1 day", "failed");
     await lot(workspaceId, 500, "-1 day", "refunded");
     expect(await sweep()).toMatchObject({ creditsExpired: 0, failures: [] });
+  });
+
+  it("[AC4] a pending or failed lot beside a succeeded one never inflates what expires — only succeeded lots are lots", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 100, "-1 day"); // succeeded, elapsed
+    await lot(workspaceId, 500, "6 months"); // succeeded, live
+    await lot(workspaceId, 400, "-1 day", "pending"); // moved no credits
+    await lot(workspaceId, 300, "-1 day", "failed");
+    // A LIVE unsucceeded lot too: counted into the total it would read as credits already consumed, and starve the expiry.
+    await lot(workspaceId, 700, "6 months", "pending");
+    expect(await purchased()).toBe(600);
+    expect(await sweep()).toMatchObject({ creditsExpired: 100 }); // not 500, not 800
+    expect(await purchased()).toBe(500);
+  });
+
+  it("[AC4] reads the balance UNDER the wallet row lock: a spend that commits while the sweep waits is seen, not overwritten", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 1000, "-1 second"); // P = 1000, one elapsed lot
+    const human = (await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`u-${randomUUID().slice(0, 8)}@nominara.test`])).rows[0]!.id;
+    const holder = await secondDiscovery();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE", [workspaceId]); // hold the wallet
+      let done = false;
+      const running = sweep().then((outcome) => { done = true; return outcome; });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(done, "the sweep must be waiting on the wallet row lock").toBe(false);
+      // The holder spends 600 from the purchased bucket, then releases the lock.
+      await adjustCredits(holder, { ...request(workspaceId, `spend-${randomUUID()}`), actorId: human, actorType: "user", reason: "test spend" }, "purchased", -600);
+      await holder.query("COMMIT");
+      const outcome = await running;
+      // 600 of the lot was consumed first-in-first-out; the sweep must expire the 400 left, not the 1000 it saw before the lock.
+      expect(outcome).toMatchObject({ creditsExpired: 400, failures: [] });
+      expect(await purchased()).toBe(0);
+      expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+    } finally {
+      await holder.end();
+    }
   });
 
   it("[AC4] FIFO — credits spent from the purchased bucket were the OLDEST lot's, so a spent expired lot expires nothing", async () => {
@@ -182,6 +220,7 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
     try {
       const [a, b] = await Promise.all([sweep(), expireDuePurchasedCredits({ discovery: second, work })]);
       expect(a.creditsExpired + b.creditsExpired).toBe(1000);
+      expect([...a.failures, ...b.failures]).toEqual([]); // the loser recomputes to zero; it does not fail on the constraint
     } finally {
       await second.end(); // an un-ended client is terminated when the container stops, and vitest fails the run on it
     }
