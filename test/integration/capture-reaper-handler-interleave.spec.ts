@@ -1,4 +1,5 @@
 import type { Client } from "pg";
+import { Logger } from "@nestjs/common";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { readWallet } from "../../src/lib/credits/wallet.js";
@@ -163,8 +164,19 @@ describe("SCANFIX-D5 · the reaper never finalises a run out from under a cell t
       const run = await addRun(db, t, { ageHours: 1, planned: 2, status });
       const prompt = await addPrompt(db, t, "replay");
 
-      await executeOn(db, t, jobFor(t, run, prompt, "replay"), emitted);
+      const logged: unknown[] = [];
+      const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((line: unknown) => {
+        logged.push(line);
+      });
+      try {
+        await executeOn(db, t, jobFor(t, run, prompt, "replay"), emitted);
+      } finally {
+        spy.mockRestore();
+      }
 
+      // Observable: a counter, and a log line carrying the workspace ID and nothing from the prompt.
+      expect(logged).toContainEqual({ metric: "nominara_capture_cells_skipped_terminal_run_total", value: 1, status });
+      expect(logged).toContainEqual({ event: "capture.cell.skipped_terminal_run", workspace_id: t.ws, run_id: run, status });
       expect(adapter.calls).toEqual([]);
       expect(await captureCount(db, run)).toBe(0);
       expect(await runRow(db, run)).toMatchObject({ status, captured_cells: 0, failed_cells: 0 });

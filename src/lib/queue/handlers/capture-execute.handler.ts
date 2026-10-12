@@ -214,7 +214,8 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     // landed: the fair-use reservation was released with it, and a late cell would capture under a run
     // that holds none (checkpoint-4).
     if (runRow.status !== "queued" && runRow.status !== "running") {
-      logger.log(`run ${payload.runId} is ${runRow.status}; skipping cell`);
+      incrementCounter("nominara_capture_cells_skipped_terminal_run_total", { status: runRow.status });
+      logger.log({ event: "capture.cell.skipped_terminal_run", workspace_id: payload.workspaceId, run_id: payload.runId, status: runRow.status });
       return;
     }
 
