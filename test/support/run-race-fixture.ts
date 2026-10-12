@@ -71,7 +71,7 @@ export async function startRaceDb(): Promise<RaceDb> {
 }
 
 export async function truncateAll(db: Client): Promise<void> {
-  await db.query("TRUNCATE answer_captures, tracked_prompts, capture_runs, projects, credit_ledger, credit_wallets, workspaces, users CASCADE");
+  await db.query("TRUNCATE answer_captures, tracked_prompts, capture_runs, projects, credit_ledger, credit_wallets, workspaces, users RESTART IDENTITY CASCADE");
 }
 
 export async function addTenant(db: Client): Promise<Tenant> {
