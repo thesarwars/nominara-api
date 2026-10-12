@@ -72,6 +72,19 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // nothing is stale, so a missed day costs nothing the next day does not cure.
   { queue: "identity.sweep_unverified", cron: "50 2 * * *", statedAs: "STORY-173: sweep stale unverified accounts daily" },
 
+  // ⚠ NOT FROM §4 — STORY-076 AC4 / STORY-071 AC10. Two credit jobs that existed with no caller: FIFO expiry of
+  // purchased credits and the nightly purge of daily counters. The data model says "nightly" for the purge and no
+  // reference gives expiry a cadence (twelve-month granularity makes a day immaterial). THE HOUR IS A CHOICE, NOT A
+  // TRANSCRIPTION — the very thing this file's header warns about — made for the same reason as the rows around it:
+  // 02:30 UTC is in the same quiet window as `audit.verify` (02:40) and the partition tick (03:20), ten minutes
+  // before the audit walk so the two estate-wide scans do not contend for connections. The owner can move it.
+  { queue: "credit.housekeeping", cron: "30 2 * * *", statedAs: "STORY-076 AC4 / STORY-071 AC10: expire purchased credits and purge daily counters, daily" },
+
+  // ⚠ NOT FROM §4 — STORY-077 R4 / STORY-013, `data-model.md` §7 ("nightly"). 03:40 UTC: after the partition tick
+  // (03:20) so the two do not contend for the same locks, and a chosen hour for the reason above. SCHEDULED IS NOT
+  // ENABLED: the handler is a no-op unless `RETENTION_PURGE_ENABLED=true`. See `handlers/retention-purge.handler.ts`.
+  { queue: "retention.purge", cron: "40 3 * * *", statedAs: "STORY-077 R4 / STORY-013, data-model.md §7: retention purge nightly (handler gated by RETENTION_PURGE_ENABLED, default off)" },
+
   // ⚠ PERIOD STATED, TIME NOT. Scheduling these needs an hour of the day (and
   // for weekly, a day) that no reference gives. Left null deliberately — see
   // this file's header. `maintenance.partition` was here until STORY-142; it

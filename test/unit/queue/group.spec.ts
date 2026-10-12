@@ -30,6 +30,9 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "identity.sweep_unverified",
     // NEW-D-7 — not in §4 either; see ADDED_BEYOND_REFERENCE.
     "billing.auto_topup",
+    // STORY-076 AC4 / STORY-071 AC10 and STORY-077 R4 — not in §4 either; see ADDED_BEYOND_REFERENCE.
+    "credit.housekeeping",
+    "retention.purge",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],

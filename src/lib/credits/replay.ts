@@ -274,6 +274,13 @@ export async function readLifetimeCounters(tx: ClientBase, workspaceId: string):
       };
 }
 
+/**
+ * ⚠ `ORDER BY credit_ledger.seq`, QUALIFIED, AND THE QUALIFIER IS THE FIX. The select list renders the column as
+ * `seq::text` (the wire form is a string, because a bigint can exceed a JS number's safe range), and an unqualified
+ * `ORDER BY seq` resolves against the OUTPUT column first: it sorted the TEXT, so "10" came before "8" and the replay
+ * walked a ledger out of order — a false divergence for every workspace whose ledger crossed a power of ten, paged as
+ * a wallet mismatch. A qualified name refers to the table's bigint. Found in PR #91's review.
+ */
 export async function readLedgerForReplay(tx: ClientBase, workspaceId: string): Promise<ReplayRow[]> {
   const result = await tx.query<{
     seq: string;
@@ -290,7 +297,7 @@ export async function readLedgerForReplay(tx: ClientBase, workspaceId: string): 
             included_after::text, purchased_after::text, reserved_after::text
        FROM credit_ledger
       WHERE workspace_id = $1
-      ORDER BY seq ASC`,
+      ORDER BY credit_ledger.seq ASC`,
     [workspaceId],
   );
 

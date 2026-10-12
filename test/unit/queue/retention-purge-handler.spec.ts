@@ -47,7 +47,7 @@ const contextWith = (flag: string | undefined) =>
   ({ pool: {} as never, env: { DATABASE_URL: "postgres://owner@direct/db", ...(flag !== undefined ? { RETENTION_PURGE_ENABLED: flag } : {}) } }) as unknown as QueueHandlerContext;
 const tick = { data: {} } as unknown as Job;
 const run = (flag: string | undefined) => createRetentionPurgeHandler(contextWith(flag))({} as never, tick);
-const metricNames = (log: ReturnType<typeof vi.spyOn>) =>
+const metricNames = (log: { mock: { calls: unknown[][] } }) =>
   log.mock.calls.map((call: unknown[]) => call[0] as Record<string, unknown>).filter((entry) => typeof entry?.metric === "string");
 
 beforeEach(() => {

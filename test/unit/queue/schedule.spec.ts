@@ -66,6 +66,19 @@ const FROM_OTHER_REFERENCES: Record<string, { cron: string; section: string; sou
     section: "STORY-173",
     source: "STORY-173 (owner decision, 2026-10-05) — the stale-unverified-account sweep runs daily",
   },
+  "credit.housekeeping": {
+    cron: "30 2 * * *",
+    section: "STORY-076 AC4 / STORY-071 AC10",
+    source:
+      "plans-and-entitlements.md §5 (purchased credits expire FIFO) and schemas/billing-and-credits.md (daily counters purged nightly) — " +
+      "the references state no time of day; 02:30 UTC is a chosen quiet window",
+  },
+  "retention.purge": {
+    cron: "40 3 * * *",
+    section: "STORY-077 R4 / STORY-013",
+    source:
+      "data-model.md §7 — retention purge 'nightly'; 03:40 UTC is a chosen hour, and the handler is a no-op unless RETENTION_PURGE_ENABLED=true",
+  },
 };
 
 describe("G12 · the schedule table matches the reference", () => {
@@ -116,8 +129,9 @@ describe("G12 · the schedule table matches the reference", () => {
     // somebody's memory. It was six until STORY-142 chose an hour for
     // `maintenance.partition` — chose, and wrote down why. The dated count is
     // 7 since STORY-173 added `identity.sweep_unverified`, which is dated by
-    // owner decision and not one of the five.
-    expect(datedSchedules()).toHaveLength(7);
+    // owner decision and not one of the five, and 9 since `credit.housekeeping`
+    // and `retention.purge` were given a chosen hour (both from other references).
+    expect(datedSchedules()).toHaveLength(9);
     expect(undatedSchedules()).toHaveLength(5);
   });
 
@@ -143,7 +157,7 @@ describe("G12 · the schedule table matches the reference", () => {
     expect(inertQueueNames()).toEqual(expect.arrayContaining(datedAndInert));
   });
 
-  it("⚠ exactly the four of the twelve that can actually be driven by a bare tick today, and each refusal has a distinct reason", () => {
+  it("⚠ exactly the six of the fourteen that can actually be driven by a bare tick today, and each refusal has a distinct reason", () => {
     // ⚠ A ROW IN THE TABLE IS NOT A QUEUE THAT TICKS, and the first cut of
     // this work conflated the two. The table records what §4 SAYS; three
     // separate conditions decide what can run, and every one of them is
@@ -157,7 +171,7 @@ describe("G12 · the schedule table matches the reference", () => {
     // has BOTH a cron and a handler, so a gate on those two alone scheduled
     // it, and a bare tick on a tenant-scoped queue throws in the signature
     // path before the handler is reached — once an hour, into the DLQ,
-    // forever. This test is the arithmetic written down: 12 − 5 − 2 − 1 = 4.
+    // forever. This test is the arithmetic written down: 14 − 5 − 2 − 1 = 6.
     const dated = datedSchedules().map((s) => s.queue);
     const inert = dated.filter((queue) => handlerFor(queue) === undefined);
     const tenantScoped = dated.filter((queue) => handlerFor(queue) !== undefined && topologyFor(queue).tenantScoped);
@@ -165,7 +179,14 @@ describe("G12 · the schedule table matches the reference", () => {
 
     expect(inert.sort()).toEqual(["attribution.rollup"]);
     expect(tenantScoped.sort()).toEqual(["capture.plan", "rollup.metric_daily"]);
-    expect(schedulable.sort()).toEqual(["audit.verify", "credit.reconcile", "identity.sweep_unverified", "maintenance.partition"]);
+    expect(schedulable.sort()).toEqual([
+      "audit.verify",
+      "credit.housekeeping",
+      "credit.reconcile",
+      "identity.sweep_unverified",
+      "maintenance.partition",
+      "retention.purge",
+    ]);
     // The three reasons partition the dated rows — no queue is refused twice
     // and none falls through unaccounted for.
     expect(inert.length + tenantScoped.length + schedulable.length).toBe(dated.length);
@@ -205,6 +226,6 @@ describe("G12 · describeSchedules — the one line a boot log gets", () => {
   });
 
   it("reports the cadence gap so an operator need not go and read the table", () => {
-    expect(describeSchedules(empty)).toContain("7 of 12 cron queues state a time");
+    expect(describeSchedules(empty)).toContain("9 of 14 cron queues state a time");
   });
 });

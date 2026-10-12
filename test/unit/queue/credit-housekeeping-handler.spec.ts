@@ -64,7 +64,7 @@ const context = { pool: {} as never, env: { DATABASE_URL: "postgres://owner@dire
 const tick = { data: {} } as unknown as Job;
 const run = () => createCreditHousekeepingHandler(context)({} as never, tick);
 
-function metrics(log: ReturnType<typeof vi.spyOn>): Record<string, unknown>[] {
+function metrics(log: { mock: { calls: unknown[][] } }): Record<string, unknown>[] {
   return log.mock.calls.map((call: unknown[]) => call[0] as Record<string, unknown>).filter((entry) => typeof entry?.metric === "string");
 }
 
