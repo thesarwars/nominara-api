@@ -145,6 +145,20 @@ describe("STORY-024 · ResponseEnvelopeInterceptor", () => {
       expect(envelopeMetaSchema.safeParse(body.meta).success).toBe(true);
     });
 
+    // STORY-134 — the prompt list's `data` is `{ prompts, summary }`, not its rows, yet its paging still belongs in
+    // the envelope's `pagination` like every other list.
+    it("[STORY-134] a Page carrying its own data body keeps pagination at the top level and uses that body as data", async () => {
+      const interceptor = new ResponseEnvelopeInterceptor(new Reflector());
+      const { context } = contextFor(Wrapped, "ws-1");
+      const data = { prompts: [{ id: "a" }], summary: { active: 1 } };
+      const body = (await lastValueFrom(
+        interceptor.intercept(context, handlerReturning(new Page([{ id: "a" }], pagination, data))),
+      )) as Record<string, unknown>;
+
+      expect(body.data).toEqual(data);
+      expect(body.pagination).toEqual(pagination);
+    });
+
     it("omits pagination entirely for a single resource — never an empty or null placeholder", async () => {
       const interceptor = new ResponseEnvelopeInterceptor(new Reflector());
       const { context } = contextFor(Wrapped, "ws-1");
