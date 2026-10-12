@@ -4,7 +4,9 @@ import { Client, Pool, type ClientBase } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { adjustCredits, provisionWalletWithGrant, recordPurchase } from "../../src/lib/credits/balance.js";
+import { adjustCredits, provisionWalletWithGrant, recordPurchase, refundCredits } from "../../src/lib/credits/balance.js";
+import { appendLedgerEntry } from "../../src/lib/credits/ledger.js";
+import { releaseReservation } from "../../src/lib/credits/settle.js";
 import { expireDuePurchasedCredits } from "../../src/lib/credits/expire.js";
 import { readLedgerForReplay, replayLedger, verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { commitCredits, readWallet, reserveCredits } from "../../src/lib/credits/wallet.js";
@@ -101,6 +103,24 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
   async function spendPurchased(ws: string, credits: number): Promise<void> {
     const human = (await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`u-${randomUUID().slice(0, 8)}@nominara.test`])).rows[0]!.id;
     await inTx((tx) => adjustCredits(tx, { ...request(ws, `spend-${randomUUID()}`), actorId: human, actorType: "user", reason: "test spend" }, "purchased", -credits));
+  }
+
+  /** reserve + its ledger entry, as the guard writes them, so the replay can explain the hold. */
+  async function reserveLogged(ws: string, key: string, credits: number): Promise<void> {
+    await inTx(async (tx) => {
+      const reserved = await reserveCredits(tx, ws, credits);
+      expect(reserved.ok).toBe(true);
+      await appendLedgerEntry(tx, { workspaceId: ws, entryType: "reserve", actionCode: "manual_scan", credits, idempotencyKey: key, attempt: 1, after: reserved.wallet!, actorId: null, actorType: "system" });
+    });
+  }
+
+  /** commit + its ledger entry (the run's debit). */
+  async function commitLogged(ws: string, key: string, credits: number): Promise<void> {
+    await inTx(async (tx) => {
+      const committed = await commitCredits(tx, ws, credits, credits);
+      expect(committed).not.toBeNull();
+      await appendLedgerEntry(tx, { workspaceId: ws, entryType: "commit", actionCode: "manual_scan", credits, idempotencyKey: key, attempt: 1, after: committed!, actorId: null, actorType: "system" });
+    });
   }
 
   const sweep = () => expireDuePurchasedCredits({ discovery, work });
@@ -328,15 +348,41 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
   it("[AC4] a same-day second sweep after a hold is released expires the remainder (equal amounts must not collide)", async () => {
     await provision(workspaceId, 0);
     await lot(workspaceId, 100, "-1 day");
-    await db.query("UPDATE credit_wallets SET reserved = 50 WHERE workspace_id = $1", [workspaceId]);
+    await reserveLogged(workspaceId, "hold-1", 50);
     expect(await sweep()).toMatchObject({ creditsExpired: 50 });
-    await db.query("UPDATE credit_wallets SET reserved = 0 WHERE workspace_id = $1", [workspaceId]); // the hold is released
+    await inTx((tx) => releaseReservation(tx, { workspaceId, idempotencyKey: "hold-1", attempt: 1, credits: 50, actionCode: "manual_scan" })); // the hold is released
     expect(await sweep()).toMatchObject({ creditsExpired: 50, failures: [] }); // the same amount as the first
     expect(await purchased()).toBe(0);
     const entries = await expireEntries();
     expect(entries.map((entry) => entry.credits)).toEqual([50, 50]);
     expect(new Set(entries.map((entry) => entry.idempotency_key)).size).toBe(2);
-    // (no wallet-vs-ledger verify here: the hold was set by a raw UPDATE, which the ledger rightly does not explain)
+    expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+  });
+
+  it("[AC4] a positive INCLUDED-bucket adjustment beside an elapsed purchased lot is not in T: the lot still expires in full", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 100, "-1 day");
+    await lot(workspaceId, 500, "6 months");
+    const human = (await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`u-${randomUUID().slice(0, 8)}@nominara.test`])).rows[0]!.id;
+    await inTx((tx) => adjustCredits(tx, { ...request(workspaceId, `goodwill-${randomUUID()}`), actorId: human, actorType: "user", reason: "goodwill" }, "included", 50));
+    expect(await sweep()).toMatchObject({ creditsExpired: 100, failures: [] }); // counted into T it would read as 50 consumed: 50
+    expect(await purchased()).toBe(500);
+    expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+  });
+
+  it("[AC4] documented residual: a run debit refunded to the purchased bucket after its lot elapsed expires, bounded by the refund", async () => {
+    await provision(workspaceId, 0);
+    await lot(workspaceId, 100, "1 hour"); // lot A
+    await lot(workspaceId, 500, "6 months");
+    await reserveLogged(workspaceId, "run-1", 100);
+    await commitLogged(workspaceId, "run-1", 100); // the run spends A's 100 (FIFO)
+    await db.query("UPDATE credit_purchases SET expires_at = now() - interval '1 second' WHERE workspace_id = $1 AND credits = 100", [workspaceId]); // A elapses
+    await inTx((tx) => refundCredits(tx, request(workspaceId, `refund-${randomUUID()}`), "purchased", 100)); // the run is undone
+    expect(await purchased()).toBe(600);
+    const outcome = await sweep();
+    expect(outcome).toMatchObject({ creditsExpired: 100, failures: [] }); // the refunded 100 expire with A: never more than the refund
+    expect(await purchased()).toBe(500);
+    expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
   });
 
   it("[AC4] the elapsed boundary is NOW: a lot expiring in an hour is not expired beside an elapsed one", async () => {
