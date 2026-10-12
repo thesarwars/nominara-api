@@ -8,6 +8,10 @@ import { adjustCredits, provisionWalletWithGrant, recordPurchase } from "../../s
 import { expireDuePurchasedCredits } from "../../src/lib/credits/expire.js";
 import { readLedgerForReplay, replayLedger, verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { readWallet } from "../../src/lib/credits/wallet.js";
+import { createCreditHousekeepingHandler } from "../../src/lib/queue/handlers/credit-housekeeping.handler.js";
+import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
+import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import type { Job } from "bullmq";
 
 // STORY-076 AC4 / STORY-073 AC12 — "Purchased rollover: 12 months from purchase, FIFO by expiry. Expiry writes an
 // `expire` ledger entry." `expireCredits` existed, with tests, and nothing called it: a purchased credit never
@@ -225,5 +229,54 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
     await provision(workspaceId);
     await lot(workspaceId, 1000, "11 months");
     expect(await sweep()).toEqual({ workspacesChecked: 0, workspacesExpired: 0, creditsExpired: 0, failures: [] });
+  });
+
+  // The handler on a real database: the owner connection for discovery, the runtime pool for the writes, the lock, and
+  // the daily-counter purge — the other half of what `credit.housekeeping` was added to call.
+  describe("credit.housekeeping handler — real SQL", () => {
+    const tick = { data: {} } as unknown as Job;
+    const handler = () =>
+      createCreditHousekeepingHandler({ pool: work, env: { DATABASE_URL: container.getConnectionUri() } } as unknown as QueueHandlerContext)({} as never, tick);
+
+    it("[STORY-076 AC4] expires an elapsed lot end to end through the handler, as the worker runs it", async () => {
+      await provision(workspaceId);
+      await lot(workspaceId, 1000, "-1 second");
+      await handler();
+      expect(await purchased()).toBe(0);
+      expect((await expireEntries()).length).toBe(1);
+      expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+    });
+
+    it("[STORY-071 AC10] purges daily counters past the retention window and keeps the rest", async () => {
+      await db.query(
+        `INSERT INTO credit_daily_counters (workspace_id, utc_date, action_code, used_count, limit_count) VALUES
+           ($1, (now() AT TIME ZONE 'UTC')::date - 40, 'lookup', 3, 10),
+           ($1, (now() AT TIME ZONE 'UTC')::date - 34, 'lookup', 2, 10),
+           ($1, (now() AT TIME ZONE 'UTC')::date,      'lookup', 1, 10)`,
+        [workspaceId],
+      );
+      await handler();
+      const left = await db.query<{ age: number }>(
+        "SELECT ((now() AT TIME ZONE 'UTC')::date - utc_date)::int AS age FROM credit_daily_counters WHERE workspace_id = $1 ORDER BY utc_date",
+        [workspaceId],
+      );
+      expect(left.rows.map((row) => row.age)).toEqual([34, 0]);
+    });
+
+    it("[STORY-076 AC4] yields to a replica that holds the lock: nothing expires, and nothing is left holding it afterwards", async () => {
+      await provision(workspaceId);
+      await lot(workspaceId, 1000, "-1 second");
+      const other = new Client({ connectionString: container.getConnectionUri() });
+      await other.connect();
+      try {
+        expect(await tryAdvisorySessionLock(other, globalQueueLockKey("credit.housekeeping"))).toBe(true);
+        await handler();
+        expect(await purchased()).toBe(1000);
+      } finally {
+        await other.end();
+      }
+      await handler(); // the holder is gone, so the next tick runs
+      expect(await purchased()).toBe(0);
+    });
   });
 });
