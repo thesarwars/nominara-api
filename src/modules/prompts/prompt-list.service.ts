@@ -1,4 +1,6 @@
 import { Injectable } from "@nestjs/common";
+import { decodeTimestampIdCursor, MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
+import { Page, pageFrom } from "../../api/pagination/page.js";
 import type {
   CreatePromptRequest,
   PromptListItem,
@@ -10,6 +12,7 @@ import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { insertPromptStatement, manualPromptRow } from "../../lib/promptgen/persist.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
 // STORY-134 — `GET /projects/{id}/prompts` and `POST /projects/{id}/prompts`.
@@ -46,6 +49,8 @@ interface PromptRow {
   stability_score: number | null;
   last_captured_at: string | null;
   created_at: string;
+  /** Full (microsecond) precision — the keyset half the cursor carries. */
+  created_at_key: string;
 }
 
 type TenantClient = { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> };
@@ -54,8 +59,10 @@ type TenantClient = { query: <R>(sql: string, params: unknown[]) => Promise<{ ro
 export class PromptListService {
   constructor(private readonly entitlements: EntitlementResolver) {}
 
-  async list(projectId: string, query: PromptListQuery): Promise<PromptListResponse> {
+  async list(projectId: string, query: PromptListQuery): Promise<Page<PromptListItem, PromptListResponse>> {
     const { client, workspaceId } = this.tenant();
+    // Decoded BEFORE any statement runs: a cursor this list did not issue is a 400, never a silent first page.
+    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor);
     await this.assertProjectExists(client, projectId);
 
     // FILTERS AS PARAMETERS, never interpolated. The values come from a
@@ -74,13 +81,23 @@ export class PromptListService {
       conditions.push(`AND ${column} = $${String(params.length)}`);
     }
 
-    params.push(query.limit);
+    // KEYSET on (created_at, id) — the same total order as the ORDER BY, so a page boundary inside a run of equal
+    // created_at (a generation pass inserts its fifteen rows in one statement) can neither skip nor repeat a row.
+    // Both halves bind as parameters; `after` is null on the first page and the predicate collapses to true.
+    params.push(after?.[0] ?? null, after?.[1] ?? null);
+    const afterAt = `$${String(params.length - 1)}`;
+    const afterId = `$${String(params.length)}`;
+    conditions.push(`AND (${afterAt}::timestamptz IS NULL OR (created_at, id) > (${afterAt}::timestamptz, ${afterId}::uuid))`);
+
+    // One row more than asked: that is how `has_more` is known without a COUNT.
+    params.push(query.limit + 1);
     const limitPlaceholder = `$${String(params.length)}`;
 
     const result = await client.query<PromptRow>(
       `SELECT id, text, text_hash, intent_archetype, funnel_stage, status, is_priority,
               generation_source, generation_batch_id, cluster_id, stability_score,
-              last_captured_at::text AS last_captured_at, created_at::text AS created_at
+              last_captured_at::text AS last_captured_at, created_at::text AS created_at,
+              to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_at_key
          FROM tracked_prompts
         WHERE project_id = $1
           AND deleted_at IS NULL
@@ -90,10 +107,14 @@ export class PromptListService {
       params,
     );
 
-    return {
-      prompts: result.rows.map(toPromptListItem),
-      summary: await this.summaryFor(client, workspaceId, projectId),
-    };
+    const page = pageFrom(result.rows, query.limit, toPromptListItem, (row) => [row.created_at_key, row.id]);
+    const summary = await this.summaryFor(client, workspaceId, projectId);
+    // Labels are booleans only — no workspace, project or cursor content.
+    incrementCounter("nominara_prompts_list_pages_total", {
+      has_more: String(page.pagination.has_more),
+      continued: String(after !== undefined),
+    });
+    return new Page(page.items, page.pagination, { prompts: [...page.items], summary });
   }
 
   /**

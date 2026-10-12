@@ -18,11 +18,21 @@ import { encodeCursor, type CursorKeyElement } from "./cursor.js";
 // route with that setting throws AuditResourceIdUnresolvedError rather than
 // recording a wrong identifier. No list route is audited today; this makes
 // the failure loud if one ever is.
-export class Page<Item> {
+export class Page<Item, Data = readonly Item[]> {
+  /**
+   * The envelope's `data` member. It is the rows themselves unless the list's body is RICHER than its rows — STORY-134's
+   * prompt list is `{ prompts, summary }` because the header's counts cannot be derived from one page. The paging still
+   * lives in `pagination`, where §1 puts it; only the shape of `data` differs.
+   */
+  readonly data: Data;
+
   constructor(
     readonly items: readonly Item[],
     readonly pagination: PaginationResponse,
-  ) {}
+    data?: Data,
+  ) {
+    this.data = data ?? (items as unknown as Data);
+  }
 }
 
 /**

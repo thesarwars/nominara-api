@@ -70,6 +70,12 @@ describe("published pagination contract", () => {
     expect(okSchema(op)?.required).toContain("pagination");
   });
 
+  it("STORY-134 · listPrompts is a cursor list: cursor/limit parameters, the three real filters and a required `pagination` member", () => {
+    const op = byId("listPrompts");
+    expect(paramNames(op)).toEqual(expect.arrayContaining(["cursor", "limit", "status", "intent_archetype", "funnel_stage"]));
+    expect(okSchema(op)?.required).toContain("pagination");
+  });
+
   it("every GET that accepts a `cursor` publishes a required `pagination` member (sweep from the hazard, no allow-list)", () => {
     const missing = getOperations
       .filter(({ op }) => paramNames(op).includes("cursor"))

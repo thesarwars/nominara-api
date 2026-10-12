@@ -112,7 +112,7 @@ export class ResponseEnvelopeInterceptor implements NestInterceptor {
         // an empty or null placeholder on a single resource, which would be a
         // member a consumer has to write a dead branch against.
         if (body instanceof Page) {
-          return { data: body.items, pagination: body.pagination, meta };
+          return { data: body.data, pagination: body.pagination, meta };
         }
 
         // A handler returning `Promise<void>` (auth/refresh, auth/logout,

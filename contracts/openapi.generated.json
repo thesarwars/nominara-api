@@ -32656,6 +32656,36 @@
                       ],
                       "additionalProperties": false
                     },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "cursor_next": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "has_more": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 200
+                        }
+                      },
+                      "required": [
+                        "cursor_next",
+                        "has_more",
+                        "limit"
+                      ],
+                      "additionalProperties": false
+                    },
                     "meta": {
                       "type": "object",
                       "properties": {
@@ -32683,6 +32713,7 @@
                   },
                   "required": [
                     "data",
+                    "pagination",
                     "meta"
                   ],
                   "additionalProperties": false
@@ -32908,7 +32939,81 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 200
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "paused",
+                "archived"
+              ]
+            }
+          },
+          {
+            "name": "intent_archetype",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "recommendation",
+                "head_to_head",
+                "alternatives",
+                "use_case_fit",
+                "pricing_value",
+                "integration_capability",
+                "objection_risk",
+                "migration_switching",
+                "compliance_security",
+                "scale_fit",
+                "vertical_fit",
+                "feature_specific",
+                "implementation_effort",
+                "support_quality",
+                "buyer_shortlist",
+                "custom"
+              ]
+            }
+          },
+          {
+            "name": "funnel_stage",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "awareness",
+                "consideration",
+                "decision"
+              ]
+            }
+          }
+        ]
       },
       "post": {
         "operationId": "createPrompt",

@@ -90,15 +90,15 @@ describe("STORY-134 · PromptListService", () => {
 
   it("scenario 1 — returns the project's prompts", async () => {
     const page = await setup().list(PROJECT, { limit: 50 });
-    expect(page.prompts).toHaveLength(1);
-    expect(page.prompts[0]?.id).toBe(P1);
-    expect(page.prompts[0]?.intent_archetype).toBe("scale_fit");
+    expect(page.data.prompts).toHaveLength(1);
+    expect(page.data.prompts[0]?.id).toBe(P1);
+    expect(page.data.prompts[0]?.intent_archetype).toBe("scale_fit");
   });
 
   it("scenario 2 — an empty project is an empty array, not an error", async () => {
     const page = await setup({ rows: [], counts: { active: 0, paused: 0, archived: 0 } }).list(PROJECT, { limit: 50 });
-    expect(page.prompts).toEqual([]);
-    expect(page.summary).toEqual({ active: 0, paused: 0, archived: 0, cap: 50 });
+    expect(page.data.prompts).toEqual([]);
+    expect(page.data.summary).toEqual({ active: 0, paused: 0, archived: 0, cap: 50 });
   });
 
   it("scenario 3 — a soft-deleted prompt is excluded by the QUERY", async () => {
@@ -148,14 +148,14 @@ describe("STORY-134 · PromptListService", () => {
 
   it("scenario 10 — never fabricates a score or a capture time", async () => {
     const page = await setup().list(PROJECT, { limit: 50 });
-    expect(page.prompts[0]?.stability_score).toBeNull();
-    expect(page.prompts[0]?.last_captured_at).toBeNull();
-    expect(page.prompts[0]?.cluster_id).toBeNull();
+    expect(page.data.prompts[0]?.stability_score).toBeNull();
+    expect(page.data.prompts[0]?.last_captured_at).toBeNull();
+    expect(page.data.prompts[0]?.cluster_id).toBeNull();
   });
 
   it("renders the hash in the `sha256:` wire form", async () => {
     const page = await setup().list(PROJECT, { limit: 50 });
-    expect(page.prompts[0]?.text_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(page.data.prompts[0]?.text_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
 
   it("FR-PA-03a — counts PAUSED separately from active", async () => {
@@ -163,7 +163,7 @@ describe("STORY-134 · PromptListService", () => {
     // and 8 paused that they have 10 slots free on a cap of 50, when a paused
     // prompt still occupies one and they have 2.
     const page = await setup({ counts: { active: 40, paused: 8, archived: 3 } }).list(PROJECT, { limit: 50 });
-    expect(page.summary).toEqual({ active: 40, paused: 8, archived: 3, cap: 50 });
+    expect(page.data.summary).toEqual({ active: 40, paused: 8, archived: 3, cap: 50 });
   });
 
   it("takes the cap from the ENTITLEMENT, not from the column", async () => {
@@ -171,7 +171,7 @@ describe("STORY-134 · PromptListService", () => {
     // upgrade did not raise the header's cap until the project was
     // recreated. Same reasoning as the activation service.
     const page = await setup({ cap: 500 }).list(PROJECT, { limit: 50 });
-    expect(page.summary.cap).toBe(500);
+    expect(page.data.summary.cap).toBe(500);
   });
 
   it("refuses an unknown project", async () => {
