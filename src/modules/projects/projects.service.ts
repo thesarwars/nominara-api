@@ -1,7 +1,9 @@
 import { Injectable, Logger } from "@nestjs/common";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type {
   ConfirmDiscoveryRequest,
   ConfirmableField,
+  LastScan,
   ProjectListItem,
   CreateProjectRequest,
   CreateProjectResponse,
@@ -54,14 +56,49 @@ const DISCOVERY_EXPECTED_MS = 20_000;
 
 // The matrix row's columns. Shared by `list` and `listForSummary` so the two
 // readers of the denormalised columns cannot drift apart.
+// STORY-175 AC1 - the project's latest capture run, in the SAME statement as the rows (no per-project
+// query). `ix_runs_ws_project_time (workspace_id, project_id, created_at DESC)` serves the LIMIT 1 per
+// project, so no new index. Only `ls_`-prefixed columns leave the subquery, so the list query's unqualified
+// `id` / `status` / `created_at` still mean the project's. There is deliberately no workspace predicate
+// (STORY-132 scenario 4): RLS scopes capture_runs to the caller's workspace, so a run stamped with another
+// workspace never joins, even one cross-wired onto this workspace's project.
+//
+// `rolled_up` is derived from bookkeeping that already exists, with no new column: `rollUpDay` upserts the
+// project's cross-engine brand row in `metric_daily` (engine_key 'all', entity_type 'brand') with
+// `computed_at = now()`, and `denormalizeProject` rewrites the card's block in the SAME transaction. So a
+// row computed at or after the run's `finished_at` means the block reflects this run; a rollup that ran
+// earlier (the scheduled day pass) predates it. A run still in flight has nothing to be reflected yet,
+// and a terminal run that captured nothing requests no rollup - it has nothing to wait for.
+const LAST_SCAN_JOIN = `LEFT JOIN LATERAL (
+           SELECT r.id AS ls_run_id, r.status AS ls_status, r.trigger AS ls_trigger,
+                  r.planned_cells AS ls_planned_cells, r.skipped_cells AS ls_skipped_cells,
+                  r.captured_cells AS ls_captured_cells, r.failed_cells AS ls_failed_cells,
+                  r.started_at AS ls_started_at, r.finished_at AS ls_finished_at,
+                  CASE
+                    WHEN r.status IN ('queued', 'running') THEN false
+                    WHEN r.captured_cells = 0 THEN true
+                    ELSE EXISTS (SELECT 1 FROM metric_daily md
+                                  WHERE md.project_id = r.project_id
+                                    AND md.engine_key = 'all' AND md.entity_type = 'brand'
+                                    AND md.computed_at >= r.finished_at)
+                  END AS ls_rolled_up
+             FROM capture_runs r
+            WHERE r.project_id = projects.id
+            ORDER BY r.created_at DESC
+            LIMIT 1
+         ) ls ON true`;
+
 const PROJECT_LIST_SELECT = `SELECT id, name, slug::text AS slug, root_domain, kind, status, discovery_status,
               prompts_active, prompts_cap, open_task_count, open_tasks_by_severity,
               domain_verified_at, created_at,
               visibility_blended, visibility_delta_30d, rendering_quality, rendering_delta_30d,
               source_coverage, aux_score_current, sentiment_score, sentiment_delta_30d, cells_30d,
               visibility_by_engine, sparkline_30d, demo_seeded_at,
+              ls.ls_run_id, ls.ls_status, ls.ls_trigger, ls.ls_planned_cells, ls.ls_skipped_cells,
+              ls.ls_captured_cells, ls.ls_failed_cells, ls.ls_started_at, ls.ls_finished_at, ls.ls_rolled_up,
               created_at::text AS created_at_key
-         FROM projects`;
+         FROM projects
+         ${LAST_SCAN_JOIN}`;
 
 @Injectable()
 export class ProjectsService {
@@ -249,6 +286,7 @@ export class ProjectsService {
       [after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
     );
 
+    recordLastScanStates(result.rows.slice(0, pagination.limit));
     return pageFrom(result.rows, pagination.limit, toProjectListItem, (row) => [row.created_at_key, row.id]);
   }
 
@@ -317,6 +355,7 @@ export class ProjectsService {
         ORDER BY engine_key`,
     );
 
+    recordLastScanStates(result.rows);
     return { projects: result.rows.map(toProjectListItem), engineKeys: engines.rows.map((row) => row.engine_key) };
   }
 
@@ -604,7 +643,43 @@ export class ProjectsService {
   }
 }
 
-interface ProjectRow {
+/** The lateral join's columns (LAST_SCAN_JOIN); every one is null when the project has no run. */
+export interface LastScanRow {
+  ls_run_id: string | null;
+  ls_status: string | null;
+  ls_trigger: string | null;
+  ls_planned_cells: number | null;
+  ls_skipped_cells: number | null;
+  ls_captured_cells: number | null;
+  ls_failed_cells: number | null;
+  ls_started_at: Date | null;
+  ls_finished_at: Date | null;
+  ls_rolled_up: boolean | null;
+}
+
+/** STORY-175 - one count per row served, by the latest run's status ("none" = never scanned). Counts only: no IDs, no names. */
+function recordLastScanStates(rows: readonly LastScanRow[]): void {
+  for (const row of rows) incrementCounter("nominara_projects_last_scan_rows_total", { state: row.ls_status ?? "none" });
+}
+
+/** STORY-175 AC1 - `null` when the project has no capture run; otherwise the run's progress. */
+export function toLastScan(row: LastScanRow): LastScan | null {
+  if (row.ls_run_id === null) return null;
+  const captured = row.ls_captured_cells ?? 0;
+  return {
+    run_id: row.ls_run_id,
+    status: row.ls_status as LastScan["status"],
+    trigger: row.ls_trigger as LastScan["trigger"],
+    planned_cells: row.ls_planned_cells ?? 0,
+    settled_cells: captured + (row.ls_failed_cells ?? 0) + (row.ls_skipped_cells ?? 0),
+    captured_cells: captured,
+    started_at: row.ls_started_at?.toISOString() ?? null,
+    completed_at: row.ls_finished_at?.toISOString() ?? null,
+    rolled_up: row.ls_rolled_up ?? false,
+  };
+}
+
+interface ProjectRow extends LastScanRow {
   id: string;
   name: string;
   slug: string;
@@ -690,6 +765,7 @@ function toProjectListItem(row: ProjectRow): ProjectListItem {
     engine_scores: toEngineScores(row.visibility_by_engine),
     sparkline_30d: row.sparkline_30d ?? null,
     demo_seeded: row.demo_seeded_at !== null,
+    last_scan: toLastScan(row),
   };
 }
 

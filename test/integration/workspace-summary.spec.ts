@@ -11,6 +11,8 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { BillingService } from "../../src/modules/billing/billing.service.js";
 import { ProjectsService } from "../../src/modules/projects/projects.service.js";
 import { WorkspaceSummaryService } from "../../src/modules/workspaces/workspace-summary.service.js";
+import * as metrics from "../../src/lib/telemetry/metrics.js";
+import { vi } from "vitest";
 import { withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
 
 // NEW-B-2 — GET /v1/workspaces/{id}/summary, real SQL as `nominara_app`.
@@ -127,6 +129,277 @@ describe("NEW-B-2 · WorkspaceSummaryService — real SQL", () => {
     expect(out.projects.map((p) => p.id)).toEqual([a]);
     expect(out.health.projects_used).toBe(1);
     expect(out.health.prompts_used).toBe(4);
+  });
+
+  // STORY-175 - capture_runs fixtures. Inserted as the superuser; the read is as nominara_app.
+  async function createRun(
+    workspaceId: string,
+    projectId: string,
+    o: {
+      status?: string;
+      trigger?: string;
+      planned?: number;
+      captured?: number;
+      failed?: number;
+      skipped?: number;
+      createdAt?: string;
+      startedAt?: string | null;
+      finishedAt?: string | null;
+    } = {},
+  ): Promise<string> {
+    const r = await client.query<{ id: string }>(
+      `INSERT INTO capture_runs (workspace_id, project_id, trigger, engine_keys, planned_cells, captured_cells,
+                                 failed_cells, skipped_cells, status, started_at, finished_at, created_at)
+       VALUES ($1,$2,$3,ARRAY['gemini'],$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+      [
+        workspaceId,
+        projectId,
+        o.trigger ?? "manual",
+        o.planned ?? 0,
+        o.captured ?? 0,
+        o.failed ?? 0,
+        o.skipped ?? 0,
+        o.status ?? "queued",
+        o.startedAt ?? null,
+        o.finishedAt ?? null,
+        o.createdAt ?? new Date().toISOString(),
+      ],
+    );
+    return r.rows[0]!.id;
+  }
+
+  async function writeRollup(workspaceId: string, projectId: string, computedAt: string, entityType = "brand", engineKey = "all"): Promise<void> {
+    await client.query(
+      `INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date, computed_at)
+       VALUES ($1,$2,$3,$4,$5,'2026-10-12',$6)`,
+      [workspaceId, projectId, engineKey, entityType, entityType === "brand" ? projectId : randomUUID(), computedAt],
+    );
+  }
+
+  const lastScanOf = (out: Awaited<ReturnType<typeof summary.summary>>, id: string) => out.projects.find((p) => p.id === id)!.last_scan;
+
+  it("STORY-175 scenario 1 (AC1): a project with no runs has last_scan null", async () => {
+    const ws = await createWorkspace();
+    const p = await createProject(ws);
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(out, p)).toBeNull();
+  });
+
+  it("STORY-175 scenario 2 (AC1): a running run reports captured 11 of planned 17, no completed_at, not rolled up", async () => {
+    const ws = await createWorkspace();
+    const p = await createProject(ws);
+    const runId = await createRun(ws, p, { status: "running", planned: 17, captured: 11, startedAt: "2026-10-12T13:00:00Z" });
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(out, p)).toEqual({
+      run_id: runId,
+      status: "running",
+      trigger: "manual",
+      planned_cells: 17,
+      settled_cells: 11,
+      captured_cells: 11,
+      started_at: "2026-10-12T13:00:00.000Z",
+      completed_at: null,
+      rolled_up: false,
+    });
+  });
+
+  it("STORY-175 scenario 3 (AC1): a completed run with no rollup written is rolled_up false", async () => {
+    const ws = await createWorkspace();
+    const p = await createProject(ws);
+    await createRun(ws, p, { status: "completed", planned: 17, captured: 17, startedAt: "2026-10-12T13:00:00Z", finishedAt: "2026-10-12T13:08:00Z" });
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(out, p)).toMatchObject({ status: "completed", completed_at: "2026-10-12T13:08:00.000Z", rolled_up: false });
+  });
+
+  it("STORY-175 scenario 4 (AC1): a rollup computed at or after the run finished makes rolled_up true", async () => {
+    const ws = await createWorkspace();
+    const p = await createProject(ws);
+    await createRun(ws, p, { status: "completed", planned: 17, captured: 17, startedAt: "2026-10-12T13:00:00Z", finishedAt: "2026-10-12T13:08:00Z" });
+    await writeRollup(ws, p, "2026-10-12T13:08:05Z");
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(out, p)).toMatchObject({ status: "completed", rolled_up: true });
+  });
+
+  it("STORY-175 AC1: a rollup computed BEFORE the run finished does not count (the older day's block is stale)", async () => {
+    const ws = await createWorkspace();
+    const p = await createProject(ws);
+    await createRun(ws, p, { status: "completed", planned: 4, captured: 4, finishedAt: "2026-10-12T13:08:00Z" });
+    await writeRollup(ws, p, "2026-10-12T13:07:59Z");
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(out, p)!.rolled_up).toBe(false);
+  });
+
+  it("STORY-175 AC1: only the project's own cross-engine brand row proves the block was rewritten", async () => {
+    const ws = await createWorkspace();
+    const p = await createProject(ws);
+    const q = await createProject(ws);
+    await createRun(ws, p, { status: "completed", planned: 4, captured: 4, finishedAt: "2026-10-12T13:08:00Z" });
+    await writeRollup(ws, p, "2026-10-12T13:09:00Z", "competitor");
+    await writeRollup(ws, p, "2026-10-12T13:09:00Z", "brand", "gemini");
+    await writeRollup(ws, q, "2026-10-12T13:09:00Z"); // a sibling project's rollup is not this project's
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(out, p)!.rolled_up).toBe(false);
+  });
+
+  it("STORY-175 AC1: a terminal run that captured nothing has nothing to roll up, so it is rolled_up true; a running one is not", async () => {
+    const ws = await createWorkspace();
+    const done = await createProject(ws);
+    const live = await createProject(ws);
+    await createRun(ws, done, { status: "completed", planned: 3, captured: 0, skipped: 3, finishedAt: "2026-10-12T13:08:00Z" });
+    await createRun(ws, live, { status: "running", planned: 3, captured: 0 });
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(out, done)!.rolled_up).toBe(true);
+    expect(lastScanOf(out, live)!.rolled_up).toBe(false);
+  });
+
+  it("STORY-175 scenario 5 (AC1): a failed run reports settled = captured + failed + skipped", async () => {
+    const ws = await createWorkspace();
+    const p = await createProject(ws);
+    await createRun(ws, p, { status: "failed", planned: 10, captured: 3, failed: 5, skipped: 2, finishedAt: "2026-10-12T13:08:00Z" });
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(out, p)).toMatchObject({ status: "failed", planned_cells: 10, captured_cells: 3, settled_cells: 10 });
+  });
+
+  it("STORY-175 AC1: the LATEST run per project wins (by created_at), and each project gets its own", async () => {
+    const ws = await createWorkspace();
+    const a = await createProject(ws);
+    const b = await createProject(ws);
+    await createRun(ws, a, { status: "failed", createdAt: "2026-10-10T10:00:00Z", finishedAt: "2026-10-10T10:05:00Z" });
+    const newest = await createRun(ws, a, { status: "running", createdAt: "2026-10-12T10:00:00Z" });
+    await createRun(ws, a, { status: "completed", createdAt: "2026-10-11T10:00:00Z", finishedAt: "2026-10-11T10:05:00Z" });
+    const bRun = await createRun(ws, b, { status: "completed", trigger: "scheduled", createdAt: "2026-10-09T10:00:00Z", finishedAt: "2026-10-09T10:05:00Z" });
+    const out = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(out, a)).toMatchObject({ run_id: newest, status: "running" });
+    expect(lastScanOf(out, b)).toMatchObject({ run_id: bRun, trigger: "scheduled" });
+  });
+
+  it("STORY-175 scenario 6 (AC3): another workspace's run never shows, even a row cross-wired onto this workspace's project", async () => {
+    const mine = await createWorkspace();
+    const theirs = await createWorkspace();
+    const myProject = await createProject(mine);
+    const theirProject = await createProject(theirs);
+    const theirRun = await createRun(theirs, theirProject, { status: "running", planned: 9 });
+    // Corrupt data: a run stamped with workspace B but pointing at A's project, newer than anything of A's.
+    const crossWired = await createRun(theirs, myProject, { status: "running", planned: 99, createdAt: "2099-01-01T00:00:00Z" });
+    const mineOnly = await inTenant(CTX(mine), () => summary.summary(mine));
+    expect(lastScanOf(mineOnly, myProject)).toBeNull();
+    expect(JSON.stringify(mineOnly)).not.toContain(theirRun);
+    expect(JSON.stringify(mineOnly)).not.toContain(crossWired);
+    const own = await createRun(mine, myProject, { status: "completed", planned: 2, captured: 2, finishedAt: "2026-10-12T13:08:00Z" });
+    const withOwn = await inTenant(CTX(mine), () => summary.summary(mine));
+    expect(lastScanOf(withOwn, myProject)).toMatchObject({ run_id: own, planned_cells: 2 });
+  });
+
+  it("STORY-175 scenario 7 (AC3): a scoped manager gets last_scan only for in-scope projects, and a hidden run id never appears", async () => {
+    const ws = await createWorkspace();
+    const inScope = await createProject(ws);
+    const hidden = await createProject(ws);
+    const mine = await createRun(ws, inScope, { status: "running", planned: 5, captured: 1 });
+    const hiddenRun = await createRun(ws, hidden, { status: "running", planned: 7 });
+    const scoped = await inTenant(CTX(ws, [inScope]), () => summary.summary(ws));
+    expect(scoped.projects.map((p) => p.id)).toEqual([inScope]);
+    expect(lastScanOf(scoped, inScope)).toMatchObject({ run_id: mine, planned_cells: 5 });
+    expect(JSON.stringify(scoped)).not.toContain(hiddenRun);
+    const all = await inTenant(CTX(ws), () => summary.summary(ws));
+    expect(lastScanOf(all, hidden)).toMatchObject({ run_id: hiddenRun });
+  });
+
+  it("STORY-175 AC2: last_scan is read with the rows - the statement count is the same with 12 scanned projects as with 1", async () => {
+    const small = await createWorkspace();
+    const one = await createProject(small);
+    await createRun(small, one, { status: "running", planned: 3 });
+    const big = await createWorkspace();
+    for (let i = 0; i < 12; i += 1) {
+      const p = await createProject(big);
+      await createRun(big, p, { status: "completed", planned: 3, captured: 3, createdAt: "2026-10-12T13:00:00Z", finishedAt: "2026-10-12T13:08:00Z" });
+      await createRun(big, p, { status: "running", planned: 3, createdAt: "2026-10-12T14:00:00Z" });
+    }
+    const smallCount = await inTenant(CTX(small), async (n) => {
+      await summary.summary(small);
+      return n();
+    });
+    const bigCount = await inTenant(CTX(big), async (n) => {
+      const out = await summary.summary(big);
+      expect(out.projects.every((p) => p.last_scan?.status === "running")).toBe(true);
+      return n();
+    });
+    expect(bigCount).toBe(smallCount);
+  });
+
+  // STORY-175 - the Command Center card reads GET /v1/projects, which shares the row builder.
+  describe("STORY-175 · GET /v1/projects list items carry last_scan", () => {
+    const projectsService = new ProjectsService(null as never, null as never, null as never);
+    const page = (limit = 50, cursor?: string) => projectsService.list({ limit, ...(cursor !== undefined ? { cursor } : {}) });
+
+    it("STORY-175 AC1/AC2: list rows carry last_scan - null with no run, the latest run otherwise, rolled_up from the rollup", async () => {
+      const ws = await createWorkspace();
+      const none = await createProject(ws);
+      const live = await createProject(ws);
+      const done = await createProject(ws);
+      const liveRun = await createRun(ws, live, { status: "running", planned: 17, captured: 11, startedAt: "2026-10-12T13:00:00Z" });
+      await createRun(ws, done, { status: "completed", planned: 4, captured: 4, finishedAt: "2026-10-12T13:08:00Z" });
+      await writeRollup(ws, done, "2026-10-12T13:09:00Z");
+      const out = await inTenant(CTX(ws), () => page());
+      const by = (id: string) => out.items.find((p) => p.id === id)!.last_scan;
+      expect(by(none)).toBeNull();
+      expect(by(live)).toMatchObject({ run_id: liveRun, status: "running", planned_cells: 17, settled_cells: 11, rolled_up: false });
+      expect(by(done)).toMatchObject({ status: "completed", rolled_up: true });
+    });
+
+    it("STORY-175 observability: the list counts rows served by last-scan state, labels carry no identifiers", async () => {
+      const spy = vi.spyOn(metrics, "incrementCounter");
+      const ws = await createWorkspace();
+      await createProject(ws);
+      const p = await createProject(ws);
+      await createRun(ws, p, { status: "running" });
+      await inTenant(CTX(ws), () => page());
+      const calls = spy.mock.calls.filter(([name]) => name === "nominara_projects_last_scan_rows_total").map(([, labels]) => labels);
+      spy.mockRestore();
+      expect(calls.map((l) => l?.state).sort()).toEqual(["none", "running"]);
+      expect(calls.every((l) => Object.keys(l ?? {}).join() === "state")).toBe(true);
+    });
+
+    it("STORY-175 scenario 6 (AC3): another workspace's run, even one cross-wired onto this workspace's project, never shows in the list", async () => {
+      const mine = await createWorkspace();
+      const theirs = await createWorkspace();
+      const myProject = await createProject(mine);
+      const theirProject = await createProject(theirs);
+      const theirRun = await createRun(theirs, theirProject, { status: "running" });
+      const crossWired = await createRun(theirs, myProject, { status: "running", createdAt: "2099-01-01T00:00:00Z" });
+      const out = await inTenant(CTX(mine), () => page());
+      expect(out.items.map((p) => p.last_scan)).toEqual([null]);
+      expect(JSON.stringify(out)).not.toContain(theirRun);
+      expect(JSON.stringify(out)).not.toContain(crossWired);
+    });
+
+    it("STORY-175 scenario 7 (AC3): a scoped manager's list carries last_scan only for in-scope projects", async () => {
+      const ws = await createWorkspace();
+      const inScope = await createProject(ws);
+      const hidden = await createProject(ws);
+      const mine = await createRun(ws, inScope, { status: "running" });
+      const hiddenRun = await createRun(ws, hidden, { status: "running" });
+      const scoped = await inTenant(CTX(ws, [inScope]), () => page());
+      expect(scoped.items.map((p) => p.id)).toEqual([inScope]);
+      expect(scoped.items[0]!.last_scan).toMatchObject({ run_id: mine });
+      expect(JSON.stringify(scoped)).not.toContain(hiddenRun);
+    });
+
+    it("STORY-175 AC2: paging with a cursor still attaches each row's own run (the join does not disturb ordering)", async () => {
+      const ws = await createWorkspace();
+      const ids: string[] = [];
+      for (let i = 0; i < 3; i += 1) {
+        const p = await createProject(ws);
+        ids.push(p);
+        await createRun(ws, p, { status: "completed", planned: i + 1, captured: i + 1, finishedAt: "2026-10-12T13:08:00Z" });
+        await createRun(ws, p, { status: "running", planned: i + 10, createdAt: "2099-01-01T00:00:00Z" });
+      }
+      const first = await inTenant(CTX(ws), () => page(2));
+      expect(first.items).toHaveLength(2);
+      const second = await inTenant(CTX(ws), () => page(2, first.pagination.cursor_next!));
+      const all = [...first.items, ...second.items];
+      expect(all.map((p) => p.id)).toEqual(ids);
+      expect(all.map((p) => p.last_scan?.planned_cells)).toEqual([10, 11, 12]);
+    });
   });
 
   it("scoped role: the engine filter list is derived from the scoped set only", async () => {
