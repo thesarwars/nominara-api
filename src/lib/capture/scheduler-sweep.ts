@@ -4,6 +4,7 @@ import { incrementCounter } from "../telemetry/metrics.js";
 import { claimDueProjectRefs } from "./scheduler.js";
 import type { EnqueueRollup } from "../queue/handlers/run-rollup-request.js";
 import { reapStaleQueuedRuns } from "./stale-run-reaper.js";
+import { reapStuckRuns } from "./stuck-run-reaper.js";
 
 // NEW-A-13 — the scheduler sweep: the producer `capture.plan` has always
 // declared and nothing ran. OWNER DECISION 2026-10-08, "Option A".
@@ -338,6 +339,14 @@ export class SchedulerSweepRuntime {
       await reapStaleQueuedRuns(client, this.clock()).catch((error: unknown) => {
         logger.error({ event: "capture.scheduler.reap_failed", error: error instanceof Error ? error.name : "unknown" });
       });
+      // SCANFIX D4 - the same discipline for runs that STARTED and never finished: finalise them, settle
+      // the money, request the rollup. Skipped without an enqueuer, because finishing a run without
+      // asking for its rollup would be half a recovery.
+      if (this.options.enqueueRollup !== undefined) {
+        await reapStuckRuns(client, this.clock(), { enqueueRollup: this.options.enqueueRollup }).catch((error: unknown) => {
+          logger.error({ event: "capture.scheduler.reap_stuck_failed", error: error instanceof Error ? error.name : "unknown" });
+        });
+      }
       return result;
     } catch (error) {
       logger.error({ event: "capture.scheduler.sweep_failed", error: error instanceof Error ? error.name : "unknown" });

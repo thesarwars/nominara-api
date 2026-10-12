@@ -110,10 +110,12 @@ describe("SCANFIX · a cell that exhausts its retries is a terminal failure, and
 
   async function addPrompt(text: string): Promise<string> {
     const id = randomUUID();
+    // The row's text is unique (ux_prompts_project_hash); the JOB carries the text the fake engine reacts to.
+    const unique = `${text} ${id}`;
     await db.query(
       `INSERT INTO tracked_prompts (id, workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, is_priority, status)
        VALUES ($1,$2,$3,$4,sha256($5::bytea),'recommendation','consideration',false,'active')`,
-      [id, workspaceId, projectId, text, Buffer.from(text)],
+      [id, workspaceId, projectId, unique, Buffer.from(unique)],
     );
     prompts.push(id);
     return id;

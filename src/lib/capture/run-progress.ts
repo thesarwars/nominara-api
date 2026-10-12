@@ -37,6 +37,7 @@ interface RunRow {
   engine_keys: string[];
   planned_cells: number;
   skipped_cells: number;
+  failed_cells: number;
   started_at: Date | null;
   finished_at: Date | null;
   captured: string;
@@ -84,7 +85,7 @@ export function pctFrom(planned: number, done: number): number {
 export async function readRunProgress(tx: ClientBase, runId: string, now: Date = new Date()): Promise<RunProgress> {
   const result = await tx.query<RunRow>(
     `SELECT r.id, r.project_id, r.trigger, r.status, r.engine_keys,
-            r.planned_cells, r.skipped_cells, r.started_at, r.finished_at,
+            r.planned_cells, r.skipped_cells, r.failed_cells, r.started_at, r.finished_at,
             c.captured, c.failed, c.l1, c.l2
        FROM capture_runs r
        LEFT JOIN LATERAL (
@@ -103,7 +104,11 @@ export async function readRunProgress(tx: ClientBase, runId: string, now: Date =
   if (row === undefined) throw new NotFoundError({ message: "no such run" });
 
   const captured = Number(row.captured);
-  const failed = Number(row.failed);
+  // SCANFIX D4 - `capture_runs.failed_cells` is the count of cells that FAILED WITHOUT LEAVING AN
+  // `answer_captures` ROW: a job that died in the dead-letter queue before the terminal-record fix, and
+  // that only the stuck-run reaper can account for. A cell that wrote a failed row is in `row.failed`;
+  // the reaper counts only the shortfall, so the two never overlap. Nothing else writes the column.
+  const failed = Number(row.failed) + row.failed_cells;
   const skipped = row.skipped_cells;
   // A SUPPRESSED CELL IS DONE. `recordSuppressedCells` writes it `status =
   // 'skipped'`, so it is excluded from `captured` above and will never be
