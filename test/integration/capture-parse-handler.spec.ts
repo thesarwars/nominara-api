@@ -9,6 +9,8 @@ import { createCaptureParseHandler, type CaptureParseDeps } from "../../src/lib/
 import { ParseAlertMonitor } from "../../src/lib/parser/parse-alerts.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { testCacheRedisUrl } from "../support/test-valkey.js";
 
 // STORY-135 — the parse stage, end to end against a real database.
@@ -381,6 +383,34 @@ describe("STORY-135 · capture.parse", () => {
     const resultId = await seedCapture(ANSWER);
     const alerts = { observe: () => { throw new Error("pager down"); } } as unknown as ParseAlertMonitor;
     await expect(handler({ alerts })(db, job(resultId))).resolves.toBeUndefined();
+    const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
+    expect(row.rows[0]!.status).toBe("parsed");
+  });
+  // The monitor's meters are cumulative counters: observing before COMMIT counts a parse that a retry then runs again.
+  it("[STORY-037 AC10] the alert monitor observes only AFTER the job commits — a rolled-back attempt is not counted", async () => {
+    const resultId = await seedCapture(ANSWER);
+    const observed: string[] = [];
+    const alerts = { observe: (observation: { engineKey: string }) => void observed.push(observation.engineKey) } as unknown as ParseAlertMonitor;
+
+    await expect(
+      withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await handler({ alerts })(tx, job(resultId));
+        expect(observed, "nothing may be observed before COMMIT").toEqual([]);
+        throw new Error("attempt fails after the parse; the job is retried");
+      }),
+    ).rejects.toThrow("attempt fails");
+    expect(observed).toEqual([]); // the rolled-back attempt left no trace in the meters
+
+    await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => handler({ alerts })(tx, job(resultId)));
+    expect(observed).toEqual(["google_ai_mode"]); // the retry that committed is counted exactly once
+  });
+
+  it("[STORY-037 AC10] a monitor that throws AFTER commit never fails or un-parses the job", async () => {
+    const resultId = await seedCapture(ANSWER);
+    const alerts = { observe: () => { throw new Error("pager down"); } } as unknown as ParseAlertMonitor;
+    await expect(
+      withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => handler({ alerts })(tx, job(resultId))),
+    ).resolves.toBeUndefined();
     const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
     expect(row.rows[0]!.status).toBe("parsed");
   });

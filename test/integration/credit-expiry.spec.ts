@@ -7,7 +7,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { adjustCredits, provisionWalletWithGrant, recordPurchase } from "../../src/lib/credits/balance.js";
 import { expireDuePurchasedCredits } from "../../src/lib/credits/expire.js";
 import { readLedgerForReplay, replayLedger, verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
-import { readWallet } from "../../src/lib/credits/wallet.js";
+import { commitCredits, readWallet, reserveCredits } from "../../src/lib/credits/wallet.js";
 import { createCreditHousekeepingHandler } from "../../src/lib/queue/handlers/credit-housekeeping.handler.js";
 import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
@@ -80,13 +80,21 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
   }
 
   /** A succeeded lot, credited to the wallet the way the Stripe handler does. `expiresIn` is a Postgres interval or null. */
-  async function lot(ws: string, credits: number, expiresIn: string | null, status = "succeeded"): Promise<void> {
-    await db.query(
+  async function lot(ws: string, credits: number, expiresIn: string | null, status = "succeeded"): Promise<string> {
+    const inserted = await db.query<{ id: string }>(
       `INSERT INTO credit_purchases (workspace_id, pack_key, credits, amount_usd, status, expires_at)
-       VALUES ($1,'starter_vault',$2,15.00,$3, CASE WHEN $4::text IS NULL THEN NULL ELSE now() + $4::interval END)`,
+       VALUES ($1,'starter_vault',$2,15.00,$3, CASE WHEN $4::text IS NULL THEN NULL ELSE now() + $4::interval END)
+       RETURNING id`,
       [ws, credits, status, expiresIn],
     );
     if (status === "succeeded") await inTx((tx) => recordPurchase(tx, request(ws, `purchase-${randomUUID()}`), credits));
+    return inserted.rows[0]!.id;
+  }
+
+  /** A human-authored credit into the purchased bucket with NO lot behind it (support goodwill). */
+  async function goodwill(ws: string, credits: number): Promise<void> {
+    const human = (await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`u-${randomUUID().slice(0, 8)}@nominara.test`])).rows[0]!.id;
+    await inTx((tx) => adjustCredits(tx, { ...request(ws, `goodwill-${randomUUID()}`), actorId: human, actorType: "user", reason: "goodwill" }, "purchased", credits));
   }
 
   /** Spends from the purchased bucket — a debit the lot accounting must treat as FIFO consumption. */
@@ -273,6 +281,153 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
     await provision(workspaceId);
     await lot(workspaceId, 1000, "11 months");
     expect(await sweep()).toEqual({ workspacesChecked: 0, workspacesExpired: 0, creditsExpired: 0, failures: [] });
+  });
+
+  it("[AC4] credits that enter the purchased bucket WITHOUT a lot (a positive adjustment) are never expired as an elapsed lot", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 100, "-1 day");
+    await spendPurchased(workspaceId, 100); // the whole elapsed lot is gone
+    await goodwill(workspaceId, 100); // support credits 100 into the purchased bucket, no lot
+    expect(await purchased()).toBe(100);
+    expect(await sweep()).toMatchObject({ creditsExpired: 0, failures: [] });
+    expect(await purchased()).toBe(100);
+    expect(await expireEntries()).toEqual([]);
+  });
+
+  it("[AC4] a positive adjustment beside an elapsed lot: only the lot expires, the adjustment stays", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 100, "-1 day");
+    await goodwill(workspaceId, 50);
+    expect(await sweep()).toMatchObject({ creditsExpired: 100 });
+    expect(await purchased()).toBe(50);
+    expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+  });
+
+  it("[AC4] a NEGATIVE adjustment is still FIFO consumption of the oldest lot", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 100, "-1 day");
+    await goodwill(workspaceId, 40);
+    await spendPurchased(workspaceId, 100); // takes the oldest 100 (the elapsed lot), leaves the 40 adjusted credits
+    expect(await sweep()).toMatchObject({ creditsExpired: 0 });
+    expect(await purchased()).toBe(40);
+  });
+
+  it("[STORY-076 test-plan 4] two lots elapsing on DIFFERENT sweeps, equal in size, produce two expire entries", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 100, "-1 day");
+    expect(await sweep()).toMatchObject({ creditsExpired: 100 });
+    await lot(workspaceId, 100, "-1 hour"); // the next lot to elapse is the same size
+    expect(await sweep()).toMatchObject({ creditsExpired: 100, failures: [] });
+    const entries = await expireEntries();
+    expect(entries.map((entry) => entry.credits)).toEqual([100, 100]);
+    expect(new Set(entries.map((entry) => entry.idempotency_key)).size).toBe(2);
+    expect(await purchased()).toBe(0);
+    expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+  });
+
+  it("[AC4] a same-day second sweep after a hold is released expires the remainder (equal amounts must not collide)", async () => {
+    await provision(workspaceId, 0);
+    await lot(workspaceId, 100, "-1 day");
+    await db.query("UPDATE credit_wallets SET reserved = 50 WHERE workspace_id = $1", [workspaceId]);
+    expect(await sweep()).toMatchObject({ creditsExpired: 50 });
+    await db.query("UPDATE credit_wallets SET reserved = 0 WHERE workspace_id = $1", [workspaceId]); // the hold is released
+    expect(await sweep()).toMatchObject({ creditsExpired: 50, failures: [] }); // the same amount as the first
+    expect(await purchased()).toBe(0);
+    expect((await expireEntries()).length).toBe(2);
+    expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+  });
+
+  it("[AC4] the elapsed boundary is NOW: a lot expiring in an hour is not expired beside an elapsed one", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 100, "-1 minute");
+    await lot(workspaceId, 200, "1 hour");
+    expect(await sweep()).toMatchObject({ creditsExpired: 100 });
+    expect(await purchased()).toBe(200);
+  });
+
+  it("[AC4] the expire entry names the lot it covers (the newest elapsed lot)", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 100, "-2 days");
+    const newest = await lot(workspaceId, 100, "-1 day");
+    await lot(workspaceId, 100, "6 months");
+    await sweep();
+    const entry = await db.query<{ reference_type: string; reference_id: string }>(
+      "SELECT reference_type, reference_id FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'expire'", [workspaceId]);
+    expect(entry.rows).toEqual([{ reference_type: "credit_purchase", reference_id: newest }]);
+  });
+
+  it("[AC4] discovery skips a workspace whose purchased balance is already empty — an old elapsed lot is not reopened forever", async () => {
+    await provision(workspaceId);
+    await lot(workspaceId, 100, "-1 day");
+    await spendPurchased(workspaceId, 100);
+    expect(await sweep()).toEqual({ workspacesChecked: 0, workspacesExpired: 0, creditsExpired: 0, failures: [] });
+  });
+
+  it("[AC4] the real reserve/commit path (included first) leaves the elapsed purchased lot to expire in full", async () => {
+    await provision(workspaceId, 50);
+    await lot(workspaceId, 100, "-1 day");
+    await inTx(async (tx) => {
+      expect((await reserveCredits(tx, workspaceId, 30)).ok).toBe(true);
+      expect(await commitCredits(tx, workspaceId, 30, 30)).not.toBeNull(); // 30 of the 50 included; purchased untouched
+    });
+    expect(await sweep()).toMatchObject({ creditsExpired: 100, failures: [] });
+    const wallet = (await readWallet(db, workspaceId))!;
+    expect(wallet).toMatchObject({ includedBalance: 20, purchasedBalance: 0, reserved: 0 });
+  });
+
+  it("[AC4] the real path under a LIVE reservation: the sweep holds back what the hold needs, and a later commit spends the rest", async () => {
+    await provision(workspaceId, 50);
+    await lot(workspaceId, 100, "-1 day");
+    await inTx(async (tx) => { expect((await reserveCredits(tx, workspaceId, 120)).ok).toBe(true); });
+    expect(await sweep()).toMatchObject({ creditsExpired: 30, failures: [] }); // available = 150 - 120
+    await inTx(async (tx) => { expect(await commitCredits(tx, workspaceId, 120, 120)).not.toBeNull(); }); // 50 included + 70 purchased
+    expect(await readWallet(db, workspaceId)).toMatchObject({ includedBalance: 0, purchasedBalance: 0, reserved: 0 });
+    expect(await sweep()).toMatchObject({ creditsExpired: 0 });
+  });
+
+  it("[AC4] a sweep racing a reserve+commit on the same wallet: nothing is lost or double counted, whichever wins", async () => {
+    for (let round = 0; round < 6; round += 1) {
+      const ws = await newWorkspace();
+      await provision(ws, 0);
+      await lot(ws, 100, "-1 day");
+      const spender = await secondDiscovery();
+      try {
+        const spend = (async (): Promise<boolean> => {
+          await spender.query("BEGIN");
+          const reserved = (await reserveCredits(spender, ws, 60)).ok;
+          if (reserved) await commitCredits(spender, ws, 60, 60);
+          await spender.query("COMMIT");
+          return reserved;
+        })();
+        const [spent, outcome] = await Promise.all([spend, sweep()]);
+        expect(outcome.failures).toEqual([]);
+        const expired = (await expireEntries(ws)).reduce((sum, entry) => sum + entry.credits, 0);
+        expect(await purchased(ws)).toBe(0);
+        expect(expired + (spent ? 60 : 0)).toBe(100);
+      } finally {
+        await spender.end();
+      }
+    }
+  });
+
+  it("[AC4] a sweep that waits on a held wallet lock sees the reserve+commit that committed meanwhile", async () => {
+    await provision(workspaceId, 0);
+    await lot(workspaceId, 100, "-1 second");
+    const holder = await secondDiscovery();
+    try {
+      await holder.query("BEGIN");
+      expect((await reserveCredits(holder, workspaceId, 60)).ok).toBe(true); // row lock held by the UPDATE
+      let done = false;
+      const running = sweep().then((outcome) => { done = true; return outcome; });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(done, "the sweep must be waiting on the wallet row lock").toBe(false);
+      await commitCredits(holder, workspaceId, 60, 60);
+      await holder.query("COMMIT");
+      expect(await running).toMatchObject({ creditsExpired: 40, failures: [] });
+      expect(await purchased()).toBe(0);
+    } finally {
+      await holder.end();
+    }
   });
 
   // The handler on a real database: the owner connection for discovery, the runtime pool for the writes, the lock, and
