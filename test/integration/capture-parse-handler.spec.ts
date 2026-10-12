@@ -121,7 +121,7 @@ describe("STORY-135 · capture.parse", () => {
   }
 
   /** The handler as the worker runs it: inside the job's tenant transaction, which owns COMMIT and the after-commit tasks. */
-  function run(h: ReturnType<typeof handler>, j: Job): Promise<void> {
+  function run(h: ReturnType<typeof handler>, j: Job): Promise<unknown> {
     return withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => h(tx, j));
   }
 
