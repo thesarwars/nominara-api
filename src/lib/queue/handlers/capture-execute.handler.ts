@@ -186,29 +186,35 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     // worker is not in the queue to drain. Checking here is what makes
     // "in-flight cells complete rather than being abandoned" mean the ones
     // that were genuinely mid-write, not every job the drain raced.
+    //
+    // `FOR KEY SHARE`, NOT A PLAIN SELECT (SCANFIX D5). This transaction spans the vendor call, and a plain
+    // read locks nothing: the stuck-run reaper's `FOR UPDATE` did not wait for a cell still in flight, so it
+    // counted that cell as lost, finalised the run `failed`, refunded the full charge and committed - and
+    // the cell then committed a captured answer on a refunded run. KEY SHARE is the weakest lock that the
+    // reaper's FOR UPDATE conflicts with, so the reaper waits for every in-flight cell to commit and its
+    // idle re-check then sees the new capture. It does not conflict with this handler's own NO KEY UPDATEs
+    // (the run's non-key columns), with another cell's KEY SHARE, or with a cancel. The other direction:
+    // a cell arriving while the reaper holds the run waits here, then reads the terminal status below.
     const run = await tx.query<{ status: string; planned_cells: number; started_at: Date | null }>(
-      "SELECT status, planned_cells, started_at FROM capture_runs WHERE id = $1",
+      "SELECT status, planned_cells, started_at FROM capture_runs WHERE id = $1 FOR KEY SHARE",
       [payload.runId],
     );
     const runRow = run.rows[0];
     if (runRow === undefined) {
       // Deleted, or in another tenant and invisible to RLS. Nothing to
-      // capture and nothing wrong — throwing would send the job down the
+      // capture and nothing wrong - throwing would send the job down the
       // retry ladder for a run that no longer exists.
       logger.log(`run ${payload.runId} is gone; skipping cell`);
       return;
     }
-    if (runRow.status === "canceled") {
-      logger.log(`run ${payload.runId} was cancelled; skipping cell`);
-      return;
-    }
-    // A `failed` run is terminal too, and cells can outlive it: capture.plan
-    // fails a run whose dispatch REJECTED, but a rejection is ambiguous (the
-    // addBulk may have landed with only the reply lost), and the fair-use
-    // reservation was released with it. A late cell would call the vendor and
-    // write a capture under a run that holds no reservation (checkpoint-4).
-    if (runRow.status === "failed") {
-      logger.log(`run ${payload.runId} has failed; skipping cell`);
+    // ANY TERMINAL RUN SKIPS THE CELL, not only canceled/failed. A late or replayed cell (admin DLQ replay,
+    // a redelivery) on a run the reaper or the last live cell already finalised would otherwise call the
+    // vendor - paid, and it spends a pacing token - and count a cell the run already accounted for.
+    // `failed` is also the case capture.plan creates when a dispatch REJECTED yet the addBulk may have
+    // landed: the fair-use reservation was released with it, and a late cell would capture under a run
+    // that holds none (checkpoint-4).
+    if (runRow.status !== "queued" && runRow.status !== "running") {
+      logger.log(`run ${payload.runId} is ${runRow.status}; skipping cell`);
       return;
     }
 

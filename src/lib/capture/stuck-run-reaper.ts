@@ -42,9 +42,13 @@ import { STALE_QUEUED_RUN_BOUND_MS } from "./stale-run-reaper.js";
 // IDEMPOTENT: the `status IN ('queued','running')` predicate inside `finalizeRun`
 // and the ledger's idempotency keys mean a second pass changes nothing.
 //
-// KNOWN, ACCEPTED: a cell that commits between this transaction's progress read and
-// its commit can leave `settled + failed_cells` one over `planned`; progress clamps
-// `done` to `planned`, and the run is already terminal so no cell acts on it.
+// A CELL STILL IN FLIGHT HOLDS THE REAPER OFF (SCANFIX D5): the handler takes
+// `FOR KEY SHARE` on the run at the start of its transaction, which conflicts with the
+// `FOR UPDATE` below, so the reaper never counts a cell mid-vendor-call as lost, never
+// refunds a run that is about to deliver an answer, and a cell arriving after the reaper
+// finalised the run waits for it and then skips (every terminal status skips). This
+// replaces the old "KNOWN, ACCEPTED" count drift - and the money half of it, which the old
+// note did not mention: a run refunded in full and then handed a captured answer.
 
 const logger = new Logger("capture.reaper");
 
@@ -86,47 +90,7 @@ export async function reapStuckRuns(client: ClientBase, now: Date, options: Stuc
   let finalized = 0;
   for (const row of stuck.rows) {
     try {
-      const status = await withTenantContext(client, { workspaceId: row.workspace_id, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
-        // Lock, then re-check under the lock: a cell may have woken the run since the SELECT above.
-        const locked = await tx.query<{ project_id: string }>(
-          `SELECT r.project_id
-             FROM capture_runs r
-            WHERE r.id = $1 AND r.status IN ('queued','running') AND ${LAST_ACTIVITY_SQL} < $2
-              FOR UPDATE OF r`,
-          [row.id, cutoff],
-        );
-        const projectId = locked.rows[0]?.project_id;
-        if (projectId === undefined) return null;
-
-        const before = await readRunProgress(tx, row.id, now);
-        const lost = Math.max(0, before.planned - (before.captured + before.failed + before.skipped));
-        if (lost > 0) {
-          await tx.query("UPDATE capture_runs SET failed_cells = failed_cells + $2 WHERE id = $1", [row.id, lost]);
-        }
-        const progress = await readRunProgress(tx, row.id, now);
-        const finalised = await finalizeRun(tx, row.workspace_id, progress);
-        if (finalised === null) return null;
-
-        // The day the captures belong to, not the day the reaper ran.
-        const lastCapture = await tx.query<{ at: Date | null }>("SELECT max(captured_at) AS at FROM answer_captures WHERE run_id = $1", [row.id]);
-        await requestRollupIfRunComplete(
-          tx,
-          { runId: row.id, projectId, workspaceId: row.workspace_id, capturedAt: lastCapture.rows[0]?.at ?? now },
-          options.enqueueRollup,
-          logger,
-        );
-        logger.log({
-          event: "capture.run.reaped_stuck",
-          workspace_id: row.workspace_id,
-          run_id: row.id,
-          status: finalised.status,
-          planned: progress.planned,
-          captured: progress.captured,
-          lost_cells: lost,
-          refunded_credits: finalised.refunded,
-        });
-        return finalised.status;
-      });
+      const status = await reapStuckRun(client, row, now, cutoff, options);
       if (status === null) continue;
       finalized += 1;
       incrementCounter("nominara_capture_stuck_runs_finalized_total", { status });
@@ -142,4 +106,62 @@ export async function reapStuckRuns(client: ClientBase, now: Date, options: Stuc
     }
   }
   return { finalized };
+}
+
+/**
+ * ONE stuck run, in its own tenant transaction (`row.workspace_id` is the context). Exported so a test can
+ * run it as the RUNTIME role with a deliberately wrong workspace and prove RLS - not the code - refuses it.
+ * Returns the status the run was finalised to, or null when it was left alone.
+ */
+export async function reapStuckRun(
+  client: ClientBase,
+  row: { readonly id: string; readonly workspace_id: string },
+  now: Date,
+  cutoff: Date,
+  options: StuckRunOptions,
+): Promise<string | null> {
+  return withTenantContext(client, { workspaceId: row.workspace_id, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+    // LOCK, THEN RE-CHECK IN A SECOND STATEMENT. The lock waits for any cell still in flight (the handler
+    // holds `FOR KEY SHARE` on the run for its whole transaction - SCANFIX D5). Under READ COMMITTED a
+    // statement that waited re-evaluates only the locked row, with its ORIGINAL snapshot for sub-selects, so
+    // a capture committed while we waited would be invisible to an idle test folded into this query. The
+    // next statement takes a fresh snapshot and sees it.
+    const locked = await tx.query<{ project_id: string }>(
+      "SELECT r.project_id FROM capture_runs r WHERE r.id = $1 AND r.status IN ('queued','running') FOR UPDATE OF r",
+      [row.id],
+    );
+    const projectId = locked.rows[0]?.project_id;
+    if (projectId === undefined) return null;
+    const idle = await tx.query(`SELECT 1 FROM capture_runs r WHERE r.id = $1 AND ${LAST_ACTIVITY_SQL} < $2`, [row.id, cutoff]);
+    if (idle.rowCount === 0) return null;
+
+    const before = await readRunProgress(tx, row.id, now);
+    const lost = Math.max(0, before.planned - (before.captured + before.failed + before.skipped));
+    if (lost > 0) {
+      await tx.query("UPDATE capture_runs SET failed_cells = failed_cells + $2 WHERE id = $1", [row.id, lost]);
+    }
+    const progress = await readRunProgress(tx, row.id, now);
+    const finalised = await finalizeRun(tx, row.workspace_id, progress);
+    if (finalised === null) return null;
+
+    // The day the captures belong to, not the day the reaper ran.
+    const lastCapture = await tx.query<{ at: Date | null }>("SELECT max(captured_at) AS at FROM answer_captures WHERE run_id = $1", [row.id]);
+    await requestRollupIfRunComplete(
+      tx,
+      { runId: row.id, projectId, workspaceId: row.workspace_id, capturedAt: lastCapture.rows[0]?.at ?? now },
+      options.enqueueRollup,
+      logger,
+    );
+    logger.log({
+      event: "capture.run.reaped_stuck",
+      workspace_id: row.workspace_id,
+      run_id: row.id,
+      status: finalised.status,
+      planned: progress.planned,
+      captured: progress.captured,
+      lost_cells: lost,
+      refunded_credits: finalised.refunded,
+    });
+    return finalised.status;
+  });
 }
