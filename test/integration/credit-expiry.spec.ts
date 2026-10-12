@@ -178,8 +178,13 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
   it("[AC4] two OVERLAPPING sweeps expire once — the wallet row lock serialises them", async () => {
     await provision(workspaceId);
     await lot(workspaceId, 1000, "-1 second");
-    const [a, b] = await Promise.all([sweep(), expireDuePurchasedCredits({ discovery: await secondDiscovery(), work })]);
-    expect(a.creditsExpired + b.creditsExpired).toBe(1000);
+    const second = await secondDiscovery();
+    try {
+      const [a, b] = await Promise.all([sweep(), expireDuePurchasedCredits({ discovery: second, work })]);
+      expect(a.creditsExpired + b.creditsExpired).toBe(1000);
+    } finally {
+      await second.end(); // an un-ended client is terminated when the container stops, and vitest fails the run on it
+    }
     expect((await expireEntries()).length).toBe(1);
     expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
   });
