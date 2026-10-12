@@ -5,7 +5,8 @@ import type { Job } from "bullmq";
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { createCaptureParseHandler } from "../../src/lib/queue/handlers/capture-parse.handler.js";
+import { createCaptureParseHandler, type CaptureParseDeps } from "../../src/lib/queue/handlers/capture-parse.handler.js";
+import { ParseAlertMonitor } from "../../src/lib/parser/parse-alerts.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { testCacheRedisUrl } from "../support/test-valkey.js";
@@ -110,11 +111,11 @@ describe("STORY-135 · capture.parse", () => {
     return resultId;
   }
 
-  function handler() {
+  function handler(deps?: CaptureParseDeps) {
     const context = { pool: undefined, env: { VALKEY_CACHE_URL: testCacheRedisUrl() } } as unknown as QueueHandlerContext;
     // No arbiter — production has none bound either, so every in-band mention
     // finalises deterministically. See STORY-038.
-    return createCaptureParseHandler(context);
+    return createCaptureParseHandler(context, deps);
   }
 
   function job(resultId: string, force = false): Job {
@@ -359,5 +360,28 @@ describe("STORY-135 · capture.parse", () => {
     const capture = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
     expect(capture.rows[0]!.status).toBe("captured");
     expect((await db.query("SELECT 1 FROM mention_facts WHERE result_id = $1", [resultId])).rowCount).toBe(0);
+  });
+
+  // STORY-037 AC10 — the alert's trigger condition existed and nothing called it. `.invalid` is reserved (RFC 6761)
+  // and can never resolve, so every one of these citations fails resolution whatever the machine's network.
+  it("[STORY-037 AC10] a parse whose citations all fail to resolve reaches the pager, naming the engine", async () => {
+    const urls = Array.from({ length: 25 }, (_, i) => `https://dead-${String(i)}.invalid/page`);
+    const resultId = await seedCapture(["## Sources", "", ...urls.map((url, i) => `${String(i + 1)}. ${url}`)].join("\n"));
+    const pages: { message: string; context: Record<string, unknown> }[] = [];
+    const alerts = new ParseAlertMonitor({ pager: { page: (message, context) => void pages.push({ message, context }) } });
+
+    await handler({ alerts })(db, job(resultId));
+
+    expect(pages).toHaveLength(1);
+    expect(pages[0]!.context).toMatchObject({ alert: "citation_resolution_failure", engineKey: "google_ai_mode", attempted: 25, failed: 25 });
+    expect(JSON.stringify(pages[0])).not.toContain("dead-"); // no citation content in the alert
+  });
+
+  it("[STORY-037 AC10] a pager that throws never fails the parse it observed", async () => {
+    const resultId = await seedCapture(ANSWER);
+    const alerts = { observe: () => { throw new Error("pager down"); } } as unknown as ParseAlertMonitor;
+    await expect(handler({ alerts })(db, job(resultId))).resolves.toBeUndefined();
+    const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
+    expect(row.rows[0]!.status).toBe("parsed");
   });
 });

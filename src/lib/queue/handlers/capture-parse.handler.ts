@@ -5,6 +5,7 @@ import { z } from "zod";
 import { decideL3 } from "../../capture/l3-short-circuit.js";
 import { loadParseContext, parseCapture, persistParse, type CaptureRow } from "../../parser/parse-capture.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
+import { defaultParseAlertMonitor, observationFrom, type ParseAlertMonitor } from "../../parser/parse-alerts.js";
 import type { SentimentArbiter } from "../../parser/sentiment/arbiter.js";
 import { SCORING_VERSION } from "../../scoring/index.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
@@ -42,6 +43,8 @@ const payloadSchema = z
 export interface CaptureParseDeps {
   /** Unbound in production — see sentiment/arbiter.ts. */
   readonly arbiter?: SentimentArbiter;
+  /** STORY-037/038/039 — the meters behind the three parser alerts. Injected in tests; production uses the process-wide one. */
+  readonly alerts?: ParseAlertMonitor;
   /** Injected in tests; production builds a producer from env on first use. */
   readonly enqueueRollup?: (
     queue: "rollup.metric_daily",
@@ -181,6 +184,15 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
 
     // Stage 6 — the facts and the capture, in the job's own transaction.
     await persistParse(tx, capture, result, aliasFingerprint);
+
+    // STORY-037 AC10 / STORY-038 AC12 / STORY-039 AC8 — feed the three alert meters from what was just persisted. An
+    // alert path that failed must never fail the parse it observed: the facts are already written, and a retry would
+    // run the whole parse again for a metering fault.
+    try {
+      (deps?.alerts ?? defaultParseAlertMonitor).observe(observationFrom(capture, result));
+    } catch (error) {
+      logger.error(`parse alert metering failed for capture ${payload.resultId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
 
     await requestRollupIfRunComplete(tx, record, payload.workspaceId);
 
