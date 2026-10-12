@@ -61,7 +61,7 @@ describe("STORY-134 · prompt list keyset paging", () => {
   const listQuery = () => calls.find((call) => call.sql.includes("ORDER BY"));
 
   it("[STORY-134 #8] fetches limit+1 rows and returns a Page whose cursor_next/has_more are set when more remain", async () => {
-    const page = (await setup([row(1), row(2), row(3)]).list(PROJECT, { limit: 2 })) as Page<unknown>;
+    const page = (await setup([row(1), row(2), row(3)]).list(PROJECT, { limit: 2 }));
     expect(page).toBeInstanceOf(Page);
     expect(listQuery()?.params).toContain(3);
     expect(page.items).toHaveLength(2);
@@ -71,12 +71,12 @@ describe("STORY-134 · prompt list keyset paging", () => {
   });
 
   it("[STORY-134 #8] the last page has cursor_next null and has_more false", async () => {
-    const page = (await setup([row(1), row(2)]).list(PROJECT, { limit: 2 })) as Page<unknown>;
+    const page = (await setup([row(1), row(2)]).list(PROJECT, { limit: 2 }));
     expect(page.pagination).toEqual({ cursor_next: null, has_more: false, limit: 2 });
   });
 
   it("[STORY-134 #2] an empty project is an empty Page with no cursor, not an error", async () => {
-    const page = (await setup([]).list(PROJECT, { limit: 50 })) as Page<unknown>;
+    const page = (await setup([]).list(PROJECT, { limit: 50 }));
     expect(page.items).toEqual([]);
     expect(page.pagination.cursor_next).toBeNull();
   });
@@ -90,7 +90,7 @@ describe("STORY-134 · prompt list keyset paging", () => {
   });
 
   it("[STORY-134 #8] cursor_next carries the LAST VISIBLE row's key at microsecond precision", async () => {
-    const page = (await setup([row(1), row(2), row(3)]).list(PROJECT, { limit: 2 })) as Page<unknown>;
+    const page = (await setup([row(1), row(2), row(3)]).list(PROJECT, { limit: 2 }));
     const next = Buffer.from(page.pagination.cursor_next!, "base64url").toString("utf8");
     expect(JSON.parse(next)).toEqual({ v: 1, k: [AT, idOf(2)] });
   });
@@ -111,7 +111,7 @@ describe("STORY-134 · prompt list keyset paging", () => {
   });
 
   it("[STORY-134 #1] the Page's data keeps the {prompts, summary} body the app already reads", async () => {
-    const page = (await setup([row(1), row(2), row(3)]).list(PROJECT, { limit: 2 })) as Page<unknown, { prompts: unknown[]; summary: unknown }>;
+    const page = (await setup([row(1), row(2), row(3)]).list(PROJECT, { limit: 2 }));
     expect(page.data.prompts).toHaveLength(2);
     expect(page.data.summary).toEqual({ active: 3, paused: 0, archived: 0, cap: 50 });
   });

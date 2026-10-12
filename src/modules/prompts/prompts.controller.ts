@@ -22,6 +22,7 @@ import { Audit } from "../../api/decorators/audit.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
+import { Page } from "../../api/pagination/page.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { PromptActivationService } from "./activation.service.js";
 import { PromptListService } from "./prompt-list.service.js";
@@ -151,7 +152,7 @@ export class PromptsController {
   listPrompts(
     @Param("id") projectId: string,
     @Query(new ZodValidationPipe(promptListQuerySchema)) query: PromptListQuery,
-  ): Promise<PromptListResponse> {
+  ): Promise<Page<PromptListItem, PromptListResponse>> {
     return this.list.list(projectId, query);
   }
 
