@@ -142,7 +142,12 @@ export class PromptsController {
   // matrix page would bury the writes that matter.
   @Get()
   @RequirePermission("tracking:read")
-  @ApiContract({ operationId: "listPrompts", responseSchema: promptListResponseSchema })
+  @ApiContract({
+    operationId: "listPrompts",
+    querySchema: promptListQuerySchema,
+    responseSchema: promptListResponseSchema,
+    listOf: true,
+  })
   listPrompts(
     @Param("id") projectId: string,
     @Query(new ZodValidationPipe(promptListQuerySchema)) query: PromptListQuery,
