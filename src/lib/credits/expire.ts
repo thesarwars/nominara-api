@@ -37,6 +37,17 @@ import { expireCredits } from "./balance.js";
 //   grant        included bucket only.
 //   release      moves `reserved`, never a balance.
 // A NEW code path that credits the purchased bucket without a lot MUST be added here, or it will be expired as one.
+// That includes a future `credit_purchases` succeeded -> refunded transition (a Stripe pack refund): the lot leaves T
+// (T reads only `succeeded` lots) while its credits may already have been spent or expired, so `T - P` and the
+// expiry key's cumulative total both shift. It MUST be reasoned through here before it ships.
+//
+// KNOWN, ACCEPTED RESIDUALS (both bounded, both customer-favourable or bounded by the refund):
+//   - Refund after the lot elapsed: a run's debit refunded to the purchased bucket (`refund`, deliberately not in T)
+//     can expire with an elapsed lot even if the debit really came from a younger one. Never more than the refunded
+//     amount. Pinned by the "documented residual" test in test/integration/credit-expiry.spec.ts.
+//   - Goodwill then correction: a +100 `adjustment` followed by a -100 correction keeps the +100 in T permanently
+//     (only positive adjustments are summed; the -100 reads as consumption). An elapsed lot beside it can therefore
+//     under-expire. Customer-favourable; accepted.
 //
 // Spending is oldest-lot-first (FIFO by expiry), so whatever has left the bucket — spent, expired before, or
 // adjusted away — came out of the OLDEST lots first. Everything that is not in P is therefore consumption:
