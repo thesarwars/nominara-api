@@ -12,9 +12,9 @@ import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { engineKeySchema } from "../../engines/contract.js";
 import { SpendMeter, ValkeySpendMeterStore } from "../../engines/spend-meter.js";
-import { captureCell } from "../../capture/execute-cell.js";
+import { captureCell, recordExhaustedCell, type CaptureCellInput, type CaptureCellOutcome } from "../../capture/execute-cell.js";
+import { finalizeRun } from "../../capture/finalize-run.js";
 import { readRunProgress } from "../../capture/run-progress.js";
-import { resolveRunOutcome } from "../../engines/run-outcome.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
@@ -186,29 +186,36 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     // worker is not in the queue to drain. Checking here is what makes
     // "in-flight cells complete rather than being abandoned" mean the ones
     // that were genuinely mid-write, not every job the drain raced.
+    //
+    // `FOR KEY SHARE`, NOT A PLAIN SELECT (SCANFIX D5). This transaction spans the vendor call, and a plain
+    // read locks nothing: the stuck-run reaper's `FOR UPDATE` did not wait for a cell still in flight, so it
+    // counted that cell as lost, finalised the run `failed`, refunded the full charge and committed - and
+    // the cell then committed a captured answer on a refunded run. KEY SHARE is the weakest lock that the
+    // reaper's FOR UPDATE conflicts with, so the reaper waits for every in-flight cell to commit and its
+    // idle re-check then sees the new capture. It does not conflict with this handler's own NO KEY UPDATEs
+    // (the run's non-key columns), with another cell's KEY SHARE, or with a cancel. The other direction:
+    // a cell arriving while the reaper holds the run waits here, then reads the terminal status below.
     const run = await tx.query<{ status: string; planned_cells: number; started_at: Date | null }>(
-      "SELECT status, planned_cells, started_at FROM capture_runs WHERE id = $1",
+      "SELECT status, planned_cells, started_at FROM capture_runs WHERE id = $1 FOR KEY SHARE",
       [payload.runId],
     );
     const runRow = run.rows[0];
     if (runRow === undefined) {
       // Deleted, or in another tenant and invisible to RLS. Nothing to
-      // capture and nothing wrong — throwing would send the job down the
+      // capture and nothing wrong - throwing would send the job down the
       // retry ladder for a run that no longer exists.
       logger.log(`run ${payload.runId} is gone; skipping cell`);
       return;
     }
-    if (runRow.status === "canceled") {
-      logger.log(`run ${payload.runId} was cancelled; skipping cell`);
-      return;
-    }
-    // A `failed` run is terminal too, and cells can outlive it: capture.plan
-    // fails a run whose dispatch REJECTED, but a rejection is ambiguous (the
-    // addBulk may have landed with only the reply lost), and the fair-use
-    // reservation was released with it. A late cell would call the vendor and
-    // write a capture under a run that holds no reservation (checkpoint-4).
-    if (runRow.status === "failed") {
-      logger.log(`run ${payload.runId} has failed; skipping cell`);
+    // ANY TERMINAL RUN SKIPS THE CELL, not only canceled/failed. A late or replayed cell (admin DLQ replay,
+    // a redelivery) on a run the reaper or the last live cell already finalised would otherwise call the
+    // vendor - paid, and it spends a pacing token - and count a cell the run already accounted for.
+    // `failed` is also the case capture.plan creates when a dispatch REJECTED yet the addBulk may have
+    // landed: the fair-use reservation was released with it, and a late cell would capture under a run
+    // that holds none (checkpoint-4).
+    if (runRow.status !== "queued" && runRow.status !== "running") {
+      incrementCounter("nominara_capture_cells_skipped_terminal_run_total", { status: runRow.status });
+      logger.log({ event: "capture.cell.skipped_terminal_run", workspace_id: payload.workspaceId, run_id: payload.runId, status: runRow.status });
       return;
     }
 
@@ -220,7 +227,7 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       [payload.runId],
     );
 
-    const outcome = await captureCell(tx, liveCache, {
+    const cellInput: CaptureCellInput = {
       workspaceId: payload.workspaceId,
       projectId: payload.projectId,
       runId: payload.runId,
@@ -233,7 +240,38 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       locale: payload.locale,
       personaHint: payload.personaHint,
       normalizerVersion: NORMALIZER_VERSION,
-    }, undefined, recordSpend, ceilingReached);
+    };
+    let outcome: CaptureCellOutcome;
+    try {
+      outcome = await captureCell(tx, liveCache, cellInput, undefined, recordSpend, ceilingReached);
+    } catch (error) {
+      // SCANFIX D1 - THE LAST ATTEMPT RECORDS INSTEAD OF DYING. Until this, a cell whose retry ladder ran
+      // out threw its way into the dead-letter queue and left NO row: `captured + failed + skipped` never
+      // reached `planned`, so the run sat at running/queued for ever, the rollup was never requested and
+      // the customer saw no scores - even for the cells that had captured. Every attempt before the last
+      // still throws (the ladder is untouched); the final one writes the terminal `failed` row and carries
+      // on, so the run can finish.
+      if (!isFinalAttempt(job)) throw error;
+      try {
+        outcome = await recordExhaustedCell(tx, cellInput, error);
+      } catch {
+        // The terminal record itself could not be written (a database error aborted this transaction).
+        // Surface the ORIGINAL failure: the job reaches the dead-letter queue as before and the stuck-run
+        // reaper accounts for the cell. Never swallow an error to keep the happy path.
+        throw error;
+      }
+      incrementCounter("nominara_capture_cells_exhausted_total", {
+        engine_key: payload.engineKey,
+        error_code: outcome.kind === "captured" ? "replayed" : outcome.errorCode,
+      });
+      logger.warn({
+        event: "capture.cell.retries_exhausted",
+        workspace_id: payload.workspaceId,
+        run_id: payload.runId,
+        engine_key: payload.engineKey,
+        error_code: outcome.kind === "captured" ? "replayed" : outcome.errorCode,
+      });
+    }
 
     // E2E-B6a — `captured_cells` counts LIVE captures only (captures-and-facts.md).
     // An atomic increment, not a recount: concurrent cells each run in their own
@@ -321,32 +359,22 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     // A suppressed cell counts as a success. It produced an answer; that the
     // answer came from a cache rather than an engine is a fact about cost,
     // not about whether the question was answered.
-    const status = resolveRunOutcome({
-      successCount: progress.captured + progress.skipped,
-      totalCount: progress.planned,
-      hasDegradedEngine: progress.failed > 0,
-    });
-    const dbStatus = status === "success" ? "completed" : status;
+    // AND the shared `finalizeRun` moves the run to its terminal status and SETTLES THE MONEY in the same
+    // transaction (SCANFIX D2): a run that captured nothing is refunded in full, a partial run is charged
+    // in full. It returns null for the second of two cells finishing together, which keeps `run.completed`
+    // to one per run.
+    const finalised = await finalizeRun(tx, payload.workspaceId, progress);
+    if (finalised === null) return;
+    const dbStatus = finalised.status;
 
-    const finalised = await tx.query<{ finished_at: Date }>(
-      // `AND status <> ...` so two cells finishing together cannot both
-      // finalise: the second updates no rows and emits nothing, which is what
-      // keeps `run.completed` to one per run.
-      `UPDATE capture_runs SET status = $2, finished_at = now()
-        WHERE id = $1 AND status IN ('queued','running')
-        RETURNING finished_at`,
-      [payload.runId, dbStatus],
-    );
-    if (finalised.rows.length === 0) return;
-
-    const startedAt = runRow.started_at ?? finalised.rows[0]!.finished_at;
+    const startedAt = runRow.started_at ?? finalised.finishedAt;
     livePublisher.toWorkspace(payload.workspaceId, "run.completed", {
       run_id: payload.runId,
       project_id: payload.projectId,
-      status: dbStatus as "completed" | "partial" | "failed",
+      status: dbStatus,
       captured: progress.captured,
       failed: progress.failed,
-      duration_ms: Math.max(0, finalised.rows[0]!.finished_at.getTime() - startedAt.getTime()),
+      duration_ms: Math.max(0, finalised.finishedAt.getTime() - startedAt.getTime()),
       // NULL, NOT ZERO. §11's own note: a delta is signed and may be zero, and
       // null is "no previous run to compare against" — a different fact. There
       // is no visibility score to compare at all until EPIC-05's scoring core
@@ -363,6 +391,17 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       });
     }
   };
+}
+
+/**
+ * Is this delivery the job's LAST? BullMQ increments `attemptsMade` when an attempt fails, so during
+ * attempt N it is N-1. Absent `opts.attempts` (a hand-built job) is "not known to be final": the error
+ * propagates exactly as it always did.
+ */
+function isFinalAttempt(job: Job): boolean {
+  const attempts = job.opts?.attempts;
+  if (attempts === undefined) return false;
+  return (job.attemptsMade ?? 0) + 1 >= attempts;
 }
 
 /**

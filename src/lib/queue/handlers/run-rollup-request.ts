@@ -34,8 +34,14 @@ export interface RunRollupTarget {
  *
  * THE RUN ROW IS LOCKED FIRST. "Is the run complete" is a read-then-decide, and
  * under READ COMMITTED two cells finishing at once each see the OTHER still
- * unsettled and both skip — the run is never rolled up. `FOR UPDATE` serialises
- * the completers; the second one's next statement then sees the first's commit.
+ * unsettled and both skip — the run is never rolled up. `FOR NO KEY UPDATE` serialises
+ * the completers (it conflicts with itself); the second one's next statement then sees the first's commit.
+ *
+ * NOT `FOR UPDATE` (SCANFIX D5): `capture.execute` holds `FOR KEY SHARE` on the run for its whole
+ * transaction so the stuck-run reaper waits for a cell in flight. `FOR UPDATE` conflicts with KEY SHARE, so
+ * two cells that each held it and each then asked for `FOR UPDATE` waited on one another: a deadlock.
+ * `FOR NO KEY UPDATE` does not conflict with KEY SHARE, serialises completers just the same, and the
+ * reaper's `FOR UPDATE` still conflicts with it.
  *
  * AFTER COMMIT: the rollup job runs on another connection and must see this
  * transaction's facts. One key per run, so a replay or a force re-parse does not
@@ -50,7 +56,7 @@ export async function requestRollupIfRunComplete(
 ): Promise<void> {
   const { runId, projectId, workspaceId } = target;
   if (runId === null) return;
-  const run = await tx.query("SELECT 1 FROM capture_runs WHERE id = $1 FOR UPDATE", [runId]);
+  const run = await tx.query("SELECT 1 FROM capture_runs WHERE id = $1 FOR NO KEY UPDATE", [runId]);
   if (run.rowCount === 0) return;
 
   const progress = await readRunProgress(tx, runId);

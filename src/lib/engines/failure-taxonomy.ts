@@ -20,12 +20,18 @@ export type CaptureFailureCode = z.infer<typeof captureFailureCodeSchema>;
 export class CaptureFailureError extends Error {
   readonly code: CaptureFailureCode;
   readonly engineKey: EngineKey;
+  /**
+   * The vendor's own "come back in N ms" (Retry-After), when it sent one. `undefined` is "the
+   * vendor said nothing" and `0` is "retry now" - two different facts, never collapsed.
+   */
+  readonly retryAfterMs: number | undefined;
 
-  constructor(code: CaptureFailureCode, engineKey: EngineKey, message?: string) {
+  constructor(code: CaptureFailureCode, engineKey: EngineKey, message?: string, options: { readonly retryAfterMs?: number } = {}) {
     super(message ?? `capture failed for '${engineKey}': ${code}`);
     this.name = "CaptureFailureError";
     this.code = code;
     this.engineKey = engineKey;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 

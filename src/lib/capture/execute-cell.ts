@@ -270,6 +270,44 @@ export async function captureCell(
   return { kind: "captured", latencyMs: raw.latencyMs };
 }
 
+/** The `error_code` of a cell whose retries ran out on an error that carried no engine code of its own. */
+export const RETRIES_EXHAUSTED = "retries_exhausted";
+
+/**
+ * SCANFIX D1 - the TERMINAL RECORD for a cell whose retry ladder is spent.
+ *
+ * `captureCell` throws retryable failures so BullMQ can retry them; on the last attempt that throw
+ * used to be the end of the cell - the job went to the dead-letter queue and NO row was written, so
+ * `captured + failed + skipped` could never reach `planned` and the run never finished. The handler
+ * calls this on the final attempt instead: the cell becomes a `failed` row carrying the engine's own
+ * code (`rate_limited`, `timeout`, `upstream_5xx`) or `retries_exhausted` for an unclassified fault.
+ *
+ * Idempotent: if the cell already has a row (a throw AFTER the row was written) nothing is added.
+ * Runs in the same transaction as the attempt that just threw, whose advisory lock is still held.
+ */
+export async function recordExhaustedCell(
+  tx: ClientBase,
+  input: CaptureCellInput,
+  error: unknown,
+  now: Date = new Date(),
+): Promise<CaptureCellOutcome> {
+  const existing = await tx.query<{ status: string; error_code: string | null }>(
+    `SELECT status, error_code FROM answer_captures
+      WHERE run_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = $4
+      ORDER BY captured_at DESC LIMIT 1`,
+    [input.runId, input.promptId, input.engineKey, input.sampleIndex],
+  );
+  const prior = existing.rows[0];
+  if (prior !== undefined) {
+    if (prior.status === "failed") return { kind: "failed", errorCode: prior.error_code ?? RETRIES_EXHAUSTED };
+    if (prior.status === "blocked") return { kind: "blocked", errorCode: prior.error_code ?? "blocked" };
+    return { kind: "captured", latencyMs: 0, replayed: true };
+  }
+  const errorCode = error instanceof CaptureFailureError ? error.code : RETRIES_EXHAUSTED;
+  await writeCell(tx, input, now, { status: "failed", errorCode });
+  return { kind: "failed", errorCode };
+}
+
 type CellWrite =
   | { readonly status: "captured"; readonly adapter: CaptureAdapter; readonly raw: RawCapture }
   | { readonly status: "blocked" | "failed"; readonly errorCode: string };

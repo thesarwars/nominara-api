@@ -358,6 +358,10 @@ export const envSchema = z
     // NEW-A-4 — optional: absent leaves Gemini honestly not capture-ready (registry.ts), it
     // does not fail boot. Never logged, never echoed in an error.
     GEMINI_API_KEY: requiredString.optional(),
+    // SCANFIX D3 - the pace the capture dispatcher holds Gemini to, in requests per minute. Default 10 =
+    // the free tier of gemini-2.5-flash; raise it with the paid quota. It builds a ONE-token bucket
+    // (no burst above the rate) and takes precedence over ENGINE_TOKEN_BUCKETS.gemini.
+    GEMINI_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
 
     // NEW-D-2 — Stripe (SANDBOX keys in every environment this week). All three
     // are OPTIONAL, deliberately: the API must boot without a payment provider,
