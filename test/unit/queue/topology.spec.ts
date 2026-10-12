@@ -298,6 +298,19 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "A balance debit that leaves a workspace below its threshold enqueues one signed tenant job; the worker verifies the signature before any context is " +
       "set, then evaluates and charges. §4's table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed. STORY-076.",
   },
+  "credit.housekeeping": {
+    workerGroup: "rollup",
+    because:
+      "STORY-076 AC4 / STORY-071 AC10: purchased credits expire FIFO twelve months after purchase (plans-and-entitlements.md §5) and credit_daily_counters rows " +
+      "older than 35 days are purged nightly (schemas/billing-and-credits.md). expireCredits and purgeDailyCounters were built and tested and had no caller. " +
+      "§4's table allocates no queue to either. One queue because both need the same privileged cross-tenant connection; independent steps in the handler.",
+  },
+  "retention.purge": {
+    workerGroup: "rollup",
+    because:
+      "STORY-077 R4 / STORY-013: runDailyPurgeCycle (data-model.md §7, 'nightly') hard-deletes soft-deleted projects past 30 days and workspaces past their " +
+      "deletion grace, and had no caller. §4's table allocates it no queue. The handler is a no-op unless RETENTION_PURGE_ENABLED=true — it deletes customer data.",
+  },
 };
 
 describe("STORY-030 · queue topology declares §4's 21 queues, plus what we have added on purpose", () => {
@@ -381,7 +394,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     }
   });
 
-  it("marks tenantScoped=false only for the four cross-tenant system jobs; true for every other queue", () => {
+  it("marks tenantScoped=false only for the six cross-tenant system jobs; true for every other queue", () => {
     // ⚠ THE SHORT LIST IS THE ASSERTION. A tenant-scoped queue cannot be
     // driven by a bare cron tick — `createJobProcessor` verifies a signature
     // before the handler is reached — so this set is exactly the set of
@@ -389,7 +402,14 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     // the rest. `audit.verify` joins it because a verifier that could only see
     // one workspace would not be a verifier.
     const systemScoped = QUEUE_TOPOLOGY.filter((entry) => !entry.tenantScoped).map((entry) => entry.name).sort();
-    expect(systemScoped).toEqual(["audit.verify", "credit.reconcile", "identity.sweep_unverified", "maintenance.partition"]);
+    expect(systemScoped).toEqual([
+      "audit.verify",
+      "credit.housekeeping",
+      "credit.reconcile",
+      "identity.sweep_unverified",
+      "maintenance.partition",
+      "retention.purge",
+    ]);
   });
 
   it("configures deploy.cms with an empty retry ladder — a single attempt, no automatic retry", () => {

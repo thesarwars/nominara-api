@@ -216,6 +216,13 @@ export const envSchema = z
     // failure this codebase keeps finding.
     OTP_DEV_LOG_CODES: z.literal("true").optional(),
 
+    // STORY-077 R4 / STORY-013 — switches on the nightly retention purge (`retention.purge`), which HARD-DELETES
+    // soft-deleted projects past 30 days and workspaces past their deletion grace. OFF unless exactly "true": a typo,
+    // "1" or "yes" is REFUSED at boot rather than guessed at, because guessing wrong here deletes customer data.
+    // Leave it off until an object store, the workspace-export sink, the retention-shortening notice and legal hold
+    // exist — see src/lib/queue/handlers/retention-purge.handler.ts for why each one matters.
+    RETENTION_PURGE_ENABLED: z.literal("true").optional(),
+
     // STORY-025 — the Valkey CACHE instance. system-architecture.md §11
     // mandates two: this one (allkeys-lru, persistence off) for token
     // buckets, idempotency records, locks and memoisation, and a separate

@@ -34,6 +34,9 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "identity.sweep_unverified",
     // NEW-D-7 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "billing.auto_topup",
+    // STORY-076 / STORY-071 and STORY-077 R4 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "credit.housekeeping",
+    "retention.purge",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],
@@ -276,6 +279,38 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
         const next = new Date(Number(found[0]!.next));
         expect(next.getUTCHours()).toBe(2);
         expect(next.getUTCMinutes()).toBe(50);
+      } finally {
+        await probe.close();
+      }
+    } finally {
+      await app.close();
+    }
+  }, 20_000);
+
+  it.each([
+    ["credit.housekeeping", "30 2 * * *", 2, 30],
+    ["retention.purge", "40 3 * * *", 3, 40],
+  ] as const)("⚠ WORKER_GROUP=rollup schedules %s at %s UTC", async (queue, pattern, hour, minute) => {
+    // STORY-076 AC4 / STORY-071 AC10 / STORY-077 R4: a handler and a cron are worth nothing if the boot does not
+    // register the repeatable. `retention.purge` is SCHEDULED and a no-op until RETENTION_PURGE_ENABLED=true.
+    await mockConnectionSpy();
+    process.env.WORKER_GROUP = "rollup";
+    const { bootstrapWorker } = await import("../../src/worker.js");
+    const app = await bootstrapWorker();
+    try {
+      const probe = new Queue(queue, {
+        connection: { url: fixture.connectionString },
+        prefix: queueKeyPrefix(process.env.NODE_ENV ?? "test"),
+      });
+      try {
+        const found = await probe.getJobSchedulers();
+        expect(found).toHaveLength(1);
+        expect(found[0]!.key).toBe(`cron:${queue}`);
+        expect(found[0]!.pattern).toBe(pattern);
+        expect((found[0] as { tz?: string }).tz).toBe("UTC");
+        const next = new Date(Number(found[0]!.next));
+        expect(next.getUTCHours()).toBe(hour);
+        expect(next.getUTCMinutes()).toBe(minute);
       } finally {
         await probe.close();
       }

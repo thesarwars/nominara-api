@@ -4,7 +4,9 @@ import { createBillingAutoTopupHandler } from "./handlers/billing-auto-topup.han
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCapturePlanHandler } from "./handlers/capture-plan.handler.js";
 import { createCaptureParseHandler } from "./handlers/capture-parse.handler.js";
+import { createCreditHousekeepingHandler } from "./handlers/credit-housekeeping.handler.js";
 import { createCreditReconcileHandler } from "./handlers/credit-reconcile.handler.js";
+import { createRetentionPurgeHandler } from "./handlers/retention-purge.handler.js";
 import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
 import { createIdentitySweepUnverifiedHandler } from "./handlers/identity-sweep-unverified.handler.js";
 import { createMaintenancePartitionHandler } from "./handlers/maintenance-partition.handler.js";
@@ -90,6 +92,8 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "capture.parse": (context) => createCaptureParseHandler(context),
   "rollup.metric_daily": (context) => createRollupMetricDailyHandler(context),
   "credit.reconcile": (context) => createCreditReconcileHandler(context),
+  "credit.housekeeping": (context) => createCreditHousekeepingHandler(context),
+  "retention.purge": (context) => createRetentionPurgeHandler(context),
   "maintenance.partition": (context) => createMaintenancePartitionHandler(context),
   "audit.verify": (context) => createAuditVerifyHandler(context),
   "identity.sweep_unverified": (context) => createIdentitySweepUnverifiedHandler(context),

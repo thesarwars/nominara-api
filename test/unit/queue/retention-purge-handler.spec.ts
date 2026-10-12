@@ -1,0 +1,124 @@
+import { Logger } from "@nestjs/common";
+import type { Job } from "bullmq";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// STORY-077 R4 / STORY-013 — `runDailyPurgeCycle` HARD-DELETES: projects 30 days after a soft delete, and workspaces
+// whose deletion grace has run out. It had no caller. These pin the part that matters most: scheduled is NOT enabled.
+// With `RETENTION_PURGE_ENABLED` unset the handler must not so much as open a connection.
+
+const state = vi.hoisted(() => ({
+  clients: [] as { ended: boolean }[],
+  locked: true,
+  cycleCalls: 0,
+  cycleThrows: false,
+  result: { projectsPurged: ["p1", "p2"] as string[], workspacesPurged: [] as string[], skipped: [] as { scope: string; scopeId: string; reason: string }[] },
+  unlocked: 0,
+}));
+
+vi.mock("../../../src/db/client.js", () => ({
+  connect: vi.fn(async () => {
+    const client = { ended: false, end: async () => void (client.ended = true), query: vi.fn() };
+    state.clients.push(client);
+    return client;
+  }),
+  withKeepalives: (url: string) => `${url}#keepalive`,
+}));
+vi.mock("../../../src/lib/queue/locks.js", async () => {
+  const actual = await vi.importActual<typeof import("../../../src/lib/queue/locks.js")>("../../../src/lib/queue/locks.js");
+  return {
+    ...actual,
+    tryAdvisorySessionLock: vi.fn(async () => state.locked),
+    releaseAdvisorySessionLock: vi.fn(async () => { state.unlocked += 1; return true; }),
+  };
+});
+vi.mock("../../../src/workers/rollup/retention.js", () => ({
+  runDailyPurgeCycle: vi.fn(async () => {
+    state.cycleCalls += 1;
+    if (state.cycleThrows) throw new Error("purge exploded");
+    return state.result;
+  }),
+}));
+
+import { createRetentionPurgeHandler } from "../../../src/lib/queue/handlers/retention-purge.handler.js";
+import { handlerFor, type QueueHandlerContext } from "../../../src/lib/queue/handlers.js";
+import { envSchema } from "../../../src/config/env.schema.js";
+
+const contextWith = (flag: string | undefined) =>
+  ({ pool: {} as never, env: { DATABASE_URL: "postgres://owner@direct/db", ...(flag !== undefined ? { RETENTION_PURGE_ENABLED: flag } : {}) } }) as unknown as QueueHandlerContext;
+const tick = { data: {} } as unknown as Job;
+const run = (flag: string | undefined) => createRetentionPurgeHandler(contextWith(flag))({} as never, tick);
+const metricNames = (log: { mock: { calls: unknown[][] } }) =>
+  log.mock.calls.map((call: unknown[]) => call[0] as Record<string, unknown>).filter((entry) => typeof entry?.metric === "string");
+
+beforeEach(() => {
+  state.clients.length = 0;
+  state.locked = true;
+  state.cycleCalls = 0;
+  state.cycleThrows = false;
+  state.result = { projectsPurged: ["p1", "p2"], workspacesPurged: [], skipped: [] };
+  state.unlocked = 0;
+});
+afterEach(() => vi.restoreAllMocks());
+
+describe("retention.purge — OFF by default", () => {
+  it("is registered, so the schedule exists and the cadence is declared in one place", () => {
+    expect(handlerFor("retention.purge")).toBeDefined();
+  });
+
+  it.each([undefined, "", "false", "1", "yes", "TRUE", "True"])("does NOT run, and opens NO connection, when RETENTION_PURGE_ENABLED is %j", async (flag) => {
+    const log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    await run(flag);
+    expect(state.cycleCalls).toBe(0);
+    expect(state.clients).toHaveLength(0);
+    expect(metricNames(log).some((entry) => entry.metric === "nominara_retention_purge_skipped_total" && entry.reason === "disabled")).toBe(true);
+  });
+
+  it("the env schema accepts exactly \"true\" and rejects every other spelling at boot", () => {
+    const shape = envSchema.shape.RETENTION_PURGE_ENABLED;
+    expect(shape.safeParse("true").success).toBe(true);
+    expect(shape.safeParse(undefined).success).toBe(true);
+    for (const bad of ["1", "yes", "TRUE", "on", ""]) expect(shape.safeParse(bad).success, bad).toBe(false);
+  });
+});
+
+describe("retention.purge — enabled", () => {
+  it("runs the purge cycle on ONE direct owner connection, single-flight, and ends the connection", async () => {
+    const { connect } = await import("../../../src/db/client.js");
+    await run("true");
+    expect(state.cycleCalls).toBe(1);
+    expect(connect).toHaveBeenCalledWith("postgres://owner@direct/db#keepalive");
+    expect(state.clients).toHaveLength(1);
+    expect(state.clients[0]!.ended).toBe(true);
+    expect(state.unlocked).toBe(1);
+  });
+
+  it("YIELDS when another replica holds the lock: nothing is purged", async () => {
+    state.locked = false;
+    vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    const log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    await run("true");
+    expect(state.cycleCalls).toBe(0);
+    expect(state.clients[0]!.ended).toBe(true);
+    expect(metricNames(log).map((entry) => entry.metric)).toContain("nominara_retention_purge_yielded_total");
+  });
+
+  it("counts projects and workspaces purged and what was skipped — IDs never appear in the log line", async () => {
+    state.result = { projectsPurged: ["p1", "p2"], workspacesPurged: ["w1"], skipped: [{ scope: "project", scopeId: "p3", reason: "export-lock-held" }] };
+    const log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    await run("true");
+    const line = log.mock.calls.map((call) => (typeof call[0] === "string" ? call[0] : "")).find((text) => text.includes("retention purge"));
+    expect(line).toContain("2 project(s)");
+    expect(line).toContain("1 workspace(s)");
+    expect(line).toContain("1 skipped");
+    expect(line).not.toMatch(/\bp1\b|\bw1\b|\bp3\b/u);
+    expect(metricNames(log).map((entry) => entry.metric)).toContain("nominara_retention_purge_runs_total");
+  });
+
+  it("lets a cycle that throws fail the job (the retry ladder) and still ends the connection", async () => {
+    state.cycleThrows = true;
+    vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
+    await expect(run("true")).rejects.toThrow(/purge exploded/u);
+    expect(state.clients[0]!.ended).toBe(true);
+  });
+});

@@ -357,6 +357,39 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "autotopup:{workspace}:{yyyy_mm_dd_hh_mm}",
     tenantScoped: true,
   },
+  // ⚠ THE FIFTH QUEUE §4 DOES NOT CONTAIN, added by the same precedent. STORY-076 AC4 / STORY-071 AC10: purchased
+  // credits expire FIFO twelve months after purchase (`plans-and-entitlements.md` §5) and `credit_daily_counters` rows
+  // older than 35 days are purged nightly (`schemas/billing-and-credits.md`). `expireCredits` and `purgeDailyCounters`
+  // were built and tested and had no caller. ONE queue for both because both need the same privileged cross-tenant
+  // connection; they stay independent steps in the handler. Not tenant-scoped (it discovers across workspaces, then
+  // writes each one's expiry inside that workspace's own tenant context). Advisory-locked (`locks.ts`): concurrency 1
+  // bounds one Worker instance, not the queue. Idempotent under redelivery — the expiry is a recomputation, not an
+  // increment — so the ladder is the ordinary three.
+  {
+    name: "credit.housekeeping",
+    producer: "cron daily (STORY-076 AC4, STORY-071 AC10; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "credithk:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
+  // ⚠ THE SIXTH, AND THE ONE THAT DELETES CUSTOMER DATA. STORY-077 R4 / STORY-013: `runDailyPurgeCycle` hard-deletes
+  // projects 30 days after a soft delete and executes workspace deletions past their grace period
+  // (`data-model.md` §7). The queue and its schedule exist so the cadence is declared in one place, but THE HANDLER DOES
+  // NOTHING UNLESS `RETENTION_PURGE_ENABLED=true`, and that flag is off by default — see
+  // `handlers/retention-purge.handler.ts` for why. Not tenant-scoped (cross-tenant discovery, owner connection).
+  {
+    name: "retention.purge",
+    producer: "cron daily (STORY-077 R4, data-model.md §7; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "retpurge:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",
