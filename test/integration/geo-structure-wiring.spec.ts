@@ -84,10 +84,13 @@ describe("STORY-060 · A3 is computed by the rollup handler from parser output",
     return { id, at };
   }
 
+  // As the worker runs it: inside the job's tenant transaction, which owns COMMIT and the after-commit tasks.
   const parse = (engineKey: string, c: { id: string; at: string }) =>
-    createCaptureParseHandler({ pool: undefined, env: { VALKEY_CACHE_URL: testCacheRedisUrl() } } as unknown as QueueHandlerContext)(db, {
-      data: { payload: { workspaceId, kid: "k", resultId: c.id, projectId, promptId, engineKey, capturedAt: c.at, force: false } },
-    } as unknown as Job);
+    withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) =>
+      createCaptureParseHandler({ pool: undefined, env: { VALKEY_CACHE_URL: testCacheRedisUrl() } } as unknown as QueueHandlerContext)(tx, {
+        data: { payload: { workspaceId, kid: "k", resultId: c.id, projectId, promptId, engineKey, capturedAt: c.at, force: false } },
+      } as unknown as Job),
+    );
 
   const rollup = () =>
     createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext)(db, {
