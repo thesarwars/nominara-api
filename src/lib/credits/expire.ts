@@ -15,8 +15,28 @@ import { expireCredits } from "./balance.js";
 // ⚠ HOW MANY — THE ACCOUNTING, because the wallet holds ONE `purchased_balance` and not a balance per lot.
 //
 //   P  the wallet's purchased balance now.
-//   T  every credit ever landed by a SUCCEEDED purchase (`credit_purchases.status = 'succeeded'`).
-//   E  the part of T whose lot has elapsed (`expires_at <= now()`).
+//   T  every credit that ever entered the purchased bucket and is not an expiry candidate's consumption:
+//        - credits landed by a SUCCEEDED purchase (`credit_purchases.status = 'succeeded'`), one lot each, PLUS
+//        - net-positive `adjustment` entries on the purchased bucket (a goodwill credit): credits with NO lot and NO
+//          expiry. They are treated as non-expiring lots, the youngest of all.
+//   E  the part of T whose lot has elapsed (`expires_at <= now()`). Adjustments are never in E.
+//
+// WHY THE ADJUSTMENTS MUST BE IN T. `consumed = T - P` is only true if every credit that raised P is in T. A positive
+// adjustment raised P without raising T, so it read as NEGATIVE consumption and inflated `E - consumed`: lot 100
+// elapsed, 100 spent, +100 goodwill, and the sweep expired the goodwill. Only POSITIVE adjustment entries are added; a
+// negative adjustment is a debit and stays consumption (oldest lot first), exactly like a spend.
+//
+// THE OTHER WAYS CREDITS REACH THE PURCHASED BUCKET (decision, from the ledger's entry types):
+//   purchase     only the Stripe credit-pack handler writes it, in the same transaction that marks the lot
+//                `succeeded`, so every `purchase` entry has a lot. In T through the lot.
+//   refund       `run-settlement` and `undo` put back credits a run debit took from the bucket. That is the reversal of
+//                a consumption, so it is deliberately NOT added to T: it lowers `T - P` and the credits return to the
+//                oldest lot's remainder, as if never spent. (If that lot has elapsed they can expire; if the debit
+//                came from a younger lot that is a known, bounded over-expiry of an undo that straddles an elapsed
+//                lot, accepted because the alternative, tracking per-lot balances, is a schema change.)
+//   grant        included bucket only.
+//   release      moves `reserved`, never a balance.
+// A NEW code path that credits the purchased bucket without a lot MUST be added here, or it will be expired as one.
 //
 // Spending is oldest-lot-first (FIFO by expiry), so whatever has left the bucket — spent, expired before, or
 // adjusted away — came out of the OLDEST lots first. Everything that is not in P is therefore consumption:
@@ -34,10 +54,14 @@ import { expireCredits } from "./balance.js";
 // either violate the constraint (the sweep fails) or strand the action. So the sweep takes what it can without
 // touching the hold and the next run — after the action commits or the reconciler releases it — takes the rest.
 //
-// ⚠ IT ERRS TOWARD UNDER-EXPIRING, deliberately. Credits that return to the bucket (a refund, an adjustment) lower
-// `T - P` and so leave more of an elapsed lot expirable, never less of a live one; a credit the customer still owns
-// under a live lot is never expired, because `P` bounds the answer and the live lots are the youngest, consumed last.
-// A lot with no `expires_at` (a sales grant) is in T and never in E: it is the youngest by construction.
+// ⚠ THE LEDGER KEY IS MONOTONIC PER EXPIRY: `expire:purchased:<cumulative credits expired from the bucket, including
+// this entry>`. A day-and-amount key collided whenever two expiries on one day were the same size (a hold released
+// after a partial expiry), and the collision rolled the second expiry back silently. The cumulative total strictly
+// rises with every applied entry, so two different expiries never share a key, and a redelivery of the same one
+// (same cumulative total) is refused by the unique index.
+//
+// ⚠ IT ERRS TOWARD UNDER-EXPIRING, deliberately: `P` bounds the answer, and the live lots (and adjustments) are the
+// youngest, consumed last. A lot with no `expires_at` (a sales grant) is in T and never in E for the same reason.
 //
 // ⚠ INCLUDED CREDITS ARE NOT THIS JOB'S. Included expiry is the cycle-end grant refresh (STORY-075), which resets
 // the bucket rather than expiring a lot of it.
@@ -54,7 +78,7 @@ export interface ExpiryConnections {
 }
 
 export interface ExpiryOutcome {
-  /** Workspaces with at least one elapsed succeeded lot. */
+  /** Workspaces with at least one elapsed succeeded lot and a purchased balance (or no wallet, which fails). */
   readonly workspacesChecked: number;
   /** Of those, the ones that actually had credits to expire. */
   readonly workspacesExpired: number;
@@ -77,6 +101,7 @@ export function expirableCredits(input: {
   readonly included: number;
   readonly reserved: number;
   readonly elapsedLots: number;
+  /** Every credit that entered the bucket as a lot or a net-positive adjustment (adjustments are never elapsed). */
   readonly allLots: number;
 }): number {
   const consumed = Math.max(0, input.allLots - input.purchased);
@@ -87,11 +112,16 @@ export function expirableCredits(input: {
 
 export async function expireDuePurchasedCredits(connections: ExpiryConnections): Promise<ExpiryOutcome> {
   // Only workspaces that HAVE an elapsed succeeded lot are opened at all: the common night is a no-op.
+  // ...and of those, only wallets that still HOLD purchased credits: once a workspace's bucket is empty its old elapsed
+  // lot has nothing left to expire, and must not be reopened every night forever. The LEFT JOIN keeps a workspace with
+  // NO wallet row in the list on purpose: that is a sequencing bug the sweep reports as a failure, not a skip.
   const due = await connections.discovery.query<{ workspace_id: string }>(
-    `SELECT DISTINCT workspace_id
-       FROM credit_purchases
-      WHERE status = 'succeeded' AND expires_at IS NOT NULL AND expires_at <= now()
-      ORDER BY workspace_id`,
+    `SELECT DISTINCT p.workspace_id
+       FROM credit_purchases p
+       LEFT JOIN credit_wallets w ON w.workspace_id = p.workspace_id
+      WHERE p.status = 'succeeded' AND p.expires_at IS NOT NULL AND p.expires_at <= now()
+        AND (w.workspace_id IS NULL OR w.purchased_balance > 0)
+      ORDER BY p.workspace_id`,
   );
 
   let workspacesExpired = 0;
@@ -139,11 +169,22 @@ async function expireForWorkspace(tx: ClientBase, workspaceId: string): Promise<
     throw new Error(`workspace ${workspaceId} has elapsed credit lots and no credit wallet`);
   }
 
-  const lots = await tx.query<{ elapsed: string; total: string }>(
+  const lots = await tx.query<{ elapsed: string; total: string; newest_elapsed_id: string | null }>(
     `SELECT coalesce(sum(credits) FILTER (WHERE expires_at IS NOT NULL AND expires_at <= now()), 0)::text AS elapsed,
-            coalesce(sum(credits), 0)::text AS total
+            coalesce(sum(credits), 0)::text AS total,
+            (array_agg(id ORDER BY expires_at DESC, id) FILTER (WHERE expires_at IS NOT NULL AND expires_at <= now()))[1]::text
+              AS newest_elapsed_id
        FROM credit_purchases
       WHERE workspace_id = $1 AND status = 'succeeded'`,
+    [workspaceId],
+  );
+
+  // Read under the wallet lock like everything above. Positive adjustments only: see the header.
+  const ledger = await tx.query<{ adjusted: string; expired: string }>(
+    `SELECT coalesce(sum(credits) FILTER (WHERE entry_type = 'adjustment' AND credits > 0), 0)::text AS adjusted,
+            coalesce(sum(credits) FILTER (WHERE entry_type = 'expire'), 0)::text AS expired
+       FROM credit_ledger
+      WHERE workspace_id = $1 AND bucket = 'purchased' AND entry_type IN ('adjustment', 'expire')`,
     [workspaceId],
   );
 
@@ -152,16 +193,22 @@ async function expireForWorkspace(tx: ClientBase, workspaceId: string): Promise<
     included: Number(row.included_balance),
     reserved: Number(row.reserved),
     elapsedLots: Number(lots.rows[0]!.elapsed),
-    allLots: Number(lots.rows[0]!.total),
+    allLots: Number(lots.rows[0]!.total) + Number(ledger.rows[0]!.adjusted),
   });
   if (amount === 0) return 0;
 
-  // The key carries the day AND the amount: a same-day redelivery that recomputes the same amount is a ledger no-op
-  // (the unique index), and a genuinely different amount (a hold released since) is a different, legitimate entry.
-  const day = new Date().toISOString().slice(0, 10);
+  const newestElapsedLot = lots.rows[0]!.newest_elapsed_id;
+  const expiredAfter = Number(ledger.rows[0]!.expired) + amount;
   const outcome = await expireCredits(
     tx,
-    { workspaceId, idempotencyKey: `expire:${day}:${String(amount)}`, actorId: null, actorType: "system" },
+    {
+      workspaceId,
+      idempotencyKey: `expire:purchased:${String(expiredAfter)}`,
+      actorId: null,
+      actorType: "system",
+      // The newest elapsed lot this entry covers; the ledger's reference is a single id.
+      ...(newestElapsedLot === null ? {} : { referenceType: "credit_purchase", referenceId: newestElapsedLot }),
+    },
     "purchased",
     amount,
   );

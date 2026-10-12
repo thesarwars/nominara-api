@@ -120,6 +120,11 @@ describe("STORY-135 · capture.parse", () => {
     return createCaptureParseHandler(context, deps);
   }
 
+  /** The handler as the worker runs it: inside the job's tenant transaction, which owns COMMIT and the after-commit tasks. */
+  function run(h: ReturnType<typeof handler>, j: Job): Promise<void> {
+    return withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => h(tx, j));
+  }
+
   function job(resultId: string, force = false): Job {
     return {
       data: {
@@ -139,7 +144,7 @@ describe("STORY-135 · capture.parse", () => {
 
   it("parses a real answer into fact rows and marks the capture parsed", async () => {
     const resultId = await seedCapture(ANSWER);
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const capture = await db.query<{ status: string; brand_present: boolean; sov: number; citation_count: number }>(
       "SELECT status, brand_present, sov, citation_count FROM answer_captures WHERE id = $1",
@@ -152,7 +157,7 @@ describe("STORY-135 · capture.parse", () => {
 
   it("writes the brand AND the competitor, with the competitor's id", async () => {
     const resultId = await seedCapture(ANSWER);
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const mentions = await db.query<{ entity_type: string; entity_label: string; entity_id: string | null }>(
       "SELECT entity_type, entity_label, entity_id FROM mention_facts WHERE result_id = $1 ORDER BY char_start",
@@ -173,7 +178,7 @@ describe("STORY-135 · capture.parse", () => {
     expect(rows.rows[0]!.brand_aliases).toEqual([]);
 
     const resultId = await seedCapture(ANSWER);
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const brand = await db.query("SELECT 1 FROM mention_facts WHERE result_id = $1 AND entity_type = 'brand'", [resultId]);
     expect(brand.rowCount).toBeGreaterThan(0);
@@ -181,7 +186,7 @@ describe("STORY-135 · capture.parse", () => {
 
   it("records the untracked entity — the precondition that cannot be retrofitted", async () => {
     const resultId = await seedCapture(ANSWER);
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const other = await db.query<{ entity_label: string; entity_id: string | null }>(
       "SELECT entity_label, entity_id FROM mention_facts WHERE result_id = $1 AND entity_type = 'other'",
@@ -197,7 +202,7 @@ describe("STORY-135 · capture.parse", () => {
     // off-by-one here renders every highlight in the drawer in the wrong
     // place, silently.
     const resultId = await seedCapture(ANSWER);
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const rows = await db.query<{
       entity_label: string;
@@ -227,7 +232,7 @@ describe("STORY-135 · capture.parse", () => {
     // caused it. The columns are NOT NULL, so this also proves nothing was
     // invented to satisfy them.
     const resultId = await seedCapture(ANSWER);
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const rows = await db.query<{ sentiment_label: string; sentiment_method: string; evidence_start: number | null }>(
       "SELECT sentiment_label, sentiment_method, evidence_start FROM mention_facts WHERE result_id = $1",
@@ -242,7 +247,7 @@ describe("STORY-135 · capture.parse", () => {
 
   it("classifies HubSpot as recommended and Salesforce past a contrastive pivot", async () => {
     const resultId = await seedCapture(ANSWER);
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const rows = await db.query<{ entity_label: string; position_class: string; prominence: number }>(
       "SELECT entity_label, position_class, prominence FROM mention_facts WHERE result_id = $1",
@@ -260,7 +265,7 @@ describe("STORY-135 · capture.parse", () => {
 
   it("classifies an owned citation as owned, on a SUBDOMAIN", async () => {
     const resultId = await seedCapture(ANSWER);
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const citations = await db.query<{ domain: string; is_owned: boolean; normalized_url: string }>(
       "SELECT domain, is_owned, normalized_url FROM citation_facts WHERE result_id = $1 ORDER BY slot_index",
@@ -279,10 +284,10 @@ describe("STORY-135 · capture.parse", () => {
     // change moving every offset, so the facts are deleted and rewritten.
     const resultId = await seedCapture(ANSWER);
     const process = handler();
-    await process(db, job(resultId));
+    await run(process, job(resultId));
 
     const first = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM mention_facts WHERE result_id = $1", [resultId]);
-    await process(db, job(resultId, true));
+    await run(process, job(resultId, true));
     const second = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM mention_facts WHERE result_id = $1", [resultId]);
 
     expect(second.rows[0]!.n).toBe(first.rows[0]!.n);
@@ -291,16 +296,16 @@ describe("STORY-135 · capture.parse", () => {
   it("SHORT-CIRCUITS an unchanged re-parse, and `force` overrides it", async () => {
     const resultId = await seedCapture(ANSWER);
     const process = handler();
-    await process(db, job(resultId));
+    await run(process, job(resultId));
     await db.query("DELETE FROM mention_facts WHERE result_id = $1", [resultId]);
 
     // Nothing changed, so the prior parse still holds and no work is redone.
-    await process(db, job(resultId));
+    await run(process, job(resultId));
     const skipped = await db.query("SELECT 1 FROM mention_facts WHERE result_id = $1", [resultId]);
     expect(skipped.rowCount).toBe(0);
 
     // `force` is what a re-parse endpoint sends, and it must recompute.
-    await process(db, job(resultId, true));
+    await run(process, job(resultId, true));
     const forced = await db.query("SELECT 1 FROM mention_facts WHERE result_id = $1", [resultId]);
     expect(forced.rowCount).toBeGreaterThan(0);
   });
@@ -308,14 +313,14 @@ describe("STORY-135 · capture.parse", () => {
   it("re-parses when a COMPETITOR IS ADDED, because the alias set changed", async () => {
     const resultId = await seedCapture(ANSWER);
     const process = handler();
-    await process(db, job(resultId));
+    await run(process, job(resultId));
 
     await db.query(
       `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source)
        VALUES ($1, $2, $3, 'Zoho CRM', 'zoho.com', ARRAY[]::text[], 'user')`,
       [randomUUID(), workspaceId, projectId],
     );
-    await process(db, job(resultId));
+    await run(process, job(resultId));
 
     // Zoho was `other` before and is a tracked competitor now.
     const zoho = await db.query<{ entity_type: string }>(
@@ -329,7 +334,7 @@ describe("STORY-135 · capture.parse", () => {
     // `blocked` and `failed` carry an error code, and turning them into
     // `parsed` would erase the distinction the matrix depends on.
     const resultId = await seedCapture("", { status: "failed", payload: { text: "" } });
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
     expect(row.rows[0]!.status).toBe("failed");
@@ -340,14 +345,14 @@ describe("STORY-135 · capture.parse", () => {
     // A suppressed (L1/L2) row carries an excerpt and no payload text. Leaving
     // it `captured` would keep its run below 100% and keep the job returning.
     const resultId = await seedCapture("x", { payload: { text: "" } });
-    await handler()(db, job(resultId));
+    await run(handler(), job(resultId));
 
     const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
     expect(row.rows[0]!.status).toBe("parsed");
   });
 
   it("skips a capture that no longer exists rather than retrying it", async () => {
-    await expect(handler()(db, job(randomUUID()))).resolves.toBeUndefined();
+    await expect(run(handler(), job(randomUUID()))).resolves.toBeUndefined();
   });
 
   it("writes NOTHING when the parse throws — the facts and the capture land together", async () => {
@@ -355,9 +360,12 @@ describe("STORY-135 · capture.parse", () => {
     // inside the caller's transaction, so a failure after the mentions are
     // written must leave the capture unparsed too.
     const resultId = await seedCapture(ANSWER);
-    await db.query("BEGIN");
-    await handler()(db, job(resultId));
-    await db.query("ROLLBACK");
+    await expect(
+      withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await handler()(tx, job(resultId));
+        throw new Error("fails after the parse");
+      }),
+    ).rejects.toThrow("fails after the parse");
 
     const capture = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
     expect(capture.rows[0]!.status).toBe("captured");
@@ -372,7 +380,7 @@ describe("STORY-135 · capture.parse", () => {
     const pages: { message: string; context: Record<string, unknown> }[] = [];
     const alerts = new ParseAlertMonitor({ pager: { page: (message, context) => void pages.push({ message, context }) } });
 
-    await handler({ alerts })(db, job(resultId));
+    await run(handler({ alerts }), job(resultId));
 
     expect(pages).toHaveLength(1);
     expect(pages[0]!.context).toMatchObject({ alert: "citation_resolution_failure", engineKey: "google_ai_mode", attempted: 25, failed: 25 });
@@ -382,7 +390,7 @@ describe("STORY-135 · capture.parse", () => {
   it("[STORY-037 AC10] a pager that throws never fails the parse it observed", async () => {
     const resultId = await seedCapture(ANSWER);
     const alerts = { observe: () => { throw new Error("pager down"); } } as unknown as ParseAlertMonitor;
-    await expect(handler({ alerts })(db, job(resultId))).resolves.toBeUndefined();
+    await expect(run(handler({ alerts }), job(resultId))).resolves.toBeUndefined();
     const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
     expect(row.rows[0]!.status).toBe("parsed");
   });

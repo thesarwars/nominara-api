@@ -8,6 +8,7 @@ import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import { defaultParseAlertMonitor, observationFrom, type ParseAlertMonitor } from "../../parser/parse-alerts.js";
 import type { SentimentArbiter } from "../../parser/sentiment/arbiter.js";
 import { SCORING_VERSION } from "../../scoring/index.js";
+import { afterCommit } from "../../../tenancy/tenant-context.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
@@ -185,14 +186,18 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
     // Stage 6 — the facts and the capture, in the job's own transaction.
     await persistParse(tx, capture, result, aliasFingerprint);
 
-    // STORY-037 AC10 / STORY-038 AC12 / STORY-039 AC8 — feed the three alert meters from what was just persisted. An
-    // alert path that failed must never fail the parse it observed: the facts are already written, and a retry would
-    // run the whole parse again for a metering fault.
-    try {
-      (deps?.alerts ?? defaultParseAlertMonitor).observe(observationFrom(capture, result));
-    } catch (error) {
-      logger.error(`parse alert metering failed for capture ${payload.resultId}: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    // STORY-037 AC10 / STORY-038 AC12 / STORY-039 AC8 — feed the three alert meters from what was just persisted.
+    // AFTER COMMIT: the meters are cumulative, so observing inside the transaction counts an attempt that then rolls
+    // back and is retried — the same parse twice. An alert path that failed must never fail the parse it observed:
+    // the facts are committed, and a retry would run the whole parse again for a metering fault.
+    const observation = observationFrom(capture, result);
+    afterCommit(() => {
+      try {
+        (deps?.alerts ?? defaultParseAlertMonitor).observe(observation);
+      } catch (error) {
+        logger.error(`parse alert metering failed for capture ${payload.resultId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
 
     await requestRollupIfRunComplete(tx, record, payload.workspaceId);
 

@@ -333,8 +333,10 @@ describe("STORY-076 AC4 · expireDuePurchasedCredits", () => {
     await db.query("UPDATE credit_wallets SET reserved = 0 WHERE workspace_id = $1", [workspaceId]); // the hold is released
     expect(await sweep()).toMatchObject({ creditsExpired: 50, failures: [] }); // the same amount as the first
     expect(await purchased()).toBe(0);
-    expect((await expireEntries()).length).toBe(2);
-    expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+    const entries = await expireEntries();
+    expect(entries.map((entry) => entry.credits)).toEqual([50, 50]);
+    expect(new Set(entries.map((entry) => entry.idempotency_key)).size).toBe(2);
+    // (no wallet-vs-ledger verify here: the hold was set by a raw UPDATE, which the ledger rightly does not explain)
   });
 
   it("[AC4] the elapsed boundary is NOW: a lot expiring in an hour is not expired beside an elapsed one", async () => {
