@@ -603,6 +603,88 @@ describe("STORY-008 · projects, prompts & captures DDL", () => {
     expect(result.rowCount).toBe(1);
   });
 
+  // ---- AC 6 / AC 13 · index propagation and fact-table index shape ---------
+
+  const FACT_TABLES = ["answer_captures", "mention_facts", "citation_facts"] as const;
+
+  it("AC 6 — every parent-table index propagates to each partition child (monthly and default)", async () => {
+    for (const parent of FACT_TABLES) {
+      const parentIndexes = await client.query<{ indexname: string }>(
+        `SELECT i.relname AS indexname
+           FROM pg_index x
+           JOIN pg_class i ON i.oid = x.indexrelid
+          WHERE x.indrelid = $1::regclass AND i.relkind = 'I'`,
+        [parent],
+      );
+      expect(parentIndexes.rowCount, `${parent} declares indexes on the parent`).toBeGreaterThan(0);
+
+      const children = await client.query<{ child: string }>(
+        "SELECT c.relname AS child FROM pg_inherits h JOIN pg_class c ON c.oid = h.inhrelid WHERE h.inhparent = $1::regclass",
+        [parent],
+      );
+      const childNames = children.rows.map((r) => r.child);
+      // current month + next month + default: the migration's promise.
+      expect(childNames.length, `${parent} partition children`).toBeGreaterThanOrEqual(3);
+      expect(childNames, parent).toContain(`${parent}_default`);
+
+      for (const child of childNames) {
+        // Every parent index must have an index on this child that is attached
+        // to it (pg_inherits on the index relation), not merely a look-alike.
+        const attached = await client.query<{ parent_index: string }>(
+          `SELECT pi.relname AS parent_index
+             FROM pg_index cx
+             JOIN pg_inherits ih ON ih.inhrelid = cx.indexrelid
+             JOIN pg_class pi ON pi.oid = ih.inhparent
+            WHERE cx.indrelid = $1::regclass`,
+          [child],
+        );
+        const attachedTo = new Set(attached.rows.map((r) => r.parent_index));
+        for (const { indexname } of parentIndexes.rows) {
+          expect(attachedTo.has(indexname), `${child} carries ${indexname}`).toBe(true);
+        }
+        expect(attachedTo.size, `${child} has exactly the parent's indexes`).toBe(parentIndexes.rowCount);
+      }
+    }
+  });
+
+  it("AC 13 — block-range (BRIN) indexes exist on captured_at of all three fact tables", async () => {
+    const expected: Array<[string, string]> = [
+      ["ix_results_brin", "answer_captures"],
+      ["ix_mentions_brin", "mention_facts"],
+      ["ix_citations_brin", "citation_facts"],
+    ];
+    for (const [indexName, table] of expected) {
+      const result = await client.query<{ indexdef: string }>(
+        "SELECT indexdef FROM pg_indexes WHERE tablename = $1 AND indexname = $2",
+        [table, indexName],
+      );
+      expect(result.rowCount, indexName).toBe(1);
+      expect(result.rows[0]!.indexdef, indexName).toMatch(/USING brin \(captured_at\)/);
+    }
+  });
+
+  it("AC 13 — the range-scan indexes on the fact tables lead with workspace_id and end on captured_at DESC", async () => {
+    const rangeScan: Array<[string, string]> = [
+      ["ix_results_ws_proj_engine", "answer_captures"],
+      ["ix_results_prompt_time", "answer_captures"],
+      ["ix_mentions_entity_time", "mention_facts"],
+      ["ix_mentions_engine", "mention_facts"],
+      ["ix_mentions_render", "mention_facts"],
+      ["ix_mentions_position", "mention_facts"],
+      ["ix_citations_domain_time", "citation_facts"],
+    ];
+    for (const [indexName, table] of rangeScan) {
+      const result = await client.query<{ indexdef: string }>(
+        "SELECT indexdef FROM pg_indexes WHERE tablename = $1 AND indexname = $2",
+        [table, indexName],
+      );
+      expect(result.rowCount, indexName).toBe(1);
+      const columns = /\((.*)\)\s*(WHERE .*)?$/.exec(result.rows[0]!.indexdef)![1]!.split(",").map((c) => c.trim());
+      expect(columns[0], `${indexName} leads with the tenant column`).toBe("workspace_id");
+      expect(columns[columns.length - 1], `${indexName} ends on the time column`).toBe("captured_at DESC");
+    }
+  });
+
   // ---- scenario 10 --------------------------------------------------------
 
   it("scenario 10 — rolling the migration back is clean, partitions dropped with their parents", async () => {
