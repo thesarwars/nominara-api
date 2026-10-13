@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { SCORING_VERSION } from "../scoring/index.js";
 
 // STORY-042 — one day's facts, grouped.
 //
@@ -91,7 +92,7 @@ export async function aggregateDay(
   metricDate: string,
   timezone: string,
 ): Promise<DayAggregate[]> {
-  return aggregateRange(tx, projectId, metricDate, metricDate, timezone);
+  return aggregateRange(tx, projectId, metricDate, metricDate, timezone, SCORING_VERSION);
 }
 
 /**
@@ -238,8 +239,8 @@ export function capturedInRunStatusSql(statusColumn = "c.status"): string {
 
 /**
  * `scoringVersion` — STORY-136 AC9. When given, only rows stamped with that version are read: a capture, and each of
- * its mentions, written under another scoring version is not part of a score reported under this one. `null` (the
- * default) reads every version, which is what the rollup has always done; the scorecards read passes the library's
+ * its mentions, written under another scoring version is not part of a score reported under this one. `null` (never
+ * a default: callers say it) reads every version; the scorecards, panel and rollup pass the library's
  * current version, so a v2 row can never be summed into a v1 figure.
  */
 export async function aggregateRange(
@@ -248,7 +249,7 @@ export async function aggregateRange(
   fromDate: string,
   toDate: string,
   timezone: string,
-  scoringVersion: string | null = null,
+  scoringVersion: string | null,
 ): Promise<DayAggregate[]> {
   const result = await tx.query<Record<string, string | null>>(
     `WITH day_cells AS (

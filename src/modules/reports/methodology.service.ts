@@ -85,7 +85,7 @@ export class MethodologyService {
         GROUP BY engine_key`,
       [projectId, settings.scoring_version, CROSS_ENGINE_KEY, from, to],
     );
-    const sources = await engineDataSourcesForDates(tx, projectId, from, to, settings.timezone);
+    const sources = await engineDataSourcesForDates(tx, projectId, from, to, settings.timezone, settings.scoring_version);
 
     const overrides = z
       .object({ scoring_weights: weightOverridesSchema })

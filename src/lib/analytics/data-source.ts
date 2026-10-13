@@ -70,7 +70,7 @@ function toMap(rows: readonly CountRow[]): Map<string, DataSource> {
  * figure was computed from. Runs on the caller's tenant transaction.
  *
  * `scoringVersion` (STORY-136 AC9): when given, only captures stamped with it count — the scorecards pass the current
- * version so the marker describes the same rows the figure summed. `null` reads every version.
+ * version so the marker describes the same rows the figure summed. `null` reads every version and must be passed explicitly.
  */
 export async function engineDataSourcesForDates(
   tx: ClientBase,
@@ -78,7 +78,7 @@ export async function engineDataSourcesForDates(
   from: string,
   to: string,
   timezone: string,
-  scoringVersion: string | null = null,
+  scoringVersion: string | null,
 ): Promise<Map<string, DataSource>> {
   const result = await tx.query<CountRow>(
     `SELECT c.engine_key,

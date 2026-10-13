@@ -126,7 +126,7 @@ export class ExportService {
       const window = await resolveWindow(tx, projectId, days);
       const footer = await this.methodology.footer(projectId, { timeframe: body.timeframe });
       const scoringVersion = footer.scoring_version;
-      const sources = await engineDataSourcesForDates(tx, projectId, window.from, window.to, window.timezone);
+      const sources = await engineDataSourcesForDates(tx, projectId, window.from, window.to, window.timezone, scoringVersion);
       const wanted = new Set<ReportSection>(body.sections);
 
       const brand = await this.aggregate(tx, projectId, scoringVersion, "brand", window.from, window.to);
