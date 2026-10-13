@@ -6,22 +6,12 @@ import { useApiHarness } from "../support/api-harness.js";
 // STORY-024 T8 (RED step) — story scenario 8 and AC5/AC9. Red until T10
 // adds the response-envelope interceptor: no route wraps its body today.
 //
-// *** NFR-API-08 IS SPLIT, AND THIS FILE PROVES ONLY ONE HALF ***
-// AC9 reads "The request identifier IS the trace identifier, so a support
-// ticket resolves to a single trace with no lookup step."
-//
-//   Provable here: every response carries `meta.request_id`; an inbound
-//   `X-Request-Id` (§1's optional header) is honoured rather than replaced;
-//   one is generated when absent; and the value is echoed back on the
-//   response so a client can quote it.
-//
-//   NOT provable here, and deliberately not claimed: that the value IS an
-//   OpenTelemetry trace identifier. This repository has no OpenTelemetry —
-//   no `@opentelemetry/*` dependency, no trace_id anywhere in src/, and
-//   src/lib/telemetry/metrics.ts is a Logger shim whose own comment says no
-//   metrics library exists. `req.id` is Fastify's `req-N` counter. That half
-//   of AC9 is pending STORY-005 (telemetry, unmerged) and must be reported
-//   as pending — never ticked off the back of a green run of this file.
+// *** NFR-API-08 / AC9 — THE REQUEST IDENTIFIER IS THE TRACE IDENTIFIER ***
+// `meta.request_id` is the 32-hex OpenTelemetry trace id of the request's
+// server span (owner decision 2026-10-13); an inbound `X-Request-Id` or
+// `traceparent` does not choose it. That the value equals the ACTIVE span's
+// trace id is proved in test/unit/request-trace-id.spec.ts; this file proves
+// the same over a real stack: shape, echo on the response, uniqueness.
 //
 //   Also not covered here: that `meta.request_id` equals the value
 //   AuditInterceptor writes to `audit_log.request_id`. That correlation
@@ -67,23 +57,23 @@ describe("STORY-024 · scenario 8 — every response carries the request identif
     );
   });
 
-  // §1: "`X-Request-Id` — optional. Echoed in responses and logs; generated
-  // if absent." Honouring an inbound value is what lets a caller correlate
-  // its own log with the API's without a lookup step.
-  it("an inbound X-Request-Id is honoured, not replaced", async () => {
+  // Owner decision 2026-10-13 #2 — a caller cannot choose the identifier a
+  // support ticket quotes. Their X-Request-Id is a span attribute only.
+  it("an inbound X-Request-Id is NOT the identifier", async () => {
     const supplied = "req-from-the-caller-0001";
     const response = await otpRequest({ "x-request-id": supplied });
     const body = response.json<{ meta: { request_id: string } }>();
 
-    expect(body.meta.request_id).toBe(supplied);
-    expect(response.headers["x-request-id"], "the identifier must be echoed on the response").toBe(supplied);
+    expect(body.meta.request_id).not.toBe(supplied);
+    expect(body.meta.request_id).toMatch(/^[0-9a-f]{32}$/);
+    expect(response.headers["x-request-id"], "the trace id is what is echoed").toBe(body.meta.request_id);
   });
 
   it("a request identifier is generated when the caller supplies none, and echoed", async () => {
     const response = await otpRequest();
     const body = response.json<{ meta: { request_id: string } }>();
 
-    expect(body.meta.request_id).toBeTruthy();
+    expect(body.meta.request_id).toMatch(/^[0-9a-f]{32}$/);
     expect(response.headers["x-request-id"]).toBe(body.meta.request_id);
   });
 
