@@ -6,6 +6,8 @@ import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach } from "vitest";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
+import { BREAKGLASS_ROLE, RUNTIME_ROLES } from "../../src/db/conventions.js";
+import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { CACHE, type Cache } from "../../src/lib/cache/cache.port.js";
 import { applyFakeApiEnv } from "./fake-env.js";
@@ -62,6 +64,14 @@ export interface ApiHarnessOptions {
    * `ThrowingController` pattern in problem.filter.http.spec.ts). Global guards, interceptors and the filter still apply.
    */
   readonly extras?: Pick<ModuleMetadata, "controllers" | "providers" | "imports">;
+  /**
+   * STORY-021 — boot the application's own pools as the real `nominara_app` role (NOBYPASSRLS) instead of the
+   * container's superuser. The default is the superuser, which sees every workspace's rows: a cross-tenant assertion
+   * made through it passes for the wrong reason. A spec whose subject is tenant isolation (a statement with NO
+   * workspace predicate, relying on RLS) sets this. `db()` stays the superuser either way, so fixtures and
+   * inspection are unaffected.
+   */
+  readonly runAsAppRole?: boolean;
 }
 
 /** Call inside a `describe`. Registers the container/app lifecycle hooks and returns accessors. */
@@ -106,6 +116,17 @@ export function useApiHarness(options: ApiHarnessOptions = {}): ApiHarness {
     await db.query("DROP SCHEMA public CASCADE");
     await db.query("CREATE SCHEMA public");
     await migrateUp(db);
+
+    if (options.runAsAppRole === true) {
+      for (const role of [...RUNTIME_ROLES, BREAKGLASS_ROLE]) {
+        await db.query(`ALTER ROLE ${role} PASSWORD ${db.escapeLiteral(resolvePassword(role, {}))}`);
+      }
+      const asApp = new URL(container.getConnectionUri());
+      asApp.username = "nominara_app";
+      asApp.password = resolvePassword("nominara_app", {});
+      process.env.DATABASE_URL = asApp.toString();
+      process.env.DATABASE_URL_POOLED = asApp.toString();
+    }
 
     const builder = Test.createTestingModule({ ...options.extras, imports: [ApiModule, ...(options.extras?.imports ?? [])] });
     if (options.cache !== undefined) builder.overrideProvider(CACHE).useValue(options.cache());
