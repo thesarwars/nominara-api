@@ -734,4 +734,22 @@ describe("STORY-042 · rollup.metric_daily", () => {
 
     expect(Number(locks.rows[0]!.n)).toBeGreaterThan(0);
   });
+  it("STORY-136 AC9 — a day rolled up under the current scoring_version counts only that version's captures and mentions", async () => {
+    // metric_daily is keyed by scoring_version, so the v1 row must be v1's figure alone. Rolling every version into it
+    // would store a mixed number under a label that promises a pure one.
+    const at = "2026-09-10T12:00:00Z";
+    const current = await addCell({ capturedAt: at, brandPresent: true, sov: 0.5 });
+    await addMention(current, at);
+    const other = await addCell({ capturedAt: at, brandPresent: true, sov: 0.5 });
+    await addMention(other, at);
+    await db.query("UPDATE answer_captures SET scoring_version = 'v2' WHERE id = $1", [other]);
+    await db.query("UPDATE mention_facts SET scoring_version = 'v2' WHERE result_id = $1", [other]);
+
+    await roll("2026-09-10");
+
+    const row = await metricRow();
+    expect(row!.cells_total).toBe("1");
+    expect(row!.cells_present).toBe("1");
+    expect(row!.mentions_total).toBe("1");
+  });
 });

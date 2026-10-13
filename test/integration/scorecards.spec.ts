@@ -98,6 +98,8 @@ describe("STORY-136 · project scorecards", () => {
     status?: string;
     /** STORY-136 scenario 12 — stamps the capture AND its mention; the column default is `v1`. */
     scoringVersion?: string;
+    /** `demo-seed` marks a capture as demo data (NEW-A-5); the default is a live-looking `n1`. */
+    normalizerVersion?: string;
   }
 
   /**
@@ -118,7 +120,7 @@ describe("STORY-136 · project scorecards", () => {
          (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,
           capture_mode,adapter_version,normalizer_version,content_hash,
           payload,flags,cache_layer,status,brand_present,scoring_version)
-       VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,'api','1.0.0','n1',$8,'{}'::jsonb,'{}','live',$9,$10,$11)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,'api','1.0.0',$12,$8,'{}'::jsonb,'{}','live',$9,$10,$11)`,
       [
         resultId,
         workspaceId,
@@ -131,6 +133,7 @@ describe("STORY-136 · project scorecards", () => {
         spec.status ?? "parsed",
         spec.brandPresent ?? false,
         spec.scoringVersion ?? "v1",
+        spec.normalizerVersion ?? "n1",
       ],
     );
     if (spec.brandPresent === true) await addMention(resultId, spec.capturedAt, 0.8, 0.5, spec.scoringVersion ?? "v1");
@@ -212,7 +215,9 @@ describe("STORY-136 · project scorecards", () => {
     // google_ai_mode: v1 has 2 cells (1 present); v2 has 4 cells, all present. Reading both would give 6 cells / 5 present.
     await addCell({ capturedAt: daysAgo(2), brandPresent: true });
     await addCell({ capturedAt: daysAgo(2), brandPresent: false });
-    for (let i = 0; i < 4; i += 1) await addCell({ capturedAt: daysAgo(2), brandPresent: true, scoringVersion: "v2" });
+    // The v2 rows are DEMO-marked, the v1 rows live: the provenance marker must describe the rows the figure summed.
+    for (let i = 0; i < 4; i += 1)
+      await addCell({ capturedAt: daysAgo(2), brandPresent: true, scoringVersion: "v2", normalizerVersion: "demo-seed" });
     // chatgpt has ONLY v2 rows, so under the current version it was never measured.
     await addCell({ capturedAt: daysAgo(2), engineKey: "chatgpt", brandPresent: true, scoringVersion: "v2" });
 
@@ -221,11 +226,45 @@ describe("STORY-136 · project scorecards", () => {
     expect(gem.measured_cells).toBe(2);
     expect(gem.metrics.presence_rate).toBe(0.5);
     expect(gem.metrics.mentions_total).toBe(1);
+    // Counting v2's demo rows would make this "mixed".
+    expect(gem.data_source).toBe("live");
 
     const chatgpt = document.engines.find((e) => e.engine_key === "chatgpt")!;
     expect(chatgpt.measured_cells).toBe(0);
     expect(chatgpt.metrics.presence_rate).toBeNull();
+    // Nothing was measured under v1, so there is nothing to call live or demo — null, not "live".
+    expect(chatgpt.data_source).toBeNull();
     expect(document.blended.measured_cells).toBe(2);
+  });
+
+  it("scenario 12 — an engine that is NOT entitled and has only other-version rows does not appear", async () => {
+    // Below the plan floor, so the entitled set cannot admit it; the `measured` CTE is the only way in, and it must
+    // read the current version only. Without that filter a v2-only capture would put the engine in the response.
+    await db.query(
+      `INSERT INTO engines (key,display_name,vendor,capture_mode,adapter_version,
+                            cache_ttl_seconds,volatility_band,min_plan_key,status,cadence_by_plan)
+       VALUES ('claude','claude','v','api','1.0.0',86400,'medium','business','active',
+               '{"business":{"full":4}}'::jsonb)
+       ON CONFLICT (key) DO NOTHING`,
+    );
+    await addCell({ capturedAt: daysAgo(1), engineKey: "claude", brandPresent: true, scoringVersion: "v2" });
+    await addCell({ capturedAt: daysAgo(1), engineKey: "google_ai_mode", brandPresent: true });
+
+    const keys = (await read()).engines.map((engine) => engine.engine_key);
+    expect(keys, "claude was measured only under v2").not.toContain("claude");
+    expect(keys).toContain("google_ai_mode");
+  });
+
+  it("scenario 12 — a v1 capture whose only mention is v2 counts as a cell and is NOT present", async () => {
+    // The mention is its own versioned row. A mention written under another version is not part of this score, so
+    // presence, mentions and the entity set must each ignore it.
+    const id = await addCell({ capturedAt: daysAgo(2), brandPresent: false });
+    await addMention(id, daysAgo(2), 0.8, 0.5, "v2");
+
+    const gem = (await read()).engines.find((e) => e.engine_key === "google_ai_mode")!;
+    expect(gem.measured_cells).toBe(1);
+    expect(gem.metrics.presence_rate).toBe(0);
+    expect(gem.metrics.mentions_total).toBe(0);
   });
 
   it("scenario 2 — a window with cells and no citations reports a NULL citation share", async () => {
