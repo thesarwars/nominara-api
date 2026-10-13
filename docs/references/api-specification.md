@@ -20,7 +20,7 @@ Content type `application/json; charset=utf-8` for requests and success response
 | `If-Match: <etag>` | on `PATCH` of mutable config | Optimistic concurrency on `projects`, `tracked_prompts`, `share_tokens`. |
 | `X-Nominara-Confirmed-Credits: <int>` | on every credit-spending execution route | Echoes the exact figure shown to the operator. A mismatch is `409 price_changed`. |
 | `X-Nominara-Scoring-Version` | optional | Pins analytics reads to a scoring version during a cut-over. |
-| `X-Request-Id` | optional | **Not an identity.** Recorded as a span attribute only. The response `X-Request-Id` header, `meta.request_id` and `error.request_id` always carry the server-generated OpenTelemetry trace id (32 lowercase hex); an inbound `traceparent` is likewise ignored. |
+| `X-Request-Id` | optional | Echoed in responses and logs; generated if absent. |
 
 Every response to an authenticated route carries wallet state, so **no client ever needs a second call to keep a balance chip current** (`NFR-API-12`):
 
@@ -41,7 +41,7 @@ X-RateLimit-Limit / -Remaining / -Reset
 {
   "data": [ /* the resource or collection */ ],
   "pagination": { "cursor_next": "eyJ0IjoiMjAyNi0wOC0wNCJ9", "has_more": true, "limit": 50 },
-  "meta": { "request_id": "4bf92f3577b34da6a3ce929d0e0e4736", "scoring_version": "v1", "computed_at": "2026-08-04T11:02:31Z" }
+  "meta": { "request_id": "req_01J9Z…", "scoring_version": "v1", "computed_at": "2026-08-04T11:02:31Z" }
 }
 ```
 
@@ -68,7 +68,7 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
                  { "key": "agency_vault",  "credits": 5000, "price_usd": "50.00" } ]
     },
     "remediation": { "kind": "purchase_credits", "url": "/settings/billing?pack=agency_vault" },
-    "request_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+    "request_id": "req_01J9Z…"
   }
 }
 ```

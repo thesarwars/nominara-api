@@ -160,7 +160,7 @@ describe("STORY-024 · request_id is the OpenTelemetry trace id", () => {
     expect(a.json().meta.request_id).not.toBe(b.json().meta.request_id);
   });
 
-  it("[STORY-024 decision 2] an inbound traceparent does not choose the trace id", async () => {
+  it("[STORY-024 owner 2026-10-13 #2] an inbound traceparent does not choose the trace id", async () => {
     const response = await app.inject({
       method: "GET",
       url: "/v1/test-trace/ok",
@@ -172,7 +172,7 @@ describe("STORY-024 · request_id is the OpenTelemetry trace id", () => {
     expect(seen[0]?.traceId).not.toBe(INBOUND_TRACE_ID);
   });
 
-  it("[STORY-024 decision 2] an inbound X-Request-Id is not echoed as the identity, on success or on error", async () => {
+  it("[STORY-024 owner 2026-10-13 #2] an inbound X-Request-Id is not echoed as the identity, on success or on error", async () => {
     const ok = await app.inject({ method: "GET", url: "/v1/test-trace/ok", headers: { "x-request-id": "caller-chosen-id" } });
     const failed = await app.inject({ method: "GET", url: "/v1/test-trace/throws", headers: { "x-request-id": "caller-chosen-id" } });
 
@@ -182,7 +182,7 @@ describe("STORY-024 · request_id is the OpenTelemetry trace id", () => {
     expect(failed.headers["x-request-id"]).toBe(failed.json().error.request_id);
   });
 
-  it("[STORY-024 decision 2] an inbound X-Request-Id is recorded on the span as an attribute only", async () => {
+  it("[STORY-024 owner 2026-10-13 #2] an inbound X-Request-Id is recorded on the span as an attribute only", async () => {
     await app.inject({ method: "GET", url: "/v1/test-trace/ok", headers: { "x-request-id": "caller-chosen-id" } });
 
     expect(seen[0]?.inboundAttribute).toBe("caller-chosen-id");

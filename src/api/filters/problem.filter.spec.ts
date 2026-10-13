@@ -21,6 +21,8 @@ import {
 import { ProblemFilter } from "./problem.filter.js";
 
 const REQUEST_ID = "req-42";
+// STORY-024 AC9 — the identifier is the trace id: 32 lowercase hex, never the request's own id or a header.
+const TRACE_ID = expect.stringMatching(/^[0-9a-f]{32}$/);
 
 function makeHost(headers: Record<string, string> = {}): {
   host: ArgumentsHost;
@@ -93,12 +95,15 @@ describe("STORY-024 · ProblemFilter emits RFC 9457 plus the `error` extension m
     expect((body.error as Record<string, unknown>).details).toEqual({ methods: ["passkey"] });
   });
 
-  it("carries the request identifier, honouring an inbound X-Request-Id", () => {
-    expect((bodyFrom(new StepUpRequiredError({ details: STEP_UP_DETAILS })).error as Record<string, unknown>).request_id).toBe(REQUEST_ID);
-    expect(
-      (bodyFrom(new StepUpRequiredError({ details: STEP_UP_DETAILS }), { "x-request-id": "from-caller" }).error as Record<string, unknown>)
-        .request_id,
-    ).toBe("from-caller");
+  it("carries the 32-hex trace id as the request identifier, never an inbound X-Request-Id", () => {
+    const own = (bodyFrom(new StepUpRequiredError({ details: STEP_UP_DETAILS })).error as Record<string, unknown>).request_id;
+    expect(own).toEqual(TRACE_ID);
+    expect(own).not.toBe(REQUEST_ID);
+    const withHeader = (
+      bodyFrom(new StepUpRequiredError({ details: STEP_UP_DETAILS }), { "x-request-id": "from-caller" }).error as Record<string, unknown>
+    ).request_id;
+    expect(withHeader).toEqual(TRACE_ID);
+    expect(withHeader).not.toBe("from-caller");
   });
 
   it("carries the code's remediation so a client can act without a second request", () => {
@@ -179,7 +184,7 @@ describe("STORY-024 · errors outside the taxonomy", () => {
       error: {
         code: "internal_error",
         message: "internal server error",
-        request_id: REQUEST_ID,
+        request_id: TRACE_ID,
       },
     });
   });
@@ -191,7 +196,7 @@ describe("STORY-024 · errors outside the taxonomy", () => {
   it("carries the request identifier in exactly one place", () => {
     const body = bodyFrom(new Error("boom"));
     expect(body).not.toHaveProperty("request_id");
-    expect((body.error as Record<string, unknown>).request_id).toBe(REQUEST_ID);
+    expect((body.error as Record<string, unknown>).request_id).toEqual(TRACE_ID);
   });
 
   // The exception's own message is the string most likely to carry a
