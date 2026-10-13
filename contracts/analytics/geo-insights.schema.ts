@@ -127,6 +127,27 @@ export type PositionClassValue = z.infer<typeof positionClassSchema>;
 const formCountSchema = z.object({ form: answerFormSchema, count: z.number().int().nonnegative() }).strict();
 
 /**
+ * The answer-form distribution of ONE prompt cluster (`topic_clusters`) over the window — STORY-040 AC8.
+ *
+ * `cluster_id`/`label` are null for the entry that gathers answers whose prompt belongs to no cluster: it is listed
+ * rather than dropped, so the entries always sum to the detail's `total`. A cluster under the evidence minimum is
+ * `sufficient: false` with `dominant_form: null` — its counts are real and shown, but it names no form to produce,
+ * because a confident recommendation from thin data is the failure the minimum exists to prevent.
+ */
+export const geoStructureClusterSchema = z
+  .object({
+    cluster_id: z.string().uuid().nullable(),
+    label: z.string().nullable(),
+    total: z.number().int().nonnegative(),
+    sufficient: z.boolean(),
+    dominant_form: answerFormSchema.nullable(),
+    forms: z.array(formCountSchema),
+    engines: z.array(z.object({ engine: z.string(), total: z.number().int().nonnegative(), forms: z.array(formCountSchema) }).strict()),
+  })
+  .strict();
+export type GeoStructureCluster = z.infer<typeof geoStructureClusterSchema>;
+
+/**
  * `GET /geo-insights/structure` -> `detail` (STORY-060, A3).
  *
  * `page_forms` is `[]` and `template`/`rationale` carry the reason, because the
@@ -152,6 +173,8 @@ export const geoStructureDetailSchema = z
         .strict(),
     ),
     page_forms: z.array(z.string()),
+    /** STORY-040 AC8. Optional only because a detail persisted before it existed has none; a fresh one always carries it. */
+    clusters: z.array(geoStructureClusterSchema).optional(),
     brand_answers: z.number().int().nonnegative(),
     prior_brand_answers: z.number().int().nonnegative(),
     /** `prior` is null when the prior window held no brand answer: no baseline, not a baseline of zero. */
