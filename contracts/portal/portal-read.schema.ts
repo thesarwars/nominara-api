@@ -6,6 +6,7 @@ import { growthMapPointSchema, growthMapResponseSchema, growthMapSeriesSchema } 
 import { methodologyFooterSchema } from "../reports/methodology-footer.schema.js";
 import { dataSourceSchema } from "../analytics/data-source.schema.js";
 import { reportTimeframeSchema } from "../reports/report-shared.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // NEW-E-0 — GET /v1/portal/{overview,growth-map,matrix,tasks,sources}.
 // Auth: portal cookie only. GET only; every mutating verb on /portal/* is refused.
@@ -24,10 +25,10 @@ import { reportTimeframeSchema } from "../reports/report-shared.schema.js";
 export const portalOverviewQuerySchema = z.object({ timeframe: reportTimeframeSchema.optional() }).strict();
 
 export const portalProjectQuerySchema = z
-  .object({ project: z.uuid(), timeframe: reportTimeframeSchema.optional() })
+  .object({ project: lowercaseUuidSchema, timeframe: reportTimeframeSchema.optional() })
   .strict();
 
-export const portalTasksQuerySchema = z.object({ project: z.uuid() }).strict();
+export const portalTasksQuerySchema = z.object({ project: lowercaseUuidSchema }).strict();
 
 /**
  * Owner decision 2026-10-08: when costs are hidden the footer drops `sample_size` (a figure derived from the capture

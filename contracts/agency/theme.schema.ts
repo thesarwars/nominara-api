@@ -2,6 +2,7 @@ import { z } from "zod";
 import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { validationFailedDetailsSchema } from "../common/error-details.schema.js";
 import { hexColorSchema } from "../reports/report-shared.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // NEW-E-0 — GET/PUT /v1/agency/theme. Permission agency:branding.
 // integrations-and-sharing.md §3 (FR-AGY-01g/h/i); STORY-097.
@@ -44,7 +45,7 @@ export const agencyThemeListResponseSchema = z.array(agencyThemeSchema);
 export const updateAgencyThemeRequestSchema = z
   .object({
     /** Absent = create a new theme. */
-    theme_id: z.uuid().optional(),
+    theme_id: lowercaseUuidSchema.optional(),
     name: z.string().trim().min(1).max(80).optional(),
     is_default: z.boolean().optional(),
     /** null resets a colour to the platform default. */

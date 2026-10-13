@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { reportFormatSchema, reportSectionSchema, reportTimeframeSchema } from "./report-shared.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // NEW-E-0 — /v1/scheduled-reports (GET/POST/PATCH/DELETE) and
 // POST /v1/scheduled-reports/{id}/send-now. Permission agency:branding.
@@ -31,7 +32,7 @@ export const scheduledReportDeliverySchema = z
 
 const scheduleFieldsShape = {
   label: z.string().trim().min(1).max(120),
-  project_ids: z.array(z.uuid()).min(1),
+  project_ids: z.array(lowercaseUuidSchema).min(1),
   sections: z.array(reportSectionSchema).min(1),
   cadence: scheduleCadenceSchema,
   /** Day of the period (weekday 1-7 for weekly/biweekly; day of month otherwise); the service range-checks it per cadence. */
@@ -42,7 +43,7 @@ const scheduleFieldsShape = {
   recipients: z.array(z.email()).min(1).max(25),
   timeframe: reportTimeframeSchema,
   /** Pinned theme; null = workspace default. Must belong to the same workspace. */
-  theme_id: z.uuid().nullable(),
+  theme_id: lowercaseUuidSchema.nullable(),
 };
 
 // Defaults live on CREATE only. A default inside a shared shape would survive

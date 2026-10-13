@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-065 (step A) — POST /v1/projects/{id}/goals.
 //
@@ -25,7 +26,7 @@ export const goalTargetRequestSchema = z
     /** 0..100 — the Visibility Score scale. */
     target_value: z.number().min(0).max(100),
     /** Required for `topic_authority`, forbidden for `engine_score` (checked below). */
-    prompt_cluster_id: z.string().uuid().optional(),
+    prompt_cluster_id: lowercaseUuidSchema.optional(),
   })
   .strict();
 

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // PATCH /members/{id}. `role` deliberately INCLUDES `owner` at the schema
 // level — STORY-021-E-9 requires the service, not this contract, to produce
@@ -9,7 +10,7 @@ import { z } from "zod";
 export const updateMemberRoleRequestSchema = z
   .object({
     role: z.enum(["owner", "admin", "manager", "analyst", "viewer"]),
-    project_scope: z.array(z.uuid()).nullable().optional(),
+    project_scope: z.array(lowercaseUuidSchema).nullable().optional(),
   })
   .strict();
 

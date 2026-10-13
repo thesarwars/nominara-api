@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { AUDIT_CATEGORIES, AUDIT_SEVERITIES } from "./audit-log-entry.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, "expected YYYY-MM-DD");
 
@@ -11,7 +12,7 @@ export const auditLogQuerySchema = paginationRequestSchema
   .extend({
     /** Exact action name, e.g. `billing.addon.create`. */
     action: z.string().min(1).max(128).optional(),
-    actor_id: z.uuid().optional(),
+    actor_id: lowercaseUuidSchema.optional(),
     category: z.enum(AUDIT_CATEGORIES).optional(),
     severity: z.enum(AUDIT_SEVERITIES).optional(),
     /** Inclusive, UTC. */

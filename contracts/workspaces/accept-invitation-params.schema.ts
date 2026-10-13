@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // POST /workspaces/{id}/invitations/accept — the PATH contract (STORY-172).
 // The route is @SkipTenantContext(), so no guard has validated `:id` before
@@ -8,7 +9,7 @@ import { z } from "zod";
 // nothing about whether the workspace exists — that stays the uniform refusal.
 export const acceptInvitationParamsSchema = z
   .object({
-    id: z.uuid(),
+    id: lowercaseUuidSchema,
   })
   .strict();
 

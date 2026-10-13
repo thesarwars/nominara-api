@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { taskPrioritySchema } from "./task-response.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-064 (step B) — PATCH /v1/tasks/{id}.
 //
@@ -21,10 +22,10 @@ export const TASK_DISMISS_REASON_MAX = 1000;
 export const updateTaskRequestSchema = z
   .object({
     status: z.enum(["todo", "in_progress", "dismissed", "done"]).optional(),
-    assignee_id: z.string().uuid().nullable().optional(),
+    assignee_id: lowercaseUuidSchema.nullable().optional(),
     priority: taskPrioritySchema.optional(),
     due_at: z.string().datetime({ offset: true }).nullable().optional(),
-    goal_id: z.string().uuid().nullable().optional(),
+    goal_id: lowercaseUuidSchema.nullable().optional(),
     dismiss_reason: z.string().trim().min(1).max(TASK_DISMISS_REASON_MAX).optional(),
   })
   .strict()

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { reportTimeframeSchema } from "../reports/report-shared.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // NEW-E-0 — /v1/share-tokens. Permissions share_token:mint / share_token:revoke.
 // integrations-and-sharing.md §4; STORY-098 (FR-AGY-01j..01o).
@@ -53,7 +54,7 @@ export const shareTokenListResponseSchema = z.array(shareTokenSchema);
 export const mintShareTokenRequestSchema = z
   .object({
     label: z.string().trim().min(1).max(120),
-    scope_project_ids: z.array(z.uuid()).min(1),
+    scope_project_ids: z.array(lowercaseUuidSchema).min(1),
     scope_tabs: z.array(portalTabSchema).min(1),
     hide_competitors: z.boolean(),
     hide_costs: z.boolean(),
@@ -65,7 +66,7 @@ export const mintShareTokenRequestSchema = z
     max_views: z.number().int().positive().nullable(),
     expires_at: z.iso.datetime().nullable(),
     /** Optional theme pin; must belong to the same workspace (FR-AGY-01i). */
-    theme_id: z.uuid().nullable().optional(),
+    theme_id: lowercaseUuidSchema.nullable().optional(),
   })
   .strict()
   .refine((v) => v.password !== null || v.acknowledge_no_password, {

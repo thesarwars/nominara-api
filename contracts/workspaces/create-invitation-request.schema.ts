@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // POST /workspaces/{id}/invitations. `role` EXCLUDES `owner` — ownership is
 // never granted through an invitation, only through the (out-of-scope,
@@ -8,7 +9,7 @@ export const createInvitationRequestSchema = z
   .object({
     email: z.email(),
     role: z.enum(["admin", "manager", "analyst", "viewer"]),
-    project_scope: z.array(z.uuid()).nullable().optional(),
+    project_scope: z.array(lowercaseUuidSchema).nullable().optional(),
   })
   .strict();
 
