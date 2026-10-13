@@ -66,6 +66,10 @@ function parsesAgainst(schema: z.ZodTypeAny, value: string): boolean {
   }
 }
 
+/** pgBouncer's documented host port (.env.example, docker-compose.yml `PGBOUNCER_PORT`) and compose service name. */
+const PGBOUNCER_HOST_PORT = "6432";
+const PGBOUNCER_SERVICE_HOST = "pgbouncer";
+
 export const envSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -396,6 +400,25 @@ export const envSchema = z
   // second; this one refuses at BOOT, so the process never starts rather
   // than starting and printing a credential on the first sign-in attempt.
   .superRefine((env, ctx) => {
+    // STORY-141 AC 8 — DATABASE_URL carries the reconciler's SESSION advisory
+    // lock (src/lib/queue/locks.ts) and the migration/DDL connection; it must
+    // be the direct connection. Under pgBouncer transaction pooling a session
+    // lock is stranded on a backend nobody owns. Only the pooler's documented
+    // signals can be recognised from a URL: its host port (6432, .env.example /
+    // docker-compose.yml) and its compose service name. A pooler on another
+    // host and port is not detectable here. DATABASE_URL_POOLED is the pooler
+    // by design and is deliberately not checked.
+    if (URL.canParse(env.DATABASE_URL)) {
+      const direct = new URL(env.DATABASE_URL);
+      if (direct.port === PGBOUNCER_HOST_PORT || direct.hostname.toLowerCase() === PGBOUNCER_SERVICE_HOST) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["DATABASE_URL"],
+          message:
+            "DATABASE_URL must be the direct Postgres connection, not the pgBouncer pooler (a session advisory lock cannot survive transaction pooling); the pooler belongs in DATABASE_URL_POOLED.",
+        });
+      }
+    }
     if (env.NODE_ENV === "production" && env.OTP_DEV_LOG_CODES === "true") {
       ctx.addIssue({
         code: "custom",
