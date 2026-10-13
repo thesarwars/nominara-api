@@ -133,6 +133,8 @@ const GATE_BODIES: Readonly<Record<string, string>> = {
   "db:drift-check": "tsx src/db/drift-check.ts",
   "db:rls-check": "tsx src/db/rls/rls-check.ts",
   "db:schema-check": "tsx src/db/schema/schema-check.ts",
+  // STORY-006 AC 7 — apply every migration forward, roll every one back, re-apply, on a shadow database.
+  "db:roundtrip-check": "tsx src/db/roundtrip-check.ts",
   "test:integration": "vitest run --config vitest.integration.config.ts",
   "test:isolation": 'vitest run --config vitest.isolation.config.ts --exclude "test/isolation/breakers/**"',
   "test:isolation:breakers": "vitest run --config vitest.isolation.config.ts test/isolation/breakers",
