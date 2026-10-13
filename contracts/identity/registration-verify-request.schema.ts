@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { webauthnCredentialJsonSchema } from "./webauthn-credential-json.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // POST /me/passkeys/verify (STORY-173: registration is session-authenticated;
 // the public /auth/passkey/verify serves sign-in only). `ceremony_id` is the
@@ -7,7 +8,7 @@ import { webauthnCredentialJsonSchema } from "./webauthn-credential-json.schema.
 // created for THIS account — never the raw challenge bytes themselves.
 export const registrationVerifyRequestSchema = z
   .object({
-    ceremony_id: z.uuid(),
+    ceremony_id: lowercaseUuidSchema,
     response: webauthnCredentialJsonSchema,
   })
   .strict();

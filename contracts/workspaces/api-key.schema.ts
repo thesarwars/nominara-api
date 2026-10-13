@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { PERMISSION_MATRIX, PERMISSIONS, ROLES } from "../../src/tenancy/permission-matrix.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // NEW-D-4 — /v1/api-keys. api-specification.md §3: `GET`/`POST`/`DELETE`
 // `/api-keys`, permission `apikey:create` (owner and admin, step-up), "secret
@@ -57,7 +58,7 @@ export const createApiKeyRequestSchema = z
   .object({
     name: z.string().trim().min(1).max(120),
     permissions: z.array(apiKeyPermissionSchema).min(1).max(GRANTABLE_API_KEY_PERMISSIONS.length),
-    project_scope: z.array(z.uuid()).min(1).nullable().default(null),
+    project_scope: z.array(lowercaseUuidSchema).min(1).nullable().default(null),
     expires_at: z.iso.datetime().nullable().default(null),
   })
   .strict();

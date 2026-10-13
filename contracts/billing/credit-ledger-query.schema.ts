@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { LEDGER_ACTION_CODES, LEDGER_ENTRY_TYPES } from "./credit-ledger-entry.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-073 AC12's filters — "by action, project, actor, and date".
 //
@@ -19,7 +20,7 @@ export const creditLedgerQuerySchema = paginationRequestSchema
     /** The action a debit paid for. Matches `credit_ledger.action_code`. */
     action: z.enum(LEDGER_ACTION_CODES).optional(),
     /** Narrow to entries about one project. Entries with no project never match. */
-    project_id: z.string().uuid().optional(),
+    project_id: lowercaseUuidSchema.optional(),
     /**
      * One person's spend.
      *
@@ -28,7 +29,7 @@ export const creditLedgerQuerySchema = paginationRequestSchema
      * reference are how those are traced, and saying so here is better than a
      * filter that quietly returns nothing.
      */
-    actor_id: z.string().uuid().optional(),
+    actor_id: lowercaseUuidSchema.optional(),
     entry_type: z.enum(LEDGER_ENTRY_TYPES).optional(),
     /** Inclusive, UTC. A day is a calendar day, not a rolling 24 hours. */
     from: isoDate.optional(),

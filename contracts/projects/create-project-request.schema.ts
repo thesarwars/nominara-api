@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-043 — POST /v1/projects. api-specification.md §4.1.
 //
@@ -64,7 +65,7 @@ export const createProjectFieldsSchema = z
 
     // Hierarchy — set at creation only (AC6).
     kind: z.enum(["brand", "product_line"]).optional(),
-    parent_project_id: z.string().uuid().optional(),
+    parent_project_id: lowercaseUuidSchema.optional(),
   })
   .strict();
 

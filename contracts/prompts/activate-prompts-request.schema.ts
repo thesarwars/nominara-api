@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-046 — POST /v1/projects/{id}/prompts/activate.
 //
@@ -27,7 +28,7 @@ export const activatePromptsRequestSchema = z
      * a count would let the server pick again between the dialog rendering
      * and the click, and activate something the customer never saw.
      */
-    prompt_ids: z.array(z.string().uuid()).min(1).max(500),
+    prompt_ids: z.array(lowercaseUuidSchema).min(1).max(500),
   })
   .strict();
 

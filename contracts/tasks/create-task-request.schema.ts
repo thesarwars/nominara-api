@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { actionItemKindSchema } from "./action-item-response.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-064 (step C) — POST /v1/projects/{id}/tasks: a MANUAL task.
 //
@@ -14,7 +15,7 @@ export const createTaskRequestSchema = z
     title: z.string().trim().min(1).max(TASK_TITLE_MAX),
     /** Defaults to `content` server-side when absent. */
     kind: actionItemKindSchema.optional(),
-    goal_id: z.string().uuid().optional(),
+    goal_id: lowercaseUuidSchema.optional(),
   })
   .strict();
 
