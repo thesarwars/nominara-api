@@ -146,6 +146,9 @@ export function executeOn(client: Client, t: Tenant, job: Job, emitted: Emitted[
     toWorkspace: (_ws, event, payload) => {
       emitted.push({ event, payload: payload as Record<string, unknown> });
     },
+    toProject: (_ws, _project, event, payload) => {
+      emitted.push({ event, payload: payload as Record<string, unknown> });
+    },
     memberChanged: () => undefined,
   };
   const handler = createCaptureExecuteHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, {

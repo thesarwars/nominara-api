@@ -82,14 +82,42 @@ export function realtimeFanoutChannel(namespace: string): string {
 /** What travels on the fan-out channel. Parsed by the gateway before anything is emitted. */
 export interface RealtimeFanoutMessage {
   readonly workspaceId: string;
+  /** Present when published with `toProject`; the gateway requires it to agree with the payload's `project_id`. */
+  readonly projectId?: string;
   readonly event: RealtimeEventName;
   readonly payload: unknown;
 }
 
+/** Events whose payload names the project they are about — the ones `toProject` accepts. */
+export type ProjectEventName = {
+  [Name in RealtimeEventName]: RealtimeEventPayloads[Name] extends { project_id: string } ? Name : never;
+}[RealtimeEventName];
+
 export interface RealtimePublisher {
-  /** Publishes to every socket in a workspace's room, across every gateway instance. */
+  /**
+   * Publishes to every socket in a workspace's room, across every gateway instance.
+   *
+   * A payload that names a project (`project_id`) is delivered only to sockets that
+   * also hold that project's room, whichever method published it — see `toProject`.
+   */
   toWorkspace<Name extends RealtimeEventName>(
     workspaceId: string,
+    event: Name,
+    payload: RealtimeEventPayloads[Name],
+  ): void;
+
+  /**
+   * Publishes a project's event: delivered only to sockets in the workspace room
+   * that ALSO hold `proj:{project_id}`, so a member's `project_scope` bounds what
+   * they receive as well as what they may join.
+   *
+   * `projectId` must equal the payload's `project_id`. A mismatch is a producer
+   * bug that would otherwise address one project's audience with another's
+   * data, so it throws here and the gateway drops it again if it arrives anyway.
+   */
+  toProject<Name extends ProjectEventName>(
+    workspaceId: string,
+    projectId: string,
     event: Name,
     payload: RealtimeEventPayloads[Name],
   ): void;
@@ -105,6 +133,14 @@ export interface RealtimePublisher {
    * do exactly that.
    */
   memberChanged(workspaceId: string, payload: RealtimeEventPayloads["member.changed"]): void;
+}
+
+/** Shared by both publishers so the Noop one cannot accept what the real one refuses. */
+function assertProjectAgrees(projectId: string, payload: unknown): void {
+  const named = (payload as { project_id?: unknown } | null)?.project_id;
+  if (typeof named !== "string" || named.toLowerCase() !== projectId.toLowerCase()) {
+    throw new Error("realtime: toProject projectId does not match the payload's project_id");
+  }
 }
 
 @Injectable()
@@ -165,6 +201,18 @@ export class ValkeyRealtimePublisher implements RealtimePublisher, OnModuleDestr
     incrementCounter("nominara_realtime_published_total", { event });
   }
 
+  toProject<Name extends ProjectEventName>(
+    workspaceId: string,
+    projectId: string,
+    event: Name,
+    payload: RealtimeEventPayloads[Name],
+  ): void {
+    assertProjectAgrees(projectId, payload);
+    const message: RealtimeFanoutMessage = { workspaceId, projectId, event, payload };
+    this.publish(realtimeFanoutChannel(cacheKeyNamespace()), JSON.stringify(message));
+    incrementCounter("nominara_realtime_published_total", { event, scope: "project" });
+  }
+
   memberChanged(workspaceId: string, payload: RealtimeEventPayloads["member.changed"]): void {
     this.toWorkspace(workspaceId, "member.changed", payload);
     this.publish(realtimeControlChannel(cacheKeyNamespace()), JSON.stringify(payload));
@@ -184,7 +232,7 @@ export class ValkeyRealtimePublisher implements RealtimePublisher, OnModuleDestr
  */
 @Injectable()
 export class NoopRealtimePublisher implements RealtimePublisher {
-  readonly published: { workspaceId: string; event: RealtimeEventName; payload: unknown }[] = [];
+  readonly published: { workspaceId: string; event: RealtimeEventName; payload: unknown; projectId?: string }[] = [];
 
   toWorkspace<Name extends RealtimeEventName>(
     workspaceId: string,
@@ -193,6 +241,17 @@ export class NoopRealtimePublisher implements RealtimePublisher {
   ): void {
     this.published.push({ workspaceId, event, payload });
     incrementCounter("nominara_realtime_published_total", { event, transport: "noop" });
+  }
+
+  toProject<Name extends ProjectEventName>(
+    workspaceId: string,
+    projectId: string,
+    event: Name,
+    payload: RealtimeEventPayloads[Name],
+  ): void {
+    assertProjectAgrees(projectId, payload);
+    this.published.push({ workspaceId, event, payload, projectId });
+    incrementCounter("nominara_realtime_published_total", { event, transport: "noop", scope: "project" });
   }
 
   memberChanged(workspaceId: string, payload: RealtimeEventPayloads["member.changed"]): void {

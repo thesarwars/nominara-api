@@ -64,6 +64,8 @@ const fanoutMessageSchema = z
     workspaceId: z.uuid(),
     event: realtimeEventNameSchema,
     payload: z.unknown(),
+    /** Set by `toProject`. Must agree with the payload's own `project_id` or the event is dropped. */
+    projectId: z.uuid().optional(),
   })
   .strict();
 
@@ -282,6 +284,26 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
       return;
     }
 
+    // WHICH PROJECT, IF ANY, THIS EVENT IS ABOUT — decided from the PAYLOAD,
+    // which the catalog schema above has just validated, and NOT from the
+    // publisher's say-so. A producer that reached for `toWorkspace` with a
+    // project-bearing payload must not be able to leak it to a scoped member by
+    // forgetting `toProject`; the envelope's `projectId` is a declaration that
+    // has to AGREE with the payload, never an alternative to it. A null
+    // `project_id` (an account-level debit) is a workspace-level event.
+    const rawProject = (message.payload as Record<string, unknown> | null)?.project_id;
+    const eventProjectId = typeof rawProject === "string" ? canonicalUuid(rawProject) : undefined;
+    if (message.projectId !== undefined && canonicalUuid(message.projectId) !== eventProjectId) {
+      incrementCounter("nominara_gateway_fanout_rejected_total", { reason: "project_mismatch", event: message.event });
+      logger.warn({
+        message: "fanout envelope names a project the payload does not; dropped",
+        workspace_id: message.workspaceId,
+        event: message.event,
+      });
+      return;
+    }
+    const projectRoomName = eventProjectId === undefined ? undefined : projectRoom(eventProjectId);
+
     const room = workspaceRoom(message.workspaceId);
     // `@WebSocketServer()` on a NAMESPACED gateway injects the Namespace, not
     // the io Server — the same mismatch attachAdapter() works around at the
@@ -294,14 +316,24 @@ export class RealtimeGateway implements OnModuleDestroy, OnApplicationShutdown {
       // per instance to every client.
       if (!socket.rooms.has(room)) continue;
 
-      // ONLY the workspace room is consulted, and that is a known limit
-      // rather than an oversight. `proj:{project_id}` rooms exist and are
-      // authorised (join:project enforces workspace_members.project_scope),
-      // but nothing PUBLISHES to them: RealtimePublisher has toWorkspace and
-      // memberChanged and no toProject, so a project-scoped event still
-      // reaches every member of the workspace. Scoped DELIVERY needs the
-      // producers that arrive with EPIC-04, and belongs with them. Recorded
-      // in STORY-026 rather than left for a reader to infer from silence.
+      // THE SCOPE BOUNDARY. The workspace room above is the tenant boundary; a
+      // project-bearing event additionally requires the PROJECT room, which a
+      // socket can only hold by passing `join:project` (workspace_members.
+      // project_scope, enforced there and re-checked every 60 s). So a manager
+      // scoped to project A holds `proj:A`, never `proj:B`, and never receives
+      // B's events however the producer published them.
+      //
+      // This sits BEFORE the budgets below on purpose: a filtered event must
+      // spend none of a socket's budget and must never provoke a `resync`
+      // naming a project the socket has no right to know exists.
+      //
+      // FAIL CLOSED: a socket that has not joined the project receives nothing
+      // about it. An unrestricted member that wants a project's events joins
+      // its room, exactly as it would to be authorised for it.
+      if (projectRoomName !== undefined && !socket.rooms.has(projectRoomName)) {
+        incrementCounter("nominara_gateway_fanout_project_filtered_total", { event: message.event });
+        continue;
+      }
 
       const key = budgetKeyFor(message.event, message.payload);
       const budget = REALTIME_DELIVERY_BUDGET[message.event as BudgetedEventName] as

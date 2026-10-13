@@ -58,6 +58,9 @@ const publisher = (sink: { event: string; payload: Record<string, unknown> }[]):
   toWorkspace: (_ws, event, payload) => {
     sink.push({ event, payload: payload as Record<string, unknown> });
   },
+  toProject: (_ws, _project, event, payload) => {
+    sink.push({ event, payload: payload as Record<string, unknown> });
+  },
   memberChanged: () => undefined,
 });
 

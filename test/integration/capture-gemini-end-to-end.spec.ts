@@ -53,7 +53,11 @@ vi.mock("../../src/lib/net/guarded-fetch.js", async (importOriginal) => {
 });
 
 const FAKE_KEY = "e2e-fake-gemini-key-not-a-secret";
-const publisher: RealtimePublisher = { toWorkspace: () => undefined, memberChanged: () => undefined };
+const publisher: RealtimePublisher = {
+  toWorkspace: () => undefined,
+  toProject: () => undefined,
+  memberChanged: () => undefined,
+};
 
 interface Queued {
   kind: "parse" | "rollup";
