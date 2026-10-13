@@ -430,6 +430,53 @@ describe("STORY-014 · passkey registration and assertion", () => {
     );
   });
 
+  // STORY-014 AC3 — resident keys, UV preferred, attachment recorded. The
+  // options are what the browser is told; the column is what later policy reads.
+  it("STORY-014 · registration options require a resident key and prefer user verification", async () => {
+    const { cookies } = await signedInSession("judy@example.com");
+    const res = await app.inject({
+      method: "POST",
+      url: apiUrl("/me/passkeys/options"),
+      payload: {},
+      ...mutatingHeaders(cookies),
+    });
+    expect(res.statusCode).toBe(201);
+    const { options } = dataOf<{ options: { authenticatorSelection?: Record<string, unknown> } }>(res);
+    expect(options.authenticatorSelection).toMatchObject({ residentKey: "required", userVerification: "preferred" });
+    // Resident key "required" implies the legacy boolean the library derives.
+    expect(options.authenticatorSelection?.requireResidentKey).toBe(true);
+  });
+
+  it("STORY-014 · the authenticator attachment the client reports is stored, and absent is NULL not a guess", async () => {
+    const { cookies } = await signedInSession("ken@example.com");
+    for (const [label, attachment] of [
+      ["cred-platform", "platform"],
+      ["cred-roaming", "cross-platform"],
+      ["cred-unreported", undefined],
+    ] as const) {
+      const ceremonyId = await beginRegistration(cookies);
+      mockRegistration(credId(label), 0);
+      const res = await app.inject({
+        method: "POST",
+        url: apiUrl("/me/passkeys/verify"),
+        payload: {
+          ceremony_id: ceremonyId,
+          response: {
+            ...credentialResponse(credId(label)),
+            ...(attachment === undefined ? {} : { authenticatorAttachment: attachment }),
+          },
+        },
+        ...mutatingHeaders(cookies),
+      });
+      expect(res.statusCode).toBe(200);
+      const row = await db.query<{ authenticator_attachment: string | null }>(
+        "SELECT authenticator_attachment FROM user_credentials WHERE credential_id = $1",
+        [Buffer.from(credId(label), "base64url")],
+      );
+      expect(row.rows[0]!.authenticator_attachment).toBe(attachment ?? null);
+    }
+  });
+
   it("STORY-014 · renaming a credential updates its device label", async () => {
     const { cookies } = await registerPasskey("ivan@example.com", credId("cred-ivan"), 0);
     const { id } = dataOf<{ id: string }[]>(
