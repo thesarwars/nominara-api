@@ -218,6 +218,9 @@ function diffSnapshots(before: readonly string[], after: readonly string[]): str
   return [...removed.slice(0, 5).map((l) => `- ${clip(l)}`), ...added.slice(0, 5).map((l) => `+ ${clip(l)}`)].join(" | ");
 }
 
+// Messages open with the word "migration", never with an interpolation followed
+// by a colon: test/isolation's ISO-13 scanner reads a template literal opening
+// `${x}:` as a cache-key construction site.
 async function exists(file: string): Promise<boolean> {
   try {
     await access(file);
@@ -242,7 +245,7 @@ export async function checkRoundTrip(client: Client, migrationsDir: string = MIG
 
   for (const file of files) {
     if (!(await exists(file.downPath))) {
-      problems.push(`${file.name}: no ${file.name}.down.sql — a migration without a rollback is not reversible`);
+      problems.push(`migration ${file.name} — no ${file.name}.down.sql — a migration without a rollback is not reversible`);
     }
   }
   if (problems.length > 0) {
@@ -264,34 +267,34 @@ export async function checkRoundTrip(client: Client, migrationsDir: string = MIG
       try {
         const applied = await migrateUp(client, stepDir);
         if (applied.length !== 1 || applied[0] !== file.name) {
-          return fail(`${file.name}: forward apply recorded [${applied.join(", ")}], expected exactly [${file.name}]`);
+          return fail(`migration ${file.name} — forward apply recorded [${applied.join(", ")}], expected exactly [${file.name}]`);
         }
       } catch (error) {
-        return fail(`${file.name}: forward apply failed: ${(error as Error).message}`);
+        return fail(`migration ${file.name} — forward apply failed: ${(error as Error).message}`);
       }
       const afterUp = await snapshotSchema(client);
 
       try {
         const rolledBack = await rollbackLast(client, stepDir);
         if (rolledBack !== file.name) {
-          return fail(`${file.name}: rollback recorded ${rolledBack ?? "nothing"}, expected ${file.name}`);
+          return fail(`migration ${file.name} — rollback recorded ${rolledBack ?? "nothing"}, expected ${file.name}`);
         }
       } catch (error) {
-        return fail(`${file.name}: rollback failed: ${(error as Error).message}`);
+        return fail(`migration ${file.name} — rollback failed: ${(error as Error).message}`);
       }
       const afterDown = await snapshotSchema(client);
       if (afterDown.join("\n") !== before.join("\n")) {
-        problems.push(`${file.name}: its down does not restore the schema it found — ${diffSnapshots(before, afterDown)}`);
+        problems.push(`migration ${file.name} — its down does not restore the schema it found — ${diffSnapshots(before, afterDown)}`);
       }
 
       try {
         await migrateUp(client, stepDir);
       } catch (error) {
-        return fail(`${file.name}: re-apply after rollback failed: ${(error as Error).message}`);
+        return fail(`migration ${file.name} — re-apply after rollback failed: ${(error as Error).message}`);
       }
       const afterAgain = await snapshotSchema(client);
       if (afterAgain.join("\n") !== afterUp.join("\n")) {
-        problems.push(`${file.name}: re-applying its up after rollback gives a different schema — ${diffSnapshots(afterUp, afterAgain)}`);
+        problems.push(`migration ${file.name} — re-applying its up after rollback gives a different schema — ${diffSnapshots(afterUp, afterAgain)}`);
       }
     }
 
