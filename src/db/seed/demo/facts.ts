@@ -433,7 +433,8 @@ interface CaptureRow {
   readonly brandPresent: boolean;
   readonly brandRank: number | null;
   readonly sov: number;
-  readonly sentimentLabel: "positive" | "neutral" | "negative" | "absent";
+  /** NULL (not 'absent') when the brand is unmentioned — the parser's rule (STORY-135 AC8). */
+  readonly sentimentLabel: "positive" | "neutral" | "negative" | null;
   readonly sentimentScore: number | null;
 }
 
@@ -550,7 +551,7 @@ export async function resetAndSeedProjectFacts(
             project.workspaceId, project.id, capture.id, capture.promptId, capture.engineKey, capture.capturedAt,
             "brand", null, project.name, project.name,
             0, 0, 100, 0, uniform(rng, 0.3, 0.95), capture.brandRank,
-            capture.sentimentLabel === "absent" ? "neutral" : capture.sentimentLabel, capture.sentimentScore ?? 0,
+            capture.sentimentLabel ?? "neutral", capture.sentimentScore ?? 0,
             uniform(rng, 0.6, 0.95), "lexicon",
             isAttributeCapable ? pick(rng, ["linked", "described", "structured_row"] as const) : "bare_text",
             renderScore,
@@ -644,7 +645,7 @@ function buildCapture(
     brandPresent: input.present,
     brandRank: input.present ? uniformInt(rng, 1, 5) : null,
     sov: input.present ? uniform(rng, 0.1, 0.6) : 0,
-    sentimentLabel: input.present ? labelFor(sentimentScore ?? 0) : "absent",
+    sentimentLabel: input.present ? labelFor(sentimentScore ?? 0) : null,
     sentimentScore,
   };
 }
