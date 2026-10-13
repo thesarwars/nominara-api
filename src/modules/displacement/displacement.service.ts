@@ -15,6 +15,7 @@ import { dataSourceOf } from "../../lib/analytics/data-source.js";
 import { authorityTargets, authorityTaskFingerprint, recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
 import type { Task } from "../../../contracts/tasks/index.js";
 import { TasksService } from "../tasks/tasks.service.js";
+import { SOURCE_INDEX_WINDOWS } from "../../lib/rollup/refresh-project-source-index.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -35,6 +36,9 @@ import { currentTenantStore } from "../../tenancy/tenant-context.js";
 // member's project scope is a 403 naming the scope (a denial is never a 404).
 
 const logger = new Logger("displacement");
+
+/** The widest source-index window: the one an authority task is gated on (STORY-054 AC10). */
+const AUTHORITY_TASK_WINDOW_DAYS = Math.max(...SOURCE_INDEX_WINDOWS);
 
 interface FeedRow {
   id: string;
@@ -125,14 +129,7 @@ export class DisplacementService {
       conceptGap: conceptGapSchema.parse(row.concept_gap),
     }));
     const domains = [...new Set(parsed.flatMap((p) => p.citationGap.map((g) => g.domain.toLowerCase())))];
-    const seedable = new Set<string>();
-    if (domains.length > 0) {
-      const seeds = await client.query<{ domain: string }>(
-        "SELECT lower(domain) AS domain FROM source_domains WHERE workspace_id = $1 AND is_seedable AND lower(domain) = ANY($2::text[])",
-        [context.workspaceId, domains],
-      );
-      for (const seed of seeds.rows) seedable.add(seed.domain);
-    }
+    const seedable = new Set((await this.actionableDomains(projectId, domains)).keys());
     const byId = new Map(parsed.map((p) => [p.row.id, p]));
 
     incrementCounter("nominara_displacement_feed_reads_total");
@@ -220,14 +217,7 @@ export class DisplacementService {
     const gap = citationGapSchema.parse(state.citation_gap);
 
     const domains = [...new Set(gap.map((g) => g.domain.toLowerCase()))];
-    const seedable = new Map<string, string>();
-    if (domains.length > 0) {
-      const seeds = await client.query<{ id: string; domain: string }>(
-        "SELECT id, lower(domain) AS domain FROM source_domains WHERE workspace_id = $1 AND is_seedable AND lower(domain) = ANY($2::text[])",
-        [context.workspaceId, domains],
-      );
-      for (const seed of seeds.rows) seedable.set(seed.domain, seed.id);
-    }
+    const seedable = await this.actionableDomains(state.project_id, domains);
 
     const tasks: Task[] = [];
     let created = 0;
@@ -265,6 +255,29 @@ export class DisplacementService {
       tasks_existing: tasks.length - created,
     });
     return tasks;
+  }
+
+  /**
+   * STORY-054 AC10 (owner decision 2026-10-13) — the domains an authority task may be made for: SEEDABLE in this
+   * workspace AND at a critical or high gap severity on the project's `project_source_index` row at engine 'all',
+   * widest (90-day) window. No row, no task. The feed's count and the plan both read THIS set, so they cannot disagree.
+   * Returns lower-cased domain to `source_domains.id`.
+   */
+  private async actionableDomains(projectId: string, domains: readonly string[]): Promise<Map<string, string>> {
+    const found = new Map<string, string>();
+    if (domains.length === 0) return found;
+    const { client, context } = this.store();
+    const rows = await client.query<{ id: string; domain: string }>(
+      `SELECT sd.id, lower(sd.domain) AS domain
+         FROM source_domains sd
+         JOIN project_source_index psi ON psi.source_domain_id = sd.id
+        WHERE sd.workspace_id = $1 AND sd.is_seedable AND lower(sd.domain) = ANY($3::text[])
+          AND psi.workspace_id = $1 AND psi.project_id = $2 AND psi.engine_key = 'all' AND psi.window_days = $4
+          AND psi.gap_severity IN ('critical', 'high')`,
+      [context.workspaceId, projectId, domains, AUTHORITY_TASK_WINDOW_DAYS],
+    );
+    for (const row of rows.rows) found.set(row.domain, row.id);
+    return found;
   }
 
   private store() {

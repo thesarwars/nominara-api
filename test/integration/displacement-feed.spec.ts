@@ -45,7 +45,7 @@ describe("NEW-C-5 · displacement feed, dismiss and restore", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE displacement_events, source_domains, answer_captures, tracked_prompts, projects, workspaces CASCADE");
+    await db.query("TRUNCATE displacement_events, project_source_index, source_domains, answer_captures, tracked_prompts, projects, workspaces CASCADE");
     await db.query("TRUNCATE users CASCADE");
     actorId = (await db.query("INSERT INTO users (email, status) VALUES ($1, 'active') RETURNING id", [`a-${randomUUID()}@example.com`])).rows[0].id;
     workspaceId = randomUUID();
@@ -176,6 +176,12 @@ describe("NEW-C-5 · displacement feed, dismiss and restore", () => {
 
   it("NEW-C-5 AC1 — takers, citation_gap and recovery_task_count: one task per concept, one per SEEDABLE citation gap", async () => {
     await db.query("INSERT INTO source_domains (workspace_id, domain, is_seedable) VALUES ($1,'seed.com',true),($1,'closed.com',false)", [workspaceId]);
+    // STORY-054 AC10: a task also needs a critical/high band on the project's engine-'all', 90-day index row.
+    await db.query(
+      `INSERT INTO project_source_index (workspace_id, project_id, source_domain_id, engine_key, window_start, window_days, gap_severity)
+       SELECT workspace_id, $2, id, 'all', '2026-07-14', 90, 'high' FROM source_domains WHERE workspace_id = $1 AND domain IN ('seed.com','closed.com')`,
+      [workspaceId, projectId],
+    );
     const id = await displacement({
       citationGap: [gapEntry("seed.com"), gapEntry("closed.com"), gapEntry("unknown.com")],
       conceptGap: [{ concept: "pricing", prevalence: 0.6, evidence_url: "https://e.com" }],
