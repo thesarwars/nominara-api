@@ -266,11 +266,14 @@ describe("STORY-143 · audit.verify handler", () => {
       await disableAppendOnly();
       await db.query("DELETE FROM audit_log WHERE seq = (SELECT max(seq) FROM audit_log)");
       await enableAppendOnly();
+      const marksBefore = await marks();
 
       const thrown: unknown = await run().then(
         () => null,
         (error: unknown) => error,
       );
+      // A detected truncation must not become the new baseline.
+      expect(await marks()).toEqual(marksBefore);
       expect(thrown, "a truncated chain was reported clean").not.toBeNull();
       expect(thrown).toBeInstanceOf(UnrecoverableError);
       expect((thrown as Error).message).toMatch(/chain_truncated/);
@@ -282,11 +285,13 @@ describe("STORY-143 · audit.verify handler", () => {
       await disableAppendOnly();
       await db.query("DELETE FROM audit_log");
       await enableAppendOnly();
+      const marksBefore = await marks();
 
       const thrown: unknown = await run().then(
         () => null,
         (error: unknown) => error,
       );
+      expect(await marks()).toEqual(marksBefore);
       expect(thrown, "a deleted chain was reported clean").not.toBeNull();
       expect(thrown).toBeInstanceOf(UnrecoverableError);
       expect((thrown as Error).message).toMatch(/chain_missing/);
@@ -313,11 +318,13 @@ describe("STORY-143 · audit.verify handler", () => {
         forgedHash,
       ]);
       await enableAppendOnly();
+      const marksBefore = await marks();
 
       const thrown: unknown = await run().then(
         () => null,
         (error: unknown) => error,
       );
+      expect(await marks()).toEqual(marksBefore);
       expect(thrown, "a self-consistent forged tail was reported clean").not.toBeNull();
       expect(thrown).toBeInstanceOf(UnrecoverableError);
       expect((thrown as Error).message).toMatch(/mark_hash_mismatch/);
@@ -333,6 +340,46 @@ describe("STORY-143 · audit.verify handler", () => {
       await appendChain(2);
 
       await expect(run()).rejects.toThrow(/mark_hash_mismatch/);
+    }, 60_000);
+
+    it("STORY-143-AC7p · compares against the GREATEST mark, not an older one: truncation back to a previously-verified head is still caught", async () => {
+      // Two clean runs leave two marks. Truncating to the first run's head
+      // satisfies THAT mark exactly, so a verifier that picked the oldest (or
+      // any non-greatest) mark would call this clean.
+      await appendChain(2);
+      await run();
+      await appendChain(2);
+      await run();
+      await disableAppendOnly();
+      await db.query(
+        "DELETE FROM audit_log WHERE workspace_id = $1 AND seq > (SELECT min(max_seq) FROM audit_chain_marks WHERE workspace_id = $1)",
+        [workspaceId],
+      );
+      await enableAppendOnly();
+
+      await expect(run()).rejects.toThrow(/chain_truncated/);
+    }, 60_000);
+
+    it("STORY-143-AC7q · a stale mark committed LATER does not become the baseline (greatest max_seq, not newest row)", async () => {
+      // A verifier walking a REPEATABLE READ snapshot can commit its mark after
+      // an erasure committed a higher one, leaving the newest-written row as
+      // the lower mark. Simulated directly: a lower mark with a later
+      // checked_at, then truncation back to that lower head.
+      await appendChain(4);
+      await run();
+      const lowerSeq = await db.query<{ seq: string; row_hash: Buffer }>(
+        "SELECT seq::text AS seq, row_hash FROM audit_log WHERE workspace_id = $1 ORDER BY seq LIMIT 1 OFFSET 1",
+        [workspaceId],
+      );
+      await db.query(
+        "INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason, checked_at) VALUES ($1, $2::int8, $3, 'verified', now() + interval '1 minute')",
+        [workspaceId, lowerSeq.rows[0]!.seq, lowerSeq.rows[0]!.row_hash],
+      );
+      await disableAppendOnly();
+      await db.query("DELETE FROM audit_log WHERE workspace_id = $1 AND seq > $2::int8", [workspaceId, lowerSeq.rows[0]!.seq]);
+      await enableAppendOnly();
+
+      await expect(run()).rejects.toThrow(/chain_truncated/);
     }, 60_000);
 
     it("STORY-143-AC7f · a legitimate erasure rechain passes, and writes a `rechain` mark at the marker row", async () => {

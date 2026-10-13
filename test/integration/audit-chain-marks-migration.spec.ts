@@ -100,7 +100,17 @@ describe("STORY-143 AC7 · audit_chain_marks — owner-only grants and a reversi
     await expect(
       db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 5, decode(repeat('04',32),'hex'), 'tombstone')", [ws]),
     ).rejects.toThrow(/ck_audit_chain_marks_shape/);
+    await expect(
+      db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 5, '\\x0405', 'verified')", [ws]),
+    ).rejects.toThrow(/ck_audit_chain_marks_shape/);
+    await expect(
+      db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 0, decode(repeat('04',32),'hex'), 'verified')", [ws]),
+    ).rejects.toThrow(/ck_audit_chain_marks_shape/);
     await db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, NULL, NULL, 'tombstone')", [ws]);
+    // At most one tombstone per workspace: a retried deletion cannot stack them.
+    await expect(
+      db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, NULL, NULL, 'tombstone')", [ws]),
+    ).rejects.toThrow(/ux_audit_chain_marks_tombstone/);
   });
 
   it("STORY-143-AC7n · the marks survive the workspace they describe (no FK that cascades a tombstone away)", async () => {
