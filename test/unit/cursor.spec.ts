@@ -57,7 +57,7 @@ describe("STORY-024 · scenario 5 — the limit cap CLAMPS, it does not reject",
 describe("STORY-024 · AC6 — the cursor is an opaque, tamper-evident encoding of the sort-key tuple", () => {
   it("round-trips a sort-key tuple", () => {
     const key = ["2026-08-04T11:02:31Z", 42];
-    expect(decodeCursor(encodeCursor(key))).toEqual(key);
+    expect(decodeCursor(encodeCursor("t", key), "t")).toEqual(key);
   });
 
   it("encodes to base64url only, so it survives a query string unescaped", () => {
@@ -97,5 +97,46 @@ describe("STORY-024 · AC6 — the cursor is an opaque, tamper-evident encoding 
     // "it threw" alone proves nothing; an integer key must NOT throw for the
     // assertion above to be about floats at all.
     expect(() => encodeCursor([1])).not.toThrow();
+  });
+});
+
+// STORY-117 AC6 / scenario 6 — a cursor names the list that issued it. Arity alone cannot tell two (timestamp, uuid)
+// lists apart: a members cursor bound against invitations and rewound to the first row.
+describe("STORY-117 · scenario 6 — a cursor is bound to its list", () => {
+  const KEY = ["2026-09-07 00:00:00.000001+00", "0198f4f6-0000-7000-8000-000000000001"];
+
+  it("STORY-117 scenario 6 — a cursor decodes for the list that issued it", () => {
+    expect(decodeCursor(encodeCursor("workspaces.members", KEY), "workspaces.members", 2)).toEqual(KEY);
+  });
+
+  it("STORY-117 scenario 6 — a cursor of the SAME arity issued by another list is refused", () => {
+    const members = encodeCursor("workspaces.members", KEY);
+    expect(() => decodeCursor(members, "workspaces.invitations", 2)).toThrow(/not issued for this list|list/u);
+  });
+
+  it("STORY-117 scenario 6 — a refusal is a 400 validation_failed naming the cursor, not a silent first page", () => {
+    const members = encodeCursor("workspaces.members", KEY);
+    try {
+      decodeCursor(members, "workspaces.invitations", 2);
+      expect.unreachable("a foreign cursor must be refused");
+    } catch (error) {
+      expect(error).toMatchObject({ details: { issues: [{ path: ["cursor"] }] } });
+    }
+  });
+
+  it("STORY-117 scenario 6 — a cursor issued before lists were tagged (no list member) is refused", () => {
+    const legacy = Buffer.from(JSON.stringify({ v: 1, k: KEY }), "utf8").toString("base64url");
+    expect(() => decodeCursor(legacy, "workspaces.members", 2)).toThrow();
+  });
+
+  it("STORY-117 scenario 6 — a payload with the tag stripped is refused, whatever its version", () => {
+    const untagged = Buffer.from(JSON.stringify({ v: 2, k: KEY }), "utf8").toString("base64url");
+    expect(() => decodeCursor(untagged, "workspaces.members", 2)).toThrow();
+  });
+
+  it("STORY-117 scenario 6 — the list tag is part of the wire payload contract", () => {
+    const raw: unknown = JSON.parse(Buffer.from(encodeCursor("workspaces.members", KEY), "base64url").toString("utf8"));
+    expect(cursorPayloadSchema.safeParse(raw).success).toBe(true);
+    expect(raw).toMatchObject({ l: "workspaces.members" });
   });
 });
