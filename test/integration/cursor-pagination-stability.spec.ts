@@ -192,7 +192,7 @@ describe("STORY-024 · scenario 4 — a cursor is stable across an interleaved i
     expect(page.cursorNext).not.toBeNull();
     const payload = Buffer.from(page.cursorNext!, "base64url").toString("utf8");
     expect(payload, "a decoded cursor must not name a workspace").not.toContain(WORKSPACE_ID);
-    expect(JSON.parse(payload)).toEqual({ v: 1, k: [expect.any(Number)] });
+    expect(JSON.parse(payload)).toEqual({ v: 2, l: "test.seq", k: [expect.any(Number)] });
   });
 
   it("a forged cursor of the wrong arity is refused, not read as NULL and rewound to page one", async () => {
