@@ -71,7 +71,9 @@ describe("STORY-173 · stale unverified accounts are swept", () => {
 
   it("STORY-173 · sweep — deletes a stale, untouched unverified account and its pending codes", async () => {
     const stale = await user({ ageDays: UNVERIFIED_ACCOUNT_TTL_DAYS + 1 });
-    await db.query("INSERT INTO email_otp_codes (user_id, code_hash, expires_at) VALUES ($1, 'h', now())", [stale]);
+    // The pending code is as old as the account: a code stamped with the wall clock would read as a recent
+    // touch once the real date passes NOW - TTL, and the account would (correctly) be kept.
+    await codeFor(stale, new Date(NOW.getTime() - (UNVERIFIED_ACCOUNT_TTL_DAYS + 1) * DAY));
     const result = await sweepStaleUnverifiedAccounts(db, NOW);
     expect(result).toEqual({ deleted: 1, skippedReferenced: 0, skippedLocked: 0 });
     expect(await exists(stale)).toBe(false);
