@@ -68,6 +68,8 @@ describe("STORY-060 · A3 answer structure (persisted, read)", () => {
     demo?: boolean;
     project?: string;
     ws?: string;
+    /** STORY-040 — the tracked prompt the answer belongs to (carries the cluster); default is an unknown prompt. */
+    prompt?: string;
   }
   async function answer(a: Answer = {}): Promise<void> {
     const id = randomUUID();
@@ -78,7 +80,7 @@ describe("STORY-060 · A3 answer structure (persisted, read)", () => {
     await db.query(
       `INSERT INTO answer_captures (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,'api','v1',$8,'\\x00','parsed')`,
-      [id, ws, project, randomUUID(), randomUUID(), engine, at, a.demo === true ? "demo-seed" : "v1"],
+      [id, ws, project, randomUUID(), a.prompt ?? randomUUID(), engine, at, a.demo === true ? "demo-seed" : "v1"],
     );
     const mention = (type: string, cls: string) =>
       db.query(
@@ -86,7 +88,7 @@ describe("STORY-060 · A3 answer structure (persisted, read)", () => {
            occurrence_index,char_start,char_end,first_token_index,prominence,sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,
            position_class,answer_form)
          VALUES ($1,$2,$3,$4,$5,$6,$7,'x','x',0,0,1,0,0.5,'neutral',0,0.5,'lexicon',$8,$9)`,
-        [ws, project, id, randomUUID(), engine, at, type, cls, a.form === undefined ? "narrative" : a.form],
+        [ws, project, id, a.prompt ?? randomUUID(), engine, at, type, cls, a.form === undefined ? "narrative" : a.form],
       );
     if (a.brand !== undefined && a.brand !== null) await mention("brand", a.brand);
     else await mention("competitor", "neutral_list");
@@ -116,6 +118,44 @@ describe("STORY-060 · A3 answer structure (persisted, read)", () => {
     expect(detail.total).toBe(32);
     expect(a.summary.status).toBe("ready");
     expect(a.summary.verdict).toBe("no_action");
+  });
+
+  /** A topic cluster with one tracked prompt in it; returns the prompt id. */
+  async function promptInCluster(label: string, clusterId: string): Promise<string> {
+    await db.query("INSERT INTO topic_clusters (id,workspace_id,project_id,label) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING", [
+      clusterId,
+      workspaceId,
+      projectId,
+      label,
+    ]);
+    const promptId = randomUUID();
+    await db.query(
+      `INSERT INTO tracked_prompts (id,workspace_id,project_id,text,text_hash,intent_archetype,funnel_stage,is_priority,status,cluster_id)
+       VALUES ($1,$2,$3,$4::text,sha256(convert_to($4::text,'UTF8')),'recommendation','consideration',false,'active',$5)`,
+      [promptId, workspaceId, projectId, `q ${promptId}`, clusterId],
+    );
+    return promptId;
+  }
+
+  it("[STORY-040 AC8] the persisted detail carries the form distribution PER PROMPT CLUSTER, read back through the API", async () => {
+    const pricingId = randomUUID();
+    const featuresId = randomUUID();
+    const pricing = await promptInCluster("Pricing", pricingId);
+    const features = await promptInCluster("Features", featuresId);
+    await many(22, { form: "comparison_table", prompt: pricing, engine: "gemini" });
+    await many(9, { form: "narrative", prompt: pricing, engine: "claude" });
+    await many(31, { form: "narrative", prompt: features, engine: "gemini" });
+    await many(3, { form: "ranked_list" }); // a prompt in no cluster
+    await refresh();
+
+    const detail = geoStructureDetailSchema.parse((await ctx((s) => s.analysis(projectId, "structure", { timeframe: "30d" }))).detail);
+    expect(detail.total).toBe(65);
+    const byId = new Map(detail.clusters!.map((c) => [c.cluster_id, c]));
+    expect(byId.get(pricingId)).toMatchObject({ label: "Pricing", total: 31, dominant_form: "comparison_table", sufficient: true });
+    expect(byId.get(pricingId)!.engines.map((e) => [e.engine, e.total])).toEqual([["claude", 9], ["gemini", 22]]);
+    expect(byId.get(featuresId)).toMatchObject({ label: "Features", total: 31, dominant_form: "narrative" });
+    expect(byId.get(null)).toMatchObject({ label: null, total: 3, sufficient: false, dominant_form: null });
+    expect(detail.clusters!.reduce((n, c) => n + c.total, 0)).toBe(detail.total);
   });
 
   it("#8 · no page crawl: page_forms [], template null, no task, no fabricated gap", async () => {

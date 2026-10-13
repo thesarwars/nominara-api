@@ -7,11 +7,18 @@ import { buildStructure, STRUCTURE_MIN_ANSWERS, type StructureInput } from "../.
 // (no page crawl exists, so the gap is never asserted).
 
 type FormRow = StructureInput["forms"][number];
-const f = (engine: string, form: FormRow["form"], answers: number, dataSource: FormRow["dataSource"] = "live"): FormRow => ({
+const f = (
+  engine: string,
+  form: FormRow["form"],
+  answers: number,
+  dataSource: FormRow["dataSource"] = "live",
+  cluster?: FormRow["cluster"],
+): FormRow => ({
   engine,
   form,
   answers,
   dataSource,
+  ...(cluster === undefined ? {} : { cluster }),
 });
 const input = (over: Partial<StructureInput> = {}): StructureInput => ({
   windowStart: "2026-09-08",
@@ -166,5 +173,73 @@ describe("STORY-060 · A3 answer structure (pure)", () => {
 
   it("the minimum is the catalogue's stated 30", () => {
     expect(STRUCTURE_MIN_ANSWERS).toBe(30);
+  });
+
+  // STORY-040 AC8 — the answer-form distribution per PROMPT CLUSTER (topic_clusters), not only per project and engine.
+  describe("STORY-040 AC8 · per prompt cluster", () => {
+    const pricing = { id: "00000000-0000-4000-8000-0000000000a1", label: "Pricing" };
+    const features = { id: "00000000-0000-4000-8000-0000000000a2", label: "Features" };
+
+    it("[AC8] each cluster carries its own distribution, dominant form and total", () => {
+      const { detail } = buildStructure(
+        input({
+          forms: [
+            f("gemini", "comparison_table", 25, "live", pricing),
+            f("claude", "narrative", 8, "live", pricing),
+            f("gemini", "narrative", 31, "live", features),
+          ],
+        }),
+      );
+      const byLabel = (label: string) => detail!.clusters!.find((c) => c.label === label)!;
+      expect(byLabel("Pricing")).toMatchObject({ cluster_id: pricing.id, total: 33, dominant_form: "comparison_table", sufficient: true });
+      expect(byLabel("Pricing")!.forms.find((x) => x.form === "narrative")!.count).toBe(8);
+      expect(byLabel("Features")).toMatchObject({ total: 31, dominant_form: "narrative" });
+      expect(geoStructureDetailSchema.safeParse(detail).success).toBe(true);
+    });
+
+    it("[AC8] and per engine inside each cluster", () => {
+      const { detail } = buildStructure(
+        input({ forms: [f("gemini", "comparison_table", 25, "live", pricing), f("claude", "narrative", 8, "live", pricing)] }),
+      );
+      const cluster = detail!.clusters![0]!;
+      expect(cluster.engines.map((e) => [e.engine, e.total])).toEqual([["claude", 8], ["gemini", 25]]);
+      expect(cluster.engines[1]!.forms.find((x) => x.form === "comparison_table")!.count).toBe(25);
+    });
+
+    it("[AC8] answers whose prompt has no cluster are reported as an unclustered entry, never dropped — the entries sum to the total", () => {
+      const { detail } = buildStructure(
+        input({ forms: [f("gemini", "narrative", 20, "live", pricing), f("gemini", "ranked_list", 12), f("gemini", "narrative", 3, "live", null)] }),
+      );
+      const unclustered = detail!.clusters!.find((c) => c.cluster_id === null)!;
+      expect(unclustered).toMatchObject({ label: null, total: 15 });
+      expect(detail!.clusters!.reduce((n, c) => n + c.total, 0)).toBe(detail!.total);
+    });
+
+    it("[AC8] a cluster under the evidence minimum is insufficient and names NO dominant form, even when the project as a whole is sufficient", () => {
+      const { detail } = buildStructure(
+        input({ forms: [f("gemini", "narrative", 40, "live", features), f("gemini", "comparison_table", STRUCTURE_MIN_ANSWERS - 1, "live", pricing)] }),
+      );
+      const thin = detail!.clusters!.find((c) => c.label === "Pricing")!;
+      expect(thin).toMatchObject({ total: STRUCTURE_MIN_ANSWERS - 1, sufficient: false, dominant_form: null });
+      expect(thin.forms.find((x) => x.form === "comparison_table")!.count).toBe(STRUCTURE_MIN_ANSWERS - 1);
+    });
+
+    it("[AC8] boundary: exactly the minimum is sufficient", () => {
+      const { detail } = buildStructure(input({ forms: [f("gemini", "comparison_table", STRUCTURE_MIN_ANSWERS, "live", pricing)] }));
+      expect(detail!.clusters![0]).toMatchObject({ sufficient: true, dominant_form: "comparison_table" });
+    });
+
+    it("[AC8] clusters are ordered by size, then id, so the output never depends on input order", () => {
+      const a = buildStructure(input({ forms: [f("gemini", "narrative", 30, "live", pricing), f("gemini", "narrative", 40, "live", features), f("gemini", "narrative", 2)] }));
+      const b = buildStructure(input({ forms: [f("gemini", "narrative", 2), f("gemini", "narrative", 40, "live", features), f("gemini", "narrative", 30, "live", pricing)] }));
+      expect(a.detail!.clusters!.map((c) => c.label)).toEqual(["Features", "Pricing", null]);
+      expect(b.detail!.clusters).toEqual(a.detail!.clusters);
+    });
+
+    it("[AC8] a detail persisted before clusters existed still validates (the member is optional, not required)", () => {
+      const { detail } = buildStructure(input());
+      const { clusters: _omitted, ...legacy } = detail!;
+      expect(geoStructureDetailSchema.safeParse(legacy).success).toBe(true);
+    });
   });
 });
