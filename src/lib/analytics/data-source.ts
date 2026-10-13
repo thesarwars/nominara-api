@@ -68,6 +68,9 @@ function toMap(rows: readonly CountRow[]): Map<string, DataSource> {
  * `(captured_at AT TIME ZONE tz)::date BETWEEN from AND to` boundary
  * `aggregateRange` uses, so the marker describes exactly the captures the
  * figure was computed from. Runs on the caller's tenant transaction.
+ *
+ * `scoringVersion` (STORY-136 AC9): when given, only captures stamped with it count — the scorecards pass the current
+ * version so the marker describes the same rows the figure summed. `null` reads every version.
  */
 export async function engineDataSourcesForDates(
   tx: ClientBase,
@@ -75,6 +78,7 @@ export async function engineDataSourcesForDates(
   from: string,
   to: string,
   timezone: string,
+  scoringVersion: string | null = null,
 ): Promise<Map<string, DataSource>> {
   const result = await tx.query<CountRow>(
     `SELECT c.engine_key,
@@ -84,8 +88,9 @@ export async function engineDataSourcesForDates(
       WHERE c.project_id = $1
         AND ${measurementStatusSql()}
         AND (c.captured_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
+        AND ($6::text IS NULL OR c.scoring_version = $6::text)
       GROUP BY c.engine_key`,
-    [projectId, from, to, timezone, DEMO_SEED_MARKER],
+    [projectId, from, to, timezone, DEMO_SEED_MARKER, scoringVersion],
   );
   return toMap(result.rows);
 }

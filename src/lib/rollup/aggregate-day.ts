@@ -236,12 +236,19 @@ export function capturedInRunStatusSql(statusColumn = "c.status"): string {
   return `${statusColumn} IN ('captured', 'parsed')`;
 }
 
+/**
+ * `scoringVersion` — STORY-136 AC9. When given, only rows stamped with that version are read: a capture, and each of
+ * its mentions, written under another scoring version is not part of a score reported under this one. `null` (the
+ * default) reads every version, which is what the rollup has always done; the scorecards read passes the library's
+ * current version, so a v2 row can never be summed into a v1 figure.
+ */
 export async function aggregateRange(
   tx: ClientBase,
   projectId: string,
   fromDate: string,
   toDate: string,
   timezone: string,
+  scoringVersion: string | null = null,
 ): Promise<DayAggregate[]> {
   const result = await tx.query<Record<string, string | null>>(
     `WITH day_cells AS (
@@ -264,6 +271,7 @@ export async function aggregateRange(
           -- data and stays in. The predicate is measurementStatusSql(), declared
           -- above -- see there for why it is not written out here.
           AND ${measurementStatusSql()}
+          AND ($5::text IS NULL OR c.scoring_version = $5::text)
      ),
      entities AS (
        -- Every (engine, entity) pair that appears in the range, so a
@@ -277,6 +285,7 @@ export async function aggregateRange(
          FROM mention_facts m
          JOIN day_cells dc ON dc.id = m.result_id
         WHERE m.entity_type IN ('brand', 'competitor')
+          AND ($5::text IS NULL OR m.scoring_version = $5::text)
        UNION
        -- ⚠ THE BRAND ALWAYS HAS A ROW WHEREVER THERE ARE CELLS, mentioned or
        -- not. Found by STORY-136.
@@ -317,7 +326,8 @@ export async function aggregateRange(
             (SELECT count(DISTINCT m.result_id) FROM mention_facts m
                JOIN day_cells dc ON dc.id = m.result_id
               WHERE dc.engine_key = e.engine_key AND m.entity_type = e.entity_type
-                AND COALESCE(m.entity_id, $1::uuid) = e.entity_id)::text  AS cells_present,
+                AND COALESCE(m.entity_id, $1::uuid) = e.entity_id
+                AND ($5::text IS NULL OR m.scoring_version = $5::text))::text  AS cells_present,
             -- §2.3's numerator. answer_captures.sov is the BRAND's share,
             -- so a competitor row carries 0 here: per-entity share over a
             -- window is EPIC-08's competitive panel, not this rollup.
@@ -351,6 +361,7 @@ export async function aggregateRange(
           WHERE dc.engine_key = e.engine_key
             AND m.entity_type = e.entity_type
             AND COALESCE(m.entity_id, $1::uuid) = e.entity_id
+            AND ($5::text IS NULL OR m.scoring_version = $5::text)
        ) agg
        CROSS JOIN LATERAL (
          -- Citations belong to the CELL, not to an entity, so every entity
@@ -367,7 +378,7 @@ export async function aggregateRange(
             -- neither owned nor foreign.
             AND f.http_status IS NOT NULL
        ) cit`,
-    [projectId, fromDate, timezone, toDate],
+    [projectId, fromDate, timezone, toDate, scoringVersion],
   );
 
   return result.rows.map((row) => ({

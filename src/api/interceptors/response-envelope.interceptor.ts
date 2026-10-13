@@ -5,6 +5,7 @@ import type { FastifyReply } from "fastify";
 import type { Observable } from "rxjs";
 import { map } from "rxjs/operators";
 import type { EnvelopeMeta } from "../../../contracts/common/envelope.schema.js";
+import { SCORING_VERSION } from "../../lib/scoring/index.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { NO_ENVELOPE_KEY } from "../decorators/no-envelope.decorator.js";
 import { STREAMING_KEY } from "../decorators/streaming.decorator.js";
@@ -36,13 +37,10 @@ import type { AuthenticatedRequest } from "../guards/auth.guard.js";
 // api.module.spec.ts lock the whole order.
 const logger = new Logger("response-envelope");
 
-// §1's example prints `"scoring_version": "v1"`, and `v1` is the DEFAULT on
-// every scoring_version column in the schema (six tables, migrations 0002-0004).
-// A per-response scoring version arrives with the analytics endpoints, which
-// pin reads via the `X-Nominara-Scoring-Version` request header (§1); until
-// one exists there is exactly one value the API computes under, and claiming
-// otherwise would be a fiction.
-export const SCORING_VERSION = "v1";
+// STORY-136 AC9 — `meta.scoring_version` is the SCORING LIBRARY's `SCORING_VERSION`, imported rather than restated.
+// This file used to declare its own `"v1"`, which agreed with the library only by coincidence: bumping the library
+// would have left every response claiming the old version. §1's example prints `"v1"`, which is today's value of
+// the one constant. A per-request pin via `X-Nominara-Scoring-Version` (§1) is not built.
 
 /** §1: "`X-Request-Id` — optional. Echoed in responses and logs; generated if absent." */
 function requestIdOf(request: AuthenticatedRequest & { id?: string | number }): string {
