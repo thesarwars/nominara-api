@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { envelopeMetaSchema } from "../../../contracts/common/envelope.schema.js";
 import { NoEnvelope } from "../decorators/no-envelope.decorator.js";
 import { Page } from "../pagination/page.js";
-import { ResponseEnvelopeInterceptor, SCORING_VERSION } from "./response-envelope.interceptor.js";
+import { SCORING_VERSION } from "../../lib/scoring/index.js";
+import { ResponseEnvelopeInterceptor } from "./response-envelope.interceptor.js";
 
 // STORY-024 T10 — coding-standards.md §7: "Every story adds at least one
 // metric and one log line, and both are verified, not assumed."
