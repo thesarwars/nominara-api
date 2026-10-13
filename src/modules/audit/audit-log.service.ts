@@ -94,7 +94,7 @@ export class AuditLogService {
 
     // Seq is the ONLY cursor key: occurred_at is transaction-start time and many
     // rows share a microsecond, so a timestamp key skips rows at page boundaries.
-    const beforeSeq = request.cursor === undefined ? undefined : seqFrom(decodeCursor(request.cursor, 1));
+    const beforeSeq = request.cursor === undefined ? undefined : seqFrom(decodeCursor(request.cursor, "trust.audit_log", 1));
     const category = request.category === undefined ? undefined : categoryPredicate(request.category);
 
     const rows = await this.query.query(store.client, {
@@ -114,7 +114,7 @@ export class AuditLogService {
     // The workspace ID only — never its name, never row content.
     this.logger.log({ message: "audit log read", workspace_id: store.context.workspaceId, rows: Math.min(rows.length, request.limit) });
 
-    return pageFrom(rows, request.limit, toAuditLogEntry, (row) => [row.seq]);
+    return pageFrom(rows, request.limit, "trust.audit_log", toAuditLogEntry, (row) => [row.seq]);
   }
 }
 

@@ -85,7 +85,7 @@ describe("STORY-024 · scenario 4 — a cursor is stable across an interleaved i
     // `decoded[0]`, which is client-supplied and forgeable. There is now
     // nothing in the cursor worth forging. The arity is pinned so a
     // shorter forged tuple is refused rather than read as NULL.
-    const afterSeq = cursor === undefined ? null : (decodeCursor(cursor, 1)[0] as number);
+    const afterSeq = cursor === undefined ? null : (decodeCursor(cursor, "test.seq", 1)[0] as number);
 
     const result = await harness.db().query<{ seq: string; action: string }>(
       `SELECT seq, action FROM audit_log
@@ -100,7 +100,7 @@ describe("STORY-024 · scenario 4 — a cursor is stable across an interleaved i
     const last = rows.at(-1);
     return {
       actions: rows.map((row) => row.action),
-      cursorNext: hasMore && last !== undefined ? encodeCursor([Number(last.seq)]) : null,
+      cursorNext: hasMore && last !== undefined ? encodeCursor("test.seq", [Number(last.seq)]) : null,
       hasMore,
     };
   }
@@ -202,10 +202,10 @@ describe("STORY-024 · scenario 4 — a cursor is stable across an interleaved i
 
     // An empty tuple is already refused by the schema; a WELL-FORMED tuple
     // of the wrong length is the dangerous one, because it decodes cleanly.
-    const forged = encodeCursor(["not-a-seq", 1]);
+    const forged = encodeCursor("test.seq", ["not-a-seq", 1]);
     let refusal: { details?: { issues?: { message?: string }[] } } | undefined;
     try {
-      decodeCursor(forged, 1);
+      decodeCursor(forged, "test.seq", 1);
     } catch (error) {
       refusal = error as typeof refusal;
     }
@@ -219,7 +219,7 @@ describe("STORY-024 · scenario 4 — a cursor is stable across an interleaved i
   });
 
   it("a sequence cursor round-trips as an integer, not a stringified one", () => {
-    const decoded = decodeCursor(encodeCursor([9]), 1);
+    const decoded = decodeCursor(encodeCursor("test.seq", [9]), "test.seq", 1);
     expect(decoded).toEqual([9]);
     expect(typeof decoded[0]).toBe("number");
   });

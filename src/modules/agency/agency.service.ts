@@ -50,7 +50,7 @@ const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 function themeCursorKeyOf(cursor: string): [number, string, string] {
-  const [isDefault, createdAt, id] = decodeCursor(cursor, 3);
+  const [isDefault, createdAt, id] = decodeCursor(cursor, "agency.themes", 3);
   if ((isDefault !== 0 && isDefault !== 1) || typeof createdAt !== "string" || !ISO_MICROS.test(createdAt) || typeof id !== "string" || !UUID.test(id)) {
     throw invalidCursor();
   }
@@ -110,7 +110,7 @@ export class AgencyService {
       [after?.[0] ?? null, after?.[1] ?? null, after?.[2] ?? null, query.limit + 1],
     );
     if (result.rows.length === 0 && after === undefined) return new Page([platformDefaultTheme()], { cursor_next: null, has_more: false, limit: query.limit });
-    return pageFrom(result.rows, query.limit, toTheme, (row) => [row.is_default ? 1 : 0, row.created_at_key, row.id]);
+    return pageFrom(result.rows, query.limit, "agency.themes", toTheme, (row) => [row.is_default ? 1 : 0, row.created_at_key, row.id]);
   }
 
   /**

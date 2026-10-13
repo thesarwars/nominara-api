@@ -63,40 +63,40 @@ describe("STORY-024 · AC6 — the cursor is an opaque, tamper-evident encoding 
   it("encodes to base64url only, so it survives a query string unescaped", () => {
     // A tuple whose JSON is long enough to force padding and non-alphanumeric
     // base64 output — the case where plain base64 would emit "+" or "/".
-    const cursor = encodeCursor(["ÿþý?>=<;:/+", 9007199254740991]);
+    const cursor = encodeCursor("t", ["ÿþý?>=<;:/+", 9007199254740991]);
     expect(cursor).toMatch(CURSOR_BASE64URL_PATTERN);
     expect(cursor).not.toContain("=");
   });
 
   it("carries the payload version, so a later sort-key change can reject a stale cursor", () => {
-    const decodedRaw: unknown = JSON.parse(Buffer.from(encodeCursor([1]), "base64url").toString("utf8"));
+    const decodedRaw: unknown = JSON.parse(Buffer.from(encodeCursor("t", [1]), "base64url").toString("utf8"));
     expect(cursorPayloadSchema.safeParse(decodedRaw).success).toBe(true);
   });
 
   // Opaque means the server must not trust what comes back. A cursor is
   // client-supplied input on every page after the first.
   it("rejects a tampered, truncated, non-base64url or wrong-version cursor rather than decoding it to nonsense", () => {
-    const valid = encodeCursor(["a", 1]);
+    const valid = encodeCursor("t", ["a", 1]);
     const cases: [string, string][] = [
       ["truncated", valid.slice(0, Math.max(1, valid.length - 4))],
       ["not base64url", "not a cursor!!"],
       ["empty", ""],
-      ["wrong version", Buffer.from(JSON.stringify({ v: 99, k: ["a"] }), "utf8").toString("base64url")],
+      ["wrong version", Buffer.from(JSON.stringify({ v: 99, l: "t", k: ["a"] }), "utf8").toString("base64url")],
       ["not an object", Buffer.from(JSON.stringify(["a"]), "utf8").toString("base64url")],
-      ["empty key tuple", Buffer.from(JSON.stringify({ v: 1, k: [] }), "utf8").toString("base64url")],
+      ["empty key tuple", Buffer.from(JSON.stringify({ v: 2, l: "t", k: [] }), "utf8").toString("base64url")],
     ];
 
     for (const [label, cursor] of cases) {
-      expect(() => decodeCursor(cursor), `a ${label} cursor must be refused`).toThrow();
+      expect(() => decodeCursor(cursor, "t"), `a ${label} cursor must be refused`).toThrow();
     }
   });
 
   it("a float sort key is refused — it cannot be compared exactly across a page boundary", () => {
-    expect(() => encodeCursor([1.5])).toThrow();
+    expect(() => encodeCursor("t", [1.5])).toThrow();
     // Guards against a VACUOUS pass. T11's stub throws for every input, so
     // "it threw" alone proves nothing; an integer key must NOT throw for the
     // assertion above to be about floats at all.
-    expect(() => encodeCursor([1])).not.toThrow();
+    expect(() => encodeCursor("t", [1])).not.toThrow();
   });
 });
 
@@ -111,7 +111,13 @@ describe("STORY-117 · scenario 6 — a cursor is bound to its list", () => {
 
   it("STORY-117 scenario 6 — a cursor of the SAME arity issued by another list is refused", () => {
     const members = encodeCursor("workspaces.members", KEY);
-    expect(() => decodeCursor(members, "workspaces.invitations", 2)).toThrow(/not issued for this list|list/u);
+    try {
+      decodeCursor(members, "workspaces.invitations", 2);
+      expect.unreachable("a foreign cursor must be refused");
+    } catch (error) {
+      // The reason travels in details.issues; the message is the client-facing constant.
+      expect(error).toMatchObject({ details: { issues: [{ message: "cursor was not issued for this list" }] } });
+    }
   });
 
   it("STORY-117 scenario 6 — a refusal is a 400 validation_failed naming the cursor, not a silent first page", () => {

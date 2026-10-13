@@ -136,7 +136,7 @@ describe("STORY-134 · GET /projects/{id}/prompts keyset paging — real SQL", (
     const { ws, actor, project } = await workspaceWithProject();
     await seedTied(ws, project, 4);
     const at = "2026-09-07T00:00:00.123456Z";
-    for (const cursor of ["not a cursor!!", encodeCursor([at, randomUUID(), at, randomUUID(), randomUUID()]), encodeCursor([1, 2])]) {
+    for (const cursor of ["not a cursor!!", encodeCursor("prompts.prompts", [at, randomUUID(), at, randomUUID(), randomUUID()]), encodeCursor("prompts.prompts", [1, 2]), encodeCursor("projects.projects", [at, randomUUID()])]) {
       await expect(page(ctx(ws, actor), project, { limit: 2, cursor })).rejects.toMatchObject({ code: "validation_failed" });
     }
   });

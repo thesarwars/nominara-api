@@ -500,7 +500,7 @@ export class IdentityService {
    * is `.strict()`, and an extra member would fail it.
    */
   async listPasskeys(userId: string, pagination: PaginationRequest): Promise<Page<PasskeyListItem>> {
-    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, "identity.passkeys", 2);
     const client = await this.pool.connect();
     try {
       const result = await client.query<PasskeyListItem & { created_at_key: string }>(
@@ -516,6 +516,7 @@ export class IdentityService {
       return pageFrom(
         result.rows,
         pagination.limit,
+        "identity.passkeys",
         ({ created_at_key: _key, ...item }) => item,
         (row) => [row.created_at_key, row.id],
       );

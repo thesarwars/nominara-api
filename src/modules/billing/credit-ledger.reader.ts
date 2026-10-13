@@ -160,7 +160,7 @@ export async function readLedgerPage(
 
   // The tuple the query ORDERED BY, in the same order — `pageFrom`'s own
   // contract, and the reason the key is passed in rather than guessed at.
-  return pageFrom(result.rows, query.limit, toEntry, (row) => [row.occurred_at_key, row.seq_key]);
+  return pageFrom(result.rows, query.limit, "billing.credit_ledger", toEntry, (row) => [row.occurred_at_key, row.seq_key]);
 }
 
 /**
@@ -266,7 +266,7 @@ export function toLedgerCsv(entries: readonly CreditLedgerEntry[]): string {
  * first of those.
  */
 function cursorKeyOf(cursor: string): [string, string] {
-  const key = decodeCursor(cursor, 2);
+  const key = decodeCursor(cursor, "billing.credit_ledger", 2);
   const [occurredAt, seq] = key;
   if (typeof occurredAt !== "string" || !ISO_MICROS.test(occurredAt) || typeof seq !== "string" || !DIGITS.test(seq)) {
     throw new ValidationFailedError({

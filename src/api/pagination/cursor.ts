@@ -19,17 +19,17 @@ import { ValidationFailedError, type DomainError } from "../errors/domain-errors
 // silently skip rows — the exact failure AC7 exists to rule out.
 export type CursorKeyElement = CursorPayload["k"][number];
 
-const CURSOR_PAYLOAD_VERSION = 1;
+const CURSOR_PAYLOAD_VERSION = 2;
 
 /**
- * Encodes a sort-key tuple into the opaque wire cursor.
+ * Encodes a sort-key tuple into the opaque wire cursor, stamped with the `list` that issued it.
  *
  * Refuses a tuple the contract cannot carry — a float key most importantly,
  * because a float cannot be compared exactly across a page boundary, which
  * is the one thing a cursor must do.
  */
-export function encodeCursor(key: readonly CursorKeyElement[]): string {
-  const payload = cursorPayloadSchema.safeParse({ v: CURSOR_PAYLOAD_VERSION, k: key });
+export function encodeCursor(list: string, key: readonly CursorKeyElement[]): string {
+  const payload = cursorPayloadSchema.safeParse({ v: CURSOR_PAYLOAD_VERSION, l: list, k: key });
   if (!payload.success) {
     throw new ValidationFailedError({
       message: "cannot encode a cursor from this sort-key tuple",
@@ -59,7 +59,13 @@ export function encodeCursor(key: readonly CursorKeyElement[]): string {
 
 /**
  * Decodes a wire cursor back to its sort-key tuple, refusing anything that
- * is not exactly a cursor this server issued at the current payload version.
+ * is not exactly a cursor this server issued, at the current payload
+ * version, FOR THIS `list`.
+ *
+ * `list` is required, not optional: arity cannot tell two lists apart, and a
+ * caller that could omit it would be a list that accepts every other list's
+ * cursor. A cursor from another list (or from before lists were tagged) is a
+ * 400, never a silent rewind.
  *
  * `expectedKeyLength` is how a caller pins the ARITY of the tuple, and
  * callers with a fixed sort key should always pass it. `v` pins the encoding
@@ -70,7 +76,7 @@ export function encodeCursor(key: readonly CursorKeyElement[]): string {
  * collapses to true, and the page silently rewinds to the first row — a
  * wrong page, from client-supplied input, with no error anywhere.
  */
-export function decodeCursor(cursor: string, expectedKeyLength?: number): CursorKeyElement[] {
+export function decodeCursor(cursor: string, list: string, expectedKeyLength?: number): CursorKeyElement[] {
   // Shape first, before any decoding: base64url charset and the length cap.
   // `Buffer.from(…, "base64url")` is LENIENT — it silently ignores bytes it
   // cannot decode rather than throwing — so "not a cursor!!" would otherwise
@@ -103,6 +109,9 @@ export function decodeCursor(cursor: string, expectedKeyLength?: number): Cursor
   const payload = cursorPayloadSchema.safeParse(parsed);
   if (!payload.success) {
     throw refuse(payload.error.issues[0]?.message ?? "cursor payload is not valid");
+  }
+  if (payload.data.l !== list) {
+    throw refuse("cursor was not issued for this list");
   }
   if (expectedKeyLength !== undefined && payload.data.k.length !== expectedKeyLength) {
     throw refuse(

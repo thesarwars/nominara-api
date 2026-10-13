@@ -116,7 +116,7 @@ export class ScheduledReportsService {
   /** NEW-E-7 checkpoint-6 — keyset page ordered (created_at DESC, id DESC); the cursor key carries the microsecond created_at. */
   async list(query: ScheduledReportListQuery): Promise<Page<ScheduledReport>> {
     const { client } = this.store();
-    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor);
+    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor, "reports.scheduled_reports");
     const reports = await client.query<ReportRow & { created_at_key: string }>(
       `SELECT ${COLUMNS}, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_at_key
          FROM scheduled_reports
@@ -125,7 +125,7 @@ export class ScheduledReportsService {
         LIMIT $3`,
       [after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
-    const page = pageFrom(reports.rows, query.limit, (r) => r, (r) => [r.created_at_key, r.id]);
+    const page = pageFrom(reports.rows, query.limit, "reports.scheduled_reports", (r) => r, (r) => [r.created_at_key, r.id]);
     if (page.items.length === 0) return new Page<ScheduledReport>([], page.pagination);
     const deliveries = await client.query<DeliveryRow>(
       `SELECT id, scheduled_report_id, attempted_at, status, reason, recipient_count

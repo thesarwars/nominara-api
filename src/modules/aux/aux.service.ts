@@ -89,7 +89,7 @@ export class AuxService {
   async listProjectAudits(projectId: string, query: AuxAuditListQuery): Promise<Page<AuxAudit>> {
     const client = currentTenantStore()!.client;
     await this.assertProjectVisible(projectId);
-    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, 2);
+    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, "aux.audits", 2);
     const result = await client.query<AuditRow>(
       `${AUDIT_SELECT}
         WHERE a.project_id = $1
@@ -99,14 +99,14 @@ export class AuxService {
       [projectId, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
     incrementCounter("nominara_aux_audit_reads_total", { route: "list" });
-    return pageFrom(result.rows, query.limit, toAudit, (row) => [row.created_at_key, row.id]);
+    return pageFrom(result.rows, query.limit, "aux.audits", toAudit, (row) => [row.created_at_key, row.id]);
   }
 
   /** `GET /v1/projects/{id}/aux-findings` — filter by severity, status, rule, URL. */
   async listProjectFindings(projectId: string, query: AuxFindingListQuery): Promise<Page<AuxFinding>> {
     const client = currentTenantStore()!.client;
     await this.assertProjectVisible(projectId);
-    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, 2);
+    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, "aux.findings", 2);
     const result = await client.query<FindingRow>(
       `WITH items AS (${FINDING_SELECT}
          WHERE f.project_id = $1
@@ -121,7 +121,7 @@ export class AuxService {
       [projectId, query.severity ?? null, query.status ?? null, query.rule_code ?? null, query.url ?? null, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
     incrementCounter("nominara_aux_finding_reads_total", { filtered: String(query.severity !== undefined || query.status !== undefined || query.rule_code !== undefined || query.url !== undefined) });
-    return pageFrom(result.rows, query.limit, toFinding, (row) => [row.severity_rank, row.id]);
+    return pageFrom(result.rows, query.limit, "aux.findings", toFinding, (row) => [row.severity_rank, row.id]);
   }
 
   /**

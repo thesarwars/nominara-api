@@ -353,7 +353,7 @@ export class WorkspacesService {
    * through Date would truncate the key and reintroduce the same bug.
    */
   async listForActor(userId: string, pagination: PaginationRequest): Promise<Page<WorkspaceListItemWithRelationship>> {
-    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, "workspaces.workspaces", 2);
     const client = await this.pool.connect();
     try {
       return await withActorContext(client, { actorId: userId }, async (tx) => {
@@ -380,6 +380,7 @@ export class WorkspacesService {
         return pageFrom(
           result.rows,
           pagination.limit,
+          "workspaces.workspaces",
           (row) => ({
             workspace_id: row.workspace_id,
             name: row.name,
@@ -580,7 +581,7 @@ export class WorkspacesService {
    * tenant, exactly as before this change.
    */
   async listMembers(pagination: PaginationRequest): Promise<Page<MemberResponse>> {
-    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, "workspaces.members", 2);
     const client = currentTenantStore()!.client;
     const result = await client.query<MemberRow & { joined_at_key: string }>(
       `SELECT ${MEMBER_JOINED_COLUMNS}, m.joined_at::text AS joined_at_key ${MEMBER_JOINED_FROM}
@@ -590,7 +591,7 @@ export class WorkspacesService {
        LIMIT $3`,
       [after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
     );
-    return pageFrom(result.rows, pagination.limit, toMemberResponse, (row) => [row.joined_at_key, row.id]);
+    return pageFrom(result.rows, pagination.limit, "workspaces.members", toMemberResponse, (row) => [row.joined_at_key, row.id]);
   }
 
   /**

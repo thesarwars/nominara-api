@@ -42,6 +42,9 @@ export class Page<Item, Data = readonly Item[]> {
  * counting is the wrong answer anyway: on a list with concurrent inserts a
  * count taken separately from the page is already stale when it arrives.
  *
+ * `list` names the list for the cursor, and the SAME name must be passed to `decodeCursor` by the query that
+ * reads the next page — that pairing is what makes another list's cursor a 400 (STORY-117 AC6).
+ *
  * `keyOf` must return the SAME tuple the query ordered by, in the same order.
  * A cursor keyed on anything else — or on a non-unique prefix of it — skips
  * and repeats rows across pages, which is the precise failure NFR-API-03
@@ -51,6 +54,7 @@ export class Page<Item, Data = readonly Item[]> {
 export function pageFrom<Row, Item>(
   rows: readonly Row[],
   limit: number,
+  list: string,
   toItem: (row: Row) => Item,
   keyOf: (row: Row) => CursorKeyElement[],
 ): Page<Item> {
@@ -65,7 +69,7 @@ export function pageFrom<Row, Item>(
   return new Page(
     visible.map(toItem),
     {
-      cursor_next: hasMore && last !== undefined ? encodeCursor(keyOf(last)) : null,
+      cursor_next: hasMore && last !== undefined ? encodeCursor(list, keyOf(last)) : null,
       has_more: hasMore,
       limit,
     },
