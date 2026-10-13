@@ -202,10 +202,35 @@ export const featureNotInPlanDetailsSchema = z
 // and is reachable only by the invited, verified account (see
 // security-and-tenancy.md, "Forwarded invitation link"). Closed enum: a new
 // reason is a contract change, not a free-form string.
+// STORY-021 core slice (EC-15) — the ownership-transfer refusals that are state
+// conflicts, named so a client can tell them apart without parsing a message:
+//
+//   transfer_already_pending            an unexpired transfer is awaiting acceptance
+//   transfer_not_pending                accept/decline/cancel with nothing to act on
+//   transfer_expired                    the 7 days passed; nothing was mutated
+//   workspace_pending_deletion          a pending deletion blocks initiation
+//   recipient_not_admin                 not an active admin of this workspace (a stranger is
+//                                       answered identically — no membership oracle)
+//   recipient_email_unverified          the recipient's address is not proved
+//   recipient_no_strong_authenticator   no un-revoked passkey; an email code alone does not count
+//   past_due_invoice                    an unpaid invoice is past its due date
+export const CONFLICT_REASONS = [
+  "member_suspended",
+  "already_member",
+  "transfer_already_pending",
+  "transfer_not_pending",
+  "transfer_expired",
+  "workspace_pending_deletion",
+  "recipient_not_admin",
+  "recipient_email_unverified",
+  "recipient_no_strong_authenticator",
+  "past_due_invoice",
+] as const;
+
 export const conflictDetailsSchema = z
   .object({
     current_state: z.string().min(1).optional(),
-    reason: z.enum(["member_suspended", "already_member"]).optional(),
+    reason: z.enum(CONFLICT_REASONS).optional(),
   })
   .strict();
 

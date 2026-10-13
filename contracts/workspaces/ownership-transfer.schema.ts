@@ -19,7 +19,18 @@ const transferStateSchema = z.enum([
   "completed",
   "cancelled",
   "failed",
+  // STORY-021 core slice: the two exits EC-15 describes as "state returns to
+  // none" are RECORDED here instead of erased, so the initiating owner and the
+  // recipient can both read how the last transfer ended. Neither blocks a new
+  // initiation (only an unexpired `awaiting_acceptance` does).
+  "declined",
+  "expired",
 ]);
+
+// EC-15: "the recipient declines, or acceptance expires after 7 days". One
+// number, one place; the service derives `expiresAt` from it and the schema
+// below carries the result.
+export const OWNERSHIP_TRANSFER_TTL_DAYS = 7;
 
 export const ownershipTransferSchema = z
   .object({
@@ -27,6 +38,12 @@ export const ownershipTransferSchema = z
     initiatedBy: z.uuid(),
     recipientId: z.uuid(),
     initiatedAt: z.iso.datetime(),
+    // Optional so a row written before this field existed still parses; the
+    // service falls back to initiatedAt + OWNERSHIP_TRANSFER_TTL_DAYS.
+    expiresAt: z.iso.datetime().optional(),
+    // When the transfer left `awaiting_acceptance` for a terminal state.
+    // Distinct from completedAt, which is only ever the successful swap.
+    resolvedAt: z.iso.datetime().optional(),
     completedAt: z.iso.datetime().optional(),
     decisions: z.record(z.string(), z.unknown()).optional(),
   })
