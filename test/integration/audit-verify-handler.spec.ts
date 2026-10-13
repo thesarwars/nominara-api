@@ -70,10 +70,9 @@ describe("STORY-143 · audit.verify handler", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE audit_log, workspaces CASCADE");
     // The marks outlive their workspaces by design (no FK), so they are
-    // cleared explicitly. Guarded so this file can show the pre-migration RED.
-    await db.query("DO $$ BEGIN IF to_regclass('audit_chain_marks') IS NOT NULL THEN TRUNCATE audit_chain_marks; END IF; END $$");
+    // cleared explicitly.
+    await db.query("TRUNCATE audit_log, audit_chain_marks, workspaces CASCADE");
     counters.length = 0;
     connectedUrls.length = 0;
     workspaceId = randomUUID();
@@ -203,8 +202,7 @@ describe("STORY-143 · audit.verify handler", () => {
   it("⚠ an empty estate is clean, not blind", async () => {
     // The guard must not fire on a genuinely fresh deployment, or the first
     // night of every environment is a false alarm and the alarm gets muted.
-    await db.query("TRUNCATE audit_log, workspaces CASCADE");
-    await db.query("DO $$ BEGIN IF to_regclass('audit_chain_marks') IS NOT NULL THEN TRUNCATE audit_chain_marks; END IF; END $$");
+    await db.query("TRUNCATE audit_log, audit_chain_marks, workspaces CASCADE");
 
     await expect(run()).resolves.toBeUndefined();
   }, 60_000);
@@ -371,11 +369,14 @@ describe("STORY-143 · audit.verify handler", () => {
       expect(afterErasure[afterErasure.length - 1]).toEqual({ max_seq: markerSeq.rows[0]!.seq, reason: "rechain" });
       await expect(run()).resolves.toBeUndefined();
 
-      // And the rechain mark is itself a promise: deleting the marker row is caught.
+      // Deleting the marker row afterwards is caught. By the WALK first, not the
+      // mark: with the marker gone, the erasure-rewritten rows are no longer in
+      // the lenient zone and fail their own hashes. The mark's own contribution
+      // is the assertion above — it exists, at the marker's seq.
       await disableAppendOnly();
       await db.query("DELETE FROM audit_log WHERE seq = $1", [markerSeq.rows[0]!.seq]);
       await enableAppendOnly();
-      await expect(run()).rejects.toThrow(/chain_truncated/);
+      await expect(run()).rejects.toThrow(/audit chain mismatch/);
     }, 60_000);
 
     it("STORY-143-AC7g · a hard-deleted workspace leaves a tombstone, so its vanished chain is expected", async () => {

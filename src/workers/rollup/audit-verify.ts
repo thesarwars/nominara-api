@@ -16,6 +16,14 @@ import {
   readChainChunk,
   listAuditedWorkspaceIds,
 } from "../../modules/audit/audit-log-reader.js";
+import {
+  appendMark,
+  hasTombstone,
+  listMarkedWorkspaceIds,
+  readChainHead,
+  readLatestMark,
+  rowHashAt,
+} from "../../modules/audit/audit-chain-marks.js";
 import type { PagingNotifier } from "../../modules/audit/ports/paging-notifier.js";
 
 // STORY-020 — security-and-tenancy.md §12: "A verifier job re-walks each
@@ -24,14 +32,36 @@ import type { PagingNotifier } from "../../modules/audit/ports/paging-notifier.j
 // same privileged connection contract as retention.ts's own cross-tenant
 // discovery functions — see that file's PRIVILEGE CONTRACT comment.
 
+/**
+ * STORY-143 AC7 — what the stored high-water mark can say that the walk cannot.
+ * The walk proves a chain is internally consistent; these prove it is still the
+ * chain a previous run saw.
+ *
+ *   chain_truncated    the head is behind the mark — rows were removed from the tail;
+ *   chain_missing      a marked chain has no rows and no tombstone;
+ *   mark_hash_mismatch the row at the marked seq is gone or has a different hash —
+ *                      a self-consistent rewrite, or a delete followed by regrowth.
+ */
+export type HighWaterReason = "chain_truncated" | "chain_missing" | "mark_hash_mismatch";
+
+export interface HighWaterMismatch {
+  /** The MARK's seq: the position the previous run vouched for. */
+  readonly seq: string;
+  readonly reason: HighWaterReason;
+}
+
+export type WorkspaceMismatch = ChainMismatch | HighWaterMismatch;
+
 export interface VerifyAllChainsResult {
   /** The first mismatch, kept for callers that only want "is anything wrong". */
-  readonly mismatch: (ChainMismatch & { readonly workspaceId: string }) | null;
+  readonly mismatch: (WorkspaceMismatch & { readonly workspaceId: string }) | null;
   /** Every workspace with a mismatch — one finding each, never more. */
-  readonly mismatches: readonly (ChainMismatch & { readonly workspaceId: string })[];
+  readonly mismatches: readonly (WorkspaceMismatch & { readonly workspaceId: string })[];
   /** How many chains this run actually walked, and how many it set out to. */
   readonly walked: number;
   readonly discovered: number;
+  /** How many `verified` marks this run appended (STORY-143 AC7). */
+  readonly marksWritten: number;
 }
 
 export class VerifierBlindError extends Error {
@@ -153,12 +183,70 @@ export async function verifyWorkspaceChain(
   // not reachable — `AuditChainService.append` holds an advisory xact lock per
   // workspace, so `seq` order is commit order and keyset cannot skip a row
   // that commits late.
+  return inSnapshot(client, () => walkChain(client, workspaceId, chunkRows));
+}
+
+/** One REPEATABLE READ snapshot around `fn` — see the comment in verifyWorkspaceChain for why. */
+async function inSnapshot<T>(client: ClientBase, fn: () => Promise<T>): Promise<T> {
   await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
   try {
-    return await walkChain(client, workspaceId, chunkRows);
+    return await fn();
   } finally {
     await client.query("COMMIT");
   }
+}
+
+/**
+ * STORY-143 AC7 — verifies one workspace's chain AND compares it with the
+ * stored high-water mark, then appends a new `verified` mark on success.
+ *
+ * ⚠ THE WALK, THE HEAD READ, THE COMPARISON AND THE MARK WRITE ARE ONE
+ * SNAPSHOT. The head is read after the walk inside the same REPEATABLE READ
+ * transaction, so it is exactly the last row the walk verified; a row appended
+ * mid-run is simply the next run's. Reading the head outside the snapshot
+ * would let the mark vouch for rows this run never walked.
+ *
+ * ⚠ A MISMATCH WRITES NO MARK. A tampered chain must not become the baseline
+ * the next night compares against; it stays a finding until someone remediates.
+ *
+ * ⚠ A CHAIN WITH NO ROWS AND NO MARK IS NOT A FINDING — nothing was ever
+ * promised about it. This is also the one residual the mark cannot close: a
+ * chain destroyed before any run marked it is invisible (the Object Lock
+ * export, when it exists, is what covers that — decisions 2026-10-13).
+ */
+export async function verifyAndMarkWorkspaceChain(
+  client: ClientBase,
+  workspaceId: string,
+  chunkRows: number = CHAIN_CHUNK_ROWS,
+): Promise<{ readonly mismatch: WorkspaceMismatch | null; readonly marked: boolean }> {
+  if (!Number.isInteger(chunkRows) || chunkRows < 1) {
+    throw new RangeError(`chain walk chunk size must be a positive integer, got ${String(chunkRows)}`);
+  }
+  return inSnapshot(client, async () => {
+    const walkMismatch = await walkChain(client, workspaceId, chunkRows);
+    if (walkMismatch) return { mismatch: walkMismatch, marked: false };
+
+    const head = await readChainHead(client, workspaceId);
+    const mark = await readLatestMark(client, workspaceId);
+
+    if (head === null) {
+      if (mark === null) return { mismatch: null, marked: false };
+      // The chain this workspace had is gone. Expected only if it was deleted on purpose.
+      if (await hasTombstone(client, workspaceId)) return { mismatch: null, marked: false };
+      return { mismatch: { seq: mark.seq, reason: "chain_missing" }, marked: false };
+    }
+
+    if (mark !== null) {
+      if (BigInt(head.seq) < BigInt(mark.seq)) return { mismatch: { seq: mark.seq, reason: "chain_truncated" }, marked: false };
+      const hashAtMark = await rowHashAt(client, workspaceId, mark.seq);
+      if (hashAtMark === null || !hashAtMark.equals(mark.rowHash)) {
+        return { mismatch: { seq: mark.seq, reason: "mark_hash_mismatch" }, marked: false };
+      }
+    }
+
+    await appendMark(client, workspaceId, head, "verified");
+    return { mismatch: null, marked: true };
+  });
 }
 
 async function walkChain(client: ClientBase, workspaceId: string, chunkRows: number): Promise<ChainMismatch | null> {
@@ -214,20 +302,26 @@ export async function verifyAllChains(
   if (workspaceIds === undefined) {
     await assertVerifierCanSee(client);
   }
-  const ids = workspaceIds ?? (await listAuditedWorkspaceIds(client));
+  // ⚠ DISCOVERY IS AUDITED ∪ MARKED. Discovering only workspaces that still
+  // HAVE audit rows is what made a deleted chain invisible: the workspace
+  // stopped existing for the verifier instead of becoming a finding. A marked
+  // workspace is one the verifier has promised to keep watching.
+  const ids = workspaceIds ?? [...new Set([...(await listAuditedWorkspaceIds(client)), ...(await listMarkedWorkspaceIds(client))])];
 
-  const mismatches: (ChainMismatch & { workspaceId: string })[] = [];
+  const mismatches: (WorkspaceMismatch & { workspaceId: string })[] = [];
   let walked = 0;
+  let marksWritten = 0;
   for (const workspaceId of ids) {
     walked += 1;
-    const mismatch = await verifyWorkspaceChain(client, workspaceId);
+    const { mismatch, marked } = await verifyAndMarkWorkspaceChain(client, workspaceId);
+    if (marked) marksWritten += 1;
     if (mismatch) {
       await notifier.page({ workspaceId, seq: mismatch.seq, reason: mismatch.reason });
       mismatches.push({ ...mismatch, workspaceId });
     }
   }
 
-  return { mismatch: mismatches[0] ?? null, mismatches, walked, discovered: ids.length };
+  return { mismatch: mismatches[0] ?? null, mismatches, walked, discovered: ids.length, marksWritten };
 }
 
 async function main(): Promise<void> {

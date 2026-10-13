@@ -31,31 +31,32 @@ import type { JobProcessor } from "../worker-factory.js";
 // queue is declared in `topology.ts` as an explicit addition — see
 // ADDED_BEYOND_REFERENCE in `test/unit/queue/topology.spec.ts`.
 
-// ⚠ WHAT A "no mismatch" LINE DOES NOT MEAN. Three tampers pass this walk
-// clean, all inherited from STORY-020 and all reproduced by review. They are
-// listed here because this story is what turns the walk into a nightly
-// assurance, and an assurance whose limits are not written down is read as
-// covering everything:
+// ⚠ WHAT A "no mismatch" LINE STILL DOES NOT MEAN. The walk proves a chain is
+// internally consistent; STORY-143 AC7 added a stored high-water mark
+// (`audit_chain_marks`, migration 0123) so it also proves the chain is still
+// the one the previous run saw. Two tampers that used to pass clean are now
+// findings, each an `UnrecoverableError` like any other mismatch:
 //
-//   1. TAIL TRUNCATION. Delete the last k rows of a chain and the remainder
-//      verifies from genesis with no complaint — there is no expected head,
-//      no expected length, and nothing persists a high-water mark between
-//      runs. This is the tamper an attacker actually performs, because the
-//      newest rows are the ones recording what they just did.
-//   2. WHOLE-CHAIN DELETION. Discovery is `SELECT DISTINCT workspace_id FROM
-//      audit_log`, so a workspace whose rows are ALL deleted stops existing
-//      for the verifier rather than becoming a finding.
-//   3. ANYTHING BEFORE A RECHAINING MARKER. `verifyChain` trusts on-disk
-//      hashes before the last marker (STORY-020-E-9, deliberate — erasure
-//      rewrites content), so one forged marker moves the whole history into
-//      the lenient zone permanently.
+//   1. TAIL TRUNCATION — the head is behind the mark (`chain_truncated`), or the
+//      row at the marked seq is gone / has another hash (`mark_hash_mismatch`,
+//      which also catches a self-consistent rewrite and delete-then-regrow).
+//   2. WHOLE-CHAIN DELETION — a marked workspace with no rows and no tombstone
+//      (`chain_missing`). A hard-deleted workspace writes a tombstone in the
+//      same transaction, so its absence is expected.
 //
-// A missing GENESIS row IS caught, for contrast: the surviving first row's
-// prev_hash will not equal GENESIS_HASH. It is the tail that is invisible.
+// Three things remain true and are deliberately not hidden:
 //
-// `audit-verify-handler.spec.ts` pins all three as KNOWN GAPS so they cannot
-// widen unnoticed, and closing them needs a stored per-workspace high-water
-// mark — its own story, not a comment here.
+//   a. A chain destroyed BEFORE any run ever marked it is invisible; the mark
+//      can only remember what a run saw. The Object Lock export is the planned
+//      second witness (decisions 2026-10-13). Pinned by AC7i.
+//   b. ANYTHING BEFORE A RECHAINING MARKER. `verifyChain` trusts on-disk hashes
+//      before the last marker (STORY-020-E-9, deliberate — erasure rewrites
+//      content), so one forged marker moves the whole history into the lenient
+//      zone permanently. The mark does not change that: it vouches for the head
+//      and the hash at one position, not for content.
+//   c. Someone who can write `audit_chain_marks` can lower it. That table is
+//      owner-only — no runtime role has any privilege on it — which is why the
+//      verifier must hold the owner connection below.
 
 /**
  * ⚠ THE OWNER CONNECTION, because the verifier is cross-tenant by definition.
@@ -92,13 +93,19 @@ export function createAuditVerifyHandler(context: QueueHandlerContext): JobProce
 
       const result = await verifyAllChains(client, new LoggingPagingNotifier());
 
+      for (let i = 0; i < result.marksWritten; i += 1) {
+        incrementCounter("nominara_audit_chain_marks_written_total");
+      }
+
       if (result.mismatches.length === 0) {
-        logger.log(`audit chains verified: no mismatch across ${String(result.walked)} workspace(s)`);
+        logger.log(
+          `audit chains verified: no mismatch across ${String(result.walked)} workspace(s), ${String(result.marksWritten)} high-water mark(s) written`,
+        );
         return;
       }
 
       for (const mismatch of result.mismatches) {
-        incrementCounter("nominara_audit_chain_mismatch_total", { workspace_id: mismatch.workspaceId });
+        incrementCounter("nominara_audit_chain_mismatch_total", { workspace_id: mismatch.workspaceId, reason: mismatch.reason });
         logger.error(
           `audit chain mismatch in workspace ${mismatch.workspaceId} at seq ${String(mismatch.seq)}: ${mismatch.reason}`,
         );

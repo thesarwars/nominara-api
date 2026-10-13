@@ -50,7 +50,7 @@ describe("STORY-143 AC7 · audit_chain_marks — owner-only grants and a reversi
     { verb: "SELECT", sql: "SELECT * FROM audit_chain_marks" },
     {
       verb: "INSERT",
-      sql: "INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES (gen_random_uuid(), 1, '\\x00', 'verified')",
+      sql: "INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES (gen_random_uuid(), 1, decode(repeat('00',32),'hex'), 'verified')",
     },
     { verb: "UPDATE", sql: "UPDATE audit_chain_marks SET max_seq = 0" },
     { verb: "DELETE", sql: "DELETE FROM audit_chain_marks" },
@@ -61,7 +61,7 @@ describe("STORY-143 AC7 · audit_chain_marks — owner-only grants and a reversi
     it(`STORY-143-AC7k · ${role} cannot read, write, update, delete or truncate the marks (42501 on every verb)`, async () => {
       // A real row to aim at, written by the owner connection.
       await db.query(
-        "INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 7, '\\x01', 'verified')",
+        "INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 7, decode(repeat('01',32),'hex'), 'verified')",
         [randomUUID()],
       );
       const client = await connectAsRole(target(), role, resolvePassword(role, {}));
@@ -82,7 +82,7 @@ describe("STORY-143 AC7 · audit_chain_marks — owner-only grants and a reversi
   }
 
   it("STORY-143-AC7l · even the owner cannot UPDATE or DELETE a mark: the table is append-only", async () => {
-    await db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 9, '\\x02', 'verified')", [
+    await db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 9, decode(repeat('02',32),'hex'), 'verified')", [
       randomUUID(),
     ]);
     await expect(db.query("UPDATE audit_chain_marks SET max_seq = 0")).rejects.toThrow(/append-only/);
@@ -92,13 +92,13 @@ describe("STORY-143 AC7 · audit_chain_marks — owner-only grants and a reversi
   it("STORY-143-AC7m · the reason and the tombstone shape are constrained", async () => {
     const ws = randomUUID();
     await expect(
-      db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 1, '\\x03', 'made_up')", [ws]),
+      db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 1, decode(repeat('03',32),'hex'), 'made_up')", [ws]),
     ).rejects.toThrow(/ck_audit_chain_marks_reason/);
     await expect(
       db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, NULL, NULL, 'verified')", [ws]),
     ).rejects.toThrow(/ck_audit_chain_marks_shape/);
     await expect(
-      db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 5, '\\x04', 'tombstone')", [ws]),
+      db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, 5, decode(repeat('04',32),'hex'), 'tombstone')", [ws]),
     ).rejects.toThrow(/ck_audit_chain_marks_shape/);
     await db.query("INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason) VALUES ($1, NULL, NULL, 'tombstone')", [ws]);
   });
@@ -144,7 +144,7 @@ describe("STORY-143 AC7 · audit_chain_marks — owner-only grants and a reversi
       };
       await push(
         "relation",
-        `SELECT c.relname || ' ' || c.relkind || ' rls=' || c.relrowsecurity || ' force=' || c.relforcerowsecurity || ' owner=' || pg_get_userbyid(c.relowner) || ' acl=' || coalesce(c.relacl::text, 'NULL') AS line
+        `SELECT c.relname || ' ' || c.relkind::text || ' rls=' || c.relrowsecurity || ' force=' || c.relforcerowsecurity || ' owner=' || pg_get_userbyid(c.relowner) || ' acl=' || coalesce(c.relacl::text, 'NULL') AS line
            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname IN ('public','app') ORDER BY 1`,
       );
       await push(
@@ -165,11 +165,11 @@ describe("STORY-143 AC7 · audit_chain_marks — owner-only grants and a reversi
       await push("policy", "SELECT tablename || ' ' || policyname || ' ' || coalesce(qual, '') AS line FROM pg_policies WHERE schemaname = 'public' ORDER BY 1");
       await push(
         "function",
-        "SELECT p.oid::regprocedure::text || ' ' || md5(pg_get_functiondef(p.oid)) AS line FROM pg_proc p WHERE pronamespace IN ('public'::regnamespace, 'app'::regnamespace) ORDER BY 1",
+        "SELECT p.oid::regprocedure::text || ' ' || md5(pg_get_functiondef(p.oid)) AS line FROM pg_proc p WHERE prokind IN ('f','p') AND pronamespace IN ('public'::regnamespace, 'app'::regnamespace) ORDER BY 1",
       );
       await push(
         "default-acl",
-        "SELECT defaclrole::regrole || ' ' || defaclobjtype || ' ' || defaclacl::text AS line FROM pg_default_acl ORDER BY 1",
+        "SELECT defaclrole::regrole || ' ' || defaclobjtype::text || ' ' || defaclacl::text AS line FROM pg_default_acl ORDER BY 1",
       );
       await push("comment", "SELECT objoid::regclass || ' ' || description AS line FROM pg_description WHERE classoid = 'pg_class'::regclass AND objoid IN (SELECT oid FROM pg_class WHERE relnamespace = 'public'::regnamespace) ORDER BY 1");
       return parts;
