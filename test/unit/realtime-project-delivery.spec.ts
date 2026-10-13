@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { REALTIME_EVENT_PAYLOADS } from "../../contracts/events/catalog.schema.js";
+import type { RealtimeEventName } from "../../contracts/events/event-name.schema.js";
 import { RealtimeGateway } from "../../src/gateway/realtime.gateway.js";
 import { projectRoom } from "../../src/gateway/room-authorization.service.js";
 import {
@@ -230,5 +232,81 @@ describe("STORY-026 AC1 · the publisher's toProject path", () => {
     expect(() => {
       publisher.toProject(WS_A, PROJECT_1, "task.created", taskCreated(PROJECT_2));
     }).toThrow(/projectId does not match/);
+  });
+});
+
+// REVIEW (MAJOR) — the filter must apply on EVERY delivery branch, the
+// coalesced (replace_latest) one included. A filter skipped for one event name
+// or one branch passed the whole suite, because the earlier cases published
+// only task.* and credits.* and every coalescing socket held the project room.
+//
+// The event list is DERIVED from the catalog, so an event added later with a
+// top-level `project_id` is covered — or fails for lack of a fixture — rather
+// than silently escaping.
+const RUN = "0192f1a0-0000-7000-8000-0000000000d1";
+const FIXTURES = (projectId: string): Record<string, (n: number) => Record<string, unknown>> => ({
+  "run.progress": (n) => ({ run_id: RUN, project_id: projectId, planned: 10, captured: n, skipped: 0, failed: 0, pct: n, eta_ms: null }),
+  "run.completed": () => ({ run_id: RUN, project_id: projectId, status: "completed", captured: 1, failed: 0, duration_ms: 5, visibility_delta: null }),
+  "run.failed": () => ({ run_id: RUN, project_id: projectId, error_code: "x", failed_engines: [] }),
+  "aux.audit_completed": () => ({ audit_id: RUN, project_id: projectId, aux_score: 50, delta: null, findings: { critical: 0, high: 0, medium: 0, low: 0 } }),
+  "aux.finding_created": () => ({ finding_id: RUN, project_id: projectId, rule_code: "R", severity: "high", url: "https://example.test/a" }),
+  "task.created": () => ({ task_id: TASK, project_id: projectId }),
+  "task.moved": () => ({ task_id: TASK, project_id: projectId }),
+  "displacement.detected": () => ({ event_id: RUN, project_id: projectId, prompt_id: RUN, engine_key: "e", kind: "k", impact_score: 1 }),
+  // Gateway-originated, but a published one would be delivered like any other.
+  resync: () => ({ reason: "rate_limited", scope: "project", project_id: projectId }),
+  "credits.debited": () => ({ action_code: "x", credits: 1, available_after: 9, reference_type: "t", reference_id: "r", project_id: projectId }),
+});
+
+const PROJECT_EVENTS = (Object.keys(REALTIME_EVENT_PAYLOADS) as RealtimeEventName[]).filter((name) => {
+  const schema = REALTIME_EVENT_PAYLOADS[name] as unknown as { shape?: Record<string, unknown> };
+  return schema.shape !== undefined && "project_id" in schema.shape;
+});
+
+describe("STORY-026 AC1 · EVERY project-bearing catalog event is filtered, on every delivery branch", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("the derived list is non-empty and includes the events the review named", () => {
+    expect(PROJECT_EVENTS.length).toBeGreaterThan(0);
+    for (const name of ["run.progress", "run.completed", "run.failed", "aux.audit_completed", "aux.finding_created", "displacement.detected"]) {
+      expect(PROJECT_EVENTS, name).toContain(name);
+    }
+  });
+
+  it.each(PROJECT_EVENTS)("%s: has a fixture that satisfies its catalogued schema", (name) => {
+    const make = FIXTURES(PROJECT_1)[name];
+    expect(make, `add a fixture for ${name}`).toBeDefined();
+    expect(REALTIME_EVENT_PAYLOADS[name].safeParse(make!(1)).success).toBe(true);
+  });
+
+  it.each(PROJECT_EVENTS)("%s: a ws-only socket receives nothing, a project-room socket receives it (after the coalescing window)", (name) => {
+    vi.useFakeTimers();
+    const make = FIXTURES(PROJECT_1)[name]!;
+    const wsOnly = socketIn("ws-only", wsRoom(WS_A));
+    const member = socketIn("member", wsRoom(WS_A), projectRoom(PROJECT_1));
+    const gateway = gatewayWith(wsOnly, member);
+
+    // Twice: the second submission of a replace_latest event is the one that is
+    // DEFERRED to the window's end, which is the branch under test.
+    gateway.deliverFanout(envelope(WS_A, name, make(1)));
+    gateway.deliverFanout(envelope(WS_A, name, make(2)));
+    vi.advanceTimersByTime(2_000);
+
+    expect(received(wsOnly, name), `${name} must not reach a socket without the project room`).toEqual([]);
+    expect(received(member, name).length, `${name} must reach the socket that holds it`).toBeGreaterThan(0);
+  });
+});
+
+describe("STORY-026 AC1 · event schemas name their project only as project_id", () => {
+  it("any other top-level key mentioning a project is a count, not an identifier the gateway would miss", () => {
+    for (const name of Object.keys(REALTIME_EVENT_PAYLOADS) as RealtimeEventName[]) {
+      const shape = (REALTIME_EVENT_PAYLOADS[name] as unknown as { shape?: Record<string, { def?: { type?: string } }> }).shape ?? {};
+      for (const [key, value] of Object.entries(shape)) {
+        if (!/project/i.test(key) || key === "project_id") continue;
+        expect(value.def?.type, `${name}.${key}`).toBe("number");
+      }
+    }
   });
 });

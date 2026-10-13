@@ -246,6 +246,41 @@ describe("STORY-026 AC1 · project_scope constrains what a socket RECEIVES", () 
     await expect(scopedSaw).resolves.toBe("quiet");
   }, 30_000);
 
+  // REVIEW (MAJOR) — run.progress takes the COALESCED branch, which every other
+  // case here bypasses. A filter skipped only for that branch leaked a scoped
+  // manager another project's progress while the rest of the suite stayed green.
+  it("run.progress for project B stays quiet for a manager scoped to A, with an in-scope positive control", async () => {
+    const { workspaceId, a, b } = await workspaceWithTwoProjects();
+    const scoped = await member(workspaceId, "manager", [a], [a]);
+    const runId = randomUUID();
+    const progress = (projectId: string, pct: number) => ({
+      run_id: runId,
+      project_id: projectId,
+      planned: 10,
+      captured: pct,
+      skipped: 0,
+      failed: 0,
+      pct,
+      eta_ms: null,
+    });
+
+    const sawProgress: { project_id: string }[] = [];
+    scoped.on("run.progress", (payload: { project_id: string }) => sawProgress.push(payload));
+    const positive = new Promise<"arrived">((resolve) => {
+      scoped.on("run.progress", (payload: { project_id: string }) => {
+        if (payload.project_id === a) resolve("arrived");
+      });
+    });
+
+    for (let pct = 1; pct <= 3; pct += 1) publisher.toProject(workspaceId, b, "run.progress", progress(b, pct));
+    publisher.toProject(workspaceId, a, "run.progress", progress(a, 5));
+
+    await expect(positive, "the in-scope run.progress must arrive, or the silence proves nothing").resolves.toBe("arrived");
+    // Past the 750 ms window, so a deferred (trailing) emit would have fired.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(sawProgress.filter((p) => p.project_id === b), "B's progress must never reach a manager scoped to A").toEqual([]);
+  }, 30_000);
+
   it("workspace-level events still reach a scoped manager", async () => {
     const { workspaceId, a } = await workspaceWithTwoProjects();
     const scoped = await member(workspaceId, "manager", [a], [a]);
