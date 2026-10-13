@@ -330,6 +330,55 @@ describe("STORY-135 · capture.parse", () => {
     expect(zoho.rows[0]?.entity_type).toBe("competitor");
   });
 
+  it("[STORY-135 AC8] answer_captures.sentiment_label and sentiment_score stay NULL when the brand is unmentioned — never 'absent'", async () => {
+    const absent = await seedCapture("## Best CRMs\n\n1. Salesforce — deeper reporting.\n2. Zoho CRM — cheapest at scale.");
+    await run(handler(), job(absent));
+
+    const row = await db.query<{ status: string; brand_present: boolean; sentiment_label: string | null; sentiment_score: string | null }>(
+      "SELECT status, brand_present, sentiment_label, sentiment_score FROM answer_captures WHERE id = $1",
+      [absent],
+    );
+    expect(row.rows[0]!.status).toBe("parsed");
+    expect(row.rows[0]!.brand_present).toBe(false);
+    expect(row.rows[0]!.sentiment_label).toBeNull();
+    expect(row.rows[0]!.sentiment_score).toBeNull();
+
+    // Control: the same column is populated when the brand IS mentioned, so the NULL above is the absence and not a column that is never written.
+    const present = await seedCapture(ANSWER);
+    await run(handler(), job(present));
+    const control = await db.query<{ sentiment_label: string | null; sentiment_score: string | null }>(
+      "SELECT sentiment_label, sentiment_score FROM answer_captures WHERE id = $1",
+      [present],
+    );
+    expect(control.rows[0]!.sentiment_label).not.toBeNull();
+    expect(control.rows[0]!.sentiment_score).not.toBeNull();
+  });
+
+  it("[STORY-135 AC8] a forced re-parse that finds the brand ABSENT clears the previous label and score — a stale sentiment is not kept", async () => {
+    const id = await seedCapture(ANSWER);
+    const process = handler();
+    await run(process, job(id));
+    const before = await db.query<{ brand_present: boolean; sentiment_label: string | null; sentiment_score: string | null }>(
+      "SELECT brand_present, sentiment_label, sentiment_score FROM answer_captures WHERE id = $1",
+      [id],
+    );
+    expect(before.rows[0]!.brand_present).toBe(true);
+    expect(before.rows[0]!.sentiment_label).not.toBeNull();
+    expect(before.rows[0]!.sentiment_score).not.toBeNull();
+
+    // The brand is no longer HubSpot, so the same stored answer no longer mentions it.
+    await db.query("UPDATE projects SET name = 'Pipedrive' WHERE id = $1", [projectId]);
+    await run(process, job(id, true));
+
+    const after = await db.query<{ brand_present: boolean; sentiment_label: string | null; sentiment_score: string | null }>(
+      "SELECT brand_present, sentiment_label, sentiment_score FROM answer_captures WHERE id = $1",
+      [id],
+    );
+    expect(after.rows[0]!.brand_present).toBe(false);
+    expect(after.rows[0]!.sentiment_label).toBeNull();
+    expect(after.rows[0]!.sentiment_score).toBeNull();
+  });
+
   it("leaves a FAILED capture alone — it has no text and is not a parse", async () => {
     // `blocked` and `failed` carry an error code, and turning them into
     // `parsed` would erase the distinction the matrix depends on.
