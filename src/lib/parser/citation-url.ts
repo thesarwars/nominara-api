@@ -305,3 +305,13 @@ export function positionWeight(slotIndex: number): number {
 export function classifyDomain(domain: string): SourceClass {
   return classifyCitation({ host: domain, domain, isOwned: false, competitorDomains: [] }).sourceClass;
 }
+
+/**
+ * STORY-054 AC1 — where a domain's class came from. `curated` is read from the curated list; everything else
+ * (a heuristic pattern match, or the `other` fallback) is `heuristic` and is queued for curation.
+ */
+export type ClassSource = "curated" | "heuristic";
+
+export function domainClassSource(domain: string): ClassSource {
+  return CURATED.has(domain) ? "curated" : "heuristic";
+}
