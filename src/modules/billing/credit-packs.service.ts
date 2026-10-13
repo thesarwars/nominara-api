@@ -53,13 +53,14 @@ export class CreditPacksService {
   async list(query: CreditPackListQuery): Promise<Page<CreditPack>> {
     const { client, workspaceId } = this.tenant();
     const ordered = [...(await purchasableOptions(client, workspaceId))].sort((a, b) => comparePackKeys([a.sortOrder, a.credits, a.key], [b.sortOrder, b.credits, b.key]));
-    const after = query.cursor === undefined ? undefined : packKeyFrom(decodeCursor(query.cursor, 3));
+    const after = query.cursor === undefined ? undefined : packKeyFrom(decodeCursor(query.cursor, "billing.credit_packs", 3));
     const rows = ordered
       .filter((o) => after === undefined || comparePackKeys([o.sortOrder, o.credits, o.key], after) > 0)
       .slice(0, query.limit + 1);
     return pageFrom(
       rows,
       query.limit,
+      "billing.credit_packs",
       (o): CreditPack => ({
         key: o.key,
         display_name: o.displayName,

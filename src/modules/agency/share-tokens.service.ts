@@ -195,7 +195,7 @@ export class ShareTokensService {
   /** NEW-E-7 checkpoint-6 — pageAfter page ordered (created_at DESC, id DESC); the cursor key carries the microsecond created_at. */
   async list(query: ShareTokenListQuery): Promise<Page<ShareToken>> {
     const { client, actorScope } = this.store();
-    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor);
+    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor, "agency.share_tokens");
     const afterArgs = [after?.[0] ?? null, after?.[1] ?? null, query.limit + 1];
     // Two static statements: an unrestricted member must not carry the scope predicate at all.
     const result =
@@ -217,7 +217,7 @@ export class ShareTokensService {
               LIMIT $3`,
             [...afterArgs, actorScope],
           );
-    return pageFrom(result.rows, query.limit, toShareToken, (row) => [row.created_at_key, row.id]);
+    return pageFrom(result.rows, query.limit, "agency.share_tokens", toShareToken, (row) => [row.created_at_key, row.id]);
   }
 
   async mint(body: MintShareTokenRequest, meta: AuditRequestMeta): Promise<MintedShareToken> {
@@ -305,7 +305,7 @@ export class ShareTokensService {
   async views(id: string, query: ShareTokenViewListQuery): Promise<Page<ShareTokenView>> {
     const { client } = this.store();
     await this.loadVisible(client, id);
-    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor);
+    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor, "agency.share_token_views");
     const result = await client.query<{
       id: string;
       viewed_at_key: string;
@@ -330,6 +330,7 @@ export class ShareTokensService {
     return pageFrom(
       result.rows,
       query.limit,
+      "agency.share_token_views",
       (r) => ({
         at: r.viewed_at.toISOString(),
         ip: r.ip,

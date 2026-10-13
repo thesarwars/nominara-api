@@ -15,8 +15,8 @@ export function invalidCursor(): InstanceType<typeof ValidationFailedError> {
 }
 
 /** Decodes a `[timestamp-micros, uuid]` cursor; a cursor issued for any other list is a 400, never a silent first page. */
-export function decodeTimestampIdCursor(cursor: string): [string, string] {
-  const [at, id, ...rest] = decodeCursor(cursor, 2);
+export function decodeTimestampIdCursor(cursor: string, list: string): [string, string] {
+  const [at, id, ...rest] = decodeCursor(cursor, list, 2);
   if (rest.length > 0 || typeof at !== "string" || !ISO_MICROS.test(at) || typeof id !== "string" || !UUID.test(id)) throw invalidCursor();
   return [at, id];
 }

@@ -108,7 +108,7 @@ export class TasksService {
     );
     if (project.rows.length === 0) throw new NotFoundError({ message: "no such project" });
 
-    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, 5);
+    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, "tasks.tasks", 5);
     const result = await client.query<TaskRow>(
       `WITH items AS (
          SELECT
@@ -167,7 +167,7 @@ export class TasksService {
       returned: Math.min(result.rows.length, query.limit),
     });
 
-    return pageFrom(result.rows, query.limit, toTask, (row) => [row.k1_key, row.k2_key, row.k3_key, row.k4_key, row.id]);
+    return pageFrom(result.rows, query.limit, "tasks.tasks", toTask, (row) => [row.k1_key, row.k2_key, row.k3_key, row.k4_key, row.id]);
   }
 
   /**
@@ -625,7 +625,7 @@ export class TasksService {
     const client = currentTenantStore()!.client;
     await this.assertTaskReadable(client, taskId);
 
-    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, 2);
+    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, "tasks.task_events", 2);
     const result = await client.query<TaskEventRow>(
       `${TASK_EVENT_SELECT}
         WHERE e.task_id = $1
@@ -635,7 +635,7 @@ export class TasksService {
       [taskId, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
     incrementCounter("nominara_tasks_events_list_total", {});
-    return pageFrom(result.rows, query.limit, toTaskEvent, (row) => [row.occurred_key, row.id]);
+    return pageFrom(result.rows, query.limit, "tasks.task_events", toTaskEvent, (row) => [row.occurred_key, row.id]);
   }
 
   /** 404 for an absent/other-tenant/soft-deleted task or a task of a soft-deleted project; the scope 403 for an in-tenant task outside the caller's scope. */
@@ -738,7 +738,7 @@ export class TasksService {
    */
   async listActionItems(pagination: PaginationRequest): Promise<Page<ActionItem>> {
     const client = currentTenantStore()!.client;
-    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 4);
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, "tasks.action_items", 4);
 
     const result = await client.query<ActionItemRow>(
       `WITH items AS (
@@ -809,7 +809,7 @@ export class TasksService {
       ],
     );
 
-    return pageFrom(result.rows, pagination.limit, toActionItem, (row) => [
+    return pageFrom(result.rows, pagination.limit, "tasks.action_items", toActionItem, (row) => [
       row.impact_key,
       row.severity_rank,
       row.created_at_key,

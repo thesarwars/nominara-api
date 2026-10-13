@@ -84,7 +84,7 @@ export class ApiKeysService {
         LIMIT $3`,
       [after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
-    return pageFrom(result.rows, query.limit, toApiKey, (row) => [row.created_at_key, row.id]);
+    return pageFrom(result.rows, query.limit, "api_keys.api_keys", toApiKey, (row) => [row.created_at_key, row.id]);
   }
 
   async create(callerRole: string, body: CreateApiKeyRequest): Promise<CreatedApiKey> {
@@ -173,7 +173,7 @@ const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 function cursorKeyOf(cursor: string): [string, string] {
-  const [createdAt, id] = decodeCursor(cursor, 2);
+  const [createdAt, id] = decodeCursor(cursor, "api_keys.api_keys", 2);
   if (typeof createdAt !== "string" || !ISO_MICROS.test(createdAt) || typeof id !== "string" || !UUID.test(id)) {
     throw new ValidationFailedError({
       message: "invalid pagination cursor",

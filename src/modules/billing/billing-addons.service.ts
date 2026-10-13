@@ -168,7 +168,7 @@ export class BillingAddonsService {
         active_until: row?.active_until ?? null,
       };
     });
-    return pageFrom(items, query.limit, (item) => item, (item) => [item.kind]);
+    return pageFrom(items, query.limit, "billing.addons", (item) => item, (item) => [item.kind]);
   }
 
   /** `POST /v1/billing/addons` — sets the add-on to the requested total; pro-rated by Stripe. */
@@ -614,7 +614,7 @@ function intentKey(requestKey: string): string {
 }
 
 function afterKind(cursor: string): AddonKind {
-  const [kind] = decodeCursor(cursor, 1);
+  const [kind] = decodeCursor(cursor, "billing.addons", 1);
   if (typeof kind !== "string" || !(ADDON_KINDS as readonly string[]).includes(kind)) {
     throw new ValidationFailedError({
       message: "invalid pagination cursor",

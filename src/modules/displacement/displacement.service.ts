@@ -90,7 +90,7 @@ export class DisplacementService {
     if (!found.in_scope) throw new ProjectOutOfScopeException();
 
     // The cursor key is (impact_score as text, id): a float cannot be a cursor element, and real -> text -> real round-trips exactly.
-    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, 2);
+    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor, "analytics.displacement", 2);
     const result = await client.query<FeedRow>(
       `SELECT e.id, e.project_id, e.prompt_id, e.engine_key, e.detected_at, e.kind,
               e.before_result_id, e.after_result_id, e.before_position, e.after_position,
@@ -139,6 +139,7 @@ export class DisplacementService {
     return pageFrom(
       result.rows,
       query.limit,
+      "analytics.displacement",
       (row): DisplacementItem => {
         const p = byId.get(row.id)!;
         return {

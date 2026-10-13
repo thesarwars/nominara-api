@@ -273,7 +273,7 @@ export class ProjectsService {
    */
   async list(pagination: PaginationRequest): Promise<Page<ProjectListItem>> {
     const client = currentTenantStore()!.client;
-    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, "projects.projects", 2);
 
     const result = await client.query<ProjectRow>(
       `${PROJECT_LIST_SELECT}
@@ -287,7 +287,7 @@ export class ProjectsService {
     );
 
     recordLastScanStates(result.rows.slice(0, pagination.limit));
-    return pageFrom(result.rows, pagination.limit, toProjectListItem, (row) => [row.created_at_key, row.id]);
+    return pageFrom(result.rows, pagination.limit, "projects.projects", toProjectListItem, (row) => [row.created_at_key, row.id]);
   }
 
   /** NEW-E-099a — display names for a set of project ids, on the ambient transaction (RLS and the portal scope narrow it). */

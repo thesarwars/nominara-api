@@ -34,9 +34,17 @@ export type Cursor = z.infer<typeof cursorSchema>;
 // boundary, which is the one thing a cursor must do.
 export const cursorKeyElementSchema = z.union([z.string(), z.number().int(), z.null()]);
 
+// STORY-117 AC6 — `l` names the LIST that issued the cursor. Arity cannot tell two lists apart (members,
+// invitations and the workspace list are all keyed on `(timestamp, uuid)`), so without it a cursor from one binds
+// against another and the page silently resumes from a position that list never had. Encoding it bumped `v` to 2:
+// a version-1 cursor carries no list, so it is refused (400) rather than guessed at — a cursor lives for one
+// paging session, and a client that held one across a deploy restarts from the first page.
+export const cursorListSchema = z.string().min(1).max(64);
+
 export const cursorPayloadSchema = z
   .object({
-    v: z.literal(1),
+    v: z.literal(2),
+    l: cursorListSchema,
     k: z.array(cursorKeyElementSchema).min(1),
   })
   .strict();

@@ -62,7 +62,7 @@ export class PromptListService {
   async list(projectId: string, query: PromptListQuery): Promise<Page<PromptListItem, PromptListResponse>> {
     const { client, workspaceId } = this.tenant();
     // Decoded BEFORE any statement runs: a cursor this list did not issue is a 400, never a silent first page.
-    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor);
+    const after = query.cursor === undefined ? undefined : decodeTimestampIdCursor(query.cursor, "prompts.prompts");
     await this.assertProjectExists(client, projectId);
 
     // FILTERS AS PARAMETERS, never interpolated. The values come from a
@@ -107,7 +107,7 @@ export class PromptListService {
       params,
     );
 
-    const page = pageFrom(result.rows, query.limit, toPromptListItem, (row) => [row.created_at_key, row.id]);
+    const page = pageFrom(result.rows, query.limit, "prompts.prompts", toPromptListItem, (row) => [row.created_at_key, row.id]);
     const summary = await this.summaryFor(client, workspaceId, projectId);
     // Labels are booleans only — no workspace, project or cursor content.
     incrementCounter("nominara_prompts_list_pages_total", {

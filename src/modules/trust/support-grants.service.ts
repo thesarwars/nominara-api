@@ -29,7 +29,7 @@ export class SupportGrantsService {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("SupportGrantsService requires an active tenant context");
 
-    const after = request.cursor === undefined ? undefined : keyFrom(decodeCursor(request.cursor, 2));
+    const after = request.cursor === undefined ? undefined : keyFrom(decodeCursor(request.cursor, "trust.support_grants", 2));
     const params: unknown[] = [];
     let keyset = "";
     if (after !== undefined) {
@@ -48,7 +48,7 @@ export class SupportGrantsService {
     );
     incrementCounter("nominara_support_grants_reads_total", { outcome: "ok" });
     this.logger.log({ message: "access grants read", workspace_id: store.context.workspaceId, rows: Math.min(result.rows.length, request.limit) });
-    return pageFrom(result.rows, request.limit, toGrant, (row) => [row.created_key, row.id]);
+    return pageFrom(result.rows, request.limit, "trust.support_grants", toGrant, (row) => [row.created_key, row.id]);
   }
 }
 

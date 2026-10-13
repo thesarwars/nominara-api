@@ -64,7 +64,7 @@ export class GoalsService {
         LIMIT $4`,
       [projectId, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
-    return pageFrom(result.rows, query.limit, toGoal, (row) => [row.created_at_key, row.id]);
+    return pageFrom(result.rows, query.limit, "tasks.goals", toGoal, (row) => [row.created_at_key, row.id]);
   }
 
   /**
@@ -192,7 +192,7 @@ const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 function cursorKeyOf(cursor: string): [string, string] {
-  const [createdAt, id] = decodeCursor(cursor, 2);
+  const [createdAt, id] = decodeCursor(cursor, "tasks.goals", 2);
   if (typeof createdAt !== "string" || !ISO_MICROS.test(createdAt) || typeof id !== "string" || !UUID.test(id)) {
     throw new ValidationFailedError({
       message: "invalid pagination cursor",

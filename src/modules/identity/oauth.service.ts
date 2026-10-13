@@ -629,7 +629,7 @@ export class OauthService {
    * names a safety net that does not exist is worse than no reason at all.
    */
   async listLinks(userId: string, pagination: PaginationRequest): Promise<Page<OauthLinkItem>> {
-    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, "identity.oauth_links", 2);
     const result = await this.pool.query<OauthLinkRow>(
       `SELECT id, provider, last_used_at, created_at, created_at::text AS created_at_key
          FROM user_credentials
@@ -639,7 +639,7 @@ export class OauthService {
         LIMIT $4`,
       [userId, after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
     );
-    return pageFrom(result.rows, pagination.limit, toOauthLinkItem, (row) => [row.created_at_key, row.id]);
+    return pageFrom(result.rows, pagination.limit, "identity.oauth_links", toOauthLinkItem, (row) => [row.created_at_key, row.id]);
   }
 
   /**

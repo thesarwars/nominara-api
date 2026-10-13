@@ -201,7 +201,7 @@ export class BillingInvoicesService {
         LIMIT $4`,
       [query.status ?? null, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
-    return pageFrom(result.rows, query.limit, toInvoice, (row) => [row.period_start_key, row.id]);
+    return pageFrom(result.rows, query.limit, "billing.invoices", toInvoice, (row) => [row.period_start_key, row.id]);
   }
 }
 
@@ -224,7 +224,7 @@ function toInvoice(row: InvoiceRow): Invoice {
 }
 
 function cursorKeyOf(cursor: string): [string, string] {
-  const key = decodeCursor(cursor, 2);
+  const key = decodeCursor(cursor, "billing.invoices", 2);
   const [periodStart, id] = key;
   if (typeof periodStart !== "string" || !ISO_MICROS.test(periodStart) || typeof id !== "string" || !UUID.test(id)) {
     throw new ValidationFailedError({

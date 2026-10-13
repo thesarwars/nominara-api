@@ -98,7 +98,7 @@ export class InvitationsService {
    * repeat one of them at a page boundary.
    */
   async list(workspaceId: string, pagination: PaginationRequest): Promise<Page<InvitationResponse>> {
-    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, 2);
+    const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, "workspaces.invitations", 2);
     const client = currentTenantStore()!.client;
     const result = await client.query<InvitationRow & { created_at_key: string }>(
       `SELECT ${INVITATION_COLUMNS}, created_at::text AS created_at_key
@@ -112,6 +112,7 @@ export class InvitationsService {
     return pageFrom(
       result.rows,
       pagination.limit,
+      "workspaces.invitations",
       (row) => toInvitationResponse(row),
       (row) => [row.created_at_key, row.id],
     );

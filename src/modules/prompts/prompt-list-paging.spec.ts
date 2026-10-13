@@ -82,7 +82,7 @@ describe("STORY-134 · prompt list keyset paging", () => {
   });
 
   it("[STORY-134 #8] a cursor becomes a (created_at, id) keyset predicate bound as parameters", async () => {
-    const cursor = encodeCursor([AT, idOf(7)]);
+    const cursor = encodeCursor("prompts.prompts", [AT, idOf(7)]);
     await setup([row(8)]).list(PROJECT, { limit: 50, cursor });
     expect(listQuery()?.sql).toMatch(/\(created_at, id\) > \(\$\d+::timestamptz, \$\d+::uuid\)/u);
     expect(listQuery()?.params).toContain(AT);
@@ -92,15 +92,16 @@ describe("STORY-134 · prompt list keyset paging", () => {
   it("[STORY-134 #8] cursor_next carries the LAST VISIBLE row's key at microsecond precision", async () => {
     const page = (await setup([row(1), row(2), row(3)]).list(PROJECT, { limit: 2 }));
     const next = Buffer.from(page.pagination.cursor_next!, "base64url").toString("utf8");
-    expect(JSON.parse(next)).toEqual({ v: 1, k: [AT, idOf(2)] });
+    expect(JSON.parse(next)).toEqual({ v: 2, l: "prompts.prompts", k: [AT, idOf(2)] });
   });
 
   it.each([
     ["garbage", "not a cursor!!"],
-    ["a tuple of the wrong arity (a tasks-list cursor)", encodeCursor([AT, idOf(1), AT, idOf(2), idOf(3)])],
-    ["a tuple of the wrong types", encodeCursor([1, 2])],
-    ["a millisecond-precision timestamp", encodeCursor(["2026-09-07T00:00:00.123Z", idOf(1)])],
-    ["a non-uuid id", encodeCursor([AT, "nope"])],
+    ["a tuple of the wrong arity (a tasks-list cursor)", encodeCursor("prompts.prompts", [AT, idOf(1), AT, idOf(2), idOf(3)])],
+    ["a same-arity cursor issued by another list (STORY-117 scenario 6)", encodeCursor("projects.projects", [AT, idOf(1)])],
+    ["a tuple of the wrong types", encodeCursor("prompts.prompts", [1, 2])],
+    ["a millisecond-precision timestamp", encodeCursor("prompts.prompts", ["2026-09-07T00:00:00.123Z", idOf(1)])],
+    ["a non-uuid id", encodeCursor("prompts.prompts", [AT, "nope"])],
   ])("[STORY-134 #8] %s is a 400, never a silent first page", async (_label, cursor) => {
     const error = await setup([row(1)]).list(PROJECT, { limit: 50, cursor }).then(
       () => undefined,
@@ -118,7 +119,7 @@ describe("STORY-134 · prompt list keyset paging", () => {
 
   it("[STORY-134 observability] counts each page served, labelled by has_more and continued only", async () => {
     const log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
-    await setup([row(1), row(2), row(3)]).list(PROJECT, { limit: 2, cursor: encodeCursor([AT, idOf(0)]) });
+    await setup([row(1), row(2), row(3)]).list(PROJECT, { limit: 2, cursor: encodeCursor("prompts.prompts", [AT, idOf(0)]) });
     const metric = log.mock.calls.map((call) => call[0] as Record<string, unknown>).find((entry) => entry?.metric === "nominara_prompts_list_pages_total");
     expect(metric).toEqual({ metric: "nominara_prompts_list_pages_total", value: 1, has_more: "true", continued: "true" });
   });
