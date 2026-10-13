@@ -71,10 +71,25 @@ describe("STORY-006 AC 7 · migration round-trip gate", () => {
     expect(result.problems.join("\n")).toMatch(/0001_widgets.*down/i);
   });
 
-  it("STORY-006 AC7 · a down that does not undo its up leaves residue and fails, naming the object", async () => {
+  it("STORY-006 AC7 · a down that does not undo its up fails, naming the migration and the object it left behind", async () => {
     await pair("0001_widgets", "CREATE TABLE widgets (id int);", "SELECT 1;");
     const result = await checkRoundTrip(client, dir);
-    expect(result.problems.join("\n")).toMatch(/residue.*widgets/i);
+    expect(result.problems.join("\n")).toMatch(/0001_widgets.*does not restore.*widgets/i);
+  });
+
+  it("STORY-006 AC7 · a no-op down on a COLUMN is caught even though a later down drops the whole table (the case a chain-wide rollback hides)", async () => {
+    await pair("0001_widgets", "CREATE TABLE widgets (id int);", "DROP TABLE widgets;");
+    await pair("0002_widgets_label", "ALTER TABLE widgets ADD COLUMN label text;", "SELECT 1;");
+    const result = await checkRoundTrip(client, dir);
+    expect(result.problems.join("\n")).toMatch(/0002_widgets_label.*does not restore.*label/i);
+    // the end state IS empty, which is exactly why a bare "rolled back to empty" assertion is not enough
+    expect(result.problems.join("\n")).not.toMatch(/residue/i);
+  });
+
+  it("STORY-006 AC7 · a down that changes a constraint, index, default or grant it should have restored is caught", async () => {
+    await pair("0001_widgets", "CREATE TABLE widgets (id int);", "DROP TABLE widgets;");
+    await pair("0002_widgets_idx", "CREATE INDEX ix_widgets_id ON widgets (id);", "SELECT 1;");
+    expect((await checkRoundTrip(client, dir)).problems.join("\n")).toMatch(/0002_widgets_idx.*ix_widgets_id/i);
   });
 
   it("STORY-006 AC7 · a down that throws fails, naming the migration", async () => {
@@ -96,14 +111,15 @@ describe("STORY-006 AC 7 · migration round-trip gate", () => {
     const result = await checkRoundTrip(client, dir);
     expect(result.problems).toEqual([]);
     expect(result.migrationCount).toBe(2);
+    // the chain was rolled back to nothing at the end
     const left = await client.query("SELECT 1 FROM pg_tables WHERE schemaname = 'public'");
     expect(left.rowCount).toBe(0);
   });
 
-  it("STORY-006 AC7 · a migration whose rollback cannot be re-applied (down leaves state the up cannot recreate) fails the re-apply leg", async () => {
+  it("STORY-006 AC7 · a down that leaves state the up cannot recreate fails, naming the migration", async () => {
     // The down removes the table but leaves a type behind; the second apply of the up then collides with it.
     await pair("0001_widgets", "CREATE TYPE widget_kind AS (a int); CREATE TABLE widgets (id int);", "DROP TABLE widgets;");
     const result = await checkRoundTrip(client, dir);
-    expect(result.problems.length).toBeGreaterThan(0);
+    expect(result.problems.join("\n")).toMatch(/0001_widgets/);
   });
 });
