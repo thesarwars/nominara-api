@@ -12,8 +12,6 @@
 # ⚠ §10 GATES THIS PIPELINE CANNOT CLAIM, because nothing exists to run:
 #   always:                        scoring and parser golden sets (no runner;
 #                                  test/golden/ absent)
-#   when a migration is present:   migration forward + rollback, as a general
-#                                  gate (per-migration specs only)
 #   when a read path changes:      EXPLAIN budget regression (one spec, no gate)
 #   when parser/scoring changes:   accuracy gates at launch-set sizes
 #
@@ -57,7 +55,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
-      # The three shadow-database gates each CREATE their own throwaway
+      # The four shadow-database gates each CREATE their own throwaway
       # database from the migrations, so a bare server is all they need —
       # the same image docker-compose.yml runs.
       postgres:
@@ -103,6 +101,10 @@ jobs:
       - run: pnpm db:rls-check
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm db:schema-check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      # STORY-006 AC 7 — every migration forward, every one back, then forward
+      # again, on its own shadow database. Zero migrations found fails.
+      - run: pnpm db:roundtrip-check
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
 
   containers:

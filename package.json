@@ -23,6 +23,7 @@
     "db:rls-check": "tsx src/db/rls/rls-check.ts",
     "db:schema-generate": "tsx src/db/schema/generate.ts",
     "db:schema-check": "tsx src/db/schema/schema-check.ts",
+    "db:roundtrip-check": "tsx src/db/roundtrip-check.ts",
     "db:studio": "tsx src/db/studio.ts",
     "db:seed-demo": "tsx src/db/seed-demo.ts",
     "db:maintenance:run": "tsx src/workers/rollup/maintenance.ts",
