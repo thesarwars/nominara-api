@@ -131,7 +131,7 @@ describe("STORY-060 · A3 answer structure (persisted, read)", () => {
     const promptId = randomUUID();
     await db.query(
       `INSERT INTO tracked_prompts (id,workspace_id,project_id,text,text_hash,intent_archetype,funnel_stage,is_priority,status,cluster_id)
-       VALUES ($1,$2,$3,$4,sha256($4::bytea),'recommendation','consideration',false,'active',$5)`,
+       VALUES ($1,$2,$3,$4::text,sha256(convert_to($4::text,'UTF8')),'recommendation','consideration',false,'active',$5)`,
       [promptId, workspaceId, projectId, `q ${promptId}`, clusterId],
     );
     return promptId;
