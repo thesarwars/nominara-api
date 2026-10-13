@@ -25,6 +25,7 @@ import {
 } from "../../src/lib/cache/realtime-publisher.js";
 import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
 import { SOCKET_MESSAGE_CAP_PER_SECOND, RESYNC_DIRECTIVE } from "../../src/gateway/backpressure.js";
+import { projectRoom } from "../../src/gateway/room-authorization.service.js";
 import { startValkey, type StartedValkey } from "../support/valkey-fixture.js";
 import { Redis } from "ioredis";
 import { SOCKET_MESSAGE_CAP_PER_SECOND as SOCKET_CAP } from "../../src/gateway/backpressure.js";
@@ -152,6 +153,30 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
     return client;
   }
 
+  /**
+   * STORY-026 AC1 — a project's events are delivered only to sockets that hold
+   * its room. These tests are about BUDGETS (coalescing, the per-second cap,
+   * resync), not about who may join a project, so the socket is placed in the
+   * project rooms server-side rather than through `join:project`, which needs a
+   * real `projects` row per id. Authorisation of the join is covered by
+   * realtime-project-scope.spec.ts and delivery filtering by
+   * realtime-project-delivery.spec.ts.
+   */
+  async function holdProjects(
+    client: ClientSocket,
+    projectIds: readonly string[],
+    gateway: RealtimeGateway = app.get(RealtimeGateway),
+  ): Promise<void> {
+    const sockets = (gateway.server as unknown as { sockets: Map<string, { join: (room: string) => Promise<void> | void }> })
+      .sockets;
+    const serverSide = sockets.get(client.id ?? "");
+    if (serverSide === undefined) throw new Error("the server-side socket for this client was not found");
+    for (const projectId of projectIds) await serverSide.join(projectRoom(projectId));
+  }
+
+  /** The project every default payload in this file names; every joined socket holds its room. */
+  const SHARED_PROJECT = randomUUID();
+
   /** A joined, authorised socket in a workspace room — the only thing events are delivered to. */
   async function joinedSocket(): Promise<{ workspaceId: string; ownerId: string; client: ClientSocket }> {
     const ownerId = await createUser();
@@ -167,6 +192,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
         resolve();
       });
     });
+    await holdProjects(client, [SHARED_PROJECT]);
     return { workspaceId: workspace.id, ownerId, client };
   }
 
@@ -181,7 +207,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
   function progress(runId: string, pct: number): Record<string, unknown> {
     return {
       run_id: runId,
-      project_id: randomUUID(),
+      project_id: SHARED_PROJECT,
       planned: 100,
       captured: pct,
       skipped: 0,
@@ -282,6 +308,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
         });
       });
 
+      await holdProjects(other, [SHARED_PROJECT], secondApp.get(RealtimeGateway));
       const here = collect(first.client, "run.progress");
       const there = collect(other, "run.progress");
 
@@ -410,6 +437,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
   it("spends a per-project budget and tells the client once that it missed rows", async () => {
     const { workspaceId, client } = await joinedSocket();
     const projectId = randomUUID();
+    await holdProjects(client, [projectId]);
     const delivered = collect(client, "aux.finding_created");
     const resyncs = collect(client, RESYNC_DIRECTIVE) as { scope: string; project_id: string | null }[];
 
@@ -434,6 +462,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
     const { workspaceId, client } = await joinedSocket();
     const busy = randomUUID();
     const quiet = randomUUID();
+    await holdProjects(client, [busy, quiet]);
     const delivered = collect(client, "aux.finding_created") as { project_id: string }[];
 
     for (let i = 0; i < 20; i += 1) {
@@ -465,6 +494,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
 
     for (let project = 0; project < 40; project += 1) {
       const projectId = randomUUID();
+      await holdProjects(client, [projectId]);
       for (let i = 0; i < 7; i += 1) {
         publisher.toWorkspace(workspaceId, "aux.finding_created", finding(projectId) as never);
       }
@@ -485,6 +515,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
     const resyncs = collect(client, RESYNC_DIRECTIVE) as { scope: string; project_id: string | null }[];
     const first = randomUUID();
     const second = randomUUID();
+    await holdProjects(client, [first, second]);
 
     for (let i = 0; i < 12; i += 1) publisher.toWorkspace(workspaceId, "aux.finding_created", finding(first) as never);
     for (let i = 0; i < 12; i += 1) publisher.toWorkspace(workspaceId, "aux.finding_created", finding(second) as never);
@@ -540,7 +571,7 @@ describe("STORY-026 · coalescing and backpressure on the real delivery path", (
     for (let i = 0; i < SOCKET_MESSAGE_CAP_PER_SECOND * 3; i += 1) {
       publisher.toWorkspace(workspaceId, "task.moved", {
         task_id: randomUUID(),
-        project_id: randomUUID(),
+        project_id: SHARED_PROJECT,
       });
     }
     await settle(900);

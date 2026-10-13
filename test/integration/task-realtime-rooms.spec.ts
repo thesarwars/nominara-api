@@ -6,7 +6,7 @@ import { Client, Pool } from "pg";
 import { io, type Socket as ClientSocket } from "socket.io-client";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { RealtimeModule } from "../../src/gateway/gateway.module.js";
-import { JOIN_WORKSPACE_MESSAGE, RealtimeGateway } from "../../src/gateway/realtime.gateway.js";
+import { JOIN_PROJECT_MESSAGE, JOIN_WORKSPACE_MESSAGE, RealtimeGateway } from "../../src/gateway/realtime.gateway.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
@@ -30,7 +30,7 @@ import { applyFakeApiEnv } from "../support/fake-env.js";
 // workspace's socket must receive NOTHING.
 const WRAPPING_KEY = Buffer.alloc(32, 10);
 
-describe("STORY-064-D · task events are delivered to the workspace room only", () => {
+describe("STORY-064-D · task events are delivered to the workspace's sockets that hold the project room", () => {
   let container: StartedPostgreSqlContainer;
   let valkey: StartedValkey;
   let db: Client;
@@ -107,6 +107,16 @@ describe("STORY-064-D · task events are delivered to the workspace room only", 
     const p = await db.query<{ id: string }>(
       `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain) VALUES ($1, 'Rooms', $2, 'https://example.com', $3) RETURNING id`,
       [workspace.id, `rooms-${randomUUID()}`, `${randomUUID()}.example.com`]);
+    // STORY-026 AC1 — a project's events are delivered only to sockets that hold
+    // its room, so the owner joins the project it is about to be told about.
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no reply to join:project within 5s")), 5_000);
+      client.emit(JOIN_PROJECT_MESSAGE, { project_id: p.rows[0]!.id }, (reply: { joined: boolean }) => {
+        clearTimeout(timer);
+        if (reply.joined) resolve();
+        else reject(new Error("join:project refused"));
+      });
+    });
     return { workspaceId: workspace.id, userId, projectId: p.rows[0]!.id, client };
   }
 

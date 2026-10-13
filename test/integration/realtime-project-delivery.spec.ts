@@ -226,13 +226,7 @@ describe("STORY-026 AC1 · project_scope constrains what a socket RECEIVES", () 
     });
 
     publisher.toProject(workspaceId, b, "task.created", { task_id: randomUUID(), project_id: b });
-    publisher.toProject(workspaceId, a, "task.moved", {
-      task_id: randomUUID(),
-      project_id: a,
-      from_status: "open",
-      to_status: "done",
-      actor_id: randomUUID(),
-    } as never);
+    publisher.toProject(workspaceId, a, "task.moved", { task_id: randomUUID(), project_id: a });
 
     await expect(sawA, "the in-scope event must arrive, or the silence below proves nothing").resolves.toBe("arrived");
     await expect(sawB, "an out-of-scope project's event must never reach a scoped manager").resolves.toBe("quiet");
