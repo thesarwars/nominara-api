@@ -3,6 +3,7 @@ import {
   type AnswerFormValue,
   type GeoAnalysisWrite,
   type GeoFinding,
+  type GeoStructureCluster,
   type GeoStructureDetail,
   type PositionClassValue,
 } from "../../../contracts/analytics/index.js";
@@ -46,7 +47,14 @@ export interface StructureInput {
   windowDays: 7 | 30 | 90;
   rootDomain: string;
   /** Distinct answers per engine and form in the window. */
-  forms: { engine: string; dataSource: "live" | "demo"; form: AnswerFormValue; answers: number }[];
+  forms: {
+    engine: string;
+    dataSource: "live" | "demo";
+    form: AnswerFormValue;
+    answers: number;
+    /** The prompt's topic cluster (STORY-040 AC8); absent or null when the prompt belongs to none. */
+    cluster?: { id: string; label: string } | null;
+  }[];
   /** Distinct answers per position class of the brand's first mention, current window. */
   position: { cls: PositionClassValue; answers: number }[];
   /** The same, for the window of equal length immediately before. */
@@ -58,6 +66,40 @@ const pct = (x: number): string => `${String(Math.round(x * 100))}%`;
 
 function formCounts(rows: { form: AnswerFormValue; answers: number }[]): { form: AnswerFormValue; count: number }[] {
   return FORM_ORDER.map((form) => ({ form, count: rows.filter((r) => r.form === form).reduce((n, r) => n + r.answers, 0) }));
+}
+
+/**
+ * STORY-040 AC8 — one entry per prompt cluster (plus one for unclustered prompts), each with its form counts, its
+ * engines, and a dominant form only when the cluster itself has `STRUCTURE_MIN_ANSWERS` answers.
+ * Largest first, then by id with the unclustered entry last, so the order never depends on input order.
+ */
+function clusterDistributions(rows: StructureInput["forms"]): GeoStructureCluster[] {
+  const groups = new Map<string | null, { label: string | null; rows: StructureInput["forms"] }>();
+  for (const row of rows) {
+    const id = row.cluster?.id ?? null;
+    const group = groups.get(id) ?? { label: row.cluster?.label ?? null, rows: [] };
+    group.rows.push(row);
+    groups.set(id, group);
+  }
+  return [...groups.entries()]
+    .map(([id, group]) => {
+      const total = group.rows.reduce((n, r) => n + r.answers, 0);
+      const forms = formCounts(group.rows);
+      const sufficient = total >= STRUCTURE_MIN_ANSWERS;
+      return {
+        cluster_id: id,
+        label: group.label,
+        total,
+        sufficient,
+        dominant_form: sufficient ? forms.reduce((best, cur) => (cur.count > best.count ? cur : best)).form : null,
+        forms,
+        engines: [...new Set(group.rows.map((r) => r.engine))].sort().map((engine) => {
+          const engineRows = group.rows.filter((r) => r.engine === engine);
+          return { engine, total: engineRows.reduce((n, r) => n + r.answers, 0), forms: formCounts(engineRows) };
+        }),
+      };
+    })
+    .sort((a, b) => b.total - a.total || (a.cluster_id === null ? 1 : b.cluster_id === null ? -1 : a.cluster_id.localeCompare(b.cluster_id)));
 }
 
 /** Pure: the persisted row and the read detail from one aggregate, so they cannot disagree. */
@@ -128,6 +170,7 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
     dominant_form: dominant.form,
     engines,
     page_forms: [],
+    clusters: clusterDistributions(input.forms),
     brand_answers: brandAnswers,
     prior_brand_answers: priorAnswers,
     position,
@@ -170,6 +213,8 @@ export function windowStartFor(asOf: Date, days: number): string {
 }
 
 interface FormRow {
+  cluster_id: string | null;
+  cluster_label: string | null;
   engine_key: string;
   answer_form: AnswerFormValue;
   answers: number;
@@ -195,15 +240,20 @@ export async function loadStructureInput(
 
   // Window bounds are UTC midnights, whatever the session timezone is.
   const forms = await tx.query<FormRow>(
-    `SELECT mf.engine_key, mf.answer_form, count(DISTINCT mf.result_id)::int AS answers,
+    `SELECT tc.id AS cluster_id, tc.label AS cluster_label,
+            mf.engine_key, mf.answer_form, count(DISTINCT mf.result_id)::int AS answers,
             (ac.normalizer_version = $4) AS is_demo
        FROM mention_facts mf
        JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at
+       -- STORY-040 AC8: a prompt has at most one cluster, so this never multiplies an answer. LEFT, because a prompt
+       -- in no cluster (or one whose cluster is gone) is still an answer and is reported as unclustered.
+       LEFT JOIN tracked_prompts tp ON tp.id = mf.prompt_id
+       LEFT JOIN topic_clusters tc ON tc.id = tp.cluster_id
       WHERE mf.project_id = $1
         AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
         AND mf.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') + make_interval(days => $3)
         AND mf.answer_form IS NOT NULL AND mf.scoring_version = $5
-      GROUP BY mf.engine_key, mf.answer_form, (ac.normalizer_version = $4)`,
+      GROUP BY tc.id, tc.label, mf.engine_key, mf.answer_form, (ac.normalizer_version = $4)`,
     [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION, SCORING_VERSION],
   );
 
@@ -232,6 +282,7 @@ export async function loadStructureInput(
       dataSource: r.is_demo ? "demo" : "live",
       form: r.answer_form,
       answers: r.answers,
+      cluster: r.cluster_id === null ? null : { id: r.cluster_id, label: r.cluster_label ?? "" },
     })),
     position: (await positionIn(0)).map((r) => ({ cls: r.position_class, answers: r.answers })),
     priorPosition: (await positionIn(windowDays)).map((r) => ({ cls: r.position_class, answers: r.answers })),

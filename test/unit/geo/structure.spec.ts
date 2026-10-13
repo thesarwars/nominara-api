@@ -190,10 +190,10 @@ describe("STORY-060 · A3 answer structure (pure)", () => {
           ],
         }),
       );
-      const byLabel = Object.fromEntries(detail!.clusters!.map((c) => [c.label, c]));
-      expect(byLabel["Pricing"]).toMatchObject({ cluster_id: pricing.id, total: 33, dominant_form: "comparison_table", sufficient: true });
-      expect(byLabel["Pricing"]!.forms.find((x) => x.form === "narrative")!.count).toBe(8);
-      expect(byLabel["Features"]).toMatchObject({ total: 31, dominant_form: "narrative" });
+      const byLabel = (label: string) => detail!.clusters!.find((c) => c.label === label)!;
+      expect(byLabel("Pricing")).toMatchObject({ cluster_id: pricing.id, total: 33, dominant_form: "comparison_table", sufficient: true });
+      expect(byLabel("Pricing")!.forms.find((x) => x.form === "narrative")!.count).toBe(8);
+      expect(byLabel("Features")).toMatchObject({ total: 31, dominant_form: "narrative" });
       expect(geoStructureDetailSchema.safeParse(detail).success).toBe(true);
     });
 
