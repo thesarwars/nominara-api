@@ -71,6 +71,9 @@ describe("STORY-143 · audit.verify handler", () => {
 
   beforeEach(async () => {
     await db.query("TRUNCATE audit_log, workspaces CASCADE");
+    // The marks outlive their workspaces by design (no FK), so they are
+    // cleared explicitly. Guarded so this file can show the pre-migration RED.
+    await db.query("DO $$ BEGIN IF to_regclass('audit_chain_marks') IS NOT NULL THEN TRUNCATE audit_chain_marks; END IF; END $$");
     counters.length = 0;
     connectedUrls.length = 0;
     workspaceId = randomUUID();
@@ -201,6 +204,7 @@ describe("STORY-143 · audit.verify handler", () => {
     // The guard must not fire on a genuinely fresh deployment, or the first
     // night of every environment is a false alarm and the alarm gets muted.
     await db.query("TRUNCATE audit_log, workspaces CASCADE");
+    await db.query("DO $$ BEGIN IF to_regclass('audit_chain_marks') IS NOT NULL THEN TRUNCATE audit_chain_marks; END IF; END $$");
 
     await expect(run()).resolves.toBeUndefined();
   }, 60_000);
@@ -231,42 +235,197 @@ describe("STORY-143 · audit.verify handler", () => {
     expect(detected.map((c) => c.labels.workspace_id).sort()).toEqual([firstWorkspace, second].sort());
   }, 60_000);
 
-  describe("⚠ KNOWN GAPS — pinned so they cannot widen unnoticed", () => {
-    // These pass CLEAN today and that is the point of asserting them: the
-    // daily "no mismatch" line does not mean what a reader would assume, and
-    // closing them needs a stored per-workspace high-water mark, which is its
-    // own story. If any of these ever starts being detected, these tests fail
-    // and someone deletes them deliberately rather than by accident.
+  describe("STORY-143 AC7 · the high-water mark closes tail truncation and whole-chain deletion", () => {
+    // These were pinned as KNOWN GAPS ("does NOT detect tail truncation",
+    // "does NOT detect a whole chain being deleted") and asserted `resolves`.
+    // They now assert the opposite, against a mark the PREVIOUS run stored:
+    // a verifier can only notice what disappeared if something remembers what
+    // was there. The first `run()` in each test is that memory being written.
 
-    it("does NOT detect tail truncation — the tamper an attacker actually performs", async () => {
+    const disableAppendOnly = () => db.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
+    const enableAppendOnly = () => db.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
+
+    async function marks(): Promise<{ max_seq: string | null; reason: string }[]> {
+      const result = await db.query<{ max_seq: string | null; reason: string }>(
+        "SELECT max_seq::text AS max_seq, reason FROM audit_chain_marks WHERE workspace_id = $1 ORDER BY checked_at, id",
+        [workspaceId],
+      );
+      return result.rows;
+    }
+
+    it("STORY-143-AC7a · a clean run appends a `verified` mark at the chain head", async () => {
+      await appendChain(3);
+      const head = await db.query<{ seq: string }>("SELECT max(seq)::text AS seq FROM audit_log WHERE workspace_id = $1", [workspaceId]);
+
+      await run();
+
+      expect(await marks()).toEqual([{ max_seq: head.rows[0]!.seq, reason: "verified" }]);
+    }, 60_000);
+
+    it("STORY-143-AC7b · DETECTS tail truncation — the tamper an attacker actually performs", async () => {
       await appendChain(4);
-      await db.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
+      await run();
+      await disableAppendOnly();
       await db.query("DELETE FROM audit_log WHERE seq = (SELECT max(seq) FROM audit_log)");
-      await db.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
+      await enableAppendOnly();
 
+      const thrown: unknown = await run().then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(thrown, "a truncated chain was reported clean").not.toBeNull();
+      expect(thrown).toBeInstanceOf(UnrecoverableError);
+      expect((thrown as Error).message).toMatch(/chain_truncated/);
+    }, 60_000);
+
+    it("STORY-143-AC7c · DETECTS a whole chain being deleted while the workspace still exists", async () => {
+      await appendChain(3);
+      await run();
+      await disableAppendOnly();
+      await db.query("DELETE FROM audit_log");
+      await enableAppendOnly();
+
+      const thrown: unknown = await run().then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(thrown, "a deleted chain was reported clean").not.toBeNull();
+      expect(thrown).toBeInstanceOf(UnrecoverableError);
+      expect((thrown as Error).message).toMatch(/chain_missing/);
+      expect(counters.filter((c) => c.name === "nominara_audit_chain_mismatch_total")).toHaveLength(1);
+    }, 60_000);
+
+    it("STORY-143-AC7d · DETECTS a forged tail whose hashes were recomputed to be self-consistent", async () => {
+      // The attacker who can write audit_log can also recompute a row's hash,
+      // so the within-chain walk passes. Only the mark remembers what the
+      // hash at that position WAS.
+      await appendChain(3);
+      await run();
+      const { readWorkspaceChain } = await import("../../src/modules/audit/audit-log-reader.js");
+      const { computeRowHash } = await import("../../src/lib/crypto/audit-chain.js");
+      const rows = await readWorkspaceChain(db, workspaceId);
+      const last = rows[rows.length - 1]!;
+      const { seq: _seq, prev_hash: _prev, row_hash: _hash, ...content } = last;
+      const forged = { ...content, after_state: { n: "forged" } };
+      const forgedHash = computeRowHash(last.prev_hash, forged);
+      await disableAppendOnly();
+      await db.query("UPDATE audit_log SET after_state = $2::jsonb, row_hash = $3 WHERE seq = $1", [
+        last.seq,
+        JSON.stringify(forged.after_state),
+        forgedHash,
+      ]);
+      await enableAppendOnly();
+
+      const thrown: unknown = await run().then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(thrown, "a self-consistent forged tail was reported clean").not.toBeNull();
+      expect(thrown).toBeInstanceOf(UnrecoverableError);
+      expect((thrown as Error).message).toMatch(/mark_hash_mismatch/);
+    }, 60_000);
+
+    it("STORY-143-AC7e · DETECTS the marked row being deleted and the chain regrown past it", async () => {
+      // max_seq has NOT gone down here, so a check on length alone passes.
+      await appendChain(3);
+      await run();
+      await disableAppendOnly();
+      await db.query("DELETE FROM audit_log WHERE seq = (SELECT max(seq) FROM audit_log)");
+      await enableAppendOnly();
+      await appendChain(2);
+
+      await expect(run()).rejects.toThrow(/mark_hash_mismatch/);
+    }, 60_000);
+
+    it("STORY-143-AC7f · a legitimate erasure rechain passes, and writes a `rechain` mark at the marker row", async () => {
+      const { requestIndividualErasure } = await import("../../src/workers/rollup/retention.js");
+      const { AuditChainService } = await import("../../src/modules/audit/audit-chain.service.js");
+      const user = await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`u-${randomUUID()}@example.com`]);
+      const userId = user.rows[0]!.id;
+      await db.query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1, $2, 'analyst', 'active')", [
+        workspaceId,
+        userId,
+      ]);
+      await new AuditChainService().append(db, {
+        workspaceId,
+        actorType: "user",
+        actorId: userId,
+        actorIp: null,
+        actorUa: null,
+        action: "workspace.updated",
+        resourceType: "workspace",
+        resourceId: workspaceId,
+        beforeState: null,
+        afterState: { n: 0 },
+        requestId: randomUUID(),
+        supportGrantId: null,
+        severity: "info",
+      });
+      await appendChain(2);
+      await run();
+
+      expect(await requestIndividualErasure(db, userId)).toEqual({ blocked: false });
+
+      const markerSeq = await db.query<{ seq: string }>("SELECT max(seq)::text AS seq FROM audit_log WHERE workspace_id = $1", [workspaceId]);
+      const afterErasure = await marks();
+      expect(afterErasure[afterErasure.length - 1]).toEqual({ max_seq: markerSeq.rows[0]!.seq, reason: "rechain" });
+      await expect(run()).resolves.toBeUndefined();
+
+      // And the rechain mark is itself a promise: deleting the marker row is caught.
+      await disableAppendOnly();
+      await db.query("DELETE FROM audit_log WHERE seq = $1", [markerSeq.rows[0]!.seq]);
+      await enableAppendOnly();
+      await expect(run()).rejects.toThrow(/chain_truncated/);
+    }, 60_000);
+
+    it("STORY-143-AC7g · a hard-deleted workspace leaves a tombstone, so its vanished chain is expected", async () => {
+      const { executeWorkspaceHardDelete } = await import("../../src/workers/rollup/retention.js");
+      await appendChain(3);
+      await run();
+
+      await executeWorkspaceHardDelete(db, workspaceId, { exportComplianceRecords: async () => undefined });
+
+      expect((await marks()).map((m) => m.reason)).toContain("tombstone");
       await expect(run()).resolves.toBeUndefined();
     }, 60_000);
 
-    it("does NOT detect a whole chain being deleted — the workspace just stops existing to it", async () => {
-      await appendChain(3);
-      await db.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
-      await db.query("DELETE FROM audit_log");
-      await db.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
+    it("STORY-143-AC7h · a workspace with no audit history and no mark is not a finding", async () => {
+      // Fresh workspace, never audited: nothing was ever promised.
+      await expect(run()).resolves.toBeUndefined();
+      expect(await marks()).toEqual([]);
+    }, 60_000);
 
-      // Reports CLEAN. The workspace still exists and its entire audit history
-      // is gone, and this run calls that "no mismatch" — the blindness guard
-      // does not catch it, because the role can see fine; there is simply
-      // nothing left to see.
+    it("STORY-143-AC7i · RESIDUAL, pinned: a chain deleted before any run ever marked it is still invisible", async () => {
+      // The mark can only remember what a run saw. Closing this needs the
+      // Object Lock export (decisions-2026-10-13: compare against it "later").
+      await appendChain(3);
+      await disableAppendOnly();
+      await db.query("DELETE FROM audit_log");
+      await enableAppendOnly();
+
       await expect(run()).resolves.toBeUndefined();
     }, 60_000);
 
     it("DOES detect a missing genesis row, for contrast", async () => {
       await appendChain(3);
-      await db.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
+      await disableAppendOnly();
       await db.query("DELETE FROM audit_log WHERE seq = (SELECT min(seq) FROM audit_log)");
-      await db.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
+      await enableAppendOnly();
 
       await expect(run()).rejects.toThrow(/audit chain mismatch/);
+    }, 60_000);
+
+    it("STORY-143-AC7j · a mismatched chain writes NO new mark", async () => {
+      await appendChain(3);
+      await run();
+      await disableAppendOnly();
+      await db.query("UPDATE audit_log SET action = 'tampered' WHERE seq = (SELECT min(seq) FROM audit_log)");
+      await enableAppendOnly();
+      const before = await marks();
+
+      await expect(run()).rejects.toThrow(/audit chain mismatch/);
+
+      expect(await marks()).toEqual(before);
     }, 60_000);
   });
 
