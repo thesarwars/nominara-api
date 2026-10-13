@@ -346,8 +346,37 @@ describe("STORY-135 · capture.parse", () => {
     // Control: the same column is populated when the brand IS mentioned, so the NULL above is the absence and not a column that is never written.
     const present = await seedCapture(ANSWER);
     await run(handler(), job(present));
-    const control = await db.query<{ sentiment_label: string | null }>("SELECT sentiment_label FROM answer_captures WHERE id = $1", [present]);
+    const control = await db.query<{ sentiment_label: string | null; sentiment_score: string | null }>(
+      "SELECT sentiment_label, sentiment_score FROM answer_captures WHERE id = $1",
+      [present],
+    );
     expect(control.rows[0]!.sentiment_label).not.toBeNull();
+    expect(control.rows[0]!.sentiment_score).not.toBeNull();
+  });
+
+  it("[STORY-135 AC8] a forced re-parse that finds the brand ABSENT clears the previous label and score — a stale sentiment is not kept", async () => {
+    const id = await seedCapture(ANSWER);
+    const process = handler();
+    await run(process, job(id));
+    const before = await db.query<{ brand_present: boolean; sentiment_label: string | null; sentiment_score: string | null }>(
+      "SELECT brand_present, sentiment_label, sentiment_score FROM answer_captures WHERE id = $1",
+      [id],
+    );
+    expect(before.rows[0]!.brand_present).toBe(true);
+    expect(before.rows[0]!.sentiment_label).not.toBeNull();
+    expect(before.rows[0]!.sentiment_score).not.toBeNull();
+
+    // The brand is no longer HubSpot, so the same stored answer no longer mentions it.
+    await db.query("UPDATE projects SET name = 'Pipedrive' WHERE id = $1", [projectId]);
+    await run(process, job(id, true));
+
+    const after = await db.query<{ brand_present: boolean; sentiment_label: string | null; sentiment_score: string | null }>(
+      "SELECT brand_present, sentiment_label, sentiment_score FROM answer_captures WHERE id = $1",
+      [id],
+    );
+    expect(after.rows[0]!.brand_present).toBe(false);
+    expect(after.rows[0]!.sentiment_label).toBeNull();
+    expect(after.rows[0]!.sentiment_score).toBeNull();
   });
 
   it("leaves a FAILED capture alone — it has no text and is not a parse", async () => {
