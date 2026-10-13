@@ -136,6 +136,39 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
     expect(() => loadEnv({ ...VALID, DATABASE_URL: "   " })).toThrow(/DATABASE_URL/);
   });
 
+  // STORY-141 AC 8 — DATABASE_URL carries the reconciler's session advisory lock
+  // and must be the DIRECT connection, never pgBouncer (transaction pooling
+  // strands a session lock on a backend nobody owns).
+  describe("STORY-141 AC 8 · DATABASE_URL must not be the pooler", () => {
+    it.each([
+      ["the documented pooler port 6432", "postgres://nominara:nominara@localhost:6432/nominara"],
+      ["the compose pooler service host", "postgres://nominara:nominara@pgbouncer:5432/nominara"],
+      ["the pooler host in any case", "postgres://nominara:nominara@PgBouncer:5432/nominara"],
+    ])("refuses to boot when DATABASE_URL is %s, naming DATABASE_URL", (_label, url) => {
+      expect(() => loadEnv({ ...VALID, DATABASE_URL: url })).toThrow(EnvValidationError);
+      expect(() => loadEnv({ ...VALID, DATABASE_URL: url })).toThrow(/DATABASE_URL: .*pooler/i);
+    });
+
+    it("accepts a direct DATABASE_URL (5432, and the 55432 host mapping) alongside a pooled DATABASE_URL_POOLED", () => {
+      expect(() => loadEnv(VALID)).not.toThrow();
+      expect(() =>
+        loadEnv({ ...VALID, DATABASE_URL: "postgres://nominara:nominara@localhost:55432/nominara" }),
+      ).not.toThrow();
+    });
+
+    it("does not constrain DATABASE_URL_POOLED, which IS the pooler by design", () => {
+      expect(() =>
+        loadEnv({ ...VALID, DATABASE_URL_POOLED: "postgres://nominara_app:x@pgbouncer:5432/nominara" }),
+      ).not.toThrow();
+    });
+
+    it("still accepts a direct URL that merely contains the digits 6432 elsewhere (port is compared, not substring)", () => {
+      expect(() =>
+        loadEnv({ ...VALID, DATABASE_URL: "postgres://nominara:p6432@localhost:5432/db6432" }),
+      ).not.toThrow();
+    });
+  });
+
   it("an invalid WORKER_GROUP value throws, naming that exact key", () => {
     expect(() => loadEnv({ ...VALID, WORKER_GROUP: "not-a-real-group" })).toThrow(/WORKER_GROUP/);
   });

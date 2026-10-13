@@ -126,9 +126,10 @@ export async function withGlobalQueueLock<T>(client: ClientBase, queueName: stri
  * is handed to the next client at the next transaction boundary: it is
  * stranded on a backend nobody owns, and a later `pg_advisory_unlock` may not
  * even reach it. `DATABASE_URL` is the direct connection and
- * `DATABASE_URL_POOLED` is the pooler, which is correct in
- * `docker-compose.yml` today — but `env.schema.ts` types both as a bare
- * string and nothing asserts they differ. Same family as `KAD-03`.
+ * `DATABASE_URL_POOLED` is the pooler. Since STORY-141 AC 8 `env.schema.ts`
+ * refuses to boot when `DATABASE_URL` carries the pooler's documented port
+ * (6432) or service host (`pgbouncer`); a pooler reachable on any other
+ * address cannot be recognised from the URL. Same family as `KAD-03`.
  *
  * ⚠ IT IS RE-ENTRANT AND REF-COUNTED PER SESSION. Calling it twice on the
  * same connection returns true both times and increments a counter; the first
