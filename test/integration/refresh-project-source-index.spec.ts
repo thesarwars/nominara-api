@@ -128,6 +128,25 @@ describe("NEW-C-4 · refreshProjectSourceIndex", () => {
     expect(byDomain["weird-unknown.io"]!.is_seedable).toBe(false);
   });
 
+  it("STORY-054 #2 / AC1 · a heuristically classified domain is flagged class_source='heuristic' for curation; a curated one is 'curated'", async () => {
+    await cite({ domain: "reddit.com", prompt: "p1" });
+    await cite({ domain: "forum.example.org", prompt: "p1" });
+    await cite({ domain: "weird-unknown.io", prompt: "p1" });
+    await run();
+    const flags = Object.fromEntries(
+      (await db.query("SELECT domain, class_source FROM source_domains WHERE workspace_id = $1", [workspaceId])).rows.map((r) => [r.domain, r.class_source]),
+    );
+    expect(flags).toEqual({ "reddit.com": "curated", "forum.example.org": "heuristic", "weird-unknown.io": "heuristic" });
+  });
+
+  it("STORY-054 #2 / AC1 · the flag is recomputed from the domain on every refresh and never accumulates a second row", async () => {
+    await cite({ domain: "weird-unknown.io", prompt: "p1" });
+    await run();
+    await run();
+    const found = (await db.query("SELECT class_source FROM source_domains WHERE workspace_id = $1", [workspaceId])).rows;
+    expect(found).toEqual([{ class_source: "heuristic" }]);
+  });
+
   it("STORY-054 #3 · a competitor-owned domain is never seedable, even in a seedable class", async () => {
     await cite({ domain: "rival.com", prompt: "p1", competitor: true, sourceClass: "community_forum" });
     await run();
