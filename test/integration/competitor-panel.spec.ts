@@ -107,7 +107,7 @@ describe("NEW-C-1 · competitor panel", () => {
 
   async function addCell(
     mentions: Mention[],
-    options: { daysAgo?: number; engine?: string; normalizer?: string } = {},
+    options: { daysAgo?: number; engine?: string; normalizer?: string; scoringVersion?: string; mentionVersions?: string[] } = {},
   ): Promise<string> {
     const resultId = randomUUID();
     const capturedAt = daysAgo(options.daysAgo ?? 1);
@@ -116,8 +116,8 @@ describe("NEW-C-1 · competitor panel", () => {
       `INSERT INTO answer_captures
          (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,
           capture_mode,adapter_version,normalizer_version,content_hash,
-          payload,flags,cache_layer,status,brand_present)
-       VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,'api','1.0.0',$8,$9,'{}'::jsonb,'{}','live','parsed',$10)`,
+          payload,flags,cache_layer,status,brand_present,scoring_version)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,'api','1.0.0',$8,$9,'{}'::jsonb,'{}','live','parsed',$10,$11)`,
       [
         resultId,
         workspaceId,
@@ -129,6 +129,7 @@ describe("NEW-C-1 · competitor panel", () => {
         options.normalizer ?? "n1",
         createHash("sha256").update(resultId).digest(),
         mentions.some((m) => m.type === "brand"),
+        options.scoringVersion ?? "v1",
       ],
     );
     let token = 0;
@@ -138,11 +139,12 @@ describe("NEW-C-1 · competitor panel", () => {
            (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,
             entity_type,entity_id,entity_label,matched_alias,occurrence_index,
             char_start,char_end,first_token_index,prominence,list_position,
-            sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,render_score)
-         VALUES ($1,$2,$3,$4,$5,$6::timestamptz,$7,$8,$9,$9,0,0,1,$10,$11,$12,'positive',0.5,0.9,'lexicon',0.4)`,
+            sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,render_score,scoring_version)
+         VALUES ($1,$2,$3,$4,$5,$6::timestamptz,$7,$8,$9,$9,0,0,1,$10,$11,$12,'positive',0.5,0.9,'lexicon',0.4,$13)`,
         [
           workspaceId, projectId, resultId, promptId, engine, capturedAt,
           m.type, m.entityId ?? null, m.label, (token += 10), m.prominence, m.listPosition ?? null,
+          options.mentionVersions?.[mentions.indexOf(m)] ?? options.scoringVersion ?? "v1",
         ],
       );
     }
@@ -272,6 +274,24 @@ describe("NEW-C-1 · competitor panel", () => {
     expect(document.engine_data_source).toEqual({ chatgpt: "demo", gemini: "live" });
     const empty = await panel({ engines: "chatgpt" });
     expect(Object.keys(empty.engine_data_source)).toEqual(["chatgpt"]);
+  });
+
+  it("STORY-136 AC9 — captures and mentions written under another scoring version are not part of the panel", async () => {
+    // Head-to-head, hand-computed under v1 only: c1 both appear, brand ranks 1 -> brand wins. Rate 1.
+    await addCell([brand(0.6, 1), compMention(compA, "Salesforce", 0.3, 2)]);
+    // A v2 CAPTURE (its mentions still v1, so only the capture filter can exclude it) where Salesforce wins: reading it would make the rate 1/2.
+    await addCell([brand(0.3, 2), compMention(compA, "Salesforce", 0.6, 1)], { scoringVersion: "v2", mentionVersions: ["v1", "v1"] });
+    // A v1 capture whose Salesforce MENTION is v2: the cell must not count as one both appear in (rate would be 1/3).
+    await addCell([brand(0.3, 2), compMention(compA, "Salesforce", 0.6, 1)], { mentionVersions: ["v1", "v2"] });
+    const row = (await panel()).rows.find((r) => r.label === "Salesforce")!;
+    expect(row.h2h_win_rate).toBe(1);
+  });
+
+  it("STORY-136 AC9 — the provenance marker describes only the current version's captures", async () => {
+    await addCell([brand(0.6)], { engine: "chatgpt" });
+    await addCell([brand(0.6)], { engine: "chatgpt", normalizer: DEMO_SEED_MARKER, scoringVersion: "v2" });
+    await addCell([brand(0.6)], { engine: "gemini", scoringVersion: "v2" });
+    expect((await panel()).engine_data_source).toEqual({ chatgpt: "live", gemini: null });
   });
 
   it("an engine with both seeded and real captures in the window is mixed, not demo", async () => {

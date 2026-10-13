@@ -84,7 +84,7 @@ export class GrowthMapService {
     const rows = await this.seriesRows(tx, projectId, from, to, selected);
     // NEW-A-5 — the series are the cross-engine blend, so each one carries the
     // combination of every measured engine's provenance in the window.
-    const allSources = await engineDataSourcesForDates(tx, projectId, from, to, timezone);
+    const allSources = await engineDataSourcesForDates(tx, projectId, from, to, timezone, SCORING_VERSION);
     const engineSources = new Map([...allSources].filter(([engine]) => selected === null || selected.includes(engine)));
     const blendSource: DataSource | null = combineDataSources([...engineSources.values()]);
     recordDemoDataServed("growth_map", store.context.workspaceId, [...engineSources.values()]);

@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { SCORING_VERSION } from "../scoring/index.js";
 
 // STORY-032 — AC9 and AC12. What a run writes for the cells it did NOT
 // capture, and the counters it records before dispatching the ones it did.
@@ -129,7 +130,7 @@ export async function recordSuppressedCells(
     INSERT INTO answer_captures
       (workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
        capture_mode, adapter_version, normalizer_version, content_hash,
-       cache_layer, source_result_id, alias_fingerprint, status, payload, response_excerpt)
+       cache_layer, source_result_id, alias_fingerprint, status, payload, response_excerpt, scoring_version)
     SELECT $1, $2, $3, c.prompt_id, c.engine_key, c.sample_index, now(),
            $4, c.adapter_version, $5,
            -- An L2 row's hash is COPIED from the capture it reuses, so the
@@ -149,7 +150,7 @@ export async function recordSuppressedCells(
            -- AFTER the cache read" — the read is what supplies the thing
            -- stored. An L2 row leaves these at their defaults because
            -- source_result_id already reaches the answer inside this tenant.
-           COALESCE(c.payload, '{}'::jsonb), c.excerpt
+           COALESCE(c.payload, '{}'::jsonb), c.excerpt, $8::text
       FROM jsonb_to_recordset($6::jsonb)
         AS c(prompt_id uuid, engine_key text, sample_index int, cache_layer text,
              adapter_version text, source_result_id uuid, content_hash text,
@@ -183,6 +184,7 @@ export async function recordSuppressedCells(
       context.normalizerVersion,
       JSON.stringify(payload),
       context.aliasFingerprint,
+      SCORING_VERSION,
     ],
   );
   return result.rowCount ?? 0;

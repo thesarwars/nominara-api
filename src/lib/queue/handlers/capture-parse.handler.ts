@@ -158,9 +158,10 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       // `captured` forever: there is genuinely nothing in it to match, and a
       // cell stuck at `captured` would keep its run below 100% and keep this
       // job coming back.
-      await tx.query("UPDATE answer_captures SET status = 'parsed', normalizer_version = $2 WHERE id = $1", [
+      await tx.query("UPDATE answer_captures SET status = 'parsed', normalizer_version = $2, scoring_version = $3 WHERE id = $1", [
         record.id,
         NORMALIZER_VERSION,
+        SCORING_VERSION,
       ]);
       await requestRollupIfRunComplete(tx, record, payload.workspaceId);
       return;

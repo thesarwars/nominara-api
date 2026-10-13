@@ -111,7 +111,7 @@ export class ScorecardsService {
     // NEW-A-5 — provenance over the SAME span as the blend's membership
     // (prior window start to current end), so the marker describes every
     // capture that can move the score or its delta.
-    const sources = await engineDataSourcesForDates(tx, projectId, window.priorFrom, window.to, window.timezone);
+    const sources = await engineDataSourcesForDates(tx, projectId, window.priorFrom, window.to, window.timezone, SCORING_VERSION);
     const perEngine = entries.map((entry) => sources.get(entry.engine.engine_key) ?? null);
     recordDemoDataServed("scorecards", store.context.workspaceId, perEngine);
 
@@ -158,11 +158,11 @@ export class ScorecardsService {
         ? "project_entitled_engines"
         : `(SELECT $1::uuid AS project_id, x.engine_key, true AS enabled, x.display_name, x.weight::real AS weight,
                    CASE WHEN x.runs_per_cycle IS NULL THEN NULL ELSE jsonb_build_object('full', x.runs_per_cycle) END AS cadence
-              FROM jsonb_to_recordset($6::jsonb) AS x(engine_key text, display_name text, runs_per_cycle int, weight text))`;
+              FROM jsonb_to_recordset($7::jsonb) AS x(engine_key text, display_name text, runs_per_cycle int, weight text))`;
     const overrideSource =
       portalEngines === undefined
         ? "project_engines"
-        : `(SELECT $1::uuid AS project_id, x.engine_key, x.weight::real AS weight FROM jsonb_to_recordset($7::jsonb) AS x(engine_key text, weight text))`;
+        : `(SELECT $1::uuid AS project_id, x.engine_key, x.weight::real AS weight FROM jsonb_to_recordset($8::jsonb) AS x(engine_key text, weight text))`;
     const portalParams = portalEngines === undefined ? [] : [JSON.stringify(portalEngines.entitled), JSON.stringify(portalEngines.overrides)];
     const result = await tx.query<{
       engine_key: string;
@@ -259,6 +259,8 @@ export class ScorecardsService {
             -- in step. The alias c is what the constant expects.
             AND ${measurementStatusSql()}
             AND (c.captured_at AT TIME ZONE $5)::date BETWEEN $3::date AND $4::date
+            -- STORY-136 AC9 — the same version filter the aggregation applies, so membership describes the rows summed.
+            AND c.scoring_version = $6
        ),
        engine_keys AS (
          SELECT e0.engine_key FROM ${entitledSource} e0 WHERE e0.project_id = $1 AND e0.enabled = true
@@ -294,7 +296,7 @@ export class ScorecardsService {
          ) last_capture ON true
         WHERE ($2::text[] IS NULL OR k.engine_key = ANY($2::text[]))
         ORDER BY k.engine_key ASC`,
-      [projectId, requested, measuredFrom, measuredTo, timezone, ...portalParams],
+      [projectId, requested, measuredFrom, measuredTo, timezone, SCORING_VERSION, ...portalParams],
     );
 
     if (result.rows.length === 0) await this.assertProjectExists(tx, projectId);
@@ -332,7 +334,7 @@ export class ScorecardsService {
     to: string,
     timezone: string,
   ): Promise<Map<string, WindowMetrics>> {
-    const aggregates = await aggregateRange(tx, projectId, from, to, timezone);
+    const aggregates = await aggregateRange(tx, projectId, from, to, timezone, SCORING_VERSION);
     const byEngine = new Map<string, WindowMetrics>();
     for (const aggregate of aggregates) {
       if (aggregate.entityType !== "brand") continue;

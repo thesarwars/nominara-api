@@ -4,6 +4,7 @@ import { structuralLimitFrom } from "../../../lib/entitlements/classification.js
 import { resolveEntitlements } from "../../../lib/entitlements/resolution.js";
 import { PROMPT_OCCUPIES_SLOT } from "../../../lib/entitlements/structural-usage.js";
 import type { EntitlementValue } from "../plan-entitlements.js";
+import { SCORING_VERSION } from "../../../lib/scoring/index.js";
 import { insertRows } from "./batch-insert.js";
 import { DEMO_COMPETITOR_NAMES, DEMO_PROMPT_MARKER_KEY, DEMO_PROMPT_TEMPLATES, DEMO_SEED_MARKER } from "./constants.js";
 import { type Rng, chance, pick, rngFor, uniform, uniformInt } from "./rng.js";
@@ -494,14 +495,14 @@ export async function resetAndSeedProjectFacts(
     "id", "workspace_id", "project_id", "run_id", "prompt_id", "engine_key", "sample_index", "captured_at",
     "capture_mode", "adapter_version", "normalizer_version", "content_hash", "payload",
     "brand_present", "brand_rank_position", "sov", "sentiment_label", "sentiment_score",
-    "citation_count", "owned_citation_count", "flags", "cache_layer", "status",
+    "citation_count", "owned_citation_count", "flags", "cache_layer", "status", "scoring_version",
   ];
   const mentionColumns = [
     "workspace_id", "project_id", "result_id", "prompt_id", "engine_key", "captured_at",
     "entity_type", "entity_id", "entity_label", "matched_alias",
     "occurrence_index", "char_start", "char_end", "first_token_index", "prominence", "list_position",
     "sentiment_label", "sentiment_score", "sentiment_confidence", "sentiment_method",
-    "render_form", "render_score", "position_class", "answer_form",
+    "render_form", "render_score", "position_class", "answer_form", "scoring_version",
   ];
   const citationColumns = [
     "workspace_id", "project_id", "result_id", "prompt_id", "engine_key", "captured_at",
@@ -556,7 +557,7 @@ export async function resetAndSeedProjectFacts(
             isAttributeCapable ? pick(rng, ["linked", "described", "structured_row"] as const) : "bare_text",
             renderScore,
             capture.brandRank === 1 ? "recommendation" : capture.brandRank !== null && capture.brandRank <= 3 ? "ranked" : "neutral_list",
-            answerForm,
+            answerForm, SCORING_VERSION,
           ]);
 
           if (chance(rng, 0.7)) {
@@ -576,7 +577,7 @@ export async function resetAndSeedProjectFacts(
             "competitor", competitorId, `Competitor ${String(competitorIndex + 1)}`, `Competitor ${String(competitorIndex + 1)}`,
             1, 100, 200, 10, prominence, uniformInt(rng, 1, 5),
             labelFor(sentimentScore), sentimentScore, uniform(rng, 0.5, 0.9), "lexicon",
-            "bare_text", 0, "neutral_list", answerForm,
+            "bare_text", 0, "neutral_list", answerForm, SCORING_VERSION,
           ]);
 
           if (chance(rng, 0.5)) {
@@ -590,7 +591,7 @@ export async function resetAndSeedProjectFacts(
           capture.id, project.workspaceId, project.id, uuidV7(), capture.promptId, capture.engineKey, 0, capture.capturedAt,
           capture.captureMode, capture.adapterVersion, DEMO_SEED_MARKER, sha1Buffer(capture.id), "{}",
           capture.brandPresent, capture.brandRank, capture.sov, capture.sentimentLabel, capture.sentimentScore,
-          cellCitations.length, ownedCitationCount, [], "live", "parsed",
+          cellCitations.length, ownedCitationCount, [], "live", "parsed", SCORING_VERSION,
         ]);
         mentionRows.push(...cellMentions);
         citationRows.push(...cellCitations);

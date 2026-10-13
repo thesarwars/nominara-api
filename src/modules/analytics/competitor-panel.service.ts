@@ -21,6 +21,7 @@ import {
 } from "../../lib/analytics/scorecard.js";
 import { dataSourceOf } from "../../lib/analytics/data-source.js";
 import { resolveWindow, TIMEFRAME_DAYS } from "../../lib/analytics/window.js";
+import { SCORING_VERSION } from "../../lib/scoring/index.js";
 import { aggregateRange, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
@@ -61,7 +62,8 @@ interface TrackedCompetitor {
 
 /**
  * The shared CTEs. Parameters: $1 project, $2 span start, $3 span end,
- * $4 timezone, $5 engine filter (text[] or null).
+ * $4 timezone, $5 engine filter (text[] or null), $6 scoring version (STORY-136 AC9: only the current version's
+ * captures and mentions are part of the figure).
  *
  * `day_cells` repeats aggregateRange's window predicate character for
  * character — same timezone conversion, same inclusive ends, same measurement
@@ -76,6 +78,7 @@ const CELLS_CTE = `day_cells AS (
      AND (c.captured_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
      AND ${measurementStatusSql()}
      AND ($5::text[] IS NULL OR c.engine_key = ANY($5::text[]))
+     AND c.scoring_version = $6
 )`;
 
 const RANKED_CTE = `${CELLS_CTE},
@@ -91,7 +94,7 @@ ent AS (
          min(m.list_position)                                        AS min_list,
          min(m.first_token_index)                                    AS min_token
     FROM day_cells dc
-    JOIN mention_facts m ON m.result_id = dc.id
+    JOIN mention_facts m ON m.result_id = dc.id AND m.scoring_version = $6
    GROUP BY dc.id, dc.engine_key, dc.day, dc.w, ekey
 ),
 ranked AS (
@@ -122,8 +125,8 @@ export class CompetitorPanelService {
 
     const tracked = await this.trackedCompetitors(tx, projectId);
     const [current, prior, facts, citations, h2h, detected, sources, weights, entitled] = await Promise.all([
-      aggregateRange(tx, projectId, window.from, window.to, window.timezone),
-      aggregateRange(tx, projectId, window.priorFrom, window.priorTo, window.timezone),
+      aggregateRange(tx, projectId, window.from, window.to, window.timezone, SCORING_VERSION),
+      aggregateRange(tx, projectId, window.priorFrom, window.priorTo, window.timezone, SCORING_VERSION),
       this.entityFacts(tx, projectId, window.priorFrom, window.to, window.timezone, requested),
       this.citationShares(tx, projectId, window.priorFrom, window.to, window.from, window.timezone, requested),
       this.headToHead(tx, projectId, window.from, window.to, window.timezone, requested),
@@ -364,7 +367,7 @@ export class CompetitorPanelService {
     timezone: string,
     engines: string[] | null,
   ): Promise<WindowFacts> {
-    const params = [projectId, from, to, timezone, engines];
+    const params = [projectId, from, to, timezone, engines, SCORING_VERSION];
     const totals = await tx.query<{ day: string; engine_key: string; cells: number; weight: number }>(
       `WITH ${CELLS_CTE}
        SELECT day::text, engine_key, count(*)::int AS cells, sum(w)::double precision AS weight
@@ -422,7 +425,7 @@ export class CompetitorPanelService {
   ): Promise<Map<string, number>> {
     const result = await tx.query<{ competitor_id: string; engine_key: string; is_current: boolean; owned: number; total: number }>(
       `WITH ${CELLS_CTE}
-       SELECT k.id AS competitor_id, dc.engine_key, (dc.day >= $6::date) AS is_current,
+       SELECT k.id AS competitor_id, dc.engine_key, (dc.day >= $7::date) AS is_current,
               COALESCE(sum(f.position_weight) FILTER (
                 WHERE f.domain = k.root_domain OR right(f.domain, length(k.root_domain) + 1) = '.' || k.root_domain
               ), 0)::double precision AS owned,
@@ -432,7 +435,7 @@ export class CompetitorPanelService {
          JOIN competitors k ON k.project_id = $1 AND k.deleted_at IS NULL AND k.root_domain IS NOT NULL
         WHERE f.http_status IS NOT NULL
         GROUP BY 1, 2, 3`,
-      [projectId, from, to, timezone, engines, currentFrom],
+      [projectId, from, to, timezone, engines, SCORING_VERSION, currentFrom],
     );
     const shares = new Map<string, number>();
     for (const r of result.rows) {
@@ -459,7 +462,7 @@ export class CompetitorPanelService {
          JOIN ranked k ON k.id = b.id AND k.ekey LIKE 'c:%'
         WHERE b.ekey = 'brand'
         GROUP BY 1, 2`,
-      [projectId, from, to, timezone, engines],
+      [projectId, from, to, timezone, engines, SCORING_VERSION],
     );
     return new Map(result.rows.map((r) => [`${r.competitor_id}|${r.engine_key}`, { both: r.both, wins: r.wins }]));
   }
@@ -504,8 +507,9 @@ export class CompetitorPanelService {
           AND (c.captured_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
           AND ${measurementStatusSql()}
           AND ($5::text[] IS NULL OR c.engine_key = ANY($5::text[]))
+          AND c.scoring_version = $7
         GROUP BY 1`,
-      [projectId, from, to, timezone, engines, DEMO_SEED_MARKER],
+      [projectId, from, to, timezone, engines, DEMO_SEED_MARKER, SCORING_VERSION],
     );
     const sources = new Map<string, DataSource>();
     for (const row of result.rows) {

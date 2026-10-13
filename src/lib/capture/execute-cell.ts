@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { SCORING_VERSION } from "../scoring/index.js";
 import type { ClientBase } from "pg";
 import type { Cache } from "../cache/cache.port.js";
 import { cacheKeyNamespace } from "../cache/key-namespace.js";
@@ -331,8 +332,8 @@ async function writeCell(tx: ClientBase, input: CaptureCellInput, now: Date, wri
        (workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
         capture_mode, adapter_version, normalizer_version, model_fingerprint, latency_ms,
         response_tokens_est, truncated, content_hash, response_excerpt, payload,
-        flags, cache_layer, status, error_code)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::text[],'live',$19,$20)`,
+        flags, cache_layer, status, error_code, scoring_version)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::text[],'live',$19,$20,$21)`,
     [
       input.workspaceId,
       input.projectId,
@@ -357,6 +358,7 @@ async function writeCell(tx: ClientBase, input: CaptureCellInput, now: Date, wri
       captured ? (write.raw.flags ?? []) : [],
       write.status,
       captured ? null : write.errorCode,
+      SCORING_VERSION,
     ],
   );
 }
