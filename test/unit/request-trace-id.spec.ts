@@ -129,6 +129,18 @@ describe("STORY-024 · request_id is the OpenTelemetry trace id", () => {
     expect(seen[0]?.traceId).toBe(response.json().meta.request_id);
   });
 
+  it("[STORY-024 scenario 8] the span is still active when the body arrives over a real socket", async () => {
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const address = app.getHttpServer().address() as { port: number };
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/test-trace/echo`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ a: 1 }),
+    });
+
+    expect(seen[0]?.traceId).toBe(((await response.json()) as { meta: { request_id: string } }).meta.request_id);
+  });
+
   it("[STORY-024 scenario 8] an error response's request_id is the same trace id", async () => {
     const response = await app.inject({ method: "GET", url: "/v1/test-trace/throws" });
 

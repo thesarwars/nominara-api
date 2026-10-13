@@ -119,15 +119,6 @@ export function registerRequestTracing(fastify: FastifyInstance): void {
     context.with(trace.setSpan(ROOT_CONTEXT, span), done);
   });
 
-  // A request body is read on a stream whose callbacks do not inherit the
-  // onRequest context; re-enter it immediately before the handler (which is
-  // where Nest runs guards, interceptors and the filter).
-  fastify.addHook("preHandler", (request, _reply, done) => {
-    const span = spans.get(request);
-    if (span === undefined) return done();
-    context.with(trace.setSpan(ROOT_CONTEXT, span), done);
-  });
-
   const finish = (request: FastifyRequest, status: number | undefined): void => {
     const span = spans.get(request);
     if (span === undefined) return;
