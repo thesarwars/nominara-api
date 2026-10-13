@@ -17,6 +17,10 @@ import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js
 import { WorkspacesController } from "./workspaces.controller.js";
 import { WorkspacesService } from "./workspaces.service.js";
 import { InvitationsService } from "./invitations.service.js";
+import { OwnershipTransferService } from "./ownership-transfer.service.js";
+import { OwnershipTransferController } from "./ownership-transfer.controller.js";
+import { ApiKeysModule } from "../api-keys/api-keys.module.js";
+import { AgencyModule } from "../agency/agency.module.js";
 
 // STORY-022 module registration, extended by STORY-018 (MembershipService/
 // MembershipCacheService exported so WorkspaceGuard, an APP_GUARD in
@@ -40,11 +44,12 @@ import { InvitationsService } from "./invitations.service.js";
 // (coding-standards.md §1 "one table, one owning service") — so this module
 // imports the SERVICE rather than querying `tasks` here.
 @Module({
-  imports: [AuditModule, IdentityModule, TenancyAccessModule, TasksModule, ProjectsModule, BillingModule],
-  controllers: [WorkspacesController],
+  imports: [AuditModule, IdentityModule, TenancyAccessModule, TasksModule, ProjectsModule, BillingModule, ApiKeysModule, AgencyModule],
+  controllers: [WorkspacesController, OwnershipTransferController],
   providers: [
     WorkspacesService,
     InvitationsService,
+    OwnershipTransferService,
     WorkspaceSummaryService,
     // STORY-026 T22 / D9 — the API process publishes realtime events onto a
     // Valkey channel the gateway reads, never by standing up a socket.io

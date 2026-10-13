@@ -230,6 +230,13 @@ export interface StripeGateway {
   createPortalSession(input: { readonly customerId: string; readonly returnUrl: string }): Promise<{ readonly url: string }>;
 
   /**
+   * STORY-021 (ownership transfer) — points an existing customer's `email` at `email`. The customer is NOT replaced:
+   * invoices, the payment method and the subscription stay as they were. Idempotent (setting the same address again
+   * is a no-op at Stripe). Throws `StripeUpstreamError`.
+   */
+  updateCustomerBillingEmail(input: { readonly customerId: string; readonly email: string }): Promise<void>;
+
+  /**
    * STORY-076b — set an add-on item's quantity with proration (creating the
    * item when there is none). Throws `StripeUpstreamError`. Writes NOTHING
    * local: the add-on rows change only when the webhook reconciles.

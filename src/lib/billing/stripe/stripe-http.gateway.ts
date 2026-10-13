@@ -254,6 +254,15 @@ export class StripeHttpGateway implements StripeGateway {
     }
   }
 
+  async updateCustomerBillingEmail(input: { readonly customerId: string; readonly email: string }): Promise<void> {
+    const client = this.requireClient();
+    try {
+      await client.customers.update(input.customerId, { email: input.email });
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
   async changeAddonQuantity(input: AddonChangeInput): Promise<void> {
     const client = this.requireClient();
     try {

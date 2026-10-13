@@ -366,7 +366,8 @@ describe("STORY-021 / EC-15 · workspace ownership transfer over HTTP", () => {
     const w = await world();
     await db().query("UPDATE workspaces SET status = 'pending_deletion' WHERE id = $1", [w.workspaceId]);
     const res = await initiate(w.owner, w.recipient.userId);
-    expect(res.statusCode, res.body).toBeGreaterThanOrEqual(400);
+    expect(res.statusCode, res.body).toBe(403);
+    expect(errorOf(res).code).toBe("workspace_suspended");
     expect(await transferDoc(w.workspaceId)).toBeNull();
   });
 

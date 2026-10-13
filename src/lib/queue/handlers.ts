@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 import type { Env } from "../../config/env.schema.js";
 import { createBillingAutoTopupHandler } from "./handlers/billing-auto-topup.handler.js";
+import { createBillingCustomerEmailHandler } from "./handlers/billing-customer-email.handler.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCapturePlanHandler } from "./handlers/capture-plan.handler.js";
 import { createCaptureParseHandler } from "./handlers/capture-parse.handler.js";
@@ -99,6 +100,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "identity.sweep_unverified": (context) => createIdentitySweepUnverifiedHandler(context),
   "source.verify_presence": (context) => createSourceVerifyPresenceHandler(context),
   "billing.auto_topup": (context) => createBillingAutoTopupHandler(context),
+  "billing.customer_email": (context) => createBillingCustomerEmailHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */

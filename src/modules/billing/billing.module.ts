@@ -61,7 +61,7 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
       inject: [StripeSubscriptionHandler, StripeCreditPackHandler, StripeInvoiceHandler],
     },
   ],
-  exports: [BillingService, AutoTopupService, STRIPE_GATEWAY],
+  exports: [BillingService, AutoTopupService, BillingInvoicesService, STRIPE_GATEWAY],
 })
 export class BillingModule implements OnModuleDestroy {
   constructor(@Inject(BILLING_WRITE_POOL) private readonly writePool: Pool) {}

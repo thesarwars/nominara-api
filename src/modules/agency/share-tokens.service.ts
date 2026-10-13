@@ -290,6 +290,24 @@ export class ShareTokensService {
     return { token: toShareToken(row), secret, url: new URL(`/r/${secret}`, PORTAL_BASE_URL).toString() };
   }
 
+  /**
+   * STORY-021 / EC-15 — ownership transfer: "passwordless tokens are force-revoked with no option". A link is
+   * passwordless when it has no password hash OR is not flagged as requiring one — either alone is enough, so a row
+   * that disagrees with itself fails closed (revoked) rather than open. Password-protected links are left alone
+   * (their retain/revoke inventory is a follow-up). RLS scopes the statement to the context's workspace.
+   */
+  async revokePasswordless(): Promise<number> {
+    const { client, workspaceId } = this.store();
+    const result = await client.query(
+      `UPDATE share_tokens SET revoked_at = now()
+        WHERE revoked_at IS NULL AND (password_hash IS NULL OR password_required = false)`,
+    );
+    const count = result.rowCount ?? 0;
+    if (count > 0) incrementCounter("nominara_share_token_revocations_total");
+    this.logger.log(`passwordless share tokens revoked on ownership transfer workspace_id=${workspaceId} count=${String(count)}`);
+    return count;
+  }
+
   /** Idempotent: revoking a revoked token returns it unchanged, keeping the first `revoked_at`. */
   async revoke(id: string): Promise<ShareToken> {
     const { client, workspaceId } = this.store();

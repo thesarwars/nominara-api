@@ -298,6 +298,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "A balance debit that leaves a workspace below its threshold enqueues one signed tenant job; the worker verifies the signature before any context is " +
       "set, then evaluates and charges. §4's table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed. STORY-076.",
   },
+  "billing.customer_email": {
+    workerGroup: "rollup",
+    because:
+      "STORY-021 / EC-15 (ownership transfer): the Stripe customer keeps its identity and only its billing email is re-pointed to the new owner. A Stripe call may " +
+      "never be made on a request path (KAD-06), so the accept enqueues one signed tenant job after commit; the worker reads the live owner and customer. §4's " +
+      "table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed.",
+  },
   "credit.housekeeping": {
     workerGroup: "rollup",
     because:
