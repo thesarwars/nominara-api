@@ -5,6 +5,7 @@ import { registerCookiePlugin } from "./register-cookies.js";
 import { registerRawBodyCapture } from "./stripe-raw-body.js";
 import { registerApiReference, registerOpenApiRoute } from "./register-openapi.js";
 import { loadEnv } from "../config/env.js";
+import { initTracing, registerRequestTracing } from "../lib/telemetry/tracing.js";
 
 // STORY-023 (EPIC-03 execution plan, decision D1) — the single seam for
 // everything `bootstrap()` needs an app instance configured with, shared by
@@ -28,6 +29,10 @@ export async function configureApp(app: NestFastifyApplication): Promise<void> {
       { path: "health/ready", method: RequestMethod.GET },
     ],
   });
+  // STORY-024 — the server span whose trace id is `meta.request_id`. Registered
+  // first so every later hook, guard, interceptor and filter runs inside it.
+  initTracing();
+  registerRequestTracing(app.getHttpAdapter().getInstance() as unknown as FastifyInstance);
   await registerCookiePlugin(app);
   // NEW-D-2 — raw bytes for routes that opt in with @RouteConfig({ rawBody: true }) and for no other route.
   registerRawBodyCapture(app.getHttpAdapter().getInstance() as unknown as FastifyInstance);

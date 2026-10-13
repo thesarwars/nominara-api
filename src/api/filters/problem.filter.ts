@@ -2,6 +2,7 @@ import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logge
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { ErrorCode } from "../../../contracts/common/error-code.schema.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { requestIdOf } from "../../lib/telemetry/tracing.js";
 import { DomainError, ERROR_STATUS_BY_CODE, type DomainRemediation } from "../errors/domain-errors.js";
 import type { AuthenticatedRequest } from "../guards/auth.guard.js";
 
@@ -45,13 +46,6 @@ function titleFor(code: ErrorCode): string {
     .split("_")
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(" ");
-}
-
-/** §1: "`X-Request-Id` — optional. Echoed in responses and logs; generated if absent." */
-function requestIdOf(request: FastifyRequest | undefined): string {
-  const supplied = request?.headers?.["x-request-id"];
-  if (typeof supplied === "string" && supplied.length > 0) return supplied;
-  return String(request?.id ?? "");
 }
 
 interface Classified {
