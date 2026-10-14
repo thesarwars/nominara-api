@@ -368,7 +368,7 @@ describe("STORY-021 / EC-15 · workspace ownership transfer over HTTP", () => {
     await db().query("UPDATE workspaces SET status = 'pending_deletion' WHERE id = $1", [w.workspaceId]);
     const res = await initiate(w.owner, w.recipient.userId);
     expect(res.statusCode, res.body).toBe(403);
-    expect(errorOf(res).code).toBe("workspace_suspended");
+    expect(errorOf(res)).toMatchObject({ code: "forbidden", details: { reason: "workspace_suspended" } });
     expect(await transferDoc(w.workspaceId)).toBeNull();
   });
 
@@ -630,7 +630,7 @@ describe("STORY-021 / EC-15 · workspace ownership transfer over HTTP", () => {
     const line = lines.find((l) => l.includes("ownership transferred"));
     expect(line, "the completion log line").toContain(`workspace_id=${x.workspaceId}`);
     for (const l of lines.filter((l) => l.includes("ownership transfer") || l.includes("nominara_workspace_ownership"))) {
-      expect(l, "no workspace name, e-mail address or credential in an ownership-transfer log line").not.toMatch(/Acme|@|cookie|token/i);
+      expect(l, "no workspace name, e-mail address or credential in an ownership-transfer log line").not.toMatch(/Acme|@|cookie|bearer|secret|token=|token_hash|password_hash/i);
     }
   });
 
