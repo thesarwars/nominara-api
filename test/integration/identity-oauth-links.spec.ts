@@ -6,6 +6,10 @@ import { oauthLinkItemSchema } from "../../contracts/identity/oauth-link-respons
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { IdentityService } from "../../src/modules/identity/identity.service.js";
 import { OauthService } from "../../src/modules/identity/oauth.service.js";
+import { SessionService } from "../../src/modules/identity/session.service.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
+import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
+import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 
 // STORY-173 — unlinking needs a fresh step-up; these service-level scenarios are
@@ -232,8 +236,10 @@ describe("STORY-096C · a person cannot be locked out by removing their last two
     } finally {
       client.release();
     }
-    oauth = new OauthService(pool, {} as never, {} as never);
-    identity = new IdentityService(pool, {} as never);
+    // STORY-018 — unlink and revoke now end the account's other sessions through SessionService.
+    const sessions = new SessionService(pool, new MembershipService(new MembershipCacheService()), new InMemoryCacheAdapter());
+    oauth = new OauthService(pool, {} as never, sessions);
+    identity = new IdentityService(pool, sessions);
   }, 300_000);
 
   afterAll(async () => {
@@ -260,7 +266,7 @@ describe("STORY-096C · a person cannot be locked out by removing their last two
       [id, randomUUID()],
     );
 
-    await expect(oauth.unlink(id, "google", FRESH_STEP_UP)).resolves.toBeUndefined();
+    await expect(oauth.unlink(id, "google", FRESH_STEP_UP, randomUUID())).resolves.toBeUndefined();
 
     const left = await pool.query<{ n: string }>(
       `SELECT count(*)::text AS n FROM user_credentials WHERE user_id = $1 AND revoked_at IS NULL`,
@@ -277,7 +283,7 @@ describe("STORY-096C · a person cannot be locked out by removing their last two
       [id, randomUUID()],
     );
 
-    await expect(oauth.unlink(id, "github", FRESH_STEP_UP)).rejects.toThrow(/last remaining credential/i);
+    await expect(oauth.unlink(id, "github", FRESH_STEP_UP, randomUUID())).rejects.toThrow(/last remaining credential/i);
   });
 
   it("⚠ one of the two concurrent removals is refused, every time", async () => {
@@ -299,8 +305,8 @@ describe("STORY-096C · a person cannot be locked out by removing their last two
 
       // Fired together: one removes the last passkey, the other the last link.
       const [a, b] = await Promise.allSettled([
-        identity.revokePasskey(id, passkey.rows[0]!.id, FRESH_STEP_UP),
-        oauth.unlink(id, "google", FRESH_STEP_UP),
+        identity.revokePasskey(id, passkey.rows[0]!.id, FRESH_STEP_UP, randomUUID()),
+        oauth.unlink(id, "google", FRESH_STEP_UP, randomUUID()),
       ]);
 
       const left = await pool.query<{ n: string }>(

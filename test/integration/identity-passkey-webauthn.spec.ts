@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Test } from "@nestjs/testing";
 import { ConflictException } from "@nestjs/common";
@@ -649,8 +650,8 @@ describe("STORY-014 · passkey registration and assertion", () => {
     let outcomes: PromiseSettledResult<void>[];
     try {
       outcomes = await Promise.allSettled([
-        service.revokePasskey(sub, list[0]!.id, FRESH_STEP_UP),
-        service.revokePasskey(sub, list[1]!.id, FRESH_STEP_UP),
+        service.revokePasskey(sub, list[0]!.id, FRESH_STEP_UP, randomUUID()),
+        service.revokePasskey(sub, list[1]!.id, FRESH_STEP_UP, randomUUID()),
       ]);
     } finally {
       querySpy.mockRestore();

@@ -841,8 +841,14 @@ export class SessionService {
    * owner's sessions are still valid. `sessions` is global (no RLS); the statement is bounded by `user_id`.
    * `revoked_reason` is left NULL: the closed reason list is not widened for this slice, the audit row says why.
    */
-  async revokeAllForUsers(client: ClientBase, userIds: readonly string[]): Promise<number> {
-    const result = await client.query(`UPDATE sessions SET revoked_at = now() WHERE user_id = ANY($1::uuid[]) AND revoked_at IS NULL`, [userIds]);
+  async revokeAllForUsers(client: ClientBase, userIds: readonly string[], exceptSessionId?: string): Promise<number> {
+    // STORY-018 — `exceptSessionId` keeps the session that is making the call: a credential change or "sign out other
+    // sessions" ends every OTHER session of the account, never the one the person is using. Absent, nothing is kept.
+    const result = await client.query(
+      `UPDATE sessions SET revoked_at = now()
+        WHERE user_id = ANY($1::uuid[]) AND revoked_at IS NULL AND ($2::uuid IS NULL OR id <> $2::uuid)`,
+      [userIds, exceptSessionId ?? null],
+    );
     return result.rowCount ?? 0;
   }
 

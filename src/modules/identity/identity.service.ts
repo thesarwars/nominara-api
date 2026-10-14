@@ -31,6 +31,7 @@ import type {
   PasskeyListItem,
   PasskeyVerifyRequest,
   RegistrationVerifyRequest,
+  SessionsRevokeOthersResponse,
 } from "./dto/index.js";
 
 // STORY-014 — ceremony validation (attestation, clientDataJSON, signature)
@@ -605,7 +606,12 @@ export class IdentityService {
     }
   }
 
-  async revokePasskey(userId: string, credentialId: string, session?: SessionStrongAuth): Promise<void> {
+  async revokePasskey(
+    userId: string,
+    credentialId: string,
+    session: SessionStrongAuth | undefined,
+    currentSessionId: string,
+  ): Promise<void> {
     // STORY-173 (audit) — removing a credential is as sensitive as adding one: a
     // stolen session must not strip the owner's other methods to lock them out,
     // or leave the thief's as the only one. The same rule as OAuth unlink.
@@ -639,13 +645,41 @@ export class IdentityService {
       }
 
       await client.query(`UPDATE user_credentials SET revoked_at = now(), revoked_reason = 'user' WHERE id = $1`, [credentialId]);
+      // STORY-018 — a credential change ends every OTHER session of the account, in the SAME transaction: there is no
+      // moment at which the credential is gone and a session that may have been the attacker's still works. The
+      // session making the call survives.
+      const revokedSessions = await this.sessions.revokeAllForUsers(client, [userId], currentSessionId);
       await client.query("COMMIT");
 
-      this.logger.log(`passkey revoked user_id=${userId} credential_id=${credentialId}`);
+      this.logger.log(`passkey revoked user_id=${userId} credential_id=${credentialId} other_sessions_revoked=${String(revokedSessions)}`);
+      incrementCounter("nominara_identity_sessions_revoked_total", { reason: "passkey_revoke" });
       incrementCounter("nominara_identity_passkey_revoked_total", { user_id: userId, credential_id: credentialId });
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * STORY-018 — POST /me/sessions/revoke-others: "sign out other sessions". Same step-up rule as revoking a passkey
+   * (both are the account's own security controls: a stolen session must not be able to sign the owner out of their
+   * other devices any more than it can strip their credentials). Idempotent: a repeat finds nothing and answers 0.
+   * Revokes by account across every workspace; the caller's own session is kept.
+   */
+  async revokeOtherSessions(
+    userId: string,
+    session: SessionStrongAuth | undefined,
+    currentSessionId: string,
+  ): Promise<SessionsRevokeOthersResponse> {
+    requireFreshStrongAuth(userId, session, this.logger, "sessions_revoke_others");
+    const client = await this.pool.connect();
+    try {
+      const revoked = await this.sessions.revokeAllForUsers(client, [userId], currentSessionId);
+      this.logger.log(`other sessions revoked user_id=${userId} revoked_count=${String(revoked)}`);
+      incrementCounter("nominara_identity_sessions_revoked_total", { reason: "user_request" });
+      return { revoked_count: revoked };
     } finally {
       client.release();
     }
