@@ -26,12 +26,22 @@ const IDENTITY = { env: ENV, workspaceId: "0192f1a0-0000-7000-8000-00000000000a"
 const writesDefaults = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "writes")!;
 const DEFAULT_WRITES_BURST = writesDefaults.burst; // 20 (api-specification.md §12)
 
-/** A complete document where `writes` is capped at one request, every other class untouched. */
+/** Tightest burst the envelope allows for `writes` (a tenth of the default's 20); the buckets keep their scopes. */
+const TIGHT_WRITES_BURST = DEFAULT_WRITES_BURST / 10;
+
+/** A complete document where `writes` is at the envelope's tightest, every other class untouched. */
 function documentWithTightWrites(): string {
   return JSON.stringify(
     RATE_LIMIT_DEFAULTS.map((entry) =>
       entry.route_class === "writes"
-        ? { route_class: "writes", burst: 1, buckets: [{ scope: "user", limit: 1, window: "rolling", window_ms: 60_000 }] }
+        ? {
+            route_class: "writes",
+            burst: TIGHT_WRITES_BURST,
+            buckets: [
+              { scope: "user", limit: 6, window: "rolling", window_ms: 60_000 },
+              { scope: "workspace", limit: 24, window: "rolling", window_ms: 60_000 },
+            ],
+          }
         : entry,
     ),
   );
@@ -87,7 +97,7 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
     await putDocument(documentWithTightWrites());
     clock.ms += REFRESH_BOUND_MS;
 
-    expect(await allowedBeforeRefusal(s, "after"), "the same process, the same steps, a different limit").toBe(1);
+    expect(await allowedBeforeRefusal(s, "after"), "the same process, the same steps, a different limit").toBe(TIGHT_WRITES_BURST);
   });
 
   it("STORY-025 row 9 · control: the same steps WITHOUT the document leave the limit where it was", async () => {
@@ -100,7 +110,7 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
   it("STORY-025 row 9 · removing the document returns the code defaults, within the bound", async () => {
     await putDocument(documentWithTightWrites());
     const s = subject();
-    expect(await allowedBeforeRefusal(s, "tight")).toBe(1);
+    expect(await allowedBeforeRefusal(s, "tight")).toBe(TIGHT_WRITES_BURST);
 
     await cache.delete(rateLimitConfigKey(ENV));
     clock.ms += REFRESH_BOUND_MS;

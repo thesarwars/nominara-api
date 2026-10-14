@@ -84,6 +84,51 @@ export function utcDayStamp(nowMs: number): string {
  */
 export const RATE_LIMIT_CONFIG_REFRESH_MS = 15_000;
 
+/**
+ * How far an operator-written document may move a number from the committed default: each of `limit`, `burst` and
+ * `window_ms` must lie in [default / FACTOR, default x FACTOR]. The document is data, so an operator tunes it; it is
+ * not a way to switch a control off. One constant, so the bound is easy to change.
+ */
+export const RATE_LIMIT_ENVELOPE_FACTOR = 10;
+
+const withinFactor = (value: number, reference: number): boolean =>
+  value >= reference / RATE_LIMIT_ENVELOPE_FACTOR && value <= reference * RATE_LIMIT_ENVELOPE_FACTOR;
+
+const bucketOrder = (a: RateLimitBucket, b: RateLimitBucket): number =>
+  `${a.scope}|${a.window}|${String(a.hard_cap)}`.localeCompare(`${b.scope}|${b.window}|${String(b.hard_cap)}`) ||
+  (a.window_ms ?? 0) - (b.window_ms ?? 0);
+
+/**
+ * Whether a schema-valid document stays inside the envelope the code defaults draw. The schema checks SHAPE only;
+ * this checks that no control was removed or neutered. Per class, the (scope, window, hard_cap) buckets must match
+ * the defaults exactly (so pre-auth classes keep an IP bucket, the UTC-day hard cap stays, and no class gains a hard
+ * cap), and limit, burst and window_ms must each stay within RATE_LIMIT_ENVELOPE_FACTOR of the default.
+ */
+export function withinEnvelope(
+  document: readonly RateLimitRouteClassConfig[],
+  defaults: readonly RateLimitRouteClassConfig[],
+): boolean {
+  return defaults.every((reference) => {
+    const candidate = document.find((entry) => entry.route_class === reference.route_class);
+    if (candidate === undefined || !withinFactor(candidate.burst, reference.burst)) return false;
+    if (candidate.buckets.length !== reference.buckets.length) return false;
+    const got = [...candidate.buckets].sort(bucketOrder);
+    const want = [...reference.buckets].sort(bucketOrder);
+    return want.every((expected, i) => {
+      const actual = got[i]!;
+      return (
+        actual.scope === expected.scope &&
+        actual.window === expected.window &&
+        actual.hard_cap === expected.hard_cap &&
+        withinFactor(actual.limit, expected.limit) &&
+        (expected.window_ms === undefined
+          ? actual.window_ms === undefined
+          : actual.window_ms !== undefined && withinFactor(actual.window_ms, expected.window_ms))
+      );
+    });
+  });
+}
+
 const logger = new Logger("rate-limit");
 
 type ConfigSource = "document" | "missing" | "invalid" | "unreadable";
@@ -109,7 +154,9 @@ export class RateLimitBuckets {
    * The Valkey-held configuration document (plan OQ-5), re-read at most once per `refreshMs`.
    *
    * EVERY FAILURE LANDS ON THE CODE DEFAULTS, never on "no limit". A missing, malformed, schema-invalid
-   * (including a document that omits a route class) or unreadable document is logged and replaced by the defaults —
+   * (including a document that omits a route class), outside-the-envelope (see `withinEnvelope`: one class that
+   * fails sends the WHOLE document to the defaults, never a partial merge) or unreadable document is logged and
+   * replaced by the defaults —
    * not by the last good document either, so what is enforced is always either a document that validated just now or
    * the committed table. The body is never logged: a log line states the outcome only.
    */
@@ -125,7 +172,7 @@ export class RateLimitBuckets {
           source = "missing";
         } else {
           const parsed = rateLimitConfigSchema.safeParse(JSON.parse(raw));
-          if (parsed.success) {
+          if (parsed.success && withinEnvelope(parsed.data, this.defaults)) {
             source = "document";
             config = parsed.data;
           } else {

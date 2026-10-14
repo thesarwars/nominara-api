@@ -305,13 +305,21 @@ describe("STORY-025 AC10 · the configuration document in a real Valkey", () => 
 
     const tight = RATE_LIMIT_DEFAULTS.map((entry) =>
       entry.route_class === "writes"
-        ? { route_class: "writes", burst: 1, buckets: [{ scope: "user", limit: 1, window: "rolling", window_ms: 60_000 }] }
+        ? {
+            // The tightest the envelope allows (a tenth of the default's burst 20 / 60 / 240); a tighter document falls back.
+            route_class: "writes",
+            burst: 2,
+            buckets: [
+              { scope: "user", limit: 6, window: "rolling", window_ms: 60_000 },
+              { scope: "workspace", limit: 24, window: "rolling", window_ms: 60_000 },
+            ],
+          }
         : entry,
     );
     await adapter.set(rateLimitConfigKey("test"), JSON.stringify(tight), { ttlMs: 60_000 });
     clock.ms += 15_000;
 
-    expect(await firstAllowed("after")).toBe(1);
+    expect(await firstAllowed("after")).toBe(2);
 
     await adapter.delete(rateLimitConfigKey("test"));
     clock.ms += 15_000;
