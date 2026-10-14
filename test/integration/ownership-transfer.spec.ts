@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
+import { Logger } from "@nestjs/common";
 import { Pool } from "pg";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
@@ -611,6 +612,26 @@ describe("STORY-021 / EC-15 · workspace ownership transfer over HTTP", () => {
     expect(queue.jobs[0]).toMatchObject({ name: "billing.customer_email", workspaceId: x.workspaceId });
     expect(queue.jobs[0]!.payload).toMatchObject({ ownerUserId: x.recipient.userId });
     expect(JSON.stringify(queue.jobs[0]!.payload), "no PII in the job").not.toContain("@");
+  });
+
+  it("EC-15 observability · accept emits nominara_workspace_ownership_transfers_total{outcome=completed} and a log line that carries the workspace ID and no name, address or token", async () => {
+    const x = await loaded();
+    const lines: string[] = [];
+    const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
+      lines.push(typeof message === "string" ? message : JSON.stringify(message));
+    });
+    try {
+      expect((await accept(x.recipient)).statusCode).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
+    const metric = lines.find((l) => l.includes("nominara_workspace_ownership_transfers_total") && l.includes("completed"));
+    expect(metric, "the completed counter was incremented").toBeDefined();
+    const line = lines.find((l) => l.includes("ownership transferred"));
+    expect(line, "the completion log line").toContain(`workspace_id=${x.workspaceId}`);
+    for (const l of lines.filter((l) => l.includes("ownership transfer") || l.includes("nominara_workspace_ownership"))) {
+      expect(l, "no workspace name, e-mail address or credential in an ownership-transfer log line").not.toMatch(/Acme|@|cookie|token/i);
+    }
   });
 
   it("EC-15 atomicity · if a write AFTER the swap fails (the request's own audit row), NOTHING is applied — roles, keys, tokens, invitations, version and sessions are as before — and no job is enqueued", async () => {
