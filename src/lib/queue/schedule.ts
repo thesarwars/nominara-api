@@ -29,8 +29,8 @@ import { QUEUE_TOPOLOGY } from "./topology.js";
 // `src/lib/capture/scheduler.ts` is for `capture.plan`), not a repeatable on
 // the queue itself: a job scheduler has no workspace to name and no key to
 // sign with, and the tenant processor rejects the empty envelope before the
-// handler is reached. Of the four dated rows below, only `credit.reconcile`
-// is schedulable today. The other three are cadences waiting on a producer.
+// handler is reached. Of the dated rows, only those with a handler on a non-tenant-scoped queue
+// are schedulable today; the rest are cadences waiting on a producer.
 //
 // ⚠ AND "HOURLY" INVENTS A MINUTE, by the same argument this header makes
 // about inventing an hour. `0 * * * *` picks minute 0, the most contended
@@ -90,9 +90,14 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // this file's header. `maintenance.partition` was here until STORY-142; it
   // left because the cost of NOT running it is dated and rising, which is a
   // reason to choose an hour rather than to keep waiting for one.
-  { queue: "geo.analyze", cron: null, statedAs: "cron daily, API" },
-  { queue: "gsc.sync", cron: null, statedAs: "cron daily, API" },
-  { queue: "topic.cluster", cron: null, statedAs: "prompt-set change >= 10%, cron weekly" },
+  //
+  // ⚠ STORY-140 AC11 — THE HOURS ARE NOW CHOSEN, by the owner (decisions-2026-10-14), UTC. They are decisions and not
+  // transcriptions of §4. A ROW HERE STILL IS NOT A TICK: all three queues are tenant-scoped and none has a handler, so
+  // `schedule-registrar.ts` refuses them (inert) until a per-project sweep producer and a handler exist. The cron waits
+  // here so the hour is not re-litigated when that lands.
+  { queue: "geo.analyze", cron: "0 3 * * *", statedAs: "cron daily, API · STORY-140: daily 03:00 UTC (owner decision)" },
+  { queue: "gsc.sync", cron: "0 4 * * *", statedAs: "cron daily, API · STORY-140: daily 04:00 UTC (owner decision)" },
+  { queue: "topic.cluster", cron: "0 5 * * 0", statedAs: "prompt-set change >= 10%, cron weekly · STORY-140: Sunday 05:00 UTC (owner decision)" },
   // ⚠ DAILY, WHERE §4 SAYS MONTHLY — A DECISION, NOT A TRANSCRIPTION, and the
   // one place in this table where the cron does not follow the reference.
   //
@@ -120,11 +125,11 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // hour is where everything else lands.
   { queue: "maintenance.partition", cron: "20 3 * * *", statedAs: "cron monthly (scheduled daily — see above)" },
 
-  // ⚠ NO CADENCE AT ALL. §4 says "cron" without a period; both are also
-  // API-triggered, so the cron half may not be a fixed schedule so much as a
-  // sweep whose trigger nobody has written down.
-  { queue: "crawl.audit", cron: null, statedAs: "API, cron" },
-  { queue: "report.build", cron: null, statedAs: "API, cron" },
+  // ⚠ ON DEMAND ONLY, BY OWNER DECISION (STORY-140 AC11, decisions-2026-10-14). §4 says "API, cron" with no period;
+  // the answer is that there is no fixed cron. These two stay `null` on purpose and `schedule.spec.ts` pins it, so a
+  // cron cannot be added silently — adding one needs a new decision, not an edit.
+  { queue: "crawl.audit", cron: null, statedAs: "API, cron · STORY-140: on demand only, no fixed cron (owner decision)" },
+  { queue: "report.build", cron: null, statedAs: "API, cron · STORY-140: on demand only, no fixed cron (owner decision)" },
 ];
 
 /** Every queue in the schedule table must be a queue that exists. */

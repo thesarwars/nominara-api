@@ -18,9 +18,9 @@ const REFERENCE: Record<string, { cron: string | null }> = {
   "credit.reconcile": { cron: "*/10 * * * *" }, // "cron every 10 min"
   // A period with no time of day. §4 gives no hour, and inventing one picks
   // an off-peak window nobody decided.
-  "geo.analyze": { cron: null }, // "cron daily, API"
-  "gsc.sync": { cron: null }, // "cron daily, API"
-  "topic.cluster": { cron: null }, // "cron weekly"
+  "geo.analyze": { cron: null }, // "cron daily, API" — hour chosen by STORY-140 AC11, see FROM_OWNER_HOURS
+  "gsc.sync": { cron: null }, // "cron daily, API" — ditto
+  "topic.cluster": { cron: null }, // "cron weekly" — ditto
   "maintenance.partition": { cron: null }, // "cron monthly" — see DELIBERATE_DIVERGENCE
   // No period at all.
   "crawl.audit": { cron: null }, // "API, cron"
@@ -49,6 +49,19 @@ const DELIBERATE_DIVERGENCE: Record<string, { cron: string; because: string }> =
       "platform-wide, and at a daily cadence the next tick would drop partitions that monthly gave a month to notice.",
   },
 };
+
+/**
+ * ⚠ STORY-140 AC11 — the hours the owner chose (decisions-2026-10-14), UTC. §4 states a period and no time; these
+ * three are decisions and not transcriptions, so they live beside the divergence list and not in REFERENCE.
+ */
+const FROM_OWNER_HOURS: Record<string, string> = {
+  "geo.analyze": "0 3 * * *", // daily 03:00
+  "gsc.sync": "0 4 * * *", // daily 04:00
+  "topic.cluster": "0 5 * * 0", // weekly, Sunday 05:00
+};
+
+/** STORY-140 AC11 — on demand only, by owner decision. No cron, ever, without a new decision. */
+const ON_DEMAND_ONLY = ["crawl.audit", "report.build"];
 
 /**
  * ⚠ SCHEDULES WHOSE CADENCE COMES FROM A DIFFERENT REFERENCE THAN §4, kept
@@ -101,7 +114,7 @@ describe("G12 · the schedule table matches the reference", () => {
   it("carries the cron expression the reference states, or null where it states none", () => {
     for (const [queue, expected] of Object.entries(REFERENCE)) {
       const divergence = DELIBERATE_DIVERGENCE[queue];
-      expect(scheduleFor(queue)?.cron, queue).toBe(divergence?.cron ?? expected.cron);
+      expect(scheduleFor(queue)?.cron, queue).toBe(divergence?.cron ?? FROM_OWNER_HOURS[queue] ?? expected.cron);
     }
   });
 
@@ -109,7 +122,9 @@ describe("G12 · the schedule table matches the reference", () => {
     // The count is the assertion. A second divergence appearing without a line
     // in `DELIBERATE_DIVERGENCE` means somebody edited a cron rather than
     // deciding one.
-    const diverging = Object.keys(REFERENCE).filter((queue) => scheduleFor(queue)?.cron !== REFERENCE[queue]!.cron);
+    const diverging = Object.keys(REFERENCE).filter(
+      (queue) => scheduleFor(queue)?.cron !== REFERENCE[queue]!.cron && !(queue in FROM_OWNER_HOURS),
+    );
     expect(diverging).toEqual(Object.keys(DELIBERATE_DIVERGENCE));
     for (const entry of Object.values(DELIBERATE_DIVERGENCE)) {
       expect(entry.because.length).toBeGreaterThan(40);
@@ -123,16 +138,26 @@ describe("G12 · the schedule table matches the reference", () => {
     for (const schedule of QUEUE_SCHEDULES) expect(names.has(schedule.queue), schedule.queue).toBe(true);
   });
 
-  it("⚠ five cron queues still state no time, and say so rather than being guessed at", () => {
-    // The count is the point: five cron queues cannot be scheduled from the
-    // references as written, and that gap belongs in a test rather than in
-    // somebody's memory. It was six until STORY-142 chose an hour for
-    // `maintenance.partition` — chose, and wrote down why. The dated count is
-    // 7 since STORY-173 added `identity.sweep_unverified`, which is dated by
-    // owner decision and not one of the five, and 9 since `credit.housekeeping`
-    // and `retention.purge` were given a chosen hour (both from other references).
-    expect(datedSchedules()).toHaveLength(9);
-    expect(undatedSchedules()).toHaveLength(5);
+  it("STORY-140 AC11 · the owner's hours are registered in UTC: geo.analyze 03:00, gsc.sync 04:00, topic.cluster Sunday 05:00", () => {
+    for (const [queue, cron] of Object.entries(FROM_OWNER_HOURS)) {
+      expect(scheduleFor(queue)?.cron, queue).toBe(cron);
+      expect(scheduleFor(queue)?.statedAs, queue).toContain("STORY-140");
+    }
+  });
+
+  it("STORY-140 AC11 · crawl.audit and report.build are on demand only: no cron, and the pin fails if one is added", () => {
+    for (const queue of ON_DEMAND_ONLY) {
+      expect(scheduleFor(queue)?.cron, `${queue} must stay on demand — a cron needs a new owner decision`).toBeNull();
+      expect(scheduleFor(queue)?.statedAs, queue).toContain("on demand only");
+    }
+    // The undated set is EXACTLY these two, so a third undated queue, or a dated one among them, fails here.
+    expect(undatedSchedules().map((s) => s.queue).sort()).toEqual([...ON_DEMAND_ONLY].sort());
+  });
+
+  it("STORY-140 AC11 · twelve of fourteen cron queues are dated, two are on demand", () => {
+    // 9 dated before + geo.analyze, gsc.sync, topic.cluster.
+    expect(datedSchedules()).toHaveLength(12);
+    expect(undatedSchedules()).toHaveLength(2);
   });
 
   it("⚠ never invents an hour — no undated schedule carries a cron", () => {
@@ -153,7 +178,7 @@ describe("G12 · the schedule table matches the reference", () => {
       .map((s) => s.queue)
       .filter((queue) => handlerFor(queue) === undefined);
 
-    expect(datedAndInert.sort()).toEqual(["attribution.rollup"]);
+    expect(datedAndInert.sort()).toEqual(["attribution.rollup", "geo.analyze", "gsc.sync", "topic.cluster"]);
     expect(inertQueueNames()).toEqual(expect.arrayContaining(datedAndInert));
   });
 
@@ -177,7 +202,7 @@ describe("G12 · the schedule table matches the reference", () => {
     const tenantScoped = dated.filter((queue) => handlerFor(queue) !== undefined && topologyFor(queue).tenantScoped);
     const schedulable = dated.filter((queue) => handlerFor(queue) !== undefined && !topologyFor(queue).tenantScoped);
 
-    expect(inert.sort()).toEqual(["attribution.rollup"]);
+    expect(inert.sort()).toEqual(["attribution.rollup", "geo.analyze", "gsc.sync", "topic.cluster"]);
     expect(tenantScoped.sort()).toEqual(["capture.plan", "rollup.metric_daily"]);
     expect(schedulable.sort()).toEqual([
       "audit.verify",
@@ -226,6 +251,6 @@ describe("G12 · describeSchedules — the one line a boot log gets", () => {
   });
 
   it("reports the cadence gap so an operator need not go and read the table", () => {
-    expect(describeSchedules(empty)).toContain("9 of 14 cron queues state a time");
+    expect(describeSchedules(empty)).toContain("12 of 14 cron queues state a time");
   });
 });

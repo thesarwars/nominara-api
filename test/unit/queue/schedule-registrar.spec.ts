@@ -114,13 +114,13 @@ describe("G12 · reconcileSchedules", () => {
   });
 
   it("⚠ schedules nothing for a queue whose cadence states no time", async () => {
-    // `topic.cluster` says "cron weekly" and names neither a day nor an hour.
-    // Scheduling it would mean inventing both. (`maintenance.partition` stood
+    // `crawl.audit` is on demand only (STORY-140 AC11): a null cron means
+    // nothing is registered. (`topic.cluster` stood here until STORY-140 gave it Sunday 05:00.) (`maintenance.partition` stood
     // here until STORY-142 chose an hour for it — deliberately, and for a
     // reason recorded in `schedule.spec.ts`'s divergence list.)
     const queue = fakeQueue();
 
-    const result = await reconcileSchedules(new Map([["topic.cluster", asQueue(queue)]]));
+    const result = await reconcileSchedules(new Map([["crawl.audit", asQueue(queue)]]));
 
     expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
     expect(result.scheduled).toEqual([]);
@@ -256,5 +256,37 @@ describe("G12 · reconcileSchedules", () => {
     expect(result.failed).toEqual([{ queue: "rollup.metric_daily", reason: "Invalid characters, got value: a" }]);
     expect(result.scheduled).toEqual([{ queue: "credit.reconcile", cron: "*/10 * * * *" }]);
     expect(good.upsertJobScheduler).toHaveBeenCalledOnce();
+  });
+});
+
+describe("STORY-140 AC11 · the owner's crons meet the registrar", () => {
+  it("geo.analyze, gsc.sync and topic.cluster carry a cron but have no handler and are tenant-scoped, so a bare tick is refused and nothing is scheduled", async () => {
+    const queue = fakeQueue();
+
+    const result = await reconcileSchedules(
+      new Map([
+        ["geo.analyze", asQueue(queue)],
+        ["gsc.sync", asQueue(queue)],
+        ["topic.cluster", asQueue(queue)],
+      ]),
+    );
+
+    expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
+    expect(result.scheduled).toEqual([]);
+    expect([...result.skippedInert].sort()).toEqual(["geo.analyze", "gsc.sync", "topic.cluster"]);
+  });
+
+  it("STORY-140 AC11 · crawl.audit and report.build never get a scheduler registered, whatever the registrar is given", async () => {
+    const queue = fakeQueue();
+
+    const result = await reconcileSchedules(
+      new Map([
+        ["crawl.audit", asQueue(queue)],
+        ["report.build", asQueue(queue)],
+      ]),
+    );
+
+    expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
+    expect(result.scheduled).toEqual([]);
   });
 });
