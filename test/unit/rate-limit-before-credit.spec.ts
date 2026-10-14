@@ -19,11 +19,8 @@ import { applyFakeApiEnv } from "../support/fake-env.js";
 // chain. Spying on the guard itself would prove that NestJS short-circuits,
 // which is NestJS's property, not this repository's.
 //
-// HONESTY NOTE, per the execution plan. "Nothing was debited" is only
-// half-provable today: CreditGuard and CreditInterceptor are no-op stubs and
-// the credit ledger does not exist until EPIC-10. The provable half — the
-// reservation path is never ENTERED — is exactly what the epic's criterion
-// asks for, and it is what this file claims. It does not claim the other half.
+// This file proves the reservation path is never ENTERED. The other half - nothing is debited - is proven against
+// the real credit ledger in test/integration/rate-limit-ledger-and-config.spec.ts (no reserve/commit/release row).
 
 const REFUSED: RateLimitDecision = {
   allowed: false,

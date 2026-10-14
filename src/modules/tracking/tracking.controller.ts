@@ -12,6 +12,7 @@ import { Audit } from "../../api/decorators/audit.decorator.js";
 import { Credits } from "../../api/decorators/credits.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import { RateLimitClass } from "../../api/rate-limit/route-class.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import type { CreditUsage } from "../../api/interceptors/credit.interceptor.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
@@ -79,6 +80,9 @@ export class TrackingController {
   @Post()
   @HttpCode(202)
   @Idempotent()
+  // §12's `project_runs`: 6/hour per user, burst 2. Without it the route fell
+  // into `writes` (60/min), which is not what a priced scan should allow.
+  @RateLimitClass("project_runs")
   @Credits("deep_scan")
   @RequirePermission("tracking:trigger")
   // Audited because it is a priced action against a plan's allowance, and

@@ -212,23 +212,9 @@ describe("STORY-025 · additive evaluation", () => {
     expect(afterRefusal.some((key) => key.includes(":workspace:"))).toBe(false);
   });
 
-  // ROW 9 / AC10 IS NOT MET, AND THE TEST THAT CLAIMED IT WAS VACUOUS.
-  //
-  // It built a SECOND RateLimitBuckets over a FRESH cache and asserted the
-  // first request was allowed — which is true of any new bucket store,
-  // whatever its configuration. The code review mutated it to remove the
-  // configuration change entirely and it still passed.
-  //
-  // AC10 says "bucket configuration is data, so a limit change needs no
-  // redeploy". RATE_LIMIT_DEFAULTS is a compiled-in constant; nothing reads
-  // `{env}:global:ratelimit:config`, and `rateLimitConfigKey` is referenced
-  // only by its own test. A limit change requires a redeploy today. The plan's
-  // OQ-5 decided for a Valkey-held document read on a short TTL with fallback,
-  // and that is unbuilt.
-  //
-  // So the assertion below is the one that IS true — configuration is injected
-  // rather than reached for — and AC10 is reported unmet rather than covered
-  // by a test that cannot fail.
+  // ROW 9 / AC10 — a change to the Valkey-held document taking effect — is asserted in
+  // test/unit/rate-limit-config-document.spec.ts, each case paired with a control. This one asserts the narrower
+  // property that configuration is injected rather than reached for.
   it("takes its limits from injected configuration, not from a module-level constant", async () => {
     const strict = rateLimitConfigSchema.parse(
       rateLimitRouteClassSchema.options.map((routeClass) => ({

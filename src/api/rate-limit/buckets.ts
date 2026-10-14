@@ -1,11 +1,13 @@
-import { Inject, Injectable } from "@nestjs/common";
-import type {
-  RateLimitBucket,
-  RateLimitRouteClass,
-  RateLimitRouteClassConfig,
+import { Inject, Injectable, Logger } from "@nestjs/common";
+import {
+  rateLimitConfigSchema,
+  type RateLimitBucket,
+  type RateLimitRouteClass,
+  type RateLimitRouteClassConfig,
 } from "../../../contracts/common/rate-limit.schema.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
-import { globalKey, rateLimitCounterKey } from "../../lib/cache/valkey-keys.js";
+import { globalKey, rateLimitConfigKey, rateLimitCounterKey } from "../../lib/cache/valkey-keys.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { RATE_LIMIT_DEFAULTS } from "./defaults.js";
 
 // STORY-025 T17 — additive bucket evaluation.
@@ -76,16 +78,160 @@ export function utcDayStamp(nowMs: number): string {
   return new Date(nowMs).toISOString().slice(0, 10);
 }
 
+/**
+ * How stale the in-process copy of the configuration document may get (STORY-025 AC10, plan OQ-5).
+ * A change written to `{env}:global:ratelimit:config` is enforced by every instance within this long.
+ */
+export const RATE_LIMIT_CONFIG_REFRESH_MS = 15_000;
+
+/**
+ * How long a request waits for the configuration read. The read is on the request path of every route, so a hung
+ * Valkey must not hang them: past this the code defaults are enforced (logged as `unreadable`) until the next refresh.
+ */
+export const RATE_LIMIT_CONFIG_READ_TIMEOUT_MS = 250;
+
+/**
+ * How far an operator-written document may move a number from the committed default: each of `limit`, `burst` and
+ * `window_ms` must lie in [default / FACTOR, default x FACTOR]. The document is data, so an operator tunes it; it is
+ * not a way to switch a control off. One constant, so the bound is easy to change.
+ */
+export const RATE_LIMIT_ENVELOPE_FACTOR = 10;
+
+const withinFactor = (value: number, reference: number): boolean =>
+  value >= reference / RATE_LIMIT_ENVELOPE_FACTOR && value <= reference * RATE_LIMIT_ENVELOPE_FACTOR;
+
+const bucketOrder = (a: RateLimitBucket, b: RateLimitBucket): number =>
+  `${a.scope}|${a.window}|${String(a.hard_cap)}`.localeCompare(`${b.scope}|${b.window}|${String(b.hard_cap)}`) ||
+  (a.window_ms ?? 0) - (b.window_ms ?? 0);
+
+/**
+ * Whether a schema-valid document stays inside the envelope the code defaults draw. The schema checks SHAPE only;
+ * this checks that no control was removed or neutered. Per class, the (scope, window, hard_cap) buckets must match
+ * the defaults exactly (so pre-auth classes keep an IP bucket, the UTC-day hard cap stays, and no class gains a hard
+ * cap), and limit, burst, window_ms and the rate limit / window_ms must each stay within
+ * RATE_LIMIT_ENVELOPE_FACTOR of the default.
+ */
+export function withinEnvelope(
+  document: readonly RateLimitRouteClassConfig[],
+  defaults: readonly RateLimitRouteClassConfig[],
+): boolean {
+  return defaults.every((reference) => {
+    const candidate = document.find((entry) => entry.route_class === reference.route_class);
+    if (candidate === undefined) return false;
+    if (!withinFactor(candidate.burst, reference.burst)) return false;
+    if (candidate.buckets.length !== reference.buckets.length) return false;
+    const got = [...candidate.buckets].sort(bucketOrder);
+    const want = [...reference.buckets].sort(bucketOrder);
+    return want.every((expected, i) => {
+      const actual = got[i]!;
+      if (actual.scope !== expected.scope) return false;
+      if (actual.window !== expected.window) return false;
+      if (actual.hard_cap !== expected.hard_cap) return false;
+      if (!withinFactor(actual.limit, expected.limit)) return false;
+      if (expected.window_ms === undefined) return true; // a utc_day bucket: the calendar is the window
+      // Unreachable once `window` matched (the schema ties a rolling window to window_ms); kept for type narrowing.
+      if (actual.window_ms === undefined) return false;
+      if (!withinFactor(actual.window_ms, expected.window_ms)) return false;
+      // The RATE (limit / window_ms) is bounded too, because limit and window_ms bounded separately would allow
+      // FACTOR^2 times the default rate. Cross-multiplied, so no division and no float rounding at the boundary.
+      const scaled = actual.limit * expected.window_ms;
+      const referenceRate = expected.limit * actual.window_ms;
+      return scaled <= referenceRate * RATE_LIMIT_ENVELOPE_FACTOR && scaled * RATE_LIMIT_ENVELOPE_FACTOR >= referenceRate;
+    });
+  });
+}
+
+const logger = new Logger("rate-limit");
+
+type ConfigSource = "document" | "missing" | "invalid" | "unreadable";
+
 @Injectable()
 export class RateLimitBuckets {
+  private active: readonly RateLimitRouteClassConfig[];
+  private loadedAtMs: number | undefined;
+  private loading: Promise<void> | undefined;
+  private lastSource: ConfigSource | undefined;
+
   constructor(
     @Inject(CACHE) private readonly cache: Cache,
-    private readonly config: readonly RateLimitRouteClassConfig[] = RATE_LIMIT_DEFAULTS,
+    /** The code defaults — what is enforced when the Valkey document is missing, invalid or unreadable. */
+    private readonly defaults: readonly RateLimitRouteClassConfig[] = RATE_LIMIT_DEFAULTS,
     private readonly now: () => number = () => Date.now(),
-  ) {}
+    private readonly refreshMs: number = RATE_LIMIT_CONFIG_REFRESH_MS,
+  ) {
+    this.active = defaults;
+  }
+
+  /**
+   * The Valkey-held configuration document (plan OQ-5), re-read at most once per `refreshMs`.
+   *
+   * EVERY FAILURE LANDS ON THE CODE DEFAULTS, never on "no limit". A missing, malformed, schema-invalid
+   * (including a document that omits a route class), outside-the-envelope (see `withinEnvelope`: one class that
+   * fails sends the WHOLE document to the defaults, never a partial merge) or unreadable document is logged and
+   * replaced by the defaults —
+   * not by the last good document either, so what is enforced is always either a document that validated just now or
+   * the committed table. The body is never logged: a log line states the outcome only.
+   */
+  private async refreshConfig(env: string): Promise<void> {
+    const nowMs = this.now();
+    // A negative age (the wall clock stepped backwards) is stale: otherwise the refresh would freeze until the clock
+    // caught up with the moment of the last load, and a changed document would go unenforced for as long.
+    const age = this.loadedAtMs === undefined ? undefined : nowMs - this.loadedAtMs;
+    if (age !== undefined && age >= 0 && age < this.refreshMs) return;
+    this.loading ??= (async (): Promise<void> => {
+      let source: ConfigSource;
+      let config = this.defaults;
+      try {
+        const raw = await this.readWithTimeout(rateLimitConfigKey(env));
+        if (raw === undefined) {
+          source = "missing";
+        } else {
+          const parsed = rateLimitConfigSchema.safeParse(JSON.parse(raw));
+          if (parsed.success && withinEnvelope(parsed.data, this.defaults)) {
+            source = "document";
+            config = parsed.data;
+          } else {
+            source = "invalid";
+          }
+        }
+      } catch (error) {
+        source = error instanceof SyntaxError ? "invalid" : "unreadable";
+      }
+      this.active = config;
+      this.loadedAtMs = nowMs;
+      incrementCounter("nominara_api_rate_limit_config_load_total", { source });
+      // A broken document must not go quiet, so invalid/unreadable log on every read; the healthy states log on change.
+      if (source === "invalid" || source === "unreadable") {
+        logger.warn({ message: `rate-limit config ${source}; enforcing the code defaults`, source });
+      } else if (source !== this.lastSource) {
+        logger.log({ message: `rate-limit config source: ${source}`, source });
+      }
+      this.lastSource = source;
+    })().finally(() => {
+      this.loading = undefined;
+    });
+    await this.loading;
+  }
+
+  /** The document read, abandoned after RATE_LIMIT_CONFIG_READ_TIMEOUT_MS; a timeout is an `unreadable` outcome. */
+  private async readWithTimeout(key: string): Promise<string | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = this.cache.get(key);
+    read.catch(() => undefined); // a read that loses the race must not become an unhandled rejection
+    try {
+      return await Promise.race([
+        read,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("rate-limit config read timed out")), RATE_LIMIT_CONFIG_READ_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
   configFor(routeClass: RateLimitRouteClass): RateLimitRouteClassConfig {
-    const found = this.config.find((entry) => entry.route_class === routeClass);
+    const found = this.active.find((entry) => entry.route_class === routeClass);
     if (found === undefined) {
       // Unreachable through the schema, which is fixed-length and
       // duplicate-checked — but a route class with no configuration is a route
@@ -173,6 +319,7 @@ export class RateLimitBuckets {
    * the workspace — an abuse control that amplifies abuse.
    */
   async check(routeClass: RateLimitRouteClass, identity: RateLimitIdentity): Promise<RateLimitDecision> {
+    await this.refreshConfig(identity.env);
     const config = this.configFor(routeClass);
     const nowMs = this.now();
     let tightest: RateLimitDecision | undefined;
