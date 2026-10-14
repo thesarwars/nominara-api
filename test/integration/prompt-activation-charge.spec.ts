@@ -135,6 +135,22 @@ describe("STORY-046 · the activation charge", () => {
   const patch = (id: string, body: { status?: "active" | "paused" | "archived"; text?: string }): Promise<PromptResponse> =>
     asTenant(() => lifecycle.update(id, body));
 
+  /**
+   * Run calls concurrently and wait for ALL of them, then surface the first failure.
+   *
+   * `Promise.all` rejects as soon as one call does and leaves the others in flight, still
+   * holding the project row lock; the next test's TRUNCATE then queues behind that lock on the
+   * same `db` connection the in-flight call needs to resolve entitlements, and the suite hangs
+   * instead of failing. Found by running the mutation battery, where a broken rule made one
+   * of two concurrent calls throw.
+   */
+  async function concurrently<T extends readonly unknown[]>(...calls: { [K in keyof T]: Promise<T[K]> }): Promise<T> {
+    const settled = await Promise.allSettled(calls);
+    const failed = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed !== undefined) throw failed.reason;
+    return settled.map((r) => (r as PromiseFulfilledResult<unknown>).value) as unknown as T;
+  }
+
   async function wallet() {
     const row = (await db.query("SELECT included_balance, purchased_balance, reserved, lifetime_spent FROM credit_wallets WHERE workspace_id=$1", [workspaceId])).rows[0];
     return row === undefined
@@ -442,7 +458,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
 
-    const [a, b] = await Promise.all([activate(project, ids), activate(project, ids)]);
+    const [a, b] = await concurrently(activate(project, ids), activate(project, ids));
 
     expect([a.credits_charged, b.credits_charged].sort()).toEqual([0, 2]);
     expect(await wallet()).toEqual({ included: 98, reserved: 0, spent: 2 });
@@ -453,7 +469,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
 
-    const [a, b] = await Promise.all([activate(project, ids.slice(0, 6)), activate(project, ids.slice(6))]);
+    const [a, b] = await concurrently(activate(project, ids.slice(0, 6)), activate(project, ids.slice(6)));
 
     expect(a.credits_charged + b.credits_charged).toBe(2);
     expect((await wallet())?.spent).toBe(2);
@@ -464,7 +480,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 9, { status: "active", activatedBefore: true });
     const [viaPost, viaPatch] = await seedPrompts(project, 2);
 
-    const [a, b] = await Promise.all([activate(project, [viaPost!]), patch(viaPatch!, { status: "active" })]);
+    const [a, b] = await concurrently(activate(project, [viaPost!]), patch(viaPatch!, { status: "active" }));
 
     expect(a.credits_charged + b.credits_charged).toBe(1);
   });
@@ -535,6 +551,8 @@ describe("STORY-046 · the activation charge", () => {
   });
 
   it("PATCH — a change that leaves the prompt archived (same status, a priority flag, a reworded text) charges nothing and records nothing", async () => {
+    // Business: the priority flag needs `scan.priority_subset_size`, which growth does not have.
+    await seedWorkspace("business", 100);
     const project = await seedProject();
     await seedPrompts(project, 10, { status: "active", activatedBefore: true });
     const [sameStatus, flagged, reworded] = await seedPrompts(project, 3);
