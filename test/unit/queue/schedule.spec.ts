@@ -44,7 +44,7 @@ const DELIBERATE_DIVERGENCE: Record<string, { cron: string; because: string }> =
     because:
       "§4's monthly is the work's resolution, not a safe check frequency; a missed run is only found once rows are in DEFAULT. " +
       "The tick runs the RUNWAY half only — detect stranded rows, create the coming months. The destructive half " +
-      "(cold-tier moves, detach/drop past retention, vector rebuilds) stays operator-invoked via `pnpm db:maintenance:run`, " +
+      "(detach/drop past retention, vector rebuilds) stays operator-invoked via `pnpm db:maintenance:run`, " +
       "because the drop cutoff is the MINIMUM retention across active workspaces: one reversible soft-delete collapses it " +
       "platform-wide, and at a daily cadence the next tick would drop partitions that monthly gave a month to notice.",
   },

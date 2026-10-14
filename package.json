@@ -27,6 +27,7 @@
     "db:studio": "tsx src/db/studio.ts",
     "db:seed-demo": "tsx src/db/seed-demo.ts",
     "db:maintenance:run": "tsx src/workers/rollup/maintenance.ts",
+    "db:maintenance:catch-up": "tsx src/workers/rollup/catch-up-default-partition.ts",
     "db:maintenance:sweep": "tsx src/workers/rollup/retention.ts",
     "identity:sweep-unverified": "tsx src/workers/rollup/unverified-sweep.ts",
     "credits:verify": "tsx src/workers/rollup/credit-verify.ts",
