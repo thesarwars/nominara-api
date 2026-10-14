@@ -129,6 +129,7 @@ export function withinEnvelope(
       if (actual.hard_cap !== expected.hard_cap) return false;
       if (!withinFactor(actual.limit, expected.limit)) return false;
       if (expected.window_ms === undefined) return true; // a utc_day bucket: the calendar is the window
+      // Unreachable once `window` matched (the schema ties a rolling window to window_ms); kept for type narrowing.
       if (actual.window_ms === undefined) return false;
       if (!withinFactor(actual.window_ms, expected.window_ms)) return false;
       // The RATE (limit / window_ms) is bounded too, because limit and window_ms bounded separately would allow
