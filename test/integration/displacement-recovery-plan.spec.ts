@@ -43,7 +43,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE tasks, ref_counters, displacement_events, source_domains, answer_captures, tracked_prompts, projects, workspaces CASCADE");
+    await db.query("TRUNCATE tasks, ref_counters, displacement_events, project_source_index, source_domains, answer_captures, tracked_prompts, projects, workspaces CASCADE");
     await db.query("TRUNCATE users CASCADE");
     actorId = (await db.query("INSERT INTO users (email, status) VALUES ($1, 'active') RETURNING id", [`a-${randomUUID()}@example.com`])).rows[0].id;
     workspaceId = randomUUID();
@@ -95,10 +95,15 @@ describe("NEW-C-6 · displacement recovery plan", () => {
     Promise.all(domains.map((d) => db.query("INSERT INTO source_domains (workspace_id, domain, is_seedable) VALUES ($1,$2,true)", [workspaceId, d])));
   const plan = (id: string, ws = workspaceId, client: Client = db) =>
     withTenantContext(client, { workspaceId: ws, actorId }, () => service.recoveryPlan(id));
+  // A seedable domain whose project index row is at the critical band: the pre-STORY-054 "seedable" fixture, now actionable.
+  const actionable = async (...domains: string[]): Promise<void> => {
+    await seedable(...domains);
+    for (const domain of domains) await indexRow(domain, "critical");
+  };
   const taskRows = async () => (await db.query("SELECT * FROM tasks ORDER BY created_at, id")).rows;
 
   it("STORY-057 #9 / NEW-C-6 AC2 — one authority task per seedable citation gap, linked to the displacement, fingerprint per the owner formula", async () => {
-    await seedable("seed.com", "other.org");
+    await actionable("seed.com", "other.org");
     const id = await displacement({ citationGap: [gapEntry("seed.com"), gapEntry("other.org", "y")] });
     const tasks = await plan(id);
 
@@ -122,7 +127,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
 
   it("STORY-057 #10 / NEW-C-6 AC2 — a non-seedable or unknown domain gets no task, and the gap stays visible in the feed", async () => {
     await db.query("INSERT INTO source_domains (workspace_id, domain, is_seedable) VALUES ($1,'closed.com',false)", [workspaceId]);
-    await seedable("seed.com");
+    await actionable("seed.com");
     const id = await displacement({ citationGap: [gapEntry("closed.com"), gapEntry("unknown.com"), gapEntry("seed.com")] });
     const tasks = await plan(id);
     expect(tasks).toHaveLength(1);
@@ -131,8 +136,84 @@ describe("NEW-C-6 · displacement recovery plan", () => {
     expect(item!.citation_gap.map((g) => g.domain)).toEqual(["closed.com", "unknown.com", "seed.com"]);
   });
 
-  it("STORY-057 #12 / NEW-C-6 AC2 — a repeat call creates no duplicate task and burns no reference; it returns the same tasks", async () => {
+  // STORY-054 AC10 (owner decision 2026-10-13): an authority task needs a SEEDABLE domain AND a critical/high gap_severity
+  // on the project's `project_source_index` row at engine 'all', window 90. No row, no task.
+  async function indexRow(
+    domain: string,
+    severity: string | null,
+    over: { engine?: string; windowDays?: number; project?: string } = {},
+  ): Promise<void> {
+    const sd = (await db.query("SELECT id FROM source_domains WHERE workspace_id = $1 AND domain = $2", [workspaceId, domain])).rows[0].id;
+    await db.query(
+      `INSERT INTO project_source_index (workspace_id, project_id, source_domain_id, engine_key, window_start, window_days, gap_severity)
+       VALUES ($1,$2,$3,$4,'2026-07-14',$5,$6)`,
+      [workspaceId, over.project ?? projectId, sd, over.engine ?? "all", over.windowDays ?? 90, severity],
+    );
+  }
+  const feedItem = async () =>
+    (await withTenantContext(db, { workspaceId, actorId }, () => service.feed(projectId, displacementFeedQuerySchema.parse({})))).items[0]!;
+
+  it("STORY-054 AC10 · critical and high bands on a seedable domain make a task; medium, low, none and an unscored (null) band do not", async () => {
+    const bands: Array<[string, string | null, boolean]> = [
+      ["crit.com", "critical", true], ["high.com", "high", true], ["med.com", "medium", false],
+      ["low.com", "low", false], ["none.com", "none", false], ["null.com", null, false],
+    ];
+    await seedable(...bands.map(([d]) => d));
+    for (const [domain, severity] of bands) await indexRow(domain, severity);
+    const id = await displacement({ citationGap: bands.map(([d]) => gapEntry(d)) });
+    const tasks = await plan(id);
+    expect(tasks.map((t) => t.affected_url).sort()).toEqual(["https://crit.com/x", "https://high.com/x"]);
+  });
+
+  it("STORY-054 AC10 · a seedable domain with NO index row makes no task", async () => {
     await seedable("seed.com");
+    const id = await displacement({ citationGap: [gapEntry("seed.com")] });
+    expect(await plan(id)).toEqual([]);
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("STORY-054 AC10 · only the engine 'all', 90-day row counts: a critical row at another engine or another window is not the gate", async () => {
+    await seedable("eng.com", "win.com", "ok.com");
+    await indexRow("eng.com", "critical", { engine: "gemini" });
+    await indexRow("win.com", "critical", { windowDays: 30 });
+    await indexRow("ok.com", "critical");
+    const id = await displacement({ citationGap: [gapEntry("eng.com"), gapEntry("win.com"), gapEntry("ok.com")] });
+    expect((await plan(id)).map((t) => t.affected_url)).toEqual(["https://ok.com/x"]);
+  });
+
+  it("STORY-054 AC10 · the gate is the PROJECT's index row: another project's critical row does not open a task", async () => {
+    const otherProject = randomUUID();
+    await db.query("INSERT INTO projects (id,workspace_id,name,slug,root_url,root_domain) VALUES ($1,$2,'Other',$3,'https://o.com','o.com')", [otherProject, workspaceId, `o-${otherProject.slice(0, 8)}`]);
+    await seedable("seed.com");
+    await indexRow("seed.com", "critical", { project: otherProject });
+    const id = await displacement({ citationGap: [gapEntry("seed.com")] });
+    expect(await plan(id)).toEqual([]);
+  });
+
+  it("STORY-054 AC10 · a critical band on a NON-seedable domain makes no task (both conditions are required)", async () => {
+    await db.query("INSERT INTO source_domains (workspace_id, domain, is_seedable) VALUES ($1,'closed.com',false)", [workspaceId]);
+    await indexRow("closed.com", "critical");
+    const id = await displacement({ citationGap: [gapEntry("closed.com")] });
+    expect(await plan(id)).toEqual([]);
+  });
+
+  it("NEW-C-5/6 · the feed's recovery_task_count and the plan read the SAME gated set and agree, gated and ungated domains mixed", async () => {
+    await seedable("crit.com", "med.com", "norow.com");
+    await indexRow("crit.com", "critical");
+    await indexRow("med.com", "medium");
+    const id = await displacement({
+      citationGap: [gapEntry("crit.com"), gapEntry("med.com"), gapEntry("norow.com"), gapEntry("unknown.com")],
+      conceptGap: [],
+    });
+    const item = await feedItem();
+    const tasks = await plan(id);
+    expect(tasks).toHaveLength(1);
+    expect(item.recovery_task_count).toBe(1);
+    expect(item.recovery_task_count).toBe(tasks.length);
+  });
+
+  it("STORY-057 #12 / NEW-C-6 AC2 — a repeat call creates no duplicate task and burns no reference; it returns the same tasks", async () => {
+    await actionable("seed.com");
     const id = await displacement({ citationGap: [gapEntry("seed.com")] });
     const first = await plan(id);
     const counter = (await db.query("SELECT next_value FROM ref_counters")).rows;
@@ -143,7 +224,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
   });
 
   it("STORY-057 #12 — a second displacement on the same project and domain reuses the open task rather than adding another", async () => {
-    await seedable("seed.com");
+    await actionable("seed.com");
     const a = await displacement({ citationGap: [gapEntry("seed.com")] });
     const b = await displacement({ citationGap: [gapEntry("seed.com")] });
     const [first] = await plan(a);
@@ -154,7 +235,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
   });
 
   it("NEW-C-6 AC2 — once the task is done, the fingerprint is free again and a new plan creates a new task", async () => {
-    await seedable("seed.com");
+    await actionable("seed.com");
     const id = await displacement({ citationGap: [gapEntry("seed.com")] });
     const [first] = await plan(id);
     await db.query("UPDATE tasks SET status = 'done', completed_at = now() WHERE id = $1", [first!.id]);
@@ -164,7 +245,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
   });
 
   it("NEW-C-6 AC2 — two gap URLs on one domain are ONE task, and the feed's recovery_task_count says the same", async () => {
-    await seedable("seed.com");
+    await actionable("seed.com");
     const id = await displacement({ citationGap: [gapEntry("seed.com", "a"), gapEntry("Seed.com", "b")] });
     const [item] = (await withTenantContext(db, { workspaceId, actorId }, () => service.feed(projectId, displacementFeedQuerySchema.parse({})))).items;
     const tasks = await plan(id);
@@ -190,7 +271,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
   });
 
   it("NEW-C-6 AC2 — concurrent plans for one displacement make exactly one task per domain and consume one reference", async () => {
-    await seedable("seed.com");
+    await actionable("seed.com");
     const id = await displacement({ citationGap: [gapEntry("seed.com")] });
     const other = new Client({ connectionString: container.getConnectionUri() });
     await other.connect();
@@ -205,7 +286,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
   });
 
   it("NEW-C-6 AC3 — under nominara_app, another workspace's displacement id is 404 and nothing is written; a scoped member outside the project is 403", async () => {
-    await seedable("seed.com");
+    await actionable("seed.com");
     const id = await displacement({ citationGap: [gapEntry("seed.com")] });
     await db.query("SET ROLE nominara_app");
     try {
@@ -220,7 +301,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
   });
 
   it("NEW-C-6 AC2 — the plan's tasks are written in one transaction: a failure part-way leaves no task and no task_id", async () => {
-    await seedable("seed.com", "b.com");
+    await actionable("seed.com", "b.com");
     const id = await displacement({ citationGap: [gapEntry("seed.com"), gapEntry("b.com")] });
     // A trigger that rejects the second task proves atomicity without touching production code.
     await db.query(`CREATE FUNCTION pg_temp.boom() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.affected_url LIKE 'https://seed.com/%' THEN RAISE EXCEPTION 'boom'; END IF; RETURN NEW; END $$`);
@@ -235,7 +316,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
   });
 
   it("NEW-C-6 observability - counts the plan and logs workspace and displacement IDs plus counts only, never a title, URL or competitor", async () => {
-    await seedable("seed.com");
+    await actionable("seed.com");
     const id = await displacement({ citationGap: [gapEntry("seed.com")] });
     const logs: unknown[] = [];
     const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void logs.push(m));

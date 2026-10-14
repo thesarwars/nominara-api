@@ -1,6 +1,6 @@
 import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
-import { classifyDomain } from "../parser/citation-url.js";
+import { classifyDomain, domainClassSource } from "../parser/citation-url.js";
 import { SCORING_VERSION, gapSeverity, isSeedableSourceClass, sourceContextWeights } from "../scoring/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { refreshProjectSourceCoverage } from "./refresh-project-source-coverage.js";
@@ -84,17 +84,24 @@ export async function refreshProjectSourceIndex(tx: ClientBase, projectId: strin
       [projectId, widestStart, asOf],
     )
   ).rows;
+  let queuedForCuration = 0;
   const classByDomain = new Map<string, { ownClass: string; ownSeedable: boolean; competitor: boolean; domainId: string }>();
   for (const fact of domainFacts) {
     const ownClass = fact.source_class ?? classifyDomain(fact.domain);
     const ownSeedable = isSeedableSourceClass(ownClass, false);
+    const classSource = domainClassSource(fact.domain);
+    if (classSource === "heuristic") {
+      queuedForCuration += 1;
+      incrementCounter("nominara_rollup_source_domains_queued_for_curation_total");
+    }
     const res = await tx.query<{ id: string }>(
-      `INSERT INTO source_domains (workspace_id, domain, display_name, source_class, is_seedable)
-       VALUES ($1,$2,$2,$3,$4)
+      `INSERT INTO source_domains (workspace_id, domain, display_name, source_class, is_seedable, class_source)
+       VALUES ($1,$2,$2,$3,$4,$5)
        ON CONFLICT (workspace_id, domain) DO UPDATE
-         SET source_class = EXCLUDED.source_class, is_seedable = EXCLUDED.is_seedable, last_seen_at = now(), updated_at = now()
+         SET source_class = EXCLUDED.source_class, is_seedable = EXCLUDED.is_seedable, class_source = EXCLUDED.class_source,
+             last_seen_at = now(), updated_at = now()
        RETURNING id`,
-      [workspaceId, fact.domain, ownClass, ownSeedable],
+      [workspaceId, fact.domain, ownClass, ownSeedable, classSource],
     );
     classByDomain.set(fact.domain, { ownClass, ownSeedable, competitor: fact.is_competitor, domainId: res.rows[0]!.id });
   }
@@ -174,5 +181,5 @@ export async function refreshProjectSourceIndex(tx: ClientBase, projectId: strin
 
   await refreshProjectSourceCoverage(tx, projectId);
   incrementCounter("nominara_rollup_source_index_refresh_total", { outcome: "ok" });
-  logger.log({ event: "source_index_refreshed", workspaceId, projectId, rows: written });
+  logger.log({ event: "source_index_refreshed", workspaceId, projectId, rows: written, queued_for_curation: queuedForCuration });
 }

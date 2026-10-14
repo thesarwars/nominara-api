@@ -126,4 +126,5 @@ export const sourceDomains = pgTable("source_domains", {
   lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().default(sql`now()`),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  classSource: text("class_source").notNull().default(sql`'heuristic'::text`),
 });

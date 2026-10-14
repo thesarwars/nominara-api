@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { GuardedFetchRefusal } from "../../../src/lib/net/guarded-fetch.js";
 import {
   classifyCitation,
+  domainClassSource,
   isOwnedHost,
   normalizeCitationUrl,
   positionWeight,
@@ -290,3 +291,14 @@ function base() {
     countsTowardShare: true,
   };
 }
+
+describe("STORY-054 AC1 · domainClassSource (curation flag)", () => {
+  it("a domain on the curated list is 'curated', a subdomain-matched curated host included", () => {
+    expect(domainClassSource("reddit.com")).toBe("curated");
+    expect(domainClassSource("hub.docker.com")).toBe("curated");
+  });
+  it("a heuristic match and an unclassifiable domain are both 'heuristic' (queued for curation)", () => {
+    expect(domainClassSource("forum.example.org")).toBe("heuristic");
+    expect(domainClassSource("weird-unknown.io")).toBe("heuristic");
+  });
+});
