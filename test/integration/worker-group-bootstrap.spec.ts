@@ -37,6 +37,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     // STORY-076 / STORY-071 and STORY-077 R4 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "credit.housekeeping",
     "retention.purge",
+    // STORY-021 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "billing.customer_email",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],
