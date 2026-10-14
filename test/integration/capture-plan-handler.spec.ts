@@ -378,7 +378,7 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
         { pool: undefined, env: {} } as unknown as QueueHandlerContext,
         {
           cache: new InMemoryCacheAdapter(),
-          realtime: { toWorkspace: () => undefined, memberChanged: () => undefined },
+          realtime: { toWorkspace: () => undefined, toProject: () => undefined, memberChanged: () => undefined },
           enqueueParse: () => Promise.resolve(),
           enqueueRollup: () => Promise.resolve(),
         },

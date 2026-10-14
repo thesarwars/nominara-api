@@ -46,7 +46,11 @@ vi.mock("../../src/lib/capture/execute-cell.js", () => ({
   },
 }));
 
-const publisher: RealtimePublisher = { toWorkspace: () => undefined, memberChanged: () => undefined };
+const publisher: RealtimePublisher = {
+  toWorkspace: () => undefined,
+  toProject: () => undefined,
+  memberChanged: () => undefined,
+};
 
 describe("NEW-A-7 · rollup requested when the last cell fails terminally", () => {
   let container: StartedPostgreSqlContainer;

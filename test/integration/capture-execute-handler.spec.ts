@@ -76,6 +76,9 @@ function recordingPublisher(sink: Emission[]): RealtimePublisher {
     toWorkspace: (_workspaceId, event, payload) => {
       sink.push({ event, payload: payload as Record<string, unknown> });
     },
+    toProject: (_workspaceId, _projectId, event, payload) => {
+      sink.push({ event, payload: payload as Record<string, unknown> });
+    },
     memberChanged: () => undefined,
   };
 }
