@@ -568,6 +568,20 @@ describe("STORY-046 · the activation charge", () => {
     }
   });
 
+  it("PATCH — a change on a prompt that is NOT archived never charges, even when its row carries no activation fact", async () => {
+    // A row written by something other than this service (a seed, a restore) can be active with
+    // first_activated_at NULL. Pausing it is not an activation: only LEAVING `archived` is.
+    const project = await seedProject();
+    await seedPrompts(project, 10, { status: "active", activatedBefore: true });
+    const [orphan] = await seedPrompts(project, 1, { status: "active" });
+
+    const paused = await patch(orphan!, { status: "paused" });
+
+    expect(paused.credits_charged).toBe(0);
+    expect(await ledger()).toEqual([]);
+    expect(await promptRow(orphan!)).toMatchObject({ status: "paused", first_activated_at: null });
+  });
+
   it("PATCH — editing a CHARGED prompt's text carries the fact to the new row: reactivating it is free", async () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 11);
