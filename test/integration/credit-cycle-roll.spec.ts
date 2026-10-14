@@ -174,10 +174,12 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
     await wallet(ws, 1000);
     await inCtx(ws, (tx) => recordPurchase(tx, { workspaceId: ws, idempotencyKey: "pack-1", actorId: null, actorType: "system" }, 500));
 
-    await roll(ws, 1200);
+    // The roll must have HAPPENED, or "purchased untouched" is vacuously true.
+    expect((await roll(ws, 1200)).rolled).toBe(true);
 
     expect((await balances(ws)).purchased_balance).toBe(500);
     const expires = await entries(ws, ["expire"]);
+    expect(expires, "the unused included credits did expire").toHaveLength(1);
     expect(expires.every((e) => e.bucket === "included")).toBe(true);
     expect(await inCtx(ws, (tx) => verifyWorkspaceWallet(tx, ws))).toBeNull();
   });
