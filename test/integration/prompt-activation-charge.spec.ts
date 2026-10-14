@@ -534,6 +534,22 @@ describe("STORY-046 · the activation charge", () => {
     expect(await ledger()).toEqual([]);
   });
 
+  it("PATCH — a change that leaves the prompt archived (same status, a priority flag, a reworded text) charges nothing and records nothing", async () => {
+    const project = await seedProject();
+    await seedPrompts(project, 10, { status: "active", activatedBefore: true });
+    const [sameStatus, flagged, reworded] = await seedPrompts(project, 3);
+
+    const a = await patch(sameStatus!, { status: "archived" });
+    const b = await asTenant(() => lifecycle.update(flagged!, { is_priority: true }));
+    const c = await patch(reworded!, { text: "reworded but still a candidate" });
+
+    expect([a.credits_charged, b.credits_charged, c.credits_charged]).toEqual([0, 0, 0]);
+    expect(await ledger()).toEqual([]);
+    for (const id of [sameStatus!, flagged!, c.prompt_id]) {
+      expect(await promptRow(id)).toMatchObject({ status: "archived", first_activated_at: null, activation_credits: 0 });
+    }
+  });
+
   it("PATCH — editing a CHARGED prompt's text carries the fact to the new row: reactivating it is free", async () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 11);
