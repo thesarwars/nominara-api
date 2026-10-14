@@ -61,8 +61,8 @@ export interface InlineDebit {
 /** A key that is stable for a set of ids regardless of the order they were named in. */
 export function idempotencyKeyFor(prefix: string, scope: string, ids: readonly string[]): string {
   const digest = createHash("sha256").update([...ids].sort().join(",")).digest("hex");
-  // `join`, not a template literal: ISO-13 flags any `${a}:${b}:${c}` literal as a cache-key
-  // construction without the {env}:{workspace} namespace, and this is a ledger key.
+  // Built with join rather than a template literal: ISO-13's scanner reads a three-segment
+  // colon-separated template as a cache key lacking the env and workspace namespace, and this is a ledger key.
   return [prefix, scope, digest].join(":");
 }
 
