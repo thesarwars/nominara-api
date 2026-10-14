@@ -8,7 +8,7 @@
 // migration breaks the build in every service that reads it.
 
 import { sql } from "drizzle-orm";
-import { boolean, date, halfvec, jsonb, numeric, pgTable, primaryKey, real, smallint, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { boolean, date, halfvec, integer, jsonb, numeric, pgTable, primaryKey, real, smallint, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { bytea } from "./columns.js";
 
 export const promptStability = pgTable("prompt_stability", {
@@ -66,4 +66,6 @@ export const trackedPrompts = pgTable("tracked_prompts", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  firstActivatedAt: timestamp("first_activated_at", { withTimezone: true }),
+  activationCredits: integer("activation_credits").notNull().default(sql`0`),
 });
