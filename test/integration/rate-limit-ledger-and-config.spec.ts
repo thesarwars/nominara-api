@@ -233,6 +233,24 @@ describe("STORY-025 · rate limiting against the real credit ledger and the real
     expect(res.statusCode, res.body).toBe(429);
   });
 
+  it("STORY-025 AC11 · POST /projects/:id/runs is limited by the project_runs class: burst 2, then the third rapid request is refused with the 6/hour limit", async () => {
+    capture.ready = [ENGINE_KEY];
+    const s = await scenario({ prompts: 2, included: 2_400 });
+
+    const first = await trigger(s);
+    const second = await trigger(s);
+    const third = await trigger(s);
+
+    expect(first.statusCode, first.body).toBe(202);
+    expect(second.statusCode, second.body).toBe(202);
+    expect(first.headers["x-ratelimit-limit"], "the project_runs user bucket (6/hour) applied, not writes (60/min)").toBe("6");
+    expect(third.statusCode, third.body).toBe(429);
+    expect(third.json()).toMatchObject({ error: { code: "rate_limited" } });
+    expect(third.headers["x-ratelimit-limit"]).toBe("6");
+    expect(third.headers["x-ratelimit-remaining"]).toBe("0");
+    expect(Number(third.headers["retry-after"]), "a refill takes minutes (6/hour), not seconds (60/min)").toBeGreaterThan(60);
+  });
+
   // ---- /auth/otp/request keeps BOTH limits ---------------------------------------------------------------------
 
   it("STORY-025 decision · /auth/otp/request is refused by the §12 per-IP bucket (burst 5) over HTTP, with the standard headers, before the per-address ledger can speak", async () => {
