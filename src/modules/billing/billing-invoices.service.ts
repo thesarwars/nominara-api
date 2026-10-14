@@ -175,6 +175,22 @@ export class BillingInvoicesService {
   }
 
   /**
+   * STORY-021 / EC-15 — "no past-due invoice" before a workspace may change owner. Decision 2026-10-13: past due is ANY
+   * unpaid invoice past its due date. `invoices` stores no due date (Stripe's `due_date` is not mirrored — see the
+   * STORY-021 report), so "due" is the end of the invoiced period: an `open` or `uncollectible` invoice, with no
+   * `paid_at`, whose `period_end` has passed. RLS scopes the read to the context's workspace; no workspace predicate.
+   */
+  async hasPastDue(client: ClientBase): Promise<boolean> {
+    const result = await client.query<{ past_due: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM invoices
+          WHERE paid_at IS NULL AND status IN ('open', 'uncollectible') AND period_end < now()
+       ) AS past_due`,
+    );
+    return result.rows[0]!.past_due;
+  }
+
+  /**
    * `GET /v1/billing/invoices` — newest billing period first, `id` breaking ties.
    *
    * ⚠ NO `workspace_id` PREDICATE, ON PURPOSE: RLS scopes this to the context's

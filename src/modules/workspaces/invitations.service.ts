@@ -144,6 +144,24 @@ export class InvitationsService {
   }
 
   /**
+   * STORY-021 / EC-15 — ownership transfer: a pending invitation that would mint an owner or an admin was issued by
+   * the departing authority, so it is revoked; manager, analyst and viewer invitations are kept. Only PENDING rows
+   * (not accepted, not already revoked) are touched. Runs on the caller's context-carrying transaction.
+   */
+  async revokePendingPrivileged(workspaceId: string): Promise<number> {
+    const client = currentTenantStore()!.client;
+    const result = await client.query(
+      `UPDATE workspace_invitations
+          SET revoked_at = now()
+        WHERE workspace_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND role IN ('owner', 'admin')`,
+      [workspaceId],
+    );
+    const count = result.rowCount ?? 0;
+    this.logger.log(`privileged invitations revoked on ownership transfer workspace_id=${workspaceId} count=${String(count)}`);
+    return count;
+  }
+
+  /**
    * STORY-021 AC10/E-12 + STORY-172 — POST /workspaces/{id}/invitations/accept.
    * @SkipTenantContext(): the invitee is not yet a member of `workspaceId`,
    * so this opens its own transaction rather than reusing an ambient one.

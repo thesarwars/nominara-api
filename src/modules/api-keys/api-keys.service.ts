@@ -123,6 +123,20 @@ export class ApiKeysService {
     return toApiKey(updated.rows[0]!);
   }
 
+  /**
+   * STORY-021 / EC-15 — ownership transfer: "ALL keys, unconditionally. There is no retain option — a service
+   * credential minted by a departed owner is never carried over". Every still-live key of the context's workspace
+   * (RLS scopes the statement; there is deliberately no id list and no creator filter). Returns how many it revoked.
+   */
+  async revokeAll(): Promise<number> {
+    const { client, workspaceId } = this.store();
+    const result = await client.query(`UPDATE api_keys SET revoked_at = now() WHERE revoked_at IS NULL`);
+    const count = result.rowCount ?? 0;
+    if (count > 0) incrementCounter("nominara_api_key_revocations_total");
+    this.logger.log(`api keys revoked on ownership transfer workspace_id=${workspaceId} count=${String(count)}`);
+    return count;
+  }
+
   /** project_scope must be readable in this tenant context (RLS hides other workspaces' projects). */
   private async assertProjectsReadable(client: ClientBase, projectIds: readonly string[]): Promise<void> {
     const found = await client.query<{ id: string }>(`SELECT id FROM projects WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`, [projectIds]);

@@ -55,7 +55,7 @@ import { SessionService } from "./session.service.js";
     { provide: EMAIL_SENDER, useFactory: selectEmailSender },
   ],
   // NEW-D-7 — billing sends the auto-top-up emails through the same port.
-  exports: [SessionService, EMAIL_SENDER],
+  exports: [SessionService, IdentityService, EMAIL_SENDER],
 })
 export class IdentityModule {}
 

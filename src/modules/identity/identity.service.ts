@@ -11,7 +11,7 @@ import {
   type PublicKeyCredentialRequestOptionsJSON,
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
-import type { Pool } from "pg";
+import type { ClientBase, Pool } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -111,6 +111,20 @@ export class IdentityService {
     @Inject(PG_POOL) private readonly pool: Pool,
     private readonly sessions: SessionService,
   ) {}
+
+  /**
+   * STORY-021 / EC-15 — "a strong authenticator enrolled". The source of truth is `user_credentials`: a passkey (kind
+   * 'passkey', WebAuthn) that has not been revoked. An email one-time code is not a credential row at all, an OAuth /
+   * SAML / OIDC link is a login method and not an authenticator, and there is no TOTP in this system — so an
+   * OTP-only account has no row that counts. Takes the caller's client: `user_credentials` is global (no RLS).
+   */
+  async hasStrongAuthenticator(client: ClientBase, userId: string): Promise<boolean> {
+    const result = await client.query<{ strong: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM user_credentials WHERE user_id = $1 AND kind = 'passkey' AND revoked_at IS NULL) AS strong`,
+      [userId],
+    );
+    return result.rows[0]!.strong;
+  }
 
   /**
    * STORY-173 — POST /me/passkeys/options. Session-authenticated; the account

@@ -357,6 +357,23 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "autotopup:{workspace}:{yyyy_mm_dd_hh_mm}",
     tenantScoped: true,
   },
+  // ⚠ A QUEUE §4 DOES NOT CONTAIN, added by the same precedent. STORY-021 / EC-15: after an ownership transfer commits,
+  // the Stripe customer keeps its identity (same customer, same subscription, same invoices) and only its billing email
+  // is re-pointed to the new owner. A Stripe call may never be made on a request path (KAD-06), so the accept enqueues
+  // one signed tenant job after commit. The handler reads the LIVE owner and customer — the payload carries ids, never
+  // an address — so a redelivery, or a job that outlived a second transfer, converges on the current owner instead of
+  // writing a stale one. Same `rollup` group as the other billing-adjacent workers; setting the same email twice is a
+  // no-op at Stripe, so the ordinary short ladder is safe under redelivery.
+  {
+    name: "billing.customer_email",
+    producer: "ownership transfer accept, after commit (STORY-021; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 2,
+    retry: { delaysMs: doubling(3) },
+    priority: 6,
+    idempotencyKeyPattern: "custmail:{workspace}:{owner}:{transfer}",
+    tenantScoped: true,
+  },
   // ⚠ THE FIFTH QUEUE §4 DOES NOT CONTAIN, added by the same precedent. STORY-076 AC4 / STORY-071 AC10: purchased
   // credits expire FIFO twelve months after purchase (`plans-and-entitlements.md` §5) and `credit_daily_counters` rows
   // older than 35 days are purged nightly (`schemas/billing-and-credits.md`). `expireCredits` and `purgeDailyCounters`

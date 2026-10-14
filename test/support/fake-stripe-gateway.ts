@@ -207,6 +207,14 @@ export class FakeStripeGateway implements StripeGateway {
     return Promise.resolve({ url: `https://billing.stripe.test/p/session_${input.customerId}` });
   }
 
+  /** STORY-021 — customer billing-email re-points, in call order. */
+  readonly customerEmailUpdates: Array<{ customerId: string; email: string }> = [];
+  updateCustomerBillingEmail(input: { customerId: string; email: string }): Promise<void> {
+    if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
+    this.customerEmailUpdates.push(input);
+    return Promise.resolve();
+  }
+
   /** STORY-076b — add-on quantity changes and scheduled removals sent to Stripe, in call order. */
   readonly addonChanges: AddonChangeInput[] = [];
   readonly addonRemovals: AddonRemovalInput[] = [];

@@ -834,6 +834,18 @@ export class SessionService {
     ]);
   }
 
+  /**
+   * STORY-021 / EC-15 — ownership transfer: every live session of the named users is revoked ("add every session of
+   * the outgoing owner to the revocation list"; the decision extends it to the incoming owner). Runs on the CALLER's
+   * client so it commits with the role swap — there is no window in which the roles have changed and the departed
+   * owner's sessions are still valid. `sessions` is global (no RLS); the statement is bounded by `user_id`.
+   * `revoked_reason` is left NULL: the closed reason list is not widened for this slice, the audit row says why.
+   */
+  async revokeAllForUsers(client: ClientBase, userIds: readonly string[]): Promise<number> {
+    const result = await client.query(`UPDATE sessions SET revoked_at = now() WHERE user_id = ANY($1::uuid[]) AND revoked_at IS NULL`, [userIds]);
+    return result.rowCount ?? 0;
+  }
+
   /** Revokes the family and adds the current jti to the deny list for its remaining lifetime (sessions.revoked_at IS the deny list). */
   async logout(sid: string): Promise<void> {
     const client = await this.pool.connect();

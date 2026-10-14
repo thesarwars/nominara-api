@@ -56,3 +56,15 @@ export {
   invitationRevokeParamsSchema,
   type InvitationRevokeParams,
 } from "../../../../contracts/workspaces/invitation-revoke-params.schema.js";
+export {
+  transferOwnershipRequestSchema,
+  type TransferOwnershipRequest,
+} from "../../../../contracts/workspaces/transfer-ownership-request.schema.js";
+export {
+  transferOwnershipParamsSchema,
+  type TransferOwnershipParams,
+} from "../../../../contracts/workspaces/transfer-ownership-params.schema.js";
+export {
+  transferOwnershipResponseSchema,
+  type TransferOwnershipResponse,
+} from "../../../../contracts/workspaces/transfer-ownership-response.schema.js";

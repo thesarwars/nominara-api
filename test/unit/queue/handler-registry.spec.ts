@@ -62,6 +62,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
     expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual([
       "audit.verify",
       "billing.auto_topup",
+      "billing.customer_email",
       "capture.execute",
       "capture.parse",
       "capture.plan",
@@ -97,7 +98,9 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "source.verify_presence",
       // NEW-D-7 — declared after source.verify_presence in topology.ts.
       "billing.auto_topup",
-      // STORY-076 / STORY-071 and STORY-077 R4 — declared after billing.auto_topup in topology.ts.
+      // STORY-021 (ownership transfer) — declared after billing.auto_topup in topology.ts.
+      "billing.customer_email",
+      // STORY-076 / STORY-071 and STORY-077 R4 — declared after billing.customer_email in topology.ts.
       "credit.housekeeping",
       "retention.purge",
     ]);
