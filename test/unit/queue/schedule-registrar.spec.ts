@@ -258,3 +258,35 @@ describe("G12 · reconcileSchedules", () => {
     expect(good.upsertJobScheduler).toHaveBeenCalledOnce();
   });
 });
+
+describe("STORY-140 AC11 · the owner's crons meet the registrar", () => {
+  it("geo.analyze, gsc.sync and topic.cluster carry a cron but have no handler and are tenant-scoped, so a bare tick is refused and nothing is scheduled", async () => {
+    const queue = fakeQueue();
+
+    const result = await reconcileSchedules(
+      new Map([
+        ["geo.analyze", asQueue(queue)],
+        ["gsc.sync", asQueue(queue)],
+        ["topic.cluster", asQueue(queue)],
+      ]),
+    );
+
+    expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
+    expect(result.scheduled).toEqual([]);
+    expect(result.skippedInert.sort()).toEqual(["geo.analyze", "gsc.sync", "topic.cluster"]);
+  });
+
+  it("STORY-140 AC11 · crawl.audit and report.build never get a scheduler registered, whatever the registrar is given", async () => {
+    const queue = fakeQueue();
+
+    const result = await reconcileSchedules(
+      new Map([
+        ["crawl.audit", asQueue(queue)],
+        ["report.build", asQueue(queue)],
+      ]),
+    );
+
+    expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
+    expect(result.scheduled).toEqual([]);
+  });
+});
