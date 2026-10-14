@@ -58,6 +58,8 @@ interface Drive {
   readonly identity: RateLimitIdentity;
   readonly stepMs: number;
   readonly requests: number;
+  /** One user spread across workspaces and addresses, so only the user-scoped buckets can bind. */
+  readonly spread?: boolean;
 }
 
 /**
@@ -145,7 +147,10 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
     let allowed = 0;
     let refusedByHardCap = false;
     for (let i = 0; i < drive.requests; i++) {
-      const decision = await s.check(drive.routeClass, drive.identity);
+      const identity = drive.spread
+        ? { ...drive.identity, workspaceId: `0192f1a0-0000-7000-8000-${String(i).padStart(12, "0")}`, ip: `203.0.113.${String(i)}` }
+        : drive.identity;
+      const decision = await s.check(drive.routeClass, identity);
       if (decision.allowed) allowed += 1;
       else if (decision.exhausted?.hardCap === true) refusedByHardCap = true;
       clock.ms += drive.stepMs;
@@ -158,6 +163,13 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
   const cappedTiers = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "capture_backed_tools_capped_tiers")!;
   const reads = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "reads")!;
   const writes = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "writes")!;
+  const authClass = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "auth")!;
+  /** `writes` requests 10/s: the user bucket (default 1/s) is what limits, so a changed user rate is visible. */
+  const PACED_WRITES: Drive = { ...WRITES_DRIVE, identity: userCaller, stepMs: 100, requests: 200 };
+  const scaleUser = (
+    config: (typeof RATE_LIMIT_DEFAULTS)[number],
+    patch: { limit?: number; window_ms?: number },
+  ): unknown[] => config.buckets.map((bucket) => (bucket.scope === "user" ? { ...bucket, ...patch } : bucket));
   const projectRuns = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "project_runs")!;
 
   // Each schema-valid probe PASSES rateLimitConfigSchema (asserted below). The two numeric ones keep the default bucket
@@ -208,7 +220,7 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
         ...cappedTiers,
         buckets: cappedTiers.buckets.filter((bucket) => bucket.window !== "utc_day"),
       }),
-      { routeClass: "capture_backed_tools_capped_tiers", identity: userCaller, stepMs: 61_000, requests: 8 },
+      { routeClass: "capture_backed_tools_capped_tiers", identity: userCaller, stepMs: 61_000, requests: 8, spread: true },
     ],
     [
       "schema-valid, reads at limit 1 / window 9e15 ms (effectively zero refill)",
@@ -226,13 +238,125 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
       }),
       { ...WRITES_DRIVE, identity: userCaller },
     ],
+    // ---- One row per envelope CONDITION. Each keeps the default bucket set and changes exactly ONE value. ----
+    [
+      "schema-valid, project_runs burst alone at 1e9 (burst check)",
+      documentWith("project_runs", { ...projectRuns, burst: 1_000_000_000 }),
+      { routeClass: "project_runs", identity: userCaller, stepMs: 0, requests: 50 },
+    ],
+    [
+      "schema-valid, auth ip bucket rescoped to workspace, two buckets kept (scope check)",
+      documentWith("auth", {
+        ...authClass,
+        buckets: authClass.buckets.map((bucket) => (bucket.scope === "ip" ? { ...bucket, scope: "workspace" } : bucket)),
+      }),
+      { routeClass: "auth", identity: preAuth, stepMs: 0, requests: 50 },
+    ],
+    [
+      "schema-valid, a writes rolling workspace bucket changed to utc_day, no window_ms (window_ms presence)",
+      documentWith("writes", {
+        ...writes,
+        buckets: writes.buckets.map((bucket) =>
+          bucket.scope === "workspace" ? { scope: "workspace", limit: bucket.limit, window: "utc_day", hard_cap: false } : bucket,
+        ),
+      }),
+      { ...WRITES_DRIVE, identity: userCaller, stepMs: 1_000, requests: 300 },
+    ],
+    [
+      "schema-valid, the capped-tier utc_day hard cap changed to a rolling 24 h bucket (window check)",
+      documentWith("capture_backed_tools_capped_tiers", {
+        ...cappedTiers,
+        buckets: cappedTiers.buckets.map((bucket) =>
+          bucket.window === "utc_day" ? { ...bucket, window: "rolling", window_ms: 86_400_000 } : bucket,
+        ),
+      }),
+      { routeClass: "capture_backed_tools_capped_tiers", identity: userCaller, stepMs: 61_000, requests: 8, spread: true },
+    ],
+    [
+      "schema-valid, writes user limit alone at default x11 (limit upper bound)",
+      documentWith("writes", { ...writes, buckets: scaleUser(writes, { limit: 660 }) }),
+      PACED_WRITES,
+    ],
+    [
+      "schema-valid, writes user limit alone at default/11, rounded down (limit lower bound)",
+      documentWith("writes", { ...writes, buckets: scaleUser(writes, { limit: Math.max(1, Math.floor(60 / 11)) }) }),
+      PACED_WRITES,
+    ],
+    [
+      "schema-valid, writes user window_ms alone at default x11 (window_ms upper bound)",
+      documentWith("writes", { ...writes, buckets: scaleUser(writes, { window_ms: 660_000 }) }),
+      PACED_WRITES,
+    ],
+    [
+      "schema-valid, writes user window_ms alone at default/11, rounded down (window_ms lower bound)",
+      documentWith("writes", { ...writes, buckets: scaleUser(writes, { window_ms: Math.floor(60_000 / 11) }) }),
+      PACED_WRITES,
+    ],
+    [
+      "schema-valid, writes limit x11 with window_ms x10, so the RATE is inside its bound (limit check, rate-blind)",
+      documentWith("writes", { ...writes, buckets: scaleUser(writes, { limit: 660, window_ms: 600_000 }) }),
+      PACED_WRITES,
+    ],
+    [
+      "schema-valid, writes limit/11 with window_ms/10, so the RATE is inside its bound (limit check, rate-blind)",
+      documentWith("writes", { ...writes, buckets: scaleUser(writes, { limit: 5, window_ms: 6_000 }) }),
+      PACED_WRITES,
+    ],
+    [
+      "schema-valid, writes window_ms x11 with limit x10, so the RATE is inside its bound (window_ms check, rate-blind)",
+      documentWith("writes", { ...writes, buckets: scaleUser(writes, { limit: 600, window_ms: 660_000 }) }),
+      PACED_WRITES,
+    ],
+    [
+      "schema-valid, writes window_ms/11 with limit/10, so the RATE is inside its bound (window_ms check, rate-blind)",
+      documentWith("writes", { ...writes, buckets: scaleUser(writes, { limit: 6, window_ms: Math.floor(60_000 / 11) }) }),
+      PACED_WRITES,
+    ],
+    [
+      "schema-valid, writes burst alone at default/11, rounded down (burst lower bound)",
+      documentWith("writes", { ...writes, burst: Math.max(1, Math.floor(DEFAULT_WRITES_BURST / 11)) }),
+      { ...WRITES_DRIVE, identity: userCaller },
+    ],
+    [
+      "schema-valid, writes burst alone at default x11 (burst upper bound)",
+      documentWith("writes", { ...writes, burst: DEFAULT_WRITES_BURST * 11 }),
+      { ...WRITES_DRIVE, identity: userCaller },
+    ],
+    [
+      "schema-valid, writes gains a second workspace bucket, its scope already present (length check)",
+      documentWith("writes", {
+        ...writes,
+        buckets: [...writes.buckets, { scope: "workspace", limit: 6, window: "rolling", window_ms: 3_600_000, hard_cap: false }],
+      }),
+      { ...WRITES_DRIVE, identity: userCaller, stepMs: 10_000, requests: 100 },
+    ],
+    [
+      "schema-valid, project_runs at 600/h per user: limit x10 and window_ms /10 each inside their bound, rate x100 (rate bound)",
+      documentWith("project_runs", {
+        ...projectRuns,
+        burst: 20,
+        buckets: [
+          { scope: "user", limit: 60, window: "rolling", window_ms: 360_000, hard_cap: false },
+          { scope: "workspace", limit: 300, window: "rolling", window_ms: 360_000, hard_cap: false },
+        ],
+      }),
+      { routeClass: "project_runs", identity: userCaller, stepMs: 0, requests: 50 },
+    ],
   ];
 
-  it("STORY-025 AC10 · the five envelope probes are SCHEMA-VALID, so only the envelope can refuse them", () => {
+  it("STORY-025 AC10 · every envelope probe is SCHEMA-VALID and, if it were enforced, would observably differ from the defaults", async () => {
     const probes = invalid.filter(([name]) => name.startsWith("schema-valid"));
-    expect(probes).toHaveLength(5);
-    for (const [name, body] of probes) {
-      expect(() => rateLimitConfigSchema.parse(JSON.parse(body)), name).not.toThrow();
+    expect(probes.length).toBeGreaterThanOrEqual(5);
+    for (const [name, body, drive = WRITES_DRIVE] of probes) {
+      const document = rateLimitConfigSchema.parse(JSON.parse(body)); // throws: not schema-valid
+      clock.ms = Date.UTC(2026, 9, 14, 12, 0, 0);
+      const control = await observe(subject(new InMemoryCacheAdapter(() => clock.ms)), drive);
+      clock.ms = Date.UTC(2026, 9, 14, 12, 0, 0);
+      const ifEnforced = await observe(
+        new RateLimitBuckets(new InMemoryCacheAdapter(() => clock.ms), document, () => clock.ms),
+        drive,
+      );
+      expect(ifEnforced, `${name}: a probe that behaves like the defaults proves nothing`).not.toEqual(control);
     }
   });
 
