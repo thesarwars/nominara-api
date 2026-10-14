@@ -60,17 +60,27 @@ interface Drive {
   readonly requests: number;
 }
 
+/**
+ * Planted wherever a document can carry free text (a malformed body, a wrong-shaped value, an unknown key). A
+ * schema-valid document is strict and cannot hold stray text, so for those the check is the serialized body itself.
+ */
+const SENTINEL = "SENTINEL-7c1f9e4a-document-body-must-never-be-logged";
+
 const WRITES_DRIVE: Drive = { routeClass: "writes", identity: { ...IDENTITY, userId: "u" }, stepMs: 0, requests: 50 };
 
 describe("STORY-025 AC10 · bucket configuration is data", () => {
   let clock: { ms: number };
   let cache: InMemoryCacheAdapter;
   let warn: ReturnType<typeof vi.spyOn>;
+  let log: ReturnType<typeof vi.spyOn>;
+  let error: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     clock = { ms: Date.UTC(2026, 9, 14, 12, 0, 0) };
     cache = new InMemoryCacheAdapter(() => clock.ms);
     warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    error = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
   });
   afterEach(() => {
     vi.restoreAllMocks();
@@ -84,6 +94,15 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
       if (!(await s.check("writes", { ...IDENTITY, userId })).allowed) return i;
     }
     return cap;
+  }
+
+  /** No logger call, at any level, carries the sentinel, the serialized body or a structural token of the document. */
+  function expectNoBodyLogged(body: string): void {
+    const logged = JSON.stringify([log.mock.calls, warn.mock.calls, error.mock.calls]);
+    expect(logged, "the sentinel is never logged").not.toContain(SENTINEL);
+    // Under 16 characters the "body" ("[]") is a substring of any serialized call list, so it proves nothing.
+    if (body.length >= 16) expect(logged, "the document body is never logged").not.toContain(JSON.stringify(body).slice(1, -1));
+    expect(logged, "no field of the document is logged").not.toContain("route_class");
   }
 
   async function putDocument(body: string): Promise<void> {
@@ -144,8 +163,8 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
   // Each schema-valid probe PASSES rateLimitConfigSchema (asserted below). The two numeric ones keep the default bucket
   // set, so ONLY the factor bound can reject them.
   const invalid: Array<[string, string, Drive?]> = [
-    ["not JSON", "{not json"],
-    ["JSON of the wrong shape", JSON.stringify({ writes: 1 })],
+    ["not JSON", `{not json ${SENTINEL}`],
+    ["JSON of the wrong shape", JSON.stringify({ writes: SENTINEL })],
     ["an empty list (every class missing = no limits)", "[]"],
     [
       "a class missing",
@@ -163,7 +182,7 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
     ],
     [
       "an unknown key",
-      JSON.stringify(RATE_LIMIT_DEFAULTS.map((entry) => ({ ...entry, unlimited: true }))),
+      JSON.stringify(RATE_LIMIT_DEFAULTS.map((entry) => ({ ...entry, unlimited: true, [SENTINEL]: SENTINEL }))),
     ],
     [
       "schema-valid, auth with only workspace buckets (pre-auth sign-in unlimited)",
@@ -229,6 +248,17 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
     const logged = JSON.stringify(warn.mock.calls);
     expect(logged).toContain("rate-limit config");
     expect(logged, "the document body is not echoed into the log").not.toContain("unlimited");
+    expectNoBodyLogged(body);
+  });
+
+  it("STORY-025 AC10 · the HEALTHY path logs the source change without the document body", async () => {
+    const body = documentWithTightWrites();
+    await putDocument(body);
+    await subject().check("writes", IDENTITY);
+
+    expect(log, "control: the healthy path does log its source").toHaveBeenCalled();
+    expect(JSON.stringify(log.mock.calls)).toContain("document");
+    expectNoBodyLogged(body);
   });
 
   it("STORY-025 AC10 · an UNREADABLE cache falls back to the code defaults, logged, and still limits", async () => {
