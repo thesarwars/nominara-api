@@ -8,6 +8,7 @@ import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { RECHAINED_MARKER_ACTION } from "../../lib/crypto/audit-chain.js";
 import { pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
+import { appendMark, appendTombstone, findBrokenMark, readChainHead } from "../../modules/audit/audit-chain-marks.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { listPartitions } from "./maintenance.js";
@@ -263,6 +264,11 @@ export async function executeWorkspaceHardDelete(
   // step is needed or run on that path.
   await privilegedClient.query("BEGIN");
   try {
+    // STORY-143 AC7 — a tombstone, in the SAME transaction as the delete, so
+    // the verifier either sees the chain and no tombstone, or neither. Without
+    // it the vanished chain is indistinguishable from a deleted one and the
+    // next verifier run pages on a deletion that was the intended outcome.
+    await appendTombstone(privilegedClient, workspaceId);
     await privilegedClient.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger DISABLE TRIGGER reject_update_delete");
     // audit_log carries NO foreign key from workspaces (deliberately — see
@@ -409,6 +415,15 @@ export async function requestIndividualErasure(privilegedClient: ClientBase, use
     // UPDATE/DELETE, never INSERT — so this runs fine with the trigger
     // already re-enabled above.
     for (const { workspace_id: affectedWorkspaceId } of affectedWorkspaces.rows) {
+      // STORY-143 AC7 — never rechain over a chain that already fails its marks.
+      // A `rechain` mark at a new head would otherwise launder a prior tail
+      // truncation. Throwing rolls the whole erasure back; the verifier pages.
+      const broken = await findBrokenMark(privilegedClient, affectedWorkspaceId);
+      if (broken !== null) {
+        throw new Error(
+          `erasure rechain refused for workspace ${affectedWorkspaceId}: audit chain fails its high-water mark at seq ${broken.seq} (${broken.present ? "mark_hash_mismatch" : "chain_truncated"})`,
+        );
+      }
       await auditChain.append(privilegedClient, {
         workspaceId: affectedWorkspaceId,
         actorType: "system",
@@ -424,6 +439,16 @@ export async function requestIndividualErasure(privilegedClient: ClientBase, use
         supportGrantId: null,
         severity: "notice",
       });
+      // STORY-143 AC7 — the head moved on purpose; say so in the same
+      // transaction. Appending the marker advanced the chain, so the verifier's
+      // previous mark is still satisfied, but the NEW head is a promise too:
+      // deleting the marker row afterwards is exactly how a forged rechain is
+      // undone, and only a mark at the marker row can see it.
+      const head = await readChainHead(privilegedClient, affectedWorkspaceId);
+      if (head === null) {
+        throw new Error(`erasure rechain for workspace ${affectedWorkspaceId} appended a marker but found no chain head`);
+      }
+      await appendMark(privilegedClient, affectedWorkspaceId, head, "rechain");
     }
 
     await privilegedClient.query("COMMIT");

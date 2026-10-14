@@ -11,6 +11,15 @@ import { sql } from "drizzle-orm";
 import { bigint, inet, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { bytea } from "./columns.js";
 
+export const auditChainMarks = pgTable("audit_chain_marks", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: uuid("workspace_id").notNull(),
+  maxSeq: bigint("max_seq", { mode: "bigint" }),
+  rowHash: bytea("row_hash"),
+  checkedAt: timestamp("checked_at", { withTimezone: true }).notNull().default(sql`now()`),
+  reason: text("reason").notNull(),
+});
+
 export const auditLog = pgTable("audit_log", {
   seq: bigint("seq", { mode: "bigint" }).primaryKey().default(sql`nextval('audit_log_seq_seq'::regclass)`),
   workspaceId: uuid("workspace_id").notNull(),

@@ -104,6 +104,14 @@ export const GLOBAL_TABLES = [
   // GRANT-protected like the auth tables: only the API's webhook route
   // (nominara_app) writes it. Migration 0048_stripe_webhook_events.up.sql.
   "stripe_webhook_events",
+  // STORY-143 AC7 — the audit chain's append-only high-water marks. Carries a
+  // `workspace_id` column but is NOT tenant data: platform integrity state
+  // written only by the verifier's / erasure / deletion jobs' owner
+  // connection, GRANT-protected with NO privilege for any runtime role (see
+  // expectedTablePrivileges). No RLS policy: a tenant policy would imply the
+  // table is reachable and merely filtered, and no FK to workspaces so a
+  // tombstone outlives its workspace. Migration 0123_audit_chain_marks.up.sql.
+  "audit_chain_marks",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -419,6 +427,9 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
   ) {
     return role === "nominara_app" ? FULL_WRITE : NO_PRIVILEGES;
   }
+  // STORY-143 AC7 — owner-only: not even SELECT. A mark readable by the
+  // application is a mark the application can learn how to forge around.
+  if (table === "audit_chain_marks") return NO_PRIVILEGES;
   if (table === "audit_log") {
     if (role === "nominara_app" || role === "nominara_worker") return APPEND_ONLY;
     if (role === "nominara_report" || role === "nominara_portal") return READ_ONLY;
