@@ -1,7 +1,6 @@
 import { fileURLToPath } from "node:url";
 import type { Client, ClientBase } from "pg";
 import {
-  COLD_TABLESPACE,
   HNSW_INDEXED_TABLES,
   HNSW_REBUILD_EF_CONSTRUCTION,
   HOT_WINDOW_DAYS,
@@ -247,7 +246,7 @@ export async function ensureAllPartitions(
  * against any statement added between the two later that CAN throw. It is not
  * pinned by a test, and nothing here pretends otherwise.
  *
- * Deliberately does NOT move cold partitions, detach, drop, reindex or
+ * Deliberately does NOT detach, drop, reindex or
  * analyse. See `runMonthlyMaintenance` and STORY-142's cadence note.
  */
 export interface RunwayMaintenanceResult {
@@ -364,7 +363,7 @@ export async function catchUpDefaultPartition(client: ClientBase, table: Partiti
 }
 
 // ---------------------------------------------------------------------------
-// Partition bound discovery — shared by cold-tier move, detach/drop, ANALYZE,
+// Partition bound discovery — shared by detach/drop, ANALYZE,
 // and retention.ts's orphan scan (imported from there, not reimplemented).
 // ---------------------------------------------------------------------------
 
@@ -398,58 +397,6 @@ export async function listPartitions(client: ClientBase, table: string): Promise
     [table],
   );
   return result.rows.map((row) => parsePartitionBound(row.relname, table, row.bound));
-}
-
-// ---------------------------------------------------------------------------
-// Cold-tier move — data-model.md §8 step 2.
-// ---------------------------------------------------------------------------
-
-async function isOnColdTablespace(client: ClientBase, relname: string): Promise<boolean> {
-  const result = await client.query<{ spcname: string | null }>(
-    "SELECT t.spcname FROM pg_class c LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace WHERE c.relname = $1",
-    [relname],
-  );
-  return result.rows[0]?.spcname === COLD_TABLESPACE;
-}
-
-async function tablespaceExists(client: ClientBase, name: string): Promise<boolean> {
-  const result = await client.query("SELECT 1 FROM pg_tablespace WHERE spcname = $1", [name]);
-  return (result.rowCount ?? 0) > 0;
-}
-
-export async function moveColdPartitions(
-  client: ClientBase,
-  referenceDate: Date = new Date(),
-  hotWindowDays: number = HOT_WINDOW_DAYS,
-): Promise<string[]> {
-  const cutoff = new Date(referenceDate.getTime() - hotWindowDays * 86_400_000);
-  const moved: string[] = [];
-  // ⚠ THE TABLESPACE IS PROVISIONED OUTSIDE MIGRATIONS AND USUALLY IS NOT.
-  // `grep -rn cold_tier docker docker-compose.yml scripts src/db/migrations`
-  // finds nothing, and a freshly migrated database has no `cold_tier`. Before
-  // STORY-142 that surfaced as an error on an operator's terminal the first
-  // time a partition aged past the hot window; once this runs unattended it
-  // would be a throw, every run, forever — and a throw here would take
-  // everything after it down too. A missing cold tier means "no cold tier to
-  // move to", which is a fact about the deployment, not a failure of the run.
-  const coldTierExists = await tablespaceExists(client, COLD_TABLESPACE);
-  if (!coldTierExists) {
-    return moved;
-  }
-  for (const table of PARTITIONED_FACT_TABLES) {
-    for (const partition of await listPartitions(client, table)) {
-      if (partition.isDefault || !partition.to || partition.to > cutoff) {
-        continue;
-      }
-      if (await isOnColdTablespace(client, partition.name)) {
-        continue;
-      }
-      await client.query(`ALTER TABLE ${quoteIdent(partition.name)} SET TABLESPACE ${quoteIdent(COLD_TABLESPACE)}`);
-      await client.query(`ALTER TABLE ${quoteIdent(partition.name)} SET (fillfactor = 100)`);
-      moved.push(partition.name);
-    }
-  }
-  return moved;
 }
 
 // ---------------------------------------------------------------------------
@@ -711,7 +658,6 @@ export interface MaintenanceOptions {
 export interface MaintenanceResult {
   readonly partitionsCreated: readonly string[];
   readonly defaultPartitionAlerts: readonly DefaultPartitionAlert[];
-  readonly coldTierMoved: readonly string[];
   readonly dropped: readonly DroppedPartitionGroup[];
   readonly recallChecks: readonly RecallCheckResult[];
   readonly analyzed: readonly string[];
@@ -724,11 +670,10 @@ export async function runMonthlyMaintenance(client: Client, options: Maintenance
     const referenceDate = options.referenceDate ?? new Date();
     const { created: partitionsCreated, failures: partitionFailures } = await ensureAllPartitions(client, referenceDate);
     const defaultPartitionAlerts = await detectDefaultPartitionRows(client);
-    const coldTierMoved = await moveColdPartitions(client, referenceDate);
     const dropped = await detachAndDropPartitions(client, referenceDate);
     const recallChecks = await checkAndRebuildVectorIndexes(client);
     const analyzed = await analyzeActivePartitions(client, referenceDate);
-    return { partitionsCreated, partitionFailures, defaultPartitionAlerts, coldTierMoved, dropped, recallChecks, analyzed };
+    return { partitionsCreated, partitionFailures, defaultPartitionAlerts, dropped, recallChecks, analyzed };
   });
 }
 

@@ -362,11 +362,8 @@ export type PartitionedFactTable = (typeof PARTITIONED_FACT_TABLES)[number];
 /** How many months AHEAD of the current month app.ensure_partitions-equivalent logic creates — data-model.md §5. */
 export const PARTITION_LEAD_MONTHS = 3;
 
-/** data-model.md §8 step 2 — partitions older than this move to COLD_TABLESPACE with fillfactor=100. */
+/** data-model.md §8 — partitions older than this are no longer "active" for ANALYZE. (The cold-tier move that also used it was removed by STORY-142: `cold_tier` is not provisioned.) */
 export const HOT_WINDOW_DAYS = 90;
-
-/** data-model.md §8 step 2. Provisioned outside migrations (a physical filesystem location, environment-specific — see this story's Implementation Decisions), never created by a portable migration. */
-export const COLD_TABLESPACE = "cold_tier";
 
 export interface VacuumTuning {
   readonly vacuumScaleFactor: number;

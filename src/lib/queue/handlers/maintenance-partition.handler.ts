@@ -26,7 +26,7 @@ import type { JobProcessor } from "../worker-factory.js";
 
 // ⚠ THIS TICK DOES THE RUNWAY HALF ONLY, AND THE SPLIT IS THE REVIEW'S DOING.
 // The first cut ran the whole of `runMonthlyMaintenance` daily, which also
-// moves cold partitions, DETACHES AND DROPS past retention, rebuilds vector
+// DETACHES AND DROPS past retention, rebuilds vector
 // indexes and analyses. Three reasons that was wrong, and none of them showed
 // up in a test:
 //

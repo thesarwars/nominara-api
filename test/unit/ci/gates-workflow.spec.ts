@@ -87,6 +87,7 @@ const NOT_A_GATE: Readonly<Record<string, string>> = {
   "db:seed-demo": "a dev-only operator CLI; mutates a database (behind its own NODE_ENV/local-host/opt-in guard — see src/db/seed/demo/guard.ts)",
   "db:maintenance:run": "an operational job",
   "db:maintenance:sweep": "an operational job",
+  "db:maintenance:catch-up": "an operator-only job that moves rows out of a _default partition under lock; deliberately never scheduled (STORY-142)",
   "identity:sweep-unverified": "an operational job that deletes stale unverified accounts; not yet on a queue schedule (STORY-173)",
   "credits:verify": "an operational job against a live ledger",
   "credits:reconcile": "an operational job against a live ledger",

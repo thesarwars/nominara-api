@@ -15,12 +15,12 @@ import {
   ensurePartitionsForTable,
   listPartitions,
   MAINTENANCE_LOCK_KEY,
-  moveColdPartitions,
   releaseAdvisoryLock,
   resolveDetachDropCutoffDays,
   runMonthlyMaintenance,
 } from "../../src/workers/rollup/maintenance.js";
-import { COLD_TABLESPACE, VECTOR_RECALL_THRESHOLD } from "../../src/db/conventions.js";
+import { runCatchUp } from "../../src/workers/rollup/catch-up-default-partition.js";
+import { VECTOR_RECALL_THRESHOLD } from "../../src/db/conventions.js";
 
 // STORY-013 · partition & vacuum maintenance — Test Scenarios 1-7 + widen
 // pass. One shared container, full migration chain applied ONCE (mirrors
@@ -28,7 +28,7 @@ import { COLD_TABLESPACE, VECTOR_RECALL_THRESHOLD } from "../../src/db/conventio
 // per test so schema-level partition mutations never collide across tests.
 //
 // Runtime-role note (qa-reviewer blocking #4): every function this file
-// tests (ensurePartitionsForTable, moveColdPartitions,
+// tests (ensurePartitionsForTable,
 // detachAndDropPartitions, checkAndRebuildVectorIndexes,
 // analyzeActivePartitions, catchUpDefaultPartition, ...) issues DDL —
 // CREATE TABLE ... PARTITION OF, ALTER TABLE ... SET TABLESPACE/storage
@@ -54,13 +54,9 @@ describe("STORY-013 · partition & vacuum maintenance", () => {
       .withPassword("nominara")
       .start();
 
-    const tablespaceDir = `/tmp/nominara_${COLD_TABLESPACE}`;
-    await container.exec(["sh", "-c", `mkdir -p ${tablespaceDir} && chown postgres:postgres ${tablespaceDir}`]);
-
     client = new Client({ connectionString: container.getConnectionUri() });
     await client.connect();
     await migrateUp(client, MIGRATIONS_DIR);
-    await client.query(`CREATE TABLESPACE ${COLD_TABLESPACE} LOCATION '${tablespaceDir}'`);
   }, 180_000);
 
   afterAll(async () => {
@@ -281,29 +277,28 @@ describe("STORY-013 · partition & vacuum maintenance", () => {
     expect(Number(inCorrectPartition.rows[0]!.count)).toBe(1);
   });
 
-  // -- Cold-tier move ---------------------------------------------------------
+  // -- STORY-142 — the operator-only catch-up script --------------------------
 
-  it("cold-tier move · a partition past the 90-day hot window moves to the cold tablespace with fillfactor=100", async () => {
-    const referenceDate = new Date("2036-06-01T00:00:00.000Z");
-    // Create a partition whose upper bound is well past the 90-day hot window relative to referenceDate.
-    await ensurePartitionsForTable(client, "answer_captures", new Date("2036-01-01T00:00:00.000Z"), 0);
+  it("STORY-142 AC9 · the ops entry point moves stranded rows out of default, for the named table only", async () => {
+    const workspaceId = await createWorkspace();
+    const projectId = await createProject(workspaceId);
+    const capturedAt = new Date("2036-03-20T00:00:00.000Z");
+    const captureId = await insertCapture(workspaceId, projectId, capturedAt);
 
-    const moved = await moveColdPartitions(client, referenceDate);
-    expect(moved).toContain("answer_captures_2036_01");
+    const results = await runCatchUp(client, ["answer_captures"]);
 
-    const result = await client.query<{ spcname: string | null; reloptions: string[] | null }>(
-      `SELECT t.spcname, c.reloptions FROM pg_class c LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
-        WHERE c.relname = 'answer_captures_2036_01'`,
-    );
-    expect(result.rows[0]!.spcname).toBe(COLD_TABLESPACE);
-    expect(result.rows[0]!.reloptions ?? []).toContain("fillfactor=100");
+    expect(results).toEqual([{ table: "answer_captures", partitions: expect.arrayContaining(["answer_captures_2036_03"]) }]);
+    const stillInDefault = await client.query("SELECT 1 FROM answer_captures_default WHERE id = $1", [captureId]);
+    expect(stillInDefault.rowCount).toBe(0);
+    const inPartition = await client.query("SELECT 1 FROM answer_captures_2036_03 WHERE id = $1", [captureId]);
+    expect(inPartition.rowCount).toBe(1);
   });
 
-  it("cold-tier move · a partition still inside the hot window is left alone", async () => {
-    const referenceDate = new Date("2037-06-01T00:00:00.000Z");
-    await ensurePartitionsForTable(client, "answer_captures", referenceDate, 0);
-    const moved = await moveColdPartitions(client, referenceDate);
-    expect(moved).not.toContain("answer_captures_2037_06");
+  it("STORY-142 AC10 · a monthly run reports no cold-tier step and does not need a cold_tier tablespace", async () => {
+    const tablespace = await client.query("SELECT 1 FROM pg_tablespace WHERE spcname = 'cold_tier'");
+    expect(tablespace.rowCount).toBe(0);
+    const result = await runMonthlyMaintenance(client, { referenceDate: new Date("2037-06-01T00:00:00.000Z") });
+    expect(Object.keys(result)).not.toContain("coldTierMoved");
   });
 
   // -- Test Scenario 6 — synchronized detach + drop --------------------------

@@ -103,7 +103,7 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   //
   // ⚠ AND THE TICK RUNS ONLY THE RUNWAY HALF. `maintenance-partition.handler.ts`
   // calls `runPartitionRunwayMaintenance`, not `runMonthlyMaintenance`: the
-  // destructive parts (cold-tier moves, detach/drop past retention, vector
+  // destructive parts (detach/drop past retention, vector
   // index rebuilds) stay operator-invoked. The drop cutoff is the MINIMUM
   // retention across ACTIVE workspaces, so one reversible soft-delete
   // collapses it platform-wide — at monthly there was up to a month to notice
