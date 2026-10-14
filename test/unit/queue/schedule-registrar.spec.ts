@@ -114,13 +114,13 @@ describe("G12 · reconcileSchedules", () => {
   });
 
   it("⚠ schedules nothing for a queue whose cadence states no time", async () => {
-    // `topic.cluster` says "cron weekly" and names neither a day nor an hour.
-    // Scheduling it would mean inventing both. (`maintenance.partition` stood
+    // `crawl.audit` is on demand only (STORY-140 AC11): a null cron means
+    // nothing is registered. (`topic.cluster` stood here until STORY-140 gave it Sunday 05:00.) (`maintenance.partition` stood
     // here until STORY-142 chose an hour for it — deliberately, and for a
     // reason recorded in `schedule.spec.ts`'s divergence list.)
     const queue = fakeQueue();
 
-    const result = await reconcileSchedules(new Map([["topic.cluster", asQueue(queue)]]));
+    const result = await reconcileSchedules(new Map([["crawl.audit", asQueue(queue)]]));
 
     expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
     expect(result.scheduled).toEqual([]);
@@ -273,7 +273,7 @@ describe("STORY-140 AC11 · the owner's crons meet the registrar", () => {
 
     expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
     expect(result.scheduled).toEqual([]);
-    expect(result.skippedInert.sort()).toEqual(["geo.analyze", "gsc.sync", "topic.cluster"]);
+    expect([...result.skippedInert].sort()).toEqual(["geo.analyze", "gsc.sync", "topic.cluster"]);
   });
 
   it("STORY-140 AC11 · crawl.audit and report.build never get a scheduler registered, whatever the registrar is given", async () => {
