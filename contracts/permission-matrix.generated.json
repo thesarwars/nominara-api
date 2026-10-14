@@ -1,0 +1,916 @@
+{
+  "version": 1,
+  "roles": [
+    "owner",
+    "admin",
+    "manager",
+    "analyst",
+    "viewer"
+  ],
+  "permissions": [
+    "workspace:read",
+    "workspace:update",
+    "workspace:delete",
+    "workspace:transfer_ownership",
+    "member:invite",
+    "member:update_role",
+    "member:remove",
+    "billing:read",
+    "billing:write",
+    "credits:spend",
+    "sso:configure",
+    "apikey:create",
+    "project:create",
+    "project:read",
+    "project:update",
+    "project:delete",
+    "prompt:write",
+    "tracking:trigger",
+    "tracking:read",
+    "lookup:execute",
+    "lookup:read_history",
+    "aux:trigger",
+    "aux:read",
+    "task:create",
+    "task:move",
+    "task:comment",
+    "task:read",
+    "optimizer:use",
+    "agency:branding",
+    "agency:custom_domain",
+    "share_token:mint",
+    "share_token:revoke",
+    "export:data",
+    "audit_log:read"
+  ],
+  "by_role": {
+    "owner": {
+      "workspace:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "workspace:update": {
+        "access": "allow",
+        "step_up": false
+      },
+      "workspace:delete": {
+        "access": "allow",
+        "step_up": true
+      },
+      "workspace:transfer_ownership": {
+        "access": "allow",
+        "step_up": true
+      },
+      "member:invite": {
+        "access": "allow",
+        "step_up": false
+      },
+      "member:update_role": {
+        "access": "allow",
+        "step_up": false
+      },
+      "member:remove": {
+        "access": "allow",
+        "step_up": false
+      },
+      "billing:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "billing:write": {
+        "access": "allow",
+        "step_up": false
+      },
+      "credits:spend": {
+        "access": "allow",
+        "step_up": false
+      },
+      "sso:configure": {
+        "access": "allow",
+        "step_up": true
+      },
+      "apikey:create": {
+        "access": "allow",
+        "step_up": true
+      },
+      "project:create": {
+        "access": "allow",
+        "step_up": false
+      },
+      "project:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "project:update": {
+        "access": "allow",
+        "step_up": false
+      },
+      "project:delete": {
+        "access": "allow",
+        "step_up": false
+      },
+      "prompt:write": {
+        "access": "allow",
+        "step_up": false
+      },
+      "tracking:trigger": {
+        "access": "allow",
+        "step_up": false
+      },
+      "tracking:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "lookup:execute": {
+        "access": "allow",
+        "step_up": false
+      },
+      "lookup:read_history": {
+        "access": "allow",
+        "step_up": false
+      },
+      "aux:trigger": {
+        "access": "allow",
+        "step_up": false
+      },
+      "aux:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:create": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:move": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:comment": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "optimizer:use": {
+        "access": "allow",
+        "step_up": false
+      },
+      "agency:branding": {
+        "access": "allow",
+        "step_up": false
+      },
+      "agency:custom_domain": {
+        "access": "allow",
+        "step_up": true
+      },
+      "share_token:mint": {
+        "access": "allow",
+        "step_up": false
+      },
+      "share_token:revoke": {
+        "access": "allow",
+        "step_up": false
+      },
+      "export:data": {
+        "access": "allow",
+        "step_up": true
+      },
+      "audit_log:read": {
+        "access": "allow",
+        "step_up": false
+      }
+    },
+    "admin": {
+      "workspace:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "workspace:update": {
+        "access": "allow",
+        "step_up": false
+      },
+      "workspace:delete": {
+        "access": "deny",
+        "step_up": false
+      },
+      "workspace:transfer_ownership": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:invite": {
+        "access": "allow",
+        "step_up": false
+      },
+      "member:update_role": {
+        "access": "allow",
+        "step_up": false
+      },
+      "member:remove": {
+        "access": "allow",
+        "step_up": false
+      },
+      "billing:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "billing:write": {
+        "access": "allow",
+        "step_up": false
+      },
+      "credits:spend": {
+        "access": "allow",
+        "step_up": false
+      },
+      "sso:configure": {
+        "access": "allow",
+        "step_up": true
+      },
+      "apikey:create": {
+        "access": "allow",
+        "step_up": true
+      },
+      "project:create": {
+        "access": "allow",
+        "step_up": false
+      },
+      "project:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "project:update": {
+        "access": "allow",
+        "step_up": false
+      },
+      "project:delete": {
+        "access": "allow",
+        "step_up": false
+      },
+      "prompt:write": {
+        "access": "allow",
+        "step_up": false
+      },
+      "tracking:trigger": {
+        "access": "allow",
+        "step_up": false
+      },
+      "tracking:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "lookup:execute": {
+        "access": "allow",
+        "step_up": false
+      },
+      "lookup:read_history": {
+        "access": "allow",
+        "step_up": false
+      },
+      "aux:trigger": {
+        "access": "allow",
+        "step_up": false
+      },
+      "aux:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:create": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:move": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:comment": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "optimizer:use": {
+        "access": "allow",
+        "step_up": false
+      },
+      "agency:branding": {
+        "access": "allow",
+        "step_up": false
+      },
+      "agency:custom_domain": {
+        "access": "allow",
+        "step_up": true
+      },
+      "share_token:mint": {
+        "access": "allow",
+        "step_up": false
+      },
+      "share_token:revoke": {
+        "access": "allow",
+        "step_up": false
+      },
+      "export:data": {
+        "access": "allow",
+        "step_up": true
+      },
+      "audit_log:read": {
+        "access": "allow",
+        "step_up": false
+      }
+    },
+    "manager": {
+      "workspace:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "workspace:update": {
+        "access": "deny",
+        "step_up": false
+      },
+      "workspace:delete": {
+        "access": "deny",
+        "step_up": false
+      },
+      "workspace:transfer_ownership": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:invite": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:update_role": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:remove": {
+        "access": "deny",
+        "step_up": false
+      },
+      "billing:read": {
+        "access": "deny",
+        "step_up": false
+      },
+      "billing:write": {
+        "access": "deny",
+        "step_up": false
+      },
+      "credits:spend": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "sso:configure": {
+        "access": "deny",
+        "step_up": false
+      },
+      "apikey:create": {
+        "access": "deny",
+        "step_up": false
+      },
+      "project:create": {
+        "access": "allow",
+        "step_up": false
+      },
+      "project:read": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "project:update": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "project:delete": {
+        "access": "deny",
+        "step_up": false
+      },
+      "prompt:write": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "tracking:trigger": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "tracking:read": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "lookup:execute": {
+        "access": "allow",
+        "step_up": false
+      },
+      "lookup:read_history": {
+        "access": "allow",
+        "step_up": false
+      },
+      "aux:trigger": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "aux:read": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "task:create": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "task:move": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "task:comment": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "task:read": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "optimizer:use": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "agency:branding": {
+        "access": "deny",
+        "step_up": false
+      },
+      "agency:custom_domain": {
+        "access": "deny",
+        "step_up": false
+      },
+      "share_token:mint": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "share_token:revoke": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "export:data": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "audit_log:read": {
+        "access": "deny",
+        "step_up": false
+      }
+    },
+    "analyst": {
+      "workspace:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "workspace:update": {
+        "access": "deny",
+        "step_up": false
+      },
+      "workspace:delete": {
+        "access": "deny",
+        "step_up": false
+      },
+      "workspace:transfer_ownership": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:invite": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:update_role": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:remove": {
+        "access": "deny",
+        "step_up": false
+      },
+      "billing:read": {
+        "access": "deny",
+        "step_up": false
+      },
+      "billing:write": {
+        "access": "deny",
+        "step_up": false
+      },
+      "credits:spend": {
+        "access": "allow",
+        "step_up": false
+      },
+      "sso:configure": {
+        "access": "deny",
+        "step_up": false
+      },
+      "apikey:create": {
+        "access": "deny",
+        "step_up": false
+      },
+      "project:create": {
+        "access": "deny",
+        "step_up": false
+      },
+      "project:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "project:update": {
+        "access": "deny",
+        "step_up": false
+      },
+      "project:delete": {
+        "access": "deny",
+        "step_up": false
+      },
+      "prompt:write": {
+        "access": "deny",
+        "step_up": false
+      },
+      "tracking:trigger": {
+        "access": "deny",
+        "step_up": false
+      },
+      "tracking:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "lookup:execute": {
+        "access": "allow",
+        "step_up": false
+      },
+      "lookup:read_history": {
+        "access": "allow",
+        "step_up": false
+      },
+      "aux:trigger": {
+        "access": "deny",
+        "step_up": false
+      },
+      "aux:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:create": {
+        "access": "deny",
+        "step_up": false
+      },
+      "task:move": {
+        "access": "deny",
+        "step_up": false
+      },
+      "task:comment": {
+        "access": "allow",
+        "step_up": false
+      },
+      "task:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "optimizer:use": {
+        "access": "deny",
+        "step_up": false
+      },
+      "agency:branding": {
+        "access": "deny",
+        "step_up": false
+      },
+      "agency:custom_domain": {
+        "access": "deny",
+        "step_up": false
+      },
+      "share_token:mint": {
+        "access": "deny",
+        "step_up": false
+      },
+      "share_token:revoke": {
+        "access": "deny",
+        "step_up": false
+      },
+      "export:data": {
+        "access": "allow",
+        "step_up": false
+      },
+      "audit_log:read": {
+        "access": "deny",
+        "step_up": false
+      }
+    },
+    "viewer": {
+      "workspace:read": {
+        "access": "allow",
+        "step_up": false
+      },
+      "workspace:update": {
+        "access": "deny",
+        "step_up": false
+      },
+      "workspace:delete": {
+        "access": "deny",
+        "step_up": false
+      },
+      "workspace:transfer_ownership": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:invite": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:update_role": {
+        "access": "deny",
+        "step_up": false
+      },
+      "member:remove": {
+        "access": "deny",
+        "step_up": false
+      },
+      "billing:read": {
+        "access": "deny",
+        "step_up": false
+      },
+      "billing:write": {
+        "access": "deny",
+        "step_up": false
+      },
+      "credits:spend": {
+        "access": "deny",
+        "step_up": false
+      },
+      "sso:configure": {
+        "access": "deny",
+        "step_up": false
+      },
+      "apikey:create": {
+        "access": "deny",
+        "step_up": false
+      },
+      "project:create": {
+        "access": "deny",
+        "step_up": false
+      },
+      "project:read": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "project:update": {
+        "access": "deny",
+        "step_up": false
+      },
+      "project:delete": {
+        "access": "deny",
+        "step_up": false
+      },
+      "prompt:write": {
+        "access": "deny",
+        "step_up": false
+      },
+      "tracking:trigger": {
+        "access": "deny",
+        "step_up": false
+      },
+      "tracking:read": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "lookup:execute": {
+        "access": "deny",
+        "step_up": false
+      },
+      "lookup:read_history": {
+        "access": "deny",
+        "step_up": false
+      },
+      "aux:trigger": {
+        "access": "deny",
+        "step_up": false
+      },
+      "aux:read": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "task:create": {
+        "access": "deny",
+        "step_up": false
+      },
+      "task:move": {
+        "access": "deny",
+        "step_up": false
+      },
+      "task:comment": {
+        "access": "deny",
+        "step_up": false
+      },
+      "task:read": {
+        "access": "scoped",
+        "step_up": false
+      },
+      "optimizer:use": {
+        "access": "deny",
+        "step_up": false
+      },
+      "agency:branding": {
+        "access": "deny",
+        "step_up": false
+      },
+      "agency:custom_domain": {
+        "access": "deny",
+        "step_up": false
+      },
+      "share_token:mint": {
+        "access": "deny",
+        "step_up": false
+      },
+      "share_token:revoke": {
+        "access": "deny",
+        "step_up": false
+      },
+      "export:data": {
+        "access": "deny",
+        "step_up": false
+      },
+      "audit_log:read": {
+        "access": "deny",
+        "step_up": false
+      }
+    }
+  },
+  "granted_to": {
+    "workspace:read": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst",
+      "viewer"
+    ],
+    "workspace:update": [
+      "owner",
+      "admin"
+    ],
+    "workspace:delete": [
+      "owner"
+    ],
+    "workspace:transfer_ownership": [
+      "owner"
+    ],
+    "member:invite": [
+      "owner",
+      "admin"
+    ],
+    "member:update_role": [
+      "owner",
+      "admin"
+    ],
+    "member:remove": [
+      "owner",
+      "admin"
+    ],
+    "billing:read": [
+      "owner",
+      "admin"
+    ],
+    "billing:write": [
+      "owner",
+      "admin"
+    ],
+    "credits:spend": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst"
+    ],
+    "sso:configure": [
+      "owner",
+      "admin"
+    ],
+    "apikey:create": [
+      "owner",
+      "admin"
+    ],
+    "project:create": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "project:read": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst",
+      "viewer"
+    ],
+    "project:update": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "project:delete": [
+      "owner",
+      "admin"
+    ],
+    "prompt:write": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "tracking:trigger": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "tracking:read": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst",
+      "viewer"
+    ],
+    "lookup:execute": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst"
+    ],
+    "lookup:read_history": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst"
+    ],
+    "aux:trigger": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "aux:read": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst",
+      "viewer"
+    ],
+    "task:create": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "task:move": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "task:comment": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst"
+    ],
+    "task:read": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst",
+      "viewer"
+    ],
+    "optimizer:use": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "agency:branding": [
+      "owner",
+      "admin"
+    ],
+    "agency:custom_domain": [
+      "owner",
+      "admin"
+    ],
+    "share_token:mint": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "share_token:revoke": [
+      "owner",
+      "admin",
+      "manager"
+    ],
+    "export:data": [
+      "owner",
+      "admin",
+      "manager",
+      "analyst"
+    ],
+    "audit_log:read": [
+      "owner",
+      "admin"
+    ]
+  },
+  "step_up": {
+    "window_ms": 300000,
+    "methods": [
+      "webauthn",
+      "email_otp"
+    ]
+  }
+}

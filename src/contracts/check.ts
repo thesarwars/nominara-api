@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { Logger } from "@nestjs/common";
 import { incrementCounter } from "../lib/telemetry/metrics.js";
 import { generateOpenApiDocument } from "./generate.js";
+import { checkPermissionMatrixDrift, PERMISSION_MATRIX_ARTIFACT_PATH } from "./permission-matrix-artifact.js";
 
 // STORY-023 T3 (GREEN step) — AC3: "A drift check compares the schemas
 // against the committed document and fails the build. There is NO WARNING
@@ -82,6 +83,23 @@ async function main(): Promise<void> {
   }
 
   console.log(`contracts:check passed — no drift against ${documentPath}`);
+
+  // STORY-019 — the generated permission matrix artifact is checked in the
+  // same step, same no-warning-mode rule. argv[3] overrides its path (tests).
+  const matrixPath = process.argv[3] ? resolve(process.argv[3]) : PERMISSION_MATRIX_ARTIFACT_PATH;
+  const matrix = checkPermissionMatrixDrift(matrixPath);
+  incrementCounter("nominara_contracts_permission_matrix_drift_check_total", {
+    result: matrix.clean ? "clean" : "drift",
+  });
+  logger.log(`contracts:check permission matrix ${matrix.clean ? "passed — no drift" : "FAILED — drift detected"} against ${matrixPath}`);
+  if (!matrix.clean) {
+    console.error(
+      `contracts:check FAILED — the permission matrix artifact regenerated from PERMISSION_MATRIX does not match ${matrixPath}. ` +
+        'Run "pnpm contracts:generate" and commit the result. There is no warning mode — hand-editing the artifact is never correct.',
+    );
+    process.exit(1);
+  }
+  console.log(`contracts:check passed — permission matrix has no drift against ${matrixPath}`);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

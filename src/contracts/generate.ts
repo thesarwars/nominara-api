@@ -14,6 +14,7 @@ import {
   PAGINATION_LIMIT_MAX,
 } from "../../contracts/common/pagination.schema.js";
 import { API_VERSION_PREFIX } from "../api/configure-app.js";
+import { writePermissionMatrixArtifact, PERMISSION_MATRIX_ARTIFACT_PATH } from "./permission-matrix-artifact.js";
 import { discoverContractRoutes, type DiscoveredContractRoute } from "./discover-routes.js";
 
 // STORY-023 T3 (GREEN step) — AC3/NFR-REPO-01: `contracts:generate` walks
@@ -591,6 +592,8 @@ async function main(): Promise<void> {
   const outPath = resolve(fileURLToPath(new URL("../..", import.meta.url)), "contracts/openapi.generated.json");
   writeFileSync(outPath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
   console.log(`contracts:generate — wrote ${outPath}`);
+  writePermissionMatrixArtifact();
+  console.log(`contracts:generate — wrote ${PERMISSION_MATRIX_ARTIFACT_PATH}`);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
