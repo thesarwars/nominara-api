@@ -19,7 +19,7 @@ import { useApiHarness } from "../support/api-harness.js";
 import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture } from "../support/valkey-fixture.js";
 
 // STORY-025 AC8 (second half), AC10 and the /auth/otp/request decision — through the REAL ApiModule against the REAL
-// credit ledger (Postgres) and a testcontainers Valkey. Never the developer's localhost:6380.
+// credit ledger (Postgres) and a testcontainers Valkey. Never a developer's own local Valkey.
 //
 // AC8: "a credit-spending call that is rate-limited never reaches CreditGuard, so no reservation is created" — the
 // unit spec proves CreditGuard is not INVOKED. This proves the BOOKS: no credit_ledger row of any kind, the wallet
