@@ -1,7 +1,11 @@
 import { Logger } from "@nestjs/common";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { rateLimitConfigSchema, rateLimitRouteClassSchema } from "../../contracts/common/rate-limit.schema.js";
-import { RateLimitBuckets } from "../../src/api/rate-limit/buckets.js";
+import {
+  rateLimitConfigSchema,
+  rateLimitRouteClassSchema,
+  type RateLimitRouteClass,
+} from "../../contracts/common/rate-limit.schema.js";
+import { RateLimitBuckets, type RateLimitIdentity } from "../../src/api/rate-limit/buckets.js";
 import { RATE_LIMIT_DEFAULTS } from "../../src/api/rate-limit/defaults.js";
 import type { Cache } from "../../src/lib/cache/cache.port.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
@@ -32,6 +36,21 @@ function documentWithTightWrites(): string {
     ),
   );
 }
+
+/** A schema-valid document where one class is replaced and every other class is the committed default. */
+function documentWith(routeClass: string, replacement: unknown): string {
+  return JSON.stringify(RATE_LIMIT_DEFAULTS.map((entry) => (entry.route_class === routeClass ? replacement : entry)));
+}
+
+/** What a probe drives through `check()`: the class, who is calling, and how far apart the requests are. */
+interface Drive {
+  readonly routeClass: RateLimitRouteClass;
+  readonly identity: RateLimitIdentity;
+  readonly stepMs: number;
+  readonly requests: number;
+}
+
+const WRITES_DRIVE: Drive = { routeClass: "writes", identity: { ...IDENTITY, userId: "u" }, stepMs: 0, requests: 50 };
 
 describe("STORY-025 AC10 · bucket configuration is data", () => {
   let clock: { ms: number };
@@ -92,7 +111,27 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
     expect(await allowedBeforeRefusal(subject(), "u")).toBe(DEFAULT_WRITES_BURST);
   });
 
-  const invalid: Array<[string, string]> = [
+  /** Enforcement observed through `check()`: how many requests pass, and whether a refusal names a hard cap. */
+  async function observe(s: RateLimitBuckets, drive: Drive): Promise<{ allowed: number; refusedByHardCap: boolean }> {
+    let allowed = 0;
+    let refusedByHardCap = false;
+    for (let i = 0; i < drive.requests; i++) {
+      const decision = await s.check(drive.routeClass, drive.identity);
+      if (decision.allowed) allowed += 1;
+      else if (decision.exhausted?.hardCap === true) refusedByHardCap = true;
+      clock.ms += drive.stepMs;
+    }
+    return { allowed, refusedByHardCap };
+  }
+
+  const preAuth: RateLimitIdentity = { env: ENV, ip: "203.0.113.7" };
+  const userCaller: RateLimitIdentity = { ...IDENTITY, userId: "probe-user" };
+  const cappedTiers = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "capture_backed_tools_capped_tiers")!;
+  const reads = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "reads")!;
+  const writes = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "writes")!;
+
+  // Each of these PASSES rateLimitConfigSchema (asserted below) and would be accepted by a shape-only loader.
+  const invalid: Array<[string, string, Drive?]> = [
     ["not JSON", "{not json"],
     ["JSON of the wrong shape", JSON.stringify({ writes: 1 })],
     ["an empty list (every class missing = no limits)", "[]"],
@@ -114,12 +153,66 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
       "an unknown key",
       JSON.stringify(RATE_LIMIT_DEFAULTS.map((entry) => ({ ...entry, unlimited: true }))),
     ],
+    [
+      "schema-valid, auth with only workspace buckets (pre-auth sign-in unlimited)",
+      documentWith("auth", {
+        route_class: "auth",
+        burst: 5,
+        buckets: [{ scope: "workspace", limit: 10, window: "rolling", window_ms: 60_000 }],
+      }),
+      { routeClass: "auth", identity: preAuth, stepMs: 0, requests: 50 },
+    ],
+    [
+      "schema-valid, project_runs at burst 1e9 / limit 1e9 / window 1 ms (unlimited)",
+      documentWith("project_runs", {
+        route_class: "project_runs",
+        burst: 1_000_000_000,
+        buckets: [{ scope: "user", limit: 1_000_000_000, window: "rolling", window_ms: 1 }],
+      }),
+      { routeClass: "project_runs", identity: userCaller, stepMs: 0, requests: 50 },
+    ],
+    [
+      "schema-valid, capped tiers without the utc_day hard cap (daily_limit_reached gone)",
+      documentWith("capture_backed_tools_capped_tiers", {
+        ...cappedTiers,
+        buckets: cappedTiers.buckets.filter((bucket) => bucket.window !== "utc_day"),
+      }),
+      { routeClass: "capture_backed_tools_capped_tiers", identity: userCaller, stepMs: 61_000, requests: 8 },
+    ],
+    [
+      "schema-valid, reads at limit 1 / window 9e15 ms (effectively zero refill)",
+      documentWith("reads", {
+        ...reads,
+        buckets: [{ scope: "user", limit: 1, window: "rolling", window_ms: 9_000_000_000_000_000 }],
+      }),
+      { routeClass: "reads", identity: userCaller, stepMs: 1_000, requests: 200 },
+    ],
+    [
+      "schema-valid, a hard_cap added to a class that has none",
+      documentWith("writes", {
+        ...writes,
+        buckets: writes.buckets.map((bucket) => (bucket.scope === "user" ? { ...bucket, hard_cap: true } : bucket)),
+      }),
+      { ...WRITES_DRIVE, identity: userCaller },
+    ],
   ];
 
-  it.each(invalid)("STORY-025 AC10 · an INVALID document (%s) falls back to the code defaults, logged, and still limits", async (_name, body) => {
-    await putDocument(body);
+  it("STORY-025 AC10 · the five envelope probes are SCHEMA-VALID, so only the envelope can refuse them", () => {
+    const probes = invalid.filter(([name]) => name.startsWith("schema-valid"));
+    expect(probes).toHaveLength(5);
+    for (const [name, body] of probes) {
+      expect(() => rateLimitConfigSchema.parse(JSON.parse(body)), name).not.toThrow();
+    }
+  });
 
-    expect(await allowedBeforeRefusal(subject(), "u")).toBe(DEFAULT_WRITES_BURST);
+  it.each(invalid)("STORY-025 AC10 · an INVALID document (%s) falls back to the code defaults, logged, and still limits", async (_name, body, drive = WRITES_DRIVE) => {
+    const control = await observe(subject(new InMemoryCacheAdapter(() => clock.ms)), drive);
+    clock.ms = Date.UTC(2026, 9, 14, 12, 0, 0);
+
+    await putDocument(body);
+    const enforced = await observe(subject(), drive);
+
+    expect(enforced, "the same requests see exactly what the code defaults allow").toEqual(control);
     expect(warn, "the fallback is logged, not silent").toHaveBeenCalled();
     const logged = JSON.stringify(warn.mock.calls);
     expect(logged).toContain("rate-limit config");
