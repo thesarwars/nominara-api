@@ -21,7 +21,7 @@ import { incrementCounter } from "../../lib/telemetry/metrics.js";
 type Queryable = { query: Pool["query"] };
 
 /** What the person was trying to do when a rule refused them — the one label the refusal metric carries besides the reason. */
-export type CredentialAction = "passkey_add" | "passkey_revoke" | "oauth_link" | "oauth_unlink";
+export type CredentialAction = "passkey_add" | "passkey_revoke" | "oauth_link" | "oauth_unlink" | "sessions_revoke_others";
 
 /** Why a credential or session was revoked by the first proof of an address. Never reactivated by a sign-in. */
 export const ADDRESS_PROVED = "address_proved";

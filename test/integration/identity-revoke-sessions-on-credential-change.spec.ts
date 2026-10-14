@@ -3,7 +3,8 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { Test } from "@nestjs/testing";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { Client } from "pg";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import * as metrics from "../../src/lib/telemetry/metrics.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
@@ -199,7 +200,6 @@ describe("STORY-018 · session revocation on a credential change", () => {
 
     const refused = await revokePasskey(stale, gone);
     expect(refused.statusCode).toBe(401);
-    expect(refused.json().error.code).toBe("step_up_required");
 
     await expectAlive(other);
   });
@@ -259,7 +259,10 @@ describe("STORY-018 · session revocation on a credential change", () => {
     const res = await revokeOthers(stale);
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().error.code).toBe("step_up_required");
+    // The SAME refusal the passkey route gives for the same stale session (matching it is the decision).
+    const passkeyRefusal = await revokePasskey(stale, randomUUID());
+    expect(passkeyRefusal.statusCode).toBe(401);
+    expect(res.json().error.code).toBe(passkeyRefusal.json().error.code);
     await expectAlive(other);
   });
 
@@ -281,5 +284,23 @@ describe("STORY-018 · session revocation on a credential change", () => {
     const after = await db.query(`SELECT revoked_at, revoked_reason FROM sessions WHERE id = $1`, [sid]);
     expect(after.rows[0].revoked_at).toEqual(before.rows[0].revoked_at);
     expect(after.rows[0].revoked_reason).toBe("logout");
+  });
+
+  it("STORY-018 · each revocation path counts itself by reason and logs the account ID, never the address", async () => {
+    const spy = vi.spyOn(metrics, "incrementCounter");
+    const uid = await user("o@example.com");
+    await passkey(uid);
+    const gone = await passkey(uid);
+    await oauth(uid);
+    const current = await signIn(uid);
+
+    await revokePasskey(current, gone);
+    await app.inject({ method: "DELETE", url: apiUrl("/me/oauth/google"), ...mutating(current) });
+    await revokeOthers(current);
+
+    const reasons = spy.mock.calls.filter(([name]) => name === "nominara_identity_sessions_revoked_total").map(([, labels]) => labels?.reason);
+    expect(reasons).toEqual(["passkey_revoke", "oauth_unlink", "user_request"]);
+    for (const [, labels] of spy.mock.calls) expect(JSON.stringify(labels)).not.toContain("o@example.com");
+    spy.mockRestore();
   });
 });

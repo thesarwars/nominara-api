@@ -649,7 +649,12 @@ export class OauthService {
    * method's comment for why locking only the target row races two
    * concurrent last-two-credential revokes into a double self-lockout.
    */
-  async unlink(userId: string, provider: OauthProvider, session?: SessionStrongAuth): Promise<void> {
+  async unlink(
+    userId: string,
+    provider: OauthProvider,
+    session: SessionStrongAuth | undefined,
+    currentSessionId: string,
+  ): Promise<void> {
     // STORY-173 — removing a credential is as sensitive as adding one: a
     // stolen session must not strip the owner's other methods to lock them out.
     requireFreshStrongAuth(userId, session, this.logger, "oauth_unlink");
@@ -682,9 +687,12 @@ export class OauthService {
       }
 
       await client.query(`UPDATE user_credentials SET revoked_at = now(), revoked_reason = 'user' WHERE id = $1`, [target.id]);
+      // STORY-018 — same as a passkey revoke: every OTHER session of the account ends in the same transaction.
+      const revokedSessions = await this.sessions.revokeAllForUsers(client, [userId], currentSessionId);
       await client.query("COMMIT");
 
-      this.logger.log(`oauth credential unlinked user_id=${userId} provider=${provider}`);
+      this.logger.log(`oauth credential unlinked user_id=${userId} provider=${provider} other_sessions_revoked=${String(revokedSessions)}`);
+      incrementCounter("nominara_identity_sessions_revoked_total", { reason: "oauth_unlink" });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       throw error;

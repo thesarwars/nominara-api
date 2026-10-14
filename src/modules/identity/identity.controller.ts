@@ -26,6 +26,8 @@ import {
   type PasskeyOptionsRequest,
   type PasskeyRenameRequest,
   type PasskeyVerifyRequest,
+  sessionsRevokeOthersResponseSchema,
+  type SessionsRevokeOthersResponse,
 } from "./dto/index.js";
 import { IdentityService, type PasskeyOptionsResult } from "./identity.service.js";
 import { SessionService } from "./session.service.js";
@@ -185,6 +187,16 @@ export class IdentityController {
   @SkipTenantContext()
   @ApiContract({ operationId: "revokePasskey", voidResponse: true })
   revoke(@Req() req: AuthenticatedRequest, @Param("id") id: string): Promise<void> {
-    return this.service.revokePasskey(req.auth!.sub, id, req.session);
+    return this.service.revokePasskey(req.auth!.sub, id, req.session, req.auth!.sid);
+  }
+
+  // STORY-018 — "sign out other sessions". Tenant-less like the rest of /me/*; the account and the session to keep both
+  // come from the verified token. Step-up lives in IdentityService, as for the passkey routes.
+  @Post("me/sessions/revoke-others")
+  @SkipTenantContext()
+  @HttpCode(200)
+  @ApiContract({ operationId: "revokeOtherSessions", responseSchema: sessionsRevokeOthersResponseSchema })
+  revokeOthers(@Req() req: AuthenticatedRequest): Promise<SessionsRevokeOthersResponse> {
+    return this.service.revokeOtherSessions(req.auth!.sub, req.session, req.auth!.sid);
   }
 }

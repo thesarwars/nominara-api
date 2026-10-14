@@ -128,6 +128,6 @@ export class OauthController {
     @Req() req: AuthenticatedRequest,
     @Param("provider", new ZodValidationPipe(oauthProviderSchema)) provider: OauthProvider,
   ): Promise<void> {
-    return this.service.unlink(req.auth!.sub, provider, req.session);
+    return this.service.unlink(req.auth!.sub, provider, req.session, req.auth!.sid);
   }
 }
