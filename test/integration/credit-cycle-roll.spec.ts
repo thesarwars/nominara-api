@@ -3,7 +3,7 @@ import { Client, Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { applyPlanChange, planKeyOnly, type ProviderSubscriptionState } from "../../src/lib/billing/apply-plan.js";
+import { applyPlanChange, type ProviderSubscriptionState } from "../../src/lib/billing/apply-plan.js";
 import { provisionWalletWithGrant, recordPurchase } from "../../src/lib/credits/balance.js";
 import { CycleRollBlockedError, rollIncludedCycle, type CycleRollOutcome } from "../../src/lib/credits/cycle-roll.js";
 import { appendLedgerEntry } from "../../src/lib/credits/ledger.js";
@@ -331,6 +331,29 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
       await apply(ws, (c) => ({ ...c, seatsPurchased: c.seatsPurchased + 1 }));
       expect((await balances(ws)).included_balance).toBe(grant - 100);
       expect(await entries(ws, ["expire"])).toEqual([]);
+    });
+
+    it("STORY-072 AC13 · an event inside a period the subscription ALREADY holds is not a roll, even if the wallet's own cycle is behind", async () => {
+      const grant = await planGrant("growth");
+      await wallet(ws, grant); // wallet cycle = CYCLE_1
+      await spend(ws, 100, "job-1");
+      await db.query(
+        "UPDATE subscriptions SET current_period_start = $2, current_period_end = $3 WHERE workspace_id = $1",
+        [ws, CYCLE_2.start, CYCLE_2.end],
+      );
+      await apply(ws, (c) => ({ ...c, seatsPurchased: c.seatsPurchased + 1 }));
+      expect((await balances(ws)).included_balance).toBe(grant - 100);
+      expect(await entries(ws, ["expire"])).toEqual([]);
+    });
+
+    it("STORY-072 AC13 · an upgrade that carries a new period still restarts the auto-top-up counter (EC-48)", async () => {
+      const grantStarter = await planGrant("starter");
+      await db.query("UPDATE workspaces SET plan_key = 'starter' WHERE id = $1", [ws]);
+      await db.query("UPDATE subscriptions SET plan_key = 'starter' WHERE workspace_id = $1", [ws]);
+      await wallet(ws, grantStarter);
+      await db.query("UPDATE credit_wallets SET auto_topup_count_cycle = 2 WHERE workspace_id = $1", [ws]);
+      await apply(ws, advance(CYCLE_2, "growth"));
+      expect((await balances(ws)).auto_topup_count_cycle).toBe(0);
     });
 
     it("STORY-072 AC13 · a downgrade landing at the period end resets to the NEW plan's grant", async () => {

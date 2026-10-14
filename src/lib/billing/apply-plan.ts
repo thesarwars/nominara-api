@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import { grantCredits } from "../credits/balance.js";
+import { rollIncludedCycle } from "../credits/cycle-roll.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import {
@@ -122,6 +123,11 @@ export interface ApplyPlanOptions {
    * as deferred, never performed here.
    */
   readonly allowDowngrade?: boolean;
+}
+
+/** The UTC calendar day of an instant, as the `YYYY-MM-DD` the wallet's `date` columns take. */
+function utcDate(instant: Date): string {
+  return instant.toISOString().slice(0, 10);
 }
 
 /** The only reconciler STORY-151 ships: change the plan, carry everything else forward. */
@@ -308,15 +314,38 @@ export async function applyPlanChange(
     ],
   );
 
-  // 6b. THE BILLING CYCLE ROLLED: auto-top-up's per-cycle counter starts again (EC-48 "the counter resets
-  //     only at cycle roll"; NEW-D-7 checkpoint-3 finding 3). This statement is the only writer of
-  //     `current_period_start`, so a period that starts LATER than the one on file IS the roll. Strictly later:
-  //     a redelivery of the same period and a stale event for an earlier one change nothing, and a reconcile
-  //     inside the period (seats, an add-on, a cancel flag) never reaches here with a new start. Only the
-  //     counter moves: the configuration is the customer's and a roll does not touch it. (`credit_wallets.cycle_*`
-  //     is rolled by nothing in src/ — see wallet.ts `cycleHasLapsed` — so it cannot be the trigger; whatever
-  //     eventually rolls it must zero this counter in the same statement.) No wallet yet: zero rows, no error.
-  if (desired.currentPeriodStart.getTime() > currentRow.current_period_start.getTime()) {
+  // 6b. THE BILLING CYCLE ROLLED: a period that starts LATER than the one on file IS the roll (this statement is the
+  //     only writer of `current_period_start`). Strictly later: a redelivery of the same period and a stale event for
+  //     an earlier one change nothing, and a reconcile inside the period (seats, an add-on, a cancel flag) never
+  //     reaches here with a new start.
+  //
+  //     STORY-072 AC13 — plans-and-entitlements.md §5 "Grant refresh": the included bucket is RESET to the plan's
+  //     grant and the unused credits expire (`rollIncludedCycle`; one `expire` and one `grant` ledger entry, the
+  //     auto-top-up counter restarted in the same statement per EC-48). The grant is the plan being moved TO, so a
+  //     downgrade that lands at the period end resets to the lower grant.
+  //
+  //     ⚠ NOT FOR AN UPGRADE. §5's mid-cycle upgrade is a pro-rata top-up that "never reduces" the balance, and it
+  //     has a step of its own below (8); a period that advances alongside an upgrade (a first paid subscription
+  //     replacing free's synthetic period) must not turn that into a reset that expires credits the customer holds.
+  //     The wallet's cycle then moves at the next renewal, which is a plain period advance. Without a wallet yet
+  //     there is nothing to roll: the first provisioning grants the new plan in full.
+  const periodAdvanced = desired.currentPeriodStart.getTime() > currentRow.current_period_start.getTime();
+  const isUpgrade = targetPlan.sort_order > currentPlan.sort_order;
+  let cycleRolled = false;
+  if (periodAdvanced && !isUpgrade) {
+    const rolled = await rollIncludedCycle(tx, {
+      workspaceId,
+      grant: targetPlan.credits_per_cycle,
+      cycleStart: utcDate(desired.currentPeriodStart),
+      cycleEnd: utcDate(desired.currentPeriodEnd),
+    });
+    cycleRolled = rolled.rolled;
+  }
+  if (periodAdvanced && !cycleRolled) {
+    // Auto-top-up's per-cycle counter still restarts with the subscription's period (EC-48 "the counter resets only
+    // at cycle roll"; NEW-D-7 checkpoint-3 finding 3) when the wallet itself was not rolled above — an upgrade
+    // carrying a new period, or a wallet whose own cycle is already current. Only the counter moves: the
+    // configuration is the customer's. No wallet yet: zero rows, no error.
     await tx.query(
       "UPDATE credit_wallets SET auto_topup_count_cycle = 0, updated_at = now() WHERE workspace_id = $1 AND auto_topup_count_cycle <> 0",
       [workspaceId],
