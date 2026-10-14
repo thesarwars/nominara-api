@@ -5,7 +5,7 @@ import {
   rateLimitRouteClassSchema,
   type RateLimitRouteClass,
 } from "../../contracts/common/rate-limit.schema.js";
-import { RateLimitBuckets, type RateLimitIdentity } from "../../src/api/rate-limit/buckets.js";
+import { RATE_LIMIT_CONFIG_READ_TIMEOUT_MS, RateLimitBuckets, type RateLimitIdentity } from "../../src/api/rate-limit/buckets.js";
 import { RATE_LIMIT_DEFAULTS } from "../../src/api/rate-limit/defaults.js";
 import type { Cache } from "../../src/lib/cache/cache.port.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
@@ -275,6 +275,50 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
 
     expect(await allowedBeforeRefusal(subject(broken), "u")).toBe(DEFAULT_WRITES_BURST);
     expect(warn).toHaveBeenCalled();
+  });
+
+  it("STORY-025 AC10 · a clock that steps BACKWARDS does not freeze the refresh", async () => {
+    const s = subject();
+    // Loads the (absent) document without touching the `writes` counters the assertion below reads.
+    expect((await s.check("reads", IDENTITY)).allowed).toBe(true);
+
+    await putDocument(documentWithTightWrites());
+    clock.ms -= 60 * 60 * 1000; // NTP step: now is an hour BEFORE the moment the document was last loaded
+
+    expect(await allowedBeforeRefusal(s, "after"), "a negative age is stale, so the new document is read").toBe(TIGHT_WRITES_BURST);
+  });
+
+  it("STORY-025 AC10 · a config read that never answers is abandoned after the timeout: defaults enforced, outcome logged", async () => {
+    vi.useFakeTimers();
+    try {
+      const hung: Cache = {
+        get: () => new Promise<string | undefined>(() => undefined),
+        getMany: (keys) => cache.getMany(keys),
+        set: (key, value, options) => cache.set(key, value, options),
+        delete: (key) => cache.delete(key),
+        deleteIf: (key, expected) => cache.deleteIf(key, expected),
+        increment: (key, ttlMs) => cache.increment(key, ttlMs),
+        timeToLiveMs: (key) => cache.timeToLiveMs(key),
+        consume: (key, bucket) => cache.consume(key, bucket),
+      };
+      const s = subject(hung);
+      let decided = false;
+      const pending = s.check("writes", IDENTITY).then((decision) => {
+        decided = true;
+        return decision;
+      });
+
+      await vi.advanceTimersByTimeAsync(RATE_LIMIT_CONFIG_READ_TIMEOUT_MS - 1);
+      expect(decided, "control: still waiting just before the timeout").toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      const decision = await pending;
+      expect(decision.allowed).toBe(true);
+      expect(decision.limit, "the code default's burst is what is published").toBe(DEFAULT_WRITES_BURST);
+      expect(JSON.stringify(warn.mock.calls)).toContain("rate-limit config unreadable");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("STORY-025 AC10 · the document is read at most once per refresh interval, not on every request", async () => {

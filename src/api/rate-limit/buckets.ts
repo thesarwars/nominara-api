@@ -85,6 +85,12 @@ export function utcDayStamp(nowMs: number): string {
 export const RATE_LIMIT_CONFIG_REFRESH_MS = 15_000;
 
 /**
+ * How long a request waits for the configuration read. The read is on the request path of every route, so a hung
+ * Valkey must not hang them: past this the code defaults are enforced (logged as `unreadable`) until the next refresh.
+ */
+export const RATE_LIMIT_CONFIG_READ_TIMEOUT_MS = 250;
+
+/**
  * How far an operator-written document may move a number from the committed default: each of `limit`, `burst` and
  * `window_ms` must lie in [default / FACTOR, default x FACTOR]. The document is data, so an operator tunes it; it is
  * not a way to switch a control off. One constant, so the bound is easy to change.
@@ -162,12 +168,15 @@ export class RateLimitBuckets {
    */
   private async refreshConfig(env: string): Promise<void> {
     const nowMs = this.now();
-    if (this.loadedAtMs !== undefined && nowMs - this.loadedAtMs < this.refreshMs) return;
+    // A negative age (the wall clock stepped backwards) is stale: otherwise the refresh would freeze until the clock
+    // caught up with the moment of the last load, and a changed document would go unenforced for as long.
+    const age = this.loadedAtMs === undefined ? undefined : nowMs - this.loadedAtMs;
+    if (age !== undefined && age >= 0 && age < this.refreshMs) return;
     this.loading ??= (async (): Promise<void> => {
       let source: ConfigSource;
       let config = this.defaults;
       try {
-        const raw = await this.cache.get(rateLimitConfigKey(env));
+        const raw = await this.readWithTimeout(rateLimitConfigKey(env));
         if (raw === undefined) {
           source = "missing";
         } else {
@@ -196,6 +205,23 @@ export class RateLimitBuckets {
       this.loading = undefined;
     });
     await this.loading;
+  }
+
+  /** The document read, abandoned after RATE_LIMIT_CONFIG_READ_TIMEOUT_MS; a timeout is an `unreadable` outcome. */
+  private async readWithTimeout(key: string): Promise<string | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = this.cache.get(key);
+    read.catch(() => undefined); // a read that loses the race must not become an unhandled rejection
+    try {
+      return await Promise.race([
+        read,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("rate-limit config read timed out")), RATE_LIMIT_CONFIG_READ_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   configFor(routeClass: RateLimitRouteClass): RateLimitRouteClassConfig {
