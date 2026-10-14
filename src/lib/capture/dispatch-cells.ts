@@ -119,3 +119,33 @@ export async function dispatchCaptureCells(
     })),
   );
 }
+
+/**
+ * STORY-032 AC7 (owner decision 2026-10-13) — one reused (L1/L2) row whose answer must be re-matched against the
+ * CURRENT alias set. It is the `capture.parse` payload minus the signature: the row stays `status = 'skipped'` (so
+ * run counts, settlement and refunds are unchanged) and the parse carries the facts onto it.
+ */
+export interface RematchJob {
+  readonly workspaceId: string;
+  readonly resultId: string;
+  readonly projectId: string;
+  readonly promptId: string;
+  readonly engineKey: string;
+  readonly capturedAt: string;
+}
+
+/** The idempotency key of a re-match parse — `capture.parse`'s own `parse:{result}` pattern, shared with `capture.execute`. */
+export function rematchIdempotencyKey(resultId: string): string {
+  return `parse:${resultId}`;
+}
+
+/** The re-match parses as dispatchable cells (cadence-independent: they are not jittered). */
+export function rematchDispatchCells(jobs: readonly RematchJob[]): DispatchCell[] {
+  return jobs.map((job) => ({
+    promptId: job.promptId,
+    engineKey: job.engineKey,
+    sampleIndex: 0,
+    payload: { ...job },
+    idempotencyKey: rematchIdempotencyKey(job.resultId),
+  }));
+}

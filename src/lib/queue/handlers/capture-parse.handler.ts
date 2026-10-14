@@ -8,6 +8,7 @@ import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import { defaultParseAlertMonitor, observationFrom, type ParseAlertMonitor } from "../../parser/parse-alerts.js";
 import type { SentimentArbiter } from "../../parser/sentiment/arbiter.js";
 import { SCORING_VERSION } from "../../scoring/index.js";
+import { incrementCounter } from "../../telemetry/metrics.js";
 import { afterCommit } from "../../../tenancy/tenant-context.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
@@ -70,7 +71,17 @@ interface CaptureRecord {
   normalizer_version: string;
   scoring_version: string;
   alias_fingerprint: Buffer | null;
+  cache_layer: string;
+  source_result_id: string | null;
+  brand_present: boolean | null;
 }
+
+/**
+ * STORY-032 AC7 — set on a reused row whose answer could not be recovered (an L2 source whose payload retention
+ * cleared or whose row is gone). Marks the row "tried and cannot", so the run's rollup is not held for a re-match
+ * that will never come. Cleared by the next successful re-match.
+ */
+export const REMATCH_UNAVAILABLE_FLAG = "rematch_unavailable";
 
 export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: CaptureParseDeps): JobProcessor {
   const logger = new Logger("capture.parse");
@@ -98,12 +109,19 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       logger,
     );
 
+  /** STORY-032 AC7 observability — IDs only, never the answer text or an alias. */
+  const rematchOutcome = (outcome: "matched" | "already_matched" | "source_unavailable", workspaceId: string, resultId: string): void => {
+    incrementCounter("nominara_capture_rematch_total", { outcome });
+    logger.log({ event: "capture.rematch", outcome, workspace_id: workspaceId, result_id: resultId });
+  };
+
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
 
     const found = await tx.query<CaptureRecord>(
       `SELECT id, project_id, run_id, prompt_id, engine_key, captured_at, status, content_hash,
-              payload, response_excerpt, flags, normalizer_version, scoring_version, alias_fingerprint
+              payload, response_excerpt, flags, normalizer_version, scoring_version, alias_fingerprint,
+              cache_layer, source_result_id, brand_present
          FROM answer_captures
         WHERE id = $1`,
       [payload.resultId],
@@ -122,6 +140,17 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
     // `parsed` would erase the distinction the matrix depends on.
     if (record.status === "blocked" || record.status === "failed") {
       logger.log(`capture ${payload.resultId} is ${record.status}; nothing to parse`);
+      return;
+    }
+
+    // STORY-032 AC7 — a REUSED (L1/L2) row is `skipped`, and it STAYS skipped: `run-progress.ts` counts
+    // captured+parsed from the rows and skipped from the run row, so a reused row turned `parsed` would be counted
+    // twice, and the second count flows into `finalizeRun` and the credit settlement. This job carries the FACTS
+    // onto it; it never moves its status. (`persistParse` enforces the same rule in SQL.)
+    const reused = record.status === "skipped";
+    if (reused && record.cache_layer === "live") {
+      // `skipped` with no cache layer is not a reused cell; there is no answer to re-match and none to invent.
+      logger.log(`capture ${payload.resultId} is skipped without a cache layer; nothing to re-match`);
       return;
     }
 
@@ -146,12 +175,24 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
     );
     if (!payload.force && decision.shortCircuit) {
       logger.log(`capture ${payload.resultId} short-circuits to ${decision.sourceResultId}`);
+      if (reused) rematchOutcome("already_matched", payload.workspaceId, record.id);
       // A redelivery after a failed rollup enqueue lands here; re-request (same key).
       await requestRollupIfRunComplete(tx, record, payload.workspaceId);
       return;
     }
 
-    const text = textOf(record);
+    const text = reused ? await reusedTextOf(tx, record, payload.workspaceId) : textOf(record);
+    if (text === null && reused) {
+      // The answer cannot be recovered. NOT marked parsed (that would count the cell twice) and not left looking
+      // pending (that would hold the run's rollup for ever): flagged, unscored, still skipped.
+      await tx.query(
+        "UPDATE answer_captures SET flags = array_append(flags, $2) WHERE id = $1 AND NOT ($2 = ANY(flags))",
+        [record.id, REMATCH_UNAVAILABLE_FLAG],
+      );
+      rematchOutcome("source_unavailable", payload.workspaceId, record.id);
+      await requestRollupIfRunComplete(tx, record, payload.workspaceId);
+      return;
+    }
     if (text === null) {
       // A suppressed (L1/L2) row carries an excerpt and no payload text, and a
       // refusal carries neither. Marked parsed with no facts rather than left
@@ -175,7 +216,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       engineKey: record.engine_key,
       capturedAt: record.captured_at,
       text,
-      flags: record.flags,
+      flags: record.flags.filter((flag) => flag !== REMATCH_UNAVAILABLE_FLAG),
       ...structuredOf(record),
     };
 
@@ -200,6 +241,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       }
     });
 
+    if (reused) rematchOutcome("matched", payload.workspaceId, record.id);
     await requestRollupIfRunComplete(tx, record, payload.workspaceId);
 
     logger.log(
@@ -210,7 +252,11 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
 
 /** The prior parse's identity, or null when this row has never been parsed. */
 function priorOf(record: CaptureRecord): Parameters<typeof decideL3>[1] {
-  if (record.status !== "parsed") return null;
+  // A reused row counts as already matched only once it HAS been: `brand_present` is NULL until the first re-match.
+  // Its alias fingerprint cannot say so — the planner stamps the CURRENT fingerprint on it at plan time, so
+  // reading the stamp as "already matched" is exactly the shortcut AC7 forbids.
+  const matched = record.status === "parsed" || (record.status === "skipped" && record.brand_present !== null);
+  if (!matched) return null;
   return {
     resultId: record.id,
     contentHash: record.content_hash,
@@ -230,6 +276,29 @@ function priorOf(record: CaptureRecord): Parameters<typeof decideL3>[1] {
  */
 function textOf(record: CaptureRecord): string | null {
   const text = record.payload?.text;
+  return typeof text === "string" && text.length > 0 ? text : null;
+}
+
+/**
+ * STORY-032 AC7 — the answer text of a REUSED row.
+ *
+ * An L1 row carries its own `payload.text` (the shared entry's answer). An L2 row carries none and reaches its
+ * source through `source_result_id`; that read is SCOPED TO THIS WORKSPACE AND PROJECT in the statement itself, not
+ * left to RLS alone: `source_result_id` has no foreign key, so a stale or poisoned pointer must resolve to nothing
+ * rather than to another tenant's answer. (RLS is the guarantee; the predicate is why the failure is a miss
+ * rather than a different tenant's text under a policy mistake.)
+ *
+ * `id` alone is not indexed (the key is (captured_at, id)), so this scans partitions as the handler's own lookup
+ * by id does; one read per reused cell, and the planner already paid the larger scan.
+ */
+async function reusedTextOf(tx: ClientBase, record: CaptureRecord, workspaceId: string): Promise<string | null> {
+  const own = textOf(record);
+  if (own !== null || record.source_result_id === null) return own;
+  const source = await tx.query<{ payload: CaptureRecord["payload"] }>(
+    "SELECT payload FROM answer_captures WHERE id = $1 AND workspace_id = $2 AND project_id = $3",
+    [record.source_result_id, workspaceId, record.project_id],
+  );
+  const text = source.rows[0]?.payload?.text;
   return typeof text === "string" && text.length > 0 ? text : null;
 }
 

@@ -238,6 +238,20 @@ export function capturedInRunStatusSql(statusColumn = "c.status"): string {
 }
 
 /**
+ * "This cell is a REUSED (suppressed) cell" — the L1/L2 rows the planner writes, which are `skipped` and STAY
+ * `skipped` (STORY-032 AC7, owner decision 2026-10-13).
+ *
+ * ⚠ A SIXTH QUESTION, AND AN EQUALITY FOR THE REASON `hasFactsStatusSql`'S IS: it names one status, and a sixth
+ * status would not join it. It is separate from `answeredStatusSql` (which ALSO admits captured/parsed) because
+ * the re-match asks "which rows are reused", and from `capturedInRunStatusSql` because run progress deliberately
+ * excludes exactly these rows — `capture_runs.skipped_cells` already counts them, so a reused row that became
+ * `parsed` would be counted twice.
+ */
+export function reusedStatusSql(statusColumn = "c.status"): string {
+  return `${statusColumn} = 'skipped'`;
+}
+
+/**
  * `scoringVersion` — STORY-136 AC9. When given, only rows stamped with that version are read: a capture, and each of
  * its mentions, written under another scoring version is not part of a score reported under this one. `null` (never
  * a default: callers say it) reads every version; the scorecards, panel and rollup pass the library's

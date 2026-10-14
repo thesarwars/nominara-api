@@ -194,6 +194,8 @@ describe("STORY-152 · answer_captures.status has named rules and no hand-writte
     answeredStatusSql: "c.status IN ('captured', 'parsed', 'skipped')",
     capturedInRunStatusSql: "c.status IN ('captured', 'parsed')",
     hasFactsStatusSql: "c.status = 'parsed'",
+    // STORY-032 AC7 — the reused (L1/L2) rows. They stay `skipped`; see the rule's own comment.
+    reusedStatusSql: "c.status = 'skipped'",
   };
 
   it("⚠ every exported rule is pinned by value — a new one cannot arrive unpinned", () => {
@@ -242,6 +244,10 @@ describe("STORY-152 · answer_captures.status has named rules and no hand-writte
     // to reuse, and a sixth status would not join it.
     expect(statusRules.hasFactsStatusSql()).toContain("=");
     expect(statusRules.hasFactsStatusSql()).not.toContain("IN");
+
+    // The sixth is an equality too, and names the status run progress deliberately excludes.
+    expect(statusRules.reusedStatusSql()).toBe("c.status = 'skipped'");
+    expect(statusRules.reusedStatusSql()).not.toContain("IN");
   });
 
   it("the status domain is parsed from the migration, not typed out here", () => {

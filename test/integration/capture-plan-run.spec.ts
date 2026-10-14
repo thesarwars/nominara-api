@@ -27,6 +27,7 @@ import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixtur
 // leaves behind, and what the ceiling is charged for.
 
 const ENTRY: QueueTopologyEntry = QUEUE_TOPOLOGY.find((entry) => entry.name === "capture.plan")!;
+const PARSE: QueueTopologyEntry = QUEUE_TOPOLOGY.find((entry) => entry.name === "capture.parse")!;
 const PERIOD = "2026-08-01";
 const TTL_SECONDS = 86_400;
 const NOW_MS = Date.UTC(2026, 7, 20, 12, 0, 0);
@@ -77,10 +78,10 @@ describe("STORY-032 · planning a run end to end", () => {
     await container.stop();
   });
 
-  function newQueue() {
+  function newQueue(entry: QueueTopologyEntry = ENTRY) {
     const connection = createQueueWorkerConnection(valkey.connectionString);
     connections.push(connection);
-    const queue = buildQueue(ENTRY, { connection, prefix: queueKeyPrefix(`plan-run-${randomUUID().slice(0, 8)}`) });
+    const queue = buildQueue(entry, { connection, prefix: queueKeyPrefix(`plan-run-${randomUUID().slice(0, 8)}`) });
     cleanups.push(async () => {
       await queue.obliterate({ force: true }).catch(() => undefined);
       await queue.close();
@@ -290,9 +291,12 @@ describe("STORY-032 · planning a run end to end", () => {
     await addPrompt("best erp");
     await seedL1(cached, "a".repeat(64));
     const queue = newQueue();
+    // STORY-032 AC7: a plan with a reused row needs somewhere to send its re-match parse. That is a different queue
+    // from the cells', so the count below is still the LIVE cells only.
+    const parseQueue = newQueue(PARSE);
 
     const plan = await planInTransaction(db, context());
-    await dispatchPlannedRun(queue, ENTRY, plan);
+    await dispatchPlannedRun(queue, ENTRY, plan, { parse: { queue: parseQueue, entry: PARSE } });
 
     expect(plan.skipped).toBe(1);
     expect(plan.live).toBe(1);

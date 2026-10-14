@@ -1,7 +1,7 @@
 import type { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { readRunProgress } from "../../capture/run-progress.js";
-import { capturedInRunStatusSql, hasFactsStatusSql } from "../../rollup/aggregate-day.js";
+import { capturedInRunStatusSql, hasFactsStatusSql, reusedStatusSql } from "../../rollup/aggregate-day.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { afterCommit } from "../../../tenancy/tenant-context.js";
 
@@ -61,9 +61,17 @@ export async function requestRollupIfRunComplete(
 
   const progress = await readRunProgress(tx, runId);
   if (progress.captured + progress.failed + progress.skipped < progress.planned) return;
+  // STORY-032 AC7 — a reused (L1/L2) row is a cell still waiting for its facts until it has been re-matched
+  // (`brand_present` is NULL until then), unless the re-match was tried and cannot be done ('rematch_unavailable').
+  // Without this the rollup could be requested before the reused cells' facts exist, and its one-per-run key would
+  // then swallow the request that follows them.
   const unparsed = await tx.query(
     `SELECT 1 FROM answer_captures
-      WHERE run_id = $1 AND ${capturedInRunStatusSql("status")} AND NOT ${hasFactsStatusSql("status")} LIMIT 1`,
+      WHERE run_id = $1
+        AND ((${capturedInRunStatusSql("status")} AND NOT ${hasFactsStatusSql("status")})
+          OR (${reusedStatusSql("status")} AND cache_layer IN ('l1', 'l2') AND brand_present IS NULL
+              AND NOT ('rematch_unavailable' = ANY(flags))))
+      LIMIT 1`,
     [runId],
   );
   if ((unparsed.rowCount ?? 0) > 0) return;
