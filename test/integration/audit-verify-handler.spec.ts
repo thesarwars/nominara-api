@@ -426,6 +426,92 @@ describe("STORY-143 · audit.verify handler", () => {
       await expect(run()).rejects.toThrow(/audit chain mismatch/);
     }, 60_000);
 
+    // A member with audit rows, so an individual erasure has a chain to rechain.
+    async function memberWithAuditRow(): Promise<string> {
+      const { AuditChainService } = await import("../../src/modules/audit/audit-chain.service.js");
+      const user = await db.query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`u-${randomUUID()}@example.com`]);
+      const userId = user.rows[0]!.id;
+      await db.query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1, $2, 'analyst', 'active')", [
+        workspaceId,
+        userId,
+      ]);
+      await new AuditChainService().append(db, {
+        workspaceId,
+        actorType: "user",
+        actorId: userId,
+        actorIp: null,
+        actorUa: null,
+        action: "workspace.updated",
+        resourceType: "workspace",
+        resourceId: workspaceId,
+        beforeState: null,
+        afterState: { n: 0 },
+        requestId: randomUUID(),
+        supportGrantId: null,
+        severity: "info",
+      });
+      return userId;
+    }
+
+    it("STORY-143-AC7r · an erasure REFUSES to rechain over a truncated chain, so it cannot launder the truncation", async () => {
+      const { requestIndividualErasure } = await import("../../src/workers/rollup/retention.js");
+      const userId = await memberWithAuditRow();
+      await appendChain(4);
+      await run();
+      const before = await marks();
+      await disableAppendOnly();
+      await db.query("DELETE FROM audit_log WHERE workspace_id = $1 AND seq > (SELECT max(seq) - 2 FROM audit_log WHERE workspace_id = $1)", [
+        workspaceId,
+      ]);
+      await enableAppendOnly();
+      const rowsBefore = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM audit_log WHERE workspace_id = $1", [workspaceId]);
+
+      await expect(requestIndividualErasure(db, userId)).rejects.toThrow(/chain_truncated|mark_hash_mismatch/);
+
+      // Nothing was written: no marker row, no `rechain` mark, and the verifier still sees the truncation.
+      const rowsAfter = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM audit_log WHERE workspace_id = $1", [workspaceId]);
+      expect(rowsAfter.rows[0]!.n).toBe(rowsBefore.rows[0]!.n);
+      expect(await marks()).toEqual(before);
+      await expect(run()).rejects.toThrow(/chain_truncated/);
+    }, 60_000);
+
+    it("STORY-143-AC7s · the verifier checks EVERY mark: a `rechain` mark forged over a truncation does not wash it out", async () => {
+      // The erasure guard is not the only line of defence — an actor with owner
+      // access can write the marker row and the `rechain` mark by hand. The
+      // old `verified` mark still says its row existed.
+      const { AuditChainService } = await import("../../src/modules/audit/audit-chain.service.js");
+      const { RECHAINED_MARKER_ACTION } = await import("../../src/lib/crypto/audit-chain.js");
+      await appendChain(5);
+      await run();
+      await disableAppendOnly();
+      await db.query("DELETE FROM audit_log WHERE workspace_id = $1 AND seq > (SELECT max(seq) - 2 FROM audit_log WHERE workspace_id = $1)", [
+        workspaceId,
+      ]);
+      await enableAppendOnly();
+      await new AuditChainService().append(db, {
+        workspaceId,
+        actorType: "system",
+        actorId: "00000000-0000-0000-0000-000000000000",
+        actorIp: null,
+        actorUa: null,
+        action: RECHAINED_MARKER_ACTION,
+        resourceType: "audit_log",
+        resourceId: null,
+        beforeState: null,
+        afterState: { reason: "individual_erasure" },
+        requestId: `forged-${workspaceId}`,
+        supportGrantId: null,
+        severity: "notice",
+      });
+      await db.query(
+        `INSERT INTO audit_chain_marks (workspace_id, max_seq, row_hash, reason)
+           SELECT workspace_id, seq, row_hash, 'rechain' FROM audit_log WHERE workspace_id = $1 ORDER BY seq DESC LIMIT 1`,
+        [workspaceId],
+      );
+
+      await expect(run()).rejects.toThrow(/chain_truncated|mark_hash_mismatch/);
+    }, 60_000);
+
     it("STORY-143-AC7g · a hard-deleted workspace leaves a tombstone, so its vanished chain is expected", async () => {
       const { executeWorkspaceHardDelete } = await import("../../src/workers/rollup/retention.js");
       await appendChain(3);
