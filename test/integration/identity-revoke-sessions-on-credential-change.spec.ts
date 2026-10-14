@@ -92,7 +92,14 @@ describe("STORY-018 · session revocation on a credential change", () => {
   }
   /** A signed-in session; `fresh` false means its last strong auth is long past the step-up window. */
   async function signIn(userId: string, fresh = true): Promise<Tokens> {
-    return sessions.createSession(userId, fresh ? new Date() : new Date(Date.now() - 60 * 60 * 1000), "email_otp");
+    // The token itself is minted NOW either way (a token minted in the past would simply be expired, and the 401 would
+    // prove nothing about step-up); only the session's recorded strong authentication is aged.
+    const tokens = await sessions.createSession(userId, new Date(), "email_otp");
+    if (!fresh) {
+      const sid = JSON.parse(Buffer.from(tokens.accessToken.split(".")[1]!, "base64url").toString("utf8")).sid as string;
+      await db.query(`UPDATE sessions SET last_strong_auth_at = now() - interval '1 hour' WHERE id = $1`, [sid]);
+    }
+    return tokens;
   }
   async function workspaceFor(tokens: Tokens): Promise<void> {
     const ws = await db.query<{ id: string }>(`INSERT INTO workspaces (name, slug, plan_key) VALUES ('W', $1, 'growth') RETURNING id`, [`w-${randomUUID().slice(0, 8)}`]);
@@ -201,7 +208,10 @@ describe("STORY-018 · session revocation on a credential change", () => {
     const refused = await revokePasskey(stale, gone);
     expect(refused.statusCode).toBe(401);
 
+    await expectAlive(stale); // the 401 is the step-up rule, not an expired token
     await expectAlive(other);
+    const row = await db.query(`SELECT revoked_at FROM user_credentials WHERE id = $1`, [gone]);
+    expect(row.rows[0].revoked_at).toBeNull();
   });
 
   it("STORY-018 · POST /me/sessions/revoke-others ends the other sessions, keeps the caller, and answers the contract", async () => {
@@ -259,6 +269,7 @@ describe("STORY-018 · session revocation on a credential change", () => {
     const res = await revokeOthers(stale);
 
     expect(res.statusCode).toBe(401);
+    await expectAlive(stale); // the 401 is the step-up rule, not an expired token
     // The SAME refusal the passkey route gives for the same stale session (matching it is the decision).
     const passkeyRefusal = await revokePasskey(stale, randomUUID());
     expect(passkeyRefusal.statusCode).toBe(401);
