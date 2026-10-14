@@ -1,11 +1,13 @@
-import { Inject, Injectable } from "@nestjs/common";
-import type {
-  RateLimitBucket,
-  RateLimitRouteClass,
-  RateLimitRouteClassConfig,
+import { Inject, Injectable, Logger } from "@nestjs/common";
+import {
+  rateLimitConfigSchema,
+  type RateLimitBucket,
+  type RateLimitRouteClass,
+  type RateLimitRouteClassConfig,
 } from "../../../contracts/common/rate-limit.schema.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
-import { globalKey, rateLimitCounterKey } from "../../lib/cache/valkey-keys.js";
+import { globalKey, rateLimitConfigKey, rateLimitCounterKey } from "../../lib/cache/valkey-keys.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { RATE_LIMIT_DEFAULTS } from "./defaults.js";
 
 // STORY-025 T17 — additive bucket evaluation.
@@ -76,16 +78,81 @@ export function utcDayStamp(nowMs: number): string {
   return new Date(nowMs).toISOString().slice(0, 10);
 }
 
+/**
+ * How stale the in-process copy of the configuration document may get (STORY-025 AC10, plan OQ-5).
+ * A change written to `{env}:global:ratelimit:config` is enforced by every instance within this long.
+ */
+export const RATE_LIMIT_CONFIG_REFRESH_MS = 15_000;
+
+const logger = new Logger("rate-limit");
+
+type ConfigSource = "document" | "missing" | "invalid" | "unreadable";
+
 @Injectable()
 export class RateLimitBuckets {
+  private active: readonly RateLimitRouteClassConfig[];
+  private loadedAtMs: number | undefined;
+  private loading: Promise<void> | undefined;
+  private lastSource: ConfigSource | undefined;
+
   constructor(
     @Inject(CACHE) private readonly cache: Cache,
-    private readonly config: readonly RateLimitRouteClassConfig[] = RATE_LIMIT_DEFAULTS,
+    /** The code defaults — what is enforced when the Valkey document is missing, invalid or unreadable. */
+    private readonly defaults: readonly RateLimitRouteClassConfig[] = RATE_LIMIT_DEFAULTS,
     private readonly now: () => number = () => Date.now(),
-  ) {}
+    private readonly refreshMs: number = RATE_LIMIT_CONFIG_REFRESH_MS,
+  ) {
+    this.active = defaults;
+  }
+
+  /**
+   * The Valkey-held configuration document (plan OQ-5), re-read at most once per `refreshMs`.
+   *
+   * EVERY FAILURE LANDS ON THE CODE DEFAULTS, never on "no limit". A missing, malformed, schema-invalid
+   * (including a document that omits a route class) or unreadable document is logged and replaced by the defaults —
+   * not by the last good document either, so what is enforced is always either a document that validated just now or
+   * the committed table. The body is never logged: a log line states the outcome only.
+   */
+  private async refreshConfig(env: string): Promise<void> {
+    const nowMs = this.now();
+    if (this.loadedAtMs !== undefined && nowMs - this.loadedAtMs < this.refreshMs) return;
+    this.loading ??= (async (): Promise<void> => {
+      let source: ConfigSource;
+      let config = this.defaults;
+      try {
+        const raw = await this.cache.get(rateLimitConfigKey(env));
+        if (raw === undefined) {
+          source = "missing";
+        } else {
+          const parsed = rateLimitConfigSchema.safeParse(JSON.parse(raw));
+          if (parsed.success) {
+            source = "document";
+            config = parsed.data;
+          } else {
+            source = "invalid";
+          }
+        }
+      } catch (error) {
+        source = error instanceof SyntaxError ? "invalid" : "unreadable";
+      }
+      this.active = config;
+      this.loadedAtMs = nowMs;
+      incrementCounter("nominara_api_rate_limit_config_load_total", { source });
+      // A broken document must not go quiet, so invalid/unreadable log on every read; the healthy states log on change.
+      if (source === "invalid" || source === "unreadable") {
+        logger.warn({ message: `rate-limit config ${source}; enforcing the code defaults`, source });
+      } else if (source !== this.lastSource) {
+        logger.log({ message: `rate-limit config source: ${source}`, source });
+      }
+      this.lastSource = source;
+    })().finally(() => {
+      this.loading = undefined;
+    });
+    await this.loading;
+  }
 
   configFor(routeClass: RateLimitRouteClass): RateLimitRouteClassConfig {
-    const found = this.config.find((entry) => entry.route_class === routeClass);
+    const found = this.active.find((entry) => entry.route_class === routeClass);
     if (found === undefined) {
       // Unreachable through the schema, which is fixed-length and
       // duplicate-checked — but a route class with no configuration is a route
@@ -173,6 +240,7 @@ export class RateLimitBuckets {
    * the workspace — an abuse control that amplifies abuse.
    */
   async check(routeClass: RateLimitRouteClass, identity: RateLimitIdentity): Promise<RateLimitDecision> {
+    await this.refreshConfig(identity.env);
     const config = this.configFor(routeClass);
     const nowMs = this.now();
     let tightest: RateLimitDecision | undefined;
