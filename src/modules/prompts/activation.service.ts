@@ -1,10 +1,12 @@
 import { Injectable } from "@nestjs/common";
+import type { ClientBase } from "pg";
 import type { ActivatePromptsRequest, ActivatePromptsResponse } from "../../../contracts/prompts/index.js";
 import { EntitlementExceededError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { chargeForActivation } from "../../lib/promptgen/activation-charge.js";
 import { nextRunAfter } from "../../lib/capture/scheduler.js";
 import type { ProjectCadence } from "../../lib/capture/dispatch-cells.js";
 import { canonicalUuid } from "../../api/canonical-uuid.js";
@@ -26,18 +28,22 @@ import { canonicalUuid } from "../../api/canonical-uuid.js";
 // ALL OR NOTHING. §3 gives this route one behaviour — "403
 // entitlement_exceeded names the remaining slots" — so a request that does
 // not fit is refused whole. A partial activation would pick which of the
-// customer's chosen prompts to drop, and once activation charges (blocked;
-// see the story) it would be a partial debit for an outcome nobody asked
-// for. The refusal therefore happens before any UPDATE.
+// customer's chosen prompts to drop, and now that activation charges it would
+// be a partial debit for an outcome nobody asked for. The refusal therefore
+// happens before any UPDATE.
 //
-// NOTHING IS CHARGED. `credits_charged` is the literal 0 in the contract and
-// there is no wallet, ledger or reserve statement anywhere in this file —
-// which is what makes that true by construction rather than by a test that
-// happens to pass. §4 prices activation at "1 per prompt activated" beyond
-// the free 10 and nothing can charge yet: `CreditGuard` is a pass-through
-// no-op whose own comment puts reserve/commit in EPIC-10, wallets are
-// unprovisioned, and §4 contradicts §10's `FR-CRD-06` about whether
-// activating an archived candidate later costs anything at all.
+// THE CHARGE (AC3; owner decision 2026-10-14). plans-and-entitlements.md
+// section 4 prices activation at "1 per prompt activated" beyond the free 10.
+// It is charged ONCE per generated prompt, at its first activation (see
+// src/lib/promptgen/activation-charge.ts for the whole rule), and the debit
+// goes through the credit ledger in THIS transaction: a refusal - the cap, or
+// 402 insufficient_credits - throws before any UPDATE and rolls back whatever
+// was written, so a refused activation charges nothing and activates nothing.
+//
+// THE PROJECT ROW IS LOCKED FIRST (`assertProjectExists` ... FOR UPDATE). Which
+// prompts are new, and how much of the project's free allowance is left, are
+// decided from rows that lock protects: two concurrent activations of the same
+// prompts serialise, and the second finds them already active and charges 0.
 
 /** `PROMPT_OCCUPIES_SLOT`, verbatim from src/lib/entitlements/structural-usage.ts. */
 const OCCUPIES_SLOT = "status <> 'archived' AND deleted_at IS NULL";
@@ -49,6 +55,8 @@ interface PromptRow {
   id: string;
   status: string;
   project_id: string;
+  generation_source: string;
+  first_activated_at: Date | null;
 }
 
 type TenantClient = { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> };
@@ -97,7 +105,8 @@ export class PromptActivationService {
 
     await this.assertProjectExists(client, projectId);
 
-    const cap = await this.resolveCap(store.context.workspaceId);
+    const resolved = await this.entitlements.resolveForWorkspace(store.context.workspaceId);
+    const cap = this.capFrom(resolved.entitlements);
     const activeBefore = await this.countOccupyingSlots(client, projectId);
     const prompts = await this.loadPrompts(client, projectId, promptIds);
 
@@ -106,6 +115,7 @@ export class PromptActivationService {
     // as newly activated would make the retry of a successful call fail with
     // a 403, the worst possible behaviour for an endpoint AC12 requires to be
     // idempotent.
+    let credits = 0;
     const alreadyActive = prompts.filter((prompt) => prompt.status === "active");
     const toActivate = prompts.filter((prompt) => prompt.status !== "active");
 
@@ -126,6 +136,20 @@ export class PromptActivationService {
     }
 
     if (toActivate.length > 0) {
+      // AFTER the cap check and BEFORE any write: a 402 here rolls the whole
+      // request back, so nothing is activated that was not paid for.
+      credits = await chargeForActivation(store.client as ClientBase, {
+        workspaceId: store.context.workspaceId,
+        actorId: store.context.actorId,
+        projectId,
+        candidates: toActivate.map((prompt) => ({
+          id: prompt.id,
+          generationSource: prompt.generation_source,
+          firstActivatedAt: prompt.first_activated_at,
+        })),
+        entitlements: resolved.entitlements,
+      });
+
       // ONE statement, not one per id. Fifteen round trips inside a
       // transaction to set fifteen rows to the same value, on the request
       // path, for no benefit.
@@ -173,7 +197,7 @@ export class PromptActivationService {
       coverage,
       prompts_active: activeAfter,
       prompts_cap: cap,
-      credits_charged: 0,
+      credits_charged: credits,
     };
   }
 
@@ -196,8 +220,9 @@ export class PromptActivationService {
   private async assertProjectExists(client: TenantClient, projectId: string): Promise<void> {
     // No `workspace_id` predicate: RLS scopes the tenant (`NFR-SEC-01`), and
     // adding one would imply the boundary lives in application code.
+    // FOR UPDATE: the lock every decision below depends on. See the header.
     const result = await client.query<{ prompts_cap: number }>(
-      "SELECT prompts_cap FROM projects WHERE id = $1 AND deleted_at IS NULL",
+      "SELECT prompts_cap FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
       [projectId],
     );
     if (result.rows.length === 0) throw new NotFoundError({ message: "no such project" });
@@ -219,9 +244,8 @@ export class PromptActivationService {
    * COUNTER to the project while the limit itself is the same for every
    * project in the workspace.
    */
-  private async resolveCap(workspaceId: string): Promise<number> {
-    const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
-    const value = resolved.entitlements["prompts.max_per_project"]?.value;
+  private capFrom(entitlements: Readonly<Record<string, { readonly value: unknown } | undefined>>): number {
+    const value = entitlements["prompts.max_per_project"]?.value;
     if (value === undefined) return 0;
     const limit = structuralLimitFrom(value as EntitlementValue);
     if (limit === undefined) return 0;
@@ -248,7 +272,7 @@ export class PromptActivationService {
    */
   private async loadPrompts(client: TenantClient, projectId: string, promptIds: readonly string[]): Promise<PromptRow[]> {
     const result = await client.query<PromptRow>(
-      `SELECT id, status, project_id FROM tracked_prompts WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+      `SELECT id, status, project_id, generation_source, first_activated_at FROM tracked_prompts WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
       [[...promptIds]],
     );
 

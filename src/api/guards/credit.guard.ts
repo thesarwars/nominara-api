@@ -9,6 +9,7 @@ import {
   type ReservationClaim,
 } from "../../lib/credits/ledger.js";
 import { provisionWalletWithGrant } from "../../lib/credits/balance.js";
+import { includedGrantOf } from "../../lib/credits/debit.js";
 import { purchasableOptions, reserveCredits, readWallet } from "../../lib/credits/wallet.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
@@ -589,17 +590,6 @@ class AlreadyReservedError extends Error {}
 const LEDGER_ACTION: Readonly<Record<CreditAction, LedgerActionCode>> = Object.freeze({
   deep_scan: "manual_scan",
 });
-
-/**
- * The plan's included grant, for a wallet that does not exist yet.
- *
- * Zero when the plan does not publish one: a wallet provisioned at zero
- * refuses correctly, where guessing a figure would hand out credits.
- */
-function includedGrantOf(entitlements: Readonly<Record<string, { readonly value: unknown }>>): number {
-  const value = entitlements["credits.included_per_cycle"]?.value;
-  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : 0;
-}
 
 /** The request's `Idempotency-Key`, so a redelivery settles the same reservation. */
 function idempotencyKeyOf(request: CreditScopedRequest): string | undefined {

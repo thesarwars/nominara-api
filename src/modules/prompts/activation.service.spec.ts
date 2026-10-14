@@ -197,7 +197,11 @@ describe("STORY-046 · PromptActivationService.activate", () => {
     // ten with eight slots gets eight they did not choose.
     const service = setup({ cap: 40, activeCount: 39, prompts: [{ id: P1, status: "archived" }, { id: P2, status: "archived" }] });
     await service.activate(PROJECT, { prompt_ids: [P1, P2] }).catch(() => undefined);
-    expect(calls.filter((call) => call.sql.includes("UPDATE"))).toHaveLength(0);
+    // A WRITE is a statement that BEGINS with a write verb. This used to be
+    // `includes("UPDATE")`, which a `SELECT ... FOR UPDATE` (the project lock the
+    // activation charge needs, AC3) also matches although it writes nothing.
+    // INSERT and DELETE are added, so the assertion is stricter, not looser.
+    expect(calls.filter((call) => /^\s*(UPDATE|INSERT|DELETE)\b/i.test(call.sql))).toHaveLength(0);
   });
 
   it("allows a request that exactly fills the last slots", async () => {
