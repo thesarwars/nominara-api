@@ -307,6 +307,17 @@ export const envSchema = z
     // when nothing sits in front and merely coarse when something does.
     TRUST_PROXY_HOPS: z.coerce.number().int().nonnegative().optional(),
 
+    // STORY-024 — tracing. Every request gets a server span regardless (its
+    // trace id IS `meta.request_id`), so ids exist with no collector. An OTLP
+    // exporter is wired ONLY when this endpoint is set; unset (the default)
+    // means spans are created and discarded. The base URL of an OTLP/HTTP
+    // collector, e.g. http://otel-collector:4318 — `/v1/traces` is appended.
+    OTEL_EXPORTER_OTLP_ENDPOINT: z.url().optional(),
+    // STORY-024 — the head-sampling ratio for new traces, 0..1, default 1
+    // (always on). Sampling decides what is EXPORTED, never whether the id
+    // exists: a request sampled out still has a trace id.
+    OTEL_TRACES_SAMPLER_ARG: z.coerce.number().min(0).max(1).optional(),
+
     // STORY-030 — the queue instance's dedicated Valkey connection
     // (system-architecture.md §4/§11: "never the cache instance"). BullMQ/
     // ioredis connect here.

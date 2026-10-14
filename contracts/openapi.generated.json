@@ -144,7 +144,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -260,7 +260,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -369,7 +369,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -521,7 +521,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -636,7 +636,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -745,7 +745,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -995,7 +995,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -1111,7 +1111,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -1220,7 +1220,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -1394,7 +1394,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -1509,7 +1509,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -1618,7 +1618,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -1847,7 +1847,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -1962,7 +1962,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -2071,7 +2071,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -2246,7 +2246,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -2362,7 +2362,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -2471,7 +2471,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -2604,7 +2604,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -2719,7 +2719,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -2828,7 +2828,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -2894,7 +2894,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -3009,7 +3009,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -3118,7 +3118,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -3228,7 +3228,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -3343,7 +3343,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -3452,7 +3452,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -3528,7 +3528,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -3643,7 +3643,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -3752,7 +3752,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -3827,7 +3827,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -3942,7 +3942,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -4051,7 +4051,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -4116,7 +4116,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -4231,7 +4231,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -4340,7 +4340,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -4429,7 +4429,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -4544,7 +4544,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -4653,7 +4653,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -4717,7 +4717,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -4832,7 +4832,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -4941,7 +4941,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -5112,7 +5112,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -5227,7 +5227,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -5336,7 +5336,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -5609,7 +5609,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -5724,7 +5724,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -5833,7 +5833,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -6189,7 +6189,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -6304,7 +6304,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -6413,7 +6413,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -6624,7 +6624,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -6740,7 +6740,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -6849,7 +6849,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -6991,7 +6991,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -7106,7 +7106,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -7215,7 +7215,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -7366,7 +7366,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -7481,7 +7481,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -7590,7 +7590,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -7664,7 +7664,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -7779,7 +7779,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -7888,7 +7888,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -8036,7 +8036,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -8152,7 +8152,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -8261,7 +8261,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -8349,7 +8349,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -8464,7 +8464,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -8573,7 +8573,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -11460,7 +11460,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -11575,7 +11575,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -11684,7 +11684,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -11871,7 +11871,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -11987,7 +11987,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -12096,7 +12096,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -12188,7 +12188,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -12303,7 +12303,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -12412,7 +12412,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -12547,7 +12547,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -12662,7 +12662,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -12771,7 +12771,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -12860,7 +12860,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -12975,7 +12975,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -13084,7 +13084,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -13272,7 +13272,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -13387,7 +13387,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -13496,7 +13496,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -13603,7 +13603,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -13718,7 +13718,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -13827,7 +13827,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -14172,7 +14172,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -14288,7 +14288,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -14397,7 +14397,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -14741,7 +14741,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -14856,7 +14856,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -14965,7 +14965,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -15052,7 +15052,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -15167,7 +15167,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -15276,7 +15276,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -15537,7 +15537,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -15652,7 +15652,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -15761,7 +15761,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -15838,7 +15838,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -15953,7 +15953,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -16062,7 +16062,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -16225,7 +16225,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -16340,7 +16340,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -16449,7 +16449,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -16610,7 +16610,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -16725,7 +16725,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -16834,7 +16834,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -17021,7 +17021,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -17137,7 +17137,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -17246,7 +17246,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -17313,7 +17313,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -17428,7 +17428,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -17537,7 +17537,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -17700,7 +17700,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -17816,7 +17816,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -17925,7 +17925,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -18011,7 +18011,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -18126,7 +18126,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -18235,7 +18235,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -18297,7 +18297,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -18412,7 +18412,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -18521,7 +18521,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -18630,7 +18630,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -18745,7 +18745,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -18854,7 +18854,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -18917,7 +18917,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -19032,7 +19032,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -19141,7 +19141,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -19271,7 +19271,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -19386,7 +19386,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -19495,7 +19495,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -19578,7 +19578,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -19693,7 +19693,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -19802,7 +19802,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -20326,7 +20326,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -20441,7 +20441,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -20550,7 +20550,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -20692,7 +20692,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -20807,7 +20807,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -20916,7 +20916,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -21315,7 +21315,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -21430,7 +21430,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -21539,7 +21539,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -21611,7 +21611,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -21726,7 +21726,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -21835,7 +21835,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -22025,7 +22025,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -22140,7 +22140,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -22249,7 +22249,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -22386,7 +22386,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -22501,7 +22501,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -22610,7 +22610,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -23195,7 +23195,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -23311,7 +23311,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -23420,7 +23420,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -23745,7 +23745,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -23861,7 +23861,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -23970,7 +23970,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -24378,7 +24378,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -24494,7 +24494,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -24603,7 +24603,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -24748,7 +24748,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -24863,7 +24863,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -24972,7 +24972,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -25313,7 +25313,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -25428,7 +25428,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -25537,7 +25537,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -25582,7 +25582,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -25697,7 +25697,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -25806,7 +25806,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -25988,7 +25988,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -26103,7 +26103,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -26212,7 +26212,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -26394,7 +26394,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -26509,7 +26509,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -26618,7 +26618,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -27148,7 +27148,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -27264,7 +27264,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -27373,7 +27373,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -27550,7 +27550,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -27665,7 +27665,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -27774,7 +27774,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -27942,7 +27942,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -28057,7 +28057,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -28166,7 +28166,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -28285,7 +28285,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -28400,7 +28400,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -28509,7 +28509,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -28839,7 +28839,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -28954,7 +28954,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -29063,7 +29063,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -29346,7 +29346,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -29461,7 +29461,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -29570,7 +29570,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -29861,7 +29861,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -29977,7 +29977,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -30086,7 +30086,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -30364,7 +30364,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -30479,7 +30479,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -30588,7 +30588,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -30905,7 +30905,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -31020,7 +31020,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -31129,7 +31129,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -31678,7 +31678,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -31793,7 +31793,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -31902,7 +31902,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -32219,7 +32219,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -32334,7 +32334,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -32443,7 +32443,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -32691,7 +32691,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -32807,7 +32807,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -32916,7 +32916,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -33161,7 +33161,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -33276,7 +33276,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -33385,7 +33385,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -33535,7 +33535,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -33650,7 +33650,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -33759,7 +33759,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -34142,7 +34142,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -34257,7 +34257,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -34366,7 +34366,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -35013,7 +35013,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -35128,7 +35128,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -35237,7 +35237,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -35458,7 +35458,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -35573,7 +35573,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -35682,7 +35682,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -35899,7 +35899,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -36014,7 +36014,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -36123,7 +36123,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -36364,7 +36364,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -36479,7 +36479,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -36588,7 +36588,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -36798,7 +36798,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -36913,7 +36913,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -37022,7 +37022,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -37723,7 +37723,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -37838,7 +37838,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -37947,7 +37947,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -38152,7 +38152,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -38267,7 +38267,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -38376,7 +38376,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -38501,7 +38501,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -38616,7 +38616,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -38725,7 +38725,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -39016,7 +39016,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -39132,7 +39132,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -39241,7 +39241,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -39548,7 +39548,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -39663,7 +39663,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -39772,7 +39772,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -39974,7 +39974,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -40089,7 +40089,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -40198,7 +40198,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -40314,7 +40314,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -40429,7 +40429,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -40538,7 +40538,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -41399,7 +41399,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -41514,7 +41514,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -41623,7 +41623,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -41864,7 +41864,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -41979,7 +41979,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -42088,7 +42088,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -42329,7 +42329,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -42444,7 +42444,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -42553,7 +42553,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -42825,7 +42825,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -42940,7 +42940,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -43049,7 +43049,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -43296,7 +43296,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -43412,7 +43412,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -43521,7 +43521,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -43755,7 +43755,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -43870,7 +43870,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -43979,7 +43979,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -44305,7 +44305,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -44420,7 +44420,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -44529,7 +44529,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -44675,7 +44675,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -44790,7 +44790,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -44899,7 +44899,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -44988,7 +44988,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -45103,7 +45103,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -45212,7 +45212,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -45447,7 +45447,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -45563,7 +45563,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -45672,7 +45672,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -45913,7 +45913,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -46028,7 +46028,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -46137,7 +46137,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -46474,7 +46474,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -46589,7 +46589,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -46698,7 +46698,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -46851,7 +46851,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -46967,7 +46967,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -47076,7 +47076,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -47356,7 +47356,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -47471,7 +47471,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -47580,7 +47580,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -47819,7 +47819,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -47934,7 +47934,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -48043,7 +48043,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -48378,7 +48378,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -48493,7 +48493,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -48602,7 +48602,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -48807,7 +48807,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -48923,7 +48923,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -49032,7 +49032,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -49210,7 +49210,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -49325,7 +49325,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -49434,7 +49434,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -49576,7 +49576,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -49692,7 +49692,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -49801,7 +49801,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -49887,7 +49887,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -50002,7 +50002,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -50111,7 +50111,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -50230,7 +50230,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -50353,7 +50353,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -50462,7 +50462,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -50631,7 +50631,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -50747,7 +50747,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -50856,7 +50856,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -50997,7 +50997,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -51120,7 +51120,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -51229,7 +51229,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -51397,7 +51397,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -51520,7 +51520,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -51629,7 +51629,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -51853,7 +51853,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -51969,7 +51969,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -52078,7 +52078,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -52209,7 +52209,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -52324,7 +52324,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -52433,7 +52433,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -52618,7 +52618,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -52734,7 +52734,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -52843,7 +52843,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -52995,7 +52995,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -53110,7 +53110,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -53219,7 +53219,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -53295,7 +53295,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -53410,7 +53410,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -53519,7 +53519,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -53704,7 +53704,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -53820,7 +53820,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -53929,7 +53929,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -54544,7 +54544,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -54659,7 +54659,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -54768,7 +54768,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -54813,7 +54813,7 @@
                       "properties": {
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         },
                         "scoring_version": {
                           "type": "string",
@@ -54928,7 +54928,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [
@@ -55037,7 +55037,7 @@
                         },
                         "request_id": {
                           "type": "string",
-                          "minLength": 1
+                          "pattern": "^[0-9a-f]{32}$"
                         }
                       },
                       "required": [

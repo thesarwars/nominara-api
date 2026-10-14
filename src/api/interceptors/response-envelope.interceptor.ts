@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { CallHandler, ExecutionContext, Injectable, Logger, NestInterceptor } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import type { FastifyReply } from "fastify";
@@ -7,6 +6,7 @@ import { map } from "rxjs/operators";
 import type { EnvelopeMeta } from "../../../contracts/common/envelope.schema.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { requestIdOf } from "../../lib/telemetry/tracing.js";
 import { NO_ENVELOPE_KEY } from "../decorators/no-envelope.decorator.js";
 import { STREAMING_KEY } from "../decorators/streaming.decorator.js";
 import { Page } from "../pagination/page.js";
@@ -42,15 +42,6 @@ const logger = new Logger("response-envelope");
 // would have left every response claiming the old version. §1's example prints `"v1"`, which is today's value of
 // the one constant. A per-request pin via `X-Nominara-Scoring-Version` (§1) is not built.
 
-/** §1: "`X-Request-Id` — optional. Echoed in responses and logs; generated if absent." */
-function requestIdOf(request: AuthenticatedRequest & { id?: string | number }): string {
-  const supplied = request.headers?.["x-request-id"];
-  const value = Array.isArray(supplied) ? supplied[0] : supplied;
-  if (typeof value === "string" && value.length > 0) return value;
-  if (request.id !== undefined) return String(request.id);
-  return randomUUID();
-}
-
 @Injectable()
 export class ResponseEnvelopeInterceptor implements NestInterceptor {
   constructor(private readonly reflector: Reflector) {}
@@ -68,10 +59,12 @@ export class ResponseEnvelopeInterceptor implements NestInterceptor {
     const http = context.switchToHttp();
     const request = http.getRequest<AuthenticatedRequest & { id?: string | number }>();
     const reply = http.getResponse<FastifyReply>();
+    // STORY-024 AC9 — the request identifier IS the OpenTelemetry trace id;
+    // an inbound `X-Request-Id` / `traceparent` does not choose it.
     const requestId = requestIdOf(request);
 
-    // Echoed whether or not the body is wrapped: a liveness probe that fails
-    // is still worth correlating, and §1 makes the echo unconditional.
+    // Sent whether or not the body is wrapped: a liveness probe that fails
+    // is still worth correlating, and §1 makes it unconditional.
     reply.header("x-request-id", requestId);
 
     if (exempt) {

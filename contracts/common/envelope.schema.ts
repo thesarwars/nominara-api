@@ -15,7 +15,8 @@ import { paginationResponseSchema } from "./pagination.schema.js";
 // all, never an empty/null placeholder for it.
 export const envelopeMetaSchema = z
   .object({
-    request_id: z.string().min(1),
+    // STORY-024 AC9 — the OpenTelemetry trace id: 32 lowercase hex, server-generated.
+    request_id: z.string().regex(/^[0-9a-f]{32}$/),
     scoring_version: z.string().min(1),
     computed_at: z.iso.datetime(),
   })

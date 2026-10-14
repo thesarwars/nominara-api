@@ -81,11 +81,13 @@ describe("STORY-024 · ResponseEnvelopeInterceptor", () => {
     expect(result, "a probe body must reach the orchestrator unwrapped").toEqual({ status: "ok" });
   });
 
-  it("echoes the request identifier on the response, honouring an inbound one", async () => {
+  // STORY-024 owner decision 2026-10-13 #2 — an inbound X-Request-Id never becomes the identity.
+  it("echoes the 32-hex trace id on the response and ignores an inbound X-Request-Id", async () => {
     const { context, header } = contextFor(Wrapped, null, { "x-request-id": "from-caller" });
     await lastValueFrom(new ResponseEnvelopeInterceptor(new Reflector()).intercept(context, handlerReturning({})));
 
-    expect(header).toHaveBeenCalledWith("x-request-id", "from-caller");
+    expect(header).toHaveBeenCalledWith("x-request-id", expect.stringMatching(/^[0-9a-f]{32}$/));
+    expect(header).not.toHaveBeenCalledWith("x-request-id", "from-caller");
   });
 
   it("emits the counter, labelled by whether the body was wrapped", async () => {
@@ -120,7 +122,11 @@ describe("STORY-024 · ResponseEnvelopeInterceptor", () => {
 
     const line = logged().find((entry: Record<string, unknown>) => entry.message === "response enveloped");
     expect(line, "the story's one log line must be emitted").toBeDefined();
-    expect(line).toEqual({ message: "response enveloped", request_id: "req-1", workspace_id: workspaceId });
+    expect(line).toEqual({
+      message: "response enveloped",
+      request_id: expect.stringMatching(/^[0-9a-f]{32}$/),
+      workspace_id: workspaceId,
+    });
 
     const serialized = JSON.stringify(logged());
     expect(serialized, "a workspace NAME must never reach a log line").not.toContain("Acme Corporation");
