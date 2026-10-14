@@ -139,8 +139,10 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
   const cappedTiers = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "capture_backed_tools_capped_tiers")!;
   const reads = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "reads")!;
   const writes = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "writes")!;
+  const projectRuns = RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === "project_runs")!;
 
-  // Each of these PASSES rateLimitConfigSchema (asserted below) and would be accepted by a shape-only loader.
+  // Each schema-valid probe PASSES rateLimitConfigSchema (asserted below). The two numeric ones keep the default bucket
+  // set, so ONLY the factor bound can reject them.
   const invalid: Array<[string, string, Drive?]> = [
     ["not JSON", "{not json"],
     ["JSON of the wrong shape", JSON.stringify({ writes: 1 })],
@@ -175,9 +177,9 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
     [
       "schema-valid, project_runs at burst 1e9 / limit 1e9 / window 1 ms (unlimited)",
       documentWith("project_runs", {
-        route_class: "project_runs",
+        ...projectRuns,
         burst: 1_000_000_000,
-        buckets: [{ scope: "user", limit: 1_000_000_000, window: "rolling", window_ms: 1 }],
+        buckets: projectRuns.buckets.map((bucket) => ({ ...bucket, limit: 1_000_000_000, window_ms: 1 })),
       }),
       { routeClass: "project_runs", identity: userCaller, stepMs: 0, requests: 50 },
     ],
@@ -193,7 +195,7 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
       "schema-valid, reads at limit 1 / window 9e15 ms (effectively zero refill)",
       documentWith("reads", {
         ...reads,
-        buckets: [{ scope: "user", limit: 1, window: "rolling", window_ms: 9_000_000_000_000_000 }],
+        buckets: reads.buckets.map((bucket) => ({ ...bucket, limit: 1, window_ms: 9_000_000_000_000_000 })),
       }),
       { routeClass: "reads", identity: userCaller, stepMs: 1_000, requests: 200 },
     ],
