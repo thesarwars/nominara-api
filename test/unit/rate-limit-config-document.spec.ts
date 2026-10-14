@@ -313,6 +313,11 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
       PACED_WRITES,
     ],
     [
+      "schema-valid, writes user at 6 per 600000 ms: limit/10 and window_ms x10 each inside their bound, rate /100 (rate lower bound)",
+      documentWith("writes", { ...writes, buckets: scaleUser(writes, { limit: 6, window_ms: 600_000 }) }),
+      PACED_WRITES,
+    ],
+    [
       "schema-valid, writes burst alone at default/11, rounded down (burst lower bound)",
       documentWith("writes", { ...writes, burst: Math.max(1, Math.floor(DEFAULT_WRITES_BURST / 11)) }),
       { ...WRITES_DRIVE, identity: userCaller },
