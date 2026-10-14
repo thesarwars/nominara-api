@@ -172,19 +172,17 @@ describe("STORY-025 · rate limiting against the real credit ledger and the real
   }
 
   /**
-   * Spends the user's bucket through the app's own limiter, so the NEXT request is the refused one.
-   *
-   * The class is `writes`, because that is what `POST /projects/:id/runs` is limited by TODAY: the route declares no
-   * `@RateLimitClass`, so §12's `project_runs` row (6/hour per user) is configured but not wired to it. That gap is
-   * recorded in docs-pending/STORY-025-*, not papered over here by exhausting a class the route is not in.
+   * Spends the user's bucket through the app's own limiter, so the NEXT request is the refused one. The class is
+   * `project_runs` — the class `POST /projects/:id/runs` declares (§12: 6/hour per user, burst 2). The AC11 test below
+   * proves the route really is in that class, so exhausting it here is not a bucket the route never touches.
    */
   async function exhaustRunsBucket(s: Scenario): Promise<void> {
     const limiter = harness.app().get(RateLimitBuckets, { strict: false });
     const identity = { env: cacheKeyNamespace(), workspaceId: s.workspaceId, userId: s.userId, ip: "127.0.0.1" };
     for (let i = 0; i < 100; i++) {
-      if (!(await limiter.check("writes", identity)).allowed) return;
+      if (!(await limiter.check("project_runs", identity)).allowed) return;
     }
-    throw new Error("the writes bucket never refused; the fixture cannot exhaust it");
+    throw new Error("the project_runs bucket never refused; the fixture cannot exhaust it");
   }
 
   it("STORY-025 row 8 · CONTROL: the same funded deep scan, not rate-limited, DOES reserve and debit", async () => {
@@ -233,7 +231,7 @@ describe("STORY-025 · rate limiting against the real credit ledger and the real
     expect(res.statusCode, res.body).toBe(429);
   });
 
-  it("STORY-025 AC11 · POST /projects/:id/runs is limited by the project_runs class: burst 2, then the third rapid request is refused with the 6/hour limit", async () => {
+  it("STORY-025 AC11 · POST /projects/:id/runs is limited by the project_runs class: burst 2, then the third rapid request is refused (6/hour refill)", async () => {
     capture.ready = [ENGINE_KEY];
     const s = await scenario({ prompts: 2, included: 2_400 });
 
@@ -243,10 +241,11 @@ describe("STORY-025 · rate limiting against the real credit ledger and the real
 
     expect(first.statusCode, first.body).toBe(202);
     expect(second.statusCode, second.body).toBe(202);
-    expect(first.headers["x-ratelimit-limit"], "the project_runs user bucket (6/hour) applied, not writes (60/min)").toBe("6");
+    // The header publishes the capacity of the bucket that applied: project_runs' burst is 2, writes' is 20.
+    expect(first.headers["x-ratelimit-limit"], "the project_runs bucket applied, not writes").toBe("2");
     expect(third.statusCode, third.body).toBe(429);
     expect(third.json()).toMatchObject({ error: { code: "rate_limited" } });
-    expect(third.headers["x-ratelimit-limit"]).toBe("6");
+    expect(third.headers["x-ratelimit-limit"]).toBe("2");
     expect(third.headers["x-ratelimit-remaining"]).toBe("0");
     expect(Number(third.headers["retry-after"]), "a refill takes minutes (6/hour), not seconds (60/min)").toBeGreaterThan(60);
   });
