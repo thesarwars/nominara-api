@@ -6,7 +6,7 @@ import type { ProjectCadence } from "./dispatch-cells.js";
 import { resolveDueEngines, scopeForKind, CYCLE_DAYS, type RunKind } from "./engine-cadence.js";
 import type { RunTrigger } from "./fair-use.js";
 import type { PriorityVariant } from "../queue/queue-factory.js";
-import { dispatchPlannedRun, planRun, type PlannedRun } from "./plan-run.js";
+import { dispatchPlannedRun, planRun, type PlannedRun, type RematchTarget } from "./plan-run.js";
 
 // STORY-033 — tracking-engine.md §5's scheduler: which projects are due, in
 // what order, and how two replicas run the same tick without colliding.
@@ -480,8 +480,10 @@ export async function dispatchScheduledRun(
   queue: Queue,
   entry: QueueTopologyEntry,
   scheduled: ScheduledRun,
+  parse?: RematchTarget,
 ): Promise<Job[]> {
   return dispatchPlannedRun(queue, entry, scheduled.plan, {
     priorityVariant: priorityVariantFor(scheduled.trigger),
+    ...(parse === undefined ? {} : { parse }),
   });
 }

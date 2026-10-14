@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger, type OnModuleDestroy } from "@nestjs/common";
 import type { Job, Queue } from "bullmq";
 import type { Redis } from "ioredis";
-import { dispatchCaptureCells } from "../capture/dispatch-cells.js";
+import { dispatchCaptureCells, rematchDispatchCells } from "../capture/dispatch-cells.js";
 import type { ProjectCadence } from "../capture/dispatch-cells.js";
 import type { PlannedRun } from "../capture/plan-run.js";
 import { signQueueJobPayload, type TenantScopedPayload } from "./envelope.js";
@@ -118,7 +118,7 @@ export class QueueProducer implements OnModuleDestroy {
     const entry = TOPOLOGY_BY_NAME.get(name);
     if (entry === undefined) throw new UnknownQueueError(name);
 
-    return dispatchCaptureCells(
+    const jobs = await dispatchCaptureCells(
       this.queueFor(entry),
       entry,
       plan.cells.map((cell) => ({
@@ -130,6 +130,25 @@ export class QueueProducer implements OnModuleDestroy {
       })),
       dispatch,
     );
+
+    // STORY-032 AC7 — the re-match parse for every reused row, SIGNED like the cells (the worker verifies the
+    // signature before anything else) and in one batch. Keyed `parse:{result}`, so a second dispatch of the same
+    // plan, or a replan, leaves one job per row. Jittering them would only postpone the day's rollup.
+    const parseEntry = TOPOLOGY_BY_NAME.get("capture.parse");
+    if (parseEntry === undefined) throw new UnknownQueueError("capture.parse");
+    await dispatchCaptureCells(
+      this.queueFor(parseEntry),
+      parseEntry,
+      rematchDispatchCells(plan.rematch).map((cell) => ({
+        ...cell,
+        payload: signQueueJobPayload(
+          { ...(cell.payload as Record<string, unknown>), kid: this.keys.current.kid } as TenantScopedPayload,
+          this.keys.current.key,
+        ),
+      })),
+      { cadence: "manual" },
+    );
+    return jobs;
   }
 
   /**

@@ -2,7 +2,16 @@ import type { Job, Queue } from "bullmq";
 import type { ClientBase } from "pg";
 import type { Cache } from "../cache/cache.port.js";
 import type { QueueTopologyEntry } from "../queue/topology.js";
-import { dispatchCaptureCells, type DispatchCell, type DispatchOptions, type ProjectCadence } from "./dispatch-cells.js";
+import {
+  dispatchCaptureCells,
+  rematchDispatchCells,
+  type DispatchCell,
+  type DispatchOptions,
+  type ProjectCadence,
+  type RematchJob,
+} from "./dispatch-cells.js";
+
+export type { RematchJob } from "./dispatch-cells.js";
 import { resolveEntitlements } from "../entitlements/resolution.js";
 import { provisionUsageCounters } from "../usage/tier-caps.js";
 import { assertFairUseCapacity, commitDeepScanCharge, type RunTrigger } from "./fair-use.js";
@@ -12,6 +21,7 @@ import { probeRunCells } from "./probe-run.js";
 import { type PlannedCell, type PromptScope, type ResolvedEngine } from "./plan-cells.js";
 import { recordRunCounts, recordSuppressedCells, type SuppressedCell } from "./record-suppressed.js";
 import { projectAliasFingerprint } from "./l3-short-circuit.js";
+import { reusedStatusSql } from "../rollup/aggregate-day.js";
 import { cohortsFor, measureCohort, type SuppressionMeasurement } from "./suppression-cohorts.js";
 
 // STORY-032 — run planning, end to end.
@@ -84,6 +94,12 @@ export interface PlanRunContext {
   readonly nowMs: number;
 }
 
+/** Where `dispatchPlannedRun` sends the re-match parses. */
+export interface RematchTarget {
+  readonly queue: Queue;
+  readonly entry: QueueTopologyEntry;
+}
+
 export interface PlannedRun {
   readonly runId: string;
   readonly planned: number;
@@ -108,6 +124,11 @@ export interface PlannedRun {
   readonly charge: { readonly charged: boolean; readonly reason: string };
   /** The cells to enqueue. Only `dispatchPlannedRun` should read this. */
   readonly cells: readonly DispatchCell[];
+  /**
+   * The reused rows this run wrote (or already had, on a replan), each to be re-matched by `capture.parse`.
+   * Read from the rows, not from the hits, so a replan reports the same set. Only dispatch should read this.
+   */
+  readonly rematch: readonly RematchJob[];
   readonly cadence: ProjectCadence;
 }
 
@@ -288,6 +309,8 @@ async function writePlan(
     engineKeys: engines.map((engine) => engine.engineKey),
   });
 
+  const rematch = await readRematchJobs(tx, context);
+
   const cohortInput = { cadence: context.cadence, planKey: context.planKey };
 
   // Hoisted out of the returned literal. The hook is a no-op until the
@@ -333,8 +356,34 @@ async function writePlan(
         personaHint: context.personaHint,
       },
     })),
+    rematch,
     cadence: context.cadence,
   };
+}
+
+/**
+ * The reused rows of this run, as re-match jobs.
+ *
+ * Read BACK from `answer_captures` rather than built from the hits: `recordSuppressedCells` skips a cell that already
+ * has a row (a replan), and the replan must still report that row, or a crash between plan and dispatch would leave
+ * its reused cells un-matched for good. `ORDER BY id` so two plans of one run report one order.
+ */
+async function readRematchJobs(tx: ClientBase, context: PlanRunContext): Promise<RematchJob[]> {
+  const found = await tx.query<{ id: string; prompt_id: string; engine_key: string; captured_at: Date }>(
+    `SELECT id, prompt_id, engine_key, captured_at
+       FROM answer_captures
+      WHERE run_id = $1 AND ${reusedStatusSql("status")} AND cache_layer IN ('l1', 'l2')
+      ORDER BY id`,
+    [context.runId],
+  );
+  return found.rows.map((row) => ({
+    workspaceId: context.workspaceId,
+    resultId: row.id,
+    projectId: context.projectId,
+    promptId: row.prompt_id,
+    engineKey: row.engine_key,
+    capturedAt: row.captured_at.toISOString(),
+  }));
 }
 
 /**
@@ -345,12 +394,27 @@ async function writePlan(
  * belongs AFTER the caller's commit: a crash between the two loses jobs, and
  * a replan re-creates them under the same deduplication keys, whereas a
  * rollback after enqueueing would leave jobs for a run that does not exist.
+ *
+ * STORY-032 AC7 — ALSO enqueues the re-match parse for every reused row, on `options.parse`. A plan with reused rows
+ * and no parse target is REFUSED before anything is enqueued: dispatching only the live cells would leave the
+ * reused cells un-matched against the current alias set, silently. The returned jobs are the live cells'.
  */
 export async function dispatchPlannedRun(
   queue: Queue,
   entry: QueueTopologyEntry,
   plan: PlannedRun,
-  options?: Omit<DispatchOptions, "cadence">,
+  options?: Omit<DispatchOptions, "cadence"> & { readonly parse?: RematchTarget },
 ): Promise<Job[]> {
-  return dispatchCaptureCells(queue, entry, plan.cells, { ...options, cadence: plan.cadence });
+  const { parse, ...dispatchOptions } = options ?? {};
+  if (plan.rematch.length > 0 && parse === undefined) {
+    throw new Error(
+      `dispatchPlannedRun: run ${plan.runId} has ${String(plan.rematch.length)} reused cell(s) to re-match and no parse queue was given`,
+    );
+  }
+  const jobs = await dispatchCaptureCells(queue, entry, plan.cells, { ...dispatchOptions, cadence: plan.cadence });
+  if (parse !== undefined) {
+    // Not jittered ('manual' is 0): they spend no vendor call, and a delay would only postpone the day's rollup.
+    await dispatchCaptureCells(parse.queue, parse.entry, rematchDispatchCells(plan.rematch), { cadence: "manual" });
+  }
+  return jobs;
 }

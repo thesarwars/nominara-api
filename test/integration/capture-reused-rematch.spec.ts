@@ -330,6 +330,18 @@ describe("STORY-032 AC7 · re-matching a reused cell", () => {
     expect((await rowOf(reused)).brand_present).toBeNull();
   });
 
+  it("[I3 no-cross-tenant-source] STORY-032 AC7 · a source row in ANOTHER WORKSPACE that claims THIS project is not read either (the workspace predicate stands on its own)", async () => {
+    // Without a foreign key on `source_result_id`, and with only RLS between tenants, the statement's own workspace
+    // predicate is what turns a corrupt pointer into a miss. The project predicate must not be what saves it.
+    const corrupt = await liveCapture({ ws: otherWorkspaceId, project: projectId, run: runId, text: LEAK });
+    const reused = await reusedL2(corrupt);
+
+    await run(reused);
+
+    expect(await factLabels(reused)).toEqual([]);
+    expect((await rowOf(reused)).status).toBe("skipped");
+  });
+
   it("[I3 no-cross-tenant-source] STORY-032 AC7 · a source in another PROJECT of the same workspace is not read either", async () => {
     const sibling = await liveCapture({ project: otherProjectId, run: null, text: LEAK });
     const reused = await reusedL2(sibling);

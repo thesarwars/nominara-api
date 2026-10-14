@@ -1,6 +1,7 @@
 import type { ClientBase } from "pg";
 import type { AnswerElement } from "../engines/contract.js";
 import { aliasSetFingerprint, loadAliasSet } from "../capture/l3-short-circuit.js";
+import { reusedStatusSql } from "../rollup/aggregate-day.js";
 import {
   classifyAnswerForm,
   classifyPositionClass,
@@ -401,8 +402,11 @@ export async function persistParse(
   const brandSentiment = result.mentions.find((entry) => entry.mention.entityType === "brand")?.sentiment;
 
   await tx.query(
+    // `status` is moved to 'parsed' for a captured row ONLY. A REUSED row is 'skipped' and stays 'skipped': the run
+    // counts it once, from `capture_runs.skipped_cells`, and `captured_cells` counts rows in captured/parsed
+    // (STORY-032 AC7). The rule lives in the statement, so no caller can break it by forgetting.
     `UPDATE answer_captures
-        SET status = 'parsed',
+        SET status = CASE WHEN ${reusedStatusSql("status")} THEN 'skipped' ELSE 'parsed' END,
             brand_present = $2,
             brand_rank_position = $3,
             sov = $4,
