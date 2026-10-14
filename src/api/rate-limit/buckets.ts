@@ -108,7 +108,8 @@ const bucketOrder = (a: RateLimitBucket, b: RateLimitBucket): number =>
  * Whether a schema-valid document stays inside the envelope the code defaults draw. The schema checks SHAPE only;
  * this checks that no control was removed or neutered. Per class, the (scope, window, hard_cap) buckets must match
  * the defaults exactly (so pre-auth classes keep an IP bucket, the UTC-day hard cap stays, and no class gains a hard
- * cap), and limit, burst and window_ms must each stay within RATE_LIMIT_ENVELOPE_FACTOR of the default.
+ * cap), and limit, burst, window_ms and the rate limit / window_ms must each stay within
+ * RATE_LIMIT_ENVELOPE_FACTOR of the default.
  */
 export function withinEnvelope(
   document: readonly RateLimitRouteClassConfig[],
@@ -116,21 +117,25 @@ export function withinEnvelope(
 ): boolean {
   return defaults.every((reference) => {
     const candidate = document.find((entry) => entry.route_class === reference.route_class);
-    if (candidate === undefined || !withinFactor(candidate.burst, reference.burst)) return false;
+    if (candidate === undefined) return false;
+    if (!withinFactor(candidate.burst, reference.burst)) return false;
     if (candidate.buckets.length !== reference.buckets.length) return false;
     const got = [...candidate.buckets].sort(bucketOrder);
     const want = [...reference.buckets].sort(bucketOrder);
     return want.every((expected, i) => {
       const actual = got[i]!;
-      return (
-        actual.scope === expected.scope &&
-        actual.window === expected.window &&
-        actual.hard_cap === expected.hard_cap &&
-        withinFactor(actual.limit, expected.limit) &&
-        (expected.window_ms === undefined
-          ? actual.window_ms === undefined
-          : actual.window_ms !== undefined && withinFactor(actual.window_ms, expected.window_ms))
-      );
+      if (actual.scope !== expected.scope) return false;
+      if (actual.window !== expected.window) return false;
+      if (actual.hard_cap !== expected.hard_cap) return false;
+      if (!withinFactor(actual.limit, expected.limit)) return false;
+      if (expected.window_ms === undefined) return true; // a utc_day bucket: the calendar is the window
+      if (actual.window_ms === undefined) return false;
+      if (!withinFactor(actual.window_ms, expected.window_ms)) return false;
+      // The RATE (limit / window_ms) is bounded too, because limit and window_ms bounded separately would allow
+      // FACTOR^2 times the default rate. Cross-multiplied, so no division and no float rounding at the boundary.
+      const scaled = actual.limit * expected.window_ms;
+      const referenceRate = expected.limit * actual.window_ms;
+      return scaled <= referenceRate * RATE_LIMIT_ENVELOPE_FACTOR && scaled * RATE_LIMIT_ENVELOPE_FACTOR >= referenceRate;
     });
   });
 }
