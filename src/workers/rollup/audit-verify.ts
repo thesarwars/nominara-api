@@ -18,11 +18,11 @@ import {
 } from "../../modules/audit/audit-log-reader.js";
 import {
   appendMark,
+  findBrokenMark,
   hasTombstone,
   listMarkedWorkspaceIds,
   readChainHead,
   readLatestMark,
-  rowHashAt,
 } from "../../modules/audit/audit-chain-marks.js";
 import type { PagingNotifier } from "../../modules/audit/ports/paging-notifier.js";
 
@@ -236,12 +236,12 @@ export async function verifyAndMarkWorkspaceChain(
       return { mismatch: { seq: mark.seq, reason: "chain_missing" }, marked: false };
     }
 
-    if (mark !== null) {
-      if (BigInt(head.seq) < BigInt(mark.seq)) return { mismatch: { seq: mark.seq, reason: "chain_truncated" }, marked: false };
-      const hashAtMark = await rowHashAt(client, workspaceId, mark.seq);
-      if (hashAtMark === null || !hashAtMark.equals(mark.rowHash)) {
-        return { mismatch: { seq: mark.seq, reason: "mark_hash_mismatch" }, marked: false };
-      }
+    // Every mark, not only the greatest — see findBrokenMark.
+    const broken = await findBrokenMark(client, workspaceId);
+    if (broken !== null) {
+      const reason: HighWaterReason =
+        BigInt(head.seq) < BigInt(broken.seq) ? "chain_truncated" : "mark_hash_mismatch";
+      return { mismatch: { seq: broken.seq, reason }, marked: false };
     }
 
     await appendMark(client, workspaceId, head, "verified");

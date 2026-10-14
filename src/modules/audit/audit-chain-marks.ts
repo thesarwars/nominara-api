@@ -31,15 +31,6 @@ export async function readChainHead(client: ClientBase, workspaceId: string): Pr
   return row === undefined ? null : { seq: row.seq, rowHash: row.row_hash };
 }
 
-/** The stored hash of the row at exactly `seq`, or null when that row does not exist. */
-export async function rowHashAt(client: ClientBase, workspaceId: string, seq: string): Promise<Buffer | null> {
-  const result = await client.query<{ row_hash: Buffer }>(
-    "SELECT row_hash FROM audit_log WHERE workspace_id = $1 AND seq = $2::int8",
-    [workspaceId, seq],
-  );
-  return result.rows[0]?.row_hash ?? null;
-}
-
 /**
  * The current mark: the non-tombstone row with the greatest `max_seq`.
  *
@@ -59,6 +50,37 @@ export async function readLatestMark(client: ClientBase, workspaceId: string): P
   );
   const row = result.rows[0];
   return row === undefined ? null : { seq: row.max_seq, rowHash: row.row_hash };
+}
+
+/**
+ * The greatest mark the chain no longer satisfies, or null when every mark still holds.
+ *
+ * ⚠ EVERY MARK, NOT JUST THE GREATEST. No legitimate path ever changes a stored
+ * `row_hash` or deletes a marked row (a hard delete writes a tombstone and
+ * removes the whole chain), so every past mark position must still exist with
+ * the same hash. Checking only the greatest let a `rechain` mark — written by
+ * an erasure over an already-truncated chain, or forged by hand — become the
+ * sole baseline and wash the truncation out for good, while an older `verified`
+ * mark still said the deleted row had existed.
+ *
+ * `present` is false when no row exists at the marked seq (the chain is shorter,
+ * or that row was deleted); true means a row exists with a different hash.
+ */
+export async function findBrokenMark(
+  client: ClientBase,
+  workspaceId: string,
+): Promise<{ readonly seq: string; readonly present: boolean } | null> {
+  const result = await client.query<{ seq: string; present: boolean }>(
+    `SELECT m.max_seq::text AS seq, (a.seq IS NOT NULL) AS present
+       FROM audit_chain_marks m
+       LEFT JOIN audit_log a ON a.workspace_id = m.workspace_id AND a.seq = m.max_seq
+      WHERE m.workspace_id = $1 AND m.reason <> 'tombstone'
+        AND (a.row_hash IS NULL OR a.row_hash <> m.row_hash)
+      ORDER BY m.max_seq DESC LIMIT 1`,
+    [workspaceId],
+  );
+  const row = result.rows[0];
+  return row === undefined ? null : { seq: row.seq, present: row.present };
 }
 
 export async function hasTombstone(client: ClientBase, workspaceId: string): Promise<boolean> {

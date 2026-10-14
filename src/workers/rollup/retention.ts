@@ -8,7 +8,7 @@ import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { RECHAINED_MARKER_ACTION } from "../../lib/crypto/audit-chain.js";
 import { pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
-import { appendMark, appendTombstone, readChainHead } from "../../modules/audit/audit-chain-marks.js";
+import { appendMark, appendTombstone, findBrokenMark, readChainHead } from "../../modules/audit/audit-chain-marks.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { listPartitions } from "./maintenance.js";
@@ -415,6 +415,15 @@ export async function requestIndividualErasure(privilegedClient: ClientBase, use
     // UPDATE/DELETE, never INSERT — so this runs fine with the trigger
     // already re-enabled above.
     for (const { workspace_id: affectedWorkspaceId } of affectedWorkspaces.rows) {
+      // STORY-143 AC7 — never rechain over a chain that already fails its marks.
+      // A `rechain` mark at a new head would otherwise launder a prior tail
+      // truncation. Throwing rolls the whole erasure back; the verifier pages.
+      const broken = await findBrokenMark(privilegedClient, affectedWorkspaceId);
+      if (broken !== null) {
+        throw new Error(
+          `erasure rechain refused for workspace ${affectedWorkspaceId}: audit chain fails its high-water mark at seq ${broken.seq} (${broken.present ? "mark_hash_mismatch" : "chain_truncated"})`,
+        );
+      }
       await auditChain.append(privilegedClient, {
         workspaceId: affectedWorkspaceId,
         actorType: "system",
