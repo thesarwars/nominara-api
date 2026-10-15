@@ -19,6 +19,16 @@ export const creditDailyCounters = pgTable("credit_daily_counters", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
 }, (table) => [primaryKey({ columns: [table.workspaceId, table.utcDate, table.actionCode] })]);
 
+export const creditHoldCarries = pgTable("credit_hold_carries", {
+  workspaceId: uuid("workspace_id").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  attempt: integer("attempt").notNull(),
+  credits: integer("credits").notNull(),
+  rolledCycleStart: date("rolled_cycle_start").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  settledAt: timestamp("settled_at", { withTimezone: true }),
+}, (table) => [primaryKey({ columns: [table.workspaceId, table.idempotencyKey, table.attempt] })]);
+
 export const creditLedger = pgTable("credit_ledger", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   workspaceId: uuid("workspace_id").notNull(),

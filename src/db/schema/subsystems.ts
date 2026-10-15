@@ -36,6 +36,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "credit_wallets",
     "credit_daily_counters",
     "credit_ledger",
+    "credit_hold_carries",
     "credit_packs",
     "credit_purchases",
     "usage_counters",

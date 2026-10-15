@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import { grantCredits } from "../credits/balance.js";
+import { rollIncludedCycle } from "../credits/cycle-roll.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import {
@@ -122,6 +123,11 @@ export interface ApplyPlanOptions {
    * as deferred, never performed here.
    */
   readonly allowDowngrade?: boolean;
+}
+
+/** The UTC calendar day of an instant, as the `YYYY-MM-DD` the wallet's `date` columns take. */
+function utcDate(instant: Date): string {
+  return instant.toISOString().slice(0, 10);
 }
 
 /** The only reconciler STORY-151 ships: change the plan, carry everything else forward. */
@@ -308,15 +314,60 @@ export async function applyPlanChange(
     ],
   );
 
-  // 6b. THE BILLING CYCLE ROLLED: auto-top-up's per-cycle counter starts again (EC-48 "the counter resets
-  //     only at cycle roll"; NEW-D-7 checkpoint-3 finding 3). This statement is the only writer of
-  //     `current_period_start`, so a period that starts LATER than the one on file IS the roll. Strictly later:
-  //     a redelivery of the same period and a stale event for an earlier one change nothing, and a reconcile
-  //     inside the period (seats, an add-on, a cancel flag) never reaches here with a new start. Only the
-  //     counter moves: the configuration is the customer's and a roll does not touch it. (`credit_wallets.cycle_*`
-  //     is rolled by nothing in src/ — see wallet.ts `cycleHasLapsed` — so it cannot be the trigger; whatever
-  //     eventually rolls it must zero this counter in the same statement.) No wallet yet: zero rows, no error.
-  if (desired.currentPeriodStart.getTime() > currentRow.current_period_start.getTime()) {
+  // 6b. THE BILLING CYCLE ROLLED. A period that starts LATER than the one on file IS the roll (this statement is the
+  //     only writer of `current_period_start`). Strictly later: a redelivery of the same period and a stale event for
+  //     an earlier one change nothing, and a reconcile inside the period (seats, an add-on, a cancel flag) never
+  //     reaches here with a new start.
+  //
+  //     STORY-072 AC13 — plans-and-entitlements.md §5 "Grant refresh": the included bucket is RESET to the plan's
+  //     grant and the unused credits expire (`rollIncludedCycle`: a `grant` and an `expire` ledger entry, the
+  //     auto-top-up counter restarted in the same statement per EC-48). The grant is the plan being moved TO, WHATEVER
+  //     THE DIRECTION: a downgrade that lands at the period end resets to the lower grant, and an upgrade that starts
+  //     a new period (free to paid is the common case) gets the new plan's full grant, with §5's conversion rule
+  //     applied — the credits left unheld CARRY INTO it, they are not expired and re-granted.
+  //
+  //     ⚠ A ROLL REPLACES THE PRO-RATA TOP-UP (step 8) FOR THE SAME UPGRADE. Pro-rata tops up the REST of the current
+  //     cycle; a roll has just started a new one with the full grant, so doing both would mint the difference twice.
+  //     Before this, a new period alongside an upgrade skipped the roll and then ran pro-rata against a cycle that
+  //     had already lapsed, which clamps to zero: the customer who paid got nothing.
+  //
+  //     ⚠ NOT WHILE THE PAYMENT IS OUTSTANDING (owner decision 2026-10-15). A `past_due` subscription's renewal has
+  //     not been paid for, so its new period grants nothing yet. The roll happens when the payment succeeds, and
+  //     that event is the same `customer.subscription.updated` carrying the SAME period start and an `active`
+  //     status — so "the period advanced" cannot be the only trigger: the subscription's PREVIOUS status being
+  //     `past_due` is the other. `rollIncludedCycle` is gated on the wallet's own `cycle_start` under its row lock,
+  //     so however many events ask, the wallet rolls once.
+  //
+  //     Without a wallet yet there is nothing to roll: the first provisioning grants the new plan in full.
+  const periodAdvanced = desired.currentPeriodStart.getTime() > currentRow.current_period_start.getTime();
+  const isUpgrade = targetPlan.sort_order > currentPlan.sort_order;
+  const paymentOutstanding = desired.status === "past_due";
+  // ⚠ RECOVERY MEANS A PAYMENT SUCCEEDED. A past_due subscription that ENDS (retries exhausted: Stripe `unpaid` or
+  // `canceled`, which reconciles to `free`) is not one, so it does not trigger the deferred roll; the free wallet's
+  // own monthly refresh is the follow-up story's.
+  const recovering = currentRow.status === "past_due" && !paymentOutstanding && desired.planKey !== "free";
+  let cycleRolled = false;
+  if ((periodAdvanced || recovering) && !paymentOutstanding) {
+    const rolled = await rollIncludedCycle(tx, {
+      workspaceId,
+      grant: targetPlan.credits_per_cycle,
+      cycleStart: utcDate(desired.currentPeriodStart),
+      cycleEnd: utcDate(desired.currentPeriodEnd),
+      carryUnused: isUpgrade,
+      // The subscription's period start MOVED FORWARD (compared as `timestamptz` under its row lock): the wallet's `date`
+      // cycle cannot say so when the free cycle began earlier the same UTC day. Only an advance carries it. A recovery
+      // does not: its period start has not moved, and a past_due event inside the CURRENT period must not look like a
+      // new one to a wallet whose cycle began that day.
+      ...(periodAdvanced ? { periodInstant: desired.currentPeriodStart.toISOString() } : {}),
+    });
+    cycleRolled = rolled.rolled;
+  }
+  if (periodAdvanced && !cycleRolled && !paymentOutstanding) {
+    // Auto-top-up's per-cycle counter still restarts with the subscription's period (EC-48 "the counter resets only
+    // at cycle roll"; NEW-D-7 checkpoint-3 finding 3) when the wallet itself was not rolled above — a wallet whose own
+    // cycle is already current, or one that does not exist yet. Only the counter moves: the configuration is the
+    // customer's. No wallet yet: zero rows, no error. While the payment is outstanding it waits for the roll, with
+    // the credits.
     await tx.query(
       "UPDATE credit_wallets SET auto_topup_count_cycle = 0, updated_at = now() WHERE workspace_id = $1 AND auto_topup_count_cycle <> 0",
       [workspaceId],
@@ -366,7 +417,20 @@ export async function applyPlanChange(
     [workspaceId],
   );
   const cycle = wallet.rows[0];
-  if (cycle === undefined) {
+  if (cycleRolled) {
+    // Step 6b rolled the wallet to the target plan's full grant: a pro-rata top-up on top would mint the same
+    // upgrade twice (and `cycle` here is the NEW cycle, whose remaining fraction is ~1).
+    creditsNote = "the billing cycle rolled: the wallet was reset to the new plan's grant, so no pro-rata top-up applies";
+  } else if (periodAdvanced) {
+    // ⚠ THE CREDIT FOR A NEW PERIOD BELONGS TO THE ROLL, DEFERRED OR NOT. The period advanced but the wallet did not
+    // roll: either the payment is outstanding (past_due, the roll waits for it and then grants the plan's FULL grant) or
+    // the wallet's own cycle is already current. Pro-rata here would run against the OLD cycle and mint the unpaid
+    // upgrade's difference (~375 credits for starter to growth), and the recovery's roll would then grant the whole
+    // target grant on top of it.
+    creditsNote = paymentOutstanding
+      ? "the new period is unpaid: its credits are granted by the billing-cycle roll when the payment succeeds, so no pro-rata top-up applies"
+      : "the subscription started a new period: its credits belong to the billing-cycle roll, so no pro-rata top-up applies";
+  } else if (cycle === undefined) {
     // Wallets are provisioned lazily on first credit use, so a workspace that
     // has never spent has none. Skipping is correct — the first provisioning
     // grants the NEW plan's full amount — and saying so beats a silent zero.
