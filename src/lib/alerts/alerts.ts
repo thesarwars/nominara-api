@@ -34,14 +34,29 @@ export function announceAlertRouting(): void {
   getAlertEmailer();
 }
 
+/**
+ * The emailer, or null when it cannot be built. An alert path must never replace the failure it is reporting: if the
+ * environment will not load here, the page still has its log line and counter, and THIS failure is logged loudly
+ * (naming the error class only) rather than thrown into the verifier or monitor that raised the page. Not memoised, so
+ * the next page tries again.
+ */
+function emailerOrNull(): EmailAlertAdapter | null {
+  try {
+    return getAlertEmailer();
+  } catch (error) {
+    logger.error(`alert email unavailable, this page was not emailed: ${error instanceof Error ? error.name : "unknown error"}`);
+    return null;
+  }
+}
+
 /** The email leg of a sync `Pager` page. A no-op when alerts are not configured. */
 export function emailAlert(message: string, context: Record<string, unknown>): void {
-  getAlertEmailer()?.page(message, context);
+  emailerOrNull()?.page(message, context);
 }
 
 /** The email leg for the async verifier ports: resolves once the mail has settled (the scripts exit right after). */
 export async function emailAlertAndWait(message: string, context: Record<string, unknown>): Promise<void> {
-  await getAlertEmailer()?.notify(message, context);
+  await emailerOrNull()?.notify(message, context);
 }
 
 /** Test seam: install (or clear, with `undefined`, to re-read the environment) the process emailer. */

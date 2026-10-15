@@ -170,6 +170,22 @@ describe("alert email · no-config fallback", () => {
   });
 });
 
+describe("alert email · an unloadable environment never replaces the failure being reported", () => {
+  it("a page with a broken env resolves, is not emailed, and says so in an error line", async () => {
+    setAlertEmailerForTests(undefined);
+    delete process.env.OTP_EMAIL_HASH_PEPPER; // a required key: loadEnv() now throws
+    await expect(
+      new LoggingPagingNotifier().page({ workspaceId: WORKSPACE_ID, seq: "1", reason: "chain_broken" }),
+    ).resolves.toBeUndefined();
+    expect(logged.some((line) => line.includes("alert email unavailable") && line.includes("EnvValidationError"))).toBe(true);
+    expect(sender.sent).toHaveLength(0);
+    const monitor = new DlqDepthMonitor({ clock: () => now });
+    monitor.observe("q", DLQ_DEPTH_PAGE_THRESHOLD + 1);
+    now += DLQ_DEPTH_SUSTAINED_MS;
+    expect(() => monitor.observe("q", DLQ_DEPTH_PAGE_THRESHOLD + 1)).not.toThrow();
+  });
+});
+
 describe("alert email · every existing page site sends exactly one email for its condition", () => {
   it("SLO-24 dead-letter depth (DlqDepthMonitor, default pager)", async () => {
     const monitor = new DlqDepthMonitor({ clock: () => now });
