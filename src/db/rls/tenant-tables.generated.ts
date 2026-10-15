@@ -34,6 +34,7 @@ export const TENANT_TABLES: ReadonlySet<string> = new Set([
   "content_chunks",
   "corpus_passages",
   "credit_daily_counters",
+  "credit_hold_carries",
   "credit_ledger",
   "credit_purchases",
   "credit_wallets",
