@@ -404,6 +404,31 @@ export const envSchema = z
     // (SELECT only, portal_scope_* policies) and is a DIFFERENT pool from DATABASE_URL_POOLED. Credentials: never logged.
     PORTAL_COOKIE_KEY: requiredString.optional(),
     DATABASE_URL_PORTAL: requiredString.optional(),
+
+    // Group C item 3 - object storage (KAD-08), S3-compatible. LocalStack in development, AWS S3 in production: the
+    // ONLY production difference is STORAGE_ENDPOINT (unset on AWS) and the credentials (an IAM role on AWS, so
+    // STORAGE_ACCESS_KEY_ID/SECRET are unset there too). Everything is OPTIONAL and the API boots without it; storage
+    // calls then answer 503 `degraded`. The two bucket names are what switch it on, and one without the other is a
+    // refused boot (superRefine below). The secret access key is a credential: never logged, never in an error.
+    STORAGE_ENDPOINT: requiredString
+      .refine((value) => URL.canParse(value), { message: "must be a URL, e.g. http://localhost:4566" })
+      .optional(),
+    STORAGE_REGION: requiredString.optional(),
+    STORAGE_BUCKET_RAW: requiredString.optional(),
+    STORAGE_BUCKET_REPORTS: requiredString.optional(),
+    STORAGE_ACCESS_KEY_ID: requiredString.optional(),
+    STORAGE_SECRET_ACCESS_KEY: requiredString.optional(),
+    // "true" only - anything else is refused rather than guessed. LocalStack needs it; AWS must not set it.
+    STORAGE_FORCE_PATH_STYLE: z.enum(["true", "false"]).optional(),
+    // Encryption at rest on every write. Default (when unset) is the spec's SSE-KMS; local development sets AES256 (SSE-S3).
+    STORAGE_SSE: z.enum(["AES256", "aws:kms"]).optional(),
+    STORAGE_KMS_KEY_ID: requiredString.optional(),
+    // The `{env}` segment of every object key (system-architecture.md section 6). Like CACHE_KEY_NAMESPACE it exists
+    // because NODE_ENV cannot name a deployment (staging); a lowercase slug, defaulting to NODE_ENV.
+    STORAGE_KEY_ENV: z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9-]{0,31}$/, { message: "must be a lowercase slug of at most 32 characters" })
+      .optional(),
   })
   .strict()
   // STORY-127 — the first of the two checks that keep plaintext one-time
@@ -429,6 +454,24 @@ export const envSchema = z
             "DATABASE_URL must be the direct Postgres connection, not the pgBouncer pooler (a session advisory lock cannot survive transaction pooling); the pooler belongs in DATABASE_URL_POOLED.",
         });
       }
+    }
+    // Group C item 3 - object storage is all-or-nothing where a half-set config would be silently wrong.
+    if ((env.STORAGE_BUCKET_RAW === undefined) !== (env.STORAGE_BUCKET_REPORTS === undefined)) {
+      ctx.addIssue({
+        code: "custom",
+        path: [env.STORAGE_BUCKET_RAW === undefined ? "STORAGE_BUCKET_RAW" : "STORAGE_BUCKET_REPORTS"],
+        message: "STORAGE_BUCKET_RAW and STORAGE_BUCKET_REPORTS must be set together.",
+      });
+    }
+    if ((env.STORAGE_ACCESS_KEY_ID === undefined) !== (env.STORAGE_SECRET_ACCESS_KEY === undefined)) {
+      ctx.addIssue({
+        code: "custom",
+        path: [env.STORAGE_ACCESS_KEY_ID === undefined ? "STORAGE_ACCESS_KEY_ID" : "STORAGE_SECRET_ACCESS_KEY"],
+        message: "STORAGE_ACCESS_KEY_ID and STORAGE_SECRET_ACCESS_KEY must be set together (or neither, to use the IAM role).",
+      });
+    }
+    if (env.STORAGE_KMS_KEY_ID !== undefined && (env.STORAGE_SSE ?? "aws:kms") !== "aws:kms") {
+      ctx.addIssue({ code: "custom", path: ["STORAGE_KMS_KEY_ID"], message: "STORAGE_KMS_KEY_ID only applies when STORAGE_SSE is aws:kms." });
     }
     if (env.NODE_ENV === "production" && env.OTP_DEV_LOG_CODES === "true") {
       ctx.addIssue({
