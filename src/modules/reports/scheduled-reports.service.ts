@@ -1,6 +1,8 @@
-import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger, type OnModuleDestroy } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
+import { SCHEDULED_REPORT_MAX_RECIPIENTS } from "../../../contracts/reports/index.js";
 import { PG_POOL } from "../../db/pg-pool.js";
+import { RESEND_WORST_CASE_SEND_MS } from "../identity/adapters/resend-email-sender.adapter.js";
 import type {
   CreateScheduledReportRequest,
   ScheduledReport,
@@ -44,8 +46,17 @@ import { ExportService } from "./export.service.js";
 // older than STALE_SENDING_MS as `failed` (the row itself is not rewritten: a sweep is a follow-up).
 
 const logger = new Logger("ScheduledReportsService");
-/** A `sending` delivery older than this reads as `failed`: its sender process is presumed dead. Not from a reference. */
-export const STALE_SENDING_MS = 15 * 60 * 1000;
+/**
+ * A `sending` delivery older than this reads as `failed`: its sender process is presumed dead. DERIVED, not chosen: the
+ * recipients go one at a time, so the longest honest delivery is every recipient at the provider's worst case, plus a margin
+ * for the cap/build before and the finalising transaction after. test/unit/scheduled-report-stale-window.spec.ts pins it, so
+ * growing a recipient limit, timeout, attempt count or Retry-After cap fails there instead of silently turning slow sends into
+ * `failed`. (25 x 90 s + 5 min = 42.5 min today.)
+ */
+export const STALE_SENDING_MARGIN_MS = 5 * 60 * 1000;
+export const STALE_SENDING_MS = SCHEDULED_REPORT_MAX_RECIPIENTS * RESEND_WORST_CASE_SEND_MS + STALE_SENDING_MARGIN_MS;
+/** How long shutdown waits for in-flight deliveries. Not the full window: a stuck one is left `sending` and reads stale. */
+export const DELIVERY_DRAIN_TIMEOUT_MS = 30_000;
 const PDF_ENTITLEMENT = "exports.pdf_per_cycle";
 const CSV_ENTITLEMENT = "exports.csv";
 /**
@@ -117,7 +128,7 @@ function failureReason(error: unknown): string {
 }
 
 @Injectable()
-export class ScheduledReportsService {
+export class ScheduledReportsService implements OnModuleDestroy {
   constructor(
     private readonly resolver: EntitlementResolver,
     private readonly usage: StructuralUsage,
@@ -132,6 +143,28 @@ export class ScheduledReportsService {
   /** Resolves when every post-commit delivery started by this instance has finished (or failed to record). */
   async settled(): Promise<void> {
     while (this.inflight.size > 0) await Promise.allSettled([...this.inflight]);
+  }
+
+  /**
+   * Graceful shutdown: give in-flight deliveries a bounded chance to record their outcome. MUST run before DbModule ends
+   * PG_POOL, because finalising takes a pooled connection. Nest runs every `onModuleDestroy` (modules in reverse distance
+   * order) BEFORE any `beforeApplicationShutdown`, and DbModule ends the pool in its own `onModuleDestroy`, so the later
+   * hook would be too late; this one is ordered ahead of DbModule's by module distance, which
+   * test/integration/scheduled-reports-http.spec.ts proves on the real module graph.
+   */
+  async onModuleDestroy(): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        logger.warn("scheduled report deliveries still running at shutdown; their rows stay sending and will read as stale");
+        resolve();
+      }, DELIVERY_DRAIN_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([this.settled(), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** NEW-E-7 checkpoint-6 — keyset page ordered (created_at DESC, id DESC); the cursor key carries the microsecond created_at. */
@@ -245,14 +278,18 @@ export class ScheduledReportsService {
 
     if (needsPdf) await commitTierCap(client, workspaceId, "pdf_exports", jobId);
     const recorded = await this.record(client, workspaceId, report, deliveryId, "sending", null, 0, artifacts[0] ?? null);
-    const { actorId } = this.store();
-    afterCommit(() => this.startDelivery({ workspaceId, actorId }, report, deliveryId, artifacts));
+    // The request's WHOLE tenant context (project scope included) carries to the second transaction.
+    const context = currentTenantStore()!.context;
+    afterCommit(() => this.startDelivery(context, report, deliveryId, artifacts));
     return recorded;
   }
 
   /** Runs after the request transaction has committed. Never throws; a failure to record leaves the row `sending` (read as stale `failed`). */
   private startDelivery(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[]): void {
-    const work = this.deliver(context, report, deliveryId, artifacts)
+    // setImmediate: the request's own connection is released right after its afterCommit tasks run, so the work (and the pooled
+    // connection it takes for the second transaction) starts on the next turn, never while the request still holds its own.
+    const work = new Promise<void>((resolve) => setImmediate(resolve))
+      .then(() => this.deliver(context, report, deliveryId, artifacts))
       .catch((error: unknown) => {
         logger.error({ message: "scheduled report delivery could not be finalised; the row stays sending", workspace_id: context.workspaceId, scheduled_report_id: report.id, error: error instanceof Error ? error.name : "unknown" });
       })
@@ -267,8 +304,7 @@ export class ScheduledReportsService {
     // `delivered` only when the sender really delivers mail; the logging/dev senders keep the owner's honesty rule (`logged`).
     const status: ScheduledReportDelivery["status"] = ok ? (this.email.delivers === true ? "delivered" : "logged") : "failed";
     const reason = ok ? null : `${String(failures)} of ${String(report.recipients.length)} recipients could not be sent`;
-    // The request's connection is long released by now (this runs after COMMIT, and after a possibly slow send), so taking
-    // a fresh one here is not hold-and-wait.
+    // Not hold-and-wait: startDelivery deferred this to a later turn than the request's release, and after the sends.
     const client = await this.pool.connect();
     try {
       await withTenantContext(client, context, (tx) => this.finalize(tx, context.workspaceId, report.id, deliveryId, status, reason, sent));
@@ -343,7 +379,8 @@ export class ScheduledReportsService {
     );
     if (status === "logged") await client.query("UPDATE scheduled_reports SET last_sent_at = now(), last_error = NULL WHERE id = $1", [report.id]);
     if (status === "failed") await client.query("UPDATE scheduled_reports SET last_error = $2 WHERE id = $1", [report.id, reason]);
-    incrementCounter("nominara_reports_scheduled_deliveries_total", { status });
+    // `sending` is not an outcome: each delivery is counted once, at its final status (see `finalize`).
+    if (status !== "sending") incrementCounter("nominara_reports_scheduled_deliveries_total", { status });
     // Workspace ID and report ID only: no label, no recipients, no figures.
     logger.log({ span: "reports.scheduled.send_now", workspace_id: workspaceId, scheduled_report_id: report.id, status });
     return toDelivery(inserted.rows[0] ?? { id: deliveryId, scheduled_report_id: report.id, attempted_at: new Date(), status, reason, recipient_count: recipients });

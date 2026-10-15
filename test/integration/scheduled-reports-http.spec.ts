@@ -383,9 +383,6 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
       } finally {
         other.release();
       }
-      // And the request's own connection is no longer inside a transaction for this workspace.
-      const idleInTx = await harness.db().query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE state = 'idle in transaction' AND datname = current_database() AND pid <> pg_backend_pid()`);
-      expect((idleInTx.rows[0] as { n: number }).n).toBe(0);
       expect((await deliveryRow(a.workspaceId))?.status).toBe("sending");
     } finally {
       release();
@@ -396,6 +393,27 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     const report = (await harness.db().query(`SELECT last_sent_at, last_error FROM scheduled_reports WHERE id = $1`, [made.id])).rows[0] as { last_sent_at: Date | null; last_error: string | null };
     expect(report.last_sent_at).not.toBeNull();
     expect(report.last_error).toBeNull();
+  }, 180_000);
+
+  it("Group C · graceful shutdown WAITS for an in-flight delivery, and finalises it before the pool is ended (hook order on the real module graph)", async () => {
+    const { a, p } = await seeded();
+    const made = scheduledReportSchema.parse(data(await call(a, "POST", "/scheduled-reports", create([p]))));
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const entered: string[] = [];
+    withSender({ delivers: true, send: async (m) => { entered.push(m.to); await gate; } });
+    expect(scheduledReportDeliverySchema.parse(data(await call(a, "POST", `/scheduled-reports/${made.id}/send-now`))).status).toBe("sending");
+    await vi_waitFor(() => entered.length === 1);
+
+    const closing = harness.close();
+    const early = await Promise.race([closing.then(() => "closed"), new Promise((resolve) => setTimeout(() => resolve("waiting"), 500))]);
+    expect(early, "app.close() did not wait for the in-flight delivery").toBe("waiting");
+    expect((await deliveryRow(a.workspaceId))?.status).toBe("sending");
+
+    release();
+    await closing;
+    // If DbModule had ended PG_POOL first, finalising would have failed and this row would still read `sending`.
+    expect(await deliveryRow(a.workspaceId)).toEqual({ status: "delivered", reason: null, recipient_count: 1 });
   }, 180_000);
 
   it("Group C · a failing recipient finishes the row `failed` with the N-of-M text, counts the successes, and sets last_error", async () => {

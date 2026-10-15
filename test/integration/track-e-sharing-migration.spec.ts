@@ -119,9 +119,9 @@ describe("NEW-E-1 · migration 0051 — Track E sharing", () => {
     }
   });
 
-  it("NEW-E-1 · status CHECK admits exactly delivered/failed/skipped_cap/logged", async () => {
+  it("NEW-E-1 · status CHECK admits exactly delivered/failed/skipped_cap/logged/sending (0126 widened it)", async () => {
     const a = await workspace("c");
-    for (const status of ["delivered", "failed", "skipped_cap", "logged"]) {
+    for (const status of ["delivered", "failed", "skipped_cap", "logged", "sending"]) {
       await client.query(`INSERT INTO ${TABLE} (workspace_id, scheduled_report_id, status, recipient_count) VALUES ($1, $2, $3, 0)`, [
         a.workspaceId,
         a.reportId,

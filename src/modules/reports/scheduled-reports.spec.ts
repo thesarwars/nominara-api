@@ -7,7 +7,8 @@ import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.
 import * as tierCaps from "../../lib/usage/tier-caps.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
 import { ScheduledReportsController } from "./scheduled-reports.controller.js";
-import { STALE_SENDING_MS, ScheduledReportsService } from "./scheduled-reports.service.js";
+import { Logger } from "@nestjs/common";
+import { DELIVERY_DRAIN_TIMEOUT_MS, STALE_SENDING_MS, ScheduledReportsService } from "./scheduled-reports.service.js";
 
 // NEW-E-100c — STORY-100 scenarios 8, 9, 10, 15 (scenario 7 is test/unit/reports/next-send-at.spec.ts).
 // The SQL itself is proved against Postgres in test/integration/scheduled-reports-http.spec.ts.
@@ -42,6 +43,8 @@ interface Harness {
   sent: Array<{ to: string; subject: string; textBody: string }>;
   /** Runs the afterCommit tasks the request registered (i.e. "the transaction committed") and waits for the delivery to finish. */
   commit(): Promise<void>;
+  /** The registered afterCommit tasks (for a test that drives timing itself). */
+  tasks: Array<() => void>;
   email: { send: ReturnType<typeof vi.fn>; delivers?: boolean };
 }
 
@@ -58,7 +61,7 @@ function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; export
     if (text.includes("FROM scheduled_reports")) return { rows: [opts.row ?? reportRow()] };
     return { rows: [], rowCount: 1 };
   });
-  vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client: { query }, context: { workspaceId: WS, actorId: "actor" } } as never);
+  vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client: { query }, context: { workspaceId: WS, actorId: "actor", scopeProjectIds: [P1] } } as never);
   const resolver = {
     resolveForWorkspace: async () => ({
       plan_key: "growth",
@@ -88,7 +91,7 @@ function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; export
   const pool = { connect: vi.fn(async () => finalClient) };
   const service = new ScheduledReportsService(resolver as never, usage as never, exports as never, email as never, pool as never);
   return {
-    service, sql, exportCalls, sent, email,
+    service, sql, exportCalls, sent, email, tasks: afterCommitTasks,
     async commit() {
       for (const task of afterCommitTasks.splice(0)) task();
       await service.settled();
@@ -184,6 +187,50 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
     const h = harness({ delivers: true });
     await h.service.sendNow(REPORT_ID);
     expect(h.email.send).not.toHaveBeenCalled();
+  });
+
+  it("the second transaction carries the request's FULL tenant context, project scope included", async () => {
+    const h = harness({ delivers: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.commit();
+    expect(vi.mocked(tenantContext.withTenantContext).mock.calls[0]![1]).toEqual({ workspaceId: WS, actorId: "actor", scopeProjectIds: [P1] });
+  });
+
+  it("each delivery is counted once, at its FINAL status: `sending` is never counted", async () => {
+    const lines: string[] = [];
+    const log = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(JSON.stringify(m)));
+    try {
+      const h = harness({ delivers: true });
+      await h.service.sendNow(REPORT_ID);
+      await h.commit();
+    } finally {
+      log.mockRestore();
+    }
+    const counted = lines.filter((l) => l.includes("nominara_reports_scheduled_deliveries_total"));
+    expect(counted).toHaveLength(1);
+    expect(counted[0]).toContain('"status":"delivered"');
+  });
+
+  it("onModuleDestroy waits for an in-flight delivery, and is bounded when one never ends", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness({ delivers: true });
+      let release: () => void = () => undefined;
+      h.email.send.mockImplementation(() => new Promise<void>((resolve) => (release = resolve)));
+      await h.service.sendNow(REPORT_ID);
+      for (const task of h.tasks.splice(0)) task();
+      await vi.advanceTimersByTimeAsync(5); // setImmediate: the delivery starts and blocks in the sender
+      let drained = false;
+      const draining = h.service.onModuleDestroy().then(() => void (drained = true));
+      await vi.advanceTimersByTimeAsync(DELIVERY_DRAIN_TIMEOUT_MS - 1);
+      expect(drained, "shutdown did not wait for the in-flight delivery").toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      await draining;
+      expect(drained).toBe(true); // bounded: the never-ending send did not hold shutdown
+      release();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a replayed finalisation (row already moved) changes nothing else", async () => {

@@ -14,10 +14,10 @@ import type { EmailMessage, EmailSender } from "../ports/email-sender.js";
 // auto-top-up sends from a worker job, so the retries and the timeout below add latency to neither (STORY-016
 // scenario 3 still holds; see test/integration/identity-email-otp-resend.spec.ts).
 //
-// ⚠ KNOWN EXCEPTION: ScheduledReportsService.sendNow awaits this inside the request's open tenant transaction (after
-// reserveTierCap has locked a usage_counters row). With retries that can hold the connection and row lock for
-// minutes. Not fixed here: moving the send past COMMIT changes what the delivery record can say. See
-// plans-7day/docs-pending/GROUPC-email-and-alerts.md.
+// Scheduled reports (ScheduledReportsService.sendNow) send AFTER the request transaction commits (migration 0126, delivery
+// status `sending`), one recipient at a time, so a slow provider holds no lock and no request connection. The longest a
+// delivery can legitimately take is bounded by RESEND_WORST_CASE_SEND_MS x recipients; the service derives its stale-`sending`
+// window from that, and a unit test pins it.
 //
 // FAILURE SEMANTICS. `send` resolves on a 2xx and otherwise rejects with an EmailDeliveryError, which is what the port
 // has always meant (callers catch and log). Only a 429, a 5xx, a network error or a timeout is retried, a bounded
@@ -35,6 +35,19 @@ export const RESEND_MAX_ATTEMPTS = 3;
 export const RESEND_BACKOFF_BASE_MS = 500;
 /** A Retry-After longer than this is not waited out: the send fails and the caller's own retry policy decides. */
 export const RESEND_MAX_RETRY_AFTER_MS = 30_000;
+
+/** Largest sleep before retry number `retry` (1-based) from the exponential backoff: the jitter factor is below 1.5. */
+export function maxBackoffMs(retry: number): number {
+  return Math.ceil(RESEND_BACKOFF_BASE_MS * 2 ** (retry - 1) * 1.5);
+}
+
+/**
+ * The longest one `send()` can take: every attempt runs to its timeout, and every retry sleeps the larger of the Retry-After
+ * cap and the backoff ceiling. (90 s with the current constants.)
+ */
+export const RESEND_WORST_CASE_SEND_MS =
+  RESEND_MAX_ATTEMPTS * RESEND_TIMEOUT_MS +
+  Array.from({ length: RESEND_MAX_ATTEMPTS - 1 }, (_, i) => Math.max(RESEND_MAX_RETRY_AFTER_MS, maxBackoffMs(i + 1))).reduce((a, b) => a + b, 0);
 
 export class EmailDeliveryError extends Error {
   constructor(
