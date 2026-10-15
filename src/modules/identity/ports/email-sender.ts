@@ -17,5 +17,10 @@ export interface EmailMessage {
 }
 
 export interface EmailSender {
+  /**
+   * True only for a sender that really hands mail to a provider (Resend). Logging and dev senders omit it (false): a
+   * record of "accepted" by them must never read as `delivered`.
+   */
+  readonly delivers?: boolean;
   send(message: EmailMessage): Promise<void>;
 }

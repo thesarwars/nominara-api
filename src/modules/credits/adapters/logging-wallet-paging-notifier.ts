@@ -38,6 +38,10 @@ export class LoggingWalletPagingNotifier implements WalletPagingNotifier {
       replayed_included: mismatch.replayed.included,
       replayed_purchased: mismatch.replayed.purchased,
       replayed_reserved: mismatch.replayed.reserved,
+      // A lifetime-counter mismatch (balances agree, a counter does not): which counter, and the two values.
+      ...(mismatch.counter === null
+        ? {}
+        : { counter: mismatch.counter.counter, counter_wallet: mismatch.counter.wallet, counter_replayed: mismatch.counter.replayed }),
     });
   }
 }

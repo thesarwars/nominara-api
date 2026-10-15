@@ -142,6 +142,9 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
   const credits = async (workspaceId: string) =>
     ((await harness.db().query(`SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1`, [workspaceId])).rows[0] as { n: number }).n;
 
+  /** The post-commit delivery of every send-now so far has finished (the row left `sending`). */
+  const settleDeliveries = (): Promise<void> => harness.app().get(ScheduledReportsService).settled();
+
   async function seeded(plan: "starter" | "growth" | "business" = "growth") {
     const a = await owner(plan);
     const p = await project(a.workspaceId);
@@ -175,7 +178,7 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
   it("AC2 · under SET ROLE nominara_app a project of another workspace is refused as unreadable (400) and another workspace's report is invisible (404)", async () => {
     const one = await seeded();
     const two = await seeded();
-    const service = new ScheduledReportsService(null as never, null as never, null as never, null as never);
+    const service = new ScheduledReportsService(null as never, null as never, null as never, null as never, null as never);
     const client = await pool.connect();
     try {
       await expect(
@@ -220,11 +223,13 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     const res = await call(a, "POST", `/scheduled-reports/${made.id}/send-now`);
     expect(res.statusCode, res.body).toBe(200);
     const delivery = scheduledReportDeliverySchema.parse(data(res));
-    expect([delivery.status, delivery.reason, delivery.recipients]).toEqual(["logged", null, 1]);
+    // The request answers before any email goes out: `sending`, and the history settles to `logged` (the logging sender delivers to nobody).
+    expect([delivery.status, delivery.reason, delivery.recipients]).toEqual(["sending", null, 0]);
+    await settleDeliveries();
     expect(await credits(a.workspaceId)).toBe(before);
     expect((await used(a.workspaceId))?.used).toBe(1);
     const listed = data<Array<{ deliveries: unknown[] }>>(await call(a, "GET", "/scheduled-reports"));
-    expect(listed[0]!.deliveries).toEqual([delivery]);
+    expect(listed[0]!.deliveries).toEqual([{ ...delivery, status: "logged", recipients: 1 }]);
   }, 180_000);
 
   it("STORY-100 s9 · send-now on a tier with ZERO allowance is 403 feature_not_in_plan, with no delivery and no unit", async () => {
@@ -243,6 +248,7 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     const { a, p } = await seeded();
     const made = scheduledReportSchema.parse(data(await call(a, "POST", "/scheduled-reports", create([p]))));
     expect((await call(a, "POST", `/scheduled-reports/${made.id}/send-now`)).statusCode).toBe(200); // creates the counter
+    await settleDeliveries();
     await harness.db().query(`UPDATE usage_counters SET used_value = limit_value WHERE workspace_id = $1 AND metric = 'pdf_exports'`, [a.workspaceId]);
     const cap = (await used(a.workspaceId))!.cap;
     const res = await call(a, "POST", `/scheduled-reports/${made.id}/send-now`);
@@ -334,4 +340,99 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     await rejectsBadCursors(a, "/scheduled-reports", foreign);
   }, 120_000);
 
+
+  // ---- Group C review, owner decision B: the send is not inside the request transaction ------------------------------
+
+  /** Swaps the live service's sender (a private field) for the duration of one test. */
+  function withSender(sender: { delivers?: boolean; send(m: { to: string }): Promise<void> }): () => void {
+    const service = harness.app().get(ScheduledReportsService) as unknown as { email: unknown };
+    const original = service.email;
+    service.email = sender;
+    return () => {
+      service.email = original;
+    };
+  }
+  const deliveryRow = async (workspaceId: string) =>
+    (await harness.db().query(`SELECT status, reason, recipient_count FROM scheduled_report_deliveries WHERE workspace_id = $1 ORDER BY attempted_at DESC LIMIT 1`, [workspaceId])).rows[0] as
+      | { status: string; reason: string | null; recipient_count: number }
+      | undefined;
+
+  it("Group C · a HANGING sender holds no row lock and no transaction: the response is `sending` at once, usage_counters is writable meanwhile, and the row finishes `delivered` when the send ends", async () => {
+    const { a, p } = await seeded();
+    const made = scheduledReportSchema.parse(data(await call(a, "POST", "/scheduled-reports", create([p], { recipients: ["a@example.test", "b@example.test"] }))));
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const entered: string[] = [];
+    const restore = withSender({ delivers: true, send: async (m) => { entered.push(m.to); await gate; } });
+    try {
+      const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 20_000));
+      const outcome = await Promise.race([call(a, "POST", `/scheduled-reports/${made.id}/send-now`), timeout]);
+      expect(outcome, "the response waited for the hanging sender (the send is inside the request)").not.toBe("timeout");
+      const res = outcome as Awaited<ReturnType<typeof call>>;
+      expect(scheduledReportDeliverySchema.parse(data(res)).status).toBe("sending");
+
+      // The sender is now stuck mid-send. Everything the request locked must be free: a competing writer must not wait.
+      await vi_waitFor(() => entered.length === 1);
+      const other = await pool.connect();
+      try {
+        await other.query("BEGIN");
+        await other.query("SET LOCAL lock_timeout = '1500ms'");
+        const bumped = await other.query(`UPDATE usage_counters SET used_value = used_value WHERE workspace_id = $1 AND metric = 'pdf_exports'`, [a.workspaceId]);
+        expect(bumped.rowCount).toBe(1);
+        await other.query("COMMIT");
+      } finally {
+        other.release();
+      }
+      // And the request's own connection is no longer inside a transaction for this workspace.
+      const idleInTx = await harness.db().query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE state = 'idle in transaction' AND datname = current_database() AND pid <> pg_backend_pid()`);
+      expect((idleInTx.rows[0] as { n: number }).n).toBe(0);
+      expect((await deliveryRow(a.workspaceId))?.status).toBe("sending");
+    } finally {
+      release();
+      await settleDeliveries();
+      restore();
+    }
+    expect(await deliveryRow(a.workspaceId)).toEqual({ status: "delivered", reason: null, recipient_count: 2 });
+    const report = (await harness.db().query(`SELECT last_sent_at, last_error FROM scheduled_reports WHERE id = $1`, [made.id])).rows[0] as { last_sent_at: Date | null; last_error: string | null };
+    expect(report.last_sent_at).not.toBeNull();
+    expect(report.last_error).toBeNull();
+  }, 180_000);
+
+  it("Group C · a failing recipient finishes the row `failed` with the N-of-M text, counts the successes, and sets last_error", async () => {
+    const { a, p } = await seeded();
+    const made = scheduledReportSchema.parse(data(await call(a, "POST", "/scheduled-reports", create([p], { recipients: ["ok@example.test", "bad@example.test"] }))));
+    const restore = withSender({ delivers: true, send: async (m) => { if (m.to.startsWith("bad")) throw new Error("provider down"); } });
+    try {
+      expect(scheduledReportDeliverySchema.parse(data(await call(a, "POST", `/scheduled-reports/${made.id}/send-now`))).status).toBe("sending");
+      await settleDeliveries();
+    } finally {
+      restore();
+    }
+    expect(await deliveryRow(a.workspaceId)).toEqual({ status: "failed", reason: "1 of 2 recipients could not be sent", recipient_count: 1 });
+    const report = (await harness.db().query(`SELECT last_error FROM scheduled_reports WHERE id = $1`, [made.id])).rows[0] as { last_error: string };
+    expect(report.last_error).toBe("1 of 2 recipients could not be sent");
+    const listed = data<Array<{ deliveries: Array<{ status: string }> }>>(await call(a, "GET", "/scheduled-reports"));
+    expect(listed[0]!.deliveries.map((d) => d.status)).toEqual(["failed"]);
+  }, 180_000);
+
+  it("Group C · a stale `sending` row (its process died) reads as `failed` in the history; the row itself is untouched", async () => {
+    const { a, p } = await seeded();
+    const made = scheduledReportSchema.parse(data(await call(a, "POST", "/scheduled-reports", create([p]))));
+    await harness.db().query(
+      `INSERT INTO scheduled_report_deliveries (workspace_id, scheduled_report_id, status, recipient_count, attempted_at) VALUES ($1,$2,'sending',1, now() - interval '1 hour')`,
+      [a.workspaceId, made.id],
+    );
+    const listed = data<Array<{ deliveries: Array<{ status: string; reason: string | null }> }>>(await call(a, "GET", "/scheduled-reports"));
+    expect(listed[0]!.deliveries[0]!.status).toBe("failed");
+    expect(listed[0]!.deliveries[0]!.reason).toMatch(/did not complete/);
+    expect((await deliveryRow(a.workspaceId))?.status).toBe("sending");
+  }, 120_000);
 });
+
+async function vi_waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const start = performance.now();
+  while (!predicate()) {
+    if (performance.now() - start > timeoutMs) throw new Error("timed out waiting for the send to start");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}

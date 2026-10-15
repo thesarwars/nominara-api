@@ -254,6 +254,27 @@ describe("alert email · every existing page site sends exactly one email for it
     expect(sender.sent[0]!.textBody).toMatch(/replayed_included: 12/);
   });
 
+  it("STORY-073 a lifetime-counter mismatch carries the counter name and both values", async () => {
+    await new LoggingWalletPagingNotifier().page({
+      workspaceId: WORKSPACE_ID,
+      seq: null,
+      reason: "the balances reconcile and lifetime_granted does not: a movement was counted wrong",
+      wallet: { included: 10, purchased: 5, reserved: 0 },
+      replayed: { included: 10, purchased: 5, reserved: 0 },
+      counter: { counter: "granted", wallet: 120, replayed: 100 },
+    });
+    expect(sender.sent[0]!.textBody).toContain("counter: granted");
+    expect(sender.sent[0]!.textBody).toContain("counter_wallet: 120");
+    expect(sender.sent[0]!.textBody).toContain("counter_replayed: 100");
+  });
+
+  it("notify never rejects, even when dispatch itself blows up (a throwing clock)", async () => {
+    const broken = new EmailAlertAdapter({ sender, to: TO, delivers: true, clock: () => { throw new Error("clock exploded"); } });
+    await expect(broken.notify("m", { alertName: "x" })).resolves.toBeUndefined();
+    expect(logged.some((l) => l.includes("dispatch failed unexpectedly") && l.includes("Error"))).toBe(true);
+    expect(logged.some((l) => l.includes("clock exploded"))).toBe(false);
+  });
+
   it("a verifier port still resolves when the mail fails (an alert path cannot fail the verifier)", async () => {
     sender.failNext = 1;
     await expect(

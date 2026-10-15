@@ -65,6 +65,7 @@ export interface ResendEmailSenderOptions {
 
 @Injectable()
 export class ResendEmailSenderAdapter implements EmailSender {
+  readonly delivers = true;
   private readonly logger = new Logger(ResendEmailSenderAdapter.name);
   private readonly apiKey: string;
   private readonly from: string;

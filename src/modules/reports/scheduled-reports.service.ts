@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
-import type { ClientBase } from "pg";
+import type { ClientBase, Pool } from "pg";
+import { PG_POOL } from "../../db/pg-pool.js";
 import type {
   CreateScheduledReportRequest,
   ScheduledReport,
@@ -18,7 +19,7 @@ import { isDayValidFor, nextSendAt, type ScheduleCadence } from "../../lib/repor
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { commitTierCap, provisionUsageCounters, readCounter, releaseTierCap, reserveTierCap, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
-import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { afterCommit, currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 import { EMAIL_SENDER, type EmailSender } from "../identity/ports/email-sender.js";
 import { ExportService } from "./export.service.js";
 
@@ -34,10 +35,17 @@ import { ExportService } from "./export.service.js";
 //   cap reached           200, a `skipped_cap` delivery AND a notification
 //                         naming the cap and the reset date - wait; never silent
 //   build/send failure    200, a `failed` delivery with its reason
-// The EmailSender port has only the logging adapter, so a delivery is recorded
-// `logged`, never `delivered`.
+// THE SEND IS NOT IN THE REQUEST TRANSACTION (Group C review, owner decision B). The request reserves the cap, builds,
+// commits the unit and records the delivery `sending`; the response is that `sending` row. AFTER the commit the emails go
+// out and a second, short tenant transaction moves the row to its final state: `delivered` (a sender that really delivers,
+// i.e. Resend accepted it), `logged` (a sender that delivers to nobody: never `delivered`), or `failed` (with last_error and
+// the "N of M recipients" text). No row lock and no pooled connection is held while the provider is slow.
+// A process that dies between the commit and the second transaction leaves the row `sending`; reads show a `sending` row
+// older than STALE_SENDING_MS as `failed` (the row itself is not rewritten: a sweep is a follow-up).
 
 const logger = new Logger("ScheduledReportsService");
+/** A `sending` delivery older than this reads as `failed`: its sender process is presumed dead. Not from a reference. */
+export const STALE_SENDING_MS = 15 * 60 * 1000;
 const PDF_ENTITLEMENT = "exports.pdf_per_cycle";
 const CSV_ENTITLEMENT = "exports.csv";
 /**
@@ -76,7 +84,11 @@ const COLUMNS = `id, name, project_ids, cadence, day_of_period, send_hour_local,
 
 const iso = (v: Date | string): string => new Date(v).toISOString();
 
-function toDelivery(r: DeliveryRow): ScheduledReportDelivery {
+function toDelivery(r: DeliveryRow, now: number = Date.now()): ScheduledReportDelivery {
+  const attemptedAt = new Date(r.attempted_at).getTime();
+  if (r.status === "sending" && now - attemptedAt > STALE_SENDING_MS) {
+    return { delivery_id: r.id, at: iso(r.attempted_at), status: "failed", reason: "delivery did not complete: the sending process did not report back", recipients: r.recipient_count };
+  }
   return { delivery_id: r.id, at: iso(r.attempted_at), status: r.status, reason: r.reason, recipients: r.recipient_count };
 }
 
@@ -95,7 +107,7 @@ function toReport(r: ReportRow, deliveries: DeliveryRow[]): ScheduledReport {
     theme_id: r.theme_id,
     paused: !r.active,
     next_run_at: r.next_send_at === null ? null : iso(r.next_send_at),
-    deliveries: deliveries.filter((d) => d.scheduled_report_id === r.id).map(toDelivery),
+    deliveries: deliveries.filter((d) => d.scheduled_report_id === r.id).map((d) => toDelivery(d)),
   };
 }
 
@@ -111,7 +123,16 @@ export class ScheduledReportsService {
     private readonly usage: StructuralUsage,
     private readonly exports: ExportService,
     @Inject(EMAIL_SENDER) private readonly email: EmailSender,
+    @Inject(PG_POOL) private readonly pool: Pool,
   ) {}
+
+  /** Deliveries whose post-commit send is still running. Tracked so tests and shutdown can wait for them. */
+  private readonly inflight = new Set<Promise<void>>();
+
+  /** Resolves when every post-commit delivery started by this instance has finished (or failed to record). */
+  async settled(): Promise<void> {
+    while (this.inflight.size > 0) await Promise.allSettled([...this.inflight]);
+  }
 
   /** NEW-E-7 checkpoint-6 — keyset page ordered (created_at DESC, id DESC); the cursor key carries the microsecond created_at. */
   async list(query: ScheduledReportListQuery): Promise<Page<ScheduledReport>> {
@@ -222,11 +243,51 @@ export class ScheduledReportsService {
       return this.record(client, workspaceId, report, deliveryId, "failed", failureReason(error), 0, null);
     }
 
-    const failures = await this.sendEmails(report, artifacts);
     if (needsPdf) await commitTierCap(client, workspaceId, "pdf_exports", jobId);
-    return failures === 0
-      ? this.record(client, workspaceId, report, deliveryId, "logged", null, report.recipients.length, artifacts[0] ?? null)
-      : this.record(client, workspaceId, report, deliveryId, "failed", `${String(failures)} of ${String(report.recipients.length)} recipients could not be sent`, report.recipients.length - failures, artifacts[0] ?? null);
+    const recorded = await this.record(client, workspaceId, report, deliveryId, "sending", null, 0, artifacts[0] ?? null);
+    const { actorId } = this.store();
+    afterCommit(() => this.startDelivery({ workspaceId, actorId }, report, deliveryId, artifacts));
+    return recorded;
+  }
+
+  /** Runs after the request transaction has committed. Never throws; a failure to record leaves the row `sending` (read as stale `failed`). */
+  private startDelivery(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[]): void {
+    const work = this.deliver(context, report, deliveryId, artifacts)
+      .catch((error: unknown) => {
+        logger.error({ message: "scheduled report delivery could not be finalised; the row stays sending", workspace_id: context.workspaceId, scheduled_report_id: report.id, error: error instanceof Error ? error.name : "unknown" });
+      })
+      .finally(() => this.inflight.delete(work));
+    this.inflight.add(work);
+  }
+
+  private async deliver(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[]): Promise<void> {
+    const failures = await this.sendEmails(report, artifacts);
+    const sent = report.recipients.length - failures;
+    const ok = failures === 0;
+    // `delivered` only when the sender really delivers mail; the logging/dev senders keep the owner's honesty rule (`logged`).
+    const status: ScheduledReportDelivery["status"] = ok ? (this.email.delivers === true ? "delivered" : "logged") : "failed";
+    const reason = ok ? null : `${String(failures)} of ${String(report.recipients.length)} recipients could not be sent`;
+    // The request's connection is long released by now (this runs after COMMIT, and after a possibly slow send), so taking
+    // a fresh one here is not hold-and-wait.
+    const client = await this.pool.connect();
+    try {
+      await withTenantContext(client, context, (tx) => this.finalize(tx, context.workspaceId, report.id, deliveryId, status, reason, sent));
+    } finally {
+      client.release();
+    }
+  }
+
+  /** `WHERE status = 'sending'` makes a replay (a retried or duplicated finalisation) a no-op: the first outcome wins. */
+  private async finalize(tx: ClientBase, workspaceId: string, reportId: string, deliveryId: string, status: ScheduledReportDelivery["status"], reason: string | null, sent: number): Promise<void> {
+    const moved = await tx.query(
+      `UPDATE scheduled_report_deliveries SET status = $2, reason = $3, recipient_count = $4 WHERE id = $1 AND status = 'sending'`,
+      [deliveryId, status, reason, sent],
+    );
+    if ((moved.rowCount ?? 0) === 0) return;
+    if (status === "failed") await tx.query("UPDATE scheduled_reports SET last_error = $2 WHERE id = $1", [reportId, reason]);
+    else await tx.query("UPDATE scheduled_reports SET last_sent_at = now(), last_error = NULL WHERE id = $1", [reportId]);
+    incrementCounter("nominara_reports_scheduled_deliveries_total", { status });
+    logger.log({ span: "reports.scheduled.deliver", workspace_id: workspaceId, scheduled_report_id: reportId, status });
   }
 
   /** One export per project and format; the export path is given no Idempotency-Key, so it commits no unit - the run's one unit is committed above. */

@@ -7,7 +7,7 @@ import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.
 import * as tierCaps from "../../lib/usage/tier-caps.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
 import { ScheduledReportsController } from "./scheduled-reports.controller.js";
-import { ScheduledReportsService } from "./scheduled-reports.service.js";
+import { STALE_SENDING_MS, ScheduledReportsService } from "./scheduled-reports.service.js";
 
 // NEW-E-100c — STORY-100 scenarios 8, 9, 10, 15 (scenario 7 is test/unit/reports/next-send-at.spec.ts).
 // The SQL itself is proved against Postgres in test/integration/scheduled-reports-http.spec.ts.
@@ -40,9 +40,12 @@ interface Harness {
   sql: Array<{ text: string; params: unknown[] }>;
   exportCalls: Array<{ projectId: string; body: Record<string, unknown>; key: unknown }>;
   sent: Array<{ to: string; subject: string; textBody: string }>;
+  /** Runs the afterCommit tasks the request registered (i.e. "the transaction committed") and waits for the delivery to finish. */
+  commit(): Promise<void>;
+  email: { send: ReturnType<typeof vi.fn>; delivers?: boolean };
 }
 
-function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; exportFails?: boolean; projects?: string[]; deliveries?: Array<Record<string, unknown>> } = {}): Harness {
+function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; exportFails?: boolean; projects?: string[]; deliveries?: Array<Record<string, unknown>>; delivers?: boolean; failFor?: string[]; replay?: boolean } = {}): Harness {
   const sql: Harness["sql"] = [];
   const exportCalls: Harness["exportCalls"] = [];
   const sent: Harness["sent"] = [];
@@ -70,9 +73,27 @@ function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; export
       return { export_id: `0190aaaa-0000-7000-8000-00000000c${exportCalls.length}0`, format: body.format };
     }),
   };
-  const email = { send: vi.fn(async (m: { to: string; subject: string; textBody: string }) => void sent.push(m)) };
-  const service = new ScheduledReportsService(resolver as never, usage as never, exports as never, email as never);
-  return { service, sql, exportCalls, sent };
+  const email: Harness["email"] = {
+    ...(opts.delivers === undefined ? {} : { delivers: opts.delivers }),
+    send: vi.fn(async (m: { to: string; subject: string; textBody: string }) => {
+      if (opts.failFor?.includes(m.to)) throw new Error("provider down");
+      sent.push(m);
+    }),
+  };
+  // The second (post-commit) transaction runs on its own pooled client; both clients record into the same `sql` log.
+  const afterCommitTasks: Array<() => void> = [];
+  vi.spyOn(tenantContext, "afterCommit").mockImplementation((task) => void afterCommitTasks.push(task));
+  const finalClient = { query: vi.fn(async (text: string, params: unknown[] = []) => { sql.push({ text, params }); return { rows: [], rowCount: opts.replay ? 0 : 1 }; }), release: vi.fn() };
+  vi.spyOn(tenantContext, "withTenantContext").mockImplementation(async (_c, _ctx, fn) => fn(finalClient as never));
+  const pool = { connect: vi.fn(async () => finalClient) };
+  const service = new ScheduledReportsService(resolver as never, usage as never, exports as never, email as never, pool as never);
+  return {
+    service, sql, exportCalls, sent, email,
+    async commit() {
+      for (const task of afterCommitTasks.splice(0)) task();
+      await service.settled();
+    },
+  };
 }
 
 describe("NEW-E-100c · STORY-100 send-now", () => {
@@ -82,7 +103,7 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
   it("s8 · a run costs zero credits and consumes ONE pdf_exports unit, however many projects it covers", async () => {
     const h = harness();
     const out = await h.service.sendNow(REPORT_ID);
-    expect(out.status).toBe("logged");
+    expect(out.status).toBe("sending");
     expect(tierCaps.reserveTierCap).toHaveBeenCalledTimes(1);
     expect(vi.mocked(tierCaps.reserveTierCap).mock.calls[0]![1]).toMatchObject({ metric: "pdf_exports", quantity: 1 });
     expect(tierCaps.commitTierCap).toHaveBeenCalledTimes(1);
@@ -127,16 +148,62 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
     expect(tierCaps.commitTierCap).not.toHaveBeenCalled();
   });
 
-  it("AC3 · delivery goes through the EmailSender port with a link to the artifact, and is recorded 'logged', never 'delivered'", async () => {
+  it("AC3 · delivery goes through the EmailSender port with a link to the artifact, and is recorded 'logged', never 'delivered', for a sender that delivers to nobody", async () => {
     const h = harness();
     const out = await h.service.sendNow(REPORT_ID);
+    expect(h.sent).toHaveLength(0); // nothing is sent until the transaction has committed
+    await h.commit();
     expect(h.sent.map((m) => m.to)).toEqual(["a@example.test", "b@example.test"]);
     expect(h.sent[0]!.textBody).toContain("0190aaaa-0000-7000-8000-00000000c10");
     // The link is a URL, not a storage key: pinned whole so a restructure cannot change what recipients receive.
     expect(h.sent[0]!.textBody).toContain("https://app.nominara.com/report-artifacts/0190aaaa-0000-7000-8000-00000000c10\n");
-    expect(out.status).toBe("logged");
-    expect(out.recipients).toBe(2);
-    expect(out.reason).toBeNull();
+    expect(out.status).toBe("sending");
+    const final = h.sql.find((s) => /UPDATE scheduled_report_deliveries SET status/.test(s.text))!;
+    expect(final.params.slice(1)).toEqual(["logged", null, 2]);
+  });
+
+  it("a sender that really delivers (Resend) finishes `delivered`", async () => {
+    const h = harness({ delivers: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.commit();
+    const final = h.sql.find((s) => /UPDATE scheduled_report_deliveries SET status/.test(s.text))!;
+    expect(final.params.slice(1)).toEqual(["delivered", null, 2]);
+    expect(h.sql.some((s) => /UPDATE scheduled_reports SET last_sent_at/.test(s.text))).toBe(true);
+  });
+
+  it("a partial send finishes `failed` with the N-of-M text, the successes counted, and last_error set", async () => {
+    const h = harness({ delivers: true, failFor: ["b@example.test"] });
+    await h.service.sendNow(REPORT_ID);
+    await h.commit();
+    const final = h.sql.find((s) => /UPDATE scheduled_report_deliveries SET status/.test(s.text))!;
+    expect(final.params.slice(1)).toEqual(["failed", "1 of 2 recipients could not be sent", 1]);
+    expect(h.sql.some((s) => /UPDATE scheduled_reports SET last_error/.test(s.text))).toBe(true);
+  });
+
+  it("the request never touches the sender: with the commit withheld, nothing is sent", async () => {
+    const h = harness({ delivers: true });
+    await h.service.sendNow(REPORT_ID);
+    expect(h.email.send).not.toHaveBeenCalled();
+  });
+
+  it("a replayed finalisation (row already moved) changes nothing else", async () => {
+    const h = harness({ delivers: true, replay: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.commit();
+    expect(h.sql.some((s) => /UPDATE scheduled_reports SET (last_sent_at|last_error)/.test(s.text))).toBe(false);
+  });
+
+  it("a `sending` row older than the stale window reads as `failed`; a fresh one reads `sending`", async () => {
+    const old = new Date(Date.now() - STALE_SENDING_MS - 60_000).toISOString();
+    const fresh = new Date().toISOString();
+    const h = harness({
+      deliveries: [
+        { id: "0190aaaa-0000-7000-8000-0000000000d2", scheduled_report_id: REPORT_ID, attempted_at: fresh, status: "sending", reason: null, recipient_count: 0 },
+        { id: "0190aaaa-0000-7000-8000-0000000000d1", scheduled_report_id: REPORT_ID, attempted_at: old, status: "sending", reason: null, recipient_count: 0 },
+      ],
+    });
+    const page = await h.service.list({ limit: 10 } as never);
+    expect(page.items[0]!.deliveries.map((d) => d.status)).toEqual(["sending", "failed"]);
   });
 
   it("s15 · a failed build is listed as 'failed' with its reason, the reservation is released, and nobody is emailed", async () => {

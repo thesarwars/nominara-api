@@ -3,6 +3,8 @@ import { UnrecoverableError, type Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
 import { LoggingPagingNotifier } from "../../../modules/audit/adapters/logging-paging-notifier.js";
+import type { ChainMismatchAlert, PagingNotifier } from "../../../modules/audit/ports/paging-notifier.js";
+import { drainAlertEmails } from "../../alerts/alerts.js";
 import { verifyAllChains } from "../../../workers/rollup/audit-verify.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { globalQueueLockKey, releaseAdvisorySessionLock, tryAdvisorySessionLock } from "../locks.js";
@@ -77,6 +79,30 @@ export function createAuditVerifyHandler(context: QueueHandlerContext): JobProce
   const logger = new Logger("audit.verify");
 
   return async (_client: ClientBase, _job: Job): Promise<void> => {
+    // Group C — PAGES ARE SENT AFTER THE LOCK IS RELEASED, never under it. Paging now emails (Resend: up to ~90 s per
+    // send with retries, several alerts per run), and the session advisory lock below is held for the whole estate walk:
+    // awaiting a provider inside it would keep every other replica yielding. The walk only COLLECTS mismatches; the outer
+    // finally pages them once the lock and the connection are gone, then waits a bounded time for the mail.
+    const collected: ChainMismatchAlert[] = [];
+    const collector: PagingNotifier = {
+      page: (alert) => {
+        collected.push(alert);
+        return Promise.resolve();
+      },
+    };
+    try {
+      await walkUnderLock(collector);
+    } finally {
+      if (collected.length > 0) {
+        const notifier = new LoggingPagingNotifier();
+        // Started together, settled by the bounded drain: neither a slow nor a hung provider can stall the job.
+        for (const alert of collected) void notifier.page(alert);
+        await drainAlertEmails();
+      }
+    }
+  };
+
+  async function walkUnderLock(notifier: PagingNotifier): Promise<void> {
     const client = await connect(withKeepalives(context.env.DATABASE_URL));
     const lockKey = globalQueueLockKey("audit.verify");
     let held = false;
@@ -91,7 +117,7 @@ export function createAuditVerifyHandler(context: QueueHandlerContext): JobProce
         return;
       }
 
-      const result = await verifyAllChains(client, new LoggingPagingNotifier());
+      const result = await verifyAllChains(client, notifier);
 
       for (let i = 0; i < result.marksWritten; i += 1) {
         incrementCounter("nominara_audit_chain_marks_written_total");
@@ -170,5 +196,5 @@ export function createAuditVerifyHandler(context: QueueHandlerContext): JobProce
       }
       await client.end();
     }
-  };
+  }
 }

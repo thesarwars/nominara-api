@@ -48,6 +48,7 @@ const SAFE_STRING_KEYS: ReadonlySet<string> = new Set([
   "workspaceId",
   "seq",
   "reason",
+  "counter",
   "table",
   "partition",
 ]);
@@ -159,7 +160,13 @@ export class EmailAlertAdapter implements Pager {
    * fail the verifier or monitor that raised it.
    */
   notify(message: string, context: Record<string, unknown>): Promise<void> {
-    const work = this.dispatch(message, context).finally(() => this.pending.delete(work));
+    // Structurally never rejects, whatever dispatch does: the catch is the last line of defence for every caller
+    // (verifier ports await this). Only the error CLASS is logged.
+    const work: Promise<void> = this.dispatch(message, context)
+      .catch((error: unknown) => {
+        logger.error(`alert email dispatch failed unexpectedly error=${error instanceof Error ? error.name : "unknown"}`);
+      })
+      .finally(() => this.pending.delete(work));
     this.pending.add(work);
     return work;
   }

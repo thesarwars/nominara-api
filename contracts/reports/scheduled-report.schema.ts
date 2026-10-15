@@ -17,7 +17,10 @@ import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 export const scheduleCadenceSchema = z.enum(["weekly", "biweekly", "monthly", "quarterly"]);
 export const scheduleFormatSchema = z.enum([...reportFormatSchema.options, "both"]);
-export const deliveryStatusSchema = z.enum(["delivered", "failed", "skipped_cap", "logged"]);
+// `sending` — the request recorded the delivery and committed; the emails are going out AFTER that commit and the row
+// moves to delivered / failed / logged when they finish (migration 0126). `send-now` answers `sending`; the history
+// (GET /scheduled-reports) shows the final state. A `sending` row older than STALE_SENDING_MS reads as `failed`.
+export const deliveryStatusSchema = z.enum(["delivered", "failed", "skipped_cap", "logged", "sending"]);
 
 export const scheduledReportDeliverySchema = z
   .object({
