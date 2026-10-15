@@ -7,7 +7,8 @@ import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.
 import * as tierCaps from "../../lib/usage/tier-caps.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
 import { ScheduledReportsController } from "./scheduled-reports.controller.js";
-import { ScheduledReportsService } from "./scheduled-reports.service.js";
+import { Logger } from "@nestjs/common";
+import { DELIVERY_CONNECT_TIMEOUT_MS, DELIVERY_DRAIN_TIMEOUT_MS, STALE_SENDING_MS, ScheduledReportsService } from "./scheduled-reports.service.js";
 
 // NEW-E-100c — STORY-100 scenarios 8, 9, 10, 15 (scenario 7 is test/unit/reports/next-send-at.spec.ts).
 // The SQL itself is proved against Postgres in test/integration/scheduled-reports-http.spec.ts.
@@ -40,9 +41,16 @@ interface Harness {
   sql: Array<{ text: string; params: unknown[] }>;
   exportCalls: Array<{ projectId: string; body: Record<string, unknown>; key: unknown }>;
   sent: Array<{ to: string; subject: string; textBody: string }>;
+  /** Runs the afterCommit tasks the request registered (i.e. "the transaction committed") and waits for the delivery to finish. */
+  commit(): Promise<void>;
+  /** The registered afterCommit tasks (for a test that drives timing itself). */
+  tasks: Array<() => void>;
+  release: ReturnType<typeof vi.fn>;
+  arriveLate(): void;
+  email: { send: ReturnType<typeof vi.fn>; delivers?: boolean };
 }
 
-function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; exportFails?: boolean; projects?: string[]; deliveries?: Array<Record<string, unknown>> } = {}): Harness {
+function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; exportFails?: boolean; projects?: string[]; deliveries?: Array<Record<string, unknown>>; delivers?: boolean; failFor?: string[]; replay?: boolean; poolFails?: boolean; poolHangs?: boolean; finalizeThrows?: Error } = {}): Harness {
   const sql: Harness["sql"] = [];
   const exportCalls: Harness["exportCalls"] = [];
   const sent: Harness["sent"] = [];
@@ -55,7 +63,7 @@ function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; export
     if (text.includes("FROM scheduled_reports")) return { rows: [opts.row ?? reportRow()] };
     return { rows: [], rowCount: 1 };
   });
-  vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client: { query }, context: { workspaceId: WS, actorId: "actor" } } as never);
+  vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client: { query }, context: { workspaceId: WS, actorId: "actor", scopeProjectIds: [P1] } } as never);
   const resolver = {
     resolveForWorkspace: async () => ({
       plan_key: "growth",
@@ -70,9 +78,37 @@ function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; export
       return { export_id: `0190aaaa-0000-7000-8000-00000000c${exportCalls.length}0`, format: body.format };
     }),
   };
-  const email = { send: vi.fn(async (m: { to: string; subject: string; textBody: string }) => void sent.push(m)) };
-  const service = new ScheduledReportsService(resolver as never, usage as never, exports as never, email as never);
-  return { service, sql, exportCalls, sent };
+  const email: Harness["email"] = {
+    ...(opts.delivers === undefined ? {} : { delivers: opts.delivers }),
+    send: vi.fn(async (m: { to: string; subject: string; textBody: string }) => {
+      if (opts.failFor?.includes(m.to)) throw new Error("provider down");
+      sent.push(m);
+    }),
+  };
+  // The second (post-commit) transaction runs on its own pooled client; both clients record into the same `sql` log.
+  const afterCommitTasks: Array<() => void> = [];
+  vi.spyOn(tenantContext, "afterCommit").mockImplementation((task) => void afterCommitTasks.push(task));
+  const finalClient = { query: vi.fn(async (text: string, params: unknown[] = []) => { sql.push({ text, params }); return { rows: [], rowCount: opts.replay ? 0 : 1 }; }), release: vi.fn() };
+  vi.spyOn(tenantContext, "withTenantContext").mockImplementation(async (_c, _ctx, fn) => {
+    if (opts.finalizeThrows) throw opts.finalizeThrows;
+    return fn(finalClient as never);
+  });
+  let arrive: (c: typeof finalClient) => void = () => undefined;
+  const pool = {
+    connect: vi.fn(() => {
+      if (opts.poolFails) return Promise.reject(new Error("pool exhausted"));
+      if (opts.poolHangs) return new Promise<typeof finalClient>((resolve) => (arrive = resolve));
+      return Promise.resolve(finalClient);
+    }),
+  };
+  const service = new ScheduledReportsService(resolver as never, usage as never, exports as never, email as never, pool as never);
+  return {
+    service, sql, exportCalls, sent, email, tasks: afterCommitTasks, release: finalClient.release, arriveLate: () => arrive(finalClient),
+    async commit() {
+      for (const task of afterCommitTasks.splice(0)) task();
+      await service.settled();
+    },
+  };
 }
 
 describe("NEW-E-100c · STORY-100 send-now", () => {
@@ -82,7 +118,7 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
   it("s8 · a run costs zero credits and consumes ONE pdf_exports unit, however many projects it covers", async () => {
     const h = harness();
     const out = await h.service.sendNow(REPORT_ID);
-    expect(out.status).toBe("logged");
+    expect(out.status).toBe("sending");
     expect(tierCaps.reserveTierCap).toHaveBeenCalledTimes(1);
     expect(vi.mocked(tierCaps.reserveTierCap).mock.calls[0]![1]).toMatchObject({ metric: "pdf_exports", quantity: 1 });
     expect(tierCaps.commitTierCap).toHaveBeenCalledTimes(1);
@@ -127,16 +163,159 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
     expect(tierCaps.commitTierCap).not.toHaveBeenCalled();
   });
 
-  it("AC3 · delivery goes through the EmailSender port with a link to the artifact, and is recorded 'logged', never 'delivered'", async () => {
+  it("AC3 · delivery goes through the EmailSender port with a link to the artifact, and is recorded 'logged', never 'delivered', for a sender that delivers to nobody", async () => {
     const h = harness();
     const out = await h.service.sendNow(REPORT_ID);
+    expect(h.sent).toHaveLength(0); // nothing is sent until the transaction has committed
+    await h.commit();
     expect(h.sent.map((m) => m.to)).toEqual(["a@example.test", "b@example.test"]);
     expect(h.sent[0]!.textBody).toContain("0190aaaa-0000-7000-8000-00000000c10");
     // The link is a URL, not a storage key: pinned whole so a restructure cannot change what recipients receive.
     expect(h.sent[0]!.textBody).toContain("https://app.nominara.com/report-artifacts/0190aaaa-0000-7000-8000-00000000c10\n");
-    expect(out.status).toBe("logged");
-    expect(out.recipients).toBe(2);
-    expect(out.reason).toBeNull();
+    expect(out.status).toBe("sending");
+    const final = h.sql.find((s) => /UPDATE scheduled_report_deliveries SET status/.test(s.text))!;
+    expect(final.params.slice(1)).toEqual(["logged", null, 2]);
+  });
+
+  it("a sender that really delivers (Resend) finishes `delivered`", async () => {
+    const h = harness({ delivers: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.commit();
+    const final = h.sql.find((s) => /UPDATE scheduled_report_deliveries SET status/.test(s.text))!;
+    expect(final.params.slice(1)).toEqual(["delivered", null, 2]);
+    expect(h.sql.some((s) => /UPDATE scheduled_reports SET last_sent_at/.test(s.text))).toBe(true);
+  });
+
+  it("a partial send finishes `failed` with the N-of-M text, the successes counted, and last_error set", async () => {
+    const h = harness({ delivers: true, failFor: ["b@example.test"] });
+    await h.service.sendNow(REPORT_ID);
+    await h.commit();
+    const final = h.sql.find((s) => /UPDATE scheduled_report_deliveries SET status/.test(s.text))!;
+    expect(final.params.slice(1)).toEqual(["failed", "1 of 2 recipients could not be sent", 1]);
+    expect(h.sql.some((s) => /UPDATE scheduled_reports SET last_error/.test(s.text))).toBe(true);
+  });
+
+  it("the request never touches the sender: with the commit withheld, nothing is sent", async () => {
+    const h = harness({ delivers: true });
+    await h.service.sendNow(REPORT_ID);
+    expect(h.email.send).not.toHaveBeenCalled();
+  });
+
+  it("the second transaction carries the request's FULL tenant context, project scope included", async () => {
+    const h = harness({ delivers: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.commit();
+    expect(vi.mocked(tenantContext.withTenantContext).mock.calls[0]![1]).toEqual({ workspaceId: WS, actorId: "actor", scopeProjectIds: [P1] });
+  });
+
+  it("each delivery is counted once, at its FINAL status: `sending` is never counted", async () => {
+    const lines: string[] = [];
+    const log = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(JSON.stringify(m)));
+    try {
+      const h = harness({ delivers: true });
+      await h.service.sendNow(REPORT_ID);
+      await h.commit();
+    } finally {
+      log.mockRestore();
+    }
+    const counted = lines.filter((l) => l.includes("nominara_reports_scheduled_deliveries_total"));
+    expect(counted).toHaveLength(1);
+    expect(counted[0]).toContain('"status":"delivered"');
+  });
+
+  it("onModuleDestroy waits for an in-flight delivery, and is bounded when one never ends", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness({ delivers: true });
+      let release: () => void = () => undefined;
+      h.email.send.mockImplementation(() => new Promise<void>((resolve) => (release = resolve)));
+      await h.service.sendNow(REPORT_ID);
+      for (const task of h.tasks.splice(0)) task();
+      await vi.advanceTimersByTimeAsync(5); // setImmediate: the delivery starts and blocks in the sender
+      let drained = false;
+      const draining = h.service.onModuleDestroy().then(() => void (drained = true));
+      await vi.advanceTimersByTimeAsync(DELIVERY_DRAIN_TIMEOUT_MS - 1);
+      expect(drained, "shutdown did not wait for the in-flight delivery").toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      await draining;
+      expect(drained).toBe(true); // bounded: the never-ending send did not hold shutdown
+      release();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shutdown: a delivery that has not begun when onModuleDestroy runs sends NOTHING and is best-effort recorded `failed`", async () => {
+    const h = harness({ delivers: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.service.onModuleDestroy(); // sets `stopping` first; nothing in flight yet
+    await h.commit();
+    expect(h.email.send).not.toHaveBeenCalled();
+    const final = h.sql.find((s) => /UPDATE scheduled_report_deliveries SET status/.test(s.text))!;
+    expect(final.params.slice(1)).toEqual(["failed", "server shutting down before send", 0]);
+  });
+
+  it("shutdown: if even the best-effort record fails, nothing throws and nothing was sent (the row stays `sending`)", async () => {
+    const h = harness({ delivers: true, poolFails: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.service.onModuleDestroy();
+    await expect(h.commit()).resolves.toBeUndefined();
+    expect(h.email.send).not.toHaveBeenCalled();
+  });
+
+  it("a connection-class failure while recording destroys the connection (release(error)); a normal outcome returns it", async () => {
+    const lost = Object.assign(new Error("Connection terminated unexpectedly"), { code: "57P01" });
+    const bad = harness({ delivers: true, finalizeThrows: lost });
+    await bad.service.sendNow(REPORT_ID);
+    await bad.commit();
+    expect(bad.release).toHaveBeenCalledTimes(1);
+    expect(bad.release.mock.calls[0]![0]).toBe(lost);
+
+    const good = harness({ delivers: true });
+    await good.service.sendNow(REPORT_ID);
+    await good.commit();
+    expect(good.release.mock.calls[0]![0]).toBeUndefined();
+  });
+
+  it("recording waits a BOUNDED time for a pooled connection, and a connection that arrives late is released, not leaked", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness({ delivers: true, poolHangs: true });
+      await h.service.sendNow(REPORT_ID);
+      for (const task of h.tasks.splice(0)) task();
+      await vi.advanceTimersByTimeAsync(5);
+      await vi.advanceTimersByTimeAsync(DELIVERY_CONNECT_TIMEOUT_MS + 1);
+      await h.service.settled(); // the delivery gave up recording instead of waiting forever
+      h.arriveLate();
+      await vi.advanceTimersByTimeAsync(5);
+      expect(h.release).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a replayed finalisation (row already moved) changes nothing else", async () => {
+    const h = harness({ delivers: true, replay: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.commit();
+    expect(h.sql.some((s) => /UPDATE scheduled_reports SET (last_sent_at|last_error)/.test(s.text))).toBe(false);
+  });
+
+  it("a `sending` row the DATABASE flags stale reads as `failed`; one it does not flag reads `sending` (staleness is judged on the DB clock, not this host's)", async () => {
+    const old = new Date(Date.now() - STALE_SENDING_MS - 60_000).toISOString();
+    const fresh = new Date().toISOString();
+    const h = harness({
+      deliveries: [
+        { id: "0190aaaa-0000-7000-8000-0000000000d2", scheduled_report_id: REPORT_ID, attempted_at: fresh, status: "sending", reason: null, recipient_count: 0, stale: false },
+        { id: "0190aaaa-0000-7000-8000-0000000000d1", scheduled_report_id: REPORT_ID, attempted_at: old, status: "sending", reason: null, recipient_count: 0, stale: true },
+      ],
+    });
+    const page = await h.service.list({ limit: 10 } as never);
+    expect(page.items[0]!.deliveries.map((d) => d.status)).toEqual(["sending", "failed"]);
+    // The stale decision is made in SQL, with the window as a bind parameter.
+    const q = h.sql.find((s) => /FROM scheduled_report_deliveries/.test(s.text))!;
+    expect(q.text).toMatch(/now\(\) - attempted_at > \$2/);
+    expect(q.params[1]).toBe(STALE_SENDING_MS);
   });
 
   it("s15 · a failed build is listed as 'failed' with its reason, the reservation is released, and nobody is emailed", async () => {

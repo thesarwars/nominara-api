@@ -12,8 +12,15 @@ export interface EmailMessage {
   readonly to: string;
   readonly subject: string;
   readonly textBody: string;
+  /** Optional HTML alternative. Nothing renders one today (no email template/branding exists); the Resend adapter passes it through when present. */
+  readonly htmlBody?: string;
 }
 
 export interface EmailSender {
+  /**
+   * True only for a sender that really hands mail to a provider (Resend). Logging and dev senders omit it (false): a
+   * record of "accepted" by them must never read as `delivered`.
+   */
+  readonly delivers?: boolean;
   send(message: EmailMessage): Promise<void>;
 }

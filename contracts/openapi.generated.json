@@ -43837,7 +43837,8 @@
                                     "delivered",
                                     "failed",
                                     "skipped_cap",
-                                    "logged"
+                                    "logged",
+                                    "sending"
                                   ]
                                 },
                                 "reason": {
@@ -44327,7 +44328,8 @@
                                   "delivered",
                                   "failed",
                                   "skipped_cap",
-                                  "logged"
+                                  "logged",
+                                  "sending"
                                 ]
                               },
                               "reason": {
@@ -44877,7 +44879,8 @@
                                   "delivered",
                                   "failed",
                                   "skipped_cap",
-                                  "logged"
+                                  "logged",
+                                  "sending"
                                 ]
                               },
                               "reason": {
@@ -45580,7 +45583,8 @@
                             "delivered",
                             "failed",
                             "skipped_cap",
-                            "logged"
+                            "logged",
+                            "sending"
                           ]
                         },
                         "reason": {

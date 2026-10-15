@@ -33,6 +33,8 @@ export interface ApiHarness {
   db(): Client;
   /** The booted application, rebuilt per test. */
   app(): NestFastifyApplication;
+  /** Closes the app now (idempotent: the per-test cleanup will not close it a second time). For a test whose subject is shutdown. */
+  close(): Promise<void>;
 }
 
 export interface ApiHarnessOptions {
@@ -79,6 +81,8 @@ export function useApiHarness(options: ApiHarnessOptions = {}): ApiHarness {
   let container: StartedPostgreSqlContainer;
   let db: Client;
   let app: NestFastifyApplication;
+  let closing: Promise<void> | undefined;
+  const closeApp = (): Promise<void> => (closing ??= app.close());
   const originalEnv = { ...process.env };
 
   beforeAll(async () => {
@@ -132,6 +136,7 @@ export function useApiHarness(options: ApiHarnessOptions = {}): ApiHarness {
     if (options.cache !== undefined) builder.overrideProvider(CACHE).useValue(options.cache());
     options.configure?.(builder);
     const moduleRef = await builder.compile();
+    closing = undefined;
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
     await configureApp(app);
     await app.init();
@@ -139,9 +144,9 @@ export function useApiHarness(options: ApiHarnessOptions = {}): ApiHarness {
   }, 60_000);
 
   afterEach(async () => {
-    await app.close();
+    await closeApp();
     await db.end();
   });
 
-  return { db: () => db, app: () => app };
+  return { db: () => db, app: () => app, close: closeApp };
 }

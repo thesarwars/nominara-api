@@ -7,6 +7,7 @@ import { Redis } from "ioredis";
 import type { ClientBase, PoolClient } from "pg";
 import { resolveEngineSpendCeilings } from "./config/env.schema.js";
 import { loadEnv } from "./config/env.js";
+import { announceAlertRouting, drainAlertEmails } from "./lib/alerts/alerts.js";
 import { connect, withKeepalives } from "./db/client.js";
 import { createPgPool, isConnectionClassFailure } from "./db/pg-pool.js";
 import { SchedulerSweepRuntime } from "./lib/capture/scheduler-sweep.js";
@@ -83,6 +84,8 @@ class WorkerGroupRuntime implements OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     await Promise.all(this.workers.map((worker) => closeWithinDeadline(worker)));
+    // Group C — handlers have stopped, so no new alert can start; give in-flight alert mail a bounded chance to land.
+    await drainAlertEmails();
     await Promise.all(this.dlqQueues.map((queue) => queue.close().catch(() => undefined)));
     await Promise.all(this.scheduleQueues.map((queue) => queue.close().catch(() => undefined)));
     // The one connection every schedule Queue shares. Closing a Queue does
@@ -200,6 +203,9 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       "WORKER_GROUP must be set to boot a worker process (capture|parse|crawl|embed|rollup|report|deploy)",
     );
   }
+
+  // Group C — one boot line if operational alerts have nowhere to go (ALERT_EMAIL_TO unset).
+  announceAlertRouting();
 
   const entries = queuesForGroup(env.WORKER_GROUP);
   const keys = signingKeysFromEnv(env);

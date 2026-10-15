@@ -1,6 +1,7 @@
 import { Logger } from "@nestjs/common";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapWorker, WorkerGroupError } from "./worker.js";
+import { setAlertEmailerForTests } from "./lib/alerts/alerts.js";
 import { testCacheRedisUrl, testQueueRedisUrl } from "../test/support/test-valkey.js";
 
 // STORY-022 — NFR-ARCH-06 cold start (<=8s) plus the worker's own
@@ -68,6 +69,23 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     } finally {
       await app.close();
       warnSpy.mockRestore();
+    }
+  }, 15_000);
+
+  it("Group C: with ALERT_EMAIL_TO unset the worker says at boot that alerts go nowhere", async () => {
+    process.env.WORKER_GROUP = "rollup";
+    delete process.env.ALERT_EMAIL_TO;
+    setAlertEmailerForTests(undefined);
+    const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+
+    const app = await bootstrapWorker();
+    try {
+      const messages = warnSpy.mock.calls.map((call) => String(call[0]));
+      expect(messages.filter((message) => message.includes("ALERT_EMAIL_TO is not set"))).toHaveLength(1);
+    } finally {
+      await app.close();
+      warnSpy.mockRestore();
+      setAlertEmailerForTests(undefined);
     }
   }, 15_000);
 

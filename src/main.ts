@@ -6,6 +6,7 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { ApiModule } from "./api/api.module.js";
 import { configureApp } from "./api/configure-app.js";
 import { loadEnv } from "./config/env.js";
+import { announceAlertRouting } from "./lib/alerts/alerts.js";
 import { fastifyServerOptions } from "./api/fastify-options.js";
 
 // STORY-022 — API bootstrap (project-structure.md §2: "src/main.ts API
@@ -17,6 +18,8 @@ import { fastifyServerOptions } from "./api/fastify-options.js";
 // the shared seam every test assembly site also calls.
 export async function bootstrap(): Promise<NestFastifyApplication> {
   const env = loadEnv();
+  // Group C — one boot line if operational alerts have nowhere to go (ALERT_EMAIL_TO unset).
+  announceAlertRouting();
   const app = await NestFactory.create<NestFastifyApplication>(ApiModule, new FastifyAdapter(fastifyServerOptions()), {
     bufferLogs: true,
   });

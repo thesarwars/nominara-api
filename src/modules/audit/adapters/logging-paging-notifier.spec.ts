@@ -1,5 +1,6 @@
 import { Logger } from "@nestjs/common";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setAlertEmailerForTests } from "../../../lib/alerts/alerts.js";
 import { LoggingPagingNotifier } from "./logging-paging-notifier.js";
 
 // STORY-020 D-2 — LoggingPagingNotifier is a stub: it logs and returns. It
@@ -7,6 +8,11 @@ import { LoggingPagingNotifier } from "./logging-paging-notifier.js";
 // the calling worker script (audit-verify.ts), not this class.
 
 describe("STORY-020 · LoggingPagingNotifier", () => {
+  // Group C — the notifier also emails when ALERT_EMAIL_TO is set. These cases are about the LOG line only, so they run
+  // with alerts explicitly unconfigured (no emailer) rather than reading an environment this spec never set up.
+  beforeEach(() => setAlertEmailerForTests(null));
+  afterEach(() => setAlertEmailerForTests(undefined));
+
   it("logs the alert's workspaceId, seq, and reason via Logger.error", async () => {
     const errorSpy = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
     const notifier = new LoggingPagingNotifier();
