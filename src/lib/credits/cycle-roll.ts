@@ -18,9 +18,10 @@ import type { WalletState } from "./wallet.js";
 // customer-visible "your 400 unused credits expired" would have no record to point at. `grant` G then `expire` I
 // (I = what the bucket held) lands the bucket on exactly G and leaves both movements explicable.
 //
-// ⚠ GRANT FIRST, EXPIRE SECOND, and it is the order that matters. The expiry is the larger of the two movements for a
-// wallet that holds a lot, and the grant landing first keeps every intermediate state a state the schema's CHECKs
-// accept; the replay also anchors on whichever of the two entries comes first (see `replay.ts`).
+// The grant is written first and the expiry second. Under option B (below) either order satisfies the schema's
+// CHECKs, because the bucket never drops below the carry and `reserved <= carry + purchased`; the replay anchors on
+// whichever of the two entries comes first (see `replay.ts`). The order is kept so the ledger reads the same way
+// every time.
 //
 // ⚠ WHY THE GATE IS THE WALLET'S OWN `cycle_start`, read under the row lock. A replayed webhook, a stale event for an
 // earlier period and two concurrent deliveries all ask the same question — "is this cycle newer than the one on file"
