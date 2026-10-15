@@ -6,6 +6,7 @@ import {
   type RenderingQualityResponse,
 } from "../../../contracts/analytics/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { RenderingQualityService } from "./rendering-quality.service.js";
@@ -18,6 +19,7 @@ export class RenderingQualityController {
 
   @Get()
   @RequirePermission("tracking:read")
+  @ProjectParam("id")
   @ApiContract({ operationId: "getProjectRenderingQuality", responseSchema: renderingQualityResponseSchema })
   renderingQuality(
     @Param("id") projectId: string,

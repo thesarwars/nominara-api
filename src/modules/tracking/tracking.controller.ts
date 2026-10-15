@@ -11,6 +11,7 @@ import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { Credits } from "../../api/decorators/credits.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
+import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { RateLimitClass } from "../../api/rate-limit/route-class.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
@@ -43,6 +44,7 @@ export class TrackingController {
   @Post("estimate")
   @HttpCode(200)
   @RequirePermission("tracking:trigger")
+  @ProjectParam("id")
   // AUDITED EVEN THOUGH IT WRITES NOTHING, and not merely to satisfy the
   // interceptor's fail-closed rule for POSTs.
   //
@@ -85,6 +87,7 @@ export class TrackingController {
   @RateLimitClass("project_runs")
   @Credits("deep_scan")
   @RequirePermission("tracking:trigger")
+  @ProjectParam("id")
   // Audited because it is a priced action against a plan's allowance, and
   // because which prompts were asked on which day IS the measurement — a
   // manual scan changes the series every later number is read against.

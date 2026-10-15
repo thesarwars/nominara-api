@@ -6,6 +6,7 @@ import {
   type ScorecardsResponse,
 } from "../../../contracts/analytics/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { ScorecardsService } from "./scorecards.service.js";
@@ -28,6 +29,7 @@ export class ScorecardsController {
   // audit-coverage.spec.ts` is the sweep that would catch a mistake here.
   @Get()
   @RequirePermission("tracking:read")
+  @ProjectParam("id")
   @ApiContract({ operationId: "getProjectScorecards", responseSchema: scorecardsResponseSchema })
   scorecard(
     @Param("id") projectId: string,

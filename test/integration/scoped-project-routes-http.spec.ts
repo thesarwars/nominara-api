@@ -118,7 +118,7 @@ describe("STORY-019 · a scoped permission on a project route (REQ-019-scope-dec
     return id;
   }
 
-  async function result(workspaceId: string, projectId: string): Promise<string> {
+  async function result(workspaceId: string, projectId: string): Promise<{ resultId: string; promptId: string }> {
     const promptId = uuidV7();
     const resultId = uuidV7();
     await harness.db().query(
@@ -142,19 +142,20 @@ describe("STORY-019 · a scoped permission on a project route (REQ-019-scope-dec
         JSON.stringify({ format: "markdown", text: "HubSpot is a CRM." }),
       ],
     );
-    return resultId;
+    return { resultId, promptId };
   }
 
   interface Routed {
     readonly name: string;
     readonly allowed: number;
     /** Builds the request for an actor against a target the fixture seeded for ONE project. */
-    readonly request: (target: Target, actor: Actor) => { method: "GET" | "POST"; url: string; headers: Record<string, string>; payload?: object };
+    readonly request: (target: Target, actor: Actor) => { method: "GET" | "POST" | "PATCH"; url: string; headers: Record<string, string>; payload?: object };
   }
   interface Target {
     readonly projectId: string;
     readonly runId: string;
     readonly resultId: string;
+    readonly promptId: string;
   }
 
   const read = (path: string) => (_t: Target, a: Actor) => ({ method: "GET" as const, url: apiUrl(path), headers: { cookie: a.cookie } });
@@ -183,11 +184,31 @@ describe("STORY-019 · a scoped permission on a project route (REQ-019-scope-dec
         payload: {},
       }),
     },
+    {
+      name: "POST /runs/{id}/undo",
+      allowed: 200,
+      request: (t, a) => ({
+        method: "POST",
+        url: apiUrl(`/runs/${t.runId}/undo`),
+        headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json" },
+        payload: {},
+      }),
+    },
+    {
+      name: "PATCH /prompts/{id}",
+      allowed: 200,
+      request: (t, a) => ({
+        method: "PATCH",
+        url: apiUrl(`/prompts/${t.promptId}`),
+        headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json" },
+        payload: { status: "paused" },
+      }),
+    },
     { name: "GET /results/{id}", allowed: 200, request: (t, a) => read(`/results/${t.resultId}`)(t, a) },
   ];
 
   async function seedTarget(workspaceId: string, projectId: string): Promise<Target> {
-    return { projectId, runId: await run(workspaceId, projectId), resultId: await result(workspaceId, projectId) };
+    return { projectId, runId: await run(workspaceId, projectId), ...(await result(workspaceId, projectId)) };
   }
 
   for (const route of routes) {

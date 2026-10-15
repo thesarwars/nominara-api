@@ -8,6 +8,7 @@ import {
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import { RunLifecycleService } from "./run-lifecycle.service.js";
 
@@ -27,6 +28,7 @@ export class RunsController {
   // the same permission as starting one.
   @Get(":id")
   @RequirePermission("tracking:read")
+  @ScopedByQuery()
   @ApiContract({ operationId: "getRun", responseSchema: runProgressResponseSchema })
   progress(@Param("id") runId: string): Promise<RunProgressResponse> {
     return this.lifecycle.progress(runId);
@@ -42,6 +44,7 @@ export class RunsController {
   @Post(":id/cancel")
   @HttpCode(200)
   @RequirePermission("tracking:trigger")
+  @ScopedByQuery()
   @Audit({ action: "run.canceled", resourceType: "capture_run" })
   @ApiContract({ operationId: "cancelRun", responseSchema: runProgressResponseSchema })
   cancel(@Param("id") runId: string): Promise<RunProgressResponse> {
@@ -64,6 +67,7 @@ export class RunsController {
   @Post(":id/undo")
   @HttpCode(200)
   @RequirePermission("tracking:trigger")
+  @ScopedByQuery()
   @Audit({ action: "run.undone", resourceType: "capture_run" })
   @ApiContract({ operationId: "undoRun", responseSchema: runUndoResponseSchema })
   undo(@Req() req: RbacScopedRequest, @Param("id") runId: string): Promise<RunUndoResponse> {

@@ -10,6 +10,7 @@ import {
   type SourceIndexResponse,
 } from "../../../contracts/analytics/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { SourcesService } from "./sources.service.js";
@@ -23,6 +24,7 @@ export class SourcesController {
 
   @Get()
   @RequirePermission("aux:read")
+  @ProjectParam("id")
   @ApiContract({ operationId: "getProjectSources", responseSchema: sourceIndexResponseSchema })
   sourceIndex(
     @Param("id") projectId: string,
@@ -33,6 +35,7 @@ export class SourcesController {
 
   @Get(":domain/playbook")
   @RequirePermission("aux:read")
+  @ProjectParam("id")
   @ApiContract({ operationId: "getSourcePlaybook", responseSchema: playbookResponseSchema })
   playbook(
     @Param("id") projectId: string,

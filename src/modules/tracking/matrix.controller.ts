@@ -1,6 +1,7 @@
 import { Controller, Get, Param, Query } from "@nestjs/common";
 import { matrixQuerySchema, matrixResponseSchema, type MatrixQuery, type MatrixResponse } from "../../../contracts/tracking/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { MatrixService } from "./matrix.service.js";
@@ -19,6 +20,7 @@ export class MatrixController {
   // is why analysts and viewers have it and `tracking:trigger` is separate.
   @Get()
   @RequirePermission("tracking:read")
+  @ProjectParam("id")
   @ApiContract({ operationId: "getProjectMatrix", responseSchema: matrixResponseSchema })
   matrix(
     @Param("id") projectId: string,

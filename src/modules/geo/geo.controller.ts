@@ -10,6 +10,7 @@ import {
   type GeoSlug,
 } from "../../../contracts/analytics/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { GeoService } from "./geo.service.js";
@@ -22,6 +23,7 @@ export class GeoController {
 
   @Get()
   @RequirePermission("tracking:read")
+  @ProjectParam("id")
   @ApiContract({ operationId: "getProjectGeoInsights", responseSchema: geoDigestSchema })
   digest(
     @Param("id") projectId: string,
@@ -32,6 +34,7 @@ export class GeoController {
 
   @Get(":analysis")
   @RequirePermission("tracking:read")
+  @ProjectParam("id")
   @ApiContract({ operationId: "getProjectGeoAnalysis", responseSchema: geoAnalysisSchema })
   analysis(
     @Param("id") projectId: string,

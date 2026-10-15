@@ -51,7 +51,7 @@ async function walk(): Promise<Route[]> {
         const read = <T>(key: string): T | undefined =>
           (Reflect.getMetadata(key, handler) as T | undefined) ?? (Reflect.getMetadata(key, exported) as T | undefined);
         routes.push({
-          label: `${verb} /${[classPath, Array.isArray(path) ? path[0] : path].filter(Boolean).join("/")} (${exported.name}.${name})`,
+          label: `${verb} /${[classPath, Array.isArray(path) ? path[0] : path].filter(Boolean).join("/").replace(/\/+/g, "/")} (${exported.name}.${name})`,
           permission: read<Permission>(REQUIRE_PERMISSION_KEY),
           isPublic: read<boolean>(IS_PUBLIC_KEY) === true,
           hasProjectParam: read<string>(PROJECT_PARAM_KEY) !== undefined,
