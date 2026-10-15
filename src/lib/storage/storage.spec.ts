@@ -10,7 +10,7 @@ const WS_A = "0197a000-0000-7000-8000-00000000000a";
 const WS_B = "0197a000-0000-7000-8000-00000000000b";
 
 // The fake's map key is a bucket/key pair, not an object key; built without a template literal so the ISO-14 scanner
-// (which reads every `${x}/...` literal in src/ as an object key) is not asked to judge it.
+// (which reads every interpolated-then-slash literal in src/ as an object key) is not asked to judge it.
 const slot = (bucket: string, key: string): string => [bucket, key].join("/");
 
 // A recording fake of the LOW-LEVEL port. It lets these tests see exactly which bucket and key the tenant layer hands to
