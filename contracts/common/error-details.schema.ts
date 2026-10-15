@@ -214,6 +214,7 @@ export const featureNotInPlanDetailsSchema = z
 //   recipient_email_unverified          the recipient's address is not proved
 //   recipient_no_strong_authenticator   no un-revoked passkey; an email code alone does not count
 //   past_due_invoice                    an unpaid invoice is past its due date
+//   prompt_superseded                   STORY-046: the prompt was reworded; the live row is the one that replaced it
 export const CONFLICT_REASONS = [
   "member_suspended",
   "already_member",
@@ -225,6 +226,7 @@ export const CONFLICT_REASONS = [
   "recipient_email_unverified",
   "recipient_no_strong_authenticator",
   "past_due_invoice",
+  "prompt_superseded",
 ] as const;
 
 export const conflictDetailsSchema = z
