@@ -1,4 +1,5 @@
 import { Logger } from "@nestjs/common";
+import { emailAlert } from "../alerts/alerts.js";
 import { Queue, type Job } from "bullmq";
 import type { Redis } from "ioredis";
 import { z } from "zod";
@@ -220,6 +221,9 @@ export const defaultPager: Pager = {
   page(message, context) {
     logger.error({ message, ...context });
     incrementCounter("nominara_queue_dlq_depth_page_total", { queue: String(context.queue ?? "unknown") });
+    // Group C — the page also goes out by email when ALERT_EMAIL_TO is configured (src/lib/alerts). The log line and
+    // counter above are unchanged and always happen.
+    emailAlert(message, context);
   },
 };
 
@@ -270,6 +274,7 @@ export class DlqDepthMonitor {
     if (now - since >= this.sustainedMs && !this.alreadyPaged.has(queueName)) {
       this.alreadyPaged.add(queueName);
       this.pager.page(`dead-letter queue "${dlqQueueName(queueName)}" depth sustained above threshold`, {
+        alertName: "dlq_depth_sustained",
         queue: queueName,
         depth,
         thresholdDepth: this.thresholdDepth,

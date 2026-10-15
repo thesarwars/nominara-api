@@ -61,6 +61,7 @@ export class BlackoutMonitor {
 
     this.lastPagedAtMs.set(engineKey, now);
     this.pager.page(`engine '${engineKey}' has been dark (no successful capture) for over 48 hours`, {
+      alertName: "engine_blackout",
       engineKey,
       darkDurationMs,
     });

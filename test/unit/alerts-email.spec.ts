@@ -1,0 +1,247 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Logger } from "@nestjs/common";
+import { applyFakeApiEnv } from "../support/fake-env.js";
+import type { EmailMessage, EmailSender } from "../../src/modules/identity/ports/email-sender.js";
+import { EmailAlertAdapter, ALERT_EMAIL_COOLDOWN_MS, renderAlertEmail } from "../../src/lib/alerts/email-alert.adapter.js";
+import { getAlertEmailer, setAlertEmailerForTests, announceAlertRouting } from "../../src/lib/alerts/alerts.js";
+import {
+  DLQ_DEPTH_PAGE_THRESHOLD,
+  DLQ_DEPTH_SUSTAINED_MS,
+  DlqDepthMonitor,
+} from "../../src/lib/queue/dead-letter.js";
+import { BLACKOUT_THRESHOLD_MS, BlackoutMonitor } from "../../src/lib/engines/blackout.js";
+import { ParseAlertMonitor } from "../../src/lib/parser/parse-alerts.js";
+import { LoggingPagingNotifier } from "../../src/modules/audit/adapters/logging-paging-notifier.js";
+import { LoggingWalletPagingNotifier } from "../../src/modules/credits/adapters/logging-wallet-paging-notifier.js";
+
+// Group C item 2 — alerts by email through the EMAIL_SENDER port. Every sender below is a fake; nothing is delivered.
+
+const TO = "oncall@example.net";
+const WORKSPACE_ID = "0198f2a0-0000-7000-8000-000000000001";
+
+class FakeSender implements EmailSender {
+  readonly sent: EmailMessage[] = [];
+  failNext = 0;
+  async send(message: EmailMessage): Promise<void> {
+    if (this.failNext > 0) {
+      this.failNext -= 1;
+      throw new Error("provider down");
+    }
+    this.sent.push(message);
+  }
+}
+
+let sender: FakeSender;
+let now: number;
+let emailer: EmailAlertAdapter;
+const logged: string[] = [];
+const originalEnv = { ...process.env };
+
+beforeEach(() => {
+  applyFakeApiEnv();
+  logged.length = 0;
+  for (const level of ["log", "warn", "error", "debug", "verbose", "fatal"] as const) {
+    vi.spyOn(Logger.prototype, level).mockImplementation((...args: unknown[]) => {
+      logged.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+    });
+  }
+  sender = new FakeSender();
+  now = 1_700_000_000_000;
+  emailer = new EmailAlertAdapter({ sender, to: TO, clock: () => now, environment: "test" });
+  setAlertEmailerForTests(emailer);
+});
+
+afterEach(() => {
+  setAlertEmailerForTests(undefined);
+  vi.restoreAllMocks();
+  process.env = { ...originalEnv };
+});
+
+describe("alert email · cooldown", () => {
+  it("one sustained condition is ONE email per window, not one per tick", async () => {
+    for (let tick = 0; tick < 50; tick += 1) {
+      emailer.page("queue is deep", { alertName: "dlq_depth_sustained", queue: "capture.run", depth: 90 });
+      now += 60_000;
+    }
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(1);
+    expect(sender.sent[0]!.to).toBe(TO);
+  });
+
+  it("pages again once the cooldown has elapsed", async () => {
+    emailer.page("queue is deep", { alertName: "dlq_depth_sustained", queue: "q1" });
+    await emailer.drain();
+    now += ALERT_EMAIL_COOLDOWN_MS - 1;
+    emailer.page("queue is deep", { alertName: "dlq_depth_sustained", queue: "q1" });
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(1);
+    now += 1;
+    emailer.page("queue is deep", { alertName: "dlq_depth_sustained", queue: "q1" });
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(2);
+  });
+
+  it("is keyed by alert name AND subject: a different queue, workspace or alert is its own incident", async () => {
+    emailer.page("m", { alertName: "dlq_depth_sustained", queue: "q1" });
+    emailer.page("m", { alertName: "dlq_depth_sustained", queue: "q2" });
+    emailer.page("m", { alertName: "engine_blackout", engineKey: "q1" });
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(3);
+  });
+
+  it("a FAILED send releases its claim, so the next occurrence tries again instead of being swallowed", async () => {
+    sender.failNext = 1;
+    emailer.page("m", { alertName: "engine_blackout", engineKey: "gemini" });
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(0);
+    emailer.page("m", { alertName: "engine_blackout", engineKey: "gemini" });
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(1);
+  });
+
+  it("a send failure never throws into the caller", async () => {
+    sender.failNext = 1;
+    expect(() => emailer.page("m", { alertName: "x" })).not.toThrow();
+    await expect(emailer.notify("m", { alertName: "y" })).resolves.toBeUndefined();
+  });
+});
+
+describe("alert email · body carries IDs only", () => {
+  it("omits free-text values, redacts anything address-shaped, keeps ids and numbers", () => {
+    const rendered = renderAlertEmail(
+      `trouble for ${TO} in workspace ${WORKSPACE_ID}`,
+      {
+        alertName: "sentiment_escalation_rate",
+        workspaceId: WORKSPACE_ID,
+        rate: 0.31,
+        promptText: "what is the best CRM for alice@example.org",
+        email: "alice@example.org",
+        reason: "mailto alice@example.org",
+      },
+      "test",
+      new Date(0),
+    );
+    const everything = `${rendered.subject}\n${rendered.textBody}`;
+    expect(everything).toContain(WORKSPACE_ID);
+    expect(everything).toContain("0.31");
+    expect(everything).not.toContain("alice");
+    expect(everything).not.toContain("best CRM");
+    expect(everything).not.toContain(TO);
+    expect(rendered.textBody).toContain("promptText: [omitted]");
+  });
+});
+
+describe("alert email · no-config fallback", () => {
+  it("ALERT_EMAIL_TO unset: no emailer, the pager sites keep their log line and counter, and ONE warning says alerts go nowhere", () => {
+    setAlertEmailerForTests(undefined);
+    delete process.env.ALERT_EMAIL_TO;
+    expect(getAlertEmailer()).toBeNull();
+    announceAlertRouting();
+    announceAlertRouting();
+    const warnings = logged.filter((line) => line.includes("ALERT_EMAIL_TO is not set"));
+    expect(warnings).toHaveLength(1);
+
+    const monitor = new DlqDepthMonitor({ clock: () => now });
+    monitor.observe("capture.run", DLQ_DEPTH_PAGE_THRESHOLD + 1);
+    now += DLQ_DEPTH_SUSTAINED_MS;
+    expect(() => monitor.observe("capture.run", DLQ_DEPTH_PAGE_THRESHOLD + 1)).not.toThrow();
+    expect(logged.some((line) => line.includes("nominara_queue_dlq_depth_page_total"))).toBe(true);
+  });
+
+  it("ALERT_EMAIL_TO set: builds the emailer from env and a page reaches the configured sender (Resend, over a fake fetch)", async () => {
+    setAlertEmailerForTests(undefined);
+    process.env.ALERT_EMAIL_TO = TO;
+    process.env.RESEND_API_KEY = "re_test_PLACEHOLDER";
+    process.env.RESEND_FROM_EMAIL = "Nominara <no-reply@nominara.test>";
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ id: "m" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const built = getAlertEmailer();
+      expect(built).not.toBeNull();
+      built!.page("m", { alertName: "dlq_depth_sustained", queue: "q1" });
+      await built!.drain();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body)) as { to: string[]; subject: string };
+      expect(body.to).toEqual([TO]);
+      expect(body.subject).toContain("dlq_depth_sustained");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("alert email · every existing page site sends exactly one email for its condition", () => {
+  it("SLO-24 dead-letter depth (DlqDepthMonitor, default pager)", async () => {
+    const monitor = new DlqDepthMonitor({ clock: () => now });
+    monitor.observe("capture.run", DLQ_DEPTH_PAGE_THRESHOLD + 5);
+    now += DLQ_DEPTH_SUSTAINED_MS;
+    for (let tick = 0; tick < 10; tick += 1) {
+      monitor.observe("capture.run", DLQ_DEPTH_PAGE_THRESHOLD + 5);
+      now += 30_000;
+    }
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(1);
+    expect(sender.sent[0]!.subject).toContain("dlq_depth_sustained");
+    expect(sender.sent[0]!.textBody).toContain("capture.run");
+  });
+
+  it("EC-06 engine blackout (BlackoutMonitor, default pager); a second monitor instance in the same window is suppressed by the email cooldown", async () => {
+    const first = new BlackoutMonitor(undefined, () => now);
+    const second = new BlackoutMonitor(undefined, () => now);
+    first.observe("gemini", false);
+    second.observe("gemini", false);
+    now += BLACKOUT_THRESHOLD_MS + 1;
+    first.observe("gemini", false);
+    first.observe("gemini", false);
+    second.observe("gemini", false);
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(1);
+    expect(sender.sent[0]!.subject).toContain("engine_blackout");
+    expect(sender.sent[0]!.subject).toContain("gemini");
+  });
+
+  it.each([
+    ["citation_resolution_failure", { citationsAttempted: 40, citationsFailed: 30, mentions: 0, escalatedMentions: 0, capableMentions: 0, classifiedFromElements: 0 }],
+    ["sentiment_escalation_rate", { citationsAttempted: 0, citationsFailed: 0, mentions: 60, escalatedMentions: 40, capableMentions: 0, classifiedFromElements: 0 }],
+    ["rendering_classification_coverage", { citationsAttempted: 0, citationsFailed: 0, mentions: 0, escalatedMentions: 0, capableMentions: 60, classifiedFromElements: 10 }],
+  ])("parse alert %s (ParseAlertMonitor, default pager)", async (kind, counts) => {
+    const monitor = new ParseAlertMonitor({ clock: () => now });
+    const observation = { workspaceId: WORKSPACE_ID, engineKey: "gemini", ...counts };
+    monitor.observe(observation);
+    monitor.observe(observation);
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(1);
+    expect(sender.sent[0]!.subject).toContain(kind);
+  });
+
+  it("STORY-020 audit-chain mismatch (LoggingPagingNotifier)", async () => {
+    await new LoggingPagingNotifier().page({ workspaceId: WORKSPACE_ID, seq: "42", reason: "chain_broken" });
+    expect(sender.sent).toHaveLength(1);
+    expect(sender.sent[0]!.subject).toContain("audit_chain_mismatch");
+    expect(sender.sent[0]!.textBody).toContain(WORKSPACE_ID);
+    expect(sender.sent[0]!.textBody).toContain("42");
+  });
+
+  it("STORY-073 wallet mismatch (LoggingWalletPagingNotifier) carries the balances as numbers", async () => {
+    await new LoggingWalletPagingNotifier().page({
+      workspaceId: WORKSPACE_ID,
+      seq: "17",
+      reason: "the balance this entry records is not the balance replaying the ledger produces",
+      wallet: { included: 10, purchased: 5, reserved: 0 },
+      replayed: { included: 12, purchased: 5, reserved: 0 },
+      counter: null,
+    });
+    expect(sender.sent).toHaveLength(1);
+    expect(sender.sent[0]!.subject).toContain("wallet_ledger_mismatch");
+    expect(sender.sent[0]!.textBody).toContain(WORKSPACE_ID);
+    expect(sender.sent[0]!.textBody).toMatch(/wallet_included: 10/);
+    expect(sender.sent[0]!.textBody).toMatch(/replayed_included: 12/);
+  });
+
+  it("a verifier port still resolves when the mail fails (an alert path cannot fail the verifier)", async () => {
+    sender.failNext = 1;
+    await expect(
+      new LoggingPagingNotifier().page({ workspaceId: WORKSPACE_ID, seq: "1", reason: "chain_broken" }),
+    ).resolves.toBeUndefined();
+  });
+});

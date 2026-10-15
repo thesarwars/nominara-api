@@ -1,6 +1,7 @@
 import { Logger } from "@nestjs/common";
 import { incrementCounter } from "../telemetry/metrics.js";
 import type { Pager } from "../queue/dead-letter.js";
+import { emailAlert } from "../alerts/alerts.js";
 import { shouldAlertOnResolutionFailures, RESOLUTION_FAILURE_THRESHOLD } from "./citations.js";
 import { CLASSIFICATION_COVERAGE_FLOOR, shouldAlertOnCoverage } from "./rendering.js";
 import { ESCALATION_ALARM, shouldAlertOnEscalationRate } from "./sentiment/arbiter.js";
@@ -69,6 +70,8 @@ export const parseAlertPager: Pager = {
   page(message, context) {
     logger.error({ message, ...context });
     incrementCounter("nominara_parser_alert_page_total", { alert: String(context.alert ?? "unknown") });
+    // Group C — also emailed when ALERT_EMAIL_TO is configured (src/lib/alerts); the log line and counter always happen.
+    emailAlert(message, context);
   },
 };
 

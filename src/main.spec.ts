@@ -1,5 +1,7 @@
 import { createServer } from "node:net";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { Logger } from "@nestjs/common";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setAlertEmailerForTests } from "./lib/alerts/alerts.js";
 import { bootstrap } from "./main.js";
 import { testCacheRedisUrl, testQueueRedisUrl } from "../test/support/test-valkey.js";
 
@@ -57,5 +59,21 @@ describe("STORY-022 · main.ts cold start", () => {
     expect(elapsedMs).toBeLessThan(8000);
 
     await app.close();
+  }, 15_000);
+
+  it("Group C: with ALERT_EMAIL_TO unset the API says at boot that alerts go nowhere", async () => {
+    process.env.PORT = String(await getFreePort());
+    delete process.env.ALERT_EMAIL_TO;
+    setAlertEmailerForTests(undefined);
+    const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    const app = await bootstrap();
+    try {
+      const messages = warnSpy.mock.calls.map((call) => String(call[0]));
+      expect(messages.filter((message) => message.includes("ALERT_EMAIL_TO is not set"))).toHaveLength(1);
+    } finally {
+      await app.close();
+      warnSpy.mockRestore();
+      setAlertEmailerForTests(undefined);
+    }
   }, 15_000);
 });
