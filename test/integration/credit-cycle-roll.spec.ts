@@ -8,6 +8,7 @@ import { StripeSubscriptionHandler } from "../../src/modules/billing/stripe-subs
 import type { BillingAddonsService } from "../../src/modules/billing/billing-addons.service.js";
 import { applyPlanChange, type ProviderSubscriptionState } from "../../src/lib/billing/apply-plan.js";
 import { provisionWalletWithGrant, recordPurchase } from "../../src/lib/credits/balance.js";
+import { debitInTransaction } from "../../src/lib/credits/debit.js";
 import { rollIncludedCycle, type CycleRollOutcome } from "../../src/lib/credits/cycle-roll.js";
 import { appendLedgerEntry } from "../../src/lib/credits/ledger.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
@@ -477,8 +478,155 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
 
       expect(await balances(ws)).toMatchObject({ included_balance: 110, purchased_balance: 500, reserved: 505 });
       await commitHold(ws, "big", 505);
-      // 100 from the carry, 10 from the grant, 395 from purchased.
-      expect(await balances(ws)).toMatchObject({ included_balance: 0, purchased_balance: 105, reserved: 0 });
+      // 100 from the carry; the other 405 were backed by PURCHASED credits before the roll, so they come from purchased and
+      // the new grant (10) is untouched: the same split as committing before the roll (below).
+      expect(await balances(ws)).toMatchObject({ included_balance: 10, purchased_balance: 95, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · the same wallet, commit THEN roll, ends on the same buckets: included 10, purchased 95 (the two orderings agree)", async () => {
+      await wallet(ws, 100);
+      await inCtx(ws, (tx) => recordPurchase(tx, { workspaceId: ws, idempotencyKey: "pack-1", actorId: null, actorType: "system" }, 500));
+      await openHold(ws, 505, "big");
+
+      await commitHold(ws, "big", 505);
+      expect(await balances(ws)).toMatchObject({ included_balance: 0, purchased_balance: 95, reserved: 0 });
+      await roll(ws, 10);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 10, purchased_balance: 95, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    for (const [consumed, included, purchased] of [[300, 10, 300], [100, 10, 500], [60, 10, 500]] as const) {
+      it(`STORY-072 AC13 · a partly carried hold committed for ${String(consumed)} of 505 splits the buckets the same in both orderings (${String(included)} / ${String(purchased)})`, async () => {
+        const arrange = async (): Promise<void> => {
+          await wallet(ws, 100);
+          await inCtx(ws, (tx) => recordPurchase(tx, { workspaceId: ws, idempotencyKey: "pack-1", actorId: null, actorType: "system" }, 500));
+          await openHold(ws, 505, "big");
+        };
+
+        await arrange();
+        await roll(ws, 10);
+        await commitHold(ws, "big", 505, consumed);
+        const rollThenCommit = await balances(ws);
+        await replayClean(ws);
+
+        ws = await newWorkspace("growth");
+        await arrange();
+        await commitHold(ws, "big", 505, consumed);
+        await roll(ws, 10);
+        const commitThenRoll = await balances(ws);
+        await replayClean(ws);
+
+        expect(rollThenCommit).toMatchObject({ included_balance: commitThenRoll.included_balance, purchased_balance: commitThenRoll.purchased_balance, reserved: 0 });
+        expect(commitThenRoll).toMatchObject({ included_balance: included, purchased_balance: purchased });
+      });
+    }
+
+    // ---- STORY-046's inline activation debit (reserve + commit in ONE request transaction) -----------------------
+
+    /** An activation debit exactly as `PromptsService` makes one: `prompt_activate:` key, reserve + commit, one tx. */
+    async function activate(workspaceId: string, credits: number, key: string): Promise<void> {
+      await inCtx(workspaceId, (tx) =>
+        debitInTransaction(tx, {
+          workspaceId, actorId: null, actorType: "system", actionCode: "prompt_activate", credits,
+          idempotencyKey: `prompt_activate:${key}`, includedGrant: 0,
+        }),
+      );
+    }
+
+    it("STORY-072 AC13 / STORY-046 · an activation debit AFTER a roll draws the pool, then purchased, and never another hold's carry", async () => {
+      await wallet(ws, 1000);
+      await inCtx(ws, (tx) => recordPurchase(tx, { workspaceId: ws, idempotencyKey: "pack-1", actorId: null, actorType: "system" }, 500));
+      await spend(ws, 300, "job-0");
+      await openHold(ws, 200, "job-1");
+      await roll(ws, 100);
+      // 700 included: 200 carried with job-1, 500 expired; the new grant is 100. included 300 = 200 carry + 100 pool.
+      expect(await balances(ws)).toMatchObject({ included_balance: 300, purchased_balance: 500, reserved: 200 });
+
+      await activate(ws, 150, "p1");
+
+      // 100 from the pool, 50 from purchased. The carry (200) is still whole.
+      expect(await balances(ws)).toMatchObject({ included_balance: 200, purchased_balance: 450, reserved: 200 });
+      await replayClean(ws);
+
+      await commitHold(ws, "job-1", 200);
+      expect(await balances(ws)).toMatchObject({ included_balance: 0, purchased_balance: 450, reserved: 0 });
+      expect((await carryRows(ws)).filter((r) => r.idempotency_key.startsWith("prompt_activate:")), "an activation never carries").toEqual([]);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 / STORY-046 · an activation debit BEFORE a roll replays cleanly and the roll carries only the real hold", async () => {
+      await wallet(ws, 1000);
+      await openHold(ws, 200, "job-1");
+      await activate(ws, 150, "p1");
+      await replayClean(ws);
+
+      const outcome = await roll(ws, 100);
+
+      expect(outcome).toMatchObject({ rolled: true, carried: 200 });
+      expect(await balances(ws)).toMatchObject({ included_balance: 300, reserved: 200 });
+      expect((await carryRows(ws)).map((r) => r.idempotency_key)).toEqual(["job-1"]);
+      await commitHold(ws, "job-1", 200);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 / STORY-046 · a roll can never see an activation hold open: it waits for the request's transaction", async () => {
+      await wallet(ws, 1000);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let inside!: () => void;
+      const entered = new Promise<void>((resolve) => { inside = resolve; });
+
+      const request = inCtx(ws, async (tx) => {
+        await debitInTransaction(tx, {
+          workspaceId: ws, actorId: null, actorType: "system", actionCode: "prompt_activate", credits: 250,
+          idempotencyKey: "prompt_activate:gate", includedGrant: 0,
+        });
+        inside();
+        await gate; // the request is still open: its reserve and commit are written, uncommitted
+      });
+      await entered;
+
+      let rolledAt: CycleRollOutcome | null = null;
+      const rolling = roll(ws, 1000).then((o) => { rolledAt = o; });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(rolledAt, "the roll is queued behind the request's wallet row lock").toBeNull();
+
+      release();
+      await request;
+      await rolling;
+
+      expect(rolledAt).toMatchObject({ rolled: true, carried: 0, expired: 750, granted: 1000 });
+      expect(await carryRows(ws)).toEqual([]);
+      expect(await balances(ws)).toMatchObject({ included_balance: 1000, reserved: 0 });
+      const order = await db.query<{ entry_type: string; idempotency_key: string }>(
+        "SELECT entry_type, idempotency_key FROM credit_ledger WHERE workspace_id = $1 AND entry_type IN ('reserve','commit','grant','expire') ORDER BY seq", [ws]);
+      const gateEntries = order.rows.filter((r) => r.idempotency_key === "prompt_activate:gate").map((r) => r.entry_type);
+      expect(gateEntries).toEqual(["reserve", "commit"]);
+      const firstRoll = order.rows.findIndex((r) => r.idempotency_key.startsWith("cycle_roll:"));
+      const lastGate = order.rows.map((r) => r.idempotency_key).lastIndexOf("prompt_activate:gate");
+      expect(lastGate, "both halves of the activation precede the roll's entries").toBeLessThan(firstRoll);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 / STORY-046 · activations racing the roll all replay cleanly, in whatever order they land", async () => {
+      await wallet(ws, 2000);
+      await openHold(ws, 300, "job-1");
+      const ops: Promise<unknown>[] = [];
+      for (let i = 0; i < 8; i++) ops.push(activate(ws, 25, `race-${String(i)}`));
+      ops.push(roll(ws, 500));
+      for (let i = 8; i < 12; i++) ops.push(activate(ws, 25, `race-${String(i)}`));
+      await Promise.all(ops);
+      await commitHold(ws, "job-1", 300);
+
+      const b = await balances(ws);
+      expect(b.reserved).toBe(0);
+      const rollSeq = await db.query<{ last: string }>("SELECT max(seq)::text AS last FROM credit_ledger WHERE workspace_id = $1 AND idempotency_key LIKE 'cycle_roll:%'", [ws]);
+      const after = await db.query<{ n: string }>(
+        "SELECT count(*)::text AS n FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'reserve' AND idempotency_key LIKE 'prompt_activate:%' AND seq > $2::bigint", [ws, rollSeq.rows[0]!.last]);
+      expect(b.included_balance, "only the activations after the roll draw the new grant").toBe(500 - 25 * Number(after.rows[0]!.n));
+      expect(await carryRows(ws)).toEqual([expect.objectContaining({ idempotency_key: "job-1", settled: true })]);
       await replayClean(ws);
     });
 
@@ -605,8 +753,9 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
       ]);
       await commitHold(ws, "a", 120);
       await commitHold(ws, "b", 80);
-      // b: 30 from its carry, 20 from the new grant, 30 from purchased.
-      expect(await balances(ws)).toMatchObject({ included_balance: 0, purchased_balance: 70, reserved: 0 });
+      // b: 30 from its carry, the other 50 from purchased (its pre-roll backing); the new grant (20) is untouched. Committing
+      // both before the roll and then rolling ends on the same 20 / 50.
+      expect(await balances(ws)).toMatchObject({ included_balance: 20, purchased_balance: 50, reserved: 0 });
       await replayClean(ws);
     });
 
@@ -688,8 +837,22 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
     expect(b.cycle_start).toBe(CYCLE_2.start);
     const open = await db.query("SELECT 1 FROM credit_hold_carries WHERE workspace_id = $1 AND settled_at IS NULL", [ws]);
     expect(open.rowCount, "no carry outlives its hold").toBe(0);
-    // Whatever the interleaving, the cycle never ends above the new grant: carries are spent or expired.
-    expect(b.included_balance).toBeLessThanOrEqual(4000);
+    // EXACT, whatever the interleaving. Every pre-roll hold (committed or released, before or after the roll) is paid from
+    // the cycle it started in, so only a spend that RESERVED AFTER the roll draws on the new grant. k of them did: read it
+    // off the ledger's seq order, where the roll's entries are contiguous (it holds the wallet row lock throughout).
+    const rollSeq = await db.query<{ last: string }>(
+      "SELECT max(seq)::text AS last FROM credit_ledger WHERE workspace_id = $1 AND idempotency_key LIKE 'cycle_roll:%'",
+      [ws],
+    );
+    const afterRoll = await db.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM credit_ledger
+        WHERE workspace_id = $1 AND entry_type = 'reserve' AND idempotency_key LIKE 'new-%' AND seq > $2::bigint`,
+      [ws, rollSeq.rows[0]!.last],
+    );
+    const k = Number(afterRoll.rows[0]!.n);
+    expect(k).toBeGreaterThanOrEqual(0);
+    expect(k).toBeLessThanOrEqual(9);
+    expect(b.included_balance, `k = ${String(k)} spends reserved after the roll`).toBe(4000 - 15 * k);
     const spent = await db.query<{ spent: string }>("SELECT lifetime_spent::text AS spent FROM credit_wallets WHERE workspace_id = $1", [ws]);
     const committed = pre.reduce((n, credits, i) => (i % 2 === 0 ? n + credits - 5 : n), 0) + 9 * 15;
     expect(Number(spent.rows[0]!.spent)).toBe(committed);
@@ -985,6 +1148,29 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
 
         expect(await balances(ws)).toMatchObject({ included_balance: grant, cycle_start: CYCLE_2.start, cycle_end: CYCLE_2.end });
         expect(await entries(ws, ["expire"])).toEqual([expect.objectContaining({ credits: grant - 100 })]);
+        await replayClean(ws);
+      });
+
+      it("STORY-072 AC13 · an UPGRADE that arrives past_due with a new period mints no pro-rata, and the recovery lands on exactly the target grant", async () => {
+        const starter = await onPlan("starter");
+        const growth = await planGrant("growth");
+        await spend(ws, 10, "job-1"); // starter - 10 left
+
+        // Mid-cycle on the OLD cycle: the pro-rata arithmetic would mint a positive figure here.
+        const outcome = await apply(
+          ws,
+          (c) => ({ ...pastDue(CYCLE_2)(c), planKey: "growth" }),
+          new Date("2026-09-16T00:00:00.000Z"),
+        );
+
+        expect(outcome.creditsToppedUp, "an unpaid new period earns no plan_change grant").toBe(0);
+        expect(await planChangeGrants(ws)).toEqual([]);
+        expect(await balances(ws)).toMatchObject({ included_balance: starter - 10, cycle_start: CYCLE_1.start });
+
+        await apply(ws, recovered);
+
+        expect(await balances(ws)).toMatchObject({ included_balance: growth, cycle_start: CYCLE_2.start });
+        expect(await planChangeGrants(ws)).toEqual([]);
         await replayClean(ws);
       });
 

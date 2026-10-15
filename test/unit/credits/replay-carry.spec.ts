@@ -102,4 +102,24 @@ describe("STORY-072 AC13 · replayLedger with a carried hold", () => {
       expect(replayLedger(rows).divergence?.seq).toBe("6");
     });
   });
+
+  // grant 100 + purchased 500, hold 505, roll to 10: the carry is 100 and the other 405 were backed by purchased.
+  const partlyCarried: ReplayRow[] = [
+    row({ seq: "1", entryType: "grant", bucket: "included", credits: 100, idempotencyKey: "grant:provision:2026-09-01", after: at(100, 0, 0) }),
+    row({ seq: "2", entryType: "purchase", bucket: "purchased", credits: 500, idempotencyKey: "pack-1", after: at(100, 500, 0) }),
+    row({ seq: "3", entryType: "reserve", credits: 505, idempotencyKey: "big", after: at(100, 500, 505) }),
+    row({ seq: "4", entryType: "grant", bucket: "included", credits: 10, idempotencyKey: ROLL, after: at(110, 500, 505) }),
+  ];
+
+  it("a partly carried hold draws its uncarried remainder from purchased BEFORE the new grant (the two orderings agree)", () => {
+    const rows = [...partlyCarried, row({ seq: "5", entryType: "commit", credits: 505, idempotencyKey: "big", after: at(10, 95, 0) })];
+    const result = replayLedger(rows);
+    expect(result.divergence).toBeNull();
+    expect(result.balance).toEqual(at(10, 95, 0));
+  });
+
+  it("flags the old split (carry, then the new grant, then purchased) for a partly carried hold", () => {
+    const rows = [...partlyCarried, row({ seq: "5", entryType: "commit", credits: 505, idempotencyKey: "big", after: at(0, 105, 0) })];
+    expect(replayLedger(rows).divergence?.seq).toBe("5");
+  });
 });
