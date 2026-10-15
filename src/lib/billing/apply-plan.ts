@@ -342,7 +342,10 @@ export async function applyPlanChange(
   const periodAdvanced = desired.currentPeriodStart.getTime() > currentRow.current_period_start.getTime();
   const isUpgrade = targetPlan.sort_order > currentPlan.sort_order;
   const paymentOutstanding = desired.status === "past_due";
-  const recovering = currentRow.status === "past_due" && !paymentOutstanding;
+  // ⚠ RECOVERY MEANS A PAYMENT SUCCEEDED. A past_due subscription that ENDS (retries exhausted: Stripe `unpaid` or
+  // `canceled`, which reconciles to `free`) is not one, so it does not trigger the deferred roll; the free wallet's
+  // own monthly refresh is the follow-up story's.
+  const recovering = currentRow.status === "past_due" && !paymentOutstanding && desired.planKey !== "free";
   let cycleRolled = false;
   if ((periodAdvanced || recovering) && !paymentOutstanding) {
     const rolled = await rollIncludedCycle(tx, {
