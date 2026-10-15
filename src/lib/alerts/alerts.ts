@@ -94,7 +94,11 @@ export async function drainAlertEmails(timeoutMs: number = ALERT_DRAIN_TIMEOUT_M
   }
 }
 
-/** Registered in the API module so a graceful shutdown flushes pending alert mail (the worker calls drainAlertEmails itself). */
+/**
+ * Registered in the API module so a graceful shutdown flushes pending alert mail (the worker calls drainAlertEmails itself).
+ * A page that arrives AFTER this drain has finished is not lost: it still logs and is counted (the Pager legs are
+ * synchronous), only its email may not be sent before the process exits.
+ */
 export class AlertEmailShutdown implements OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     await drainAlertEmails();

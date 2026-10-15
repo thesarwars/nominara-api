@@ -8,7 +8,7 @@ import * as tierCaps from "../../lib/usage/tier-caps.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
 import { ScheduledReportsController } from "./scheduled-reports.controller.js";
 import { Logger } from "@nestjs/common";
-import { DELIVERY_DRAIN_TIMEOUT_MS, STALE_SENDING_MS, ScheduledReportsService } from "./scheduled-reports.service.js";
+import { DELIVERY_CONNECT_TIMEOUT_MS, DELIVERY_DRAIN_TIMEOUT_MS, STALE_SENDING_MS, ScheduledReportsService } from "./scheduled-reports.service.js";
 
 // NEW-E-100c — STORY-100 scenarios 8, 9, 10, 15 (scenario 7 is test/unit/reports/next-send-at.spec.ts).
 // The SQL itself is proved against Postgres in test/integration/scheduled-reports-http.spec.ts.
@@ -45,10 +45,12 @@ interface Harness {
   commit(): Promise<void>;
   /** The registered afterCommit tasks (for a test that drives timing itself). */
   tasks: Array<() => void>;
+  release: ReturnType<typeof vi.fn>;
+  arriveLate(): void;
   email: { send: ReturnType<typeof vi.fn>; delivers?: boolean };
 }
 
-function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; exportFails?: boolean; projects?: string[]; deliveries?: Array<Record<string, unknown>>; delivers?: boolean; failFor?: string[]; replay?: boolean } = {}): Harness {
+function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; exportFails?: boolean; projects?: string[]; deliveries?: Array<Record<string, unknown>>; delivers?: boolean; failFor?: string[]; replay?: boolean; poolFails?: boolean; poolHangs?: boolean; finalizeThrows?: Error } = {}): Harness {
   const sql: Harness["sql"] = [];
   const exportCalls: Harness["exportCalls"] = [];
   const sent: Harness["sent"] = [];
@@ -87,11 +89,21 @@ function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; export
   const afterCommitTasks: Array<() => void> = [];
   vi.spyOn(tenantContext, "afterCommit").mockImplementation((task) => void afterCommitTasks.push(task));
   const finalClient = { query: vi.fn(async (text: string, params: unknown[] = []) => { sql.push({ text, params }); return { rows: [], rowCount: opts.replay ? 0 : 1 }; }), release: vi.fn() };
-  vi.spyOn(tenantContext, "withTenantContext").mockImplementation(async (_c, _ctx, fn) => fn(finalClient as never));
-  const pool = { connect: vi.fn(async () => finalClient) };
+  vi.spyOn(tenantContext, "withTenantContext").mockImplementation(async (_c, _ctx, fn) => {
+    if (opts.finalizeThrows) throw opts.finalizeThrows;
+    return fn(finalClient as never);
+  });
+  let arrive: (c: typeof finalClient) => void = () => undefined;
+  const pool = {
+    connect: vi.fn(() => {
+      if (opts.poolFails) return Promise.reject(new Error("pool exhausted"));
+      if (opts.poolHangs) return new Promise<typeof finalClient>((resolve) => (arrive = resolve));
+      return Promise.resolve(finalClient);
+    }),
+  };
   const service = new ScheduledReportsService(resolver as never, usage as never, exports as never, email as never, pool as never);
   return {
-    service, sql, exportCalls, sent, email, tasks: afterCommitTasks,
+    service, sql, exportCalls, sent, email, tasks: afterCommitTasks, release: finalClient.release, arriveLate: () => arrive(finalClient),
     async commit() {
       for (const task of afterCommitTasks.splice(0)) task();
       await service.settled();
@@ -233,6 +245,55 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
     }
   });
 
+  it("shutdown: a delivery that has not begun when onModuleDestroy runs sends NOTHING and is best-effort recorded `failed`", async () => {
+    const h = harness({ delivers: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.service.onModuleDestroy(); // sets `stopping` first; nothing in flight yet
+    await h.commit();
+    expect(h.email.send).not.toHaveBeenCalled();
+    const final = h.sql.find((s) => /UPDATE scheduled_report_deliveries SET status/.test(s.text))!;
+    expect(final.params.slice(1)).toEqual(["failed", "server shutting down before send", 0]);
+  });
+
+  it("shutdown: if even the best-effort record fails, nothing throws and nothing was sent (the row stays `sending`)", async () => {
+    const h = harness({ delivers: true, poolFails: true });
+    await h.service.sendNow(REPORT_ID);
+    await h.service.onModuleDestroy();
+    await expect(h.commit()).resolves.toBeUndefined();
+    expect(h.email.send).not.toHaveBeenCalled();
+  });
+
+  it("a connection-class failure while recording destroys the connection (release(error)); a normal outcome returns it", async () => {
+    const lost = Object.assign(new Error("Connection terminated unexpectedly"), { code: "57P01" });
+    const bad = harness({ delivers: true, finalizeThrows: lost });
+    await bad.service.sendNow(REPORT_ID);
+    await bad.commit();
+    expect(bad.release).toHaveBeenCalledTimes(1);
+    expect(bad.release.mock.calls[0]![0]).toBe(lost);
+
+    const good = harness({ delivers: true });
+    await good.service.sendNow(REPORT_ID);
+    await good.commit();
+    expect(good.release.mock.calls[0]![0]).toBeUndefined();
+  });
+
+  it("recording waits a BOUNDED time for a pooled connection, and a connection that arrives late is released, not leaked", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness({ delivers: true, poolHangs: true });
+      await h.service.sendNow(REPORT_ID);
+      for (const task of h.tasks.splice(0)) task();
+      await vi.advanceTimersByTimeAsync(5);
+      await vi.advanceTimersByTimeAsync(DELIVERY_CONNECT_TIMEOUT_MS + 1);
+      await h.service.settled(); // the delivery gave up recording instead of waiting forever
+      h.arriveLate();
+      await vi.advanceTimersByTimeAsync(5);
+      expect(h.release).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a replayed finalisation (row already moved) changes nothing else", async () => {
     const h = harness({ delivers: true, replay: true });
     await h.service.sendNow(REPORT_ID);
@@ -240,17 +301,21 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
     expect(h.sql.some((s) => /UPDATE scheduled_reports SET (last_sent_at|last_error)/.test(s.text))).toBe(false);
   });
 
-  it("a `sending` row older than the stale window reads as `failed`; a fresh one reads `sending`", async () => {
+  it("a `sending` row the DATABASE flags stale reads as `failed`; one it does not flag reads `sending` (staleness is judged on the DB clock, not this host's)", async () => {
     const old = new Date(Date.now() - STALE_SENDING_MS - 60_000).toISOString();
     const fresh = new Date().toISOString();
     const h = harness({
       deliveries: [
-        { id: "0190aaaa-0000-7000-8000-0000000000d2", scheduled_report_id: REPORT_ID, attempted_at: fresh, status: "sending", reason: null, recipient_count: 0 },
-        { id: "0190aaaa-0000-7000-8000-0000000000d1", scheduled_report_id: REPORT_ID, attempted_at: old, status: "sending", reason: null, recipient_count: 0 },
+        { id: "0190aaaa-0000-7000-8000-0000000000d2", scheduled_report_id: REPORT_ID, attempted_at: fresh, status: "sending", reason: null, recipient_count: 0, stale: false },
+        { id: "0190aaaa-0000-7000-8000-0000000000d1", scheduled_report_id: REPORT_ID, attempted_at: old, status: "sending", reason: null, recipient_count: 0, stale: true },
       ],
     });
     const page = await h.service.list({ limit: 10 } as never);
     expect(page.items[0]!.deliveries.map((d) => d.status)).toEqual(["sending", "failed"]);
+    // The stale decision is made in SQL, with the window as a bind parameter.
+    const q = h.sql.find((s) => /FROM scheduled_report_deliveries/.test(s.text))!;
+    expect(q.text).toMatch(/now\(\) - attempted_at > \$2/);
+    expect(q.params[1]).toBe(STALE_SENDING_MS);
   });
 
   it("s15 · a failed build is listed as 'failed' with its reason, the reservation is released, and nobody is emailed", async () => {

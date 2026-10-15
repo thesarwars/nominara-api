@@ -7,6 +7,8 @@
 --
 -- Expand only: the CHECK is widened (a superset of the old one), no column, row or index changes. The constraint keeps the
 -- name Postgres gave it in 0051 (`<table>_status_check`). Existing rows all satisfy the wider check.
+-- (If this table grows large, add the widened CHECK `NOT VALID` and `VALIDATE CONSTRAINT` it afterwards, so the scan does not
+-- run under the ACCESS EXCLUSIVE lock. Not needed while it is small.)
 ALTER TABLE scheduled_report_deliveries DROP CONSTRAINT scheduled_report_deliveries_status_check;
 ALTER TABLE scheduled_report_deliveries
   ADD CONSTRAINT scheduled_report_deliveries_status_check

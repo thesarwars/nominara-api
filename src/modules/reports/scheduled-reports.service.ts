@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger, type OnModuleDestroy } from "@nestjs/common";
-import type { ClientBase, Pool } from "pg";
+import type { ClientBase, Pool, PoolClient } from "pg";
 import { SCHEDULED_REPORT_MAX_RECIPIENTS } from "../../../contracts/reports/index.js";
-import { PG_POOL } from "../../db/pg-pool.js";
+import { PG_POOL, isConnectionClassFailure } from "../../db/pg-pool.js";
 import { RESEND_WORST_CASE_SEND_MS } from "../identity/adapters/resend-email-sender.adapter.js";
 import type {
   CreateScheduledReportRequest,
@@ -57,6 +57,8 @@ export const STALE_SENDING_MARGIN_MS = 5 * 60 * 1000;
 export const STALE_SENDING_MS = SCHEDULED_REPORT_MAX_RECIPIENTS * RESEND_WORST_CASE_SEND_MS + STALE_SENDING_MARGIN_MS;
 /** How long shutdown waits for in-flight deliveries. Not the full window: a stuck one is left `sending` and reads stale. */
 export const DELIVERY_DRAIN_TIMEOUT_MS = 30_000;
+/** How long recording an outcome waits for a pooled connection before giving up (the row then stays `sending` and reads stale). */
+export const DELIVERY_CONNECT_TIMEOUT_MS = 10_000;
 const PDF_ENTITLEMENT = "exports.pdf_per_cycle";
 const CSV_ENTITLEMENT = "exports.csv";
 /**
@@ -88,16 +90,26 @@ interface DeliveryRow {
   status: ScheduledReportDelivery["status"];
   reason: string | null;
   recipient_count: number;
+  /**
+   * Computed by the DATABASE (see DELIVERY_COLUMNS): a `sending` row older than STALE_SENDING_MS. Judged on the database
+   * clock, so an API host with a skewed clock cannot turn a live send into `failed`. `now()` is the START of the reading
+   * transaction, which can only make a row look slightly younger, never older: the safe direction.
+   */
+  stale?: boolean;
 }
+
+/** The delivery columns every history read selects; `$N` is STALE_SENDING_MS as a bind parameter. */
+const deliveryColumns = (staleParam: number): string =>
+  `id, scheduled_report_id, attempted_at, status, reason, recipient_count,
+   (status = 'sending' AND now() - attempted_at > $${String(staleParam)} * interval '1 millisecond') AS stale`;
 
 const COLUMNS = `id, name, project_ids, cadence, day_of_period, send_hour_local, timeframe, format, recipients::text[] AS recipients,
                  theme_id, include_sections, next_send_at, active`;
 
 const iso = (v: Date | string): string => new Date(v).toISOString();
 
-function toDelivery(r: DeliveryRow, now: number = Date.now()): ScheduledReportDelivery {
-  const attemptedAt = new Date(r.attempted_at).getTime();
-  if (r.status === "sending" && now - attemptedAt > STALE_SENDING_MS) {
+function toDelivery(r: DeliveryRow): ScheduledReportDelivery {
+  if (r.status === "sending" && r.stale === true) {
     return { delivery_id: r.id, at: iso(r.attempted_at), status: "failed", reason: "delivery did not complete: the sending process did not report back", recipients: r.recipient_count };
   }
   return { delivery_id: r.id, at: iso(r.attempted_at), status: r.status, reason: r.reason, recipients: r.recipient_count };
@@ -137,6 +149,9 @@ export class ScheduledReportsService implements OnModuleDestroy {
     @Inject(PG_POOL) private readonly pool: Pool,
   ) {}
 
+  /** Set at the start of shutdown: deliveries that have not yet begun sending do not begin (see `deliver`). */
+  private stopping = false;
+
   /** Deliveries whose post-commit send is still running. Tracked so tests and shutdown can wait for them. */
   private readonly inflight = new Set<Promise<void>>();
 
@@ -153,6 +168,8 @@ export class ScheduledReportsService implements OnModuleDestroy {
    * test/integration/scheduled-reports-http.spec.ts proves on the real module graph.
    */
   async onModuleDestroy(): Promise<void> {
+    // FIRST: a delivery whose turn comes after this point must not start a send the drain below can no longer wait for.
+    this.stopping = true;
     let timer: NodeJS.Timeout | undefined;
     const deadline = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
@@ -182,9 +199,9 @@ export class ScheduledReportsService implements OnModuleDestroy {
     const page = pageFrom(reports.rows, query.limit, "reports.scheduled_reports", (r) => r, (r) => [r.created_at_key, r.id]);
     if (page.items.length === 0) return new Page<ScheduledReport>([], page.pagination);
     const deliveries = await client.query<DeliveryRow>(
-      `SELECT id, scheduled_report_id, attempted_at, status, reason, recipient_count
+      `SELECT ${deliveryColumns(2)}
          FROM scheduled_report_deliveries WHERE scheduled_report_id = ANY($1::uuid[]) ORDER BY attempted_at DESC, id DESC`,
-      [page.items.map((r) => r.id)],
+      [page.items.map((r) => r.id), STALE_SENDING_MS],
     );
     return new Page(page.items.map((r) => toReport(r, deliveries.rows)), page.pagination);
   }
@@ -298,18 +315,60 @@ export class ScheduledReportsService implements OnModuleDestroy {
   }
 
   private async deliver(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[]): Promise<void> {
+    if (this.stopping) {
+      // Shutdown began before this delivery's turn: send NOTHING (the drain has already stopped waiting) and record it as
+      // failed, best effort. If recording fails too, the row stays `sending`, reads `failed` after STALE_SENDING_MS, and no
+      // mail went out, so a resend is the correct response.
+      await this.recordOutcome(context, deliveryId, report.id, "failed", "server shutting down before send", 0);
+      return;
+    }
+    // NOTE: `report.recipients` is the list captured at REQUEST time: edits made while the send runs do not change who is mailed.
     const failures = await this.sendEmails(report, artifacts);
     const sent = report.recipients.length - failures;
     const ok = failures === 0;
     // `delivered` only when the sender really delivers mail; the logging/dev senders keep the owner's honesty rule (`logged`).
     const status: ScheduledReportDelivery["status"] = ok ? (this.email.delivers === true ? "delivered" : "logged") : "failed";
     const reason = ok ? null : `${String(failures)} of ${String(report.recipients.length)} recipients could not be sent`;
-    // Not hold-and-wait: startDelivery deferred this to a later turn than the request's release, and after the sends.
-    const client = await this.pool.connect();
+    await this.recordOutcome(context, deliveryId, report.id, status, reason, sent);
+  }
+
+  /**
+   * The second (post-commit) transaction. Not hold-and-wait: startDelivery deferred this to a later turn than the request's
+   * release, and after the sends. If the report was DELETED while the send ran, the delivery row cascaded away with it and the
+   * UPDATE matches 0 rows: a silent no-op, correctly.
+   */
+  private async recordOutcome(context: TenantContext, deliveryId: string, reportId: string, status: ScheduledReportDelivery["status"], reason: string | null, sent: number): Promise<void> {
+    const client = await this.connectWithin(DELIVERY_CONNECT_TIMEOUT_MS);
+    let failure: unknown;
     try {
-      await withTenantContext(client, context, (tx) => this.finalize(tx, context.workspaceId, report.id, deliveryId, status, reason, sent));
+      await withTenantContext(client, context, (tx) => this.finalize(tx, context.workspaceId, reportId, deliveryId, status, reason, sent));
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
-      client.release();
+      // As TenantContextInterceptor does: a connection-class failure destroys the connection instead of returning it.
+      if (failure !== undefined && isConnectionClassFailure(failure)) incrementCounter("nominara_db_connection_lost_total", { stage: "report_delivery" });
+      client.release(failure !== undefined && isConnectionClassFailure(failure) ? (failure as Error) : undefined);
+    }
+  }
+
+  /**
+   * pg's Pool takes its wait bound pool-wide (`connectionTimeoutMillis`), not per call, so the bound is applied here: a
+   * connection that arrives after the deadline is released straight back instead of leaking.
+   */
+  private async connectWithin(ms: number): Promise<PoolClient> {
+    const connecting = this.pool.connect();
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("timed out waiting for a database connection to record the delivery")), ms);
+    });
+    try {
+      return await Promise.race([connecting, timeout]);
+    } catch (error) {
+      void connecting.then((late) => late.release()).catch(() => undefined);
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -395,9 +454,9 @@ export class ScheduledReportsService implements OnModuleDestroy {
 
   private async deliveriesOf(client: ClientBase, id: string): Promise<DeliveryRow[]> {
     const r = await client.query<DeliveryRow>(
-      `SELECT id, scheduled_report_id, attempted_at, status, reason, recipient_count
+      `SELECT ${deliveryColumns(2)}
          FROM scheduled_report_deliveries WHERE scheduled_report_id = $1 ORDER BY attempted_at DESC, id DESC`,
-      [id],
+      [id, STALE_SENDING_MS],
     );
     return r.rows;
   }
