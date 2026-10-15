@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdtemp, readdir, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
@@ -78,7 +78,20 @@ describe("STORY-046 AC3 - migration 0124 backfills the activation fact on existi
     ids.archivedNeverRan = await prompt("archived", "generated");
     ids.archivedManualRan = await prompt("archived", "manual", { captured: true });
     ids.activeManual = await prompt("active", "manual");
-    await migrateUp(client);
+    // Production runs every migration as nominara_owner (NOSUPERUSER, NOBYPASSRLS; README G-4), which owns the tables.
+    // Both tables carry FORCE ROW LEVEL SECURITY and policies only TO the runtime roles, so as the owner an unwrapped
+    // UPDATE matches ZERO rows and its EXISTS(answer_captures) sees none. The local superuser hides that, so 0124 is
+    // applied here the production way: tables owned by nominara_owner, the file run under SET LOCAL ROLE.
+    await client.query("ALTER TABLE tracked_prompts OWNER TO nominara_owner");
+    await client.query("ALTER TABLE answer_captures OWNER TO nominara_owner");
+    const attrs = (await client.query("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'nominara_owner'")).rows[0];
+    expect(attrs).toEqual({ rolsuper: false, rolbypassrls: false });
+    const upSql = await readFile(path.join(MIGRATIONS_DIR, "0124_tracked_prompts_activation_charge.up.sql"), "utf8");
+    await client.query("BEGIN");
+    await client.query("SET LOCAL ROLE nominara_owner");
+    await client.query(upSql);
+    await client.query("COMMIT");
+    await client.query("RESET ROLE");
   }, 300_000);
 
   async function fact(key: string): Promise<{ stamped: boolean; credits: number; atCreated: boolean }> {
@@ -112,5 +125,18 @@ describe("STORY-046 AC3 - migration 0124 backfills the activation fact on existi
   it("manual prompts are never stamped, with or without evidence: they are never charged and never spend the allowance", async () => {
     expect((await fact("archivedManualRan")).stamped).toBe(false);
     expect((await fact("activeManual")).stamped).toBe(false);
+  });
+
+  it("FORCE ROW LEVEL SECURITY is back on for both tables the backfill had to step around", async () => {
+    const rows = (
+      await client.query(
+        `SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class
+          WHERE relname IN ('tracked_prompts','answer_captures') AND relnamespace = 'public'::regnamespace ORDER BY relname`,
+      )
+    ).rows;
+    expect(rows).toEqual([
+      { relname: "answer_captures", relrowsecurity: true, relforcerowsecurity: true },
+      { relname: "tracked_prompts", relrowsecurity: true, relforcerowsecurity: true },
+    ]);
   });
 });
