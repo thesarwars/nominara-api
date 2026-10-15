@@ -1,4 +1,4 @@
-import { Body, Controller, Param, Patch } from "@nestjs/common";
+import { Body, Controller, Headers, Param, Patch } from "@nestjs/common";
 import {
   promptResponseSchema,
   updatePromptRequestSchema,
@@ -9,6 +9,7 @@ import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
+import { CONFIRMED_CREDITS_HEADER } from "../../lib/credits/confirmed-credits.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { PromptLifecycleService } from "./lifecycle.service.js";
 
@@ -56,7 +57,10 @@ export class PromptLifecycleController {
   update(
     @Param("id") promptId: string,
     @Body(new ZodValidationPipe(updatePromptRequestSchema)) body: UpdatePromptRequest,
+    // Owner decision 2026-10-15 (option C): when this change activates a prompt and the charge is above 0, the figure
+    // from `POST /projects/{id}/prompts/activate/preview` (with `prompt_ids: [id]`) must be echoed here.
+    @Headers(CONFIRMED_CREDITS_HEADER) confirmed?: string | string[],
   ): Promise<PromptResponse> {
-    return this.lifecycle.update(promptId, body);
+    return this.lifecycle.update(promptId, body, confirmed);
   }
 }

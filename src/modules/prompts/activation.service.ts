@@ -1,12 +1,21 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
-import type { ActivatePromptsRequest, ActivatePromptsResponse } from "../../../contracts/prompts/index.js";
-import { EntitlementExceededError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import type {
+  ActivatePromptsPreviewResponse,
+  ActivatePromptsRequest,
+  ActivatePromptsResponse,
+} from "../../../contracts/prompts/index.js";
+import { ConflictError, EntitlementExceededError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { autoTopupEnqueuerFor } from "../../lib/credits/auto-topup-request.js";
+import { parseConfirmedCredits } from "../../lib/credits/confirmed-credits.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
-import { chargeForActivation } from "../../lib/promptgen/activation-charge.js";
+import { chargeForActivation, quoteActivation, type ActivationCandidate } from "../../lib/promptgen/activation-charge.js";
 import { nextRunAfter } from "../../lib/capture/scheduler.js";
 import type { ProjectCadence } from "../../lib/capture/dispatch-cells.js";
 import { canonicalUuid } from "../../api/canonical-uuid.js";
@@ -57,51 +66,95 @@ interface PromptRow {
   project_id: string;
   generation_source: string;
   first_activated_at: Date | null;
+  superseded_by: string | null;
 }
+
+const logger = new Logger("prompts.activation");
+const tracer = trace.getTracer("nominara-api");
 
 type TenantClient = { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> };
 
 @Injectable()
 export class PromptActivationService {
-  constructor(private readonly entitlements: EntitlementResolver) {}
+  constructor(
+    private readonly entitlements: EntitlementResolver,
+    // Optional, as in CreditInterceptor: a process with no queue producer still charges; it just cannot ask for a top-up.
+    @Optional() private readonly producer?: QueueProducer,
+  ) {}
 
-  async activate(projectId: string, request: ActivatePromptsRequest): Promise<ActivatePromptsResponse> {
+  /**
+   * `POST /projects/{id}/prompts/activate/preview` - what activating exactly these prompts would cost now.
+   *
+   * READ-ONLY: no project lock, no wallet read, no reservation, no ledger row, no write of any kind. It prices by
+   * `quoteActivation`, the code the activation charges by, so the figure is the one the activation will compute -
+   * unless the project changes in between, which is exactly what the activation's own comparison catches (409
+   * `price_changed`).
+   */
+  async preview(projectId: string, request: ActivatePromptsRequest): Promise<ActivatePromptsPreviewResponse> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("PromptActivationService.preview requires an active tenant context");
+    const client = store.client as TenantClient;
+    const promptIds = this.canonicalIds(request);
+
+    return tracer.startActiveSpan("prompts.activation.preview", async (span) => {
+      try {
+        await this.assertProjectExists(client, projectId, false);
+        const resolved = await this.entitlements.resolveForWorkspace(store.context.workspaceId);
+        const prompts = await this.loadPrompts(client, projectId, promptIds);
+        const alreadyActive = prompts.filter((prompt) => prompt.status === "active");
+        const quote = await quoteActivation(store.client as ClientBase, {
+          projectId,
+          candidates: this.firstActivationCandidates(prompts),
+          entitlements: resolved.entitlements,
+        });
+        span.setAttributes({
+          "nominara.prompts.requested": promptIds.length,
+          "nominara.prompts.quoted_free": quote.free.length,
+          "nominara.prompts.quoted_charged": quote.charged.length,
+          "nominara.credits.quoted": quote.total,
+        });
+        incrementCounter("nominara_prompts_activation_previews_total", { outcome: quote.total > 0 ? "charged" : "free" });
+        logger.log({
+          event: "prompts.activation.previewed",
+          workspace_id: store.context.workspaceId,
+          project_id: projectId,
+          prompts_requested: promptIds.length,
+          credits: quote.total,
+        });
+        return {
+          credits: quote.total,
+          prompts: {
+            requested: promptIds.length,
+            already_active: alreadyActive.length,
+            free: quote.free.length,
+            charged: quote.charged.length,
+          },
+          credits_charged: 0 as const,
+        };
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        incrementCounter("nominara_prompts_activation_previews_total", { outcome: "refused" });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  /** `confirmed` is the raw `X-Nominara-Confirmed-Credits` header: required, and compared, only when the charge is above 0. */
+  async activate(
+    projectId: string,
+    request: ActivatePromptsRequest,
+    confirmed?: string | readonly string[],
+  ): Promise<ActivatePromptsResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("PromptActivationService.activate requires an active tenant context");
     const client = store.client as TenantClient;
 
-    // ⚠ CANONICALISED BEFORE ANYTHING COMPARES THEM. STORY-150's review found
-    // this one live: `prompt_ids` is a BODY field, so `CanonicalParamsGuard`
-    // never sees it, and `z.string().uuid()` accepts an uppercase uuid (zod's
-    // check is case-insensitive — verified, not assumed). Postgres then
-    // matched the row anyway, because `$1::uuid[]` casts — so `loadPrompts`
-    // got the row back, `found.get(UPPERCASE)` missed the lowercase key it was
-    // stored under, and the caller was told "no such prompt in this project"
-    // about a prompt in their own project.
-    //
-    // It also made the duplicate check below miss `[lower, UPPER]` of one
-    // prompt, which is the same id twice. That failed closed at `loadPrompts`
-    // instead, so the refusal was right for the wrong reason.
-    //
-    // ⚠ BODY AND QUERY UUIDS ARE NOT SYSTEMATICALLY HANDLED, and this fixes
-    // one instance rather than the class. There are 67 uuid fields across
-    // `contracts/`; the boundary for them is a shared schema with a lowercase
-    // transform, which changes the generated OpenAPI and belongs in its own
-    // story. This one is fixed here because it is live and it is the defect
-    // STORY-150 is named for.
-    const promptIds = request.prompt_ids.map((id) => canonicalUuid(id));
-
-    // A DUPLICATE ID IS A REFUSAL, not something to quietly collapse. With
-    // one slot left, `[P1, P1]` either passes the cap check as two and
-    // activates one, or passes as one and is reported as two — both of which
-    // lie in the summary. Refusing names the mistake instead.
-    const unique = new Set(promptIds);
-    if (unique.size !== promptIds.length) {
-      throw new ValidationFailedError({
-        message: "prompt_ids contains a duplicate",
-        details: { issues: [{ path: ["prompt_ids"], message: "each prompt may appear at most once" }] },
-      });
-    }
+    const promptIds = this.canonicalIds(request);
+    // Parsed up front so a malformed header is a 400 before any row is read; whether one is REQUIRED is decided later,
+    // from the recomputed charge.
+    const confirmedCredits = parseConfirmedCredits(confirmed);
 
     await this.assertProjectExists(client, projectId);
 
@@ -136,18 +189,19 @@ export class PromptActivationService {
     }
 
     if (toActivate.length > 0) {
+      const autoTopup = autoTopupEnqueuerFor(this.producer);
       // AFTER the cap check and BEFORE any write: a 402 here rolls the whole
       // request back, so nothing is activated that was not paid for.
       credits = await chargeForActivation(store.client as ClientBase, {
         workspaceId: store.context.workspaceId,
         actorId: store.context.actorId,
         projectId,
-        candidates: toActivate.map((prompt) => ({
-          id: prompt.id,
-          generationSource: prompt.generation_source,
-          firstActivatedAt: prompt.first_activated_at,
-        })),
+        // ONLY rows leaving `archived`. `status <> 'active'` also admits a paused row, and PATCH treats a change on
+        // a non-archived row as no activation at all; the two doors must price the same prompt the same way.
+        candidates: this.firstActivationCandidates(toActivate),
         entitlements: resolved.entitlements,
+        confirmedCredits,
+        ...(autoTopup === undefined ? {} : { autoTopup }),
       });
 
       // ONE statement, not one per id. Fifteen round trips inside a
@@ -217,12 +271,61 @@ export class PromptActivationService {
     );
   }
 
-  private async assertProjectExists(client: TenantClient, projectId: string): Promise<void> {
+  /** The prompts that are LEAVING `archived`: the only ones an activation prices, here and on the PATCH door. */
+  private firstActivationCandidates(prompts: readonly PromptRow[]): ActivationCandidate[] {
+    return prompts
+      .filter((prompt) => prompt.status === "archived")
+      .map((prompt) => ({
+        id: prompt.id,
+        generationSource: prompt.generation_source,
+        firstActivatedAt: prompt.first_activated_at,
+      }));
+  }
+
+  /**
+   * ⚠ CANONICALISED BEFORE ANYTHING COMPARES THEM. STORY-150's review found
+   * this one live: `prompt_ids` is a BODY field, so `CanonicalParamsGuard`
+   * never sees it, and `z.string().uuid()` accepts an uppercase uuid (zod's
+   * check is case-insensitive — verified, not assumed). Postgres then
+   * matched the row anyway, because `$1::uuid[]` casts — so `loadPrompts`
+   * got the row back, `found.get(UPPERCASE)` missed the lowercase key it was
+   * stored under, and the caller was told "no such prompt in this project"
+   * about a prompt in their own project.
+   *
+   * It also made the duplicate check below miss `[lower, UPPER]` of one
+   * prompt, which is the same id twice. That failed closed at `loadPrompts`
+   * instead, so the refusal was right for the wrong reason.
+   *
+   * ⚠ BODY AND QUERY UUIDS ARE NOT SYSTEMATICALLY HANDLED, and this fixes
+   * one instance rather than the class. There are 67 uuid fields across
+   * `contracts/`; the boundary for them is a shared schema with a lowercase
+   * transform, which changes the generated OpenAPI and belongs in its own
+   * story. This one is fixed here because it is live and it is the defect
+   * STORY-150 is named for.
+   *
+   * A DUPLICATE ID IS A REFUSAL, not something to quietly collapse. With
+   * one slot left, `[P1, P1]` either passes the cap check as two and
+   * activates one, or passes as one and is reported as two — both of which
+   * lie in the summary. Refusing names the mistake instead.
+   */
+  private canonicalIds(request: ActivatePromptsRequest): string[] {
+    const promptIds = request.prompt_ids.map((id) => canonicalUuid(id));
+    const unique = new Set(promptIds);
+    if (unique.size !== promptIds.length) {
+      throw new ValidationFailedError({
+        message: "prompt_ids contains a duplicate",
+        details: { issues: [{ path: ["prompt_ids"], message: "each prompt may appear at most once" }] },
+      });
+    }
+    return promptIds;
+  }
+
+  private async assertProjectExists(client: TenantClient, projectId: string, lock = true): Promise<void> {
     // No `workspace_id` predicate: RLS scopes the tenant (`NFR-SEC-01`), and
     // adding one would imply the boundary lives in application code.
     // FOR UPDATE: the lock every decision below depends on. See the header.
     const result = await client.query<{ prompts_cap: number }>(
-      "SELECT prompts_cap FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+      `SELECT prompts_cap FROM projects WHERE id = $1 AND deleted_at IS NULL${lock ? " FOR UPDATE" : ""}`,
       [projectId],
     );
     if (result.rows.length === 0) throw new NotFoundError({ message: "no such project" });
@@ -272,7 +375,7 @@ export class PromptActivationService {
    */
   private async loadPrompts(client: TenantClient, projectId: string, promptIds: readonly string[]): Promise<PromptRow[]> {
     const result = await client.query<PromptRow>(
-      `SELECT id, status, project_id, generation_source, first_activated_at FROM tracked_prompts WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+      `SELECT id, status, project_id, generation_source, first_activated_at, superseded_by FROM tracked_prompts WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
       [[...promptIds]],
     );
 
@@ -286,6 +389,17 @@ export class PromptActivationService {
       throw new ValidationFailedError({
         message: "one or more prompt_ids does not name a prompt in this project",
         details: { issues: unusable.map((id) => ({ path: ["prompt_ids"], message: `no such prompt in this project: ${id}` })) },
+      });
+    }
+
+    // A SUPERSEDED row is history, not a live prompt. The free-allowance count reads chain heads only, so activating
+    // a row that is no longer a head would spend a free slot that is never counted - the allowance would be
+    // recyclable by rewording and then activating the old row. Refused as a whole, before anything is charged.
+    const superseded = promptIds.map((id) => found.get(id)!).filter((row) => typeof row.superseded_by === "string");
+    if (superseded.length > 0) {
+      throw new ConflictError({
+        message: `prompt ${superseded[0]!.id} was reworded and replaced by ${superseded[0]!.superseded_by!}; activate the replacement`,
+        details: { reason: "prompt_superseded" },
       });
     }
 

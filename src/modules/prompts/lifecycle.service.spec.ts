@@ -217,7 +217,8 @@ describe("STORY-046 · PromptLifecycleService.update", () => {
 
   it("links the old row with superseded_by and archives it", async () => {
     await setup({ status: "active" }).update(PROMPT, { text: "a new wording?" });
-    const link = calls.find((call) => call.sql.includes("superseded_by"));
+    // The WRITE that links the rows: the prompt SELECT also names the column (to refuse a superseded row), so match on the verb too.
+    const link = calls.find((call) => /^\s*UPDATE/i.test(call.sql) && call.sql.includes("superseded_by"));
     expect(link).toBeDefined();
     // Archived, so it stops capturing and releases its slot to the new row —
     // the net occupancy of an edit is zero.

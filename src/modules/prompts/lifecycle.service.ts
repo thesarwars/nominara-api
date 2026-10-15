@@ -1,12 +1,15 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Optional } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import type { IntentArchetype, PromptResponse, UpdatePromptRequest } from "../../../contracts/prompts/index.js";
 import type { FunnelStage } from "../../../contracts/prompts/index.js";
 import { ConflictError, EntitlementExceededError, NotFoundError } from "../../api/errors/domain-errors.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
+import { autoTopupEnqueuerFor } from "../../lib/credits/auto-topup-request.js";
+import { parseConfirmedCredits } from "../../lib/credits/confirmed-credits.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { chargeForActivation, inheritFirstActivation } from "../../lib/promptgen/activation-charge.js";
 import { insertPromptStatement } from "../../lib/promptgen/persist.js";
 import { promptTextHash } from "../../lib/promptgen/text-hash.js";
@@ -55,15 +58,21 @@ interface PromptRow {
   generator_meta: Record<string, unknown>;
   first_activated_at: Date | null;
   activation_credits: number;
+  superseded_by: string | null;
 }
 
 type TenantClient = { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> };
 
 @Injectable()
 export class PromptLifecycleService {
-  constructor(private readonly entitlements: EntitlementResolver) {}
+  constructor(
+    private readonly entitlements: EntitlementResolver,
+    // Optional, as in CreditInterceptor: a process with no queue producer still charges; it just cannot ask for a top-up.
+    @Optional() private readonly producer?: QueueProducer,
+  ) {}
 
-  async update(promptId: string, request: UpdatePromptRequest): Promise<PromptResponse> {
+  /** `confirmed` is the raw `X-Nominara-Confirmed-Credits` header: required, and compared, only when this change is a charged activation. */
+  async update(promptId: string, request: UpdatePromptRequest, confirmed?: string | readonly string[]): Promise<PromptResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("PromptLifecycleService.update requires an active tenant context");
     const client = store.client as TenantClient;
@@ -79,6 +88,15 @@ export class PromptLifecycleService {
     // The id names a prompt, not a project: a scoped member is checked against the row's own project.
     await assertProjectInScope(store.client, prompt.project_id);
 
+    // A SUPERSEDED row is history: the live prompt is the one that replaced it. Changing it would let one question
+    // grow a second head (an edit inherits the fact and overwrites `superseded_by`), or let a row the free-allowance
+    // count never sees be activated. Refused whole - status, flag and text alike.
+    if (typeof prompt.superseded_by === "string") {
+      throw new ConflictError({
+        message: `this prompt was reworded and replaced by ${prompt.superseded_by}; change the replacement`,
+        details: { reason: "prompt_superseded" },
+      });
+    }
     if (request.status !== undefined) await this.assertStatusChangeAllowed(client, store.context.workspaceId, prompt, request.status);
     if (request.is_priority !== undefined) await this.assertPriorityAllowed(client, store.context.workspaceId, prompt, request.is_priority);
 
@@ -91,9 +109,12 @@ export class PromptLifecycleService {
     // uses), not becoming `active`: archived -> paused takes a slot, and a
     // charge keyed on `active` would be dodged by pausing first.
     const leavingArchived = prompt.status === "archived" && (request.status ?? "archived") !== "archived";
-    if (edited !== null) return this.supersede(client, store.context, prompt, edited, request, leavingArchived);
+    // Read only when this change IS an activation: a pause, an archive or a flag change has no price to confirm, and a
+    // header sent with one is not this route's business.
+    const confirmedCredits = leavingArchived ? parseConfirmedCredits(confirmed) : null;
+    if (edited !== null) return this.supersede(client, store.context, prompt, edited, request, leavingArchived, confirmedCredits);
 
-    return this.applyInPlace(client, store.context, prompt, request, leavingArchived);
+    return this.applyInPlace(client, store.context, prompt, request, leavingArchived, confirmedCredits);
   }
 
   /**
@@ -127,6 +148,7 @@ export class PromptLifecycleService {
     text: string,
     request: UpdatePromptRequest,
     leavingArchived: boolean,
+    confirmedCredits: number | null,
   ): Promise<PromptResponse> {
     const status = request.status ?? (prompt.status === "archived" ? "archived" : prompt.status);
     const row = {
@@ -183,7 +205,7 @@ export class PromptLifecycleService {
       activationCredits: prompt.activation_credits,
     });
     const credits = leavingArchived
-      ? await this.chargeFirstActivation(client, context, prompt, row.id, row.generationSource)
+      ? await this.chargeFirstActivation(client, context, prompt, row.id, row.generationSource, confirmedCredits)
       : 0;
 
     const counts = await this.refreshCounts(client, prompt.project_id);
@@ -207,13 +229,14 @@ export class PromptLifecycleService {
     prompt: PromptRow,
     request: UpdatePromptRequest,
     leavingArchived: boolean,
+    confirmedCredits: number | null,
   ): Promise<PromptResponse> {
     const status = request.status ?? prompt.status;
     const isPriority = request.is_priority ?? prompt.is_priority;
 
     // Before the UPDATE: a 402 rolls the request back with the prompt still archived.
     const credits = leavingArchived
-      ? await this.chargeFirstActivation(client, context, prompt, prompt.id, prompt.generation_source)
+      ? await this.chargeFirstActivation(client, context, prompt, prompt.id, prompt.generation_source, confirmedCredits)
       : 0;
 
     await client.query(
@@ -309,14 +332,18 @@ export class PromptLifecycleService {
     prompt: PromptRow,
     recordOn: string,
     generationSource: string,
+    confirmedCredits: number | null,
   ): Promise<number> {
     const resolved = await this.entitlements.resolveForWorkspace(context.workspaceId);
+    const autoTopup = autoTopupEnqueuerFor(this.producer);
     return chargeForActivation(client as unknown as ClientBase, {
       workspaceId: context.workspaceId,
       actorId: context.actorId,
       projectId: prompt.project_id,
       candidates: [{ id: recordOn, generationSource, firstActivatedAt: prompt.first_activated_at }],
       entitlements: resolved.entitlements,
+      confirmedCredits,
+      ...(autoTopup === undefined ? {} : { autoTopup }),
     });
   }
 
@@ -327,7 +354,7 @@ export class PromptLifecycleService {
     const result = await client.query<PromptRow>(
       `SELECT p.id, p.project_id, p.workspace_id, p.status, p.is_priority, p.text,
               p.intent_archetype, p.funnel_stage, p.generation_source,
-              p.generation_batch_id, p.generator_meta, p.first_activated_at, p.activation_credits
+              p.generation_batch_id, p.generator_meta, p.first_activated_at, p.activation_credits, p.superseded_by
          FROM tracked_prompts p
         WHERE p.id = $1 AND p.deleted_at IS NULL`,
       [promptId],

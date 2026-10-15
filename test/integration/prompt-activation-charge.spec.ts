@@ -160,6 +160,29 @@ describe("STORY-046 · the activation charge", () => {
   const settleJobs = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 50));
 
   /**
+   * The honest client: asks the server for the price, then echoes exactly that figure (owner decision 2026-10-15).
+   * The older scenarios are about the charge arithmetic, not the confirmation, so they go through this.
+   */
+  const activateQuoted = async (project: string, ids: string[]): Promise<ActivatePromptsResponse> =>
+    activate(project, ids, String((await preview(project, ids)).credits));
+  /** The loser of a race is told its quote is stale (409 price_changed); an honest client re-quotes and tries once more. */
+  async function requotingOnPriceChange<T>(attempt: () => Promise<T>): Promise<T> {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (codeOf(error) !== "price_changed") throw error;
+      return attempt();
+    }
+  }
+  const patchQuoted = async (
+    id: string,
+    body: { status?: "active" | "paused" | "archived"; text?: string; is_priority?: boolean },
+  ): Promise<PromptResponse> => {
+    const project = (await db.query("SELECT project_id FROM tracked_prompts WHERE id=$1", [id])).rows[0].project_id as string;
+    return patch(id, body, String((await preview(project, [id])).credits));
+  };
+
+  /**
    * Run calls concurrently and wait for ALL of them, then surface the first failure.
    *
    * `Promise.all` rejects as soon as one call does and leaves the others in flight, still
@@ -204,7 +227,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
 
-    const result = await activate(project, ids);
+    const result = await activateQuoted(project, ids);
 
     expect(result.summary.activated).toBe(12);
     expect(result.prompts_active).toBe(12);
@@ -216,7 +239,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
 
-    await activate(project, ids);
+    await activateQuoted(project, ids);
 
     const rows = await ledger();
     expect(rows.map((r) => [r.entry_type, r.action_code, r.credits])).toEqual([
@@ -230,7 +253,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
 
-    await activate(project, ids);
+    await activateQuoted(project, ids);
 
     const rows = await Promise.all(ids.map(promptRow));
     expect(rows.every((r) => r.first_activated_at !== null)).toBe(true);
@@ -242,7 +265,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, GROWTH_FREE);
 
-    const result = await activate(project, ids);
+    const result = await activateQuoted(project, ids);
 
     expect(result.credits_charged).toBe(0);
     expect(await wallet()).toEqual({ included: 100, reserved: 0, spent: 0 });
@@ -252,9 +275,9 @@ describe("STORY-046 · the activation charge", () => {
   it("scenario 2 — the free allowance is PER PROJECT: a second project gets its own ten", async () => {
     const first = await seedProject();
     const second = await seedProject();
-    await activate(first, await seedPrompts(first, 10));
+    await activateQuoted(first, await seedPrompts(first, 10));
 
-    const result = await activate(second, await seedPrompts(second, 10));
+    const result = await activateQuoted(second, await seedPrompts(second, 10));
 
     expect(result.credits_charged).toBe(0);
     expect(await ledger()).toEqual([]);
@@ -266,7 +289,7 @@ describe("STORY-046 · the activation charge", () => {
     );
     const project = await seedProject();
 
-    const result = await activate(project, await seedPrompts(project, 12));
+    const result = await activateQuoted(project, await seedPrompts(project, 12));
 
     expect(result.credits_charged).toBe(6);
     expect((await wallet())?.included).toBe(94);
@@ -278,7 +301,7 @@ describe("STORY-046 · the activation charge", () => {
     );
     const project = await seedProject();
 
-    const result = await activate(project, await seedPrompts(project, 6));
+    const result = await activateQuoted(project, await seedPrompts(project, 6));
 
     expect(result.credits_charged).toBe(2);
   });
@@ -287,7 +310,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedWorkspace("growth", null);
     const project = await seedProject();
 
-    const result = await activate(project, await seedPrompts(project, 11));
+    const result = await activateQuoted(project, await seedPrompts(project, 11));
 
     expect(result.credits_charged).toBe(1);
     const w = await wallet();
@@ -302,7 +325,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 15);
 
-    const result = await activate(project, ids.slice(0, 11));
+    const result = await activateQuoted(project, ids.slice(0, 11));
 
     expect(result.credits_charged).toBe(1);
     for (const rejected of ids.slice(11)) {
@@ -318,9 +341,9 @@ describe("STORY-046 · the activation charge", () => {
   it("scenario 5 — a never-activated archived candidate is charged ONCE, at its first activation beyond the free ten", async () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 11);
-    await activate(project, ids.slice(0, 10));
+    await activateQuoted(project, ids.slice(0, 10));
 
-    const result = await activate(project, ids.slice(10));
+    const result = await activateQuoted(project, ids.slice(10));
 
     expect(result.credits_charged).toBe(1);
     expect((await wallet())?.spent).toBe(1);
@@ -329,11 +352,11 @@ describe("STORY-046 · the activation charge", () => {
   it("scenario 5 — re-activating a prompt that was already charged (archived then activated again) is free", async () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 11);
-    await activate(project, ids);
+    await activateQuoted(project, ids);
     const charged = (await Promise.all(ids.map(async (id) => ({ id, ...(await promptRow(id)) })))).find((r) => Number(r.activation_credits) === 1)!;
 
-    await patch(charged.id, { status: "archived" });
-    const result = await activate(project, [charged.id]);
+    await patchQuoted(charged.id, { status: "archived" });
+    const result = await activateQuoted(project, [charged.id]);
 
     expect(result.credits_charged).toBe(0);
     expect((await wallet())?.spent).toBe(1);
@@ -343,12 +366,12 @@ describe("STORY-046 · the activation charge", () => {
   it("scenario 5 — re-activating a prompt that was FREE the first time is still free, and does not eat a second free slot", async () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 10);
-    await activate(project, ids);
-    await patch(ids[0]!, { status: "archived" });
-    await activate(project, [ids[0]!]);
+    await activateQuoted(project, ids);
+    await patchQuoted(ids[0]!, { status: "archived" });
+    await activateQuoted(project, [ids[0]!]);
     const [extra] = await seedPrompts(project, 1);
 
-    const result = await activate(project, [extra!]);
+    const result = await activateQuoted(project, [extra!]);
 
     // Ten distinct prompts have been activated; the eleventh pays.
     expect(result.credits_charged).toBe(1);
@@ -357,11 +380,11 @@ describe("STORY-046 · the activation charge", () => {
   it("scenario 5 — pausing and resuming a charged prompt is free", async () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 11);
-    await activate(project, ids);
+    await activateQuoted(project, ids);
 
     for (const id of ids) {
-      await patch(id, { status: "paused" });
-      const back = await patch(id, { status: "active" });
+      await patchQuoted(id, { status: "paused" });
+      const back = await patchQuoted(id, { status: "active" });
       expect(back.credits_charged).toBe(0);
     }
     expect((await wallet())?.spent).toBe(1);
@@ -373,10 +396,10 @@ describe("STORY-046 · the activation charge", () => {
 
   it("scenario 8 — a manually typed prompt is never charged, even beyond the free ten", async () => {
     const project = await seedProject();
-    await activate(project, await seedPrompts(project, 10));
+    await activateQuoted(project, await seedPrompts(project, 10));
     const manual = await seedPrompts(project, 3, { source: "manual" });
 
-    const result = await activate(project, manual);
+    const result = await activateQuoted(project, manual);
 
     expect(result.credits_charged).toBe(0);
     expect(await ledger()).toEqual([]);
@@ -386,7 +409,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     await seedPrompts(project, 10, { source: "manual", status: "active", activatedBefore: true });
 
-    const result = await activate(project, await seedPrompts(project, 10));
+    const result = await activateQuoted(project, await seedPrompts(project, 10));
 
     expect(result.credits_charged).toBe(0);
   });
@@ -398,9 +421,9 @@ describe("STORY-046 · the activation charge", () => {
   it("scenario 13 — replaying a charged activation charges nothing the second time", async () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
-    await activate(project, ids);
+    await activateQuoted(project, ids);
 
-    const replay = await activate(project, ids);
+    const replay = await activateQuoted(project, ids);
 
     expect(replay.credits_charged).toBe(0);
     expect(replay.summary).toMatchObject({ activated: 0, already_active: 12 });
@@ -419,7 +442,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 30, { status: "active", activatedBefore: true });
     const ids = await seedPrompts(project, 2);
 
-    const error = await activate(project, ids).catch((e: unknown) => e as { code?: string });
+    const error = await activateQuoted(project, ids).catch((e: unknown) => e as { code?: string });
 
     expect((error as { code?: string }).code).toBe("entitlement_exceeded");
     expect(await ledger()).toEqual([]);
@@ -432,7 +455,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
 
-    const error = await activate(project, ids).catch((e: unknown) => e as { code?: string; details?: { required?: number; available?: number } });
+    const error = await activateQuoted(project, ids).catch((e: unknown) => e as { code?: string; details?: { required?: number; available?: number } });
 
     expect((error as { code?: string }).code).toBe("insufficient_credits");
     expect((error as { details?: { required?: number } }).details?.required).toBe(2);
@@ -446,7 +469,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedWorkspace("growth", 2);
     const project = await seedProject();
 
-    const result = await activate(project, await seedPrompts(project, 12));
+    const result = await activateQuoted(project, await seedPrompts(project, 12));
 
     expect(result.credits_charged).toBe(2);
     expect(await wallet()).toEqual({ included: 0, reserved: 0, spent: 2 });
@@ -457,7 +480,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
 
-    const error = await activate(project, ids).catch((e: unknown) => e as { code?: string });
+    const error = await activateQuoted(project, ids).catch((e: unknown) => e as { code?: string });
 
     expect((error as { code?: string }).code).toBe("insufficient_credits");
   });
@@ -468,7 +491,7 @@ describe("STORY-046 · the activation charge", () => {
     const ids = await seedPrompts(project, 11);
     const foreign = await seedPrompts(other, 1);
 
-    const error = await activate(project, [...ids, ...foreign]).catch((e: unknown) => e as { code?: string });
+    const error = await activateQuoted(project, [...ids, ...foreign]).catch((e: unknown) => e as { code?: string });
 
     expect((error as { code?: string }).code).toBe("validation_failed");
     expect(await ledger()).toEqual([]);
@@ -482,7 +505,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
 
-    const [a, b] = await concurrently(activate(project, ids), activate(project, ids));
+    const [a, b] = await concurrently(activateQuoted(project, ids), activateQuoted(project, ids));
 
     expect([a.credits_charged, b.credits_charged].sort()).toEqual([0, 2]);
     expect(await wallet()).toEqual({ included: 98, reserved: 0, spent: 2 });
@@ -493,7 +516,10 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 12);
 
-    const [a, b] = await concurrently(activate(project, ids.slice(0, 6)), activate(project, ids.slice(6)));
+    const [a, b] = await concurrently(
+      requotingOnPriceChange(() => activateQuoted(project, ids.slice(0, 6))),
+      requotingOnPriceChange(() => activateQuoted(project, ids.slice(6))),
+    );
 
     expect(a.credits_charged + b.credits_charged).toBe(2);
     expect((await wallet())?.spent).toBe(2);
@@ -504,7 +530,10 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 9, { status: "active", activatedBefore: true });
     const [viaPost, viaPatch] = await seedPrompts(project, 2);
 
-    const [a, b] = await concurrently(activate(project, [viaPost!]), patch(viaPatch!, { status: "active" }));
+    const [a, b] = await concurrently(
+      requotingOnPriceChange(() => activateQuoted(project, [viaPost!])),
+      requotingOnPriceChange(() => patchQuoted(viaPatch!, { status: "active" })),
+    );
 
     expect(a.credits_charged + b.credits_charged).toBe(1);
   });
@@ -518,7 +547,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 10, { status: "active", activatedBefore: true });
     const [candidate] = await seedPrompts(project, 1);
 
-    const result = await patch(candidate!, { status: "active" });
+    const result = await patchQuoted(candidate!, { status: "active" });
 
     expect(result.credits_charged).toBe(1);
     expect((await ledger()).map((r) => [r.entry_type, r.action_code, r.credits])).toEqual([
@@ -532,8 +561,8 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 10, { status: "active", activatedBefore: true });
     const [candidate] = await seedPrompts(project, 1);
 
-    const paused = await patch(candidate!, { status: "paused" });
-    const resumed = await patch(candidate!, { status: "active" });
+    const paused = await patchQuoted(candidate!, { status: "paused" });
+    const resumed = await patchQuoted(candidate!, { status: "active" });
 
     expect(paused.credits_charged).toBe(1);
     expect(resumed.credits_charged).toBe(0);
@@ -544,7 +573,7 @@ describe("STORY-046 · the activation charge", () => {
     const project = await seedProject();
     const [candidate] = await seedPrompts(project, 1);
 
-    const result = await patch(candidate!, { status: "active" });
+    const result = await patchQuoted(candidate!, { status: "active" });
 
     expect(result.credits_charged).toBe(0);
     expect(await ledger()).toEqual([]);
@@ -556,7 +585,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 10, { status: "active", activatedBefore: true });
     const [candidate] = await seedPrompts(project, 1);
 
-    const error = await patch(candidate!, { status: "active" }).catch((e: unknown) => e as { code?: string });
+    const error = await patchQuoted(candidate!, { status: "active" }).catch((e: unknown) => e as { code?: string });
 
     expect((error as { code?: string }).code).toBe("insufficient_credits");
     expect(await promptRow(candidate!)).toMatchObject({ status: "archived", first_activated_at: null });
@@ -568,7 +597,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 10, { status: "active", activatedBefore: true });
     const [active] = await seedPrompts(project, 1, { status: "active", activatedBefore: true });
 
-    const archived = await patch(active!, { status: "archived" });
+    const archived = await patchQuoted(active!, { status: "archived" });
 
     expect(archived.credits_charged).toBe(0);
     expect(await ledger()).toEqual([]);
@@ -581,9 +610,9 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 10, { status: "active", activatedBefore: true });
     const [sameStatus, flagged, reworded] = await seedPrompts(project, 3);
 
-    const a = await patch(sameStatus!, { status: "archived" });
+    const a = await patchQuoted(sameStatus!, { status: "archived" });
     const b = await asTenant(() => lifecycle.update(flagged!, { is_priority: true }));
-    const c = await patch(reworded!, { text: "reworded but still a candidate" });
+    const c = await patchQuoted(reworded!, { text: "reworded but still a candidate" });
 
     expect([a.credits_charged, b.credits_charged, c.credits_charged]).toEqual([0, 0, 0]);
     expect(await ledger()).toEqual([]);
@@ -599,7 +628,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 10, { status: "active", activatedBefore: true });
     const [orphan] = await seedPrompts(project, 1, { status: "active" });
 
-    const paused = await patch(orphan!, { status: "paused" });
+    const paused = await patchQuoted(orphan!, { status: "paused" });
 
     expect(paused.credits_charged).toBe(0);
     expect(await ledger()).toEqual([]);
@@ -609,12 +638,12 @@ describe("STORY-046 · the activation charge", () => {
   it("PATCH — editing a CHARGED prompt's text carries the fact to the new row: reactivating it is free", async () => {
     const project = await seedProject();
     const ids = await seedPrompts(project, 11);
-    await activate(project, ids);
+    await activateQuoted(project, ids);
     const charged = (await Promise.all(ids.map(async (id) => ({ id, ...(await promptRow(id)) })))).find((r) => Number(r.activation_credits) === 1)!;
 
-    const edited = await patch(charged.id, { text: "a reworded question" });
-    await patch(edited.prompt_id, { status: "archived" });
-    const back = await patch(edited.prompt_id, { status: "active" });
+    const edited = await patchQuoted(charged.id, { text: "a reworded question" });
+    await patchQuoted(edited.prompt_id, { status: "archived" });
+    const back = await patchQuoted(edited.prompt_id, { status: "active" });
 
     expect(edited.credits_charged).toBe(0);
     expect(back.credits_charged).toBe(0);
@@ -625,11 +654,11 @@ describe("STORY-046 · the activation charge", () => {
   it("PATCH — an edit does not count one question twice against the free ten", async () => {
     const project = await seedProject();
     const nine = await seedPrompts(project, 9);
-    await activate(project, nine);
-    await patch(nine[0]!, { text: "the same question reworded" });
+    await activateQuoted(project, nine);
+    await patchQuoted(nine[0]!, { text: "the same question reworded" });
     const [tenth] = await seedPrompts(project, 1);
 
-    const result = await activate(project, [tenth!]);
+    const result = await activateQuoted(project, [tenth!]);
 
     // Nine questions, one of them reworded: the tenth is still inside the allowance.
     expect(result.credits_charged).toBe(0);
@@ -640,7 +669,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 10, { status: "active", activatedBefore: true });
     const [candidate] = await seedPrompts(project, 1);
 
-    const edited = await patch(candidate!, { text: "reworded and activated", status: "active" });
+    const edited = await patchQuoted(candidate!, { text: "reworded and activated", status: "active" });
 
     expect(edited.credits_charged).toBe(1);
     expect(await promptRow(edited.prompt_id)).toMatchObject({ status: "active", activation_credits: 1 });
@@ -656,7 +685,7 @@ describe("STORY-046 · the activation charge", () => {
     await seedPrompts(project, 1, { status: "archived", activatedBefore: true, deleted: true });
     const [next] = await seedPrompts(project, 1);
 
-    const result = await activate(project, [next!]);
+    const result = await activateQuoted(project, [next!]);
 
     expect(result.credits_charged).toBe(1);
   });

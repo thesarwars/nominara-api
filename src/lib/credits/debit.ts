@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
+import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import type { LedgerUnitDetail } from "../../../contracts/billing/ledger-unit-detail.schema.js";
 import { InsufficientCreditsError } from "../../api/errors/domain-errors.js";
 import { resolveBillingPeriod } from "../usage/billing-period.js";
 import { provisionWalletWithGrant } from "./balance.js";
+import { requestAutoTopupIfBelowThreshold, type EnqueueAutoTopup } from "./auto-topup-request.js";
 import { appendLedgerEntry, type LedgerActionCode } from "./ledger.js";
 import { commitCredits, lockWallet, purchasableOptions, readWallet, reserveCredits } from "./wallet.js";
 
@@ -27,6 +29,19 @@ import { commitCredits, lockWallet, purchasableOptions, readWallet, reserveCredi
 // statement runs BEFORE the ledger append (replay's ordering is only sound with
 // the wallet row lock already held - see `appendLedgerEntry`), a refused append
 // is a defect and throws, and the entry pair carries the idempotency key.
+
+const logger = new Logger("credits.debit");
+
+/**
+ * Ledger idempotency keys the SERVER writes from inside a handler. A client `Idempotency-Key` is used verbatim as a
+ * ledger key by `CreditGuard`, so a client key in this namespace could collide with one of these; the guard refuses it.
+ */
+export const RESERVED_LEDGER_KEY_PREFIXES = ["prompt_activate:"] as const;
+
+export function isReservedLedgerKey(key: string): boolean {
+  const lowered = key.toLowerCase();
+  return RESERVED_LEDGER_KEY_PREFIXES.some((prefix) => lowered.startsWith(prefix));
+}
 
 /**
  * The plan's included grant, for a wallet that does not exist yet.
@@ -56,6 +71,12 @@ export interface InlineDebit {
   readonly unitDetail?: LedgerUnitDetail;
   /** The plan's `credits.included_per_cycle`, for a workspace whose wallet does not exist yet. */
   readonly includedGrant: number;
+  /**
+   * How to enqueue a `billing.auto_topup` job. When given, a debit that leaves the balance under the workspace's
+   * threshold asks for one - AFTER this transaction commits, never before and never on rollback. This is the
+   * inline path's counterpart of `CreditInterceptor`, which is the only other producer of the request (NEW-D-7).
+   */
+  readonly autoTopup?: EnqueueAutoTopup;
 }
 
 /** A key that is stable for a set of ids regardless of the order they were named in. */
@@ -139,5 +160,11 @@ export async function debitInTransaction(tx: ClientBase, debit: InlineDebit): Pr
     }))
   ) {
     throw new Error(`the ledger already holds a commit under ${debit.idempotencyKey}; refusing to charge twice`);
+  }
+
+  // NEW-D-7 - the balance this debit just committed may be under the threshold. Registers an after-commit enqueue
+  // (nothing is charged here, and a rolled-back request never reaches the queue).
+  if (debit.autoTopup !== undefined) {
+    await requestAutoTopupIfBelowThreshold(tx, debit.workspaceId, debit.autoTopup, logger);
   }
 }

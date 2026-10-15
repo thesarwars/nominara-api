@@ -73,12 +73,13 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
     "prompts.credits_per_generated": { value: 1 },
     "credits.included_per_cycle": { value: 37 },
   };
-  const input = (candidates: ActivationCandidate[], ents: Record<string, { value: unknown }> = entitlements) => ({
+  const input = (candidates: ActivationCandidate[], ents: Record<string, { value: unknown }> = entitlements, confirmedCredits: number | null = null) => ({
     workspaceId: "ws-1",
     actorId: "user-1",
     projectId: "proj-1",
     candidates,
     entitlements: ents,
+    confirmedCredits,
   });
 
   beforeAll(() => {
@@ -96,7 +97,7 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
 
   it("debits exactly price x charged prompts, as action prompt_activate, naming the project", async () => {
     used = 9;
-    const charged = await chargeForActivation(tx, input([gen("a"), gen("b"), gen("c")]));
+    const charged = await chargeForActivation(tx, input([gen("a"), gen("b"), gen("c")], entitlements, 2));
 
     expect(charged).toBe(2);
     expect(debit.debitInTransaction).toHaveBeenCalledTimes(1);
@@ -113,8 +114,8 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
 
   it("the ledger key names the project and the charged set, whatever order they were sent in", async () => {
     used = 10;
-    await chargeForActivation(tx, input([gen("a"), gen("b")]));
-    await chargeForActivation(tx, input([gen("b"), gen("a")]));
+    await chargeForActivation(tx, input([gen("a"), gen("b")], entitlements, 2));
+    await chargeForActivation(tx, input([gen("b"), gen("a")], entitlements, 2));
     const [first, second] = vi.mocked(debit.debitInTransaction).mock.calls.map((c) => c[1].idempotencyKey);
     expect(first).toBe(second);
     expect(first).toMatch(/^prompt_activate:proj-1:[0-9a-f]{64}$/);
@@ -133,7 +134,7 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
 
   it("charged prompts are recorded at the price they were charged", async () => {
     used = 10;
-    await chargeForActivation(tx, input([gen("a")], { ...entitlements, "prompts.credits_per_generated": { value: 3 } }));
+    await chargeForActivation(tx, input([gen("a")], { ...entitlements, "prompts.credits_per_generated": { value: 3 } }, 3));
     const writes = calls.filter((c) => c.sql.startsWith("UPDATE tracked_prompts"));
     expect(writes.map((w) => w.params)).toEqual([[["a"], 3]]);
     expect(vi.mocked(debit.debitInTransaction).mock.calls[0]![1].credits).toBe(3);
@@ -149,7 +150,7 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
   it("a missing allowance means no free slots, not unlimited ones", async () => {
     used = 0;
     const { "prompts.free_at_creation": _drop, ...withoutAllowance } = entitlements;
-    expect(await chargeForActivation(tx, input([gen("a")], withoutAllowance))).toBe(1);
+    expect(await chargeForActivation(tx, input([gen("a")], withoutAllowance, 1))).toBe(1);
   });
 
   it("a plan that holds prompts but publishes no price refuses rather than guessing one", async () => {
@@ -174,7 +175,7 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
   it("a debit refusal writes nothing to the prompts", async () => {
     used = 10;
     vi.mocked(debit.debitInTransaction).mockRejectedValue(new InsufficientCreditsError({ message: "no" } as never));
-    await expect(chargeForActivation(tx, input([gen("a")]))).rejects.toMatchObject({ code: "insufficient_credits" });
+    await expect(chargeForActivation(tx, input([gen("a")], entitlements, 1))).rejects.toMatchObject({ code: "insufficient_credits" });
     expect(calls.filter((c) => c.sql.startsWith("UPDATE"))).toEqual([]);
   });
 
@@ -182,7 +183,7 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
 
   it("emits a span carrying the counts and no ids", async () => {
     used = 9;
-    await chargeForActivation(tx, input([gen("a"), gen("b"), gen("c")]));
+    await chargeForActivation(tx, input([gen("a"), gen("b"), gen("c")], entitlements, 2));
 
     const spans = exporter.getFinishedSpans();
     expect(spans.map((s) => s.name)).toEqual(["prompts.activation.charge"]);
@@ -197,7 +198,7 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
   it("marks the span as an error when the debit is refused", async () => {
     used = 10;
     vi.mocked(debit.debitInTransaction).mockRejectedValue(new InsufficientCreditsError({ message: "no" } as never));
-    await chargeForActivation(tx, input([gen("a")])).catch(() => undefined);
+    await chargeForActivation(tx, input([gen("a")], entitlements, 1)).catch(() => undefined);
     expect(exporter.getFinishedSpans()[0]!.status.code).toBe(SpanStatusCode.ERROR);
   });
 
@@ -205,12 +206,12 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
     const log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
 
     used = 10;
-    await chargeForActivation(tx, input([gen("a")]));
+    await chargeForActivation(tx, input([gen("a")], entitlements, 1));
     used = 0;
     await chargeForActivation(tx, input([gen("b")]));
     used = 10;
     vi.mocked(debit.debitInTransaction).mockRejectedValue(new InsufficientCreditsError({ message: "no" } as never));
-    await chargeForActivation(tx, input([gen("c")])).catch(() => undefined);
+    await chargeForActivation(tx, input([gen("c")], entitlements, 1)).catch(() => undefined);
 
     const metrics = log.mock.calls.map((c) => c[0] as Record<string, unknown>).filter((m) => m.metric === "nominara_prompts_activation_charges_total");
     expect(metrics.map((m) => m.outcome)).toEqual(["charged", "free", "refused_insufficient_credits"]);

@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 import { CacheModule } from "../../lib/cache/cache.module.js";
+import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
 import { EntitlementsModule } from "../entitlements/entitlements.module.js";
 import { PromptActivationService } from "./activation.service.js";
 import { PromptLifecycleController } from "./lifecycle.controller.js";
@@ -30,8 +31,10 @@ import { TopicsService } from "./topics.service.js";
 // binds the prompt cap at activation. STORY-046's whole point is that "caps
 // bind at activation, not at generation", so this module cannot resolve one
 // without it.
+// QueueProducerModule: the inline activation debit asks for an auto top-up after it commits (NEW-D-7), which is a
+// queue job. The producer is @Optional in both services, so a process without one still charges.
 @Module({
-  imports: [CacheModule, EntitlementsModule],
+  imports: [CacheModule, EntitlementsModule, QueueProducerModule],
   controllers: [PromptsController, PromptLifecycleController, TopicsController],
   providers: [PromptsService, PromptActivationService, PromptLifecycleService, PromptListService, TopicsService],
 })

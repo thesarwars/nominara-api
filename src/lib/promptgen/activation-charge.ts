@@ -1,7 +1,9 @@
 import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
-import { PreconditionUnmetError } from "../../api/errors/domain-errors.js";
+import { PreconditionUnmetError, PriceChangedError } from "../../api/errors/domain-errors.js";
+import type { EnqueueAutoTopup } from "../credits/auto-topup-request.js";
+import { requireConfirmedCredits } from "../credits/confirmed-credits.js";
 import { debitInTransaction, idempotencyKeyFor, includedGrantOf } from "../credits/debit.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 
@@ -32,6 +34,13 @@ import { incrementCounter } from "../telemetry/metrics.js";
 // slots is read from the same column, so it survives pause, archive and a
 // restart, and a soft-deleted prompt still counts - deleting must not hand a
 // free slot back.
+//
+// THE QUOTE (owner decision 2026-10-15, option C). The price is variable - it depends on which of the named prompts
+// are new to the project and how much of the free allowance is left - so `CreditGuard`'s flat quote cannot carry it.
+// `quoteActivation` computes it, by the SAME code `chargeForActivation` charges by, and the server serves it on a
+// read-only preview route. When the charge is above 0 the request must echo that figure in
+// `X-Nominara-Confirmed-Credits`; it is compared with the figure recomputed UNDER THE PROJECT LOCK, and a difference
+// is `409 price_changed` naming both. A fully free activation debits nothing and needs no header.
 //
 // CALLER CONTRACT. The caller holds the PROJECT row lock (`SELECT ... FOR
 // UPDATE`) before reading the prompts it passes in. Everything here - which
@@ -88,6 +97,56 @@ function wholeNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
 }
 
+export interface QuoteActivationInput {
+  readonly projectId: string;
+  /** Exactly the prompts that are leaving `archived` in this call, in request order. */
+  readonly candidates: readonly ActivationCandidate[];
+  readonly entitlements: Entitlements;
+}
+
+export interface ActivationQuote extends ActivationChargePlan {
+  /** Credits per charged prompt: 0 when nothing is charged (the plan may then publish no price). */
+  readonly price: number;
+  /** What activating these candidates debits now: `price` x `charged.length`. */
+  readonly total: number;
+}
+
+/** True when at least one candidate is a generated prompt that has never been activated. */
+function hasFirstActivation(candidates: readonly ActivationCandidate[]): boolean {
+  return candidates.some((c) => c.generationSource === "generated" && c.firstActivatedAt === null);
+}
+
+/**
+ * What activating `candidates` costs, by the rule `chargeForActivation` charges by. Reads, writes nothing.
+ *
+ * The caller decides whether the read is under the project lock: the activation holds it, the preview does not (a
+ * preview that locked the project would let any reader stall every writer, and it is advisory by construction -
+ * the activation recomputes and compares).
+ */
+export async function quoteActivation(tx: ClientBase, input: QuoteActivationInput): Promise<ActivationQuote> {
+  if (!hasFirstActivation(input.candidates)) return { free: [], charged: [], price: 0, total: 0 };
+
+  const allowance = wholeNumber(input.entitlements[PROMPT_FREE_ALLOWANCE_KEY]?.value) ?? 0;
+  const used = await countFreeAllowanceUsed(tx, input.projectId);
+  const plan = planActivationCharge(input.candidates, allowance - used);
+
+  let price = 0;
+  if (plan.charged.length > 0) {
+    const resolved = wholeNumber(input.entitlements[PROMPT_PRICE_KEY]?.value);
+    if (resolved === null) {
+      // A plan that holds prompts but publishes no price is an unfinished
+      // setup, not a free tier. Charging a default would bill against a
+      // schedule nobody agreed; waving it through would give prompts away.
+      throw new PreconditionUnmetError({
+        message: `this workspace's prompt activation price resolves to "${String(input.entitlements[PROMPT_PRICE_KEY]?.value)}", which is not a credit figure`,
+        details: { reason: "price_not_agreed" },
+      });
+    }
+    price = resolved;
+  }
+  return { ...plan, price, total: price * plan.charged.length };
+}
+
 export interface ChargeActivationInput {
   readonly workspaceId: string;
   readonly actorId: string;
@@ -95,83 +154,98 @@ export interface ChargeActivationInput {
   /** Exactly the prompts that are leaving `archived` in this call, in request order. */
   readonly candidates: readonly ActivationCandidate[];
   readonly entitlements: Entitlements;
+  /**
+   * The parsed `X-Nominara-Confirmed-Credits`, or null/absent when the request carried none. Required (and compared)
+   * only when the charge is above 0.
+   */
+  readonly confirmedCredits?: number | null;
+  /** Asks for an auto top-up after the debit commits. Absent when the process has no queue producer. */
+  readonly autoTopup?: EnqueueAutoTopup;
 }
 
 /**
  * Charge for, and record, the first activation of `candidates`. Returns the
  * credits charged (0 when everything was free, already activated, or manual).
  *
- * Throws `InsufficientCreditsError` (402) and writes nothing when the wallet
- * cannot cover it; the caller's transaction rolls back with it.
+ * Throws, and writes nothing (the caller's transaction rolls back with it):
+ *   - 400 `validation_failed` when the charge is above 0 and no confirmed figure came with the request;
+ *   - 409 `price_changed` when the confirmed figure is not the figure recomputed here;
+ *   - 402 `insufficient_credits` when the wallet cannot cover it.
  */
 export async function chargeForActivation(tx: ClientBase, input: ChargeActivationInput): Promise<number> {
-  if (!input.candidates.some((c) => c.generationSource === "generated" && c.firstActivatedAt === null)) return 0;
+  if (!hasFirstActivation(input.candidates)) return 0;
 
   return tracer.startActiveSpan("prompts.activation.charge", async (span) => {
     try {
-      const allowance = wholeNumber(input.entitlements[PROMPT_FREE_ALLOWANCE_KEY]?.value) ?? 0;
-      const used = await countFreeAllowanceUsed(tx, input.projectId);
-      const plan = planActivationCharge(input.candidates, allowance - used);
-
-      let price = 0;
-      if (plan.charged.length > 0) {
-        const resolved = wholeNumber(input.entitlements[PROMPT_PRICE_KEY]?.value);
-        if (resolved === null) {
-          // A plan that holds prompts but publishes no price is an unfinished
-          // setup, not a free tier. Charging a default would bill against a
-          // schedule nobody agreed; waving it through would give prompts away.
-          throw new PreconditionUnmetError({
-            message: `this workspace's prompt activation price resolves to "${String(input.entitlements[PROMPT_PRICE_KEY]?.value)}", which is not a credit figure`,
-            details: { reason: "price_not_agreed" },
-          });
-        }
-        price = resolved;
-      }
-
-      const total = price * plan.charged.length;
+      const quote = await quoteActivation(tx, input);
+      const { price, total } = quote;
       span.setAttributes({
-        "nominara.prompts.activated_free": plan.free.length,
-        "nominara.prompts.activated_charged": plan.charged.length,
+        "nominara.prompts.activated_free": quote.free.length,
+        "nominara.prompts.activated_charged": quote.charged.length,
         "nominara.credits.charged": total,
       });
 
       if (total > 0) {
+        const confirmed = requireConfirmedCredits(input.confirmedCredits ?? null);
+        if (confirmed !== total) {
+          throw new PriceChangedError({
+            message: "the confirmed price does not match this activation's current price",
+            // BOTH FIGURES: a client told only "it changed" cannot tell whether to re-quote or give up.
+            details: {
+              shown: confirmed,
+              recomputed: total,
+              reason: `${PROMPT_PRICE_KEY} resolved to ${String(price)} for ${String(quote.charged.length)} prompt(s) beyond the free allowance`,
+            },
+          });
+        }
         await debitInTransaction(tx, {
           workspaceId: input.workspaceId,
           actorId: input.actorId,
           actorType: "user",
           actionCode: "prompt_activate",
           credits: total,
-          idempotencyKey: idempotencyKeyFor("prompt_activate", input.projectId, plan.charged),
+          idempotencyKey: idempotencyKeyFor("prompt_activate", input.projectId, quote.charged),
           projectId: input.projectId,
-          unitDetail: { prompts: plan.charged.length, engines: 0, cells_charged: 0, cells_cached: 0 },
+          unitDetail: { prompts: quote.charged.length, engines: 0, cells_charged: 0, cells_cached: 0 },
           includedGrant: includedGrantOf(input.entitlements),
+          ...(input.autoTopup === undefined ? {} : { autoTopup: input.autoTopup }),
         });
       }
 
-      await recordFirstActivation(tx, plan.free, 0);
-      await recordFirstActivation(tx, plan.charged, price);
+      await recordFirstActivation(tx, quote.free, 0);
+      await recordFirstActivation(tx, quote.charged, price);
 
       incrementCounter("nominara_prompts_activation_charges_total", { outcome: total > 0 ? "charged" : "free" });
       logger.log({
         event: "prompts.activation.charged",
         workspace_id: input.workspaceId,
         project_id: input.projectId,
-        prompts_free: plan.free.length,
-        prompts_charged: plan.charged.length,
+        prompts_free: quote.free.length,
+        prompts_charged: quote.charged.length,
         credits: total,
       });
       return total;
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });
-      incrementCounter("nominara_prompts_activation_charges_total", {
-        outcome: (error as { code?: string }).code === "insufficient_credits" ? "refused_insufficient_credits" : "error",
-      });
+      incrementCounter("nominara_prompts_activation_charges_total", { outcome: refusalOutcome((error as { code?: string }).code) });
       throw error;
     } finally {
       span.end();
     }
   });
+}
+
+function refusalOutcome(code: string | undefined): string {
+  switch (code) {
+    case "insufficient_credits":
+      return "refused_insufficient_credits";
+    case "price_changed":
+      return "refused_price_changed";
+    case "validation_failed":
+      return "refused_price_unconfirmed";
+    default:
+      return "error";
+  }
 }
 
 /**
