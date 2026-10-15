@@ -166,6 +166,13 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
   for (let i = 0; i < R; i++) {
     await client.query("INSERT INTO stripe_subscription_syncs (workspace_id, stripe_subscription_id, fetch_started_at) VALUES ($1, $2, now())", [workspaceId, `sub_${label}_${i}`]);
   }
+  // STORY-072 AC13 (migration 0124) — a carried hold per row.
+  for (let i = 0; i < R; i++) {
+    await client.query(
+      "INSERT INTO credit_hold_carries (workspace_id, idempotency_key, attempt, credits, rolled_cycle_start) VALUES ($1, $2, 1, 5, CURRENT_DATE)",
+      [workspaceId, `hold_${label}_${i}`],
+    );
+  }
   // credit_wallets: PRIMARY KEY (workspace_id) alone — structurally ONE row per tenant.
   await client.query("INSERT INTO credit_wallets (workspace_id, cycle_start, cycle_end) VALUES ($1, CURRENT_DATE, CURRENT_DATE + INTERVAL '30 days')", [
     workspaceId,
