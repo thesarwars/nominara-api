@@ -275,9 +275,30 @@ One resource family for all six tools. `tool_key` selects behaviour; lifecycle, 
 | `GET`/`POST` | `/share-tokens` ✚ ⛨ | `share_token:mint` | secret returned once |
 | `PATCH`/`DELETE` | `/share-tokens/{id}` | `share_token:revoke` | revocation is immediate |
 | `GET` | `/share-tokens/{id}/views` | `share_token:mint` | access telemetry |
-| `GET`/`POST`/`PATCH`/`DELETE` | `/scheduled-reports` · `POST /{id}/send-now` ✚ | `agency:branding` | |
+| `GET`/`POST`/`PATCH`/`DELETE` | `/scheduled-reports` · `POST /{id}/send-now` ✚ | `agency:branding` | send-now answers `200` with the delivery in `status: "sending"`; the emails go out after commit — see [Scheduled-report delivery](#scheduled-report-delivery) |
 | `POST` | `/portal/session` | token secret + password | → a short-lived scoped cookie (4 h) |
 | `GET` | `/portal/overview` · `/growth-map` · `/sources` · `/tasks` · `/matrix` · `/report.pdf` | portal cookie | the origin sets `app.current_scope_projects` from the cookie |
+
+#### Scheduled-report delivery
+
+As built (Group C, owner decision 2026-10-15, option B). `POST /scheduled-reports/{id}/send-now` reserves the PDF cap unit, builds the artifacts, commits the unit, records the delivery as `sending` and answers **`200` with that delivery, `status: "sending"`**. The emails are sent **after the request transaction commits** (`afterCommit`); a second, short tenant transaction then moves the row to its final state with `UPDATE … WHERE status = 'sending'`, so a replayed finalisation is a no-op and the first outcome wins. No row lock, transaction or pooled connection is held while the provider is slow. The client polls `GET /scheduled-reports`, whose `deliveries` carry the final state.
+
+Answering after the sends was rejected: the response cannot outlive the interceptor-owned transaction without either holding an idle transaction and connection across the send, or taking a second pooled connection while the request still holds one (hold-and-wait).
+
+| `status` | Meaning |
+|---|---|
+| `sending` | Recorded; the emails are not finished yet |
+| `delivered` | A sender that really delivers (Resend) accepted every recipient |
+| `logged` | A sender that delivers to nobody (the logging adapter) accepted every recipient. Never reported as `delivered` |
+| `failed` | The build failed, or at least one recipient could not be sent: `reason` is "N of M recipients could not be sent", `recipients` counts those that succeeded, and `scheduled_reports.last_error` is set. Also "server shutting down before send" when shutdown began before the delivery's turn (nothing was sent, so a resend is correct) |
+| `skipped_cap` | The PDF cap was reached; a notification names the cap and the reset date |
+
+- **Stale `sending`.** A process that dies between the commit and the second transaction leaves the row `sending`. Reads show a `sending` row older than `STALE_SENDING_MS` as `failed`, reason "delivery did not complete: the sending process did not report back"; **the row itself is not rewritten**. The window is derived, not chosen: `SCHEDULED_REPORT_MAX_RECIPIENTS` (25) × the Resend worst-case send (3 × 10 s timeout + 2 × 30 s `Retry-After` cap = 90 s) + 5 min margin = **42.5 min**, pinned by a unit test. It is judged on the **database clock** (`now() - attempted_at > STALE_SENDING_MS` in the history query; `now()` is the start of the reading transaction, which can only make a row look younger). Recipients go one at a time. **Follow-up, not built:** a sweep that rewrites stale `sending` rows and sets `last_error` ([STORY-183](../stories/agency/STORY-183-stale-sending-delivery-sweep.md)).
+- **Shutdown.** The service waits up to 30 s for in-flight deliveries before the database pool closes. A delivery whose turn comes after shutdown began sends nothing and is recorded `failed` (best effort; if that fails too, it reads stale after the window). Recording an outcome waits at most 10 s for a pooled connection.
+- **Recipients** are the ones captured at request time. A report deleted mid-send takes its delivery with it (cascade), and the finalisation updates nothing.
+- **Counted once.** `nominara_reports_scheduled_deliveries_total` counts each delivery at its final status, never at `sending`.
+- **Contract.** `deliveryStatusSchema` gained `sending`; `contracts:diff` classifies the change as **patch** (a response-side enum widening). The frontend's delivery-status union must gain `sending`.
+- **Content as built.** Plain text, one link per built artifact, no attachment. The agency display name and reply-to, the attachment up to 8 MB and the oversize signed link are not built ([`integrations-and-sharing.md` §5](./integrations-and-sharing.md#5-scheduled-reports)).
 
 ### Integrations (post-launch)
 
