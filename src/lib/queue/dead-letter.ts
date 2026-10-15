@@ -1,4 +1,5 @@
 import { Logger } from "@nestjs/common";
+import { emailAlert } from "../alerts/alerts.js";
 import { Queue, type Job } from "bullmq";
 import type { Redis } from "ioredis";
 import { z } from "zod";
@@ -213,6 +214,12 @@ export const DLQ_DEPTH_SUSTAINED_MS = 10 * 60 * 1000;
  * swaps in a real adapter without this monitor's logic changing.
  */
 export interface Pager {
+  /**
+   * `message` must be FIXED TEXT PLUS IDs (a queue name, an engine key, a workspace id): it is emailed verbatim (minus
+   * address-shaped text, capped at 200 characters). Never interpolate a customer string — a prompt, a name, an email,
+   * engine output. Free text belongs nowhere in `context` either: only numbers, booleans and the identifier/enum keys on
+   * SAFE_STRING_KEYS (src/lib/alerts/email-alert.adapter.ts) are emailed; every other string becomes "[omitted]".
+   */
   page(message: string, context: Record<string, unknown>): void;
 }
 
@@ -220,6 +227,9 @@ export const defaultPager: Pager = {
   page(message, context) {
     logger.error({ message, ...context });
     incrementCounter("nominara_queue_dlq_depth_page_total", { queue: String(context.queue ?? "unknown") });
+    // Group C — the page also goes out by email when ALERT_EMAIL_TO is configured (src/lib/alerts). The log line and
+    // counter above are unchanged and always happen.
+    emailAlert(message, context);
   },
 };
 
@@ -270,6 +280,7 @@ export class DlqDepthMonitor {
     if (now - since >= this.sustainedMs && !this.alreadyPaged.has(queueName)) {
       this.alreadyPaged.add(queueName);
       this.pager.page(`dead-letter queue "${dlqQueueName(queueName)}" depth sustained above threshold`, {
+        alertName: "dlq_depth_sustained",
         queue: queueName,
         depth,
         thresholdDepth: this.thresholdDepth,

@@ -7,6 +7,8 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { createAuditVerifyHandler } from "../../src/lib/queue/handlers/audit-verify.handler.js";
 import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
 import type { Env } from "../../src/config/env.schema.js";
+import { EmailAlertAdapter } from "../../src/lib/alerts/email-alert.adapter.js";
+import { setAlertEmailerForTests } from "../../src/lib/alerts/alerts.js";
 
 // STORY-143 — the tick for `security-and-tenancy.md` §12's daily verifier.
 //
@@ -123,6 +125,52 @@ describe("STORY-143 · audit.verify handler", () => {
 
     expect(logs.some((line) => line.includes("no mismatch"))).toBe(true);
     expect(counters.filter((c) => c.name === "audit_chain_mismatch_detected")).toHaveLength(0);
+  }, 60_000);
+
+  it("Group C · a HANGING alert-email sender is never awaited under the audit.verify lock: the lock is free the moment the sender is entered, and the job still fails with UnrecoverableError", async () => {
+    await appendChain(3);
+    await db.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
+    await db.query("UPDATE audit_log SET action = 'tampered' WHERE seq = (SELECT min(seq) FROM audit_log)");
+    await db.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
+
+    const probe = new Client({ connectionString: container.getConnectionUri() });
+    await probe.connect();
+    let lockFreeWhenSenderEntered: boolean | undefined;
+    let sends = 0;
+    setAlertEmailerForTests(
+      new EmailAlertAdapter({
+        delivers: true,
+        to: "oncall@example.net",
+        sender: {
+          send: async () => {
+            sends += 1;
+            if (lockFreeWhenSenderEntered === undefined) {
+              // If the page were awaited inside the lock this would be false.
+              lockFreeWhenSenderEntered = await tryAdvisorySessionLock(probe, LOCK_KEY);
+            }
+            await new Promise<void>(() => {}); // hangs forever
+          },
+        },
+      }),
+    );
+    const { Logger } = await import("@nestjs/common");
+    const spy = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
+    try {
+      const started = performance.now();
+      const thrown: unknown = await run().then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(thrown).toBeInstanceOf(UnrecoverableError);
+      expect(sends).toBe(1);
+      expect(lockFreeWhenSenderEntered, "the hanging sender was entered while the audit.verify lock was still held").toBe(true);
+      // The drain is bounded (5 s): a hung provider cannot hold the job indefinitely either.
+      expect(performance.now() - started).toBeLessThan(20_000);
+    } finally {
+      spy.mockRestore();
+      setAlertEmailerForTests(undefined);
+      await probe.end();
+    }
   }, 60_000);
 
   it("⚠ DETECTS a tampered row, counts it, and FAILS the job so something notices", async () => {

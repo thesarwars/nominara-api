@@ -15,9 +15,15 @@ import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 // `scheduled_report_deliveries` (NEW-E-1) is the history table; the status
 // vocabulary here is its CHECK.
 
+/** The most recipients one scheduled report may have. The stale-`sending` window is derived from it. */
+export const SCHEDULED_REPORT_MAX_RECIPIENTS = 25;
+
 export const scheduleCadenceSchema = z.enum(["weekly", "biweekly", "monthly", "quarterly"]);
 export const scheduleFormatSchema = z.enum([...reportFormatSchema.options, "both"]);
-export const deliveryStatusSchema = z.enum(["delivered", "failed", "skipped_cap", "logged"]);
+// `sending` — the request recorded the delivery and committed; the emails are going out AFTER that commit and the row
+// moves to delivered / failed / logged when they finish (migration 0126). `send-now` answers `sending`; the history
+// (GET /scheduled-reports) shows the final state. A `sending` row older than STALE_SENDING_MS reads as `failed`.
+export const deliveryStatusSchema = z.enum(["delivered", "failed", "skipped_cap", "logged", "sending"]);
 
 export const scheduledReportDeliverySchema = z
   .object({
@@ -40,7 +46,7 @@ const scheduleFieldsShape = {
   /** Workspace-local hour, 0-23. */
   hour: z.number().int().min(0).max(23),
   format: scheduleFormatSchema,
-  recipients: z.array(z.email()).min(1).max(25),
+  recipients: z.array(z.email()).min(1).max(SCHEDULED_REPORT_MAX_RECIPIENTS),
   timeframe: reportTimeframeSchema,
   /** Pinned theme; null = workspace default. Must belong to the same workspace. */
   theme_id: lowercaseUuidSchema.nullable(),
