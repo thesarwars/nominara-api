@@ -1022,8 +1022,8 @@ describe("STORY-046 · the activation charge", () => {
     const [free, other] = await seedPrompts(project, 2);
 
     expect((await patch(free!, { status: "active" })).credits_charged).toBe(0);
-    expect((await patch(other!, { is_priority: true })).credits_charged).toBe(0);
-    expect((await patch(free!, { status: "paused" })).credits_charged).toBe(0);
+    expect((await patch(other!, { status: "archived" })).credits_charged).toBe(0); // not leaving archived
+    expect((await patch(free!, { status: "paused" })).credits_charged).toBe(0); // already activated, so a re-pause is free
   });
 
   // -------------------------------------------------------------------------
