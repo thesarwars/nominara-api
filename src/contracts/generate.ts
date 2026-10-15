@@ -14,7 +14,12 @@ import {
   PAGINATION_LIMIT_MAX,
 } from "../../contracts/common/pagination.schema.js";
 import { API_VERSION_PREFIX } from "../api/configure-app.js";
-import { writePermissionMatrixArtifact, PERMISSION_MATRIX_ARTIFACT_PATH } from "./permission-matrix-artifact.js";
+import {
+  buildPermissionMatrixArtifact,
+  writePermissionMatrixArtifact,
+  PERMISSION_MATRIX_ARTIFACT_PATH,
+} from "./permission-matrix-artifact.js";
+import type { PermissionMatrixArtifact } from "../../contracts/identity/permission-matrix-artifact.schema.js";
 import { discoverContractRoutes, type DiscoveredContractRoute } from "./discover-routes.js";
 
 // STORY-023 T3 (GREEN step) — AC3/NFR-REPO-01: `contracts:generate` walks
@@ -551,6 +556,26 @@ export function isErrorCode(value: unknown): value is ErrorCode {
 `;
 }
 
+// STORY-019 — the permission matrix, emitted as data so the app can drive its
+// disabled-with-reason states from the table RbacGuard enforces. Rendered from
+// the artifact BUILT IN MEMORY (the same builder contracts:generate writes the
+// committed JSON from), never read back from that file.
+function renderPermissionMatrixModule(artifact: PermissionMatrixArtifact): string {
+  return `${CLIENT_GENERATED_HEADER}
+/**
+ * The RBAC permission matrix (STORY-019), generated from the table RbacGuard
+ * enforces. \`by_role[role][permission]\` is the cell; \`granted_to[permission]\`
+ * lists the roles that hold it (the "ask an owner or admin" explanation).
+ */
+export const PERMISSION_MATRIX = ${JSON.stringify(artifact, null, 2)} as const;
+
+export type Role = (typeof PERMISSION_MATRIX.roles)[number];
+export type Permission = (typeof PERMISSION_MATRIX.permissions)[number];
+/** allow = workspace-wide; scoped = only within project_scope; deny = refused with a 403 naming the permission. */
+export type PermissionAccess = "allow" | "scoped" | "deny";
+`;
+}
+
 function renderIndexModule(): string {
   return `${CLIENT_GENERATED_HEADER}
 import createClient, { type Client, type ClientOptions } from "openapi-fetch";
@@ -565,6 +590,8 @@ export {
   type RealtimeEventName,
 } from "./events.js";
 
+export { PERMISSION_MATRIX, type Role, type Permission, type PermissionAccess } from "./permission-matrix.js";
+
 export type NominaraClient = Client<paths>;
 
 /** The typed fetch client (AC4). \`baseUrl\` should include no version segment — every path already carries "${API_VERSION_PREFIX}". */
@@ -574,7 +601,11 @@ export function createNominaraClient(options: ClientOptions): NominaraClient {
 `;
 }
 
-export async function generateClient(document: OpenApiDocument, outDir: string): Promise<void> {
+export async function generateClient(
+  document: OpenApiDocument,
+  outDir: string,
+  permissionMatrix: PermissionMatrixArtifact = buildPermissionMatrixArtifact(),
+): Promise<void> {
   // openapiTS accepts an in-memory document object as well as a path/URL,
   // which is what lets both the live document and the committed
   // previous-minor proxy go through this one code path (scenario 9) without
@@ -584,6 +615,7 @@ export async function generateClient(document: OpenApiDocument, outDir: string):
   writeFileSync(join(outDir, "types.ts"), `${CLIENT_GENERATED_HEADER}\n${types}`, "utf8");
   writeFileSync(join(outDir, "errors.ts"), renderErrorCodesModule(), "utf8");
   writeFileSync(join(outDir, "events.ts"), renderRealtimeEventsModule(), "utf8");
+  writeFileSync(join(outDir, "permission-matrix.ts"), renderPermissionMatrixModule(permissionMatrix), "utf8");
   writeFileSync(join(outDir, "index.ts"), renderIndexModule(), "utf8");
 }
 
