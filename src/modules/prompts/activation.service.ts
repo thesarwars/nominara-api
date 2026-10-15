@@ -1,10 +1,21 @@
-import { Injectable } from "@nestjs/common";
-import type { ActivatePromptsRequest, ActivatePromptsResponse } from "../../../contracts/prompts/index.js";
-import { EntitlementExceededError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { Injectable, Logger, Optional } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
+import type { ClientBase } from "pg";
+import type {
+  ActivatePromptsPreviewResponse,
+  ActivatePromptsRequest,
+  ActivatePromptsResponse,
+} from "../../../contracts/prompts/index.js";
+import { ConflictError, EntitlementExceededError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { autoTopupEnqueuerFor } from "../../lib/credits/auto-topup-request.js";
+import { parseConfirmedCredits } from "../../lib/credits/confirmed-credits.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { chargeForActivation, quoteActivation, type ActivationCandidate } from "../../lib/promptgen/activation-charge.js";
 import { nextRunAfter } from "../../lib/capture/scheduler.js";
 import type { ProjectCadence } from "../../lib/capture/dispatch-cells.js";
 import { canonicalUuid } from "../../api/canonical-uuid.js";
@@ -26,18 +37,22 @@ import { canonicalUuid } from "../../api/canonical-uuid.js";
 // ALL OR NOTHING. §3 gives this route one behaviour — "403
 // entitlement_exceeded names the remaining slots" — so a request that does
 // not fit is refused whole. A partial activation would pick which of the
-// customer's chosen prompts to drop, and once activation charges (blocked;
-// see the story) it would be a partial debit for an outcome nobody asked
-// for. The refusal therefore happens before any UPDATE.
+// customer's chosen prompts to drop, and now that activation charges it would
+// be a partial debit for an outcome nobody asked for. The refusal therefore
+// happens before any UPDATE.
 //
-// NOTHING IS CHARGED. `credits_charged` is the literal 0 in the contract and
-// there is no wallet, ledger or reserve statement anywhere in this file —
-// which is what makes that true by construction rather than by a test that
-// happens to pass. §4 prices activation at "1 per prompt activated" beyond
-// the free 10 and nothing can charge yet: `CreditGuard` is a pass-through
-// no-op whose own comment puts reserve/commit in EPIC-10, wallets are
-// unprovisioned, and §4 contradicts §10's `FR-CRD-06` about whether
-// activating an archived candidate later costs anything at all.
+// THE CHARGE (AC3; owner decision 2026-10-14). plans-and-entitlements.md
+// section 4 prices activation at "1 per prompt activated" beyond the free 10.
+// It is charged ONCE per generated prompt, at its first activation (see
+// src/lib/promptgen/activation-charge.ts for the whole rule), and the debit
+// goes through the credit ledger in THIS transaction: a refusal - the cap, or
+// 402 insufficient_credits - throws before any UPDATE and rolls back whatever
+// was written, so a refused activation charges nothing and activates nothing.
+//
+// THE PROJECT ROW IS LOCKED FIRST (`assertProjectExists` ... FOR UPDATE). Which
+// prompts are new, and how much of the project's free allowance is left, are
+// decided from rows that lock protects: two concurrent activations of the same
+// prompts serialise, and the second finds them already active and charges 0.
 
 /** `PROMPT_OCCUPIES_SLOT`, verbatim from src/lib/entitlements/structural-usage.ts. */
 const OCCUPIES_SLOT = "status <> 'archived' AND deleted_at IS NULL";
@@ -49,55 +64,102 @@ interface PromptRow {
   id: string;
   status: string;
   project_id: string;
+  generation_source: string;
+  first_activated_at: Date | null;
+  superseded_by: string | null;
 }
+
+const logger = new Logger("prompts.activation");
+const tracer = trace.getTracer("nominara-api");
 
 type TenantClient = { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> };
 
 @Injectable()
 export class PromptActivationService {
-  constructor(private readonly entitlements: EntitlementResolver) {}
+  constructor(
+    private readonly entitlements: EntitlementResolver,
+    // Optional, as in CreditInterceptor: a process with no queue producer still charges; it just cannot ask for a top-up.
+    @Optional() private readonly producer?: QueueProducer,
+  ) {}
 
-  async activate(projectId: string, request: ActivatePromptsRequest): Promise<ActivatePromptsResponse> {
+  /**
+   * `POST /projects/{id}/prompts/activate/preview` - what activating exactly these prompts would cost now.
+   *
+   * READ-ONLY: no project lock, no wallet read, no reservation, no ledger row, no write of any kind. It prices by
+   * `quoteActivation`, the code the activation charges by, so the figure is the one the activation will compute -
+   * unless the project changes in between, which is exactly what the activation's own comparison catches (409
+   * `price_changed`).
+   */
+  async preview(projectId: string, request: ActivatePromptsRequest): Promise<ActivatePromptsPreviewResponse> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("PromptActivationService.preview requires an active tenant context");
+    const client = store.client as TenantClient;
+    const promptIds = this.canonicalIds(request);
+
+    return tracer.startActiveSpan("prompts.activation.preview", async (span) => {
+      try {
+        await this.assertProjectExists(client, projectId, false);
+        const resolved = await this.entitlements.resolveForWorkspace(store.context.workspaceId);
+        const prompts = await this.loadPrompts(client, projectId, promptIds);
+        const alreadyActive = prompts.filter((prompt) => prompt.status === "active");
+        const quote = await quoteActivation(store.client as ClientBase, {
+          projectId,
+          candidates: this.firstActivationCandidates(prompts),
+          entitlements: resolved.entitlements,
+        });
+        span.setAttributes({
+          "nominara.prompts.requested": promptIds.length,
+          "nominara.prompts.quoted_free": quote.free.length,
+          "nominara.prompts.quoted_charged": quote.charged.length,
+          "nominara.credits.quoted": quote.total,
+        });
+        incrementCounter("nominara_prompts_activation_previews_total", { outcome: quote.total > 0 ? "charged" : "free" });
+        logger.log({
+          event: "prompts.activation.previewed",
+          workspace_id: store.context.workspaceId,
+          project_id: projectId,
+          prompts_requested: promptIds.length,
+          credits: quote.total,
+        });
+        return {
+          credits: quote.total,
+          prompts: {
+            requested: promptIds.length,
+            already_active: alreadyActive.length,
+            free: quote.free.length,
+            charged: quote.charged.length,
+          },
+          credits_charged: 0 as const,
+        };
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        incrementCounter("nominara_prompts_activation_previews_total", { outcome: "refused" });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  /** `confirmed` is the raw `X-Nominara-Confirmed-Credits` header: required, and compared, only when the charge is above 0. */
+  async activate(
+    projectId: string,
+    request: ActivatePromptsRequest,
+    confirmed?: string | readonly string[],
+  ): Promise<ActivatePromptsResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("PromptActivationService.activate requires an active tenant context");
     const client = store.client as TenantClient;
 
-    // ⚠ CANONICALISED BEFORE ANYTHING COMPARES THEM. STORY-150's review found
-    // this one live: `prompt_ids` is a BODY field, so `CanonicalParamsGuard`
-    // never sees it, and `z.string().uuid()` accepts an uppercase uuid (zod's
-    // check is case-insensitive — verified, not assumed). Postgres then
-    // matched the row anyway, because `$1::uuid[]` casts — so `loadPrompts`
-    // got the row back, `found.get(UPPERCASE)` missed the lowercase key it was
-    // stored under, and the caller was told "no such prompt in this project"
-    // about a prompt in their own project.
-    //
-    // It also made the duplicate check below miss `[lower, UPPER]` of one
-    // prompt, which is the same id twice. That failed closed at `loadPrompts`
-    // instead, so the refusal was right for the wrong reason.
-    //
-    // ⚠ BODY AND QUERY UUIDS ARE NOT SYSTEMATICALLY HANDLED, and this fixes
-    // one instance rather than the class. There are 67 uuid fields across
-    // `contracts/`; the boundary for them is a shared schema with a lowercase
-    // transform, which changes the generated OpenAPI and belongs in its own
-    // story. This one is fixed here because it is live and it is the defect
-    // STORY-150 is named for.
-    const promptIds = request.prompt_ids.map((id) => canonicalUuid(id));
-
-    // A DUPLICATE ID IS A REFUSAL, not something to quietly collapse. With
-    // one slot left, `[P1, P1]` either passes the cap check as two and
-    // activates one, or passes as one and is reported as two — both of which
-    // lie in the summary. Refusing names the mistake instead.
-    const unique = new Set(promptIds);
-    if (unique.size !== promptIds.length) {
-      throw new ValidationFailedError({
-        message: "prompt_ids contains a duplicate",
-        details: { issues: [{ path: ["prompt_ids"], message: "each prompt may appear at most once" }] },
-      });
-    }
+    const promptIds = this.canonicalIds(request);
+    // Parsed up front so a malformed header is a 400 before any row is read; whether one is REQUIRED is decided later,
+    // from the recomputed charge.
+    const confirmedCredits = parseConfirmedCredits(confirmed);
 
     await this.assertProjectExists(client, projectId);
 
-    const cap = await this.resolveCap(store.context.workspaceId);
+    const resolved = await this.entitlements.resolveForWorkspace(store.context.workspaceId);
+    const cap = this.capFrom(resolved.entitlements);
     const activeBefore = await this.countOccupyingSlots(client, projectId);
     const prompts = await this.loadPrompts(client, projectId, promptIds);
 
@@ -106,6 +168,7 @@ export class PromptActivationService {
     // as newly activated would make the retry of a successful call fail with
     // a 403, the worst possible behaviour for an endpoint AC12 requires to be
     // idempotent.
+    let credits = 0;
     const alreadyActive = prompts.filter((prompt) => prompt.status === "active");
     const toActivate = prompts.filter((prompt) => prompt.status !== "active");
 
@@ -126,6 +189,21 @@ export class PromptActivationService {
     }
 
     if (toActivate.length > 0) {
+      const autoTopup = autoTopupEnqueuerFor(this.producer);
+      // AFTER the cap check and BEFORE any write: a 402 here rolls the whole
+      // request back, so nothing is activated that was not paid for.
+      credits = await chargeForActivation(store.client as ClientBase, {
+        workspaceId: store.context.workspaceId,
+        actorId: store.context.actorId,
+        projectId,
+        // ONLY rows leaving `archived`. `status <> 'active'` also admits a paused row, and PATCH treats a change on
+        // a non-archived row as no activation at all; the two doors must price the same prompt the same way.
+        candidates: this.firstActivationCandidates(toActivate),
+        entitlements: resolved.entitlements,
+        confirmedCredits,
+        ...(autoTopup === undefined ? {} : { autoTopup }),
+      });
+
       // ONE statement, not one per id. Fifteen round trips inside a
       // transaction to set fifteen rows to the same value, on the request
       // path, for no benefit.
@@ -173,7 +251,7 @@ export class PromptActivationService {
       coverage,
       prompts_active: activeAfter,
       prompts_cap: cap,
-      credits_charged: 0,
+      credits_charged: credits,
     };
   }
 
@@ -193,11 +271,61 @@ export class PromptActivationService {
     );
   }
 
-  private async assertProjectExists(client: TenantClient, projectId: string): Promise<void> {
+  /** The prompts that are LEAVING `archived`: the only ones an activation prices, here and on the PATCH door. */
+  private firstActivationCandidates(prompts: readonly PromptRow[]): ActivationCandidate[] {
+    return prompts
+      .filter((prompt) => prompt.status === "archived")
+      .map((prompt) => ({
+        id: prompt.id,
+        generationSource: prompt.generation_source,
+        firstActivatedAt: prompt.first_activated_at,
+      }));
+  }
+
+  /**
+   * ⚠ CANONICALISED BEFORE ANYTHING COMPARES THEM. STORY-150's review found
+   * this one live: `prompt_ids` is a BODY field, so `CanonicalParamsGuard`
+   * never sees it, and `z.string().uuid()` accepts an uppercase uuid (zod's
+   * check is case-insensitive — verified, not assumed). Postgres then
+   * matched the row anyway, because `$1::uuid[]` casts — so `loadPrompts`
+   * got the row back, `found.get(UPPERCASE)` missed the lowercase key it was
+   * stored under, and the caller was told "no such prompt in this project"
+   * about a prompt in their own project.
+   *
+   * It also made the duplicate check below miss `[lower, UPPER]` of one
+   * prompt, which is the same id twice. That failed closed at `loadPrompts`
+   * instead, so the refusal was right for the wrong reason.
+   *
+   * ⚠ BODY AND QUERY UUIDS ARE NOT SYSTEMATICALLY HANDLED, and this fixes
+   * one instance rather than the class. There are 67 uuid fields across
+   * `contracts/`; the boundary for them is a shared schema with a lowercase
+   * transform, which changes the generated OpenAPI and belongs in its own
+   * story. This one is fixed here because it is live and it is the defect
+   * STORY-150 is named for.
+   *
+   * A DUPLICATE ID IS A REFUSAL, not something to quietly collapse. With
+   * one slot left, `[P1, P1]` either passes the cap check as two and
+   * activates one, or passes as one and is reported as two — both of which
+   * lie in the summary. Refusing names the mistake instead.
+   */
+  private canonicalIds(request: ActivatePromptsRequest): string[] {
+    const promptIds = request.prompt_ids.map((id) => canonicalUuid(id));
+    const unique = new Set(promptIds);
+    if (unique.size !== promptIds.length) {
+      throw new ValidationFailedError({
+        message: "prompt_ids contains a duplicate",
+        details: { issues: [{ path: ["prompt_ids"], message: "each prompt may appear at most once" }] },
+      });
+    }
+    return promptIds;
+  }
+
+  private async assertProjectExists(client: TenantClient, projectId: string, lock = true): Promise<void> {
     // No `workspace_id` predicate: RLS scopes the tenant (`NFR-SEC-01`), and
     // adding one would imply the boundary lives in application code.
+    // FOR UPDATE: the lock every decision below depends on. See the header.
     const result = await client.query<{ prompts_cap: number }>(
-      "SELECT prompts_cap FROM projects WHERE id = $1 AND deleted_at IS NULL",
+      `SELECT prompts_cap FROM projects WHERE id = $1 AND deleted_at IS NULL${lock ? " FOR UPDATE" : ""}`,
       [projectId],
     );
     if (result.rows.length === 0) throw new NotFoundError({ message: "no such project" });
@@ -219,9 +347,8 @@ export class PromptActivationService {
    * COUNTER to the project while the limit itself is the same for every
    * project in the workspace.
    */
-  private async resolveCap(workspaceId: string): Promise<number> {
-    const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
-    const value = resolved.entitlements["prompts.max_per_project"]?.value;
+  private capFrom(entitlements: Readonly<Record<string, { readonly value: unknown } | undefined>>): number {
+    const value = entitlements["prompts.max_per_project"]?.value;
     if (value === undefined) return 0;
     const limit = structuralLimitFrom(value as EntitlementValue);
     if (limit === undefined) return 0;
@@ -248,7 +375,7 @@ export class PromptActivationService {
    */
   private async loadPrompts(client: TenantClient, projectId: string, promptIds: readonly string[]): Promise<PromptRow[]> {
     const result = await client.query<PromptRow>(
-      `SELECT id, status, project_id FROM tracked_prompts WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+      `SELECT id, status, project_id, generation_source, first_activated_at, superseded_by FROM tracked_prompts WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
       [[...promptIds]],
     );
 
@@ -262,6 +389,17 @@ export class PromptActivationService {
       throw new ValidationFailedError({
         message: "one or more prompt_ids does not name a prompt in this project",
         details: { issues: unusable.map((id) => ({ path: ["prompt_ids"], message: `no such prompt in this project: ${id}` })) },
+      });
+    }
+
+    // A SUPERSEDED row is history, not a live prompt. The free-allowance count reads chain heads only, so activating
+    // a row that is no longer a head would spend a free slot that is never counted - the allowance would be
+    // recyclable by rewording and then activating the old row. Refused as a whole, before anything is charged.
+    const superseded = promptIds.map((id) => found.get(id)!).filter((row) => typeof row.superseded_by === "string");
+    if (superseded.length > 0) {
+      throw new ConflictError({
+        message: `prompt ${superseded[0]!.id} was reworded and replaced by ${superseded[0]!.superseded_by!}; activate the replacement`,
+        details: { reason: "prompt_superseded" },
       });
     }
 

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Param, Post, Query, Req } from "@nestjs/common";
+import { Body, Controller, Get, Headers, HttpCode, Param, Post, Query, Req } from "@nestjs/common";
 import {
   activatePromptsRequestSchema,
   createPromptRequestSchema,
@@ -9,9 +9,11 @@ import {
   type PromptListItem,
   type PromptListQuery,
   type PromptListResponse,
+  activatePromptsPreviewResponseSchema,
   activatePromptsResponseSchema,
   generatePromptsRequestSchema,
   generatePromptsResponseSchema,
+  type ActivatePromptsPreviewResponse,
   type ActivatePromptsRequest,
   type ActivatePromptsResponse,
   type GeneratePromptsRequest,
@@ -24,6 +26,7 @@ import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import { Page } from "../../api/pagination/page.js";
+import { CONFIRMED_CREDITS_HEADER } from "../../lib/credits/confirmed-credits.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { PromptActivationService } from "./activation.service.js";
 import { PromptListService } from "./prompt-list.service.js";
@@ -127,8 +130,35 @@ export class PromptsController {
   activate(
     @Param("id") projectId: string,
     @Body(new ZodValidationPipe(activatePromptsRequestSchema)) body: ActivatePromptsRequest,
+    // Owner decision 2026-10-15 (option C): required, and compared with the recomputed figure, when the charge is
+    // above 0. NOT `@Credits(...)`: that is a flat price quoted before the handler, and this one is known only
+    // inside it, under the project lock.
+    @Headers(CONFIRMED_CREDITS_HEADER) confirmed?: string | string[],
   ): Promise<ActivatePromptsResponse> {
-    return this.activation.activate(projectId, body);
+    return this.activation.activate(projectId, body, confirmed);
+  }
+
+  // STORY-046 AC3 - the QUOTE half of the two-step guard rail. Free, read-only (no reservation, no ledger row, no
+  // write), same body as `activate`. `credits` is the figure to echo in `X-Nominara-Confirmed-Credits`.
+  //
+  // A POST because it carries the id list in a body, like `runs/estimate`; no `@Idempotent()` for the same reason
+  // that route has none (a repeated quote is a repeated read). Audited because the interceptor refuses any mutating
+  // method without it, and "what was the operator quoted" is the question a disputed charge asks.
+  @Post("activate/preview")
+  @HttpCode(200)
+  @RequirePermission("prompt:write")
+  @ProjectParam("id")
+  @Audit({ action: "prompt.activation_previewed", resourceType: "project" })
+  @ApiContract({
+    operationId: "previewPromptActivation",
+    requestSchema: activatePromptsRequestSchema,
+    responseSchema: activatePromptsPreviewResponseSchema,
+  })
+  previewActivation(
+    @Param("id") projectId: string,
+    @Body(new ZodValidationPipe(activatePromptsRequestSchema)) body: ActivatePromptsRequest,
+  ): Promise<ActivatePromptsPreviewResponse> {
+    return this.activation.preview(projectId, body);
   }
 
   // STORY-134 — §3: "filter by engine, topic cluster, archetype, funnel,

@@ -177,6 +177,21 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     }
   }, 120_000);
 
+  it("STORY-046 AC3 · the seed stamps the activation fact on every prompt it writes: a demo prompt is activated-and-free, never an orphan", async () => {
+    const workspaceId = await createWorkspace("business");
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+
+    const rows = (
+      await client.query(
+        `SELECT first_activated_at, activation_credits FROM tracked_prompts
+          WHERE workspace_id = $1 AND generator_meta ->> 'demo_seed_marker' = 'demo-seed'`,
+        [workspaceId],
+      )
+    ).rows;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => r.first_activated_at !== null && Number(r.activation_credits) === 0)).toBe(true);
+  }, 120_000);
+
   it.each([
     ["growth", "twice_weekly", (30 * 24 * 60 * 60 * 1000) / 8],
     ["business", "daily", 24 * 60 * 60 * 1000],

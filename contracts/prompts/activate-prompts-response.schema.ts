@@ -52,22 +52,21 @@ export const activatePromptsResponseSchema = z
     prompts_active: z.number().int().nonnegative(),
     prompts_cap: z.number().int().nonnegative(),
     /**
-     * A LITERAL ZERO, and the literal is the point.
+     * What this call debited, in whole credits.
      *
-     * `plans-and-entitlements.md` §4 prices activation at "1 per prompt
-     * activated" beyond the free 10, and nothing can charge yet:
-     * `CreditGuard` is a pass-through no-op whose own comment puts the
-     * reserve/commit path in EPIC-10, and wallets are not provisioned. §4
-     * and §10's `FR-CRD-06` also disagree about whether activating an
-     * archived candidate later costs anything — see the story.
+     * `plans-and-entitlements.md` section 4: "Prompt generation beyond the free
+     * 10 - 1 per prompt activated. A rejected prompt is not charged. Typing a
+     * prompt manually is 0." Owner decision 2026-10-14: a generated prompt is
+     * charged ONCE, at its first activation beyond the project's free
+     * `prompts.free_at_creation`; re-activating one, replaying the call, a
+     * manual prompt and a rejected candidate are all 0.
      *
-     * Typed as `0` rather than a number so a future edit that introduces the
-     * debit CANNOT ship without changing this contract, which is the same
-     * device `discover.ts` uses for its own "discovery charges nothing".
-     * Reporting a plain `number` here would let a charge appear silently in
-     * a field nobody re-reviewed.
+     * This was the literal `0` until the debit existed (story decision 6: a
+     * charge could not ship without changing this contract). It is a plain
+     * non-negative integer now, and `0` stays the honest answer for every free
+     * activation - never absent, never null.
      */
-    credits_charged: z.literal(0),
+    credits_charged: z.number().int().nonnegative(),
   })
   .strict();
 
@@ -94,7 +93,8 @@ export const promptResponseSchema = z
     supersedes_prompt_id: z.string().uuid().nullable(),
     prompts_active: z.number().int().nonnegative(),
     prompts_cap: z.number().int().nonnegative(),
-    credits_charged: z.literal(0),
+    /** What this change debited: non-zero only when it moved a generated prompt out of `archived` for the first time, beyond the free allowance. */
+    credits_charged: z.number().int().nonnegative(),
   })
   .strict();
 

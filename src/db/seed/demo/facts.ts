@@ -214,10 +214,13 @@ async function ensurePrompts(tx: ClientBase, project: DemoProjectRef, count: num
     }
     if (headroom <= 0) continue; // the plan's cap is already full — an honestly smaller demo prompt set, never one that exceeds it
     const id = uuidV7();
+    // STORY-046 AC3: inserted `active`, so it is activated-and-free by construction; an unstamped active row would be an
+    // orphan the charge rule has no fact for.
     await tx.query(
       `INSERT INTO tracked_prompts
-         (id, workspace_id, project_id, generation_source, text, text_hash, intent_archetype, funnel_stage, status, generator_meta)
-       VALUES ($1,$2,$3,'generated',$4,sha256($5::bytea),$6,$7,'active',$8::jsonb)`,
+         (id, workspace_id, project_id, generation_source, text, text_hash, intent_archetype, funnel_stage, status, generator_meta,
+          first_activated_at, activation_credits)
+       VALUES ($1,$2,$3,'generated',$4,sha256($5::bytea),$6,$7,'active',$8::jsonb, now(), 0)`,
       // `text` is bound TWICE ($4 and $5) rather than referencing $4 a second
       // time under a `::bytea` cast — Postgres's parser refuses to deduce two
       // different types for one parameter number within a single statement

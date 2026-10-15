@@ -2,6 +2,7 @@ import type { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { afterCommit } from "../../tenancy/tenant-context.js";
+import type { QueueProducer } from "../queue/queue-producer.js";
 
 // NEW-D-7 checkpoint-3 finding 4 / owner decision 4 — the ONE place a debit asks for an auto top-up.
 //
@@ -20,6 +21,12 @@ export type EnqueueAutoTopup = (
   payload: Record<string, unknown>,
   idempotencyKey: string,
 ) => Promise<unknown>;
+
+/** The enqueue function for a queue producer, or `undefined` when the process has none (the producer is optional). */
+export function autoTopupEnqueuerFor(producer: QueueProducer | undefined): EnqueueAutoTopup | undefined {
+  if (producer === undefined) return undefined;
+  return (queue, workspaceId, payload, idempotencyKey) => producer.enqueueTenantJob(queue, workspaceId, payload, { idempotencyKey });
+}
 
 /**
  * One key per workspace per UTC minute: a burst of debits while the balance is low queues one job, and a

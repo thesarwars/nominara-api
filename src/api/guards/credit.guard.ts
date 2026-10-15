@@ -9,6 +9,8 @@ import {
   type ReservationClaim,
 } from "../../lib/credits/ledger.js";
 import { provisionWalletWithGrant } from "../../lib/credits/balance.js";
+import { CONFIRMED_CREDITS_HEADER, parseConfirmedCredits, requireConfirmedCredits } from "../../lib/credits/confirmed-credits.js";
+import { includedGrantOf, isReservedLedgerKey } from "../../lib/credits/debit.js";
 import { purchasableOptions, reserveCredits, readWallet } from "../../lib/credits/wallet.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
@@ -121,7 +123,7 @@ export interface CreditReservation {
 }
 
 /** §1's header, verbatim. Lowercased because Node normalises incoming header names. */
-export const CONFIRMED_CREDITS_HEADER = "x-nominara-confirmed-credits";
+export { CONFIRMED_CREDITS_HEADER };
 
 @Injectable()
 export class CreditGuard implements CanActivate {
@@ -248,6 +250,15 @@ export class CreditGuard implements CanActivate {
         details: {
           issues: [{ path: ["idempotency-key"], message: "required on a credit-priced route" }],
         },
+      });
+    }
+
+    // The inline debits (prompt activation) write their own ledger keys in this namespace from inside a handler. A
+    // client-chosen key here could collide with one, turning a genuine charge into a refused append.
+    if (isReservedLedgerKey(idempotencyKey)) {
+      throw new ValidationFailedError({
+        message: "this Idempotency-Key is in a namespace reserved for the server",
+        details: { issues: [{ path: ["idempotency-key"], message: "must not start with a reserved internal prefix" }] },
       });
     }
 
@@ -525,24 +536,8 @@ export class CreditGuard implements CanActivate {
    * check unfalsifiable.
    */
   private confirmedCredits(request: CreditScopedRequest): number {
-    const raw = request.headers?.[CONFIRMED_CREDITS_HEADER];
-    const value = Array.isArray(raw) ? raw[0] : raw;
-    if (value === undefined || value.trim() === "") {
-      throw new ValidationFailedError({
-        message: `this action is priced in credits and requires the ${CONFIRMED_CREDITS_HEADER} header`,
-        details: { issues: [{ path: [CONFIRMED_CREDITS_HEADER], message: "required on a credit-priced route" }] },
-      });
-    }
-    // `Number()` rather than `parseInt`: "200abc" must not read as 200. A
-    // header that is not exactly an integer was not echoed from a quote.
-    const parsed = Number(value.trim());
-    if (!Number.isInteger(parsed) || parsed < 0) {
-      throw new ValidationFailedError({
-        message: `${CONFIRMED_CREDITS_HEADER} must be a non-negative integer`,
-        details: { issues: [{ path: [CONFIRMED_CREDITS_HEADER], message: "must be a non-negative integer" }] },
-      });
-    }
-    return parsed;
+    // The parser is shared with the inline-debit routes (prompt activation): one definition of a well-formed header.
+    return requireConfirmedCredits(parseConfirmedCredits(request.headers?.[CONFIRMED_CREDITS_HEADER]));
   }
 
   /** Re-read which of a key's attempts is open, after losing a race to open one. */
@@ -589,17 +584,6 @@ class AlreadyReservedError extends Error {}
 const LEDGER_ACTION: Readonly<Record<CreditAction, LedgerActionCode>> = Object.freeze({
   deep_scan: "manual_scan",
 });
-
-/**
- * The plan's included grant, for a wallet that does not exist yet.
- *
- * Zero when the plan does not publish one: a wallet provisioned at zero
- * refuses correctly, where guessing a figure would hand out credits.
- */
-function includedGrantOf(entitlements: Readonly<Record<string, { readonly value: unknown }>>): number {
-  const value = entitlements["credits.included_per_cycle"]?.value;
-  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : 0;
-}
 
 /** The request's `Idempotency-Key`, so a redelivery settles the same reservation. */
 function idempotencyKeyOf(request: CreditScopedRequest): string | undefined {

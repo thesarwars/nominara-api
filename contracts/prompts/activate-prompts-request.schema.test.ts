@@ -42,7 +42,7 @@ describe("STORY-046 · activatePromptsResponse", () => {
     coverage: { activated: 8, generated: 15 },
     prompts_active: 33,
     prompts_cap: 40,
-    credits_charged: 0 as const,
+    credits_charged: 0,
   };
 
   it("accepts a full response", () => {
@@ -64,13 +64,18 @@ describe("STORY-046 · activatePromptsResponse", () => {
     expect(activatePromptsResponseSchema.safeParse(replay).success).toBe(true);
   });
 
-  it("types `credits_charged` as the LITERAL 0", () => {
-    // The device `discover.ts` uses for its own "discovery charges nothing":
-    // a future edit that introduces the debit cannot ship without changing
-    // this contract. A plain `number` would let a charge appear silently in
-    // a field nobody re-reviewed.
-    expect(activatePromptsResponseSchema.safeParse({ ...base, credits_charged: 1 }).success).toBe(false);
+  it("STORY-046 AC3 — `credits_charged` reports the real charge: a non-negative integer, not the literal 0", () => {
+    // Decision 6 of the story typed this as the literal 0 so that introducing
+    // the debit could not ship without changing the contract. This is that
+    // change. 0 stays valid (a free activation, a replay), and the member is
+    // still never fractional, negative or absent: money is whole credits.
+    expect(activatePromptsResponseSchema.safeParse({ ...base, credits_charged: 2 }).success).toBe(true);
     expect(activatePromptsResponseSchema.safeParse({ ...base, credits_charged: 0 }).success).toBe(true);
+    expect(activatePromptsResponseSchema.safeParse({ ...base, credits_charged: -1 }).success).toBe(false);
+    expect(activatePromptsResponseSchema.safeParse({ ...base, credits_charged: 1.5 }).success).toBe(false);
+    expect(activatePromptsResponseSchema.safeParse({ ...base, credits_charged: "1" }).success).toBe(false);
+    const { credits_charged: _omitted, ...without } = base;
+    expect(activatePromptsResponseSchema.safeParse(without).success).toBe(false);
   });
 
   it("rejects an undocumented summary member", () => {
@@ -90,11 +95,17 @@ describe("STORY-046 · promptResponse", () => {
     supersedes_prompt_id: null,
     prompts_active: 33,
     prompts_cap: 40,
-    credits_charged: 0 as const,
+    credits_charged: 0,
   };
 
   it("accepts a plain status change", () => {
     expect(promptResponseSchema.safeParse(base).success).toBe(true);
+  });
+
+  it("STORY-046 AC3 — PATCH reports the real charge too: the second door into activation shares the contract", () => {
+    expect(promptResponseSchema.safeParse({ ...base, credits_charged: 1 }).success).toBe(true);
+    expect(promptResponseSchema.safeParse({ ...base, credits_charged: -1 }).success).toBe(false);
+    expect(promptResponseSchema.safeParse({ ...base, credits_charged: 0.5 }).success).toBe(false);
   });
 
   it("carries `supersedes_prompt_id` for an EDIT, where prompt_id is a NEW row", () => {

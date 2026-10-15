@@ -14,7 +14,7 @@ import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 // prompts with eight slots left is REFUSED, not partially served. Two
 // reasons, and the second is the one that matters: a partial activation
 // gives the customer no way to say which eight they wanted, and once
-// activation charges (blocked — see the story) a partial success is a
+// activation charges (STORY-046 AC3) a partial success is a
 // partial debit for an outcome nobody asked for.
 
 export const activatePromptsRequestSchema = z
