@@ -15,6 +15,22 @@ const requiredString = z
   .string()
   .refine((value) => value.trim().length > 0, { message: "must not be empty or whitespace-only" });
 
+const EMAIL_ADDRESS = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
+
+/** A bare email address. Deliberately loose: Resend, not this regex, is the authority on deliverability. */
+export function isEmailAddress(value: string): boolean {
+  return EMAIL_ADDRESS.test(value);
+}
+
+/** `address` or `Display Name <address>` — the two shapes Resend accepts for `from`. */
+export function isSenderIdentity(value: string): boolean {
+  const bracketed = /^[^<>]+<([^<>]+)>$/.exec(value);
+  return isEmailAddress(bracketed ? bracketed[1]!.trim() : value);
+}
+
+// A compose file passes `KEY=` for an unset optional variable; that is "not configured", not a malformed value.
+const blankIsUnset = (value: unknown): unknown => (typeof value === "string" && value.trim() === "" ? undefined : value);
+
 // STORY-030 — "deploy" added alongside the original six: deploy.cms
 // (src/lib/queue/topology.ts) is a documented worker group too, and
 // WORKER_GROUP must accept every group that actually owns a queue.
@@ -219,6 +235,27 @@ export const envSchema = z
     // independent checks, because one that can be refactored away is the
     // failure this codebase keeps finding.
     OTP_DEV_LOG_CODES: z.literal("true").optional(),
+
+    // Group C — real email through Resend (https://resend.com/docs/api-reference/emails/send-email). When BOTH
+    // RESEND_API_KEY and RESEND_FROM_EMAIL are set the EMAIL_SENDER port is bound to ResendEmailSenderAdapter;
+    // otherwise today's behaviour (logging adapter, or the OTP_DEV_LOG_CODES dev logger) is unchanged.
+    // RESEND_FROM_EMAIL is either `address` or `Display Name <address>`; it must be a sender the Resend account may use
+    // (the shared `onboarding@resend.dev` test sender, or an address on a verified domain).
+    RESEND_API_KEY: z.preprocess(blankIsUnset, z.string().trim().optional()),
+    RESEND_FROM_EMAIL: z.preprocess(
+      blankIsUnset,
+      z.string().trim().refine(isSenderIdentity, "must be an email address or `Display Name <address>`").optional(),
+    ),
+    // DEV-ONLY OVERRIDE. Redirects EVERY outgoing message to this one address. Resend's shared test sender can only
+    // deliver to the account owner's own address, so a developer sets this to that address and every code, alert and
+    // report lands in one inbox. Refused at boot under NODE_ENV=production (see the superRefine below) and again by the
+    // adapter's constructor.
+    RESEND_TO_EMAIL: z.preprocess(blankIsUnset, z.string().trim().refine(isEmailAddress, "must be an email address").optional()),
+
+    // Group C — where operational alerts (dead-letter depth, engine blackout, parse alarms, audit-chain and wallet
+    // mismatches) are emailed, through the same EMAIL_SENDER. Unset: alerts keep their log line and counter and go
+    // nowhere else (one line at boot says so).
+    ALERT_EMAIL_TO: z.preprocess(blankIsUnset, z.string().trim().refine(isEmailAddress, "must be an email address").optional()),
 
     // STORY-077 R4 / STORY-013 — switches on the nightly retention purge (`retention.purge`), which HARD-DELETES
     // soft-deleted projects past 30 days and workspaces past their deletion grace. OFF unless exactly "true": a typo,
@@ -429,6 +466,22 @@ export const envSchema = z
             "DATABASE_URL must be the direct Postgres connection, not the pgBouncer pooler (a session advisory lock cannot survive transaction pooling); the pooler belongs in DATABASE_URL_POOLED.",
         });
       }
+    }
+    if (env.NODE_ENV === "production" && env.RESEND_TO_EMAIL !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["RESEND_TO_EMAIL"],
+        message:
+          "RESEND_TO_EMAIL redirects every outgoing email to one address and is a development-only override; it cannot be set under NODE_ENV=production.",
+      });
+    }
+    if (env.NODE_ENV === "production" && (env.RESEND_API_KEY === undefined) !== (env.RESEND_FROM_EMAIL === undefined)) {
+      ctx.addIssue({
+        code: "custom",
+        path: [env.RESEND_API_KEY === undefined ? "RESEND_API_KEY" : "RESEND_FROM_EMAIL"],
+        message:
+          "RESEND_API_KEY and RESEND_FROM_EMAIL must be set together: one without the other would fall back to a sender that delivers nothing.",
+      });
     }
     if (env.NODE_ENV === "production" && env.OTP_DEV_LOG_CODES === "true") {
       ctx.addIssue({

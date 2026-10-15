@@ -12,6 +12,8 @@ export interface EmailMessage {
   readonly to: string;
   readonly subject: string;
   readonly textBody: string;
+  /** Optional HTML alternative. Nothing renders one today (no email template/branding exists); the Resend adapter passes it through when present. */
+  readonly htmlBody?: string;
 }
 
 export interface EmailSender {
