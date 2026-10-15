@@ -822,6 +822,72 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
       await replayClean(ws);
     });
 
+    describe("a conversion on the SAME UTC day the free wallet's cycle began (the common path)", () => {
+      const FREE_START = new Date("2026-09-01T03:00:00.000Z");
+      const PAID = (hour: string) => (c: ProviderSubscriptionState): ProviderSubscriptionState => ({
+        ...c,
+        planKey: "starter",
+        currentPeriodStart: new Date(`2026-09-01T${hour}:00:00.000Z`),
+        currentPeriodEnd: new Date(`2026-10-01T${hour}:00:00.000Z`),
+      });
+
+      beforeEach(async () => {
+        await onPlan("free");
+        await db.query("UPDATE subscriptions SET current_period_start = $2, current_period_end = $3 WHERE workspace_id = $1", [
+          ws, FREE_START, new Date("2026-10-01T03:00:00.000Z"),
+        ]);
+      });
+
+      it("STORY-072 AC13 · free to paid hours later the same UTC day lands on exactly the target grant, with no pro-rata (exact)", async () => {
+        const free = 60;
+        const starter = await planGrant("starter");
+        await spend(ws, 20, "job-1"); // 40 left of 60
+
+        const outcome = await apply(ws, PAID("11"), new Date("2026-09-01T11:00:00.000Z"));
+
+        expect(outcome.creditsToppedUp).toBe(0);
+        expect(await balances(ws)).toMatchObject({ included_balance: starter, reserved: 0 });
+        expect(await planChangeGrants(ws), "no pro-rata on top of the roll").toEqual([]);
+        expect(await entries(ws, ["expire"])).toEqual([]);
+        expect(await lifetimeGranted(ws)).toBe(free + starter - 40);
+        await replayClean(ws);
+      });
+
+      it("STORY-072 AC13 · the same with the whole free grant spent (exact)", async () => {
+        const starter = await planGrant("starter");
+        await spend(ws, 60, "job-1");
+
+        await apply(ws, PAID("11"), new Date("2026-09-01T11:00:00.000Z"));
+
+        expect((await balances(ws)).included_balance).toBe(starter);
+        expect(await planChangeGrants(ws)).toEqual([]);
+        await replayClean(ws);
+      });
+
+      it("STORY-072 AC13 · a redelivery of that same-day conversion does not roll or grant again", async () => {
+        const starter = await planGrant("starter");
+        await spend(ws, 20, "job-1");
+        await apply(ws, PAID("11"), new Date("2026-09-01T11:00:00.000Z"));
+        const before = await entries(ws, ["grant", "expire"]);
+
+        await apply(ws, PAID("11"), new Date("2026-09-01T11:30:00.000Z"));
+
+        expect((await balances(ws)).included_balance).toBe(starter);
+        expect(await entries(ws, ["grant", "expire"])).toEqual(before);
+      });
+
+      it("STORY-072 AC13 · an event whose period starts EARLIER the same day than the one on file is not a roll", async () => {
+        const starter = await planGrant("starter");
+        await spend(ws, 20, "job-1");
+        await apply(ws, PAID("11"), new Date("2026-09-01T11:00:00.000Z"));
+        await spend(ws, 5, "job-2");
+
+        await apply(ws, PAID("05"), new Date("2026-09-01T12:00:00.000Z"));
+
+        expect((await balances(ws)).included_balance).toBe(starter - 5);
+      });
+    });
+
     it("STORY-072 AC13 · PAID to PAID upgrade with a new period lands on exactly the target grant, with no pro-rata on top (exact)", async () => {
       const starter = await onPlan("starter");
       const growth = await planGrant("growth");
