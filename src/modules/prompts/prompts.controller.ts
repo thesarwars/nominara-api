@@ -147,6 +147,7 @@ export class PromptsController {
   @Post("activate/preview")
   @HttpCode(200)
   @RequirePermission("prompt:write")
+  @ProjectParam("id")
   @Audit({ action: "prompt.activation_previewed", resourceType: "project" })
   @ApiContract({
     operationId: "previewPromptActivation",

@@ -83,10 +83,11 @@ export class PromptLifecycleService {
     // first read only finds the project to lock. Without it a POST .../activate
     // and this PATCH could both take the last free slot.
     const found = await this.load(client, promptId);
+    // The id names a prompt, not a project: a scoped member is checked against the row's own project, BEFORE the
+    // lock, so a caller outside that project's scope cannot hold its row lock. A prompt never changes project.
+    await assertProjectInScope(store.client, found.project_id);
     await client.query("SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE", [found.project_id]);
     const prompt = await this.load(client, promptId);
-    // The id names a prompt, not a project: a scoped member is checked against the row's own project.
-    await assertProjectInScope(store.client, prompt.project_id);
 
     // A SUPERSEDED row is history: the live prompt is the one that replaced it. Changing it would let one question
     // grow a second head (an edit inherits the fact and overwrites `superseded_by`), or let a row the free-allowance
