@@ -421,6 +421,15 @@ export async function applyPlanChange(
     // Step 6b rolled the wallet to the target plan's full grant: a pro-rata top-up on top would mint the same
     // upgrade twice (and `cycle` here is the NEW cycle, whose remaining fraction is ~1).
     creditsNote = "the billing cycle rolled: the wallet was reset to the new plan's grant, so no pro-rata top-up applies";
+  } else if (periodAdvanced) {
+    // ⚠ THE CREDIT FOR A NEW PERIOD BELONGS TO THE ROLL, DEFERRED OR NOT. The period advanced but the wallet did not
+    // roll: either the payment is outstanding (past_due, the roll waits for it and then grants the plan's FULL grant) or
+    // the wallet's own cycle is already current. Pro-rata here would run against the OLD cycle and mint the unpaid
+    // upgrade's difference (~375 credits for starter to growth), and the recovery's roll would then grant the whole
+    // target grant on top of it.
+    creditsNote = paymentOutstanding
+      ? "the new period is unpaid: its credits are granted by the billing-cycle roll when the payment succeeds, so no pro-rata top-up applies"
+      : "the subscription started a new period: its credits belong to the billing-cycle roll, so no pro-rata top-up applies";
   } else if (cycle === undefined) {
     // Wallets are provisioned lazily on first credit use, so a workspace that
     // has never spent has none. Skipping is correct — the first provisioning
