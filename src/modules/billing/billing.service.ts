@@ -293,11 +293,11 @@ export class BillingService {
  *     the running action consumes the lot. Warning someone to spend credits
  *     that are already committed sends them to buy what they do not need.
  *
- *   ⚠ A LAPSED CYCLE HAS NO DEADLINE TO REPORT. Nothing rolls `cycle_end`
- *     until STORY-075/076, so a wallet provisioned in August still names an
- *     August date. Those credits did NOT expire — no writer took them — so
- *     `available` stays true, but when they lapse is genuinely unknown, and a
- *     past date presented as a deadline is the one thing worse than silence.
+ *   ⚠ A LAPSED CYCLE HAS NO DEADLINE TO REPORT. `cycle_end` moves only when the cycle rolls (`rollIncludedCycle`,
+ *     STORY-072, on a subscription period change or a past_due payment finally succeeding). A free wallet, and a
+ *     subscription whose renewal is unpaid, can sit past its `cycle_end` unrolled. Those credits did NOT expire - the
+ *     roll has not run - so `available` stays true, but when they lapse is genuinely unknown, and a past date presented
+ *     as a deadline is the one thing worse than silence.
  */
 async function expiringSoon(
   client: ClientBase,
