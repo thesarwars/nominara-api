@@ -66,6 +66,8 @@ function fakeClient(
           },
         ];
       }
+      // STORY-072 AC13: the carries table the verifier now cross-checks. No fixture carries a hold across a roll.
+      if (sql.includes("FROM credit_hold_carries")) return [];
       if (sql.includes("FROM credit_ledger")) {
         return fixture.ledger.map((row) => ({
           ...row,

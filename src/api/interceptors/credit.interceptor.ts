@@ -12,14 +12,13 @@ import { catchError, from, mergeMap, type Observable } from "rxjs";
 import type { ClientBase, Pool } from "pg";
 import { createPgPool, PG_POOL } from "../../db/pg-pool.js";
 import {
-  appendLedgerEntry,
   ledgerEntryExists,
   reservationActor,
   settlementOf,
 } from "../../lib/credits/ledger.js";
-import { releaseReservation } from "../../lib/credits/settle.js";
+import { commitReservation, releaseReservation } from "../../lib/credits/settle.js";
 import { requestAutoTopupIfBelowThreshold } from "../../lib/credits/auto-topup-request.js";
-import { commitCredits, lockWallet, readWallet } from "../../lib/credits/wallet.js";
+import { lockWallet, readWallet } from "../../lib/credits/wallet.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
@@ -357,7 +356,23 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
         reservation.idempotencyKey,
         reservation.attempt,
       )) ?? reservation.actor;
-    const committed = await commitCredits(store.client, reservation.workspaceId, consumed, reservation.amount);
+    // STORY-072 AC13 (option B): the commit pays a hold that was carried across a cycle roll from its own carry, and
+    // expires the carry's unused remainder. The wallet statement, the `commit` entry and that expiry are one call.
+    //
+    // AC10 — the action, the actor, the project and the reference, which together are the whole of "what spent my
+    // credits?".
+    const committed = await commitReservation(
+      store.client,
+      {
+        workspaceId: reservation.workspaceId,
+        idempotencyKey: reservation.idempotencyKey,
+        attempt: reservation.attempt,
+        credits: reservation.amount,
+        actionCode: reservation.ledgerAction,
+      },
+      consumed,
+      { ...actor, ...usage },
+    );
 
     if (committed === null) {
       // ⚠ THIS FAILS THE REQUEST, and the comment that used to sit here said
@@ -371,20 +386,6 @@ export class CreditInterceptor implements NestInterceptor, OnModuleDestroy {
           `(idempotency key ${reservation.idempotencyKey}); the reservation is no longer held`,
       );
     }
-
-    await appendLedgerEntry(store.client, {
-      workspaceId: reservation.workspaceId,
-      entryType: "commit",
-      actionCode: reservation.ledgerAction,
-      credits: consumed,
-      idempotencyKey: reservation.idempotencyKey,
-      attempt: reservation.attempt,
-      after: committed,
-      // AC10 — the action, the actor, the project and the reference, which
-      // together are the whole of "what spent my credits?".
-      ...actor,
-      ...usage,
-    });
 
     // NEW-D-7 — a debit that leaves the balance under the threshold asks for an auto top-up. A queue job,
     // after this transaction commits; the charge itself is never made here.

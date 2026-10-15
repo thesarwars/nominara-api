@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import { appendLedgerEntry, settlementOf, type LedgerActionCode, type LedgerMovementEntry } from "./ledger.js";
+import { readHoldCarry, settleHoldCarry } from "./hold-carry.js";
 import { commitCredits, lockWallet, readWallet, releaseCredits, type WalletState } from "./wallet.js";
 
 // STORY-073 — the one way a reservation is released, shared by the two
@@ -123,6 +124,11 @@ export async function releaseReservation(
     );
   }
 
+  // STORY-072 AC13 (option B): a hold that carries credits across a cycle roll gives them back to the void when it is
+  // released unspent — they are old-cycle credit and must not outlive the hold. After the release entry, so the
+  // ledger reads "released, then expired" in the order it happened.
+  await settleHoldCarry(tx, reservation.workspaceId, reservation.idempotencyKey, reservation.attempt, 0, "released");
+
   return "released";
 }
 
@@ -135,7 +141,16 @@ export type CommitEntryFields = Partial<
 >;
 
 /**
- * STUB (red commit): the pre-fix behaviour, which knows nothing about a hold carried over a cycle roll.
+ * The commit of a reservation: the wallet statement, the `commit` ledger entry and, for a hold that carries credits
+ * across a cycle roll, the expiry of the carry's unused remainder — all in the caller's transaction.
+ *
+ * STORY-072 AC13 (option B). The commit pays from the hold's own carry first (see `commitCredits`), so an action that
+ * started before the roll is charged once, to the cycle it started in. What the carry still holds when the hold
+ * settles for less than it reserved is expired, as a separate `expire` entry after the `commit` one.
+ *
+ * Returns null when the commit matched no row (the reservation is no longer held); the caller decides what that means.
+ * ⚠ THE CALLER MUST ALREADY HOLD THE WALLET ROW LOCK (this takes it again, which is free): the carry it reads is only
+ * true while nothing else settles a hold.
  */
 export async function commitReservation(
   tx: ClientBase,
@@ -143,9 +158,13 @@ export async function commitReservation(
   consumed: number,
   entry: CommitEntryFields = {},
 ): Promise<WalletState | null> {
-  const committed = await commitCredits(tx, reservation.workspaceId, consumed, reservation.credits);
+  if (!(await lockWallet(tx, reservation.workspaceId))) return null;
+
+  const carry = await readHoldCarry(tx, reservation.workspaceId, reservation.idempotencyKey, reservation.attempt);
+  const committed = await commitCredits(tx, reservation.workspaceId, consumed, reservation.credits, carry);
   if (committed === null) return null;
-  await appendLedgerEntry(tx, {
+
+  const appended = await appendLedgerEntry(tx, {
     workspaceId: reservation.workspaceId,
     entryType: "commit",
     actionCode: reservation.actionCode,
@@ -157,5 +176,22 @@ export async function commitReservation(
     actorType: reservation.actor?.actorType ?? "system",
     ...entry,
   });
-  return committed;
+  if (!appended) {
+    // The balance has moved in this transaction; returning would commit a debit the ledger refused to record.
+    throw new ReservationSettlementError(
+      `the ledger refused a commit entry for workspace ${reservation.workspaceId} ` +
+        `(key ${reservation.idempotencyKey}, attempt ${String(reservation.attempt)}) while holding the wallet lock`,
+    );
+  }
+
+  if (carry.held === 0) return committed;
+  await settleHoldCarry(
+    tx,
+    reservation.workspaceId,
+    reservation.idempotencyKey,
+    reservation.attempt,
+    Math.min(consumed, carry.held),
+    "committed",
+  );
+  return (await readWallet(tx, reservation.workspaceId)) ?? committed;
 }

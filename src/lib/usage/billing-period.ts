@@ -58,8 +58,11 @@ export async function resolveBillingPeriod(
   const result = await tx.query<{ period_start: string | null; period_end: string | null }>(
     `SELECT w.cycle_start::text        AS wallet_start,
             w.cycle_end::text          AS wallet_end,
-            s.current_period_start::date::text AS sub_start,
-            s.current_period_end::date::text   AS sub_end
+            -- ⚠ THE UTC DAY, whatever the session's TimeZone. A bare timestamptz::date uses the session zone, and the
+            -- roll (apply-plan.ts utcDate) names its cycle by the UTC day: in America/Los_Angeles an instant at
+            -- 2026-10-01T00:00Z is 30 September, so the period derivation and the wallet would name different days.
+            (s.current_period_start AT TIME ZONE 'UTC')::date::text AS sub_start,
+            (s.current_period_end   AT TIME ZONE 'UTC')::date::text AS sub_end
        FROM (SELECT $1::uuid AS id) target
        LEFT JOIN credit_wallets w ON w.workspace_id = target.id
        LEFT JOIN LATERAL (

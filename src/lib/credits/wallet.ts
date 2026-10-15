@@ -155,22 +155,34 @@ export async function commitCredits(
   workspaceId: string,
   committed: number,
   reserved: number,
+  carry: { readonly held: number; readonly total: number } = { held: 0, total: 0 },
 ): Promise<WalletState | null> {
   assertNonNegativeInteger(committed, "commit");
   assertPositiveInteger(reserved, "commit reservation");
+  assertNonNegativeInteger(carry.held, "hold carry");
+  assertNonNegativeInteger(carry.total, "carry total");
   if (committed > reserved) {
     throw new Error(`cannot commit ${String(committed)} against a reservation of ${String(reserved)}`);
   }
+  if (carry.held > carry.total) {
+    throw new Error(`a hold cannot carry ${String(carry.held)} credits when every hold together carries ${String(carry.total)}`);
+  }
 
+  // STORY-072 AC13 (option B) — THE DRAW HAS THREE SOURCES, IN THIS ORDER, and the middle one is what keeps a hold
+  // from spending another hold's carry:
+  //   1. the hold's OWN carry (credits it kept across a cycle roll);
+  //   2. the included bucket that is NOT any hold's carry (`included - total carried`), floored at zero;
+  //   3. purchased.
+  // With no carry anywhere ($4 = $5 = 0) this is exactly "included first, then purchased".
   const result = await tx.query<WalletRow>(
     `WITH split AS (
-       SELECT LEAST(included_balance, $2::int) AS from_included,
-              GREATEST($2::int - LEAST(included_balance, $2::int), 0) AS from_purchased
+       SELECT LEAST($4::int, $2::int) AS from_carry,
+              LEAST(GREATEST(included_balance - $5::int, 0), $2::int - LEAST($4::int, $2::int)) AS from_pool
          FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE
      )
      UPDATE credit_wallets w
-        SET included_balance  = w.included_balance  - s.from_included,
-            purchased_balance = w.purchased_balance - s.from_purchased,
+        SET included_balance  = w.included_balance  - s.from_carry - s.from_pool,
+            purchased_balance = w.purchased_balance - ($2::int - s.from_carry - s.from_pool),
             reserved          = w.reserved - $3,
             lifetime_spent    = w.lifetime_spent + $2,
             updated_at        = now()
@@ -179,7 +191,7 @@ export async function commitCredits(
         AND w.reserved >= $3
      RETURNING w.included_balance, w.purchased_balance, w.reserved,
                to_char(w.cycle_end, 'YYYY-MM-DD') AS cycle_end`,
-    [workspaceId, committed, reserved],
+    [workspaceId, committed, reserved, carry.held, carry.total],
   );
 
   const row = result.rows[0];

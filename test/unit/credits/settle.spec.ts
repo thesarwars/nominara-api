@@ -32,6 +32,8 @@ function fakeTx(script: Script): { tx: ClientBase; statements: string[] } {
       const settlement = script.settlement ?? null;
       return settlement === null ? { rows: [], rowCount: 0 } : { rows: [{ entry_type: settlement }], rowCount: 1 };
     }
+    // STORY-072 AC13: closing the hold's carry. These scripts release holds that carry nothing across a cycle roll.
+    if (sql.startsWith("UPDATE credit_hold_carries")) return { rows: [], rowCount: 0 };
     if (sql.startsWith("UPDATE credit_wallets")) return { rows: [], rowCount: 1 };
     if (sql.includes("FROM credit_wallets WHERE workspace_id")) {
       return script.walletVanishes === true

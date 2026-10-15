@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import type { CreditBucket, LedgerEntryType } from "./ledger.js";
+import { assignCarries, carryExpiryKey, readOpenCarries, type OpenHold } from "./hold-carry.js";
 import { readWallet, type WalletState } from "./wallet.js";
 
 // STORY-073 — `NFR-CRD-03`: "Wallet balance is reconstructable by ledger
@@ -111,6 +112,81 @@ function equal(a: BalanceTriple, b: BalanceTriple): boolean {
 type ApplyOutcome = { readonly next: BalanceTriple } | { readonly failure: string };
 
 /**
+ * STORY-072 AC13 (option B) — the holds open at this point of the walk, and what each carries across a cycle roll.
+ *
+ * ⚠ DERIVED FROM THE LEDGER ALONE, never read from `credit_hold_carries`: the table is what the wallet's commit
+ * statement consults, and this is the independent derivation it is checked against (`verifyWorkspaceWallet`). A hold
+ * opens at its `reserve` entry and closes at its `commit` or `release`; a roll (the first entry under
+ * `cycle_roll:<start>`) assigns `min(included, reserved)` credits to the open holds with the same `assignCarries` the
+ * roll used.
+ */
+class HoldBook {
+  private open: { key: string; attempt: number; credits: number; carry: number }[] = [];
+  /** The expiry each settled carried hold is owed, keyed by the ledger key it must be recorded under. */
+  readonly owed = new Map<string, { expected: number; seq: string; entryType: LedgerEntryType; idempotencyKey: string; attempt: number }>();
+  private readonly rolls = new Set<string>();
+
+  reserve(key: string, attempt: number, credits: number): void {
+    this.open.push({ key, attempt, credits, carry: 0 });
+  }
+
+  carryOf(key: string, attempt: number): number {
+    return this.open.find((hold) => hold.key === key && hold.attempt === attempt)?.carry ?? 0;
+  }
+
+  totalCarry(): number {
+    return this.open.reduce((sum, hold) => sum + hold.carry, 0);
+  }
+
+  /** The first entry of a roll anchors it; `balance` is the wallet BEFORE that entry. */
+  roll(rollKey: string, balance: BalanceTriple): void {
+    if (this.rolls.has(rollKey)) return;
+    this.rolls.add(rollKey);
+    const holds: OpenHold[] = this.open.map((hold) => ({
+      idempotencyKey: hold.key,
+      attempt: hold.attempt,
+      credits: hold.credits,
+      carry: hold.carry,
+    }));
+    const assigned = assignCarries(Math.min(balance.included, balance.reserved), holds);
+    assigned.forEach((a, i) => {
+      this.open[i]!.carry = a.carry;
+    });
+  }
+
+  /** The hold settled: forget it, and note the expiry its unspent carry is owed. */
+  settle(row: ReplayRow, spentFromCarry: number): void {
+    const index = this.open.findIndex((hold) => hold.key === row.idempotencyKey && hold.attempt === row.attempt);
+    if (index < 0) return;
+    const hold = this.open[index]!;
+    this.open.splice(index, 1);
+    const expected = hold.carry - spentFromCarry;
+    if (expected > 0) {
+      this.owed.set(carryExpiryKey(row.idempotencyKey, row.attempt), {
+        expected,
+        seq: row.seq,
+        entryType: row.entryType,
+        idempotencyKey: row.idempotencyKey,
+        attempt: row.attempt,
+      });
+    }
+  }
+
+  /** The carries still open, for the comparison with `credit_hold_carries`. */
+  carries(): OpenCarry[] {
+    return this.open
+      .filter((hold) => hold.carry > 0)
+      .map((hold) => ({ idempotencyKey: hold.key, attempt: hold.attempt, carry: hold.carry }));
+  }
+}
+
+export interface OpenCarry {
+  readonly idempotencyKey: string;
+  readonly attempt: number;
+  readonly carry: number;
+}
+
+/**
  * Apply one entry to the running balance, mirroring the wallet statement
  * that wrote it.
  *
@@ -118,8 +194,9 @@ type ApplyOutcome = { readonly next: BalanceTriple } | { readonly failure: strin
  * that look like defensive noise. `release` clamps at zero because
  * `releaseCredits` does (`GREATEST(reserved - $2, 0)`), and a replay that
  * went negative where the wallet clamped would report a divergence on a
- * wallet that is perfectly correct. `commit` draws from the included bucket
- * first because `commitCredits` does, and getting that split wrong produces
+ * wallet that is perfectly correct. `commit` draws from the hold's own carry,
+ * then the included bucket that is not any hold's carry, then purchased,
+ * because `commitCredits` does, and getting that split wrong produces
  * the right total across two buckets that are individually both wrong —
  * worse than an obvious error, because the totals still reconcile.
  *
@@ -130,9 +207,11 @@ function apply(
   balance: BalanceTriple,
   row: ReplayRow,
   reserveOf: (key: string, attempt: number) => number | undefined,
+  book: HoldBook,
 ): ApplyOutcome {
   switch (row.entryType) {
     case "reserve":
+      book.reserve(row.idempotencyKey, row.attempt, row.credits);
       return { next: { ...balance, reserved: balance.reserved + row.credits } };
 
     case "commit": {
@@ -144,17 +223,21 @@ function apply(
           failure: "a commit with no reserve entry under the same key and attempt: nothing authorised this charge",
         };
       }
-      const fromIncluded = Math.min(balance.included, row.credits);
+      const carry = book.carryOf(row.idempotencyKey, row.attempt);
+      const fromCarry = Math.min(carry, row.credits);
+      const fromPool = Math.min(Math.max(balance.included - book.totalCarry(), 0), row.credits - fromCarry);
+      book.settle(row, fromCarry);
       return {
         next: {
-          included: balance.included - fromIncluded,
-          purchased: balance.purchased - (row.credits - fromIncluded),
+          included: balance.included - fromCarry - fromPool,
+          purchased: balance.purchased - (row.credits - fromCarry - fromPool),
           reserved: balance.reserved - reserved,
         },
       };
     }
 
     case "release":
+      book.settle(row, 0);
       return { next: { ...balance, reserved: Math.max(balance.reserved - row.credits, 0) } };
 
     case "grant":
@@ -164,6 +247,21 @@ function apply(
     case "adjustment": {
       if (row.bucket === null) {
         return { failure: `a ${row.entryType} entry with no bucket: which balance it moved is unrecorded` };
+      }
+      if ((row.entryType === "grant" || row.entryType === "expire") && row.idempotencyKey.startsWith("cycle_roll:")) {
+        book.roll(row.idempotencyKey, balance);
+      }
+      if (row.entryType === "expire" && row.idempotencyKey.startsWith("hold_carry:")) {
+        const owed = book.owed.get(row.idempotencyKey);
+        if (owed === undefined) {
+          return { failure: "an expiry of a hold's carry that no settled hold accounts for" };
+        }
+        if (owed.expected !== row.credits) {
+          return {
+            failure: `the hold's carry expiry is ${String(row.credits)} credits and the settled hold left ${String(owed.expected)} unspent`,
+          };
+        }
+        book.owed.delete(row.idempotencyKey);
       }
       // `expire` is the one unsigned type that moves a balance DOWN; every
       // other unsigned type moves it up, and `adjustment` carries its own
@@ -180,6 +278,12 @@ function apply(
   }
 }
 
+export interface CarryReplay {
+  readonly result: ReplayResult;
+  /** The carries the ledger implies are still open at the end of the walk (empty on a divergence). */
+  readonly carries: readonly OpenCarry[];
+}
+
 /**
  * Walk a workspace's ledger forward, checking every row's after-state as it
  * goes.
@@ -189,6 +293,10 @@ function apply(
  * integration test.
  */
 export function replayLedger(rows: readonly ReplayRow[]): ReplayResult {
+  return replayLedgerWithCarries(rows).result;
+}
+
+export function replayLedgerWithCarries(rows: readonly ReplayRow[]): CarryReplay {
   // Keyed key-then-attempt rather than by a joined string: a client-supplied
   // `idempotency_key` can contain any character at all, and a separator a
   // key can also contain is a collision waiting for the one customer whose
@@ -202,12 +310,13 @@ export function replayLedger(rows: readonly ReplayRow[]): ReplayResult {
   }
   const reserveOf = (key: string, attempt: number): number | undefined => reserves.get(key)?.get(attempt);
 
+  const book = new HoldBook();
   let balance = ZERO;
   let lifetime = NO_LIFETIME;
   let applied = 0;
 
   for (const row of rows) {
-    const outcome = apply(balance, row, reserveOf);
+    const outcome = apply(balance, row, reserveOf, book);
     const divergence =
       "failure" in outcome
         ? { replayed: balance, reason: outcome.failure }
@@ -220,17 +329,20 @@ export function replayLedger(rows: readonly ReplayRow[]): ReplayResult {
 
     if (divergence !== null) {
       return {
-        balance,
-        lifetime,
-        entries: applied,
-        divergence: {
-          seq: row.seq,
-          entryType: row.entryType,
-          idempotencyKey: row.idempotencyKey,
-          attempt: row.attempt,
-          recorded: row.after,
-          replayed: divergence.replayed,
-          reason: divergence.reason,
+        carries: [],
+        result: {
+          balance,
+          lifetime,
+          entries: applied,
+          divergence: {
+            seq: row.seq,
+            entryType: row.entryType,
+            idempotencyKey: row.idempotencyKey,
+            attempt: row.attempt,
+            recorded: row.after,
+            replayed: divergence.replayed,
+            reason: divergence.reason,
+          },
         },
       };
     }
@@ -240,7 +352,30 @@ export function replayLedger(rows: readonly ReplayRow[]): ReplayResult {
     applied += 1;
   }
 
-  return { balance, lifetime, entries: applied, divergence: null };
+  // A settled hold that carried credits is owed an expiry for the unspent part, written in the same transaction as the
+  // settlement: a walk that ends with one still owed is a carry that outlived its hold.
+  const owed = [...book.owed.values()][0];
+  if (owed !== undefined) {
+    return {
+      carries: [],
+      result: {
+        balance,
+        lifetime,
+        entries: applied,
+        divergence: {
+          seq: owed.seq,
+          entryType: owed.entryType,
+          idempotencyKey: owed.idempotencyKey,
+          attempt: owed.attempt,
+          recorded: balance,
+          replayed: balance,
+          reason: `the hold settled with ${String(owed.expected)} credits of carry unspent and the ledger never expired them: a carry outlived its hold`,
+        },
+      },
+    };
+  }
+
+  return { carries: book.carries(), result: { balance, lifetime, entries: applied, divergence: null } };
 }
 
 /**
@@ -397,7 +532,7 @@ export async function verifyWorkspaceWallet(tx: ClientBase, workspaceId: string)
     };
   }
 
-  const result = replayLedger(rows);
+  const { result, carries } = replayLedgerWithCarries(rows);
   if (result.divergence !== null) {
     return {
       workspaceId,
@@ -421,6 +556,21 @@ export async function verifyWorkspaceWallet(tx: ClientBase, workspaceId: string)
     };
   }
 
+  // STORY-072 AC13 (option B): the carries the wallet's commit statement consults must be the ones the ledger implies.
+  // A carry that is too small would charge a hold's customer twice, one that is too large would let old-cycle credit
+  // outlive its hold, and a wrong one on a wallet whose balances still add up is invisible to everything above.
+  const carryDifference = firstCarryDifference(carries, await readOpenCarries(tx, workspaceId));
+  if (carryDifference !== null) {
+    return {
+      workspaceId,
+      seq: null,
+      reason: `the ledger replays cleanly and the open hold carries in credit_hold_carries differ from what it implies: ${carryDifference}`,
+      wallet: actual,
+      replayed: result.balance,
+      counter: null,
+    };
+  }
+
   // The balances agree. The lifetime totals are checked SECOND and reported
   // separately because they mean something different: a spendable balance
   // that is wrong is the customer's money, and a lifetime total that is
@@ -436,6 +586,18 @@ export async function verifyWorkspaceWallet(tx: ClientBase, workspaceId: string)
     replayed: result.balance,
     counter,
   };
+}
+
+function firstCarryDifference(implied: readonly OpenCarry[], stored: readonly OpenCarry[]): string | null {
+  const keyOf = (c: OpenCarry): string => JSON.stringify([c.idempotencyKey, c.attempt]);
+  const stores = new Map(stored.map((c) => [keyOf(c), c.carry]));
+  for (const c of implied) {
+    const have = stores.get(keyOf(c)) ?? 0;
+    if (have !== c.carry) return `a hold should carry ${String(c.carry)} credits and the table holds ${String(have)}`;
+    stores.delete(keyOf(c));
+  }
+  const extra = [...stores.values()][0];
+  return extra === undefined ? null : `the table carries ${String(extra)} credits for a hold the ledger says carries none`;
 }
 
 function firstCounterMismatch(wallet: LifetimeCounters, replayed: LifetimeCounters): CounterMismatch | null {

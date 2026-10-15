@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { expireCredits, grantCredits } from "./balance.js";
+import { assignCarries, openHolds, writeCarries } from "./hold-carry.js";
 import type { WalletState } from "./wallet.js";
 
 // STORY-072 AC13 — the billing-cycle roll.
@@ -17,9 +18,9 @@ import type { WalletState } from "./wallet.js";
 // customer-visible "your 400 unused credits expired" would have no record to point at. `grant` G then `expire` I
 // (I = what the bucket held) lands the bucket on exactly G and leaves both movements explicable.
 //
-// ⚠ GRANT FIRST, EXPIRE SECOND, and it is the order that matters. `ck_wallet_reserved` is immediate, so expiring
-// first could momentarily leave `reserved` above `included + purchased` and fail the whole roll on a wallet that is
-// perfectly healthy once the grant lands.
+// ⚠ GRANT FIRST, EXPIRE SECOND, and it is the order that matters. The expiry is the larger of the two movements for a
+// wallet that holds a lot, and the grant landing first keeps every intermediate state a state the schema's CHECKs
+// accept; the replay also anchors on whichever of the two entries comes first (see `replay.ts`).
 //
 // ⚠ WHY THE GATE IS THE WALLET'S OWN `cycle_start`, read under the row lock. A replayed webhook, a stale event for an
 // earlier period and two concurrent deliveries all ask the same question — "is this cycle newer than the one on file"
@@ -27,34 +28,48 @@ import type { WalletState } from "./wallet.js";
 // gate says "roll" and the ledger says "already done", the two disagree about history, and that REFUSES instead of
 // half-applying (a refused entry is `applied: false`, never an outcome to shrug at).
 //
-// RESERVATIONS ARE NEVER TOUCHED. `reserved` is not read as a balance and never written here, so a hold taken before
-// the roll commits or releases against the new cycle exactly as it would have. The specification does not say
-// whether an in-flight hold should be paid from the old cycle's credits or the new grant; the literal reading (the
-// bucket is RESET to the grant, so the commit debits the new grant) is what happens, and it is recorded in
-// docs-pending/STORY-072 as the one policy question. The only case that cannot be literal is a hold larger than
-// what the wallet holds after the reset, which `ck_wallet_reserved` makes unrepresentable: that refuses the whole
-// roll (retryable — holds settle within minutes) instead of trimming or releasing someone's reservation.
+// ⚠ RESERVATIONS IN FLIGHT KEEP THEIR HOLD (owner decision 2026-10-15, option B). The roll does NOT reset the whole
+// bucket: `min(included, reserved)` credits — the part that backs a hold still open — are the CARRY and stay in the
+// bucket with their holds (`hold-carry.ts`). Only `included - carry` is unused, and only that expires. The bucket
+// therefore sits at `grant + carry` until the holds settle: a commit pays from the carry, a release (or the unspent
+// part of a partial commit) expires it at that moment, so the customer pays an in-flight action once, from the cycle
+// it started in. Literal reset charged it twice (grant 1000, spend 300, hold 200, roll to 1200: committing the hold
+// ended on 1000, where committing first ends on 1200).
+//
+// The carry can never exceed what `ck_wallet_reserved` needs, so the roll no longer has a refusal case: after it the
+// bucket holds `grant + carry` where `carry = min(included, reserved)`, and `reserved <= carry + purchased` by
+// construction. (`CycleRollBlockedError`, which refused a hold larger than the new grant, is gone with it.)
+//
+// A plan UPGRADE that carries a new period applies §5's conversion rule: the unheld credits CARRY INTO the new grant
+// ("remaining credits carry into `included_balance` up to the new grant") instead of expiring and being re-granted, so
+// the ledger says "granted what was missing", not "expired 40, granted 450".
 
 export interface CycleRollRequest {
   readonly workspaceId: string;
   /** The plan's `credits_per_cycle` for the cycle that is starting. */
   readonly grant: number;
+  /**
+   * §5 "Free → paid conversion": the credits left unheld CARRY INTO the new grant (up to it) instead of expiring.
+   * Set for an upgrade; a renewal and a downgrade reset.
+   */
+  readonly carryUnused?: boolean;
   /** `YYYY-MM-DD`, UTC — `credit_wallets.cycle_start` / `cycle_end` are `date`. */
   readonly cycleStart: string;
   readonly cycleEnd: string;
 }
 
 export type CycleRollOutcome =
-  | { readonly rolled: true; readonly expired: number; readonly granted: number; readonly wallet: WalletState }
+  | {
+      readonly rolled: true;
+      /** What the roll expired: the unused credits that were not held and did not carry into the grant. */
+      readonly expired: number;
+      /** What the `grant` entry recorded: the grant less whatever carried into it. */
+      readonly granted: number;
+      /** What stayed in the bucket with the holds open at the roll. */
+      readonly carried: number;
+      readonly wallet: WalletState;
+    }
   | { readonly rolled: false; readonly reason: "no_wallet" | "not_newer" };
-
-/** A live reservation is larger than the wallet would hold after the reset: retry once holds settle. */
-export class CycleRollBlockedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "CycleRollBlockedError";
-  }
-}
 
 const logger = new Logger("cycle-roll");
 const tracer = trace.getTracer("nominara.credits");
@@ -85,6 +100,7 @@ export async function rollIncludedCycle(tx: ClientBase, request: CycleRollReques
       if (outcome.rolled) {
         span.setAttribute("nominara.credits.cycle_roll.expired_credits", outcome.expired);
         span.setAttribute("nominara.credits.cycle_roll.granted_credits", outcome.granted);
+        span.setAttribute("nominara.credits.cycle_roll.carried_credits", outcome.carried);
       }
       incrementCounter("nominara_credits_cycle_roll_total", { outcome: outcome.rolled ? "rolled" : outcome.reason });
       if (outcome.rolled) {
@@ -95,6 +111,7 @@ export async function rollIncludedCycle(tx: ClientBase, request: CycleRollReques
           cycle_start: request.cycleStart,
           expired_credits: outcome.expired,
           granted_credits: outcome.granted,
+          carried_credits: outcome.carried,
         });
       }
       return outcome;
@@ -121,12 +138,13 @@ async function roll(tx: ClientBase, request: CycleRollRequest): Promise<CycleRol
   if (wallet === undefined) return { rolled: false, reason: "no_wallet" };
   if (!wallet.newer) return { rolled: false, reason: "not_newer" };
 
-  if (wallet.reserved > grant + wallet.purchased_balance) {
-    throw new CycleRollBlockedError(
-      `workspace ${workspaceId} holds ${String(wallet.reserved)} credits in live reservations, more than the ` +
-        `${String(grant + wallet.purchased_balance)} it would hold after the cycle reset: retry once they settle`,
-    );
-  }
+  // Option B: what backs a hold stays with it; everything else in the bucket is unused. An upgrade carries the unused
+  // credits into the new grant (§5 conversion) instead of expiring them.
+  const carried = Math.min(wallet.included_balance, wallet.reserved);
+  const unused = wallet.included_balance - carried;
+  const carriedIn = request.carryUnused === true ? Math.min(unused, grant) : 0;
+  const toGrant = grant - carriedIn;
+  const toExpire = unused - carriedIn;
 
   // Cycle dates first, so every ledger snapshot below carries the NEW `cycle_end`. The counter restarts here
   // (EC-48: it resets only at cycle roll).
@@ -145,14 +163,19 @@ async function roll(tx: ClientBase, request: CycleRollRequest): Promise<CycleRol
     referenceType: "cycle_roll",
   };
 
-  const unused = wallet.included_balance;
-  let granted = 0;
-  if (grant > 0) {
-    if (!(await grantCredits(tx, attribution, grant)).applied) throw disagreement(workspaceId, "grant", request);
-    granted = grant;
+  // Which hold keeps how much. Written ONLY when the roll leaves a ledger entry for the replay to anchor on (a grant or an
+  // expiry under this roll's key): a plan with no grant and a bucket that is entirely held writes neither, and then the
+  // holds simply settle as they always did.
+  if (toGrant > 0 || toExpire > 0) {
+    const holds = await openHolds(tx, workspaceId);
+    await writeCarries(tx, workspaceId, request.cycleStart, holds, assignCarries(carried, holds));
   }
-  if (unused > 0) {
-    if (!(await expireCredits(tx, attribution, "included", unused)).applied) {
+
+  if (toGrant > 0) {
+    if (!(await grantCredits(tx, attribution, toGrant)).applied) throw disagreement(workspaceId, "grant", request);
+  }
+  if (toExpire > 0) {
+    if (!(await expireCredits(tx, attribution, "included", toExpire)).applied) {
       throw disagreement(workspaceId, "expire", request);
     }
   }
@@ -165,8 +188,9 @@ async function roll(tx: ClientBase, request: CycleRollRequest): Promise<CycleRol
   const row = after.rows[0]!;
   return {
     rolled: true,
-    expired: unused,
-    granted,
+    expired: toExpire,
+    granted: toGrant,
+    carried,
     wallet: {
       includedBalance: row.included_balance,
       purchasedBalance: row.purchased_balance,
