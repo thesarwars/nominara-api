@@ -214,6 +214,12 @@ export const DLQ_DEPTH_SUSTAINED_MS = 10 * 60 * 1000;
  * swaps in a real adapter without this monitor's logic changing.
  */
 export interface Pager {
+  /**
+   * `message` must be FIXED TEXT PLUS IDs (a queue name, an engine key, a workspace id): it is emailed verbatim (minus
+   * address-shaped text, capped at 200 characters). Never interpolate a customer string — a prompt, a name, an email,
+   * engine output. Free text belongs nowhere in `context` either: only numbers, booleans and the identifier/enum keys on
+   * SAFE_STRING_KEYS (src/lib/alerts/email-alert.adapter.ts) are emailed; every other string becomes "[omitted]".
+   */
   page(message: string, context: Record<string, unknown>): void;
 }
 

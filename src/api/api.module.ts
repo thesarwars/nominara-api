@@ -1,4 +1,5 @@
 import { Module } from "@nestjs/common";
+import { AlertEmailShutdown } from "../lib/alerts/alerts.js";
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from "@nestjs/core";
 import { CanonicalParamsGuard } from "./guards/canonical-params.guard.js";
 import { DbModule } from "../db/db.module.js";
@@ -88,6 +89,8 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     AuditModule,
   ],
   providers: [
+    // Group C — flush in-flight alert emails on graceful shutdown (bounded wait).
+    AlertEmailShutdown,
     // STORY-025 T16 — the idempotency record store, injected into
     // IdempotencyInterceptor. Not a global: only the interceptor uses it.
     IdempotencyStore,

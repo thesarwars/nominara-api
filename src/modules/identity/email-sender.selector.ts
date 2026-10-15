@@ -6,6 +6,7 @@ import { ResendEmailSenderAdapter } from "./adapters/resend-email-sender.adapter
 import type { EmailSender } from "./ports/email-sender.js";
 
 const logger = new Logger("email-sender");
+let warnedHalfConfig = false;
 
 /**
  * STORY-127 — which EmailSender this process runs with.
@@ -35,6 +36,17 @@ export function selectEmailSender(): EmailSender {
       from: env.RESEND_FROM_EMAIL,
       ...(env.RESEND_TO_EMAIL !== undefined ? { toOverride: env.RESEND_TO_EMAIL } : {}),
     });
+  }
+  // Outside production a half-set pair or a lone override is a developer typo, not a refusal: say so once. (Production
+  // refuses the half pair and the override at boot, in env.schema.ts.)
+  if (!warnedHalfConfig && env.NODE_ENV !== "production") {
+    const half = (env.RESEND_API_KEY === undefined) !== (env.RESEND_FROM_EMAIL === undefined);
+    if (half || (env.RESEND_TO_EMAIL !== undefined && (env.RESEND_API_KEY === undefined || env.RESEND_FROM_EMAIL === undefined))) {
+      warnedHalfConfig = true;
+      logger.warn(
+        "Resend is only partly configured (needs BOTH RESEND_API_KEY and RESEND_FROM_EMAIL; RESEND_TO_EMAIL does nothing without them): email is NOT being delivered.",
+      );
+    }
   }
   if (env.OTP_DEV_LOG_CODES === "true" && env.NODE_ENV !== "production") {
     return new DevEmailSenderAdapter();

@@ -30,6 +30,12 @@ import { incrementCounter } from "../telemetry/metrics.js";
 // monitor's 24 hours and the DLQ monitor's once-per-breach sit above/below it on their own. Named for the owner to move.
 
 export const ALERT_EMAIL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+/**
+ * At most this many emails per alert NAME per cooldown window, across all subjects: a verifier run that finds a hundred
+ * broken workspaces sends five emails and a "N more suppressed" line, not a hundred. Not from a reference; named for the
+ * owner to move.
+ */
+export const ALERT_EMAIL_MAX_PER_NAME_PER_WINDOW = 5;
 const MAX_TRACKED_KEYS = 1000;
 const MAX_VALUE_LENGTH = 200;
 
@@ -55,6 +61,12 @@ export interface AlertEmailAdapterOptions {
   readonly to: string;
   readonly clock?: () => number;
   readonly cooldownMs?: number;
+  readonly maxPerNamePerWindow?: number;
+  /**
+   * Whether `sender` really delivers mail (Resend). False for the logging and dev senders: the alert is then counted as
+   * `not_delivered`, never `sent`, and never logged as emailed.
+   */
+  readonly delivers: boolean;
   /** Shown in the body so an alert from staging is not mistaken for production. */
   readonly environment?: string;
 }
@@ -121,6 +133,9 @@ export class EmailAlertAdapter implements Pager {
   private readonly clock: () => number;
   private readonly cooldownMs: number;
   private readonly environment: string;
+  private readonly delivers: boolean;
+  private readonly maxPerName: number;
+  private readonly perName = new Map<string, { windowEndsAt: number; count: number; suppressed: number }>();
   private readonly claimedUntil = new Map<string, number>();
   private readonly pending = new Set<Promise<void>>();
 
@@ -130,6 +145,8 @@ export class EmailAlertAdapter implements Pager {
     this.clock = options.clock ?? Date.now;
     this.cooldownMs = options.cooldownMs ?? ALERT_EMAIL_COOLDOWN_MS;
     this.environment = options.environment ?? "unknown";
+    this.delivers = options.delivers;
+    this.maxPerName = options.maxPerNamePerWindow ?? ALERT_EMAIL_MAX_PER_NAME_PER_WINDOW;
   }
 
   /** The synchronous `Pager` port: fire and forget. A send failure is counted and logged, never thrown into the caller. */
@@ -150,6 +167,18 @@ export class EmailAlertAdapter implements Pager {
   /** Resolves when every in-flight send has settled. For shutdown and for tests. */
   async drain(): Promise<void> {
     while (this.pending.size > 0) await Promise.allSettled([...this.pending]);
+    this.flushSuppressed(this.clock(), true);
+  }
+
+  /** One "N more suppressed" line per alert name whose window has ended (or at drain), then forget the tally. */
+  private flushSuppressed(now: number, all: boolean): void {
+    for (const [name, tally] of this.perName) {
+      if (tally.suppressed > 0 && (all || now >= tally.windowEndsAt)) {
+        logger.warn(`alert email cap: ${tally.suppressed} more suppressed name=${name}`);
+        tally.suppressed = 0;
+      }
+      if (now >= tally.windowEndsAt) this.perName.delete(name);
+    }
   }
 
   private async dispatch(message: string, context: Record<string, unknown>): Promise<void> {
@@ -162,6 +191,23 @@ export class EmailAlertAdapter implements Pager {
       incrementCounter("nominara_alerts_email_total", { outcome: "suppressed" });
       return;
     }
+
+    this.flushSuppressed(now, false);
+    let tally = this.perName.get(rendered.name);
+    if (tally === undefined) {
+      tally = { windowEndsAt: now + this.cooldownMs, count: 0, suppressed: 0 };
+      this.perName.set(rendered.name, tally);
+    }
+    if (tally.count >= this.maxPerName) {
+      if (tally.suppressed === 0) {
+        logger.warn(`alert email cap reached name=${rendered.name} (${this.maxPerName} per window): further emails for it are suppressed`);
+      }
+      tally.suppressed += 1;
+      incrementCounter("nominara_alerts_email_total", { outcome: "suppressed" });
+      return;
+    }
+    tally.count += 1;
+    const counted = tally;
     this.claimedUntil.set(key, now + this.cooldownMs);
     this.prune(now);
 
@@ -169,11 +215,19 @@ export class EmailAlertAdapter implements Pager {
       span.setAttribute("nominara.alerts.name", rendered.name);
       try {
         await this.sender.send({ to: this.to, subject: rendered.subject, textBody: rendered.textBody });
-        span.setAttribute("nominara.alerts.outcome", "sent");
-        incrementCounter("nominara_alerts_email_total", { outcome: "sent" });
-        logger.log(`alert emailed name=${rendered.name} subject_id=${rendered.subjectId}`);
+        if (this.delivers) {
+          span.setAttribute("nominara.alerts.outcome", "sent");
+          incrementCounter("nominara_alerts_email_total", { outcome: "sent" });
+          logger.log(`alert emailed name=${rendered.name} subject_id=${rendered.subjectId}`);
+        } else {
+          // The sender accepted it and delivered it to nobody (logging/dev sender). Never "sent".
+          span.setAttribute("nominara.alerts.outcome", "not_delivered");
+          incrementCounter("nominara_alerts_email_total", { outcome: "not_delivered" });
+          logger.error(`alert NOT delivered (no email provider configured) name=${rendered.name} subject_id=${rendered.subjectId}`);
+        }
       } catch (error) {
         this.claimedUntil.delete(key);
+        counted.count -= 1;
         span.setAttribute("nominara.alerts.outcome", "failed");
         span.setStatus({ code: SpanStatusCode.ERROR });
         incrementCounter("nominara_alerts_email_total", { outcome: "failed" });

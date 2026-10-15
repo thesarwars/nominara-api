@@ -10,10 +10,14 @@ import type { EmailMessage, EmailSender } from "../ports/email-sender.js";
 // (POST https://api.resend.com/emails, Bearer key) over the platform `fetch`. No SDK: one endpoint does not earn a
 // dependency, and the fetch is injectable so every test runs against a fake HTTP layer.
 //
-// WHEN IT RUNS. Never on a request's critical path. EmailOtpService defers the send with setImmediate AFTER its
-// uniform-duration floor has settled, auto-top-up sends from a worker job, and reports from a worker — so the
-// retries and the timeout below add latency to none of them (STORY-016 scenario 3 still holds; see
-// test/integration/identity-email-otp-timing.spec.ts).
+// WHEN IT RUNS. EmailOtpService defers the send with setImmediate AFTER its uniform-duration floor has settled, and
+// auto-top-up sends from a worker job, so the retries and the timeout below add latency to neither (STORY-016
+// scenario 3 still holds; see test/integration/identity-email-otp-resend.spec.ts).
+//
+// ⚠ KNOWN EXCEPTION: ScheduledReportsService.sendNow awaits this inside the request's open tenant transaction (after
+// reserveTierCap has locked a usage_counters row). With retries that can hold the connection and row lock for
+// minutes. Not fixed here: moving the send past COMMIT changes what the delivery record can say. See
+// plans-7day/docs-pending/GROUPC-email-and-alerts.md.
 //
 // FAILURE SEMANTICS. `send` resolves on a 2xx and otherwise rejects with an EmailDeliveryError, which is what the port
 // has always meant (callers catch and log). Only a 429, a 5xx, a network error or a timeout is retried, a bounded
@@ -190,7 +194,12 @@ export class ResendEmailSenderAdapter implements EmailSender {
       return { kind: "sent", id };
     }
 
-    const retryable = response.status === 429 || response.status >= 500;
+    // A 409 `concurrent_idempotent_requests` means our own earlier attempt (same Idempotency-Key) is still in flight at
+    // Resend: wait and retry, the retry will return that attempt's result. Any other 409 is a real conflict.
+    const concurrentIdempotent = response.status === 409 && (await errorNameOf(response)) === "concurrent_idempotent_requests";
+    // Release the connection without reading a body we do not need.
+    await response.body?.cancel().catch(() => {});
+    const retryable = response.status === 429 || response.status >= 500 || concurrentIdempotent;
     return {
       kind: "failed",
       status: response.status,
@@ -213,6 +222,16 @@ export class ResendEmailSenderAdapter implements EmailSender {
 type AttemptOutcome =
   | { kind: "sent"; id: string }
   | { kind: "failed"; status: number | undefined; retryable: boolean; reason: string; retryAfterMs?: number | undefined };
+
+/** The `name` Resend puts in an error body, or undefined if the body is not that shape. Read only for a 409. */
+async function errorNameOf(response: Response): Promise<string | undefined> {
+  try {
+    const body = (await response.json()) as { name?: unknown };
+    return typeof body.name === "string" ? body.name : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Retry-After is delay-seconds or an HTTP date; anything unparseable is treated as absent. */
 function parseRetryAfterMs(header: string | null): number | undefined {

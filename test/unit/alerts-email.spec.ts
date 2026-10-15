@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Logger } from "@nestjs/common";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 import type { EmailMessage, EmailSender } from "../../src/modules/identity/ports/email-sender.js";
-import { EmailAlertAdapter, ALERT_EMAIL_COOLDOWN_MS, renderAlertEmail } from "../../src/lib/alerts/email-alert.adapter.js";
-import { getAlertEmailer, setAlertEmailerForTests, announceAlertRouting } from "../../src/lib/alerts/alerts.js";
+import { EmailAlertAdapter, ALERT_EMAIL_COOLDOWN_MS, ALERT_EMAIL_MAX_PER_NAME_PER_WINDOW, renderAlertEmail } from "../../src/lib/alerts/email-alert.adapter.js";
+import { getAlertEmailer, setAlertEmailerForTests, announceAlertRouting, drainAlertEmails } from "../../src/lib/alerts/alerts.js";
 import {
   DLQ_DEPTH_PAGE_THRESHOLD,
   DLQ_DEPTH_SUSTAINED_MS,
@@ -47,7 +47,7 @@ beforeEach(() => {
   }
   sender = new FakeSender();
   now = 1_700_000_000_000;
-  emailer = new EmailAlertAdapter({ sender, to: TO, clock: () => now, environment: "test" });
+  emailer = new EmailAlertAdapter({ sender, to: TO, clock: () => now, environment: "test", delivers: true });
   setAlertEmailerForTests(emailer);
 });
 
@@ -259,5 +259,107 @@ describe("alert email · every existing page site sends exactly one email for it
     await expect(
       new LoggingPagingNotifier().page({ workspaceId: WORKSPACE_ID, seq: "1", reason: "chain_broken" }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("alert email · honesty about delivery", () => {
+  function metrics(): string[] {
+    return logged.filter((line) => line.includes("nominara_alerts_email_total"));
+  }
+
+  it("a sender that delivers to nobody is counted not_delivered and never logged as emailed", async () => {
+    const quiet = new EmailAlertAdapter({ sender, to: TO, clock: () => now, delivers: false });
+    quiet.page("m", { alertName: "engine_blackout", engineKey: "gemini" });
+    await quiet.drain();
+    expect(metrics().some((l) => l.includes('"outcome":"not_delivered"'))).toBe(true);
+    expect(metrics().some((l) => l.includes('"outcome":"sent"'))).toBe(false);
+    expect(logged.some((l) => l.includes("alert emailed"))).toBe(false);
+    expect(logged.some((l) => l.includes("NOT delivered"))).toBe(true);
+  });
+
+  it("outside production, ALERT_EMAIL_TO without Resend builds a non-delivering emailer, warns once, and its alert is not_delivered", async () => {
+    setAlertEmailerForTests(undefined);
+    process.env.NODE_ENV = "development";
+    process.env.ALERT_EMAIL_TO = TO;
+    delete process.env.RESEND_API_KEY;
+    delete process.env.RESEND_FROM_EMAIL;
+    const built = getAlertEmailer()!;
+    announceAlertRouting();
+    expect(logged.filter((l) => l.includes("alerts are NOT delivered"))).toHaveLength(1);
+    expect(logged.some((l) => l.includes("are emailed to ALERT_EMAIL_TO"))).toBe(false);
+    built.page("m", { alertName: "dlq_depth_sustained", queue: "q" });
+    await built.drain();
+    expect(metrics().some((l) => l.includes('"outcome":"not_delivered"'))).toBe(true);
+    expect(metrics().some((l) => l.includes('"outcome":"sent"'))).toBe(false);
+  });
+
+  it("with Resend configured the alert is counted sent", async () => {
+    setAlertEmailerForTests(undefined);
+    process.env.NODE_ENV = "development";
+    process.env.ALERT_EMAIL_TO = TO;
+    process.env.RESEND_API_KEY = "re_test_PLACEHOLDER";
+    process.env.RESEND_FROM_EMAIL = "Nominara <no-reply@nominara.test>";
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ id: "m" }), { status: 200 })));
+    try {
+      const built = getAlertEmailer()!;
+      built.page("m", { alertName: "dlq_depth_sustained", queue: "q" });
+      await built.drain();
+      expect(metrics().some((l) => l.includes('"outcome":"sent"'))).toBe(true);
+      expect(logged.some((l) => l.includes("are emailed to ALERT_EMAIL_TO through Resend"))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("alert email · per-name cap", () => {
+  it("a verifier run that finds many subjects sends the cap, suppresses the rest, and logs ONE 'N more suppressed' line", async () => {
+    for (let i = 0; i < 12; i += 1) {
+      await emailer.notify("m", { alertName: "audit_chain_mismatch", workspaceId: `ws-${i}` });
+    }
+    await emailer.drain();
+    expect(sender.sent).toHaveLength(ALERT_EMAIL_MAX_PER_NAME_PER_WINDOW);
+    const suppressedMetrics = logged.filter((l) => l.includes("nominara_alerts_email_total") && l.includes('"outcome":"suppressed"'));
+    expect(suppressedMetrics).toHaveLength(12 - ALERT_EMAIL_MAX_PER_NAME_PER_WINDOW);
+    expect(logged.filter((l) => l.includes("7 more suppressed name=audit_chain_mismatch"))).toHaveLength(1);
+  });
+
+  it("is per NAME: another alert still sends", async () => {
+    for (let i = 0; i < 7; i += 1) await emailer.notify("m", { alertName: "audit_chain_mismatch", workspaceId: `ws-${i}` });
+    await emailer.notify("m", { alertName: "wallet_ledger_mismatch", workspaceId: "ws-x" });
+    expect(sender.sent.filter((m) => m.subject.includes("wallet_ledger_mismatch"))).toHaveLength(1);
+  });
+
+  it("the cap resets with the window", async () => {
+    for (let i = 0; i < 6; i += 1) await emailer.notify("m", { alertName: "audit_chain_mismatch", workspaceId: `ws-${i}` });
+    now += ALERT_EMAIL_COOLDOWN_MS;
+    await emailer.notify("m", { alertName: "audit_chain_mismatch", workspaceId: "ws-new" });
+    expect(sender.sent).toHaveLength(ALERT_EMAIL_MAX_PER_NAME_PER_WINDOW + 1);
+  });
+
+  it("a failed send does not consume the cap", async () => {
+    sender.failNext = 3;
+    for (let i = 0; i < 3; i += 1) await emailer.notify("m", { alertName: "audit_chain_mismatch", workspaceId: `f-${i}` });
+    for (let i = 0; i < 5; i += 1) await emailer.notify("m", { alertName: "audit_chain_mismatch", workspaceId: `ok-${i}` });
+    expect(sender.sent).toHaveLength(5);
+  });
+});
+
+describe("alert email · shutdown drain", () => {
+  it("drainAlertEmails waits for an in-flight send but is bounded when the provider hangs", async () => {
+    const hung: EmailSender = { send: () => new Promise<void>(() => {}) };
+    const stuck = new EmailAlertAdapter({ sender: hung, to: TO, delivers: true });
+    setAlertEmailerForTests(stuck);
+    stuck.page("m", { alertName: "x" });
+    const started = performance.now();
+    await drainAlertEmails(50);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(logged.some((l) => l.includes("alert email drain timed out"))).toBe(true);
+  });
+
+  it("drainAlertEmails returns once pending sends settle", async () => {
+    emailer.page("m", { alertName: "x" });
+    await drainAlertEmails(5000);
+    expect(sender.sent).toHaveLength(1);
   });
 });

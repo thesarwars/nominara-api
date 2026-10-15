@@ -483,6 +483,18 @@ export const envSchema = z
           "RESEND_API_KEY and RESEND_FROM_EMAIL must be set together: one without the other would fall back to a sender that delivers nothing.",
       });
     }
+    if (
+      env.NODE_ENV === "production" &&
+      env.ALERT_EMAIL_TO !== undefined &&
+      (env.RESEND_API_KEY === undefined || env.RESEND_FROM_EMAIL === undefined)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["ALERT_EMAIL_TO"],
+        message:
+          "ALERT_EMAIL_TO needs RESEND_API_KEY and RESEND_FROM_EMAIL under NODE_ENV=production: without a real sender the alert would be logged as emailed and delivered to nobody.",
+      });
+    }
     if (env.NODE_ENV === "production" && env.OTP_DEV_LOG_CODES === "true") {
       ctx.addIssue({
         code: "custom",

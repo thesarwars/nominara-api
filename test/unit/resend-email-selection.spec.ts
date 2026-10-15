@@ -98,3 +98,53 @@ describe("Resend boot validation", () => {
     }
   });
 });
+
+describe("ALERT_EMAIL_TO needs a real sender in production", () => {
+  const load = (overrides: Record<string, string>) => () => loadEnv({ ...process.env, ...overrides });
+
+  it("REFUSES ALERT_EMAIL_TO under production without the Resend pair, naming the key", () => {
+    const attempt = load({ NODE_ENV: "production", ALERT_EMAIL_TO: "oncall@example.net" });
+    expect(attempt).toThrow(EnvValidationError);
+    expect(attempt).toThrow(/ALERT_EMAIL_TO/);
+  });
+
+  it("allows it under production with the pair, and outside production without it", () => {
+    expect(load({ NODE_ENV: "production", ALERT_EMAIL_TO: "oncall@example.net", RESEND_API_KEY: "re_x", RESEND_FROM_EMAIL: "a@b.test" })).not.toThrow();
+    expect(load({ NODE_ENV: "development", ALERT_EMAIL_TO: "oncall@example.net" })).not.toThrow();
+  });
+});
+
+describe("outside production a half-set Resend config warns once", () => {
+  async function warnings(setup: () => void): Promise<string[]> {
+    const { Logger } = await import("@nestjs/common");
+    const lines: string[] = [];
+    vi.spyOn(Logger.prototype, "warn").mockImplementation((...args: unknown[]) => void lines.push(String(args[0])));
+    setup();
+    process.env.NODE_ENV = "development";
+    const { selectEmailSender } = await import("../../src/modules/identity/identity.module.js");
+    selectEmailSender();
+    selectEmailSender();
+    return lines.filter((l) => l.includes("only partly configured"));
+  }
+
+  it("key without sender", async () => {
+    expect(await warnings(() => (process.env.RESEND_API_KEY = "re_x"))).toHaveLength(1);
+  });
+  it("sender without key", async () => {
+    expect(await warnings(() => (process.env.RESEND_FROM_EMAIL = "a@b.test"))).toHaveLength(1);
+  });
+  it("RESEND_TO_EMAIL alone", async () => {
+    expect(await warnings(() => (process.env.RESEND_TO_EMAIL = "owner@example.net"))).toHaveLength(1);
+  });
+  it("nothing set: silent", async () => {
+    expect(await warnings(() => undefined)).toHaveLength(0);
+  });
+  it("the full pair: silent", async () => {
+    expect(
+      await warnings(() => {
+        process.env.RESEND_API_KEY = "re_x";
+        process.env.RESEND_FROM_EMAIL = "a@b.test";
+      }),
+    ).toHaveLength(0);
+  });
+});

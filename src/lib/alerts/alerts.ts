@@ -1,5 +1,6 @@
-import { Logger } from "@nestjs/common";
+import { Logger, type OnModuleDestroy } from "@nestjs/common";
 import { loadEnv } from "../../config/env.js";
+import { ResendEmailSenderAdapter } from "../../modules/identity/adapters/resend-email-sender.adapter.js";
 import { selectEmailSender } from "../../modules/identity/email-sender.selector.js";
 import { EmailAlertAdapter } from "./email-alert.adapter.js";
 
@@ -22,9 +23,18 @@ export function getAlertEmailer(): EmailAlertAdapter | null {
     logger.warn("ALERT_EMAIL_TO is not set: operational alerts are logged and counted only, and nobody is emailed.");
     resolved = null;
   } else {
-    // The address is configuration, but this line names the setting, not the value.
-    logger.log("operational alerts are emailed to ALERT_EMAIL_TO through the configured EMAIL_SENDER.");
-    resolved = new EmailAlertAdapter({ sender: selectEmailSender(), to: env.ALERT_EMAIL_TO, environment: env.NODE_ENV });
+    const sender = selectEmailSender();
+    const delivers = sender instanceof ResendEmailSenderAdapter;
+    if (delivers) {
+      // The address is configuration, but this line names the setting, not the value.
+      logger.log("operational alerts are emailed to ALERT_EMAIL_TO through Resend.");
+    } else {
+      // Production refuses this combination at boot (env.schema.ts); here it is a developer's machine.
+      logger.warn(
+        "ALERT_EMAIL_TO is set but Resend is not configured (RESEND_API_KEY + RESEND_FROM_EMAIL): alerts are NOT delivered, only logged and counted as not_delivered.",
+      );
+    }
+    resolved = new EmailAlertAdapter({ sender, to: env.ALERT_EMAIL_TO, environment: env.NODE_ENV, delivers });
   }
   return resolved;
 }
@@ -62,4 +72,31 @@ export async function emailAlertAndWait(message: string, context: Record<string,
 /** Test seam: install (or clear, with `undefined`, to re-read the environment) the process emailer. */
 export function setAlertEmailerForTests(emailer: EmailAlertAdapter | null | undefined): void {
   resolved = emailer;
+}
+
+/** How long shutdown waits for in-flight alert emails before giving up on them. */
+export const ALERT_DRAIN_TIMEOUT_MS = 5_000;
+
+/** Waits (bounded) for in-flight alert emails to settle. Never rejects; a hung provider cannot hold shutdown. */
+export async function drainAlertEmails(timeoutMs: number = ALERT_DRAIN_TIMEOUT_MS): Promise<void> {
+  if (resolved === undefined || resolved === null) return;
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      logger.warn("alert email drain timed out; unsent alerts are dropped");
+      resolve();
+    }, timeoutMs);
+  });
+  try {
+    await Promise.race([resolved.drain().catch(() => undefined), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Registered in the API module so a graceful shutdown flushes pending alert mail (the worker calls drainAlertEmails itself). */
+export class AlertEmailShutdown implements OnModuleDestroy {
+  async onModuleDestroy(): Promise<void> {
+    await drainAlertEmails();
+  }
 }

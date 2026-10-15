@@ -39,7 +39,8 @@ function fakeFetch(responses: Array<Response | Error | (() => Promise<Response>)
     const next = responses[Math.min(calls.length - 1, responses.length - 1)]!;
     if (next instanceof Error) throw next;
     if (typeof next === "function") return next();
-    return next.clone();
+    // A fresh Response per call: a clone() is a tee, and cancelling one branch of a tee waits for the other.
+    return new Response(await next.clone().text(), { status: next.status, headers: next.headers });
   });
   return { impl: impl as unknown as typeof fetch, calls };
 }
@@ -164,6 +165,57 @@ describe("Resend adapter · retries", () => {
     await expect(adapter.send(MESSAGE)).rejects.toBeInstanceOf(EmailDeliveryError);
     expect(f.calls).toHaveLength(1);
     expect(sleeps).toEqual([]);
+  });
+
+  it("retries a 409 concurrent_idempotent_requests (our own attempt still in flight) with backoff", async () => {
+    const f = fakeFetch([jsonResponse(409, { name: "concurrent_idempotent_requests" }), jsonResponse(200, { id: "m" })]);
+    const { adapter, sleeps } = make(f.impl);
+    await adapter.send(MESSAGE);
+    expect(f.calls).toHaveLength(2);
+    expect(sleeps).toHaveLength(1);
+    expect(f.calls[1]!.init.headers["Idempotency-Key"]).toBe(f.calls[0]!.init.headers["Idempotency-Key"]);
+  });
+
+  it("does NOT retry any other 409 (a real conflict, e.g. invalid_idempotent_request)", async () => {
+    const f = fakeFetch([jsonResponse(409, { name: "invalid_idempotent_request" })]);
+    const error = (await make(f.impl).adapter.send(MESSAGE).catch((e: unknown) => e)) as EmailDeliveryError;
+    expect(f.calls).toHaveLength(1);
+    expect(error.retryable).toBe(false);
+  });
+
+  it("honours a Retry-After given as an HTTP date", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-15T12:00:00Z"));
+    try {
+      const date = new Date("2026-10-15T12:00:07Z").toUTCString();
+      const f = fakeFetch([jsonResponse(429, {}, { "retry-after": date }), jsonResponse(200, { id: "m" })]);
+      const { adapter, sleeps } = make(f.impl);
+      await adapter.send(MESSAGE);
+      expect(sleeps).toEqual([7000]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a Retry-After of exactly the 30 s cap is waited out; 31 s is refused", async () => {
+    const ok = fakeFetch([jsonResponse(429, {}, { "retry-after": "30" }), jsonResponse(200, { id: "m" })]);
+    const first = make(ok.impl);
+    await first.adapter.send(MESSAGE);
+    expect(first.sleeps).toEqual([30_000]);
+
+    const over = fakeFetch([jsonResponse(429, {}, { "retry-after": "31" }), jsonResponse(200, { id: "m" })]);
+    const second = make(over.impl);
+    await expect(second.adapter.send(MESSAGE)).rejects.toBeInstanceOf(EmailDeliveryError);
+    expect(over.calls).toHaveLength(1);
+    expect(second.sleeps).toEqual([]);
+  });
+
+  it("cancels the body of a non-2xx response it does not read", async () => {
+    const response = jsonResponse(400, { name: "validation_error" });
+    const cancel = vi.spyOn(response.body!, "cancel");
+    const f = fakeFetch([() => Promise.resolve(response)]);
+    await make(f.impl).adapter.send(MESSAGE).catch(() => undefined);
+    expect(cancel).toHaveBeenCalled();
   });
 
   it("backoff grows between attempts when there is no Retry-After", async () => {
