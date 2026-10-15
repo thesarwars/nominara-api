@@ -51,6 +51,8 @@
     "test:isolation:breakers": "vitest run --config vitest.isolation.config.ts test/isolation/breakers"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1150.0",
+    "@aws-sdk/s3-request-presigner": "3.1150.0",
     "@fastify/cookie": "11.1.2",
     "@nestjs/common": "11.2.1",
     "@nestjs/core": "11.2.1",
