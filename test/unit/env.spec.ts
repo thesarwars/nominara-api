@@ -355,3 +355,90 @@ describe("NEW-D-2 · Stripe configuration is optional — the API boots without 
   });
 });
 
+
+describe("Group C item 3 · object storage configuration", () => {
+  const buckets = { STORAGE_BUCKET_RAW: "nominara-raw", STORAGE_BUCKET_REPORTS: "nominara-reports" };
+
+  it("OS-E1 · every storage variable is optional: the API boots without object storage", () => {
+    const env = loadEnv(VALID);
+    expect(env.STORAGE_BUCKET_RAW).toBeUndefined();
+    expect(env.STORAGE_ENDPOINT).toBeUndefined();
+  });
+
+  it("OS-E2 · the LocalStack shape validates", () => {
+    const env = loadEnv({
+      ...VALID,
+      ...buckets,
+      STORAGE_ENDPOINT: "http://localhost:4566",
+      STORAGE_REGION: "us-east-1",
+      STORAGE_ACCESS_KEY_ID: "test",
+      STORAGE_SECRET_ACCESS_KEY: "test",
+      STORAGE_FORCE_PATH_STYLE: "true",
+      STORAGE_SSE: "AES256",
+      STORAGE_KEY_ENV: "dev",
+    });
+    expect(env.STORAGE_SSE).toBe("AES256");
+  });
+
+  it("OS-E3 · one bucket without the other is refused at boot, naming the missing one", () => {
+    expect(() => loadEnv({ ...VALID, STORAGE_BUCKET_RAW: "nominara-raw" })).toThrow(/STORAGE_BUCKET_REPORTS/);
+    expect(() => loadEnv({ ...VALID, STORAGE_BUCKET_REPORTS: "nominara-reports" })).toThrow(/STORAGE_BUCKET_RAW/);
+  });
+
+  it("OS-E4 · an access key without its secret (or the reverse) is refused, naming the missing one", () => {
+    expect(() => loadEnv({ ...VALID, ...buckets, STORAGE_ACCESS_KEY_ID: "k" })).toThrow(/STORAGE_SECRET_ACCESS_KEY/);
+    expect(() => loadEnv({ ...VALID, ...buckets, STORAGE_SECRET_ACCESS_KEY: "s" })).toThrow(/STORAGE_ACCESS_KEY_ID/);
+  });
+
+  it.each([
+    ["a non-URL endpoint", { STORAGE_ENDPOINT: "not a url" }, /STORAGE_ENDPOINT/],
+    ["a whitespace-only bucket", { STORAGE_BUCKET_RAW: "  " }, /STORAGE_BUCKET_RAW/],
+    ["force-path-style spelled yes", { STORAGE_FORCE_PATH_STYLE: "yes" }, /STORAGE_FORCE_PATH_STYLE/],
+    ["an unknown SSE mode", { STORAGE_SSE: "none" }, /STORAGE_SSE/],
+    ["an uppercase key environment", { STORAGE_KEY_ENV: "Prod" }, /STORAGE_KEY_ENV/],
+    ["a key environment with a slash", { STORAGE_KEY_ENV: "a/b" }, /STORAGE_KEY_ENV/],
+    ["a KMS key id with SSE-S3", { STORAGE_SSE: "AES256", STORAGE_KMS_KEY_ID: "k" }, /STORAGE_KMS_KEY_ID/],
+  ])("OS-E5 · refuses %s, naming the key", (_label, extra, pattern) => {
+    expect(() => loadEnv({ ...VALID, ...buckets, ...extra })).toThrow(pattern);
+  });
+
+  it("OS-E6 · a refusal never echoes the secret access key", () => {
+    let message = "";
+    try {
+      loadEnv({ ...VALID, ...buckets, STORAGE_SECRET_ACCESS_KEY: "s3cr3t-value" });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/STORAGE_ACCESS_KEY_ID/);
+    expect(message).not.toContain("s3cr3t-value");
+  });
+
+  describe("production hardening", () => {
+    const prod = { ...VALID, NODE_ENV: "production", ...buckets, STORAGE_KEY_ENV: "production" };
+    const kmsArn = "arn:aws:kms:us-east-1:111122223333:key/abc";
+
+    it("OS-E7 · production with SSE-KMS (explicit or by default) and no STORAGE_KMS_KEY_ID is refused, naming the key", () => {
+      expect(() => loadEnv(prod)).toThrow(/STORAGE_KMS_KEY_ID/);
+      expect(() => loadEnv({ ...prod, STORAGE_SSE: "aws:kms" })).toThrow(/STORAGE_KMS_KEY_ID/);
+    });
+
+    it("OS-E7 · production with a KMS key id validates; outside production no key id is needed", () => {
+      expect(() => loadEnv({ ...prod, STORAGE_KMS_KEY_ID: kmsArn })).not.toThrow();
+      expect(() => loadEnv({ ...VALID, ...buckets })).not.toThrow();
+      expect(() => loadEnv({ ...VALID, NODE_ENV: "test", ...buckets })).not.toThrow();
+    });
+
+    it("OS-E8 · production with storage configured requires STORAGE_KEY_ENV", () => {
+      const { STORAGE_KEY_ENV: _drop, ...noEnv } = prod;
+      expect(() => loadEnv({ ...noEnv, STORAGE_KMS_KEY_ID: kmsArn })).toThrow(/STORAGE_KEY_ENV/);
+    });
+
+    it("OS-E8 · production without storage configured needs neither", () => {
+      expect(() => loadEnv({ ...VALID, NODE_ENV: "production" })).not.toThrow();
+    });
+
+    it("OS-E9 · STORAGE_KEY_ENV=crawl is reserved and refused", () => {
+      expect(() => loadEnv({ ...VALID, ...buckets, STORAGE_KEY_ENV: "crawl" })).toThrow(/STORAGE_KEY_ENV/);
+    });
+  });
+});
