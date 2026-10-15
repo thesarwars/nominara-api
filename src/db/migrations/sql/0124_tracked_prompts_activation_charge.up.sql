@@ -20,8 +20,20 @@ ALTER TABLE tracked_prompts
   ADD COLUMN first_activated_at timestamptz,
   ADD COLUMN activation_credits integer NOT NULL DEFAULT 0 CONSTRAINT ck_prompts_activation_credits CHECK (activation_credits >= 0);
 
+-- FORCE ROW LEVEL SECURITY: tracked_prompts and answer_captures are ENABLE + FORCE (0006) with policies only TO
+-- nominara_app / nominara_worker / nominara_report. In production nominara_owner (NOSUPERUSER, NOBYPASSRLS; README G-4)
+-- runs this file, and under FORCE even the owner is subject to the policies, which it matches none of: the UPDATE would
+-- touch zero rows and the EXISTS would see no captures, silently. (The local superuser bypasses RLS and hides this.)
+-- The owner is exempt from RLS while it is not forced, so FORCE is lifted for the backfill and restored straight after.
+-- One transaction: no other session ever sees either table unforced.
+ALTER TABLE tracked_prompts NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE answer_captures NO FORCE ROW LEVEL SECURITY;
+
 UPDATE tracked_prompts tp
    SET first_activated_at = tp.created_at
  WHERE tp.generation_source = 'generated' AND tp.first_activated_at IS NULL
    AND (tp.status <> 'archived'
         OR EXISTS (SELECT 1 FROM answer_captures ac WHERE ac.workspace_id = tp.workspace_id AND ac.prompt_id = tp.id));
+
+ALTER TABLE answer_captures FORCE ROW LEVEL SECURITY;
+ALTER TABLE tracked_prompts FORCE ROW LEVEL SECURITY;
