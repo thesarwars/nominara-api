@@ -277,6 +277,7 @@ describe("STORY-021 / EC-15 · workspace ownership transfer over HTTP", () => {
     const res = await initiate(owner, admin.userId);
     expect(res.statusCode, res.body).toBe(401);
     expect(errorOf(res).code).toBe("step_up_required");
+    expect(errorOf(res).details).toEqual({ methods: ["webauthn", "email_otp"] }); // STORY-018: the client re-verifies by method
     expect(await transferDoc(owner.workspaceId)).toBeNull();
   });
 
@@ -677,6 +678,7 @@ describe("STORY-021 / EC-15 · workspace ownership transfer over HTTP", () => {
     const res = await accept(recipient);
     expect(res.statusCode, res.body).toBe(401);
     expect(errorOf(res).code).toBe("step_up_required");
+    expect(errorOf(res).details).toEqual({ methods: ["webauthn", "email_otp"] }); // STORY-018
     expect(await snapshot(x.workspaceId)).toEqual(before);
     expect(await transferDoc(x.workspaceId)).toMatchObject({ state: "awaiting_acceptance" });
     expect(queue.jobs).toHaveLength(0);
