@@ -822,14 +822,17 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
     for (let i = 0; i < 10; i++) await openHold(ws, 20 + i, `pre-${String(i)}`);
     const pre = Array.from({ length: 10 }, (_, i) => 20 + i);
 
-    const ops: Promise<unknown>[] = [];
+    // The roll is started among the FIRST operations, so most pre-roll holds settle after it (the carried-commit path is
+    // the one this exactness is for); the final balance is derived from the ledger either way.
+    const thunks: (() => Promise<unknown>)[] = [];
     pre.forEach((credits, i) => {
       const key = `pre-${String(i)}`;
-      ops.push(i % 2 === 0 ? commitHold(ws, key, credits, credits - 5) : releaseHold(ws, key, credits));
+      thunks.push(() => (i % 2 === 0 ? commitHold(ws, key, credits, credits - 5) : releaseHold(ws, key, credits)));
     });
-    for (let i = 0; i < 9; i++) ops.push(spend(ws, 15, `new-${String(i)}`));
-    ops.push(roll(ws, 4000));
-    expect(ops).toHaveLength(20);
+    for (let i = 0; i < 9; i++) thunks.push(() => spend(ws, 15, `new-${String(i)}`));
+    thunks.splice(3, 0, () => roll(ws, 4000));
+    expect(thunks).toHaveLength(20);
+    const ops = thunks.map((start) => start());
     await Promise.all(ops);
 
     const b = await balances(ws);
