@@ -177,3 +177,24 @@ describe("STORY-034 · CreditGuard confirms the quoted price", () => {
     }
   });
 });
+
+describe("STORY-046 review 7 - the inline-debit ledger keys are reserved", () => {
+  it("refuses a client Idempotency-Key that starts with the internal prompt_activate: prefix, before reserving", async () => {
+    // The activation charge writes its own ledger key (`prompt_activate:<project>:<digest>`) inside the handler's
+    // transaction. A client-chosen key in that namespace could collide with it and make a genuine charge a refused append.
+    // Refusing the prefix here also happens before any reservation: the pool of `guardWith` throws if it is reached.
+    for (const key of ["prompt_activate:p:abc", "prompt_activate:", "PROMPT_ACTIVATE:p:abc"]) {
+      await expect(
+        guardWith(200).canActivate(contextWith({ [CONFIRMED_CREDITS_HEADER]: "200", "idempotency-key": key })),
+      ).rejects.toMatchObject({ code: "validation_failed" });
+    }
+  });
+
+  it("still accepts an ordinary key, including one that merely contains the word", async () => {
+    for (const key of ["k-1", "my-prompt_activate:x", "prompt_activated"]) {
+      await expect(
+        guardThatCanReserve(200).canActivate(contextWith({ [CONFIRMED_CREDITS_HEADER]: "200", "idempotency-key": key })),
+      ).resolves.toBe(true);
+    }
+  });
+});

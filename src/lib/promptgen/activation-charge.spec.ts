@@ -9,6 +9,7 @@ import {
   chargeForActivation,
   inheritFirstActivation,
   planActivationCharge,
+  quoteActivation,
   type ActivationCandidate,
 } from "./activation-charge.js";
 
@@ -224,6 +225,87 @@ describe("STORY-046 AC3 · chargeForActivation", () => {
       prompts_charged: 1,
       credits: 1,
     });
+  });
+});
+
+describe("STORY-046 AC3 · the price quote (owner decision 2026-10-15, option C)", () => {
+  const calls: { sql: string; params: unknown[] }[] = [];
+  let used = 0;
+  const tx = {
+    query: vi.fn(async (sql: string, params: unknown[]) => {
+      calls.push({ sql, params });
+      return { rows: sql.includes("count(*)") ? [{ n: used }] : [], rowCount: 0 };
+    }),
+  } as unknown as ClientBase;
+  const entitlements = {
+    "prompts.free_at_creation": { value: 10 },
+    "prompts.credits_per_generated": { value: 1 },
+    "credits.included_per_cycle": { value: 37 },
+  };
+  const input = (candidates: ActivationCandidate[], extra: Record<string, unknown> = {}) => ({
+    workspaceId: "ws-1",
+    actorId: "user-1",
+    projectId: "proj-1",
+    candidates,
+    entitlements,
+    ...extra,
+  });
+
+  beforeEach(() => {
+    calls.length = 0;
+    used = 0;
+    vi.spyOn(debit, "debitInTransaction").mockResolvedValue(undefined);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("quoteActivation prices a batch by the same rule the charge uses and writes nothing", async () => {
+    used = 9;
+    const quote = await quoteActivation(tx, input([gen("a"), gen("b"), gen("c"), manual("m"), gen("old", new Date())]));
+
+    expect(quote).toMatchObject({ free: ["a"], charged: ["b", "c"], total: 2 });
+    expect(calls.filter((c) => /^\s*(UPDATE|INSERT|DELETE)/i.test(c.sql))).toEqual([]);
+    expect(debit.debitInTransaction).not.toHaveBeenCalled();
+  });
+
+  it("a batch with nothing new quotes 0 without a read", async () => {
+    expect(await quoteActivation(tx, input([manual("m")]))).toMatchObject({ free: [], charged: [], total: 0 });
+    expect(calls).toEqual([]);
+  });
+
+  it("a charged activation with NO confirmed figure is refused before any debit or write", async () => {
+    used = 10;
+    await expect(chargeForActivation(tx, input([gen("a")], { confirmedCredits: null }))).rejects.toMatchObject({ code: "validation_failed" });
+    expect(debit.debitInTransaction).not.toHaveBeenCalled();
+    expect(calls.filter((c) => c.sql.startsWith("UPDATE"))).toEqual([]);
+  });
+
+  it("a confirmed figure that differs is price_changed naming both figures, before any debit or write", async () => {
+    used = 10;
+    await expect(chargeForActivation(tx, input([gen("a"), gen("b")], { confirmedCredits: 1 }))).rejects.toMatchObject({
+      code: "price_changed",
+      details: { shown: 1, recomputed: 2 },
+    });
+    expect(debit.debitInTransaction).not.toHaveBeenCalled();
+    expect(calls.filter((c) => c.sql.startsWith("UPDATE"))).toEqual([]);
+  });
+
+  it("a matching figure debits exactly that figure", async () => {
+    used = 10;
+    expect(await chargeForActivation(tx, input([gen("a"), gen("b")], { confirmedCredits: 2 }))).toBe(2);
+    expect(vi.mocked(debit.debitInTransaction).mock.calls[0]![1].credits).toBe(2);
+  });
+
+  it("a free activation needs no figure, and 0 is accepted when given", async () => {
+    used = 0;
+    expect(await chargeForActivation(tx, input([gen("a")], { confirmedCredits: null }))).toBe(0);
+    expect(await chargeForActivation(tx, input([gen("b")], { confirmedCredits: 0 }))).toBe(0);
+  });
+
+  it("forwards the auto top-up request to the debit", async () => {
+    used = 10;
+    const autoTopup = vi.fn();
+    await chargeForActivation(tx, input([gen("a")], { confirmedCredits: 1, autoTopup }));
+    expect(vi.mocked(debit.debitInTransaction).mock.calls[0]![1].autoTopup).toBe(autoTopup);
   });
 });
 

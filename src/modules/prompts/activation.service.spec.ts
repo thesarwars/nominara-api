@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { Logger } from "@nestjs/common";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DomainError } from "../../api/errors/domain-errors.js";
 import type { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
@@ -311,5 +314,76 @@ describe("STORY-046 · PromptActivationService.activate", () => {
     const service = new PromptActivationService(resolverReturning(40));
     const error = await service.activate(PROJECT, { prompt_ids: [P1] }).catch((e: unknown) => e as DomainError);
     expect((error as DomainError).code).toBe("not_found");
+  });
+});
+
+describe("STORY-046 AC3 - PromptActivationService.preview", () => {
+  const exporter = new InMemorySpanExporter();
+  const entitlements = {
+    "prompts.max_per_project": { value: 40 },
+    "prompts.free_at_creation": { value: 10 },
+    "prompts.credits_per_generated": { value: 1 },
+  };
+  let calls: Recorded[];
+
+  beforeAll(() => {
+    trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }));
+  });
+
+  function setup(rows: Record<string, unknown>[]) {
+    calls = [];
+    exporter.reset();
+    const client = clientAnsweringWith(calls, [
+      { match: "FROM projects", rows: [{ prompts_cap: 40 }] },
+      { match: "WHERE id = ANY", rows },
+    ]);
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client, context: { workspaceId: WS } } as never);
+    const resolver = { resolveForWorkspace: vi.fn(async () => ({ entitlements })) } as unknown as EntitlementResolver;
+    return new PromptActivationService(resolver);
+  }
+  const generated = (id: string, status = "archived") => ({
+    id,
+    status,
+    project_id: PROJECT,
+    generation_source: "generated",
+    first_activated_at: null,
+    superseded_by: null,
+  });
+
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("is read-only: no write statement and no project lock", async () => {
+    const service = setup([generated(P1), generated(P2)]);
+    await service.preview(PROJECT, { prompt_ids: [P1, P2] });
+    expect(calls.filter((call) => /^\s*(UPDATE|INSERT|DELETE)\b/i.test(call.sql))).toEqual([]);
+    expect(calls.filter((call) => call.sql.includes("FOR UPDATE"))).toEqual([]);
+  });
+
+  it("quotes the same figure the activation would charge", async () => {
+    const service = setup([generated(P1), generated(P2, "active")]);
+    const quote = await service.preview(PROJECT, { prompt_ids: [P1, P2] });
+    expect(quote).toEqual({ credits: 0, prompts: { requested: 2, already_active: 1, free: 1, charged: 0 }, credits_charged: 0 });
+  });
+
+  it("emits a span carrying counts and no ids, a counter, and a log line with the workspace id only", async () => {
+    const log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    const service = setup([generated(P1)]);
+
+    await service.preview(PROJECT, { prompt_ids: [P1] });
+
+    const spans = exporter.getFinishedSpans().filter((span) => span.name === "prompts.activation.preview");
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.attributes).toMatchObject({ "nominara.prompts.requested": 1, "nominara.credits.quoted": 0 });
+    expect(spans[0]!.status.code).not.toBe(SpanStatusCode.ERROR);
+    expect(JSON.stringify(spans[0]!.attributes)).not.toContain(WS);
+    const lines = log.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    expect(lines.some((l) => l.metric === "nominara_prompts_activation_previews_total")).toBe(true);
+    expect(lines.find((l) => l.event === "prompts.activation.previewed")).toEqual({
+      event: "prompts.activation.previewed",
+      workspace_id: WS,
+      project_id: PROJECT,
+      prompts_requested: 1,
+      credits: 0,
+    });
   });
 });
