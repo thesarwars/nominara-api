@@ -354,6 +354,11 @@ export async function applyPlanChange(
       cycleStart: utcDate(desired.currentPeriodStart),
       cycleEnd: utcDate(desired.currentPeriodEnd),
       carryUnused: isUpgrade,
+      // The subscription's period start MOVED FORWARD (compared as `timestamptz` under its row lock): the wallet's `date`
+      // cycle cannot say so when the free cycle began earlier the same UTC day. Only an advance carries it. A recovery
+      // does not: its period start has not moved, and a past_due event inside the CURRENT period must not look like a
+      // new one to a wallet whose cycle began that day.
+      ...(periodAdvanced ? { periodInstant: desired.currentPeriodStart.toISOString() } : {}),
     });
     cycleRolled = rolled.rolled;
   }

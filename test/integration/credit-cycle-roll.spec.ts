@@ -876,6 +876,26 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
         expect(await entries(ws, ["grant", "expire"])).toEqual(before);
       });
 
+      it("STORY-072 AC13 · a second new period on that same day rolls again under its own ledger key (no disagreement)", async () => {
+        const growth = await planGrant("growth");
+        await apply(ws, PAID("11"), new Date("2026-09-01T11:00:00.000Z"));
+
+        await apply(ws, (c) => ({ ...PAID("15")(c), planKey: "growth" }), new Date("2026-09-01T15:00:00.000Z"));
+
+        expect((await balances(ws)).included_balance).toBe(growth);
+        expect(await planChangeGrants(ws)).toEqual([]);
+        await replayClean(ws);
+      });
+
+      it("STORY-072 AC13 · a wallet whose cycle is already LATER than the event's period day is never rolled backwards", async () => {
+        await db.query("UPDATE credit_wallets SET cycle_start = '2026-10-01', cycle_end = '2026-11-01' WHERE workspace_id = $1", [ws]);
+
+        await apply(ws, (c) => ({ ...c, currentPeriodStart: new Date("2026-09-01T11:00:00.000Z"), currentPeriodEnd: new Date("2026-10-01T11:00:00.000Z") }), new Date("2026-09-01T12:00:00.000Z"));
+
+        expect(await balances(ws)).toMatchObject({ cycle_start: "2026-10-01", included_balance: 60 });
+        expect(await entries(ws, ["grant", "expire"]).then((e) => e.filter((x) => x.idempotency_key.startsWith("cycle_roll")))).toEqual([]);
+      });
+
       it("STORY-072 AC13 · an event whose period starts EARLIER the same day than the one on file is not a roll", async () => {
         const starter = await planGrant("starter");
         await spend(ws, 20, "job-1");

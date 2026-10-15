@@ -57,6 +57,14 @@ export interface CycleRollRequest {
   /** `YYYY-MM-DD`, UTC — `credit_wallets.cycle_start` / `cycle_end` are `date`. */
   readonly cycleStart: string;
   readonly cycleEnd: string;
+  /**
+   * The ISO instant the subscription's period began, set ONLY by a caller that has already seen the subscription's
+   * `timestamptz` period start ADVANCE under the subscription row lock. The wallet's cycle is a `date`, so a free wallet
+   * provisioned today and upgraded a few hours later has the SAME day on both sides and the day comparison cannot tell
+   * a new period from an old one. With this set, a new period starting on the wallet's own `cycle_start` day is a roll,
+   * and the ledger key carries the instant so it stays unique. A LATER wallet cycle is still "not newer".
+   */
+  readonly periodInstant?: string;
 }
 
 export type CycleRollOutcome =
@@ -80,6 +88,7 @@ interface LockedWallet {
   purchased_balance: number;
   reserved: number;
   newer: boolean;
+  same_day: boolean;
 }
 
 /**
@@ -131,13 +140,16 @@ async function roll(tx: ClientBase, request: CycleRollRequest): Promise<CycleRol
 
   // The lock, then the question. `newer` is computed by Postgres so no JS Date ever stands in for a `date`.
   const locked = await tx.query<LockedWallet>(
-    `SELECT included_balance, purchased_balance, reserved, ($2::date > cycle_start) AS newer
+    `SELECT included_balance, purchased_balance, reserved, ($2::date > cycle_start) AS newer, ($2::date = cycle_start) AS same_day
        FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE`,
     [workspaceId, request.cycleStart],
   );
   const wallet = locked.rows[0];
   if (wallet === undefined) return { rolled: false, reason: "no_wallet" };
-  if (!wallet.newer) return { rolled: false, reason: "not_newer" };
+  // A period the subscription says is new, starting on the day the wallet's cycle already began (free wallet, same-day
+  // conversion), is a roll too; the calendar day alone cannot see it.
+  const sameDayRoll = request.periodInstant !== undefined && wallet.same_day;
+  if (!wallet.newer && !sameDayRoll) return { rolled: false, reason: "not_newer" };
 
   // Option B: what backs a hold stays with it; everything else in the bucket is unused. An upgrade carries the unused
   // credits into the new grant (§5 conversion) instead of expiring them.
@@ -158,7 +170,7 @@ async function roll(tx: ClientBase, request: CycleRollRequest): Promise<CycleRol
 
   const attribution = {
     workspaceId,
-    idempotencyKey: `cycle_roll:${request.cycleStart}`,
+    idempotencyKey: `cycle_roll:${sameDayRoll ? request.periodInstant! : request.cycleStart}`,
     actorId: null,
     actorType: "system" as const,
     referenceType: "cycle_roll",
