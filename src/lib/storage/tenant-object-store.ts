@@ -8,7 +8,17 @@ import type { ObjectHead, ObjectStoragePort, StorageNamespace } from "./storage.
 //
 // THE WORKSPACE COMES FROM THE TENANT CONTEXT, NEVER FROM AN ARGUMENT. There is no workspaceId parameter on any method
 // here, so a caller cannot name one, and a client-supplied string can only ever be the RELATIVE part of a key (which is
-// validated against traversal). Outside a tenant context every method throws before the port is reached: fail closed.
+// validated against traversal). Outside a tenant context every unbound call throws before the port is reached: fail closed.
+//
+// THE INTENDED PATTERN (KAD-06: no network call while a request transaction is open)
+//   1. INSIDE the tenant context / transaction: `const bound = store.bind()`. This only READS the workspace id from the
+//      context; it does no I/O. Relative-key calls need nothing else.
+//   2. AFTER the commit (`afterCommit`) or in a worker with no transaction open: `await bound.put(...)`. The bound store
+//      carries the workspace id and key environment captured in step 1, so it works with no context at all, and it
+//      cannot be retargeted: it has no workspace parameter and its captured id is frozen.
+//   3. Record the returned key in a SECOND short transaction (`raw_object_key`, `object_key`).
+// Calling `store.put(...)` directly is the same as `store.bind().put(...)` and so needs the context at call time; it is
+// for code that is already inside a tenant context and is not holding a transaction across the await.
 //
 // Two ways to name an object:
 //   relative key   `get("raw", "2026/10/x.json.gz")` - resolved into THIS workspace's prefix.
@@ -34,15 +44,19 @@ export interface PutOptions {
 
 const logger = new Logger("object-storage");
 
-export class TenantObjectStore {
+/** A store fixed to ONE workspace at capture time. Obtain it with `TenantObjectStore.bind()` inside the tenant context. */
+export class BoundObjectStore {
   constructor(
     private readonly port: ObjectStoragePort,
     private readonly keyEnv: string,
-  ) {}
+    private readonly workspaceId: string,
+  ) {
+    Object.freeze(this);
+  }
 
   /** Writes `body` and returns the FULL key to store in the owning table (`raw_object_key`, `object_key`). */
   async put(namespace: StorageNamespace, relative: string, body: Uint8Array | string, options: PutOptions = {}): Promise<string> {
-    const { workspaceId } = this.requireWorkspace();
+    const workspaceId = this.workspaceId;
     const location = buildObjectLocation(this.keyEnv, workspaceId, namespace, relative);
     await this.observe("put", workspaceId, namespace, () =>
       this.port.put({ bucket: location.bucket, key: location.key, body, ...options }),
@@ -51,25 +65,25 @@ export class TenantObjectStore {
   }
 
   async get(namespace: StorageNamespace, relative: string): Promise<Buffer> {
-    const { workspaceId } = this.requireWorkspace();
+    const workspaceId = this.workspaceId;
     const location = buildObjectLocation(this.keyEnv, workspaceId, namespace, relative);
     return this.observe("get", workspaceId, namespace, () => this.port.get(location.bucket, location.key));
   }
 
   async head(namespace: StorageNamespace, relative: string): Promise<ObjectHead> {
-    const { workspaceId } = this.requireWorkspace();
+    const workspaceId = this.workspaceId;
     const location = buildObjectLocation(this.keyEnv, workspaceId, namespace, relative);
     return this.observe("head", workspaceId, namespace, () => this.port.head(location.bucket, location.key));
   }
 
   async delete(namespace: StorageNamespace, relative: string): Promise<void> {
-    const { workspaceId } = this.requireWorkspace();
+    const workspaceId = this.workspaceId;
     const location = buildObjectLocation(this.keyEnv, workspaceId, namespace, relative);
     return this.observe("delete", workspaceId, namespace, () => this.port.delete(location.bucket, location.key));
   }
 
   async presignGet(namespace: StorageNamespace, relative: string, options: PresignOptions = {}): Promise<string> {
-    const { workspaceId } = this.requireWorkspace();
+    const workspaceId = this.workspaceId;
     const expiresInSeconds = options.expiresInSeconds ?? DEFAULT_PRESIGN_SECONDS;
     if (!Number.isInteger(expiresInSeconds) || expiresInSeconds < 1 || expiresInSeconds > MAX_PRESIGN_SECONDS) {
       throw new StorageKeyError("presign lifetime must be a whole number of seconds from 1 to 604800");
@@ -95,14 +109,8 @@ export class TenantObjectStore {
   }
 
   private relativeOf(namespace: StorageNamespace, stored: string): string {
-    const { workspaceId } = this.requireWorkspace();
+    const workspaceId = this.workspaceId;
     return relativeKeyFromStored(this.keyEnv, workspaceId, namespace, stored);
-  }
-
-  private requireWorkspace(): { workspaceId: string } {
-    const store = currentTenantStore();
-    if (store === undefined) throw new StorageTenancyError("object storage requires an active tenant context");
-    return { workspaceId: store.context.workspaceId };
   }
 
   // One span-shaped log line and one counter per operation. The line carries the workspace ID, the operation, the
@@ -128,5 +136,47 @@ export class TenantObjectStore {
       });
       throw error;
     }
+  }
+}
+
+export class TenantObjectStore {
+  constructor(
+    private readonly port: ObjectStoragePort,
+    private readonly keyEnv: string,
+  ) {}
+
+  /** Captures the CURRENT tenant context's workspace. Call it inside the context; use the result anywhere, later. */
+  bind(): BoundObjectStore {
+    const store = currentTenantStore();
+    if (store === undefined) throw new StorageTenancyError("object storage requires an active tenant context");
+    return new BoundObjectStore(this.port, this.keyEnv, store.context.workspaceId);
+  }
+
+  async put(namespace: StorageNamespace, relative: string, body: Uint8Array | string, options: PutOptions = {}): Promise<string> {
+    return this.bind().put(namespace, relative, body, options);
+  }
+  async get(namespace: StorageNamespace, relative: string): Promise<Buffer> {
+    return this.bind().get(namespace, relative);
+  }
+  async head(namespace: StorageNamespace, relative: string): Promise<ObjectHead> {
+    return this.bind().head(namespace, relative);
+  }
+  async delete(namespace: StorageNamespace, relative: string): Promise<void> {
+    return this.bind().delete(namespace, relative);
+  }
+  async presignGet(namespace: StorageNamespace, relative: string, options: PresignOptions = {}): Promise<string> {
+    return this.bind().presignGet(namespace, relative, options);
+  }
+  async getStored(namespace: StorageNamespace, stored: string): Promise<Buffer> {
+    return this.bind().getStored(namespace, stored);
+  }
+  async headStored(namespace: StorageNamespace, stored: string): Promise<ObjectHead> {
+    return this.bind().headStored(namespace, stored);
+  }
+  async deleteStored(namespace: StorageNamespace, stored: string): Promise<void> {
+    return this.bind().deleteStored(namespace, stored);
+  }
+  async presignGetStored(namespace: StorageNamespace, stored: string, options: PresignOptions = {}): Promise<string> {
+    return this.bind().presignGetStored(namespace, stored, options);
   }
 }

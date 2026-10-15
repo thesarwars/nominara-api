@@ -412,4 +412,33 @@ describe("Group C item 3 · object storage configuration", () => {
     expect(message).toMatch(/STORAGE_ACCESS_KEY_ID/);
     expect(message).not.toContain("s3cr3t-value");
   });
+
+  describe("production hardening", () => {
+    const prod = { ...VALID, NODE_ENV: "production", ...buckets, STORAGE_KEY_ENV: "production" };
+    const kmsArn = "arn:aws:kms:us-east-1:111122223333:key/abc";
+
+    it("OS-E7 · production with SSE-KMS (explicit or by default) and no STORAGE_KMS_KEY_ID is refused, naming the key", () => {
+      expect(() => loadEnv(prod)).toThrow(/STORAGE_KMS_KEY_ID/);
+      expect(() => loadEnv({ ...prod, STORAGE_SSE: "aws:kms" })).toThrow(/STORAGE_KMS_KEY_ID/);
+    });
+
+    it("OS-E7 · production with a KMS key id validates; outside production no key id is needed", () => {
+      expect(() => loadEnv({ ...prod, STORAGE_KMS_KEY_ID: kmsArn })).not.toThrow();
+      expect(() => loadEnv({ ...VALID, ...buckets })).not.toThrow();
+      expect(() => loadEnv({ ...VALID, NODE_ENV: "test", ...buckets })).not.toThrow();
+    });
+
+    it("OS-E8 · production with storage configured requires STORAGE_KEY_ENV", () => {
+      const { STORAGE_KEY_ENV: _drop, ...noEnv } = prod;
+      expect(() => loadEnv({ ...noEnv, STORAGE_KMS_KEY_ID: kmsArn })).toThrow(/STORAGE_KEY_ENV/);
+    });
+
+    it("OS-E8 · production without storage configured needs neither", () => {
+      expect(() => loadEnv({ ...VALID, NODE_ENV: "production" })).not.toThrow();
+    });
+
+    it("OS-E9 · STORAGE_KEY_ENV=crawl is reserved and refused", () => {
+      expect(() => loadEnv({ ...VALID, ...buckets, STORAGE_KEY_ENV: "crawl" })).toThrow(/STORAGE_KEY_ENV/);
+    });
+  });
 });

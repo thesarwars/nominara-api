@@ -62,6 +62,8 @@ describe("object storage · key building", () => {
     ["a trailing slash", "a/"],
     ["an empty segment", "a//b"],
     ["a dot segment", "a/./b"],
+    ["a dot-only segment", "a/.../b"],
+    ["a lone triple dot", "..."],
     ["a parent segment", "../other/x"],
     ["a parent segment in the middle", "a/../../x"],
     ["a backslash", "a\\b"],
@@ -78,7 +80,7 @@ describe("object storage · key building", () => {
     expect(() => buildObjectLocation("production", workspaceId, "raw", "a")).toThrow(StorageKeyError);
   });
 
-  it.each(["", "Prod", "a/b", "..", "a".repeat(33)])("OS-K5 · refuses key environment %j", (env) => {
+  it.each(["", "Prod", "a/b", "..", "crawl", "a".repeat(33)])("OS-K5 · refuses key environment %j", (env) => {
     expect(() => buildObjectLocation(env, WS_A, "raw", "a")).toThrow(StorageKeyError);
   });
 
@@ -210,5 +212,44 @@ describe("object storage · the tenant layer", () => {
     const port = new FakePort();
     await inWorkspace(WS_A, () => store(port).presignGet("raw", "a"));
     expect(port.presigned[0]?.expiresInSeconds).toBe(300);
+  });
+
+  describe("bind() · capture inside the context, use after it", () => {
+    it("OS-B1 · a bound store used AFTER the context has ended still writes under the captured workspace", async () => {
+      const port = new FakePort();
+      const bound = await inWorkspace(WS_A, async () => store(port).bind());
+      // No tenant context here at all (as in afterCommit, or a worker with no transaction open).
+      const key = await bound.put("raw", "after-commit.gz", Buffer.from("x"));
+      expect(key).toBe(`production/${WS_A}/after-commit.gz`);
+      expect([...port.objects.keys()]).toEqual([`raw/production/${WS_A}/after-commit.gz`]);
+      expect((await bound.get("raw", "after-commit.gz")).toString()).toBe("x");
+    });
+
+    it("OS-B2 · a bound store cannot be retargeted: used inside ANOTHER workspace's context it still acts for the captured one", async () => {
+      const port = new FakePort();
+      const boundA = await inWorkspace(WS_A, async () => store(port).bind());
+      await inWorkspace(WS_B, () => boundA.put("raw", "k.gz", Buffer.from("a")));
+      expect([...port.objects.keys()]).toEqual([`raw/production/${WS_A}/k.gz`]);
+      // B's own stored-key check does not apply to a store bound to A, and A's bound store refuses B's keys.
+      await expect(boundA.getStored("raw", `production/${WS_B}/k.gz`)).rejects.toThrow(StorageTenancyError);
+    });
+
+    it("OS-B3 · the captured workspace is frozen: the bound store cannot be mutated to point elsewhere", async () => {
+      const port = new FakePort();
+      const bound = await inWorkspace(WS_A, async () => store(port).bind());
+      expect(Object.isFrozen(bound)).toBe(true);
+      expect(() => {
+        (bound as unknown as { workspaceId: string }).workspaceId = WS_B;
+      }).toThrow(TypeError);
+      await bound.put("raw", "k.gz", "x");
+      expect([...port.objects.keys()]).toEqual([`raw/production/${WS_A}/k.gz`]);
+    });
+
+    it("OS-B4 · bind() outside a tenant context fails closed, and so does an unbound call", async () => {
+      const port = new FakePort();
+      expect(() => store(port).bind()).toThrow(StorageTenancyError);
+      await expect(store(port).put("raw", "a", "x")).rejects.toThrow(StorageTenancyError);
+      expect(port.objects.size).toBe(0);
+    });
   });
 });

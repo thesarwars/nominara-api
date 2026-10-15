@@ -7,7 +7,7 @@ import { GenericContainer, Wait, type StartedTestContainer } from "testcontainer
 //
 // Start it under the shared docker lock (plans-7day/scratch/dlock.sh); never beside the owner's api-* containers.
 
-export const LOCALSTACK_IMAGE = "localstack/localstack:4.14.0";
+export const LOCALSTACK_IMAGE = "localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a";
 const EDGE_PORT = 4566;
 
 export interface LocalstackFixture {

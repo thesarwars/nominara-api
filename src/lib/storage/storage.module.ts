@@ -34,6 +34,7 @@ function unconfiguredPort(): ObjectStoragePort {
       inject: [OBJECT_STORAGE],
     },
   ],
-  exports: [OBJECT_STORAGE, TenantObjectStore],
+  // Only TenantObjectStore is injectable: the raw port can name any key in a bucket, so it stays private to this module.
+  exports: [TenantObjectStore],
 })
 export class StorageModule {}

@@ -28,6 +28,7 @@ describe("S3Adapter · every write is encrypted at rest", () => {
     await new Promise((r) => setImmediate(r));
     expect(input.ServerSideEncryption).toBe("aws:kms");
     expect(input.SSEKMSKeyId).toBe("arn:aws:kms:us-east-1:111122223333:key/abc");
+    expect(input.BucketKeyEnabled).toBe(true);
     expect(input.Bucket).toBe("r");
   });
 
@@ -36,12 +37,14 @@ describe("S3Adapter · every write is encrypted at rest", () => {
     await new Promise((r) => setImmediate(r));
     expect(input.ServerSideEncryption).toBe("AES256");
     expect(input.SSEKMSKeyId).toBeUndefined();
+    expect(input.BucketKeyEnabled).toBeUndefined();
   });
 
-  it("OS-A3 · SSE-KMS with no key id uses the account's default aws/s3 key (no SSEKMSKeyId sent)", async () => {
+  it("OS-A3 · SSE-KMS sends a bucket key, and with no key id sends no SSEKMSKeyId (the adapter never invents a key; production boot refuses this config, see env.spec OS-E7)", async () => {
     const input = putInput({});
     await new Promise((r) => setImmediate(r));
     expect(input.ServerSideEncryption).toBe("aws:kms");
+    expect(input.BucketKeyEnabled).toBe(true);
     expect(input.SSEKMSKeyId).toBeUndefined();
   });
 });

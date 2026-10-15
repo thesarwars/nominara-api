@@ -20,7 +20,8 @@ import type { ObjectHead, ObjectStoragePort, PutObjectRequest, StorageBucketName
 //   anything else           -> DegradedError (503), with a fixed message. The SDK's own message can carry a request id,
 //                              a bucket name or an endpoint, and the credentials are never in scope here, but a fixed
 //                              string is the only version that cannot leak by accident. The error NAME is logged.
-// KAD-06: the network calls here run from a worker or after commit, never inside a request-handler transaction. The
+// KAD-06: the network calls here must run from a worker or after commit, never inside a request-handler transaction;
+// TenantObjectStore.bind() exists so the workspace can be captured inside the transaction and used after it. The
 // presign is purely local.
 
 const logger = new Logger("s3-adapter");
@@ -57,6 +58,7 @@ export class S3Adapter implements ObjectStoragePort {
           ...(request.metadata !== undefined ? { Metadata: { ...request.metadata } } : {}),
           // Encryption at rest on every write (system-architecture.md section 10: SSE-KMS). Never optional per call.
           ServerSideEncryption: this.config.sse,
+          ...(this.config.sse === "aws:kms" ? { BucketKeyEnabled: true } : {}),
           ...(this.config.sse === "aws:kms" && this.config.kmsKeyId !== undefined ? { SSEKMSKeyId: this.config.kmsKeyId } : {}),
         }),
       ),

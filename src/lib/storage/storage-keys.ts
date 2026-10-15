@@ -38,15 +38,15 @@ export interface ObjectLocation {
 }
 
 function assertEnvAndWorkspace(keyEnv: string, workspaceId: string): void {
-  if (!ENV_SEGMENT.test(keyEnv)) throw new StorageKeyError("storage key environment is not a lowercase slug");
+  if (!ENV_SEGMENT.test(keyEnv) || keyEnv === "crawl") throw new StorageKeyError("storage key environment is not a lowercase slug");
   if (!UUID.test(workspaceId)) throw new StorageKeyError("storage workspace id is not a lowercase uuid");
 }
 
 function assertRelative(relative: string): void {
   if (relative.length === 0 || relative.length > MAX_RELATIVE_KEY_LENGTH) throw new StorageKeyError("storage key length is out of range");
   for (const segment of relative.split("/")) {
-    if (segment === "." || segment === ".." || !RELATIVE_SEGMENT.test(segment)) {
-      throw new StorageKeyError("storage key has an empty, dot or disallowed segment");
+    if (/^\.+$/.test(segment) || !RELATIVE_SEGMENT.test(segment)) {
+      throw new StorageKeyError("storage key has an empty, dot-only or disallowed segment");
     }
   }
 }

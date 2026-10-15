@@ -425,9 +425,12 @@ export const envSchema = z
     STORAGE_KMS_KEY_ID: requiredString.optional(),
     // The `{env}` segment of every object key (system-architecture.md section 6). Like CACHE_KEY_NAMESPACE it exists
     // because NODE_ENV cannot name a deployment (staging); a lowercase slug, defaulting to NODE_ENV.
+    // `crawl` is reserved: the crawl namespace is `crawl/{env}/{ws}/…`, so an env named crawl would make a raw key
+    // `crawl/{ws}/…` indistinguishable in shape from a crawl key.
     STORAGE_KEY_ENV: z
       .string()
       .regex(/^[a-z0-9][a-z0-9-]{0,31}$/, { message: "must be a lowercase slug of at most 32 characters" })
+      .refine((value) => value !== "crawl", { message: "crawl is reserved for the crawl key namespace" })
       .optional(),
   })
   .strict()
@@ -469,6 +472,20 @@ export const envSchema = z
         path: [env.STORAGE_ACCESS_KEY_ID === undefined ? "STORAGE_ACCESS_KEY_ID" : "STORAGE_SECRET_ACCESS_KEY"],
         message: "STORAGE_ACCESS_KEY_ID and STORAGE_SECRET_ACCESS_KEY must be set together (or neither, to use the IAM role).",
       });
+    }
+    // Production: the spec's SSE-KMS means OUR customer-managed key, not the account's default aws/s3 key, and the key
+    // environment must be named rather than inherited from NODE_ENV (it is a segment of every object key).
+    if (env.NODE_ENV === "production" && env.STORAGE_BUCKET_RAW !== undefined) {
+      if ((env.STORAGE_SSE ?? "aws:kms") === "aws:kms" && env.STORAGE_KMS_KEY_ID === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["STORAGE_KMS_KEY_ID"],
+          message: "STORAGE_KMS_KEY_ID is required in production when STORAGE_SSE is aws:kms (or unset): the default aws/s3 key is not the spec's CMK.",
+        });
+      }
+      if (env.STORAGE_KEY_ENV === undefined) {
+        ctx.addIssue({ code: "custom", path: ["STORAGE_KEY_ENV"], message: "STORAGE_KEY_ENV is required in production when object storage is configured." });
+      }
     }
     if (env.STORAGE_KMS_KEY_ID !== undefined && (env.STORAGE_SSE ?? "aws:kms") !== "aws:kms") {
       ctx.addIssue({ code: "custom", path: ["STORAGE_KMS_KEY_ID"], message: "STORAGE_KMS_KEY_ID only applies when STORAGE_SSE is aws:kms." });

@@ -99,7 +99,7 @@ services:
   # Group C item 3 - object storage (KAD-08), S3-compatible, development only. Production uses AWS S3 and differs
   # only in STORAGE_ENDPOINT (unset) and the credentials (IAM role). S3 ONLY: LocalStack loads nothing else.
   #
-  # PINNED to 4.14.0, deliberately NOT `latest`: LocalStack moved to date-versioned (2026.x) images that, per its own
+  # PINNED to 4.14.0 AND by digest (the multi-arch index digest), deliberately NOT `latest`: LocalStack moved to date-versioned (2026.x) images that, per its own
   # announcement, need an auth token; 4.14.0 (Feb 2026) is the last 4.x release, which runs without one. Moving past
   # it is a licensing decision, not a version bump.
   #
@@ -108,7 +108,10 @@ services:
   # persistence would make a restart behave differently from a fresh clone. The init script creates the two buckets
   # when LocalStack reports ready.
   localstack:
-    image: localstack/localstack:4.14.0
+    image: localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
+    # Opt-in: `docker compose up -d` does not pull this image or bind 4566. Start it with
+    # `docker compose --profile storage up -d localstack` (or COMPOSE_PROFILES=storage).
+    profiles: ["storage"]
     environment:
       SERVICES: s3
       DEBUG: "0"
