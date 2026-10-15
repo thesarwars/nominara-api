@@ -26,7 +26,7 @@ import { NOOP_REVERT, type Breaker } from "../support/breakers.js";
 // its own migration — see POLICY_IN_OWN_MIGRATION in src/db/conventions.ts
 // for why 0006 must not carry it.
 //
-// 82/63/19 as of STORY-072 AC13: `credit_hold_carries` (migration 0124) is a tenant table (workspace_id, own-migration policy, not portal-readable).
+// 82/63/19 as of STORY-072 AC13: `credit_hold_carries` (migration 0125) is a tenant table (workspace_id, own-migration policy, not portal-readable).
 //
 // 81/62/19 as of STORY-143 AC7: `audit_chain_marks` (migration 0123) is global — GRANT-protected, owner-only, no tenant policy; tenant count unchanged.
 //

@@ -166,7 +166,7 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
   for (let i = 0; i < R; i++) {
     await client.query("INSERT INTO stripe_subscription_syncs (workspace_id, stripe_subscription_id, fetch_started_at) VALUES ($1, $2, now())", [workspaceId, `sub_${label}_${i}`]);
   }
-  // STORY-072 AC13 (migration 0124) — a carried hold per row.
+  // STORY-072 AC13 (migration 0125) — a carried hold per row.
   for (let i = 0; i < R; i++) {
     await client.query(
       "INSERT INTO credit_hold_carries (workspace_id, idempotency_key, attempt, credits, rolled_cycle_start) VALUES ($1, $2, 1, 5, CURRENT_DATE)",

@@ -54,7 +54,7 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       // NEW-D-2 checkpoint-1 — third post-0006 tenant table (stripe_subscription_syncs).
       "0074_stripe_subscription_syncs",
       // STORY-072 AC13 — fourth post-0006 tenant table (credit_hold_carries).
-      "0124_credit_hold_carries",
+      "0125_credit_hold_carries",
       // CP2 decision 1 (ADR-0002) — checkRls() expects share_token_gate_lookup, a policy 0112 creates on share_tokens.
       // 0080 supplies the locked_until column the lookup function selects.
       "0080_portal_session_gate",
