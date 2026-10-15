@@ -4,11 +4,14 @@ import { Logger } from "@nestjs/common";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { StripeSubscriptionHandler } from "../../src/modules/billing/stripe-subscription.handler.js";
+import type { BillingAddonsService } from "../../src/modules/billing/billing-addons.service.js";
 import { applyPlanChange, type ProviderSubscriptionState } from "../../src/lib/billing/apply-plan.js";
 import { provisionWalletWithGrant, recordPurchase } from "../../src/lib/credits/balance.js";
 import { rollIncludedCycle, type CycleRollOutcome } from "../../src/lib/credits/cycle-roll.js";
 import { appendLedgerEntry } from "../../src/lib/credits/ledger.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
+import { writeCarries } from "../../src/lib/credits/hold-carry.js";
 import { reconcileOrphanedReservations } from "../../src/lib/credits/reconcile.js";
 import { settleFinishedRunCredits } from "../../src/lib/credits/run-settlement.js";
 import { commitReservation, releaseReservation, type SettleableReservation } from "../../src/lib/credits/settle.js";
@@ -124,10 +127,19 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
     expect(await inCtx(workspaceId, (tx) => verifyWorkspaceWallet(tx, workspaceId))).toBeNull();
   }
 
-  async function roll(workspaceId: string, grant: number, cycle = CYCLE_2): Promise<CycleRollOutcome> {
+  async function roll(workspaceId: string, grant: number, cycle = CYCLE_2, carryUnused = false): Promise<CycleRollOutcome> {
     return inCtx(workspaceId, (tx) =>
-      rollIncludedCycle(tx, { workspaceId, grant, cycleStart: cycle.start, cycleEnd: cycle.end }),
+      rollIncludedCycle(tx, { workspaceId, grant, cycleStart: cycle.start, cycleEnd: cycle.end, carryUnused }),
     );
+  }
+
+  async function carryRows(workspaceId: string) {
+    const r = await db.query<{ idempotency_key: string; credits: number; settled: boolean; rolled: string }>(
+      `SELECT idempotency_key, credits, settled_at IS NOT NULL AS settled, to_char(rolled_cycle_start,'YYYY-MM-DD') AS rolled
+         FROM credit_hold_carries WHERE workspace_id = $1 ORDER BY idempotency_key`,
+      [workspaceId],
+    );
+    return r.rows;
   }
 
   async function balances(workspaceId: string) {
@@ -554,6 +566,78 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
       expect(JSON.stringify(line)).not.toContain("ws-");
     });
 
+    it("STORY-072 AC13 · the carry-into-the-grant of an upgrade is CAPPED at the grant: more unused than the grant still expires the rest", async () => {
+      await wallet(ws, 1000);
+      await spend(ws, 100, "job-0"); // 900 unused
+
+      const outcome = await roll(ws, 450, CYCLE_2, true);
+
+      expect(outcome).toMatchObject({ rolled: true, expired: 450, granted: 0, carried: 0 });
+      expect((await balances(ws)).included_balance).toBe(450);
+      expect(await entries(ws, ["expire"])).toEqual([expect.objectContaining({ credits: 450 })]);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a plan with NO grant but unused credits still carries a hold across the roll (the expiry alone anchors it)", async () => {
+      await wallet(ws, 100);
+      await openHold(ws, 40, "held");
+
+      await roll(ws, 0);
+
+      expect((await entries(ws, ["expire"])).map((e) => e.credits)).toEqual([60]);
+      expect(await carryRows(ws)).toEqual([expect.objectContaining({ idempotency_key: "held", credits: 40, settled: false })]);
+      await commitHold(ws, "held", 40, 25);
+      expect(await balances(ws)).toMatchObject({ included_balance: 0, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · the carry goes to the OLDEST hold first when the bucket cannot cover every hold", async () => {
+      await wallet(ws, 150);
+      await inCtx(ws, (tx) => recordPurchase(tx, { workspaceId: ws, idempotencyKey: "pack-1", actorId: null, actorType: "system" }, 100));
+      await openHold(ws, 120, "a");
+      await openHold(ws, 80, "b");
+
+      await roll(ws, 20);
+
+      expect(await carryRows(ws)).toEqual([
+        expect.objectContaining({ idempotency_key: "a", credits: 120 }),
+        expect.objectContaining({ idempotency_key: "b", credits: 30 }),
+      ]);
+      await commitHold(ws, "a", 120);
+      await commitHold(ws, "b", 80);
+      // b: 30 from its carry, 20 from the new grant, 30 from purchased.
+      expect(await balances(ws)).toMatchObject({ included_balance: 0, purchased_balance: 70, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a hold that carries nothing cannot draw the bucket BELOW the others' carries (the pool is floored at zero)", async () => {
+      await wallet(ws, 100);
+      await inCtx(ws, (tx) => recordPurchase(tx, { workspaceId: ws, idempotencyKey: "pack-1", actorId: null, actorType: "system" }, 500));
+      await openHold(ws, 100, "old");
+      await roll(ws, 10);
+      // An out-of-band correction leaves the bucket (40) below the carry (100).
+      await db.query("UPDATE credit_wallets SET included_balance = 40 WHERE workspace_id = $1", [ws]);
+      await openHold(ws, 30, "new");
+
+      await commitHold(ws, "new", 30);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 40, purchased_balance: 470, reserved: 100 });
+    });
+
+    it("STORY-072 AC13 · a settled carry is never reopened by a later write", async () => {
+      await exampleWallet();
+      await roll(ws, 1200);
+      await releaseHold(ws, "job-1", 200);
+
+      await inCtx(ws, (tx) =>
+        writeCarries(tx, ws, CYCLE_3.start,
+          [{ idempotencyKey: "job-1", attempt: 1, credits: 200, carry: 0 }],
+          [{ idempotencyKey: "job-1", attempt: 1, carry: 150 }]),
+      );
+
+      expect(await carryRows(ws)).toEqual([expect.objectContaining({ credits: 200, settled: true, rolled: CYCLE_2.start })]);
+    });
+
     it("STORY-072 AC13 · a plan with NO grant and a fully held bucket behaves as before: the hold simply settles (documented corner)", async () => {
       await wallet(ws, 100);
       await openHold(ws, 100, "all");
@@ -846,6 +930,28 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
         await replayClean(ws);
       });
 
+      it("STORY-072 AC13 · the auto-top-up counter waits for the roll, too: it restarts at recovery, not while past_due", async () => {
+        await onPlan("growth");
+        await db.query("UPDATE credit_wallets SET auto_topup_count_cycle = 2 WHERE workspace_id = $1", [ws]);
+
+        await apply(ws, pastDue(CYCLE_2));
+        expect((await balances(ws)).auto_topup_count_cycle).toBe(2);
+
+        await apply(ws, recovered);
+        expect((await balances(ws)).auto_topup_count_cycle).toBe(0);
+      });
+
+      it("STORY-072 AC13 · a past_due subscription that ENDS (back to free, never paid) is not a payment and does not roll", async () => {
+        const grant = await onPlan("growth");
+        await spend(ws, 100, "job-1");
+        await apply(ws, pastDue(CYCLE_2));
+
+        await apply(ws, (c) => ({ ...c, planKey: "free", status: "active" }));
+
+        expect(await balances(ws)).toMatchObject({ included_balance: grant - 100, cycle_start: CYCLE_1.start });
+        expect(await entries(ws, ["expire"])).toEqual([]);
+      });
+
       it("STORY-072 AC13 · a past_due event inside the CURRENT period changes nothing, and neither does the active one that follows", async () => {
         const grant = await onPlan("growth");
         await spend(ws, 100, "job-1");
@@ -867,6 +973,66 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
 
       expect(await balances(ws)).toMatchObject({ included_balance: grant, cycle_start: year.start, cycle_end: year.end });
       expect(await entries(ws, ["expire"])).toHaveLength(1);
+    });
+  });
+
+  // ---- the WEBHOOK that marks the payment succeeded ------------------------------------------------------------
+  //
+  // `customer.subscription.updated` is the event that returns a subscription from past_due to active (and that lifts
+  // the workspace out of past_due); it carries the SAME period start the failed-renewal one did. Driven through the real
+  // handler, so "the roll happens when the payment succeeds" is proven at the event, not only at applyPlanChange.
+  describe("the subscription webhook handler", () => {
+    const SUB = "sub_hook";
+    const sec = (day: string): number => Math.floor(Date.parse(`${day}T00:00:00Z`) / 1000);
+
+    function subscription(status: string, period: { start: string; end: string }): Record<string, unknown> {
+      return {
+        id: SUB, object: "subscription", status, customer: "cus_hook", cancel_at_period_end: false,
+        current_period_start: sec(period.start), current_period_end: sec(period.end),
+        items: { data: [{ quantity: 1, price: { unit_amount: 12900, currency: "usd", recurring: { interval: "month", interval_count: 1 }, product: { metadata: { nominara_kind: "plan" } } } }] },
+      };
+    }
+
+    let fetchAt = Date.now();
+    async function deliver(workspaceId: string, eventId: string, raw: Record<string, unknown>): Promise<void> {
+      const handler = new StripeSubscriptionHandler({ reconcile: async () => undefined } as unknown as BillingAddonsService);
+      fetchAt += 1000;
+      await inCtx(workspaceId, (tx) =>
+        handler.handle({
+          tx, workspaceId,
+          event: { id: eventId, type: "customer.subscription.updated", objectId: SUB },
+          object: { kind: "subscription", id: SUB, metadata: { plan_key: "growth", workspace_id: workspaceId }, raw },
+          fetchStartedAt: new Date(fetchAt),
+          afterCommit: [],
+        }),
+      );
+    }
+
+    async function workspaceStatus(workspaceId: string): Promise<string> {
+      return (await db.query<{ status: string }>("SELECT status FROM workspaces WHERE id = $1", [workspaceId])).rows[0]!.status;
+    }
+
+    it("STORY-072 AC13 · past_due waits; the active event that follows rolls the wallet once; a redelivery does not roll it again", async () => {
+      await db.query("UPDATE subscriptions SET stripe_subscription_id = $2, provider = 'stripe' WHERE workspace_id = $1", [ws, SUB]);
+      const grant = (await db.query<{ credits_per_cycle: number }>("SELECT credits_per_cycle FROM plans WHERE key = 'growth'")).rows[0]!.credits_per_cycle;
+      await wallet(ws, grant);
+      await spend(ws, 100, "job-1");
+
+      await deliver(ws, "evt_1", subscription("past_due", CYCLE_2));
+      expect(await workspaceStatus(ws)).toBe("past_due");
+      expect(await balances(ws)).toMatchObject({ included_balance: grant - 100, cycle_start: CYCLE_1.start });
+      expect(await entries(ws, ["expire"])).toEqual([]);
+
+      await deliver(ws, "evt_2", subscription("active", CYCLE_2));
+      expect(await workspaceStatus(ws)).not.toBe("past_due");
+      expect(await balances(ws)).toMatchObject({ included_balance: grant, cycle_start: CYCLE_2.start });
+      expect(await entries(ws, ["expire"])).toEqual([expect.objectContaining({ credits: grant - 100 })]);
+
+      await spend(ws, 25, "job-2");
+      await deliver(ws, "evt_3", subscription("active", CYCLE_2));
+      expect((await balances(ws)).included_balance).toBe(grant - 25);
+      expect(await entries(ws, ["expire"])).toHaveLength(1);
+      await replayClean(ws);
     });
   });
 
