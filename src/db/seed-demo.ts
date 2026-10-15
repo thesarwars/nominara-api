@@ -227,6 +227,11 @@ async function assertPooledConnectionIsRuntimeApp(tx: ClientBase): Promise<void>
 export interface SeedDemoOptions {
   readonly windowDays?: number;
   readonly promptsPerProject?: number;
+  /**
+   * Test-only: the instant "today" is derived from. Omitted (as the real CLI
+   * always omits it), the database clock is used — production is unchanged.
+   */
+  readonly now?: Date;
 }
 
 export async function runSeedDemo(args: SeedDemoArgs, deps: SeedDemoDeps, options: SeedDemoOptions = {}): Promise<void> {
@@ -281,8 +286,8 @@ export async function runSeedDemo(args: SeedDemoArgs, deps: SeedDemoDeps, option
   // BACKFILL needs the months behind today too, so this computes its own
   // reference date and month count rather than reusing that default.
   const todayRow = await ownerClient.query<{ today: string }>(
-    `SELECT to_char((now() AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS today`,
-    [timezone],
+    `SELECT to_char((coalesce($2::timestamptz, now()) AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS today`,
+    [timezone, options.now?.toISOString() ?? null],
   );
   const today = todayRow.rows[0]!.today;
   const earliestDay = shiftDate(today, -(windowDays - 1));
@@ -316,6 +321,7 @@ export async function runSeedDemo(args: SeedDemoArgs, deps: SeedDemoDeps, option
       }
       const factsOptions = {
         windowDays,
+        ...(options.now === undefined ? {} : { now: options.now }),
         ...(options.promptsPerProject === undefined ? {} : { promptsPerProject: options.promptsPerProject }),
         ...(excludeEngines.length === 0 ? {} : { excludeEngines }),
       };

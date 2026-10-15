@@ -59,6 +59,8 @@ export interface SeedFactsOptions {
    * competitor would corrupt real share of voice and cannot be purged).
    */
   readonly existingOnly?: boolean;
+  /** Test-only: the instant "today" is derived from; omitted, the database clock. */
+  readonly now?: Date;
 }
 
 export interface SeedFactsResult {
@@ -107,16 +109,16 @@ interface WorkspaceLocalDay {
  * resolves the DST-aware offset for that exact calendar day, which no fixed
  * JS offset arithmetic can.
  */
-async function workspaceLocalWindow(tx: ClientBase, timezone: string, windowDays: number): Promise<WorkspaceLocalDay[]> {
+async function workspaceLocalWindow(tx: ClientBase, timezone: string, windowDays: number, now?: Date): Promise<WorkspaceLocalDay[]> {
   const result = await tx.query<{ d: string; noon_utc: Date }>(
     `SELECT to_char(gs::date, 'YYYY-MM-DD') AS d,
             ((gs::date::timestamp + interval '12 hours') AT TIME ZONE $1) AS noon_utc
        FROM generate_series(
-              (now() AT TIME ZONE $1)::date - ($2 - 1),
-              (now() AT TIME ZONE $1)::date,
+              (coalesce($3::timestamptz, now()) AT TIME ZONE $1)::date - ($2 - 1),
+              (coalesce($3::timestamptz, now()) AT TIME ZONE $1)::date,
               interval '1 day'
             ) gs`,
-    [timezone, windowDays],
+    [timezone, windowDays, now?.toISOString() ?? null],
   );
   return result.rows.map((row) => ({ day: row.d, capturedAt: row.noon_utc }));
 }
@@ -456,7 +458,7 @@ export async function resetAndSeedProjectFacts(
   const windowDays = options.windowDays ?? 60;
   const promptCount = options.promptsPerProject ?? 8;
 
-  const days = await workspaceLocalWindow(tx, timezone, windowDays);
+  const days = await workspaceLocalWindow(tx, timezone, windowDays, options.now);
   const excluded = new Set(options.excludeEngines ?? []);
   const engines = (await entitledEngines(tx, project.id)).filter((engine) => !excluded.has(engine.engineKey));
   const existingOnly = options.existingOnly === true;

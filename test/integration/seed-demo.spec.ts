@@ -139,6 +139,22 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
   // the test fast.
   const FAST_OPTIONS = { windowDays: 60, promptsPerProject: 2 };
 
+  // A pinned clock for the Pacific/Kiritimati (UTC+14) tests. 10:00 UTC is
+  // midnight there, so a test reading the wall clock between two operations
+  // can straddle the workspace-local day and flake. 09:30Z is 23:30 local on
+  // 2026-03-10; both seeds and every date assertion derive from this ONE
+  // instant, so the result cannot depend on when the suite runs.
+  const KIRITIMATI = "Pacific/Kiritimati";
+  const PINNED_NOW = new Date("2026-03-10T09:30:00.000Z");
+  const PINNED_OPTIONS = { ...FAST_OPTIONS, now: PINNED_NOW };
+  const pinnedLocalDay = async (at: Date, offsetDays = 0): Promise<string> =>
+    (
+      await client.query<{ d: string }>(
+        `SELECT to_char(($1::timestamptz AT TIME ZONE $2)::date + $3::int, 'YYYY-MM-DD') AS d`,
+        [at.toISOString(), KIRITIMATI, offsetDays],
+      )
+    ).rows[0]!.d;
+
   it("STORY-169 · seeds a workspace with no projects: creates the 3 fixtures and fills every contract-A field", async () => {
     const workspaceId = await createWorkspace("business");
     const { log } = collectingLog();
@@ -776,6 +792,8 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
   // claims to have removed it.
   it("STORY-169 re-audit · on a UTC+14 pre-existing project, a re-seed does not duplicate facts and --purge removes every demo-marked one", async () => {
     const workspaceId = await createWorkspace("growth", "Pacific/Kiritimati");
+    const realRowDay = await pinnedLocalDay(PINNED_NOW, -90);
+    const windowStartDay = await pinnedLocalDay(PINNED_NOW, -59);
     const project = await client.query<{ id: string }>(
       `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, status)
        VALUES ($1,'Real Project','real-project-g','https://real-g.example','real-g.example','active')
@@ -790,11 +808,11 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
       `INSERT INTO metric_daily
          (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date,
           cells_total, cells_present, presence_rate, sov, visibility_score, scoring_version)
-       VALUES ($1,$2,'all','brand',$2, (CURRENT_DATE - 90), 5, 3, 0.6, 0.4, 42.5, 'v1')`,
-      [workspaceId, projectId],
+       VALUES ($1,$2,'all','brand',$2, $3::date, 5, 3, 0.6, 0.4, 42.5, 'v1')`,
+      [workspaceId, projectId, realRowDay],
     );
 
-    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, PINNED_OPTIONS);
 
     const capturesAfterFirstSeed = await client.query<{ n: string }>(
       `SELECT count(*)::text AS n FROM answer_captures WHERE project_id = $1 AND normalizer_version = 'demo-seed'`,
@@ -804,7 +822,7 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
 
     // Re-run, same day — idempotent means the SAME demo capture count, not
     // the earliest window day's facts doubled up.
-    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, PINNED_OPTIONS);
     const capturesAfterReSeed = await client.query<{ n: string }>(
       `SELECT count(*)::text AS n FROM answer_captures WHERE project_id = $1 AND normalizer_version = 'demo-seed'`,
       [projectId],
@@ -824,15 +842,15 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     // No metric_daily row survives inside the seed's own 60-day window —
     // the real 90-day-old row is the only history left.
     const demoWindowRows = await client.query<{ n: string }>(
-      `SELECT count(*)::text AS n FROM metric_daily WHERE project_id = $1 AND metric_date >= (CURRENT_DATE - 59)`,
-      [projectId],
+      `SELECT count(*)::text AS n FROM metric_daily WHERE project_id = $1 AND metric_date >= $2::date`,
+      [projectId, windowStartDay],
     );
     expect(Number(demoWindowRows.rows[0]!.n)).toBe(0);
 
     const realRow = await client.query<{ n: string }>(
       `SELECT count(*)::text AS n FROM metric_daily
-        WHERE project_id = $1 AND metric_date = (CURRENT_DATE - 90) AND engine_key = 'all' AND entity_type = 'brand'`,
-      [projectId],
+        WHERE project_id = $1 AND metric_date = $2::date AND engine_key = 'all' AND entity_type = 'brand'`,
+      [projectId, realRowDay],
     );
     expect(Number(realRow.rows[0]!.n)).toBe(1);
 
@@ -843,6 +861,60 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
       [projectId],
     );
     expect(projectRow.rows[0]!.demo_seeded_at).toBeNull();
+  }, 180_000);
+
+  // The seed's "today" is the workspace-local day. Re-seeding after that day
+  // rolls over (10:00 UTC is midnight at UTC+14) moves the window forward one
+  // day. Pinned either side of the boundary so it is deterministic: the
+  // overlapping days must not be duplicated, the day that fell out of the
+  // window is kept (the reset only covers the new window), and --purge must
+  // still remove every demo-marked capture.
+  it("STORY-169 re-audit · a re-seed across the workspace-local midnight keeps the prior day once, duplicates nothing, and --purge removes all", async () => {
+    const workspaceId = await createWorkspace("growth", KIRITIMATI);
+    const project = await client.query<{ id: string }>(
+      `INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, status)
+       VALUES ($1,'Real Project','real-project-x','https://real-x.example','real-x.example','active')
+       RETURNING id`,
+      [workspaceId],
+    );
+    const projectId = project.rows[0]!.id;
+    const beforeMidnight = new Date("2026-03-10T09:59:59.000Z");
+    const afterMidnight = new Date("2026-03-10T10:00:01.000Z");
+    expect(await pinnedLocalDay(afterMidnight)).toBe(await pinnedLocalDay(beforeMidnight, 1));
+
+    const seed = (now: Date) =>
+      runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, { ...FAST_OPTIONS, now });
+    const captureCount = async () =>
+      Number(
+        (
+          await client.query<{ n: string }>(
+            `SELECT count(*)::text AS n FROM answer_captures WHERE project_id = $1 AND normalizer_version = 'demo-seed'`,
+            [projectId],
+          )
+        ).rows[0]!.n,
+      );
+
+    await seed(beforeMidnight);
+    const first = await captureCount();
+    expect(first).toBeGreaterThan(0);
+    const perDay = first / FAST_OPTIONS.windowDays;
+    expect(Number.isInteger(perDay)).toBe(true);
+
+    await seed(afterMidnight);
+    expect(await captureCount()).toBe(first + perDay);
+
+    const perDayCounts = await client.query<{ d: string; n: string }>(
+      `SELECT to_char((captured_at AT TIME ZONE $2)::date, 'YYYY-MM-DD') AS d, count(*)::text AS n
+         FROM answer_captures WHERE project_id = $1 AND normalizer_version = 'demo-seed' GROUP BY 1 ORDER BY 1`,
+      [projectId, KIRITIMATI],
+    );
+    expect(perDayCounts.rows).toHaveLength(FAST_OPTIONS.windowDays + 1);
+    expect(new Set(perDayCounts.rows.map((r) => Number(r.n)))).toEqual(new Set([perDay]));
+    expect(perDayCounts.rows[0]!.d).toBe(await pinnedLocalDay(beforeMidnight, -(FAST_OPTIONS.windowDays - 1)));
+    expect(perDayCounts.rows.at(-1)!.d).toBe(await pinnedLocalDay(afterMidnight));
+
+    await runSeedDemo({ workspaceId, purge: true }, { ownerClient: client, pool: testPool(), log: () => {} });
+    expect(await captureCount()).toBe(0);
   }, 180_000);
 
   // STORY-169 review, PROBE E — the seed's first version counted only
@@ -1054,16 +1126,19 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
   // (no DST), which keeps this test deterministic.
   it("STORY-169 review · a UTC+14 workspace's captures land on the correct workspace-local day, not the next one", async () => {
     const workspaceId = await createWorkspace("business", "Pacific/Kiritimati");
-    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    // One instant, read once: the seed's window and every date assertion
+    // below derive from it, so a workspace-local midnight passing mid-test
+    // cannot move them apart. It stays the real clock (not PINNED_NOW)
+    // because the rollup's trailing-30-day denormalisation reads the DB
+    // clock, and this test asserts that denormalised score is set.
+    const seededAt = new Date();
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, { ...FAST_OPTIONS, now: seededAt });
 
     const projects = await projectsOf(workspaceId);
     expect(projects.length).toBeGreaterThan(0);
     const projectId = projects[0]!.id as string;
 
-    const todayRow = await client.query<{ today: string }>(
-      `SELECT to_char((now() AT TIME ZONE 'Pacific/Kiritimati')::date, 'YYYY-MM-DD') AS today`,
-    );
-    const today = todayRow.rows[0]!.today;
+    const today = await pinnedLocalDay(seededAt);
 
     // A row for TODAY, workspace-local — not shifted a day into the future.
     const todayRollup = await client.query<{ n: string }>(
