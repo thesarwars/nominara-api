@@ -20,6 +20,7 @@ import {
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
+import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import { Page } from "../../api/pagination/page.js";
@@ -67,6 +68,7 @@ export class PromptsController {
   // submission must replay rather than double them.
   @Idempotent()
   @RequirePermission("prompt:write")
+  @ProjectParam("id")
   // Audited because a pass writes fifteen rows that shape every subsequent
   // measurement: which questions the engines are asked IS the measurement,
   // and a changed prompt set changes the meaning of every number after it.
@@ -112,6 +114,7 @@ export class PromptsController {
   // `already_active` summary member meaningful.
   @Idempotent()
   @RequirePermission("prompt:write")
+  @ProjectParam("id")
   // Audited because activation is what decides which questions the engines
   // are actually asked — the prompt set IS the measurement, and a change to
   // it changes the meaning of every number after it.
@@ -143,6 +146,7 @@ export class PromptsController {
   // matrix page would bury the writes that matter.
   @Get()
   @RequirePermission("tracking:read")
+  @ProjectParam("id")
   @ApiContract({
     operationId: "listPrompts",
     querySchema: promptListQuerySchema,
@@ -179,6 +183,7 @@ export class PromptsController {
   @HttpCode(201)
   @Idempotent()
   @RequirePermission("prompt:write")
+  @ProjectParam("id")
   @Audit({ action: "prompt.created", resourceType: "prompt" })
   @ApiContract({
     operationId: "createPrompt",

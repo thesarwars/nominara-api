@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DomainError } from "../../api/errors/domain-errors.js";
 import type { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
+import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
 import { PromptLifecycleService } from "./lifecycle.service.js";
 
@@ -49,6 +50,8 @@ interface Scenario {
   readonly entitlements?: Record<string, { value: unknown }>;
   readonly failOn?: { match: string; error: Error };
   readonly missing?: boolean;
+  /** The member's project scope covers the prompt's project. Default true (unrestricted). */
+  readonly inScope?: boolean;
 }
 
 describe("STORY-046 · PromptLifecycleService.update", () => {
@@ -79,6 +82,7 @@ describe("STORY-046 · PromptLifecycleService.update", () => {
                 },
               ],
         },
+        { match: "current_scope_projects", rows: [{ in_scope: scenario.inScope ?? true }] },
         { match: "count(*) FILTER (WHERE is_priority", rows: [{ n: scenario.priorityCount ?? 0 }] },
         { match: "status <> 'archived'", rows: [{ n: scenario.activeCount ?? 10 }] },
         { match: "prompts_cap", rows: [{ prompts_active: scenario.activeCount ?? 10, prompts_cap: 40 }] },
@@ -91,6 +95,13 @@ describe("STORY-046 · PromptLifecycleService.update", () => {
 
   beforeEach(() => {
     vi.restoreAllMocks();
+  });
+
+  // STORY-019 review - the id names a prompt, so the member's project scope is checked against the row's own
+  // project BEFORE anything is read or written; a denial is 403 project_out_of_scope, never 404.
+  it("REQ-019-scope-out: refuses a prompt outside the member's project scope and writes nothing", async () => {
+    await expect(setup({ inScope: false }).update(PROMPT, { status: "paused" })).rejects.toBeInstanceOf(ProjectOutOfScopeException);
+    expect(calls.some((call) => /UPDATE|INSERT/.test(call.sql))).toBe(false);
   });
 
   // ---------------------------------------------------------------------------

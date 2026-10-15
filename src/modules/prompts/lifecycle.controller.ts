@@ -8,6 +8,7 @@ import {
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { PromptLifecycleService } from "./lifecycle.service.js";
 
@@ -42,6 +43,7 @@ export class PromptLifecycleController {
   // `archived`), which is the check that can tell those apart.
   @Patch(":id")
   @RequirePermission("prompt:write")
+  @ScopedByQuery()
   // Audited because all three changes alter the measurement: pausing stops
   // capturing a question, archiving removes it, and an edit starts a new
   // history series whose numbers are not comparable to the old one's.

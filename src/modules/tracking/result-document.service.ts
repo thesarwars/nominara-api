@@ -7,6 +7,7 @@ import type {
 } from "../../../contracts/tracking/index.js";
 import { RESULT_DOCUMENT_SCHEMA } from "../../../contracts/tracking/index.js";
 import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
+import { assertProjectInScope } from "../../tenancy/project-scope.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
 // STORY-034 AC7 — `GET /v1/results/{id}`, §6's parser document.
@@ -109,6 +110,8 @@ export class ResultDocumentService {
 
     const capture = found.rows[0];
     if (capture === undefined) throw new NotFoundError({ message: "no such result" });
+    // The id names a result, not a project: a scoped member is checked against the row's own project.
+    await assertProjectInScope(store.client, capture.project_id);
 
     const text = typeof capture.payload?.text === "string" ? capture.payload.text : "";
 

@@ -8,6 +8,7 @@ import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { insertPromptStatement } from "../../lib/promptgen/persist.js";
 import { promptTextHash } from "../../lib/promptgen/text-hash.js";
+import { assertProjectInScope } from "../../tenancy/project-scope.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
 // STORY-046 — `PATCH /v1/prompts/{id}`. api-specification.md §3:
@@ -64,6 +65,8 @@ export class PromptLifecycleService {
     const client = store.client as TenantClient;
 
     const prompt = await this.load(client, promptId);
+    // The id names a prompt, not a project: a scoped member is checked against the row's own project.
+    await assertProjectInScope(store.client, prompt.project_id);
 
     if (request.status !== undefined) await this.assertStatusChangeAllowed(client, store.context.workspaceId, prompt, request.status);
     if (request.is_priority !== undefined) await this.assertPriorityAllowed(client, store.context.workspaceId, prompt, request.is_priority);

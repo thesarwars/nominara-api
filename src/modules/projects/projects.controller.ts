@@ -23,6 +23,7 @@ import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequireEntitlement } from "../../api/decorators/require-entitlement.decorator.js";
+import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
@@ -67,6 +68,7 @@ export class ProjectsController {
   // viewer watching onboarding must be able to see discovery arrive.
   @Get(":id/discovery")
   @RequirePermission("project:read")
+  @ProjectParam("id")
   @ApiContract({ operationId: "getProjectDiscovery", responseSchema: discoveryResponseSchema })
   discovery(@Param("id") id: string): Promise<DiscoveryResponse> {
     return this.service.discoveryFor(id);
@@ -78,6 +80,7 @@ export class ProjectsController {
   @Post(":id/discovery/confirm")
   @HttpCode(200)
   @RequirePermission("project:update")
+  @ProjectParam("id")
   @Audit({ action: "project.discovery_confirmed", resourceType: "project" })
   @ApiContract({
     operationId: "confirmProjectDiscovery",
@@ -98,6 +101,7 @@ export class ProjectsController {
   @Post(":id/domain-verification")
   @HttpCode(200)
   @RequirePermission("project:update")
+  @ProjectParam("id")
   @Audit({ action: "project.domain_verification_started", resourceType: "project" })
   @ApiContract({
     operationId: "startDomainVerification",
@@ -114,6 +118,7 @@ export class ProjectsController {
   @Post(":id/domain-verification/check")
   @HttpCode(200)
   @RequirePermission("project:update")
+  @ProjectParam("id")
   @Audit({ action: "project.domain_verification_checked", resourceType: "project" })
   @ApiContract({
     operationId: "checkDomainVerification",
@@ -132,6 +137,7 @@ export class ProjectsController {
   // render the audit scope it implies.
   @Get(":id/domain-verification")
   @RequirePermission("project:read")
+  @ProjectParam("id")
   @ApiContract({ operationId: "getDomainVerification", responseSchema: verificationStatusResponseSchema })
   verificationStatus(@Param("id") id: string): Promise<VerificationStatusResponse> {
     return this.verification.status(id);

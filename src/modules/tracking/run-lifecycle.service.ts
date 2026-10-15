@@ -16,6 +16,7 @@ import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { undoRunCharge } from "../../lib/credits/undo.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
+import { assertProjectInScope } from "../../tenancy/project-scope.js";
 
 // STORY-034 AC2–AC5 — trigger, observe, cancel.
 
@@ -135,6 +136,7 @@ export class RunLifecycleService {
     if (store === undefined) throw new Error("RunLifecycleService requires an active tenant context");
 
     const progress = await readRunProgress(store.client, runId);
+    await assertProjectInScope(store.client, progress.projectId);
     return this.present(
       progress,
       // Recomputed rather than stored. The hook is pure — it reports what
@@ -181,6 +183,8 @@ export class RunLifecycleService {
     if (store === undefined) throw new Error("RunLifecycleService requires an active tenant context");
 
     const current = await readRunProgress(store.client, runId);
+    // Before the status answer, so an out-of-scope member learns nothing about the run.
+    await assertProjectInScope(store.client, current.projectId);
     if (!CANCELLABLE.has(current.status)) {
       // Not idempotent-by-silence. A run that already completed cannot be
       // cancelled, and answering 200 would let a client report "cancelled" for
@@ -237,6 +241,7 @@ export class RunLifecycleService {
     if (store === undefined) throw new Error("RunLifecycleService requires an active tenant context");
 
     const current = await readRunProgress(store.client, runId);
+    await assertProjectInScope(store.client, current.projectId);
 
     try {
       return await this.attemptUndo(store.client, current, runId, actorId);
