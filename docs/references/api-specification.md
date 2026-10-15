@@ -5,6 +5,8 @@ Content type `application/json; charset=utf-8` for requests and success response
 
 **The specification source of truth is `nominara-api/contracts` (zod).** The OpenAPI 3.1 document is generated from it and served at `GET /v1/openapi.json`. Drift between the schemas and the committed document fails CI. Hand-editing the OpenAPI file is never correct.
 
+**The RBAC permission matrix is a generated contract artifact too** (STORY-019): `contracts/permission-matrix.generated.json`, built from the table `RbacGuard` evaluates ([`security-and-tenancy.md` §6](./security-and-tenancy.md#6-permission-matrix)), and exported by `@nominara/client` as `PERMISSION_MATRIX`. `contracts:check` fails on drift. No endpoint serves it.
+
 ---
 
 ## 1. Request envelope
@@ -16,13 +18,13 @@ Content type `application/json; charset=utf-8` for requests and success response
 | `Authorization: Bearer <jwt>` | one of | Interactive sessions. Ed25519 JWT, 15-minute TTL. The `ws` claim pins the active workspace. |
 | `Authorization: Bearer nk_live_…` | one of | Service API key. Requires `X-Nominara-Workspace`. |
 | `X-Nominara-Workspace: <uuid>` | API keys only | Must match the key's workspace; a mismatch is `403 workspace_mismatch`. |
-| `Idempotency-Key: <=255 chars>` | on every billable or external-effect `POST` | 24-hour replay window. Identical key + identical body returns the cached response; identical key + different body is `409 idempotency_conflict`. |
+| `Idempotency-Key: <=255 chars>` | on every billable or external-effect `POST` | 24-hour replay window. Identical key + identical body returns the cached response; identical key + different body is `409 idempotency_conflict`. On a credit-spending route a key starting with `prompt_activate:` (any case) is refused (`400 validation_failed`): that namespace holds the server's own ledger keys. |
 | `If-Match: <etag>` | on `PATCH` of mutable config | Optimistic concurrency on `projects`, `tracked_prompts`, `share_tokens`. |
-| `X-Nominara-Confirmed-Credits: <int>` | on every credit-spending execution route | Echoes the exact figure shown to the operator. A mismatch is `409 price_changed`. |
+| `X-Nominara-Confirmed-Credits: <int>` | on every credit-spending execution route | Echoes the exact figure shown to the operator. A mismatch is `409 price_changed`. Digits only: `1e3`, `0x10` and `+5` are refused (`400`). |
 | `X-Nominara-Scoring-Version` | optional | Pins analytics reads to a scoring version during a cut-over. |
 | `X-Request-Id` | optional | Not an identity; recorded as a span attribute only. The response `X-Request-Id` header, `meta.request_id` and `error.request_id` always carry the server-generated OpenTelemetry trace id (32 lowercase hex); an inbound `traceparent` is likewise ignored. |
 
-Every response to an authenticated route carries wallet state, so **no client ever needs a second call to keep a balance chip current** (`NFR-API-12`):
+Every **successful** response to an authenticated route carries wallet state, read inside the request's own transaction, so **no client ever needs a second call to keep a balance chip current** (`NFR-API-12`). Error responses omit it deliberately: the transaction is rolling back, and a balance read out of it is not current. `402 insufficient_credits` carries the full wallet in its own `details` (STORY-072, owner decision 2026-10-14):
 
 ```
 X-Nominara-Credits-Available: 1462
@@ -84,11 +86,11 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | **402** | **`insufficient_credits`** | The wallet cannot cover the action. Carries the required/available split and purchasable packs |
 | 403 | `forbidden` | `details.required_permission` names the missing permission |
 | 403 | `workspace_mismatch` | Tenant or scoped-role violation |
-| 403 | `project_out_of_scope` | Tenant or scoped-role violation |
+| 403 | `project_out_of_scope` | Tenant or scoped-role violation. A scoped member asking for a project outside its `project_scope` — named by the path, or, on a route that names an entity (a run, a result, a prompt), by that row's own project. Never `404` (STORY-019) |
 | **403** | **`entitlement_exceeded`** | A **structural** plan limit is reached — projects, prompts, seats, competitors, share tokens, API keys. `details.{key, limit, current}` plus upgrade/add-on remediation |
 | **403** | **`feature_not_in_plan`** | A **feature flag** entitlement is absent — white-label, Search Console, SSO, CSV export, share links, drift sampling. `details.{key, min_plan}` |
 | 404 | `not_found` | Resource absent **within the caller's tenant** |
-| 409 | `conflict` | `If-Match` mismatch, unique violation, or state-machine violation (`details.current_state`). Accepting an invitation as an existing member carries `details.reason` — `already_member` or `member_suspended` — and consumes nothing. Ownership-transfer refusals carry a closed `details.reason` (`transfer_already_pending`, `transfer_not_pending`, `transfer_expired`, `workspace_pending_deletion`, `recipient_not_admin`, `recipient_email_unverified`, `recipient_no_strong_authenticator`, `past_due_invoice`) — see `/workspaces/{id}/transfer-ownership` |
+| 409 | `conflict` | `If-Match` mismatch, unique violation, or state-machine violation (`details.current_state`). Accepting an invitation as an existing member carries `details.reason` — `already_member` or `member_suspended` — and consumes nothing. Ownership-transfer refusals carry a closed `details.reason` (`transfer_already_pending`, `transfer_not_pending`, `transfer_expired`, `workspace_pending_deletion`, `recipient_not_admin`, `recipient_email_unverified`, `recipient_no_strong_authenticator`, `past_due_invoice`) — see `/workspaces/{id}/transfer-ownership`. A superseded (reworded) prompt is refused on `POST /projects/{id}/prompts/activate` and every `PATCH /prompts/{id}` with `details.reason = prompt_superseded`; the message names the row that replaced it |
 | 409 | `idempotency_conflict` | Same key, different body |
 | **409** | **`workspace_limit_reached`** | A user may own only one workspace. `details.{owned_workspace_id, owned_workspace_name}` plus the transfer path. **Joining by invitation never hits this** |
 | **409** | **`price_changed`** | `X-Nominara-Confirmed-Credits` does not match the server's current price. `details.{shown, recomputed, reason}`; the client re-presents the modal |
@@ -175,11 +177,14 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | Method | Path | Permission | Notes |
 |---|---|---|---|
 | `POST` | `/projects/{id}/prompts/generate` ✚ | `prompt:write` | §5. **Generation is free**; activation is what consumes the cap and the credits |
-| `POST` | `/projects/{id}/prompts/activate` ✚ ⛨ **¢** | `prompt:write` | activate a chosen subset; `403 entitlement_exceeded` names the remaining slots |
+| `POST` | `/projects/{id}/prompts/activate/preview` | `prompt:write` | **free, read-only** — same body as `activate`; no project lock, no reservation, no ledger row, no write (audited as `prompt.activation_previewed`). `200 { credits, prompts: { requested, already_active, free, charged }, credits_charged: 0 }`; `credits` is the figure to echo. A `PATCH` activation is previewed with `prompt_ids: [id]` |
+| `POST` | `/projects/{id}/prompts/activate` ✚ ⛨ **¢** | `prompt:write` | activate a chosen subset; `403 entitlement_exceeded` names the remaining slots. **Charges once per generated prompt, at its first activation beyond the free `prompts.free_at_creation`** (STORY-046). `credits_charged` is the whole credits debited (0 when free). Requires `X-Nominara-Confirmed-Credits` when the charge is above 0; `402 insufficient_credits` is a documented refusal; a superseded prompt is `409 conflict` (`prompt_superseded`) |
 | `POST` | `/projects/{id}/prompts` ✚ ⛨ | `prompt:write` | manual creation — **0 credits** |
 | `GET` | `/projects/{id}/prompts` | `tracking:read` | filter by engine, topic cluster, archetype, funnel, presence, sentiment, status |
-| `PATCH` | `/prompts/{id}` | `prompt:write` | pause/resume, priority flag, edit text (re-hashes and starts a new series) |
+| `PATCH` | `/prompts/{id}` **¢** | `prompt:write` | pause/resume, priority flag, edit text (re-hashes and starts a new series). **Leaving `archived` is an activation** and follows the same charge and quote rule as `activate`: `credits_charged`, `402 insufficient_credits`, the header above 0. An edit's new row inherits whether the prompt was already charged. A superseded row is `409 conflict` (`prompt_superseded`) |
 | `GET` | `/prompts/{id}/stability` | `tracking:read` | drift telemetry |
+
+**The activation price is quoted, then echoed (STORY-046, owner decision 2026-10-15).** `X-Nominara-Confirmed-Credits` is REQUIRED on `POST /projects/{id}/prompts/activate`, and on a `PATCH /prompts/{id}` that leaves `archived`, whenever the recomputed charge is above 0: missing is `400 validation_failed` naming the header (as on the deep-scan route), and a value that is not a non-negative integer is `400`. The server recomputes the charge UNDER THE PROJECT LOCK and compares; a mismatch is `409 price_changed` with `details.{shown, recomputed, reason}`. A fully free activation (charge 0), a replay with nothing new to activate, and a `PATCH` that does not leave `archived` need no header, and a header sent with them is not checked. These two routes are not `@Credits(...)`-guarded, because their price is known only inside the handler; the missing, mismatch and refusal semantics are `CreditGuard`'s. The debit is a `reserve` and a `commit` in the request's own transaction, so a refused activation (`403` at the cap, `402`) leaves no ledger row.
 
 ### Tracking
 
