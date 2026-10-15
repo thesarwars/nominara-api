@@ -1,6 +1,6 @@
 import type { ClientBase } from "pg";
-import { appendLedgerEntry, settlementOf, type LedgerActionCode } from "./ledger.js";
-import { lockWallet, readWallet, releaseCredits } from "./wallet.js";
+import { appendLedgerEntry, settlementOf, type LedgerActionCode, type LedgerMovementEntry } from "./ledger.js";
+import { commitCredits, lockWallet, readWallet, releaseCredits, type WalletState } from "./wallet.js";
 
 // STORY-073 — the one way a reservation is released, shared by the two
 // things that release one.
@@ -124,4 +124,38 @@ export async function releaseReservation(
   }
 
   return "released";
+}
+
+/** The optional fields a commit entry carries beyond the settlement itself (AC10: the actor, project and reference). */
+export type CommitEntryFields = Partial<
+  Pick<
+    LedgerMovementEntry,
+    "actorId" | "actorType" | "actorPseudonym" | "projectId" | "referenceType" | "referenceId" | "unitDetail" | "internalCostUsd"
+  >
+>;
+
+/**
+ * STUB (red commit): the pre-fix behaviour, which knows nothing about a hold carried over a cycle roll.
+ */
+export async function commitReservation(
+  tx: ClientBase,
+  reservation: SettleableReservation,
+  consumed: number,
+  entry: CommitEntryFields = {},
+): Promise<WalletState | null> {
+  const committed = await commitCredits(tx, reservation.workspaceId, consumed, reservation.credits);
+  if (committed === null) return null;
+  await appendLedgerEntry(tx, {
+    workspaceId: reservation.workspaceId,
+    entryType: "commit",
+    actionCode: reservation.actionCode,
+    credits: consumed,
+    idempotencyKey: reservation.idempotencyKey,
+    attempt: reservation.attempt,
+    after: committed,
+    actorId: reservation.actor?.actorId ?? null,
+    actorType: reservation.actor?.actorType ?? "system",
+    ...entry,
+  });
+  return committed;
 }

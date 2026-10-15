@@ -1,14 +1,19 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { Logger } from "@nestjs/common";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { applyPlanChange, type ProviderSubscriptionState } from "../../src/lib/billing/apply-plan.js";
 import { provisionWalletWithGrant, recordPurchase } from "../../src/lib/credits/balance.js";
-import { CycleRollBlockedError, rollIncludedCycle, type CycleRollOutcome } from "../../src/lib/credits/cycle-roll.js";
+import { rollIncludedCycle, type CycleRollOutcome } from "../../src/lib/credits/cycle-roll.js";
 import { appendLedgerEntry } from "../../src/lib/credits/ledger.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
-import { commitCredits, reserveCredits } from "../../src/lib/credits/wallet.js";
+import { reconcileOrphanedReservations } from "../../src/lib/credits/reconcile.js";
+import { settleFinishedRunCredits } from "../../src/lib/credits/run-settlement.js";
+import { commitReservation, releaseReservation, type SettleableReservation } from "../../src/lib/credits/settle.js";
+import { reserveCredits } from "../../src/lib/credits/wallet.js";
+import { resolveBillingPeriod } from "../../src/lib/usage/billing-period.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
@@ -80,20 +85,43 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
     await inCtx(workspaceId, (tx) => provisionWalletWithGrant(tx, workspaceId, grant, CYCLE_1));
   }
 
-  /** A spend exactly as the guard and interceptor leave it: reserve entry, then commit entry. */
-  async function spend(workspaceId: string, credits: number, key: string): Promise<void> {
+  function holdOf(key: string, credits: number): SettleableReservation {
+    return { workspaceId: ws, idempotencyKey: key, attempt: 1, credits, actionCode: "manual_scan" };
+  }
+
+  /** A hold exactly as the guard leaves it: the reserve statement, then the reserve entry. It stays OPEN. */
+  async function openHold(workspaceId: string, credits: number, key: string): Promise<void> {
     await inCtx(workspaceId, async (tx) => {
       const reserved = await reserveCredits(tx, workspaceId, credits);
+      expect(reserved.ok, `reserving ${String(credits)} for ${key}`).toBe(true);
       await appendLedgerEntry(tx, {
         workspaceId, entryType: "reserve", actionCode: "manual_scan", credits, idempotencyKey: key, attempt: 1,
         after: reserved.wallet!, actorId: null, actorType: "system",
       });
-      const committed = await commitCredits(tx, workspaceId, credits, credits);
-      await appendLedgerEntry(tx, {
-        workspaceId, entryType: "commit", actionCode: "manual_scan", credits, idempotencyKey: key, attempt: 1,
-        after: committed!, actorId: null, actorType: "system",
-      });
     });
+  }
+
+  /** The settle path the interceptor takes for a successful request. */
+  async function commitHold(workspaceId: string, key: string, credits: number, consumed = credits, entry = {}): Promise<void> {
+    const outcome = await inCtx(workspaceId, (tx) =>
+      commitReservation(tx, { ...holdOf(key, credits), workspaceId }, consumed, entry),
+    );
+    expect(outcome, `committing ${key}`).not.toBeNull();
+  }
+
+  /** The settle path the interceptor (failed request) and the reconciler take. */
+  async function releaseHold(workspaceId: string, key: string, credits: number): Promise<string> {
+    return inCtx(workspaceId, (tx) => releaseReservation(tx, { ...holdOf(key, credits), workspaceId }));
+  }
+
+  /** A spend exactly as the guard and interceptor leave it: reserve entry, then commit entry. */
+  async function spend(workspaceId: string, credits: number, key: string): Promise<void> {
+    await openHold(workspaceId, credits, key);
+    await commitHold(workspaceId, key, credits);
+  }
+
+  async function replayClean(workspaceId: string): Promise<void> {
+    expect(await inCtx(workspaceId, (tx) => verifyWorkspaceWallet(tx, workspaceId))).toBeNull();
   }
 
   async function roll(workspaceId: string, grant: number, cycle = CYCLE_2): Promise<CycleRollOutcome> {
@@ -249,33 +277,339 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
     expect((await entries(ws, ["grant"])).filter((g) => g.idempotency_key.includes(CYCLE_2.start))).toEqual([]);
   });
 
-  // The spec does not say what a reservation straddling the roll does. These pin only what the schema and §6
-  // already force; the policy question is recorded in docs-pending/STORY-072.
-  it("STORY-072 AC13 · an in-flight reservation survives the roll untouched and can still commit", async () => {
-    await wallet(ws, 1000);
-    await spend(ws, 300, "job-1");
-    const held = await inCtx(ws, (tx) => reserveCredits(tx, ws, 200));
-    expect(held.ok).toBe(true);
+  // ---- a reservation in flight at the roll: OPTION B, "keep the hold" (owner decision 2026-10-15) --------------
+  //
+  // The held part of the included bucket is NOT expired at the roll. It stays with its hold; a commit pays from it,
+  // and whatever part of it a release leaves unspent expires at that moment. The customer pays ONCE, from the cycle
+  // the action started in. Each case runs in BOTH orderings, because "the same final balance whichever came first" is
+  // the whole point, and each one ends in the ledger replay.
+  describe("a hold in flight at the roll (option B: keep the hold)", () => {
+    /** grant 1000, spend 300 (700 left), a 200 hold open: the owner's own example. */
+    async function exampleWallet(): Promise<void> {
+      await wallet(ws, 1000);
+      await spend(ws, 300, "job-0");
+      await openHold(ws, 200, "job-1");
+    }
 
-    await roll(ws, 1200);
+    it("STORY-072 AC13 · a hold that COMMITS in full after the roll is paid from the old cycle: 1200, not 1000 (roll then commit)", async () => {
+      await exampleWallet();
 
-    expect((await balances(ws)).reserved, "the roll must never release a live hold").toBe(200);
-    const committed = await inCtx(ws, (tx) => commitCredits(tx, ws, 200, 200));
-    expect(committed).not.toBeNull();
-    const b = await balances(ws);
-    expect(b.reserved).toBe(0);
-    expect(b.included_balance).toBe(1000);
+      await roll(ws, 1200);
+      const mid = await balances(ws);
+      // 500 unheld credits expired; the 200 held ones stay with their hold on top of the new grant.
+      expect(mid).toMatchObject({ included_balance: 1400, reserved: 200 });
+      expect(await entries(ws, ["expire"])).toEqual([expect.objectContaining({ credits: 500 })]);
+
+      await commitHold(ws, "job-1", 200);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 1200, purchased_balance: 0, reserved: 0 });
+      expect(await entries(ws, ["expire"]), "a fully spent carry expires nothing more").toHaveLength(1);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · the same wallet, commit THEN roll, ends on the same 1200 (the two orderings agree)", async () => {
+      await exampleWallet();
+
+      await commitHold(ws, "job-1", 200);
+      await roll(ws, 1200);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 1200, purchased_balance: 0, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a PARTIAL commit after the roll spends from the carry and expires the carry's unused remainder (roll then commit)", async () => {
+      await exampleWallet();
+      await roll(ws, 1200);
+
+      await commitHold(ws, "job-1", 200, 150);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 1200, reserved: 0 });
+      // 500 at the roll, 50 when the hold settled for less than it held.
+      expect((await entries(ws, ["expire"])).map((e) => e.credits)).toEqual([500, 50]);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a PARTIAL commit BEFORE the roll ends on the same 1200 (commit then roll)", async () => {
+      await exampleWallet();
+
+      await commitHold(ws, "job-1", 200, 150);
+      await roll(ws, 1200);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 1200, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a hold RELEASED after the roll expires its carry at that moment (roll then release)", async () => {
+      await exampleWallet();
+      await roll(ws, 1200);
+      expect((await balances(ws)).included_balance).toBe(1400);
+
+      expect(await releaseHold(ws, "job-1", 200)).toBe("released");
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 1200, reserved: 0 });
+      expect((await entries(ws, ["expire"])).map((e) => e.credits)).toEqual([500, 200]);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · the same wallet, release THEN roll, ends on the same 1200", async () => {
+      await exampleWallet();
+
+      await releaseHold(ws, "job-1", 200);
+      await roll(ws, 1200);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 1200, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · the carry's expiry is keyed deterministically: settling twice expires once", async () => {
+      await exampleWallet();
+      await roll(ws, 1200);
+
+      await releaseHold(ws, "job-1", 200);
+      expect(await releaseHold(ws, "job-1", 200)).toBe("already_settled");
+
+      const expired = await entries(ws, ["expire"]);
+      expect(expired).toHaveLength(2);
+      expect(expired[1]!.idempotency_key).toBe("hold_carry:1:job-1");
+      expect((await balances(ws)).included_balance).toBe(1200);
+    });
+
+    it("STORY-072 AC13 · the RECONCILER's orphan release honours the carry, too", async () => {
+      await exampleWallet();
+      await roll(ws, 1200);
+
+      const outcome = await reconcileOrphanedReservations({ discovery: db, work: pool }, { graceMs: 0 });
+
+      expect(outcome.failures).toEqual([]);
+      expect(outcome.released).toBeGreaterThanOrEqual(1);
+      expect(await balances(ws)).toMatchObject({ included_balance: 1200, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a run refund of a debit paid from a carry goes back to the included bucket it came from", async () => {
+      await exampleWallet();
+      await roll(ws, 1200);
+      const runId = uuidV7();
+
+      await commitHold(ws, "job-1", 200, 200, { referenceType: "run", referenceId: runId });
+      expect((await balances(ws)).included_balance).toBe(1200);
+      const refund = await inCtx(ws, (tx) => settleFinishedRunCredits(tx, { workspaceId: ws, runId, deliveredCells: 0 }));
+
+      expect(refund.refunded).toBe(200);
+      expect(await balances(ws)).toMatchObject({ included_balance: 1400, purchased_balance: 0, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a hold taken AFTER the roll never consumes or expires an old hold's carry", async () => {
+      // 100 left in included, all of it held by job-1; purchased credits behind the new hold.
+      await wallet(ws, 1000);
+      await spend(ws, 900, "job-0");
+      await inCtx(ws, (tx) => recordPurchase(tx, { workspaceId: ws, idempotencyKey: "pack-1", actorId: null, actorType: "system" }, 500));
+      await openHold(ws, 100, "old");
+      await roll(ws, 50);
+      expect(await balances(ws)).toMatchObject({ included_balance: 150, purchased_balance: 500, reserved: 100 });
+
+      await openHold(ws, 200, "new");
+      await commitHold(ws, "new", 200);
+      // 50 from the new grant, 150 from purchased. The old hold's 100 are untouched.
+      expect(await balances(ws)).toMatchObject({ included_balance: 100, purchased_balance: 350, reserved: 100 });
+
+      await releaseHold(ws, "old", 100);
+      expect(await balances(ws)).toMatchObject({ included_balance: 0, purchased_balance: 350, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · releasing the old hold while a NEW hold is still open expires only the old carry", async () => {
+      await wallet(ws, 1000);
+      await spend(ws, 900, "job-0");
+      await inCtx(ws, (tx) => recordPurchase(tx, { workspaceId: ws, idempotencyKey: "pack-1", actorId: null, actorType: "system" }, 500));
+      await openHold(ws, 100, "old");
+      await roll(ws, 50);
+      await openHold(ws, 200, "new");
+
+      await releaseHold(ws, "old", 100);
+      expect(await balances(ws)).toMatchObject({ included_balance: 50, purchased_balance: 500, reserved: 200 });
+
+      await commitHold(ws, "new", 200);
+      expect(await balances(ws)).toMatchObject({ included_balance: 0, purchased_balance: 350, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    for (const order of [["a", "b"], ["b", "a"]] as const) {
+      it(`STORY-072 AC13 · two carried holds settle independently, ${order.join(" then ")}`, async () => {
+        await wallet(ws, 1000);
+        await spend(ws, 700, "job-0"); // 300 left
+        await openHold(ws, 120, "a");
+        await openHold(ws, 80, "b");
+        await roll(ws, 1000);
+        // 100 unheld expired; 200 held stay on top of the grant.
+        expect(await balances(ws)).toMatchObject({ included_balance: 1200, reserved: 200 });
+
+        for (const which of order) {
+          if (which === "a") await commitHold(ws, "a", 120, 100); // 20 of a's carry expire
+          else await releaseHold(ws, "b", 80); // all 80 of b's carry expire
+        }
+
+        expect(await balances(ws), "the new grant is untouched: the carries were spent or expired").toMatchObject({ included_balance: 1000, purchased_balance: 0, reserved: 0 });
+        await replayClean(ws);
+      });
+    }
+
+    it("STORY-072 AC13 · a hold backed by PURCHASED credits larger than the grant rolls instead of being refused", async () => {
+      await wallet(ws, 100);
+      await inCtx(ws, (tx) => recordPurchase(tx, { workspaceId: ws, idempotencyKey: "pack-1", actorId: null, actorType: "system" }, 500));
+      await openHold(ws, 505, "big");
+
+      // The grant (10) is far smaller than the hold (505); 10 + 500 purchased would still cover 505.
+      await roll(ws, 10);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 110, purchased_balance: 500, reserved: 505 });
+      await commitHold(ws, "big", 505);
+      // 100 from the carry, 10 from the grant, 395 from purchased.
+      expect(await balances(ws)).toMatchObject({ included_balance: 0, purchased_balance: 105, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a hold equal to the whole bucket carries all of it and expires nothing (the min boundary)", async () => {
+      await wallet(ws, 100);
+      await openHold(ws, 100, "all");
+
+      await roll(ws, 50);
+
+      expect(await entries(ws, ["expire"]), "nothing is unheld, so nothing expires").toEqual([]);
+      expect(await balances(ws)).toMatchObject({ included_balance: 150, reserved: 100 });
+      await commitHold(ws, "all", 100);
+      expect(await balances(ws)).toMatchObject({ included_balance: 50, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a hold one credit under the bucket expires exactly the one unheld credit", async () => {
+      await wallet(ws, 100);
+      await openHold(ws, 99, "almost");
+
+      await roll(ws, 50);
+
+      expect(await entries(ws, ["expire"])).toEqual([expect.objectContaining({ credits: 1 })]);
+      expect(await balances(ws)).toMatchObject({ included_balance: 149, reserved: 99 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a live hold larger than the grant used to REFUSE the roll; under option B it cannot (CycleRollBlockedError is gone)", async () => {
+      await wallet(ws, 100);
+      await openHold(ws, 80, "held");
+
+      const outcome = await roll(ws, 10);
+
+      expect(outcome).toMatchObject({ rolled: true, expired: 20, granted: 10 });
+      expect(await balances(ws)).toMatchObject({ included_balance: 90, reserved: 80, cycle_start: CYCLE_2.start });
+      await commitHold(ws, "held", 80);
+      expect(await balances(ws)).toMatchObject({ included_balance: 10, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · a hold that outlives TWO rolls is still paid once, from the cycle it started in", async () => {
+      await exampleWallet();
+      await roll(ws, 1200, CYCLE_2);
+      await roll(ws, 1200, CYCLE_3);
+      expect(await balances(ws)).toMatchObject({ included_balance: 1400, reserved: 200 });
+
+      await commitHold(ws, "job-1", 200);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: 1200, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · the verifier reports a carry row that disagrees with what the ledger implies (too small, and missing)", async () => {
+      await exampleWallet();
+      await roll(ws, 1200);
+      await replayClean(ws);
+
+      await db.query("UPDATE credit_hold_carries SET credits = credits - 1 WHERE workspace_id = $1", [ws]);
+      const small = await inCtx(ws, (tx) => verifyWorkspaceWallet(tx, ws));
+      expect(small?.reason).toMatch(/carr/);
+
+      await db.query("DELETE FROM credit_hold_carries WHERE workspace_id = $1", [ws]);
+      const missing = await inCtx(ws, (tx) => verifyWorkspaceWallet(tx, ws));
+      expect(missing?.reason).toMatch(/carr/);
+    });
+
+    it("STORY-072 AC13 · settling a carried hold logs a metric and a redacted line (workspace ID, credit counts, no names)", async () => {
+      const lines: unknown[] = [];
+      const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
+        lines.push(message);
+      });
+      try {
+        await exampleWallet();
+        await roll(ws, 1200);
+        await commitHold(ws, "job-1", 200, 150);
+      } finally {
+        spy.mockRestore();
+      }
+
+      expect(lines).toContainEqual(expect.objectContaining({ metric: "nominara_credits_hold_carry_settled_total", outcome: "committed" }));
+      const line = lines.find((l) => typeof l === "object" && l !== null && (l as { message?: string }).message === "carried hold settled") as
+        | Record<string, unknown>
+        | undefined;
+      expect(line).toMatchObject({ workspace_id: ws, spent_credits: 150, expired_credits: 50 });
+      expect(JSON.stringify(line)).not.toContain("ws-");
+    });
+
+    it("STORY-072 AC13 · a plan with NO grant and a fully held bucket behaves as before: the hold simply settles (documented corner)", async () => {
+      await wallet(ws, 100);
+      await openHold(ws, 100, "all");
+
+      await roll(ws, 0);
+
+      expect(await entries(ws, ["expire", "grant"]).then((e) => e.filter((x) => x.idempotency_key.startsWith("cycle_roll")))).toEqual([]);
+      await commitHold(ws, "all", 100);
+      expect(await balances(ws)).toMatchObject({ included_balance: 0, reserved: 0 });
+      await replayClean(ws);
+    });
   });
 
-  it("STORY-072 AC13 · a roll that would leave a live hold larger than the wallet is REFUSED, whole, rather than violating ck_wallet_reserved", async () => {
-    await wallet(ws, 100);
-    await inCtx(ws, (tx) => reserveCredits(tx, ws, 80));
+  it("STORY-072 AC13 · the roll is refused whole when the ledger already holds its GRANT entry for a wallet that has not rolled", async () => {
+    await wallet(ws, 1000);
+    const key = `cycle_roll:${CYCLE_2.start}`;
+    await db.query(
+      `INSERT INTO credit_ledger (workspace_id, actor_type, entry_type, credits, bucket, included_after,
+                                  purchased_after, reserved_after, idempotency_key, attempt)
+       VALUES ($1,'system','grant',1,'included',0,0,0,$2,1)`,
+      [ws, key],
+    );
+    await expect(roll(ws, 1200)).rejects.toThrow(/disagree/);
+    const b = await balances(ws);
+    expect(b.included_balance).toBe(1000);
+    expect(b.cycle_start).toBe(CYCLE_1.start);
+    expect(await entries(ws, ["expire"])).toEqual([]);
+  });
 
-    await expect(roll(ws, 10)).rejects.toThrow(CycleRollBlockedError);
+  it("STORY-072 AC13 · 20 operations racing the roll (reserves, commits, releases) leave a wallet the ledger replays and every hold settled once", async () => {
+    await wallet(ws, 5000);
+    // 10 holds open before the race; 10 more flows begin inside it; the roll is among them.
+    for (let i = 0; i < 10; i++) await openHold(ws, 20 + i, `pre-${String(i)}`);
+    const pre = Array.from({ length: 10 }, (_, i) => 20 + i);
+
+    const ops: Promise<unknown>[] = [];
+    pre.forEach((credits, i) => {
+      const key = `pre-${String(i)}`;
+      ops.push(i % 2 === 0 ? commitHold(ws, key, credits, credits - 5) : releaseHold(ws, key, credits));
+    });
+    for (let i = 0; i < 9; i++) ops.push(spend(ws, 15, `new-${String(i)}`));
+    ops.push(roll(ws, 4000));
+    expect(ops).toHaveLength(20);
+    await Promise.all(ops);
 
     const b = await balances(ws);
-    expect(b).toMatchObject({ included_balance: 100, reserved: 80, cycle_start: CYCLE_1.start });
-    expect(await entries(ws, ["expire"])).toEqual([]);
+    expect(b.reserved, "every hold settled").toBe(0);
+    expect(b.cycle_start).toBe(CYCLE_2.start);
+    const open = await db.query("SELECT 1 FROM credit_hold_carries WHERE workspace_id = $1 AND settled_at IS NULL", [ws]);
+    expect(open.rowCount, "no carry outlives its hold").toBe(0);
+    // Whatever the interleaving, the cycle never ends above the new grant: carries are spent or expired.
+    expect(b.included_balance).toBeLessThanOrEqual(4000);
+    const spent = await db.query<{ spent: string }>("SELECT lifetime_spent::text AS spent FROM credit_wallets WHERE workspace_id = $1", [ws]);
+    const committed = pre.reduce((n, credits, i) => (i % 2 === 0 ? n + credits - 5 : n), 0) + 9 * 15;
+    expect(Number(spent.rows[0]!.spent)).toBe(committed);
+    await replayClean(ws);
   });
 
   // ---- the subscription renewal is what rolls it ------------------------------------------------------------
@@ -292,8 +626,27 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
       });
     }
 
-    async function apply(workspaceId: string, reconcile: (c: ProviderSubscriptionState) => ProviderSubscriptionState) {
-      return inCtx(workspaceId, (tx) => applyPlanChange(tx, workspaceId, reconcile, provenance, { allowDowngrade: true }));
+    async function apply(workspaceId: string, reconcile: (c: ProviderSubscriptionState) => ProviderSubscriptionState, now?: Date) {
+      return inCtx(workspaceId, (tx) =>
+        applyPlanChange(tx, workspaceId, reconcile, provenance, { allowDowngrade: true, ...(now === undefined ? {} : { now }) }),
+      );
+    }
+
+    /** The workspace and its subscription on `plan`, with a wallet on that plan's grant. */
+    async function onPlan(plan: string): Promise<number> {
+      await db.query("UPDATE workspaces SET plan_key = $2 WHERE id = $1", [ws, plan]);
+      await db.query("UPDATE subscriptions SET plan_key = $2 WHERE workspace_id = $1", [ws, plan]);
+      const grant = await planGrant(plan);
+      await wallet(ws, grant);
+      return grant;
+    }
+
+    async function lifetimeGranted(workspaceId: string): Promise<number> {
+      return Number((await balances(workspaceId)).lifetime_granted);
+    }
+
+    async function planChangeGrants(workspaceId: string) {
+      return (await entries(workspaceId, ["grant"])).filter((g) => g.idempotency_key.startsWith("grant:plan_change"));
     }
 
     async function planGrant(key: string): Promise<number> {
@@ -367,17 +720,171 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
       expect(await entries(ws, ["expire"])).toEqual([expect.objectContaining({ credits: grantGrowth })]);
     });
 
-    it("STORY-072 AC13 / AC14 · an UPGRADE keeps its pro-rata top-up: a period change alongside it is not a reset", async () => {
-      const grantStarter = await planGrant("starter");
-      await db.query("UPDATE workspaces SET plan_key = 'starter' WHERE id = $1", [ws]);
-      await db.query("UPDATE subscriptions SET plan_key = 'starter' WHERE workspace_id = $1", [ws]);
-      await wallet(ws, grantStarter);
-      await spend(ws, 10, "job-1");
+    it("STORY-072 AC13 · FREE to PAID with a new period grants the new plan: the remaining credits carry in, up to the grant (exact)", async () => {
+      const free = await onPlan("free");
+      const starter = await planGrant("starter");
+      await spend(ws, 20, "job-1"); // 40 left of 60
+
+      await apply(ws, advance(CYCLE_2, "starter"));
+
+      const b = await balances(ws);
+      expect(b).toMatchObject({ included_balance: starter, reserved: 0, cycle_start: CYCLE_2.start, cycle_end: CYCLE_2.end });
+      // The 40 remaining credits carry INTO the grant: granted = grant - carried, nothing expires, nothing is minted twice.
+      expect(await entries(ws, ["expire"])).toEqual([]);
+      const rollGrant = (await entries(ws, ["grant"])).filter((g) => g.idempotency_key === `cycle_roll:${CYCLE_2.start}`);
+      expect(rollGrant).toEqual([expect.objectContaining({ credits: starter - 40 })]);
+      expect(await lifetimeGranted(ws)).toBe(free + starter - 40);
+      expect(await planChangeGrants(ws), "the pro-rata step is skipped whenever a roll happened").toEqual([]);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · PAID to PAID upgrade with a new period lands on exactly the target grant, with no pro-rata on top (exact)", async () => {
+      const starter = await onPlan("starter");
+      const growth = await planGrant("growth");
+      await spend(ws, 10, "job-1"); // 440 left
 
       await apply(ws, advance(CYCLE_2, "growth"));
 
-      expect(await entries(ws, ["expire"]), "an upgrade expires nothing").toEqual([]);
-      expect((await balances(ws)).included_balance).toBeGreaterThanOrEqual(grantStarter - 10);
+      expect(await balances(ws)).toMatchObject({ included_balance: growth, cycle_start: CYCLE_2.start });
+      expect(await entries(ws, ["expire"])).toEqual([]);
+      expect(await lifetimeGranted(ws)).toBe(starter + (growth - (starter - 10)));
+      expect(await planChangeGrants(ws)).toEqual([]);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 / AC14 · an upgrade WITHIN the same period keeps its pro-rata top-up, on a controlled clock (exact)", async () => {
+      const starter = await onPlan("starter");
+      const growth = await planGrant("growth");
+      await spend(ws, 10, "job-1");
+
+      // CYCLE_1 is 2026-09-01 .. 2026-10-01: 30 days, 15 of them left at the 16th.
+      const topUp = Math.floor(((growth - starter) * 15) / 30);
+      const outcome = await apply(
+        ws,
+        (c) => ({ ...c, planKey: "growth" }),
+        new Date("2026-09-16T00:00:00.000Z"),
+      );
+
+      expect(outcome.creditsToppedUp).toBe(topUp);
+      expect(await balances(ws)).toMatchObject({ included_balance: starter - 10 + topUp, cycle_start: CYCLE_1.start });
+      expect(await entries(ws, ["expire"])).toEqual([]);
+      expect(await planChangeGrants(ws)).toHaveLength(1);
+      await replayClean(ws);
+    });
+
+    it("STORY-072 AC13 · an upgrade with a new period for a wallet that carries a HELD credit keeps the hold and still lands on grant + carry", async () => {
+      await onPlan("starter");
+      const growth = await planGrant("growth");
+      await openHold(ws, 100, "job-1");
+
+      await apply(ws, advance(CYCLE_2, "growth"));
+      await commitHold(ws, "job-1", 100);
+
+      expect(await balances(ws)).toMatchObject({ included_balance: growth, reserved: 0 });
+      await replayClean(ws);
+    });
+
+    // ---- past_due: wait for the payment (owner decision 2026-10-15) ----------------------------------------
+    describe("a failed renewal (past_due)", () => {
+      const pastDue = (period: { start: string; end: string }) => (c: ProviderSubscriptionState): ProviderSubscriptionState => ({
+        ...advance(period)(c),
+        status: "past_due",
+      });
+      const recovered = (c: ProviderSubscriptionState): ProviderSubscriptionState => ({ ...c, status: "active" });
+
+      it("STORY-072 AC13 · a period change that arrives past_due does NOT roll the wallet", async () => {
+        const grant = await onPlan("growth");
+        await spend(ws, 100, "job-1");
+
+        await apply(ws, pastDue(CYCLE_2));
+
+        expect(await balances(ws)).toMatchObject({ included_balance: grant - 100, cycle_start: CYCLE_1.start });
+        expect(await entries(ws, ["expire"])).toEqual([]);
+        const sub = await db.query<{ status: string; start: string }>(
+          "SELECT status, to_char(current_period_start,'YYYY-MM-DD') AS start FROM subscriptions WHERE workspace_id = $1", [ws]);
+        expect(sub.rows[0]).toEqual({ status: "past_due", start: CYCLE_2.start });
+      });
+
+      it("STORY-072 AC13 · the payment succeeding (the subscription is active again, same period) rolls the wallet ONCE", async () => {
+        const grant = await onPlan("growth");
+        await spend(ws, 100, "job-1");
+        await apply(ws, pastDue(CYCLE_2));
+        expect(await entries(ws, ["expire"]), "nothing rolled while the payment was outstanding").toEqual([]);
+
+        await apply(ws, recovered);
+
+        expect(await balances(ws)).toMatchObject({ included_balance: grant, cycle_start: CYCLE_2.start, cycle_end: CYCLE_2.end });
+        expect(await entries(ws, ["expire"])).toEqual([expect.objectContaining({ credits: grant - 100 })]);
+        await replayClean(ws);
+      });
+
+      it("STORY-072 AC13 · a replay of the recovery (or of the past_due event) does not roll twice", async () => {
+        const grant = await onPlan("growth");
+        await spend(ws, 100, "job-1");
+        await apply(ws, pastDue(CYCLE_2));
+        expect(await entries(ws, ["expire"]), "nothing rolled while the payment was outstanding").toEqual([]);
+        await apply(ws, recovered);
+        await spend(ws, 50, "job-2");
+
+        await apply(ws, recovered);
+        await apply(ws, recovered);
+
+        expect(await entries(ws, ["expire"])).toHaveLength(1);
+        expect((await balances(ws)).included_balance, "the spend after the roll must survive the replays").toBe(grant - 50);
+      });
+
+      it("STORY-072 AC13 · several past_due period changes then one recovery roll once, into the LATEST period", async () => {
+        const grant = await onPlan("growth");
+        await spend(ws, 100, "job-1");
+        await apply(ws, pastDue(CYCLE_2));
+        await apply(ws, pastDue(CYCLE_3));
+
+        await apply(ws, recovered);
+
+        expect(await balances(ws)).toMatchObject({ included_balance: grant, cycle_start: CYCLE_3.start });
+        expect(await entries(ws, ["expire"])).toHaveLength(1);
+        await replayClean(ws);
+      });
+
+      it("STORY-072 AC13 · a past_due event inside the CURRENT period changes nothing, and neither does the active one that follows", async () => {
+        const grant = await onPlan("growth");
+        await spend(ws, 100, "job-1");
+
+        await apply(ws, (c) => ({ ...c, status: "past_due" }));
+        await apply(ws, recovered);
+
+        expect(await balances(ws)).toMatchObject({ included_balance: grant - 100, cycle_start: CYCLE_1.start });
+        expect(await entries(ws, ["expire"])).toEqual([]);
+      });
+    });
+
+    it("STORY-072 AC13 · an ANNUAL subscription's period change still rolls (the monthly refresh is a follow-up story)", async () => {
+      const grant = await onPlan("growth");
+      await spend(ws, 100, "job-1");
+      const year = { start: "2026-10-01", end: "2027-10-01" };
+
+      await apply(ws, (c) => ({ ...advance(year)(c), billingInterval: "annual" }));
+
+      expect(await balances(ws)).toMatchObject({ included_balance: grant, cycle_start: year.start, cycle_end: year.end });
+      expect(await entries(ws, ["expire"])).toHaveLength(1);
+    });
+  });
+
+  describe("the period the roll and the period derivation both name (UTC)", () => {
+    it("STORY-072 AC13 · resolveBillingPeriod names the UTC day of a period boundary whatever the session time zone", async () => {
+      const id = await newWorkspace("growth");
+      await db.query(
+        "UPDATE subscriptions SET current_period_start = $2, current_period_end = $3 WHERE workspace_id = $1",
+        [id, "2026-10-01T00:00:00.000Z", "2026-11-01T00:00:00.000Z"],
+      );
+
+      const period = await inCtx(id, async (tx) => {
+        await tx.query("SET LOCAL TIME ZONE 'America/Los_Angeles'");
+        return resolveBillingPeriod(tx, id);
+      });
+
+      // In Los Angeles that instant is the evening of 30 September; the roll writes the UTC day.
+      expect(period).toEqual({ start: "2026-10-01", end: "2026-11-01" });
     });
   });
 });
