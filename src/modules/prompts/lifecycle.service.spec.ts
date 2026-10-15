@@ -119,6 +119,18 @@ describe("STORY-046 · PromptLifecycleService.update", () => {
     expect(update?.params).toContain("paused");
   });
 
+  it("STORY-046 AC3 — a change that is not an activation ignores the confirmed-price header, even a malformed one", async () => {
+    // Only LEAVING `archived` has a price to confirm. A pause, an archive or a flag change must not be refused over a
+    // header it has no use for.
+    await expect(setup({ status: "active" }).update(PROMPT, { status: "paused" }, "not-a-figure")).resolves.toMatchObject({ status: "paused" });
+  });
+
+  it("STORY-046 AC3 — an activation (leaving archived) reads the header, so a malformed one is a 400 before any write", async () => {
+    const service = setup({ status: "archived", activeCount: 10 });
+    await expect(service.update(PROMPT, { status: "active" }, "not-a-figure")).rejects.toMatchObject({ code: "validation_failed" });
+    expect(calls.filter((call) => /^\s*(UPDATE|INSERT|DELETE)\b/i.test(call.sql))).toEqual([]);
+  });
+
   it("scenario 10 — archiving frees a slot", async () => {
     const result = await setup({ status: "active", activeCount: 10 }).update(PROMPT, { status: "archived" });
     expect(result.status).toBe("archived");
