@@ -225,7 +225,10 @@ function apply(
       }
       const carry = book.carryOf(row.idempotencyKey, row.attempt);
       const fromCarry = Math.min(carry, row.credits);
-      const fromPool = Math.min(Math.max(balance.included - book.totalCarry(), 0), row.credits - fromCarry);
+      // A hold that carries something draws its uncarried remainder from purchased first (see `commitCredits`).
+      const remainder = row.credits - fromCarry;
+      const fromPurchasedFirst = carry > 0 ? Math.min(remainder, balance.purchased) : 0;
+      const fromPool = Math.min(Math.max(balance.included - book.totalCarry(), 0), remainder - fromPurchasedFirst);
       book.settle(row, fromCarry);
       return {
         next: {

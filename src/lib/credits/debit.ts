@@ -7,6 +7,7 @@ import { resolveBillingPeriod } from "../usage/billing-period.js";
 import { provisionWalletWithGrant } from "./balance.js";
 import { requestAutoTopupIfBelowThreshold, type EnqueueAutoTopup } from "./auto-topup-request.js";
 import { appendLedgerEntry, type LedgerActionCode } from "./ledger.js";
+import { readHoldCarry } from "./hold-carry.js";
 import { commitCredits, lockWallet, purchasableOptions, readWallet, reserveCredits } from "./wallet.js";
 
 // STORY-046 AC3 — a debit whose amount is known only INSIDE the handler.
@@ -146,7 +147,11 @@ export async function debitInTransaction(tx: ClientBase, debit: InlineDebit): Pr
     throw new Error(`the ledger already holds a reserve under ${debit.idempotencyKey}; refusing to charge twice`);
   }
 
-  const committed = await commitCredits(tx, debit.workspaceId, debit.credits, debit.credits);
+  // STORY-072 AC13 (option B): this commit carries nothing itself (reserve and commit are one transaction under the
+  // wallet row lock, so no roll can fall between them), but OTHER holds may carry credits across a roll and sit in the
+  // included bucket. The draw must leave them alone, so it is told how much the open holds carry in total.
+  const carries = await readHoldCarry(tx, debit.workspaceId, debit.idempotencyKey, 1);
+  const committed = await commitCredits(tx, debit.workspaceId, debit.credits, debit.credits, carries);
   if (committed === null) {
     throw new Error(`credit commit matched no wallet row for workspace ${debit.workspaceId} (${debit.idempotencyKey})`);
   }

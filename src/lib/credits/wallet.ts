@@ -168,17 +168,33 @@ export async function commitCredits(
     throw new Error(`a hold cannot carry ${String(carry.held)} credits when every hold together carries ${String(carry.total)}`);
   }
 
-  // STORY-072 AC13 (option B) — THE DRAW HAS THREE SOURCES, IN THIS ORDER, and the middle one is what keeps a hold
-  // from spending another hold's carry:
+  // STORY-072 AC13 (option B) — THE DRAW HAS THREE SOURCES, and the middle one is what keeps a hold from spending
+  // another hold's carry:
   //   1. the hold's OWN carry (credits it kept across a cycle roll);
   //   2. the included bucket that is NOT any hold's carry (`included - total carried`), floored at zero;
   //   3. purchased.
   // With no carry anywhere ($4 = $5 = 0) this is exactly "included first, then purchased".
+  //
+  // ⚠ A HOLD THAT CARRIES SOMETHING DRAWS ITS UNCARRIED REMAINDER FROM PURCHASED BEFORE THE POOL (2 and 3 swap). A hold
+  // is only partly carried when the bucket held less than it reserved, so the rest was backed by purchased credits
+  // before the roll; the pool is the NEW cycle's grant, which that hold never touched. Committing before the roll
+  // draws included first (the whole old bucket, which is the carry) and purchased for the rest, so this reproduces it
+  // and both orderings end on the same buckets. A hold that carries nothing keeps "pool first": it was opened after the
+  // roll, or its pre-roll backing is not recorded (see `hold-carry.ts`).
   const result = await tx.query<WalletRow>(
     `WITH split AS (
        SELECT LEAST($4::int, $2::int) AS from_carry,
-              LEAST(GREATEST(included_balance - $5::int, 0), $2::int - LEAST($4::int, $2::int)) AS from_pool
+              purchased_balance AS purchased_now,
+              included_balance AS included_now
          FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE
+     ), pooled AS (
+       SELECT from_carry,
+              LEAST(
+                GREATEST(included_now - $5::int, 0),
+                $2::int - from_carry
+                  - CASE WHEN $4::int > 0 THEN LEAST($2::int - from_carry, purchased_now) ELSE 0 END
+              ) AS from_pool
+         FROM split
      )
      UPDATE credit_wallets w
         SET included_balance  = w.included_balance  - s.from_carry - s.from_pool,
@@ -186,7 +202,7 @@ export async function commitCredits(
             reserved          = w.reserved - $3,
             lifetime_spent    = w.lifetime_spent + $2,
             updated_at        = now()
-       FROM split s
+       FROM pooled s
       WHERE w.workspace_id = $1
         AND w.reserved >= $3
      RETURNING w.included_balance, w.purchased_balance, w.reserved,
@@ -348,11 +364,11 @@ export async function readWallet(tx: ClientBase, workspaceId: string): Promise<W
 /**
  * Whether the wallet's cycle has ALREADY ENDED without being rolled.
  *
- * ⚠ NOTHING IN `src/` WRITES `cycle_end` AFTER `provisionWallet`. The roll is
- * STORY-075/076's, so every wallet still carries the date it was provisioned
- * against, and a workspace provisioned in August reports a cycle ending in
- * August. Read straight through, that turns a date six weeks in the past into
- * a future expiry deadline on the billing screen.
+ * ⚠ A CYCLE CAN STILL END WITHOUT BEING ROLLED. The only writer of `cycle_end` after `provisionWallet` is
+ * `rollIncludedCycle` (STORY-072), and it runs only when the subscription's period moves (or when a past_due payment
+ * finally succeeds). A free wallet has no subscription period to move, a past_due subscription's roll waits for the
+ * payment, and a roll that has not happened yet leaves the wallet naming a date that has passed. Read straight through,
+ * that turns a date in the past into a future expiry deadline on the billing screen.
  *
  * ⚠ COMPARED IN POSTGRES, NEVER AGAINST A JS `Date`. The reconciler's grace
  * window was written the other way first and found zero orphans, because the

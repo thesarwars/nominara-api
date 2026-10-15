@@ -21,6 +21,13 @@ import { expireCredits } from "./balance.js";
 // would then have nothing left to expire. `credit_hold_carries` says which hold keeps how much, and every draw on the
 // bucket by a hold that carries nothing is limited to the bucket MINUS the carries.
 //
+// ⚠ A PARTLY CARRIED HOLD PAYS ITS UNCARRIED REMAINDER FROM PURCHASED FIRST (`commitCredits`, mirrored in `replay.ts`).
+// Carry < reserved means the bucket was smaller than the hold, so the rest was backed by purchased credits before the
+// roll; drawing the new grant for it would make roll-then-commit and commit-then-roll end on different buckets. KNOWN
+// LIMIT: a hold wholly backed by purchased before the roll (the bucket was empty or went to older holds) has carry 0
+// and no row, so it is indistinguishable from a hold opened after the roll and keeps "new grant first". Telling them
+// apart needs a row per open hold at the roll, including zero carries - a design change, not made here.
+//
 // ⚠ THE SAME FUNCTION RUNS IN THE ROLL AND IN THE REPLAY. `assignCarries` is pure, and `replay.ts` calls it on the
 // holds it reconstructs from the ledger rather than reading `credit_hold_carries`, so the nightly verifier checks the
 // table against an independent derivation instead of trusting it.
