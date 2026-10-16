@@ -92,6 +92,7 @@ const NOT_A_GATE: Readonly<Record<string, string>> = {
   "credits:verify": "an operational job against a live ledger",
   "credits:reconcile": "an operational job against a live ledger",
   "plan:set": "the operator CLI; it changes a workspace's plan",
+  "billing:invoices-resync": "the operator CLI; it re-fetches recorded invoices from live Stripe",
   "support:grant": "the operator CLI; it issues a time-boxed support access grant",
   "support:revoke": "the operator CLI; it revokes a support access grant",
   "audit:verify": "an operational job against a live audit chain",

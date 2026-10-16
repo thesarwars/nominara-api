@@ -156,10 +156,16 @@ function isRecurringLine(line: Record<string, unknown>): boolean {
 // instant ("Oct 15 - Oct 15"). The service period is the `period` of the recurring plan line: a line that is a subscription
 // item and neither an add-on nor a credit pack (a credit pack is a one-off and an add-on may be prorated mid-cycle, so
 // neither speaks for the plan). Failing that the first line with a period; failing that the caller uses the invoice's own.
-function servicePeriod(lines: readonly unknown[]): { start: Date; end: Date } | null {
+//
+// ⚠ A PARTIAL LINE LIST CANNOT NAME THE PLAN LINE. `invoices.retrieve` embeds only the first page of lines (`has_more`);
+// the gateway pages the rest in, but if a list still arrives incomplete and holds no recurring plan line, a first-line guess
+// could be an add-on or a pack, so the invoice's own period is used instead.
+function servicePeriod(lines: readonly unknown[], hasMore: boolean): { start: Date; end: Date } | null {
   const candidates = lines.filter(isRecord).filter((line) => linePeriod(line) !== null);
-  const plan = candidates.find((line) => lineCategory(line) === null && isRecurringLine(line)) ?? candidates[0];
-  return plan === undefined ? null : linePeriod(plan);
+  const plan = candidates.find((line) => lineCategory(line) === null && isRecurringLine(line));
+  if (plan !== undefined) return linePeriod(plan);
+  if (hasMore) return null;
+  return candidates[0] === undefined ? null : linePeriod(candidates[0]);
 }
 
 function isStatus(value: unknown): value is InvoiceStatus {
@@ -185,7 +191,7 @@ export function desiredFromStripeInvoice(raw: Readonly<Record<string, unknown>>)
   }
 
   const lines = isRecord(raw.lines) && Array.isArray(raw.lines.data) ? raw.lines.data : [];
-  const service = servicePeriod(lines);
+  const service = servicePeriod(lines, isRecord(raw.lines) && raw.lines.has_more === true);
   const periodStart = service?.start ?? seconds(raw.period_start);
   const periodEnd = service?.end ?? seconds(raw.period_end);
   if (periodStart === null || periodEnd === null) return { kind: "ignore", reason: "invoice carries no billing period" };

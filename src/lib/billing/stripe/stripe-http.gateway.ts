@@ -390,6 +390,13 @@ export class StripeHttpGateway implements StripeGateway {
           // An invoice carries no workspace of its own; the subscription's
           // metadata (copied onto the invoice by Stripe) is where it lives.
           const raw = object as unknown as Record<string, unknown>;
+          // `retrieve` embeds only the first page of lines; the service period is read from the plan line, which may
+          // be on a later page of a long invoice. Page the rest in, so what the reader sees is the whole list.
+          const embedded = raw.lines as { data?: unknown[]; has_more?: boolean } | undefined;
+          if (embedded?.has_more === true) {
+            const all = await client.invoices.listLineItems(objectId, { limit: 100 }).autoPagingToArray({ limit: 1000 });
+            raw.lines = { ...embedded, data: all, has_more: all.length >= 1000 };
+          }
           const parent = raw.parent as { subscription_details?: { metadata?: unknown } } | null | undefined;
           const metadata = { ...stringMetadata(parent?.subscription_details?.metadata), ...stringMetadata(raw.metadata) };
           return { kind, id: object.id as string, metadata, raw };

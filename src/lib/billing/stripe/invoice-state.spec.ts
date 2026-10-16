@@ -206,7 +206,8 @@ describe("service period · the invoice publishes the plan line's period, and ke
     amount: 2_000,
     period: { start: OCT15 + 5, end: OCT15 + 5 },
     parent: null,
-    pricing: { price_details: { product: { id: "p", metadata: { nominara_kind: "credit_pack" } } } },
+    // Stripe 2026-09-30.endive: the product is a bare id string, and a one-off line has no subscription parent.
+    pricing: { price_details: { product: "prod_credit_pack" } },
   };
   const addonLine = {
     amount: 4_900,
@@ -257,6 +258,38 @@ describe("service period · the invoice publishes the plan line's period, and ke
   it("due_at is Stripe's due_date when present, else the invoice-level period_end", () => {
     expect(write({ due_date: OCT15 + 99, period_end: OCT15, lines: { data: [planLine] } }).dueAt).toEqual(at(OCT15 + 99));
     expect(write({ due_date: null, period_end: OCT15, lines: { data: [planLine] } }).dueAt).toEqual(at(OCT15));
+  });
+
+  it("a NON-proration add-on line FIRST, with a period of its own, does not speak for the plan: the plan line's period wins", () => {
+    const addon = {
+      amount: 4_900,
+      period: { start: OCT15 + 10 * 86_400, end: NOV15 + 10 * 86_400 },
+      parent: { type: "subscription_item_details", subscription_item_details: { proration: false } },
+      pricing: { price_details: { product: "nominara_addon_extra_project" } },
+    };
+    expect(write({ lines: { data: [addon, planLine] } })).toMatchObject({ periodStart: at(OCT15), periodEnd: at(NOV15) });
+  });
+
+  it("a proration-only upgrade invoice (every line a proration) shows the first line's period: change time to cycle end", () => {
+    const CHANGE = OCT15 + 12 * 86_400;
+    const credit = { amount: -3_000, period: { start: CHANGE, end: NOV15 }, parent: { type: "subscription_item_details", subscription_item_details: { proration: true } }, pricing: { price_details: { product: "prod_starter" } } };
+    const charge = { amount: 9_000, period: { start: CHANGE, end: NOV15 }, parent: { type: "subscription_item_details", subscription_item_details: { proration: true } }, pricing: { price_details: { product: "prod_growth" } } };
+    expect(write({ period_start: CHANGE, period_end: CHANGE, lines: { data: [credit, charge] } })).toMatchObject({ periodStart: at(CHANGE), periodEnd: at(NOV15) });
+  });
+
+  it("a proration line ahead of a regular recurring line does not speak for the period", () => {
+    const CHANGE = OCT15 + 12 * 86_400;
+    const proration = { amount: -3_000, period: { start: CHANGE, end: NOV15 }, parent: { type: "subscription_item_details", subscription_item_details: { proration: true } }, pricing: { price_details: { product: "prod_starter" } } };
+    expect(write({ lines: { data: [proration, planLine] } })).toMatchObject({ periodStart: at(OCT15), periodEnd: at(NOV15) });
+  });
+
+  it("an INCOMPLETE line list (has_more) with no recurring plan line on it uses the invoice-level period, not a guess at the first line", () => {
+    const inv = write({ period_start: OCT15, period_end: OCT15 + 1, lines: { data: [packLine], has_more: true } });
+    expect(inv).toMatchObject({ periodStart: at(OCT15), periodEnd: at(OCT15 + 1) });
+  });
+
+  it("an incomplete line list that DOES hold the plan line still uses it", () => {
+    expect(write({ lines: { data: [packLine, planLine], has_more: true } })).toMatchObject({ periodStart: at(OCT15), periodEnd: at(NOV15) });
   });
 
   it("with no invoice-level period_end and no due_date, due_at falls back to the service end", () => {

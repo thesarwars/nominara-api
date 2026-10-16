@@ -74,8 +74,21 @@ function same(stored: StoredInvoice, desired: DesiredInvoice): boolean {
 }
 
 /** What an audit row says about an invoice. No URLs: a hosted-invoice link is a bearer link to pay. */
-function auditState(invoice: { status: string; total: string; currency: string; number: string | null }, stripeInvoiceId: string) {
-  return { stripe_invoice_id: stripeInvoiceId, number: invoice.number, status: invoice.status, total: invoice.total, currency: invoice.currency };
+function auditState(
+  invoice: { status: string; total: string; currency: string; number: string | null },
+  period: { start: Date; end: Date; dueAt: Date | null },
+  stripeInvoiceId: string,
+) {
+  return {
+    stripe_invoice_id: stripeInvoiceId,
+    number: invoice.number,
+    status: invoice.status,
+    total: invoice.total,
+    currency: invoice.currency,
+    period_start: period.start.toISOString(),
+    period_end: period.end.toISOString(),
+    due_at: period.dueAt?.toISOString() ?? null,
+  };
 }
 
 @Injectable()
@@ -169,8 +182,8 @@ export class BillingInvoicesService {
       action: "billing.invoice_recorded",
       resourceType: "invoice",
       resourceId: invoiceId,
-      beforeState: stored === undefined ? null : auditState(stored, desired.stripeInvoiceId),
-      afterState: { ...auditState(desired, desired.stripeInvoiceId), event_type: provenance.eventType },
+      beforeState: stored === undefined ? null : auditState(stored, { start: stored.period_start, end: stored.period_end, dueAt: stored.due_at }, desired.stripeInvoiceId),
+      afterState: { ...auditState(desired, { start: desired.periodStart, end: desired.periodEnd, dueAt: desired.dueAt }, desired.stripeInvoiceId), event_type: provenance.eventType },
       requestId: provenance.eventId,
       supportGrantId: null,
       severity: "info",

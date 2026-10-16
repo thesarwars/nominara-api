@@ -7,7 +7,8 @@
 --
 -- EXPAND phase: one nullable column, metadata-only. BACKFILL: every existing row holds the invoice-level end in period_end
 -- (that is what the old code stored), which is exactly the due proxy past-due used, so due_at = period_end keeps every
--- existing invoice's past-due answer unchanged. Their displayed period is corrected the next time Stripe redelivers them.
+-- existing invoice's past-due answer unchanged. Their displayed period is NOT corrected by this file or by a webhook (a paid invoice is terminal and Stripe never redelivers it): run
+-- `pnpm billing:invoices-resync` once after deploying, which re-fetches every recorded invoice through the normal write path.
 ALTER TABLE invoices ADD COLUMN due_at timestamptz;
 
 -- FORCE ROW LEVEL SECURITY: invoices is ENABLE + FORCE (0006) with policies only TO nominara_app / nominara_worker /
