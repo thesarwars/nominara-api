@@ -34,7 +34,8 @@ export const downgradeExcessItemSchema = z.discriminatedUnion("kind", [
       key: z.string().min(1),
       /** Null: unlimited. */
       from_days: z.number().int().positive().nullable(),
-      to_days: z.number().int().positive(),
+      /** 0: the target plan keeps none (a tier whose rollup retention is "—"). */
+      to_days: z.number().int().nonnegative(),
     })
     .strict(),
 ]);
