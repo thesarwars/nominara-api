@@ -55,6 +55,10 @@ interface InvoiceRow {
 const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
+function epochSeconds(date: Date): number {
+  return Math.floor(date.getTime() / 1000);
+}
+
 function same(stored: StoredInvoice, desired: DesiredInvoice): boolean {
   return (
     stored.number === desired.number &&
@@ -73,7 +77,13 @@ function same(stored: StoredInvoice, desired: DesiredInvoice): boolean {
   );
 }
 
-/** What an audit row says about an invoice. No URLs: a hosted-invoice link is a bearer link to pay. */
+/**
+ * What an audit row says about an invoice. No URLs: a hosted-invoice link is a bearer link to pay.
+ *
+ * ⚠ THE PERIOD IS INTEGER EPOCH SECONDS, NOT AN ISO STRING. `redactState` masks any whitespace-free string of 20+ characters
+ * whose character entropy is 3.5 bits or more, and roughly 1.7% of ISO timestamps (e.g. 2026-09-28T17:34:56.000Z) reach it:
+ * the audit row would then say "[redacted]" for a date. A number is never a candidate.
+ */
 function auditState(
   invoice: { status: string; total: string; currency: string; number: string | null },
   period: { start: Date; end: Date; dueAt: Date | null },
@@ -85,9 +95,9 @@ function auditState(
     status: invoice.status,
     total: invoice.total,
     currency: invoice.currency,
-    period_start: period.start.toISOString(),
-    period_end: period.end.toISOString(),
-    due_at: period.dueAt?.toISOString() ?? null,
+    period_start: epochSeconds(period.start),
+    period_end: epochSeconds(period.end),
+    due_at: period.dueAt === null ? null : epochSeconds(period.dueAt),
   };
 }
 
@@ -107,7 +117,13 @@ export class BillingInvoicesService {
     tx: ClientBase,
     workspaceId: string,
     desired: DesiredInvoice,
-    provenance: { readonly eventId: string; readonly eventType: string },
+    provenance: {
+      readonly eventId: string;
+      /** Keep it SHORT: a 20+ character label can be masked by `redactState` (see `auditState`). */
+      readonly eventType: string;
+      /** The audit row's actor label; the webhook's by default. */
+      readonly actorUa?: string;
+    },
   ): Promise<InvoiceRecordOutcome> {
     const existing = await tx.query<StoredInvoice>(
       `SELECT id, number, status, subtotal::text, total::text, addon_amount::text, credit_pack_amount::text, currency, period_start, period_end, due_at, hosted_invoice_url, pdf_url, paid_at
@@ -178,7 +194,7 @@ export class BillingInvoicesService {
       actorType: "system",
       actorId: SYSTEM_ACTOR_ID,
       actorIp: null,
-      actorUa: "operator:stripe-webhook",
+      actorUa: provenance.actorUa ?? "operator:stripe-webhook",
       action: "billing.invoice_recorded",
       resourceType: "invoice",
       resourceId: invoiceId,

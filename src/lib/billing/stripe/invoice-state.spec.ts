@@ -292,8 +292,8 @@ describe("service period · the invoice publishes the plan line's period, and ke
     expect(write({ lines: { data: [packLine, planLine], has_more: true } })).toMatchObject({ periodStart: at(OCT15), periodEnd: at(NOV15) });
   });
 
-  it("with no invoice-level period_end and no due_date, due_at falls back to the service end", () => {
-    const inv = write({ period_start: undefined, period_end: undefined, lines: { data: [planLine] } });
-    expect(inv.dueAt).toEqual(at(NOV15));
+  it("with no invoice-level period_end and no due_date, due_at is the invoice's created time, and only without that the service end", () => {
+    expect(write({ period_start: undefined, period_end: undefined, created: OCT15 + 3, lines: { data: [planLine] } }).dueAt).toEqual(at(OCT15 + 3));
+    expect(write({ period_start: undefined, period_end: undefined, lines: { data: [planLine] } }).dueAt).toEqual(at(NOV15));
   });
 });

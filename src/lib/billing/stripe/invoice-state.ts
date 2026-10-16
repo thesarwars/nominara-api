@@ -29,7 +29,7 @@ export interface DesiredInvoice {
   /** The SERVICE period the invoice pays for (see `servicePeriod`), not Stripe's invoice-level one. */
   readonly periodStart: Date;
   readonly periodEnd: Date;
-  /** When the invoice fell due: Stripe's `due_date`, else the invoice-level `period_end` (roughly when it was issued). */
+  /** When the invoice fell due: Stripe's `due_date`, else the invoice-level `period_end` (roughly when it was issued), else `created`. */
   readonly dueAt: Date;
   readonly hostedInvoiceUrl: string | null;
   readonly pdfUrl: string | null;
@@ -196,7 +196,7 @@ export function desiredFromStripeInvoice(raw: Readonly<Record<string, unknown>>)
   const periodEnd = service?.end ?? seconds(raw.period_end);
   if (periodStart === null || periodEnd === null) return { kind: "ignore", reason: "invoice carries no billing period" };
   // Past-due semantics ride on this, not on the service period (which ends a month AFTER a first invoice is issued).
-  const dueAt = seconds(raw.due_date) ?? seconds(raw.period_end) ?? periodEnd;
+  const dueAt = seconds(raw.due_date) ?? seconds(raw.period_end) ?? seconds(raw.created) ?? periodEnd;
 
   let amounts: { addon: string; creditPack: string };
   try {

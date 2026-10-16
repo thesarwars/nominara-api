@@ -52,6 +52,9 @@ describe("migration 0127 - invoices.due_at", () => {
   });
 
   it("up, run as the NOBYPASSRLS owner, backfills due_at = period_end on every existing row and leaves FORCE RLS on; down drops the column; up again restores it", async () => {
+    const policy = async () => (await client.query("SELECT cmd, roles, qual, with_check FROM pg_policies WHERE tablename = 'invoices' AND policyname = 'ws_isolation_invoices'")).rows;
+    const policyBefore = await policy();
+    expect(policyBefore).toHaveLength(1);
     await client.query("ALTER TABLE invoices OWNER TO nominara_owner");
     const attrs = (await client.query("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'nominara_owner'")).rows[0];
     expect(attrs).toEqual({ rolsuper: false, rolbypassrls: false });
@@ -66,7 +69,8 @@ describe("migration 0127 - invoices.due_at", () => {
     const rows = (await client.query("SELECT stripe_invoice_id, due_at, period_end FROM invoices ORDER BY stripe_invoice_id")).rows as Array<{ due_at: Date | null; period_end: Date }>;
     expect(rows).toHaveLength(2);
     for (const row of rows) expect(row.due_at?.getTime()).toBe(row.period_end.getTime());
-    expect((await client.query("SELECT relforcerowsecurity FROM pg_class WHERE relname = 'invoices' AND relkind = 'r'")).rows[0]).toEqual({ relforcerowsecurity: true });
+    expect((await client.query("SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'invoices' AND relkind = 'r'")).rows[0]).toEqual({ relrowsecurity: true, relforcerowsecurity: true });
+    expect(await policy()).toEqual(policyBefore);
 
     const down = await readFile(path.join(MIGRATIONS_DIR, `${NAME}.down.sql`), "utf8");
     await client.query("BEGIN");

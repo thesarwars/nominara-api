@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import Stripe from "stripe";
 import {
   STRIPE_ERROR_TYPES,
@@ -35,6 +36,8 @@ export interface StripeHttpGatewayConfig {
   readonly webhookSecret: string | undefined;
 }
 
+/** The most invoice lines paged in; beyond it the list is reported incomplete (`has_more`). */
+const INVOICE_LINES_CAP = 1000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** PaymentIntent statuses that took no money and will not: the charge was refused, abandoned or cancelled. */
@@ -51,6 +54,7 @@ function stringMetadata(value: unknown): Record<string, string> {
 }
 
 export class StripeHttpGateway implements StripeGateway {
+  private readonly logger = new Logger(StripeHttpGateway.name);
   private readonly client: Stripe | undefined;
   private readonly webhookSecret: string | undefined;
 
@@ -394,8 +398,11 @@ export class StripeHttpGateway implements StripeGateway {
           // be on a later page of a long invoice. Page the rest in, so what the reader sees is the whole list.
           const embedded = raw.lines as { data?: unknown[]; has_more?: boolean } | undefined;
           if (embedded?.has_more === true) {
-            const all = await client.invoices.listLineItems(objectId, { limit: 100 }).autoPagingToArray({ limit: 1000 });
-            raw.lines = { ...embedded, data: all, has_more: all.length >= 1000 };
+            const all = await client.invoices.listLineItems(objectId, { limit: 100 }).autoPagingToArray({ limit: INVOICE_LINES_CAP });
+            const capped = all.length >= INVOICE_LINES_CAP;
+            // Counts only: no invoice id. A capped list may not hold the plan line; the reader then uses the invoice's period.
+            if (capped) this.logger.warn({ message: "stripe invoice has more lines than the paging cap; the line list is incomplete", cap: INVOICE_LINES_CAP });
+            raw.lines = { ...embedded, data: all, has_more: capped };
           }
           const parent = raw.parent as { subscription_details?: { metadata?: unknown } } | null | undefined;
           const metadata = { ...stringMetadata(parent?.subscription_details?.metadata), ...stringMetadata(raw.metadata) };

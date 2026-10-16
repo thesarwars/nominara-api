@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import { describe, expect, it, vi } from "vitest";
 import { StripeUpstreamError } from "./stripe-gateway.js";
 import { StripeHttpGateway } from "./stripe-http.gateway.js";
@@ -34,5 +35,26 @@ describe("fetchObject(invoice) · lines", () => {
     const listLineItems = () => ({ autoPagingToArray: () => Promise.reject(Object.assign(new Error("x"), { statusCode: 500 })) });
     const retrieve = () => Promise.resolve({ id: "in_1", lines: { data: [], has_more: true } });
     await expect(gatewayWith({ invoices: { retrieve, listLineItems } }).fetchObject("invoice", "in_1")).rejects.toBeInstanceOf(StripeUpstreamError);
+  });
+
+  it("a listing that reaches the 1000-line cap is returned with has_more still true, and a warning (counts only, no id) is logged", async () => {
+    const all = Array.from({ length: 1000 }, (_, i) => ({ id: `il_${i}` }));
+    const autoPagingToArray = vi.fn(() => Promise.resolve(all));
+    const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    const retrieve = () => Promise.resolve({ id: "in_secret_1", lines: { data: [{ id: "il_0" }], has_more: true } });
+    const out = await gatewayWith({ invoices: { retrieve, listLineItems: () => ({ autoPagingToArray }) } }).fetchObject("invoice", "in_secret_1");
+    expect(autoPagingToArray).toHaveBeenCalledWith({ limit: 1000 });
+    expect(out?.raw.lines).toMatchObject({ has_more: true });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("in_secret_1");
+    warn.mockRestore();
+  });
+
+  it("a listing under the cap logs no warning", async () => {
+    const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    const retrieve = () => Promise.resolve({ id: "in_1", lines: { data: [], has_more: true } });
+    await gatewayWith({ invoices: { retrieve, listLineItems: () => ({ autoPagingToArray: () => Promise.resolve([{ id: "il_1" }]) }) } }).fetchObject("invoice", "in_1");
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

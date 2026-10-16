@@ -21,3 +21,12 @@ ALTER TABLE invoices NO FORCE ROW LEVEL SECURITY;
 UPDATE invoices SET due_at = period_end WHERE due_at IS NULL;
 
 ALTER TABLE invoices FORCE ROW LEVEL SECURITY;
+
+-- The unforced window above must have closed. If the table is not FORCE ROW LEVEL SECURITY here, fail the whole migration.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = 'public.invoices'::regclass AND relrowsecurity AND relforcerowsecurity) THEN
+    RAISE EXCEPTION 'invoices must be ENABLE + FORCE ROW LEVEL SECURITY after 0127';
+  END IF;
+END
+$$;
