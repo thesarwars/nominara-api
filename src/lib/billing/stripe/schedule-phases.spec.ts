@@ -68,6 +68,20 @@ describe("STORY-184 · currentPhaseIndex", () => {
 describe("STORY-184 · isFinishedSchedule", () => {
   const base = { status: "active", end_behavior: "release", phases: [{ start_date: 1, metadata: {} }, { start_date: 2, metadata: { plan_change_intent_id: "i" } }], current_phase: { start_date: 2 } };
   it("is true for a last phase carrying our intent id", () => expect(isFinishedSchedule(base, "starter")).toBe(true));
+  // The MAJOR of review round 2: `from_subscription` creates a ONE-phase schedule; a downgrade's update gives it its second. A lost reply
+  // between the two leaves the one-phase schedule attached (with or without the subscription's metadata copied onto it), and it must NOT read
+  // as finished - or the replay releases the very schedule it is completing.
+  it.each([
+    ["with the subscription's metadata copied onto it", { plan_key: "starter", workspace_id: "ws" }],
+    ["carrying an intent id", { plan_change_intent_id: "i" }],
+    ["with no metadata", {}],
+  ])("is false for a ONE-phase from_subscription schedule %s", (_label, metadata) => {
+    const onePhase = { status: "active", end_behavior: "release", phases: [{ start_date: 1, metadata }], current_phase: { start_date: 1 } };
+    expect(isFinishedSchedule(onePhase, "starter")).toBe(false);
+  });
+  it("is false when the current phase is the FIRST of several (a downgrade not yet taken)", () => {
+    expect(isFinishedSchedule({ ...base, current_phase: { start_date: 1 } }, "starter")).toBe(false);
+  });
   it("is false when the schedule has not started (no current phase)", () => expect(isFinishedSchedule({ ...base, current_phase: null }, "starter")).toBe(false));
   it("is false for end_behavior cancel", () => expect(isFinishedSchedule({ ...base, end_behavior: "cancel" }, "starter")).toBe(false));
   it("is false when the phase metadata names a different plan and no intent", () => {

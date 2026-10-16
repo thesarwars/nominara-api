@@ -272,7 +272,7 @@ export class BillingAddonsService {
               await this.gateway.releaseFinishedSchedule({
                 subscriptionId: subscription.stripe_subscription_id,
                 expectedPlanKey: fetched.metadata.plan_key,
-                idempotencyKey: `finished-schedule-${typeof schedule === "string" ? schedule : subscription.stripe_subscription_id}`,
+                idempotencyKey: `finished-schedule-${typeof schedule === "string" ? schedule : typeof (schedule as { id?: unknown }).id === "string" ? (schedule as { id: string }).id : subscription.stripe_subscription_id}`,
               })
             ).released
           : false;

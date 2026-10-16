@@ -70,4 +70,22 @@ describe("STORY-184 · plan:set refuses a Stripe-tracked workspace", () => {
     await workspace({ plan: "growth", provider: "stripe", status: "active" });
     await expect(assertNotStripeTracked(client, await workspace({ plan: "free", provider: "none", status: "active" }))).resolves.toBeUndefined();
   });
+
+  it("takes the WORKSPACE LOCK before it looks: while another transaction holds the workspace row, the check is a clear 'busy' refusal, not a race with a webhook", async () => {
+    const id = await workspace({ plan: "free", provider: "none", status: "active" });
+    const other = new Client({ connectionString: container.getConnectionUri() });
+    await other.connect();
+    try {
+      await other.query("BEGIN");
+      await other.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [id]);
+      await client.query("BEGIN");
+      await expect(assertNotStripeTracked(client, id)).rejects.toThrow(/busy with another billing change/u);
+      await client.query("ROLLBACK");
+    } finally {
+      await other.query("ROLLBACK");
+      await other.end();
+    }
+    // and once the lock is free it answers
+    await expect(assertNotStripeTracked(client, id)).resolves.toBeUndefined();
+  }, 30_000);
 });

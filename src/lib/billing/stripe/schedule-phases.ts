@@ -141,8 +141,13 @@ export function currentPhaseIndex(schedule: ScheduleLike): number {
 export function isFinishedSchedule(schedule: ScheduleLike, subscriptionPlanKey: string | undefined): boolean {
   if (schedule.status !== "active" || schedule.end_behavior !== "release") return false;
   if (schedule.current_phase === null || schedule.current_phase === undefined) return false;
+  // ⚠ A schedule with ONE phase is never finished: it is what `from_subscription` creates, BEFORE a downgrade's update gives it a
+  // second phase (a lost reply between the create and the update leaves exactly that behind, possibly with the subscription's
+  // metadata copied onto it). Its only phase is "current" and "last", and releasing it would throw away the downgrade being set up.
+  // Finished means a phase 2+ is running: it has been through a cut-over.
+  if (schedule.phases.length < 2) return false;
   const index = currentPhaseIndex(schedule);
-  if (index !== schedule.phases.length - 1) return false;
+  if (index < 1 || index !== schedule.phases.length - 1) return false;
   const metadata = stringMetadataOf(schedule.phases[index]!.metadata);
   return metadata.plan_change_intent_id !== undefined || (subscriptionPlanKey !== undefined && metadata.plan_key === subscriptionPlanKey);
 }

@@ -142,7 +142,7 @@ export class PlanChangeService {
           this.refused(direction, "plan_change_pending");
           throw new ConflictError({ message: "a plan change is already pending on this subscription: cancel it or wait for it to be confirmed", details: { reason: "plan_change_pending" } });
         }
-        await this.refuseScheduled(ctx, fresh);
+        await this.refuseScheduled(ctx, fresh, false);
       }
 
       const topUp = direction === "upgrade" ? await this.estimateTopUp(client, workspaceId, sub, target) : 0;
@@ -216,7 +216,7 @@ export class PlanChangeService {
       const locked = await this.context(client, workspaceId, request.plan_key, true);
       if (!locked.sameAsCurrent) this.refuseByState(locked);
       const fresh = await this.fetchFresh(locked);
-      if (locked.sameAsCurrent) return this.alreadyApplied(locked, fresh, request);
+      if (locked.sameAsCurrent) return await this.alreadyApplied(locked, fresh, request);
 
       const replay = await this.existingIntent(locked, fresh, request);
       // A REPLAY is the same change retried after a lost reply: its own schedule (a downgrade's) is already on the
@@ -229,23 +229,27 @@ export class PlanChangeService {
 
   /**
    * The request names the plan the workspace is on NOW. Normally that is a 400 (nothing to change). The exception is a RETRY
-   * of an upgrade whose reply was lost AFTER the webhook adopted it: the intent is spent, so "same plan" is the whole trace.
-   * Stripe's own subscription still carries the change's intent id and names the plan, and the quote is one this period could
-   * have issued: then it is answered like the original, without any call. A customer who is simply on that plan and resends a
-   * quote from this period gets the same harmless no-op.
+   * of an upgrade whose reply was lost AFTER the webhook adopted it: the intent is spent, so the trace is the audit row the
+   * webhook wrote when it adopted the change (`billing.plan_change.adopted`: the intent's id and the quote's proration date).
+   * The retry is answered like the original, without any call, ONLY when the subscription still carries that intent's id AND
+   * the request's quote is the one for that very change (same proration date). Any other request for the plan the workspace
+   * is on is the 400 it always was.
    */
-  private alreadyApplied(ctx: Context, fresh: Fresh, request: PlanChangeRequest): PlanChangeResponse {
+  private async alreadyApplied(ctx: Context, fresh: Fresh, request: PlanChangeRequest): Promise<PlanChangeResponse> {
     const quote = request.quote;
-    const periodStart = fresh.periodStart ?? Math.floor(ctx.sub.current_period_start.getTime() / 1000);
-    if (
-      quote !== undefined &&
-      fresh.metadata.plan_change_intent_id !== undefined &&
-      fresh.metadata.plan_key === ctx.target.key &&
-      quote.proration_date >= periodStart &&
-      quote.proration_date >= Math.floor(Date.now() / 1000) - INTENT_RETENTION_MS / 1000
-    ) {
-      this.outcome("upgrade", "replayed_adopted");
-      return { status: "pending", direction: "upgrade", target_plan_key: ctx.target.key, effective: "immediate", effective_at: null };
+    const intentId = fresh.metadata.plan_change_intent_id;
+    if (quote !== undefined && intentId !== undefined && fresh.metadata.plan_key === ctx.target.key) {
+      const trace = await ctx.client.query(
+        `SELECT 1 FROM audit_log
+          WHERE workspace_id = $1 AND action = 'billing.plan_change.adopted'
+            AND after_state ->> 'intent_id' = $2 AND after_state ->> 'to_plan_key' = $3 AND after_state ->> 'proration_date' = $4
+          LIMIT 1`,
+        [ctx.workspaceId, intentId, ctx.target.key, String(quote.proration_date)],
+      );
+      if ((trace.rowCount ?? 0) > 0) {
+        this.outcome("upgrade", "replayed_adopted");
+        return { status: "pending", direction: "upgrade", target_plan_key: ctx.target.key, effective: "immediate", effective_at: null };
+      }
     }
     this.refused("upgrade", "already_on_plan");
     throw new ValidationFailedError({ message: "the workspace is already on this plan", details: { issues: [{ path: ["plan_key"], message: "already on this plan" }] } });
@@ -465,7 +469,10 @@ export class PlanChangeService {
     if (target.key === sub.plan_key && !allowCurrent) {
       throw new ValidationFailedError({ message: "the workspace is already on this plan", details: { issues: [{ path: ["plan_key"], message: "already on this plan" }] } });
     }
-    return { client, workspaceId, sub, target, direction: target.sort_order >= sub.current_sort_order ? "upgrade" : "downgrade", sameAsCurrent: target.key === sub.plan_key };
+    // `>=`: equal sort orders only happen when the target IS the current plan (sameAsCurrent), which is never a downgrade. It is
+    // given "upgrade" because the only request allowed to name the current plan is the retry of an upgrade (see alreadyApplied).
+    const direction: Direction = target.sort_order >= sub.current_sort_order ? "upgrade" : "downgrade";
+    return { client, workspaceId, sub, target, direction, sameAsCurrent: target.key === sub.plan_key };
   }
 
   private async subscriptionRow(client: ClientBase, workspaceId: string): Promise<SubscriptionRow> {
@@ -502,7 +509,7 @@ export class PlanChangeService {
    * attached for the whole of its last phase (a billing cycle), and refusing every change for a cycle after a customer's own
    * downgrade would be a lockout. Such a schedule is released first (the subscription does not change), then the change goes on.
    */
-  private async refuseScheduled(ctx: Context, fresh: Fresh): Promise<void> {
+  private async refuseScheduled(ctx: Context, fresh: Fresh, release = true): Promise<void> {
     const schedule = (fresh.raw as { schedule?: unknown }).schedule;
     if (schedule === null || schedule === undefined) return;
     try {
@@ -510,8 +517,11 @@ export class PlanChangeService {
         subscriptionId: ctx.sub.stripe_subscription_id,
         expectedPlanKey: fresh.metadata.plan_key,
         idempotencyKey: `finished-schedule-${typeof schedule === "string" ? schedule : isRecordWithId(schedule) ? schedule.id : ctx.sub.stripe_subscription_id}`,
+        // A PREVIEW only looks: it must change nothing at Stripe, so a finished schedule is treated as non-blocking WITHOUT releasing it.
+        // The change (and the add-on paths) release it when they actually go ahead.
+        dryRun: !release,
       });
-      if (finished.released) {
+      if (finished.released || (!release && finished.finished === true)) {
         this.outcome(ctx.direction, "finished_schedule_released");
         return;
       }

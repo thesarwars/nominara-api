@@ -336,6 +336,44 @@ describe("STORY-184 · in-app plan change", () => {
     expect(gateway.upgrades).toHaveLength(1);
   });
 
+  it("MAJOR (round 2) · the lost reply BETWEEN the schedule's create and its update leaves a ONE-phase schedule (with the subscription's metadata copied onto it): the replay COMPLETES it - never releases and replaces it", async () => {
+    for (const copies of [true, false]) {
+      const { workspaceId, owner } = await f.newWorkspace("growth");
+      gateway.fromSubscriptionCopiesMetadata = copies;
+      gateway.failDowngradeBetweenCreateAndUpdate = new StripeUpstreamError(504);
+      expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(503);
+      expect(gateway.downgrades, "the update never ran").toHaveLength(0);
+      const created = [...gateway.schedules.keys()];
+      expect(created).toHaveLength(1);
+      expect(((await f.intentOf(workspaceId))!).settled_at).toBeUndefined();
+
+      gateway.failDowngradeBetweenCreateAndUpdate = undefined;
+      const retry = await f.post(owner, CHANGE, { plan_key: "starter" });
+      expect(retry.statusCode, `copies metadata: ${String(copies)} · ${retry.body}`).toBe(202);
+      expect(gateway.replacedSchedules, "the one-phase schedule was NOT mistaken for a finished one").toEqual([]);
+      expect([...gateway.schedules.keys()], "and no second schedule was made").toEqual(created);
+      expect(gateway.downgrades).toHaveLength(1);
+      expect(((await f.intentOf(workspaceId))!)).toMatchObject({ settled_at: expect.any(String) });
+      gateway.reset();
+    }
+  });
+
+  it("MINOR (round 2) · the PREVIEW treats a finished schedule as non-blocking but does NOT release it; the change releases it", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
+    cutOver(workspaceId, "starter", String((await f.intentOf(workspaceId))!.id));
+    expect((await f.reconcile(workspaceId)).statusCode).toBe(200);
+    gateway.finishedScheduleIds.add("sub_sched_1");
+    const owner2 = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    const preview = await f.post(owner2, PREVIEW, { plan_key: "growth" });
+    expect(preview.statusCode, preview.body).toBe(200);
+    expect(gateway.finishedReleases, "a preview changes nothing at Stripe").toHaveLength(0);
+    const preview2 = planChangePreviewResponseSchema.parse(dataOf(preview));
+    const change = await f.post(owner2, CHANGE, { plan_key: "growth", quote: preview2.quote });
+    expect(change.statusCode, change.body).toBe(202);
+    expect(gateway.finishedReleases).toHaveLength(1);
+  });
+
   it("MAJOR · and while a schedule is NOT finished (an add-on removal still to come) the same upgrade is still change_scheduled", async () => {
     const { workspaceId, owner } = await f.newWorkspace("starter");
     f.stripeSubscription(workspaceId, { plan: "starter", schedule: "sub_sched_addon" });
@@ -400,6 +438,10 @@ describe("STORY-184 · in-app plan change", () => {
     const retry = await f.post(owner2, CHANGE, { plan_key: "growth", quote: preview.quote });
     expect(retry.statusCode, retry.body).toBe(202);
     expect(gateway.upgrades, "Stripe was not asked again").toHaveLength(1);
+    expect(gateway.upgradeAttempts).toHaveLength(1);
+    // The same trace but ANOTHER quote (a different proration date) is not this request's change: 400.
+    const other = await f.post(owner2, CHANGE, { plan_key: "growth", quote: { ...preview.quote, proration_date: preview.quote!.proration_date - 7 } });
+    expect(other.statusCode, "a different quote is not a replay").toBe(400);
     expect(gateway.upgradeAttempts).toHaveLength(1);
     // A workspace on growth with NO such trace is still told it is already on that plan.
     const plain = await f.newWorkspace("growth");

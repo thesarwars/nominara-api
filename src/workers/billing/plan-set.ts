@@ -3,6 +3,7 @@ import type { ClientBase, PoolClient } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { createPgPool } from "../../db/pg-pool.js";
 import { applyPlanChange, planKeyOnly, type BillingInterval } from "../../lib/billing/apply-plan.js";
+import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 
@@ -130,6 +131,10 @@ export class PlanSetStripeTrackedError extends Error {
  * plan write, so the answer and the write cannot be separated by a webhook.
  */
 export async function assertNotStripeTracked(tx: ClientBase, workspaceId: string): Promise<void> {
+  // ⚠ THE WORKSPACE ROW LOCK FIRST (the same lock the webhook and every billing write take), so the answer cannot be separated from
+  // the plan write by a webhook adopting a Stripe subscription between the check and the write. Bounded: a holder inside a Stripe
+  // call makes this a clear refusal, not a hang.
+  await lockWorkspaceBounded(tx, workspaceId, () => new Error(`workspace ${workspaceId} is busy with another billing change: retry shortly`));
   const result = await tx.query<{ plan_key: string }>(
     "SELECT plan_key FROM subscriptions WHERE workspace_id = $1 AND provider = 'stripe' AND status IN ('trialing','active','past_due') AND plan_key <> 'free'",
     [workspaceId],

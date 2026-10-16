@@ -1,4 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
+import { AuditChainService } from "../audit/audit-chain.service.js";
+import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
 import { readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
 import { addonItemsFromSubscription } from "../../lib/billing/stripe/addon-items.js";
@@ -189,6 +191,34 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
           AND (charged_unit_amount_cents, charged_currency, charged_interval) IS DISTINCT FROM ($3::integer, $4::char(3), $5::text)`,
       [workspaceId, desired.state.providerSubscriptionId, desired.charge?.unitAmountCents ?? null, desired.charge?.currency.toLowerCase() ?? null, desired.charge?.interval ?? null],
     );
+
+    // STORY-184 - the adoption is RECORDED before the intent is spent (an audit row in this transaction, naming the intent's id and
+    // the quote's proration date). It is the trace a retry whose reply was lost after the adoption is matched against: "the
+    // workspace is already on this plan" is answered as a replay only for the quote of the change that was really adopted.
+    const adoptable = await tx.query<{ intent: unknown }>(
+      `SELECT pending_plan_change AS intent FROM subscriptions
+        WHERE workspace_id = $1 AND stripe_subscription_id = $2 AND status IN ('trialing','active','past_due')
+          AND pending_plan_change ->> 'id' = $3 AND pending_plan_change ->> 'to_plan_key' = $4`,
+      [workspaceId, desired.state.providerSubscriptionId, object.metadata.plan_change_intent_id ?? "", desired.state.planKey],
+    );
+    const adopted = readPendingPlanChange(adoptable.rows[0]?.intent);
+    if (adopted.kind === "intent") {
+      await new AuditChainService().append(tx, {
+        workspaceId,
+        actorType: "system",
+        actorId: SYSTEM_ACTOR_ID,
+        actorIp: null,
+        actorUa: `operator:${WEBHOOK_OPERATOR}`,
+        action: "billing.plan_change.adopted",
+        resourceType: "workspace",
+        resourceId: workspaceId,
+        beforeState: { intent_id: adopted.intent.id, from_plan_key: adopted.intent.from_plan_key },
+        afterState: { intent_id: adopted.intent.id, direction: adopted.intent.direction, to_plan_key: adopted.intent.to_plan_key, proration_date: adopted.intent.proration_date },
+        requestId: event.id,
+        supportGrantId: null,
+        severity: "info",
+      });
+    }
 
     // STORY-184 — the in-app plan change is spent once its plan is adopted (or the subscription ended). Only THIS
     // subscription's intent, and only when the plan it names is the plan now held AND the subscription names this intent's id: an event that left the row where it was

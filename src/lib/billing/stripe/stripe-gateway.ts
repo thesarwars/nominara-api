@@ -179,6 +179,8 @@ export interface FinishedScheduleInput {
   /** The plan the subscription is on NOW (its fresh metadata): a last phase naming it is ours. */
   readonly expectedPlanKey: string | undefined;
   readonly idempotencyKey: string;
+  /** Only LOOK: report whether the schedule is finished (`finished`), release nothing. For a read-only preview. */
+  readonly dryRun?: boolean;
 }
 
 /** NEW-D-7 — a card the customer agreed to have reused off-session (a Checkout with `setup_future_usage`). */
@@ -341,7 +343,7 @@ export interface StripeGateway {
    * subscription itself does not change. `released: false` when there is no schedule or it is not finished.
    * Throws `StripeUpstreamError`.
    */
-  releaseFinishedSchedule(input: FinishedScheduleInput): Promise<{ readonly released: boolean }>;
+  releaseFinishedSchedule(input: FinishedScheduleInput): Promise<{ readonly released: boolean; readonly finished?: boolean }>;
 
   /** `null` when Stripe has no such object (deleted, or a test-mode id at a live endpoint). */
   fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null>;

@@ -1,3 +1,4 @@
+import { isFinishedSchedule } from "../../src/lib/billing/stripe/schedule-phases.js";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import {
   StripeSignatureError,
@@ -370,20 +371,68 @@ export class FakeStripeGateway implements StripeGateway {
     this.objects.set(`subscription:${input.subscriptionId}`, { ...stored, metadata: { ...stored.metadata, ...input.metadata }, raw: { ...stored.raw, metadata: { ...raw.metadata, ...input.metadata } } });
   }
 
+  /**
+   * Modelled schedules (id -> shape Stripe returns), for the flows that need the REAL `isFinishedSchedule` predicate to run: a
+   * schedule created by `from_subscription` has ONE phase until the downgrade's update gives it a second.
+   */
+  readonly schedules = new Map<string, { status: string; end_behavior: string; phases: Array<{ start_date: number; metadata: Record<string, string> }>; current_phase: { start_date: number } | null }>();
+  /** Does `from_subscription` copy the subscription's metadata onto the new schedule's phase? (Unknown at Stripe; the checklist asks.) */
+  fromSubscriptionCopiesMetadata = true;
+  /** Stripe CREATES the schedule (one phase) and the reply is lost before the update: the retry must COMPLETE it. */
+  failDowngradeBetweenCreateAndUpdate: Error | undefined;
+  /** Schedules the downgrade replaced because it found a finished one attached (should stay empty for a replay). */
+  readonly replacedSchedules: string[] = [];
+  private scheduleSeq = 0;
+
   async schedulePlanDowngrade(input: PlanDowngradeInput): Promise<{ readonly scheduleId: string }> {
     await this.beforePlanChangeCall?.();
     this.downgradeAttempts.push(input);
     if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    const subKey = `subscription:${input.subscriptionId}`;
+    const attach = (id: string | null): void => {
+      const stored = this.objects.get(subKey);
+      if (stored !== undefined) this.objects.set(subKey, { ...stored, raw: { ...stored.raw, schedule: id } });
+    };
+
+    // The modelled path (like the real gateway's scheduleIdOf): reuse an attached schedule unless it is FINISHED.
+    const modelled = this.failDowngradeBetweenCreateAndUpdate !== undefined || [...this.schedules.keys()].length > 0;
+    if (modelled && !this.downgradeKeys.has(input.idempotencyKey)) {
+      const stored = this.objects.get(subKey);
+      const planKey = stored?.metadata.plan_key;
+      const attached = (stored?.raw as { schedule?: unknown } | undefined)?.schedule;
+      let id: string | null = typeof attached === "string" ? attached : null;
+      let existing = id === null ? undefined : this.schedules.get(id);
+      if (id !== null && existing !== undefined && isFinishedSchedule(existing, planKey)) {
+        this.replacedSchedules.push(id);
+        existing = undefined;
+        id = null;
+      }
+      if (existing === undefined || id === null) {
+        id = `sub_sched_m${String(++this.scheduleSeq)}`;
+        this.schedules.set(id, {
+          status: "active",
+          end_behavior: "release",
+          phases: [{ start_date: 1, metadata: this.fromSubscriptionCopiesMetadata ? { ...(stored?.metadata ?? {}) } : {} }],
+          current_phase: { start_date: 1 },
+        });
+        attach(id);
+        if (this.failDowngradeBetweenCreateAndUpdate !== undefined) return Promise.reject(this.failDowngradeBetweenCreateAndUpdate);
+      }
+      // the update: the schedule gets its second phase
+      const schedule = this.schedules.get(id)!;
+      schedule.phases = [schedule.phases[0]!, { start_date: 2, metadata: { ...input.metadata } }];
+      this.downgrades.push(input);
+      this.downgradeKeys.set(input.idempotencyKey, id);
+      return Promise.resolve({ scheduleId: id });
+    }
+
     // Like Stripe: the same key answers from the first call and applies nothing twice.
     let scheduleId = this.downgradeKeys.get(input.idempotencyKey);
     if (scheduleId === undefined) {
       this.downgrades.push(input);
       scheduleId = `sub_sched_${String(this.downgrades.length)}`;
       this.downgradeKeys.set(input.idempotencyKey, scheduleId);
-      const stored = this.objects.get(`subscription:${input.subscriptionId}`);
-      if (stored !== undefined && this.failDowngradeAfterApplying !== undefined) {
-        this.objects.set(`subscription:${input.subscriptionId}`, { ...stored, raw: { ...stored.raw, schedule: scheduleId } });
-      }
+      if (this.failDowngradeAfterApplying !== undefined) attach(scheduleId);
     }
     if (this.failDowngradeAfterApplying !== undefined) return Promise.reject(this.failDowngradeAfterApplying);
     return Promise.resolve({ scheduleId });
@@ -416,12 +465,17 @@ export class FakeStripeGateway implements StripeGateway {
   readonly finishedScheduleIds = new Set<string>();
   readonly finishedReleases: FinishedScheduleInput[] = [];
 
-  releaseFinishedSchedule(input: FinishedScheduleInput): Promise<{ readonly released: boolean }> {
+  releaseFinishedSchedule(input: FinishedScheduleInput): Promise<{ readonly released: boolean; readonly finished?: boolean }> {
     if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
     const key = `subscription:${input.subscriptionId}`;
     const stored = this.objects.get(key);
     const scheduleId = (stored?.raw as { schedule?: unknown } | undefined)?.schedule;
-    if (stored === undefined || typeof scheduleId !== "string" || !this.finishedScheduleIds.has(scheduleId)) return Promise.resolve({ released: false });
+    if (stored === undefined || typeof scheduleId !== "string") return Promise.resolve({ released: false });
+    const modelled = this.schedules.get(scheduleId);
+    // The REAL predicate runs on a modelled schedule; a bare id in `finishedScheduleIds` is the shortcut the cut-over tests use.
+    const finished = modelled !== undefined ? isFinishedSchedule(modelled, input.expectedPlanKey) : this.finishedScheduleIds.has(scheduleId);
+    if (!finished) return Promise.resolve({ released: false, finished: false });
+    if (input.dryRun === true) return Promise.resolve({ released: false, finished: true });
     this.finishedReleases.push(input);
     this.objects.set(key, { ...stored, raw: { ...stored.raw, schedule: null } });
     return Promise.resolve({ released: true });
@@ -438,6 +492,10 @@ export class FakeStripeGateway implements StripeGateway {
     this.failUpgradeAfterApplying = undefined;
     this.failUpgradeWith = undefined;
     this.failDowngradeAfterApplying = undefined;
+    this.failDowngradeBetweenCreateAndUpdate = undefined;
+    this.schedules.clear();
+    this.replacedSchedules.length = 0;
+    this.fromSubscriptionCopiesMetadata = true;
     this.downgradeKeys.clear();
     this.beforePlanChangeCall = undefined;
     this.upgradeFingerprints.clear();

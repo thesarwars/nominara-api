@@ -373,10 +373,10 @@ export class StripeHttpGateway implements StripeGateway {
       if (!isFinishedSchedule(schedule, stringMetadataOf(subscription.metadata).plan_key)) return existingId;
       await client.subscriptionSchedules.release(existingId, {}, { idempotencyKey: `${createKey}-release-finished` });
     }
-    return (await client.subscriptionSchedules.create({ from_subscription: subscriptionId }, { idempotencyKey: createKey })).id;
+    return (await client.subscriptionSchedules.create({ from_subscription: subscriptionId }, { idempotencyKey: existingId === null ? createKey : `${createKey}-after-${existingId}` })).id;
   }
 
-  async releaseFinishedSchedule(input: FinishedScheduleInput): Promise<{ readonly released: boolean }> {
+  async releaseFinishedSchedule(input: FinishedScheduleInput): Promise<{ readonly released: boolean; readonly finished?: boolean }> {
     const client = this.requireClient();
     try {
       const subscription = await client.subscriptions.retrieve(input.subscriptionId);
@@ -384,9 +384,10 @@ export class StripeHttpGateway implements StripeGateway {
       const id = typeof existing === "string" ? existing : existing !== null && existing !== undefined ? existing.id : null;
       if (id === null) return { released: false };
       const schedule = await client.subscriptionSchedules.retrieve(id);
-      if (!isFinishedSchedule(schedule, input.expectedPlanKey)) return { released: false };
+      if (!isFinishedSchedule(schedule, input.expectedPlanKey)) return { released: false, finished: false };
+      if (input.dryRun === true) return { released: false, finished: true };
       await client.subscriptionSchedules.release(id, {}, { idempotencyKey: input.idempotencyKey });
-      return { released: true };
+      return { released: true, finished: true };
     } catch (error) {
       throw this.asUpstream(error);
     }

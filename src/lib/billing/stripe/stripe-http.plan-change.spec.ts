@@ -261,7 +261,26 @@ describe("STORY-184 · after the cut-over the CURRENT phase is rewritten, not ph
     expect(result).toEqual({ scheduleId: "sub_sched_2" });
     expect(release).toHaveBeenCalledWith("sub_sched_1", {}, expect.anything());
     expect(create).toHaveBeenCalledTimes(1);
+    // a DISTINCT key: Stripe's idempotency cache must not hand back the schedule that was just released
+    expect(create).toHaveBeenCalledWith({ from_subscription: "sub_1" }, { idempotencyKey: "k-schedule-after-sub_sched_1" });
     expect(update).toHaveBeenCalledWith("sub_sched_2", expect.anything(), expect.anything());
+  });
+
+  it("MAJOR · a ONE-phase schedule left by a lost reply between create and update (even with the subscription's metadata copied onto it) is REUSED, not released", async () => {
+    const update = vi.fn(() => Promise.resolve({}));
+    const release = vi.fn(() => Promise.resolve({}));
+    const create = vi.fn();
+    const onePhase = { id: "sub_sched_1", status: "active", end_behavior: "release", phases: [{ items: [{ price: "price_plan", quantity: 1 }], start_date: 100, end_date: 200, metadata: { workspace_id: "ws-1", plan_key: "starter" } }], current_phase: { start_date: 100, end_date: 200 } };
+    const client = {
+      products: { create: vi.fn(() => Promise.resolve({})) },
+      subscriptions: { retrieve: () => Promise.resolve({ schedule: "sub_sched_1", metadata: { workspace_id: "ws-1", plan_key: "starter" } }) },
+      subscriptionSchedules: { retrieve: () => Promise.resolve(onePhase), release, create, update },
+    };
+    const result = await gatewayWith(client).schedulePlanDowngrade({ subscriptionId: "sub_1", target: starter, keepAddons: [], metadata: META, idempotencyKey: "k" });
+    expect(result).toEqual({ scheduleId: "sub_sched_1" });
+    expect(release).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledWith("sub_sched_1", expect.anything(), { idempotencyKey: "k" });
   });
 });
 
