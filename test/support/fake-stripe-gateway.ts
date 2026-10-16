@@ -308,6 +308,8 @@ export class FakeStripeGateway implements StripeGateway {
   upgradeOutcome: "applied" | "payment_failed" = "applied";
   /** Makes plan-change calls fail like an upstream outage (the request never reached Stripe). */
   failPlanChangeWith: Error | undefined;
+  /** Makes ONLY the upgrade call fail (the request never reached Stripe): previews and fetches still work. */
+  failUpgradeWith: Error | undefined;
   /** Stripe APPLIES the upgrade and the reply is lost: the stored subscription moves, the call then rejects. */
   failUpgradeAfterApplying: Error | undefined;
   private readonly upgradeFingerprints = new Map<string, string>();
@@ -323,7 +325,11 @@ export class FakeStripeGateway implements StripeGateway {
     return Promise.resolve({ amountDueCents, currency: input.target.currency.toLowerCase() });
   }
 
-  applyPlanUpgrade(input: PlanUpgradeInput): Promise<PlanUpgradeResult> {
+  /** Runs at the instant a plan-change call REACHES Stripe (upgrade or schedule): lets a test look at what was committed by then. */
+  beforePlanChangeCall: (() => Promise<void>) | undefined;
+
+  async applyPlanUpgrade(input: PlanUpgradeInput): Promise<PlanUpgradeResult> {
+    await this.beforePlanChangeCall?.();
     this.upgradeAttempts.push(input);
     // Like Stripe: a reused key with a DIFFERENT call is refused (idempotency_error); the same call is answered from the first.
     const { idempotencyKey: _key, ...call } = input;
@@ -332,6 +338,7 @@ export class FakeStripeGateway implements StripeGateway {
     if (earlier !== undefined && earlier !== fingerprint) return Promise.reject(new StripeUpstreamError(400, "idempotency_error"));
     this.upgradeFingerprints.set(input.idempotencyKey, fingerprint);
     if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    if (this.failUpgradeWith !== undefined) return Promise.reject(this.failUpgradeWith);
     if (this.upgradeOutcome === "payment_failed") return Promise.resolve({ outcome: "payment_failed" });
     if (!this.upgrades.some((u) => u.idempotencyKey === input.idempotencyKey)) {
       this.upgrades.push(input);
@@ -359,7 +366,8 @@ export class FakeStripeGateway implements StripeGateway {
     this.objects.set(`subscription:${input.subscriptionId}`, { ...stored, metadata: { ...stored.metadata, ...input.metadata }, raw: { ...stored.raw, metadata: { ...raw.metadata, ...input.metadata } } });
   }
 
-  schedulePlanDowngrade(input: PlanDowngradeInput): Promise<{ readonly scheduleId: string }> {
+  async schedulePlanDowngrade(input: PlanDowngradeInput): Promise<{ readonly scheduleId: string }> {
+    await this.beforePlanChangeCall?.();
     this.downgradeAttempts.push(input);
     if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
     this.downgrades.push(input);
@@ -381,6 +389,8 @@ export class FakeStripeGateway implements StripeGateway {
     this.upgradeOutcome = "applied";
     this.failPlanChangeWith = undefined;
     this.failUpgradeAfterApplying = undefined;
+    this.failUpgradeWith = undefined;
+    this.beforePlanChangeCall = undefined;
     this.upgradeFingerprints.clear();
     this.downgradeAttempts.length = 0;
     this.downgrades.length = 0;

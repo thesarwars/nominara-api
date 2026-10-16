@@ -192,6 +192,28 @@ describe("STORY-075a · subscriptions", () => {
   const auditRows = async (workspaceId: string) =>
     (await harness.db().query("SELECT actor_type, action, request_id, after_state FROM audit_log WHERE workspace_id = $1 AND action = 'workspace.plan_changed' ORDER BY seq", [workspaceId])).rows;
 
+  /**
+   * STORY-184 — a plan on a TRACKED subscription moves only through the workspace's own recorded intent (the in-app plan
+   * change writes it before asking Stripe, and Stripe echoes its id in the subscription's metadata). A bare relabel is
+   * refused (plan-change-webhook.spec.ts proves that and every wrong intent). Tests here that model "the customer changed
+   * plan in Stripe" therefore carry the intent the product would have recorded: call AFTER `stripeSubscription(...)`.
+   */
+  async function withPlanChangeIntent(workspaceId: string, from: string, to: string, cents: number, subscriptionId = "sub_1"): Promise<string> {
+    const intentId = randomUUID();
+    const direction = ["free", "starter", "growth", "business"].indexOf(to) > ["free", "starter", "growth", "business"].indexOf(from) ? "upgrade" : "downgrade";
+    await harness.db().query("UPDATE subscriptions SET pending_plan_change = $2::jsonb WHERE workspace_id = $1", [
+      workspaceId,
+      JSON.stringify({
+        id: intentId, direction, from_plan_key: from, to_plan_key: to, billing_interval: "monthly", unit_amount_cents: cents, currency: "USD",
+        effective: direction === "upgrade" ? "immediate" : "period_end", effective_at: null, stripe_subscription_id: subscriptionId, stripe_idempotency_key: `plan-change-${intentId}`,
+        proration_date: null, amount_due_now_cents: null, schedule_id: null, created_at: new Date().toISOString(), settled_at: new Date().toISOString(),
+      }),
+    ]);
+    const stored = gateway.objects.get(`subscription:${subscriptionId}`)!;
+    gateway.objects.set(`subscription:${subscriptionId}`, { ...stored, metadata: { ...stored.metadata, plan_change_intent_id: intentId } });
+    return intentId;
+  }
+
   // ---- STORY-075 AC1 / scenario 1 -----------------------------------------------------------------
 
   it("scenario 1 · checkout is billing:write only; owner and admin get a hosted URL, manager and viewer a 403 naming the permission", async () => {
@@ -408,6 +430,7 @@ describe("STORY-075a · subscriptions", () => {
     const versionBefore = (await row(workspaceId)).entitlement_version as number;
 
     stripeSubscription(workspaceId, { plan: "starter" });
+    await withPlanChangeIntent(workspaceId, "business", "starter", 4_900);
     const res = await deliver(eventBody("evt_d2", "customer.subscription.updated", "sub_1"));
     expect(res.statusCode, res.body).toBe(200);
     const r = await row(workspaceId);
@@ -519,6 +542,7 @@ describe("STORY-075a · subscriptions", () => {
     const { workspaceId } = await newWorkspace();
     await deliver(eventBody("evt_au1", "customer.subscription.created", stripeSubscription(workspaceId)));
     stripeSubscription(workspaceId, { plan: "business" });
+    await withPlanChangeIntent(workspaceId, "growth", "business", 34_900);
     await deliver(eventBody("evt_au2", "customer.subscription.updated", "sub_1"));
     const audits = await auditRows(workspaceId);
     expect(audits.map((a) => [a.actor_type, a.request_id])).toEqual([
@@ -620,6 +644,7 @@ describe("STORY-075a · subscriptions", () => {
 
     // The customer upgrades; the API instance that handles it has a clock one hour slow.
     stripeSubscription(workspaceId, { id: "sub_k", plan: "business" });
+    await withPlanChangeIntent(workspaceId, "growth", "business", 34_900, "sub_k");
     vi.useFakeTimers({ toFake: ["Date"], now: Date.now() - 3_600_000 });
     try {
       expect(outcomeOf(await deliver(eventBody("evt_k2", "customer.subscription.updated", "sub_k")))).toBe("processed");

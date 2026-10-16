@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
+import { readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
 import { addonItemsFromSubscription } from "../../lib/billing/stripe/addon-items.js";
 import { applyPlanChange, type SubscriptionReconciler } from "../../lib/billing/apply-plan.js";
 import { desiredFromStripeSubscription, toCents, type ClaimedPlanPrice } from "../../lib/billing/stripe/subscription-state.js";
@@ -185,6 +186,17 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       [workspaceId, desired.state.providerSubscriptionId, desired.charge?.unitAmountCents ?? null, desired.charge?.currency.toLowerCase() ?? null, desired.charge?.interval ?? null],
     );
 
+    // STORY-184 — the in-app plan change is spent once its plan is adopted (or the subscription ended). Only THIS
+    // subscription's intent, and only when the plan it names is the plan now held: an event that left the row where it was
+    // (a phase-0 event while a downgrade is pending) must leave the intent where it is too.
+    await tx.query(
+      `UPDATE subscriptions SET pending_plan_change = NULL, updated_at = now()
+        WHERE workspace_id = $1 AND stripe_subscription_id = $2 AND status IN ('trialing','active','past_due')
+          AND pending_plan_change IS NOT NULL
+          AND (pending_plan_change ->> 'to_plan_key' = $3 OR $3 = 'free')`,
+      [workspaceId, desired.state.providerSubscriptionId, desired.state.planKey],
+    );
+
     // A paid subscription was adopted: the Checkout session that bought it is
     // settled, so a later checkout has nothing to supersede.
     if (desired.state.planKey !== "free") {
@@ -235,18 +247,44 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
 
     const live = await tx.query<{
       plan_key: string;
+      provider: string;
       stripe_subscription_id: string;
       charged_unit_amount_cents: number | null;
       charged_currency: string | null;
       charged_interval: "month" | "year" | null;
       pending_checkout: unknown;
+      pending_plan_change: unknown;
     }>(
-      `SELECT plan_key, stripe_subscription_id, charged_unit_amount_cents, charged_currency, charged_interval, pending_checkout
+      `SELECT plan_key, provider, stripe_subscription_id, charged_unit_amount_cents, charged_currency, charged_interval, pending_checkout, pending_plan_change
          FROM subscriptions WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')`,
       [workspaceId],
     );
     const row = live.rows[0];
     if (row === undefined) return catalog;
+
+    // ⚠ STORY-184 — A TRACKED SUBSCRIPTION CHANGES PLAN ONLY THROUGH THE WORKSPACE'S OWN INTENT. This row already tracks
+    // this very Stripe subscription on a paid plan, and the event claims a DIFFERENT plan. Before the in-app plan change
+    // the catalog vouched for any such claim whose price matched it, so a Dashboard edit (the price AND the label moved to
+    // another plan's) was adopted as an upgrade nobody had asked the product for. Now the one door is the intent this
+    // workspace recorded BEFORE it asked Stripe for the change, and it opens only when all three agree: the intent's id is
+    // the one on the subscription's own metadata, the plan it names is the plan claimed, and the subscription is the one the
+    // intent was made for. The charge verified is the intent's frozen one (never the catalog's), so a price that is not what
+    // the customer was quoted is still refused. Anything else returns null: the caller refuses and ALARMS (a relabel).
+    if (row.provider === "stripe" && row.plan_key !== "free" && row.stripe_subscription_id === subscriptionId && planKey !== row.plan_key) {
+      const read = readPendingPlanChange(row.pending_plan_change);
+      if (
+        read.kind === "intent" &&
+        read.intent.id === metadata.plan_change_intent_id &&
+        read.intent.to_plan_key === planKey &&
+        read.intent.stripe_subscription_id === subscriptionId
+      ) {
+        return {
+          ...catalog,
+          frozen: { unitAmountCents: read.intent.unit_amount_cents, currency: read.intent.currency, interval: read.intent.billing_interval === "annual" ? "year" : "month" },
+        };
+      }
+      return null;
+    }
 
     if (
       row.stripe_subscription_id === subscriptionId &&

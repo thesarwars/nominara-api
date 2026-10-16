@@ -17,6 +17,8 @@ import { Page, pageFrom } from "../../api/pagination/page.js";
 import type { Entitlement } from "../../db/seed/plan-entitlements.js";
 import { ADDON_CATALOG, addonGrant } from "../../lib/billing/addon-catalog.js";
 import { STRIPE_GATEWAY, StripeUpstreamError, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
+import { readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
+import { isDefiniteRejection } from "../../lib/billing/stripe/definite-rejection.js";
 import { addonItemsFromSubscription, duplicatedAddonKinds, type AddonItem } from "../../lib/billing/stripe/addon-items.js";
 import { centsToDecimal } from "../../lib/billing/stripe/invoice-state.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
@@ -83,6 +85,7 @@ interface SubscriptionRow {
   stripe_subscription_id: string;
   current_period_end: Date;
   pending_addon_changes: unknown;
+  pending_plan_change: unknown;
 }
 
 /** The most intents kept per subscription. Only intents past INTENT_RETENTION_MS are ever dropped to make room; a full map of live ones refuses (409). */
@@ -330,6 +333,13 @@ export class BillingAddonsService {
     if (kind === "extra_seat") await this.refuseIfMembersWouldExceed(client, workspaceId, held.quantity);
 
     const [plan, subscription] = [await this.plan(client, workspaceId), await this.liveSubscription(client, workspaceId)];
+    // ⚠ STORY-184 — a scheduled downgrade owns the subscription's schedule. Rewriting its second phase to drop an add-on
+    // would silently change what the customer was shown (and the cancel of the downgrade would release the removal with
+    // it), so the removal waits until the downgrade has taken effect or been cancelled.
+    if (readPendingPlanChange(subscription.pending_plan_change).kind !== "none") {
+      incrementCounter("nominara_billing_addon_change_total", { kind, outcome: "plan_change_pending" });
+      throw new ConflictError({ message: "a plan change is pending on this subscription: wait for it to take effect, or cancel it, before removing an add-on", details: { reason: "plan_change_pending" } });
+    }
     try {
       // A fresh fetch: the local row lags the webhook and cannot show a second Stripe line.
       const fetched = await this.gateway.fetchObject("subscription", subscription.stripe_subscription_id);
@@ -565,7 +575,7 @@ export class BillingAddonsService {
 
   private async liveSubscription(client: ClientBase, workspaceId: string): Promise<SubscriptionRow> {
     const result = await client.query<SubscriptionRow>(
-      `SELECT plan_key, billing_interval, provider, stripe_subscription_id, current_period_end, pending_addon_changes
+      `SELECT plan_key, billing_interval, provider, stripe_subscription_id, current_period_end, pending_addon_changes, pending_plan_change
          FROM subscriptions WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')`,
       [workspaceId],
     );
@@ -596,16 +606,6 @@ export class BillingAddonsService {
     if (store === undefined) throw new Error("BillingAddonsService requires an active tenant context");
     return { client: store.client, workspaceId: store.context.workspaceId, actorId: store.context.actorId };
   }
-}
-
-/**
- * Stripe answered and did not apply the change: a 4xx that is not a timeout (408), an in-flight conflict (409) or a
- * rate limit (429), and not `idempotency_error`. That one is also a 400, but it says the key was reused with a
- * DIFFERENT call, i.e. the original call under it may have been applied: it proves nothing about the change.
- */
-function isDefiniteRejection(error: StripeUpstreamError): boolean {
-  const { statusCode, errorType } = error;
-  return statusCode !== undefined && statusCode >= 400 && statusCode < 500 && statusCode !== 408 && statusCode !== 409 && statusCode !== 429 && errorType !== "idempotency_error";
 }
 
 /** The map key an Idempotency-Key is stored under: hashed, so the caller's key (and its length) is never persisted. */

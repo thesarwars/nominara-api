@@ -12,6 +12,8 @@ import { IdentityModule } from "../identity/identity.module.js";
 import { AutoTopupService } from "./auto-topup.service.js";
 import { BillingSubscriptionController } from "./billing-subscription.controller.js";
 import { BillingSubscriptionService } from "./billing-subscription.service.js";
+import { PlanChangeController } from "./plan-change.controller.js";
+import { PlanChangeService } from "./plan-change.service.js";
 import { CreditPacksController } from "./credit-packs.controller.js";
 import { CreditPacksService } from "./credit-packs.service.js";
 import { BillingUsageController } from "./billing-usage.controller.js";
@@ -28,7 +30,7 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
 // only — no logic here (coding-standards.md §1's module layout).
 @Module({
   imports: [IdentityModule],
-  controllers: [BillingController, BillingUsageController, CreditPacksController, BillingSubscriptionController, BillingInvoicesController, BillingAddonsController, StripeWebhookController],
+  controllers: [BillingController, BillingUsageController, CreditPacksController, BillingSubscriptionController, BillingInvoicesController, BillingAddonsController, PlanChangeController, StripeWebhookController],
   providers: [
     // The short independent writes of checkout, the credit-pack purchase and add-ons run here, never on the
     // main pool their request already holds a connection of (hold-and-wait).
@@ -38,6 +40,7 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
     CreditPacksService,
     BillingInvoicesService,
     BillingAddonsService,
+    PlanChangeService,
     StripeInvoiceHandler,
     AutoTopupService,
     StripeSubscriptionHandler,
