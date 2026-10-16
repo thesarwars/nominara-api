@@ -20,8 +20,8 @@ describe("checkpoint-6 · inBillingWriteTransaction is the only way to a write-p
     expect(writePool).not.toHaveProperty("connectForWrite");
   });
 
-  it("D-3 AC-write-pool-consumers . the three money services (checkout, credit packs, add-ons) are the consumers the pin covers", () => {
-    expect(consumers.map(({ name }) => name).sort()).toEqual(["billing-addons.service.ts", "billing-subscription.service.ts", "credit-packs.service.ts"]);
+  it("D-3 AC-write-pool-consumers . the four money services (checkout, credit packs, add-ons, the plan change) are the consumers the pin covers", () => {
+    expect(consumers.map(({ name }) => name).sort()).toEqual(["billing-addons.service.ts", "billing-subscription.service.ts", "credit-packs.service.ts", "plan-change.service.ts"]);
   });
 
   it.each(consumers.map(({ name, text }) => [name, text] as const))("D-3 AC-write-pool-usage . %s touches its injected write pool only as the first argument of inBillingWriteTransaction", (_name, text) => {

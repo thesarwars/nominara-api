@@ -192,6 +192,7 @@ export const subscriptions = pgTable("subscriptions", {
   chargedCurrency: char("charged_currency", { length: 3 }),
   chargedInterval: text("charged_interval"),
   pendingAddonChanges: jsonb("pending_addon_changes"),
+  pendingPlanChange: jsonb("pending_plan_change"),
 });
 
 export const usageCounters = pgTable("usage_counters", {

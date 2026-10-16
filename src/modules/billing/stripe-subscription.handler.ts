@@ -1,5 +1,8 @@
 import { Injectable, Logger } from "@nestjs/common";
+import { AuditChainService } from "../audit/audit-chain.service.js";
+import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
+import { adoptionRef, readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
 import { addonItemsFromSubscription } from "../../lib/billing/stripe/addon-items.js";
 import { applyPlanChange, type SubscriptionReconciler } from "../../lib/billing/apply-plan.js";
 import { desiredFromStripeSubscription, toCents, type ClaimedPlanPrice } from "../../lib/billing/stripe/subscription-state.js";
@@ -58,6 +61,33 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       this.logger.warn({ message: "stripe webhook refused as retryable: the workspace is busy with another billing change", event_id: event.id, workspace_id: workspaceId });
       return new DegradedError({ message: "billing is busy: retry shortly" });
     });
+    // ⚠ THE STALE-FETCH CHECK COMES BEFORE THE PRICE VERDICT (STORY-184). A fetch taken before a newer event committed
+    // describes a subscription as it WAS - for an in-app upgrade, the old plan at the old price with no intent (the intent
+    // was spent when the new plan was adopted) - and judged first it reads as a relabel and raises a false mismatch alarm
+    // for a customer who did nothing wrong. Stale means "not looked at", so it is skipped before anything is judged.
+    // ⚠ A STALE FETCH MUST NOT OVERWRITE A NEWER COMMIT. The fetch is taken
+    // outside the transaction (KAD-06), so an event fetched at t1 can commit
+    // after one fetched at t2 > t1 for the SAME subscription and put its older
+    // state back (a cancelled plan returning to growth, plus a pro-rata grant).
+    // The workspace row is the serialiser applyPlanChange also locks first; it
+    // was taken above, so the read below is the one the write is ordered by.
+    //
+    // ⚠ THE MARK IS KEPT PER SUBSCRIPTION, WHETHER OR NOT THE ROW ADOPTS IT.
+    // Reading it off the `subscriptions` row only covered the subscription that
+    // row already tracked; a NEW subscription that was cancelled before its
+    // first event committed left no mark, and the held `active` fetch then
+    // resurrected it. `fetchStartedAt` is the DATABASE's clock, so two API
+    // instances with skewed wall clocks order their writes consistently.
+    const marked = await tx.query<{ fetch_started_at: Date }>(
+      "SELECT fetch_started_at FROM stripe_subscription_syncs WHERE workspace_id = $1 AND stripe_subscription_id = $2",
+      [workspaceId, object.id],
+    );
+    const markedAt = marked.rows[0]?.fetch_started_at ?? null;
+    if (markedAt !== null && markedAt.getTime() > fetchStartedAt.getTime()) {
+      incrementCounter("nominara_billing_subscription_reconcile_total", { outcome: "stale_fetch" });
+      this.logger.warn({ message: "stripe subscription fetch is older than the committed state: skipped", event_id: event.id, workspace_id: workspaceId });
+      return;
+    }
     const claimedPlan = await this.claimedPlanPrice(tx, workspaceId, object.metadata, object.id);
     const desired = desiredFromStripeSubscription(object.raw, object.metadata, claimedPlan);
     if (desired.kind === "ignore") {
@@ -79,29 +109,6 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       return;
     }
 
-    // ⚠ A STALE FETCH MUST NOT OVERWRITE A NEWER COMMIT. The fetch is taken
-    // outside the transaction (KAD-06), so an event fetched at t1 can commit
-    // after one fetched at t2 > t1 for the SAME subscription and put its older
-    // state back (a cancelled plan returning to growth, plus a pro-rata grant).
-    // The workspace row is the serialiser applyPlanChange also locks first; it
-    // was taken above, so the read below is the one the write is ordered by.
-    //
-    // ⚠ THE MARK IS KEPT PER SUBSCRIPTION, WHETHER OR NOT THE ROW ADOPTS IT.
-    // Reading it off the `subscriptions` row only covered the subscription that
-    // row already tracked; a NEW subscription that was cancelled before its
-    // first event committed left no mark, and the held `active` fetch then
-    // resurrected it. `fetchStartedAt` is the DATABASE's clock, so two API
-    // instances with skewed wall clocks order their writes consistently.
-    const marked = await tx.query<{ fetch_started_at: Date }>(
-      "SELECT fetch_started_at FROM stripe_subscription_syncs WHERE workspace_id = $1 AND stripe_subscription_id = $2",
-      [workspaceId, desired.state.providerSubscriptionId],
-    );
-    const markedAt = marked.rows[0]?.fetch_started_at ?? null;
-    if (markedAt !== null && markedAt.getTime() > fetchStartedAt.getTime()) {
-      incrementCounter("nominara_billing_subscription_reconcile_total", { outcome: "stale_fetch" });
-      this.logger.warn({ message: "stripe subscription fetch is older than the committed state: skipped", event_id: event.id, workspace_id: workspaceId });
-      return;
-    }
     await tx.query(
       `INSERT INTO stripe_subscription_syncs (workspace_id, stripe_subscription_id, fetch_started_at) VALUES ($1, $2, $3)
        ON CONFLICT (workspace_id, stripe_subscription_id) DO UPDATE SET fetch_started_at = GREATEST(stripe_subscription_syncs.fetch_started_at, EXCLUDED.fetch_started_at)`,
@@ -185,6 +192,45 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       [workspaceId, desired.state.providerSubscriptionId, desired.charge?.unitAmountCents ?? null, desired.charge?.currency.toLowerCase() ?? null, desired.charge?.interval ?? null],
     );
 
+    // STORY-184 - the adoption is RECORDED before the intent is spent (an audit row in this transaction, naming the intent's id and
+    // the quote's proration date). It is the trace a retry whose reply was lost after the adoption is matched against: "the
+    // workspace is already on this plan" is answered as a replay only for the quote of the change that was really adopted.
+    const adoptable = await tx.query<{ intent: unknown }>(
+      `SELECT pending_plan_change AS intent FROM subscriptions
+        WHERE workspace_id = $1 AND stripe_subscription_id = $2 AND status IN ('trialing','active','past_due')
+          AND pending_plan_change ->> 'id' = $3 AND pending_plan_change ->> 'to_plan_key' = $4`,
+      [workspaceId, desired.state.providerSubscriptionId, object.metadata.plan_change_intent_id ?? "", desired.state.planKey],
+    );
+    const adopted = readPendingPlanChange(adoptable.rows[0]?.intent);
+    if (adopted.kind === "intent") {
+      await new AuditChainService().append(tx, {
+        workspaceId,
+        actorType: "system",
+        actorId: SYSTEM_ACTOR_ID,
+        actorIp: null,
+        actorUa: `operator:${WEBHOOK_OPERATOR}`,
+        action: "billing.plan_change.adopted",
+        resourceType: "workspace",
+        resourceId: workspaceId,
+        beforeState: { from_plan_key: adopted.intent.from_plan_key },
+        afterState: { intent_ref: adoptionRef(workspaceId, adopted.intent.id), direction: adopted.intent.direction, to_plan_key: adopted.intent.to_plan_key, proration_date: adopted.intent.proration_date },
+        requestId: event.id,
+        supportGrantId: null,
+        severity: "info",
+      });
+    }
+
+    // STORY-184 — the in-app plan change is spent once its plan is adopted (or the subscription ended). Only THIS
+    // subscription's intent, and only when the plan it names is the plan now held AND the subscription names this intent's id: an event that left the row where it was
+    // (a phase-0 event while a downgrade is pending) must leave the intent where it is too.
+    await tx.query(
+      `UPDATE subscriptions SET pending_plan_change = NULL, updated_at = now()
+        WHERE workspace_id = $1 AND stripe_subscription_id = $2 AND status IN ('trialing','active','past_due')
+          AND pending_plan_change IS NOT NULL
+          AND ((pending_plan_change ->> 'to_plan_key' = $3 AND pending_plan_change ->> 'id' = $4) OR $3 = 'free')`,
+      [workspaceId, desired.state.providerSubscriptionId, desired.state.planKey, object.metadata.plan_change_intent_id ?? ""],
+    );
+
     // A paid subscription was adopted: the Checkout session that bought it is
     // settled, so a later checkout has nothing to supersede.
     if (desired.state.planKey !== "free") {
@@ -235,18 +281,44 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
 
     const live = await tx.query<{
       plan_key: string;
+      provider: string;
       stripe_subscription_id: string;
       charged_unit_amount_cents: number | null;
       charged_currency: string | null;
       charged_interval: "month" | "year" | null;
       pending_checkout: unknown;
+      pending_plan_change: unknown;
     }>(
-      `SELECT plan_key, stripe_subscription_id, charged_unit_amount_cents, charged_currency, charged_interval, pending_checkout
+      `SELECT plan_key, provider, stripe_subscription_id, charged_unit_amount_cents, charged_currency, charged_interval, pending_checkout, pending_plan_change
          FROM subscriptions WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')`,
       [workspaceId],
     );
     const row = live.rows[0];
     if (row === undefined) return catalog;
+
+    // ⚠ STORY-184 — A TRACKED SUBSCRIPTION CHANGES PLAN ONLY THROUGH THE WORKSPACE'S OWN INTENT. This row already tracks
+    // this very Stripe subscription on a paid plan, and the event claims a DIFFERENT plan. Before the in-app plan change
+    // the catalog vouched for any such claim whose price matched it, so a Dashboard edit (the price AND the label moved to
+    // another plan's) was adopted as an upgrade nobody had asked the product for. Now the one door is the intent this
+    // workspace recorded BEFORE it asked Stripe for the change, and it opens only when all three agree: the intent's id is
+    // the one on the subscription's own metadata, the plan it names is the plan claimed, and the subscription is the one the
+    // intent was made for. The charge verified is the intent's frozen one (never the catalog's), so a price that is not what
+    // the customer was quoted is still refused. Anything else returns null: the caller refuses and ALARMS (a relabel).
+    if (row.provider === "stripe" && row.plan_key !== "free" && row.stripe_subscription_id === subscriptionId && planKey !== row.plan_key) {
+      const read = readPendingPlanChange(row.pending_plan_change);
+      if (
+        read.kind === "intent" &&
+        read.intent.id === metadata.plan_change_intent_id &&
+        read.intent.to_plan_key === planKey &&
+        read.intent.stripe_subscription_id === subscriptionId
+      ) {
+        return {
+          ...catalog,
+          frozen: { unitAmountCents: read.intent.unit_amount_cents, currency: read.intent.currency, interval: read.intent.billing_interval === "annual" ? "year" : "month" },
+        };
+      }
+      return null;
+    }
 
     if (
       row.stripe_subscription_id === subscriptionId &&

@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { ClientBase, Pool } from "pg";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { isFeatureGranted, type FeatureFlagKey, type StructuralLimitKey } from "./classification.js";
@@ -75,6 +75,22 @@ const COUNTERS: Record<StructuralLimitKey, StructuralCounter> = {
   },
 };
 
+/**
+ * STORY-184 — the same counts the guards enforce, over a transaction the CALLER already holds (the plan-change
+ * preview reads them inside the request's tenant context). One predicate per key, here and only here: a downgrade's
+ * "you are over" and the guard's "you are at the cap" must be the same arithmetic, or a customer is told one thing and
+ * refused another.
+ */
+export async function countStructural(tx: ClientBase, key: StructuralLimitKey, workspaceId: string, projectId?: string): Promise<number> {
+  const counter = COUNTERS[key];
+  if (counter.scope === "project" && projectId === undefined) {
+    throw new MissingProjectScopeError(key);
+  }
+  const params = counter.scope === "project" ? [workspaceId, projectId] : [workspaceId];
+  const result = await tx.query<{ n: number }>(counter.sql, params);
+  return result.rows[0]?.n ?? 0;
+}
+
 export function scopeOf(key: StructuralLimitKey): StructuralScope {
   return COUNTERS[key].scope;
 }
@@ -101,11 +117,7 @@ export class StructuralUsage {
 
     const client = await this.pool.connect();
     try {
-      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
-        const params = counter.scope === "project" ? [workspaceId, projectId] : [workspaceId];
-        const result = await tx.query<{ n: number }>(counter.sql, params);
-        return result.rows[0]?.n ?? 0;
-      });
+      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => countStructural(tx, key, workspaceId, projectId));
     } finally {
       client.release();
     }

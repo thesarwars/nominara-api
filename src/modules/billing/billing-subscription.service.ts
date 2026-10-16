@@ -6,6 +6,7 @@ import { ConflictError, DegradedError, NotFoundError, PreconditionUnmetError, Va
 import { loadEnv } from "../../config/env.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { STRIPE_GATEWAY, StripeUpstreamError, type StripeGateway, type SubscriptionCheckoutInput } from "../../lib/billing/stripe/stripe-gateway.js";
+import { summarizePendingPlanChange } from "../../lib/billing/plan-change-intent.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -62,6 +63,7 @@ interface SubscriptionRow {
   projects_purchased: number;
   open_checkout_session_id: string | null;
   pending_checkout: unknown;
+  pending_plan_change: unknown;
   sort_order: number;
 }
 
@@ -88,6 +90,7 @@ export class BillingSubscriptionService {
       cancel_at_period_end: row.cancel_at_period_end,
       seats_purchased: row.seats_purchased,
       projects_purchased: row.projects_purchased,
+      pending_plan_change: summarizePendingPlanChange(row.pending_plan_change),
     };
   }
 
@@ -123,7 +126,7 @@ export class BillingSubscriptionService {
     // the plan from the price Stripe charges, so a portal price switch is
     // refused and alarmed, never granted.
     if (current.provider === "stripe" && current.plan_key !== "free") {
-      throw new ConflictError({ message: "this workspace already has an active subscription: manage payment details or cancel it in the billing portal" });
+      throw new ConflictError({ message: "this workspace already has an active subscription: change its plan in Settings > Plan (the in-app plan change), or manage payment details or cancel it in the billing portal" });
     }
     if (target.sort_order <= current.sort_order) {
       throw new ConflictError({ message: "the workspace is already on this plan or a higher one" });
@@ -283,7 +286,7 @@ export class BillingSubscriptionService {
     const result = await client.query<SubscriptionRow>(
       `SELECT s.plan_key, s.billing_interval, s.status, s.provider, s.stripe_customer_id,
               s.current_period_start, s.current_period_end, s.trial_ends_at, s.cancel_at_period_end,
-              s.seats_purchased, s.projects_purchased, s.open_checkout_session_id, s.pending_checkout, p.sort_order
+              s.seats_purchased, s.projects_purchased, s.open_checkout_session_id, s.pending_checkout, s.pending_plan_change, p.sort_order
          FROM subscriptions s JOIN plans p ON p.key = s.plan_key
         WHERE s.workspace_id = $1 AND s.status IN ('trialing','active','past_due')`,
       [workspaceId],

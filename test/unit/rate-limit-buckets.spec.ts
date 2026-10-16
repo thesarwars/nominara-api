@@ -31,8 +31,8 @@ function buckets(config = RATE_LIMIT_DEFAULTS, clock = { ms: Date.UTC(2026, 7, 2
 // ---- the transcription --------------------------------------------------
 
 describe("STORY-025 · §12 transcribed exactly", () => {
-  it("defines every one of the thirteen route classes, once each", () => {
-    expect(RATE_LIMIT_DEFAULTS).toHaveLength(13);
+  it("defines every one of the fifteen route classes, once each", () => {
+    expect(RATE_LIMIT_DEFAULTS).toHaveLength(15);
     expect(RATE_LIMIT_DEFAULTS.map((entry) => entry.route_class).sort()).toEqual(
       [...rateLimitRouteClassSchema.options].sort(),
     );
@@ -63,6 +63,11 @@ describe("STORY-025 · §12 transcribed exactly", () => {
     ["command_execute", "workspace", 60, 60_000],
     ["credit_pack_purchase", "user", 5, 3_600_000],
     ["credit_pack_purchase", "workspace", 10, 3_600_000],
+    // STORY-184 — copied from the credit-pack purchase class (owner decision 2026-10-16).
+    ["plan_change", "user", 5, 3_600_000],
+    ["plan_change", "workspace", 10, 3_600_000],
+    ["plan_change_preview", "user", 30, 3_600_000],
+    ["plan_change_preview", "workspace", 60, 3_600_000],
     ["portal_session", "ip", 10, 3_600_000],
     ["public_niche_reports", "ip", 120, 3_600_000],
   ])("%s / %s is %i per %i ms", (routeClass, scope, limit, windowMs) => {
@@ -84,6 +89,8 @@ describe("STORY-025 · §12 transcribed exactly", () => {
     ["command_parse", 30],
     ["command_execute", 5],
     ["credit_pack_purchase", 2],
+    ["plan_change", 3],
+    ["plan_change_preview", 5],
     ["portal_session", 2],
     ["public_niche_reports", 1],
   ])("%s bursts at %i", (routeClass, burst) => {

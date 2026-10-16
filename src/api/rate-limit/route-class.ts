@@ -1,7 +1,7 @@
 import { SetMetadata } from "@nestjs/common";
 import type { RateLimitRouteClass } from "../../../contracts/common/rate-limit.schema.js";
 
-// STORY-025 T17 — deciding which of §12's thirteen rows a request belongs to.
+// STORY-025 T17 — deciding which of §12's fifteen rows a request belongs to.
 //
 // Three of the rows are DEFAULTS keyed on the request itself — §12 names them
 // "Auth (`/auth/*`)", "Reads (`GET /*`)" and "Writes". The other ten name a

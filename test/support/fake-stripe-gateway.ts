@@ -1,3 +1,4 @@
+import { isFinishedSchedule } from "../../src/lib/billing/stripe/schedule-phases.js";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import {
   StripeSignatureError,
@@ -11,6 +12,13 @@ import {
   type OffSessionPaymentInput,
   type OffSessionPaymentResult,
   type OffSessionPaymentState,
+  type FinishedScheduleInput,
+  type PlanChangePreviewInput,
+  type PlanChangePreviewResult,
+  type PlanDowngradeInput,
+  type PlanDowngradeReleaseInput,
+  type PlanUpgradeInput,
+  type PlanUpgradeResult,
   type SavedPaymentMethod,
   type StripeObjectKind,
   type SubscriptionCheckoutInput,
@@ -290,8 +298,216 @@ export class FakeStripeGateway implements StripeGateway {
     this.addonRemovals.push(input);
   }
 
+  // ---- STORY-184 · the in-app plan change ----------------------------------------------------------------------
+  /** Every preview asked for, in call order. */
+  readonly planPreviews: PlanChangePreviewInput[] = [];
+  /** What Stripe says the upgrade costs: a number, or a function of the preview asked for. */
+  previewAmountCents: number | ((input: PlanChangePreviewInput) => number) = 3850;
+  /** Every upgrade ATTEMPTED (recorded before any failure is raised) and every one Stripe actually applied. */
+  readonly upgradeAttempts: PlanUpgradeInput[] = [];
+  readonly upgrades: PlanUpgradeInput[] = [];
+  /** `payment_failed` models a declined card or a 3-D Secure requirement: Stripe applies NOTHING. */
+  upgradeOutcome: "applied" | "payment_failed" = "applied";
+  /** Makes plan-change calls fail like an upstream outage (the request never reached Stripe). */
+  failPlanChangeWith: Error | undefined;
+  /** Makes ONLY the upgrade call fail (the request never reached Stripe): previews and fetches still work. */
+  failUpgradeWith: Error | undefined;
+  /** Stripe APPLIES the upgrade and the reply is lost: the stored subscription moves, the call then rejects. */
+  failUpgradeAfterApplying: Error | undefined;
+  private readonly upgradeFingerprints = new Map<string, string>();
+  /** Stripe CREATES the schedule and the reply is lost: the stored subscription now holds a schedule, the call then rejects. */
+  failDowngradeAfterApplying: Error | undefined;
+  private readonly downgradeKeys = new Map<string, string>();
+  readonly downgradeAttempts: PlanDowngradeInput[] = [];
+  readonly downgrades: PlanDowngradeInput[] = [];
+  readonly releases: PlanDowngradeReleaseInput[] = [];
+  releaseOutcome: "released" | "not_releasable" = "released";
+
+  previewPlanChange(input: PlanChangePreviewInput): Promise<PlanChangePreviewResult> {
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    this.planPreviews.push(input);
+    const amountDueCents = typeof this.previewAmountCents === "function" ? this.previewAmountCents(input) : this.previewAmountCents;
+    return Promise.resolve({ amountDueCents, currency: input.target.currency.toLowerCase() });
+  }
+
+  /** Runs at the instant a plan-change call REACHES Stripe (upgrade or schedule): lets a test look at what was committed by then. */
+  beforePlanChangeCall: (() => Promise<void>) | undefined;
+
+  async applyPlanUpgrade(input: PlanUpgradeInput): Promise<PlanUpgradeResult> {
+    await this.beforePlanChangeCall?.();
+    this.upgradeAttempts.push(input);
+    // Like Stripe: a reused key with a DIFFERENT call is refused (idempotency_error); the same call is answered from the first.
+    const { idempotencyKey: _key, ...call } = input;
+    const fingerprint = JSON.stringify(call);
+    const earlier = this.upgradeFingerprints.get(input.idempotencyKey);
+    if (earlier !== undefined && earlier !== fingerprint) return Promise.reject(new StripeUpstreamError(400, "idempotency_error"));
+    this.upgradeFingerprints.set(input.idempotencyKey, fingerprint);
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    if (this.failUpgradeWith !== undefined) return Promise.reject(this.failUpgradeWith);
+    if (this.upgradeOutcome === "payment_failed") return Promise.resolve({ outcome: "payment_failed" });
+    if (!this.upgrades.some((u) => u.idempotencyKey === input.idempotencyKey)) {
+      this.upgrades.push(input);
+      this.applyUpgradeToObject(input);
+    }
+    if (this.failUpgradeAfterApplying !== undefined) return Promise.reject(this.failUpgradeAfterApplying);
+    return Promise.resolve({ outcome: "applied" });
+  }
+
+  /** Moves the stored subscription's PLAN line to the target price and merges the metadata, as Stripe does when it applies the update. */
+  private applyUpgradeToObject(input: PlanUpgradeInput): void {
+    const stored = this.objects.get(`subscription:${input.subscriptionId}`);
+    if (stored === undefined) return;
+    const raw = stored.raw as { items?: { data: Array<Record<string, unknown> & { id?: unknown; price?: Record<string, unknown> }> }; metadata?: Record<string, string> };
+    const line = raw.items?.data.find((candidate) => candidate.id === input.planItemId);
+    if (line !== undefined) {
+      line.price = {
+        ...(line.price ?? {}),
+        unit_amount: input.target.unitAmountCents,
+        currency: input.target.currency.toLowerCase(),
+        recurring: { interval: input.target.interval, interval_count: 1 },
+        product: { metadata: { nominara_kind: "plan" } },
+      };
+    }
+    this.objects.set(`subscription:${input.subscriptionId}`, { ...stored, metadata: { ...stored.metadata, ...input.metadata }, raw: { ...stored.raw, metadata: { ...raw.metadata, ...input.metadata } } });
+  }
+
+  /**
+   * Modelled schedules (id -> shape Stripe returns), for the flows that need the REAL `isFinishedSchedule` predicate to run: a
+   * schedule created by `from_subscription` has ONE phase until the downgrade's update gives it a second.
+   */
+  readonly schedules = new Map<string, { status: string; end_behavior: string; phases: Array<{ start_date: number; metadata: Record<string, string> }>; current_phase: { start_date: number } | null }>();
+  /** Does `from_subscription` copy the subscription's metadata onto the new schedule's phase? (Unknown at Stripe; the checklist asks.) */
+  fromSubscriptionCopiesMetadata = true;
+  /** Stripe CREATES the schedule (one phase) and the reply is lost before the update: the retry must COMPLETE it. */
+  failDowngradeBetweenCreateAndUpdate: Error | undefined;
+  /** Schedules the downgrade replaced because it found a finished one attached (should stay empty for a replay). */
+  readonly replacedSchedules: string[] = [];
+  private scheduleSeq = 0;
+
+  async schedulePlanDowngrade(input: PlanDowngradeInput): Promise<{ readonly scheduleId: string }> {
+    await this.beforePlanChangeCall?.();
+    this.downgradeAttempts.push(input);
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    const subKey = `subscription:${input.subscriptionId}`;
+    const attach = (id: string | null): void => {
+      const stored = this.objects.get(subKey);
+      if (stored !== undefined) this.objects.set(subKey, { ...stored, raw: { ...stored.raw, schedule: id } });
+    };
+
+    // The modelled path (like the real gateway's scheduleIdOf): reuse an attached schedule unless it is FINISHED.
+    const modelled = this.failDowngradeBetweenCreateAndUpdate !== undefined || [...this.schedules.keys()].length > 0;
+    if (modelled && !this.downgradeKeys.has(input.idempotencyKey)) {
+      const stored = this.objects.get(subKey);
+      const planKey = stored?.metadata.plan_key;
+      const attached = (stored?.raw as { schedule?: unknown } | undefined)?.schedule;
+      let id: string | null = typeof attached === "string" ? attached : null;
+      let existing = id === null ? undefined : this.schedules.get(id);
+      if (id !== null && existing !== undefined && isFinishedSchedule(existing, planKey)) {
+        this.replacedSchedules.push(id);
+        existing = undefined;
+        id = null;
+      }
+      if (existing === undefined || id === null) {
+        id = `sub_sched_m${String(++this.scheduleSeq)}`;
+        this.schedules.set(id, {
+          status: "active",
+          end_behavior: "release",
+          phases: [{ start_date: 1, metadata: this.fromSubscriptionCopiesMetadata ? { ...(stored?.metadata ?? {}) } : {} }],
+          current_phase: { start_date: 1 },
+        });
+        attach(id);
+        if (this.failDowngradeBetweenCreateAndUpdate !== undefined) return Promise.reject(this.failDowngradeBetweenCreateAndUpdate);
+      }
+      // the update: the schedule gets its second phase
+      const schedule = this.schedules.get(id)!;
+      schedule.phases = [schedule.phases[0]!, { start_date: 2, metadata: { ...input.metadata } }];
+      this.downgrades.push(input);
+      this.downgradeKeys.set(input.idempotencyKey, id);
+      return Promise.resolve({ scheduleId: id });
+    }
+
+    // Like Stripe: the same key answers from the first call and applies nothing twice.
+    let scheduleId = this.downgradeKeys.get(input.idempotencyKey);
+    if (scheduleId === undefined) {
+      this.downgrades.push(input);
+      scheduleId = `sub_sched_${String(this.downgrades.length)}`;
+      this.downgradeKeys.set(input.idempotencyKey, scheduleId);
+      if (this.failDowngradeAfterApplying !== undefined) attach(scheduleId);
+    }
+    if (this.failDowngradeAfterApplying !== undefined) return Promise.reject(this.failDowngradeAfterApplying);
+    return Promise.resolve({ scheduleId });
+  }
+
+  /** Schedule ids the fake treats as released already (so a repeat release is `not_releasable`, like Stripe's). */
+  private readonly releasedScheduleIds = new Set<string>();
+  /** Runs when a release is APPLIED, before the call answers: lets a test move Stripe on at that instant (the boundary race). */
+  onReleaseApplied: (() => void) | undefined;
+  /** Stripe APPLIES the release and the reply is lost. */
+  failReleaseAfterApplying: Error | undefined;
+
+  releasePlanDowngrade(input: PlanDowngradeReleaseInput): Promise<{ readonly outcome: "released" | "not_releasable" }> {
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    this.releases.push(input);
+    if (this.releaseOutcome === "not_releasable" || this.releasedScheduleIds.has(input.scheduleId)) return Promise.resolve({ outcome: "not_releasable" });
+    this.releasedScheduleIds.add(input.scheduleId);
+    // Releasing detaches the schedule from the stored subscription.
+    for (const [key, stored] of this.objects) {
+      if (key.startsWith("subscription:") && (stored.raw as { schedule?: unknown }).schedule === input.scheduleId) {
+        this.objects.set(key, { ...stored, raw: { ...stored.raw, schedule: null } });
+      }
+    }
+    this.onReleaseApplied?.();
+    if (this.failReleaseAfterApplying !== undefined) return Promise.reject(this.failReleaseAfterApplying);
+    return Promise.resolve({ outcome: "released" });
+  }
+
+  /** Ids of schedules that have nothing left to do (a downgrade that took effect), for `releaseFinishedSchedule`. */
+  readonly finishedScheduleIds = new Set<string>();
+  readonly finishedReleases: FinishedScheduleInput[] = [];
+
+  releaseFinishedSchedule(input: FinishedScheduleInput): Promise<{ readonly released: boolean; readonly finished?: boolean }> {
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    const key = `subscription:${input.subscriptionId}`;
+    const stored = this.objects.get(key);
+    const scheduleId = (stored?.raw as { schedule?: unknown } | undefined)?.schedule;
+    if (stored === undefined || typeof scheduleId !== "string") return Promise.resolve({ released: false });
+    const modelled = this.schedules.get(scheduleId);
+    // The REAL predicate runs on a modelled schedule; a bare id in `finishedScheduleIds` is the shortcut the cut-over tests use.
+    const finished = modelled !== undefined ? isFinishedSchedule(modelled, input.expectedPlanKey) : this.finishedScheduleIds.has(scheduleId);
+    if (!finished) return Promise.resolve({ released: false, finished: false });
+    if (input.dryRun === true) return Promise.resolve({ released: false, finished: true });
+    this.finishedReleases.push(input);
+    this.objects.set(key, { ...stored, raw: { ...stored.raw, schedule: null } });
+    return Promise.resolve({ released: true });
+  }
+
   /** Back to a clean slate between tests (the instance is shared by a whole spec file). */
   reset(): void {
+    this.planPreviews.length = 0;
+    this.previewAmountCents = 3850;
+    this.upgradeAttempts.length = 0;
+    this.upgrades.length = 0;
+    this.upgradeOutcome = "applied";
+    this.failPlanChangeWith = undefined;
+    this.failUpgradeAfterApplying = undefined;
+    this.failUpgradeWith = undefined;
+    this.failDowngradeAfterApplying = undefined;
+    this.failDowngradeBetweenCreateAndUpdate = undefined;
+    this.schedules.clear();
+    this.replacedSchedules.length = 0;
+    this.fromSubscriptionCopiesMetadata = true;
+    this.downgradeKeys.clear();
+    this.beforePlanChangeCall = undefined;
+    this.upgradeFingerprints.clear();
+    this.downgradeAttempts.length = 0;
+    this.downgrades.length = 0;
+    this.releases.length = 0;
+    this.releaseOutcome = "released";
+    this.releasedScheduleIds.clear();
+    this.onReleaseApplied = undefined;
+    this.failReleaseAfterApplying = undefined;
+    this.finishedScheduleIds.clear();
+    this.finishedReleases.length = 0;
     this.objects.clear();
     this.fetches.length = 0;
     this.checkouts.length = 0;

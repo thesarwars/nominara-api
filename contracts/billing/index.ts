@@ -9,6 +9,7 @@ export * from "./credit-pack-purchase.schema.js";
 export * from "./credit-pack.schema.js";
 export * from "./invoice.schema.js";
 export * from "./money.schema.js";
+export * from "./plan-change.schema.js";
 export * from "./portal-session.schema.js";
 export * from "./subscription.schema.js";
 export * from "./usage.schema.js";
