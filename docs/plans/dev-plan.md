@@ -557,6 +557,161 @@ KAD-12 is the thing to hold: structural limits, feature flags, tier caps, daily 
 
 **[STORY-001](./stories/preflight/STORY-001-vendor-accounts-and-engine-smoke.md) landing at any point re-opens [STORY-028](./stories/capture/STORY-028-api-engine-adapters.md), [STORY-029](./stories/capture/STORY-029-licensed-serp-google-adapters.md) and [STORY-075](./stories/billing/STORY-075-stripe-subscriptions-and-webhooks.md).** Because [STORY-027](./stories/capture/STORY-027-capture-adapter-contract-and-registry.md) shipped fixture adapters, those slot in behind an interface that already exists and is already tested — no slice above needs rescheduling when they arrive.
 
+## 6a. Group D: the road to launch (planned 2026-10-16)
+
+**How this was built.** On 2026-10-16 every story file was read again and its unmet acceptance criteria were checked against the code: nominara-api `main` `52af58f` and nominara-client `main` `a40704d`, by eight read-only audit agents, one per group of epics. Each story was classified by the requirement priority in [product-spec §17](./references/product-spec.md): P0 blocks launch, P1 ships within the launch quarter, and "post-launch" covers anything the references mark that way. The audit's corrections are in [STATUS.md](./STATUS.md) and in each corrected story's "Status update 2026-10-16 (Group D audit)" section.
+
+### Where we are
+
+| | Stories | Remaining estimate |
+|---|---|---|
+| **Done** | 51 | — |
+| **Partial** | 73, plus STORY-184 (in review, not merged) | — |
+| **Not started** | 37 | — |
+| **P0, blocks launch** | 88 unfinished | **about 260 dev-days** |
+| **P1, launch quarter** | 18 unfinished | about 42 dev-days |
+| **Post-launch** | 5 unfinished | about 19 dev-days |
+
+A **dev-day** is the audit's estimate for one story through this repository's pipeline: build, RED/GREEN tests, code review and, where the dangerous areas are touched, the second-engineer review. Calibration: STORY-184's API half was planned at 5.5 dev-days. It went from plan to all reviews approved, with three review rounds, in about one working day.
+
+Engines: **Gemini is the one live capture engine.** ChatGPT, Claude, Perplexity, Google AI Overviews and Google AI Mode are fixture adapters until STORY-001 provides their accounts. That single fact gates about 20 P0 stories, and it is why the Overview shows "needs 2+ engines" and "no Google AI data".
+
+### What only the owner can unblock
+
+Nothing below can be built around. Each item names the batch it opens.
+
+| # | Owner action | Opens |
+|---|---|---|
+| 1 | **Fix GitHub Actions billing for the Nominara org.** Every api and app CI run since about 2026-10-14 fails in 2–4 s with "recent account payments have failed or your spending limit needs to be increased", so nothing is gated in CI today. Also: add the `NOMINARA_API_DEPLOY_KEY` secret, and choose a plan that allows branch protection on private repos. | All batches (STORY-155, 002) |
+| 2 | **Pick the embedding provider and model**, and supply its key and spend budget. The spec pins OpenAI `text-embedding-3-large`. | D2 |
+| 3 | **Engine vendor contracts and production keys:** OpenAI, Anthropic, Perplexity, and a licensed SERP provider for Google AI Overviews and AI Mode. | D3 |
+| 4 | **Production cloud account** in two residency regions, with KMS, a budget, and DNS delegation. | D4 |
+| 5 | **Observability choices:** a tracing and metrics backend, an error tracker, and a paging tool with an on-call rotation. | D4, D5 |
+| 6 | **Verified Resend sending domain** (SPF/DKIM) and a production Resend key; a Resend webhook secret. | D1 (alerts in production), D4 |
+| 7 | **Live Stripe account** with products and a webhook. | D4 |
+| 8 | **Legal text:** terms, privacy notice (with the retention and backup-window disclosure), subprocessors, and the platform contribution guidelines for STORY-055. | D5 |
+| 9 | **Annotator contracts** and the golden-set category list (8 categories). | D3 (STORY-106) |
+| 10 | **An external security reviewer**, with contract and budget. | D5 (STORY-110) |
+| 11 | **Product decisions still open:** the 180-category taxonomy data (STORY-043); whether Gemini is allowed in the Tools engine set (STORY-078/079, `ck_tr_engine_set` currently refuses it); a one-request summary vs a composed list (STORY-089/175); the CLS/skeleton fix (STORY-087); the arbiter model for sentiment (STORY-038); the authoritative-profile sources for entity readiness (STORY-060). | D1–D3 |
+| 12 | **Beta cohort** and agency recruitment. | D5 (STORY-112) |
+
+### The batches, in launch order
+
+Batches run as far in parallel as their unblockers allow. **D1 can start now.**
+
+**D1: buildable now, no outside dependency (34 stories, about 82 dev-days)**
+- *What you will see:* action items fill up from findings, the AUX audit runs, alerts arrive by email, and run history works.
+- **Task engine:**
+  - STORY-063 task generation;
+  - STORY-064 task API;
+  - STORY-065 goals;
+  - STORY-066 milestones and the Growth Map;
+  - STORY-062 digest and top levers;
+  - STORY-068 alert catalog and digests, sent through Resend.
+- **Capture plumbing:**
+  - STORY-042 rollup;
+  - STORY-031 token buckets and breakers;
+  - STORY-034 run lifecycle;
+  - STORY-030 queue topology;
+  - STORY-179 the DLQ and blackout monitors;
+  - STORY-181 raw capture on object storage.
+- **AUX without embeddings:**
+  - STORY-049 crawl pipeline;
+  - STORY-052 score and finding lifecycle;
+  - STORY-053 patches;
+  - STORY-048 domain verification;
+  - STORY-056 displacement.
+- **Billing:**
+  - STORY-077 downgrade and over-limit policy;
+  - STORY-151;
+  - STORY-153;
+  - STORY-184 plan change.
+- **Platform:**
+  - STORY-019 role guard;
+  - STORY-144 chunked chain walk;
+  - STORY-004 local seeds;
+  - STORY-155 CI, which needs owner item 1.
+- **Reports:** STORY-100 scheduled reports and STORY-178 bounce suppression.
+- **Frontend:**
+  - STORY-123 contract resync;
+  - STORY-125 workspace endpoints;
+  - STORY-086 shell;
+  - STORY-087 design system;
+  - STORY-089 Command Center;
+  - STORY-092 competitors;
+  - STORY-147.
+
+**D2: needs the embedding provider (owner item 2) (13 stories, about 51 dev-days)**
+- *What you will see:* topic clusters, AUX rules and GEO insights (alignment, entity readiness, divergence), plus the AUX, Sources and GEO screens.
+- **Embeddings and prompts:**
+  - STORY-133 embedding client;
+  - STORY-045 prompt generation;
+  - STORY-047 topic clustering;
+  - STORY-043 discovery, which needs the taxonomy.
+- **AUX and GEO analysis:**
+  - STORY-050 document extraction;
+  - STORY-051 the 34 AUX rules;
+  - STORY-058 corpus passages;
+  - STORY-059 alignment;
+  - STORY-060 entity and structure;
+  - STORY-061 divergence, topics and sentiment drivers.
+- **Screens:** STORY-093 Sources and GEO, STORY-094 AUX and action plan, and STORY-088 onboarding.
+
+**D3: needs the engine vendors (owner items 3 and 9) (20 stories, about 57 dev-days)**
+- *What you will see:* six engines in every scan, so Best/Worst and Rendering fill in. Also accuracy calibrated against a labelled golden set, and the Tools.
+- **Engines and accuracy:**
+  - STORY-001 vendor smoke;
+  - STORY-027;
+  - STORY-028 four API adapters;
+  - STORY-029 the Google licensed adapters;
+  - STORY-130 and STORY-152 catalog;
+  - STORY-106 golden set;
+  - STORY-036, STORY-038, STORY-039 and STORY-041 calibration;
+  - STORY-057 citation and concept gap;
+  - STORY-055 playbooks.
+- **Tools:** STORY-078 tool core, STORY-079 Visibility Scan, and STORY-095 Tools screens.
+- **Screens:** STORY-090 Overview parity, STORY-091 Prompts matrix, and STORY-145 and STORY-146 for the free tier.
+
+**D4: production infrastructure (owner items 4–7) (14 stories, about 39 dev-days)**
+- *What you will see:* a deployed staging and production environment in both regions, with tracing, dashboards and paging.
+- **Repos and infrastructure:**
+  - STORY-002 repos and CI;
+  - STORY-003 Terraform;
+  - STORY-005 observability.
+- **Data layer:** STORY-010 roles and pooler, STORY-012 isolation on staging, and STORY-013 partitions and retention.
+- **Audit:** STORY-020 Object Lock audit export, and STORY-148 and STORY-149 proxy hops.
+- **Billing:** STORY-073 ledger replay and STORY-075 live Stripe.
+- **Product features:**
+  - STORY-180 report artifacts;
+  - STORY-067 verification scheduler;
+  - STORY-096 settings and billing screens.
+
+**D5: launch hardening (owner items 8, 10 and 12) (8 stories, about 36 dev-days)**
+- **Accuracy and load:** STORY-107 accuracy gates in CI and STORY-108 load and SLO validation.
+- **Operations and security:**
+  - STORY-109 chaos drills and on-call;
+  - STORY-110 external security review and abuse suites;
+  - STORY-111 subject requests, retention and residency.
+- **Marketing site:** STORY-102 and STORY-105 (methodology and legal pages).
+- **Release:** STORY-112 beta and the launch sign-off.
+
+**P1, within the launch quarter (about 42 dev-days):**
+- **Tools:** STORY-080 to 085 (the other five tools and the command bar).
+- **White-label and portal:** STORY-097 to 099.
+- **Marketing:** STORY-103 pricing page and STORY-104 category reports.
+- **Smaller items:** STORY-023, 175, 176, 177, 182 and 183.
+
+**Post-launch (about 19 dev-days):** STORY-101 custom domains, and STORY-113 to 116 outcome attribution.
+
+### Time
+
+These estimates are rough, and the owner items set the real date.
+- **One builder stream** clears roughly 4–5 planned dev-days per calendar day, judged by the STORY-184 calibration.
+- **Two or three streams** can run in parallel when they don't share files. They are limited by owner merges and the 35-minute full test run.
+- **P0 build, about 260 dev-days:** that comes to **about 5–8 weeks of calendar time**, *if* the owner items arrive before their batch needs them.
+- **D1 alone,** about 82 dev-days, comes to about 2–3 weeks.
+- **Outside our control:** the external security review, the beta cohort and the vendor contracts usually take longer than the build itself.
+
 ## 7. The cross-repo protocol
 
 ### 7.1 The local layout, and the one symlink that makes it work
