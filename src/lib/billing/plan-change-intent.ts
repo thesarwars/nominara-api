@@ -15,11 +15,14 @@ export function readPendingPlanChange(raw: unknown): PendingPlanChangeRead {
 }
 
 /**
- * What `GET /billing/subscription` shows: only a change Stripe has ACCEPTED (`settled_at`). An intent whose outcome is
- * unknown is internal, and a client banner offering to cancel something that may not exist would be a lie.
+ * What `GET /billing/subscription` shows: a change Stripe has ACCEPTED (`settled_at`), and ALSO a downgrade whose outcome is
+ * unknown. A downgrade may have left a schedule at Stripe whose reply was lost: the customer must be able to see it, and
+ * cancel it (which releases the schedule), rather than have it happen at the period end unannounced. An UPGRADE of unknown
+ * outcome stays internal: it is charged at once or not at all, and a banner for something that may not exist would be a lie.
  */
 export function summarizePendingPlanChange(raw: unknown): PendingPlanChangeSummary | null {
   const read = readPendingPlanChange(raw);
-  if (read.kind !== "intent" || read.intent.settled_at === undefined) return null;
+  if (read.kind !== "intent") return null;
+  if (read.intent.settled_at === undefined && read.intent.direction === "upgrade") return null;
   return { direction: read.intent.direction, target_plan_key: read.intent.to_plan_key, effective_at: read.intent.effective_at };
 }

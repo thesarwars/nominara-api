@@ -313,6 +313,9 @@ export class FakeStripeGateway implements StripeGateway {
   /** Stripe APPLIES the upgrade and the reply is lost: the stored subscription moves, the call then rejects. */
   failUpgradeAfterApplying: Error | undefined;
   private readonly upgradeFingerprints = new Map<string, string>();
+  /** Stripe CREATES the schedule and the reply is lost: the stored subscription now holds a schedule, the call then rejects. */
+  failDowngradeAfterApplying: Error | undefined;
+  private readonly downgradeKeys = new Map<string, string>();
   readonly downgradeAttempts: PlanDowngradeInput[] = [];
   readonly downgrades: PlanDowngradeInput[] = [];
   readonly releases: PlanDowngradeReleaseInput[] = [];
@@ -370,8 +373,19 @@ export class FakeStripeGateway implements StripeGateway {
     await this.beforePlanChangeCall?.();
     this.downgradeAttempts.push(input);
     if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
-    this.downgrades.push(input);
-    return Promise.resolve({ scheduleId: `sub_sched_${String(this.downgrades.length)}` });
+    // Like Stripe: the same key answers from the first call and applies nothing twice.
+    let scheduleId = this.downgradeKeys.get(input.idempotencyKey);
+    if (scheduleId === undefined) {
+      this.downgrades.push(input);
+      scheduleId = `sub_sched_${String(this.downgrades.length)}`;
+      this.downgradeKeys.set(input.idempotencyKey, scheduleId);
+      const stored = this.objects.get(`subscription:${input.subscriptionId}`);
+      if (stored !== undefined && this.failDowngradeAfterApplying !== undefined) {
+        this.objects.set(`subscription:${input.subscriptionId}`, { ...stored, raw: { ...stored.raw, schedule: scheduleId } });
+      }
+    }
+    if (this.failDowngradeAfterApplying !== undefined) return Promise.reject(this.failDowngradeAfterApplying);
+    return Promise.resolve({ scheduleId });
   }
 
   releasePlanDowngrade(input: PlanDowngradeReleaseInput): Promise<{ readonly outcome: "released" | "already_effective" }> {
@@ -390,6 +404,8 @@ export class FakeStripeGateway implements StripeGateway {
     this.failPlanChangeWith = undefined;
     this.failUpgradeAfterApplying = undefined;
     this.failUpgradeWith = undefined;
+    this.failDowngradeAfterApplying = undefined;
+    this.downgradeKeys.clear();
     this.beforePlanChangeCall = undefined;
     this.upgradeFingerprints.clear();
     this.downgradeAttempts.length = 0;

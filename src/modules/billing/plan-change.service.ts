@@ -202,11 +202,10 @@ export class PlanChangeService {
       const fresh = await this.fetchFresh(locked);
 
       const replay = await this.existingIntent(locked, fresh, request);
-      if (direction === "upgrade") {
-        this.refuseScheduled(locked, fresh);
-        return await this.upgrade(locked, fresh, request.quote!, replay);
-      }
-      this.refuseScheduled(locked, fresh);
+      // A REPLAY is the same change retried after a lost reply: its own schedule (a downgrade's) is already on the
+      // subscription, and that must not read as "someone else's change is scheduled".
+      if (replay === null) this.refuseScheduled(locked, fresh);
+      if (direction === "upgrade") return await this.upgrade(locked, fresh, request.quote!, replay);
       return await this.downgrade(locked, fresh, replay);
     });
   }
@@ -572,7 +571,17 @@ export class PlanChangeService {
 
     // An unsettled intent for something else: young, it may still be in flight in a request that died (refuse); old, Stripe
     // either applied it (its id is on the subscription's metadata: the webhook will adopt it) or never saw it (release it).
-    if (intent.settled_at === undefined && Date.now() - Date.parse(intent.created_at) >= UNSETTLED_INTENT_RECENT_MS && fresh.metadata.plan_change_intent_id !== intent.id) {
+    // A downgrade is different: it may have left a SCHEDULE on the subscription whose phase metadata is not on the
+    // subscription yet, so "my id is not on the metadata" does not prove Stripe never saw it. While the subscription holds
+    // a schedule the intent is kept (the customer sees the pending downgrade and can cancel it, which releases the schedule).
+    const schedule = (fresh.raw as { schedule?: unknown }).schedule;
+    const holdsSchedule = schedule !== null && schedule !== undefined;
+    if (
+      intent.settled_at === undefined &&
+      Date.now() - Date.parse(intent.created_at) >= UNSETTLED_INTENT_RECENT_MS &&
+      fresh.metadata.plan_change_intent_id !== intent.id &&
+      !(intent.direction === "downgrade" && holdsSchedule)
+    ) {
       await this.clearIntent(ctx.workspaceId, intent.id);
       this.logger.warn({ message: "released a plan-change intent Stripe never applied", workspace_id: ctx.workspaceId });
       return null;

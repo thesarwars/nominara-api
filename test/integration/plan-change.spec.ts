@@ -255,6 +255,43 @@ describe("STORY-184 · in-app plan change", () => {
     expect(seenByStripe).toMatchObject({ direction: "downgrade", to_plan_key: "starter" });
   });
 
+  it("hazard · the SCHEDULE of a downgrade was created and the reply lost: the retry is a replay (not 'change_scheduled'), schedules ONCE, and the customer can see and cancel it meanwhile", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    gateway.failDowngradeAfterApplying = new StripeUpstreamError(504);
+    expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(503);
+    expect(gateway.downgrades).toHaveLength(1); // Stripe holds the schedule
+    const unsettled = (await f.intentOf(workspaceId))!;
+    expect(unsettled.settled_at).toBeUndefined();
+    // The outcome is unknown, so the downgrade is SHOWN (it may happen at the period end) and can be cancelled.
+    expect(subscriptionSchema.parse(dataOf(await f.get(owner, "/billing/subscription"))).pending_plan_change).toMatchObject({ direction: "downgrade", target_plan_key: "starter" });
+
+    gateway.failDowngradeAfterApplying = undefined;
+    const retry = await f.post(owner, CHANGE, { plan_key: "starter" });
+    expect(retry.statusCode, retry.body).toBe(202);
+    expect(gateway.downgrades, "one schedule, however many retries").toHaveLength(1);
+    expect((await f.intentOf(workspaceId))!).toMatchObject({ id: unsettled.id, schedule_id: "sub_sched_1" });
+  });
+
+  it("hazard · an OLD unsettled downgrade while Stripe holds a schedule is never released as 'never applied': a different change is plan_change_pending and a cancel releases the schedule", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    gateway.failDowngradeAfterApplying = new StripeUpstreamError(504);
+    await f.post(owner, CHANGE, { plan_key: "growth" });
+    gateway.failDowngradeAfterApplying = undefined;
+    await harness.db().query(
+      "UPDATE subscriptions SET pending_plan_change = jsonb_set(pending_plan_change, '{created_at}', to_jsonb(to_char(now() - interval '1 hour', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))) WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    const other = await f.post(owner, CHANGE, { plan_key: "starter" });
+    expect(other.statusCode).toBe(409);
+    expect(errorOf(other).details).toMatchObject({ reason: "plan_change_pending" });
+    expect(await f.intentOf(workspaceId)).not.toBeNull();
+
+    const cancelled = await f.del(owner, CHANGE);
+    expect(cancelled.statusCode, cancelled.body).toBe(200);
+    expect(gateway.releases.map((r) => r.scheduleId)).toEqual(["sub_sched_1"]);
+    expect(await f.intentOf(workspaceId)).toBeNull();
+  });
+
   it("hazard · two simultaneous upgrades (different Idempotency-Keys, one quote): exactly one is charged, the other is plan_change_pending", async () => {
     const { owner } = await f.newWorkspace("starter");
     const preview = await quoteOf(owner, "growth");
