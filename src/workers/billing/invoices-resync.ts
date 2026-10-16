@@ -211,7 +211,8 @@ async function main(): Promise<void> {
     try {
       const counts = await resyncInvoices({ discovery, pool, gateway, operator, ticket });
       console.log(formatCounts(counts));
-      if (counts.failed > 0) process.exitCode = 1;
+      // A mismatched or vanished row is a row this run could NOT correct; an exit code of 0 would read as "all fixed".
+      if (counts.failed > 0 || counts.mismatched > 0 || counts.unexpected_insert > 0) process.exitCode = 1;
     } finally {
       await pool.end();
       await discovery.end();
