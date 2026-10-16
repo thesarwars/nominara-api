@@ -38,7 +38,7 @@ describe("STORY-184 · plan:set refuses a Stripe-tracked workspace", () => {
       await client.query(
         `INSERT INTO subscriptions (workspace_id, plan_key, billing_interval, stripe_customer_id, stripe_subscription_id, status, provider, current_period_start, current_period_end)
          VALUES ($1,$2,'monthly','cus_1',$3,$4,$5, now(), now() + interval '30 days')`,
-        [id, sub.plan, sub.provider === "stripe" ? `sub_${id}` : "", sub.status, sub.provider],
+        [id, sub.plan, `sub_${id}`, sub.status, sub.provider],
       );
     }
     return id;
