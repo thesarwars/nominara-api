@@ -17,6 +17,7 @@ function gatewayWith(client: unknown): StripeHttpGateway {
   return gateway;
 }
 
+const META = { workspace_id: "ws-1", plan_key: "growth", billing_interval: "monthly" };
 const input = { subscriptionId: "sub_1", kind: "extra_project" as const, quantity: 2, existingItemId: null, productName: "Nominara Extra project", unitAmountCents: 4900, currency: "USD", interval: "month" as const, proration: "create_prorations" as const, idempotencyKey: "k1" };
 
 describe("STORY-076b · changeAddonQuantity", () => {
@@ -91,6 +92,7 @@ describe("STORY-076b · scheduleAddonRemoval", () => {
         retrieve: () =>
           Promise.resolve({
             schedule: over.schedule ?? null,
+            metadata: { workspace_id: "ws-1", plan_key: "growth", billing_interval: "monthly" },
             items: { data: over.items ?? [{ id: "si_plan", price: { id: "price_plan", recurring: { interval: "month" } } }, { id: "si_proj", price: { id: "price_proj", recurring: { interval: "month" } } }] },
           }),
       },
@@ -111,9 +113,11 @@ describe("STORY-076b · scheduleAddonRemoval", () => {
       "sub_sched_1",
       {
         end_behavior: "release",
+        // STORY-184: both phases now carry the subscription's metadata (a phase's metadata replaces the subscription's at
+        // the cut-over; without it `plan_key` was stripped) and are never prorated.
         phases: [
-          { items: [{ price: "price_plan", quantity: 1 }, { price: "price_proj", quantity: 2 }], start_date: 100, end_date: 200 },
-          { items: [{ price: "price_plan", quantity: 1 }], duration: { interval: "month", interval_count: 1 } },
+          { items: [{ price: "price_plan", quantity: 1 }, { price: "price_proj", quantity: 2 }], start_date: 100, end_date: 200, metadata: META, proration_behavior: "none" },
+          { items: [{ price: "price_plan", quantity: 1 }], duration: { interval: "month", interval_count: 1 }, metadata: META, proration_behavior: "none" },
         ],
       },
       { idempotencyKey: "r1" },

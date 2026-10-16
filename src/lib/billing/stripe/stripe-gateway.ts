@@ -116,6 +116,64 @@ export interface AddonRemovalInput {
   readonly itemId: string;
   readonly idempotencyKey: string;
 }
+/**
+ * STORY-184 — the plan item a change moves TO, priced from OUR catalog row (integer cents; never a float, never from the
+ * client). Stripe prices it inline against the fixed product `nominara_plan_<planKey>`.
+ */
+export interface PlanPrice {
+  readonly planKey: string;
+  readonly productName: string;
+  readonly unitAmountCents: number;
+  /** ISO 4217, any case. */
+  readonly currency: string;
+  readonly interval: "month" | "year";
+}
+
+/** STORY-184 — Stripe's preview of the invoice an upgrade would produce at `prorationDate`. Charges nothing. */
+export interface PlanChangePreviewInput {
+  readonly customerId: string;
+  readonly subscriptionId: string;
+  /** The subscription item of the PLAN (`si_…`); add-on items are not listed, so they are untouched. */
+  readonly planItemId: string;
+  readonly target: PlanPrice;
+  /** Unix seconds; the same instant the change is applied at. */
+  readonly prorationDate: number;
+}
+export interface PlanChangePreviewResult {
+  /** Stripe's `amount_due`, integer minor units. */
+  readonly amountDueCents: number;
+  /** Lower-case, as Stripe returns it. */
+  readonly currency: string;
+}
+
+/** STORY-184 — the upgrade: charged now, or not applied at all. */
+export interface PlanUpgradeInput {
+  readonly subscriptionId: string;
+  readonly planItemId: string;
+  readonly target: PlanPrice;
+  readonly prorationDate: number;
+  /** `plan_key`, `billing_interval`, `plan_change_intent_id` — merged onto the subscription's metadata. */
+  readonly metadata: Readonly<Record<string, string>>;
+  readonly idempotencyKey: string;
+}
+/** `payment_failed`: the card was declined or needs the customer present; Stripe applied NOTHING. */
+export type PlanUpgradeResult = { readonly outcome: "applied" } | { readonly outcome: "payment_failed" };
+
+/** STORY-184 — the downgrade: a subscription schedule whose second phase is the target plan plus the surviving add-ons. */
+export interface PlanDowngradeInput {
+  readonly subscriptionId: string;
+  readonly target: PlanPrice;
+  /** The add-on lines that survive the move (price id + quantity); the caller dropped the ones the target plan does not allow. */
+  readonly keepAddons: ReadonlyArray<{ readonly priceId: string; readonly quantity: number }>;
+  /** Phase 1's metadata: the subscription's own, with `plan_key`, `billing_interval` and `plan_change_intent_id` set. */
+  readonly metadata: Readonly<Record<string, string>>;
+  readonly idempotencyKey: string;
+}
+export interface PlanDowngradeReleaseInput {
+  readonly scheduleId: string;
+  readonly idempotencyKey: string;
+}
+
 /** NEW-D-7 — a card the customer agreed to have reused off-session (a Checkout with `setup_future_usage`). */
 export interface SavedPaymentMethod {
   readonly customerId: string;
@@ -248,6 +306,22 @@ export interface StripeGateway {
    * Idempotent for an already-scheduled removal. Throws `StripeUpstreamError`.
    */
   scheduleAddonRemoval(input: AddonRemovalInput): Promise<void>;
+
+  /** STORY-184 — `invoices.createPreview` at a fixed proration instant. Charges nothing. Throws `StripeUpstreamError`. */
+  previewPlanChange(input: PlanChangePreviewInput): Promise<PlanChangePreviewResult>;
+
+  /**
+   * STORY-184 — updates the PLAN item only (`always_invoice` + `error_if_incomplete`): the proration is invoiced and paid
+   * now, or nothing changes. A decline or 3-D Secure is `payment_failed`; anything else throws `StripeUpstreamError`.
+   * Writes NOTHING local: the plan changes only when the webhook reconciles.
+   */
+  applyPlanUpgrade(input: PlanUpgradeInput): Promise<PlanUpgradeResult>;
+
+  /** STORY-184 — schedules the downgrade for the period end (metadata on both phases). Returns the schedule id. Throws `StripeUpstreamError`. */
+  schedulePlanDowngrade(input: PlanDowngradeInput): Promise<{ readonly scheduleId: string }>;
+
+  /** STORY-184 — releases a scheduled downgrade; `already_effective` when it has taken effect (or Stripe no longer has it). Throws `StripeUpstreamError`. */
+  releasePlanDowngrade(input: PlanDowngradeReleaseInput): Promise<{ readonly outcome: "released" | "already_effective" }>;
 
   /** `null` when Stripe has no such object (deleted, or a test-mode id at a live endpoint). */
   fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null>;

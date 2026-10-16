@@ -12,12 +12,20 @@ import {
   type OffSessionPaymentInput,
   type OffSessionPaymentState,
   type OffSessionPaymentResult,
+  type PlanChangePreviewInput,
+  type PlanChangePreviewResult,
+  type PlanDowngradeInput,
+  type PlanDowngradeReleaseInput,
+  type PlanPrice,
+  type PlanUpgradeInput,
+  type PlanUpgradeResult,
   type SavedPaymentMethod,
   type StripeGateway,
   type StripeObjectKind,
   type SubscriptionCheckoutInput,
   type VerifiedStripeEvent,
 } from "./stripe-gateway.js";
+import { buildTwoPhaseSchedule, phaseLinesOf, stringMetadataOf, type PhaseItem, type PhaseLine } from "./schedule-phases.js";
 
 // NEW-D-2 — the real adapter, over the official `stripe` SDK. The only file
 // that holds `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`.
@@ -319,37 +327,144 @@ export class StripeHttpGateway implements StripeGateway {
       // One more billing cycle, then the schedule is released and the subscription carries on as normal.
       const cycle = item.price.recurring?.interval === "year" ? "year" : "month";
 
-      const existing = subscription.schedule;
-      const scheduleId =
-        typeof existing === "string"
-          ? existing
-          : existing !== null && existing !== undefined
-            ? existing.id
-            : (await client.subscriptionSchedules.create({ from_subscription: input.subscriptionId }, { idempotencyKey: `${input.idempotencyKey}-schedule` })).id;
+      const scheduleId = await this.scheduleIdOf(client, subscription, input.subscriptionId, `${input.idempotencyKey}-schedule`);
       const schedule = await client.subscriptionSchedules.retrieve(scheduleId);
-
-      const priceOf = (line: { price: string | Stripe.Price | Stripe.DeletedPrice }): string => (typeof line.price === "string" ? line.price : line.price.id);
       const current = schedule.phases[0];
       if (current === undefined) throw new StripeUpstreamError(undefined);
-      const asItems = (lines: typeof current.items) => lines.map((line) => ({ price: priceOf(line), ...(line.quantity === undefined ? {} : { quantity: line.quantity }) }));
-      const keep = (lines: typeof current.items) => asItems(lines.filter((line) => priceOf(line) !== removedPrice));
 
-      // The current phase runs to the period end unchanged; the phase after it
-      // is the same items without the add-on (the second one, if a removal is
-      // already scheduled, is rewritten rather than appended to).
+      // ⚠ BOTH PHASES CARRY THE SUBSCRIPTION'S METADATA, and the plan line travels with them (STORY-184). The phase after
+      // the removal is the same items without the add-on (the second one, if a change is already scheduled, is rewritten
+      // rather than appended to); its metadata is that phase's own over the subscription's.
       const next = schedule.phases[1];
+      const live = stringMetadataOf(subscription.metadata);
+      const keep = (lines: PhaseLine[]): PhaseLine[] => lines.filter((line) => line.price !== removedPrice);
       await client.subscriptionSchedules.update(
         scheduleId,
-        {
-          end_behavior: "release",
-          phases: [
-            { items: asItems(current.items), start_date: current.start_date, end_date: current.end_date },
-            { items: keep(next?.items ?? current.items), duration: { interval: cycle, interval_count: 1 } },
-          ],
-        },
+        buildTwoPhaseSchedule({
+          current: { items: phaseLinesOf(current.items), startDate: current.start_date, endDate: current.end_date, metadata: live },
+          next: { items: keep(phaseLinesOf((next ?? current).items)), metadata: { ...live, ...stringMetadataOf(next?.metadata) }, interval: cycle },
+        }),
         { idempotencyKey: input.idempotencyKey },
       );
     } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  /** The schedule a subscription already has, else a new one created from it. */
+  private async scheduleIdOf(client: Stripe, subscription: Stripe.Subscription, subscriptionId: string, createKey: string): Promise<string> {
+    const existing = subscription.schedule;
+    if (typeof existing === "string") return existing;
+    if (existing !== null && existing !== undefined) return existing.id;
+    return (await client.subscriptionSchedules.create({ from_subscription: subscriptionId }, { idempotencyKey: createKey })).id;
+  }
+
+  /**
+   * STORY-184 — the target plan's product, created once under a fixed id (an item's inline `price_data` takes a product
+   * ID, and only Checkout accepts `product_data`). `nominara_kind=plan` is how the reconciler tells the plan line from an
+   * add-on line on the fetched subscription.
+   */
+  private async planProductId(client: Stripe, target: PlanPrice): Promise<string> {
+    const id = `nominara_plan_${target.planKey}`;
+    try {
+      await client.products.create({ id, name: target.productName, metadata: { nominara_kind: "plan" } });
+    } catch (error) {
+      if (!(error instanceof Stripe.errors.StripeInvalidRequestError && error.code === "resource_already_exists")) throw error;
+    }
+    return id;
+  }
+
+  private planPriceData(target: PlanPrice, product: string) {
+    return { currency: target.currency.toLowerCase(), product, unit_amount: target.unitAmountCents, recurring: { interval: target.interval } } as const;
+  }
+
+  async previewPlanChange(input: PlanChangePreviewInput): Promise<PlanChangePreviewResult> {
+    const client = this.requireClient();
+    try {
+      const product = await this.planProductId(client, input.target);
+      const preview = await client.invoices.createPreview({
+        customer: input.customerId,
+        subscription: input.subscriptionId,
+        subscription_details: {
+          items: [{ id: input.planItemId, price_data: this.planPriceData(input.target, product) }],
+          proration_behavior: "always_invoice",
+          proration_date: input.prorationDate,
+        },
+      });
+      // Fail closed: a preview with no amount is not a free upgrade.
+      if (typeof preview.amount_due !== "number" || !Number.isSafeInteger(preview.amount_due) || typeof preview.currency !== "string") throw new StripeUpstreamError(undefined);
+      return { amountDueCents: preview.amount_due, currency: preview.currency };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async applyPlanUpgrade(input: PlanUpgradeInput): Promise<PlanUpgradeResult> {
+    const client = this.requireClient();
+    try {
+      const product = await this.planProductId(client, input.target);
+      await client.subscriptions.update(
+        input.subscriptionId,
+        {
+          // ONLY the plan item is listed: the add-on items are left exactly as they are.
+          items: [{ id: input.planItemId, price_data: this.planPriceData(input.target, product) }],
+          proration_behavior: "always_invoice",
+          proration_date: input.prorationDate,
+          // The proration is paid now or the update is not applied: a decline leaves the subscription untouched.
+          payment_behavior: "error_if_incomplete",
+          metadata: { ...input.metadata },
+        },
+        { idempotencyKey: input.idempotencyKey },
+      );
+      return { outcome: "applied" };
+    } catch (error) {
+      // A declined card, or one that needs the customer present (3-D Secure, also a card error): Stripe applied nothing.
+      if (error instanceof Stripe.errors.StripeCardError) return { outcome: "payment_failed" };
+      throw this.asUpstream(error);
+    }
+  }
+
+  async schedulePlanDowngrade(input: PlanDowngradeInput): Promise<{ readonly scheduleId: string }> {
+    const client = this.requireClient();
+    try {
+      const subscription = await client.subscriptions.retrieve(input.subscriptionId);
+      const product = await this.planProductId(client, input.target);
+      const scheduleId = await this.scheduleIdOf(client, subscription, input.subscriptionId, `${input.idempotencyKey}-schedule`);
+      const schedule = await client.subscriptionSchedules.retrieve(scheduleId);
+      const current = schedule.phases[0];
+      if (current === undefined) throw new StripeUpstreamError(undefined);
+      const items: PhaseItem[] = [
+        { price_data: this.planPriceData(input.target, product), quantity: 1 },
+        ...input.keepAddons.map((addon) => ({ price: addon.priceId, quantity: addon.quantity })),
+      ];
+      await client.subscriptionSchedules.update(
+        scheduleId,
+        buildTwoPhaseSchedule({
+          // Phase 0 keeps the subscription's OWN metadata, explicitly: omitting it would strip it at the cut-over.
+          current: { items: phaseLinesOf(current.items), startDate: current.start_date, endDate: current.end_date, metadata: stringMetadataOf(subscription.metadata) },
+          next: { items, metadata: input.metadata, interval: input.target.interval },
+        }),
+        { idempotencyKey: input.idempotencyKey },
+      );
+      return { scheduleId };
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
+  async releasePlanDowngrade(input: PlanDowngradeReleaseInput): Promise<{ readonly outcome: "released" | "already_effective" }> {
+    const client = this.requireClient();
+    try {
+      const schedule = await client.subscriptionSchedules.retrieve(input.scheduleId);
+      const second = schedule.phases[1];
+      const inSecondPhase = second !== undefined && schedule.current_phase !== null && schedule.current_phase.start_date >= second.start_date;
+      // Only a schedule still in its first phase can be cancelled; completed, released, canceled or already running the
+      // second phase means the downgrade has taken effect (or there is nothing left to cancel).
+      if ((schedule.status !== "active" && schedule.status !== "not_started") || inSecondPhase) return { outcome: "already_effective" };
+      await client.subscriptionSchedules.release(input.scheduleId, {}, { idempotencyKey: input.idempotencyKey });
+      return { outcome: "released" };
+    } catch (error) {
+      if (error instanceof Stripe.errors.StripeInvalidRequestError && error.code === "resource_missing") return { outcome: "already_effective" };
       throw this.asUpstream(error);
     }
   }

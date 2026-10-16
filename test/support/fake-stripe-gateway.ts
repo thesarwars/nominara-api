@@ -11,6 +11,12 @@ import {
   type OffSessionPaymentInput,
   type OffSessionPaymentResult,
   type OffSessionPaymentState,
+  type PlanChangePreviewInput,
+  type PlanChangePreviewResult,
+  type PlanDowngradeInput,
+  type PlanDowngradeReleaseInput,
+  type PlanUpgradeInput,
+  type PlanUpgradeResult,
   type SavedPaymentMethod,
   type StripeObjectKind,
   type SubscriptionCheckoutInput,
@@ -290,8 +296,96 @@ export class FakeStripeGateway implements StripeGateway {
     this.addonRemovals.push(input);
   }
 
+  // ---- STORY-184 · the in-app plan change ----------------------------------------------------------------------
+  /** Every preview asked for, in call order. */
+  readonly planPreviews: PlanChangePreviewInput[] = [];
+  /** What Stripe says the upgrade costs: a number, or a function of the preview asked for. */
+  previewAmountCents: number | ((input: PlanChangePreviewInput) => number) = 3850;
+  /** Every upgrade ATTEMPTED (recorded before any failure is raised) and every one Stripe actually applied. */
+  readonly upgradeAttempts: PlanUpgradeInput[] = [];
+  readonly upgrades: PlanUpgradeInput[] = [];
+  /** `payment_failed` models a declined card or a 3-D Secure requirement: Stripe applies NOTHING. */
+  upgradeOutcome: "applied" | "payment_failed" = "applied";
+  /** Makes plan-change calls fail like an upstream outage (the request never reached Stripe). */
+  failPlanChangeWith: Error | undefined;
+  /** Stripe APPLIES the upgrade and the reply is lost: the stored subscription moves, the call then rejects. */
+  failUpgradeAfterApplying: Error | undefined;
+  private readonly upgradeFingerprints = new Map<string, string>();
+  readonly downgradeAttempts: PlanDowngradeInput[] = [];
+  readonly downgrades: PlanDowngradeInput[] = [];
+  readonly releases: PlanDowngradeReleaseInput[] = [];
+  releaseOutcome: "released" | "already_effective" = "released";
+
+  previewPlanChange(input: PlanChangePreviewInput): Promise<PlanChangePreviewResult> {
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    this.planPreviews.push(input);
+    const amountDueCents = typeof this.previewAmountCents === "function" ? this.previewAmountCents(input) : this.previewAmountCents;
+    return Promise.resolve({ amountDueCents, currency: input.target.currency.toLowerCase() });
+  }
+
+  applyPlanUpgrade(input: PlanUpgradeInput): Promise<PlanUpgradeResult> {
+    this.upgradeAttempts.push(input);
+    // Like Stripe: a reused key with a DIFFERENT call is refused (idempotency_error); the same call is answered from the first.
+    const { idempotencyKey: _key, ...call } = input;
+    const fingerprint = JSON.stringify(call);
+    const earlier = this.upgradeFingerprints.get(input.idempotencyKey);
+    if (earlier !== undefined && earlier !== fingerprint) return Promise.reject(new StripeUpstreamError(400, "idempotency_error"));
+    this.upgradeFingerprints.set(input.idempotencyKey, fingerprint);
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    if (this.upgradeOutcome === "payment_failed") return Promise.resolve({ outcome: "payment_failed" });
+    if (!this.upgrades.some((u) => u.idempotencyKey === input.idempotencyKey)) {
+      this.upgrades.push(input);
+      this.applyUpgradeToObject(input);
+    }
+    if (this.failUpgradeAfterApplying !== undefined) return Promise.reject(this.failUpgradeAfterApplying);
+    return Promise.resolve({ outcome: "applied" });
+  }
+
+  /** Moves the stored subscription's PLAN line to the target price and merges the metadata, as Stripe does when it applies the update. */
+  private applyUpgradeToObject(input: PlanUpgradeInput): void {
+    const stored = this.objects.get(`subscription:${input.subscriptionId}`);
+    if (stored === undefined) return;
+    const raw = stored.raw as { items?: { data: Array<Record<string, unknown> & { id?: unknown; price?: Record<string, unknown> }> }; metadata?: Record<string, string> };
+    const line = raw.items?.data.find((candidate) => candidate.id === input.planItemId);
+    if (line !== undefined) {
+      line.price = {
+        ...(line.price ?? {}),
+        unit_amount: input.target.unitAmountCents,
+        currency: input.target.currency.toLowerCase(),
+        recurring: { interval: input.target.interval, interval_count: 1 },
+        product: { metadata: { nominara_kind: "plan" } },
+      };
+    }
+    this.objects.set(`subscription:${input.subscriptionId}`, { ...stored, metadata: { ...stored.metadata, ...input.metadata }, raw: { ...stored.raw, metadata: { ...raw.metadata, ...input.metadata } } });
+  }
+
+  schedulePlanDowngrade(input: PlanDowngradeInput): Promise<{ readonly scheduleId: string }> {
+    this.downgradeAttempts.push(input);
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    this.downgrades.push(input);
+    return Promise.resolve({ scheduleId: `sub_sched_${String(this.downgrades.length)}` });
+  }
+
+  releasePlanDowngrade(input: PlanDowngradeReleaseInput): Promise<{ readonly outcome: "released" | "already_effective" }> {
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    this.releases.push(input);
+    return Promise.resolve({ outcome: this.releaseOutcome });
+  }
+
   /** Back to a clean slate between tests (the instance is shared by a whole spec file). */
   reset(): void {
+    this.planPreviews.length = 0;
+    this.previewAmountCents = 3850;
+    this.upgradeAttempts.length = 0;
+    this.upgrades.length = 0;
+    this.upgradeOutcome = "applied";
+    this.failPlanChangeWith = undefined;
+    this.failUpgradeAfterApplying = undefined;
+    this.upgradeFingerprints.clear();
+    this.downgradeAttempts.length = 0;
+    this.downgrades.length = 0;
+    this.releases.length = 0;
+    this.releaseOutcome = "released";
     this.objects.clear();
     this.fetches.length = 0;
     this.checkouts.length = 0;
