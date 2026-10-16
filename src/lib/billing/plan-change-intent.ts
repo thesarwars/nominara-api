@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { pendingPlanChangeSchema, type PendingPlanChange, type PendingPlanChangeSummary } from "../../../contracts/billing/plan-change.schema.js";
 
 // STORY-184 — reading `subscriptions.pending_plan_change` (jsonb). Fails CLOSED: a column that does not parse is not
@@ -25,4 +26,13 @@ export function summarizePendingPlanChange(raw: unknown): PendingPlanChangeSumma
   if (read.kind !== "intent") return null;
   if (read.intent.settled_at === undefined && read.intent.direction === "upgrade") return null;
   return { direction: read.intent.direction, target_plan_key: read.intent.to_plan_key, effective_at: read.intent.effective_at };
+}
+
+/**
+ * The reference an adoption trace (`billing.plan_change.adopted` audit row) is looked up by: 16 hex characters of a hash of the
+ * workspace and the intent id. NOT the raw id: audit redaction replaces any long, unbroken, high-entropy string (a UUID can
+ * qualify) with "[redacted]", and a trace that redacts itself matches nothing.
+ */
+export function adoptionRef(workspaceId: string, intentId: string): string {
+  return createHash("sha256").update(`${workspaceId}:${intentId}`).digest("hex").slice(0, 16);
 }

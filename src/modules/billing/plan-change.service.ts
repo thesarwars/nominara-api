@@ -14,7 +14,7 @@ import { entitlementOverridesSchema } from "../../../contracts/entitlements/reso
 import { ConflictError, DegradedError, PreconditionUnmetError, ValidationFailedError, type DomainError } from "../../api/errors/domain-errors.js";
 import type { Entitlement, EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { computeDowngradeExcess, readExcessUsage, splitAddons, type DowngradeExcess } from "../../lib/billing/downgrade-excess.js";
-import { readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
+import { adoptionRef, readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
 import { proRataTopUp, utcMidnight } from "../../lib/billing/plan-grant.js";
 import { isDefiniteRejection } from "../../lib/billing/stripe/definite-rejection.js";
 import { centsToDecimal } from "../../lib/billing/stripe/invoice-state.js";
@@ -242,9 +242,9 @@ export class PlanChangeService {
       const trace = await ctx.client.query(
         `SELECT 1 FROM audit_log
           WHERE workspace_id = $1 AND action = 'billing.plan_change.adopted'
-            AND after_state ->> 'intent_id' = $2 AND after_state ->> 'to_plan_key' = $3 AND after_state ->> 'proration_date' = $4
+            AND after_state ->> 'intent_ref' = $2 AND after_state ->> 'to_plan_key' = $3 AND after_state ->> 'proration_date' = $4
           LIMIT 1`,
-        [ctx.workspaceId, intentId, ctx.target.key, String(quote.proration_date)],
+        [ctx.workspaceId, adoptionRef(ctx.workspaceId, intentId), ctx.target.key, String(quote.proration_date)],
       );
       if ((trace.rowCount ?? 0) > 0) {
         this.outcome("upgrade", "replayed_adopted");

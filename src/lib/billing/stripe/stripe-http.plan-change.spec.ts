@@ -196,7 +196,7 @@ describe("STORY-184 · releaseFinishedSchedule", () => {
 
   it("a downgrade that took effect (last phase, release at the end, our metadata) is released", async () => {
     const { client, release } = stubs(finished());
-    expect(await call(client)).toEqual({ released: true });
+    expect(await call(client)).toEqual({ released: true, finished: true });
     expect(release).toHaveBeenCalledWith("sub_sched_1", {}, { idempotencyKey: "k1" });
   });
 
@@ -207,13 +207,13 @@ describe("STORY-184 · releaseFinishedSchedule", () => {
     ["a last phase whose metadata is not ours", finished({ phases: [phases[0], { start_date: 200, end_date: 300, metadata: { team: "billing" } }] })],
   ])("%s is left alone", async (_label, schedule) => {
     const { client, release } = stubs(schedule);
-    expect(await call(client)).toEqual({ released: false });
+    expect(await call(client)).toEqual({ released: false, finished: false });
     expect(release).not.toHaveBeenCalled();
   });
 
   it("a last phase naming the subscription's current plan counts as ours even without an intent id (the add-on removal's phases)", async () => {
     const { client } = stubs(finished({ phases: [phases[0], { start_date: 200, end_date: 300, metadata: { plan_key: "starter" } }] }));
-    expect(await call(client)).toEqual({ released: true });
+    expect(await call(client)).toEqual({ released: true, finished: true });
   });
 
   it("no schedule attached: nothing to release", async () => {

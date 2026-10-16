@@ -2,7 +2,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
-import { readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
+import { adoptionRef, readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
 import { addonItemsFromSubscription } from "../../lib/billing/stripe/addon-items.js";
 import { applyPlanChange, type SubscriptionReconciler } from "../../lib/billing/apply-plan.js";
 import { desiredFromStripeSubscription, toCents, type ClaimedPlanPrice } from "../../lib/billing/stripe/subscription-state.js";
@@ -212,8 +212,8 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
         action: "billing.plan_change.adopted",
         resourceType: "workspace",
         resourceId: workspaceId,
-        beforeState: { intent_id: adopted.intent.id, from_plan_key: adopted.intent.from_plan_key },
-        afterState: { intent_id: adopted.intent.id, direction: adopted.intent.direction, to_plan_key: adopted.intent.to_plan_key, proration_date: adopted.intent.proration_date },
+        beforeState: { from_plan_key: adopted.intent.from_plan_key },
+        afterState: { intent_ref: adoptionRef(workspaceId, adopted.intent.id), direction: adopted.intent.direction, to_plan_key: adopted.intent.to_plan_key, proration_date: adopted.intent.proration_date },
         requestId: event.id,
         supportGrantId: null,
         severity: "info",
