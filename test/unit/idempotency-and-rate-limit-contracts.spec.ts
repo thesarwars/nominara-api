@@ -74,9 +74,9 @@ describe("STORY-025 · the Idempotency-Key contract (§1, NFR-API-07)", () => {
 });
 
 describe("STORY-025 · the rate-limit configuration contract (§12)", () => {
-  it("names exactly the thirteen route classes §12 defines", () => {
-    expect(RATE_LIMIT_ROUTE_CLASS_COUNT).toBe(13);
-    expect(rateLimitRouteClassSchema.options).toHaveLength(13);
+  it("names exactly the fourteen route classes §12 defines", () => {
+    expect(RATE_LIMIT_ROUTE_CLASS_COUNT).toBe(14);
+    expect(rateLimitRouteClassSchema.options).toHaveLength(14);
   });
 
   it("requires a rolling bucket to carry its window and a utc_day bucket not to", () => {

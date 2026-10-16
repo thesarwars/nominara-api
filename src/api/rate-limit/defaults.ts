@@ -10,8 +10,8 @@ import {
 // is rounded, harmonised or inferred. Where §12 is ambiguous the ambiguity is
 // named rather than resolved silently.
 //
-// THIRTEEN classes. STORY-025's own acceptance criteria list nine; the
-// reference outranks the story, so thirteen ship and the story text goes on
+// FOURTEEN classes. STORY-025's own acceptance criteria list nine; the
+// reference outranks the story, so fourteen ship and the story text goes on
 // the hand-carried specification-fix list.
 //
 // The two columns are NOT redundant. §12 says "token buckets", so the rate
@@ -129,6 +129,15 @@ export const RATE_LIMIT_DEFAULTS: RateLimitConfig = rateLimitConfigSchema.parse(
   },
   {
     route_class: "credit_pack_purchase",
+    burst: 2,
+    buckets: [
+      { scope: "user", limit: 5, window: "rolling", window_ms: HOUR_MS },
+      { scope: "workspace", limit: 10, window: "rolling", window_ms: HOUR_MS },
+    ],
+  },
+  {
+    // STORY-184 — the in-app plan change takes the credit-pack purchase's shape (owner decision 2026-10-16).
+    route_class: "plan_change",
     burst: 2,
     buckets: [
       { scope: "user", limit: 5, window: "rolling", window_ms: HOUR_MS },

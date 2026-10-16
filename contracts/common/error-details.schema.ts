@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { downgradeExcessItemSchema } from "./downgrade-excess.schema.js";
 import { idempotencyConflictDetailsSchema } from "./idempotency.schema.js";
 import type { ErrorCode } from "./error-code.schema.js";
 import { MONEY_AMOUNT_USD_PATTERN } from "./money.schema.js";
@@ -215,6 +216,15 @@ export const featureNotInPlanDetailsSchema = z
 //   recipient_no_strong_authenticator   no un-revoked passkey; an email code alone does not count
 //   past_due_invoice                    an unpaid invoice is past its due date
 //   prompt_superseded                   STORY-046: the prompt was reworded; the live row is the one that replaced it
+// STORY-184 — the in-app plan change (`/billing/subscription/change*`):
+//   quote_changed                       the echoed quote no longer matches Stripe's re-preview, or is stale; nothing charged
+//   downgrade_exceeds_limits            usage is above the target plan's limits; `details.excess[]` is the exact list
+//   downgrade_already_effective         cancelling a scheduled downgrade that has already taken effect
+//   subscription_past_due               an unpaid subscription cannot change plan
+//   cancellation_pending                `cancel_at_period_end` is set: resume it in the billing portal first
+//   change_scheduled                    an add-on removal is scheduled on the subscription
+//   plan_change_pending                 a plan change is already pending: cancel it first
+//   plan_change_not_pending             cancelling when nothing is pending
 export const CONFLICT_REASONS = [
   "member_suspended",
   "already_member",
@@ -227,12 +237,22 @@ export const CONFLICT_REASONS = [
   "recipient_no_strong_authenticator",
   "past_due_invoice",
   "prompt_superseded",
+  "quote_changed",
+  "downgrade_exceeds_limits",
+  "downgrade_already_effective",
+  "subscription_past_due",
+  "cancellation_pending",
+  "change_scheduled",
+  "plan_change_pending",
+  "plan_change_not_pending",
 ] as const;
 
 export const conflictDetailsSchema = z
   .object({
     current_state: z.string().min(1).optional(),
     reason: z.enum(CONFLICT_REASONS).optional(),
+    /** STORY-184 — present with `reason = downgrade_exceeds_limits`: the exact structural excess, so the client renders it without a second request. */
+    excess: z.array(downgradeExcessItemSchema).optional(),
   })
   .strict();
 
@@ -281,7 +301,10 @@ export const unsafeTargetDetailsSchema = z.object({ reason: z.string().min(1) })
 //   no_capturable_scope   the scan would plan zero cells: no engine this
 //                         project is entitled to can capture yet, or it has no
 //                         active prompts — nothing was started, nothing charged
-export const PRECONDITION_UNMET_REASONS = ["price_not_agreed", "no_capturable_scope"] as const;
+//   payment_failed        STORY-184: an upgrade's charge was declined or needs the customer present (3-D Secure);
+//                         Stripe applied nothing and nothing changed
+//   cancel_in_portal      STORY-184: the target is Free — a cancellation at period end, done in the billing portal
+export const PRECONDITION_UNMET_REASONS = ["price_not_agreed", "no_capturable_scope", "payment_failed", "cancel_in_portal"] as const;
 
 export const preconditionUnmetDetailsSchema = z
   .object({ reason: z.enum(PRECONDITION_UNMET_REASONS).optional() })

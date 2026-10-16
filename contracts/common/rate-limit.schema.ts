@@ -2,12 +2,13 @@ import { z } from "zod";
 
 // STORY-025 T13 — api-specification.md §12: "Token buckets in Valkey; keys
 // are ADDITIVE — every applicable bucket must have capacity." This file is
-// the SHAPE of that configuration. The thirteen route classes' numbers are
+// the SHAPE of that configuration. The fourteen route classes' numbers are
 // data (src/api/rate-limit/defaults.ts), transcribed from §12's table.
 //
-// §12 defines THIRTEEN route classes. STORY-025's own acceptance criteria
+// §12 defines FOURTEEN route classes (the fourteenth, `plan_change`, is
+// STORY-184's). STORY-025's own acceptance criteria
 // list nine. The reference beats the story (spec-navigation precedence), so
-// thirteen are implemented and the story text goes on the hand-carried
+// fourteen are implemented and the story text goes on the hand-carried
 // specification-fix list.
 //
 // Rate limits are an ABUSE control and independent of credits: exhausting one
@@ -28,6 +29,7 @@ export const rateLimitRouteClassSchema = z.enum([
   "command_parse",
   "command_execute",
   "credit_pack_purchase",
+  "plan_change",
   "portal_session",
   "public_niche_reports",
 ]);

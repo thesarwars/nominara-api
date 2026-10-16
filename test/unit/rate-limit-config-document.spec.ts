@@ -475,6 +475,6 @@ describe("STORY-025 AC10 · bucket configuration is data", () => {
 
   it("STORY-025 AC10 · the document the loader accepts is exactly the contract's rateLimitConfigSchema", () => {
     expect(() => rateLimitConfigSchema.parse(JSON.parse(documentWithTightWrites()))).not.toThrow();
-    expect(rateLimitRouteClassSchema.options).toHaveLength(13);
+    expect(rateLimitRouteClassSchema.options).toHaveLength(14);
   });
 });
