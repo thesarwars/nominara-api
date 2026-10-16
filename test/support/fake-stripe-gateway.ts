@@ -11,6 +11,7 @@ import {
   type OffSessionPaymentInput,
   type OffSessionPaymentResult,
   type OffSessionPaymentState,
+  type FinishedScheduleInput,
   type PlanChangePreviewInput,
   type PlanChangePreviewResult,
   type PlanDowngradeInput,
@@ -319,7 +320,7 @@ export class FakeStripeGateway implements StripeGateway {
   readonly downgradeAttempts: PlanDowngradeInput[] = [];
   readonly downgrades: PlanDowngradeInput[] = [];
   readonly releases: PlanDowngradeReleaseInput[] = [];
-  releaseOutcome: "released" | "already_effective" = "released";
+  releaseOutcome: "released" | "not_releasable" = "released";
 
   previewPlanChange(input: PlanChangePreviewInput): Promise<PlanChangePreviewResult> {
     if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
@@ -388,10 +389,42 @@ export class FakeStripeGateway implements StripeGateway {
     return Promise.resolve({ scheduleId });
   }
 
-  releasePlanDowngrade(input: PlanDowngradeReleaseInput): Promise<{ readonly outcome: "released" | "already_effective" }> {
+  /** Schedule ids the fake treats as released already (so a repeat release is `not_releasable`, like Stripe's). */
+  private readonly releasedScheduleIds = new Set<string>();
+  /** Runs when a release is APPLIED, before the call answers: lets a test move Stripe on at that instant (the boundary race). */
+  onReleaseApplied: (() => void) | undefined;
+  /** Stripe APPLIES the release and the reply is lost. */
+  failReleaseAfterApplying: Error | undefined;
+
+  releasePlanDowngrade(input: PlanDowngradeReleaseInput): Promise<{ readonly outcome: "released" | "not_releasable" }> {
     if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
     this.releases.push(input);
-    return Promise.resolve({ outcome: this.releaseOutcome });
+    if (this.releaseOutcome === "not_releasable" || this.releasedScheduleIds.has(input.scheduleId)) return Promise.resolve({ outcome: "not_releasable" });
+    this.releasedScheduleIds.add(input.scheduleId);
+    // Releasing detaches the schedule from the stored subscription.
+    for (const [key, stored] of this.objects) {
+      if (key.startsWith("subscription:") && (stored.raw as { schedule?: unknown }).schedule === input.scheduleId) {
+        this.objects.set(key, { ...stored, raw: { ...stored.raw, schedule: null } });
+      }
+    }
+    this.onReleaseApplied?.();
+    if (this.failReleaseAfterApplying !== undefined) return Promise.reject(this.failReleaseAfterApplying);
+    return Promise.resolve({ outcome: "released" });
+  }
+
+  /** Ids of schedules that have nothing left to do (a downgrade that took effect), for `releaseFinishedSchedule`. */
+  readonly finishedScheduleIds = new Set<string>();
+  readonly finishedReleases: FinishedScheduleInput[] = [];
+
+  releaseFinishedSchedule(input: FinishedScheduleInput): Promise<{ readonly released: boolean }> {
+    if (this.failPlanChangeWith !== undefined) return Promise.reject(this.failPlanChangeWith);
+    const key = `subscription:${input.subscriptionId}`;
+    const stored = this.objects.get(key);
+    const scheduleId = (stored?.raw as { schedule?: unknown } | undefined)?.schedule;
+    if (stored === undefined || typeof scheduleId !== "string" || !this.finishedScheduleIds.has(scheduleId)) return Promise.resolve({ released: false });
+    this.finishedReleases.push(input);
+    this.objects.set(key, { ...stored, raw: { ...stored.raw, schedule: null } });
+    return Promise.resolve({ released: true });
   }
 
   /** Back to a clean slate between tests (the instance is shared by a whole spec file). */
@@ -412,6 +445,11 @@ export class FakeStripeGateway implements StripeGateway {
     this.downgrades.length = 0;
     this.releases.length = 0;
     this.releaseOutcome = "released";
+    this.releasedScheduleIds.clear();
+    this.onReleaseApplied = undefined;
+    this.failReleaseAfterApplying = undefined;
+    this.finishedScheduleIds.clear();
+    this.finishedReleases.length = 0;
     this.objects.clear();
     this.fetches.length = 0;
     this.checkouts.length = 0;

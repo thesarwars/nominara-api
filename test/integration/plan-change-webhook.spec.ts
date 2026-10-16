@@ -191,6 +191,37 @@ describe("STORY-184 · the webhook honours only the workspace's own matching int
     expect(await f.intentOf(workspaceId)).toMatchObject({ id: intent.id });
   });
 
+  it("item 3 · a STALE fetch (taken before the upgrade was adopted) is skipped BEFORE it is judged: no false mismatch alarm for the customer's own upgrade", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("starter");
+    const alarm = vi.spyOn(Logger.prototype, "error");
+    // Event A fetches the subscription as it is NOW (starter) and is held before it can commit.
+    const release = gateway.holdNextFetch("subscription", f.subIdOf(workspaceId));
+    const fetchesBefore = gateway.fetches.length;
+    const stale = f.reconcile(workspaceId);
+    while (gateway.fetches.length === fetchesBefore) await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // The customer upgrades and event B (a newer fetch) adopts growth, spending the intent.
+    const preview = planChangePreviewResponseSchema.parse(dataOf(await f.post(owner, PREVIEW, { plan_key: "growth" })));
+    expect((await f.post(owner, CHANGE, { plan_key: "growth", quote: preview.quote })).statusCode).toBe(202);
+    expect((await f.reconcile(workspaceId)).statusCode).toBe(200);
+    expect((await f.planOf(workspaceId)).plan_key).toBe("growth");
+    expect(await f.intentOf(workspaceId)).toBeNull();
+
+    // A's stale starter fetch now lands: it describes the old plan with no intent, which read as a relabel.
+    release();
+    expect((await stale).statusCode).toBe(200);
+    expect((await f.planOf(workspaceId)).plan_key, "the stale event did not put the old plan back").toBe("growth");
+    expect(alarm, "and it did not alarm").not.toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining("does not match its claimed plan") }));
+  });
+
+  it("item 13 · adoption spends only the intent whose id the subscription names: a different (stale) intent for the same plan stays", async () => {
+    const { workspaceId } = await f.newWorkspace("business");
+    const other = await seedIntent(workspaceId, { direction: "downgrade", from_plan_key: "business", to_plan_key: "business", unit_amount_cents: PRICES.business.monthly });
+    f.stripeSubscription(workspaceId, { plan: "business", metadata: { plan_change_intent_id: randomUUID() } });
+    expect((await f.reconcile(workspaceId)).statusCode).toBe(200);
+    expect(await f.intentOf(workspaceId)).toMatchObject({ id: other.id });
+  });
+
   it("an ENDED subscription (cancelled) takes the plan away as always, and its stale intent goes with it", async () => {
     const { workspaceId } = await f.newWorkspace("business");
     await seedIntent(workspaceId, { direction: "downgrade", from_plan_key: "business", to_plan_key: "growth", unit_amount_cents: PRICES.growth.monthly, effective: "period_end" });

@@ -69,3 +69,16 @@ export function addonLinesOf(raw: Readonly<Record<string, unknown>>): AddonLine[
   }
   return out;
 }
+
+/**
+ * When the subscription's CURRENT billing period began, in unix seconds, from the fresh fetch: on the subscription itself
+ * (older API versions) or on its plan line (newer ones). `null` when Stripe states neither - the caller then falls back to
+ * the local row, which lags the webhook.
+ */
+export function periodStartOf(raw: Readonly<Record<string, unknown>>): number | null {
+  if (typeof raw.current_period_start === "number" && Number.isFinite(raw.current_period_start)) return raw.current_period_start;
+  for (const line of lines(raw)) {
+    if (kindOf(line) === "plan" && typeof line.current_period_start === "number" && Number.isFinite(line.current_period_start)) return line.current_period_start;
+  }
+  return null;
+}

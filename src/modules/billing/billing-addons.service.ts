@@ -264,7 +264,19 @@ export class BillingAddonsService {
       // until Stripe releases the schedule. Whether Stripe even accepts a direct item change on a
       // scheduled subscription is collected against the sandbox (NEW-A-17).
       const schedule = (fetched.raw as { schedule?: unknown }).schedule;
-      if (schedule !== null && schedule !== undefined) {
+      // STORY-184: a schedule with NOTHING LEFT TO DO (a downgrade that took effect, attached for the rest of its last phase)
+      // is released first - the subscription does not change - or every add-on purchase would be refused for a billing cycle.
+      const stillScheduled =
+        schedule !== null && schedule !== undefined
+          ? !(
+              await this.gateway.releaseFinishedSchedule({
+                subscriptionId: subscription.stripe_subscription_id,
+                expectedPlanKey: fetched.metadata.plan_key,
+                idempotencyKey: `finished-schedule-${typeof schedule === "string" ? schedule : subscription.stripe_subscription_id}`,
+              })
+            ).released
+          : false;
+      if (stillScheduled) {
         incrementCounter("nominara_billing_addon_change_total", { kind: request.kind, outcome: "removal_scheduled_conflict" });
         throw new ConflictError({ message: "an add-on removal is scheduled for the end of this billing period: add-ons cannot be changed until it has taken effect" });
       }

@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import type { PoolClient } from "pg";
+import type { ClientBase, PoolClient } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { createPgPool } from "../../db/pg-pool.js";
 import { applyPlanChange, planKeyOnly, type BillingInterval } from "../../lib/billing/apply-plan.js";
@@ -110,6 +110,34 @@ export function parsePlanSetArgs(argv: readonly string[]): PlanSetArgs {
   };
 }
 
+/** The operator CLI refused: the workspace is billed through Stripe. */
+export class PlanSetStripeTrackedError extends Error {
+  constructor(workspaceId: string, planKey: string) {
+    super(
+      `refusing: workspace ${workspaceId} is billed through Stripe (live subscription on '${planKey}'). ` +
+        "A comp written over a Stripe-tracked subscription is not recorded anywhere Stripe can see, and the webhook would then refuse every " +
+        "later event for it as a relabel. Change the plan in Stripe (the customer's in-app plan change, or the Dashboard with the " +
+        "subscription's own metadata) or cancel the subscription first; plan:set is for workspaces with no live Stripe subscription",
+    );
+    this.name = "PlanSetStripeTrackedError";
+  }
+}
+
+/**
+ * STORY-184 (owner decision 2026-10-16) - `plan:set` is BLOCKED on a workspace whose subscription is Stripe-tracked
+ * (`provider = 'stripe'`) and not ended. Ended means the webhook reconciled it to `free` (the row keeps `provider = stripe` and
+ * the customer link, so a re-subscribe works): a comp there is allowed. Run inside the same tenant-context transaction as the
+ * plan write, so the answer and the write cannot be separated by a webhook.
+ */
+export async function assertNotStripeTracked(tx: ClientBase, workspaceId: string): Promise<void> {
+  const result = await tx.query<{ plan_key: string }>(
+    "SELECT plan_key FROM subscriptions WHERE workspace_id = $1 AND provider = 'stripe' AND status IN ('trialing','active','past_due') AND plan_key <> 'free'",
+    [workspaceId],
+  );
+  const row = result.rows[0];
+  if (row !== undefined) throw new PlanSetStripeTrackedError(workspaceId, row.plan_key);
+}
+
 /** Its own context-carrying transaction: `workspace_members` is a tenant table. */
 async function activeMemberCount(client: PoolClient, workspaceId: string): Promise<string> {
   const rows = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
@@ -134,14 +162,16 @@ export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void 
       const outcome = await withTenantContext(
         client,
         { workspaceId: args.workspaceId, actorId: SYSTEM_ACTOR_ID },
-        (tx) =>
-          applyPlanChange(
+        async (tx) => {
+          await assertNotStripeTracked(tx, args.workspaceId);
+          return await applyPlanChange(
             tx,
             args.workspaceId,
             planKeyOnly(args.planKey, args.billingInterval),
             { requestId: args.ticket, operator: args.operator, reason: args.reason },
             { allowNegotiatedTier: args.allowNegotiatedTier },
-          ),
+          );
+        },
       );
 
       if (!outcome.changed) {

@@ -48,7 +48,9 @@ export const PRICES: Record<PlanName, Record<"monthly" | "annual", number>> = {
 function widenedPlanChangeDocument(): string {
   return JSON.stringify(
     RATE_LIMIT_DEFAULTS.map((entry) =>
-      entry.route_class === "plan_change"
+      entry.route_class === "plan_change_preview"
+        ? { route_class: "plan_change_preview", burst: 50, buckets: [{ scope: "user", limit: 300, window: "rolling", window_ms: 3_600_000 }, { scope: "workspace", limit: 600, window: "rolling", window_ms: 3_600_000 }] }
+        : entry.route_class === "plan_change"
         ? {
             route_class: "plan_change",
             burst: 20,
@@ -230,8 +232,12 @@ export function usePlanChangeFixture(options: { readonly widenRateLimit?: boolea
     return ids;
   }
 
+  /** The workspace's owner user id (a fresh token is needed after a version bump). */
+  const ownerOf = async (workspaceId: string): Promise<string> =>
+    (await harness.db().query<{ user_id: string }>("SELECT user_id FROM workspace_members WHERE workspace_id = $1 AND role = 'owner'", [workspaceId])).rows[0]!.user_id;
+
   return {
-    gateway, harness, meta, nowSeconds, periodStart, periodEnd, createUser, enter, memberIn, newWorkspace, stripeSubscription, subIdOf,
+    ownerOf, gateway, harness, meta, nowSeconds, periodStart, periodEnd, createUser, enter, memberIn, newWorkspace, stripeSubscription, subIdOf,
     eventBody, deliver, reconcile, cookies, get, post, del, planOf, intentOf, auditActions, walletFor, includedOf, ledgerRows, projects,
   };
 }

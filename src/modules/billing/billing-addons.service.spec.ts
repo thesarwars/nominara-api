@@ -52,6 +52,8 @@ function gateway(over: Partial<StripeGateway> = {}): StripeGateway & { changes: 
       removals.push(input);
       return Promise.resolve();
     },
+    // STORY-184: a schedule with nothing left to do is released before an add-on change is refused; these tests' schedules are live ones.
+    releaseFinishedSchedule: () => Promise.resolve({ released: false }),
     ...over,
   } as unknown as StripeGateway & { changes: unknown[]; removals: unknown[]; fetches: string[] };
 }

@@ -31,6 +31,7 @@ export class PlanChangeController {
   // and charges nothing, and its row is named `previewed`, never `requested`.
   @Post("preview")
   @HttpCode(200)
+  @RateLimitClass("plan_change_preview")
   @RequirePermission("billing:write")
   @Audit({ action: "billing.plan_change.previewed", resourceType: "workspace", resourceIdFrom: "workspace" })
   @ApiContract({ operationId: "previewPlanChange", requestSchema: planChangePreviewRequestSchema, responseSchema: planChangePreviewResponseSchema })

@@ -4,6 +4,7 @@ import { AUDIT_METADATA_KEY } from "../../../src/api/decorators/audit.decorator.
 import { IDEMPOTENT_KEY } from "../../../src/api/decorators/idempotent.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../../../src/api/decorators/require-permission.decorator.js";
 import { RATE_LIMIT_CLASS_KEY } from "../../../src/api/rate-limit/route-class.js";
+import { evaluatePermission } from "../../../src/tenancy/permission-matrix.js";
 import { PlanChangeController } from "../../../src/modules/billing/plan-change.controller.js";
 
 // STORY-184 scenarios 26-28 — the declarations of the three routes, in the fast suite (the behaviour over HTTP is proved
@@ -18,9 +19,14 @@ describe("STORY-184 · plan-change route declarations", () => {
     expect(reflector.get<string>(REQUIRE_PERMISSION_KEY, handler)).toBe("billing:write");
   });
 
-  it("scenario 26 · none of them asks for a step-up (owner decision 2026-10-16)", () => {
-    for (const handler of Object.values(handlers)) {
-      expect(Reflect.getMetadataKeys(handler).filter((key) => String(key).toLowerCase().includes("stepup") || String(key).toLowerCase().includes("step_up"))).toEqual([]);
+  // The matrix is what RbacGuard evaluates: step-up lives THERE, per role, not in a decorator. (The earlier version of this test
+  // looked for decorator keys containing "stepup", which no route could ever carry, and so could never fail.)
+  it("scenario 26 · billing:write needs NO step-up for owner or admin (owner decision 2026-10-16), and a manager and a viewer are denied", () => {
+    for (const role of ["owner", "admin"]) {
+      expect(evaluatePermission(role, "billing:write")).toMatchObject({ access: "allow", stepUp: false });
+    }
+    for (const role of ["manager", "viewer"]) {
+      expect(evaluatePermission(role, "billing:write").access).toBe("deny");
     }
   });
 
@@ -38,9 +44,9 @@ describe("STORY-184 · plan-change route declarations", () => {
     ]);
   });
 
-  it("scenario 28 · the change and the cancel share the plan_change rate class; the preview is an ordinary write", () => {
+  it("scenario 28 · the change and the cancel share the plan_change rate class; the preview has its own plan_change_preview class", () => {
     expect(reflector.get<string>(RATE_LIMIT_CLASS_KEY, handlers.change)).toBe("plan_change");
     expect(reflector.get<string>(RATE_LIMIT_CLASS_KEY, handlers.cancel)).toBe("plan_change");
-    expect(reflector.get<string | undefined>(RATE_LIMIT_CLASS_KEY, handlers.preview)).toBeUndefined();
+    expect(reflector.get<string>(RATE_LIMIT_CLASS_KEY, handlers.preview)).toBe("plan_change_preview");
   });
 });

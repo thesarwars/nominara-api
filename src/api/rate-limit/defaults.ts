@@ -10,8 +10,8 @@ import {
 // is rounded, harmonised or inferred. Where §12 is ambiguous the ambiguity is
 // named rather than resolved silently.
 //
-// FOURTEEN classes. STORY-025's own acceptance criteria list nine; the
-// reference outranks the story, so fourteen ship and the story text goes on
+// FIFTEEN classes. STORY-025's own acceptance criteria list nine; the
+// reference outranks the story, so fifteen ship and the story text goes on
 // the hand-carried specification-fix list.
 //
 // The two columns are NOT redundant. §12 says "token buckets", so the rate
@@ -138,10 +138,22 @@ export const RATE_LIMIT_DEFAULTS: RateLimitConfig = rateLimitConfigSchema.parse(
   {
     // STORY-184 — the in-app plan change takes the credit-pack purchase's shape (owner decision 2026-10-16).
     route_class: "plan_change",
-    burst: 2,
+    // Burst 3 (owner decision 2026-10-16, loosened from the credit-pack shape's 2): change, cancel, change again is a
+    // normal sequence. The hourly limits are still the credit-pack purchase's.
+    burst: 3,
     buckets: [
       { scope: "user", limit: 5, window: "rolling", window_ms: HOUR_MS },
       { scope: "workspace", limit: 10, window: "rolling", window_ms: HOUR_MS },
+    ],
+  },
+  {
+    // STORY-184 - the preview calls Stripe but charges nothing, so it has a class of its own rather than sharing the
+    // money-moving one (owner decision 2026-10-16): 30/hour per user, 60/hour per workspace (chosen here), burst 5.
+    route_class: "plan_change_preview",
+    burst: 5,
+    buckets: [
+      { scope: "user", limit: 30, window: "rolling", window_ms: HOUR_MS },
+      { scope: "workspace", limit: 60, window: "rolling", window_ms: HOUR_MS },
     ],
   },
   {

@@ -74,6 +74,11 @@ describe("STORY-184 · applyPlanUpgrade", () => {
     expect(await gatewayWith({ subscriptions: { update: () => Promise.reject(needs) }, products: { create: () => Promise.resolve({}) } }).applyPlanUpgrade(args)).toEqual({ outcome: "payment_failed" });
   });
 
+  it("T4 · a 402 that the SDK did not class as a card error is still payment_failed (3-D Secure arrives that way for some flows)", async () => {
+    const odd = Object.assign(new Error("payment required"), { statusCode: 402, rawType: "invalid_request_error" });
+    expect(await gatewayWith({ subscriptions: { update: () => Promise.reject(odd) }, products: { create: () => Promise.resolve({}) } }).applyPlanUpgrade(args)).toEqual({ outcome: "payment_failed" });
+  });
+
   it("T4 · any other failure stays an upstream error carrying only the status and type, never the SDK text", async () => {
     const boom = Object.assign(new Error(`secret ${SECRET}`), { statusCode: 500, rawType: "api_error" });
     const err = await gatewayWith({ subscriptions: { update: () => Promise.reject(boom) }, products: { create: () => Promise.resolve({}) } }).applyPlanUpgrade(args).catch((e: unknown) => e);
@@ -128,6 +133,7 @@ describe("STORY-184 · schedulePlanDowngrade", () => {
     const { client } = stubs();
     const exists = new Stripe.errors.StripeInvalidRequestError({ type: "invalid_request_error", code: "resource_already_exists", message: "x" } as never);
     client.products.create = vi.fn(() => Promise.reject(exists));
+    (client.products as unknown as { retrieve: unknown }).retrieve = vi.fn(() => Promise.resolve({ metadata: { nominara_kind: "plan" } }));
     await expect(gatewayWith(client).schedulePlanDowngrade({ subscriptionId: "sub_1", target: starter, keepAddons: [], metadata: META, idempotencyKey: "k" })).resolves.toEqual({ scheduleId: "sub_sched_1" });
   });
 
@@ -152,28 +158,141 @@ describe("STORY-184 · releasePlanDowngrade", () => {
     return { client: { subscriptionSchedules: { retrieve: () => Promise.resolve(s), release } }, release };
   };
 
-  it("T3 · a schedule still in its first phase is released", async () => {
+  it("a schedule still in its first phase is released", async () => {
     const { client, release } = clientFor(schedule({}));
     expect(await gatewayWith(client).releasePlanDowngrade({ scheduleId: "sub_sched_1", idempotencyKey: "c1" })).toEqual({ outcome: "released" });
     expect(release).toHaveBeenCalledWith("sub_sched_1", {}, { idempotencyKey: "c1" });
   });
 
-  it("T3 · a schedule already in its second phase has taken effect: nothing is released", async () => {
+  it("a schedule already in its second phase is NOT released - and is not declared 'effective' either (the caller reads that from the subscription)", async () => {
     const { client, release } = clientFor(schedule({ current_phase: { start_date: 200, end_date: 300 } }));
-    expect(await gatewayWith(client).releasePlanDowngrade({ scheduleId: "sub_sched_1", idempotencyKey: "c1" })).toEqual({ outcome: "already_effective" });
+    expect(await gatewayWith(client).releasePlanDowngrade({ scheduleId: "sub_sched_1", idempotencyKey: "c1" })).toEqual({ outcome: "not_releasable" });
     expect(release).not.toHaveBeenCalled();
   });
 
-  it.each(["completed", "released", "canceled"])("T3 · a %s schedule has nothing left to cancel", async (status) => {
+  // A schedule's status cannot tell "cancelled" from "ran": a completed, released or canceled schedule is only NOT RELEASABLE. (The old
+  // test here called all three 'already effective', which locked out a customer whose release the Dashboard - or our own lost reply - had done.)
+  it.each(["completed", "released", "canceled"])("a %s schedule is not releasable, and the gateway claims nothing more", async (status) => {
     const { client, release } = clientFor(schedule({ status, current_phase: null }));
-    expect((await gatewayWith(client).releasePlanDowngrade({ scheduleId: "sub_sched_1", idempotencyKey: "c1" })).outcome).toBe("already_effective");
+    expect((await gatewayWith(client).releasePlanDowngrade({ scheduleId: "sub_sched_1", idempotencyKey: "c1" })).outcome).toBe("not_releasable");
     expect(release).not.toHaveBeenCalled();
   });
 
-  it("T3 · a schedule Stripe no longer has is already effective, not an outage", async () => {
+  it("resource_missing (Stripe no longer has the schedule) is not releasable, not an outage", async () => {
     const gone = new Stripe.errors.StripeInvalidRequestError({ type: "invalid_request_error", code: "resource_missing", message: "x" } as never);
     const client = { subscriptionSchedules: { retrieve: () => Promise.reject(gone), release: vi.fn() } };
-    expect(await gatewayWith(client).releasePlanDowngrade({ scheduleId: "sub_sched_1", idempotencyKey: "c1" })).toEqual({ outcome: "already_effective" });
+    expect(await gatewayWith(client).releasePlanDowngrade({ scheduleId: "sub_sched_1", idempotencyKey: "c1" })).toEqual({ outcome: "not_releasable" });
+  });
+});
+
+describe("STORY-184 · releaseFinishedSchedule", () => {
+  const phases = [{ start_date: 100, end_date: 200, metadata: { plan_key: "growth" } }, { start_date: 200, end_date: 300, metadata: { plan_key: "starter", plan_change_intent_id: "i1" } }];
+  const finished = (over: Record<string, unknown> = {}) => ({ id: "sub_sched_1", status: "active", end_behavior: "release", phases, current_phase: { start_date: 200, end_date: 300 }, ...over });
+  const stubs = (schedule: unknown, attached: string | null = "sub_sched_1") => {
+    const release = vi.fn(() => Promise.resolve({}));
+    return { release, client: { subscriptions: { retrieve: () => Promise.resolve({ schedule: attached, metadata: { plan_key: "starter" } }) }, subscriptionSchedules: { retrieve: () => Promise.resolve(schedule), release } } };
+  };
+  const call = (client: unknown, expectedPlanKey: string | undefined = "starter") => gatewayWith(client).releaseFinishedSchedule({ subscriptionId: "sub_1", expectedPlanKey, idempotencyKey: "k1" });
+
+  it("a downgrade that took effect (last phase, release at the end, our metadata) is released", async () => {
+    const { client, release } = stubs(finished());
+    expect(await call(client)).toEqual({ released: true });
+    expect(release).toHaveBeenCalledWith("sub_sched_1", {}, { idempotencyKey: "k1" });
+  });
+
+  it.each([
+    ["a schedule still in its FIRST phase (a downgrade not yet taken)", finished({ current_phase: { start_date: 100, end_date: 200 } })],
+    ["a schedule that ends by CANCELLING the subscription (releasing it would drop the cancellation)", finished({ end_behavior: "cancel" })],
+    ["a schedule that is not active", finished({ status: "completed" })],
+    ["a last phase whose metadata is not ours", finished({ phases: [phases[0], { start_date: 200, end_date: 300, metadata: { team: "billing" } }] })],
+  ])("%s is left alone", async (_label, schedule) => {
+    const { client, release } = stubs(schedule);
+    expect(await call(client)).toEqual({ released: false });
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  it("a last phase naming the subscription's current plan counts as ours even without an intent id (the add-on removal's phases)", async () => {
+    const { client } = stubs(finished({ phases: [phases[0], { start_date: 200, end_date: 300, metadata: { plan_key: "starter" } }] }));
+    expect(await call(client)).toEqual({ released: true });
+  });
+
+  it("no schedule attached: nothing to release", async () => {
+    const { client, release } = stubs(finished(), null);
+    expect(await call(client)).toEqual({ released: false });
+    expect(release).not.toHaveBeenCalled();
+  });
+});
+
+describe("STORY-184 · after the cut-over the CURRENT phase is rewritten, not phases[0]", () => {
+  const schedule = {
+    id: "sub_sched_1",
+    status: "active",
+    phases: [
+      { items: [{ price: "price_old_plan", quantity: 1 }], start_date: 100, end_date: 200, metadata: {} },
+      { items: [{ price: "price_plan", quantity: 1 }, { price: "price_proj", quantity: 2 }], start_date: 200, end_date: 300, metadata: { plan_key: "starter", plan_change_intent_id: "i1" } },
+    ],
+    current_phase: { start_date: 200, end_date: 300 },
+  };
+  it("an add-on removal after the cut-over: the current phase (phase 2) is phase 0 of the rewrite, the removal is the next", async () => {
+    const update = vi.fn(() => Promise.resolve({}));
+    const client = {
+      subscriptions: { retrieve: () => Promise.resolve({ schedule: "sub_sched_1", metadata: { workspace_id: "ws-1", plan_key: "starter" }, items: { data: [{ id: "si_plan", price: { id: "price_plan", recurring: { interval: "month" } } }, { id: "si_proj", price: { id: "price_proj", recurring: { interval: "month" } } }] } }) },
+      // a schedule that is NOT finished for this purpose: end_behavior absent -> reused
+      subscriptionSchedules: { retrieve: () => Promise.resolve(schedule), update },
+    };
+    await gatewayWith(client).scheduleAddonRemoval({ subscriptionId: "sub_1", itemId: "si_proj", idempotencyKey: "r1" });
+    const body = (update.mock.calls[0] as unknown as [string, { phases: Array<{ items: unknown[]; start_date?: number }> }])[1];
+    expect(body.phases[0]).toMatchObject({ items: [{ price: "price_plan", quantity: 1 }, { price: "price_proj", quantity: 2 }], start_date: 200, end_date: 300 });
+    expect(body.phases[1]!.items).toEqual([{ price: "price_plan", quantity: 1 }]);
+  });
+
+  it("a finished schedule found when scheduling is released and replaced by a new one from the subscription", async () => {
+    const update = vi.fn(() => Promise.resolve({}));
+    const release = vi.fn(() => Promise.resolve({}));
+    const create = vi.fn(() => Promise.resolve({ id: "sub_sched_2" }));
+    const finishedSchedule = { ...schedule, end_behavior: "release" };
+    const fresh = { id: "sub_sched_2", phases: [{ items: [{ price: "price_plan", quantity: 1 }], start_date: 200, end_date: 300 }] };
+    const client = {
+      products: { create: vi.fn(() => Promise.resolve({})) },
+      subscriptions: { retrieve: () => Promise.resolve({ schedule: "sub_sched_1", metadata: { workspace_id: "ws-1", plan_key: "starter" } }) },
+      subscriptionSchedules: { retrieve: (id: string) => Promise.resolve(id === "sub_sched_1" ? finishedSchedule : fresh), release, create, update },
+    };
+    const result = await gatewayWith(client).schedulePlanDowngrade({ subscriptionId: "sub_1", target: starter, keepAddons: [], metadata: META, idempotencyKey: "k" });
+    expect(result).toEqual({ scheduleId: "sub_sched_2" });
+    expect(release).toHaveBeenCalledWith("sub_sched_1", {}, expect.anything());
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledWith("sub_sched_2", expect.anything(), expect.anything());
+  });
+});
+
+describe("STORY-184 · the plan product", () => {
+  const args = { subscriptionId: "sub_1", planItemId: "si_plan", target: growth, prorationDate: 1, metadata: META, idempotencyKey: "k" };
+  const exists = () => new Stripe.errors.StripeInvalidRequestError({ type: "invalid_request_error", code: "resource_already_exists", message: "x" } as never);
+
+  it("is written ONCE per process, not on every call", async () => {
+    const create = vi.fn(() => Promise.resolve({}));
+    const gateway = gatewayWith({ subscriptions: { update: vi.fn(() => Promise.resolve({})) }, products: { create } });
+    await gateway.applyPlanUpgrade(args);
+    await gateway.applyPlanUpgrade({ ...args, idempotencyKey: "k2" });
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("an existing product is accepted only if it is marked nominara_kind=plan; otherwise fail closed", async () => {
+    const good = gatewayWith({ subscriptions: { update: vi.fn(() => Promise.resolve({})) }, products: { create: () => Promise.reject(exists()), retrieve: () => Promise.resolve({ metadata: { nominara_kind: "plan" } }) } });
+    await expect(good.applyPlanUpgrade(args)).resolves.toEqual({ outcome: "applied" });
+    const update = vi.fn();
+    for (const metadata of [{}, { nominara_kind: "extra_seat" }]) {
+      const bad = gatewayWith({ subscriptions: { update }, products: { create: () => Promise.reject(exists()), retrieve: () => Promise.resolve({ metadata }) } });
+      await expect(bad.applyPlanUpgrade(args)).rejects.toBeInstanceOf(StripeUpstreamError);
+    }
+    expect(update, "nothing was priced against a product that is not ours").not.toHaveBeenCalled();
+  });
+
+  it("a failed verification is not cached as verified", async () => {
+    const retrieve = vi.fn().mockResolvedValueOnce({ metadata: {} }).mockResolvedValueOnce({ metadata: { nominara_kind: "plan" } });
+    const gateway = gatewayWith({ subscriptions: { update: vi.fn(() => Promise.resolve({})) }, products: { create: () => Promise.reject(exists()), retrieve } });
+    await expect(gateway.applyPlanUpgrade(args)).rejects.toBeInstanceOf(StripeUpstreamError);
+    await expect(gateway.applyPlanUpgrade({ ...args, idempotencyKey: "k2" })).resolves.toEqual({ outcome: "applied" });
   });
 });
 

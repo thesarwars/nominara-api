@@ -859,7 +859,7 @@ describe("STORY-075a · subscriptions", () => {
     });
   });
 
-  it("AUDIT MAJOR · a frozen charge belongs to the plan it was frozen for: the same subscription re-labelled a dearer plan at the same price is refused", async () => {
+  it("AUDIT MAJOR · a re-label of a tracked subscription to a dearer plan at the same price is refused (since STORY-184 by the tracked-subscription intent gate, before the frozen-charge comparison is ever reached)", async () => {
     const { workspaceId } = await newWorkspace();
     await deliver(eventBody("evt_r1", "customer.subscription.created", stripeSubscription(workspaceId, { id: "sub_r", plan: "growth" })));
     const tracked = await row(workspaceId);

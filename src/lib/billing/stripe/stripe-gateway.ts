@@ -173,6 +173,13 @@ export interface PlanDowngradeReleaseInput {
   readonly scheduleId: string;
   readonly idempotencyKey: string;
 }
+/** STORY-184 - release a schedule that has nothing left to do (a downgrade that took effect), so it stops blocking later changes. */
+export interface FinishedScheduleInput {
+  readonly subscriptionId: string;
+  /** The plan the subscription is on NOW (its fresh metadata): a last phase naming it is ours. */
+  readonly expectedPlanKey: string | undefined;
+  readonly idempotencyKey: string;
+}
 
 /** NEW-D-7 — a card the customer agreed to have reused off-session (a Checkout with `setup_future_usage`). */
 export interface SavedPaymentMethod {
@@ -320,8 +327,21 @@ export interface StripeGateway {
   /** STORY-184 — schedules the downgrade for the period end (metadata on both phases). Returns the schedule id. Throws `StripeUpstreamError`. */
   schedulePlanDowngrade(input: PlanDowngradeInput): Promise<{ readonly scheduleId: string }>;
 
-  /** STORY-184 — releases a scheduled downgrade; `already_effective` when it has taken effect (or Stripe no longer has it). Throws `StripeUpstreamError`. */
-  releasePlanDowngrade(input: PlanDowngradeReleaseInput): Promise<{ readonly outcome: "released" | "already_effective" }>;
+  /**
+   * STORY-184 — tries to release a scheduled downgrade. `released`: the release was made. `not_releasable`: the schedule is
+   * gone, was already released or cancelled (a Dashboard release, or a lost reply of THIS call), completed, or is already
+   * running its second phase. The gateway does NOT say whether the downgrade took effect: the caller reads that from the
+   * SUBSCRIPTION (its metadata names the intent), because a schedule's status cannot tell "cancelled" from "ran".
+   * Throws `StripeUpstreamError`.
+   */
+  releasePlanDowngrade(input: PlanDowngradeReleaseInput): Promise<{ readonly outcome: "released" | "not_releasable" }>;
+
+  /**
+   * STORY-184 - releases the subscription's schedule iff it has nothing left to do (see `isFinishedSchedule`); the
+   * subscription itself does not change. `released: false` when there is no schedule or it is not finished.
+   * Throws `StripeUpstreamError`.
+   */
+  releaseFinishedSchedule(input: FinishedScheduleInput): Promise<{ readonly released: boolean }>;
 
   /** `null` when Stripe has no such object (deleted, or a test-mode id at a live endpoint). */
   fetchObject(kind: StripeObjectKind, objectId: string): Promise<FetchedStripeObject | null>;

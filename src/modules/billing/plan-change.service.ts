@@ -18,7 +18,7 @@ import { readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
 import { proRataTopUp, utcMidnight } from "../../lib/billing/plan-grant.js";
 import { isDefiniteRejection } from "../../lib/billing/stripe/definite-rejection.js";
 import { centsToDecimal } from "../../lib/billing/stripe/invoice-state.js";
-import { addonLinesOf, planItemsOf, type PlanItem } from "../../lib/billing/stripe/plan-item.js";
+import { addonLinesOf, periodStartOf, planItemsOf, type PlanItem } from "../../lib/billing/stripe/plan-item.js";
 import { STRIPE_GATEWAY, StripeUpstreamError, type PlanPrice, type StripeGateway } from "../../lib/billing/stripe/stripe-gateway.js";
 import { toCents } from "../../lib/billing/stripe/subscription-state.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
@@ -63,6 +63,8 @@ const QUOTE_MAX_AGE_SECONDS = 30 * 60;
 const QUOTE_MAX_FUTURE_SECONDS = 60;
 /** An unsettled intent younger than this may still be in flight in a request that died; it blocks a DIFFERENT change. */
 const UNSETTLED_INTENT_RECENT_MS = 10 * 60 * 1000;
+/** Stripe forgets an idempotency key after this long: an unsettled intent older than it can no longer be replayed. */
+const INTENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 interface SubscriptionRow {
   plan_key: string;
@@ -98,6 +100,8 @@ interface Context {
   readonly sub: SubscriptionRow;
   readonly target: TargetRow;
   readonly direction: Direction;
+  /** The request names the plan the workspace is already on (only ever allowed through, for a retry whose change has already been applied). */
+  readonly sameAsCurrent: boolean;
 }
 
 interface Fresh {
@@ -106,6 +110,8 @@ interface Fresh {
   readonly planItem: PlanItem;
   readonly interval: "month" | "year";
   readonly billingInterval: "monthly" | "annual";
+  /** When Stripe says the current period began (unix seconds), or null; the local row lags the webhook. */
+  readonly periodStart: number | null;
 }
 
 @Injectable()
@@ -127,7 +133,17 @@ export class PlanChangeService {
       // Free is described, not refused: the confirmation can still say what a cancellation would cost (the change route points at the portal).
       if (!toFree) this.refuseByState(ctx);
       const fresh = await this.fetchFresh(ctx);
-      if (!toFree) this.refuseScheduled(ctx, fresh);
+      if (!toFree) {
+        // The pending change is reported before a schedule is (a pending downgrade OWNS the schedule): plan_change_pending, not change_scheduled.
+        const pending = readPendingPlanChange(sub.pending_plan_change);
+        if (pending.kind === "malformed") throw this.malformed(workspaceId, direction);
+        // A change of UNKNOWN outcome (an upgrade whose reply was lost) does not block a re-preview: the customer needs one to retry.
+        if (pending.kind === "intent" && (pending.intent.settled_at !== undefined || pending.intent.direction === "downgrade")) {
+          this.refused(direction, "plan_change_pending");
+          throw new ConflictError({ message: "a plan change is already pending on this subscription: cancel it or wait for it to be confirmed", details: { reason: "plan_change_pending" } });
+        }
+        await this.refuseScheduled(ctx, fresh);
+      }
 
       const topUp = direction === "upgrade" ? await this.estimateTopUp(client, workspaceId, sub, target) : 0;
       const creditEstimate = { basis: "estimate" as const, top_up_now: topUp, grant_at_next_cycle: target.credits_per_cycle };
@@ -136,7 +152,7 @@ export class PlanChangeService {
       if (direction === "upgrade") {
         const prorationDate = Math.floor(Date.now() / 1000);
         const quoted = await this.quote(ctx, fresh, prorationDate);
-        incrementCounter("nominara_billing_plan_change_total", { direction, outcome: "previewed" });
+        this.outcome(direction, "previewed");
         return {
           direction,
           current_plan_key: sub.plan_key,
@@ -155,7 +171,7 @@ export class PlanChangeService {
       }
 
       const excess = await this.excessFor(ctx);
-      incrementCounter("nominara_billing_plan_change_total", { direction, outcome: "previewed" });
+      this.outcome(direction, "previewed");
       return {
         direction,
         current_plan_key: sub.plan_key,
@@ -179,7 +195,7 @@ export class PlanChangeService {
   async change(request: PlanChangeRequest): Promise<PlanChangeResponse> {
     return await this.traced("billing.plan_change.change", async () => {
       const { client, workspaceId } = this.tenant();
-      const ctx = await this.context(client, workspaceId, request.plan_key);
+      const ctx = await this.context(client, workspaceId, request.plan_key, true);
       const { target, direction } = ctx;
 
       // A move to Free is a cancellation at period end, done in the portal; it is never blocked by usage (owner decision).
@@ -197,17 +213,42 @@ export class PlanChangeService {
 
       await this.lockWorkspace(client, workspaceId, direction);
       // Re-read under the lock: a concurrent change has recorded its intent by now.
-      const locked = await this.context(client, workspaceId, request.plan_key);
-      this.refuseByState(locked);
+      const locked = await this.context(client, workspaceId, request.plan_key, true);
+      if (!locked.sameAsCurrent) this.refuseByState(locked);
       const fresh = await this.fetchFresh(locked);
+      if (locked.sameAsCurrent) return this.alreadyApplied(locked, fresh, request);
 
       const replay = await this.existingIntent(locked, fresh, request);
       // A REPLAY is the same change retried after a lost reply: its own schedule (a downgrade's) is already on the
       // subscription, and that must not read as "someone else's change is scheduled".
-      if (replay === null) this.refuseScheduled(locked, fresh);
+      if (replay === null) await this.refuseScheduled(locked, fresh);
       if (direction === "upgrade") return await this.upgrade(locked, fresh, request.quote!, replay);
       return await this.downgrade(locked, fresh, replay);
     });
+  }
+
+  /**
+   * The request names the plan the workspace is on NOW. Normally that is a 400 (nothing to change). The exception is a RETRY
+   * of an upgrade whose reply was lost AFTER the webhook adopted it: the intent is spent, so "same plan" is the whole trace.
+   * Stripe's own subscription still carries the change's intent id and names the plan, and the quote is one this period could
+   * have issued: then it is answered like the original, without any call. A customer who is simply on that plan and resends a
+   * quote from this period gets the same harmless no-op.
+   */
+  private alreadyApplied(ctx: Context, fresh: Fresh, request: PlanChangeRequest): PlanChangeResponse {
+    const quote = request.quote;
+    const periodStart = fresh.periodStart ?? Math.floor(ctx.sub.current_period_start.getTime() / 1000);
+    if (
+      quote !== undefined &&
+      fresh.metadata.plan_change_intent_id !== undefined &&
+      fresh.metadata.plan_key === ctx.target.key &&
+      quote.proration_date >= periodStart &&
+      quote.proration_date >= Math.floor(Date.now() / 1000) - INTENT_RETENTION_MS / 1000
+    ) {
+      this.outcome("upgrade", "replayed_adopted");
+      return { status: "pending", direction: "upgrade", target_plan_key: ctx.target.key, effective: "immediate", effective_at: null };
+    }
+    this.refused("upgrade", "already_on_plan");
+    throw new ValidationFailedError({ message: "the workspace is already on this plan", details: { issues: [{ path: ["plan_key"], message: "already on this plan" }] } });
   }
 
   /** `DELETE /v1/billing/subscription/change` — cancels a scheduled downgrade. */
@@ -220,33 +261,39 @@ export class PlanChangeService {
       const read = readPendingPlanChange(sub.pending_plan_change);
       if (read.kind === "malformed") throw this.malformed(workspaceId, "downgrade");
       if (read.kind === "none") {
-        incrementCounter("nominara_billing_plan_change_total", { direction: "downgrade", outcome: "cancel_not_pending" });
+        this.outcome("downgrade", "cancel_not_pending");
         throw new ConflictError({ message: "no plan change is pending", details: { reason: "plan_change_not_pending" } });
       }
       const intent = read.intent;
       if (intent.direction !== "downgrade") {
         // An upgrade is charged and applied by Stripe at once; there is nothing to cancel, only a webhook to wait for.
-        incrementCounter("nominara_billing_plan_change_total", { direction: "upgrade", outcome: "cancel_refused_upgrade" });
+        this.outcome("upgrade", "cancel_refused_upgrade");
         throw new ConflictError({ message: "the upgrade has already been charged and cannot be cancelled: it applies as soon as Stripe confirms it", details: { reason: "plan_change_pending" } });
       }
 
       try {
         const fetched = await this.gateway.fetchObject("subscription", sub.stripe_subscription_id);
         if (fetched === null) throw new PreconditionUnmetError({ message: "the payment provider has no such subscription" });
+        // ⚠ "EFFECTIVE" IS READ FROM THE SUBSCRIPTION, never from the schedule. A schedule that is released, canceled or
+        // missing says nothing about whether the downgrade RAN (a Dashboard release, or the lost reply of our own release,
+        // look the same as a completed one). The subscription does: once phase 1 has started its metadata is phase 1's,
+        // naming this intent and the target plan. Effective -> keep the intent (the webhook adopts it) and say so.
+        const effective = (candidate: { readonly metadata: Readonly<Record<string, string>> }): boolean =>
+          candidate.metadata.plan_change_intent_id === intent.id && candidate.metadata.plan_key === intent.to_plan_key;
+        if (effective(fetched)) throw this.alreadyEffective();
+
         const rawSchedule = (fetched.raw as { schedule?: unknown }).schedule;
         const scheduleId = intent.schedule_id ?? (typeof rawSchedule === "string" ? rawSchedule : isRecordWithId(rawSchedule) ? rawSchedule.id : null);
-
-        if (scheduleId === null) {
-          // No schedule: either the downgrade never reached Stripe (clear the intent) or it already ran (the subscription carries it).
-          if (fetched.metadata.plan_change_intent_id === intent.id && fetched.metadata.plan_key === intent.to_plan_key) {
-            throw this.alreadyEffective();
-          }
-        } else {
-          const released = await this.gateway.releasePlanDowngrade({ scheduleId, idempotencyKey: `plan-change-cancel-${intent.id}` });
-          if (released.outcome === "already_effective") throw this.alreadyEffective();
+        if (scheduleId !== null) {
+          await this.gateway.releasePlanDowngrade({ scheduleId, idempotencyKey: `plan-change-cancel-${intent.id}` });
+          // The boundary race: Stripe may have started phase 1 between our read and the release. Read the subscription AGAIN
+          // and apply the same rule; a released or missing schedule on a subscription that does not carry the intent is a
+          // successful cancel.
+          const after = await this.gateway.fetchObject("subscription", sub.stripe_subscription_id);
+          if (after !== null && effective(after)) throw this.alreadyEffective();
         }
         await this.clearIntent(workspaceId, intent.id);
-        incrementCounter("nominara_billing_plan_change_total", { direction: "downgrade", outcome: "cancelled" });
+        this.outcome("downgrade", "cancelled");
         this.logger.log({ message: "scheduled downgrade cancelled", workspace_id: workspaceId, to_plan_key: intent.to_plan_key });
         return { status: "cancelled", target_plan_key: intent.to_plan_key };
       } catch (error) {
@@ -266,7 +313,8 @@ export class PlanChangeService {
       intent = replay;
     } else {
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const periodStart = Math.floor(sub.current_period_start.getTime() / 1000);
+      // The period start is STRIPE'S (fresh): a renewal the webhook has not applied yet would leave the local row a period behind.
+      const periodStart = fresh.periodStart ?? Math.floor(sub.current_period_start.getTime() / 1000);
       // ⚠ THE PRORATION INSTANT IS THE SERVER'S TO BOUND. Stripe prices the credit for the unused time and the charge for
       // the new plan from this instant, while the wallet is topped up pro rata from "now": an instant near the period end
       // would make the upgrade almost free and the top-up whole.
@@ -311,7 +359,7 @@ export class PlanChangeService {
       if (result.outcome === "payment_failed") {
         // Stripe applied NOTHING: the intent goes, so the webhook cannot mistake a later event for this change.
         await this.clearIntent(workspaceId, intent.id);
-        incrementCounter("nominara_billing_plan_change_total", { direction: "upgrade", outcome: "payment_failed" });
+        this.outcome("upgrade", "payment_failed");
         this.logger.warn({ message: "plan upgrade payment failed; nothing changed", workspace_id: workspaceId, to_plan_key: target.key });
         throw new PreconditionUnmetError({
           message: "the payment for this upgrade did not go through (the card was declined or needs authentication); your plan has not changed",
@@ -319,7 +367,7 @@ export class PlanChangeService {
         });
       }
       await this.settleIntent(workspaceId, { ...intent, settled_at: new Date().toISOString() });
-      incrementCounter("nominara_billing_plan_change_total", { direction: "upgrade", outcome: "requested" });
+      this.outcome("upgrade", "requested");
       this.logger.log({ message: "plan upgrade requested", workspace_id: workspaceId, from_plan_key: sub.plan_key, to_plan_key: target.key });
       return { status: "pending", direction: "upgrade", target_plan_key: target.key, effective: "immediate", effective_at: null };
     } catch (error) {
@@ -336,7 +384,7 @@ export class PlanChangeService {
       // ⚠ REFUSED UNTIL USAGE IS REDUCED (owner decision 2026-10-16, Q3 = refuse), before any Stripe call and any write.
       const excess = await this.excessFor(ctx);
       if (excess.blocking.length > 0) {
-        incrementCounter("nominara_billing_plan_change_total", { direction: "downgrade", outcome: "exceeds_limits" });
+        this.outcome("downgrade", "exceeds_limits");
         this.logger.warn({ message: "plan downgrade refused: usage exceeds the target plan's limits", workspace_id: workspaceId, to_plan_key: target.key, excess_entries: excess.blocking.length });
         throw new ConflictError({
           message: `usage is above ${target.display_name}'s limits: reduce it first (${excess.blocking.length} limit${excess.blocking.length === 1 ? "" : "s"} exceeded)`,
@@ -387,7 +435,7 @@ export class PlanChangeService {
         idempotencyKey: intent.stripe_idempotency_key,
       });
       await this.settleIntent(workspaceId, { ...intent, schedule_id: scheduled.scheduleId, settled_at: new Date().toISOString() });
-      incrementCounter("nominara_billing_plan_change_total", { direction: "downgrade", outcome: "requested" });
+      this.outcome("downgrade", "requested");
       this.logger.log({ message: "plan downgrade scheduled for the period end", workspace_id: workspaceId, from_plan_key: sub.plan_key, to_plan_key: target.key });
       return { status: "pending", direction: "downgrade", target_plan_key: target.key, effective: "period_end", effective_at: intent.effective_at };
     } catch (error) {
@@ -399,7 +447,7 @@ export class PlanChangeService {
   // ---- shared -------------------------------------------------------------------------------------------------
 
   /** Loads the plans and the live subscription, and refuses what no state can change: an unknown, contract-priced or current target. */
-  private async context(client: ClientBase, workspaceId: string, planKey: string): Promise<Context> {
+  private async context(client: ClientBase, workspaceId: string, planKey: string, allowCurrent = false): Promise<Context> {
     this.requireConfigured();
     const targetRows = await client.query<TargetRow>(
       "SELECT key, display_name, monthly_price, annual_price, currency, credits_per_cycle, sort_order, entitlements FROM plans WHERE key = $1",
@@ -414,10 +462,10 @@ export class PlanChangeService {
       throw new ValidationFailedError({ message: "this plan cannot be selected here", details: { issues: [{ path: ["plan_key"], message: "contract-priced: contact sales" }] } });
     }
     const sub = await this.subscriptionRow(client, workspaceId);
-    if (target.key === sub.plan_key) {
+    if (target.key === sub.plan_key && !allowCurrent) {
       throw new ValidationFailedError({ message: "the workspace is already on this plan", details: { issues: [{ path: ["plan_key"], message: "already on this plan" }] } });
     }
-    return { client, workspaceId, sub, target, direction: target.sort_order > sub.current_sort_order ? "upgrade" : "downgrade" };
+    return { client, workspaceId, sub, target, direction: target.sort_order >= sub.current_sort_order ? "upgrade" : "downgrade", sameAsCurrent: target.key === sub.plan_key };
   }
 
   private async subscriptionRow(client: ClientBase, workspaceId: string): Promise<SubscriptionRow> {
@@ -449,12 +497,29 @@ export class PlanChangeService {
     }
   }
 
-  private refuseScheduled(ctx: Context, fresh: Fresh): void {
+  /**
+   * A schedule on the subscription blocks a change, EXCEPT one with nothing left to do: a downgrade that took effect stays
+   * attached for the whole of its last phase (a billing cycle), and refusing every change for a cycle after a customer's own
+   * downgrade would be a lockout. Such a schedule is released first (the subscription does not change), then the change goes on.
+   */
+  private async refuseScheduled(ctx: Context, fresh: Fresh): Promise<void> {
     const schedule = (fresh.raw as { schedule?: unknown }).schedule;
-    if (schedule !== null && schedule !== undefined) {
-      this.refused(ctx.direction, "change_scheduled");
-      throw new ConflictError({ message: "a change is already scheduled on this subscription (an add-on removal): wait until it has taken effect", details: { reason: "change_scheduled" } });
+    if (schedule === null || schedule === undefined) return;
+    try {
+      const finished = await this.gateway.releaseFinishedSchedule({
+        subscriptionId: ctx.sub.stripe_subscription_id,
+        expectedPlanKey: fresh.metadata.plan_key,
+        idempotencyKey: `finished-schedule-${typeof schedule === "string" ? schedule : isRecordWithId(schedule) ? schedule.id : ctx.sub.stripe_subscription_id}`,
+      });
+      if (finished.released) {
+        this.outcome(ctx.direction, "finished_schedule_released");
+        return;
+      }
+    } catch (error) {
+      throw this.upstream(error, ctx.direction);
     }
+    this.refused(ctx.direction, "change_scheduled");
+    throw new ConflictError({ message: "a change is already scheduled on this subscription (an add-on removal or a plan change): wait until it has taken effect", details: { reason: "change_scheduled" } });
   }
 
   /** A FRESH fetch: the local row lags the webhook, and only Stripe can show the plan line, the add-on lines and a schedule. */
@@ -468,7 +533,8 @@ export class PlanChangeService {
         throw new PreconditionUnmetError({ message: "the payment provider's subscription does not belong to this workspace" });
       }
       const status = (fetched.raw as { status?: unknown }).status;
-      if (status === "past_due") {
+      // A Free target is DESCRIBED, not refused (the change route points at the portal): no state refusal applies to it, local or fresh.
+      if (status === "past_due" && ctx.target.key !== "free") {
         this.refused(ctx.direction, "subscription_past_due");
         throw new ConflictError({ message: "the subscription has an unpaid invoice: pay it before changing plan", details: { reason: "subscription_past_due" } });
       }
@@ -479,13 +545,13 @@ export class PlanChangeService {
       const planItems = planItemsOf(fetched.raw);
       if (planItems.length !== 1) {
         // Two plan lines make "the" plan item ambiguous: an update to one leaves the customer billed for the other.
-        incrementCounter("nominara_billing_plan_change_total", { direction: ctx.direction, outcome: "plan_lines_ambiguous" });
+        this.outcome(ctx.direction, "plan_lines_ambiguous");
         this.logger.error({ message: "MONEY ALARM: stripe holds an unexpected number of plan lines; plan change refused", workspace_id: ctx.workspaceId, plan_lines: planItems.length });
         throw new ConflictError({ message: "this subscription cannot be changed in the app: contact support" });
       }
       const planItem = planItems[0]!;
       if (planItem.interval === null) throw new PreconditionUnmetError({ message: "the subscription's billing interval is not recognised" });
-      return { raw: fetched.raw, metadata: fetched.metadata, planItem, interval: planItem.interval, billingInterval: planItem.interval === "year" ? "annual" : "monthly" };
+      return { raw: fetched.raw, metadata: fetched.metadata, planItem, interval: planItem.interval, billingInterval: planItem.interval === "year" ? "annual" : "monthly", periodStart: periodStartOf(fetched.raw) };
     } catch (error) {
       throw this.upstream(error, ctx.direction);
     }
@@ -567,18 +633,22 @@ export class PlanChangeService {
       intent.to_plan_key === ctx.target.key &&
       intent.direction === ctx.direction &&
       (ctx.direction === "downgrade" || intent.proration_date === request.quote?.proration_date);
-    if (intent.settled_at === undefined && sameChange) return intent;
-
-    // An unsettled intent for something else: young, it may still be in flight in a request that died (refuse); old, Stripe
-    // either applied it (its id is on the subscription's metadata: the webhook will adopt it) or never saw it (release it).
-    // A downgrade is different: it may have left a SCHEDULE on the subscription whose phase metadata is not on the
-    // subscription yet, so "my id is not on the metadata" does not prove Stripe never saw it. While the subscription holds
-    // a schedule the intent is kept (the customer sees the pending downgrade and can cancel it, which releases the schedule).
+    const age = Date.now() - Date.parse(intent.created_at);
     const schedule = (fresh.raw as { schedule?: unknown }).schedule;
     const holdsSchedule = schedule !== null && schedule !== undefined;
+    // A same-change retry replays the stored call - but only while Stripe still REMEMBERS its idempotency key. Older than
+    // that, the replay would be a brand-new call carrying an old quote.
+    if (intent.settled_at === undefined && sameChange && age < INTENT_RETENTION_MS) return intent;
+
+    // An unsettled intent for something else (or too old to replay): young, it may still be in flight in a request that died
+    // (refuse); old, Stripe either applied it (its id is on the subscription's metadata: the webhook will adopt it) or never
+    // saw it (release it, and let the request be validated as a new one). A downgrade is different: it may have left a
+    // SCHEDULE whose phase metadata is not on the subscription yet, so "my id is not on the metadata" does not prove Stripe
+    // never saw it. While the subscription holds a schedule the intent is kept (the customer sees the pending downgrade and
+    // can cancel it, which releases the schedule).
     if (
       intent.settled_at === undefined &&
-      Date.now() - Date.parse(intent.created_at) >= UNSETTLED_INTENT_RECENT_MS &&
+      age >= UNSETTLED_INTENT_RECENT_MS &&
       fresh.metadata.plan_change_intent_id !== intent.id &&
       !(intent.direction === "downgrade" && holdsSchedule)
     ) {
@@ -648,45 +718,58 @@ export class PlanChangeService {
   // ---- errors, metrics, plumbing -------------------------------------------------------------------------------
 
   private quoteChanged(why: "stale" | "amount_differs"): DomainError {
-    incrementCounter("nominara_billing_plan_change_total", { direction: "upgrade", outcome: "quote_changed" });
-    this.logger.warn({ message: "plan upgrade refused: the quote no longer holds", why });
+    this.outcome("upgrade", "quote_changed");
+    this.logger.warn({ message: "plan upgrade refused: the quote no longer holds", workspace_id: this.workspaceIdOrNull(), why });
     return new ConflictError({ message: "the price of this change has moved since you looked: review the new amount and confirm again", details: { reason: "quote_changed" } });
   }
 
   private alreadyEffective(): DomainError {
-    incrementCounter("nominara_billing_plan_change_total", { direction: "downgrade", outcome: "cancel_already_effective" });
+    this.outcome("downgrade", "cancel_already_effective");
     return new ConflictError({ message: "the downgrade has already taken effect and cannot be cancelled", details: { reason: "downgrade_already_effective" } });
   }
 
   private malformed(workspaceId: string, direction: Direction): DomainError {
-    incrementCounter("nominara_billing_plan_change_total", { direction, outcome: "intent_malformed" });
+    this.outcome(direction, "intent_malformed");
     this.logger.error({ message: "pending_plan_change does not parse; plan change refused", workspace_id: workspaceId });
     return new ConflictError({ message: "a plan change is in an unknown state: contact support", details: { reason: "plan_change_pending" } });
   }
 
   private refused(direction: Direction, outcome: string): void {
+    this.outcome(direction, outcome);
+  }
+
+  /**
+   * EVERY outcome is one metric increment AND one log line carrying the workspace ID (never its name, never Stripe text),
+   * through this one door, so no outcome can be counted without being logged or the other way round.
+   */
+  private outcome(direction: string, outcome: string): void {
     incrementCounter("nominara_billing_plan_change_total", { direction, outcome });
+    this.logger.log({ message: "plan change outcome", workspace_id: this.workspaceIdOrNull(), direction, outcome });
+  }
+
+  private workspaceIdOrNull(): string | null {
+    return currentTenantStore()?.context.workspaceId ?? null;
   }
 
   private async lockWorkspace(client: ClientBase, workspaceId: string, direction: Direction): Promise<void> {
     await lockWorkspaceBounded(client, workspaceId, () => {
-      incrementCounter("nominara_billing_plan_change_total", { direction, outcome: "lock_wait_exceeded" });
+      this.outcome(direction, "lock_wait_exceeded");
       return new ConflictError({ message: "another billing change for this workspace is in progress: retry shortly" });
     });
   }
 
   private requireConfigured(): void {
     if (!this.gateway.isConfigured()) {
-      incrementCounter("nominara_billing_plan_change_total", { direction: "unknown", outcome: "not_configured" });
+      this.outcome("unknown", "not_configured");
       throw new DegradedError({ message: "payment provider is not configured" });
     }
   }
 
   private upstream(error: unknown, direction: Direction): unknown {
     if (!(error instanceof StripeUpstreamError)) return error;
-    incrementCounter("nominara_billing_plan_change_total", { direction, outcome: "upstream_error" });
+    this.outcome(direction, "upstream_error");
     // Status code only: Stripe's own text can echo request details.
-    this.logger.error({ message: "stripe plan change failed", status: error.statusCode });
+    this.logger.error({ message: "stripe plan change failed", workspace_id: this.workspaceIdOrNull(), status: error.statusCode });
     return new DegradedError({ message: "payment provider is unavailable" });
   }
 

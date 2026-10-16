@@ -319,6 +319,110 @@ describe("STORY-184 · in-app plan change", () => {
     expect(await f.intentOf(workspaceId)).toBeNull();
   });
 
+  it("MAJOR · a full cycle after a downgrade took effect the schedule is still attached: an UPGRADE is not locked out (the finished schedule is released first)", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
+    const intent = (await f.intentOf(workspaceId))!;
+    cutOver(workspaceId, "starter", String(intent.id));
+    expect((await f.reconcile(workspaceId)).statusCode).toBe(200);
+    expect((await f.planOf(workspaceId)).plan_key).toBe("starter");
+    expect(await f.intentOf(workspaceId)).toBeNull();
+    gateway.finishedScheduleIds.add("sub_sched_1");
+
+    const owner2 = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    const res = await upgrade(owner2, "growth");
+    expect(res.statusCode, res.body).toBe(202);
+    expect(gateway.finishedReleases).toHaveLength(1);
+    expect(gateway.upgrades).toHaveLength(1);
+  });
+
+  it("MAJOR · and while a schedule is NOT finished (an add-on removal still to come) the same upgrade is still change_scheduled", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("starter");
+    f.stripeSubscription(workspaceId, { plan: "starter", schedule: "sub_sched_addon" });
+    const res = await f.post(owner, CHANGE, { plan_key: "growth", quote: { proration_date: f.nowSeconds(), amount_due_now: "38.50", currency: "USD" } });
+    expect(res.statusCode).toBe(409);
+    expect(errorOf(res).details).toMatchObject({ reason: "change_scheduled" });
+    expect(errorOf(res).message).not.toMatch(/^an add-on removal/u); // it is not always an add-on removal
+  });
+
+  it("MAJOR · an ADD-ON purchase after the cut-over is not refused either", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
+    cutOver(workspaceId, "starter", String((await f.intentOf(workspaceId))!.id));
+    expect((await f.reconcile(workspaceId)).statusCode).toBe(200);
+    gateway.finishedScheduleIds.add("sub_sched_1");
+    const owner2 = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    const res = await f.post(owner2, "/billing/addons", { kind: "extra_seat", quantity: 1 });
+    expect(res.statusCode, res.body).toBe(202);
+    expect(gateway.finishedReleases).toHaveLength(1);
+    expect(gateway.addonChanges).toHaveLength(1);
+  });
+
+  it("item 4 · the proration date is bounded by STRIPE'S current period start, not the local row's (a renewal the webhook has not applied)", async () => {
+    const { owner, workspaceId } = await f.newWorkspace("starter");
+    // Stripe renewed 5 minutes ago; the local row still has the old period (10 days back).
+    f.stripeSubscription(workspaceId, { plan: "starter", periodStart: f.nowSeconds() - 300, periodEnd: f.nowSeconds() + 30 * 86_400 });
+    const res = await f.post(owner, CHANGE, { plan_key: "growth", quote: { proration_date: f.nowSeconds() - 600, amount_due_now: centsToDecimal(3_850), currency: "USD" } });
+    expect(res.statusCode).toBe(409);
+    expect(errorOf(res).details).toMatchObject({ reason: "quote_changed" });
+    expect(gateway.upgradeAttempts).toHaveLength(0);
+  });
+
+  it("item 5 · an unsettled intent OLDER than Stripe's key retention (24h) is NOT replayed: it is released and the request is validated as a new one", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("starter");
+    const preview = await quoteOf(owner, "growth");
+    gateway.failUpgradeWith = new StripeUpstreamError(503);
+    expect((await f.post(owner, CHANGE, { plan_key: "growth", quote: preview.quote })).statusCode).toBe(503);
+    const old = (await f.intentOf(workspaceId))!;
+    gateway.failUpgradeWith = undefined;
+    await harness.db().query(
+      "UPDATE subscriptions SET pending_plan_change = jsonb_set(pending_plan_change, '{created_at}', to_jsonb(to_char(now() - interval '25 hours', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))) WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    const fresh = await quoteOf(owner, "growth");
+    const res = await f.post(owner, CHANGE, { plan_key: "growth", quote: fresh.quote });
+    expect(res.statusCode, res.body).toBe(202);
+    const now = (await f.intentOf(workspaceId))!;
+    expect(now.id, "a NEW intent, not the old one replayed").not.toBe(old.id);
+    expect(gateway.upgradeAttempts.map((a) => a.idempotencyKey)).toEqual([`plan-change-${String(old.id)}`, `plan-change-${String(now.id)}`]);
+  });
+
+  it("item 5 · the reply of an applied upgrade is lost AND the webhook has already adopted the plan: the retry with the same quote is 202, not 400", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("starter");
+    const preview = await quoteOf(owner, "growth");
+    gateway.failUpgradeAfterApplying = new StripeUpstreamError(504);
+    expect((await f.post(owner, CHANGE, { plan_key: "growth", quote: preview.quote })).statusCode).toBe(503);
+    expect((await f.reconcile(workspaceId)).statusCode).toBe(200);
+    expect((await f.planOf(workspaceId)).plan_key).toBe("growth");
+    expect(await f.intentOf(workspaceId)).toBeNull();
+    gateway.failUpgradeAfterApplying = undefined;
+    const owner2 = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    const retry = await f.post(owner2, CHANGE, { plan_key: "growth", quote: preview.quote });
+    expect(retry.statusCode, retry.body).toBe(202);
+    expect(gateway.upgrades, "Stripe was not asked again").toHaveLength(1);
+    expect(gateway.upgradeAttempts).toHaveLength(1);
+    // A workspace on growth with NO such trace is still told it is already on that plan.
+    const plain = await f.newWorkspace("growth");
+    expect((await f.post(plain.owner, CHANGE, { plan_key: "growth", quote: preview.quote })).statusCode).toBe(400);
+  });
+
+  it("item 7 · the preview reports a pending change as plan_change_pending, ahead of the schedule it owns (not change_scheduled)", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    expect((await f.post(owner, CHANGE, { plan_key: "growth" })).statusCode).toBe(202);
+    f.stripeSubscription(workspaceId, { plan: "business", schedule: "sub_sched_1" });
+    const res = await f.post(owner, PREVIEW, { plan_key: "starter" });
+    expect(res.statusCode).toBe(409);
+    expect(errorOf(res).details).toMatchObject({ reason: "plan_change_pending" });
+  });
+
+  it("item 12 · a Free target is DESCRIBED whatever the state: past_due on Stripe's own state does not turn the preview into a refusal", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("starter");
+    f.stripeSubscription(workspaceId, { plan: "starter", status: "past_due" });
+    const res = await f.post(owner, PREVIEW, { plan_key: "free" });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(planChangePreviewResponseSchema.parse(dataOf(res)).blocked_by).toBe("cancel_in_portal");
+  });
+
   it("hazard · two simultaneous upgrades (different Idempotency-Keys, one quote): exactly one is charged, the other is plan_change_pending", async () => {
     const { owner } = await f.newWorkspace("starter");
     const preview = await quoteOf(owner, "growth");
@@ -543,18 +647,76 @@ describe("STORY-184 · in-app plan change", () => {
     expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
   });
 
-  it("scenario 19 · cancelling a downgrade that has already taken effect is 409 downgrade_already_effective (the intent is left for the webhook); with nothing pending it is plan_change_not_pending", async () => {
-    const { workspaceId, owner } = await f.newWorkspace("growth");
+  /** The cut-over as Stripe shows it: phase 1 is running (the plan line, the phase's metadata naming the intent, a new period), the schedule still attached. */
+  const cutOver = (workspaceId: string, plan: "starter" | "growth", intentId: string) => {
+    const start = f.nowSeconds() - 86_400; // a day ago
+    f.stripeSubscription(workspaceId, { plan, metadata: { plan_change_intent_id: intentId }, schedule: "sub_sched_1", periodStart: start, periodEnd: start + 30 * 86_400 });
+  };
+
+  it("scenario 19 · with nothing pending a cancel is plan_change_not_pending", async () => {
+    const { owner } = await f.newWorkspace("growth");
     const none = await f.del(owner, CHANGE);
     expect(none.statusCode).toBe(409);
     expect(errorOf(none).details).toMatchObject({ reason: "plan_change_not_pending" });
+  });
 
+  it("scenario 19 · a cancel AFTER the downgrade took effect (the subscription carries the intent) is 409 downgrade_already_effective and the intent is KEPT for the webhook", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
     expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
-    gateway.releaseOutcome = "already_effective";
+    const intent = (await f.intentOf(workspaceId))!;
+    cutOver(workspaceId, "starter", String(intent.id));
     const late = await f.del(owner, CHANGE);
-    expect(late.statusCode).toBe(409);
+    expect(late.statusCode, late.body).toBe(409);
     expect(errorOf(late).details).toMatchObject({ reason: "downgrade_already_effective" });
-    expect(await f.intentOf(workspaceId)).not.toBeNull();
+    expect(gateway.releases, "nothing was released: it had already run").toHaveLength(0);
+    expect(await f.intentOf(workspaceId)).toMatchObject({ id: intent.id });
+  });
+
+  it("BLOCKER · the BOUNDARY RACE: release is applied while Stripe moves to phase 1 between our read and the release - re-read the subscription: 409 downgrade_already_effective, intent KEPT", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
+    const intent = (await f.intentOf(workspaceId))!;
+    gateway.onReleaseApplied = () => cutOver(workspaceId, "starter", String(intent.id));
+    const res = await f.del(owner, CHANGE);
+    expect(res.statusCode, res.body).toBe(409);
+    expect(errorOf(res).details).toMatchObject({ reason: "downgrade_already_effective" });
+    expect(gateway.releases).toHaveLength(1);
+    expect(await f.intentOf(workspaceId)).toMatchObject({ id: intent.id });
+  });
+
+  it("BLOCKER · release APPLIED and the reply lost: the retry is 200 (the schedule is gone and the subscription does not carry the intent) and the intent is null", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
+    gateway.failReleaseAfterApplying = new StripeUpstreamError(504);
+    expect((await f.del(owner, CHANGE)).statusCode).toBe(503);
+    expect(await f.intentOf(workspaceId), "outcome unknown: the intent stays").not.toBeNull();
+    gateway.failReleaseAfterApplying = undefined;
+    const retry = await f.del(owner, CHANGE);
+    expect(retry.statusCode, retry.body).toBe(200);
+    expect(await f.intentOf(workspaceId)).toBeNull();
+  });
+
+  it("BLOCKER · a schedule released in the Stripe DASHBOARD is a successful cancel, not 'already effective'", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
+    // Someone released it in the Dashboard: the subscription has no schedule, still describes growth, and the schedule says released.
+    f.stripeSubscription(workspaceId, { plan: "growth", schedule: null });
+    gateway.releaseOutcome = "not_releasable";
+    const res = await f.del(owner, CHANGE);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(await f.intentOf(workspaceId)).toBeNull();
+    // and the customer can schedule again
+    gateway.releaseOutcome = "released";
+    expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
+  });
+
+  it("BLOCKER · a schedule Stripe no longer has (resource_missing -> not releasable) on a subscription that does not carry the intent is 200", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    expect((await f.post(owner, CHANGE, { plan_key: "starter" })).statusCode).toBe(202);
+    gateway.releaseOutcome = "not_releasable"; // schedule still named on the subscription, but Stripe says it cannot be released
+    const res = await f.del(owner, CHANGE);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(await f.intentOf(workspaceId)).toBeNull();
   });
 
   it("scenario 19 · an upgrade cannot be cancelled: it is already charged (409 plan_change_pending)", async () => {

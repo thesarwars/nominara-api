@@ -112,3 +112,37 @@ export function stringMetadataOf(value: unknown): Record<string, string> {
   }
   return out;
 }
+
+interface ScheduleLike {
+  readonly status?: unknown;
+  readonly end_behavior?: unknown;
+  readonly phases: ReadonlyArray<{ readonly start_date: number; readonly metadata?: unknown }>;
+  readonly current_phase?: { readonly start_date: number } | null;
+}
+
+/**
+ * The index of the phase a schedule is IN NOW. `phases[0]` is the first phase it ever had, which after a cut-over is in the
+ * past: rewriting it as "the current phase" re-sends a phase that has ended. With no `current_phase` (not started) the
+ * first phase is the one to come.
+ */
+export function currentPhaseIndex(schedule: ScheduleLike): number {
+  if (schedule.current_phase === null || schedule.current_phase === undefined) return 0;
+  const start = schedule.current_phase.start_date;
+  const index = schedule.phases.findIndex((phase) => phase.start_date === start);
+  return index === -1 ? 0 : index;
+}
+
+/**
+ * A schedule with NOTHING LEFT TO DO: active, ending by RELEASE (never a scheduled cancellation), in its last phase, and
+ * that phase's metadata is ours (it carries a `plan_change_intent_id`, or names the plan the subscription is on now).
+ * Stripe keeps such a schedule attached for the whole phase, and an attached schedule blocks every later change; releasing
+ * it leaves the subscription exactly as it is.
+ */
+export function isFinishedSchedule(schedule: ScheduleLike, subscriptionPlanKey: string | undefined): boolean {
+  if (schedule.status !== "active" || schedule.end_behavior !== "release") return false;
+  if (schedule.current_phase === null || schedule.current_phase === undefined) return false;
+  const index = currentPhaseIndex(schedule);
+  if (index !== schedule.phases.length - 1) return false;
+  const metadata = stringMetadataOf(schedule.phases[index]!.metadata);
+  return metadata.plan_change_intent_id !== undefined || (subscriptionPlanKey !== undefined && metadata.plan_key === subscriptionPlanKey);
+}

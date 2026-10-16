@@ -59,6 +59,33 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       this.logger.warn({ message: "stripe webhook refused as retryable: the workspace is busy with another billing change", event_id: event.id, workspace_id: workspaceId });
       return new DegradedError({ message: "billing is busy: retry shortly" });
     });
+    // ⚠ THE STALE-FETCH CHECK COMES BEFORE THE PRICE VERDICT (STORY-184). A fetch taken before a newer event committed
+    // describes a subscription as it WAS - for an in-app upgrade, the old plan at the old price with no intent (the intent
+    // was spent when the new plan was adopted) - and judged first it reads as a relabel and raises a false mismatch alarm
+    // for a customer who did nothing wrong. Stale means "not looked at", so it is skipped before anything is judged.
+    // ⚠ A STALE FETCH MUST NOT OVERWRITE A NEWER COMMIT. The fetch is taken
+    // outside the transaction (KAD-06), so an event fetched at t1 can commit
+    // after one fetched at t2 > t1 for the SAME subscription and put its older
+    // state back (a cancelled plan returning to growth, plus a pro-rata grant).
+    // The workspace row is the serialiser applyPlanChange also locks first; it
+    // was taken above, so the read below is the one the write is ordered by.
+    //
+    // ⚠ THE MARK IS KEPT PER SUBSCRIPTION, WHETHER OR NOT THE ROW ADOPTS IT.
+    // Reading it off the `subscriptions` row only covered the subscription that
+    // row already tracked; a NEW subscription that was cancelled before its
+    // first event committed left no mark, and the held `active` fetch then
+    // resurrected it. `fetchStartedAt` is the DATABASE's clock, so two API
+    // instances with skewed wall clocks order their writes consistently.
+    const marked = await tx.query<{ fetch_started_at: Date }>(
+      "SELECT fetch_started_at FROM stripe_subscription_syncs WHERE workspace_id = $1 AND stripe_subscription_id = $2",
+      [workspaceId, object.id],
+    );
+    const markedAt = marked.rows[0]?.fetch_started_at ?? null;
+    if (markedAt !== null && markedAt.getTime() > fetchStartedAt.getTime()) {
+      incrementCounter("nominara_billing_subscription_reconcile_total", { outcome: "stale_fetch" });
+      this.logger.warn({ message: "stripe subscription fetch is older than the committed state: skipped", event_id: event.id, workspace_id: workspaceId });
+      return;
+    }
     const claimedPlan = await this.claimedPlanPrice(tx, workspaceId, object.metadata, object.id);
     const desired = desiredFromStripeSubscription(object.raw, object.metadata, claimedPlan);
     if (desired.kind === "ignore") {
@@ -80,29 +107,6 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       return;
     }
 
-    // ⚠ A STALE FETCH MUST NOT OVERWRITE A NEWER COMMIT. The fetch is taken
-    // outside the transaction (KAD-06), so an event fetched at t1 can commit
-    // after one fetched at t2 > t1 for the SAME subscription and put its older
-    // state back (a cancelled plan returning to growth, plus a pro-rata grant).
-    // The workspace row is the serialiser applyPlanChange also locks first; it
-    // was taken above, so the read below is the one the write is ordered by.
-    //
-    // ⚠ THE MARK IS KEPT PER SUBSCRIPTION, WHETHER OR NOT THE ROW ADOPTS IT.
-    // Reading it off the `subscriptions` row only covered the subscription that
-    // row already tracked; a NEW subscription that was cancelled before its
-    // first event committed left no mark, and the held `active` fetch then
-    // resurrected it. `fetchStartedAt` is the DATABASE's clock, so two API
-    // instances with skewed wall clocks order their writes consistently.
-    const marked = await tx.query<{ fetch_started_at: Date }>(
-      "SELECT fetch_started_at FROM stripe_subscription_syncs WHERE workspace_id = $1 AND stripe_subscription_id = $2",
-      [workspaceId, desired.state.providerSubscriptionId],
-    );
-    const markedAt = marked.rows[0]?.fetch_started_at ?? null;
-    if (markedAt !== null && markedAt.getTime() > fetchStartedAt.getTime()) {
-      incrementCounter("nominara_billing_subscription_reconcile_total", { outcome: "stale_fetch" });
-      this.logger.warn({ message: "stripe subscription fetch is older than the committed state: skipped", event_id: event.id, workspace_id: workspaceId });
-      return;
-    }
     await tx.query(
       `INSERT INTO stripe_subscription_syncs (workspace_id, stripe_subscription_id, fetch_started_at) VALUES ($1, $2, $3)
        ON CONFLICT (workspace_id, stripe_subscription_id) DO UPDATE SET fetch_started_at = GREATEST(stripe_subscription_syncs.fetch_started_at, EXCLUDED.fetch_started_at)`,
@@ -187,14 +191,14 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     );
 
     // STORY-184 — the in-app plan change is spent once its plan is adopted (or the subscription ended). Only THIS
-    // subscription's intent, and only when the plan it names is the plan now held: an event that left the row where it was
+    // subscription's intent, and only when the plan it names is the plan now held AND the subscription names this intent's id: an event that left the row where it was
     // (a phase-0 event while a downgrade is pending) must leave the intent where it is too.
     await tx.query(
       `UPDATE subscriptions SET pending_plan_change = NULL, updated_at = now()
         WHERE workspace_id = $1 AND stripe_subscription_id = $2 AND status IN ('trialing','active','past_due')
           AND pending_plan_change IS NOT NULL
-          AND (pending_plan_change ->> 'to_plan_key' = $3 OR $3 = 'free')`,
-      [workspaceId, desired.state.providerSubscriptionId, desired.state.planKey],
+          AND ((pending_plan_change ->> 'to_plan_key' = $3 AND pending_plan_change ->> 'id' = $4) OR $3 = 'free')`,
+      [workspaceId, desired.state.providerSubscriptionId, desired.state.planKey, object.metadata.plan_change_intent_id ?? ""],
     );
 
     // A paid subscription was adopted: the Checkout session that bought it is

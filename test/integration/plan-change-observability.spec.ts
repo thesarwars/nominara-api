@@ -38,6 +38,31 @@ describe("STORY-184 · the plan change is observable, and what it logs is redact
     expect(metrics).toContainEqual({ metric: "nominara_billing_plan_change_total", value: 1, direction: "upgrade", outcome: "requested" });
     expect(metrics).toContainEqual({ metric: "nominara_billing_plan_change_total", value: 1, direction: "upgrade", outcome: "plan_change_pending" });
 
+    // More outcomes, so "one log line per outcome" is proved over refusals as well as successes: a Free target, the same
+    // upgrade with a changed quote, a payment failure.
+    expect((await f.post(owner, "/billing/subscription/change", { plan_key: "free" })).statusCode).toBe(422);
+    f.gateway.upgradeOutcome = "payment_failed";
+    const second = await f.newWorkspace("starter");
+    const secondPreview = planChangePreviewResponseSchema.parse(dataOf(await f.post(second.owner, "/billing/subscription/change/preview", { plan_key: "growth" })));
+    expect((await f.post(second.owner, "/billing/subscription/change", { plan_key: "growth", quote: secondPreview.quote })).statusCode).toBe(422);
+    f.gateway.upgradeOutcome = "applied";
+    f.gateway.previewAmountCents = 1;
+    expect((await f.post(second.owner, "/billing/subscription/change", { plan_key: "growth", quote: secondPreview.quote })).statusCode).toBe(409);
+
+    const outcomes = logged(log).filter((entry) => entry.message === "plan change outcome");
+    const counted = metrics.concat(logged(log).filter((entry) => entry.metric === "nominara_billing_plan_change_total"));
+    expect(counted.length).toBeGreaterThanOrEqual(6);
+    for (const metric of logged(log).filter((entry) => entry.metric === "nominara_billing_plan_change_total")) {
+      const line = outcomes.find((entry) => entry.direction === metric.direction && entry.outcome === metric.outcome);
+      expect(line, `a log line for ${String(metric.direction)}/${String(metric.outcome)}`).toBeDefined();
+      expect([workspaceId, second.workspaceId]).toContain(line!.workspace_id);
+    }
+    for (const outcome of ["previewed", "requested", "plan_change_pending", "cancel_in_portal", "payment_failed", "quote_changed"]) {
+      expect(outcomes.some((entry) => entry.outcome === outcome), outcome).toBe(true);
+    }
+    // the quote_changed and upstream warnings carry the workspace id too
+    expect([...logged(warn)].filter((entry) => String(entry.message).startsWith("plan upgrade refused")).every((entry) => typeof entry.workspace_id === "string")).toBe(true);
+
     const lines = [...logged(log), ...logged(warn)].filter((entry) => typeof entry.message === "string" && entry.message.startsWith("plan upgrade requested"));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatchObject({ workspace_id: workspaceId, from_plan_key: "starter", to_plan_key: "growth" });

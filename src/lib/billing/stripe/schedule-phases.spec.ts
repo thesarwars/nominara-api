@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTwoPhaseSchedule, phaseLinesOf } from "./schedule-phases.js";
+import { buildTwoPhaseSchedule, currentPhaseIndex, isFinishedSchedule, phaseLinesOf } from "./schedule-phases.js";
 
 // STORY-184 T3 — the ONE builder behind both a scheduled downgrade and a scheduled add-on removal.
 //
@@ -49,5 +49,30 @@ describe("STORY-184 · phaseLinesOf", () => {
   });
   it("keeps a line with no quantity as a line with no quantity (a metered price)", () => {
     expect(phaseLinesOf([{ price: "a" }])).toEqual([{ price: "a" }]);
+  });
+});
+
+describe("STORY-184 · currentPhaseIndex", () => {
+  const phases = [{ start_date: 100 }, { start_date: 200 }, { start_date: 300 }];
+  it("is the phase the schedule is IN, not the first it ever had", () => {
+    expect(currentPhaseIndex({ phases, current_phase: { start_date: 200 } })).toBe(1);
+    expect(currentPhaseIndex({ phases, current_phase: { start_date: 300 } })).toBe(2);
+  });
+  it("null path - a schedule that has not started (no current phase), or one whose current phase matches none, is at the first", () => {
+    expect(currentPhaseIndex({ phases, current_phase: null })).toBe(0);
+    expect(currentPhaseIndex({ phases })).toBe(0);
+    expect(currentPhaseIndex({ phases, current_phase: { start_date: 999 } })).toBe(0);
+  });
+});
+
+describe("STORY-184 · isFinishedSchedule", () => {
+  const base = { status: "active", end_behavior: "release", phases: [{ start_date: 1, metadata: {} }, { start_date: 2, metadata: { plan_change_intent_id: "i" } }], current_phase: { start_date: 2 } };
+  it("is true for a last phase carrying our intent id", () => expect(isFinishedSchedule(base, "starter")).toBe(true));
+  it("is false when the schedule has not started (no current phase)", () => expect(isFinishedSchedule({ ...base, current_phase: null }, "starter")).toBe(false));
+  it("is false for end_behavior cancel", () => expect(isFinishedSchedule({ ...base, end_behavior: "cancel" }, "starter")).toBe(false));
+  it("is false when the phase metadata names a different plan and no intent", () => {
+    const other = { ...base, phases: [base.phases[0]!, { start_date: 2, metadata: { plan_key: "growth" } }] };
+    expect(isFinishedSchedule(other, "starter")).toBe(false);
+    expect(isFinishedSchedule(other, "growth")).toBe(true);
   });
 });
