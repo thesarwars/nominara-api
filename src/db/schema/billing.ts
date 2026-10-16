@@ -120,6 +120,7 @@ export const invoices = pgTable("invoices", {
   pdfUrl: text("pdf_url"),
   paidAt: timestamp("paid_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  dueAt: timestamp("due_at", { withTimezone: true }),
 });
 
 export const plans = pgTable("plans", {

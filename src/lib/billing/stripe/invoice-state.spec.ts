@@ -36,6 +36,7 @@ describe("STORY-075 AC9 · an invoice is copied as Stripe issued it", () => {
         currency: "USD",
         periodStart: new Date(T0 * 1000),
         periodEnd: new Date((T0 + 30 * 86_400) * 1000),
+        dueAt: new Date((T0 + 30 * 86_400) * 1000),
         hostedInvoiceUrl: "https://invoice.stripe.test/i/acct/in_1",
         pdfUrl: "https://pay.stripe.test/invoice/in_1/pdf",
         paidAt: new Date((T0 + 60) * 1000),
@@ -187,5 +188,79 @@ describe("STORY-075b audit · addon_amount and credit_pack_amount come from the 
   it("the totals are still Stripe's, untouched by the line classification", () => {
     const inv = write([addonLine], { subtotal: 1, total: 2 });
     expect(inv).toMatchObject({ subtotal: "0.01", total: "0.02", addonAmount: "49.00" });
+  });
+});
+
+// The period an invoice SHOWS is the one the customer is paying for - the recurring plan line's - not the invoice-level
+// period Stripe sets (the usage window billed in arrears; on a first invoice both ends are the creation instant).
+describe("service period · the invoice publishes the plan line's period, and keeps its own as the due date", () => {
+  const OCT15 = 1_760_486_400; // 2025-10-15T00:00:00Z
+  const NOV15 = OCT15 + 31 * 86_400;
+  const planLine = {
+    amount: 12_900,
+    period: { start: OCT15, end: NOV15 },
+    parent: { type: "subscription_item_details", subscription_item_details: { proration: false, subscription: "sub_1" } },
+    pricing: { price_details: { product: "prod_growth" } },
+  };
+  const packLine = {
+    amount: 2_000,
+    period: { start: OCT15 + 5, end: OCT15 + 5 },
+    parent: null,
+    pricing: { price_details: { product: { id: "p", metadata: { nominara_kind: "credit_pack" } } } },
+  };
+  const addonLine = {
+    amount: 4_900,
+    period: { start: OCT15 + 7 * 86_400, end: NOV15 },
+    parent: { type: "subscription_item_details", subscription_item_details: { proration: true } },
+    pricing: { price_details: { product: "nominara_addon_extra_project" } },
+  };
+  const write = (over: Record<string, unknown>) => {
+    const out = desiredFromStripeInvoice(invoice(over));
+    if (out.kind !== "write") throw new Error("expected a write");
+    return out.invoice;
+  };
+  const at = (s: number) => new Date(s * 1000);
+
+  it("a first subscription invoice (invoice-level start == end == creation) shows the plan line's Oct 15 - Nov 15, due at creation", () => {
+    const inv = write({ status: "open", period_start: OCT15, period_end: OCT15, lines: { data: [planLine] } });
+    expect(inv.periodStart).toEqual(at(OCT15));
+    expect(inv.periodEnd).toEqual(at(NOV15));
+    expect(inv.dueAt).toEqual(at(OCT15));
+  });
+
+  it("a mixed invoice with a credit-pack or add-on line BEFORE the plan line still picks the plan line", () => {
+    expect(write({ lines: { data: [packLine, addonLine, planLine] } })).toMatchObject({ periodStart: at(OCT15), periodEnd: at(NOV15) });
+  });
+
+  it("a renewal invoice shows the NEW cycle (the plan line), not the cycle just ended that the invoice-level period describes", () => {
+    const prev = OCT15 - 30 * 86_400;
+    const renewal = { ...planLine, period: { start: NOV15, end: NOV15 + 30 * 86_400 } };
+    const inv = write({ period_start: prev, period_end: NOV15, lines: { data: [renewal] } });
+    expect(inv).toMatchObject({ periodStart: at(NOV15), periodEnd: at(NOV15 + 30 * 86_400), dueAt: at(NOV15) });
+  });
+
+  it("a one-off credit-pack invoice with no subscription line takes the first line with a period", () => {
+    expect(write({ period_start: OCT15, period_end: OCT15, lines: { data: [{ amount: 1 }, packLine] } })).toMatchObject({ periodStart: at(OCT15 + 5), periodEnd: at(OCT15 + 5) });
+  });
+
+  it("an invoice whose lines carry no period keeps the invoice-level period (today's behaviour)", () => {
+    expect(write({ period_start: OCT15, period_end: NOV15, lines: { data: [{ amount: 100 }] } })).toMatchObject({ periodStart: at(OCT15), periodEnd: at(NOV15) });
+  });
+
+  it("a proration-only subscription line yields to a recurring non-proration one; the legacy type/price.recurring shapes count as recurring", () => {
+    const legacy = { amount: 1, type: "subscription", period: { start: OCT15, end: NOV15 } };
+    expect(write({ lines: { data: [addonLine, legacy] } })).toMatchObject({ periodEnd: at(NOV15), periodStart: at(OCT15) });
+    const viaPrice = { amount: 1, price: { recurring: { interval: "month" } }, period: { start: OCT15, end: NOV15 } };
+    expect(write({ lines: { data: [packLine, viaPrice] } })).toMatchObject({ periodStart: at(OCT15), periodEnd: at(NOV15) });
+  });
+
+  it("due_at is Stripe's due_date when present, else the invoice-level period_end", () => {
+    expect(write({ due_date: OCT15 + 99, period_end: OCT15, lines: { data: [planLine] } }).dueAt).toEqual(at(OCT15 + 99));
+    expect(write({ due_date: null, period_end: OCT15, lines: { data: [planLine] } }).dueAt).toEqual(at(OCT15));
+  });
+
+  it("with no invoice-level period_end and no due_date, due_at falls back to the service end", () => {
+    const inv = write({ period_start: undefined, period_end: undefined, lines: { data: [planLine] } });
+    expect(inv.dueAt).toEqual(at(NOV15));
   });
 });
