@@ -28,6 +28,7 @@ interface StoredInvoice {
   currency: string;
   period_start: Date;
   period_end: Date;
+  due_at: Date | null;
   hosted_invoice_url: string | null;
   pdf_url: string | null;
   paid_at: Date | null;
@@ -54,6 +55,10 @@ interface InvoiceRow {
 const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
+function epochSeconds(date: Date): number {
+  return Math.floor(date.getTime() / 1000);
+}
+
 function same(stored: StoredInvoice, desired: DesiredInvoice): boolean {
   return (
     stored.number === desired.number &&
@@ -65,15 +70,35 @@ function same(stored: StoredInvoice, desired: DesiredInvoice): boolean {
     stored.currency === desired.currency &&
     stored.period_start.getTime() === desired.periodStart.getTime() &&
     stored.period_end.getTime() === desired.periodEnd.getTime() &&
+    stored.due_at?.getTime() === desired.dueAt.getTime() &&
     stored.hosted_invoice_url === desired.hostedInvoiceUrl &&
     stored.pdf_url === desired.pdfUrl &&
     (stored.paid_at?.getTime() ?? null) === (desired.paidAt?.getTime() ?? null)
   );
 }
 
-/** What an audit row says about an invoice. No URLs: a hosted-invoice link is a bearer link to pay. */
-function auditState(invoice: { status: string; total: string; currency: string; number: string | null }, stripeInvoiceId: string) {
-  return { stripe_invoice_id: stripeInvoiceId, number: invoice.number, status: invoice.status, total: invoice.total, currency: invoice.currency };
+/**
+ * What an audit row says about an invoice. No URLs: a hosted-invoice link is a bearer link to pay.
+ *
+ * ⚠ THE PERIOD IS INTEGER EPOCH SECONDS, NOT AN ISO STRING. `redactState` masks any whitespace-free string of 20+ characters
+ * whose character entropy is 3.5 bits or more, and roughly 1.7% of ISO timestamps (e.g. 2026-09-28T17:34:56.000Z) reach it:
+ * the audit row would then say "[redacted]" for a date. A number is never a candidate.
+ */
+function auditState(
+  invoice: { status: string; total: string; currency: string; number: string | null },
+  period: { start: Date; end: Date; dueAt: Date | null },
+  stripeInvoiceId: string,
+) {
+  return {
+    stripe_invoice_id: stripeInvoiceId,
+    number: invoice.number,
+    status: invoice.status,
+    total: invoice.total,
+    currency: invoice.currency,
+    period_start: epochSeconds(period.start),
+    period_end: epochSeconds(period.end),
+    due_at: period.dueAt === null ? null : epochSeconds(period.dueAt),
+  };
 }
 
 @Injectable()
@@ -92,10 +117,16 @@ export class BillingInvoicesService {
     tx: ClientBase,
     workspaceId: string,
     desired: DesiredInvoice,
-    provenance: { readonly eventId: string; readonly eventType: string },
+    provenance: {
+      readonly eventId: string;
+      /** Keep it SHORT: a 20+ character label can be masked by `redactState` (see `auditState`). */
+      readonly eventType: string;
+      /** The audit row's actor label; the webhook's by default. */
+      readonly actorUa?: string;
+    },
   ): Promise<InvoiceRecordOutcome> {
     const existing = await tx.query<StoredInvoice>(
-      `SELECT id, number, status, subtotal::text, total::text, addon_amount::text, credit_pack_amount::text, currency, period_start, period_end, hosted_invoice_url, pdf_url, paid_at
+      `SELECT id, number, status, subtotal::text, total::text, addon_amount::text, credit_pack_amount::text, currency, period_start, period_end, due_at, hosted_invoice_url, pdf_url, paid_at
          FROM invoices WHERE stripe_invoice_id = $1 FOR UPDATE`,
       [desired.stripeInvoiceId],
     );
@@ -105,8 +136,8 @@ export class BillingInvoicesService {
     let outcome: InvoiceRecordOutcome;
     if (stored === undefined) {
       const inserted = await tx.query<{ id: string }>(
-        `INSERT INTO invoices (workspace_id, stripe_invoice_id, number, status, subtotal, total, addon_amount, credit_pack_amount, currency, period_start, period_end, hosted_invoice_url, pdf_url, paid_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+        `INSERT INTO invoices (workspace_id, stripe_invoice_id, number, status, subtotal, total, addon_amount, credit_pack_amount, currency, period_start, period_end, due_at, hosted_invoice_url, pdf_url, paid_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
         [
           workspaceId,
           desired.stripeInvoiceId,
@@ -119,6 +150,7 @@ export class BillingInvoicesService {
           desired.currency,
           desired.periodStart,
           desired.periodEnd,
+          desired.dueAt,
           desired.hostedInvoiceUrl,
           desired.pdfUrl,
           desired.paidAt,
@@ -134,7 +166,7 @@ export class BillingInvoicesService {
       invoiceId = stored.id;
       await tx.query(
         `UPDATE invoices SET number = $2, status = $3, subtotal = $4, total = $5, addon_amount = $6, credit_pack_amount = $7, currency = $8,
-                period_start = $9, period_end = $10, hosted_invoice_url = $11, pdf_url = $12, paid_at = $13
+                period_start = $9, period_end = $10, due_at = $11, hosted_invoice_url = $12, pdf_url = $13, paid_at = $14
           WHERE id = $1`,
         [
           invoiceId,
@@ -147,6 +179,7 @@ export class BillingInvoicesService {
           desired.currency,
           desired.periodStart,
           desired.periodEnd,
+          desired.dueAt,
           desired.hostedInvoiceUrl,
           desired.pdfUrl,
           desired.paidAt,
@@ -161,12 +194,12 @@ export class BillingInvoicesService {
       actorType: "system",
       actorId: SYSTEM_ACTOR_ID,
       actorIp: null,
-      actorUa: "operator:stripe-webhook",
+      actorUa: provenance.actorUa ?? "operator:stripe-webhook",
       action: "billing.invoice_recorded",
       resourceType: "invoice",
       resourceId: invoiceId,
-      beforeState: stored === undefined ? null : auditState(stored, desired.stripeInvoiceId),
-      afterState: { ...auditState(desired, desired.stripeInvoiceId), event_type: provenance.eventType },
+      beforeState: stored === undefined ? null : auditState(stored, { start: stored.period_start, end: stored.period_end, dueAt: stored.due_at }, desired.stripeInvoiceId),
+      afterState: { ...auditState(desired, { start: desired.periodStart, end: desired.periodEnd, dueAt: desired.dueAt }, desired.stripeInvoiceId), event_type: provenance.eventType },
       requestId: provenance.eventId,
       supportGrantId: null,
       severity: "info",
@@ -176,15 +209,16 @@ export class BillingInvoicesService {
 
   /**
    * STORY-021 / EC-15 — "no past-due invoice" before a workspace may change owner. Decision 2026-10-13: past due is ANY
-   * unpaid invoice past its due date. `invoices` stores no due date (Stripe's `due_date` is not mirrored — see the
-   * STORY-021 report), so "due" is the end of the invoiced period: an `open` or `uncollectible` invoice, with no
-   * `paid_at`, whose `period_end` has passed. RLS scopes the read to the context's workspace; no workspace predicate.
+   * unpaid invoice past its due date: an `open` or `uncollectible` invoice, with no `paid_at`, whose `due_at` has passed.
+   * `due_at` is Stripe's `due_date`, else the invoice-level period end (about when it was issued). It is NOT `period_end`,
+   * which is the service period the invoice pays for and ends a month after a first invoice is issued. Rows written before
+   * `due_at` existed hold the old invoice-level end in `period_end` and are backfilled; `coalesce` covers any still null. RLS scopes the read to the context's workspace; no workspace predicate.
    */
   async hasPastDue(client: ClientBase): Promise<boolean> {
     const result = await client.query<{ past_due: boolean }>(
       `SELECT EXISTS (
          SELECT 1 FROM invoices
-          WHERE paid_at IS NULL AND status IN ('open', 'uncollectible') AND period_end < now()
+          WHERE paid_at IS NULL AND status IN ('open', 'uncollectible') AND coalesce(due_at, period_end) < now()
        ) AS past_due`,
     );
     return result.rows[0]!.past_due;
