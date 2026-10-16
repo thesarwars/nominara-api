@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { planChangeCancelResponseSchema, planChangePreviewResponseSchema, planChangeResponseSchema, subscriptionSchema } from "../../contracts/billing/index.js";
+import { centsToDecimal } from "../../src/lib/billing/stripe/invoice-state.js";
 import { StripeUpstreamError } from "../../src/lib/billing/stripe/stripe-gateway.js";
 import { dataOf } from "../support/envelope.js";
 import { usePlanChangeFixture } from "../support/plan-change-fixture.js";
@@ -160,6 +161,32 @@ describe("STORY-184 · in-app plan change", () => {
     // BOUNDARY: 29 minutes old is still a quote.
     const ok = await f.post(owner, CHANGE, { plan_key: "growth", quote: { ...quote, proration_date: f.nowSeconds() - 29 * 60 } });
     expect(ok.statusCode, ok.body).toBe(202);
+  });
+
+  it("scenario 5 · the re-preview is taken at the QUOTE's own instant (a 29-minute-old quote is re-priced at that moment, not at 'now')", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("starter");
+    // Stripe's figure depends on WHEN: a fresh-instant re-preview would price it differently and the quote would never hold.
+    gateway.previewAmountCents = (input) => 1_000 + (input.prorationDate % 7_919);
+    const oldInstant = f.nowSeconds() - 29 * 60;
+    const quote = { proration_date: oldInstant, amount_due_now: centsToDecimal(1_000 + (oldInstant % 7_919)), currency: "USD" };
+    const res = await f.post(owner, CHANGE, { plan_key: "growth", quote });
+    expect(res.statusCode, res.body).toBe(202);
+    expect(gateway.planPreviews.at(-1)!.prorationDate).toBe(oldInstant);
+    expect(gateway.upgrades[0]!.prorationDate, "and the update is applied at the same instant it was quoted at").toBe(oldInstant);
+    void workspaceId;
+  });
+
+  it("scenario 6 · a quote from before the PERIOD began is refused even when it is younger than 30 minutes (a period that began 5 minutes ago)", async () => {
+    const start = f.nowSeconds() - 5 * 60;
+    const { workspaceId, owner } = await f.newWorkspace("starter", { periodStart: start, periodEnd: start + 30 * 86_400 });
+    const before = await f.post(owner, CHANGE, { plan_key: "growth", quote: { proration_date: start - 120, amount_due_now: centsToDecimal(3_850), currency: "USD" } });
+    expect(before.statusCode).toBe(409);
+    expect(errorOf(before).details).toMatchObject({ reason: "quote_changed" });
+    expect(gateway.upgradeAttempts).toHaveLength(0);
+    expect(await f.intentOf(workspaceId)).toBeNull();
+    // Inside the period (and inside 30 minutes) it is a quote.
+    const inside = await f.post(owner, CHANGE, { plan_key: "growth", quote: { proration_date: start + 60, amount_due_now: centsToDecimal(3_850), currency: "USD" } });
+    expect(inside.statusCode, inside.body).toBe(202);
   });
 
   it("scenario 7 · an upgrade without a quote is 400 validation_failed naming the quote; the preview is not optional", async () => {
@@ -430,17 +457,27 @@ describe("STORY-184 · in-app plan change", () => {
     expect(errorOf(await f.post(owner, PREVIEW, { plan_key: "growth" })).details).toMatchObject({ reason: "subscription_past_due" });
   });
 
-  it("scenario 15 · a subscription set to cancel at the period end cannot change plan: 409 cancellation_pending", async () => {
+  it("scenario 15 · a subscription set to cancel at the period end cannot change plan: 409 cancellation_pending (the local row, and Stripe's own fresh state, each on their own)", async () => {
     const { workspaceId, ownerId } = await f.newWorkspace("starter");
-    f.stripeSubscription(workspaceId, { plan: "starter", cancelAtPeriodEnd: true });
-    await f.reconcile(workspaceId);
-    // The reconcile bumped the entitlement version: the old token is stale, the recovery is a fresh one.
-    const fresh = await f.enter(ownerId, workspaceId);
+    const body = (path: string) => (path === PREVIEW ? { plan_key: "growth" } : { plan_key: "growth", quote: { proration_date: f.nowSeconds(), amount_due_now: "1.00", currency: "USD" } });
+
+    // (a) the LOCAL row says so, Stripe's fetch does not (the webhook lagged the other way).
+    await harness.db().query("UPDATE subscriptions SET cancel_at_period_end = true WHERE workspace_id = $1", [workspaceId]);
     for (const path of [PREVIEW, CHANGE]) {
-      const res = await f.post(fresh, path, path === PREVIEW ? { plan_key: "growth" } : { plan_key: "growth", quote: { proration_date: f.nowSeconds(), amount_due_now: "1.00", currency: "USD" } });
-      expect(res.statusCode, path).toBe(409);
-      expect(errorOf(res).details, path).toMatchObject({ reason: "cancellation_pending" });
+      const res = await f.post(await f.enter(ownerId, workspaceId), path, body(path));
+      expect(res.statusCode, `local · ${path}`).toBe(409);
+      expect(errorOf(res).details, `local · ${path}`).toMatchObject({ reason: "cancellation_pending" });
     }
+    await harness.db().query("UPDATE subscriptions SET cancel_at_period_end = false WHERE workspace_id = $1", [workspaceId]);
+
+    // (b) STRIPE says so, the local row does not yet (no webhook has landed).
+    f.stripeSubscription(workspaceId, { plan: "starter", cancelAtPeriodEnd: true });
+    for (const path of [PREVIEW, CHANGE]) {
+      const res = await f.post(await f.enter(ownerId, workspaceId), path, body(path));
+      expect(res.statusCode, `stripe · ${path}`).toBe(409);
+      expect(errorOf(res).details, `stripe · ${path}`).toMatchObject({ reason: "cancellation_pending" });
+    }
+    expect(gateway.upgradeAttempts).toHaveLength(0);
   });
 
   it("scenario 16 · an add-on removal already scheduled on the subscription blocks both directions: 409 change_scheduled", async () => {

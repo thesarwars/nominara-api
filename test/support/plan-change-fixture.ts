@@ -174,7 +174,7 @@ export function usePlanChangeFixture(options: { readonly widenRateLimit?: boolea
   const reconcile = (workspaceId: string, eventId = `evt_${randomUUID()}`) => deliver(eventBody(eventId, "customer.subscription.updated", subIdOf(workspaceId)));
 
   /** A workspace on `plan`, its Stripe subscription adopted through the real webhook, plus its owner (re-entered after the version bump). */
-  async function newWorkspace(plan: PlanName = "growth", opts: { interval?: "monthly" | "annual"; held?: Held[] } = {}) {
+  async function newWorkspace(plan: PlanName = "growth", opts: { interval?: "monthly" | "annual"; held?: Held[]; periodStart?: number; periodEnd?: number } = {}) {
     const ownerId = await createUser();
     const ws = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
     stripeSubscription(ws.id, { plan, ...opts });
