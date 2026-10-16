@@ -26,8 +26,11 @@ export interface DesiredInvoice {
   readonly creditPackAmount: string;
   /** ISO 4217, upper case (the column is `char(3)` and the contract is `^[A-Z]{3}$`). */
   readonly currency: string;
+  /** The SERVICE period the invoice pays for (see `servicePeriod`), not Stripe's invoice-level one. */
   readonly periodStart: Date;
   readonly periodEnd: Date;
+  /** When the invoice fell due: Stripe's `due_date`, else the invoice-level `period_end` (roughly when it was issued), else `created`. */
+  readonly dueAt: Date;
   readonly hostedInvoiceUrl: string | null;
   readonly pdfUrl: string | null;
   readonly paidAt: Date | null;
@@ -129,6 +132,42 @@ function categoryAmounts(lines: readonly unknown[]): { addon: string; creditPack
   return { addon: centsToDecimal(Math.max(0, addon)), creditPack: centsToDecimal(Math.max(0, creditPack)) };
 }
 
+function linePeriod(line: Record<string, unknown>): { start: Date; end: Date } | null {
+  if (!isRecord(line.period)) return null;
+  const start = seconds(line.period.start);
+  const end = seconds(line.period.end);
+  return start === null || end === null ? null : { start, end };
+}
+
+/** A recurring (subscription) line: the 2025+ `parent.subscription_item_details`, the older `type`, or a recurring price; never a proration. */
+function isRecurringLine(line: Record<string, unknown>): boolean {
+  const parent = isRecord(line.parent) ? line.parent : undefined;
+  const details = parent !== undefined && isRecord(parent.subscription_item_details) ? parent.subscription_item_details : undefined;
+  if (details?.proration === true || line.proration === true) return false;
+  if (details !== undefined) return true;
+  if (line.type === "subscription") return true;
+  const price = isRecord(line.price) ? line.price : undefined;
+  const pricing = isRecord(line.pricing) ? line.pricing : undefined;
+  return (price !== undefined && isRecord(price.recurring)) || (pricing !== undefined && isRecord(pricing.price_details) && isRecord(pricing.price_details.recurring));
+}
+
+// ⚠ THE PERIOD THE CUSTOMER IS PAYING FOR IS THE PLAN LINE'S, NOT THE INVOICE'S. On a Stripe subscription invoice the
+// invoice-level `period_start`/`period_end` bracket the usage billed in arrears; on a first invoice both are the creation
+// instant ("Oct 15 - Oct 15"). The service period is the `period` of the recurring plan line: a line that is a subscription
+// item and neither an add-on nor a credit pack (a credit pack is a one-off and an add-on may be prorated mid-cycle, so
+// neither speaks for the plan). Failing that the first line with a period; failing that the caller uses the invoice's own.
+//
+// ⚠ A PARTIAL LINE LIST CANNOT NAME THE PLAN LINE. `invoices.retrieve` embeds only the first page of lines (`has_more`);
+// the gateway pages the rest in, but if a list still arrives incomplete and holds no recurring plan line, a first-line guess
+// could be an add-on or a pack, so the invoice's own period is used instead.
+function servicePeriod(lines: readonly unknown[], hasMore: boolean): { start: Date; end: Date } | null {
+  const candidates = lines.filter(isRecord).filter((line) => linePeriod(line) !== null);
+  const plan = candidates.find((line) => lineCategory(line) === null && isRecurringLine(line));
+  if (plan !== undefined) return linePeriod(plan);
+  if (hasMore) return null;
+  return candidates[0] === undefined ? null : linePeriod(candidates[0]);
+}
+
 function isStatus(value: unknown): value is InvoiceStatus {
   return typeof value === "string" && (INVOICE_STATUSES as readonly string[]).includes(value);
 }
@@ -151,14 +190,14 @@ export function desiredFromStripeInvoice(raw: Readonly<Record<string, unknown>>)
     return { kind: "ignore", reason: "invoice subtotal or total is not an amount in cents" };
   }
 
-  // The invoice's own period; failing that, the service period of its first line.
-  const firstLine = isRecord(raw.lines) && Array.isArray(raw.lines.data) ? raw.lines.data.find(isRecord) : undefined;
-  const linePeriod = firstLine !== undefined && isRecord(firstLine.period) ? firstLine.period : undefined;
-  const periodStart = seconds(raw.period_start) ?? seconds(linePeriod?.start);
-  const periodEnd = seconds(raw.period_end) ?? seconds(linePeriod?.end);
-  if (periodStart === null || periodEnd === null) return { kind: "ignore", reason: "invoice carries no billing period" };
-
   const lines = isRecord(raw.lines) && Array.isArray(raw.lines.data) ? raw.lines.data : [];
+  const service = servicePeriod(lines, isRecord(raw.lines) && raw.lines.has_more === true);
+  const periodStart = service?.start ?? seconds(raw.period_start);
+  const periodEnd = service?.end ?? seconds(raw.period_end);
+  if (periodStart === null || periodEnd === null) return { kind: "ignore", reason: "invoice carries no billing period" };
+  // Past-due semantics ride on this, not on the service period (which ends a month AFTER a first invoice is issued).
+  const dueAt = seconds(raw.due_date) ?? seconds(raw.period_end) ?? seconds(raw.created) ?? periodEnd;
+
   let amounts: { addon: string; creditPack: string };
   try {
     amounts = categoryAmounts(lines);
@@ -180,6 +219,7 @@ export function desiredFromStripeInvoice(raw: Readonly<Record<string, unknown>>)
       currency: currency.toUpperCase(),
       periodStart,
       periodEnd,
+      dueAt,
       hostedInvoiceUrl: link(raw.hosted_invoice_url),
       pdfUrl: link(raw.invoice_pdf),
       paidAt: seconds(transitions?.paid_at),

@@ -9,6 +9,7 @@ import { STRIPE_GATEWAY } from "../../src/lib/billing/stripe/stripe-gateway.js";
 import { claimDueProjects } from "../../src/lib/capture/scheduler.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
+import { BillingInvoicesService } from "../../src/modules/billing/billing-invoices.service.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
@@ -223,6 +224,74 @@ describe("STORY-075b · invoices", () => {
     stripeInvoice(workspaceId, { status, status_transitions: { paid_at: paidAt } });
     expect(outcomeOf(await deliver(eventBody(`evt_t_${type}`, type, "in_1")))).toBe("processed");
     expect(await invoiceRows(workspaceId)).toMatchObject([{ status }]);
+  });
+
+  /** A first Growth invoice as Stripe sends it: invoice-level start == end == creation, the plan line carries the month paid for. */
+  const firstInvoiceLines = (created: number) => ({
+    data: [
+      {
+        amount: 12_900,
+        period: { start: created, end: created + 30 * 86_400 },
+        parent: { type: "subscription_item_details", subscription_item_details: { proration: false } },
+        pricing: { price_details: { product: "prod_growth" } },
+      },
+    ],
+  });
+  /** As nominara_app with RLS in force: hasPastDue has no workspace predicate, so only the context scopes it. */
+  async function pastDueFor(workspaceId: string): Promise<boolean> {
+    const url = new URL(process.env.DATABASE_URL!);
+    url.username = "nominara_app";
+    url.password = resolvePassword("nominara_app", {});
+    const app = new Pool({ connectionString: url.toString() });
+    try {
+      const client = await app.connect();
+      try {
+        return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => new BillingInvoicesService().hasPastDue(tx));
+      } finally {
+        client.release();
+      }
+    } finally {
+      await app.end();
+    }
+  }
+
+  it("service period · a first invoice publishes the plan line's month, not the creation instant, and a redelivery is unchanged", async () => {
+    const { workspaceId, owner } = await newWorkspace();
+    const created = T0 - 3_600;
+    stripeInvoice(workspaceId, { status: "open", period_start: created, period_end: created, lines: firstInvoiceLines(created) });
+    expect(outcomeOf(await deliver(eventBody("evt_sp1", "invoice.finalized", "in_1")))).toBe("processed");
+    const rows = await invoiceRows(workspaceId);
+    expect(rows[0].period_start.getTime()).toBe(created * 1000);
+    expect(rows[0].period_end.getTime()).toBe((created + 30 * 86_400) * 1000);
+    expect(rows[0].due_at.getTime()).toBe(created * 1000);
+    const listed = dataOf<Array<{ period_start: string; period_end: string }>>(await get(owner, "/billing/invoices"));
+    expect(listed[0]!.period_start).not.toBe(listed[0]!.period_end);
+    expect(listed[0]!.period_end).toBe(new Date((created + 30 * 86_400) * 1000).toISOString());
+    // Redelivery: due_at is in the unchanged comparison, so nothing is rewritten.
+    expect(outcomeOf(await deliver(eventBody("evt_sp2", "invoice.finalized", "in_1")))).toBe("processed");
+    expect(await invoiceAudits(workspaceId)).toHaveLength(1);
+  });
+
+  it("service period · an unpaid open FIRST invoice is past due immediately, although its service period ends a month from now", async () => {
+    const { workspaceId } = await newWorkspace();
+    const created = T0 - 3_600;
+    stripeInvoice(workspaceId, { status: "open", period_start: created, period_end: created, lines: firstInvoiceLines(created) });
+    await deliver(eventBody("evt_pd1", "invoice.finalized", "in_1"));
+    const row = (await invoiceRows(workspaceId))[0];
+    expect(row.period_end.getTime()).toBeGreaterThan(Date.now() + 20 * 86_400_000);
+    expect(row.due_at.getTime()).toBeLessThan(Date.now());
+    expect(await pastDueFor(workspaceId)).toBe(true);
+  });
+
+  it("service period · an open invoice whose Stripe due_date is still ahead is not past due; one whose due_date has passed is", async () => {
+    const { workspaceId } = await newWorkspace();
+    const created = T0 - 3_600;
+    stripeInvoice(workspaceId, { status: "open", period_start: created, period_end: created, due_date: T0 + 7 * 86_400, lines: firstInvoiceLines(created) });
+    await deliver(eventBody("evt_dd1", "invoice.finalized", "in_1"));
+    expect(await pastDueFor(workspaceId)).toBe(false);
+    stripeInvoice(workspaceId, { status: "open", period_start: created, period_end: created, due_date: T0 - 60, lines: firstInvoiceLines(created) });
+    await deliver(eventBody("evt_dd2", "invoice.payment_failed", "in_1"));
+    expect(await pastDueFor(workspaceId)).toBe(true);
   });
 
   it("scenario 9 · uncollectible is a recorded status (the contract covers it)", async () => {
