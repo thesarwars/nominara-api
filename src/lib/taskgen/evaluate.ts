@@ -1,0 +1,286 @@
+import type { ClientBase } from "pg";
+import {
+  taskGenerationConditionSchema,
+  type MetricWindowCondition,
+  type TaskGenerationCondition,
+} from "../../../contracts/tasks/index.js";
+import { citationGapSchema } from "../../../contracts/analytics/index.js";
+import { actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint } from "../analytics/displacement-recovery.js";
+import { SOURCE_INDEX_WINDOWS } from "../rollup/refresh-project-source-index.js";
+import { incrementCounter } from "../telemetry/metrics.js";
+import { compileMetricWindow } from "./compile.js";
+import { taskFingerprint } from "./fingerprint.js";
+import { strengthOf } from "./impact.js";
+import type { EvalContext, RuleRow, TaskDraft } from "./types.js";
+
+// STORY-063 — one evaluator per condition template. Each reads FACTS (metric_daily, displacement_events, aux_findings,
+// project_source_index, tracked_prompts) inside the job's tenant transaction and returns drafts; it never writes. Every
+// statement is static SQL with bound parameters — the stored condition supplies numbers and enum members only.
+
+/** The widest source-index window: the one an authority task is gated on (STORY-054 AC10). */
+const AUTHORITY_WINDOW_DAYS = Math.max(...SOURCE_INDEX_WINDOWS);
+
+/** Parses a stored condition. `undefined` is "this rule is not usable": the caller skips it and counts it (fail closed). */
+export function parseCondition(rule: Pick<RuleRow, "code" | "condition">): TaskGenerationCondition | undefined {
+  const parsed = taskGenerationConditionSchema.safeParse(rule.condition);
+  return parsed.success ? parsed.data : undefined;
+}
+
+export async function evaluateRule(rule: RuleRow, condition: TaskGenerationCondition, ctx: EvalContext): Promise<TaskDraft[]> {
+  switch (condition.kind) {
+    case "metric_window":
+      return evaluateMetricWindow(rule, condition, ctx);
+    case "competitor_overtake":
+      return evaluateCompetitorOvertake(rule, condition, ctx);
+    case "displacement":
+      return evaluateDisplacement(condition, ctx);
+    case "aux_finding":
+      return evaluateAuxFinding(rule, condition, ctx);
+    case "source_gap":
+      return evaluateSourceGap(condition, ctx);
+    case "prompt_stability":
+      return evaluatePromptStability(rule, condition, ctx);
+    case "pending_analysis":
+      // The analysis this rule reads does not exist yet (D2/D4). Nothing is generated, and it is counted: a rule enabled
+      // before its facts exist must be visible, not silently inert.
+      incrementCounter("nominara_taskgen_rules_pending_analysis_total", { analysis: condition.analysis });
+      return [];
+  }
+}
+
+// ---- metric_window ---------------------------------------------------------------------------------------------------
+
+interface MetricWindowRow {
+  engine_key: string;
+  n_current: number;
+  n_prior: number;
+  cur_value: number;
+  prior_value: number;
+  change_value: number;
+}
+
+/** `change_value` as the number a title shows: points for a rate, percent for a relative change, a count for a count. */
+function changeText(condition: MetricWindowCondition, change: number): number {
+  const asPercent = condition.change === "relative" || condition.metric !== "owned_citation_count";
+  const value = asPercent ? change * 100 : change;
+  return Math.round(value * 10) / 10;
+}
+
+async function evaluateMetricWindow(rule: RuleRow, condition: MetricWindowCondition, ctx: EvalContext): Promise<TaskDraft[]> {
+  const compiled = compileMetricWindow(condition, { projectId: ctx.projectId, metricDate: ctx.metricDate, scoringVersion: ctx.scoringVersion });
+  const rows = (await ctx.tx.query<MetricWindowRow>(compiled.text, [...compiled.values])).rows;
+
+  if (condition.engine_scope === "each_engine") {
+    return rows.map((row) => ({
+      fingerprint: taskFingerprint(rule.code, ctx.projectId, row.engine_key),
+      vars: { engine: row.engine_key, change_pct: changeText(condition, row.change_value), window_days: condition.window_days },
+      strength: strengthOf(row.change_value, condition.threshold),
+      baselineEngine: row.engine_key,
+      affectedEngines: [row.engine_key],
+      affectedPromptIds: [],
+    }));
+  }
+
+  const minEngines = condition.min_engines ?? 3;
+  if (rows.length < minEngines) return [];
+  const smallest = Math.min(...rows.map((row) => row.change_value));
+  const mean = rows.reduce((sum, row) => sum + row.change_value, 0) / rows.length;
+  return [
+    {
+      fingerprint: taskFingerprint(rule.code, ctx.projectId, "project"),
+      // "at least": the smallest of the engines' changes, so the title never overstates the drop.
+      vars: { engine_count: rows.length, change_pct: changeText(condition, smallest), window_days: condition.window_days },
+      strength: strengthOf(mean, condition.threshold),
+      baselineEngine: "all",
+      affectedEngines: rows.map((row) => row.engine_key),
+      affectedPromptIds: [],
+    },
+  ];
+}
+
+// ---- competitor_overtake ---------------------------------------------------------------------------------------------
+
+async function evaluateCompetitorOvertake(
+  rule: RuleRow,
+  condition: Extract<TaskGenerationCondition, { kind: "competitor_overtake" }>,
+  ctx: EvalContext,
+): Promise<TaskDraft[]> {
+  const result = await ctx.tx.query<{ entity_id: string; name: string | null; gap: number }>(
+    `WITH w AS (
+       SELECT entity_type, entity_id,
+              (metric_date > $2::date - $3::int) AS is_current,
+              avg(visibility_score)::float8 AS vis,
+              sum(cells_total)::float8 AS cells
+         FROM metric_daily
+        WHERE project_id = $1::uuid AND engine_key = 'all' AND scoring_version = $4
+          AND metric_date >  $2::date - 2 * $3::int
+          AND metric_date <= $2::date
+        GROUP BY entity_type, entity_id, is_current
+     )
+     SELECT cc.entity_id, k.name, (cc.vis - bc.vis) AS gap
+       FROM w bc
+       JOIN w bp ON bp.entity_type = 'brand' AND bp.entity_id = bc.entity_id AND NOT bp.is_current
+       JOIN w cc ON cc.entity_type = 'competitor' AND cc.is_current
+       JOIN w cp ON cp.entity_type = 'competitor' AND cp.entity_id = cc.entity_id AND NOT cp.is_current
+       LEFT JOIN competitors k ON k.id = cc.entity_id
+      WHERE bc.entity_type = 'brand' AND bc.is_current
+        AND bc.cells >= $5::float8 AND bp.cells >= $5::float8
+        AND cc.vis > bc.vis
+        AND cp.vis <= bp.vis
+      ORDER BY cc.entity_id`,
+    [ctx.projectId, ctx.metricDate, condition.window_days, ctx.scoringVersion, condition.min_n],
+  );
+  return result.rows.map((row) => ({
+    fingerprint: taskFingerprint(rule.code, ctx.projectId, `competitor:${row.entity_id}`),
+    vars: { competitor: row.name ?? "A competitor", window_days: condition.window_days },
+    // The crossing has no threshold; a gap of 10 Visibility Score points is the 0.5 mark, 20 or more is full strength.
+    strength: strengthOf(row.gap, 10),
+    baselineEngine: "all",
+    affectedEngines: [],
+    affectedPromptIds: [],
+  }));
+}
+
+// ---- displacement ----------------------------------------------------------------------------------------------------
+
+async function evaluateDisplacement(condition: Extract<TaskGenerationCondition, { kind: "displacement" }>, ctx: EvalContext): Promise<TaskDraft[]> {
+  // Events DETECTED on the evaluated day and not yet planned (`task_id IS NULL`). The day is strict on purpose: a re-enabled
+  // rule must not reach back into the period it was off, and `task_id` is what makes a reprocess of the day a no-op.
+  const events = await ctx.tx.query<{ id: string; engine_key: string; prompt_id: string; impact: number; citation_gap: unknown }>(
+    `SELECT id, engine_key, prompt_id, impact_score::float8 AS impact, citation_gap
+       FROM displacement_events
+      WHERE project_id = $1::uuid
+        AND task_id IS NULL AND recovered_at IS NULL AND dismissed_at IS NULL
+        AND impact_score >= $4::real
+        AND (detected_at AT TIME ZONE $2)::date = $3::date
+      ORDER BY detected_at, id`,
+    [ctx.projectId, ctx.timezone, ctx.metricDate, condition.min_impact],
+  );
+
+  const drafts: TaskDraft[] = [];
+  for (const event of events.rows) {
+    const parsed = citationGapSchema.safeParse(event.citation_gap);
+    if (!parsed.success) {
+      incrementCounter("nominara_taskgen_displacement_gap_invalid_total");
+      continue;
+    }
+    const gap = parsed.data;
+    const domains = [...new Set(gap.map((entry) => entry.domain.toLowerCase()))];
+    const seedable = await actionableAuthorityDomains(ctx.tx, ctx.workspaceId, ctx.projectId, domains, AUTHORITY_WINDOW_DAYS);
+    const slugs = await playbookSlugs(ctx.tx, [...seedable.values()]);
+    for (const entry of authorityTargets(gap, new Set(seedable.keys()))) {
+      const domain = entry.domain.toLowerCase();
+      const domainId = seedable.get(domain) ?? null;
+      drafts.push({
+        // The recovery plan's own fingerprint: the rule path and the on-demand path collapse into one task per domain.
+        fingerprint: authorityTaskFingerprint(ctx.projectId, domain),
+        kind: "authority",
+        vars: { domain },
+        strength: Math.min(1, Math.max(0, event.impact / 100)),
+        baselineEngine: event.engine_key,
+        affectedEngines: [event.engine_key],
+        affectedPromptIds: [event.prompt_id],
+        sourceDisplacementId: event.id,
+        sourceDomainId: domainId,
+        affectedUrl: entry.url,
+        playbook: { slug: domainId === null ? null : (slugs.get(domainId) ?? null), domain, url: entry.url, angle: "displacement_recovery" },
+        displacementId: event.id,
+        noCooldown: true,
+      });
+    }
+  }
+  return drafts;
+}
+
+// ---- aux_finding -----------------------------------------------------------------------------------------------------
+
+const SEVERITY_STRENGTH: Readonly<Record<string, number>> = { critical: 1, high: 0.75, medium: 0.5, low: 0.25, info: 0.1 };
+
+async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerationCondition, { kind: "aux_finding" }>, ctx: EvalContext): Promise<TaskDraft[]> {
+  const found = await ctx.tx.query<{ id: string; fingerprint: Buffer; title: string; url: string | null; severity: string }>(
+    `SELECT id, fingerprint, title, url, severity
+       FROM aux_findings
+      WHERE project_id = $1::uuid AND rule_code = $2 AND severity = ANY($3::text[])
+        AND status IN ('open', 'regressed')
+        AND ((first_detected_at AT TIME ZONE $4)::date = $5::date OR (regressed_at AT TIME ZONE $4)::date = $5::date)
+      ORDER BY first_detected_at, id`,
+    [ctx.projectId, condition.aux_rule_code, condition.severities, ctx.timezone, ctx.metricDate],
+  );
+  return found.rows.map((row) => ({
+    fingerprint: taskFingerprint(rule.code, ctx.projectId, Buffer.from(row.fingerprint).toString("hex")),
+    vars: { finding_title: row.title, aux_rule_code: condition.aux_rule_code },
+    strength: SEVERITY_STRENGTH[row.severity] ?? 0.5,
+    baselineEngine: "all",
+    affectedEngines: [],
+    affectedPromptIds: [],
+    sourceFindingId: row.id,
+    affectedUrl: row.url,
+  }));
+}
+
+// ---- source_gap ------------------------------------------------------------------------------------------------------
+
+async function evaluateSourceGap(condition: Extract<TaskGenerationCondition, { kind: "source_gap" }>, ctx: EvalContext): Promise<TaskDraft[]> {
+  // The latest index row per domain at engine 'all', THEN the severity filter: an older critical row superseded by a newer
+  // lower one must not generate.
+  const found = await ctx.tx.query<{ id: string; domain: string; gap_severity: string; seeding_playbook_slug: string | null }>(
+    `WITH latest AS (
+       SELECT DISTINCT ON (psi.source_domain_id) psi.source_domain_id, psi.gap_severity
+         FROM project_source_index psi
+        WHERE psi.project_id = $1::uuid AND psi.engine_key = 'all' AND psi.window_days = $2::int
+        ORDER BY psi.source_domain_id, psi.window_start DESC
+     )
+     SELECT sd.id, lower(sd.domain) AS domain, l.gap_severity, sd.seeding_playbook_slug
+       FROM latest l
+       JOIN source_domains sd ON sd.id = l.source_domain_id
+      WHERE sd.is_seedable AND l.gap_severity = ANY($3::text[])
+      ORDER BY lower(sd.domain)`,
+    [ctx.projectId, condition.window_days, condition.gap_severities],
+  );
+  return found.rows.map((row) => ({
+    // Shared with the recovery plan and the displacement rule: one authority task per project and domain.
+    fingerprint: authorityTaskFingerprint(ctx.projectId, row.domain),
+    kind: "authority" as const,
+    vars: { domain: row.domain },
+    strength: SEVERITY_STRENGTH[row.gap_severity] ?? 0.5,
+    baselineEngine: "all",
+    affectedEngines: [],
+    affectedPromptIds: [],
+    sourceDomainId: row.id,
+    playbook: { slug: row.seeding_playbook_slug, domain: row.domain, url: null, angle: "source_gap" },
+  }));
+}
+
+// ---- prompt_stability ------------------------------------------------------------------------------------------------
+
+async function evaluatePromptStability(rule: RuleRow, condition: Extract<TaskGenerationCondition, { kind: "prompt_stability" }>, ctx: EvalContext): Promise<TaskDraft[]> {
+  const found = await ctx.tx.query<{ id: string }>(
+    `SELECT id FROM tracked_prompts
+      WHERE project_id = $1::uuid AND is_priority AND status = 'active' AND deleted_at IS NULL
+        AND stability_score IS NOT NULL AND stability_score < $2::real
+      ORDER BY id`,
+    [ctx.projectId, condition.max_stability],
+  );
+  if (found.rows.length < condition.min_prompts) return [];
+  return [
+    {
+      fingerprint: taskFingerprint(rule.code, ctx.projectId, "project"),
+      vars: { prompt_count: found.rows.length, max_stability: condition.max_stability },
+      strength: strengthOf(found.rows.length, condition.min_prompts),
+      baselineEngine: "all",
+      affectedEngines: [],
+      affectedPromptIds: found.rows.map((row) => row.id),
+    },
+  ];
+}
+
+async function playbookSlugs(tx: ClientBase, domainIds: readonly string[]): Promise<Map<string, string | null>> {
+  const slugs = new Map<string, string | null>();
+  if (domainIds.length === 0) return slugs;
+  const rows = await tx.query<{ id: string; seeding_playbook_slug: string | null }>(
+    `SELECT id, seeding_playbook_slug FROM source_domains WHERE id = ANY($1::uuid[])`,
+    [[...domainIds]],
+  );
+  for (const row of rows.rows) slugs.set(row.id, row.seeding_playbook_slug);
+  return slugs;
+}

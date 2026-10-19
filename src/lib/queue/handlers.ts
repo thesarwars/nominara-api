@@ -15,6 +15,7 @@ import { createCrawlAuditHandler } from "./handlers/crawl-audit.handler.js";
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { createRollupMetricDailyHandler } from "./handlers/rollup-metric-daily.handler.js";
 import { createSourceVerifyPresenceHandler } from "./handlers/source-verify-presence.handler.js";
+import { createTaskGenerateHandler } from "./handlers/task-generate.handler.js";
 import { QUEUE_TOPOLOGY } from "./topology.js";
 import type { JobProcessor } from "./worker-factory.js";
 
@@ -80,6 +81,9 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * queue — turning "not built yet" into "tried and failed" in the record an
  * operator reads during an incident.
  *
+ * `task.generate` lands with STORY-063: it evaluates the task rule catalog for one project and day. Its producers are the
+ * rollup handler (after each day's rollup) and, later, the AUX finding lifecycle.
+ *
  * `maintenance.partition` is the obvious first real entry — non-tenant-
  * scoped, and its logic already exists in src/workers/rollup/maintenance.ts,
  * invoked today only by a hand-run script (README gap G-10). Wiring it is a
@@ -99,6 +103,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "audit.verify": (context) => createAuditVerifyHandler(context),
   "identity.sweep_unverified": (context) => createIdentitySweepUnverifiedHandler(context),
   "source.verify_presence": (context) => createSourceVerifyPresenceHandler(context),
+  "task.generate": (context) => createTaskGenerateHandler(context),
   "billing.auto_topup": (context) => createBillingAutoTopupHandler(context),
   "billing.customer_email": (context) => createBillingCustomerEmailHandler(context),
 };

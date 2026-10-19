@@ -12,7 +12,7 @@ import { Page, pageFrom } from "../../api/pagination/page.js";
 import { ConflictError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
 import { dataSourceOf } from "../../lib/analytics/data-source.js";
-import { authorityTargets, authorityTaskFingerprint, recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
+import { actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint, recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
 import type { Task } from "../../../contracts/tasks/index.js";
 import { TasksService } from "../tasks/tasks.service.js";
 import { SOURCE_INDEX_WINDOWS } from "../../lib/rollup/refresh-project-source-index.js";
@@ -264,20 +264,8 @@ export class DisplacementService {
    * Returns lower-cased domain to `source_domains.id`.
    */
   private async actionableDomains(projectId: string, domains: readonly string[]): Promise<Map<string, string>> {
-    const found = new Map<string, string>();
-    if (domains.length === 0) return found;
     const { client, context } = this.store();
-    const rows = await client.query<{ id: string; domain: string }>(
-      `SELECT sd.id, lower(sd.domain) AS domain
-         FROM source_domains sd
-         JOIN project_source_index psi ON psi.source_domain_id = sd.id
-        WHERE sd.workspace_id = $1 AND sd.is_seedable AND lower(sd.domain) = ANY($3::text[])
-          AND psi.workspace_id = $1 AND psi.project_id = $2 AND psi.engine_key = 'all' AND psi.window_days = $4
-          AND psi.gap_severity IN ('critical', 'high')`,
-      [context.workspaceId, projectId, domains, AUTHORITY_TASK_WINDOW_DAYS],
-    );
-    for (const row of rows.rows) found.set(row.domain, row.id);
-    return found;
+    return actionableAuthorityDomains(client, context.workspaceId, projectId, domains, AUTHORITY_TASK_WINDOW_DAYS);
   }
 
   private store() {

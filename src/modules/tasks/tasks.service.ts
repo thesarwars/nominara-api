@@ -15,6 +15,7 @@ import type {
 } from "../../../contracts/tasks/index.js";
 import { ConflictError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
+import { taskEvidenceRefreshPayloadSchema } from "../../../contracts/tasks/index.js";
 import { refreshProjectTaskCounts } from "../../lib/rollup/refresh-project-task-counts.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type { ActionItem, ActionItemEffort, ActionItemPrimaryActionKind, ActionItemSource } from "../../../contracts/tasks/index.js";
@@ -54,11 +55,59 @@ interface TaskInsert {
   sourceDisplacementId: string | null;
   sourceDomainId: string | null;
   affectedUrl: string | null;
+  /** STORY-063 — what a rule-generated task records at creation. Absent for a manual task and a recovery-plan task. */
+  readonly generation?: TaskGenerationFields;
 }
+
+/**
+ * STORY-063 — the columns only the generation engine writes. All optional: a column left out takes its table default
+ * (impact 0, effort `m`, priority 3, no evidence links), exactly as before this story.
+ */
+export interface TaskGenerationFields {
+  readonly sourceFindingId?: string | null;
+  readonly sourceGeoAnalysis?: string | null;
+  readonly affectedEngines?: readonly string[];
+  readonly affectedPromptIds?: readonly string[];
+  readonly playbookSlug?: string | null;
+  readonly playbookPayload?: unknown;
+  /** Captured AT CREATION. Never rewritten by a recurrence or by completion. */
+  readonly baselineMetrics?: unknown;
+  readonly impactScore?: number;
+  readonly effortBand?: "xs" | "s" | "m" | "l" | "xl";
+  readonly priority?: number;
+  /** The end of the metric day the evidence is from; it seeds `last_evidence_at`. */
+  readonly evidenceAt?: Date;
+  /** The `created` event is a system event (a worker has no user), with a null actor. */
+  readonly systemActor?: boolean;
+}
+
+/** STORY-063 — what `createGeneratedTask` did. `created` is true only for `created`. */
+export type GeneratedTaskOutcome = "created" | "deduplicated" | "refreshed" | "suppressed";
 
 /** NEW-C-6 — the input of `TasksService.createGeneratedTask`: a generated task is never a goal task and always carries a deterministic fingerprint. */
 export interface GeneratedTaskInput extends Omit<TaskInsert, "goalId"> {
   projectId: string;
+  /**
+   * STORY-063 — a rule's `cooldown_days`. Applies only when no OPEN task has the fingerprint: a task of the same
+   * fingerprint created inside the window (in ANY state, deleted included) suppresses a new one. 0 or absent: none.
+   */
+  readonly cooldownDays?: number;
+  /**
+   * STORY-063 — set by the generation engine. When an open task already has the fingerprint, evidence that is NEWER than
+   * the task's `last_evidence_at` refreshes it, bumps `recurrence_count` and writes an `evidence_refreshed` event; evidence
+   * that is not newer (a re-run of the same day) writes nothing. Absent (the recovery plan): an open task is returned untouched.
+   */
+  readonly refresh?: TaskEvidenceRefresh;
+}
+
+/** The evidence a recurrence carries. */
+export interface TaskEvidenceRefresh {
+  /** End of the evaluated metric day. */
+  readonly evidenceAt: Date;
+  readonly metricDate: string;
+  readonly impactScore: number;
+  readonly affectedEngines: readonly string[];
+  readonly affectedPromptIds: readonly string[];
 }
 
 /** schemas/tasks-and-goals.md: a dismissed task re-surfaces after 180 days. */
@@ -455,7 +504,7 @@ export class TasksService {
    *
    * Runs in the ambient tenant transaction; a failure after the insert rolls the task back with the caller.
    */
-  async createGeneratedTask(input: GeneratedTaskInput): Promise<{ task: Task; created: boolean }> {
+  async createGeneratedTask(input: GeneratedTaskInput): Promise<{ task: Task; created: boolean; outcome: GeneratedTaskOutcome }> {
     const store = currentTenantStore()!;
     const client = store.client;
 
@@ -479,31 +528,95 @@ export class TasksService {
     );
     if (existing.rows[0] !== undefined) {
       incrementCounter("nominara_tasks_generated_deduplicated_total", { origin: input.origin });
-      return { task: await this.readTask(client, existing.rows[0].id), created: false };
+      const refreshed = input.refresh === undefined ? false : await this.refreshEvidence(client, existing.rows[0].id, input.refresh);
+      return { task: await this.readTask(client, existing.rows[0].id), created: false, outcome: refreshed ? "refreshed" : "deduplicated" };
+    }
+    if (input.cooldownDays !== undefined && input.cooldownDays > 0) {
+      const recent = await client.query<{ id: string }>(
+        `SELECT id FROM tasks
+          WHERE project_id = $1 AND dedupe_fingerprint = $2 AND created_at > now() - make_interval(days => $3::int)
+          ORDER BY created_at DESC LIMIT 1`,
+        [input.projectId, input.fingerprint, input.cooldownDays],
+      );
+      if (recent.rows[0] !== undefined) {
+        return { task: await this.readTask(client, recent.rows[0].id), created: false, outcome: "suppressed" };
+      }
     }
     const task = await this.insertTask(client, input.projectId, found.name, input);
-    return { task, created: true };
+    return { task, created: true, outcome: "created" };
+  }
+
+  /**
+   * STORY-063 AC6 — a recurrence on an OPEN (todo / in progress) task. The conditional UPDATE is the idempotency: it only
+   * matches when the evidence is newer than what the task already holds, so the same rollup re-run any number of times
+   * (and an out-of-order older date) changes nothing. A dismissed task is left exactly as dismissed. `baseline_metrics` is
+   * never touched: the before must predate the work.
+   */
+  private async refreshEvidence(client: ClientBase, taskId: string, refresh: TaskEvidenceRefresh): Promise<boolean> {
+    const updated = await client.query<{ recurrence_count: number }>(
+      `UPDATE tasks
+          SET recurrence_count = recurrence_count + 1,
+              last_evidence_at = $2,
+              impact_score = $3,
+              affected_engines = $4::text[],
+              affected_prompt_ids = $5::uuid[]
+        WHERE id = $1 AND status IN ('todo', 'in_progress')
+          AND (last_evidence_at IS NULL OR last_evidence_at < $2)
+        RETURNING recurrence_count`,
+      [taskId, refresh.evidenceAt, refresh.impactScore, [...refresh.affectedEngines], [...refresh.affectedPromptIds]],
+    );
+    const row = updated.rows[0];
+    if (row === undefined) return false;
+    const payload = taskEvidenceRefreshPayloadSchema.parse({
+      metric_date: refresh.metricDate,
+      recurrence_count: row.recurrence_count,
+      impact_score: refresh.impactScore,
+      affected_engines: [...refresh.affectedEngines],
+    });
+    await client.query(
+      `INSERT INTO task_events (workspace_id, task_id, actor_id, actor_type, event, payload, occurred_at)
+       VALUES (app.current_workspace(), $1, NULL, 'system', 'evidence_refreshed', $2::jsonb, clock_timestamp())`,
+      [taskId, JSON.stringify(payload)],
+    );
+    incrementCounter("nominara_tasks_events_written_total", { event: "evidence_refreshed" });
+    incrementCounter("nominara_tasks_recurrence_total", {});
+    return true;
   }
 
   /** The one `INSERT INTO tasks` for new tasks: reference, row, `created` event, open counts, metric, log, realtime. */
   private async insertTask(client: ClientBase, projectId: string, projectName: string, input: TaskInsert): Promise<Task> {
     const store = currentTenantStore()!;
     const shortRef = await nextShortRef(client, store.context.workspaceId, shortRefPrefix(projectName));
+    const g = input.generation;
+    // Optional generation fields fall back to the table defaults (COALESCE of a NULL parameter), so a manual task and a
+    // recovery-plan task are written exactly as before.
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO tasks (workspace_id, project_id, short_ref, kind, origin, rule_code, dedupe_fingerprint, title, description,
-                          goal_id, source_displacement_id, source_domain_id, affected_url)
-       VALUES (app.current_workspace(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                          goal_id, source_displacement_id, source_domain_id, affected_url,
+                          source_finding_id, source_geo_analysis, affected_engines, affected_prompt_ids, playbook_slug, playbook_payload,
+                          baseline_metrics, impact_score, effort_band, priority, last_evidence_at)
+       VALUES (app.current_workspace(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+               $13, $14, COALESCE($15::text[], '{}'::text[]), COALESCE($16::uuid[], '{}'::uuid[]), $17, $18::jsonb,
+               $19::jsonb, COALESCE($20::real, 0), COALESCE($21::text, 'm'), COALESCE($22::smallint, 3), $23)
        RETURNING id`,
       [
         projectId, shortRef, input.kind, input.origin, input.ruleCode, input.fingerprint, input.title, input.description,
         input.goalId ?? null, input.sourceDisplacementId, input.sourceDomainId, input.affectedUrl,
+        g?.sourceFindingId ?? null, g?.sourceGeoAnalysis ?? null,
+        g?.affectedEngines === undefined ? null : [...g.affectedEngines],
+        g?.affectedPromptIds === undefined ? null : [...g.affectedPromptIds],
+        g?.playbookSlug ?? null,
+        g?.playbookPayload === undefined || g.playbookPayload === null ? null : JSON.stringify(g.playbookPayload),
+        g?.baselineMetrics === undefined || g.baselineMetrics === null ? null : JSON.stringify(g.baselineMetrics),
+        g?.impactScore ?? null, g?.effortBand ?? null, g?.priority ?? null, g?.evidenceAt ?? null,
       ],
     );
     const taskId = inserted.rows[0]!.id;
+    const systemActor = g?.systemActor === true;
     await client.query(
       `INSERT INTO task_events (workspace_id, task_id, actor_id, actor_type, event, to_value, occurred_at)
-       VALUES (app.current_workspace(), $1, $2, 'user', 'created', 'todo', clock_timestamp())`,
-      [taskId, store.context.actorId],
+       VALUES (app.current_workspace(), $1, $2, $3, 'created', 'todo', clock_timestamp())`,
+      [taskId, systemActor ? null : store.context.actorId, systemActor ? "system" : "user"],
     );
     await refreshProjectTaskCounts(client, projectId);
 

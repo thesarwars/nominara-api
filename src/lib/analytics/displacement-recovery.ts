@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ClientBase } from "pg";
 import type { CitationGapEntry, ConceptGapEntry } from "../../../contracts/analytics/index.js";
 
 // NEW-C-5 AC1 — how many tasks a recovery plan would create for a displacement.
@@ -42,4 +43,35 @@ export function authorityTargets<T extends Pick<CitationGapEntry, "domain">>(
 /** NEW-C-6 — `sha256('authority:{project_id}:{domain}')`, the domain lower-cased (owner decision 2026-10-08). */
 export function authorityTaskFingerprint(projectId: string, domain: string): Buffer {
   return createHash("sha256").update(`authority:${projectId}:${domain.toLowerCase()}`).digest();
+}
+
+/**
+ * STORY-054 AC10 (owner decision 2026-10-13) — the domains an authority task may be made for: SEEDABLE in the workspace AND
+ * at a critical or high gap severity on the project's `project_source_index` row at engine 'all', over `windowDays` (the
+ * widest window). No row, no task. Returns lower-cased domain to `source_domains.id`.
+ *
+ * ONE definition for every path that makes an authority task: the on-demand recovery plan (DisplacementService) and the
+ * rule-driven generator (STORY-063) both read it, so they cannot disagree about which domains are actionable. The caller's
+ * transaction supplies RLS; `workspaceId` is the value of the equality, not the isolation.
+ */
+export async function actionableAuthorityDomains(
+  client: ClientBase,
+  workspaceId: string,
+  projectId: string,
+  domains: readonly string[],
+  windowDays: number,
+): Promise<Map<string, string>> {
+  const found = new Map<string, string>();
+  if (domains.length === 0) return found;
+  const rows = await client.query<{ id: string; domain: string }>(
+    `SELECT sd.id, lower(sd.domain) AS domain
+       FROM source_domains sd
+       JOIN project_source_index psi ON psi.source_domain_id = sd.id
+      WHERE sd.workspace_id = $1 AND sd.is_seedable AND lower(sd.domain) = ANY($3::text[])
+        AND psi.workspace_id = $1 AND psi.project_id = $2 AND psi.engine_key = 'all' AND psi.window_days = $4
+        AND psi.gap_severity IN ('critical', 'high')`,
+    [workspaceId, projectId, [...domains], windowDays],
+  );
+  for (const row of rows.rows) found.set(row.domain, row.id);
+  return found;
 }

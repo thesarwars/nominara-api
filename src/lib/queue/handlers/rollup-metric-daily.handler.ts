@@ -48,8 +48,12 @@ const payloadSchema = z
 /** Enqueues one `source.verify_presence` job. Injected in tests; production builds a producer from env on first use. */
 export type EnqueueVerifyPresence = (workspaceId: string, payload: { projectId: string }, idempotencyKey: string) => Promise<unknown>;
 
+/** STORY-063 — enqueues one `task.generate` job for a project and workspace-local day. Injected in tests. */
+export type EnqueueTaskGenerate = (workspaceId: string, payload: { projectId: string; metricDate: string }, idempotencyKey: string) => Promise<unknown>;
+
 export interface RollupMetricDailyDeps {
   readonly enqueueVerifyPresence?: EnqueueVerifyPresence;
+  readonly enqueueTaskGenerate?: EnqueueTaskGenerate;
 }
 
 export function createRollupMetricDailyHandler(context: QueueHandlerContext, deps?: RollupMetricDailyDeps): JobProcessor {
@@ -68,6 +72,17 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
         signingKeysFromEnv(context.env),
       );
       return producer.enqueueTenantJob("source.verify_presence", workspaceId, payload, { idempotencyKey });
+    });
+
+  const enqueueTaskGenerate: EnqueueTaskGenerate =
+    deps?.enqueueTaskGenerate ??
+    (async (workspaceId, payload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob("task.generate", workspaceId, payload, { idempotencyKey });
     });
 
   return async (tx: ClientBase, job: Job): Promise<void> => {
@@ -133,6 +148,31 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
       if (currentTenantStore() !== undefined) {
         const today = await localToday(tx, timezone);
         const { projectId, workspaceId } = payload;
+
+        // STORY-063 AC3 — generation runs after each rollup, on the latest day it rolled up. A separate job, queued once this
+        // transaction has committed (so it reads what this run wrote), because the rule evaluation is its own unit of
+        // work with its own retries. The key carries this job's id: a redelivery of THIS rollup queues nothing more, while
+        // a later rollup of the same day (a dirty-date reprocess) queues a fresh evaluation, which is safe because
+        // generation is idempotent. A failed enqueue is logged, never thrown: the rollup is durable.
+        const lastDate = dates[dates.length - 1];
+        if (lastDate !== undefined) {
+          const runKey = job.id ?? today;
+          afterCommit(() => {
+            void enqueueTaskGenerate(workspaceId, { projectId, metricDate: lastDate }, `taskgen:${projectId}:${lastDate}:${runKey}`)
+              .then(() => {
+                incrementCounter("nominara_taskgen_requested_total");
+              })
+              .catch((error: unknown) => {
+                incrementCounter("nominara_taskgen_request_failed_total");
+                logger.error({
+                  event: "taskgen.request_failed",
+                  workspace_id: workspaceId,
+                  project_id: projectId,
+                  error: error instanceof Error ? error.name : "unknown",
+                });
+              });
+          });
+        }
         afterCommit(() => {
           void enqueueVerifyPresence(workspaceId, { projectId }, `srcver:${projectId}:${today}`)
             .then(() => {
