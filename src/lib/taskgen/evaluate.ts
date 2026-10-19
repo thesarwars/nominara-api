@@ -8,7 +8,7 @@ import { citationGapSchema } from "../../../contracts/analytics/index.js";
 import { actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint } from "../analytics/displacement-recovery.js";
 import { SOURCE_INDEX_WINDOWS } from "../rollup/refresh-project-source-index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
-import { compileMetricWindow, effectiveWindowDays } from "./compile.js";
+import { compileMetricWindow, effectiveWindowDays, runFloorCells } from "./compile.js";
 import { taskFingerprint } from "./fingerprint.js";
 import { strengthOf } from "./impact.js";
 import type { EvalContext, RuleRow, TaskDraft } from "./types.js";
@@ -79,8 +79,9 @@ async function evaluateMetricWindow(rule: RuleRow, condition: MetricWindowCondit
   // The window per engine comes from the plan's cadence (`cadence_by_plan`, through the entitled-engines view the scheduler also reads).
   const cadence = await ctx.tx.query<{ engine_key: string; cadence: unknown }>(`SELECT engine_key, cadence FROM project_entitled_engines WHERE project_id = $1::uuid`, [ctx.projectId]);
   const engineWindowDays = Object.fromEntries(cadence.rows.map((row) => [row.engine_key, effectiveWindowDays(condition.window_days, row.cadence)]));
+  const engineRunFloor = Object.fromEntries(cadence.rows.map((row) => [row.engine_key, runFloorCells(condition.min_n, engineWindowDays[row.engine_key]!, row.cadence)]));
   const compiled = compileMetricWindow(condition, {
-    projectId: ctx.projectId, metricDate: ctx.metricDate, scoringVersion: ctx.scoringVersion, timezone: ctx.timezone, engineWindowDays,
+    projectId: ctx.projectId, metricDate: ctx.metricDate, scoringVersion: ctx.scoringVersion, timezone: ctx.timezone, engineWindowDays, engineRunFloor,
   });
   /** The window an engine was actually compared over: the title names it, so a Starter task says 14 days, not the rule's 7. */
   const windowOf = (engine: string): number => engineWindowDays[engine] ?? condition.window_days;

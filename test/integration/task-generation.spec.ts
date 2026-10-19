@@ -164,7 +164,7 @@ describe("STORY-063 · task generation engine", () => {
     const parts: (Required<Omit<RunPart, "planned" | "inProgress">> & Pick<RunPart, "planned" | "inProgress">)[] =
       spec.parts !== undefined
         ? spec.parts.map((p) => ({ ...p, present: p.present ?? p.cells, sov: p.sov ?? 0.4, owned: p.owned ?? 0 }))
-        : [{ run: spec.run ?? date, cells: spec.cells ?? 5, present: spec.present ?? spec.cells ?? 5, sov: spec.sov ?? 0.4, owned: spec.owned ?? 0, planned: spec.planned, inProgress: spec.inProgress }];
+        : [{ run: spec.run ?? date, cells: spec.cells ?? 5, present: spec.present ?? spec.cells ?? 5, sov: spec.sov ?? 0.4, owned: spec.owned ?? 0, ...(spec.planned === undefined ? {} : { planned: spec.planned }), ...(spec.inProgress === undefined ? {} : { inProgress: spec.inProgress }) }];
     const cells = parts.reduce((n, p) => n + p.cells, 0);
     const present = parts.reduce((n, p) => n + p.present, 0);
     const owned = parts.reduce((n, p) => n + p.owned, 0);
@@ -189,14 +189,18 @@ describe("STORY-063 · task generation engine", () => {
   }
 
   /** Seven days ending `end`, one row a day. */
-  async function windowOf(engine: string, end: string, spec: MetricSpec | ((i: number) => MetricSpec)): Promise<void> {
-    for (let i = 0; i < 7; i += 1) await metric(engine, day(end, -i), typeof spec === "function" ? spec(i) : spec);
+  const GROWTH_DAYS = 14; // Growth runs 1.87 times in 7 days, so its window is 14 days (owner decision 2026-10-19)
+  async function windowOf(engine: string, end: string, spec: MetricSpec | ((i: number) => MetricSpec), days = 7): Promise<void> {
+    for (let i = 0; i < days; i += 1) await metric(engine, day(end, -i), typeof spec === "function" ? spec(i) : spec);
   }
 
-  /** A prior window at `prior` and a current window at `current` for one engine, ending at D. */
-  async function twoWindows(engine: string, prior: MetricSpec | ((i: number) => MetricSpec), current: MetricSpec | ((i: number) => MetricSpec)): Promise<void> {
-    await windowOf(engine, day(D, -7), prior);
-    await windowOf(engine, D, current);
+  /**
+   * A prior window at `prior` and a current window at `current` for one engine, ending at D. `days` is the window the engine is compared over:
+   * 7, the rule's own, for an engine the workspace's plan does not schedule (the fallback); `GROWTH_DAYS` for ChatGPT on the default Growth plan.
+   */
+  async function twoWindows(engine: string, prior: MetricSpec | ((i: number) => MetricSpec), current: MetricSpec | ((i: number) => MetricSpec), days = 7): Promise<void> {
+    await windowOf(engine, day(D, -days), prior, days);
+    await windowOf(engine, D, current, days);
   }
 
   const generate = (date = D, ws = workspaceId, triggerKinds?: readonly string[]): Promise<GenerationSummary> =>
@@ -311,7 +315,7 @@ describe("STORY-063 · task generation engine", () => {
     // TG-SOV-DROP-ENGINE: sov 0.40 -> 0.30 is a 25% relative drop on one engine, n = 35 in both windows.
     await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
     // TG-PRESENCE-LOSS: presence 1.0 -> 0.8 is a 0.20 absolute drop (>= 0.10) on another engine; sov flat.
-    await twoWindows("chatgpt", { present: 5 }, { present: 4 });
+    await twoWindows("chatgpt", { cells: 10, present: 10 }, { cells: 10, present: 8 }, GROWTH_DAYS);
     // TG-CITATION-LOSS: owned citations 40 -> 20 (50% down, >= 25%) on a third; presence/sov flat.
     await twoWindows("claude", { owned: 4 }, { owned: 2 });
     const summary = await generate();
@@ -326,7 +330,7 @@ describe("STORY-063 · task generation engine", () => {
   });
 
   it("[STORY-063 #1] TG-SOV-DROP-GLOBAL needs the same drop across >= 3 engines; two engines make only the per-engine tasks", async () => {
-    for (const engine of ["gemini", "chatgpt"]) await twoWindows(engine, { sov: 0.4 }, { sov: 0.3 });
+    for (const engine of ["gemini", "chatgpt"]) await twoWindows(engine, { cells: 10, sov: 0.4 }, { cells: 10, sov: 0.3 }, engine === "chatgpt" ? GROWTH_DAYS : 7);
     await generate();
     expect(await taskRows("TG-SOV-DROP-GLOBAL")).toHaveLength(0);
     expect(await taskRows("TG-SOV-DROP-ENGINE")).toHaveLength(2);
@@ -340,7 +344,7 @@ describe("STORY-063 · task generation engine", () => {
   it("[STORY-063 #1] the cross-engine `all` row is not an engine: a drop only there makes no per-engine task and does not count toward the global rule", async () => {
     await twoWindows("all", { sov: 0.4 }, { sov: 0.3 });
     await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
-    await twoWindows("chatgpt", { sov: 0.4 }, { sov: 0.3 });
+    await twoWindows("chatgpt", { cells: 10, sov: 0.4 }, { cells: 10, sov: 0.3 }, GROWTH_DAYS);
     await generate();
     expect((await taskRows("TG-SOV-DROP-ENGINE")).flatMap((t) => t.affected_engines).sort()).toEqual(["chatgpt", "gemini"]);
     expect(await taskRows("TG-SOV-DROP-GLOBAL")).toHaveLength(0);
@@ -770,7 +774,7 @@ describe("STORY-063 · task generation engine", () => {
 
   it("[STORY-063 #9] impact orders the queue: the higher-impact rule's task sorts first", async () => {
     await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
-    await twoWindows("chatgpt", { present: 5 }, { present: 4 });
+    await twoWindows("chatgpt", { cells: 10, present: 10 }, { cells: 10, present: 8 }, GROWTH_DAYS);
     await generate();
     const ordered = (await db.query("SELECT rule_code FROM tasks ORDER BY impact_score DESC, id")).rows.map((r) => r.rule_code);
     const impacts = (await db.query("SELECT impact_score FROM tasks ORDER BY impact_score DESC")).rows.map((r) => r.impact_score);
@@ -1199,13 +1203,13 @@ describe("STORY-063 · task generation engine", () => {
       if (sov !== undefined) await metric(engine, day(D, -offset), { cells, sov });
     }
   }
-  /** Growth's two runs a week: capture days at `offsets` (days back from each window's last day) in the current (k = 0) and prior (1) windows. */
-  const GROWTH = [1, 4];
+  /** Growth's runs (every 3.75 days, 14-day windows): three capture days at `GROWTH` (days back from each window's last day) in the current (k = 0) and prior (1) windows. */
+  const GROWTH = [2, 6, 10];
   async function growthRuns(engine: string, spec: (k: number, j: number) => MetricSpec | undefined): Promise<void> {
     for (let k = 0; k < 2; k += 1) {
       for (const [j, offset] of GROWTH.entries()) {
         const row = spec(k, j);
-        if (row !== undefined) await metric(engine, day(day(D, -7 * k), -offset), row);
+        if (row !== undefined) await metric(engine, day(day(D, -14 * k), -offset), row);
       }
     }
   }
@@ -1291,15 +1295,15 @@ describe("STORY-063 · task generation engine", () => {
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #14] the window comes from the plan's cadence data: Growth and Business keep the rule's own 7 days, and a Starter project's 7-day pair does not fire", async () => {
-    // Growth: two runs a 7-day window, both fell.
-    await growthRuns("chatgpt", (k) => ({ cells: 20, sov: k === 0 ? 0.25 : 0.4 }));
+  it("[STORY-063 #14] the window comes from the plan's cadence data: Growth compares 14 days (three runs a side, 40 cells each), and a 7-day pair of runs is not enough there", async () => {
+    await growthRuns("chatgpt", (k) => ({ cells: 40, sov: k === 0 ? 0.25 : 0.4 }));
     await generate();
-    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+    const tasks = await taskRows();
+    expect(tasks.map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+    expect(tasks[0].description).toContain("last 14 days against the 14 days before");
     await reset();
-    // The same rows at Starter: the 14-day windows hold D-1, D-4, D-8, D-11 (current) and nothing older, so there is no prior window.
-    await setPlan("starter");
-    await growthRuns("chatgpt", (k) => ({ cells: 20, sov: k === 0 ? 0.25 : 0.4 }));
+    // Runs laid out for 7-day windows (D-1, D-4 and D-8, D-11) all sit in the current 14 days: there is no prior window to compare.
+    for (const [offset, sov] of [[1, 0.25], [4, 0.25], [8, 0.4], [11, 0.4]] as const) await metric("chatgpt", day(D, -offset), { cells: 40, sov });
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
@@ -1316,30 +1320,30 @@ describe("STORY-063 · task generation engine", () => {
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #3 / AC3] Growth cadence (2 captures a week): both capture days breaching makes a task", async () => {
-    await growthRuns("chatgpt", (k) => ({ cells: 20, sov: k === 0 ? 0.25 : 0.4 }));
+  it("[STORY-063 #3 / AC3] Growth cadence (14-day windows, three runs a side): all three runs breaching makes a task", async () => {
+    await growthRuns("chatgpt", (k) => ({ cells: 40, sov: k === 0 ? 0.25 : 0.4 }));
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
   });
 
-  it("[STORY-063 #2] Growth cadence: one bad run (one of two capture days) makes NO task even though the window aggregate fell 37.5%", async () => {
-    await growthRuns("chatgpt", (k, j) => ({ cells: 20, sov: k === 0 && j === 0 ? 0.1 : 0.4 }));
+  it("[STORY-063 #2] Growth cadence: one bad run (one of three) makes NO task even though the window aggregate fell 25%", async () => {
+    await growthRuns("chatgpt", (k, j) => ({ cells: 40, sov: k === 0 && j === 0 ? 0.1 : 0.4 }));
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #3 / #17] owned citations are per measured CELL: Starter (14 days) and Growth (7 days) fire on a real per-cell drop, and one bad Growth run does not", async () => {
+  it("[STORY-063 #3 / #17] owned citations are per measured CELL: Starter and Growth (14 days each) fire on a real per-cell drop, and one bad Growth run does not", async () => {
     await setPlan("starter");
     for (const [i, offset] of STARTER_RUN_OFFSETS.entries()) await metric(STARTER_ENGINE, day(D, -offset), { cells: 30, sov: 0.4, owned: i < 2 ? 6 : 10 });
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
     await reset();
     await setPlan("growth");
-    await growthRuns("chatgpt", (k) => ({ cells: 20, sov: 0.4, owned: k === 0 ? 4 : 7 })); // 0.2 a cell against 0.35
+    await growthRuns("chatgpt", (k) => ({ cells: 40, sov: 0.4, owned: k === 0 ? 8 : 14 })); // 0.2 a cell against 0.35
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
     await reset();
-    await growthRuns("chatgpt", (k, j) => ({ cells: 20, sov: 0.4, owned: k === 0 ? (j === 0 ? 8 : 0) : 7 })); // one bad run
+    await growthRuns("chatgpt", (k, j) => ({ cells: 40, sov: 0.4, owned: k === 0 ? (j === 0 ? 0 : 14) : 14 })); // one bad run: the window fell a third, two runs held
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
@@ -1388,7 +1392,8 @@ describe("STORY-063 · task generation engine", () => {
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
   });
 
-  it("[STORY-063 #16 / #2] a capture RUN is not a date, at Growth cadence: a straddling bad run plus one good run is one breaching run of two, so NO task", async () => {
+  it("[STORY-063 #16 / #2] a capture RUN is not a date, at a cadence of two runs a 7-day window (Business): a straddling bad run plus one good run is one breaching run of two, so NO task", async () => {
+    await setPlan("business");
     await metric("chatgpt", day(D, -4), { cells: 20, sov: 0.4 });
     await metric("chatgpt", day(D, -1), { cells: 10, sov: 0.1, run: "straddler" });
     await metric("chatgpt", D, { cells: 10, sov: 0.1, run: "straddler" });
@@ -1416,7 +1421,8 @@ describe("STORY-063 · task generation engine", () => {
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
-  it("[STORY-063 #15 / #2 / REV6-A] Growth: a scheduled run plus a manual deep scan on one date, one of them bad, make NO task", async () => {
+  it("[STORY-063 #15 / #2 / REV6-A] Business (7-day window): a scheduled run plus a manual deep scan on one date, one of them bad, make NO task", async () => {
+    await setPlan("business");
     await metric("chatgpt", day(D, -11), { cells: 20, sov: 0.4 });
     await metric("chatgpt", day(D, -8), { cells: 20, sov: 0.4 });
     await metric("chatgpt", day(D, -3), { parts: [{ run: "scheduled", cells: 20, sov: 0.2 }, { run: "manual", cells: 20, sov: 0.4 }] });
@@ -1637,10 +1643,10 @@ describe("STORY-063 · task generation engine", () => {
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
   });
 
-  /** Business: a bad day is 8 of 20 cells present against 18 of 20; the three most recent days are bad. */
+  /** Business: a bad day is 8 of 20 cells present against 18 of 20; exactly the three most recent days are bad (`sustained_days` is 3). */
   async function businessDays(overrides: Readonly<Record<number, MetricSpec>>): Promise<void> {
     await setPlan("business");
-    for (let i = 0; i <= 13; i += 1) await metric("chatgpt", day(D, -i), { cells: 20, present: i <= 6 ? 8 : 18, ...overrides[i] });
+    for (let i = 0; i <= 13; i += 1) await metric("chatgpt", day(D, -i), { cells: 20, present: i <= 2 ? 8 : 18, ...overrides[i] });
   }
   it("[STORY-063 #2 / #4] a run's floor is relative to ITS OWN size: a run that measured under half of what it planned is not a breach (Business: 6 of 20 planned), exactly half is", async () => {
     await businessDays({ 1: { cells: 6, present: 2, planned: 20 } });
@@ -1697,7 +1703,8 @@ describe("STORY-063 · task generation engine", () => {
 
   // ---- a count is per measured CELL: a split or a resized run keeps its rate ---------------------------------------------------------
 
-  it("[STORY-063 #16 / #17] Growth: a STABLE run straddling midnight plus ONE run with no owned citations makes NO task (halves keep the run's per-cell rate)", async () => {
+  it("[STORY-063 #16 / #17] Business (7-day window): a STABLE run straddling midnight plus ONE run with no owned citations makes NO task (halves keep the run's per-cell rate)", async () => {
+    await setPlan("business");
     await metric("chatgpt", day(D, -11), { cells: 20, sov: 0.4, owned: 10 });
     await metric("chatgpt", day(D, -8), { cells: 20, sov: 0.4, owned: 10 });
     await metric("chatgpt", day(D, -4), { cells: 10, sov: 0.4, owned: 5, run: "s" });
@@ -1707,7 +1714,8 @@ describe("STORY-063 · task generation engine", () => {
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #17] Growth: trimming prompts from 40 to 28 with the per-prompt citations unchanged is a configuration edit, not a loss: NO task", async () => {
+  it("[STORY-063 #17] Business (7-day window): trimming prompts from 40 to 28 with the per-prompt citations unchanged is a configuration edit, not a loss: NO task", async () => {
+    await setPlan("business");
     await metric("chatgpt", day(D, -11), { cells: 40, sov: 0.4, owned: 20 });
     await metric("chatgpt", day(D, -8), { cells: 40, sov: 0.4, owned: 20 });
     await metric("chatgpt", day(D, -4), { cells: 28, sov: 0.4, owned: 14 });
@@ -1716,14 +1724,16 @@ describe("STORY-063 · task generation engine", () => {
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #17] a count with an extra run in the PRIOR window is not a drop: three prior runs against two current runs at the same per-cell rate", async () => {
+  it("[STORY-063 #17] (Business, 7-day window) a count with an extra run in the PRIOR window is not a drop: three prior runs against two current runs at the same per-cell rate", async () => {
+    await setPlan("business");
     for (const offset of [12, 10, 8]) await metric("chatgpt", day(D, -offset), { cells: 20, sov: 0.4, owned: 10 });
     for (const offset of [4, 1]) await metric("chatgpt", day(D, -offset), { cells: 20, sov: 0.4, owned: 10 });
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #17] a count with an extra run in the CURRENT window does not hide a real 40% per-cell drop", async () => {
+  it("[STORY-063 #17] (Business, 7-day window) a count with an extra run in the CURRENT window does not hide a real 40% per-cell drop", async () => {
+    await setPlan("business");
     await metric("chatgpt", day(D, -10), { cells: 35, sov: 0.4, owned: 17 });
     for (const offset of [5, 3, 1]) await metric("chatgpt", day(D, -offset), { cells: 35, sov: 0.4, owned: 10 });
     await generate();

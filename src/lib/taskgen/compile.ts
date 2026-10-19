@@ -11,22 +11,26 @@ import { measurementStatusSql } from "../rollup/aggregate-day.js";
 // runs in the job's tenant transaction, so RLS still scopes every read.
 
 /**
- * The window a rule actually compares for one engine, derived from the PLAN'S CADENCE (`engines.cadence_by_plan -> <plan>`, the
- * `cadence` column of `project_entitled_engines`: runs per 30-day cycle, per run kind) — data, never a plan name.
+ * The days between an engine's runs, from the PLAN'S CADENCE (`engines.cadence_by_plan -> <plan>`, the `cadence` column of
+ * `project_entitled_engines`: runs per 30-day cycle, per run kind): `CYCLE_DAYS / (its most frequent kind's runs per cycle)`.
+ * `null` when there is no usable cadence (an engine the plan does not schedule, a malformed value). Data, never a plan name.
+ */
+export function runIntervalDays(cadence: unknown): number | null {
+  if (typeof cadence !== "object" || cadence === null || Array.isArray(cadence)) return null;
+  const runsPerCycle = Math.max(0, ...Object.values(cadence).filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0));
+  return runsPerCycle === 0 ? null : CYCLE_DAYS / runsPerCycle;
+}
+
+/**
+ * The window a rule actually compares for one engine, derived from the plan's cadence (`runIntervalDays`).
  *
- * The rule's `window_days` is the SHORTEST window worth comparing, and a window must be able to hold two runs for "sustained" to mean
- * anything. The interval between an engine's runs is `CYCLE_DAYS / (its most frequent kind's runs per cycle)`. A cadence whose
- * interval fits the rule's window (Growth: 3.75 days, Business: daily) keeps it. A slower cadence (Starter: 4 runs, 7.5 days, which can
- * leave a 7-day window with no run at all) widens the window to the smallest whole multiple of `window_days` that covers the
- * interval: a `window_days: 7` rule at Starter compares the last 14 days with the 14 before (owner decision 2026-10-19), two runs a
- * side, and the drop has to hold in both recent runs.
+ * The rule's `window_days` is the SHORTEST window worth comparing, and "sustained" needs a window that can hold two runs. A cadence with
+ * two or more runs in `window_days` (interval no longer than half of it: Business daily, Enterprise hourly) keeps the rule's own window.
+ * Any slower cadence widens it to the smallest whole multiple of `window_days` that is at least double AND covers the interval:
+ * Starter (4 runs a cycle, 7.5 days) and Growth (8 runs, 3.75 days, 1.87 runs a 7-day window: owner's rule applied literally,
+ * 2026-10-19) compare the last 14 days with the 14 before, and the drop has to hold in the recent runs of both.
  *
- * No usable cadence (an engine the plan does not schedule, a malformed value) returns the rule's own window.
- *
- * "Keeps the rule's window" means the INTERVAL between runs (`CYCLE_DAYS / runs per cycle`) is no longer than `window_days`, not "two or
- * more runs per 7 days" literally: Growth (8 runs, 3.75 days, 1.87 a week) keeps 7 days although a 7-day window can then hold one run,
- * in which case no `metric_window` rule fires (it misses a drop; it never raises a false alarm). Owner confirmation of Growth at 7 days
- * is OPEN (plans-7day/story-063-decisions.md, Round 6).
+ * No usable cadence returns the rule's own window.
  *
  * KNOWN LIMIT: the most frequent KIND sets the interval. At Business that is `priority` (30 runs), which runs only the `is_priority`
  * prompts, while `full` (4 runs) covers every prompt. A 7-day window can hold 0 or 1 full runs, so two compared windows may mix
@@ -35,11 +39,20 @@ import { measurementStatusSql } from "../rollup/aggregate-day.js";
  * so the common case is the full list.
  */
 export function effectiveWindowDays(windowDays: number, cadence: unknown): number {
-  if (typeof cadence !== "object" || cadence === null || Array.isArray(cadence)) return windowDays;
-  const runsPerCycle = Math.max(0, ...Object.values(cadence).filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0));
-  if (runsPerCycle === 0) return windowDays;
-  const intervalDays = CYCLE_DAYS / runsPerCycle;
-  return windowDays * Math.max(1, Math.ceil(intervalDays / windowDays));
+  const intervalDays = runIntervalDays(cadence);
+  if (intervalDays === null || intervalDays * 2 <= windowDays) return windowDays;
+  return windowDays * Math.max(2, Math.ceil(intervalDays / windowDays));
+}
+
+/**
+ * The cells a run must hold to be a run at all, from the same cadence data as `effectiveWindowDays`: the window's sample floor
+ * (`min_n`) divided by the runs the window is expected to hold (`span / interval`), `ceil(min_n * interval / span)`, never under 1.
+ * About 17 cells at Starter (30 / 1.87), 9 at Growth (30 / 3.73), 5 at Business (30 / 7) and 1 at Enterprise. With no usable cadence the
+ * window is assumed to hold one run a day, `ceil(min_n / span)`.
+ */
+export function runFloorCells(minN: number, span: number, cadence: unknown): number {
+  const intervalDays = runIntervalDays(cadence) ?? 1;
+  return Math.max(1, Math.ceil((minN * intervalDays) / span - 1e-9));
 }
 
 export interface CompileParams {
@@ -51,6 +64,8 @@ export interface CompileParams {
   readonly timezone: string;
   /** Per engine, the window `effectiveWindowDays` derived from its cadence. An engine absent here is compared over the rule's own `window_days`. */
   readonly engineWindowDays: Readonly<Record<string, number>>;
+  /** Per engine, the cells a run must hold to count (`runFloorCells`). An engine absent here uses `ceil(min_n / window_days)`. */
+  readonly engineRunFloor?: Readonly<Record<string, number>>;
 }
 
 export interface CompiledQuery {
@@ -80,44 +95,44 @@ const CHANGE_SQL: Record<MetricWindowCondition["change"], Record<MetricWindowCon
   absolute: { down: (cur, prior) => `${prior} - ${cur}`, up: (cur, prior) => `${cur} - ${prior}` },
 };
 
-// Run floor (a documented constant of the grammar, derived from the rule's own numbers rather than tuned separately): a run only
-// breaches when it carries at least `ceil(min_n / span)` cells, where `span` is the engine's effective window (see
-// `effectiveWindowDays`), the average a day would hold if the sample floor were reached on daily captures. A low-volume blip
-// therefore cannot make up the count around one heavy run. It never blocks a sparse cadence, whose runs hold MORE than that average
-// (a weekly run carries a whole window's sample divided by its two runs).
-
 /**
  * One row per engine (never the cross-engine `all` row) whose metric moved by at least the threshold in the given direction,
  * with the windows at or above the sample floor, AND the change sustained.
  *
  * THE WINDOW is the engine's effective window (`effectiveWindowDays`, from the plan's cadence): the rule's own `window_days` for a
- * cadence with two or more runs in it, a whole multiple of it for a weekly cadence. The current window is the `span` days ending
+ * cadence with two or more runs in it, a whole multiple of it otherwise. The current window is the `span` days ending
  * at `metricDate`; the prior window is the `span` days before it.
+ *
+ * A RUN IS A FINISHED, REPRESENTATIVE CAPTURE RUN. A distinct `answer_captures.run_id` of the engine (measurement status, scoring
+ * version, read in the workspace timezone exactly as the rollup does) counts as a run, and can breach, only when
+ *  - its `capture_runs` row is finished (`completed` or `partial`): the hourly rollup enqueues task.generate while the next run is
+ *    still being captured, and its first cells are neither a run nor a breach until it finishes;
+ *  - it measured at least half of the cells it planned for the engine (`planned_cells` over the `engine_keys` it covered): a run that
+ *    lost most of its cells to failures is an outage, not a sample; and
+ *  - it holds at least the cadence floor (`runFloorCells`: `ceil(min_n / runs expected in the window)`, from the same cadence data as the
+ *    window), so a remnant cannot be "the second of both recent runs".
+ * A run that is none of those is simply absent: not counted in `current_runs`, not a breach.
  *
  * A CAPTURE RUN IS NOT A DATE, AND BELONGS TO EXACTLY ONE WINDOW. `metric_daily` is keyed by the workspace-local date of a capture,
  * and the scheduler's cadence (7.5 days, plus per-cell jitter) drifts across local midnight, so ONE run can put facts on two dates,
- * even on either side of a window boundary. A run (a distinct `answer_captures.run_id` of the engine, measurement status, scoring
- * version, read in the workspace timezone exactly as the rollup does) is therefore bucketed by its EARLIEST local capture date,
- * for the count of runs and for the sustain check alike. The compared windows' run sets are disjoint by construction, so one bad
- * run can never be both the "prior" and the "current" breach. (The window VALUES and cell totals still follow `metric_daily`'s dates,
- * so a straddler on a window boundary leaves part of its cells in the neighbouring window; its two halves are different prompt
- * subsets and need not share a rate, so that can move a window value slightly. The sample floor and the threshold bound the effect.)
+ * even on either side of a window boundary. A run is therefore bucketed by its EARLIEST local capture date, for the count of runs and
+ * for the sustain check alike. The compared windows' run sets are disjoint by construction, so one bad run can never be both the
+ * "prior" and the "current" breach. (The window VALUES and cell totals still follow `metric_daily`'s dates, so a straddler on a window
+ * boundary leaves part of its cells in the neighbouring window; its two halves are different prompt subsets and need not share a
+ * rate, so that can move a window value slightly. The sample floor and the threshold bound the effect.)
  *  - The change needs TWO OR MORE runs in the current window (a single run is a single sample: there is no shared-baseline path).
- *    The window change must reach the threshold, and it must hold on at least `min(sustained_days, runs_in_window)` distinct RUNS,
- *    each compared with the prior window's value. One heavy day or one bad run cannot carry the aggregate when there are runs to compare.
+ *    The window change must reach the threshold, and it must hold on at least `min(sustained_days, runs_in_window)` runs, each compared
+ *    with the prior window's value, AND those breaching runs must cover at least `min(sustained_days, distinct dates the window's runs
+ *    start on)` distinct local dates. Runs prove it is not one sample; dates prove it lasted. At Enterprise one local date holds 25
+ *    runs, so counting runs alone made three hours of one bad day "sustained".
  *
- * A RUN IS JUDGED ON ITS OWN CELLS, ALL OF THEM. The per-run rate is read from `answer_captures` grouped by `(engine_key, run_id)`,
- * under the same measurement-status predicate, scoring version and timezone as the run set: presence is the cells with
- * `brand_present`, share the mean of `sov` over the run's cells, owned citations `owned_citation_count` per cell. A run breaches when that rate
- * moves by the threshold against the prior window's value and it carries the run floor (`ceil(min_n / span)` cells). A date is
- * NOT the unit of evidence: a date row blends every run that touched it (and a run's two halves are different prompt subsets), so judging
- * on dates either credited two runs for one bad sample or, once shared dates were discarded, switched the rule off for any cadence that
- * puts two runs on every date (Enterprise: hourly priority runs plus a daily full run; Business runs that straddle local midnight).
- * Counting breaching RUNS needs neither exclusion.
+ * A RUN IS JUDGED ON ITS OWN CELLS, ALL OF THEM. The per-run rate is read from `answer_captures` grouped by `(engine_key, run_id)`:
+ * presence is the cells with `brand_present`, share the mean of `sov` over the run's cells, owned citations `owned_citation_count`
+ * per cell. A run breaches when that rate moves by the threshold against the prior window's value. A date is NOT the unit of
+ * evidence: a date row blends every run that touched it (and a run's two halves are different prompt subsets).
  *
  * `runs` reads one day MORE than the compared windows reach back, so a run that began just before them still has its true earliest
- * date (and lands in an older bucket, where it is not judged). At an hourly cadence `sustained_days` distinct runs is a few hours; the
- * window change still has to reach the threshold across the whole window, which is what keeps one glitchy hour from firing.
+ * date (and lands in an older bucket, where it is not judged).
  *
  * Columns: `engine_key`, `n_current`, `n_prior`, `cur_value`, `prior_value`, `change_value` (a positive magnitude in the rule's unit).
  * A relative change needs a non-zero prior value; an empty or null window cannot fire.
@@ -127,6 +142,7 @@ export function compileMetricWindow(condition: MetricWindowCondition, params: Co
   const values: unknown[] = [
     params.projectId, params.metricDate, condition.window_days, params.scoringVersion, condition.min_n, condition.threshold, condition.sustained_days,
     params.timezone, spanEngines, spanEngines.map((engine) => params.engineWindowDays[engine]),
+    spanEngines.map((engine) => params.engineRunFloor?.[engine] ?? Math.max(1, Math.ceil(condition.min_n / params.engineWindowDays[engine]!))),
   ];
   const relative = condition.change === "relative";
   const priorGuard = relative ? "AND s.prior_value > 0" : "";
@@ -134,8 +150,8 @@ export function compileMetricWindow(condition: MetricWindowCondition, params: Co
   const v = VALUE_SQL[condition.metric];
   const text = `
 WITH eng AS (
-  SELECT engine_key, span
-    FROM unnest($9::text[], $10::int[]) AS e(engine_key, span)
+  SELECT engine_key, span, run_floor
+    FROM unnest($9::text[], $10::int[], $11::int[]) AS e(engine_key, span, run_floor)
 ), win AS (
   SELECT d.engine_key,
          (($2::date - d.metric_date) / COALESCE(e.span, $3::int)) AS bucket,
@@ -152,27 +168,36 @@ WITH eng AS (
      AND d.metric_date >  $2::date - 2 * COALESCE(e.span, $3::int)
      AND d.metric_date <= $2::date
    GROUP BY d.engine_key, bucket
-), runs AS (
+), runcells AS (
   SELECT c.engine_key, c.run_id, COALESCE(e.span, $3::int) AS span,
+         COALESCE(e.run_floor, CEIL($5::float8 / $3::int))::float8 AS run_floor,
+         (r.planned_cells::float8 / GREATEST(cardinality(r.engine_keys), 1)) AS planned,
          min((c.captured_at AT TIME ZONE $8::text)::date) AS first_date,
          (count(*))::float8 AS cells,
          (count(*) FILTER (WHERE c.brand_present))::float8 AS present,
          COALESCE(sum(COALESCE(c.sov, 0)), 0)::float8 AS sov_w,
          COALESCE(sum(c.owned_citation_count), 0)::float8 AS owned
     FROM answer_captures c
+    JOIN capture_runs r ON r.id = c.run_id AND r.project_id = c.project_id
     LEFT JOIN eng e ON e.engine_key = c.engine_key
    WHERE c.project_id = $1::uuid
      AND c.scoring_version = $4
      AND ${measurementStatusSql("c.status")}
+     AND r.status IN ('completed', 'partial')
      AND c.captured_at >= (($2::date - 2 * COALESCE(e.span, $3::int))::timestamp AT TIME ZONE $8::text)
      AND c.captured_at <  (($2::date + 1)::timestamp AT TIME ZONE $8::text)
-   GROUP BY c.engine_key, c.run_id, COALESCE(e.span, $3::int)
+   GROUP BY c.engine_key, c.run_id, COALESCE(e.span, $3::int), COALESCE(e.run_floor, CEIL($5::float8 / $3::int)), r.planned_cells, cardinality(r.engine_keys)
+), runs AS (
+  SELECT *, (($2::date - first_date) / span) AS bucket
+    FROM runcells
+   WHERE cells >= run_floor
+     AND cells >= planned / 2
 ), runwin AS (
-  SELECT engine_key, (($2::date - first_date) / span) AS bucket, (count(*))::int AS runs
+  SELECT engine_key, bucket, (count(*))::int AS runs, (count(DISTINCT first_date))::int AS run_dates
     FROM runs
    GROUP BY engine_key, bucket
 ), winr AS (
-  SELECT w.*, COALESCE(r.runs, 0) AS runs
+  SELECT w.*, COALESCE(r.runs, 0) AS runs, COALESCE(r.run_dates, 0) AS run_dates
     FROM win w
     LEFT JOIN runwin r ON r.engine_key = w.engine_key AND r.bucket = w.bucket
 ), pair AS (
@@ -180,20 +205,20 @@ WITH eng AS (
          c.cells AS n_current,
          p.cells AS n_prior,
          c.runs AS current_runs,
+         c.run_dates AS current_dates,
          ${v("c")} AS cur_value,
          ${v("p")} AS prior_value
     FROM winr c
     JOIN winr p ON p.engine_key = c.engine_key AND c.bucket = 0 AND p.bucket = 1
 ), scored AS (
-  SELECT engine_key, n_current, n_prior, current_runs, cur_value, prior_value,
+  SELECT engine_key, n_current, n_prior, current_runs, current_dates, cur_value, prior_value,
          CASE WHEN prior_value IS NULL OR cur_value IS NULL THEN NULL ELSE ${change("cur_value", "prior_value")} END AS change_value
     FROM pair
 ), breached AS (
-  SELECT r.engine_key, (count(*))::int AS runs_breached
+  SELECT r.engine_key, (count(*))::int AS runs_breached, (count(DISTINCT r.first_date))::int AS dates_breached
     FROM runs r
     JOIN scored s ON s.engine_key = r.engine_key
-   WHERE (($2::date - r.first_date) / r.span) = 0
-     AND r.cells >= ceil($5::float8 / r.span)
+   WHERE r.bucket = 0
      AND s.prior_value IS NOT NULL
      ${priorGuard}
      AND ${change(v("r"), "s.prior_value")} >= $6::float8
@@ -210,6 +235,7 @@ SELECT s.engine_key, s.n_current, s.n_prior, s.cur_value, s.prior_value, s.chang
    ${priorGuard}
    AND s.change_value >= $6::float8
    AND COALESCE(y.runs_breached, 0) >= LEAST($7::int, s.current_runs)
+   AND COALESCE(y.dates_breached, 0) >= LEAST($7::int, s.current_dates)
  ORDER BY s.engine_key`;
   return { text, values };
 }

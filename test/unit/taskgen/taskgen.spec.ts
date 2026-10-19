@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { QUEUE_HANDLERS } from "../../../src/lib/queue/handlers.js";
-import { compileMetricWindow, effectiveWindowDays } from "../../../src/lib/taskgen/compile.js";
+import { compileMetricWindow, effectiveWindowDays, runFloorCells } from "../../../src/lib/taskgen/compile.js";
 import { taskFingerprint } from "../../../src/lib/taskgen/fingerprint.js";
 import { impactScore, strengthOf } from "../../../src/lib/taskgen/impact.js";
 import { renderTemplate } from "../../../src/lib/taskgen/template.js";
@@ -96,15 +96,18 @@ describe("STORY-063 · the task.generate queue has a handler", () => {
 });
 
 describe("STORY-063 · the window a rule compares is derived from the plan's cadence", () => {
-  it("[STORY-063 #14] weekly cadence (4 runs a cycle, 7.5 days) widens a 7-day rule to 14; twice weekly, daily and hourly keep it", () => {
+  it("[STORY-063 #14] a cadence with under two runs in the window (weekly 7.5 days, Growth 3.75 days) widens a 7-day rule to 14; daily and hourly keep it", () => {
     expect(effectiveWindowDays(7, { full: 4 })).toBe(14);
-    expect(effectiveWindowDays(7, { full: 8 })).toBe(7);
+    expect(effectiveWindowDays(7, { full: 8 })).toBe(14); // 1.87 runs in 7 days: owner decision 2026-10-19
+    expect(effectiveWindowDays(7, { full: 9 })).toBe(7); // 3.33 days: two runs fit in 7 days
+    expect(effectiveWindowDays(7, { full: 8, priority: 8 })).toBe(14);
     expect(effectiveWindowDays(7, { full: 4, priority: 30 })).toBe(7);
     expect(effectiveWindowDays(7, { full: 30, priority: 720 })).toBe(7);
   });
 
   it("[STORY-063 #14] the widening is the smallest whole multiple covering the interval, and a wide rule window is left alone", () => {
-    expect(effectiveWindowDays(14, { full: 4 })).toBe(14);
+    expect(effectiveWindowDays(14, { full: 4 })).toBe(28); // 14 days hold 1.87 runs: the same rule, applied to the rule's own window
+    expect(effectiveWindowDays(14, { full: 8 })).toBe(14); // 3.75 days: 3.7 runs
     expect(effectiveWindowDays(3, { full: 4 })).toBe(9); // 7.5 days -> 3 x 3
     expect(effectiveWindowDays(7, { full: 1 })).toBe(35); // a 30-day interval
   });
@@ -113,5 +116,20 @@ describe("STORY-063 · the window a rule compares is derived from the plan's cad
     for (const cadence of [null, undefined, {}, [], "weekly", 4, { full: 0 }, { full: -4 }, { full: "4" }, { full: Number.NaN }]) {
       expect(effectiveWindowDays(7, cadence)).toBe(7);
     }
+  });
+});
+
+describe("STORY-063 · the cells a run needs to count come from the same cadence data", () => {
+  it("[STORY-063 #4] ceil(min_n x interval / window): about 17 at Starter, 9 at Growth, 5 at Business, 1 at Enterprise", () => {
+    expect(runFloorCells(30, 14, { full: 4 })).toBe(17); // 30 / 1.87 runs
+    expect(runFloorCells(30, 14, { full: 8 })).toBe(9); // 30 / 3.73
+    expect(runFloorCells(30, 7, { full: 4, priority: 30 })).toBe(5); // 30 / 7
+    expect(runFloorCells(30, 7, { full: 30, priority: 720 })).toBe(1);
+  });
+
+  it("[STORY-063 #4] no usable cadence assumes a run a day, and the floor is never under one cell", () => {
+    expect(runFloorCells(30, 7, null)).toBe(5);
+    expect(runFloorCells(30, 14, {})).toBe(3);
+    expect(runFloorCells(0, 7, { full: 4 })).toBe(1);
   });
 });
