@@ -8,3 +8,4 @@ export * from "./task-event-response.schema.js";
 export * from "./complete-task-response.schema.js";
 export * from "./create-goal-request.schema.js";
 export * from "./goal-response.schema.js";
+export * from "./task-generation.schema.js";
