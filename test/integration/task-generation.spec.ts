@@ -108,30 +108,52 @@ describe("STORY-063 · task generation engine", () => {
     entityId?: string;
     /** The capture RUN the day's cells belong to. Rows sharing a key are ONE run (one run can straddle local midnight). Defaults to one run a day. */
     run?: string;
-    /** OTHER runs that put cells on the same local date (a manual deep scan beside a scheduled run): the date row is the blend of them all. */
-    alsoRuns?: readonly string[];
+    /**
+     * Several runs that put cells on this local date, each with ITS OWN rates (a manual deep scan beside a scheduled run; a run's tail beside the
+     * next run's head). The date row is their blend; the generator judges each run on its own cells. When given, cells / present / sov / owned of
+     * the spec itself are ignored.
+     */
+    parts?: readonly RunPart[];
+  }
+  interface RunPart {
+    run: string;
+    cells: number;
+    present?: number;
+    sov?: number;
+    owned?: number;
   }
   let runIds = new Map<string, string>();
 
+  /** `cells` answer_captures of one run on one local date, carrying the per-cell facts the generator reads (presence, share, owned citations). */
+  async function writeCells(engine: string, date: string, part: Required<RunPart>): Promise<void> {
+    const key = `${engine}|${part.run}`;
+    if (!runIds.has(key)) runIds.set(key, uuidV7());
+    const capturedAt = `${date}T10:00:00Z`;
+    await db.query("DELETE FROM answer_captures WHERE project_id = $1 AND run_id = $2 AND engine_key = $3 AND captured_at = $4", [projectId, runIds.get(key), engine, capturedAt]);
+    await db.query(
+      `INSERT INTO answer_captures
+         (id,workspace_id,project_id,run_id,prompt_id,engine_key,sample_index,captured_at,capture_mode,adapter_version,
+          normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present,sov,owned_citation_count)
+       SELECT gen_random_uuid(),$1,$2,$3,$4,$5,g,$6::timestamptz,'api','1.0.0','n1',sha256(gen_random_uuid()::text::bytea),'{}'::jsonb,'{}','live','parsed',
+              g <= $7::int, $8::real, ($9::int / $10::int) + CASE WHEN g <= ($9::int % $10::int) THEN 1 ELSE 0 END
+         FROM generate_series(1, $10::int) AS g`,
+      [workspaceId, projectId, runIds.get(key), promptId, engine, capturedAt, part.present, part.sov, part.owned, part.cells],
+    );
+  }
+
   async function metric(engine: string, date: string, spec: MetricSpec = {}): Promise<void> {
-    const cells = spec.cells ?? 5;
-    const present = spec.present ?? cells;
     const entity = spec.entity ?? "brand";
-    if (entity === "brand" && cells > 0) {
-      // The generator counts capture RUNS (a date is not a run), so a day's facts carry the capture that produced them.
-      for (const run of [spec.run ?? date, ...(spec.alsoRuns ?? [])]) {
-        const key = `${engine}|${run}`;
-        if (!runIds.has(key)) runIds.set(key, uuidV7());
-        const id = randomUUID();
-        await db.query(
-          `INSERT INTO answer_captures
-             (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,
-              normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'api','1.0.0','n1',$8,'{}'::jsonb,'{}','live','parsed',true)
-           ON CONFLICT DO NOTHING`,
-          [id, workspaceId, projectId, runIds.get(key), promptId, engine, `${date}T10:00:00Z`, createHash("sha256").update(id).digest()],
-        );
-      }
+    const parts: Required<RunPart>[] =
+      spec.parts !== undefined
+        ? spec.parts.map((p) => ({ run: p.run, cells: p.cells, present: p.present ?? p.cells, sov: p.sov ?? 0.4, owned: p.owned ?? 0 }))
+        : [{ run: spec.run ?? date, cells: spec.cells ?? 5, present: spec.present ?? spec.cells ?? 5, sov: spec.sov ?? 0.4, owned: spec.owned ?? 0 }];
+    const cells = parts.reduce((n, p) => n + p.cells, 0);
+    const present = parts.reduce((n, p) => n + p.present, 0);
+    const owned = parts.reduce((n, p) => n + p.owned, 0);
+    const sov = cells === 0 ? (spec.sov ?? 0.4) : parts.reduce((n, p) => n + p.sov * p.cells, 0) / cells;
+    if (entity === "brand") {
+      // The generator judges capture RUNS (a date is not a run) on their own cells, so a day's facts carry the captures that produced them.
+      for (const part of parts) if (part.cells > 0) await writeCells(engine, date, part);
     }
     await db.query(
       `INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date, cells_total, cells_present,
@@ -143,7 +165,7 @@ describe("STORY-063 · task generation engine", () => {
              citations_total = EXCLUDED.citations_total, visibility_score = EXCLUDED.visibility_score`,
       [
         workspaceId, projectId, engine, entity, spec.entityId ?? projectId, date, cells, present, cells === 0 ? 0 : present / cells,
-        spec.sov ?? 0.4, spec.mentions ?? 0, spec.negative ?? 0, spec.owned ?? 0, spec.visibility ?? 50,
+        sov, spec.mentions ?? 0, spec.negative ?? 0, owned, spec.visibility ?? 50,
       ],
     );
   }
@@ -1360,11 +1382,11 @@ describe("STORY-063 · task generation engine", () => {
 
   // ---- a run breaches from facts that are ITS OWN: a date two runs share is a blend, and breaches for neither -------------------------
 
-  it("[STORY-063 #15 / #2 / R6PROBE A] Starter: a good scheduled run and a BAD manual deep scan on the same local date make NO task (the blended date row is not either run's value)", async () => {
+  it("[STORY-063 #15 / #2 / R6PROBE A] Starter: a good scheduled run and a BAD manual deep scan on the same local date make NO task (each run is judged on its own cells, and one bad run is one breach)", async () => {
     await setPlan("starter");
     await metric(STARTER_ENGINE, day(D, -14), { cells: 30, sov: 0.4 });
     await metric(STARTER_ENGINE, day(D, -21), { cells: 30, sov: 0.4 });
-    await metric(STARTER_ENGINE, day(D, -7), { cells: 60, sov: 0.3, run: "scheduled", alsoRuns: ["deep-scan"] });
+    await metric(STARTER_ENGINE, day(D, -7), { parts: [{ run: "scheduled", cells: 30, sov: 0.4 }, { run: "deep-scan", cells: 30, sov: 0.2 }] }); // blends to 0.3
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
@@ -1372,14 +1394,14 @@ describe("STORY-063 · task generation engine", () => {
     await setPlan("starter");
     await metric(STARTER_ENGINE, day(D, -14), { cells: 30, sov: 0.4 });
     await metric(STARTER_ENGINE, day(D, -21), { cells: 30, sov: 0.4 });
-    await metric(STARTER_ENGINE, day(D, -7), { cells: 60, sov: 0.3, run: "deep-scan", alsoRuns: ["scheduled"] });
+    await metric(STARTER_ENGINE, day(D, -7), { parts: [{ run: "scheduled", cells: 30, sov: 0.2 }, { run: "deep-scan", cells: 30, sov: 0.4 }] }); // blends to 0.3
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
   it("[STORY-063 #15 / #2 / REV6-A] Growth: a scheduled run plus a manual deep scan on one date, one of them bad, make NO task", async () => {
     await metric("chatgpt", day(D, -11), { cells: 20, sov: 0.4 });
     await metric("chatgpt", day(D, -8), { cells: 20, sov: 0.4 });
-    await metric("chatgpt", day(D, -3), { cells: 40, sov: 0.2, run: "scheduled", alsoRuns: ["manual"] });
+    await metric("chatgpt", day(D, -3), { parts: [{ run: "scheduled", cells: 20, sov: 0.2 }, { run: "manual", cells: 20, sov: 0.4 }] });
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
@@ -1387,7 +1409,7 @@ describe("STORY-063 · task generation engine", () => {
     await setPlan("starter");
     await metric(STARTER_ENGINE, day(D, -25), { cells: 30, sov: 0.4 });
     await metric(STARTER_ENGINE, day(D, -17), { cells: 30, sov: 0.4 });
-    await metric(STARTER_ENGINE, day(D, -2), { cells: 60, sov: 0.2, run: "scheduled", alsoRuns: ["manual"] });
+    await metric(STARTER_ENGINE, day(D, -2), { parts: [{ run: "scheduled", cells: 30, sov: 0.2 }, { run: "manual", cells: 30, sov: 0.4 }] });
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
@@ -1395,8 +1417,8 @@ describe("STORY-063 · task generation engine", () => {
     await setPlan("business");
     for (let i = 0; i <= 13; i += 1) {
       const date = day(D, -i);
-      if (i === 4 || i === 3) await metric("chatgpt", date, { cells: 30, present: 18, run: date, alsoRuns: ["full"] }); // 20 priority cells + 10 of the full run's, none present
-      else if (i === 10) await metric("chatgpt", date, { cells: 40, present: 36, run: date, alsoRuns: ["full-good"] });
+      if (i === 4 || i === 3) await metric("chatgpt", date, { parts: [{ run: date, cells: 20, present: 18 }, { run: "full", cells: 10, present: 0 }] }); // the full run's two halves, none present
+      else if (i === 10) await metric("chatgpt", date, { parts: [{ run: date, cells: 20, present: 18 }, { run: "full-good", cells: 20, present: 18 }] });
       else await metric("chatgpt", date, { cells: 20, present: 18 });
     }
     await generate();
@@ -1411,16 +1433,97 @@ describe("STORY-063 · task generation engine", () => {
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
   });
-  it("[STORY-063 #16 / control] Business: genuine daily drops still fire although a full run shares two of the dates (the shared dates carry no evidence, the rest do)", async () => {
+  it("[STORY-063 #16 / control] Business: genuine daily drops still fire although a full run shares two of the dates (each run is judged on its own cells)", async () => {
     await setPlan("business");
     for (let i = 0; i <= 13; i += 1) {
       const date = day(D, -i);
       const bad = i <= 6;
-      if (i === 4 || i === 3) await metric("chatgpt", date, { cells: 30, present: 12, run: date, alsoRuns: ["full"] });
+      if (i === 4 || i === 3) await metric("chatgpt", date, { parts: [{ run: date, cells: 20, present: 8 }, { run: "full", cells: 10, present: 4 }] });
       else await metric("chatgpt", date, { cells: 20, present: bad ? 8 : 18 });
     }
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toContain("TG-PRESENCE-LOSS");
+  });
+
+  // ---- a run is judged on ITS OWN cells (round 7): the date is neither the unit of evidence nor a reason to discard it -----------------------
+
+  /** R7C-A / R7C-A mirror: a run's two halves are different prompt subsets, so a half can sit far from the run's rate. The whole run is the unit. */
+  for (const [label, head, tail] of [
+    ["a small weak head, then the strong rest", { cells: 5, present: 1 }, { cells: 25, present: 14 }],
+    ["a strong rest, then a small weak tail", { cells: 25, present: 14 }, { cells: 5, present: 1 }],
+  ] as const) {
+    it(`[STORY-063 #2 / #16 / R7C-A] Starter: ONE bad run beside a good run that straddles local midnight as ${label} makes NO task (the good run is 15/30, as in the prior window)`, async () => {
+      await setPlan("starter");
+      await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 15 });
+      await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 15 });
+      await metric(STARTER_ENGINE, day(D, -11), { ...head, run: "good" });
+      await metric(STARTER_ENGINE, day(D, -10), { ...tail, run: "good" });
+      await metric(STARTER_ENGINE, day(D, -2), { cells: 30, present: 8 });
+      await generate();
+      expect(await taskRows()).toHaveLength(0);
+    });
+  }
+  it("[STORY-063 #16 / R7C-A control] Starter: the same straddling good run on ONE date, and the bad run beside it, also makes no task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 30, present: 8 });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #16 / #3] Starter: a run straddling local midnight whose halves have DIFFERENT rates is judged whole, and two such bad runs fire", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -11), { cells: 5, present: 3, run: "a" }); // a strong head ...
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 25, present: 5, run: "a" }); // ... a weak rest: 8/30 over the run
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 30, present: 8 });
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
+  });
+
+  /** Enterprise: hourly priority runs plus a daily full run, so every local date holds 25 runs (migration 0027: `{"full":30,"priority":720}`). */
+  async function enterpriseDays(spec: (day: number, run: number) => { present: number; sov: number; cells?: number }): Promise<void> {
+    await setPlan("enterprise");
+    for (let i = 0; i <= 13; i += 1) {
+      const parts: RunPart[] = [];
+      for (let k = 0; k < 25; k += 1) parts.push({ run: k === 0 ? `full-${i}` : `h-${i}-${k}`, cells: 50, ...spec(i, k) });
+      await metric("chatgpt", day(D, -i), { parts });
+    }
+  }
+  it("[STORY-063 #1 / AC3 / R7PROBE enterprise] Enterprise (hourly priority runs plus a daily full run, 25 runs on every date): a Visibility sustained fall makes TG-SOV-DROP-ENGINE", async () => {
+    await enterpriseDays((i) => ({ present: 25, sov: i <= 6 ? 0.2 : 0.4 }));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toContain("TG-SOV-DROP-ENGINE");
+  }, 120_000);
+  it("[STORY-063 #1 / AC3 / R7C-B] Enterprise: a presence fall from 90% to 30% makes TG-PRESENCE-LOSS", async () => {
+    await enterpriseDays((i) => ({ present: i <= 6 ? 15 : 45, sov: 0.4 }));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toContain("TG-PRESENCE-LOSS");
+  }, 120_000);
+  it("[STORY-063 #2 / R7C-B control] Enterprise: TWO huge bad runs among 173 good ones move the week's presence by 29 points but are two runs, not three: NO task", async () => {
+    await enterpriseDays((i, k) => (i === 0 && (k === 3 || k === 4) ? { cells: 2000, present: 0, sov: 0.4 } : { present: 45, sov: 0.4 }));
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  }, 120_000);
+  it("[STORY-063 #1 / AC3 / R7PROBE business] Business: daily runs that each straddle local midnight (every date is shared by two runs) still fire on a sustained fall", async () => {
+    await setPlan("business");
+    const sovOf = (run: number): number => (run < 7 ? 0.2 : 0.4);
+    for (let i = 0; i <= 13; i += 1) {
+      // Date D-i holds run i's head and run i+1's tail.
+      await metric("chatgpt", day(D, -i), { parts: [{ run: `r${i}`, cells: 10, sov: sovOf(i) }, { run: `r${i + 1}`, cells: 10, sov: sovOf(i + 1) }] });
+    }
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toContain("TG-SOV-DROP-ENGINE");
+  });
+  it("[STORY-063 #2 / #16 / R7PROBE business control] Business: the same midnight-straddling daily runs with TWO bad runs (a 28% fall in the aggregate) make NO task", async () => {
+    await setPlan("business");
+    for (let i = 0; i <= 13; i += 1) {
+      await metric("chatgpt", day(D, -i), { parts: [{ run: `r${i}`, cells: 10, sov: i === 2 || i === 4 ? 0 : 0.4 }, { run: `r${i + 1}`, cells: 10, sov: i + 1 === 2 || i + 1 === 4 ? 0 : 0.4 }] });
+    }
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
   });
 
   // ---- a count is per measured CELL: a split or a resized run keeps its rate ---------------------------------------------------------
