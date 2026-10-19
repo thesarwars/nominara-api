@@ -66,6 +66,28 @@ export function createQueueReaderConnection(url: string): Redis {
 }
 
 /**
+ * STORY-179 — the connection for a loop that runs for the life of the process (the monitor driver). Unlike the reader
+ * above, which is built for one-shot boot reads, it must NEVER give up reconnecting: when a `retryStrategy` returns
+ * null ioredis moves the connection to `end` for good and every later command rejects with "Connection is closed". A
+ * Valkey restart or failover would then end the monitoring until the pod restarted. Each command still fails fast
+ * (one retry, bounded connect, `commandTimeout` for a socket that is open but silent), so a tick is skipped, not stuck.
+ */
+export function createQueueMonitorConnection(url: string): Redis {
+  const redis = new Redis(url, {
+    lazyConnect: true,
+    connectTimeout: 500,
+    commandTimeout: 2_000,
+    retryStrategy: (times) => Math.min(times * 200, 5_000),
+    maxRetriesPerRequest: 1,
+  });
+  redis.on("error", () => {
+    // Swallowed deliberately, as the reader factory does: every use handles its own failure, and an unhandled 'error'
+    // event on a background reconnect would crash the process.
+  });
+  return redis;
+}
+
+/**
  * BullMQ's own `prefix` option namespaces the whole queue instance per
  * environment (Phase A decision D7) — every Queue/Worker/QueueEvents for a
  * given NODE_ENV shares this prefix, so `development`, `test`, and

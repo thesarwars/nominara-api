@@ -16,7 +16,7 @@ import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
 import { TokenBucket } from "./lib/engines/token-bucket.js";
 import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
 import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
-import { createQueueReaderConnection, createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
+import { createQueueMonitorConnection, createQueueReaderConnection, createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue } from "./lib/queue/dead-letter.js";
 import { MonitorRuntime, ValkeyMonitorStateStore, dlqDepthReader } from "./lib/queue/monitor-runtime.js";
 import { QUEUE_TOPOLOGY } from "./lib/queue/topology.js";
@@ -203,12 +203,14 @@ class RollupMonitorHolder implements OnModuleDestroy {
   constructor(
     public readonly runtime: MonitorRuntime,
     private readonly dlqReaders: readonly Queue[],
+    private readonly connection: Redis,
   ) {}
 
   async onModuleDestroy(): Promise<void> {
     this.runtime.stop();
-    // Closes the Queue handles only; the connection is the group's shared producer-side one, which WorkerGroupRuntime closes.
     await Promise.all(this.dlqReaders.map((queue) => queue.close().catch(() => undefined)));
+    // The monitor's own long-lived connection (not the group's shared producer-side one).
+    await this.connection.quit().catch(() => this.connection.disconnect());
   }
 }
 
@@ -392,20 +394,20 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
 
   // STORY-179 — SLO-24 (dead-letter depth) and EC-06 (engine blackout) paging. The platform/system group owns it, so
   // capture pods stay lean. Every replica of the group ticks; the advisory-lock election inside the runtime makes one of
-  // them drive each tick. It reads EVERY queue's DLQ, not just this group's, through the same bounded reader connection
-  // the schedule registrar uses, and keeps its state on the queue Valkey (noeviction) rather than the LRU cache.
+  // them drive each tick. It reads EVERY queue's DLQ, not just this group's, through its OWN long-lived, always-reconnecting
+  // connection (the schedule registrar's reader gives up after one retry and would stay closed after a Valkey restart), and keeps its state on the queue Valkey (noeviction) rather than the LRU cache.
   if (env.WORKER_GROUP === "rollup") {
-    if (scheduleConnection === undefined) throw new WorkerGroupError("monitor driver: the producer-side connection was not built");
-    const dlqReaders = new Map(QUEUE_TOPOLOGY.map((entry) => [entry.name, buildDlqQueue(entry, { connection: scheduleConnection as Redis, prefix })]));
+    const monitorConnection = createQueueMonitorConnection(env.QUEUE_REDIS_URL);
+    const dlqReaders = new Map(QUEUE_TOPOLOGY.map((entry) => [entry.name, buildDlqQueue(entry, { connection: monitorConnection, prefix })]));
     const engineHealth = new EngineHealthService(pool);
     const monitorRuntime = new MonitorRuntime({
       pool,
-      store: new ValkeyMonitorStateStore(scheduleConnection, prefix),
+      store: new ValkeyMonitorStateStore(monitorConnection, prefix),
       readDlqDepths: dlqDepthReader(dlqReaders),
-      readLastSuccess: (engines) => engineHealth.lastSuccessAtMs(engines),
+      readLastSuccess: (engines, db) => engineHealth.lastSuccessAtMs(engines, db),
     });
     monitorRuntime.start();
-    providers.push({ provide: ROLLUP_MONITOR_RUNTIME, useValue: new RollupMonitorHolder(monitorRuntime, [...dlqReaders.values()]) });
+    providers.push({ provide: ROLLUP_MONITOR_RUNTIME, useValue: new RollupMonitorHolder(monitorRuntime, [...dlqReaders.values()], monitorConnection) });
   }
 
   @Module({ providers })
