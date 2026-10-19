@@ -27,10 +27,12 @@ export const taskMetricWindowMetricSchema = z.enum(TASK_METRIC_WINDOW_METRICS);
  *
  * "SUSTAINED" IS A PROPERTY OF THE GRAMMAR, not of the window aggregate, and it is measured over the capture RUNS that exist in the
  * window (cadence is plan-driven: daily, twice weekly, weekly), not over calendar days or metric dates (one run can straddle local
- * midnight). With two or more runs the change must ALSO hold, against the prior window's value, on at least
- * `min(sustained_days, runs_in_window)` distinct runs, each on a day carrying at least `ceil(min_n / window_days)` cells (the day
- * floor: a blip cannot pad the count around one heavy day). A window with ONE run has nothing to compare, so both it and the prior
- * window must breach against the window before the prior one (a shared baseline). A count metric is per run.
+ * midnight). A run belongs to exactly ONE window, the one holding its earliest local capture date. The window itself comes from the
+ * plan's cadence data (`engines.cadence_by_plan`): `window_days` for a cadence with two runs in it, a whole multiple of it for a
+ * slower one (a weekly cadence compares 14 days with the 14 before when `window_days` is 7). The change needs two or more runs in the
+ * current window and must ALSO hold, against the prior window's value, on at least `min(sustained_days, runs_in_window)` distinct
+ * runs, each on a day carrying at least `ceil(min_n / window)` cells (the day floor: a blip cannot pad the count around one heavy
+ * day). Every metric is a rate per measured cell, a count included (`owned_citation_count`).
  * A window-wide sum alone lets one very heavy bad day carry the aggregate; this does not. `sustained_days` is at least 2 and
  * `min_n` at least 30, so an ops UPDATE can tune a threshold but cannot tune the hysteresis away.
  */

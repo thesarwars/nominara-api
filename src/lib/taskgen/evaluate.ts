@@ -8,7 +8,7 @@ import { citationGapSchema } from "../../../contracts/analytics/index.js";
 import { actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint } from "../analytics/displacement-recovery.js";
 import { SOURCE_INDEX_WINDOWS } from "../rollup/refresh-project-source-index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
-import { compileMetricWindow } from "./compile.js";
+import { compileMetricWindow, effectiveWindowDays } from "./compile.js";
 import { taskFingerprint } from "./fingerprint.js";
 import { strengthOf } from "./impact.js";
 import type { EvalContext, RuleRow, TaskDraft } from "./types.js";
@@ -70,21 +70,26 @@ interface MetricWindowRow {
   change_value: number;
 }
 
-/** `change_value` as the number a title shows: points for a rate, percent for a relative change, a count for a count. */
-function changeText(condition: MetricWindowCondition, change: number): number {
-  const asPercent = condition.change === "relative" || condition.metric !== "owned_citation_count";
-  const value = asPercent ? change * 100 : change;
-  return Math.round(value * 10) / 10;
+/** `change_value` as the number a title shows: percent for a relative change, points for an absolute change of a rate (every metric is a rate per measured cell). */
+function changeText(change: number): number {
+  return Math.round(change * 100 * 10) / 10;
 }
 
 async function evaluateMetricWindow(rule: RuleRow, condition: MetricWindowCondition, ctx: EvalContext): Promise<TaskDraft[]> {
-  const compiled = compileMetricWindow(condition, { projectId: ctx.projectId, metricDate: ctx.metricDate, scoringVersion: ctx.scoringVersion, timezone: ctx.timezone });
+  // The window per engine comes from the plan's cadence (`cadence_by_plan`, through the entitled-engines view the scheduler also reads).
+  const cadence = await ctx.tx.query<{ engine_key: string; cadence: unknown }>(`SELECT engine_key, cadence FROM project_entitled_engines WHERE project_id = $1::uuid`, [ctx.projectId]);
+  const engineWindowDays = Object.fromEntries(cadence.rows.map((row) => [row.engine_key, effectiveWindowDays(condition.window_days, row.cadence)]));
+  const compiled = compileMetricWindow(condition, {
+    projectId: ctx.projectId, metricDate: ctx.metricDate, scoringVersion: ctx.scoringVersion, timezone: ctx.timezone, engineWindowDays,
+  });
+  /** The window an engine was actually compared over: the title names it, so a Starter task says 14 days, not the rule's 7. */
+  const windowOf = (engine: string): number => engineWindowDays[engine] ?? condition.window_days;
   const rows = (await ctx.tx.query<MetricWindowRow>(compiled.text, [...compiled.values])).rows;
 
   if (condition.engine_scope === "each_engine") {
     return rows.map((row) => ({
       fingerprint: taskFingerprint(rule.code, ctx.projectId, row.engine_key),
-      vars: { engine: row.engine_key, change_pct: changeText(condition, row.change_value), window_days: condition.window_days },
+      vars: { engine: row.engine_key, change_pct: changeText(row.change_value), window_days: windowOf(row.engine_key) },
       strength: strengthOf(row.change_value, condition.threshold),
       baselineEngine: row.engine_key,
       affectedEngines: [row.engine_key],
@@ -100,7 +105,7 @@ async function evaluateMetricWindow(rule: RuleRow, condition: MetricWindowCondit
     {
       fingerprint: taskFingerprint(rule.code, ctx.projectId, "project"),
       // "at least": the smallest of the engines' changes, so the title never overstates the drop.
-      vars: { engine_count: rows.length, change_pct: changeText(condition, smallest), window_days: condition.window_days },
+      vars: { engine_count: rows.length, change_pct: changeText(smallest), window_days: Math.max(...rows.map((row) => windowOf(row.engine_key))) },
       strength: strengthOf(mean, condition.threshold),
       baselineEngine: "all",
       affectedEngines: rows.map((row) => row.engine_key),

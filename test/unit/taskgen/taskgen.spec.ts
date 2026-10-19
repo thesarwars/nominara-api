@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { QUEUE_HANDLERS } from "../../../src/lib/queue/handlers.js";
-import { compileMetricWindow } from "../../../src/lib/taskgen/compile.js";
+import { compileMetricWindow, effectiveWindowDays } from "../../../src/lib/taskgen/compile.js";
 import { taskFingerprint } from "../../../src/lib/taskgen/fingerprint.js";
 import { impactScore, strengthOf } from "../../../src/lib/taskgen/impact.js";
 import { renderTemplate } from "../../../src/lib/taskgen/template.js";
@@ -60,7 +60,7 @@ describe("STORY-063 · taskgen template", () => {
 
 describe("STORY-063 · taskgen compile (closed grammar to parameterised SQL)", () => {
   it("binds every condition value as a parameter and never inlines one", () => {
-    const { text, values } = compileMetricWindow({ ...base, threshold: 0.1234567, min_n: 4321, window_days: 9 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1", timezone: "UTC" });
+    const { text, values } = compileMetricWindow({ ...base, threshold: 0.1234567, min_n: 4321, window_days: 9 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1", timezone: "UTC", engineWindowDays: {} });
     expect(values).toContain(0.1234567);
     expect(values).toContain(4321);
     expect(values).toContain(9);
@@ -69,7 +69,7 @@ describe("STORY-063 · taskgen compile (closed grammar to parameterised SQL)", (
   });
 
   it("[STORY-063 #2] 'sustained' is compiled in: the statement counts breaching RUNS and binds the day floor as a parameter", () => {
-    const { text, values } = compileMetricWindow({ ...base, sustained_days: 5 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1", timezone: "UTC" });
+    const { text, values } = compileMetricWindow({ ...base, sustained_days: 5 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1", timezone: "UTC", engineWindowDays: {} });
     // capped by the capture runs that exist in the window: min(sustained_days, runs)
     expect(text).toMatch(/runs_breached,\s*0\)\s*>=\s*LEAST\(\$\d+::int,\s*s\.current_runs\)/u);
     expect(values).toContain(5);
@@ -80,7 +80,7 @@ describe("STORY-063 · taskgen compile (closed grammar to parameterised SQL)", (
     for (const metric of ["sov", "presence_rate", "owned_citation_count"] as const) {
       for (const direction of ["down", "up"] as const) {
         for (const change of ["relative", "absolute"] as const) {
-          const { text } = compileMetricWindow({ ...base, metric, direction, change }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1", timezone: "UTC" });
+          const { text } = compileMetricWindow({ ...base, metric, direction, change }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1", timezone: "UTC", engineWindowDays: {} });
           expect(text).toContain("FROM metric_daily");
           expect(text).not.toMatch(/;|--|\/\*/u);
         }
@@ -92,5 +92,26 @@ describe("STORY-063 · taskgen compile (closed grammar to parameterised SQL)", (
 describe("STORY-063 · the task.generate queue has a handler", () => {
   it("registers task.generate", () => {
     expect(Object.keys(QUEUE_HANDLERS)).toContain("task.generate");
+  });
+});
+
+describe("STORY-063 · the window a rule compares is derived from the plan's cadence", () => {
+  it("[STORY-063 #14] weekly cadence (4 runs a cycle, 7.5 days) widens a 7-day rule to 14; twice weekly, daily and hourly keep it", () => {
+    expect(effectiveWindowDays(7, { full: 4 })).toBe(14);
+    expect(effectiveWindowDays(7, { full: 8 })).toBe(7);
+    expect(effectiveWindowDays(7, { full: 4, priority: 30 })).toBe(7);
+    expect(effectiveWindowDays(7, { full: 30, priority: 720 })).toBe(7);
+  });
+
+  it("[STORY-063 #14] the widening is the smallest whole multiple covering the interval, and a wide rule window is left alone", () => {
+    expect(effectiveWindowDays(14, { full: 4 })).toBe(14);
+    expect(effectiveWindowDays(3, { full: 4 })).toBe(9); // 7.5 days -> 3 x 3
+    expect(effectiveWindowDays(7, { full: 1 })).toBe(35); // a 30-day interval
+  });
+
+  it("[STORY-063 #14] no usable cadence means the rule's own window: absent, empty, malformed, zero or negative", () => {
+    for (const cadence of [null, undefined, {}, [], "weekly", 4, { full: 0 }, { full: -4 }, { full: "4" }, { full: Number.NaN }]) {
+      expect(effectiveWindowDays(7, cadence)).toBe(7);
+    }
   });
 });

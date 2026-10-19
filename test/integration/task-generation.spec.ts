@@ -1138,149 +1138,253 @@ describe("STORY-063 · task generation engine", () => {
     expect(await taskRows("TG-SOV-NEW")).toHaveLength(1);
   });
 
-  // ---- round 3: "sustained" is measured over the capture days that exist, not over calendar days -------------------------------------
+  // ---- "sustained" is measured over capture RUNS, in a window derived from the plan's cadence -----------------------------------------
   //
-  // Capture cadence is plan-driven (Starter weekly, Growth twice a week, Business daily), so a 7-day window holds 1, 2 or 7 capture
-  // days. These tests seed the CADENCE the product runs, not seven rows a window: every earlier fixture was `windowOf`.
-  /** Capture days at `offsets` (days back from each window's last day) in the current (k = 0), prior (1) and preceding (2) windows. */
-  async function cadence(engine: string, offsets: readonly number[], spec: (k: number, j: number) => MetricSpec | undefined): Promise<void> {
-    for (let k = 0; k < 3; k += 1) {
-      for (const [j, offset] of offsets.entries()) {
+  // Capture cadence is plan-driven (Starter weekly = 4 runs a 30-day cycle, Growth twice weekly = 8, Business daily). Starter's 7.5-day
+  // interval can leave a 7-day window with no run at all, so for a weekly cadence a `window_days: 7` rule compares the last 14 days
+  // with the 14 days before (owner decision 2026-10-19): two runs a side, and the drop must hold in both recent runs. A plan that
+  // runs at least twice in `window_days` keeps the rule's own window. These tests seed the cadence the product runs, at the volume
+  // the plan can produce: Starter holds at most 30 prompts (drift sampling off), so a run is at most 30 cells per engine.
+  const setPlan = (key: string): Promise<unknown> => db.query("UPDATE workspaces SET plan_key = $1 WHERE id = $2", [key, workspaceId]);
+  const STARTER_ENGINE = "chatgpt"; // entitled on every plan; Starter's cadence is `{"full":4}`
+  /** Starter's weekly runs, NEWEST FIRST, as days back from D: two in the current 14 days (D-13..D) and two in the 14 before. */
+  const STARTER_RUN_OFFSETS = [2, 10, 17, 25] as const;
+  async function starterRuns(sovs: readonly (number | undefined)[], cells = 30, engine = STARTER_ENGINE): Promise<void> {
+    for (const [i, offset] of STARTER_RUN_OFFSETS.entries()) {
+      const sov = sovs[i];
+      if (sov !== undefined) await metric(engine, day(D, -offset), { cells, sov });
+    }
+  }
+  /** Growth's two runs a week: capture days at `offsets` (days back from each window's last day) in the current (k = 0) and prior (1) windows. */
+  const GROWTH = [1, 4];
+  async function growthRuns(engine: string, spec: (k: number, j: number) => MetricSpec | undefined): Promise<void> {
+    for (let k = 0; k < 2; k += 1) {
+      for (const [j, offset] of GROWTH.entries()) {
         const row = spec(k, j);
         if (row !== undefined) await metric(engine, day(day(D, -7 * k), -offset), row);
       }
     }
   }
-  const STARTER = [3]; // one capture day a window
-  const GROWTH = [1, 4]; // two
-  const sovAt = (current: number, prior: number, preceding: number | undefined, cells: number) => (k: number): MetricSpec | undefined => {
-    const sov = [current, prior, preceding][k];
-    return sov === undefined ? undefined : { cells, sov };
-  };
+  const reset = (): Promise<unknown> => db.query("TRUNCATE tasks, metric_daily, answer_captures CASCADE");
 
-  it("[STORY-063 #3 / AC3] Starter cadence (1 capture a week): a decline that holds over two consecutive windows makes a task", async () => {
-    await cadence("gemini", STARTER, sovAt(0.3, 0.4, 0.5, 35));
+  it("[STORY-063 #14 / AC3] Starter (weekly): a drop that holds in both of the last two runs, at the plan's real 30 cells a run, makes a task", async () => {
+    await setPlan("starter");
+    await starterRuns([0.28, 0.28, 0.4, 0.4]);
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
   });
 
-  it("[STORY-063 #2] Starter cadence: one bad run makes NO task, whether or not it recovers", async () => {
-    await cadence("gemini", STARTER, sovAt(0.2, 0.4, 0.4, 35)); // the bad run is the latest: the preceding window did not move
+  it("[STORY-063 #14 / AC3] Starter: a step drop whose baseline is a single earlier run still fires once the last two runs both fell", async () => {
+    await setPlan("starter");
+    await starterRuns([0.28, 0.28, 0.4, undefined]);
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+  });
+
+  it("[STORY-063 #15 / #2] Starter: ONE bad run makes no task, whether it is the newest or the older of the two, though the 14-day aggregate fell 25%", async () => {
+    await setPlan("starter");
+    await starterRuns([0.2, 0.4, 0.4, 0.4]);
     await generate();
     expect(await taskRows()).toHaveLength(0);
-    await db.query("TRUNCATE metric_daily, answer_captures");
-    await cadence("gemini", STARTER, sovAt(0.4, 0.2, 0.4, 35)); // it recovered: the latest window rose
+    await reset();
+    await starterRuns([0.4, 0.2, 0.4, 0.4]); // it recovered
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #2] Starter cadence: a preceding window that fell by less than the threshold is not a second breach, and no preceding window is no second breach", async () => {
-    await cadence("gemini", STARTER, sovAt(0.3, 0.4, 0.44, 35)); // 0.44 -> 0.4 is a 9% fall
+  it("[STORY-063 #15 / #2] Starter: a window holding a single run is not sustained, however large the fall (there is no shared-baseline path)", async () => {
+    await setPlan("starter");
+    await starterRuns([0.1, undefined, 0.4, 0.4]); // the only run in the last 14 days
     await generate();
     expect(await taskRows()).toHaveLength(0);
-    await db.query("TRUNCATE metric_daily, answer_captures");
-    await cadence("gemini", STARTER, sovAt(0.3, 0.4, undefined, 35)); // only two windows of history
+    await reset();
+    await starterRuns([0.1, 0.1, 0.4, undefined].map((v, i) => (i === 1 ? undefined : v))); // a lone current run against a lone prior run
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #4] Starter cadence: the sample floor still applies to both compared windows (29 cells is not enough)", async () => {
-    await cadence("gemini", STARTER, (k) => ({ cells: k === 1 ? 29 : 35, sov: [0.3, 0.4, 0.5][k]! }));
+  it("[STORY-063 #15 / #2] a window holding ONE run never fires, even when the last three single-run windows held a step drop (the shared-baseline path is gone)", async () => {
+    await setPlan("business"); // a 7-day window; the runs are a week apart, so each window holds one
+    await metric("chatgpt", day(D, -3), { cells: 60, sov: 0.28 });
+    await metric("chatgpt", day(D, -10), { cells: 60, sov: 0.28 });
+    await metric("chatgpt", day(D, -17), { cells: 60, sov: 0.4 });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #4 / #14] Starter at 29 measured cells a run (one failed prompt): the two-run windows (58 cells) still fire; a one-run window of 29 does not", async () => {
+    await setPlan("starter");
+    await starterRuns([0.28, 0.28, 0.4, 0.4], 29);
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+    await reset();
+    await starterRuns([0.28, 0.28, 0.4, undefined], 29); // the prior window is ONE run of 29 cells: under the floor
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+    await reset();
+    await starterRuns([0.28, undefined, 0.4, 0.4], 29); // the current window is one run of 29 cells
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #4] Starter: the sample floor applies to both 14-day windows (a prior window of one 29-cell run, a current window of two runs of 30)", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 30, sov: 0.28 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, sov: 0.28 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 29, sov: 0.4 });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #16 / #2] Starter: ONE run straddling local midnight (two metric dates) is one bad run and makes NO task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -1), { cells: 15, sov: 0.2, run: "straddler" });
+    await metric(STARTER_ENGINE, D, { cells: 15, sov: 0.2, run: "straddler" });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #14] the window comes from the plan's cadence data: Growth and Business keep the rule's own 7 days, and a Starter project's 7-day pair does not fire", async () => {
+    // Growth: two runs a 7-day window, both fell.
+    await growthRuns("chatgpt", (k) => ({ cells: 20, sov: k === 0 ? 0.25 : 0.4 }));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+    await reset();
+    // The same rows at Starter: the 14-day windows hold D-1, D-4, D-8, D-11 (current) and nothing older, so there is no prior window.
+    await setPlan("starter");
+    await growthRuns("chatgpt", (k) => ({ cells: 20, sov: k === 0 ? 0.25 : 0.4 }));
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #14] the cadence is per ENGINE and read from data: Gemini on Business runs weekly (`{\"full\":4}`), so it gets the 14-day window while ChatGPT on the same plan keeps 7", async () => {
+    await setPlan("business");
+    await starterRuns([0.28, 0.28, 0.4, 0.4], 30, "gemini");
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+    expect((await taskRows())[0].description).toContain("last 14 days against the 14 days before");
+    await reset();
+    await starterRuns([0.2, 0.4, 0.4, 0.4], 30, "gemini"); // one bad weekly run
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
   it("[STORY-063 #3 / AC3] Growth cadence (2 captures a week): both capture days breaching makes a task", async () => {
-    await cadence("gemini", GROWTH, sovAt(0.25, 0.4, 0.4, 20));
+    await growthRuns("chatgpt", (k) => ({ cells: 20, sov: k === 0 ? 0.25 : 0.4 }));
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
   });
 
   it("[STORY-063 #2] Growth cadence: one bad run (one of two capture days) makes NO task even though the window aggregate fell 37.5%", async () => {
-    await cadence("gemini", GROWTH, (k, j) => ({ cells: 20, sov: k === 0 && j === 0 ? 0.1 : 0.4 }));
+    await growthRuns("chatgpt", (k, j) => ({ cells: 20, sov: k === 0 && j === 0 ? 0.1 : 0.4 }));
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #3 / #2] owned citations at Starter and Growth cadence: a day is compared with the prior window's per-capture-day count, not the window's total", async () => {
-    const owned = (counts: readonly [number, number, number]) => (k: number): MetricSpec => ({ cells: 35, sov: 0.4, owned: counts[k]! });
-    await cadence("gemini", STARTER, owned([8, 14, 20])); // a weekly day's count is the whole window's count
+  it("[STORY-063 #3 / #17] owned citations are per measured CELL: Starter (14 days) and Growth (7 days) fire on a real per-cell drop, and one bad Growth run does not", async () => {
+    await setPlan("starter");
+    for (const [i, offset] of STARTER_RUN_OFFSETS.entries()) await metric(STARTER_ENGINE, day(D, -offset), { cells: 30, sov: 0.4, owned: i < 2 ? 6 : 10 });
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
-    await db.query("TRUNCATE tasks, metric_daily, answer_captures CASCADE");
-    await cadence("gemini", GROWTH, (k) => ({ cells: 20, sov: 0.4, owned: k === 0 ? 4 : 7 })); // 8 against 14
+    await reset();
+    await setPlan("growth");
+    await growthRuns("chatgpt", (k) => ({ cells: 20, sov: 0.4, owned: k === 0 ? 4 : 7 })); // 0.2 a cell against 0.35
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
-    await db.query("TRUNCATE tasks, metric_daily, answer_captures CASCADE");
-    await cadence("gemini", GROWTH, (k, j) => ({ cells: 20, sov: 0.4, owned: k === 0 ? (j === 0 ? 8 : 0) : 7 })); // one bad run
+    await reset();
+    await growthRuns("chatgpt", (k, j) => ({ cells: 20, sov: 0.4, owned: k === 0 ? (j === 0 ? 8 : 0) : 7 })); // one bad run
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
   it("[STORY-063 #3 / #2] Business cadence (daily): a drop over the whole window makes a task; one bad day does not", async () => {
-    await twoWindows("gemini", { sov: 0.4 }, { sov: 0.28 });
+    await setPlan("business");
+    await twoWindows("chatgpt", { sov: 0.4 }, { sov: 0.28 });
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
-    await db.query("TRUNCATE tasks, metric_daily, answer_captures CASCADE");
-    await twoWindows("gemini", { sov: 0.4 }, (i) => ({ sov: i === 0 ? 0 : 0.4 }));
+    await reset();
+    await twoWindows("chatgpt", { sov: 0.4 }, (i) => ({ sov: i === 0 ? 0 : 0.4 }));
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  // ---- round 4: a held step drop fires on Starter; a capture RUN is not a date; a count is per run --------------------------------
+  // ---- a capture RUN belongs to exactly ONE window (its earliest local capture date) ----------------------------------------------
 
-  it("[STORY-063 #3 / AC3] Starter cadence: a step drop that then HOLDS (both of the last two windows breach against the window before them) makes a task", async () => {
-    await cadence("gemini", STARTER, sovAt(0.28, 0.28, 0.4, 35));
-    await generate();
+  it("[STORY-063 #16 / #2] a bad run straddling the boundary between the windows is in ONE window: evaluated 7 days later it does not fire alone (60 cells a run: Business with drift sampling)", async () => {
+    await setPlan("business");
+    await metric("chatgpt", day(D, -14), { cells: 60, sov: 0.4 });
+    await metric("chatgpt", day(D, -7), { cells: 30, sov: 0.2, run: "bad" });
+    await metric("chatgpt", day(D, -6), { cells: 30, sov: 0.2, run: "bad" });
+    await generate(D); // the next run has not landed: D is not a capture date
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #16 / #2] the same straddling bad run with an extra good run in the prior window: still no task 7 days after it", async () => {
+    await setPlan("business");
+    await metric("chatgpt", day(D, -14), { cells: 60, sov: 0.4 });
+    await metric("chatgpt", day(D, -8), { cells: 60, sov: 0.4 });
+    await metric("chatgpt", day(D, -7), { cells: 30, sov: 0.2, run: "bad" });
+    await metric("chatgpt", day(D, -6), { cells: 30, sov: 0.2, run: "bad" });
+    await generate(D);
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #16 / #2] a run is bucketed by its EARLIEST date: a straddler first seen in the prior window is not a run of the current one", async () => {
+    // Two real runs in the current window (D-4, D) fell, plus a straddler (D-7 / D-6) that fell: the current window holds two runs, not three, and both breach.
+    await setPlan("business");
+    await metric("chatgpt", day(D, -13), { cells: 60, sov: 0.4 });
+    await metric("chatgpt", day(D, -4), { cells: 60, sov: 0.2 });
+    await metric("chatgpt", D, { cells: 60, sov: 0.2 });
+    await metric("chatgpt", day(D, -7), { cells: 30, sov: 0.4, run: "good" });
+    await metric("chatgpt", day(D, -6), { cells: 30, sov: 0.4, run: "good" });
+    await generate(D);
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
   });
 
-  it("[STORY-063 #2] Starter cadence: a bad run that recovers, and a single latest bad run, make NO task; a window under the floor in ANY of the three is no task", async () => {
-    await cadence("gemini", STARTER, sovAt(0.4, 0.28, 0.4, 35)); // chronologically 0.4, 0.28, 0.4: it recovered
-    await generate();
-    expect(await taskRows()).toHaveLength(0);
-    await db.query("TRUNCATE metric_daily, answer_captures");
-    await cadence("gemini", STARTER, sovAt(0.28, 0.4, 0.4, 35)); // chronologically 0.4, 0.4, 0.28: only the latest run is bad
-    await generate();
-    expect(await taskRows()).toHaveLength(0);
-    await db.query("TRUNCATE metric_daily, answer_captures");
-    await cadence("gemini", STARTER, (k) => ({ cells: k === 2 ? 29 : 35, sov: [0.28, 0.28, 0.4][k]! })); // the held drop, but the baseline window is thin
+  it("[STORY-063 #16 / #2] a capture RUN is not a date, at Growth cadence: a straddling bad run plus one good run is one breaching run of two, so NO task", async () => {
+    await metric("chatgpt", day(D, -4), { cells: 20, sov: 0.4 });
+    await metric("chatgpt", day(D, -1), { cells: 10, sov: 0.1, run: "straddler" });
+    await metric("chatgpt", D, { cells: 10, sov: 0.1, run: "straddler" });
+    await metric("chatgpt", day(D, -11), { cells: 20, sov: 0.4 });
+    await metric("chatgpt", day(D, -8), { cells: 20, sov: 0.4 });
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #2] a capture RUN is not a date: ONE Starter run that straddles local midnight (two metric dates) is still one bad run and makes NO task", async () => {
-    await metric("gemini", day(D, -17), { cells: 36, sov: 0.4 });
-    await metric("gemini", day(D, -10), { cells: 36, sov: 0.4 });
-    await metric("gemini", day(D, -1), { cells: 18, sov: 0.2, run: "straddler" });
-    await metric("gemini", D, { cells: 18, sov: 0.2, run: "straddler" });
+  // ---- a count is per measured CELL: a split or a resized run keeps its rate ---------------------------------------------------------
+
+  it("[STORY-063 #16 / #17] Growth: a STABLE run straddling midnight plus ONE run with no owned citations makes NO task (halves keep the run's per-cell rate)", async () => {
+    await metric("chatgpt", day(D, -11), { cells: 20, sov: 0.4, owned: 10 });
+    await metric("chatgpt", day(D, -8), { cells: 20, sov: 0.4, owned: 10 });
+    await metric("chatgpt", day(D, -4), { cells: 10, sov: 0.4, owned: 5, run: "s" });
+    await metric("chatgpt", day(D, -3), { cells: 10, sov: 0.4, owned: 5, run: "s" });
+    await metric("chatgpt", D, { cells: 20, sov: 0.4, owned: 0 });
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #2] a capture RUN is not a date, at Growth cadence: a straddling bad run plus one good run is one breaching run of two, so NO task", async () => {
-    await metric("gemini", day(D, -4), { cells: 20, sov: 0.4 });
-    await metric("gemini", day(D, -1), { cells: 10, sov: 0.1, run: "straddler" });
-    await metric("gemini", D, { cells: 10, sov: 0.1, run: "straddler" });
-    await metric("gemini", day(D, -11), { cells: 20, sov: 0.4 });
-    await metric("gemini", day(D, -8), { cells: 20, sov: 0.4 });
+  it("[STORY-063 #17] Growth: trimming prompts from 40 to 28 with the per-prompt citations unchanged is a configuration edit, not a loss: NO task", async () => {
+    await metric("chatgpt", day(D, -11), { cells: 40, sov: 0.4, owned: 20 });
+    await metric("chatgpt", day(D, -8), { cells: 40, sov: 0.4, owned: 20 });
+    await metric("chatgpt", day(D, -4), { cells: 28, sov: 0.4, owned: 14 });
+    await metric("chatgpt", day(D, -1), { cells: 28, sov: 0.4, owned: 14 });
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #3 / #2] a count is per CAPTURE RUN, not per window: an extra run in the preceding window does not make a stable per-run count look like a drop (a manual deep scan)", async () => {
-    await metric("gemini", day(D, -19), { cells: 35, sov: 0.4, owned: 10 });
-    await metric("gemini", day(D, -16), { cells: 35, sov: 0.4, owned: 10 }); // two runs in the preceding window
-    await metric("gemini", day(D, -10), { cells: 35, sov: 0.4, owned: 10 }); // one in the prior
-    await metric("gemini", D, { cells: 35, sov: 0.4, owned: 6 }); // one bad run
+  it("[STORY-063 #17] a count with an extra run in the PRIOR window is not a drop: three prior runs against two current runs at the same per-cell rate", async () => {
+    for (const offset of [12, 10, 8]) await metric("chatgpt", day(D, -offset), { cells: 20, sov: 0.4, owned: 10 });
+    for (const offset of [4, 1]) await metric("chatgpt", day(D, -offset), { cells: 20, sov: 0.4, owned: 10 });
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
 
-  it("[STORY-063 #3 / #2] a count is per CAPTURE RUN: an extra run in the current window does not hide a real 40% per-run drop", async () => {
-    await metric("gemini", day(D, -10), { cells: 35, sov: 0.4, owned: 10 });
-    await metric("gemini", day(D, -4), { cells: 35, sov: 0.4, owned: 6 });
-    await metric("gemini", D, { cells: 35, sov: 0.4, owned: 6 });
+  it("[STORY-063 #17] a count with an extra run in the CURRENT window does not hide a real 40% per-cell drop", async () => {
+    await metric("chatgpt", day(D, -10), { cells: 35, sov: 0.4, owned: 17 });
+    for (const offset of [5, 3, 1]) await metric("chatgpt", day(D, -offset), { cells: 35, sov: 0.4, owned: 10 });
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
   });
