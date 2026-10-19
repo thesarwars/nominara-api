@@ -9,7 +9,14 @@ import { QUEUE_TOPOLOGY } from "../../../src/lib/queue/topology.js";
 // proves the real advisory-lock election.
 
 function fakePool() {
-  const client = { query: vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] as unknown[], rowCount: 0 })), release: vi.fn() };
+  // The election is pg_try_advisory_xact_lock, which answers { locked } — granted by default.
+  const client = {
+    query: vi.fn(async (sql: string, _params?: unknown[]) => ({
+      rows: (/pg_try_advisory_xact_lock/.test(sql) ? [{ locked: true }] : []) as unknown[],
+      rowCount: 0,
+    })),
+    release: vi.fn(),
+  };
   return { pool: { connect: vi.fn(async () => client) }, client };
 }
 
@@ -24,7 +31,7 @@ function memoryStore(initial: MonitorState | null = null) {
   return { store, current: () => state };
 }
 
-function harness(options: { oldestAges?: () => Promise<ReadonlyMap<string, number | null>>; depths?: () => Promise<ReadonlyMap<string, number>>; lastSuccess?: () => Promise<ReadonlyMap<EngineKey, number | null>>; store?: MonitorStateStore } = {}) {
+function harness(options: { oldestAges?: () => Promise<ReadonlyMap<string, number | null>>; depths?: () => Promise<ReadonlyMap<string, number>>; lastSuccess?: (engines: readonly EngineKey[], db?: unknown) => Promise<ReadonlyMap<EngineKey, number | null>>; store?: MonitorStateStore } = {}) {
   const { pool, client } = fakePool();
   const nowRef = { now: 1_000_000_000 };
   const pages: Array<Record<string, unknown>> = [];
@@ -128,7 +135,7 @@ describe("STORY-179 AC3 · tick lifecycle and failure handling", () => {
     await h.runtime.tick();
     const sql = h.client.query.mock.calls.map((c) => String(c[0]));
     expect(sql[0]).toMatch(/BEGIN/i);
-    expect(sql[1]).toMatch(/pg_advisory_xact_lock/);
+    expect(sql[1]).toMatch(/pg_try_advisory_xact_lock/);
     expect(h.client.query.mock.calls[1]![1]![0]).toBe("queue-lock:monitor.driver:global");
     expect(sql[sql.length - 1]).toMatch(/COMMIT/i);
     expect(h.client.release).toHaveBeenCalledTimes(1);
@@ -143,8 +150,9 @@ describe("STORY-179 AC3 · tick lifecycle and failure handling", () => {
       },
     });
     h.client.query.mockImplementation(async (sql: string) => {
-      order.push(/pg_advisory/.test(sql) ? "lock" : sql.trim().split(/\s/)[0]!);
-      return { rows: [], rowCount: 0 };
+      const isLock = /pg_try_advisory/.test(sql);
+      order.push(isLock ? "lock" : sql.trim().split(/\s/)[0]!);
+      return { rows: isLock ? [{ locked: true }] : [], rowCount: 0 };
     });
     await h.runtime.tick();
     expect(order).toEqual(["BEGIN", "lock", "load", "save", "COMMIT"]);
@@ -166,6 +174,50 @@ describe("STORY-179 AC3 · tick lifecycle and failure handling", () => {
     const h = harness();
     (h.runtime as unknown as { pool: { connect: () => Promise<never> } }).pool = { connect: async () => { throw new Error("pool down"); } };
     await expect(h.runtime.tick()).resolves.toBeUndefined();
+  });
+
+  it("STORY-179 review · a lost election is a skipped tick: no state load, no reads, no page, rolled back, released", async () => {
+    const depths = vi.fn(async () => new Map([["capture.execute", 999]]));
+    const lastSuccess = vi.fn(async () => new Map<EngineKey, number | null>());
+    const mem = memoryStore();
+    const h = harness({ depths, lastSuccess, store: mem.store });
+    h.client.query.mockImplementation(async (sql: string) => ({ rows: /pg_try_advisory_xact_lock/.test(sql) ? [{ locked: false }] : [], rowCount: 0 }));
+    await h.runtime.tick();
+    expect(mem.store.load).not.toHaveBeenCalled();
+    expect(depths).not.toHaveBeenCalled();
+    expect(lastSuccess).not.toHaveBeenCalled();
+    expect(h.client.query.mock.calls.map((c) => String(c[0])).at(-1)).toMatch(/ROLLBACK|COMMIT/);
+    expect(h.client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("STORY-030 review · only the replica that wins the election reads and emits the age, so the series is not duplicated per replica", async () => {
+    const oldestAges = vi.fn(async () => new Map<string, number | null>([["lookup.execute", 4]]));
+    const h = harness({ oldestAges });
+    h.client.query.mockImplementation(async (sql: string) => ({ rows: /pg_try_advisory_xact_lock/.test(sql) ? [{ locked: false }] : [], rowCount: 0 }));
+    await h.runtime.tick();
+    expect(oldestAges).not.toHaveBeenCalled();
+  });
+
+  it("STORY-179 review · a tick that starts while the previous one is still running does not check out a pool connection", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const h = harness({ depths: async () => (await gate, new Map()) });
+    const first = h.runtime.tick();
+    await vi.waitFor(() => expect((h.runtime as unknown as { pool: { connect: ReturnType<typeof vi.fn> } }).pool.connect).toHaveBeenCalledTimes(1));
+    await h.runtime.tick();
+    await h.runtime.tick();
+    expect((h.runtime as unknown as { pool: { connect: ReturnType<typeof vi.fn> } }).pool.connect).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+    await h.runtime.tick();
+    expect((h.runtime as unknown as { pool: { connect: ReturnType<typeof vi.fn> } }).pool.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("STORY-179 review · the engine_health read runs on the locked client, so one tick holds one pool connection", async () => {
+    const seen: unknown[] = [];
+    const h = harness({ lastSuccess: async (_engines, db) => (seen.push(db), new Map<EngineKey, number | null>()) });
+    await h.runtime.tick();
+    expect(seen).toEqual([h.client]);
   });
 
   it("start() ticks on the interval and stop() ends it", async () => {

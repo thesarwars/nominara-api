@@ -2,23 +2,27 @@ import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { Queue } from "bullmq";
 import type { Redis } from "ioredis";
-import type { Pool } from "pg";
+import type { ClientBase, Pool } from "pg";
 import { z } from "zod";
 import { BlackoutMonitor } from "../engines/blackout.js";
 import type { EngineKey } from "../engines/contract.js";
 import { ACTIVE_ENGINE_KEYS } from "../engines/registry.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { DlqDepthMonitor, defaultPager, type Pager } from "./dead-letter.js";
-import { withGlobalQueueLock } from "./locks.js";
+import { tryWithGlobalQueueLock } from "./locks.js";
 import { emitOldestJobAges } from "./queue-age-monitor.js";
 
 // STORY-179 — drives DlqDepthMonitor (SLO-24) and BlackoutMonitor (EC-06), which existed with tests but were never
 // instantiated, so neither alert could fire in a running worker.
 //
-// ELECTION. Every replica of the group ticks; each tick takes `withGlobalQueueLock` (a transaction-scoped advisory
-// lock, the same primitive runElectedCanaryRound uses, safe behind pgBouncer transaction pooling) and the monitors'
-// state is read from Valkey AFTER the lock is held and written back BEFORE it is released. So whichever replica wins a
-// tick continues the same window and the same "already paged", and a replica that was waiting sees the winner's result.
+// ELECTION. Every replica of the group ticks; each tick TRIES a transaction-scoped advisory lock
+// (`pg_try_advisory_xact_lock`, safe behind pgBouncer transaction pooling). A replica that does not get it skips the
+// tick (outcome `skipped`) without waiting and without reading anything, so one replica runs each tick's reads. The
+// monitors' state is read from Valkey AFTER the lock is held and written back BEFORE it is released, so whichever
+// replica wins the next tick continues the same window and the same "already paged".
+// A tick is also single-flight per process: one that starts while the previous is still running is skipped, so a stall
+// can never pile up pooled Postgres connections (the pool is shared with the rollup handlers). The engine_health read
+// runs on the locked client, so one tick holds exactly one pool connection.
 // A session-level lock held for the process lifetime would not survive transaction pooling (EC-14); a scheduled job
 // would land on any replica and split the state, which is what the store exists to prevent.
 //
@@ -111,7 +115,8 @@ export interface MonitorRuntimeOptions {
   readonly store: MonitorStateStore;
   /** Depth of each `{queue}.dlq`, keyed by the SOURCE queue's name. A queue absent from the map is not observed this tick. */
   readonly readDlqDepths: () => Promise<ReadonlyMap<string, number>>;
-  readonly readLastSuccess: (engines: readonly EngineKey[]) => Promise<ReadonlyMap<EngineKey, number | null>>;
+  /** `db` is the locked election client: read on it, so the tick holds one pool connection. */
+  readonly readLastSuccess: (engines: readonly EngineKey[], db: ClientBase) => Promise<ReadonlyMap<EngineKey, number | null>>;
   /** STORY-030 AC8 — oldest waiting job age per interactive queue, in seconds (null: nothing waiting). Optional: absent means no age signal. */
   readonly readOldestAges?: () => Promise<ReadonlyMap<string, number | null>>;
   readonly engines?: readonly EngineKey[];
@@ -133,6 +138,7 @@ export class MonitorRuntime {
   private readonly clock: () => number;
   private readonly tickIntervalMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
+  private inFlight = false;
 
   constructor(options: MonitorRuntimeOptions) {
     this.pool = options.pool;
@@ -146,8 +152,24 @@ export class MonitorRuntime {
     this.tickIntervalMs = options.tickIntervalMs ?? MONITOR_TICK_INTERVAL_MS;
   }
 
-  /** Best-effort, always: a Valkey or Postgres outage must never crash the worker. A skipped tick loses nothing the next one cannot recover. */
+  /**
+   * Best-effort, always: a Valkey or Postgres outage must never crash the worker. A skipped tick loses nothing the next
+   * one cannot recover, PROVIDED the Valkey connection reconnects (createQueueMonitorConnection) rather than ending.
+   */
   async tick(): Promise<void> {
+    if (this.inFlight) {
+      incrementCounter("nominara_queue_monitor_tick_total", { outcome: "skipped" });
+      return;
+    }
+    this.inFlight = true;
+    try {
+      await this.tracedTick();
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  private async tracedTick(): Promise<void> {
     await tracer.startActiveSpan("queue.monitor_tick", async (span) => {
       let outcome: TickOutcome = "skipped";
       try {
@@ -167,9 +189,9 @@ export class MonitorRuntime {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const outcome = await withGlobalQueueLock(client, MONITOR_DRIVER_LOCK, () => this.round());
+      const elected = await tryWithGlobalQueueLock(client, MONITOR_DRIVER_LOCK, () => this.round(client));
       await client.query("COMMIT");
-      return outcome;
+      return elected.acquired ? elected.value : "skipped";
     } catch (error) {
       try {
         await client.query("ROLLBACK");
@@ -183,7 +205,7 @@ export class MonitorRuntime {
   }
 
   /** Runs under the lock. */
-  private async round(): Promise<TickOutcome> {
+  private async round(client: ClientBase): Promise<TickOutcome> {
     // Loaded only now, under the lock. If it cannot be read the tick is skipped rather than run on empty state, which
     // would forget an open window and an already-paged breach.
     const stored = await this.store.load();
@@ -210,7 +232,7 @@ export class MonitorRuntime {
     }
 
     try {
-      const lastSuccess = await this.readLastSuccess(this.engines);
+      const lastSuccess = await this.readLastSuccess(this.engines, client);
       for (const [engineKey, at] of lastSuccess) {
         blackout.observeLastSuccess(engineKey, at);
         enginesObserved += 1;

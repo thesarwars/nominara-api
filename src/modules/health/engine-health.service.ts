@@ -1,8 +1,8 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
-import type { Pool } from "pg";
+import type { ClientBase, Pool } from "pg";
 import { PG_POOL } from "../../db/pg-pool.js";
 import type { EngineKey } from "../../lib/engines/contract.js";
-import { healthBucketStart, percentile } from "../../lib/engines/engine-health.js";
+import { HEALTH_BUCKET_MS, healthBucketStart, percentile } from "../../lib/engines/engine-health.js";
 import type { CircuitState } from "../../lib/resilience/circuit-breaker.js";
 
 // STORY-031 Phase E — `engine_health` is "global telemetry, deliberately no
@@ -155,20 +155,21 @@ export class EngineHealthService {
 
   /**
    * STORY-179 — when each engine last had a successful attempt, for the blackout monitor. `engine_health` is
-   * bucketed, so this is the START of the latest bucket holding a success: it can understate the real instant by up to
-   * HEALTH_BUCKET_MS, never overstate it. `null` is an engine with no success on record, which is not the same as one
+   * bucketed, so this is the END of the latest bucket holding a success: it can overstate the real instant by up to
+   * HEALTH_BUCKET_MS, never understate it, so the dark time EC-06 measures is never overstated and a "> 48h" page never
+   * fires early. `null` is an engine with no success on record, which is not the same as one
    * whose last success was long ago. Unlike recordAttempt this does not swallow errors: a failed read must not look
    * like "no success".
    */
-  async lastSuccessAtMs(engineKeys: readonly EngineKey[]): Promise<Map<EngineKey, number | null>> {
-    const result = await this.pool.query<{ engine_key: EngineKey; last_success: Date }>(
+  async lastSuccessAtMs(engineKeys: readonly EngineKey[], db: Pool | ClientBase = this.pool): Promise<Map<EngineKey, number | null>> {
+    const result = await db.query<{ engine_key: EngineKey; last_success: Date }>(
       `SELECT engine_key, MAX(bucket_start) AS last_success
        FROM engine_health
        WHERE successes > 0 AND engine_key = ANY($1::text[])
        GROUP BY engine_key`,
       [[...engineKeys]],
     );
-    const found = new Map(result.rows.map((row) => [row.engine_key, row.last_success.getTime()]));
+    const found = new Map(result.rows.map((row) => [row.engine_key, row.last_success.getTime() + HEALTH_BUCKET_MS]));
     return new Map(engineKeys.map((key) => [key, found.get(key) ?? null]));
   }
 }

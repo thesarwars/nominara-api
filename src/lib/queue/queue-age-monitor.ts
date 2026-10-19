@@ -21,14 +21,17 @@ export const INTERACTIVE_QUEUES: readonly string[] = ["lookup.execute"];
 export const OLDEST_JOB_AGE_METRIC = "nominara_queue_oldest_job_age_seconds";
 
 /**
- * Seconds the longest-waiting job has waited, or `null` when nothing is waiting. `null` and `0` are different answers:
+ * Seconds the NEXT job to run has waited, or `null` when nothing is waiting. `null` and `0` are different answers:
  * an empty queue has no wait, a job enqueued this millisecond has waited 0.
  *
  * Reads only the HEAD of each structure that holds runnable jobs: `waiting` (a list) and `prioritized` (a sorted set;
  * every queue with a priority in topology.ts, lookup.execute included, uses it). Both are first-in-first-out within a
- * priority, and an asc read returns the next job to run, which is the oldest. A `delayed` job is excluded: it is not
+ * priority, and an asc read returns the next job to run. That is what an autoscaler needs (how long the head of the line has
+ * waited) but it is NOT strictly the oldest job: a retried job re-enters `prioritized` behind newer ones with a new
+ * position and its ORIGINAL timestamp, so it can be older than the head without being read. A `delayed` job is excluded: it is not
  * waiting to run, and a retry carries its original enqueue time, so counting it would report a backoff as a queue stall.
- * The age is measured from the job's enqueue timestamp, so it includes any time the job spent being retried.
+ * The age is measured from the job's enqueue timestamp, so for the job that is read it includes any time that job
+ * spent being retried.
  */
 export async function oldestWaitingAgeSeconds(queue: Pick<Queue, "getWaiting" | "getPrioritized">, nowMs: number): Promise<number | null> {
   const [waiting, prioritized] = await Promise.all([queue.getWaiting(0, 0), queue.getPrioritized(0, 0)]);
@@ -58,7 +61,12 @@ export function queueAgeReader(
   };
 }
 
-/** One structured line per queue. An empty queue reads as value 0, flagged `empty`, which is what an autoscaler wants ("no wait") while still telling it from a real 0 s. Queue name only: no job data, no tenant. */
+/**
+ * One structured line per queue. DELIBERATE: an empty queue is emitted as value 0 flagged `empty: true`, because a
+ * target-tracking autoscaler needs an input to scale in on ("no wait"); a backend that drops the label cannot tell it from
+ * a job that waited 0 s, and that is accepted. Emitted only by the replica that won the tick's election (see
+ * monitor-runtime.ts), so the series is not duplicated per replica; the 60 s tick is its sampling interval. Queue name only: no job data, no tenant.
+ */
 export function emitOldestJobAges(ages: ReadonlyMap<string, number | null>): void {
   for (const [queue, age] of ages) {
     logger.log(age === null ? { metric: OLDEST_JOB_AGE_METRIC, value: 0, queue, empty: true } : { metric: OLDEST_JOB_AGE_METRIC, value: age, queue });
