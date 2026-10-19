@@ -1,9 +1,10 @@
-import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable } from "@nestjs/common";
 import { randomBytes } from "node:crypto";
 import { NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { defaultCheckDeps, runCheck, type CheckDeps } from "../../lib/verification/checkers.js";
+import { applyCheckOutcome, type VerificationRow } from "../../lib/verification/transition.js";
 import {
   instructionsFor,
   type VerificationFailure,
@@ -27,20 +28,8 @@ function newNonce(): string {
   return randomBytes(16).toString("base64url");
 }
 
-interface VerificationRow {
-  id: string;
-  domain: string;
-  method: string;
-  nonce: string;
-  verified_at: Date | null;
-  last_checked_at: Date | null;
-  failure_reason: string | null;
-}
-
 @Injectable()
 export class DomainVerificationService {
-  private readonly logger = new Logger(DomainVerificationService.name);
-
   constructor(@Inject(CHECK_DEPS) private readonly checks: CheckDeps = defaultCheckDeps()) {}
 
   /**
@@ -97,32 +86,9 @@ export class DomainVerificationService {
     }
 
     const row = found.rows[0]!;
-    const wasVerified = row.verified_at !== null;
     const outcome = await runCheck(method, domain, row.nonce, this.checks);
-    const reason: VerificationFailure | null = outcome.ok ? null : outcome.reason;
-
-    const updated = await client.query<VerificationRow>(
-      `UPDATE domain_verifications
-          SET verified_at = $2, last_checked_at = now(), failure_reason = $3
-        WHERE id = $1
-        RETURNING id, domain, method, nonce, verified_at, last_checked_at, failure_reason`,
-      // Cleared on failure, not left standing: AC7's whole point is that a
-      // domain which stops verifying stops being verified. Keeping the old
-      // timestamp would leave full scope in place on evidence that no longer
-      // holds.
-      [row.id, outcome.ok ? new Date() : null, reason],
-    );
-
-    await this.syncProjectVerifiedAt(client, projectId, domain);
-
-    // Scenario 10 — the notification, and only on an actual transition. A
-    // check that fails twice must not notify twice; a customer who has already
-    // been told is not helped by being told again.
-    if (wasVerified && !outcome.ok) {
-      await this.notifyScopeLoss(client, workspaceId, projectId, domain, reason!);
-    }
-
-    return toState(updated.rows[0]!);
+    const applied = await applyCheckOutcome(client, { workspaceId, projectId, domain, row, outcome, now: new Date() });
+    return toState(applied.row);
   }
 
   /** AC5 — state per domain and per method, plus the resulting audit scope. */
@@ -140,51 +106,6 @@ export class DomainVerificationService {
     const verified = methods.some((state) => state.verified);
 
     return { domain, verified, audit_scope: verified ? "full" : "public_surface", methods };
-  }
-
-  /**
-   * `projects.domain_verified_at` mirrors "any method currently verified".
-   *
-   * Denormalised deliberately: the audit tool (STORY-082) reads the project
-   * row it already has rather than joining verifications on every scope
-   * decision, and a scope check that needs a join is a scope check somebody
-   * will be tempted to skip.
-   */
-  private async syncProjectVerifiedAt(
-    client: { query: (sql: string, params: unknown[]) => Promise<{ rows: { verified_at: Date | null }[] }> },
-    projectId: string,
-    domain: string,
-  ): Promise<void> {
-    const any = await client.query(
-      "SELECT max(verified_at) AS verified_at FROM domain_verifications WHERE project_id = $1 AND domain = $2",
-      [projectId, domain],
-    );
-    await client.query("UPDATE projects SET domain_verified_at = $2, updated_at = now() WHERE id = $1", [
-      projectId,
-      any.rows[0]?.verified_at ?? null,
-    ]);
-  }
-
-  private async notifyScopeLoss(
-    client: { query: (sql: string, params: unknown[]) => Promise<unknown> },
-    workspaceId: string,
-    projectId: string,
-    domain: string,
-    reason: VerificationFailure,
-  ): Promise<void> {
-    await client.query(
-      `INSERT INTO notifications (id, workspace_id, project_id, kind, severity, title, body, payload)
-       VALUES ($1,$2,$3,'domain.verification_lost','warning',$4,$5,$6)`,
-      [
-        uuidV7(),
-        workspaceId,
-        projectId,
-        `${domain} is no longer verified`,
-        `Audits of ${domain} are limited to public-surface scope until it verifies again. Every rule that could not run is named on the audit itself.`,
-        JSON.stringify({ domain, reason }),
-      ],
-    );
-    this.logger.warn(`project ${projectId}: ${domain} lost verification (${reason}); audit scope reduced`);
   }
 
   private async projectDomain(projectId: string): Promise<{ workspaceId: string; domain: string }> {

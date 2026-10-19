@@ -19,7 +19,11 @@ describe("STORY-048 · DomainVerificationService", () => {
   let calls: Recorded[];
   let rowStore: Record<string, unknown>[];
 
-  function harness(deps: Partial<CheckDeps> = {}, existingRows: Record<string, unknown>[] = []) {
+  function harness(
+    deps: Partial<CheckDeps> = {},
+    existingRows: Record<string, unknown>[] = [],
+    aggregateVerifiedAt: Date | null = null,
+  ) {
     calls = [];
     rowStore = existingRows;
     vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
@@ -29,6 +33,8 @@ describe("STORY-048 · DomainVerificationService", () => {
           if (sql.includes("SELECT workspace_id, root_domain")) {
             return { rows: [{ workspace_id: WS, root_domain: "hubspot.com" }] };
           }
+          // Before the generic read below: the aggregate also reads `FROM domain_verifications WHERE project_id`.
+          if (sql.includes("max(verified_at)")) return { rows: [{ verified_at: aggregateVerifiedAt }] };
           if (sql.includes("FROM domain_verifications WHERE project_id")) return { rows: rowStore };
           if (sql.includes("INSERT INTO domain_verifications")) {
             const row = {
@@ -47,7 +53,6 @@ describe("STORY-048 · DomainVerificationService", () => {
               rows: [{ ...rowStore[0], verified_at: params[1], failure_reason: params[2], last_checked_at: new Date() }],
             };
           }
-          if (sql.includes("max(verified_at)")) return { rows: [{ verified_at: null }] };
           return { rows: [] };
         }),
       },
@@ -154,6 +159,21 @@ describe("STORY-048 · DomainVerificationService", () => {
     const notify = calls.find((c) => c.sql.includes("INSERT INTO notifications"));
     expect(notify, "losing verification must notify, not silently downgrade").toBeDefined();
     expect(notify!.sql).toContain("domain.verification_lost");
+  });
+
+  // STORY-048 AC7 — the notification says audits are limited to public-surface scope. That is only true when NO method
+  // still verifies the domain; telling a customer they lost scope they still have is a false alarm.
+  it("AC7 — does NOT claim scope was lost when another method still verifies the domain", async () => {
+    const verified = {
+      id: "v1", domain: "hubspot.com", method: "dns_txt", nonce: "n1",
+      verified_at: new Date("2026-09-01"), last_checked_at: new Date("2026-09-01"), failure_reason: null,
+    };
+    const stillVerifiedByFile = new Date("2026-09-02");
+    await harness({ resolveTxt: vi.fn(async () => { throw new Error("ENOTFOUND"); }) }, [verified], stillVerifiedByFile).check(
+      PROJECT,
+      "dns_txt",
+    );
+    expect(calls.some((c) => c.sql.includes("INSERT INTO notifications"))).toBe(false);
   });
 
   // A check that fails twice must not notify twice.
