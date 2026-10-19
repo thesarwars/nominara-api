@@ -239,7 +239,7 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
 
   describe("NEW-C-15 audit · the producer: rollup.metric_daily enqueues source.verify_presence after commit", () => {
     const rollup = (enqueue: (workspace: string, payload: Record<string, unknown>, key: string) => Promise<unknown>) =>
-      createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { enqueueVerifyPresence: enqueue });
+      createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { enqueueVerifyPresence: enqueue, enqueueTaskGenerate: async () => undefined });
     const rollupJob = (): Job => ({ data: { payload: { workspaceId, kid: "k", projectId } } }) as unknown as Job;
     const today = async (): Promise<string> => (await db.query("SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d")).rows[0].d as string;
 
