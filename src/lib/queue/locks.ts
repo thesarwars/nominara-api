@@ -37,6 +37,12 @@ export async function acquireAdvisoryXactLock(client: ClientBase, key: string): 
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [key]);
 }
 
+/** `SELECT pg_try_advisory_xact_lock(...)` on `key` — never waits: `true` when acquired (auto-released at COMMIT/ROLLBACK), `false` when another session holds it. */
+export async function tryAcquireAdvisoryXactLock(client: ClientBase, key: string): Promise<boolean> {
+  const result = await client.query<{ locked: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked", [key]);
+  return result.rows[0]?.locked === true;
+}
+
 /** Per-project serialization key for a queue documented as locked "per project" (rollup.metric_daily, topic.cluster). Namespaced by queue name so two queues' per-project locks never collide with each other. */
 export function projectQueueLockKey(queueName: string, projectId: string): string {
   return `queue-lock:${queueName}:${projectId}`;
@@ -73,6 +79,16 @@ export async function withProjectQueueLock<T>(
 export async function withGlobalQueueLock<T>(client: ClientBase, queueName: string, fn: () => Promise<T>): Promise<T> {
   await acquireAdvisoryXactLock(client, globalQueueLockKey(queueName));
   return fn();
+}
+
+/** Runs `fn` under `queueName`'s global advisory lock only if it is free right now; `{ acquired: false }` otherwise, without waiting. `client` must already be inside an open transaction. */
+export async function tryWithGlobalQueueLock<T>(
+  client: ClientBase,
+  queueName: string,
+  fn: () => Promise<T>,
+): Promise<{ acquired: true; value: T } | { acquired: false }> {
+  if (!(await tryAcquireAdvisoryXactLock(client, globalQueueLockKey(queueName)))) return { acquired: false };
+  return { acquired: true, value: await fn() };
 }
 
 // ─────────────────────────────────────────────────────────────────────────

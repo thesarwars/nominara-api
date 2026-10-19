@@ -18,6 +18,12 @@ export const BLACKOUT_THRESHOLD_MS = 48 * 60 * 60 * 1000;
  */
 export const BLACKOUT_PAGE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
+/** Serialisable monitor state (STORY-179): epoch-ms maps keyed by engine. */
+export interface BlackoutMonitorState {
+  readonly darkSinceMs: Readonly<Record<string, number>>;
+  readonly lastPagedAtMs: Readonly<Record<string, number>>;
+}
+
 export class BlackoutMonitor {
   private readonly darkSinceMs = new Map<EngineKey, number>();
   private readonly lastPagedAtMs = new Map<EngineKey, number>();
@@ -49,6 +55,45 @@ export class BlackoutMonitor {
       return;
     }
 
+    this.evaluate(engineKey, darkSince, now);
+  }
+
+  /**
+   * STORY-179 — feed the monitor from the last recorded success (`engine_health`) rather than from a live stream of
+   * outcomes. A success inside the window clears the dark clock; an older one starts it AT THAT SUCCESS, so the page
+   * lands 48h after the engine last worked and not 48h after this process first looked. `null` means no success was
+   * ever recorded, which is not "dark since the epoch": the clock starts at the first look, exactly as `observe(false)`.
+   */
+  observeLastSuccess(engineKey: EngineKey, lastSuccessAtMs: number | null): void {
+    if (lastSuccessAtMs === null) {
+      this.observe(engineKey, false);
+      return;
+    }
+    const now = this.clock();
+    if (now - lastSuccessAtMs <= this.thresholdMs) {
+      this.darkSinceMs.delete(engineKey);
+      return;
+    }
+    this.darkSinceMs.set(engineKey, lastSuccessAtMs);
+    this.evaluate(engineKey, lastSuccessAtMs, now);
+  }
+
+  /** Plain data, so a different replica can carry on from where this one stopped (STORY-179). */
+  exportState(): BlackoutMonitorState {
+    return {
+      darkSinceMs: Object.fromEntries(this.darkSinceMs),
+      lastPagedAtMs: Object.fromEntries(this.lastPagedAtMs),
+    };
+  }
+
+  importState(state: BlackoutMonitorState): void {
+    this.darkSinceMs.clear();
+    this.lastPagedAtMs.clear();
+    for (const [key, at] of Object.entries(state.darkSinceMs)) this.darkSinceMs.set(key as EngineKey, at);
+    for (const [key, at] of Object.entries(state.lastPagedAtMs)) this.lastPagedAtMs.set(key as EngineKey, at);
+  }
+
+  private evaluate(engineKey: EngineKey, darkSince: number, now: number): void {
     const darkDurationMs = now - darkSince;
     if (darkDurationMs <= this.thresholdMs) {
       return;
