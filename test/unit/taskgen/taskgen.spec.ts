@@ -60,7 +60,7 @@ describe("STORY-063 · taskgen template", () => {
 
 describe("STORY-063 · taskgen compile (closed grammar to parameterised SQL)", () => {
   it("binds every condition value as a parameter and never inlines one", () => {
-    const { text, values } = compileMetricWindow({ ...base, threshold: 0.1234567, min_n: 4321, window_days: 9 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1" });
+    const { text, values } = compileMetricWindow({ ...base, threshold: 0.1234567, min_n: 4321, window_days: 9 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1", timezone: "UTC" });
     expect(values).toContain(0.1234567);
     expect(values).toContain(4321);
     expect(values).toContain(9);
@@ -68,19 +68,19 @@ describe("STORY-063 · taskgen compile (closed grammar to parameterised SQL)", (
     expect(text).toMatch(/\$1\b/u);
   });
 
-  it("[STORY-063 #2] 'sustained' is compiled in: the statement counts breaching days and binds the day floor as a parameter", () => {
-    const { text, values } = compileMetricWindow({ ...base, sustained_days: 5 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1" });
-    // capped by the capture days that exist in the window: min(sustained_days, capture_days)
-    expect(text).toMatch(/days_breached\s*>=\s*LEAST\(\$\d+::int,\s*s\.current_capture_days\)/u);
+  it("[STORY-063 #2] 'sustained' is compiled in: the statement counts breaching RUNS and binds the day floor as a parameter", () => {
+    const { text, values } = compileMetricWindow({ ...base, sustained_days: 5 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1", timezone: "UTC" });
+    // capped by the capture runs that exist in the window: min(sustained_days, runs)
+    expect(text).toMatch(/runs_breached,\s*0\)\s*>=\s*LEAST\(\$\d+::int,\s*s\.current_runs\)/u);
     expect(values).toContain(5);
-    expect(text).not.toMatch(/days_breached\s*>=\s*(LEAST\()?5\b/u);
+    expect(text).not.toMatch(/runs_breached,\s*0\)\s*>=\s*(LEAST\()?5\b/u);
   });
 
   it("is built only from fixed fragments: every metric and direction compiles to a statement with no condition text in it", () => {
     for (const metric of ["sov", "presence_rate", "owned_citation_count"] as const) {
       for (const direction of ["down", "up"] as const) {
         for (const change of ["relative", "absolute"] as const) {
-          const { text } = compileMetricWindow({ ...base, metric, direction, change }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1" });
+          const { text } = compileMetricWindow({ ...base, metric, direction, change }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1", timezone: "UTC" });
           expect(text).toContain("FROM metric_daily");
           expect(text).not.toMatch(/;|--|\/\*/u);
         }

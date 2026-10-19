@@ -74,6 +74,7 @@ describe("STORY-063 · task generation engine", () => {
     await db.query("INSERT INTO task_generation_rules SELECT * FROM jsonb_populate_recordset(NULL::task_generation_rules, $1::jsonb)", [JSON.stringify(catalog)]);
     // The INSERT trigger stamps a rule inserted enabled; the shipped catalog is "evaluated since always", so restore that.
     await db.query("UPDATE task_generation_rules SET enabled_since = NULL");
+    runIds = new Map();
     workspaceId = randomUUID();
     otherWorkspaceId = randomUUID();
     projectId = randomUUID();
@@ -105,12 +106,29 @@ describe("STORY-063 · task generation engine", () => {
     visibility?: number;
     entity?: "brand" | "competitor";
     entityId?: string;
+    /** The capture RUN the day's cells belong to. Rows sharing a key are ONE run (one run can straddle local midnight). Defaults to one run a day. */
+    run?: string;
   }
+  let runIds = new Map<string, string>();
 
   async function metric(engine: string, date: string, spec: MetricSpec = {}): Promise<void> {
     const cells = spec.cells ?? 5;
     const present = spec.present ?? cells;
     const entity = spec.entity ?? "brand";
+    if (entity === "brand" && cells > 0) {
+      // The generator counts capture RUNS (a date is not a run), so a day's facts carry the capture that produced them.
+      const key = `${engine}|${spec.run ?? date}`;
+      if (!runIds.has(key)) runIds.set(key, uuidV7());
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO answer_captures
+           (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,
+            normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'api','1.0.0','n1',$8,'{}'::jsonb,'{}','live','parsed',true)
+         ON CONFLICT DO NOTHING`,
+        [id, workspaceId, projectId, runIds.get(key), promptId, engine, `${date}T10:00:00Z`, createHash("sha256").update(id).digest()],
+      );
+    }
     await db.query(
       `INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date, cells_total, cells_present,
                                  presence_rate, sov, mentions_total, mentions_negative, citations_owned, citations_total, visibility_score)
@@ -1150,7 +1168,7 @@ describe("STORY-063 · task generation engine", () => {
     await cadence("gemini", STARTER, sovAt(0.2, 0.4, 0.4, 35)); // the bad run is the latest: the preceding window did not move
     await generate();
     expect(await taskRows()).toHaveLength(0);
-    await db.query("TRUNCATE metric_daily");
+    await db.query("TRUNCATE metric_daily, answer_captures");
     await cadence("gemini", STARTER, sovAt(0.4, 0.2, 0.4, 35)); // it recovered: the latest window rose
     await generate();
     expect(await taskRows()).toHaveLength(0);
@@ -1160,7 +1178,7 @@ describe("STORY-063 · task generation engine", () => {
     await cadence("gemini", STARTER, sovAt(0.3, 0.4, 0.44, 35)); // 0.44 -> 0.4 is a 9% fall
     await generate();
     expect(await taskRows()).toHaveLength(0);
-    await db.query("TRUNCATE metric_daily");
+    await db.query("TRUNCATE metric_daily, answer_captures");
     await cadence("gemini", STARTER, sovAt(0.3, 0.4, undefined, 35)); // only two windows of history
     await generate();
     expect(await taskRows()).toHaveLength(0);
@@ -1189,11 +1207,11 @@ describe("STORY-063 · task generation engine", () => {
     await cadence("gemini", STARTER, owned([8, 14, 20])); // a weekly day's count is the whole window's count
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
-    await db.query("TRUNCATE tasks, metric_daily CASCADE");
+    await db.query("TRUNCATE tasks, metric_daily, answer_captures CASCADE");
     await cadence("gemini", GROWTH, (k) => ({ cells: 20, sov: 0.4, owned: k === 0 ? 4 : 7 })); // 8 against 14
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
-    await db.query("TRUNCATE tasks, metric_daily CASCADE");
+    await db.query("TRUNCATE tasks, metric_daily, answer_captures CASCADE");
     await cadence("gemini", GROWTH, (k, j) => ({ cells: 20, sov: 0.4, owned: k === 0 ? (j === 0 ? 8 : 0) : 7 })); // one bad run
     await generate();
     expect(await taskRows()).toHaveLength(0);
@@ -1203,10 +1221,81 @@ describe("STORY-063 · task generation engine", () => {
     await twoWindows("gemini", { sov: 0.4 }, { sov: 0.28 });
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
-    await db.query("TRUNCATE tasks, metric_daily CASCADE");
+    await db.query("TRUNCATE tasks, metric_daily, answer_captures CASCADE");
     await twoWindows("gemini", { sov: 0.4 }, (i) => ({ sov: i === 0 ? 0 : 0.4 }));
     await generate();
     expect(await taskRows()).toHaveLength(0);
+  });
+
+  // ---- round 4: a held step drop fires on Starter; a capture RUN is not a date; a count is per run --------------------------------
+
+  it("[STORY-063 #3 / AC3] Starter cadence: a step drop that then HOLDS (both of the last two windows breach against the window before them) makes a task", async () => {
+    await cadence("gemini", STARTER, sovAt(0.28, 0.28, 0.4, 35));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+  });
+
+  it("[STORY-063 #2] Starter cadence: a bad run that recovers, and a single latest bad run, make NO task; a window under the floor in ANY of the three is no task", async () => {
+    await cadence("gemini", STARTER, sovAt(0.4, 0.28, 0.4, 35)); // chronologically 0.4, 0.28, 0.4: it recovered
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+    await db.query("TRUNCATE metric_daily, answer_captures");
+    await cadence("gemini", STARTER, sovAt(0.28, 0.4, 0.4, 35)); // chronologically 0.4, 0.4, 0.28: only the latest run is bad
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+    await db.query("TRUNCATE metric_daily, answer_captures");
+    await cadence("gemini", STARTER, (k) => ({ cells: k === 2 ? 29 : 35, sov: [0.28, 0.28, 0.4][k]! })); // the held drop, but the baseline window is thin
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #2] a capture RUN is not a date: ONE Starter run that straddles local midnight (two metric dates) is still one bad run and makes NO task", async () => {
+    await metric("gemini", day(D, -17), { cells: 36, sov: 0.4 });
+    await metric("gemini", day(D, -10), { cells: 36, sov: 0.4 });
+    await metric("gemini", day(D, -1), { cells: 18, sov: 0.2, run: "straddler" });
+    await metric("gemini", D, { cells: 18, sov: 0.2, run: "straddler" });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #2] a capture RUN is not a date, at Growth cadence: a straddling bad run plus one good run is one breaching run of two, so NO task", async () => {
+    await metric("gemini", day(D, -4), { cells: 20, sov: 0.4 });
+    await metric("gemini", day(D, -1), { cells: 10, sov: 0.1, run: "straddler" });
+    await metric("gemini", D, { cells: 10, sov: 0.1, run: "straddler" });
+    await metric("gemini", day(D, -11), { cells: 20, sov: 0.4 });
+    await metric("gemini", day(D, -8), { cells: 20, sov: 0.4 });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #3 / #2] a count is per CAPTURE RUN, not per window: an extra run in the preceding window does not make a stable per-run count look like a drop (a manual deep scan)", async () => {
+    await metric("gemini", day(D, -19), { cells: 35, sov: 0.4, owned: 10 });
+    await metric("gemini", day(D, -16), { cells: 35, sov: 0.4, owned: 10 }); // two runs in the preceding window
+    await metric("gemini", day(D, -10), { cells: 35, sov: 0.4, owned: 10 }); // one in the prior
+    await metric("gemini", D, { cells: 35, sov: 0.4, owned: 6 }); // one bad run
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #3 / #2] a count is per CAPTURE RUN: an extra run in the current window does not hide a real 40% per-run drop", async () => {
+    await metric("gemini", day(D, -10), { cells: 35, sov: 0.4, owned: 10 });
+    await metric("gemini", day(D, -4), { cells: 35, sov: 0.4, owned: 6 });
+    await metric("gemini", D, { cells: 35, sov: 0.4, owned: 6 });
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
+  });
+
+  it("[STORY-063 hazard] a SOFT-DELETED task absorbs nothing, by either key: the finding and the gap are planned again, as the dedupe itself would", async () => {
+    await auxFinding("AUX-R-001", "critical");
+    await actionable("deleted.example");
+    await generate();
+    const first = (await taskRows()).filter((t) => t.rule_code === "TG-AUX-R-001" || t.rule_code === "TG-SOURCE-ABSENCE");
+    expect(first).toHaveLength(2);
+    await db.query("UPDATE tasks SET deleted_at = now() WHERE id = ANY($1::uuid[])", [first.map((t) => t.id)]);
+    await db.query("UPDATE task_generation_rules SET cooldown_days = 0");
+    await generate();
+    const live = (await taskRows()).filter((t) => t.deleted_at === null);
+    expect(live.map((t) => t.rule_code).sort()).toEqual(["TG-AUX-R-001", "TG-SOURCE-ABSENCE"]);
   });
 
   // ---- round 3: a refresh absorbs the event it counted, whatever became of the task afterwards ------------------------------------------

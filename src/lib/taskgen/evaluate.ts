@@ -78,7 +78,7 @@ function changeText(condition: MetricWindowCondition, change: number): number {
 }
 
 async function evaluateMetricWindow(rule: RuleRow, condition: MetricWindowCondition, ctx: EvalContext): Promise<TaskDraft[]> {
-  const compiled = compileMetricWindow(condition, { projectId: ctx.projectId, metricDate: ctx.metricDate, scoringVersion: ctx.scoringVersion });
+  const compiled = compileMetricWindow(condition, { projectId: ctx.projectId, metricDate: ctx.metricDate, scoringVersion: ctx.scoringVersion, timezone: ctx.timezone });
   const rows = (await ctx.tx.query<MetricWindowRow>(compiled.text, [...compiled.values])).rows;
 
   if (condition.engine_scope === "each_engine") {
@@ -239,7 +239,7 @@ async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerati
         AND ($4::timestamptz IS NULL OR GREATEST(f.first_detected_at, f.regressed_at) >= $4::timestamptz)
         AND NOT EXISTS (
           SELECT 1 FROM tasks t
-           WHERE t.source_finding_id = f.id
+           WHERE t.source_finding_id = f.id AND t.deleted_at IS NULL
              AND (t.created_at >= GREATEST(f.first_detected_at, f.regressed_at)
                   -- A regression that an OPEN task already absorbed is counted once. "Absorbed" is a WALL-CLOCK fact — the
                   -- recurrence event was written after the regression — never the task's last_evidence_at, which is the END of
@@ -309,7 +309,7 @@ async function evaluateSourceGap(
         AND ($5::timestamptz IS NULL OR r.verified_at >= $5::timestamptz)
         AND NOT EXISTS (
           SELECT 1 FROM tasks t
-           WHERE t.project_id = $1::uuid AND t.source_domain_id = sd.id
+           WHERE t.project_id = $1::uuid AND t.source_domain_id = sd.id AND t.deleted_at IS NULL
              AND (t.created_at >= r.verified_at
                   -- No status test: a refresh counted this verification whatever became of the task since, and a completed task
                   -- makes nothing new until the gap is verified AGAIN (a later verified_at than every event).
