@@ -233,6 +233,12 @@ export const defaultPager: Pager = {
   },
 };
 
+/** Serialisable monitor state (STORY-179): when each queue first went over the threshold, and which have already paged. */
+export interface DlqDepthMonitorState {
+  readonly aboveSince: Readonly<Record<string, number>>;
+  readonly alreadyPaged: string[];
+}
+
 export interface DlqDepthMonitorOptions {
   /** Returns the current time in epoch ms — injectable for deterministic tests. Defaults to Date.now. */
   readonly clock?: () => number;
@@ -260,6 +266,18 @@ export class DlqDepthMonitor {
     this.pager = options.pager ?? defaultPager;
     this.thresholdDepth = options.thresholdDepth ?? DLQ_DEPTH_PAGE_THRESHOLD;
     this.sustainedMs = options.sustainedMs ?? DLQ_DEPTH_SUSTAINED_MS;
+  }
+
+  /** Plain data, so a different replica can carry on from where this one stopped (STORY-179). */
+  exportState(): DlqDepthMonitorState {
+    return { aboveSince: Object.fromEntries(this.aboveSince), alreadyPaged: [...this.alreadyPaged] };
+  }
+
+  importState(state: DlqDepthMonitorState): void {
+    this.aboveSince.clear();
+    this.alreadyPaged.clear();
+    for (const [queue, at] of Object.entries(state.aboveSince)) this.aboveSince.set(queue, at);
+    for (const queue of state.alreadyPaged) this.alreadyPaged.add(queue);
   }
 
   observe(queueName: string, depth: number): void {

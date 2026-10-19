@@ -152,4 +152,23 @@ export class EngineHealthService {
       circuitState: latestRow?.circuit_state ?? "closed",
     };
   }
+
+  /**
+   * STORY-179 — when each engine last had a successful attempt, for the blackout monitor. `engine_health` is
+   * bucketed, so this is the START of the latest bucket holding a success: it can understate the real instant by up to
+   * HEALTH_BUCKET_MS, never overstate it. `null` is an engine with no success on record, which is not the same as one
+   * whose last success was long ago. Unlike recordAttempt this does not swallow errors: a failed read must not look
+   * like "no success".
+   */
+  async lastSuccessAtMs(engineKeys: readonly EngineKey[]): Promise<Map<EngineKey, number | null>> {
+    const result = await this.pool.query<{ engine_key: EngineKey; last_success: Date }>(
+      `SELECT engine_key, MAX(bucket_start) AS last_success
+       FROM engine_health
+       WHERE successes > 0 AND engine_key = ANY($1::text[])
+       GROUP BY engine_key`,
+      [[...engineKeys]],
+    );
+    const found = new Map(result.rows.map((row) => [row.engine_key, row.last_success.getTime()]));
+    return new Map(engineKeys.map((key) => [key, found.get(key) ?? null]));
+  }
 }
