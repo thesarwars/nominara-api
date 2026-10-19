@@ -227,6 +227,20 @@ describe("STORY-144 AC7 · audit-export streams the estate in chunks", () => {
     expect(level.rows[0]?.transaction_isolation).toBe("read committed");
   }, 120_000);
 
+  it("STORY-144 AC7 · a sink that abandons the stream without return() cannot leave the privileged connection in the snapshot", async () => {
+    await estate([5]);
+    const sink: AuditExportSink = {
+      async export(rows) {
+        const iterator = (rows as AsyncIterable<AuditChainRow>)[Symbol.asyncIterator]();
+        await iterator.next(); // pulls one row, opening the snapshot, then walks away
+        return "abandoned";
+      },
+    };
+    await expect(runAuditExport(db, sink, { chunkRows: 2 })).resolves.toBe("abandoned");
+    const level = await db.query<{ transaction_isolation: string }>("SHOW transaction_isolation");
+    expect(level.rows[0]?.transaction_isolation).toBe("read committed");
+  }, 120_000);
+
   it("STORY-144 AC7 · an estate with no audit rows exports an empty file", async () => {
     const path = await runAuditExport(db, new LocalDirExportSink(dir), { chunkRows: 2 });
     expect(await readFile(path, "utf8")).toBe("");

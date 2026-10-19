@@ -44,9 +44,14 @@ export async function runAuditExport(
     throw new RangeError(`audit export chunk size must be a positive integer, got ${String(chunkRows)}`);
   }
   const workspaceIds = await listAuditedWorkspaceIds(privilegedClient);
-  return sink.export(streamEstate(privilegedClient, workspaceIds, chunkRows), {
-    retentionDays: options.retentionDays ?? AUDIT_EXPORT_RETENTION_DAYS,
-  });
+  const rows = streamEstate(privilegedClient, workspaceIds, chunkRows);
+  try {
+    return await sink.export(rows, { retentionDays: options.retentionDays ?? AUDIT_EXPORT_RETENTION_DAYS });
+  } finally {
+    // A sink that stops pulling without finishing the stream or calling return() must not leave the privileged
+    // connection idle in a REPEATABLE READ transaction, pinning xmin. A no-op once the stream has completed.
+    await rows.return(undefined);
+  }
 }
 
 async function* streamEstate(client: ClientBase, workspaceIds: readonly string[], chunkRows: number): AsyncGenerator<AuditChainRow> {
