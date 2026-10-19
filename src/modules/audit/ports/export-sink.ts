@@ -10,7 +10,14 @@ export interface AuditExportOptions {
   readonly retentionDays: number;
 }
 
+/**
+ * STORY-144 AC7 — the rows to export, as a stream. The export covers the whole estate, so a sink must consume this as
+ * it arrives and never collect it: holding every chain at once is the heap problem the chunked walk was written to
+ * remove. An array is still a valid `Iterable`.
+ */
+export type AuditExportRows = Iterable<AuditChainRow> | AsyncIterable<AuditChainRow>;
+
 export interface AuditExportSink {
-  /** Writes one immutable export batch. Returns an opaque, loggable location identifier (never row content). */
-  export(rows: readonly AuditChainRow[], options: AuditExportOptions): Promise<string>;
+  /** Writes one immutable export batch. Returns an opaque, loggable location identifier (never row content). A stream that throws must leave no export behind. */
+  export(rows: AuditExportRows, options: AuditExportOptions): Promise<string>;
 }

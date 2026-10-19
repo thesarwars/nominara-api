@@ -145,6 +145,32 @@ export async function readChainChunk(
   return result.rows.map(toAuditChainRow);
 }
 
+/**
+ * STORY-144 AC7 — a workspace's WHOLE chain, oldest first, as a stream of keyset chunks: the streaming sibling of
+ * `readWorkspaceChain`, which stays as the in-memory oracle the chunked paths are tested against. Unlike the verifier's
+ * walk it reads the lenient zone too, because an export is a copy of everything.
+ *
+ * Holds one chunk at a time. It takes no snapshot of its own: consistency across chunks is the CALLER's, and a caller
+ * that does not open one gets a different snapshot per chunk (see `runAuditExport`).
+ */
+export async function* iterateWorkspaceChain(
+  client: ClientBase,
+  workspaceId: string,
+  chunkRows: number = CHAIN_CHUNK_ROWS,
+): AsyncGenerator<AuditChainRow[]> {
+  // `LIMIT 0` would read an empty chunk and call the chain finished, which for an export is a silently empty copy.
+  if (!Number.isInteger(chunkRows) || chunkRows < 1) {
+    throw new RangeError(`chain chunk size must be a positive integer, got ${String(chunkRows)}`);
+  }
+  let afterSeq: string | null = null;
+  for (;;) {
+    const chunk: AuditChainRow[] = await readChainChunk(client, workspaceId, afterSeq, chunkRows);
+    if (chunk.length === 0) return;
+    yield chunk;
+    afterSeq = chunk[chunk.length - 1]!.seq;
+  }
+}
+
 /** The exact text `readChainChunk` runs for a continuing chunk — so a plan test can EXPLAIN the real thing. */
 export function chainChunkQueryText(): string {
   return `SELECT ${ROW_COLUMNS} FROM audit_log
