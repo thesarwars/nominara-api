@@ -10,14 +10,25 @@ import { z } from "zod";
 //
 // Every member is strict, so an unknown key is a parse failure and the rule is skipped (fail closed), not half-applied.
 
-export const TASK_METRIC_WINDOW_METRICS = ["sov", "presence_rate", "owned_citation_count", "negative_mention_rate"] as const;
+// `negative_cell_rate` (scoring-models.md §6/§15: cells with ANY negative mention over cells) is NOT here: metric_daily
+// holds no negative-cell count, and `mentions_negative / mentions_total` is the other §6 formula, not the alert's. The
+// rule is seeded as a `pending_analysis` until the count exists.
+export const TASK_METRIC_WINDOW_METRICS = ["sov", "presence_rate", "owned_citation_count"] as const;
+
+/** The reference's floor on a sample (scoring-models.md §15: n >= 30). A tuned rule cannot go below it. */
+export const TASK_MIN_SAMPLE = 30;
 export const taskMetricWindowMetricSchema = z.enum(TASK_METRIC_WINDOW_METRICS);
 
 /**
  * A sustained change of a brand metric over `window_days` versus the `window_days` before it (scoring-models.md §15:
  * "a sustained relative change across a window versus the prior window, n >= 30"). `min_n` applies to BOTH windows.
  * `change` is the unit of `threshold`: a fraction of the prior value (`relative`) or a difference in the metric's own
- * unit (`absolute`). `min_current` is an optional floor on the current value (`negative_spike`).
+ * unit (`absolute`).
+ *
+ * "SUSTAINED" IS A PROPERTY OF THE GRAMMAR, not of the window aggregate: the change must ALSO hold, against the prior
+ * window's value, on at least `sustained_days` individual days of the current window. A window-wide sum lets one very
+ * heavy bad day carry the whole aggregate; this does not. `sustained_days` is at least 2 and `min_n` at least 30, so an
+ * ops UPDATE can tune a threshold but cannot tune the hysteresis away.
  */
 export const metricWindowConditionSchema = z
   .object({
@@ -27,24 +38,26 @@ export const metricWindowConditionSchema = z
     change: z.enum(["relative", "absolute"]),
     threshold: z.number().positive().finite(),
     window_days: z.number().int().min(1).max(90),
-    min_n: z.number().int().min(1),
+    min_n: z.number().int().min(TASK_MIN_SAMPLE),
+    sustained_days: z.number().int().min(2).max(90),
     /** `each_engine`: one candidate per engine. `across_engines`: one project-wide candidate when >= `min_engines` engines moved. */
     engine_scope: z.enum(["each_engine", "across_engines"]),
     min_engines: z.number().int().min(1).max(10).optional(),
-    min_current: z.number().min(0).finite().optional(),
   })
-  .strict();
+  .strict()
+  .refine((condition) => condition.sustained_days <= condition.window_days, { message: "sustained_days cannot exceed window_days", path: ["sustained_days"] });
 
 /** A tracked competitor's Visibility Score crossing above the brand's, windowed against the prior window. */
 export const competitorOvertakeConditionSchema = z
   .object({
     kind: z.literal("competitor_overtake"),
     window_days: z.number().int().min(1).max(90),
-    min_n: z.number().int().min(1),
+    /** Applies to the brand's AND the competitor's windows, in both periods. */
+    min_n: z.number().int().min(TASK_MIN_SAMPLE),
   })
   .strict();
 
-/** A displacement event of this workspace-local day whose impact score is at least `min_impact` (0..100). */
+/** A displacement event not yet planned (no task), detected since the rule was enabled, whose impact score is at least `min_impact` (0..100). */
 export const displacementConditionSchema = z
   .object({
     kind: z.literal("displacement"),
@@ -52,7 +65,7 @@ export const displacementConditionSchema = z
   })
   .strict();
 
-/** A finding of AUX rule `aux_rule_code`, first detected (or regressed) on the evaluated day, at one of `severities`. */
+/** An open or regressed finding of AUX rule `aux_rule_code` at one of `severities`, with no task yet for its current detection. */
 export const auxFindingConditionSchema = z
   .object({
     kind: z.literal("aux_finding"),
@@ -61,12 +74,16 @@ export const auxFindingConditionSchema = z
   })
   .strict();
 
-/** A domain at one of `gap_severities` on the project's index row (engine `all`, `window_days`), seedable in the workspace. */
+/**
+ * A domain whose latest index row (engine `all`, the WIDEST window — the one every authority path reads, STORY-054 AC10)
+ * has moved INTO one of `gap_severities`, seedable in the workspace. "A new critical gap": a gap that was already at that
+ * severity on the previous row does not generate again. The window is not tunable here, so this rule cannot disagree with
+ * the recovery plan about which domains are actionable.
+ */
 export const sourceGapConditionSchema = z
   .object({
     kind: z.literal("source_gap"),
     gap_severities: z.array(z.enum(["critical", "high"])).min(1),
-    window_days: z.number().int().min(1).max(365),
   })
   .strict();
 
@@ -87,7 +104,7 @@ export const promptStabilityConditionSchema = z
 export const pendingAnalysisConditionSchema = z
   .object({
     kind: z.literal("pending_analysis"),
-    analysis: z.enum(["topic_gap", "divergence", "entity_node", "render_downgrade"]),
+    analysis: z.enum(["topic_gap", "divergence", "entity_node", "render_downgrade", "negative_cell_rate"]),
   })
   .strict();
 
@@ -147,6 +164,8 @@ export const taskEvidenceRefreshPayloadSchema = z
     recurrence_count: z.number().int().min(1),
     impact_score: z.number().min(0).max(100),
     affected_engines: z.array(z.string()),
+    /** Set when the recurrence is a further displacement event on the same task (a second loss on one domain). */
+    source_displacement_id: z.string().uuid().optional(),
   })
   .strict();
 export type TaskEvidenceRefreshPayload = z.infer<typeof taskEvidenceRefreshPayloadSchema>;
