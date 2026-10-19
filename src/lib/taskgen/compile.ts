@@ -49,7 +49,8 @@ const CHANGE_SQL: Record<MetricWindowCondition["change"], Record<MetricWindowCon
 /**
  * One row per engine (never the cross-engine `all` row) whose metric moved by at least the threshold in the given
  * direction, with BOTH windows at or above the sample floor AND the change holding on at least `sustained_days` individual days of the
- * current window (so one heavy day cannot carry the aggregate). Columns: `engine_key`, `n_current`, `n_prior`, `cur_value`,
+ * current window (so one heavy day cannot carry the aggregate). A day is only a breaching day when it carries at least
+ * `ceil(min_n / window_days)` cells: low-volume blips cannot make up the count around one heavy day. Columns: `engine_key`, `n_current`, `n_prior`, `cur_value`,
  * `prior_value`, `change_value` (a positive magnitude in the rule's unit).
  *
  * The current window is the `window_days` ending at `metricDate`; the prior window is the `window_days` before it. A
@@ -98,7 +99,7 @@ WITH win AS (
      AND d.scoring_version = $4
      AND d.metric_date >  $2::date - $3::int
      AND d.metric_date <= $2::date
-     AND d.cells_total > 0
+     AND d.cells_total >= ceil($5::float8 / $3::int)
      AND s.prior_value IS NOT NULL
      ${priorGuard.replace("prior_value", "s.prior_value")}
      AND ${change(DAY_VALUE_SQL[condition.metric], "s.prior_value")} >= $6::float8

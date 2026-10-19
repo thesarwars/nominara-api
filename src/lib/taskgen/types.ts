@@ -51,4 +51,6 @@ export interface TaskDraft {
   /** A displacement every one of which must surface: never subject to a cooldown, and linked back to its task. */
   readonly displacementId?: string;
   readonly noCooldown?: boolean;
+  /** A discrete event (an AUX regression, a re-verified source gap): it counts on an open task once, even within the same metric day. */
+  readonly discrete?: boolean;
 }

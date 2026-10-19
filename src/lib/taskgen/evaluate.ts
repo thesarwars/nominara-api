@@ -233,8 +233,13 @@ async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerati
           SELECT 1 FROM tasks t
            WHERE t.source_finding_id = f.id
              AND (t.created_at >= GREATEST(f.first_detected_at, f.regressed_at)
-                  -- a regression that an OPEN task already absorbed (its evidence was refreshed after the regression) is counted once
-                  OR t.last_evidence_at >= f.regressed_at)
+                  -- A regression that an OPEN task already absorbed is counted once. "Absorbed" is a WALL-CLOCK fact — the
+                  -- recurrence event was written after the regression — never the task's last_evidence_at, which is the END of
+                  -- the evaluated day (a future instant when that day is today) and would swallow a regression the same day.
+                  -- A done task absorbs nothing: a regression after its completion is a new piece of work.
+                  OR (t.status IN ('todo', 'in_progress') AND EXISTS (
+                        SELECT 1 FROM task_events e
+                         WHERE e.task_id = t.id AND e.event = 'evidence_refreshed' AND e.occurred_at >= f.regressed_at)))
         )
       ORDER BY f.first_detected_at, f.id`,
     [ctx.projectId, condition.aux_rule_code, condition.severities, rule.enabled_since],
@@ -248,6 +253,8 @@ async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerati
     affectedPromptIds: [],
     sourceFindingId: row.id,
     affectedUrl: row.url,
+    // A regression is a discrete event: it counts on the open task once, even on the day the task was last refreshed.
+    discrete: true,
   }));
 }
 
@@ -259,14 +266,19 @@ async function evaluateSourceGap(
   ctx: EvalContext,
 ): Promise<TaskDraft[]> {
   // The ONE actionable-domain predicate (latest row, widest window, seedable) the recovery plan reads, so the two paths cannot
-  // disagree; THEN the rule's own question: has the gap just MOVED INTO the rule's severity ("a new critical gap")? A gap that
-  // was already there on the previous index row does not regenerate every cooldown.
+  // disagree; THEN the rule's own question: is this a NEW critical gap?
+  //
+  // "New" is judged on what the production writer keeps. `refreshProjectSourceIndex` DELETEs and re-inserts the project's rows on
+  // every rollup (a new `window_start` and `computed_at` each time), so neither a previous row nor `computed_at` survives a day.
+  // What it DOES carry across a recompute is the verified presence, and a critical gap exists only through it (an unverified
+  // domain has no severity): `verified_at` moves when the gap is re-confirmed by a fetch, and only then. A gap is new when it
+  // was verified after the last task for the domain was made; an open task for an older verification is refreshed ONCE (the
+  // recurrence event is the witness), not on every rollup.
   const actionable = await actionableAuthorityDomains(ctx.tx, ctx.workspaceId, ctx.projectId, null, AUTHORITY_WINDOW_DAYS);
   if (actionable.size === 0) return [];
   const found = await ctx.tx.query<{ id: string; domain: string; gap_severity: string; seeding_playbook_slug: string | null }>(
     `WITH ranked AS (
-       SELECT psi.source_domain_id, psi.gap_severity, psi.computed_at,
-              lead(psi.gap_severity) OVER (PARTITION BY psi.source_domain_id ORDER BY psi.window_start DESC) AS previous_severity,
+       SELECT psi.source_domain_id, psi.gap_severity, psi.verified_at,
               row_number() OVER (PARTITION BY psi.source_domain_id ORDER BY psi.window_start DESC) AS rn
          FROM project_source_index psi
         WHERE psi.project_id = $1::uuid AND psi.engine_key = 'all' AND psi.window_days = $2::int
@@ -277,15 +289,15 @@ async function evaluateSourceGap(
        JOIN source_domains sd ON sd.id = r.source_domain_id
       WHERE r.rn = 1
         AND r.gap_severity = ANY($4::text[])
-        AND (r.previous_severity IS NULL OR NOT (r.previous_severity = ANY($4::text[])))
-        AND ($5::timestamptz IS NULL OR r.computed_at >= $5::timestamptz)
-        -- A gap is absorbed ONCE: a task for this domain made since this index row was computed (by this rule, or by the
-        -- displacement path, which shares the fingerprint) already carries it. Without this the same row would count as a
-        -- recurrence on every evaluated day.
+        AND r.verified_at IS NOT NULL
+        AND ($5::timestamptz IS NULL OR r.verified_at >= $5::timestamptz)
         AND NOT EXISTS (
           SELECT 1 FROM tasks t
            WHERE t.project_id = $1::uuid AND t.source_domain_id = sd.id
-             AND t.created_at >= r.computed_at
+             AND (t.created_at >= r.verified_at
+                  OR (t.status IN ('todo', 'in_progress') AND EXISTS (
+                        SELECT 1 FROM task_events e
+                         WHERE e.task_id = t.id AND e.event = 'evidence_refreshed' AND e.occurred_at >= r.verified_at)))
         )
       ORDER BY lower(sd.domain)`,
     [ctx.projectId, AUTHORITY_WINDOW_DAYS, [...actionable.values()], condition.gap_severities, rule.enabled_since],
@@ -301,6 +313,7 @@ async function evaluateSourceGap(
     affectedPromptIds: [],
     sourceDomainId: row.id,
     playbook: { slug: row.seeding_playbook_slug, domain: row.domain, url: null, angle: "source_gap" },
+    discrete: true,
   }));
 }
 

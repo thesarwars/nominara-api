@@ -130,7 +130,7 @@ async function generate(tx: ClientBase, tasks: TasksService, request: GenerateRe
       incrementCounter("nominara_taskgen_tasks_total", { outcome: result.outcome });
       if (draft.displacementId !== undefined && result.outcome !== "suppressed") {
         // The displacement points at its task, so it is planned once. The first task wins and is never replaced.
-        await linkDisplacementToTask(tx, draft.displacementId, result.task.id);
+        await linkDisplacementToTask(tx, ctx.workspaceId, draft.displacementId, result.task.id);
       }
     }
   }
@@ -219,6 +219,7 @@ async function toTaskInput(
       // A displacement is a discrete event consumed exactly once (it is linked to its task straight after), so a SECOND loss on
       // a domain that already has an open task is a recurrence even on the same metric day.
       ...(draft.displacementId === undefined ? {} : { sourceDisplacementId: draft.displacementId }),
+      ...(draft.discrete === true ? { discreteEvent: true } : {}),
     },
   };
 }

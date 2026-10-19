@@ -13,6 +13,7 @@ import { generateTasksForProject, type GenerationSummary } from "../../src/lib/t
 import { evaluateRule, parseCondition } from "../../src/lib/taskgen/evaluate.js";
 import { captureBaseline } from "../../src/lib/taskgen/baseline.js";
 import { SCORING_VERSION } from "../../src/lib/scoring/index.js";
+import { refreshProjectSourceIndex } from "../../src/lib/rollup/refresh-project-source-index.js";
 import { TasksService } from "../../src/modules/tasks/tasks.service.js";
 import { authorityTaskFingerprint } from "../../src/lib/analytics/displacement-recovery.js";
 import { DisplacementService } from "../../src/modules/displacement/displacement.service.js";
@@ -175,8 +176,9 @@ describe("STORY-063 · task generation engine", () => {
   async function actionable(domain: string, severity = "critical"): Promise<string> {
     const sd = (await db.query("INSERT INTO source_domains (workspace_id, domain, is_seedable) VALUES ($1,$2,true) RETURNING id", [workspaceId, domain])).rows[0].id;
     await db.query(
-      `INSERT INTO project_source_index (workspace_id, project_id, source_domain_id, engine_key, window_start, window_days, gap_severity)
-       VALUES ($1,$2,$3,'all','2026-07-16',90,$4)`,
+      `INSERT INTO project_source_index (workspace_id, project_id, source_domain_id, engine_key, window_start, window_days, gap_severity,
+                                         brand_present_on_domain, verified_at)
+       VALUES ($1,$2,$3,'all','2026-07-16',90,$4,false, now() - interval '1 day')`,
       [workspaceId, projectId, sd, severity],
     );
     return sd;
@@ -618,22 +620,6 @@ describe("STORY-063 · task generation engine", () => {
     expect((await taskRows()).filter((t) => t.rule_code === "TG-AUX-R-004-NEW")).toHaveLength(0);
   });
 
-  it("[STORY-063 #1] TG-SOURCE-ABSENCE is a NEW critical gap: a gap already critical on the previous row does not regenerate, one that moved into critical does", async () => {
-    const sd = await actionable("persist.com");
-    await db.query(
-      `INSERT INTO project_source_index (workspace_id, project_id, source_domain_id, engine_key, window_start, window_days, gap_severity)
-       VALUES ($1,$2,$3,'all','2026-07-17',90,'critical')`,
-      [workspaceId, projectId, sd],
-    );
-    // The previous row (07-16) is critical too: nothing is new.
-    await generate();
-    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(0);
-    // The previous row was only high: it moved into critical.
-    await db.query("UPDATE project_source_index SET gap_severity = 'high' WHERE source_domain_id = $1 AND window_start = '2026-07-16'", [sd]);
-    await generate();
-    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(1);
-  });
-
   it("[STORY-063 AC10] the source-gap rule and the recovery plan agree on actionability: a critical row superseded by a newer medium one is neither", async () => {
     const sd = await actionable("fixed.com");
     await db.query(
@@ -911,6 +897,28 @@ describe("STORY-063 · task generation engine", () => {
     expect(await taskRows("TG-SOV-DROP-ENGINE")).toHaveLength(1);
   });
 
+  it("[STORY-063 hazard] the on-demand recovery plan takes the same per-project lock as task.generate, so an API call and a worker job cannot deadlock", async () => {
+    await actionable("lock.com");
+    const id = await displacement({ citationGap: [gapEntry("lock.com")], impact: 80 });
+    const holder = new Client({ connectionString: container.getConnectionUri() });
+    await holder.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [projectQueueLockKey("task.generate", projectId)]);
+      let finished = false;
+      const running = withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => displacementService.recoveryPlan(id)).then(() => {
+        finished = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(finished).toBe(false);
+      await holder.query("COMMIT");
+      await running;
+    } finally {
+      await holder.end();
+    }
+    expect(await taskRows()).toHaveLength(1);
+  });
+
   it("[STORY-063 hazard] two task.generate jobs for one project running at once make one task and no error", async () => {
     await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
     await actionable("one.com");
@@ -974,13 +982,124 @@ describe("STORY-063 · task generation engine", () => {
     expect(after.recurrence_count).toBe(1);
   });
 
-  it("[STORY-063 hazard] a source gap that already has a task is not a recurrence every day: the same index row is absorbed once", async () => {
-    await actionable("steady.com");
+  // ---- round 2: from the hazard, against the shapes production writes ----------------------------------------------
+
+  const realToday = (): string => new Date().toISOString().slice(0, 10);
+  const auxTasks = async (code: string) => (await taskRows()).filter((t) => t.rule_code === code);
+
+  it("[STORY-063 hazard] a critical finding that regresses the day its task was completed surfaces again: a done task absorbs nothing", async () => {
+    // Anchored on the REAL date: `last_evidence_at` is the end of the evaluated day, a future instant when that day is today.
+    const finding = await auxFinding("AUX-R-001", "critical", new Date(Date.now() - 3_600_000).toISOString());
+    const today = realToday();
+    await generate(today);
+    await db.query("UPDATE tasks SET status = 'done', completed_at = now() WHERE source_finding_id = $1", [finding]);
+    await db.query("UPDATE aux_findings SET status = 'regressed', regressed_at = now() + interval '1 minute' WHERE id = $1", [finding]);
+    await generate(today);
+    await generate(day(today, 1));
+    expect(await auxTasks("TG-AUX-R-001")).toHaveLength(2);
+  });
+
+  it("[STORY-063 hazard] a second regression on the same day as the first refresh is counted too: each regression exactly once", async () => {
+    const finding = await auxFinding("AUX-R-001", "critical");
+    await generate(realToday());
+    const [task] = await auxTasks("TG-AUX-R-001");
+    await db.query("UPDATE tasks SET created_at = now() - interval '3 hours' WHERE id = $1", [task.id]);
+    await db.query("UPDATE aux_findings SET status = 'regressed', regressed_at = now() - interval '2 hours' WHERE id = $1", [finding]);
+    for (const date of [realToday(), realToday(), day(realToday(), 1)]) await generate(date);
+    expect((await auxTasks("TG-AUX-R-001"))[0].recurrence_count).toBe(1);
+    // The refresh happened an hour ago; the finding regresses again 10 minutes ago, the same local day.
+    await db.query("UPDATE task_events SET occurred_at = now() - interval '1 hour' WHERE task_id = $1 AND event = 'evidence_refreshed'", [task.id]);
+    await db.query("UPDATE aux_findings SET regressed_at = now() - interval '10 minutes' WHERE id = $1", [finding]);
+    for (const date of [realToday(), realToday(), day(realToday(), 1)]) await generate(date);
+    const after = await auxTasks("TG-AUX-R-001");
+    expect(after).toHaveLength(1);
+    expect(after[0].recurrence_count).toBe(2);
+  });
+
+  it("[STORY-063 AC4 / hazard] one heavy bad day plus low-volume blips cannot reach sustained_days: a 1-cell day is not a breaching day, for ANY metric_window rule", async () => {
+    const shape = (i: number): MetricSpec => {
+      if (i === 0) return { cells: 100, sov: 0, present: 0, owned: 0 };
+      if (i < 3) return { cells: 1, sov: 0, present: 0, owned: 0 };
+      return { cells: 5, sov: 0.4, present: 5, owned: 4 };
+    };
+    for (const engine of ["gemini", "chatgpt", "claude"]) {
+      await windowOf(engine, day(D, -7), { sov: 0.4, present: 5, owned: 4 });
+      await windowOf(engine, D, shape);
+    }
     await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  // The production writer of project_source_index: every refresh DELETEs the project's rows and re-inserts them with a new
+  // window_start and computed_at, carrying only verified presence. These tests drive THAT, not hand-built row pairs.
+  async function refreshIndex(date: string): Promise<void> {
+    await db.query("BEGIN");
+    await refreshProjectSourceIndex(db, projectId, date);
+    await db.query("COMMIT");
+  }
+
+  async function verifiedGap(domain: string, verifiedAgo: string): Promise<void> {
+    const url = `https://${domain}/p/1`;
+    await db.query(
+      `INSERT INTO citation_facts (workspace_id, project_id, result_id, prompt_id, engine_key, captured_at, slot_index, raw_url, normalized_url,
+                                   url_hash, domain, is_owned, is_competitor, http_status, position_weight)
+       VALUES ($1,$2,$3,$4,'gemini', now() - interval '1 day', 1, $5, $5, $6, $7, false, false, 200, 1)`,
+      [workspaceId, projectId, randomUUID(), promptId, url, createHash("sha256").update(url).digest(), domain],
+    );
+    await refreshIndex(realToday());
+    await db.query(
+      `UPDATE project_source_index psi SET brand_present_on_domain = false, verified_at = now() - $3::interval
+         FROM source_domains sd WHERE sd.id = psi.source_domain_id AND psi.project_id = $1 AND sd.domain = $2`,
+      [projectId, domain, verifiedAgo],
+    );
+    await refreshIndex(realToday()); // verified presence is carried across a recompute
+    const row = (await db.query("SELECT gap_severity FROM project_source_index WHERE project_id = $1 AND engine_key = 'all' AND window_days = 90", [projectId])).rows[0];
+    expect(row.gap_severity).toBe("critical");
+  }
+
+  it("[STORY-063 hazard] a persistent critical gap, refreshed by the REAL index writer every day, is planned once and never refreshed as a recurrence", async () => {
+    await verifiedGap("reddit.com", "1 day");
+    const today = realToday();
+    await generate(today);
     expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(1);
-    for (const date of [NEXT, day(NEXT, 1), day(NEXT, 2)]) await generate(date);
+    for (let i = 1; i <= 4; i += 1) {
+      await refreshIndex(day(today, i)); // DELETE + re-insert: a new window_start and computed_at every time
+      await generate(day(today, i));
+    }
     const [task] = await taskRows("TG-SOURCE-ABSENCE");
     expect(task.recurrence_count).toBe(0);
+    expect(await events(task.id)).toHaveLength(1);
+    // Completed, the gap persists: nothing regenerates until the gap is verified AGAIN.
+    await db.query("UPDATE tasks SET status = 'done', completed_at = now(), created_at = now() - interval '40 days' WHERE id = $1", [task.id]);
+    await db.query("UPDATE project_source_index SET verified_at = now() - interval '45 days' WHERE project_id = $1", [projectId]);
+    for (let i = 5; i <= 7; i += 1) {
+      await refreshIndex(day(today, i));
+      await generate(day(today, i));
+    }
+    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(1);
+    // Verified again (and the 30-day cooldown has passed): ONE new task, and only one however many days follow.
+    await db.query("UPDATE project_source_index SET verified_at = now() - interval '1 hour' WHERE project_id = $1", [projectId]);
+    for (let i = 8; i <= 10; i += 1) {
+      await refreshIndex(day(today, i));
+      await generate(day(today, i));
+    }
+    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(2);
+  });
+
+  it("[STORY-063 hazard] an OPEN task for a gap that is verified again is refreshed once, however many daily index refreshes follow", async () => {
+    await verifiedGap("reddit.com", "1 day");
+    const today = realToday();
+    await generate(today);
+    const [task] = await taskRows("TG-SOURCE-ABSENCE");
+    await db.query("UPDATE tasks SET created_at = now() - interval '40 days' WHERE id = $1", [task.id]);
+    await db.query("UPDATE project_source_index SET verified_at = now() - interval '1 hour' WHERE project_id = $1", [projectId]);
+    for (let i = 1; i <= 4; i += 1) {
+      await refreshIndex(day(today, i));
+      await generate(day(today, i));
+    }
+    const rows = await taskRows("TG-SOURCE-ABSENCE");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].recurrence_count).toBe(1);
   });
 
   it("[STORY-063 AC13] a windowed rule inserted after the fact does not generate when an earlier date is reprocessed", async () => {

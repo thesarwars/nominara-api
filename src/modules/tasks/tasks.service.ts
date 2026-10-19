@@ -119,6 +119,11 @@ export interface TaskEvidenceRefresh {
    * newer than the task's evidence (a second loss on the same domain the same day), and the impact never moves down.
    */
   readonly sourceDisplacementId?: string;
+  /**
+   * Any other discrete event (an AUX regression, a re-verified source gap): counted once even within the evidence's metric day.
+   * The caller's own absorption predicate (the recurrence event's wall-clock time) is what stops a second count.
+   */
+  readonly discreteEvent?: boolean;
 }
 
 /** schemas/tasks-and-goals.md: a dismissed task re-surfaces after 180 days. */
@@ -564,7 +569,7 @@ export class TasksService {
    * never touched: the before must predate the work.
    */
   private async refreshEvidence(client: ClientBase, taskId: string, refresh: TaskEvidenceRefresh): Promise<boolean> {
-    const everyEvent = refresh.sourceDisplacementId !== undefined;
+    const everyEvent = refresh.sourceDisplacementId !== undefined || refresh.discreteEvent === true;
     const updated = await client.query<{ recurrence_count: number }>(
       `UPDATE tasks
           SET recurrence_count = recurrence_count + 1,

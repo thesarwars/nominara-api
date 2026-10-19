@@ -86,6 +86,9 @@ export async function actionableAuthorityDomains(
  * The displacement points at its task, so the same event is never planned twice. Set once and never replaced: the first
  * task wins. Both the on-demand recovery plan and the rule-driven generator call this one statement.
  */
-export async function linkDisplacementToTask(client: ClientBase, displacementId: string, taskId: string): Promise<void> {
-  await client.query("UPDATE displacement_events SET task_id = $2 WHERE id = $1 AND task_id IS NULL", [displacementId, taskId]);
+export async function linkDisplacementToTask(client: ClientBase, workspaceId: string, displacementId: string, taskId: string): Promise<void> {
+  // `workspace_id` is defence in depth: RLS is the guarantee, the equality is not.
+  await client.query("UPDATE displacement_events SET task_id = $3 WHERE id = $1 AND workspace_id = $2 AND task_id IS NULL", [
+    displacementId, workspaceId, taskId,
+  ]);
 }
