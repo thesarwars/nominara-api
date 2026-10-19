@@ -15,7 +15,13 @@ import type {
 } from "../../../contracts/tasks/index.js";
 import { ConflictError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
-import { taskEvidenceRefreshPayloadSchema } from "../../../contracts/tasks/index.js";
+import {
+  taskBaselineMetricsSchema,
+  taskEvidenceRefreshPayloadSchema,
+  taskPlaybookPayloadSchema,
+  type TaskBaselineMetrics,
+  type TaskPlaybookPayload,
+} from "../../../contracts/tasks/index.js";
 import { refreshProjectTaskCounts } from "../../lib/rollup/refresh-project-task-counts.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type { ActionItem, ActionItemEffort, ActionItemPrimaryActionKind, ActionItemSource } from "../../../contracts/tasks/index.js";
@@ -69,9 +75,9 @@ export interface TaskGenerationFields {
   readonly affectedEngines?: readonly string[];
   readonly affectedPromptIds?: readonly string[];
   readonly playbookSlug?: string | null;
-  readonly playbookPayload?: unknown;
+  readonly playbookPayload?: TaskPlaybookPayload | null;
   /** Captured AT CREATION. Never rewritten by a recurrence or by completion. */
-  readonly baselineMetrics?: unknown;
+  readonly baselineMetrics?: TaskBaselineMetrics | null;
   readonly impactScore?: number;
   readonly effortBand?: "xs" | "s" | "m" | "l" | "xl";
   readonly priority?: number;
@@ -108,6 +114,11 @@ export interface TaskEvidenceRefresh {
   readonly impactScore: number;
   readonly affectedEngines: readonly string[];
   readonly affectedPromptIds: readonly string[];
+  /**
+   * A discrete event (a displacement) that is consumed exactly once. Present: the recurrence counts even when the metric day is not
+   * newer than the task's evidence (a second loss on the same domain the same day), and the impact never moves down.
+   */
+  readonly sourceDisplacementId?: string;
 }
 
 /** schemas/tasks-and-goals.md: a dismissed task re-surfaces after 180 days. */
@@ -553,17 +564,18 @@ export class TasksService {
    * never touched: the before must predate the work.
    */
   private async refreshEvidence(client: ClientBase, taskId: string, refresh: TaskEvidenceRefresh): Promise<boolean> {
+    const everyEvent = refresh.sourceDisplacementId !== undefined;
     const updated = await client.query<{ recurrence_count: number }>(
       `UPDATE tasks
           SET recurrence_count = recurrence_count + 1,
-              last_evidence_at = $2,
-              impact_score = $3,
-              affected_engines = $4::text[],
-              affected_prompt_ids = $5::uuid[]
+              last_evidence_at = GREATEST(COALESCE(last_evidence_at, $2), $2),
+              impact_score = CASE WHEN $6::boolean THEN GREATEST(impact_score, $3::real) ELSE $3::real END,
+              affected_engines = CASE WHEN $6::boolean THEN ARRAY(SELECT DISTINCT e FROM unnest(affected_engines || $4::text[]) AS e ORDER BY e) ELSE $4::text[] END,
+              affected_prompt_ids = CASE WHEN $6::boolean THEN ARRAY(SELECT DISTINCT p FROM unnest(affected_prompt_ids || $5::uuid[]) AS p ORDER BY p) ELSE $5::uuid[] END
         WHERE id = $1 AND status IN ('todo', 'in_progress')
-          AND (last_evidence_at IS NULL OR last_evidence_at < $2)
+          AND ($6::boolean OR last_evidence_at IS NULL OR last_evidence_at < $2)
         RETURNING recurrence_count`,
-      [taskId, refresh.evidenceAt, refresh.impactScore, [...refresh.affectedEngines], [...refresh.affectedPromptIds]],
+      [taskId, refresh.evidenceAt, refresh.impactScore, [...refresh.affectedEngines], [...refresh.affectedPromptIds], everyEvent],
     );
     const row = updated.rows[0];
     if (row === undefined) return false;
@@ -572,6 +584,7 @@ export class TasksService {
       recurrence_count: row.recurrence_count,
       impact_score: refresh.impactScore,
       affected_engines: [...refresh.affectedEngines],
+      ...(refresh.sourceDisplacementId === undefined ? {} : { source_displacement_id: refresh.sourceDisplacementId }),
     });
     await client.query(
       `INSERT INTO task_events (workspace_id, task_id, actor_id, actor_type, event, payload, occurred_at)
@@ -606,8 +619,9 @@ export class TasksService {
         g?.affectedEngines === undefined ? null : [...g.affectedEngines],
         g?.affectedPromptIds === undefined ? null : [...g.affectedPromptIds],
         g?.playbookSlug ?? null,
-        g?.playbookPayload === undefined || g.playbookPayload === null ? null : JSON.stringify(g.playbookPayload),
-        g?.baselineMetrics === undefined || g.baselineMetrics === null ? null : JSON.stringify(g.baselineMetrics),
+        // The owning service validates the jsonb it writes; a caller's type is not the guarantee.
+        g?.playbookPayload === undefined || g.playbookPayload === null ? null : JSON.stringify(taskPlaybookPayloadSchema.parse(g.playbookPayload)),
+        g?.baselineMetrics === undefined || g.baselineMetrics === null ? null : JSON.stringify(taskBaselineMetricsSchema.parse(g.baselineMetrics)),
         g?.impactScore ?? null, g?.effortBand ?? null, g?.priority ?? null, g?.evidenceAt ?? null,
       ],
     );
@@ -820,9 +834,9 @@ export class TasksService {
    * DEDUP IS DEFERRED. FR-GD-02's second sentence — "deduplicated across
    * projects when the same rule code and affected URL recur, collapsing
    * into one row with a project-count badge" — is NOT implemented here.
-   * There is no `task.generate` handler yet (STORY-063/064 are Backlog per
-   * the story snapshot), so no two real tasks can currently share a rule
-   * code and `affected_url` across projects to prove a dedup query against;
+   * The `task.generate` handler exists now (STORY-063), but its catalog is
+   * per-project work and nothing yet produces two tasks sharing a rule code
+   * and `affected_url` across projects to prove a dedup query against;
    * building it now would be exercised by nothing. Each task is its own row.
    *
    * SEVERITY has no column on `tasks` (`priority` is a 1-5 ranking, not a

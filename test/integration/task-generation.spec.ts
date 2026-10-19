@@ -10,6 +10,9 @@ import { taskBaselineMetricsSchema, taskGenerationConditionSchema, taskPlaybookP
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { generateTasksForProject, type GenerationSummary } from "../../src/lib/taskgen/generate.js";
+import { evaluateRule, parseCondition } from "../../src/lib/taskgen/evaluate.js";
+import { captureBaseline } from "../../src/lib/taskgen/baseline.js";
+import { SCORING_VERSION } from "../../src/lib/scoring/index.js";
 import { TasksService } from "../../src/modules/tasks/tasks.service.js";
 import { authorityTaskFingerprint } from "../../src/lib/analytics/displacement-recovery.js";
 import { DisplacementService } from "../../src/modules/displacement/displacement.service.js";
@@ -19,6 +22,9 @@ import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import { createTaskGenerateHandler } from "../../src/lib/queue/handlers/task-generate.handler.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { projectQueueLockKey } from "../../src/lib/queue/locks.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // STORY-063 — the task generation engine. Scenario numbers are the story's Test scenarios table.
 //
@@ -65,6 +71,8 @@ describe("STORY-063 · task generation engine", () => {
     // The catalog is data and some tests tune it; every test starts from what the migration shipped.
     await db.query("DELETE FROM task_generation_rules");
     await db.query("INSERT INTO task_generation_rules SELECT * FROM jsonb_populate_recordset(NULL::task_generation_rules, $1::jsonb)", [JSON.stringify(catalog)]);
+    // The INSERT trigger stamps a rule inserted enabled; the shipped catalog is "evaluated since always", so restore that.
+    await db.query("UPDATE task_generation_rules SET enabled_since = NULL");
     workspaceId = randomUUID();
     otherWorkspaceId = randomUUID();
     projectId = randomUUID();
@@ -204,7 +212,14 @@ describe("STORY-063 · task generation engine", () => {
     expect(codes.filter((c) => c.startsWith("TG-AUX-")).length).toBeGreaterThan(0);
     for (const row of rows) expect(taskGenerationConditionSchema.safeParse(row.condition).success, row.code).toBe(true);
     // The rules whose facts need an analysis that has not shipped are seeded disabled.
-    for (const code of ["TG-RENDER-SCHEMA", "TG-ENTITY-NODE", "TG-DIVERGENCE", "TG-TOPIC-CONTENT"]) expect((await rule(code)).enabled, code).toBe(false);
+    for (const code of ["TG-RENDER-SCHEMA", "TG-ENTITY-NODE", "TG-DIVERGENCE", "TG-TOPIC-CONTENT", "TG-SENTIMENT-NEGATIVE"]) expect((await rule(code)).enabled, code).toBe(false);
+    // negative_cell_rate is not computable from metric_daily, so the alert is pending, never approximated by another formula.
+    expect((await rule("TG-SENTIMENT-NEGATIVE")).condition).toEqual({ kind: "pending_analysis", analysis: "negative_cell_rate" });
+    // Hysteresis is in every windowed rule: a sample floor of 30 and a day-level sustain.
+    for (const row of rows.filter((r) => r.condition.kind === "metric_window" || r.condition.kind === "competitor_overtake")) {
+      expect(row.condition.min_n, row.code).toBeGreaterThanOrEqual(30);
+      if (row.condition.kind === "metric_window") expect(row.condition.sustained_days, row.code).toBeGreaterThanOrEqual(2);
+    }
     // scoring-models.md §15 numbers, transcribed exactly.
     expect((await rule("TG-SOV-DROP-ENGINE")).cooldown_days).toBe(7);
     expect((await rule("TG-SOV-DROP-ENGINE")).condition).toMatchObject({ threshold: 0.15, window_days: 7, min_n: 30 });
@@ -235,15 +250,13 @@ describe("STORY-063 · task generation engine", () => {
     await twoWindows("chatgpt", { present: 5 }, { present: 4 });
     // TG-CITATION-LOSS: owned citations 40 -> 20 (50% down, >= 25%) on a third; presence/sov flat.
     await twoWindows("claude", { owned: 4 }, { owned: 2 });
-    // TG-SENTIMENT-NEGATIVE: negative mention rate 0.02 -> 0.10 (>= 0.05 and up >= 0.03) on a fourth.
-    await twoWindows("perplexity", { mentions: 100, negative: 2 }, { mentions: 100, negative: 10 });
     const summary = await generate();
-    expect(summary.created).toBeGreaterThanOrEqual(4);
+    // Exactly the three that moved: the negative-sentiment alert is a pending analysis now, so it is not a fourth.
+    expect(summary.created).toBe(3);
     const byRule = new Map((await taskRows()).map((t) => [t.rule_code, t]));
     expect(byRule.get("TG-SOV-DROP-ENGINE")!.affected_engines).toEqual(["gemini"]);
     expect(byRule.get("TG-PRESENCE-LOSS")!.affected_engines).toEqual(["chatgpt"]);
     expect(byRule.get("TG-CITATION-LOSS")!.affected_engines).toEqual(["claude"]);
-    expect(byRule.get("TG-SENTIMENT-NEGATIVE")!.affected_engines).toEqual(["perplexity"]);
     // The unmoved engines made nothing: sov flat on chatgpt/claude/perplexity (0.4 -> 0.4).
     expect((await taskRows("TG-SOV-DROP-ENGINE")).length).toBe(1);
   });
@@ -334,6 +347,70 @@ describe("STORY-063 · task generation engine", () => {
     await twoWindows("gemini", { sov: 0.4 }, (i) => ({ sov: i === 0 ? 0 : 0.4 }));
     await generate();
     expect(await taskRows()).toHaveLength(0);
+  });
+
+
+  // ---- hysteresis, from the hazard ---------------------------------------------------------------------------------
+
+  // One bad day must never carry a content rule. Each case is built from the HAZARD (a single bad day, with the same or a much
+  // heavier volume than its neighbours), not from the arithmetic of one rule's threshold.
+  for (const heavy of [false, true]) {
+    it(`[STORY-063 #2] one bad day${heavy ? " with 20x the volume" : ""} cannot generate a task from ANY metric_window rule`, async () => {
+      const bad = (i: number, normal: MetricSpec, worst: MetricSpec): MetricSpec => (i === 0 ? { ...worst, ...(heavy ? { cells: 100 } : {}) } : normal);
+      // sov (TG-SOV-DROP-*), presence (TG-PRESENCE-LOSS), owned citations (TG-CITATION-LOSS), on three engines so the global rule is in play.
+      for (const engine of ["gemini", "chatgpt", "claude"]) {
+        await windowOf(engine, day(D, -7), { sov: 0.4, present: 5, owned: 4 });
+        await windowOf(engine, D, (i) => bad(i, { sov: 0.4, present: 5, owned: 4 }, { sov: 0, present: 0, owned: 0 }));
+      }
+      await generate();
+      expect(await taskRows()).toHaveLength(0);
+    });
+  }
+
+  it("[STORY-063 #2] the day floor is exact: the change on 3 of 7 days fires, on 2 of 7 does not, even though both clear the window aggregate", async () => {
+    await windowOf("gemini", day(D, -7), { sov: 0.4 });
+    // 3 days at 0.1: window mean 0.271 (a 32% drop) and 3 breaching days.
+    await windowOf("gemini", D, (i) => ({ sov: i < 3 ? 0.1 : 0.4 }));
+    await generate();
+    expect(await taskRows("TG-SOV-DROP-ENGINE")).toHaveLength(1);
+    await db.query("TRUNCATE tasks CASCADE");
+    // 2 days at 0: window mean 0.286 (a 28.6% drop, well over 15%) but only 2 breaching days.
+    await windowOf("gemini", D, (i) => ({ sov: i < 2 ? 0 : 0.4 }));
+    await generate();
+    expect(await taskRows("TG-SOV-DROP-ENGINE")).toHaveLength(0);
+  });
+
+  it("[STORY-063 AC4] the negative-sentiment alert is not approximated by the mention rate: a rise in mentions_negative / mentions_total makes no task even when the rule is enabled", async () => {
+    // The rate over MENTIONS goes 0 -> 0.17 (the mention-rate rule would fire, n = 42 mentions); the reference alert is the share of
+    // CELLS with a negative mention (scoring-models.md §6/§15), which metric_daily cannot yet say. The rule fails closed.
+    await db.query("UPDATE task_generation_rules SET enabled = true WHERE code = 'TG-SENTIMENT-NEGATIVE'");
+    await windowOf("gemini", day(D, -7), { cells: 30, mentions: 6, negative: 0 });
+    await windowOf("gemini", D, { cells: 30, mentions: 6, negative: 1 });
+    await generate();
+    expect(await taskRows("TG-SENTIMENT-NEGATIVE")).toHaveLength(0);
+  });
+
+  it("[STORY-063 #4] a competitor window under the sample floor cannot produce an overtake, in either period", async () => {
+    const competitorId = randomUUID();
+    await db.query("INSERT INTO competitors (id,workspace_id,project_id,name,root_domain,aliases,source) VALUES ($1,$2,$3,'Rival','r.com',ARRAY[]::text[],'user')", [competitorId, workspaceId, projectId]);
+    await windowOf("all", day(D, -7), { visibility: 60 });
+    await windowOf("all", D, { visibility: 40 });
+    await windowOf("all", day(D, -7), { visibility: 50, entity: "competitor", entityId: competitorId, cells: 2 }); // 14 cells
+    await windowOf("all", D, { visibility: 55, entity: "competitor", entityId: competitorId, cells: 2 });
+    await generate();
+    expect(await taskRows("TG-COMPETITOR-GAIN")).toHaveLength(0);
+  });
+
+  it("[STORY-063 #4] a competitor's window is weighted by cells: a one-cell day at 100 does not lift a 50-point competitor over a 55 brand", async () => {
+    const competitorId = randomUUID();
+    await db.query("INSERT INTO competitors (id,workspace_id,project_id,name,root_domain,aliases,source) VALUES ($1,$2,$3,'Rival','r.com',ARRAY[]::text[],'user')", [competitorId, workspaceId, projectId]);
+    await windowOf("all", day(D, -7), { visibility: 60, cells: 6 });
+    await windowOf("all", D, { visibility: 55, cells: 6 });
+    await windowOf("all", day(D, -7), { visibility: 50, entity: "competitor", entityId: competitorId, cells: 6 });
+    // Unweighted mean (100 + 6*50) / 7 = 57.1 (> 55); weighted (1*100 + 36*50) / 37 = 51.4 (< 55).
+    await windowOf("all", D, (i) => ({ visibility: i === 0 ? 100 : 50, entity: "competitor", entityId: competitorId, cells: i === 0 ? 1 : 6 }));
+    await generate();
+    expect(await taskRows("TG-COMPETITOR-GAIN")).toHaveLength(0);
   });
 
   it("[STORY-063 #2] the window comparison is the unit: the same drop spread across the whole window DOES fire", async () => {
@@ -445,6 +522,132 @@ describe("STORY-063 · task generation engine", () => {
     expect(await taskRows()).toHaveLength(1);
   });
 
+
+  // ---- events are planned once, whatever date the job carries ----------------------------------------------------------
+
+  it("[STORY-063 AC5] a displacement detected after local midnight (D+1 00:10) for a run captured on D is planned once, by the job for D or for D+7", async () => {
+    await actionable("late.com");
+    await displacement({ citationGap: [gapEntry("late.com")], impact: 80, detectedAt: `${NEXT}T00:10:00Z` });
+    expect((await generate(D)).created).toBe(1);
+    await generate(day(D, 7));
+    await generate(NEXT);
+    expect(await taskRows("TG-DISPLACEMENT-RECOVER")).toHaveLength(1);
+  });
+
+  it("[STORY-063 AC5] a displacement detected NOW while an earlier date is reprocessed is not lost", async () => {
+    await actionable("now.com");
+    await displacement({ citationGap: [gapEntry("now.com")], impact: 90, detectedAt: new Date().toISOString() });
+    // The job carries a date three days before the detection; the event still surfaces.
+    const date = day(new Date().toISOString().slice(0, 10), -3);
+    expect((await generate(date)).created).toBe(1);
+  });
+
+  it("[STORY-063 AC5] a displacement older than the lookback, or one detected before the rule was (re-)enabled, is not planned", async () => {
+    // The source-gap rule shares the displacement rule's fingerprint, so left on it would take these domains first.
+    await db.query("UPDATE task_generation_rules SET enabled = false WHERE code = 'TG-SOURCE-ABSENCE'");
+    await actionable("old.com");
+    await actionable("off.com");
+    await displacement({ citationGap: [gapEntry("old.com")], impact: 80, detectedAt: `${day(D, -45)}T12:00:00Z` });
+    await generate(D);
+    expect(await taskRows("TG-DISPLACEMENT-RECOVER")).toHaveLength(0);
+    // Timestamp watermark: detected an hour before the rule was switched on.
+    await db.query("UPDATE task_generation_rules SET enabled_since = $1 WHERE code = 'TG-DISPLACEMENT-RECOVER'", [`${D}T13:00:00Z`]);
+    await displacement({ citationGap: [gapEntry("off.com")], impact: 80, detectedAt: `${D}T12:00:00Z` });
+    await generate(D);
+    expect(await taskRows("TG-DISPLACEMENT-RECOVER")).toHaveLength(0);
+    await displacement({ citationGap: [gapEntry("old.com", "z")], impact: 80, detectedAt: `${D}T14:00:00Z` });
+    await generate(D);
+    expect(await taskRows("TG-DISPLACEMENT-RECOVER")).toHaveLength(1);
+  });
+
+  it("[STORY-063 #6] a second loss on the SAME domain the SAME day is not folded away: it refreshes the open task, counts once, and is linked", async () => {
+    await actionable("dup.com");
+    const first = await displacement({ citationGap: [gapEntry("dup.com", "a")], impact: 70 });
+    await generate();
+    const second = await displacement({ citationGap: [gapEntry("dup.com", "b")], impact: 85 });
+    const again = await generate();
+    expect(again.refreshed).toBe(1);
+    const [task] = await taskRows("TG-DISPLACEMENT-RECOVER");
+    expect(await taskRows("TG-DISPLACEMENT-RECOVER")).toHaveLength(1);
+    expect(task.recurrence_count).toBe(1);
+    expect(task.source_displacement_id).toBe(first);
+    const refreshed = (await events(task.id)).filter((e) => e.event === "evidence_refreshed");
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0].payload).toMatchObject({ source_displacement_id: second, recurrence_count: 1 });
+    expect((await db.query("SELECT count(*)::int AS n FROM displacement_events WHERE task_id = $1", [task.id])).rows[0].n).toBe(2);
+    // Consumed once: running again counts nothing more.
+    await generate();
+    await generate(NEXT);
+    expect((await taskRows("TG-DISPLACEMENT-RECOVER"))[0].recurrence_count).toBe(1);
+  });
+
+  it("[STORY-063 AC3] an AUX finding from an audit that finishes after the day's rollup, or on a day no rollup runs, still becomes a task", async () => {
+    const finding = await auxFinding("AUX-R-001", "critical", `${D}T23:30:00Z`);
+    // Evaluated for the day before the finding, and for a week later.
+    await generate(day(D, -1));
+    await generate(day(D, 7));
+    const aux = (await taskRows()).filter((t) => t.rule_code === "TG-AUX-R-001");
+    expect(aux).toHaveLength(1);
+    expect(aux[0].source_finding_id).toBe(finding);
+  });
+
+  it("[STORY-063 AC3] a finding that has a task is not planned again; one that REGRESSES after it is, and a finding detected before the rule was enabled is not", async () => {
+    const finding = await auxFinding("AUX-R-002", "critical");
+    await generate();
+    await db.query("UPDATE tasks SET status = 'done', completed_at = now() WHERE source_finding_id = $1", [finding]);
+    await generate();
+    expect((await taskRows()).filter((t) => t.rule_code === "TG-AUX-R-002")).toHaveLength(1);
+    await db.query("UPDATE aux_findings SET status = 'regressed', regressed_at = now() + interval '1 minute' WHERE id = $1", [finding]);
+    await generate();
+    expect((await taskRows()).filter((t) => t.rule_code === "TG-AUX-R-002")).toHaveLength(2);
+    // Watermark: a finding first detected before the rule's enabled_since is the period the rule was off.
+    await db.query("UPDATE task_generation_rules SET enabled_since = now() + interval '1 hour' WHERE code = 'TG-AUX-R-003'");
+    await auxFinding("AUX-R-003", "critical");
+    await generate();
+    expect((await taskRows()).filter((t) => t.rule_code === "TG-AUX-R-003")).toHaveLength(0);
+  });
+
+  it("[STORY-063 AC13 / hazard] a rule inserted enabled starts at its insertion: it does not reach back into history", async () => {
+    await db.query(
+      `INSERT INTO task_generation_rules (code, category, title_template, description_template, trigger_kind, condition, default_priority, impact_weight, effort_band, cooldown_days, rule_version)
+       VALUES ('TG-AUX-R-004-NEW','technical','t','d','aux_finding','{"kind":"aux_finding","aux_rule_code":"AUX-R-009","severities":["critical"]}'::jsonb,3,0.5,'s',0,'1')`,
+    );
+    expect((await rule("TG-AUX-R-004-NEW")).enabled_since).not.toBeNull();
+    await auxFinding("AUX-R-009", "critical", `${day(D, -10)}T12:00:00Z`);
+    await generate();
+    expect((await taskRows()).filter((t) => t.rule_code === "TG-AUX-R-004-NEW")).toHaveLength(0);
+  });
+
+  it("[STORY-063 #1] TG-SOURCE-ABSENCE is a NEW critical gap: a gap already critical on the previous row does not regenerate, one that moved into critical does", async () => {
+    const sd = await actionable("persist.com");
+    await db.query(
+      `INSERT INTO project_source_index (workspace_id, project_id, source_domain_id, engine_key, window_start, window_days, gap_severity)
+       VALUES ($1,$2,$3,'all','2026-07-17',90,'critical')`,
+      [workspaceId, projectId, sd],
+    );
+    // The previous row (07-16) is critical too: nothing is new.
+    await generate();
+    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(0);
+    // The previous row was only high: it moved into critical.
+    await db.query("UPDATE project_source_index SET gap_severity = 'high' WHERE source_domain_id = $1 AND window_start = '2026-07-16'", [sd]);
+    await generate();
+    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(1);
+  });
+
+  it("[STORY-063 AC10] the source-gap rule and the recovery plan agree on actionability: a critical row superseded by a newer medium one is neither", async () => {
+    const sd = await actionable("fixed.com");
+    await db.query(
+      `INSERT INTO project_source_index (workspace_id, project_id, source_domain_id, engine_key, window_start, window_days, gap_severity)
+       VALUES ($1,$2,$3,'all','2026-07-17',90,'medium')`,
+      [workspaceId, projectId, sd],
+    );
+    const id = await displacement({ citationGap: [gapEntry("fixed.com")], impact: 80 });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+    const planned = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => displacementService.recoveryPlan(id));
+    expect(planned).toHaveLength(0);
+  });
+
   // ---- idempotency and recurrence -------------------------------------------------------------------------------
 
   it("[STORY-063 #7] running the same evaluation five times leaves the task count — and the recurrence counter — unchanged", async () => {
@@ -542,8 +745,13 @@ describe("STORY-063 · task generation engine", () => {
     const [later] = await taskRows("TG-SOV-DROP-ENGINE");
     expect(later.baseline_metrics).toEqual(created.baseline_metrics);
     expect(taskBaselineMetricsSchema.parse(later.baseline_metrics).sov).toBeCloseTo(0.3, 5);
-    // Completion does not touch it either (STORY-064), and nothing here writes completion_metrics.
-    expect(later.completion_metrics).toBeNull();
+    // Completion does not touch it either: complete the task through the real path and read the baseline back. (A baseline written
+    // or overwritten at completion would be a "before" that postdates the work.)
+    await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => tasksService.completeTask(created.id));
+    const [done] = await taskRows("TG-SOV-DROP-ENGINE");
+    expect(done.status).toBe("done");
+    expect(done.baseline_metrics).toEqual(created.baseline_metrics);
+    expect(done.completion_metrics).toBeNull();
   });
 
   it("[STORY-063 #10] a baseline with no facts keeps null distinct from zero", async () => {
@@ -627,7 +835,7 @@ describe("STORY-063 · task generation engine", () => {
   });
 
   it("[STORY-063 hazard] a rule for a not-yet-built analysis generates nothing even when enabled — it fails closed", async () => {
-    await db.query("UPDATE task_generation_rules SET enabled = true WHERE code IN ('TG-TOPIC-CONTENT','TG-DIVERGENCE','TG-ENTITY-NODE','TG-RENDER-SCHEMA')");
+    await db.query("UPDATE task_generation_rules SET enabled = true WHERE code IN ('TG-TOPIC-CONTENT','TG-DIVERGENCE','TG-ENTITY-NODE','TG-RENDER-SCHEMA','TG-SENTIMENT-NEGATIVE')");
     await expect(generate()).resolves.toBeDefined();
     expect(await taskRows()).toHaveLength(0);
   });
@@ -663,7 +871,9 @@ describe("STORY-063 · task generation engine", () => {
     });
     await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => rollup(db, job({ metricDate: D }, "rollup-job-1")));
     await new Promise((resolve) => setImmediate(resolve));
-    expect(calls).toEqual([{ ws: workspaceId, payload: { projectId, metricDate: D }, key: `taskgen:${projectId}:${D}:rollup-job-1` }]);
+    // D is in the past, so the evaluated day is today: a window anchored on an old date would raise tasks from a stale period.
+    const today = new Date().toISOString().slice(0, 10);
+    expect(calls).toEqual([{ ws: workspaceId, payload: { projectId, metricDate: today }, key: `taskgen:${projectId}:${today}:rollup-job-1` }]);
   });
 
   it("[STORY-063 #3] a failed enqueue never fails the rollup", async () => {
@@ -675,6 +885,197 @@ describe("STORY-063 · task generation engine", () => {
     });
     await expect(withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => rollup(db, job({ metricDate: D })))).resolves.toBeUndefined();
     await new Promise((resolve) => setImmediate(resolve));
+  });
+
+
+  it("[STORY-063 hazard] two task.generate jobs for one project serialise on a project lock instead of overlapping", async () => {
+    await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
+    const handler = createTaskGenerateHandler(context, { realtime: new NoopRealtimePublisher() });
+    const holder = new Client({ connectionString: container.getConnectionUri() });
+    await holder.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [projectQueueLockKey("task.generate", projectId)]);
+      let finished = false;
+      const running = withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => handler(db, job({ metricDate: D }))).then(() => {
+        finished = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(finished).toBe(false);
+      await holder.query("COMMIT");
+      await running;
+      expect(finished).toBe(true);
+    } finally {
+      await holder.end();
+    }
+    expect(await taskRows("TG-SOV-DROP-ENGINE")).toHaveLength(1);
+  });
+
+  it("[STORY-063 hazard] two task.generate jobs for one project running at once make one task and no error", async () => {
+    await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
+    await actionable("one.com");
+    await actionable("two.com");
+    await displacement({ citationGap: [gapEntry("one.com"), gapEntry("two.com")], impact: 80 });
+    await displacement({ citationGap: [gapEntry("two.com", "b"), gapEntry("one.com", "b")], impact: 75 });
+    const handler = createTaskGenerateHandler(context, { realtime: new NoopRealtimePublisher() });
+    const second = new Client({ connectionString: container.getConnectionUri() });
+    await second.connect();
+    try {
+      const results = await Promise.allSettled([
+        withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => handler(db, job({ metricDate: D }, "a"))),
+        withTenantContext(second, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => handler(second, job({ metricDate: D }, "b"))),
+      ]);
+      expect(results.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+    } finally {
+      await second.end();
+    }
+    expect(await taskRows("TG-SOV-DROP-ENGINE")).toHaveLength(1);
+    expect(await taskRows("TG-DISPLACEMENT-RECOVER")).toHaveLength(2);
+  });
+
+  it("[STORY-063 hazard] the owning service validates the jsonb it writes: a malformed baseline is refused, not stored", async () => {
+    await expect(
+      withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () =>
+        tasksService.createGeneratedTask({
+          projectId, kind: "monitoring", origin: "auto", ruleCode: null, fingerprint: createHash("sha256").update("x").digest(), title: "t", description: "d",
+          sourceDisplacementId: null, sourceDomainId: null, affectedUrl: null,
+          generation: { baselineMetrics: { captured_at: "not a date" } as never },
+        }),
+      ),
+    ).rejects.toThrow();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 migration] rolling 0129 back restores an upgraded placeholder instead of deleting it, and drops the catalog the engine owns", async () => {
+    const down = readFileSync(join(MIGRATIONS_DIR, "0129_task_generation_engine.down.sql"), "utf8");
+    await db.query("BEGIN");
+    try {
+      await db.query(down);
+      const restored = (await db.query("SELECT condition, rule_version FROM task_generation_rules WHERE code = 'TG-SOV-DROP-ENGINE'")).rows[0];
+      expect(restored).toEqual({ condition: {}, rule_version: "1.0.0" });
+      expect((await db.query("SELECT count(*)::int AS n FROM task_generation_rules WHERE code = 'TG-PRESENCE-LOSS'")).rows[0].n).toBe(0);
+    } finally {
+      await db.query("ROLLBACK");
+    }
+  });
+
+  it("[STORY-063 hazard] a regression is counted ONCE: three later days on a finding that stays regressed raise recurrence_count to 1, not 3", async () => {
+    const finding = await auxFinding("AUX-R-001", "critical");
+    await generate();
+    const [task] = (await taskRows()).filter((t) => t.rule_code === "TG-AUX-R-001");
+    // The task was made two hours ago and is still open when the finding regresses an hour ago; the clock is the real one because
+    // `regressed_at` and the task's own timestamps are wall-clock time, while the evaluated dates below are real days.
+    await db.query("UPDATE tasks SET created_at = now() - interval '2 hours' WHERE id = $1", [task.id]);
+    await db.query("UPDATE aux_findings SET status = 'regressed', regressed_at = now() - interval '1 hour' WHERE id = $1", [finding]);
+    const today = new Date().toISOString().slice(0, 10);
+    for (const date of [today, day(today, 1), day(today, 2)]) await generate(date);
+    const [after] = (await taskRows()).filter((t) => t.rule_code === "TG-AUX-R-001");
+    expect(after.id).toBe(task.id);
+    expect(after.recurrence_count).toBe(1);
+  });
+
+  it("[STORY-063 hazard] a source gap that already has a task is not a recurrence every day: the same index row is absorbed once", async () => {
+    await actionable("steady.com");
+    await generate();
+    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(1);
+    for (const date of [NEXT, day(NEXT, 1), day(NEXT, 2)]) await generate(date);
+    const [task] = await taskRows("TG-SOURCE-ABSENCE");
+    expect(task.recurrence_count).toBe(0);
+  });
+
+  it("[STORY-063 AC13] a windowed rule inserted after the fact does not generate when an earlier date is reprocessed", async () => {
+    await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
+    await db.query("DELETE FROM task_generation_rules");
+    await db.query(
+      `INSERT INTO task_generation_rules (code, category, title_template, description_template, trigger_kind, condition, default_priority, impact_weight, effort_band, cooldown_days, rule_version)
+       VALUES ('TG-SOV-NEW','monitoring','t {engine}','d','sov_drop',
+               '{"kind":"metric_window","metric":"sov","direction":"down","change":"relative","threshold":0.15,"window_days":7,"min_n":30,"sustained_days":3,"engine_scope":"each_engine"}'::jsonb,3,0.5,'s',0,'1')`,
+    );
+    await generate(D);
+    expect(await taskRows("TG-SOV-NEW")).toHaveLength(0);
+    // Reaching the present it does evaluate: the watermark holds back the past, not the rule.
+    const today = new Date().toISOString().slice(0, 10);
+    await windowOf("gemini", day(today, -7), { sov: 0.4 });
+    await windowOf("gemini", today, { sov: 0.3 });
+    await generate(today);
+    expect(await taskRows("TG-SOV-NEW")).toHaveLength(1);
+  });
+
+  // ---- the catalog is configuration every tenant trusts ---------------------------------------------------------
+
+  it("[STORY-063 hazard] the runtime roles can only READ the catalog: no UPDATE, INSERT or DELETE under nominara_app or nominara_worker", async () => {
+    const grants = (await db.query(
+      `SELECT grantee, privilege_type FROM information_schema.role_table_grants
+        WHERE table_name = 'task_generation_rules' AND table_schema = 'public' AND grantee IN ('nominara_app','nominara_worker')
+        ORDER BY grantee, privilege_type`,
+    )).rows;
+    expect(grants).toEqual([
+      { grantee: "nominara_app", privilege_type: "SELECT" },
+      { grantee: "nominara_worker", privilege_type: "SELECT" },
+    ]);
+    for (const role of ["nominara_worker", "nominara_app"]) {
+      await db.query(`SET ROLE ${role}`);
+      try {
+        await expect(db.query("UPDATE task_generation_rules SET title_template = 'phish', enabled = false")).rejects.toMatchObject({ code: "42501" });
+        await expect(db.query("DELETE FROM task_generation_rules")).rejects.toMatchObject({ code: "42501" });
+        await expect(
+          db.query(`INSERT INTO task_generation_rules (code, category, title_template, description_template, trigger_kind, condition, default_priority, impact_weight, effort_band, rule_version)
+                    VALUES ('TG-X','monitoring','t','d','sov_drop','{}'::jsonb,3,0.5,'m','1')`),
+        ).rejects.toMatchObject({ code: "42501" });
+        expect((await db.query("SELECT count(*)::int AS n FROM task_generation_rules")).rows[0].n).toBeGreaterThan(0);
+      } finally {
+        await db.query("RESET ROLE");
+      }
+    }
+  });
+
+  it("[STORY-063 hazard] under nominara_worker (production's role) the handler generates for its own workspace", async () => {
+    await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
+    const handler = createTaskGenerateHandler(context, { realtime: new NoopRealtimePublisher() });
+    await db.query("SET ROLE nominara_worker");
+    try {
+      const summary = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => handler(db, job({ metricDate: D })));
+      expect(summary).toMatchObject({ created: 1 });
+    } finally {
+      await db.query("RESET ROLE");
+    }
+  });
+
+  it("[STORY-063 hazard] under nominara_worker and ANOTHER workspace's context, every evaluator and the baseline read return nothing for this project", async () => {
+    await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
+    await twoWindows("all", { sov: 0.4, visibility: 40 }, { sov: 0.3, visibility: 40 });
+    await actionable("seed.com");
+    await displacement({ citationGap: [gapEntry("seed.com")], impact: 90 });
+    await auxFinding("AUX-R-001", "critical");
+    const rules = (await db.query("SELECT code, category, title_template, description_template, trigger_kind, condition, default_priority, impact_weight::float8 AS impact_weight, effort_band, opens_alignment, playbook_slug, cooldown_days, NULL::text AS enabled_since_date, enabled_since FROM task_generation_rules WHERE enabled")).rows;
+    const ctxFor = (ws: string) => ({ tx: db, workspaceId: ws, projectId, metricDate: D, timezone: "UTC", scoringVersion: SCORING_VERSION });
+    const run = async (ws: string) => {
+      const out: Record<string, number> = {};
+      await withTenantContext(db, { workspaceId: ws, actorId: SYSTEM_ACTOR_ID }, async () => {
+        for (const row of rules) {
+          const condition = parseCondition(row);
+          if (condition !== undefined) out[row.code] = (await evaluateRule(row, condition, ctxFor(ws))).length;
+        }
+        out.__baseline = (await captureBaseline(db, projectId, D, "gemini", SCORING_VERSION)).cells_total;
+      });
+      return out;
+    };
+    await db.query("SET ROLE nominara_worker");
+    let foreign: Record<string, number>;
+    let own: Record<string, number>;
+    try {
+      foreign = await run(otherWorkspaceId);
+      own = await run(workspaceId);
+    } finally {
+      await db.query("RESET ROLE");
+    }
+    expect(Object.keys(foreign).length).toBeGreaterThan(5);
+    for (const [code, n] of Object.entries(foreign)) expect(n, code).toBe(0);
+    // The control: the same calls in the owning workspace do see facts, so the zeros above are RLS and not an empty fixture.
+    expect(own["TG-SOV-DROP-ENGINE"]).toBe(1);
+    expect(own["TG-DISPLACEMENT-RECOVER"]).toBeGreaterThan(0);
+    expect(own["TG-AUX-R-001"]).toBe(1);
+    expect(own.__baseline).toBeGreaterThan(0);
   });
 
   // ---- tenancy, observability -----------------------------------------------------------------------------------

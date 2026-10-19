@@ -1,13 +1,14 @@
 import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
-import { taskPlaybookPayloadSchema } from "../../../contracts/tasks/index.js";
+import { taskPlaybookPayloadSchema, type TaskBaselineMetrics } from "../../../contracts/tasks/index.js";
 import type { TasksService, GeneratedTaskInput } from "../../modules/tasks/tasks.service.js";
 import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { captureBaseline } from "./baseline.js";
-import { evaluateRule, parseCondition } from "./evaluate.js";
+import { linkDisplacementToTask } from "../analytics/displacement-recovery.js";
+import { evaluateRule, parseCondition, WINDOWED_KINDS } from "./evaluate.js";
 import { impactScore } from "./impact.js";
 import { renderTemplate } from "./template.js";
 import type { EvalContext, RuleRow, TaskDraft } from "./types.js";
@@ -82,7 +83,7 @@ async function generate(tx: ClientBase, tasks: TasksService, request: GenerateRe
   const rules = await tx.query<RuleRow>(
     `SELECT code, category, title_template, description_template, trigger_kind, condition, default_priority,
             impact_weight::float8 AS impact_weight, effort_band, opens_alignment, playbook_slug, cooldown_days,
-            (enabled_since AT TIME ZONE $1)::date::text AS enabled_since_date
+            (enabled_since AT TIME ZONE $1)::date::text AS enabled_since_date, enabled_since
        FROM task_generation_rules
       WHERE enabled AND ($2::text[] IS NULL OR trigger_kind = ANY($2::text[]))
       ORDER BY code`,
@@ -100,7 +101,7 @@ async function generate(tx: ClientBase, tasks: TasksService, request: GenerateRe
     timezone: found.timezone,
     scoringVersion: SCORING_VERSION,
   };
-  const baselines = new Map<string, unknown>();
+  const baselines = new Map<string, TaskBaselineMetrics>();
 
   for (const rule of rules.rows) {
     const condition = parseCondition(rule);
@@ -111,8 +112,10 @@ async function generate(tx: ClientBase, tasks: TasksService, request: GenerateRe
       summary.rulesSkipped += 1;
       continue;
     }
-    // AC13 — non-retroactive re-enable: a day before the rule was last switched back on is not evaluated.
-    if (rule.enabled_since_date !== null && request.metricDate < rule.enabled_since_date) {
+    // AC13 — non-retroactive re-enable. A rule over a day's WINDOWS skips a day before it was last switched back on; an event or
+    // state rule (a displacement, an AUX finding, a source gap) gates on the `enabled_since` TIMESTAMP inside its own query,
+    // because the event's own time, not the day being evaluated, says whether it belongs to the period the rule was off.
+    if (WINDOWED_KINDS.has(condition.kind) && rule.enabled_since_date !== null && request.metricDate < rule.enabled_since_date) {
       incrementCounter("nominara_taskgen_rules_skipped_total", { reason: "before_enabled_since" });
       summary.rulesSkipped += 1;
       continue;
@@ -127,7 +130,7 @@ async function generate(tx: ClientBase, tasks: TasksService, request: GenerateRe
       incrementCounter("nominara_taskgen_tasks_total", { outcome: result.outcome });
       if (draft.displacementId !== undefined && result.outcome !== "suppressed") {
         // The displacement points at its task, so it is planned once. The first task wins and is never replaced.
-        await tx.query(`UPDATE displacement_events SET task_id = $2 WHERE id = $1 AND task_id IS NULL`, [draft.displacementId, result.task.id]);
+        await linkDisplacementToTask(tx, draft.displacementId, result.task.id);
       }
     }
   }
@@ -154,7 +157,7 @@ async function toTaskInput(
   draft: TaskDraft,
   ctx: EvalContext,
   evidenceAt: Date,
-  baselines: Map<string, unknown>,
+  baselines: Map<string, TaskBaselineMetrics>,
 ): Promise<GeneratedTaskInput> {
   const kind = draft.kind ?? rule.category;
   const score = impactScore(rule.impact_weight, draft.strength);
@@ -178,6 +181,10 @@ async function toTaskInput(
         })
       : null;
 
+  // AC12 (alignment-session reference on content tasks that would benefit) is DEFERRED, not met: there is no `alignment_sessions`
+  // table yet, so `rule.opens_alignment` is read but `tasks.alignment_session_id` is never written. The only rules that set
+  // `opens_alignment` (TG-ENTITY-NODE, TG-TOPIC-CONTENT) are `pending_analysis` and disabled, so no such task exists today.
+  // Revisit when the alignment-session story ships.
   return {
     projectId: ctx.projectId,
     kind,
@@ -203,6 +210,15 @@ async function toTaskInput(
       systemActor: true,
     },
     cooldownDays: draft.noCooldown === true ? 0 : rule.cooldown_days,
-    refresh: { evidenceAt, metricDate: ctx.metricDate, impactScore: score, affectedEngines: draft.affectedEngines, affectedPromptIds: draft.affectedPromptIds },
+    refresh: {
+      evidenceAt,
+      metricDate: ctx.metricDate,
+      impactScore: score,
+      affectedEngines: draft.affectedEngines,
+      affectedPromptIds: draft.affectedPromptIds,
+      // A displacement is a discrete event consumed exactly once (it is linked to its task straight after), so a SECOND loss on
+      // a domain that already has an open task is a recurrence even on the same metric day.
+      ...(draft.displacementId === undefined ? {} : { sourceDisplacementId: draft.displacementId }),
+    },
   };
 }

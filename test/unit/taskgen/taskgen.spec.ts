@@ -8,7 +8,7 @@ import { authorityTaskFingerprint } from "../../../src/lib/analytics/displacemen
 import type { MetricWindowCondition } from "../../../contracts/tasks/index.js";
 
 const PROJECT = "0198f6a0-0000-7000-8000-000000000001";
-const base: MetricWindowCondition = { kind: "metric_window", metric: "sov", direction: "down", change: "relative", threshold: 0.15, window_days: 7, min_n: 30, engine_scope: "each_engine" };
+const base: MetricWindowCondition = { kind: "metric_window", metric: "sov", direction: "down", change: "relative", threshold: 0.15, window_days: 7, min_n: 30, sustained_days: 3, engine_scope: "each_engine" };
 
 describe("STORY-063 · taskgen fingerprint", () => {
   it("is deterministic and separates rule, project and scope", () => {
@@ -68,8 +68,15 @@ describe("STORY-063 · taskgen compile (closed grammar to parameterised SQL)", (
     expect(text).toMatch(/\$1\b/u);
   });
 
+  it("[STORY-063 #2] 'sustained' is compiled in: the statement counts breaching days and binds the day floor as a parameter", () => {
+    const { text, values } = compileMetricWindow({ ...base, sustained_days: 5 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1" });
+    expect(text).toMatch(/days_breached\s*>=\s*\$\d+/u);
+    expect(values).toContain(5);
+    expect(text).not.toMatch(/days_breached\s*>=\s*5/u);
+  });
+
   it("is built only from fixed fragments: every metric and direction compiles to a statement with no condition text in it", () => {
-    for (const metric of ["sov", "presence_rate", "owned_citation_count", "negative_mention_rate"] as const) {
+    for (const metric of ["sov", "presence_rate", "owned_citation_count"] as const) {
       for (const direction of ["down", "up"] as const) {
         for (const change of ["relative", "absolute"] as const) {
           const { text } = compileMetricWindow({ ...base, metric, direction, change }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1" });

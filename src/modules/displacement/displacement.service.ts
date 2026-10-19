@@ -12,7 +12,7 @@ import { Page, pageFrom } from "../../api/pagination/page.js";
 import { ConflictError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
 import { dataSourceOf } from "../../lib/analytics/data-source.js";
-import { actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint, recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
+import { actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint, linkDisplacementToTask, recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
 import type { Task } from "../../../contracts/tasks/index.js";
 import { TasksService } from "../tasks/tasks.service.js";
 import { SOURCE_INDEX_WINDOWS } from "../../lib/rollup/refresh-project-source-index.js";
@@ -241,9 +241,7 @@ export class DisplacementService {
 
     // The displacement's `task_id` is the plan's first task, set once and never replaced.
     if (tasks.length > 0 && state.task_id === null) {
-      await client.query("UPDATE displacement_events SET task_id = $3 WHERE id = $1 AND workspace_id = $2 AND task_id IS NULL", [
-        displacementId, context.workspaceId, tasks[0]!.id,
-      ]);
+      await linkDisplacementToTask(client, displacementId, tasks[0]!.id);
     }
 
     incrementCounter("nominara_displacement_recovery_plans_total", { outcome: created > 0 ? "created" : "unchanged" });

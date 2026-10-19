@@ -5,6 +5,7 @@ import { z } from "zod";
 import { TasksService } from "../../../modules/tasks/tasks.service.js";
 import { ValkeyRealtimePublisher, type RealtimePublisher } from "../../cache/realtime-publisher.js";
 import { generateTasksForProject, type GenerationSummary } from "../../taskgen/generate.js";
+import { withProjectQueueLock } from "../locks.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 
@@ -47,6 +48,13 @@ export function createTaskGenerateHandler(context: QueueHandlerContext, deps: Ta
 
   return async (tx: ClientBase, job: Job): Promise<GenerationSummary> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
+    // One generation per project at a time. The queue allows concurrency 4 and each rollup queues its own job, so two jobs for one
+    // project can overlap; they would take the per-task fingerprint locks and the project row lock (task counts) in different
+    // orders and deadlock (40P01). Serialised here, the second job simply runs after the first and finds its tasks.
+    return withProjectQueueLock(tx, "task.generate", payload.projectId, () => run(tx, payload));
+  };
+
+  async function run(tx: ClientBase, payload: z.infer<typeof payloadSchema>): Promise<GenerationSummary> {
     const metricDate = payload.metricDate ?? (await localToday(tx, payload.projectId));
     if (metricDate === undefined) {
       logger.log({ event: "task.generate.project_gone", workspace_id: payload.workspaceId, project_id: payload.projectId });
@@ -57,7 +65,7 @@ export function createTaskGenerateHandler(context: QueueHandlerContext, deps: Ta
       metricDate,
       ...(payload.triggerKinds === undefined ? {} : { triggerKinds: payload.triggerKinds }),
     });
-  };
+  }
 }
 
 /** Today in the workspace's zone, asked of Postgres so the conversion uses the same tz database the rollup does. */

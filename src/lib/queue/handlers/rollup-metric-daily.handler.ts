@@ -154,11 +154,20 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
         // work with its own retries. The key carries this job's id: a redelivery of THIS rollup queues nothing more, while
         // a later rollup of the same day (a dirty-date reprocess) queues a fresh evaluation, which is safe because
         // generation is idempotent. A failed enqueue is logged, never thrown: the rollup is durable.
+        //
+        // The day evaluated is never earlier than TODAY: a dirty-date or from/to reprocess of past days ends on an old date, and a
+        // trailing window anchored there would raise tasks from a period that may be weeks old and already recovered. Event rules
+        // (displacement, AUX) do not depend on the date at all, so nothing is lost by evaluating the present.
+        //
+        // No `triggerKinds` is passed on purpose (AC3, "rules whose trigger matches the changed facts"): a rollup changes every metric a
+        // windowed rule reads and the event rules read their own tables, so the changed facts of a rollup match every trigger kind.
+        // Narrowing is for a producer that knows ONE kind of change (the AUX audit), which is what the payload field is for.
         const lastDate = dates[dates.length - 1];
         if (lastDate !== undefined) {
+          const evaluateDate = lastDate > today ? lastDate : today;
           const runKey = job.id ?? today;
           afterCommit(() => {
-            void enqueueTaskGenerate(workspaceId, { projectId, metricDate: lastDate }, `taskgen:${projectId}:${lastDate}:${runKey}`)
+            void enqueueTaskGenerate(workspaceId, { projectId, metricDate: evaluateDate }, `taskgen:${projectId}:${evaluateDate}:${runKey}`)
               .then(() => {
                 incrementCounter("nominara_taskgen_requested_total");
               })

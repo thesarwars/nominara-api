@@ -20,6 +20,17 @@ import type { EvalContext, RuleRow, TaskDraft } from "./types.js";
 /** The widest source-index window: the one an authority task is gated on (STORY-054 AC10). */
 const AUTHORITY_WINDOW_DAYS = Math.max(...SOURCE_INDEX_WINDOWS);
 
+/**
+ * How far back, from the evaluated day, an unplanned displacement is still picked up. Planning is gated on the event not
+ * having a task, never on its detection DAY: `detected_at` is the wall-clock time the rollup ran, so it can fall on a later
+ * day than the facts it belongs to (a run captured at 23:50 and parsed after midnight, a dirty-date reprocess), and a
+ * day-equality filter would lose those events without trace.
+ */
+export const DISPLACEMENT_LOOKBACK_DAYS = 30;
+
+/** The rule kinds whose condition is a function of the evaluated DAY's windows. Event and state kinds gate on `enabled_since` instead. */
+export const WINDOWED_KINDS: ReadonlySet<TaskGenerationCondition["kind"]> = new Set(["metric_window", "competitor_overtake"]);
+
 /** Parses a stored condition. `undefined` is "this rule is not usable": the caller skips it and counts it (fail closed). */
 export function parseCondition(rule: Pick<RuleRow, "code" | "condition">): TaskGenerationCondition | undefined {
   const parsed = taskGenerationConditionSchema.safeParse(rule.condition);
@@ -33,11 +44,11 @@ export async function evaluateRule(rule: RuleRow, condition: TaskGenerationCondi
     case "competitor_overtake":
       return evaluateCompetitorOvertake(rule, condition, ctx);
     case "displacement":
-      return evaluateDisplacement(condition, ctx);
+      return evaluateDisplacement(rule, condition, ctx);
     case "aux_finding":
       return evaluateAuxFinding(rule, condition, ctx);
     case "source_gap":
-      return evaluateSourceGap(condition, ctx);
+      return evaluateSourceGap(rule, condition, ctx);
     case "prompt_stability":
       return evaluatePromptStability(rule, condition, ctx);
     case "pending_analysis":
@@ -105,12 +116,14 @@ async function evaluateCompetitorOvertake(
   condition: Extract<TaskGenerationCondition, { kind: "competitor_overtake" }>,
   ctx: EvalContext,
 ): Promise<TaskDraft[]> {
+  // Both entities' windows are weighted by their cells (an unweighted mean of daily scores lets a one-cell day count as much as a
+  // full one) and BOTH the brand's and the competitor's windows must meet the sample floor in both periods.
   const result = await ctx.tx.query<{ entity_id: string; name: string | null; gap: number }>(
     `WITH w AS (
        SELECT entity_type, entity_id,
               (metric_date > $2::date - $3::int) AS is_current,
-              avg(visibility_score)::float8 AS vis,
-              sum(cells_total)::float8 AS cells
+              (sum(visibility_score * cells_total) / NULLIF(sum(cells_total) FILTER (WHERE visibility_score IS NOT NULL), 0))::float8 AS vis,
+              (sum(cells_total) FILTER (WHERE visibility_score IS NOT NULL))::float8 AS cells
          FROM metric_daily
         WHERE project_id = $1::uuid AND engine_key = 'all' AND scoring_version = $4
           AND metric_date >  $2::date - 2 * $3::int
@@ -125,6 +138,7 @@ async function evaluateCompetitorOvertake(
        LEFT JOIN competitors k ON k.id = cc.entity_id
       WHERE bc.entity_type = 'brand' AND bc.is_current
         AND bc.cells >= $5::float8 AND bp.cells >= $5::float8
+        AND cc.cells >= $5::float8 AND cp.cells >= $5::float8
         AND cc.vis > bc.vis
         AND cp.vis <= bp.vis
       ORDER BY cc.entity_id`,
@@ -143,18 +157,27 @@ async function evaluateCompetitorOvertake(
 
 // ---- displacement ----------------------------------------------------------------------------------------------------
 
-async function evaluateDisplacement(condition: Extract<TaskGenerationCondition, { kind: "displacement" }>, ctx: EvalContext): Promise<TaskDraft[]> {
-  // Events DETECTED on the evaluated day and not yet planned (`task_id IS NULL`). The day is strict on purpose: a re-enabled
-  // rule must not reach back into the period it was off, and `task_id` is what makes a reprocess of the day a no-op.
+async function evaluateDisplacement(
+  rule: RuleRow,
+  condition: Extract<TaskGenerationCondition, { kind: "displacement" }>,
+  ctx: EvalContext,
+): Promise<TaskDraft[]> {
+  // Events not yet planned (`task_id IS NULL`), detected since the rule was (re-)enabled, inside a bounded lookback. NOT the
+  // evaluated day: see DISPLACEMENT_LOOKBACK_DAYS. `task_id` is what makes any reprocess of any date a no-op, and the
+  // `enabled_since` TIMESTAMP is what keeps a re-enabled rule from reaching back into the period it was off.
+  //
+  // TODO(STORY-058): a displacement's concept gap should yield one CONTENT task per concept (scoring-models.md §15,
+  // TG-DISPLACEMENT-RECOVER). `concept_gap` is always [] until the concept analysis ships, so only authority tasks exist.
   const events = await ctx.tx.query<{ id: string; engine_key: string; prompt_id: string; impact: number; citation_gap: unknown }>(
     `SELECT id, engine_key, prompt_id, impact_score::float8 AS impact, citation_gap
        FROM displacement_events
       WHERE project_id = $1::uuid
         AND task_id IS NULL AND recovered_at IS NULL AND dismissed_at IS NULL
-        AND impact_score >= $4::real
-        AND (detected_at AT TIME ZONE $2)::date = $3::date
+        AND impact_score >= $2::real
+        AND ($3::timestamptz IS NULL OR detected_at >= $3::timestamptz)
+        AND detected_at >= (($4::date - $5::int)::timestamp AT TIME ZONE $6::text)
       ORDER BY detected_at, id`,
-    [ctx.projectId, ctx.timezone, ctx.metricDate, condition.min_impact],
+    [ctx.projectId, condition.min_impact, rule.enabled_since, ctx.metricDate, DISPLACEMENT_LOOKBACK_DAYS, ctx.timezone],
   );
 
   const drafts: TaskDraft[] = [];
@@ -197,14 +220,24 @@ async function evaluateDisplacement(condition: Extract<TaskGenerationCondition, 
 const SEVERITY_STRENGTH: Readonly<Record<string, number>> = { critical: 1, high: 0.75, medium: 0.5, low: 0.25, info: 0.1 };
 
 async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerationCondition, { kind: "aux_finding" }>, ctx: EvalContext): Promise<TaskDraft[]> {
+  // An open or regressed finding with NO task yet for its current detection (a task created since it was first detected or last
+  // regressed), detected since the rule was enabled. Not the evaluated day: an audit can finish after the day's last rollup, or
+  // on a day no rollup runs, and a same-day filter would never turn that finding into a task.
   const found = await ctx.tx.query<{ id: string; fingerprint: Buffer; title: string; url: string | null; severity: string }>(
-    `SELECT id, fingerprint, title, url, severity
-       FROM aux_findings
-      WHERE project_id = $1::uuid AND rule_code = $2 AND severity = ANY($3::text[])
-        AND status IN ('open', 'regressed')
-        AND ((first_detected_at AT TIME ZONE $4)::date = $5::date OR (regressed_at AT TIME ZONE $4)::date = $5::date)
-      ORDER BY first_detected_at, id`,
-    [ctx.projectId, condition.aux_rule_code, condition.severities, ctx.timezone, ctx.metricDate],
+    `SELECT f.id, f.fingerprint, f.title, f.url, f.severity
+       FROM aux_findings f
+      WHERE f.project_id = $1::uuid AND f.rule_code = $2 AND f.severity = ANY($3::text[])
+        AND f.status IN ('open', 'regressed')
+        AND ($4::timestamptz IS NULL OR GREATEST(f.first_detected_at, f.regressed_at) >= $4::timestamptz)
+        AND NOT EXISTS (
+          SELECT 1 FROM tasks t
+           WHERE t.source_finding_id = f.id
+             AND (t.created_at >= GREATEST(f.first_detected_at, f.regressed_at)
+                  -- a regression that an OPEN task already absorbed (its evidence was refreshed after the regression) is counted once
+                  OR t.last_evidence_at >= f.regressed_at)
+        )
+      ORDER BY f.first_detected_at, f.id`,
+    [ctx.projectId, condition.aux_rule_code, condition.severities, rule.enabled_since],
   );
   return found.rows.map((row) => ({
     fingerprint: taskFingerprint(rule.code, ctx.projectId, Buffer.from(row.fingerprint).toString("hex")),
@@ -220,22 +253,42 @@ async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerati
 
 // ---- source_gap ------------------------------------------------------------------------------------------------------
 
-async function evaluateSourceGap(condition: Extract<TaskGenerationCondition, { kind: "source_gap" }>, ctx: EvalContext): Promise<TaskDraft[]> {
-  // The latest index row per domain at engine 'all', THEN the severity filter: an older critical row superseded by a newer
-  // lower one must not generate.
+async function evaluateSourceGap(
+  rule: RuleRow,
+  condition: Extract<TaskGenerationCondition, { kind: "source_gap" }>,
+  ctx: EvalContext,
+): Promise<TaskDraft[]> {
+  // The ONE actionable-domain predicate (latest row, widest window, seedable) the recovery plan reads, so the two paths cannot
+  // disagree; THEN the rule's own question: has the gap just MOVED INTO the rule's severity ("a new critical gap")? A gap that
+  // was already there on the previous index row does not regenerate every cooldown.
+  const actionable = await actionableAuthorityDomains(ctx.tx, ctx.workspaceId, ctx.projectId, null, AUTHORITY_WINDOW_DAYS);
+  if (actionable.size === 0) return [];
   const found = await ctx.tx.query<{ id: string; domain: string; gap_severity: string; seeding_playbook_slug: string | null }>(
-    `WITH latest AS (
-       SELECT DISTINCT ON (psi.source_domain_id) psi.source_domain_id, psi.gap_severity
+    `WITH ranked AS (
+       SELECT psi.source_domain_id, psi.gap_severity, psi.computed_at,
+              lead(psi.gap_severity) OVER (PARTITION BY psi.source_domain_id ORDER BY psi.window_start DESC) AS previous_severity,
+              row_number() OVER (PARTITION BY psi.source_domain_id ORDER BY psi.window_start DESC) AS rn
          FROM project_source_index psi
         WHERE psi.project_id = $1::uuid AND psi.engine_key = 'all' AND psi.window_days = $2::int
-        ORDER BY psi.source_domain_id, psi.window_start DESC
+          AND psi.source_domain_id = ANY($3::uuid[])
      )
-     SELECT sd.id, lower(sd.domain) AS domain, l.gap_severity, sd.seeding_playbook_slug
-       FROM latest l
-       JOIN source_domains sd ON sd.id = l.source_domain_id
-      WHERE sd.is_seedable AND l.gap_severity = ANY($3::text[])
+     SELECT sd.id, lower(sd.domain) AS domain, r.gap_severity, sd.seeding_playbook_slug
+       FROM ranked r
+       JOIN source_domains sd ON sd.id = r.source_domain_id
+      WHERE r.rn = 1
+        AND r.gap_severity = ANY($4::text[])
+        AND (r.previous_severity IS NULL OR NOT (r.previous_severity = ANY($4::text[])))
+        AND ($5::timestamptz IS NULL OR r.computed_at >= $5::timestamptz)
+        -- A gap is absorbed ONCE: a task for this domain made since this index row was computed (by this rule, or by the
+        -- displacement path, which shares the fingerprint) already carries it. Without this the same row would count as a
+        -- recurrence on every evaluated day.
+        AND NOT EXISTS (
+          SELECT 1 FROM tasks t
+           WHERE t.project_id = $1::uuid AND t.source_domain_id = sd.id
+             AND t.created_at >= r.computed_at
+        )
       ORDER BY lower(sd.domain)`,
-    [ctx.projectId, condition.window_days, condition.gap_severities],
+    [ctx.projectId, AUTHORITY_WINDOW_DAYS, [...actionable.values()], condition.gap_severities, rule.enabled_since],
   );
   return found.rows.map((row) => ({
     // Shared with the recovery plan and the displacement rule: one authority task per project and domain.

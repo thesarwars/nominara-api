@@ -48,7 +48,7 @@ export function authorityTaskFingerprint(projectId: string, domain: string): Buf
 /**
  * STORY-054 AC10 (owner decision 2026-10-13) — the domains an authority task may be made for: SEEDABLE in the workspace AND
  * at a critical or high gap severity on the project's `project_source_index` row at engine 'all', over `windowDays` (the
- * widest window). No row, no task. Returns lower-cased domain to `source_domains.id`.
+ * widest window), on its LATEST row. No row, no task. Returns lower-cased domain to `source_domains.id`.
  *
  * ONE definition for every path that makes an authority task: the on-demand recovery plan (DisplacementService) and the
  * rule-driven generator (STORY-063) both read it, so they cannot disagree about which domains are actionable. The caller's
@@ -58,20 +58,34 @@ export async function actionableAuthorityDomains(
   client: ClientBase,
   workspaceId: string,
   projectId: string,
-  domains: readonly string[],
+  domains: readonly string[] | null,
   windowDays: number,
 ): Promise<Map<string, string>> {
   const found = new Map<string, string>();
-  if (domains.length === 0) return found;
+  if (domains !== null && domains.length === 0) return found;
+  // The LATEST row per domain, then the severity filter: an older critical row superseded by a newer lower one is not a gap.
   const rows = await client.query<{ id: string; domain: string }>(
-    `SELECT sd.id, lower(sd.domain) AS domain
-       FROM source_domains sd
-       JOIN project_source_index psi ON psi.source_domain_id = sd.id
-      WHERE sd.workspace_id = $1 AND sd.is_seedable AND lower(sd.domain) = ANY($3::text[])
-        AND psi.workspace_id = $1 AND psi.project_id = $2 AND psi.engine_key = 'all' AND psi.window_days = $4
-        AND psi.gap_severity IN ('critical', 'high')`,
-    [workspaceId, projectId, [...domains], windowDays],
+    `WITH latest AS (
+       SELECT DISTINCT ON (psi.source_domain_id) psi.source_domain_id, psi.gap_severity
+         FROM project_source_index psi
+        WHERE psi.workspace_id = $1 AND psi.project_id = $2 AND psi.engine_key = 'all' AND psi.window_days = $4
+        ORDER BY psi.source_domain_id, psi.window_start DESC
+     )
+     SELECT sd.id, lower(sd.domain) AS domain
+       FROM latest l
+       JOIN source_domains sd ON sd.id = l.source_domain_id
+      WHERE sd.workspace_id = $1 AND sd.is_seedable AND ($3::text[] IS NULL OR lower(sd.domain) = ANY($3::text[]))
+        AND l.gap_severity IN ('critical', 'high')`,
+    [workspaceId, projectId, domains === null ? null : [...domains], windowDays],
   );
   for (const row of rows.rows) found.set(row.domain, row.id);
   return found;
+}
+
+/**
+ * The displacement points at its task, so the same event is never planned twice. Set once and never replaced: the first
+ * task wins. Both the on-demand recovery plan and the rule-driven generator call this one statement.
+ */
+export async function linkDisplacementToTask(client: ClientBase, displacementId: string, taskId: string): Promise<void> {
+  await client.query("UPDATE displacement_events SET task_id = $2 WHERE id = $1 AND task_id IS NULL", [displacementId, taskId]);
 }

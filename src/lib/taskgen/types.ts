@@ -16,6 +16,8 @@ export interface RuleRow {
   readonly cooldown_days: number;
   /** The workspace-local date of the last false-to-true flip of `enabled`, or null when the rule was never switched off. */
   readonly enabled_since_date: string | null;
+  /** The instant of that flip (or of the rule's insertion), or null. The watermark every event-driven rule gates on. */
+  readonly enabled_since: Date | null;
 }
 
 export interface EvalContext {
