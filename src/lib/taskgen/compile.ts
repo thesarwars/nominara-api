@@ -28,14 +28,15 @@ const VALUE_SQL: Record<MetricWindowCondition["metric"], (t: string) => string> 
 };
 
 /**
- * The same metric for ONE day's row (alias `d` is a `metric_daily` row; `$3` is the window length). A count is scaled to the
- * window (a day that matches the prior window's daily average reads as the prior window's total), so a day and a window
- * are comparable in one unit.
+ * The same metric for ONE day's row (alias `d` is a `metric_daily` row, `s` the engine's `scored` row). A count is scaled by the
+ * prior window's CAPTURE DAYS, not its calendar length (a day that matches the prior window's per-capture-day average reads as
+ * the prior window's total), so a day and a window are comparable in one unit whatever the plan's cadence: a weekly project's
+ * one day IS its window.
  */
 const DAY_VALUE_SQL: Record<MetricWindowCondition["metric"], string> = {
   sov: "d.sov::float8",
   presence_rate: "d.cells_present::float8 / NULLIF(d.cells_total, 0)",
-  owned_citation_count: "d.citations_owned::float8 * $3::int",
+  owned_citation_count: "d.citations_owned::float8 * s.prior_capture_days",
 };
 
 const CHANGE_SQL: Record<MetricWindowCondition["change"], Record<MetricWindowCondition["direction"], (cur: string, prior: string) => string>> = {
@@ -46,12 +47,25 @@ const CHANGE_SQL: Record<MetricWindowCondition["change"], Record<MetricWindowCon
   absolute: { down: (cur, prior) => `${prior} - ${cur}`, up: (cur, prior) => `${cur} - ${prior}` },
 };
 
+// Day floor (a documented constant of the grammar, derived from the rule's own numbers rather than tuned separately): a day is
+// only a breaching day when it carries at least `ceil(min_n / window_days)` cells, the average a day would hold if the sample
+// floor were reached on daily captures. A low-volume blip therefore cannot make up the count around one heavy day. It never
+// blocks a sparse cadence, whose capture days hold MORE than that average (a weekly day carries the whole window's sample).
+
 /**
- * One row per engine (never the cross-engine `all` row) whose metric moved by at least the threshold in the given
- * direction, with BOTH windows at or above the sample floor AND the change holding on at least `sustained_days` individual days of the
- * current window (so one heavy day cannot carry the aggregate). A day is only a breaching day when it carries at least
- * `ceil(min_n / window_days)` cells: low-volume blips cannot make up the count around one heavy day. Columns: `engine_key`, `n_current`, `n_prior`, `cur_value`,
- * `prior_value`, `change_value` (a positive magnitude in the rule's unit).
+ * One row per engine (never the cross-engine `all` row) whose metric moved by at least the threshold in the given direction,
+ * with BOTH windows at or above the sample floor, AND the change sustained.
+ *
+ * "SUSTAINED" IS MEASURED OVER THE CAPTURE DAYS THAT EXIST IN THE WINDOW, not over calendar days (capture cadence is plan-driven:
+ * a 7-day window holds 7 capture days on daily, about 2 on twice-weekly and 1 on weekly):
+ *  - the change must hold on at least `min(sustained_days, capture_days_in_window)` individual capture days of the current
+ *    window, each carrying the day floor above (so one heavy day cannot carry the aggregate when there are days to compare);
+ *  - when the window holds ONE capture day there are no days to compare, so the same change must ALSO hold in the immediately
+ *    preceding window (the window ending `window_days` earlier, against the window before it, both at the sample floor): a
+ *    single bad run is never enough, and a decline that continues over two consecutive windows is.
+ * A capture day is a `metric_daily` row of the engine with `cells_total > 0`.
+ *
+ * Columns: `engine_key`, `n_current`, `n_prior`, `cur_value`, `prior_value`, `change_value` (a positive magnitude in the rule's unit).
  *
  * The current window is the `window_days` ending at `metricDate`; the prior window is the `window_days` before it. A
  * relative change needs a non-zero prior value; an empty or null window cannot fire.
@@ -65,31 +79,44 @@ export function compileMetricWindow(condition: MetricWindowCondition, params: Co
   const text = `
 WITH win AS (
   SELECT engine_key,
-         (metric_date > $2::date - $3::int) AS is_current,
+         (($2::date - metric_date) / $3::int) AS bucket,
          sum(cells_total)::float8 AS cells,
          sum(cells_present)::float8 AS present,
          sum(sov * cells_total)::float8 AS sov_w,
-         sum(citations_owned)::float8 AS owned
+         sum(citations_owned)::float8 AS owned,
+         (count(*) FILTER (WHERE cells_total > 0))::int AS capture_days
     FROM metric_daily
    WHERE project_id = $1::uuid
      AND entity_type = 'brand'
      AND engine_key <> 'all'
      AND scoring_version = $4
-     AND metric_date >  $2::date - 2 * $3::int
+     AND metric_date >  $2::date - 3 * $3::int
      AND metric_date <= $2::date
-   GROUP BY engine_key, is_current
+   GROUP BY engine_key, bucket
 ), pair AS (
   SELECT c.engine_key,
          c.cells AS n_current,
          p.cells AS n_prior,
+         c.capture_days AS current_capture_days,
+         p.capture_days AS prior_capture_days,
          ${VALUE_SQL[condition.metric]("c")} AS cur_value,
          ${VALUE_SQL[condition.metric]("p")} AS prior_value
     FROM win c
-    JOIN win p ON p.engine_key = c.engine_key AND c.is_current AND NOT p.is_current
+    JOIN win p ON p.engine_key = c.engine_key AND c.bucket = 0 AND p.bucket = 1
 ), scored AS (
-  SELECT engine_key, n_current, n_prior, cur_value, prior_value,
+  SELECT engine_key, n_current, n_prior, current_capture_days, prior_capture_days, cur_value, prior_value,
          CASE WHEN prior_value IS NULL OR cur_value IS NULL THEN NULL ELSE ${change("cur_value", "prior_value")} END AS change_value
     FROM pair
+), preceding AS (
+  SELECT c.engine_key,
+         COALESCE(
+           c.cells >= $5::float8 AND p.cells >= $5::float8
+           AND ${VALUE_SQL[condition.metric]("c")} IS NOT NULL AND ${VALUE_SQL[condition.metric]("p")} IS NOT NULL
+           ${condition.change === "relative" ? `AND ${VALUE_SQL[condition.metric]("p")} > 0` : ""}
+           AND ${change(VALUE_SQL[condition.metric]("c"), VALUE_SQL[condition.metric]("p"))} >= $6::float8,
+           false) AS breached
+    FROM win c
+    JOIN win p ON p.engine_key = c.engine_key AND c.bucket = 1 AND p.bucket = 2
 ), daily AS (
   SELECT d.engine_key, count(*) AS days_breached
     FROM metric_daily d
@@ -108,13 +135,15 @@ WITH win AS (
 SELECT s.engine_key, s.n_current, s.n_prior, s.cur_value, s.prior_value, s.change_value
   FROM scored s
   JOIN daily y ON y.engine_key = s.engine_key
+  LEFT JOIN preceding g ON g.engine_key = s.engine_key
  WHERE s.n_current >= $5::float8
    AND s.n_prior   >= $5::float8
    AND s.cur_value IS NOT NULL
    AND s.prior_value IS NOT NULL
    ${priorGuard.replace("prior_value", "s.prior_value")}
    AND s.change_value >= $6::float8
-   AND y.days_breached >= $7::int
+   AND y.days_breached >= LEAST($7::int, s.current_capture_days)
+   AND (s.current_capture_days >= 2 OR COALESCE(g.breached, false))
  ORDER BY s.engine_key`;
   return { text, values };
 }

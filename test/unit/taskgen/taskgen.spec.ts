@@ -70,9 +70,10 @@ describe("STORY-063 · taskgen compile (closed grammar to parameterised SQL)", (
 
   it("[STORY-063 #2] 'sustained' is compiled in: the statement counts breaching days and binds the day floor as a parameter", () => {
     const { text, values } = compileMetricWindow({ ...base, sustained_days: 5 }, { projectId: PROJECT, metricDate: "2026-10-14", scoringVersion: "v1" });
-    expect(text).toMatch(/days_breached\s*>=\s*\$\d+/u);
+    // capped by the capture days that exist in the window: min(sustained_days, capture_days)
+    expect(text).toMatch(/days_breached\s*>=\s*LEAST\(\$\d+::int,\s*s\.current_capture_days\)/u);
     expect(values).toContain(5);
-    expect(text).not.toMatch(/days_breached\s*>=\s*5/u);
+    expect(text).not.toMatch(/days_breached\s*>=\s*(LEAST\()?5\b/u);
   });
 
   it("is built only from fixed fragments: every metric and direction compiles to a statement with no condition text in it", () => {

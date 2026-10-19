@@ -25,10 +25,13 @@ export const taskMetricWindowMetricSchema = z.enum(TASK_METRIC_WINDOW_METRICS);
  * `change` is the unit of `threshold`: a fraction of the prior value (`relative`) or a difference in the metric's own
  * unit (`absolute`).
  *
- * "SUSTAINED" IS A PROPERTY OF THE GRAMMAR, not of the window aggregate: the change must ALSO hold, against the prior
- * window's value, on at least `sustained_days` individual days of the current window. A window-wide sum lets one very
- * heavy bad day carry the whole aggregate; this does not. `sustained_days` is at least 2 and `min_n` at least 30, so an
- * ops UPDATE can tune a threshold but cannot tune the hysteresis away.
+ * "SUSTAINED" IS A PROPERTY OF THE GRAMMAR, not of the window aggregate, and it is measured over the CAPTURE DAYS that exist in
+ * the window (cadence is plan-driven: daily, twice weekly, weekly), not over calendar days. The change must ALSO hold, against the
+ * prior window's value, on at least `min(sustained_days, capture_days_in_window)` individual capture days of the current window,
+ * each carrying at least `ceil(min_n / window_days)` cells (the day floor: a blip cannot pad the count around one heavy day). A
+ * window with ONE capture day has no days to compare, so the same change must also hold in the immediately preceding window.
+ * A window-wide sum alone lets one very heavy bad day carry the aggregate; this does not. `sustained_days` is at least 2 and
+ * `min_n` at least 30, so an ops UPDATE can tune a threshold but cannot tune the hysteresis away.
  */
 export const metricWindowConditionSchema = z
   .object({

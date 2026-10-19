@@ -223,8 +223,16 @@ async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerati
   // An open or regressed finding with NO task yet for its current detection (a task created since it was first detected or last
   // regressed), detected since the rule was enabled. Not the evaluated day: an audit can finish after the day's last rollup, or
   // on a day no rollup runs, and a same-day filter would never turn that finding into a task.
-  const found = await ctx.tx.query<{ id: string; fingerprint: Buffer; title: string; url: string | null; severity: string }>(
-    `SELECT f.id, f.fingerprint, f.title, f.url, f.severity
+  const found = await ctx.tx.query<{
+    id: string;
+    fingerprint: Buffer;
+    title: string;
+    url: string | null;
+    severity: string;
+    detected_at: Date;
+    regressed_at: Date | null;
+  }>(
+    `SELECT f.id, f.fingerprint, f.title, f.url, f.severity, GREATEST(f.first_detected_at, f.regressed_at) AS detected_at, f.regressed_at
        FROM aux_findings f
       WHERE f.project_id = $1::uuid AND f.rule_code = $2 AND f.severity = ANY($3::text[])
         AND f.status IN ('open', 'regressed')
@@ -236,16 +244,24 @@ async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerati
                   -- A regression that an OPEN task already absorbed is counted once. "Absorbed" is a WALL-CLOCK fact — the
                   -- recurrence event was written after the regression — never the task's last_evidence_at, which is the END of
                   -- the evaluated day (a future instant when that day is today) and would swallow a regression the same day.
-                  -- A done task absorbs nothing: a regression after its completion is a new piece of work.
-                  OR (t.status IN ('todo', 'in_progress') AND EXISTS (
+                  -- Whatever became of the task since (completed, say) the event still says this regression was counted, so it
+                  -- is NOT counted again. No status test: a regression AFTER the completion has a later regressed_at than
+                  -- every event on the task, so it is still new work.
+                  OR EXISTS (
                         SELECT 1 FROM task_events e
-                         WHERE e.task_id = t.id AND e.event = 'evidence_refreshed' AND e.occurred_at >= f.regressed_at)))
+                         WHERE e.task_id = t.id AND e.event = 'evidence_refreshed' AND e.occurred_at >= f.regressed_at))
         )
       ORDER BY f.first_detected_at, f.id`,
     [ctx.projectId, condition.aux_rule_code, condition.severities, rule.enabled_since],
   );
-  return found.rows.map((row) => ({
-    fingerprint: taskFingerprint(rule.code, ctx.projectId, Buffer.from(row.fingerprint).toString("hex")),
+  const drafted = found.rows.map((row) => ({ row, fingerprint: taskFingerprint(rule.code, ctx.projectId, Buffer.from(row.fingerprint).toString("hex")) }));
+  // The task the dedupe lands on is found by FINGERPRINT, and its `source_finding_id` can be gone; absorb through it too.
+  const absorbed = await absorbedByFingerprint(
+    ctx,
+    drafted.map(({ row, fingerprint }) => ({ fingerprint, createdSince: row.detected_at, eventSince: row.regressed_at })),
+  );
+  return drafted.filter(({ fingerprint }) => !absorbed.has(fingerprint.toString("hex"))).map(({ row, fingerprint }) => ({
+    fingerprint,
     vars: { finding_title: row.title, aux_rule_code: condition.aux_rule_code },
     strength: SEVERITY_STRENGTH[row.severity] ?? 0.5,
     baselineEngine: "all",
@@ -276,7 +292,7 @@ async function evaluateSourceGap(
   // recurrence event is the witness), not on every rollup.
   const actionable = await actionableAuthorityDomains(ctx.tx, ctx.workspaceId, ctx.projectId, null, AUTHORITY_WINDOW_DAYS);
   if (actionable.size === 0) return [];
-  const found = await ctx.tx.query<{ id: string; domain: string; gap_severity: string; seeding_playbook_slug: string | null }>(
+  const found = await ctx.tx.query<{ id: string; domain: string; gap_severity: string; seeding_playbook_slug: string | null; verified_at: Date }>(
     `WITH ranked AS (
        SELECT psi.source_domain_id, psi.gap_severity, psi.verified_at,
               row_number() OVER (PARTITION BY psi.source_domain_id ORDER BY psi.window_start DESC) AS rn
@@ -284,7 +300,7 @@ async function evaluateSourceGap(
         WHERE psi.project_id = $1::uuid AND psi.engine_key = 'all' AND psi.window_days = $2::int
           AND psi.source_domain_id = ANY($3::uuid[])
      )
-     SELECT sd.id, lower(sd.domain) AS domain, r.gap_severity, sd.seeding_playbook_slug
+     SELECT sd.id, lower(sd.domain) AS domain, r.gap_severity, sd.seeding_playbook_slug, r.verified_at
        FROM ranked r
        JOIN source_domains sd ON sd.id = r.source_domain_id
       WHERE r.rn = 1
@@ -295,16 +311,23 @@ async function evaluateSourceGap(
           SELECT 1 FROM tasks t
            WHERE t.project_id = $1::uuid AND t.source_domain_id = sd.id
              AND (t.created_at >= r.verified_at
-                  OR (t.status IN ('todo', 'in_progress') AND EXISTS (
+                  -- No status test: a refresh counted this verification whatever became of the task since, and a completed task
+                  -- makes nothing new until the gap is verified AGAIN (a later verified_at than every event).
+                  OR EXISTS (
                         SELECT 1 FROM task_events e
-                         WHERE e.task_id = t.id AND e.event = 'evidence_refreshed' AND e.occurred_at >= r.verified_at)))
+                         WHERE e.task_id = t.id AND e.event = 'evidence_refreshed' AND e.occurred_at >= r.verified_at))
         )
       ORDER BY lower(sd.domain)`,
     [ctx.projectId, AUTHORITY_WINDOW_DAYS, [...actionable.values()], condition.gap_severities, rule.enabled_since],
   );
-  return found.rows.map((row) => ({
+  const drafted = found.rows.map((row) => ({ row, fingerprint: authorityTaskFingerprint(ctx.projectId, row.domain) }));
+  const absorbed = await absorbedByFingerprint(
+    ctx,
+    drafted.map(({ row, fingerprint }) => ({ fingerprint, createdSince: row.verified_at, eventSince: row.verified_at })),
+  );
+  return drafted.filter(({ fingerprint }) => !absorbed.has(fingerprint.toString("hex"))).map(({ row, fingerprint }) => ({
     // Shared with the recovery plan and the displacement rule: one authority task per project and domain.
-    fingerprint: authorityTaskFingerprint(ctx.projectId, row.domain),
+    fingerprint,
     kind: "authority" as const,
     vars: { domain: row.domain },
     strength: SEVERITY_STRENGTH[row.gap_severity] ?? 0.5,
@@ -338,6 +361,32 @@ async function evaluatePromptStability(rule: RuleRow, condition: Extract<TaskGen
       affectedPromptIds: found.rows.map((row) => row.id),
     },
   ];
+}
+
+/**
+ * A discrete event's absorption, by the key the task service dedupes on. The id-keyed predicates in the queries above
+ * (`source_finding_id`, `source_domain_id`) stop matching if that link is ever NULLed (ON DELETE SET NULL, or a task made without
+ * it); the fingerprint is what `createGeneratedTask` lands on, so the two must agree or a discrete refresh would count again on
+ * every run. A candidate is absorbed when a task (any status, not deleted) under its fingerprint was created at or after
+ * `createdSince`, or has an `evidence_refreshed` event at or after `eventSince` (a null bound never matches). Returns hex fingerprints.
+ */
+async function absorbedByFingerprint(
+  ctx: EvalContext,
+  items: ReadonlyArray<{ fingerprint: Buffer; createdSince: Date | null; eventSince: Date | null }>,
+): Promise<Set<string>> {
+  if (items.length === 0) return new Set();
+  const result = await ctx.tx.query<{ fp: string }>(
+    `SELECT c.fp
+       FROM unnest($2::text[], $3::timestamptz[], $4::timestamptz[]) AS c(fp, created_since, event_since)
+      WHERE EXISTS (
+        SELECT 1 FROM tasks t
+         WHERE t.project_id = $1::uuid AND t.deleted_at IS NULL AND t.dedupe_fingerprint = decode(c.fp, 'hex')
+           AND (t.created_at >= c.created_since
+                OR EXISTS (SELECT 1 FROM task_events e
+                            WHERE e.task_id = t.id AND e.event = 'evidence_refreshed' AND e.occurred_at >= c.event_since)))`,
+    [ctx.projectId, items.map((item) => item.fingerprint.toString("hex")), items.map((item) => item.createdSince), items.map((item) => item.eventSince)],
+  );
+  return new Set(result.rows.map((row) => row.fp));
 }
 
 async function playbookSlugs(tx: ClientBase, domainIds: readonly string[]): Promise<Map<string, string | null>> {

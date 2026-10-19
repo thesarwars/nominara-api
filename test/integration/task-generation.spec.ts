@@ -15,7 +15,7 @@ import { captureBaseline } from "../../src/lib/taskgen/baseline.js";
 import { SCORING_VERSION } from "../../src/lib/scoring/index.js";
 import { refreshProjectSourceIndex } from "../../src/lib/rollup/refresh-project-source-index.js";
 import { TasksService } from "../../src/modules/tasks/tasks.service.js";
-import { authorityTaskFingerprint } from "../../src/lib/analytics/displacement-recovery.js";
+import { authorityTaskFingerprint, linkDisplacementToTask } from "../../src/lib/analytics/displacement-recovery.js";
 import { DisplacementService } from "../../src/modules/displacement/displacement.service.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import type { Job } from "bullmq";
@@ -1118,6 +1118,204 @@ describe("STORY-063 · task generation engine", () => {
     await windowOf("gemini", today, { sov: 0.3 });
     await generate(today);
     expect(await taskRows("TG-SOV-NEW")).toHaveLength(1);
+  });
+
+  // ---- round 3: "sustained" is measured over the capture days that exist, not over calendar days -------------------------------------
+  //
+  // Capture cadence is plan-driven (Starter weekly, Growth twice a week, Business daily), so a 7-day window holds 1, 2 or 7 capture
+  // days. These tests seed the CADENCE the product runs, not seven rows a window: every earlier fixture was `windowOf`.
+  /** Capture days at `offsets` (days back from each window's last day) in the current (k = 0), prior (1) and preceding (2) windows. */
+  async function cadence(engine: string, offsets: readonly number[], spec: (k: number, j: number) => MetricSpec | undefined): Promise<void> {
+    for (let k = 0; k < 3; k += 1) {
+      for (const [j, offset] of offsets.entries()) {
+        const row = spec(k, j);
+        if (row !== undefined) await metric(engine, day(day(D, -7 * k), -offset), row);
+      }
+    }
+  }
+  const STARTER = [3]; // one capture day a window
+  const GROWTH = [1, 4]; // two
+  const sovAt = (current: number, prior: number, preceding: number | undefined, cells: number) => (k: number): MetricSpec | undefined => {
+    const sov = [current, prior, preceding][k];
+    return sov === undefined ? undefined : { cells, sov };
+  };
+
+  it("[STORY-063 #3 / AC3] Starter cadence (1 capture a week): a decline that holds over two consecutive windows makes a task", async () => {
+    await cadence("gemini", STARTER, sovAt(0.3, 0.4, 0.5, 35));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+  });
+
+  it("[STORY-063 #2] Starter cadence: one bad run makes NO task, whether or not it recovers", async () => {
+    await cadence("gemini", STARTER, sovAt(0.2, 0.4, 0.4, 35)); // the bad run is the latest: the preceding window did not move
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+    await db.query("TRUNCATE metric_daily");
+    await cadence("gemini", STARTER, sovAt(0.4, 0.2, 0.4, 35)); // it recovered: the latest window rose
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #2] Starter cadence: a preceding window that fell by less than the threshold is not a second breach, and no preceding window is no second breach", async () => {
+    await cadence("gemini", STARTER, sovAt(0.3, 0.4, 0.44, 35)); // 0.44 -> 0.4 is a 9% fall
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+    await db.query("TRUNCATE metric_daily");
+    await cadence("gemini", STARTER, sovAt(0.3, 0.4, undefined, 35)); // only two windows of history
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #4] Starter cadence: the sample floor still applies to both compared windows (29 cells is not enough)", async () => {
+    await cadence("gemini", STARTER, (k) => ({ cells: k === 1 ? 29 : 35, sov: [0.3, 0.4, 0.5][k]! }));
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #3 / AC3] Growth cadence (2 captures a week): both capture days breaching makes a task", async () => {
+    await cadence("gemini", GROWTH, sovAt(0.25, 0.4, 0.4, 20));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+  });
+
+  it("[STORY-063 #2] Growth cadence: one bad run (one of two capture days) makes NO task even though the window aggregate fell 37.5%", async () => {
+    await cadence("gemini", GROWTH, (k, j) => ({ cells: 20, sov: k === 0 && j === 0 ? 0.1 : 0.4 }));
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #3 / #2] owned citations at Starter and Growth cadence: a day is compared with the prior window's per-capture-day count, not the window's total", async () => {
+    const owned = (counts: readonly [number, number, number]) => (k: number): MetricSpec => ({ cells: 35, sov: 0.4, owned: counts[k]! });
+    await cadence("gemini", STARTER, owned([8, 14, 20])); // a weekly day's count is the whole window's count
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
+    await db.query("TRUNCATE tasks, metric_daily CASCADE");
+    await cadence("gemini", GROWTH, (k) => ({ cells: 20, sov: 0.4, owned: k === 0 ? 4 : 7 })); // 8 against 14
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-CITATION-LOSS"]);
+    await db.query("TRUNCATE tasks, metric_daily CASCADE");
+    await cadence("gemini", GROWTH, (k, j) => ({ cells: 20, sov: 0.4, owned: k === 0 ? (j === 0 ? 8 : 0) : 7 })); // one bad run
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #3 / #2] Business cadence (daily): a drop over the whole window makes a task; one bad day does not", async () => {
+    await twoWindows("gemini", { sov: 0.4 }, { sov: 0.28 });
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+    await db.query("TRUNCATE tasks, metric_daily CASCADE");
+    await twoWindows("gemini", { sov: 0.4 }, (i) => ({ sov: i === 0 ? 0 : 0.4 }));
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  // ---- round 3: a refresh absorbs the event it counted, whatever became of the task afterwards ------------------------------------------
+
+  it("[STORY-063 hazard] a regression refreshed onto its task is not planned AGAIN when the user then completes the task", async () => {
+    const finding = await auxFinding("AUX-R-001", "critical");
+    await generate(realToday());
+    const [task] = await auxTasks("TG-AUX-R-001");
+    await db.query("UPDATE tasks SET created_at = now() - interval '2 hours' WHERE id = $1", [task.id]);
+    await db.query("UPDATE aux_findings SET status = 'regressed', regressed_at = now() - interval '1 hour' WHERE id = $1", [finding]);
+    await generate(realToday()); // refreshes the open task: the regression is counted once
+    expect((await auxTasks("TG-AUX-R-001"))[0].recurrence_count).toBe(1);
+    await db.query("UPDATE tasks SET status = 'done', completed_at = now() WHERE id = $1", [task.id]);
+    await generate(realToday());
+    await generate(day(realToday(), 1));
+    expect(await auxTasks("TG-AUX-R-001")).toHaveLength(1);
+  });
+
+  it("[STORY-063 hazard] a gap whose re-verification was refreshed onto its task is not planned AGAIN when the user then completes the task", async () => {
+    await verifiedGap("reddit.com", "1 day");
+    await generate(realToday());
+    const [task] = await taskRows("TG-SOURCE-ABSENCE");
+    await db.query("UPDATE tasks SET created_at = now() - interval '40 days' WHERE id = $1", [task.id]);
+    await db.query("UPDATE project_source_index SET verified_at = now() - interval '1 hour' WHERE project_id = $1", [projectId]);
+    await refreshIndex(realToday());
+    await generate(realToday()); // refreshes the open task once
+    expect((await taskRows("TG-SOURCE-ABSENCE"))[0].recurrence_count).toBe(1);
+    await db.query("UPDATE tasks SET status = 'done', completed_at = now() - interval '35 days' WHERE id = $1", [task.id]);
+    await refreshIndex(day(realToday(), 1));
+    await generate(day(realToday(), 1));
+    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(1);
+  });
+
+  it("[STORY-063 hazard] a discrete event is absorbed through the task's fingerprint when its finding link is gone: the counter does not climb on every run", async () => {
+    const finding = await auxFinding("AUX-R-001", "critical");
+    await generate(realToday());
+    const [task] = await auxTasks("TG-AUX-R-001");
+    // The link a SET NULL leaves behind: the task still exists under its fingerprint, but source_finding_id is NULL.
+    await db.query("UPDATE tasks SET source_finding_id = NULL, created_at = now() - interval '2 hours' WHERE id = $1", [task.id]);
+    await db.query("UPDATE aux_findings SET status = 'regressed', regressed_at = now() - interval '1 hour' WHERE id = $1", [finding]);
+    for (const date of [realToday(), realToday(), day(realToday(), 1), day(realToday(), 2)]) await generate(date);
+    const after = await auxTasks("TG-AUX-R-001");
+    expect(after).toHaveLength(1);
+    expect(after[0].recurrence_count).toBe(1);
+  });
+
+  it("[STORY-063 hazard] a re-verified gap is absorbed through the task's fingerprint when its domain link is gone: the counter does not climb on every run", async () => {
+    await verifiedGap("reddit.com", "1 day");
+    await generate(realToday());
+    const [task] = await taskRows("TG-SOURCE-ABSENCE");
+    await db.query("UPDATE tasks SET source_domain_id = NULL, created_at = now() - interval '40 days' WHERE id = $1", [task.id]);
+    await db.query("UPDATE project_source_index SET verified_at = now() - interval '1 hour' WHERE project_id = $1", [projectId]);
+    for (let i = 1; i <= 4; i += 1) {
+      await refreshIndex(day(realToday(), i));
+      await generate(day(realToday(), i));
+    }
+    const rows = await taskRows("TG-SOURCE-ABSENCE");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].recurrence_count).toBe(1);
+  });
+
+  it("[STORY-063 hazard] a gap that MOVES into critical with no new verification (its context weight rose) is planned, driven by the real index writer", async () => {
+    const cite = async (domain: string, n: number, from = 0): Promise<void> => {
+      for (let i = from; i < from + n; i += 1) {
+        const url = `https://${domain}/p/${String(i)}`;
+        await db.query(
+          `INSERT INTO citation_facts (workspace_id, project_id, result_id, prompt_id, engine_key, captured_at, slot_index, raw_url, normalized_url,
+                                       url_hash, domain, is_owned, is_competitor, http_status, position_weight)
+           VALUES ($1,$2,$3,$4,'gemini', now() - interval '1 day', 1, $5, $5, $6, $7, false, false, 200, 1)`,
+          [workspaceId, projectId, randomUUID(), promptId, url, createHash("sha256").update(url).digest(), domain],
+        );
+      }
+    };
+    await cite("reddit.com", 1);
+    await cite("other.example", 30); // reddit holds ~3% of the weight: medium, not critical
+    await refreshIndex(realToday());
+    await db.query(
+      `UPDATE project_source_index psi SET brand_present_on_domain = false, verified_at = now() - interval '10 days'
+         FROM source_domains sd WHERE sd.id = psi.source_domain_id AND psi.project_id = $1 AND sd.domain = 'reddit.com'`,
+      [projectId],
+    );
+    await refreshIndex(realToday());
+    const severity = async () =>
+      (await db.query(
+        `SELECT psi.gap_severity FROM project_source_index psi JOIN source_domains sd ON sd.id = psi.source_domain_id
+          WHERE psi.project_id = $1 AND sd.domain = 'reddit.com' AND psi.engine_key = 'all' AND psi.window_days = 90`,
+        [projectId],
+      )).rows[0].gap_severity;
+    expect(await severity()).not.toBe("critical");
+    await generate(realToday());
+    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(0);
+    await cite("reddit.com", 40, 1); // no new verification: only the weight moved
+    await refreshIndex(realToday());
+    expect(await severity()).toBe("critical");
+    await generate(realToday());
+    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(1);
+    await generate(day(realToday(), 1));
+    expect(await taskRows("TG-SOURCE-ABSENCE")).toHaveLength(1);
+  });
+
+  it("[STORY-063 hazard] linking a displacement is scoped to its workspace: another workspace's id changes nothing", async () => {
+    await auxFinding("AUX-R-001", "critical");
+    await generate(realToday());
+    const [task] = await auxTasks("TG-AUX-R-001");
+    const id = await displacement({ citationGap: [] });
+    await linkDisplacementToTask(db, otherWorkspaceId, id, task.id);
+    expect((await db.query("SELECT task_id FROM displacement_events WHERE id = $1", [id])).rows[0].task_id).toBeNull();
+    await linkDisplacementToTask(db, workspaceId, id, task.id);
+    expect((await db.query("SELECT task_id FROM displacement_events WHERE id = $1", [id])).rows[0].task_id).toBe(task.id);
   });
 
   // ---- the catalog is configuration every tenant trusts ---------------------------------------------------------
