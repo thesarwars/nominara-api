@@ -6,9 +6,19 @@ import { z } from "zod";
 // preview's `exceeds[]` (billing) and the `details.excess[]` of the
 // `409 downgrade_exceeds_limits` refusal (error details).
 //
-// Only `structural` entries BLOCK a downgrade (plans-and-entitlements.md §14,
-// as read by STORY-184: refuse until usage is reduced). The other three are
-// the "named warning" §14 requires and never block.
+// STORY-077 slice A — plans-and-entitlements.md §14: a downgrade is ACCEPTED
+// and, at the cut-over, the most recently created excess projects and prompts
+// are PAUSED (never deleted). So a `structural` entry says what happens to it
+// in `effect`:
+//   paused_at_period_end  projects and prompts (`projects.max`,
+//                         `prompts.max_total`, `prompts.max_per_project`):
+//                         named, never blocking; paused at the cut-over.
+//   must_reduce           seats, competitors and API keys, which §14 does not
+//                         name as pausable: these still BLOCK the downgrade
+//                         (STORY-184's refusal, kept for these keys only)
+//                         until usage is reduced.
+// The other three kinds are the "named warning" §14 requires and never block.
+export const STRUCTURAL_EXCESS_EFFECTS = ["paused_at_period_end", "must_reduce"] as const;
 export const downgradeExcessItemSchema = z.discriminatedUnion("kind", [
   z
     .object({
@@ -22,7 +32,9 @@ export const downgradeExcessItemSchema = z.discriminatedUnion("kind", [
       current: z.number().int().nonnegative(),
       /** `current - limit`, always positive: an entry exists only when usage is above the ceiling. */
       excess: z.number().int().positive(),
-      /** `projects.max` only: the projects that exceed, most recently created first (the ones to reduce first). */
+      /** STORY-077: what the cut-over does with it. Only `must_reduce` blocks the downgrade. */
+      effect: z.enum(STRUCTURAL_EXCESS_EFFECTS),
+      /** `projects.max` only: the projects that exceed, most recently created first (the ones paused at the cut-over). */
       items: z.array(z.object({ id: z.uuid(), name: z.string() }).strict()).max(100).optional(),
     })
     .strict(),

@@ -47,6 +47,7 @@ describe("STORY-134 · promptListItem", () => {
     intent_archetype: "scale_fit" as const,
     funnel_stage: "consideration" as const,
     status: "active" as const,
+    paused_by_downgrade_at: null,
     is_priority: true,
     generation_source: "generated" as const,
     generation_batch_id: "01a06ccd-0000-7000-8000-0000000000ff",

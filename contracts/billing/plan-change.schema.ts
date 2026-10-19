@@ -80,9 +80,9 @@ export const planChangePreviewResponseSchema = z
       .strict(),
     /** Always true: purchased credits are never clawed back (plans-and-entitlements.md §14). */
     purchased_credits_kept: z.literal(true),
-    /** Empty for an upgrade. */
+    /** Empty for an upgrade. A `structural` entry's `effect` says whether it is paused at the cut-over or must be reduced first. */
     exceeds: z.array(downgradeExcessItemSchema),
-    /** Non-null when the change route would refuse this target (a structural excess, or Free). */
+    /** Non-null when the change route would refuse this target (a `must_reduce` structural excess, or Free). */
     blocked_by: z.enum(PLAN_CHANGE_BLOCKED_BY).nullable(),
   })
   .strict();
