@@ -43,6 +43,10 @@ interface TaskCandidate {
 
 async function ensureTaskRules(tx: ClientBase): Promise<void> {
   for (const rule of DEMO_TASK_RULES) {
+    // Migration 0129 seeds these codes and revokes INSERT on the catalog from the runtime role this seeder connects as, so the row is
+    // only ever READ here; the insert below is the fallback for a database that predates 0129.
+    const existing = await tx.query("SELECT 1 FROM task_generation_rules WHERE code = $1", [rule.code]);
+    if (existing.rows.length > 0) continue;
     await tx.query(
       `INSERT INTO task_generation_rules
          (code, category, title_template, description_template, trigger_kind, condition,
