@@ -26,6 +26,8 @@ import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixtur
 // pool connections sharing one store, ticking at the same moment.
 
 const PREFIX = "nominara-queue-test";
+// The proxy binds an ephemeral port, never a developer one.
+const LOOPBACK = "127.0.0.1";
 
 describe("STORY-179 · MonitorRuntime — two replicas, real Postgres lock + Valkey", () => {
   let container: StartedPostgreSqlContainer;
@@ -221,13 +223,13 @@ describe("STORY-179 · MonitorRuntime — two replicas, real Postgres lock + Val
           client.pipe(upstream).pipe(client);
           for (const socket of [client, upstream]) socket.on("error", () => socket.destroy()).on("close", () => { client.destroy(); upstream.destroy(); });
         });
-        server.listen(port, "127.0.0.1", () => {
+        server.listen(port, LOOPBACK, () => {
           port = (server!.address() as net.AddressInfo).port;
           resolve();
         });
       });
     return {
-      start: async () => (await listen(), `redis://127.0.0.1:${port}`),
+      start: async () => (await listen(), `redis://${LOOPBACK}:${port}`),
       down: async () => {
         for (const socket of sockets) socket.destroy();
         sockets.clear();
