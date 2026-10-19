@@ -19,6 +19,7 @@ import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
 import { createQueueReaderConnection, createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue } from "./lib/queue/dead-letter.js";
 import { MonitorRuntime, ValkeyMonitorStateStore, dlqDepthReader } from "./lib/queue/monitor-runtime.js";
+import { INTERACTIVE_QUEUES, queueAgeReader } from "./lib/queue/queue-age-monitor.js";
 import { QUEUE_TOPOLOGY } from "./lib/queue/topology.js";
 import { EngineHealthService } from "./modules/health/engine-health.service.js";
 import { queuesForGroup } from "./lib/queue/group.js";
@@ -198,17 +199,17 @@ class CaptureSchedulerSweepHolder implements OnModuleDestroy {
   }
 }
 
-/** STORY-179 — owns the monitor driver's timer and the read-only DLQ Queue handles it counts through. */
+/** STORY-179 — owns the monitor driver's timer and the read-only Queue handles it counts and ages through. */
 class RollupMonitorHolder implements OnModuleDestroy {
   constructor(
     public readonly runtime: MonitorRuntime,
-    private readonly dlqReaders: readonly Queue[],
+    private readonly readers: readonly Queue[],
   ) {}
 
   async onModuleDestroy(): Promise<void> {
     this.runtime.stop();
     // Closes the Queue handles only; the connection is the group's shared producer-side one, which WorkerGroupRuntime closes.
-    await Promise.all(this.dlqReaders.map((queue) => queue.close().catch(() => undefined)));
+    await Promise.all(this.readers.map((queue) => queue.close().catch(() => undefined)));
   }
 }
 
@@ -397,15 +398,20 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   if (env.WORKER_GROUP === "rollup") {
     if (scheduleConnection === undefined) throw new WorkerGroupError("monitor driver: the producer-side connection was not built");
     const dlqReaders = new Map(QUEUE_TOPOLOGY.map((entry) => [entry.name, buildDlqQueue(entry, { connection: scheduleConnection as Redis, prefix })]));
+    // STORY-030 AC8 — the interactive queues' oldest-waiting-job age rides the same tick.
+    const interactiveReaders = new Map(
+      QUEUE_TOPOLOGY.filter((entry) => INTERACTIVE_QUEUES.includes(entry.name)).map((entry) => [entry.name, buildQueue(entry, { connection: scheduleConnection as Redis, prefix })]),
+    );
     const engineHealth = new EngineHealthService(pool);
     const monitorRuntime = new MonitorRuntime({
       pool,
       store: new ValkeyMonitorStateStore(scheduleConnection, prefix),
       readDlqDepths: dlqDepthReader(dlqReaders),
       readLastSuccess: (engines) => engineHealth.lastSuccessAtMs(engines),
+      readOldestAges: queueAgeReader(interactiveReaders),
     });
     monitorRuntime.start();
-    providers.push({ provide: ROLLUP_MONITOR_RUNTIME, useValue: new RollupMonitorHolder(monitorRuntime, [...dlqReaders.values()]) });
+    providers.push({ provide: ROLLUP_MONITOR_RUNTIME, useValue: new RollupMonitorHolder(monitorRuntime, [...dlqReaders.values(), ...interactiveReaders.values()]) });
   }
 
   @Module({ providers })
