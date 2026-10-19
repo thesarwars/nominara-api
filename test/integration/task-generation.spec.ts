@@ -108,6 +108,10 @@ describe("STORY-063 · task generation engine", () => {
     entityId?: string;
     /** The capture RUN the day's cells belong to. Rows sharing a key are ONE run (one run can straddle local midnight). Defaults to one run a day. */
     run?: string;
+    /** Cells the run PLANNED for the engine (default: the cells it wrote). A run that planned 30 and measured 3 lost 27 to failures. */
+    planned?: number;
+    /** The run is still being captured (status `running`, no `finished_at`): the hourly rollup can see its first cells. */
+    inProgress?: boolean;
     /**
      * Several runs that put cells on this local date, each with ITS OWN rates (a manual deep scan beside a scheduled run; a run's tail beside the
      * next run's head). The date row is their blend; the generator judges each run on its own cells. When given, cells / present / sov / owned of
@@ -121,11 +125,13 @@ describe("STORY-063 · task generation engine", () => {
     present?: number;
     sov?: number;
     owned?: number;
+    planned?: number;
+    inProgress?: boolean;
   }
   let runIds = new Map<string, string>();
 
   /** `cells` answer_captures of one run on one local date, carrying the per-cell facts the generator reads (presence, share, owned citations). */
-  async function writeCells(engine: string, date: string, part: Required<RunPart>): Promise<void> {
+  async function writeCells(engine: string, date: string, part: Required<Omit<RunPart, "planned" | "inProgress">> & Pick<RunPart, "planned" | "inProgress">): Promise<void> {
     const key = `${engine}|${part.run}`;
     if (!runIds.has(key)) runIds.set(key, uuidV7());
     const capturedAt = `${date}T10:00:00Z`;
@@ -139,14 +145,26 @@ describe("STORY-063 · task generation engine", () => {
          FROM generate_series(1, $10::int) AS g`,
       [workspaceId, projectId, runIds.get(key), promptId, engine, capturedAt, part.present, part.sov, part.owned, part.cells],
     );
+    // The run row the cells belong to: finished unless the test says it is still being captured; it planned what it wrote unless told otherwise.
+    const inProgress = part.inProgress === true;
+    await db.query(
+      `INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys, planned_cells, status, started_at, finished_at)
+       VALUES ($1, $2, $3, 'scheduled', ARRAY[$4::text], 0, $5, $6::timestamptz, CASE WHEN $5 = 'completed' THEN $6::timestamptz END)
+       ON CONFLICT (id) DO NOTHING`,
+      [runIds.get(key), workspaceId, projectId, engine, inProgress ? "running" : "completed", capturedAt],
+    );
+    await db.query(
+      `UPDATE capture_runs SET planned_cells = COALESCE($2::int, (SELECT count(*) FROM answer_captures WHERE run_id = $1 AND engine_key = $3))::int WHERE id = $1`,
+      [runIds.get(key), part.planned ?? null, engine],
+    );
   }
 
   async function metric(engine: string, date: string, spec: MetricSpec = {}): Promise<void> {
     const entity = spec.entity ?? "brand";
-    const parts: Required<RunPart>[] =
+    const parts: (Required<Omit<RunPart, "planned" | "inProgress">> & Pick<RunPart, "planned" | "inProgress">)[] =
       spec.parts !== undefined
-        ? spec.parts.map((p) => ({ run: p.run, cells: p.cells, present: p.present ?? p.cells, sov: p.sov ?? 0.4, owned: p.owned ?? 0 }))
-        : [{ run: spec.run ?? date, cells: spec.cells ?? 5, present: spec.present ?? spec.cells ?? 5, sov: spec.sov ?? 0.4, owned: spec.owned ?? 0 }];
+        ? spec.parts.map((p) => ({ ...p, present: p.present ?? p.cells, sov: p.sov ?? 0.4, owned: p.owned ?? 0 }))
+        : [{ run: spec.run ?? date, cells: spec.cells ?? 5, present: spec.present ?? spec.cells ?? 5, sov: spec.sov ?? 0.4, owned: spec.owned ?? 0, planned: spec.planned, inProgress: spec.inProgress }];
     const cells = parts.reduce((n, p) => n + p.cells, 0);
     const present = parts.reduce((n, p) => n + p.present, 0);
     const owned = parts.reduce((n, p) => n + p.owned, 0);
@@ -1191,7 +1209,7 @@ describe("STORY-063 · task generation engine", () => {
       }
     }
   }
-  const reset = (): Promise<unknown> => db.query("TRUNCATE tasks, metric_daily, answer_captures CASCADE");
+  const reset = (): Promise<unknown> => db.query("TRUNCATE tasks, metric_daily, answer_captures, capture_runs CASCADE");
 
   it("[STORY-063 #14 / AC3] Starter (weekly): a drop that holds in both of the last two runs, at the plan's real 30 cells a run, makes a task", async () => {
     await setPlan("starter");
@@ -1525,6 +1543,157 @@ describe("STORY-063 · task generation engine", () => {
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
+
+  // ---- round 8: only FINISHED, REPRESENTATIVE runs count, and "sustained" spans DATES ------------------------------------------------
+  //
+  // The hourly rollup enqueues task.generate while the next run is still being captured, and an outage leaves a run with a handful of
+  // measured cells. Neither is a run. A run's sample floor is relative to the run's own size (at least half the cells it planned for
+  // the engine) and to the plan's cadence (`ceil(min_n / runs expected in the window)`: 17 cells at Starter, 9 at Growth, 5 at Business).
+
+  it("[STORY-063 #2 / #15 / R8-A] Starter: ONE complete bad run plus the first 3 cells of the next run (still in progress at the hourly rollup) makes NO task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, sov: 0.2 }); // the one bad run
+    await metric(STARTER_ENGINE, D, { cells: 3, sov: 0, planned: 30, inProgress: true }); // 3 of 30 cells captured so far
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #2 / #15 / R8-A2] Starter: ONE bad run plus a finished run in which 27 of 30 cells FAILED (3 measured) makes NO task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 30, sov: 0.2 }); // the one bad run
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 3, sov: 0.1, planned: 30 }); // an outage run: 3 measured cells
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #2 / #15 / R8-B] Starter presence: ONE bad run plus a 3-cell in-progress fragment makes NO TG-PRESENCE-LOSS", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 27 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 27 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, D, { cells: 3, present: 0, planned: 30, inProgress: true });
+    await generate();
+    expect(await taskRows("TG-PRESENCE-LOSS")).toHaveLength(0);
+  });
+  it("[STORY-063 #2 / #15 / R8-C] Growth (14-day window): ONE complete bad run of 40 cells plus a 5-cell in-progress fragment of the next run makes NO task", async () => {
+    for (const offset of [24, 20, 16, 12, 8]) await metric("chatgpt", day(D, -offset), { cells: 40, sov: 0.4 });
+    await metric("chatgpt", day(D, -4), { cells: 40, sov: 0.2 });
+    await metric("chatgpt", D, { cells: 5, sov: 0, planned: 40, inProgress: true });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #2 / R8-control] Starter: the same bad run plus a 2-cell in-progress fragment makes no task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, sov: 0.2 });
+    await metric(STARTER_ENGINE, D, { cells: 2, sov: 0, planned: 30, inProgress: true });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #3 / #14 / R8-control] Starter: the same two bad runs fire once the newest run has FINISHED (an in-progress run is neither a run nor a breach, a finished one is both)", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, sov: 0.2 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 30, sov: 0.2 });
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+  });
+  it("[STORY-063 #2 / R8OWN-P1] Starter: one moderately bad full run plus a finished 3-measured-cell remnant (27 cells failed, planned 30) makes NO task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 11 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 3, present: 0 }); // planned defaults to the 3 it wrote: the cadence floor (17) alone rejects it
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #2 / R8OWN-P1b] Starter control: the same bad run plus a 3-cell run that does NOT drop makes NO task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 11 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 3, present: 2 });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #4 / #2] Starter: the cadence floor is 17 cells a run (30 / the 1.87 runs a 14-day window holds): a 16-cell second run is no run, a 17-cell one is", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 8 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 16, present: 4 });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+    await reset();
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 8 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 17, present: 4 });
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
+  });
+
+  /** Business: a bad day is 8 of 20 cells present against 18 of 20; the three most recent days are bad. */
+  async function businessDays(overrides: Readonly<Record<number, MetricSpec>>): Promise<void> {
+    await setPlan("business");
+    for (let i = 0; i <= 13; i += 1) await metric("chatgpt", day(D, -i), { cells: 20, present: i <= 6 ? 8 : 18, ...overrides[i] });
+  }
+  it("[STORY-063 #2 / #4] a run's floor is relative to ITS OWN size: a run that measured under half of what it planned is not a breach (Business: 6 of 20 planned), exactly half is", async () => {
+    await businessDays({ 1: { cells: 6, present: 2, planned: 20 } });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+    await reset();
+    await businessDays({ 1: { cells: 6, present: 2, planned: 12 } }); // 6 >= 12 / 2
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
+    await reset();
+    await businessDays({ 1: { cells: 6, present: 2, planned: 13 } }); // 6 < 13 / 2
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #2 / #15] Business: a bad run still in progress is neither a run nor a breach: two finished bad runs and an in-progress one make NO task", async () => {
+    await businessDays({ 0: { cells: 20, present: 8, inProgress: true } });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+
+  it("[STORY-063 #14 / #3] Growth keeps no 7-day window: its 1.87 runs a week make the window 14 days (owner decision 2026-10-19), and a drop in all three recent runs, 40 cells each, fires", async () => {
+    for (const offset of [24, 20, 16]) await metric("chatgpt", day(D, -offset), { cells: 40, sov: 0.4 });
+    for (const offset of [12, 8, 4]) await metric("chatgpt", day(D, -offset), { cells: 40, sov: 0.25 });
+    await generate();
+    const tasks = await taskRows();
+    expect(tasks.map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+    expect(tasks[0].description).toContain("last 14 days against the 14 days before");
+  });
+  it("[STORY-063 #2 / #15] Growth (14 days): one bad run of three makes NO task, the newest or the oldest of them", async () => {
+    for (const bad of [4, 12]) {
+      await reset();
+      for (const offset of [24, 20, 16]) await metric("chatgpt", day(D, -offset), { cells: 40, sov: 0.4 });
+      for (const offset of [12, 8, 4]) await metric("chatgpt", day(D, -offset), { cells: 40, sov: offset === bad ? 0.05 : 0.4 });
+      await generate();
+      expect(await taskRows()).toHaveLength(0);
+    }
+  });
+
+  // Sustained spans DATES. Enterprise holds 25 runs on every local date, so counting runs alone made 3 hours of one day "sustained".
+  it("[STORY-063 #2 / #15 / R8OWN-P2] Enterprise: ONE bad day (25 runs) among 14 good days makes NO task", async () => {
+    await enterpriseDays((i) => ({ present: i === 3 ? 5 : 45, sov: 0.4 }));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual([]);
+  }, 120_000);
+  it("[STORY-063 #2 / #15] Enterprise: TWO bad days make no task either (sustained is three distinct dates), and the same fall over THREE days does", async () => {
+    await enterpriseDays((i) => ({ present: i === 1 || i === 2 ? 5 : 45, sov: 0.4 }));
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+    await reset();
+    await enterpriseDays((i) => ({ present: i <= 2 ? 5 : 45, sov: 0.4 }));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
+  }, 240_000);
 
   // ---- a count is per measured CELL: a split or a resized run keeps its rate ---------------------------------------------------------
 
