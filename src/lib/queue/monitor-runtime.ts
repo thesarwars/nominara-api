@@ -10,6 +10,7 @@ import { ACTIVE_ENGINE_KEYS } from "../engines/registry.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { DlqDepthMonitor, defaultPager, type Pager } from "./dead-letter.js";
 import { tryWithGlobalQueueLock } from "./locks.js";
+import { emitOldestJobAges } from "./queue-age-monitor.js";
 
 // STORY-179 — drives DlqDepthMonitor (SLO-24) and BlackoutMonitor (EC-06), which existed with tests but were never
 // instantiated, so neither alert could fire in a running worker.
@@ -116,6 +117,8 @@ export interface MonitorRuntimeOptions {
   readonly readDlqDepths: () => Promise<ReadonlyMap<string, number>>;
   /** `db` is the locked election client: read on it, so the tick holds one pool connection. */
   readonly readLastSuccess: (engines: readonly EngineKey[], db: ClientBase) => Promise<ReadonlyMap<EngineKey, number | null>>;
+  /** STORY-030 AC8 — oldest waiting job age per interactive queue, in seconds (null: nothing waiting). Optional: absent means no age signal. */
+  readonly readOldestAges?: () => Promise<ReadonlyMap<string, number | null>>;
   readonly engines?: readonly EngineKey[];
   readonly pager?: Pager;
   readonly clock?: () => number;
@@ -129,6 +132,7 @@ export class MonitorRuntime {
   private readonly store: MonitorStateStore;
   private readonly readDlqDepths: MonitorRuntimeOptions["readDlqDepths"];
   private readonly readLastSuccess: MonitorRuntimeOptions["readLastSuccess"];
+  private readonly readOldestAges: MonitorRuntimeOptions["readOldestAges"];
   private readonly engines: readonly EngineKey[];
   private readonly pager: Pager;
   private readonly clock: () => number;
@@ -141,6 +145,7 @@ export class MonitorRuntime {
     this.store = options.store;
     this.readDlqDepths = options.readDlqDepths;
     this.readLastSuccess = options.readLastSuccess;
+    this.readOldestAges = options.readOldestAges;
     this.engines = options.engines ?? ACTIVE_ENGINE_KEYS;
     this.pager = options.pager ?? defaultPager;
     this.clock = options.clock ?? (() => Date.now());
@@ -235,6 +240,16 @@ export class MonitorRuntime {
     } catch (error) {
       outcome = "partial";
       logger.warn(`monitor: engine last-success unreadable this tick — not observed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (this.readOldestAges) {
+      try {
+        emitOldestJobAges(await this.readOldestAges());
+      } catch (error) {
+        // No line at all: an unreadable age must not be reported as a short one.
+        outcome = "partial";
+        logger.warn(`monitor: oldest-job ages unreadable this tick — not emitted: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
 
     try {

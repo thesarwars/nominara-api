@@ -31,7 +31,7 @@ function memoryStore(initial: MonitorState | null = null) {
   return { store, current: () => state };
 }
 
-function harness(options: { depths?: () => Promise<ReadonlyMap<string, number>>; lastSuccess?: (engines: readonly EngineKey[], db?: unknown) => Promise<ReadonlyMap<EngineKey, number | null>>; store?: MonitorStateStore } = {}) {
+function harness(options: { oldestAges?: () => Promise<ReadonlyMap<string, number | null>>; depths?: () => Promise<ReadonlyMap<string, number>>; lastSuccess?: (engines: readonly EngineKey[], db?: unknown) => Promise<ReadonlyMap<EngineKey, number | null>>; store?: MonitorStateStore } = {}) {
   const { pool, client } = fakePool();
   const nowRef = { now: 1_000_000_000 };
   const pages: Array<Record<string, unknown>> = [];
@@ -43,6 +43,7 @@ function harness(options: { depths?: () => Promise<ReadonlyMap<string, number>>;
     store: options.store ?? mem.store,
     readDlqDepths: options.depths ?? (async () => new Map(QUEUE_TOPOLOGY.map((entry) => [entry.name, entry.name === "capture.execute" ? depth.value : 0]))),
     readLastSuccess: options.lastSuccess ?? (async () => new Map([["chatgpt", nowRef.now]])),
+    ...(options.oldestAges ? { readOldestAges: options.oldestAges } : {}),
     engines: ["chatgpt"],
     pager,
     clock: () => nowRef.now,
@@ -189,6 +190,14 @@ describe("STORY-179 AC3 · tick lifecycle and failure handling", () => {
     expect(h.client.release).toHaveBeenCalledTimes(1);
   });
 
+  it("STORY-030 review · only the replica that wins the election reads and emits the age, so the series is not duplicated per replica", async () => {
+    const oldestAges = vi.fn(async () => new Map<string, number | null>([["lookup.execute", 4]]));
+    const h = harness({ oldestAges });
+    h.client.query.mockImplementation(async (sql: string) => ({ rows: /pg_try_advisory_xact_lock/.test(sql) ? [{ locked: false }] : [], rowCount: 0 }));
+    await h.runtime.tick();
+    expect(oldestAges).not.toHaveBeenCalled();
+  });
+
   it("STORY-179 review · a tick that starts while the previous one is still running does not check out a pool connection", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -225,5 +234,47 @@ describe("STORY-179 AC3 · tick lifecycle and failure handling", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("STORY-030 AC8 · the oldest-job-age signal rides the same tick", () => {
+  async function metricLines(run: () => Promise<void>): Promise<Array<Record<string, unknown>>> {
+    const { Logger } = await import("@nestjs/common");
+    const lines: Array<Record<string, unknown>> = [];
+    const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
+      if (typeof message === "object" && message !== null && (message as { metric?: string }).metric === "nominara_queue_oldest_job_age_seconds") {
+        lines.push(message as Record<string, unknown>);
+      }
+    });
+    try {
+      await run();
+    } finally {
+      spy.mockRestore();
+    }
+    return lines;
+  }
+
+  it("logs one structured line per queue per tick, with the queue name and no job data", async () => {
+    const h = harness({ oldestAges: async () => new Map([["lookup.execute", 4]]) });
+    const lines = await metricLines(() => h.runtime.tick());
+    expect(lines).toEqual([{ metric: "nominara_queue_oldest_job_age_seconds", value: 4, queue: "lookup.execute" }]);
+  });
+
+  it("an empty queue is logged as value 0 flagged empty, so an autoscaler reads 'no wait' and a reader can still tell it from a real 0s", async () => {
+    const h = harness({ oldestAges: async () => new Map([["lookup.execute", null]]) });
+    const lines = await metricLines(() => h.runtime.tick());
+    expect(lines).toEqual([{ metric: "nominara_queue_oldest_job_age_seconds", value: 0, queue: "lookup.execute", empty: true }]);
+  });
+
+  it("an unreadable age emits no line (absent is not 0), does not stop the monitors, and the tick is partial", async () => {
+    const h = harness({ oldestAges: async () => { throw new Error("valkey down"); } });
+    h.depth.value = 60;
+    const lines = await metricLines(async () => {
+      await h.runtime.tick();
+      h.nowRef.now += DLQ_DEPTH_SUSTAINED_MS;
+      await h.runtime.tick();
+    });
+    expect(lines).toEqual([]);
+    expect(h.pages).toHaveLength(1);
   });
 });
