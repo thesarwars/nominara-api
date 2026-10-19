@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import type { AuditChainRow } from "../../src/lib/crypto/audit-chain.js";
 import { AuditChainService, type AppendAuditRowInput } from "../../src/modules/audit/audit-chain.service.js";
-import type { AuditExportOptions, AuditExportSink } from "../../src/modules/audit/ports/export-sink.js";
+import type { AuditExportOptions, AuditExportRows, AuditExportSink } from "../../src/modules/audit/ports/export-sink.js";
 import { AUDIT_EXPORT_RETENTION_DAYS, runAuditExport } from "../../src/workers/rollup/audit-export.js";
 
 // STORY-020 Test Scenario 9 — "Run the export -> Object locked with the
@@ -15,10 +15,11 @@ import { AUDIT_EXPORT_RETENTION_DAYS, runAuditExport } from "../../src/workers/r
 class RecordingSink implements AuditExportSink {
   rows: readonly AuditChainRow[] = [];
   options: AuditExportOptions | null = null;
-  async export(rows: readonly AuditChainRow[], options: AuditExportOptions): Promise<string> {
-    this.rows = rows;
+  async export(rows: AuditExportRows, options: AuditExportOptions): Promise<string> {
+    const collected: AuditChainRow[] = [];
+    for await (const row of rows) collected.push(row);
+    this.rows = collected;
     this.options = options;
-    await Promise.resolve();
     return "recorded";
   }
 }

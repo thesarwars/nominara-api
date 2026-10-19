@@ -6,7 +6,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { RECHAINED_MARKER_ACTION, verifyChain } from "../../src/lib/crypto/audit-chain.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
 import { CHAIN_CHUNK_ROWS, chainChunkQueryText, readChainChunk } from "../../src/modules/audit/audit-log-reader.js";
-import { verifyWorkspaceChain } from "../../src/workers/rollup/audit-verify.js";
+import { verifyAndMarkWorkspaceChain, verifyWorkspaceChain } from "../../src/workers/rollup/audit-verify.js";
 
 // STORY-144 — the chain walk reads in keyset chunks instead of pulling a whole
 // chain into memory.
@@ -447,5 +447,97 @@ describe("STORY-144 · the chunked chain walk", () => {
     expect(text).not.toContain("Filter:");
     expect(text).not.toContain("Sort Key");
   }, 60_000);
-});
 
+  // -------------------------------------------------------------------------
+  // STORY-144 AC4 — "one snapshot, so a concurrent erasure cannot make the walk disagree with verifyChain".
+  // The code (REPEATABLE READ in audit-verify.ts) existed; nothing proved it. This commits a real-shaped erasure on a
+  // SECOND connection between two chunk reads.
+  // -------------------------------------------------------------------------
+
+  /**
+   * What `requestIndividualErasure` does to a chain, on its own connection and in its own committed transaction:
+   * rewrite a row's hashed content WITHOUT rehashing it, then append the rechaining marker that moves the strict
+   * zone past it. Committed before this returns.
+   */
+  async function commitErasureOnAnotherConnection(rewriteOffset: number): Promise<void> {
+    const other = new Client({ connectionString: container.getConnectionUri() });
+    await other.connect();
+    try {
+      await other.query("BEGIN");
+      await other.query("ALTER TABLE audit_log DISABLE TRIGGER reject_update_delete");
+      await other.query(
+        `UPDATE audit_log SET after_state = '{"erased":true}'::jsonb
+          WHERE seq = (SELECT seq FROM audit_log WHERE workspace_id = $1 ORDER BY seq ASC OFFSET $2 LIMIT 1)`,
+        [workspaceId, rewriteOffset],
+      );
+      await other.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
+      await service.append(other, {
+        workspaceId,
+        actorType: "system",
+        actorId: null,
+        actorIp: null,
+        actorUa: null,
+        action: RECHAINED_MARKER_ACTION,
+        resourceType: "audit_log",
+        resourceId: null,
+        beforeState: null,
+        afterState: { reason: "individual_erasure" },
+        requestId: randomUUID(),
+        supportGrantId: null,
+        severity: "notice",
+      });
+      await other.query("COMMIT");
+    } finally {
+      await other.end();
+    }
+  }
+
+  /** A client whose SECOND chunk read (the first continuing one, `seq > $2`) is preceded by `beforeSecondChunk`. */
+  function erasingBeforeSecondChunk(beforeSecondChunk: () => Promise<void>): { client: Client; fired: () => boolean } {
+    let fired = false;
+    const client = {
+      query: (async (text: unknown, params: unknown) => {
+        if (!fired && String(text).includes("audit_log.seq > $2")) {
+          fired = true;
+          await beforeSecondChunk();
+        }
+        return db.query(text as string, params as unknown[]);
+      }) as Client["query"],
+    } as unknown as Client;
+    return { client, fired: () => fired };
+  }
+
+  it("⚠ STORY-144 AC4 · an erasure committing between two chunks does not make the walk report a mismatch verifyChain does not", async () => {
+    await chain(6);
+    // The rewrite lands on a row the walk has NOT yet read (chunk size 1: only row 0 is behind it). Without a
+    // snapshot the second chunk sees rewritten content that no longer matches its row_hash.
+    const { client, fired } = erasingBeforeSecondChunk(() => commitErasureOnAnotherConnection(3));
+
+    const walked = await verifyWorkspaceChain(client, workspaceId, 1);
+
+    expect(fired(), "the erasure must actually have committed mid-walk").toBe(true);
+    // The oracle, over the post-erasure chain: the marker makes the rewritten row lenient, so it is clean.
+    expect(verifyChain(await allRows())).toBeNull();
+    expect(walked).toBeNull();
+  }, 60_000);
+
+  it("⚠ STORY-144 AC4 · the same holds for the walk that also writes the high-water mark", async () => {
+    await chain(6);
+    const { client, fired } = erasingBeforeSecondChunk(() => commitErasureOnAnotherConnection(3));
+
+    const result = await verifyAndMarkWorkspaceChain(client, workspaceId, 1);
+
+    expect(fired()).toBe(true);
+    expect(result.mismatch).toBeNull();
+  }, 60_000);
+
+  it("⚠ STORY-144 AC4 · a real tamper is still found under a concurrent erasure, and it is the SAME mismatch the pre-erasure chain gives", async () => {
+    await chain(6);
+    await tamperAt(2);
+    const before = verifyChain(await allRows());
+    expect(before).not.toBeNull();
+
+    const { client } = erasingBeforeSecondChunk(() => commitErasureOnAnotherConnection(4));
+    expect(await verifyWorkspaceChain(client, workspaceId, 1)).toEqual(before);
+  }, 60_000);
+});
