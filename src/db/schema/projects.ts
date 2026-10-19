@@ -96,4 +96,6 @@ export const projects = pgTable("projects", {
   cells30d: integer("cells_30d"),
   openTasksBySeverity: jsonb("open_tasks_by_severity").notNull().default(sql`'{"low": 0, "high": 0, "medium": 0, "critical": 0}'::jsonb`),
   demoSeededAt: timestamp("demo_seeded_at", { withTimezone: true }),
+  pausedByDowngradeAt: timestamp("paused_by_downgrade_at", { withTimezone: true }),
+  pausedByDowngradeFrom: text("paused_by_downgrade_from"),
 });
