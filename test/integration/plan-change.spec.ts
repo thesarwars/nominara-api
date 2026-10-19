@@ -66,16 +66,16 @@ describe("STORY-184 · in-app plan change", () => {
     expect(gateway.upgradeAttempts).toHaveLength(0);
   });
 
-  it("scenario 2 · a downgrade preview over the target's limits names the exact excess, newest projects first, and says blocked", async () => {
+  it("scenario 2 · a downgrade preview over the target's project limit names the exact excess, newest projects first, as paused at period end (STORY-077: not blocked)", async () => {
     const { workspaceId, owner } = await f.newWorkspace("business");
     const ids = await f.projects(workspaceId, 5); // oldest first: ids[4] is the newest
     const res = await f.post(owner, PREVIEW, { plan_key: "growth" });
     expect(res.statusCode, res.body).toBe(200);
     const preview = planChangePreviewResponseSchema.parse(dataOf(res));
-    expect(preview).toMatchObject({ direction: "downgrade", effective: "period_end", amount_due_now: "0.00", quote: null, blocked_by: "exceeds_limits", purchased_credits_kept: true });
+    expect(preview).toMatchObject({ direction: "downgrade", effective: "period_end", amount_due_now: "0.00", quote: null, blocked_by: null, purchased_credits_kept: true });
     expect(preview.effective_at).not.toBeNull();
     const structural = preview.exceeds.filter((e) => e.kind === "structural");
-    expect(structural).toEqual([{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, items: [{ id: ids[4], name: "P4" }, { id: ids[3], name: "P3" }] }]);
+    expect(structural).toEqual([{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", items: [{ id: ids[4], name: "P4" }, { id: ids[3], name: "P3" }] }]);
     expect(gateway.downgradeAttempts).toHaveLength(0);
   });
 
@@ -517,28 +517,37 @@ describe("STORY-184 · in-app plan change", () => {
     expect((await f.planOf(workspaceId)).plan_key).toBe("growth");
   });
 
-  it("scenario 10 · a downgrade above the target's limits is 409 downgrade_exceeds_limits with the EXACT list, and Stripe is never asked", async () => {
+  /** `n` more active members (seats), inserted directly: the seat count is all that is under test. */
+  async function seats(workspaceId: string, n: number): Promise<void> {
+    for (let i = 0; i < n; i++) {
+      const userId = await f.createUser();
+      await f.harness.db().query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1,$2,'viewer','active')", [workspaceId, userId]);
+    }
+  }
+
+  it("scenario 10 · a downgrade above a limit §14 does NOT pause (seats) is 409 downgrade_exceeds_limits with the EXACT list, and Stripe is never asked", async () => {
+    // STORY-077: projects and prompts no longer refuse (they pause at the cut-over); seats, competitors and API keys still do.
     const { workspaceId, owner } = await f.newWorkspace("business");
-    const ids = await f.projects(workspaceId, 5);
+    await seats(workspaceId, 7); // the owner + 7 = 8 seats; growth allows 7
     const res = await f.post(owner, CHANGE, { plan_key: "growth" });
     expect(res.statusCode).toBe(409);
     const error = errorOf(res);
     expect(error.code).toBe("conflict");
     expect(error.details).toEqual({
       reason: "downgrade_exceeds_limits",
-      excess: [{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, items: [{ id: ids[4], name: "P4" }, { id: ids[3], name: "P3" }] }],
+      excess: [{ kind: "structural", key: "seats.max", limit: 7, current: 8, excess: 1, effect: "must_reduce" }],
     });
     expect(gateway.downgradeAttempts).toHaveLength(0);
     expect(await f.intentOf(workspaceId)).toBeNull();
   });
 
-  it("scenario 10 · BOUNDARY: usage exactly at the target's limit downgrades; one over is refused", async () => {
+  it("scenario 10 · BOUNDARY: seats exactly at the target's limit downgrade; one over is refused", async () => {
     const { workspaceId, owner } = await f.newWorkspace("business");
-    await f.projects(workspaceId, 3);
+    await seats(workspaceId, 6);
     expect((await f.post(owner, CHANGE, { plan_key: "growth" })).statusCode).toBe(202);
     expect(gateway.downgrades).toHaveLength(1);
     const second = await f.newWorkspace("business");
-    await f.projects(second.workspaceId, 4);
+    await seats(second.workspaceId, 7);
     expect((await f.post(second.owner, CHANGE, { plan_key: "growth" })).statusCode).toBe(409);
   });
 
