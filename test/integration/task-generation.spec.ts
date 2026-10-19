@@ -108,6 +108,8 @@ describe("STORY-063 · task generation engine", () => {
     entityId?: string;
     /** The capture RUN the day's cells belong to. Rows sharing a key are ONE run (one run can straddle local midnight). Defaults to one run a day. */
     run?: string;
+    /** OTHER runs that put cells on the same local date (a manual deep scan beside a scheduled run): the date row is the blend of them all. */
+    alsoRuns?: readonly string[];
   }
   let runIds = new Map<string, string>();
 
@@ -117,17 +119,19 @@ describe("STORY-063 · task generation engine", () => {
     const entity = spec.entity ?? "brand";
     if (entity === "brand" && cells > 0) {
       // The generator counts capture RUNS (a date is not a run), so a day's facts carry the capture that produced them.
-      const key = `${engine}|${spec.run ?? date}`;
-      if (!runIds.has(key)) runIds.set(key, uuidV7());
-      const id = randomUUID();
-      await db.query(
-        `INSERT INTO answer_captures
-           (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,
-            normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'api','1.0.0','n1',$8,'{}'::jsonb,'{}','live','parsed',true)
-         ON CONFLICT DO NOTHING`,
-        [id, workspaceId, projectId, runIds.get(key), promptId, engine, `${date}T10:00:00Z`, createHash("sha256").update(id).digest()],
-      );
+      for (const run of [spec.run ?? date, ...(spec.alsoRuns ?? [])]) {
+        const key = `${engine}|${run}`;
+        if (!runIds.has(key)) runIds.set(key, uuidV7());
+        const id = randomUUID();
+        await db.query(
+          `INSERT INTO answer_captures
+             (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,
+              normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'api','1.0.0','n1',$8,'{}'::jsonb,'{}','live','parsed',true)
+           ON CONFLICT DO NOTHING`,
+          [id, workspaceId, projectId, runIds.get(key), promptId, engine, `${date}T10:00:00Z`, createHash("sha256").update(id).digest()],
+        );
+      }
     }
     await db.query(
       `INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date, cells_total, cells_present,
@@ -1352,6 +1356,71 @@ describe("STORY-063 · task generation engine", () => {
     await metric("chatgpt", day(D, -8), { cells: 20, sov: 0.4 });
     await generate();
     expect(await taskRows()).toHaveLength(0);
+  });
+
+  // ---- a run breaches from facts that are ITS OWN: a date two runs share is a blend, and breaches for neither -------------------------
+
+  it("[STORY-063 #15 / #2 / R6PROBE A] Starter: a good scheduled run and a BAD manual deep scan on the same local date make NO task (the blended date row is not either run's value)", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -14), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -21), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -7), { cells: 60, sov: 0.3, run: "scheduled", alsoRuns: ["deep-scan"] });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #15 / #2 / R6PROBE A mirror] Starter: a BAD scheduled run and a good manual deep scan on the same local date make NO task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -14), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -21), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -7), { cells: 60, sov: 0.3, run: "deep-scan", alsoRuns: ["scheduled"] });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #15 / #2 / REV6-A] Growth: a scheduled run plus a manual deep scan on one date, one of them bad, make NO task", async () => {
+    await metric("chatgpt", day(D, -11), { cells: 20, sov: 0.4 });
+    await metric("chatgpt", day(D, -8), { cells: 20, sov: 0.4 });
+    await metric("chatgpt", day(D, -3), { cells: 40, sov: 0.2, run: "scheduled", alsoRuns: ["manual"] });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #15 / #2 / REV6-B] Starter: a scheduled run plus a manual deep scan on one date, one of them bad, make NO task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 60, sov: 0.2, run: "scheduled", alsoRuns: ["manual"] });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #16 / #2 / REV6-C] Business: ONE bad full run straddling midnight over two daily priority runs makes NO task (three run ids, one bad run)", async () => {
+    await setPlan("business");
+    for (let i = 0; i <= 13; i += 1) {
+      const date = day(D, -i);
+      if (i === 4 || i === 3) await metric("chatgpt", date, { cells: 30, present: 18, run: date, alsoRuns: ["full"] }); // 20 priority cells + 10 of the full run's, none present
+      else if (i === 10) await metric("chatgpt", date, { cells: 40, present: 36, run: date, alsoRuns: ["full-good"] });
+      else await metric("chatgpt", date, { cells: 20, present: 18 });
+    }
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
+  });
+  it("[STORY-063 #14 / #3 / control] runs that share NO date still fire: a genuine drop in both scheduled runs and a deep scan on a date of its own", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, sov: 0.4 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 30, sov: 0.2 });
+    await metric(STARTER_ENGINE, day(D, -5), { cells: 30, sov: 0.2, run: "deep-scan" });
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-SOV-DROP-ENGINE"]);
+  });
+  it("[STORY-063 #16 / control] Business: genuine daily drops still fire although a full run shares two of the dates (the shared dates carry no evidence, the rest do)", async () => {
+    await setPlan("business");
+    for (let i = 0; i <= 13; i += 1) {
+      const date = day(D, -i);
+      const bad = i <= 6;
+      if (i === 4 || i === 3) await metric("chatgpt", date, { cells: 30, present: 12, run: date, alsoRuns: ["full"] });
+      else await metric("chatgpt", date, { cells: 20, present: bad ? 8 : 18 });
+    }
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toContain("TG-PRESENCE-LOSS");
   });
 
   // ---- a count is per measured CELL: a split or a resized run keeps its rate ---------------------------------------------------------

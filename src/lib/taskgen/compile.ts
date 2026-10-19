@@ -22,6 +22,17 @@ import { measurementStatusSql } from "../rollup/aggregate-day.js";
  * side, and the drop has to hold in both recent runs.
  *
  * No usable cadence (an engine the plan does not schedule, a malformed value) returns the rule's own window.
+ *
+ * "Keeps the rule's window" means the INTERVAL between runs (`CYCLE_DAYS / runs per cycle`) is no longer than `window_days`, not "two or
+ * more runs per 7 days" literally: Growth (8 runs, 3.75 days, 1.87 a week) keeps 7 days although a 7-day window can then hold one run,
+ * in which case no `metric_window` rule fires (it misses a drop; it never raises a false alarm). Owner confirmation of Growth at 7 days
+ * is OPEN (plans-7day/story-063-decisions.md, Round 6).
+ *
+ * KNOWN LIMIT: the most frequent KIND sets the interval. At Business that is `priority` (30 runs), which runs only the `is_priority`
+ * prompts, while `full` (4 runs) covers every prompt. A 7-day window can hold 0 or 1 full runs, so two compared windows may mix
+ * prompt sets and their per-cell rates move from composition alone when the priority subset is smaller than the prompt list, and a
+ * Business project with no priority prompts flagged runs weekly on a 7-day window. Prompt generation flags the top 50 by default,
+ * so the common case is the full list.
  */
 export function effectiveWindowDays(windowDays: number, cadence: unknown): number {
   if (typeof cadence !== "object" || cadence === null || Array.isArray(cadence)) return windowDays;
@@ -101,8 +112,16 @@ const CHANGE_SQL: Record<MetricWindowCondition["change"], Record<MetricWindowCon
  *    each on a date carrying the day floor, compared with the prior window's value. One heavy day or one bad run cannot carry the
  *    aggregate when there are runs to compare.
  *
+ * A RUN BREACHES FROM FACTS THAT ARE ITS OWN. A `metric_daily` row blends every run that put cells on that date (a manual deep scan
+ * beside a scheduled run; a Business full run beside a daily priority run; a straddler's tail beside the next run's head), so a
+ * bad run and a good one on one date make a row that is neither run's value, and breaching on it would credit BOTH runs for one bad
+ * sample. A date is therefore evidence only for the run that is ALONE on it (`date_runs.runs_on_date = 1`, over the engine's runs
+ * in the same measurement status, scoring version and timezone); a run with no date of its own breaches on nothing. The cost is
+ * recall, never a false alarm: a shared date can only hide a breach (the run still counts toward `current_runs`, so the sustain
+ * requirement does not shrink). The upgrade path is a per-run rate from `answer_captures` grouped by `run_id`.
+ *
  * `run_dates` reads one day MORE than the compared windows reach back, so a run that began just before them still has its true earliest date;
- * the `daily` CTE counts a date for every run of the CURRENT window (bucket 0) that put facts on it, a run once however many dates it touches.
+ * the `daily` CTE counts a date for every run of the CURRENT window (bucket 0) that put facts on it, a run once however many dates it touches, and only for a date no other run of the engine touches.
  *
  * Columns: `engine_key`, `n_current`, `n_prior`, `cur_value`, `prior_value`, `change_value` (a positive magnitude in the rule's unit).
  * A relative change needs a non-zero prior value; an empty or null window cannot fire.
@@ -151,6 +170,10 @@ WITH eng AS (
          (($2::date - min(run_date)) / span) AS bucket
     FROM run_dates
    GROUP BY engine_key, run_id, span
+), date_runs AS (
+  SELECT engine_key, run_date, (count(*))::int AS runs_on_date
+    FROM run_dates
+   GROUP BY engine_key, run_date
 ), runwin AS (
   SELECT engine_key, bucket, (count(*))::int AS runs
     FROM runs
@@ -177,6 +200,7 @@ WITH eng AS (
     FROM metric_daily d
     JOIN scored s ON s.engine_key = d.engine_key
     JOIN run_dates rd ON rd.engine_key = d.engine_key AND rd.run_date = d.metric_date
+    JOIN date_runs dr ON dr.engine_key = rd.engine_key AND dr.run_date = rd.run_date AND dr.runs_on_date = 1
     JOIN runs r ON r.engine_key = rd.engine_key AND r.run_id = rd.run_id AND r.bucket = 0
    WHERE d.project_id = $1::uuid
      AND d.entity_type = 'brand'
