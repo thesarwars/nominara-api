@@ -13,6 +13,7 @@ import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { chargeForActivation, inheritFirstActivation } from "../../lib/promptgen/activation-charge.js";
 import { insertPromptStatement } from "../../lib/promptgen/persist.js";
 import { promptTextHash } from "../../lib/promptgen/text-hash.js";
+import { assertActiveWithinLimits } from "./active-limit.js";
 import { assertProjectInScope } from "../../tenancy/project-scope.js";
 import { currentTenantStore, type TenantContext } from "../../tenancy/tenant-context.js";
 
@@ -269,10 +270,13 @@ export class PromptLifecycleService {
   /**
    * Refuses a transition that would take a slot the plan does not have.
    *
-   * `wouldTakeASlot` is the whole check: only a move OUT of `archived`
-   * changes occupancy, because `PROMPT_OCCUPIES_SLOT` treats `active` and
-   * `paused` identically. So `active -> paused` is free, `paused -> active`
-   * is free, and `archived -> anything else` is an activation.
+   * Two checks. `wouldTakeASlot`: only a move OUT of `archived` changes
+   * occupancy, because `PROMPT_OCCUPIES_SLOT` treats `active` and `paused`
+   * identically, so `archived -> anything else` is an activation. And a move
+   * INTO `active` must fit the ACTIVE count (STORY-077, active-limit.ts): a
+   * downgrade leaves more paused prompts than the cap, and `paused -> active`
+   * being free would undo the cut-over one PATCH at a time. `active -> paused`
+   * is always free.
    */
   private async assertStatusChangeAllowed(
     client: TenantClient,
@@ -281,16 +285,21 @@ export class PromptLifecycleService {
     next: "active" | "paused" | "archived",
   ): Promise<void> {
     const wouldTakeASlot = prompt.status === "archived" && next !== "archived";
-    if (!wouldTakeASlot) return;
+    if (wouldTakeASlot) {
+      const cap = await this.resolveLimit(workspaceId, "prompts.max_per_project");
+      const occupying = await this.countOccupying(client, prompt.project_id);
+      if (occupying + 1 > cap) {
+        throw new EntitlementExceededError({
+          message: `this plan allows ${String(cap)} active prompts per project`,
+          details: { key: "prompts.max_per_project", limit: cap, current: occupying },
+          remediation: { kind: "increase_limit", url: "/settings/billing" },
+        });
+      }
+    }
 
-    const cap = await this.resolveLimit(workspaceId, "prompts.max_per_project");
-    const occupying = await this.countOccupying(client, prompt.project_id);
-    if (occupying + 1 > cap) {
-      throw new EntitlementExceededError({
-        message: `this plan allows ${String(cap)} active prompts per project`,
-        details: { key: "prompts.max_per_project", limit: cap, current: occupying },
-        remediation: { kind: "increase_limit", url: "/settings/billing" },
-      });
+    if (next === "active" && prompt.status !== "active") {
+      const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
+      await assertActiveWithinLimits(client, { workspaceId, projectId: prompt.project_id, becomingActive: 1, entitlements: resolved.entitlements });
     }
   }
 

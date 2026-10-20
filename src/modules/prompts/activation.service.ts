@@ -19,6 +19,7 @@ import { chargeForActivation, quoteActivation, type ActivationCandidate } from "
 import { nextRunAfter } from "../../lib/capture/scheduler.js";
 import type { ProjectCadence } from "../../lib/capture/dispatch-cells.js";
 import { canonicalUuid } from "../../api/canonical-uuid.js";
+import { assertActiveWithinLimits } from "./active-limit.js";
 
 // STORY-046 — `POST /v1/projects/{id}/prompts/activate`.
 // plans-and-entitlements.md §10, api-specification.md §3.
@@ -172,11 +173,15 @@ export class PromptActivationService {
     const alreadyActive = prompts.filter((prompt) => prompt.status === "active");
     const toActivate = prompts.filter((prompt) => prompt.status !== "active");
 
+    // Only rows leaving `archived` take a NEW slot: a paused row already
+    // occupies one (`PROMPT_OCCUPIES_SLOT`), so counting it again refused a
+    // resume PATCH allows (STORY-077: the two doors apply one rule).
     // `activeBefore` can already exceed `cap` after a plan downgrade — the
     // error-details schema's own comment says so. `>` rather than arithmetic
     // on a possibly-negative remainder, so that case refuses cleanly instead
     // of letting a request through on a negative.
-    if (activeBefore + toActivate.length > cap) {
+    const takingSlots = toActivate.filter((prompt) => prompt.status === "archived").length;
+    if (takingSlots > 0 && activeBefore + takingSlots > cap) {
       throw new EntitlementExceededError({
         message: `this plan allows ${String(cap)} active prompts per project`,
         details: { key: "prompts.max_per_project", limit: cap, current: activeBefore },
@@ -187,6 +192,15 @@ export class PromptActivationService {
         remediation: { kind: "increase_limit", url: "/settings/billing" },
       });
     }
+
+    // STORY-077 — and every row becoming `active` must fit the ACTIVE count, per project and workspace-wide
+    // (active-limit.ts): a downgrade leaves paused prompts above the cap, and a resume must not undo the cut-over.
+    await assertActiveWithinLimits(client, {
+      workspaceId: store.context.workspaceId,
+      projectId,
+      becomingActive: toActivate.length,
+      entitlements: resolved.entitlements,
+    });
 
     if (toActivate.length > 0) {
       const autoTopup = autoTopupEnqueuerFor(this.producer);
@@ -230,7 +244,8 @@ export class PromptActivationService {
       );
     }
 
-    const activeAfter = activeBefore + toActivate.length;
+    // Slots occupied after this call (`prompts_active` counts `PROMPT_OCCUPIES_SLOT`): a resumed paused row held its slot already.
+    const activeAfter = activeBefore + takingSlots;
 
     // Owner decision 2026-10-09 pm #1: confirming the prompt set is the
     // activation event. Only an `initializing` project moves (a paused or
