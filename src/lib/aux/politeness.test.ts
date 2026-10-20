@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { PolitenessBudget, PolitenessCapReached, MIN_INTERVAL_MS, MAX_REQUESTS_PER_SECOND } from "./politeness.js";
+import {
+  PolitenessBudget,
+  PolitenessCapReached,
+  PolitenessDeadlineReached,
+  MIN_INTERVAL_MS,
+  MAX_REQUESTS_PER_SECOND,
+  MAX_CRAWL_DELAY_SECONDS,
+} from "./politeness.js";
 
 // STORY-049 AC7 / AC8 / scenarios 8 and 9 — the crawl's politeness budget: <= 2 requests per second per host, a 500 ms
 // minimum interval, the declared Crawl-delay honoured, and a hard stop. ONE budget is shared by every kind of request to
@@ -164,5 +171,72 @@ describe("STORY-049 AC7 · hard stop", () => {
     for (const hardCap of [Number.NaN, -1, 1.5, Number.POSITIVE_INFINITY]) {
       expect(() => budget(clock, { hardCap })).toThrow(/hard cap/i);
     }
+  });
+});
+
+// REVIEW FINDING (blocker) — the target's robots.txt is untrusted input and is read even for an UNVERIFIED project. An
+// unbounded Crawl-delay kept one crawl.audit job asleep for days inside an open tenant transaction. MAX_CRAWL_DELAY_SECONDS
+// and the wall-clock deadline are NOT FROM THE REFERENCE: they are safety bounds, and these tests are written from the
+// hostile value, not from the implementation.
+describe("politeness · a hostile Crawl-delay cannot pin a worker", () => {
+  it("the maximum honoured delay is a stated constant", () => {
+    expect(MAX_CRAWL_DELAY_SECONDS).toBe(10);
+  });
+
+  it.each([86_400, 1e9, 10.0001])("a declared Crawl-delay of %s is clamped to the maximum", async (seconds) => {
+    const clock = fakeClock();
+    const b = budget(clock, { crawlDelaySeconds: seconds });
+    expect(b.intervalMs).toBe(MAX_CRAWL_DELAY_SECONDS * 1000);
+    await b.acquire("site_file");
+    await b.acquire("site_file");
+    expect(clock.sleeps).toEqual([MAX_CRAWL_DELAY_SECONDS * 1000]);
+  });
+
+  it("a delay at or under the maximum is honoured exactly (the clamp does not lower it)", () => {
+    const clock = fakeClock();
+    expect(budget(clock, { crawlDelaySeconds: 10 }).intervalMs).toBe(10_000);
+    const b = budget(clock);
+    b.setCrawlDelay(1e9);
+    expect(b.intervalMs).toBe(10_000);
+  });
+
+  it("a whole crawl under a hostile delay finishes in bounded virtual time: the deadline stops it, without sleeping past it", async () => {
+    const clock = fakeClock();
+    const start = clock.now();
+    const b = budget(clock, { hardCap: 1_000, crawlDelaySeconds: 1e9, wallClockBudgetMs: 60_000 });
+    let granted = 0;
+    let stopped: unknown;
+    for (let i = 0; i < 1_000; i += 1) {
+      try {
+        await b.acquire("page");
+        granted += 1;
+      } catch (error) {
+        stopped = error;
+        break;
+      }
+    }
+    expect(stopped).toBeInstanceOf(PolitenessDeadlineReached);
+    expect(granted).toBe(7); // t = 0, 10, ... 60 s
+    expect(clock.now() - start).toBeLessThanOrEqual(60_000);
+    expect(b.used).toBe(7); // the refused request is not counted as made
+  });
+
+  it("the deadline is a distinct condition from the request cap, and is checked even for the first request", async () => {
+    const clock = fakeClock();
+    const b = budget(clock, { wallClockBudgetMs: 1_000 });
+    clock.advance(1_001); // the budget was spent before the first request was ever made
+    await expect(b.acquire("site_file")).rejects.toBeInstanceOf(PolitenessDeadlineReached);
+    expect(new PolitenessDeadlineReached(1)).not.toBeInstanceOf(PolitenessCapReached);
+  });
+
+  it("affordableRequests says how many more requests fit before the deadline at the current interval", () => {
+    const clock = fakeClock();
+    const b = budget(clock, { wallClockBudgetMs: 60_000, crawlDelaySeconds: 10 });
+    expect(b.affordableRequests()).toBe(7);
+    clock.advance(30_000);
+    expect(b.affordableRequests()).toBe(4);
+    clock.advance(1e9);
+    expect(b.affordableRequests()).toBe(0);
+    expect(budget(clock).affordableRequests()).toBe(Number.POSITIVE_INFINITY);
   });
 });

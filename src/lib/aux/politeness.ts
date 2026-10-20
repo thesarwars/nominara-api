@@ -17,6 +17,14 @@ export const MIN_INTERVAL_MS = 500;
 /** aux-and-geo-analysis.md §1: at most 2 requests per second per host. */
 export const MAX_REQUESTS_PER_SECOND = 2;
 
+/**
+ * NOT FROM THE REFERENCE. The reference says the crawl "honours Crawl-delay" and names no upper bound; robots.txt is
+ * untrusted input, read even for an unverified project, and an unbounded delay kept one crawl.audit job asleep for days
+ * inside an open tenant transaction. The honoured delay is clamped here; a longer declared value is treated as this.
+ * 10 s is already 20x the 500 ms floor. Provisional until the architect names a number.
+ */
+export const MAX_CRAWL_DELAY_SECONDS = 10;
+
 export type RequestKind = "site_file" | "page" | "probe";
 
 /** The hard cap is spent. A typed error, never a silent skip: the caller records what it did not fetch. */
@@ -27,11 +35,27 @@ export class PolitenessCapReached extends Error {
   }
 }
 
+/**
+ * The wall-clock budget for the whole crawl is spent. Distinct from `PolitenessCapReached` (the request count): the
+ * caller records what it did not fetch as `crawl_delay_budget`, not as the page cap.
+ */
+export class PolitenessDeadlineReached extends Error {
+  constructor(readonly budgetMs: number) {
+    super(`politeness: the ${String(budgetMs)} ms wall-clock budget for this crawl is spent`);
+    this.name = "PolitenessDeadlineReached";
+  }
+}
+
 export interface PolitenessOptions {
   /** The most requests of ALL kinds this crawl may make to the host. */
   readonly hardCap: number;
   /** The target's declared `Crawl-delay` in seconds, when robots.txt is already known. null/0 = none declared. */
   readonly crawlDelaySeconds?: number | null;
+  /**
+   * NOT FROM THE REFERENCE. The most wall-clock milliseconds, from construction, the crawl may take. A request that
+   * would START after it is refused with `PolitenessDeadlineReached` instead of slept for. Absent = unbounded (tests only).
+   */
+  readonly wallClockBudgetMs?: number;
   /** Milliseconds; injectable so the spec runs on a fake clock. */
   readonly now?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -44,6 +68,8 @@ export class PolitenessBudget {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private crawlDelayMs = 0;
+  private readonly deadline: number | null;
+  private readonly wallClockBudgetMs: number;
   private lastStart: number | null = null;
   private count = 0;
   private readonly byKind: Record<RequestKind, number> = { site_file: 0, page: 0, probe: 0 };
@@ -58,15 +84,18 @@ export class PolitenessBudget {
     this.hardCap = options.hardCap;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? realSleep;
+    this.wallClockBudgetMs = options.wallClockBudgetMs ?? Number.POSITIVE_INFINITY;
+    this.deadline = options.wallClockBudgetMs === undefined ? null : this.now() + options.wallClockBudgetMs;
     this.setCrawlDelay(options.crawlDelaySeconds ?? null);
   }
 
   /**
    * robots.txt is the FIRST request, so its `Crawl-delay` is only known after it: call this once it is parsed. An unusable
-   * value (negative, NaN, Infinity) is ignored; no declared delay can LOWER the 500 ms floor.
+   * value (negative, NaN, Infinity) is ignored; no declared delay can LOWER the 500 ms floor, and none can RAISE the
+   * interval above MAX_CRAWL_DELAY_SECONDS.
    */
   setCrawlDelay(seconds: number | null): void {
-    this.crawlDelayMs = seconds !== null && Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
+    this.crawlDelayMs = seconds !== null && Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, MAX_CRAWL_DELAY_SECONDS) * 1000 : 0;
   }
 
   get used(): number {
@@ -87,16 +116,27 @@ export class PolitenessBudget {
   }
 
   /**
+   * How many more requests can START before the deadline at the current interval; infinity with no deadline. An estimate
+   * (it ignores how long each response takes), used to shrink the page list up front; `acquire` is the backstop.
+   */
+  affordableRequests(): number {
+    if (this.deadline === null) return Number.POSITIVE_INFINITY;
+    const earliest = this.lastStart === null ? this.now() : Math.max(this.now(), this.lastStart + this.intervalMs);
+    if (earliest > this.deadline) return 0;
+    return 1 + Math.floor((this.deadline - earliest) / this.intervalMs);
+  }
+
+  /**
    * Resolves when the caller may send ONE request, having waited out the interval since the previous start. Throws
-   * `PolitenessCapReached` without waiting once the cap is spent; a refused request is not counted as made.
+   * `PolitenessCapReached` without waiting once the cap is spent, and `PolitenessDeadlineReached` without waiting when
+   * the wait would carry the request past the wall-clock deadline; a refused request is not counted as made.
    */
   acquire(kind: RequestKind): Promise<void> {
     const turn = this.tail.then(async () => {
       if (this.count >= this.hardCap) throw new PolitenessCapReached(this.hardCap);
-      if (this.lastStart !== null) {
-        const wait = this.lastStart + this.intervalMs - this.now();
-        if (wait > 0) await this.sleep(wait);
-      }
+      const wait = this.lastStart === null ? 0 : this.lastStart + this.intervalMs - this.now();
+      if (this.deadline !== null && this.now() + Math.max(wait, 0) > this.deadline) throw new PolitenessDeadlineReached(this.wallClockBudgetMs);
+      if (wait > 0) await this.sleep(wait);
       this.lastStart = this.now();
       this.count += 1;
       this.byKind[kind] += 1;
