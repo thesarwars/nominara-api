@@ -1,9 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { Client } from "pg";
+import { Client, Pool } from "pg";
+import type { ClientBase } from "pg";
 import type { Job } from "bullmq";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolvePassword } from "../../src/db/dev-credentials.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { TenantObjectStore } from "../../src/lib/storage/tenant-object-store.js";
+import type { ObjectStoragePort } from "../../src/lib/storage/storage.port.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { gunzipSync } from "node:zlib";
 import { createCrawlAuditHandler, type CrawlAuditDeps } from "../../src/lib/queue/handlers/crawl-audit.handler.js";
@@ -356,7 +362,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     const uas = requestedUas.map((r) => r.ua);
     expect(uas).toContain(BROWSER_PROBE_USER_AGENT);
     expect(uas).toContain(AGENT_PROBE_USER_AGENT);
-    expect((await manifestOf()).probe).toMatchObject({ outcome: "consistent", browserStatus: 200, agentStatus: 200 });
+    expect((await manifestOf()).probe).toMatchObject({ outcome: "consistent", browser_status: 200, agent_status: 200 });
   });
 
   it("STORY-049 AC8 · a WAF that refuses the agent UA but serves the browser is recorded as hostile", async () => {
@@ -365,7 +371,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     const deps = depsServing(served);
     const inner = deps.fetch!;
     await run(job(), { ...deps, fetch: async (url, init) => (init?.headers?.["user-agent"] === AGENT_PROBE_USER_AGENT ? { status: 403, headers: {}, body: Buffer.from("denied"), finalUrl: url } : inner(url, init)) });
-    expect((await manifestOf()).probe).toMatchObject({ outcome: "hostile", browserStatus: 200, agentStatus: 403 });
+    expect((await manifestOf()).probe).toMatchObject({ outcome: "hostile", browser_status: 200, agent_status: 403 });
   });
 
   it("STORY-049 AC7 · every request carries the identified NominaraBot user agent, the pages and the site files alike", async () => {
@@ -466,6 +472,10 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     await run(job(), deps);
     const [a] = await audits();
     expect(a.status).toBe("partial");
+    // REVIEW FINDING: a page whose plain copy IS stored is not "failed". It is counted apart, so a deployment with no
+    // renderer does not read as "every page failed".
+    expect(a).toMatchObject({ pages_crawled: 1, pages_failed: 0 });
+    expect(a.error_summary.pages_partial).toBe(1);
     expect(a.error_summary.failed_pages[0].failures).toEqual([{ stage: "rendered", reason: "renderer_unavailable", http_status: null }]);
     expect([...stored.keys()].some((k) => k.endsWith(".raw.html.gz"))).toBe(true);
     expect([...stored.keys()].some((k) => k.endsWith(".rendered.html.gz"))).toBe(false);
@@ -533,6 +543,139 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     await verifyDomain();
     await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
     expect(counters.filter((c) => c.name === "nominara_aux_crawl_pages_total").map((c) => c.labels.outcome)).toContain("ok");
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------
+  // REVIEW ROUND 1 — a hostile robots.txt, the open transaction, partial vs failed, and the runtime role
+  // ------------------------------------------------------------------------------------------------------------------
+  it.each(["86400", "1000000000"])(
+    "REVIEW · a robots.txt with Crawl-delay %s cannot pin the worker: the wait is clamped, the audit finishes in bounded virtual time, and what it did not fetch is recorded",
+    async (delay) => {
+      await verifyDomain();
+      const budgetMs = 100_000;
+      await run(job(), depsServing(withSitemap(SITEMAP_PAGES, `User-agent: *\nCrawl-delay: ${delay}\nAllow: /\n`), [], 10_000, { wallClockBudgetMs: budgetMs }));
+      const [a] = await audits();
+      expect(["completed", "partial"]).toContain(a.status);
+      expect(Math.max(...sleeps)).toBeLessThanOrEqual(10_000);
+      expect(clockMs).toBeLessThanOrEqual(budgetMs);
+      expect(a.error_summary.crawl_delay_limited).toEqual({ crawl_delay_seconds: 10, pages_skipped: 1 });
+      expect(a.error_summary.skipped_pages).toContainEqual({ url: expect.stringMatching(/^https:\/\/acme\.com\//), reason: "crawl_delay_budget" });
+      const skipped = (await manifestOf()).selection_skipped.filter((x) => x.reason === "crawl_delay_budget");
+      expect(skipped).toHaveLength(1);
+    },
+  );
+
+  it("REVIEW · an UNVERIFIED project is bounded too: robots.txt is read before any verification matters", async () => {
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nCrawl-delay: 86400\n"), [], 10_000, { wallClockBudgetMs: 100_000 }));
+    expect(Math.max(...sleeps)).toBeLessThanOrEqual(10_000);
+    expect(clockMs).toBeLessThanOrEqual(100_000);
+    expect((await audits())[0]!.status).not.toBe("running");
+  });
+
+  it("REVIEW · a budget too short for even the site files ends the audit instead of throwing out of the handler", async () => {
+    await verifyDomain();
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nCrawl-delay: 5\n"), [], 10_000, { wallClockBudgetMs: 6_000 }));
+    const [a] = await audits();
+    expect(["completed", "partial", "failed"]).toContain(a.status);
+    expect(clockMs).toBeLessThanOrEqual(6_000);
+  });
+
+  it("REVIEW · the transaction-local idle_in_transaction_session_timeout is set before the crawl begins, and does not outlive the transaction", async () => {
+    await verifyDomain();
+    const during: string[] = [];
+    const deps = depsServing(withSitemap(SITEMAP_PAGES));
+    const inner = deps.fetch!;
+    await db.query("BEGIN");
+    try {
+      await run(job(), {
+        ...deps,
+        fetch: async (url, init) => {
+          during.push((await db.query("SELECT current_setting('idle_in_transaction_session_timeout') AS v")).rows[0].v as string);
+          return inner(url, init);
+        },
+      });
+    } finally {
+      await db.query("COMMIT");
+    }
+    expect(during.length).toBeGreaterThan(0);
+    expect(new Set(during)).toEqual(new Set(["15min"]));
+    expect((await db.query("SELECT current_setting('idle_in_transaction_session_timeout') AS v")).rows[0].v).toBe("0");
+  });
+
+  it("REVIEW · a page that hangs is bounded by the same timeout as the site files, recorded as a timeout, and the crawl continues", async () => {
+    await verifyDomain();
+    const served = { ...withSitemap(SITEMAP_PAGES), "/pricing": "hang" } as Served;
+    await run(job(), depsServing(served, [], 50));
+    const [a] = await audits();
+    expect(a.error_summary.failed_pages).toContainEqual({ url: "https://acme.com/pricing", failures: [{ stage: "raw", reason: "timeout", http_status: null }] });
+    expect(rendered).toContain("https://acme.com/about");
+  });
+
+  it("REVIEW · pages_failed counts only pages with NO stored copy; a page with a stored plain copy and no rendered one is counted apart", async () => {
+    await verifyDomain();
+    const served = { ...withSitemap(SITEMAP_PAGES), "/pricing": { status: 500, body: "boom" } } as Served;
+    const deps = depsServing(served);
+    const { renderer: _none, ...noRenderer } = deps;
+    void _none;
+    await run(job(), noRenderer);
+    const [a] = await audits();
+    // root and /about: plain copy stored, render unavailable -> partial; /pricing: 500 -> failed
+    expect(a).toMatchObject({ status: "partial", pages_crawled: 2, pages_failed: 1 });
+    expect(a.error_summary.pages_partial).toBe(2);
+  });
+
+  describe("under the runtime role, with RLS in force", () => {
+    let pool: Pool;
+    beforeAll(async () => {
+      const password = resolvePassword("nominara_app", {});
+      await db.query(`ALTER ROLE nominara_app PASSWORD ${db.escapeLiteral(password)}`);
+      pool = new Pool({ host: container.getHost(), port: container.getMappedPort(5432), database: container.getDatabase(), user: "nominara_app", password });
+    });
+    afterAll(async () => { await pool.end(); });
+
+    const asTenant = async (workspace: string, fn: (tx: ClientBase) => Promise<unknown>): Promise<void> => {
+      const client = await pool.connect();
+      try {
+        await withTenantContext(client, { workspaceId: workspace, actorId: SYSTEM_ACTOR_ID }, fn);
+      } finally {
+        client.release();
+      }
+    };
+
+    it("REVIEW · authorisation reads domain_verifications under RLS: workspace B's verified row for the same domain does not widen A's scope", async () => {
+      const wsB = (await db.query("INSERT INTO workspaces (name, slug, plan_key) VALUES ('B','w-c9-b','free') RETURNING id")).rows[0].id as string;
+      const projectB = (await db.query(
+        "INSERT INTO projects (workspace_id, name, slug, root_url, root_domain) VALUES ($1,'PB','p-c9-b','https://acme.com','acme.com') RETURNING id", [wsB],
+      )).rows[0].id as string;
+      await db.query(
+        `INSERT INTO domain_verifications (id, workspace_id, project_id, domain, method, nonce, verified_at, last_checked_at)
+         VALUES ($1,$2,$3,'acme.com','dns_txt','nonce-b',now(),now())`, [randomUUID(), wsB, projectB],
+      );
+      const requested: string[] = [];
+      const j = job();
+      await asTenant(workspaceId, (tx) => createCrawlAuditHandler({ pool: {} as never, env: {} as never }, depsServing(withSitemap(SITEMAP_PAGES), requested))(tx, j));
+      const [a] = await audits();
+      expect(a).toMatchObject({ scope: "public_surface", workspace_id: workspaceId });
+      expect(requested).not.toContain("https://acme.com/pricing");
+      // and a verified A under the same role does get full scope
+      await verifyDomain();
+      await asTenant(workspaceId, (tx) => createCrawlAuditHandler({ pool: {} as never, env: {} as never }, depsServing(withSitemap(SITEMAP_PAGES)))(tx, job()));
+      expect((await audits()).at(-1)).toMatchObject({ scope: "key_pages", pages_crawled: 3 });
+    });
+
+    it("REVIEW · the tenant object store resolves the workspace from the tenant context at call time: every key lands under crawl/{env}/{workspace_id}/", async () => {
+      await verifyDomain();
+      const puts: string[] = [];
+      const port = { put: async (r: { key: string }) => { puts.push(r.key); } } as unknown as ObjectStoragePort;
+      const tenantStore = new TenantObjectStore(port, "test");
+      const deps = depsServing(withSitemap(SITEMAP_PAGES), [], 10_000, {
+        store: (relative, body, contentType) => tenantStore.put("crawl", relative, body, { contentType }),
+      });
+      await asTenant(workspaceId, (tx) => createCrawlAuditHandler({ pool: {} as never, env: {} as never }, deps)(tx, job()));
+      expect(puts.length).toBeGreaterThan(0);
+      for (const key of puts) expect(key.startsWith(`crawl/test/${workspaceId}/`)).toBe(true);
+      expect(puts.some((k) => k.endsWith("/manifest.json"))).toBe(true);
+    });
   });
 
   it("NEW-C-9 AC1.8 · the handler source adds no workspace_id predicate of its own", () => {

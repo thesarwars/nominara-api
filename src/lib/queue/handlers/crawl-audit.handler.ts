@@ -24,7 +24,7 @@ import {
 } from "../../aux/lifecycle.js";
 import { crawlPages, NOMINARA_USER_AGENT, type PageRecord } from "../../aux/page-crawl.js";
 import { pageCapForPlan, selectPages, type SelectionScope } from "../../aux/page-selection.js";
-import { PolitenessBudget } from "../../aux/politeness.js";
+import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "../../aux/politeness.js";
 import { unavailableRenderer, type Renderer } from "../../aux/renderer.js";
 import { CRAWL_AGENT, crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../../aux/robots.js";
 import { sanitiseText } from "../../aux/sanitise.js";
@@ -61,10 +61,30 @@ import type { JobProcessor } from "../worker-factory.js";
 //
 // THE TRANSACTION. This handler holds one tenant transaction across its fetches and stores, as it did before pages. A real
 // crawl makes that minutes long. Moving the network out of the transaction changes the worker-factory pattern, which is an
-// architectural decision, not something to slip into this story: it is raised in the story report.
+// architectural decision, not something to slip into this story: it is OPEN, and needs the architect before merge (see
+// docs/plans/docs-carry/STORY-049.md). Until it is made, the exposure is BOUNDED rather than accepted open-ended:
+//   - the honoured Crawl-delay is clamped (politeness.ts), so a hostile robots.txt cannot stretch the waits;
+//   - the whole crawl has a wall-clock budget (CRAWL_WALL_CLOCK_BUDGET_MS); a request that would start after it is refused,
+//     the page list is shrunk UP FRONT to what fits, and what was not fetched is recorded (`crawl_delay_limited`);
+//   - the transaction carries a transaction-local idle_in_transaction_session_timeout, a backstop above that budget so a
+//     wedged worker cannot hold a pooled connection indefinitely.
+// All three numbers are NOT FROM THE REFERENCE.
 
 export const RULE_VERSION = "2026.10.1";
 export const FETCH_TIMEOUT_MS = 10_000;
+/**
+ * NOT FROM THE REFERENCE. The wall-clock budget for one audit's requests to the target. An honest crawl is ~80 requests at
+ * 500 ms plus response time, i.e. about a minute; 10 minutes leaves an order of magnitude of slack and still ends a crawl
+ * that a slow or hostile target would stretch. Provisional until the architect names a number.
+ */
+export const CRAWL_WALL_CLOCK_BUDGET_MS = 10 * 60 * 1000;
+/**
+ * NOT FROM THE REFERENCE. The backstop for the open transaction: above the wall-clock budget plus one in-flight fetch and
+ * one render, so it fires only on a wedged worker, never on a crawl that is still within budget.
+ */
+export const IDLE_IN_TRANSACTION_TIMEOUT_MS = 15 * 60 * 1000;
+/** Requests held back for the differential probe when the page list is shrunk to the wall-clock budget. */
+const PROBE_REQUESTS = 2;
 /** aux-and-geo-analysis.md §1: a 500 ms minimum interval between requests to one host. */
 export { MIN_INTERVAL_MS as POLITENESS_INTERVAL_MS } from "../../aux/politeness.js";
 const TOKENIZER = "none"; // aux_audits.tokenizer is NOT NULL; no text is tokenised in this stage.
@@ -91,6 +111,8 @@ export interface CrawlAuditDeps {
   readonly store?: StoreFn;
   /** Overrides the plan's page cap. */
   readonly pageCap?: number;
+  /** Overrides CRAWL_WALL_CLOCK_BUDGET_MS; for tests. */
+  readonly wallClockBudgetMs?: number;
 }
 
 type Fetched = { readonly responded: true; readonly status: number; readonly file: SiteFile } | { readonly responded: false };
@@ -142,6 +164,19 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     }
   }
 
+  /** The same timeout, but the failure is THROWN so the page stage can record its reason (a refusal names its check, a timeout says so). */
+  async function boundedThrowing(url: string, init: GuardedFetchInit): Promise<GuardedResponse> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("crawl.audit: fetch timeout")), timeoutMs);
+      });
+      return await Promise.race([fetchOne(url, init), timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   const toFetched = (res: GuardedResponse | null): Fetched =>
     res === null
       ? { responded: false }
@@ -150,6 +185,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const startedMs = Date.now();
     const payload = crawlAuditJobPayloadSchema.parse((job.data as { payload: unknown }).payload);
+    // Transaction-local (`is_local => true`), so it ends with the job's transaction and never leaks to the pooled connection.
+    await tx.query("SELECT set_config('idle_in_transaction_session_timeout', $1, true)", [`${String(IDLE_IN_TRANSACTION_TIMEOUT_MS)}ms`]);
 
     const project = await tx.query<{ root_domain: string; root_url: string; plan_key: string }>(
       `SELECT p.root_domain, p.root_url, w.plan_key
@@ -209,15 +246,24 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // ONE budget for every request this audit makes to the host: site files, pages (both fetches) and both probe requests.
     // The hard cap is the arithmetic of what the audit may legitimately need: robots, two llms files, the sitemap files,
     // two fetches per page, and the two probe requests.
+    const wallClockBudgetMs = deps.wallClockBudgetMs ?? CRAWL_WALL_CLOCK_BUDGET_MS;
     const budget = new PolitenessBudget({
       hardCap: 3 + MAX_SITEMAP_FILES + 2 * pageCap + 2,
+      wallClockBudgetMs,
       ...(deps.nowMs === undefined ? {} : { now: deps.nowMs }),
       sleep,
     });
 
     // SITE FILES (step 2). Sequential, each charged to the budget.
     const siteFile = async (url: string): Promise<Fetched> => {
-      await budget.acquire("site_file");
+      try {
+        await budget.acquire("site_file");
+      } catch (error) {
+        // The wall-clock budget (or the cap) is spent: we did not ask, so there is no answer. Recorded like any
+        // other fetch that did not happen, never thrown out of the handler.
+        if (error instanceof PolitenessDeadlineReached || error instanceof PolitenessCapReached) return { responded: false };
+        throw error;
+      }
       return toFetched(await bounded(url));
     };
     const robots = await siteFile(urls.robots);
@@ -298,17 +344,26 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       targetUrls: payload.targetUrls ?? [],
     });
 
+    // THE WALL-CLOCK BUDGET, UP FRONT. Each page costs two requests (plain and rendered) at the interval now in force, which a
+    // hostile Crawl-delay has already stretched to its clamp. Shrink the list to what fits, and record what was not attempted.
+    const probeReserve = verified ? PROBE_REQUESTS : 0;
+    const affordablePages = Math.max(0, Math.floor((budget.affordableRequests() - probeReserve) / 2));
+    const delaySkipped = selection.urls.length > affordablePages ? selection.urls.slice(affordablePages) : [];
+    const pagesToCrawl = delaySkipped.length > 0 ? selection.urls.slice(0, affordablePages) : selection.urls;
+    const delaySkippedRecords = delaySkipped.map((u) => ({ url: sanitiseText(u, 2048), reason: "crawl_delay_budget" }));
+
     // RFC 9309: a robots.txt that errored (5xx, unreachable) means "assume disallow"; a 4xx means "no rules".
     const robotsForCrawl: ParsedRobots | "unavailable" | null =
       parsedRobots !== null ? parsedRobots : robots.responded && robots.status >= 400 && robots.status < 500 ? null : "unavailable";
     const keyPrefix = payload.auditId;
     const store = deps.store ?? defaultStore(context);
-    const crawl = await crawlPages(selection.urls, {
+    const crawl = await crawlPages(pagesToCrawl, {
       rootUrl,
       budget,
       robots: robotsForCrawl,
       renderer,
-      fetch: (url, init) => fetchOne(url, init),
+      // The same bounded timeout as every other fetch: a page that hangs must not hold the transaction for the guard's 20 s.
+      fetch: (url, init) => boundedThrowing(url, init),
       store,
       keyPrefix,
     });
@@ -321,20 +376,29 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       return `${u.pathname}${u.search}`;
     })();
     if (verified && robotsForCrawl !== "unavailable" && (robotsForCrawl === null || isAllowed(robotsForCrawl, CRAWL_AGENT, rootPath))) {
-      probe = await runDifferentialProbe({
-        url: new URL(rootUrl).href,
-        budget,
-        fetch: async (url, init) => {
-          const res = await bounded(url, init);
-          if (res === null) throw new Error("probe fetch failed");
-          return res;
-        },
-      });
+      try {
+        probe = await runDifferentialProbe({
+          url: new URL(rootUrl).href,
+          budget,
+          fetch: async (url, init) => {
+            const res = await bounded(url, init);
+            if (res === null) throw new Error("probe fetch failed");
+            return res;
+          },
+        });
+      } catch (error) {
+        // The wall-clock budget ran out between the two halves: a half probe proves nothing, so none is recorded as a result.
+        if (!(error instanceof PolitenessDeadlineReached || error instanceof PolitenessCapReached)) throw error;
+        probe = { outcome: "skipped_budget", browserStatus: null, agentStatus: null };
+      }
       incrementCounter("nominara_aux_crawl_probe_total", { outcome: probe.outcome });
     }
     const finishedAt = now();
 
+    // `failed`: no stored copy at all. `partial`: a copy is stored and something else (usually the rendered half) is not. They are
+    // reported apart, so a deployment with no renderer does not read as "every page failed"; both carry their reasons.
     const failedPages = crawl.pages.filter((p) => p.outcome === "failed" || p.outcome === "partial");
+    const partialPages = crawl.pages.filter((p) => p.outcome === "partial");
     const skippedPages = crawl.pages.filter((p) => p.outcome === "skipped");
     const pagesCrawled = crawl.pages.filter((p) => p.raw !== undefined).length;
     for (const p of crawl.pages) incrementCounter("nominara_aux_crawl_pages_total", { outcome: p.outcome });
@@ -348,9 +412,9 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       pages: crawl.pages.map(toManifestPage),
       pages_over_cap: selection.overCap,
       stopped_at_cap: crawl.stoppedAtCap,
-      selection_skipped: selection.skipped.map((x) => ({ url: sanitiseText(x.url, 2048), reason: x.reason })),
+      selection_skipped: [...selection.skipped.map((x) => ({ url: sanitiseText(x.url, 2048), reason: x.reason })), ...delaySkippedRecords],
       sitemap: { files_fetched: sitemapResult.filesFetched, total_seen: sitemapResult.totalSeen, sampled: sitemapResult.sampled, problems: sitemapProblems },
-      probe,
+      probe: probe === null ? null : { outcome: probe.outcome, browser_status: probe.browserStatus, agent_status: probe.agentStatus },
     });
     let domObjectPrefix: string | null = null;
     let manifestStored: boolean | null = null;
@@ -366,11 +430,17 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       }
     }
 
-    const pagesFailed = failedPages.length;
+    const pagesFailed = failedPages.length - partialPages.length;
     const summary: AuxErrorSummary = {
       ...(siteFilesFailed.length > 0 ? { site_files_failed: siteFilesFailed } : {}),
       ...(failedPages.length > 0 ? { failed_pages: failedPages.map((p) => ({ url: p.url, failures: p.failures })) } : {}),
-      ...(skippedPages.length > 0 ? { skipped_pages: skippedPages.map((p) => ({ url: p.url, reason: p.skipped_reason ?? "skipped" })) } : {}),
+      ...(skippedPages.length > 0 || delaySkippedRecords.length > 0
+        ? { skipped_pages: [...skippedPages.map((p) => ({ url: p.url, reason: p.skipped_reason ?? "skipped" })), ...delaySkippedRecords] }
+        : {}),
+      ...(partialPages.length > 0 ? { pages_partial: partialPages.length } : {}),
+      ...(delaySkippedRecords.length > 0 || crawl.stoppedAtDeadline
+        ? { crawl_delay_limited: { crawl_delay_seconds: budget.intervalMs / 1000, pages_skipped: delaySkippedRecords.length + skippedPages.filter((p) => p.skipped_reason === "crawl_delay_budget").length } }
+        : {}),
       ...(selection.overCap > 0 ? { pages_over_cap: selection.overCap } : {}),
       ...(crawl.stoppedAtCap ? { stopped_at_cap: true } : {}),
       ...(manifestStored === false ? { manifest_stored: false as const } : {}),
@@ -462,7 +532,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         ? false
         : null;
     const sitemapCount = sitemap.responded && sitemap.status >= 200 && sitemap.status < 300 ? sitemapResult.totalSeen : null;
-    const status = failed + pagesFailed > 0 || manifestStored === false ? "partial" : "completed";
+    const status = failed + pagesFailed + partialPages.length > 0 || manifestStored === false ? "partial" : "completed";
     const excluded = pagesCrawled > 0 ? RULES_NOT_RUN : EXCLUDED_RULES;
 
     await tx.query(
@@ -479,7 +549,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         robotsOk ? createHash("sha256").update(robots.file.body).digest() : null,
         llmsPresent, sitemapCount, capped, JSON.stringify({ crawler_access: subscore }),
         counts.critical, counts.high, counts.medium, counts.low, finishedAt,
-        [...new Set([...Object.values(urls), sitemapUrl, ...selection.urls])], [...excluded], domObjectPrefix, errorSummary,
+        [...new Set([...Object.values(urls), sitemapUrl, ...pagesToCrawl])], [...excluded], domObjectPrefix, errorSummary,
       ],
     );
 
@@ -493,6 +563,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       status,
       pages_crawled: pagesCrawled,
       pages_failed: pagesFailed,
+      pages_partial: partialPages.length,
       pages_skipped: skippedPages.length,
       site_files_failed: failed,
       requests: budget.used,
