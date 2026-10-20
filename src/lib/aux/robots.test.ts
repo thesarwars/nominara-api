@@ -79,3 +79,66 @@ describe("STORY-049 AC7 · robots.txt for the NominaraBot agent", () => {
     expect(sitemapUrlsOf(odd)).toEqual(["https://acme.com/ok.xml"]);
   });
 });
+
+// Review round 2 — a hostile robots.txt must not be able to freeze a worker. The matcher used to compile each
+// pattern into a backtracking regex, so `/*a*a*a*a*a*a*a*a*a*a*b` against a long run of `a` took exponential time on a
+// SYNCHRONOUS call (no timer, budget or lock renewal can interrupt it). Both inputs belong to the target site: the file
+// and, through sitemap <loc> entries and redirect Locations, the path.
+describe("STORY-049 · robots.txt matching is linear-time on hostile input", () => {
+  const timed = <T>(fn: () => T): { value: T; ms: number } => {
+    const start = performance.now();
+    const value = fn();
+    return { value, ms: performance.now() - start };
+  };
+  const PATHOLOGICAL = `/${"*a".repeat(12)}*b`;
+  const LONG_PATH = `/${"a".repeat(2048)}`;
+
+  it("a pathological wildcard pattern against a 2048-character path finishes in well under 50 ms and does not match", () => {
+    const parsed = parseRobots(`User-agent: *\nDisallow: ${PATHOLOGICAL}\n`);
+    const { value, ms } = timed(() => isAllowed(parsed, "NominaraBot", LONG_PATH));
+    expect(value).toBe(true); // no `b` anywhere: the rule does not match
+    expect(ms).toBeLessThan(50);
+  });
+
+  it("thousands of pathological rules against a long path stay bounded", () => {
+    const rules = Array.from({ length: 3000 }, () => `Disallow: ${PATHOLOGICAL}`).join("\n");
+    const parsed = parseRobots(`User-agent: *\n${rules}\n`);
+    const { ms } = timed(() => isAllowed(parsed, "NominaraBot", LONG_PATH));
+    expect(ms).toBeLessThan(500);
+  });
+
+  it("a multi-megabyte path (a hostile sitemap <loc> or redirect Location) is bounded too", () => {
+    const parsed = parseRobots(`User-agent: *\nDisallow: ${PATHOLOGICAL}\n`);
+    const { ms } = timed(() => isAllowed(parsed, "NominaraBot", `/${"a".repeat(2_000_000)}`));
+    expect(ms).toBeLessThan(100);
+  });
+
+  it("an over-long pattern is bounded as well", () => {
+    const parsed = parseRobots(`User-agent: *\nDisallow: /${"*a".repeat(200_000)}b\n`);
+    const { ms } = timed(() => isAllowed(parsed, "NominaraBot", LONG_PATH));
+    expect(ms).toBeLessThan(100);
+  });
+
+  // The behaviour the regex gave must survive the rewrite.
+  it.each([
+    ["/a*c", "/abc", false],
+    ["/a*c", "/ac", false],
+    ["/a*c", "/ab", true],
+    ["/*.pdf$", "/x/y.pdf", false],
+    ["/*.pdf$", "/x/y.pdf?x=1", true],
+    ["/*.pdf", "/x/y.pdf?x=1", false],
+    ["/private$", "/private", false],
+    ["/private$", "/private/x", true],
+    ["/a*b*c", "/a-b-c-d", false],
+    ["/a*b*c", "/a-c-b", true],
+    ["/a**b", "/ab", false],
+    ["/*", "/anything", false],
+    ["/*$", "/anything", false],
+    ["/a.b", "/axb", true],
+    ["/a+b", "/a+b", false],
+    ["/a*", "/a", false],
+  ] as const)("Disallow %s against %s: allowed=%s", (pattern, path, allowed) => {
+    expect(isAllowed(parseRobots(`User-agent: *\nDisallow: ${pattern}\n`), "NominaraBot", path)).toBe(allowed);
+  });
+});
+

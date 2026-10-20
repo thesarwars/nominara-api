@@ -69,11 +69,47 @@ export function parseRobots(body: string): ParsedRobots {
   return { groups, unparseable, sitemaps };
 }
 
-function patternRegex(pattern: string): RegExp {
-  const anchored = pattern.endsWith("$");
-  const core = anchored ? pattern.slice(0, -1) : pattern;
-  const source = core.split("*").map((p) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*");
-  return new RegExp(`^${source}${anchored ? "$" : ""}`);
+/**
+ * Bounds that keep matching cheap on hostile input. NOT FROM THE REFERENCE: chosen so one match is at most a few
+ * million character comparisons. A pattern longer than the cap is cut to it and treated as a plain prefix (a Disallow
+ * cut this way blocks a superset, which is the fail-closed side); a path longer than the cap is matched on its first
+ * MAX_MATCH_PATH_LENGTH characters, and cannot satisfy a `$` anchor (it does not end where the pattern says).
+ */
+export const MAX_PATTERN_LENGTH = 2048;
+export const MAX_MATCH_PATH_LENGTH = 4096;
+
+/**
+ * Does the robots pattern match the start of `path`? `*` is any run of characters, a trailing `$` anchors the end.
+ *
+ * LINEAR, NOT A REGEX. Translating `*` to `.*` and running a backtracking regex is exponential on
+ * `/*a*a*a*a*a*b` against a run of `a`, and it runs on the event loop where no timeout can reach it. Splitting on `*`
+ * and taking each literal piece at its FIRST occurrence after the previous one is correct for this grammar (the leftmost
+ * choice never rules out a later match) and costs at most pieces x path.
+ */
+function patternMatches(rawPattern: string, rawPath: string): boolean {
+  const cut = rawPattern.length > MAX_PATTERN_LENGTH;
+  const pattern = cut ? rawPattern.slice(0, MAX_PATTERN_LENGTH) : rawPattern;
+  const anchored = !cut && pattern.endsWith("$");
+  const pathCut = rawPath.length > MAX_MATCH_PATH_LENGTH;
+  if (anchored && pathCut) return false;
+  const path = pathCut ? rawPath.slice(0, MAX_MATCH_PATH_LENGTH) : rawPath;
+
+  const parts = (anchored ? pattern.slice(0, -1) : pattern).split(/\*+/);
+  const first = parts[0]!;
+  if (!path.startsWith(first)) return false;
+  if (parts.length === 1) return anchored ? path.length === first.length : true;
+
+  let position = first.length;
+  for (let i = 1; i < parts.length - 1; i += 1) {
+    const part = parts[i]!;
+    if (part === "") continue;
+    const found = path.indexOf(part, position);
+    if (found < 0) return false;
+    position = found + part.length;
+  }
+  const last = parts[parts.length - 1]!;
+  if (anchored) return path.length - last.length >= position && path.endsWith(last);
+  return last === "" || path.indexOf(last, position) >= 0;
 }
 
 /** The rule that decides `path` for the merged rules of an agent, or `null` when none matches. Longest pattern wins; a tie goes to Allow. */
@@ -82,7 +118,7 @@ function decidingRule(rules: readonly RobotsRule[], path: string): RobotsRule | 
   let best: RobotsRule | null = null;
   for (const rule of rules) {
     if (rule.pattern === "") continue;
-    if (!patternRegex(rule.pattern).test(target)) continue;
+    if (!patternMatches(rule.pattern, target)) continue;
     if (best === null || rule.pattern.length > best.pattern.length || (rule.pattern.length === best.pattern.length && rule.allow && !best.allow)) {
       best = rule;
     }

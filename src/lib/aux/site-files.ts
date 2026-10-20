@@ -1,6 +1,7 @@
 import type { SiteFileEvidence, SiteFileFinding } from "../../../contracts/aux/index.js";
 import { SITE_FILE_EVIDENCE_SNIPPET_MAX } from "../../../contracts/aux/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
+import { elementsOf, firstElement } from "./xml-scan.js";
 import { blockingRule, parseRobots, rulesFor, type RobotsRule } from "./robots.js";
 
 // NEW-C-8 (STORY-051 subset) — pure evaluators for the three site files:
@@ -219,14 +220,15 @@ export function evaluateSitemap(
   const { sitemapStaleDays, sitemapStaleRatio } = SITE_FILE_THRESHOLDS;
   let total = 0;
   const stale: { loc: string; lastmod: string }[] = [];
-  for (const m of file.body.matchAll(/<(url|sitemap)\b[^>]*>([\s\S]*?)<\/\1>/g)) {
+  // `elementsOf`, not a regex: a file of unclosed tags is quadratic under a lazy quantifier (see xml-scan.ts).
+  for (const block of [...elementsOf(file.body, "url"), ...elementsOf(file.body, "sitemap")]) {
     total += 1;
-    const lastmod = /<lastmod>\s*([^<]*?)\s*<\/lastmod>/.exec(m[2]!)?.[1];
-    if (lastmod === undefined) continue;
+    const lastmod = firstElement(block, "lastmod")?.trim();
+    if (lastmod === undefined || lastmod.includes("<")) continue; // a nested tag is not a date
     const t = Date.parse(lastmod);
     if (Number.isNaN(t)) continue;
     if (ctx.now.getTime() - t > sitemapStaleDays * DAY_MS) {
-      stale.push({ loc: /<loc>\s*([^<]*?)\s*<\/loc>/.exec(m[2]!)?.[1] ?? "", lastmod });
+      stale.push({ loc: firstElement(block, "loc")?.trim() ?? "", lastmod });
     }
   }
   if (total === 0) return [];

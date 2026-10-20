@@ -200,3 +200,42 @@ describe("STORY-049 AC4 · sitemap discovery", () => {
     expect(result.problems).toEqual([{ url: u("/sitemap.xml"), reason: "http_404" }]);
   });
 });
+
+// Review round 2 — the parser used to scan with lazy-quantifier regexes, so a file of UNCLOSED tags made every start
+// position scan to the end of the input: quadratic, about 11 minutes for a 5 MB file, on a synchronous call.
+describe("STORY-049 AC4 · a hostile sitemap cannot make the parser quadratic", () => {
+  const timed = async <T>(fn: () => Promise<T>): Promise<{ value: T; ms: number }> => {
+    const start = performance.now();
+    const value = await fn();
+    return { value, ms: performance.now() - start };
+  };
+  const collect = (body: string) =>
+    collectSitemap({ origin: ORIGIN, declared: [`${ORIGIN}/sitemap.xml`], fetch: serve({ [`${ORIGIN}/sitemap.xml`]: body }) });
+
+  it("2 MB of unclosed <url> tags in a urlset finishes in well under a second", async () => {
+    const { value, ms } = await timed(() => collect(`<urlset>${"<url>".repeat(400_000)}`));
+    expect(value.urls).toEqual([]);
+    expect(ms).toBeLessThan(500);
+  });
+
+  it("2 MB of unclosed <sitemap> tags in an index finishes in well under a second", async () => {
+    const { ms } = await timed(() => collect(`<sitemapindex>${"<sitemap>".repeat(250_000)}`));
+    expect(ms).toBeLessThan(500);
+  });
+
+  it("2 MB of unclosed <loc> tags INSIDE one <url> is linear too", async () => {
+    const { ms } = await timed(() => collect(`<urlset><url>${"<loc>".repeat(400_000)}</url></urlset>`));
+    expect(ms).toBeLessThan(500);
+  });
+
+  it("still reads the well-formed entries that precede the junk", async () => {
+    const { value } = await timed(() => collect(`<urlset><url><loc>${ORIGIN}/a</loc></url><url><loc>${ORIGIN}/b</loc></url>${"<url>".repeat(1000)}`));
+    expect(value.urls.map((u) => u.loc)).toEqual([`${ORIGIN}/a`, `${ORIGIN}/b`]);
+  });
+
+  it("a tag whose name merely STARTS with url (<urlx>) is not a <url>", async () => {
+    const { value } = await timed(() => collect(`<urlset><urlx><loc>${ORIGIN}/no</loc></urlx><url><loc>${ORIGIN}/yes</loc></url></urlset>`));
+    expect(value.urls.map((u) => u.loc)).toEqual([`${ORIGIN}/yes`]);
+  });
+});
+

@@ -1,6 +1,7 @@
 import { gunzipSync } from "node:zlib";
 import { MAX_RESPONSE_BYTES } from "../net/address-rules.js";
 import { toRegistrableDomain } from "../net/registrable-domain.js";
+import { elementsOf, firstElement } from "./xml-scan.js";
 
 // STORY-049 AC4 — the sitemap, with bounded index recursion and a sampling cap.
 //
@@ -77,9 +78,9 @@ function text(raw: string): string {
 }
 
 function tag(block: string, name: string): string | null {
-  const match = new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`).exec(block);
-  if (match === null) return null;
-  const value = text(match[1]!);
+  const inner = firstElement(block, name);
+  if (inner === null) return null;
+  const value = text(inner);
   return value === "" ? null : value;
 }
 
@@ -100,8 +101,8 @@ type Parsed =
 function parse(xml: string): Parsed {
   if (/<sitemapindex\b/.test(xml)) {
     const children: string[] = [];
-    for (const m of xml.matchAll(/<sitemap\b[^>]*>([\s\S]*?)<\/sitemap>/g)) {
-      const loc = tag(m[1]!, "loc");
+    for (const block of elementsOf(xml, "sitemap")) {
+      const loc = tag(block, "loc");
       if (loc !== null) children.push(loc);
     }
     return { kind: "index", children };
@@ -109,14 +110,14 @@ function parse(xml: string): Parsed {
   if (/<urlset\b/.test(xml)) {
     const entries: SitemapEntry[] = [];
     let seen = 0;
-    for (const m of xml.matchAll(/<url\b[^>]*>([\s\S]*?)<\/url>/g)) {
-      const loc = tag(m[1]!, "loc");
+    for (const block of elementsOf(xml, "url")) {
+      const loc = tag(block, "loc");
       if (loc === null) continue;
       seen += 1;
       if (seen > MAX_URLS_PER_FILE) break;
-      const priorityText = tag(m[1]!, "priority");
+      const priorityText = tag(block, "priority");
       const priority = priorityText === null ? null : Number(priorityText);
-      entries.push({ loc, lastmod: tag(m[1]!, "lastmod"), priority: priority !== null && Number.isFinite(priority) ? priority : null });
+      entries.push({ loc, lastmod: tag(block, "lastmod"), priority: priority !== null && Number.isFinite(priority) ? priority : null });
     }
     return { kind: "urlset", entries, seen };
   }
