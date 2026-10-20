@@ -177,7 +177,7 @@ describe("STORY-049 AC4 · sitemap discovery", () => {
   it("the number of files fetched is bounded, so an index of a million sitemaps cannot become a million requests", async () => {
     const children = Array.from({ length: MAX_SITEMAP_FILES + 30 }, (_, i) => u(`/c${String(i)}.xml`));
     const files: Files = { [u("/sitemap.xml")]: index(children) };
-    for (const c of children) files[c] = urlset([`${c}/page`]);
+    for (const c of children) files[c] = urlset([[c, "page"].join("/")]);
     const fetched: string[] = [];
     const result = await run(files, {}, fetched);
     expect(fetched).toHaveLength(MAX_SITEMAP_FILES);
