@@ -35,7 +35,7 @@ export interface ApplyCheckInput {
   readonly workspaceId: string;
   readonly projectId: string;
   readonly domain: string;
-  /** The row as the caller read it. */
+  /** The row as the caller read it: identifies it; its `verified_at` is NOT trusted (see the lock in `applyCheckOutcome`). */
   readonly row: VerificationRow;
   readonly outcome: CheckOutcome;
   readonly now: Date;
@@ -43,7 +43,15 @@ export interface ApplyCheckInput {
 
 export async function applyCheckOutcome(client: ClientBase, input: ApplyCheckInput): Promise<AppliedTransition> {
   const { row, outcome } = input;
-  const wasVerified = row.verified_at !== null;
+  // The prior state is read HERE, under a row lock held to the end of the caller's transaction, never taken from
+  // the caller's copy: that copy may have been read before a network wait during which another writer (the daily
+  // sweep, a second manual check) committed a loss, and trusting it would notify that loss twice.
+  const prior = await client.query<{ verified_at: Date | null }>(
+    "SELECT verified_at FROM domain_verifications WHERE id = $1 FOR UPDATE",
+    [row.id],
+  );
+  const priorVerifiedAt = prior.rows[0]?.verified_at ?? null;
+  const wasVerified = priorVerifiedAt !== null;
   const reason: VerificationFailure | null = outcome.ok ? null : outcome.reason;
 
   const updated = await client.query<VerificationRow>(
@@ -54,7 +62,7 @@ export async function applyCheckOutcome(client: ClientBase, input: ApplyCheckInp
     // Cleared on failure, not left standing: AC7's whole point is that a domain which stops verifying stops
     // being verified. Keeping the old timestamp would leave full scope in place on evidence that no longer
     // holds. On success an existing verified time is kept: it is when control was FIRST proved.
-    [row.id, outcome.ok ? (row.verified_at ?? input.now) : null, reason, input.now],
+    [row.id, outcome.ok ? (priorVerifiedAt ?? input.now) : null, reason, input.now],
   );
 
   // `projects.domain_verified_at` mirrors "any method currently verified". Denormalised deliberately: the

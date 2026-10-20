@@ -20,7 +20,19 @@ import {
 export const TXT_PREFIX = "nominara-verify=";
 export const META_TAG_NAME = "nominara-verify";
 
-export type CheckOutcome = { readonly ok: true } | { readonly ok: false; readonly reason: VerificationFailure };
+/**
+ * `inconclusive` marks a failure on OUR side of the wire (resolver outage, network error, timeout, 5xx/429), as
+ * opposed to the customer's proof being absent or wrong. The manual `/check` treats it as the failure it reports
+ * (the customer retries); the unattended re-verification must NOT read it as "the domain stopped verifying".
+ */
+export type CheckOutcome =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: VerificationFailure; readonly inconclusive?: true };
+
+const INCONCLUSIVE = true as const;
+
+/** Statuses that say "the server could not answer now", not "the file is not there". */
+const isTransientStatus = (status: number): boolean => status >= 500 || status === 429 || status === 408;
 
 export interface CheckDeps {
   /** TXT lookup. Separate from the guarded fetcher's `lookup`, which resolves A/AAAA only. */
@@ -58,12 +70,13 @@ export async function checkDnsTxt(domain: string, nonce: string, deps: CheckDeps
   let records: string[][];
   try {
     records = await deps.resolveTxt(dnsRecordName(domain));
-  } catch {
-    // ENOTFOUND and ENODATA both mean "no such record", which is the
-    // overwhelmingly common case and is actionable; a genuine resolver outage
-    // is indistinguishable here and reads the same to the customer, who should
-    // simply try again.
-    return { ok: false, reason: "record_absent" };
+  } catch (error) {
+    // ENOTFOUND and ENODATA both mean "no such record": conclusive absence. Anything else (ETIMEOUT, ESERVFAIL,
+    // ECONNREFUSED to the resolver) is a failure to ASK, not an answer, and is marked inconclusive so the
+    // periodic sweep cannot de-verify a fleet on one resolver outage. The customer-facing reason is unchanged.
+    const code = (error as { code?: unknown }).code ?? (error as Error).message;
+    if (code === "ENOTFOUND" || code === "ENODATA") return { ok: false, reason: "record_absent" };
+    return { ok: false, reason: "record_absent", inconclusive: INCONCLUSIVE };
   }
 
   // A TXT record arrives as an array of string CHUNKS — a value over 255 bytes
@@ -93,7 +106,7 @@ export async function checkWellKnownFile(domain: string, nonce: string, deps: Ch
     // fired would turn verification into the address oracle STORY-131 exists
     // to deny.
     if (error instanceof GuardedFetchRefusal) return { ok: false, reason: "fetch_refused" };
-    return { ok: false, reason: "file_absent" };
+    return { ok: false, reason: "file_absent", inconclusive: INCONCLUSIVE };
   }
 
   // Scenario 5 — a redirect is NOT proof. The file must be served by this
@@ -101,6 +114,7 @@ export async function checkWellKnownFile(domain: string, nonce: string, deps: Ch
   // of the domain being verified, and following it is how this check would
   // become forgeable.
   if (response.status >= 300 && response.status < 400) return { ok: false, reason: "file_redirected" };
+  if (isTransientStatus(response.status)) return { ok: false, reason: "file_absent", inconclusive: INCONCLUSIVE };
   if (response.status !== 200) return { ok: false, reason: "file_absent" };
 
   const body = response.body.toString("utf8").trim();
@@ -123,9 +137,10 @@ export async function checkMetaTag(domain: string, nonce: string, deps: CheckDep
     response = await deps.fetch(`https://${domain}/`);
   } catch (error) {
     if (error instanceof GuardedFetchRefusal) return { ok: false, reason: "fetch_refused" };
-    return { ok: false, reason: "tag_absent" };
+    return { ok: false, reason: "tag_absent", inconclusive: INCONCLUSIVE };
   }
 
+  if (isTransientStatus(response.status)) return { ok: false, reason: "tag_absent", inconclusive: INCONCLUSIVE };
   if (response.status !== 200) return { ok: false, reason: "tag_absent" };
 
   const html = response.body.toString("utf8");

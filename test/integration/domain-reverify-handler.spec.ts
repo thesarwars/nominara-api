@@ -12,6 +12,9 @@ import { handlerFor, type QueueHandlerContext } from "../../src/lib/queue/handle
 import { createDomainReverifyHandler, MIN_RECHECK_INTERVAL_MS } from "../../src/lib/queue/handlers/domain-reverify.handler.js";
 import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
 import { TXT_PREFIX, type CheckDeps } from "../../src/lib/verification/checkers.js";
+import { applyCheckOutcome, type VerificationRow } from "../../src/lib/verification/transition.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import type { Env } from "../../src/config/env.schema.js";
 
 // STORY-048 AC7 — the PERIODIC half. `domain.reverify` is the daily tick that re-checks every verified domain, so a
@@ -79,6 +82,7 @@ describe("STORY-048 AC7 · domain.reverify (periodic re-verification)", () => {
     counters.length = 0;
     exporter.reset();
     published = {};
+    resolverFails = {};
     resolveCalls = [];
     openTxDuringCheck = [];
   });
@@ -92,6 +96,8 @@ describe("STORY-048 AC7 · domain.reverify (periodic re-verification)", () => {
       );
       openTxDuringCheck.push(Number(open.rows[0]!.n));
       const domain = name.replace(/^_nominara-verify\./, "");
+      const failure = resolverFails[domain];
+      if (failure !== undefined) throw Object.assign(new Error(failure), { code: failure });
       const values = published[domain];
       if (values === undefined) throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" });
       return values.map((value) => [value]);
@@ -101,6 +107,8 @@ describe("STORY-048 AC7 · domain.reverify (periodic re-verification)", () => {
     },
   });
 
+  /** domain -> an error code the resolver throws instead of answering (our-side failure). */
+  let resolverFails: Record<string, string>;
   const run = async (overrides: Partial<Parameters<typeof createDomainReverifyHandler>[1]> = {}): Promise<unknown> => {
     const context = { pool, env } as unknown as QueueHandlerContext;
     return createDomainReverifyHandler(context, { checks: checks(), now: () => NOW, ...overrides })(db, tick());
@@ -260,6 +268,93 @@ describe("STORY-048 AC7 · domain.reverify (periodic re-verification)", () => {
     // every notification and audit row carries the workspace it was written for
     const stray = await db.query("SELECT 1 FROM notifications n JOIN projects p ON p.id = n.project_id WHERE p.workspace_id <> n.workspace_id");
     expect(stray.rows).toHaveLength(0);
+  });
+
+  it.each(["ETIMEOUT", "ESERVFAIL"])("AC7 · a resolver %s is OUR outage: scope kept, no notification, no audit row, the next run re-checks", async (code) => {
+    const s = await seed("outage");
+    resolverFails[s.domain] = code;
+    const first = await run();
+
+    const row = await verification(s);
+    expect(row.verified_at).not.toBeNull();
+    expect(new Date(row.last_checked_at).getTime()).toBe(NOW.getTime());
+    expect(await mirror(s)).not.toBeNull();
+    expect(await notifications(s)).toHaveLength(0);
+    expect(await auditRows(s)).toHaveLength(0);
+    expect(first).toMatchObject({ status: "complete", checked: 1, lost: 0, failed: 0 });
+    expect(counters.some((c) => c.name === "nominara_domain_reverify_checked_total" && c.labels.outcome === "inconclusive")).toBe(true);
+
+    // inside the interval nothing re-checks; once the interval passes the same domain is checked again, and this time the record is gone
+    delete resolverFails[s.domain];
+    await run();
+    expect(resolveCalls).toHaveLength(1);
+    const later = new Date(NOW.getTime() + MIN_RECHECK_INTERVAL_MS + 1000);
+    await run({ now: () => later });
+    expect(resolveCalls).toHaveLength(2);
+    expect((await verification(s)).verified_at).toBeNull();
+    expect(await notifications(s)).toHaveLength(1);
+  });
+
+  it("AC7 · an outcome computed before a newer manual check committed is discarded, not applied on stale evidence", async () => {
+    const s = await seed("stale");
+    // the manual check lands WHILE the sweep's check is in flight: it fails the domain at a time after the sweep began
+    const manualAt = new Date(NOW.getTime() + 5 * 60 * 1000);
+    const base = checks();
+    const interleaved: CheckDeps = {
+      ...base,
+      resolveTxt: async () => {
+        await db.query(
+          "UPDATE domain_verifications SET verified_at = NULL, last_checked_at = $2, failure_reason = 'record_absent' WHERE project_id = $1",
+          [s.project, manualAt],
+        );
+        return [[`${TXT_PREFIX}${s.nonce}-dns_txt`]]; // the sweep saw a good record at T0
+      },
+    };
+    await run({ checks: interleaved });
+    const row = await verification(s);
+    expect(row.verified_at).toBeNull(); // not re-verified on the older evidence
+    expect(new Date(row.last_checked_at).getTime()).toBe(manualAt.getTime());
+  });
+
+  it("NFR-SEC-01 · the write runs as nominara_app inside the row's own workspace context, not on the owner connection", async () => {
+    const a = await seed("rls-a");
+    await db.query("CREATE TABLE write_sessions (tbl text, usr text, ws text)");
+    await db.query(`CREATE FUNCTION note_session() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+      BEGIN INSERT INTO write_sessions VALUES (TG_TABLE_NAME, session_user, current_setting('app.current_workspace_id', true)); RETURN NEW; END $$`);
+    await db.query("CREATE TRIGGER note_dv BEFORE UPDATE ON domain_verifications FOR EACH ROW EXECUTE FUNCTION note_session()");
+    await db.query("CREATE TRIGGER note_pr BEFORE UPDATE ON projects FOR EACH ROW EXECUTE FUNCTION note_session()");
+    try {
+      await run();
+      const rows = (await db.query("SELECT tbl, usr, ws FROM write_sessions")).rows;
+      expect(rows.length).toBeGreaterThanOrEqual(2);
+      for (const r of rows) {
+        expect(r.usr).toBe("nominara_app");
+        expect(r.ws).toBe(a.ws);
+      }
+    } finally {
+      await db.query("DROP TRIGGER note_dv ON domain_verifications");
+      await db.query("DROP TRIGGER note_pr ON projects");
+      await db.query("DROP FUNCTION note_session()");
+      await db.query("DROP TABLE write_sessions");
+    }
+  });
+
+  it("AC7 · a manual check holding a STALE row cannot notify a loss the sweep already recorded", async () => {
+    const s = await seed("raced");
+    const stale = (await db.query("SELECT id, domain, method, nonce, verified_at, last_checked_at, failure_reason FROM domain_verifications WHERE project_id=$1", [s.project])).rows[0] as VerificationRow;
+    await run(); // the sweep records the loss and notifies once
+    expect(await notifications(s)).toHaveLength(1);
+
+    const client = await pool.connect();
+    try {
+      const applied = await withTenantContext(client, { workspaceId: s.ws, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+        applyCheckOutcome(tx, { workspaceId: s.ws, projectId: s.project, domain: s.domain, row: stale, outcome: { ok: false, reason: "record_absent" }, now: NOW }),
+      );
+      expect(applied.methodLost).toBe(false);
+    } finally {
+      client.release();
+    }
+    expect(await notifications(s)).toHaveLength(1);
   });
 
   it("KAD-06 · no transaction is open while a domain is being checked", async () => {

@@ -138,3 +138,44 @@ describe("STORY-048 · meta tag", () => {
     await expect(checkMetaTag("127.0.0.1", NONCE, d)).resolves.toEqual({ ok: false, reason: "fetch_refused" });
   });
 });
+
+// Review finding — a failure on OUR side is not evidence the customer removed the proof. The periodic sweep
+// must be able to tell the two apart, so every checker marks it `inconclusive`.
+describe("STORY-048 · inconclusive outcomes (our outage is not their absence)", () => {
+  const code = (c: string) => Object.assign(new Error(c), { code: c });
+
+  it.each(["ETIMEOUT", "ESERVFAIL", "ECONNREFUSED", "EREFUSED"])("a resolver %s is inconclusive", async (c) => {
+    const d = deps({ resolveTxt: vi.fn(async () => { throw code(c); }) });
+    await expect(checkDnsTxt(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "record_absent", inconclusive: true });
+  });
+
+  it.each(["ENOTFOUND", "ENODATA"])("a resolver %s is conclusive absence", async (c) => {
+    const d = deps({ resolveTxt: vi.fn(async () => { throw code(c); }) });
+    await expect(checkDnsTxt(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "record_absent" });
+  });
+
+  it("a network error or timeout fetching the file is inconclusive", async () => {
+    const d = deps({ fetch: vi.fn(async () => { throw new Error("socket hang up"); }) });
+    await expect(checkWellKnownFile(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "file_absent", inconclusive: true });
+  });
+
+  it.each([500, 502, 503, 429])("a %d fetching the file or tag is inconclusive", async (status) => {
+    await expect(checkWellKnownFile(DOMAIN, NONCE, deps({ fetch: serving(status, "") }))).resolves.toEqual({
+      ok: false, reason: "file_absent", inconclusive: true,
+    });
+    await expect(checkMetaTag(DOMAIN, NONCE, deps({ fetch: serving(status, "") }))).resolves.toEqual({
+      ok: false, reason: "tag_absent", inconclusive: true,
+    });
+  });
+
+  it("a network error fetching the root page is inconclusive", async () => {
+    const d = deps({ fetch: vi.fn(async () => { throw new Error("ETIMEDOUT"); }) });
+    await expect(checkMetaTag(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "tag_absent", inconclusive: true });
+  });
+
+  it("a 404 and a guard refusal stay conclusive", async () => {
+    await expect(checkMetaTag(DOMAIN, NONCE, deps({ fetch: serving(404, "") }))).resolves.toEqual({ ok: false, reason: "tag_absent" });
+    const refuse = deps({ fetch: vi.fn(async () => { throw new GuardedFetchRefusal("address_not_global"); }) });
+    await expect(checkMetaTag(DOMAIN, NONCE, refuse)).resolves.toEqual({ ok: false, reason: "fetch_refused" });
+  });
+});

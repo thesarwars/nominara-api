@@ -61,10 +61,11 @@ export function createDomainReverifyHandler(context: QueueHandlerContext, deps: 
           span.setAttribute("nominara.domain_reverify.checked", result.checked);
           span.setAttribute("nominara.domain_reverify.lost", result.lost);
           span.setAttribute("nominara.domain_reverify.failed", result.failed);
+          span.setAttribute("nominara.domain_reverify.inconclusive", result.inconclusive);
           incrementCounter("nominara_domain_reverify_runs_total", { status: result.status });
           for (let i = 0; i < result.lost; i += 1) incrementCounter("nominara_domain_reverify_lost_total");
           // Counts only — never a domain or an address.
-          logger.log({ event: "domain.reverify.run", status: result.status, checked: result.checked, lost: result.lost, failed: result.failed });
+          logger.log({ event: "domain.reverify.run", status: result.status, checked: result.checked, lost: result.lost, failed: result.failed, inconclusive: result.inconclusive });
           return result;
         } catch (error) {
           span.setStatus({ code: SpanStatusCode.ERROR });

@@ -18,8 +18,16 @@ import type { VerificationMethod } from "../../../contracts/projects/index.js";
 //
 // WHY THE CHECK IS OUTSIDE THE TRANSACTION. A DNS lookup or an HTTPS fetch of a customer's site can take
 // seconds; no handler holds a transaction open across an await on an external service (KAD-06). The outcome is
-// computed first and applied after, and `applyCheckOutcome` re-reads the row `FOR UPDATE` so a manual check
-// racing this one cannot make a loss notify twice.
+// computed first and applied after.
+//
+// RACES. `applyCheckOutcome` takes the row `FOR UPDATE` and works out the prior state itself, so whichever of
+// this sweep and a manual check commits first, the loss notifies exactly once. `DomainVerificationService.check`
+// does not lock before its network wait (that would hold a row lock across an external await, KAD-06); the lock
+// inside the transition is what makes it safe. An outcome computed BEFORE a newer check committed is discarded.
+//
+// OUR OUTAGE IS NOT THEIR ABSENCE. A resolver or network failure on our side (`inconclusive`) records the attempt
+// and changes nothing else: no scope change, no notification, no audit row. Without this one resolver outage at
+// 02:20 UTC would de-verify every DNS-verified domain in the fleet.
 
 const logger = new Logger("domain.reverify");
 
@@ -41,6 +49,8 @@ export interface ReverifyResult {
   readonly checked: number;
   readonly lost: number;
   readonly failed: number;
+  /** Checks that could not reach a verdict (our resolver/network): scope untouched, re-checked next run. */
+  readonly inconclusive: number;
 }
 
 interface Candidate {
@@ -74,16 +84,23 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
 
   let lost = 0;
   let failed = 0;
+  let inconclusive = 0;
   for (let start = 0; start < candidates.length; start += CHECK_CONCURRENCY) {
     const chunk = candidates.slice(start, start + CHECK_CONCURRENCY);
-    // No transaction is open here: this is the external wait.
+    // No transaction is open here: this is the external wait. Outcomes are only as fresh as this instant.
+    const checkStartedAt = deps.now();
     const outcomes = await Promise.all(
       chunk.map(async (candidate): Promise<CheckOutcome> => runCheck(candidate.method, candidate.domain, candidate.nonce, deps.checks)),
     );
     for (const [index, candidate] of chunk.entries()) {
       try {
-        if (await applyOne(pool, candidate, outcomes[index]!, now)) lost += 1;
-        incrementCounter("nominara_domain_reverify_checked_total", { outcome: outcomes[index]!.ok ? "verified" : "failed" });
+        const outcome = outcomes[index]!;
+        const isInconclusive = !outcome.ok && outcome.inconclusive === true;
+        if (isInconclusive) inconclusive += 1;
+        if (await applyOne(pool, candidate, outcome, now, checkStartedAt)) lost += 1;
+        incrementCounter("nominara_domain_reverify_checked_total", {
+          outcome: outcome.ok ? "verified" : isInconclusive ? "inconclusive" : "failed",
+        });
       } catch (error) {
         failed += 1;
         incrementCounter("nominara_domain_reverify_failures_total");
@@ -99,11 +116,17 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
     }
   }
 
-  return { status: failed === 0 ? "complete" : "partial", checked: candidates.length, lost, failed };
+  return { status: failed === 0 ? "complete" : "partial", checked: candidates.length, lost, failed, inconclusive };
 }
 
 /** Applies one outcome in the row's own tenant context. Returns true when the method stopped verifying. */
-async function applyOne(pool: Pool, candidate: Candidate, outcome: CheckOutcome, now: Date): Promise<boolean> {
+async function applyOne(
+  pool: Pool,
+  candidate: Candidate,
+  outcome: CheckOutcome,
+  now: Date,
+  checkStartedAt: Date,
+): Promise<boolean> {
   const client = await pool.connect();
   try {
     return await withTenantContext(client, { workspaceId: candidate.workspace_id, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
@@ -116,6 +139,13 @@ async function applyOne(pool: Pool, candidate: Candidate, outcome: CheckOutcome,
       );
       const row = locked.rows[0];
       if (row === undefined) return false;
+      // A newer check (a manual one) committed while ours was in flight: its evidence is fresher than ours.
+      if (row.last_checked_at !== null && row.last_checked_at.getTime() > checkStartedAt.getTime()) return false;
+      // Our side failed, not theirs: record that we looked and leave scope, mirror, inbox and audit alone.
+      if (!outcome.ok && outcome.inconclusive === true) {
+        await tx.query("UPDATE domain_verifications SET last_checked_at = $2 WHERE id = $1", [row.id, now]);
+        return false;
+      }
 
       const applied = await applyCheckOutcome(tx, {
         workspaceId: candidate.workspace_id,
