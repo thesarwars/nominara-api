@@ -264,24 +264,116 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     expect(marked.every((p) => p.status === "paused")).toBe(true);
   });
 
-  it("AC5 · a person resuming a downgrade-paused prompt makes it theirs: the marker is cleared, so billing no longer owns it", async () => {
+  /** PATCH /prompts/{id} as `actor`. */
+  const patchPrompt = (actor: Actor, promptId: string, payload: Record<string, unknown>) =>
+    harness.app().inject({
+      method: "PATCH",
+      url: apiUrl(`/prompts/${promptId}`),
+      cookies: f.cookies(actor),
+      headers: { [CSRF_HEADER_NAME]: actor.csrfToken, "content-type": "application/json", "idempotency-key": randomUUID() },
+      payload,
+    });
+
+  /** `count` prompts in `projectId` created `fromMinutesAgo`, `fromMinutesAgo - 1`, … minutes ago (oldest first). */
+  async function promptsAt(workspaceId: string, projectId: string, count: number, fromMinutesAgo: number): Promise<string[]> {
+    const ids: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const text = `prompt ${String(i)} ${randomUUID()}`;
+      const r = await db().query<{ id: string }>(
+        `INSERT INTO tracked_prompts (workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status, created_at)
+         VALUES ($1, $2, $3, sha256(convert_to($3, 'UTF8')), 'recommendation', 'consideration', 'active', now() - ($4 || ' minutes')::interval) RETURNING id`,
+        [workspaceId, projectId, text, String(fromMinutesAgo - i)],
+      );
+      ids.push(r.rows[0]!.id);
+    }
+    return ids;
+  }
+
+  // ⚠ THE HAZARD (review round 1, blocker): a downgrade now leaves a workspace holding MORE prompts than its cap, the
+  // excess paused. PATCH treated paused -> active as free (a paused prompt already occupies its slot), so one PATCH per
+  // prompt undid the cut-over and the workspace tracked above its plan. Resuming must fit the ACTIVE count under the
+  // resolved limits, on both doors, per project and workspace-wide.
+
+  it("AC5 · resuming a downgrade-paused prompt over the cap is REFUSED (403 entitlement_exceeded); after an archive frees room it resumes and becomes the person's", async () => {
     const { workspaceId, owner } = await f.newWorkspace("business");
     const ids = await f.projects(workspaceId, 1);
-    const ps = await prompts(workspaceId, ids[0]!, 41);
+    const ps = await prompts(workspaceId, ids[0]!, 41); // growth allows 40 per project
     spyEmail();
     await downgradeAtCutOver(workspaceId, owner, "growth");
     const newest = ps[40]!;
     expect((await promptRows(ids[0]!)).find((p) => p.id === newest)).toMatchObject({ status: "paused" });
 
     const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
-    const res = await harness.app().inject({
-      method: "PATCH",
-      url: apiUrl(`/prompts/${newest}`),
-      cookies: f.cookies(actor),
-      headers: { [CSRF_HEADER_NAME]: actor.csrfToken, "content-type": "application/json", "idempotency-key": randomUUID() },
-      payload: { status: "active" },
-    });
+    const refused = await patchPrompt(actor, newest, { status: "active" });
+    expect(refused.statusCode, refused.body).toBe(403);
+    expect(JSON.parse(refused.body)).toMatchObject({ error: { code: "entitlement_exceeded", details: { key: "prompts.max_per_project", limit: 40, current: 40 } } });
+    expect((await promptRows(ids[0]!)).find((p) => p.id === newest), "still the downgrade's").toMatchObject({ status: "paused" });
+    expect((await promptRows(ids[0]!)).find((p) => p.id === newest)!.paused_by_downgrade_at).not.toBeNull();
+
+    // The email's advice: archive one you no longer need, then resume the one you want.
+    expect((await patchPrompt(actor, ps[0]!, { status: "archived" })).statusCode).toBe(200);
+    const res = await patchPrompt(actor, newest, { status: "active" });
     expect(res.statusCode, res.body).toBe(200);
     expect((await promptRows(ids[0]!)).find((p) => p.id === newest)).toMatchObject({ status: "active", paused_by_downgrade_at: null });
+    expect((await promptRows(ids[0]!)).filter((p) => p.status === "active")).toHaveLength(40);
+  });
+
+  it("AC5 · POST .../prompts/activate applies the SAME rule: refused over the cap, allowed once an archive frees room", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const ids = await f.projects(workspaceId, 1);
+    const ps = await prompts(workspaceId, ids[0]!, 41);
+    spyEmail();
+    await downgradeAtCutOver(workspaceId, owner, "growth");
+    const newest = ps[40]!;
+
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    const refused = await f.post(actor, `/projects/${ids[0]!}/prompts/activate`, { prompt_ids: [newest] });
+    expect(refused.statusCode, refused.body).toBe(403);
+    expect(JSON.parse(refused.body)).toMatchObject({ error: { code: "entitlement_exceeded", details: { key: "prompts.max_per_project", limit: 40 } } });
+
+    expect((await patchPrompt(actor, ps[0]!, { status: "archived" })).statusCode).toBe(200);
+    const res = await f.post(actor, `/projects/${ids[0]!}/prompts/activate`, { prompt_ids: [newest] });
+    expect(res.statusCode, res.body).toBe(200);
+    expect((await promptRows(ids[0]!)).find((p) => p.id === newest)).toMatchObject({ status: "active", paused_by_downgrade_at: null });
+  });
+
+  it("AC5 · the WORKSPACE-WIDE cap (prompts.max_total) also binds a resume, on both doors, even when the project has room", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const ids = await f.projects(workspaceId, 4); // growth: 3 projects, 40 per project, 120 in total
+    // P0's last five are the NEWEST prompts in the workspace, so the max_total excess (125 - 120) lands in P0, an
+    // ACTIVE project with room under its own 40.
+    const p0 = [...(await promptsAt(workspaceId, ids[0]!, 35, 2000)), ...(await promptsAt(workspaceId, ids[0]!, 5, 5))];
+    await promptsAt(workspaceId, ids[1]!, 40, 1500);
+    await promptsAt(workspaceId, ids[2]!, 40, 1400);
+    await promptsAt(workspaceId, ids[3]!, 5, 1300);
+    spyEmail();
+    await downgradeAtCutOver(workspaceId, owner, "growth");
+    const paused = (await promptRows(ids[0]!)).filter((p) => p.paused_by_downgrade_at !== null).map((p) => p.id);
+    expect(paused).toEqual(p0.slice(35));
+
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    const viaPatch = await patchPrompt(actor, paused[0]!, { status: "active" });
+    expect(viaPatch.statusCode, viaPatch.body).toBe(403);
+    expect(JSON.parse(viaPatch.body)).toMatchObject({ error: { code: "entitlement_exceeded", details: { key: "prompts.max_total", limit: 120, current: 120 } } });
+    const viaActivate = await f.post(actor, `/projects/${ids[0]!}/prompts/activate`, { prompt_ids: [paused[0]!] });
+    expect(viaActivate.statusCode, viaActivate.body).toBe(403);
+    expect(JSON.parse(viaActivate.body)).toMatchObject({ error: { code: "entitlement_exceeded", details: { key: "prompts.max_total", limit: 120 } } });
+
+    expect((await patchPrompt(actor, p0[0]!, { status: "archived" })).statusCode).toBe(200);
+    expect((await patchPrompt(actor, paused[0]!, { status: "active" })).statusCode).toBe(200);
+  });
+
+  it("AC5 · a person's OWN pause cannot be resumed past the cap either (an over-limit workspace binds every resume, not only the downgrade's)", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const ids = await f.projects(workspaceId, 1);
+    await prompts(workspaceId, ids[0]!, 40);
+    const mine = (await prompts(workspaceId, ids[0]!, 1, "paused"))[0]!; // the newest, paused by a person: 41 occupy
+    spyEmail();
+    await downgradeAtCutOver(workspaceId, owner, "growth");
+    expect((await promptRows(ids[0]!)).find((p) => p.id === mine)).toMatchObject({ status: "paused", paused_by_downgrade_at: null });
+
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    const refused = await patchPrompt(actor, mine, { status: "active" });
+    expect(refused.statusCode, refused.body).toBe(403);
   });
 });
