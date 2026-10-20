@@ -5,10 +5,10 @@ const failure = { stage: "raw", reason: "http_500", http_status: 500 };
 
 describe("STORY-049 AC12 · aux_audits.error_summary (jsonb)", () => {
   it("records a crawl that the Crawl-delay or wall-clock budget limited, and the partial pages separately from the failed ones", () => {
-    const parsed = auxErrorSummarySchema.parse({ crawl_delay_limited: { crawl_delay_seconds: 10, pages_skipped: 4 }, pages_partial: 3 });
-    expect(parsed.crawl_delay_limited).toEqual({ crawl_delay_seconds: 10, pages_skipped: 4 });
+    const parsed = auxErrorSummarySchema.parse({ crawl_delay_limited: { crawl_delay_ms: 10_000, pages_skipped: 4 }, pages_partial: 3 });
+    expect(parsed.crawl_delay_limited).toEqual({ crawl_delay_ms: 10_000, pages_skipped: 4 });
     expect(parsed.pages_partial).toBe(3);
-    expect(auxErrorSummarySchema.safeParse({ crawl_delay_limited: { crawl_delay_seconds: 10 } }).success).toBe(false);
+    expect(auxErrorSummarySchema.safeParse({ crawl_delay_limited: { crawl_delay_ms: 10_000 } }).success).toBe(false);
   });
 
   it("accepts the all-unreachable shape the site-file stage already writes", () => {

@@ -47,7 +47,7 @@ export const auxErrorSummarySchema = z
      */
     crawl_delay_limited: z
       .object({
-        crawl_delay_seconds: z.number().min(0),
+        crawl_delay_ms: z.number().int().min(0),
         pages_skipped: z.number().int().min(0),
       })
       .strict()
