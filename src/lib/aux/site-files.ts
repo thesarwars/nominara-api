@@ -1,6 +1,7 @@
 import type { SiteFileEvidence, SiteFileFinding } from "../../../contracts/aux/index.js";
 import { SITE_FILE_EVIDENCE_SNIPPET_MAX } from "../../../contracts/aux/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
+import { blockingRule, parseRobots, rulesFor, type RobotsRule } from "./robots.js";
 
 // NEW-C-8 (STORY-051 subset) — pure evaluators for the three site files:
 // robots.txt (AUX-R-001, 002, 003), llms.txt (AUX-R-004) and the sitemap
@@ -72,87 +73,6 @@ function finding(
 // ---------------------------------------------------------------------------
 // robots.txt
 // ---------------------------------------------------------------------------
-
-interface RobotsRule {
-  readonly allow: boolean;
-  readonly pattern: string;
-  readonly line: number;
-  readonly text: string;
-}
-interface RobotsGroup {
-  readonly agents: string[];
-  readonly rules: RobotsRule[];
-}
-interface ParsedRobots {
-  readonly groups: RobotsGroup[];
-  readonly unparseable: { line: number; text: string }[];
-}
-
-const FIELD = /^[A-Za-z][A-Za-z0-9_-]*$/;
-
-function parseRobots(body: string): ParsedRobots {
-  const groups: RobotsGroup[] = [];
-  const unparseable: { line: number; text: string }[] = [];
-  let current: RobotsGroup | null = null;
-  let collectingAgents = false;
-  body.split(/\r?\n/).forEach((raw, i) => {
-    const text = raw.replace(/#.*$/, "").trim();
-    if (text === "") return;
-    const colon = text.indexOf(":");
-    const field = colon < 0 ? "" : text.slice(0, colon).trim();
-    if (colon < 0 || !FIELD.test(field)) {
-      unparseable.push({ line: i + 1, text: raw.trim() });
-      return;
-    }
-    const value = text.slice(colon + 1).trim();
-    const name = field.toLowerCase();
-    if (name === "user-agent") {
-      if (!collectingAgents || current === null) {
-        current = { agents: [], rules: [] };
-        groups.push(current);
-      }
-      current.agents.push(value.toLowerCase());
-      collectingAgents = true;
-      return;
-    }
-    collectingAgents = false;
-    if ((name === "allow" || name === "disallow") && current !== null) {
-      current.rules.push({ allow: name === "allow", pattern: value, line: i + 1, text: raw.trim() });
-    }
-  });
-  return { groups, unparseable };
-}
-
-function patternRegex(pattern: string): RegExp {
-  const anchored = pattern.endsWith("$");
-  const core = anchored ? pattern.slice(0, -1) : pattern;
-  const source = core.split("*").map((p) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*");
-  return new RegExp(`^${source}${anchored ? "$" : ""}`);
-}
-
-/** The rule that decides `path` for the merged rules of an agent, or `null` when none matches. Longest pattern wins; a tie goes to Allow. */
-function decidingRule(rules: readonly RobotsRule[], path: string): RobotsRule | null {
-  const target = path.startsWith("/") ? path : `/${path}`;
-  let best: RobotsRule | null = null;
-  for (const rule of rules) {
-    if (rule.pattern === "") continue;
-    if (!patternRegex(rule.pattern).test(target)) continue;
-    if (best === null || rule.pattern.length > best.pattern.length || (rule.pattern.length === best.pattern.length && rule.allow && !best.allow)) {
-      best = rule;
-    }
-  }
-  return best;
-}
-
-const blockingRule = (rules: readonly RobotsRule[], path: string): RobotsRule | null => {
-  const r = decidingRule(rules, path);
-  return r !== null && !r.allow ? r : null;
-};
-
-function rulesFor(parsed: ParsedRobots, agent: string): RobotsRule[] {
-  const key = agent.toLowerCase();
-  return parsed.groups.filter((g) => g.agents.includes(key)).flatMap((g) => g.rules);
-}
 
 /**
  * AUX-R-001 / 002 / 003 over `/robots.txt`. `trackedPaths` are the paths of
