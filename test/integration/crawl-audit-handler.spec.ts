@@ -431,6 +431,25 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(a.error_summary).toMatchObject({ skipped_pages: [{ url: "https://acme.com/pricing", reason: "robots_disallowed" }] });
   });
 
+  it("STORY-049 AC7 · a robots.txt that errors (5xx or unreachable) means NO page is fetched, and each is recorded as skipped (RFC 9309: assume disallow)", async () => {
+    await verifyDomain();
+    for (const robots of [{ status: 503, body: "" }, "throw" as const]) {
+      stored.clear();
+      const requested: string[] = [];
+      await run(job(), depsServing({ ...withSitemap(SITEMAP_PAGES), "/robots.txt": robots }, requested));
+      expect(requested.filter((u) => !/robots|llms|sitemap/.test(u))).toEqual([]);
+    }
+    const a = (await audits()).at(-1)!;
+    expect(a.error_summary.skipped_pages.map((p: { reason: string }) => p.reason)).toContain("robots_unavailable");
+  });
+
+  it("STORY-049 AC7 · a robots.txt that is simply absent (404) is not a prohibition: the pages are fetched", async () => {
+    await verifyDomain();
+    const requested: string[] = [];
+    await run(job(), depsServing({ ...withSitemap(SITEMAP_PAGES), "/robots.txt": { status: 404, body: "" } }, requested));
+    expect(requested).toContain("https://acme.com/pricing");
+  });
+
   it("STORY-049 scenario 11 · a page returning an error is recorded as failed with its reason, the audit CONTINUES and ends partial", async () => {
     await verifyDomain();
     const served = { ...withSitemap(SITEMAP_PAGES), "/pricing": { status: 500, body: "boom" } } as Served;
