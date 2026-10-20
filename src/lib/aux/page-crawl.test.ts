@@ -12,7 +12,7 @@ const sha = (b: Buffer | string): string => createHash("sha256").update(b).diges
 interface Harness {
   deps: PageCrawlDeps;
   budget: PolitenessBudget;
-  fetched: { url: string; headers: Record<string, string>; truncateAtCap: boolean | undefined }[];
+  fetched: { url: string; headers: Record<string, string>; truncateAtCap: boolean | undefined; followRedirect: ((next: string) => boolean) | undefined }[];
   stored: Map<string, Buffer>;
   sleeps: number[];
   rendered: string[];
@@ -27,6 +27,7 @@ function harness(
     store?: PageCrawlDeps["store"];
     renderTimeoutMs?: number;
     crawlDelaySeconds?: number;
+    wallClockBudgetMs?: number;
   } = {},
 ): Harness {
   let clock = 0;
@@ -34,6 +35,7 @@ function harness(
   const budget = new PolitenessBudget({
     hardCap: opts.hardCap ?? 100,
     crawlDelaySeconds: opts.crawlDelaySeconds ?? null,
+    ...(opts.wallClockBudgetMs === undefined ? {} : { wallClockBudgetMs: opts.wallClockBudgetMs }),
     now: () => clock,
     sleep: async (ms) => {
       sleeps.push(ms);
@@ -58,7 +60,7 @@ function harness(
     renderer,
     renderTimeoutMs: opts.renderTimeoutMs ?? 1000,
     fetch: async (url, init) => {
-      fetched.push({ url, headers: { ...init.headers }, truncateAtCap: init.truncateAtCap });
+      fetched.push({ url, headers: { ...init.headers }, truncateAtCap: init.truncateAtCap, followRedirect: init.followRedirect });
       const hit = (opts.pages ?? {})[new URL(url).pathname] ?? { status: 200, body: `<html>raw ${url}</html>` };
       if (hit === "refuse") throw new GuardedFetchRefusal("address_not_global");
       if (hit === "throw") throw new Error("connect ECONNREFUSED 10.0.0.5:443");
@@ -230,6 +232,58 @@ describe("STORY-049 · crawlPages", () => {
 
   it("no pages selected is an empty crawl, not an error", async () => {
     const h = harness();
-    expect(await crawlPages([], h.deps)).toEqual({ pages: [], stoppedAtCap: false });
+    expect(await crawlPages([], h.deps)).toEqual({ pages: [], stoppedAtCap: false, stoppedAtDeadline: false });
+  });
+
+  // REVIEW FINDINGS — robots.txt was checked only against the URL as SELECTED, and redirects went anywhere public first.
+  it("a page that redirects into a path robots.txt disallows is discarded: not stored, not rendered, recorded", async () => {
+    const h = harness({
+      robots: parseRobots("User-agent: *\nDisallow: /private\n"),
+      pages: { "/a": { status: 200, body: "<html>secret</html>", finalUrl: "https://acme.com/private/x" } },
+    });
+    const { pages } = await crawlPages(["https://acme.com/a"], h.deps);
+    expect(pages[0]).toMatchObject({ outcome: "failed", failures: [{ stage: "raw", reason: "robots_disallowed_after_redirect", http_status: 200 }] });
+    expect(pages[0]!.raw).toBeUndefined();
+    expect(h.stored.size).toBe(0);
+    expect(h.rendered).toEqual([]);
+  });
+
+  it("a redirect that lands on an ALLOWED path of the same site is kept", async () => {
+    const h = harness({
+      robots: parseRobots("User-agent: *\nDisallow: /private\n"),
+      pages: { "/a": { status: 200, finalUrl: "https://acme.com/public/x" } },
+    });
+    const { pages } = await crawlPages(["https://acme.com/a"], h.deps);
+    expect(pages[0]!.outcome).toBe("ok");
+  });
+
+  it("each redirect hop is vetted BEFORE it is requested: off-site and robots-disallowed hops are vetoed, an allowed same-site hop is not", async () => {
+    const h = harness({ robots: parseRobots("User-agent: *\nDisallow: /private\n") });
+    await crawlPages(["https://acme.com/a"], h.deps);
+    const follow = h.fetched[0]!.followRedirect!;
+    expect(follow).toBeTypeOf("function");
+    expect(follow("https://acme.com/elsewhere")).toBe(true);
+    expect(follow("https://www.acme.com/elsewhere")).toBe(true);
+    expect(follow("https://third-party.example/x")).toBe(false);
+    expect(follow("https://acme.com/private/x")).toBe(false);
+  });
+
+  it("a redirect the guard did not follow is recorded as such, not as a page", async () => {
+    const h = harness({ pages: { "/a": { status: 302, body: "" } } });
+    const { pages } = await crawlPages(["https://acme.com/a"], h.deps);
+    expect(pages[0]).toMatchObject({ outcome: "failed", failures: [{ stage: "raw", reason: "redirect_not_followed", http_status: 302 }] });
+  });
+
+  it("a crawl that runs out of wall-clock budget skips the rest as crawl_delay_budget, finishing in bounded virtual time", async () => {
+    const h = harness({ crawlDelaySeconds: 1e9, wallClockBudgetMs: 25_000 });
+    const urls = Array.from({ length: 10 }, (_, i) => `https://acme.com/p${String(i)}`);
+    const result = await crawlPages(urls, h.deps);
+    expect(result.stoppedAtDeadline).toBe(true);
+    expect(result.stoppedAtCap).toBe(false);
+    // t = 0, 10 s, 20 s: three requests, i.e. one page (raw + rendered) and the raw fetch of the next
+    expect(h.budget.used).toBe(3);
+    expect(h.sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(25_000);
+    expect(result.pages.filter((p) => p.outcome === "skipped").every((p) => p.skipped_reason === "crawl_delay_budget")).toBe(true);
+    expect(result.pages).toHaveLength(10);
   });
 });

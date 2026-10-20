@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { GuardedFetchRefusal, type GuardedFetchInit, type GuardedResponse } from "../net/guarded-fetch.js";
 import { toRegistrableDomain } from "../net/registrable-domain.js";
-import { PolitenessBudget, PolitenessCapReached } from "./politeness.js";
+import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "./politeness.js";
 import { createRenderRequestGuard, RendererUnavailable, type Renderer } from "./renderer.js";
 import { CRAWL_AGENT, isAllowed, type ParsedRobots } from "./robots.js";
 import { sanitiseText } from "./sanitise.js";
@@ -27,7 +27,8 @@ const MAX_URL_CHARS = 2048;
 
 export type PageStage = "raw" | "rendered" | "store";
 export type PageOutcome = "ok" | "partial" | "failed" | "skipped";
-export type SkippedPageReason = "robots_disallowed" | "robots_unavailable" | "page_cap_reached";
+/** `crawl_delay_budget`: the wall-clock budget (NOT FROM THE REFERENCE) ran out under the target's Crawl-delay. */
+export type SkippedPageReason = "robots_disallowed" | "robots_unavailable" | "page_cap_reached" | "crawl_delay_budget";
 
 export interface StoredCopy {
   readonly object_key: string;
@@ -75,6 +76,8 @@ export interface PageCrawlResult {
   readonly pages: PageRecord[];
   /** True when the politeness hard cap ended the crawl early. */
   readonly stoppedAtCap: boolean;
+  /** True when the wall-clock budget ended the crawl early. Distinct from the cap: the pages are skipped as `crawl_delay_budget`. */
+  readonly stoppedAtDeadline: boolean;
 }
 
 const sha256 = (b: Buffer | string): string => createHash("sha256").update(b).digest("hex");
@@ -82,6 +85,18 @@ const sha256 = (b: Buffer | string): string => createHash("sha256").update(b).di
 function sameSite(a: string, b: string): boolean {
   try {
     return toRegistrableDomain(a) === toRegistrableDomain(b);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether our own robots rules let NominaraBot fetch `url`. null = no robots.txt to obey; "unavailable" is handled before any fetch. */
+function robotsAllows(robots: ParsedRobots | "unavailable" | null, url: string): boolean {
+  if (robots === null) return true;
+  if (robots === "unavailable") return false;
+  try {
+    const parsed = new URL(url);
+    return isAllowed(robots, CRAWL_AGENT, `${parsed.pathname}${parsed.search}`);
   } catch {
     return false;
   }
@@ -96,6 +111,7 @@ function fetchFailureReason(error: unknown): string {
 export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): Promise<PageCrawlResult> {
   const pages: PageRecord[] = [];
   let stoppedAtCap = false;
+  let stoppedAtDeadline = false;
   const renderTimeoutMs = deps.renderTimeoutMs ?? RENDER_TIMEOUT_MS;
 
   for (const rawUrl of urls) {
@@ -104,6 +120,10 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
       pages.push({ url, outcome: "skipped", failures: [], skipped_reason: reason });
     };
 
+    if (stoppedAtDeadline) {
+      skip("crawl_delay_budget");
+      continue;
+    }
     if (stoppedAtCap) {
       skip("page_cap_reached");
       continue;
@@ -139,9 +159,20 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
     let rawOk = false;
     try {
       await deps.budget.acquire("page");
-      const response = await deps.fetch(rawUrl, { headers: { "user-agent": NOMINARA_USER_AGENT }, truncateAtCap: true });
-      if (!sameSite(response.finalUrl, deps.rootUrl)) {
+      const response = await deps.fetch(rawUrl, {
+        headers: { "user-agent": NOMINARA_USER_AGENT },
+        truncateAtCap: true,
+        // Vetted BEFORE the hop is requested: a redirect off the site, or into a path our own robots rules disallow, is
+        // not followed, so no request reaches a third party and no disallowed path is fetched.
+        followRedirect: (next) => sameSite(next, deps.rootUrl) && robotsAllows(deps.robots, next),
+      });
+      if (response.status >= 300 && response.status < 400) {
+        failures.push({ stage: "raw", reason: "redirect_not_followed", http_status: response.status });
+      } else if (!sameSite(response.finalUrl, deps.rootUrl)) {
         failures.push({ stage: "raw", reason: "redirected_off_site", http_status: response.status });
+      } else if (!robotsAllows(deps.robots, response.finalUrl)) {
+        // Defence in depth for a fetcher that did not apply the hop check: the body is dropped, not stored.
+        failures.push({ stage: "raw", reason: "robots_disallowed_after_redirect", http_status: response.status });
       } else if (response.status < 200 || response.status >= 300) {
         failures.push({ stage: "raw", reason: `http_${response.status}`, http_status: response.status });
       } else {
@@ -149,6 +180,11 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
         raw = await keep("raw", response.body, response.status, response.truncated === true);
       }
     } catch (error) {
+      if (error instanceof PolitenessDeadlineReached) {
+        stoppedAtDeadline = true;
+        skip("crawl_delay_budget");
+        continue;
+      }
       if (error instanceof PolitenessCapReached) {
         stoppedAtCap = true;
         skip("page_cap_reached");
@@ -169,7 +205,10 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
         const page = await Promise.race([deps.renderer.render(rawUrl, guard), timeout]);
         rendered = await keep("rendered", Buffer.from(page.html, "utf8"), page.status, false);
       } catch (error) {
-        if (error instanceof PolitenessCapReached) {
+        if (error instanceof PolitenessDeadlineReached) {
+          stoppedAtDeadline = true;
+          failures.push({ stage: "rendered", reason: "crawl_delay_budget", http_status: null });
+        } else if (error instanceof PolitenessCapReached) {
           stoppedAtCap = true;
           failures.push({ stage: "rendered", reason: "page_cap_reached", http_status: null });
         } else if (error instanceof RendererUnavailable) {
@@ -194,5 +233,5 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
     });
   }
 
-  return { pages, stoppedAtCap };
+  return { pages, stoppedAtCap, stoppedAtDeadline };
 }

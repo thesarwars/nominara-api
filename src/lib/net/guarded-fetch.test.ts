@@ -234,6 +234,27 @@ describe("STORY-131 · guardedFetch — the loop, against a real server", () => 
     ).rejects.toMatchObject({ reason: "redirect_target_refused" });
   });
 
+  // REVIEW FINDING — a crawl followed redirects to any public host before deciding the target was off-site, so an off-site
+  // redirect still sent a NominaraBot request to a third party. The caller can now veto a hop BEFORE it is requested.
+  it("STORY-049 — a caller that vetoes a redirect hop gets the redirect response back and the target is never requested", async () => {
+    const seen: string[] = [];
+    const response = await guardedFetch(
+      at("/relative"),
+      { followRedirect: (next) => { seen.push(next); return false; } },
+      permitTestOrigin,
+    );
+    expect(seen).toEqual([at("/landed")]);
+    expect(response.status).toBe(302);
+    expect(response.finalUrl).toBe(at("/relative"));
+    expect(response.body.toString()).not.toBe("landed");
+  });
+
+  it("STORY-049 — a caller that permits the hop still gets it followed", async () => {
+    const response = await guardedFetch(at("/relative"), { followRedirect: () => true }, permitTestOrigin);
+    expect(response.status).toBe(200);
+    expect(response.finalUrl).toBe(at("/landed"));
+  });
+
   // Scenario 15 — headers arrive, body never does.
   it("scenario 15 — aborts when the body never arrives", async () => {
     await expect(guardedFetch(at("/never"), {}, permitTestOrigin)).rejects.toThrow(/timeout/);

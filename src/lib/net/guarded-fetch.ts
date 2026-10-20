@@ -90,6 +90,14 @@ export interface GuardedFetchInit {
    * (STORY-049 scenario 5 — a page is evidence even when it is huge, as long as the cut is recorded).
    */
   readonly truncateAtCap?: boolean;
+  /**
+   * Asked BEFORE each redirect hop is requested, with the hop's absolute URL. `false` stops there: the redirect response
+   * itself is returned (status 3xx, `finalUrl` the URL that redirected) and the target is never contacted. The SSRF
+   * validation still runs on every hop that IS followed; this only lets a caller narrow where it may go (STORY-049: a
+   * crawl must not send a request to a third party, or into a path robots.txt disallows, just to find out where a page
+   * redirected).
+   */
+  readonly followRedirect?: (nextUrl: string) => boolean;
 }
 
 /** Headers a caller may not set: they re-point or re-frame the request the guard validated. */
@@ -235,6 +243,7 @@ export async function guardedFetch(
     // absolute one replaces it — matching how a browser would follow it, which
     // is the behaviour an attacker would be reasoning about.
     const next = new URL(location, target.url).toString();
+    if (init.followRedirect !== undefined && !init.followRedirect(next)) return response;
     try {
       // The SAME validator as the initial URL — one policy for the whole call.
       // In production `deps` is DEFAULT_DEPS, so every hop goes through the
