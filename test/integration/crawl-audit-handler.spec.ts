@@ -558,7 +558,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(["completed", "partial"]).toContain(a.status);
       expect(Math.max(...sleeps)).toBeLessThanOrEqual(10_000);
       expect(clockMs).toBeLessThanOrEqual(budgetMs);
-      expect(a.error_summary.crawl_delay_limited).toEqual({ crawl_delay_seconds: 10, pages_skipped: 1 });
+      expect(a.error_summary.crawl_delay_limited).toEqual({ crawl_delay_ms: 10_000, pages_skipped: 1 });
       expect(a.error_summary.skipped_pages).toContainEqual({ url: expect.stringMatching(/^https:\/\/acme\.com\//), reason: "crawl_delay_budget" });
       const skipped = (await manifestOf()).selection_skipped.filter((x) => x.reason === "crawl_delay_budget");
       expect(skipped).toHaveLength(1);

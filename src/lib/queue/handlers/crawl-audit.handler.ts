@@ -439,7 +439,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         : {}),
       ...(partialPages.length > 0 ? { pages_partial: partialPages.length } : {}),
       ...(delaySkippedRecords.length > 0 || crawl.stoppedAtDeadline
-        ? { crawl_delay_limited: { crawl_delay_seconds: budget.intervalMs / 1000, pages_skipped: delaySkippedRecords.length + skippedPages.filter((p) => p.skipped_reason === "crawl_delay_budget").length } }
+        ? { crawl_delay_limited: { crawl_delay_ms: budget.intervalMs, pages_skipped: delaySkippedRecords.length + skippedPages.filter((p) => p.skipped_reason === "crawl_delay_budget").length } }
         : {}),
       ...(selection.overCap > 0 ? { pages_over_cap: selection.overCap } : {}),
       ...(crawl.stoppedAtCap ? { stopped_at_cap: true } : {}),
