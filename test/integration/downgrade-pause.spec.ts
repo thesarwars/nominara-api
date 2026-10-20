@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
-import { EMAIL_SENDER, type EmailMessage, type EmailSender } from "../../src/modules/identity/ports/email-sender.js";
+import { LoggingEmailSenderAdapter } from "../../src/modules/identity/adapters/logging-email-sender.adapter.js";
+import type { EmailMessage } from "../../src/modules/identity/ports/email-sender.js";
 import { dataOf } from "../support/envelope.js";
 import { apiUrl } from "../support/api-url.js";
 import { usePlanChangeFixture, type Actor, type PlanName } from "../support/plan-change-fixture.js";
@@ -59,7 +60,9 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     const res = await f.post(owner, CHANGE, { plan_key: target });
     expect(res.statusCode, res.body).toBe(202);
     const call = gateway.downgrades.at(-1)!;
-    const start = f.periodEnd();
+    // The cut-over has JUST happened: the new period began a minute ago. (Its start must not be in the future, or a later
+    // in-app upgrade's quote, dated now, would be refused as older than the period.)
+    const start = f.nowSeconds() - 60;
     f.stripeSubscription(workspaceId, { plan: target, metadata: { plan_change_intent_id: String(call.metadata.plan_change_intent_id) }, periodStart: start, periodEnd: start + 30 * 86_400 });
     const delivered = await f.reconcile(workspaceId);
     expect(delivered.statusCode, delivered.body).toBe(200);
@@ -78,12 +81,16 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
 
   function spyEmail(): EmailMessage[] {
     const sent: EmailMessage[] = [];
-    const sender = harness.app().get<EmailSender>(EMAIL_SENDER);
-    vi.spyOn(sender, "send").mockImplementation(async (message) => {
+    // On the adapter's prototype: the app holds more than one EMAIL_SENDER instance (IdentityModule's, which BillingModule
+    // imports, and ReportsModule's own binding), so a spy on whichever instance app.get() returns can miss the one used.
+    vi.spyOn(LoggingEmailSenderAdapter.prototype, "send").mockImplementation(async (message: EmailMessage) => {
       sent.push(message);
     });
     return sent;
   }
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
   // ---- scenario 1 -----------------------------------------------------------------------------------------------
 
@@ -142,7 +149,8 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
 
     const audit = await f.auditActions(workspaceId, "billing.downgrade.paused");
     expect(audit).toHaveLength(1);
-    expect(audit[0]!.after_state).toMatchObject({ project_ids: [ids[4], ids[3]], prompt_count: 5 });
+    // Names, newest first, not ids: the audit redactor stores any UUID in a state as "[redacted]" (lib/crypto/redact.ts).
+    expect(audit[0]!.after_state).toEqual({ project_count: 2, project_names: ["P4", "P3"], prompt_count: 5 });
   });
 
   it("scenario 3 · a project a PERSON paused is not taken over by the cut-over, and a redelivered cut-over pauses, audits and emails nothing more", async () => {
