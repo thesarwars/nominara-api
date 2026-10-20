@@ -4,6 +4,7 @@ import { loadEnv } from "../../config/env.js";
 import { createPgPool } from "../../db/pg-pool.js";
 import { applyPlanChange, planKeyOnly, type BillingInterval, type PlanChangeOutcome } from "../../lib/billing/apply-plan.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
+import type { EmailMessage } from "../../modules/identity/ports/email-sender.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 
@@ -158,7 +159,7 @@ async function activeMemberCount(client: PoolClient, workspaceId: string): Promi
  * Everything `plan:set` writes, inside the CALLER's tenant-context transaction (exported so it is testable against a
  * real database without the CLI's own pool): the Stripe-tracked refusal under the workspace lock, then the plan write.
  */
-export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): Promise<{ outcome: PlanChangeOutcome }> {
+export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): Promise<{ outcome: PlanChangeOutcome; notices: EmailMessage[] }> {
   await assertNotStripeTracked(tx, args.workspaceId);
   const outcome = await applyPlanChange(
     tx,
@@ -167,7 +168,7 @@ export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): P
     { requestId: args.ticket, operator: args.operator, reason: args.reason },
     { allowNegotiatedTier: args.allowNegotiatedTier },
   );
-  return { outcome };
+  return { outcome, notices: [] };
 }
 
 export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void = console.log): Promise<void> {
