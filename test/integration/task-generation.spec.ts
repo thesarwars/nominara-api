@@ -1626,21 +1626,55 @@ describe("STORY-063 · task generation engine", () => {
     await generate();
     expect(await taskRows()).toHaveLength(0);
   });
-  it("[STORY-063 #4 / #2] Starter: the cadence floor is 17 cells a run (30 / the 1.87 runs a 14-day window holds): a 16-cell second run is no run, a 17-cell one is", async () => {
+  it("[STORY-063 #4 / #2] Starter: the cadence floor is 15 cells a run (30 over the 2 runs a 14-day window can hold): a 14-cell second run is no run, a 15-cell one is", async () => {
     await setPlan("starter");
     await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 15 });
     await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 15 });
     await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 8 });
-    await metric(STARTER_ENGINE, day(D, -2), { cells: 16, present: 4 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 14, present: 4 });
     await generate();
     expect(await taskRows()).toHaveLength(0);
     await reset();
     await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 15 });
     await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 15 });
     await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 8 });
-    await metric(STARTER_ENGINE, day(D, -2), { cells: 17, present: 4 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 15, present: 4 });
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
+  });
+  it("[STORY-063 #14 / #4 / R9-S1] Starter with 16 prompts: four runs of 16 cells, both current runs drop (15/16 to 6/16), two runs and 32 cells a window, makes a task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 16, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 16, present: 15 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 16, present: 6 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 16, present: 6 });
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
+  });
+  it("[STORY-063 #14 / #4 / R9B-S2] Starter with 15 prompts: both runs drop (14/15 to 9/15), n = 30 a window, makes a task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 15, present: 14 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 15, present: 14 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 15, present: 9 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 15, present: 9 });
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
+  });
+  it("[STORY-063 #3 / R9B-THRESHOLD] a change EXACTLY at the threshold counts: Starter presence 27/30 to 24/30 in both runs (0.9 - 0.8 is 0.0999... in floating point) makes a task", async () => {
+    await setPlan("starter");
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 27 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 27 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 24 });
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 30, present: 24 });
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
+    await reset();
+    await metric(STARTER_ENGINE, day(D, -25), { cells: 30, present: 27 });
+    await metric(STARTER_ENGINE, day(D, -17), { cells: 30, present: 27 });
+    await metric(STARTER_ENGINE, day(D, -10), { cells: 30, present: 25 }); // 7 points: under it
+    await metric(STARTER_ENGINE, day(D, -2), { cells: 30, present: 25 });
+    await generate();
+    expect(await taskRows()).toHaveLength(0);
   });
 
   /** Business: a bad day is 8 of 20 cells present against 18 of 20; exactly the three most recent days are bad (`sustained_days` is 3). */
@@ -1700,6 +1734,23 @@ describe("STORY-063 · task generation engine", () => {
     await generate();
     expect((await taskRows()).map((t) => t.rule_code)).toEqual(["TG-PRESENCE-LOSS"]);
   }, 240_000);
+
+  // A date is judged on the cells of ALL the runs that start on it, pooled: one noisy hour among 25 cannot make a date count.
+  it("[STORY-063 #2 / #15 / R9B-E1b] Enterprise: ONE bad day plus one ordinary 39/50 hour on each of two other days makes NO task", async () => {
+    await enterpriseDays((i, k) => ({ present: i === 3 ? 5 : (i === 1 || i === 5) && k === 7 ? 39 : 45, sov: 0.4 }));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual([]);
+  }, 120_000);
+  it("[STORY-063 #2 / R9B-E1b control] Enterprise: the same two noisy hours without the bad day make no task", async () => {
+    await enterpriseDays((i, k) => ({ present: (i === 1 || i === 5) && k === 7 ? 39 : 45, sov: 0.4 }));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual([]);
+  }, 120_000);
+  it("[STORY-063 #2 / #15 / R9-E1] Enterprise: TWO bad days plus one noisy hour on a third date make NO task", async () => {
+    await enterpriseDays((i, k) => ({ present: i === 1 || i === 2 ? 5 : i === 5 && k === 7 ? 39 : 45, sov: 0.4 }));
+    await generate();
+    expect((await taskRows()).map((t) => t.rule_code)).toEqual([]);
+  }, 120_000);
 
   // ---- a count is per measured CELL: a split or a resized run keeps its rate ---------------------------------------------------------
 

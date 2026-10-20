@@ -120,10 +120,10 @@ describe("STORY-063 · the window a rule compares is derived from the plan's cad
 });
 
 describe("STORY-063 · the cells a run needs to count come from the same cadence data", () => {
-  it("[STORY-063 #4] ceil(min_n x interval / window): about 17 at Starter, 9 at Growth, 5 at Business, 1 at Enterprise", () => {
-    expect(runFloorCells(30, 14, { full: 4 })).toBe(17); // 30 / 1.87 runs
-    expect(runFloorCells(30, 14, { full: 8 })).toBe(9); // 30 / 3.73
-    expect(runFloorCells(30, 7, { full: 4, priority: 30 })).toBe(5); // 30 / 7
+  it("[STORY-063 #4] ceil(min_n / the runs a window can hold): 15 at Starter (2 runs), 8 at Growth (4), 5 at Business (7), 1 at Enterprise", () => {
+    expect(runFloorCells(30, 14, { full: 4 })).toBe(15);
+    expect(runFloorCells(30, 14, { full: 8 })).toBe(8);
+    expect(runFloorCells(30, 7, { full: 4, priority: 30 })).toBe(5);
     expect(runFloorCells(30, 7, { full: 30, priority: 720 })).toBe(1);
   });
 
