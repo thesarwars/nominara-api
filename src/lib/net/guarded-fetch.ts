@@ -68,6 +68,49 @@ export interface GuardedResponse {
   readonly body: Buffer;
   /** The URL actually fetched, after redirects. */
   readonly finalUrl: string;
+  /**
+   * True when the body was cut at MAX_RESPONSE_BYTES (only possible with `truncateAtCap`). Always set by `guardedFetch`;
+   * optional on the type so a test double that answers `{status, headers, body, finalUrl}` stays a GuardedResponse.
+   */
+  readonly truncated?: boolean;
+}
+
+export interface GuardedFetchInit {
+  readonly method?: string;
+  /**
+   * Request headers, e.g. the crawl's identified `User-Agent` (STORY-049 AC7). Names are matched case-insensitively. The
+   * ones that would change WHERE the request goes or how its body is framed are ignored, never honoured: `host` (the
+   * validated name is the only Host), `accept-encoding` (always `identity`; a compressed body is never decoded here),
+   * and the connection and framing headers.
+   */
+  readonly headers?: Readonly<Record<string, string>>;
+  /**
+   * What to do with a body past MAX_RESPONSE_BYTES. Default (false): REJECT, because a half-read proof file or robots
+   * file must never be mistaken for the whole of one. true: keep the first MAX_RESPONSE_BYTES and set `truncated`
+   * (STORY-049 scenario 5 — a page is evidence even when it is huge, as long as the cut is recorded).
+   */
+  readonly truncateAtCap?: boolean;
+}
+
+/** Headers a caller may not set: they re-point or re-frame the request the guard validated. */
+const IGNORED_REQUEST_HEADERS: ReadonlySet<string> = new Set([
+  "host",
+  "accept-encoding",
+  "connection",
+  "content-length",
+  "transfer-encoding",
+  "upgrade",
+  "te",
+  "trailer",
+]);
+
+function callerHeaders(headers: Readonly<Record<string, string>> | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    const lower = name.toLowerCase();
+    if (!IGNORED_REQUEST_HEADERS.has(lower)) out[lower] = value;
+  }
+  return out;
 }
 
 /**
@@ -171,7 +214,7 @@ export function defaultDepsAreStrict(): boolean {
  */
 export async function guardedFetch(
   rawUrl: string,
-  init: { readonly method?: string } = {},
+  init: GuardedFetchInit = {},
   deps: GuardedFetchDeps = DEFAULT_DEPS,
 ): Promise<GuardedResponse> {
   const deadline = Date.now() + TOTAL_TIMEOUT_MS;
@@ -179,7 +222,7 @@ export async function guardedFetch(
   let hops = 0;
 
   for (;;) {
-    const response = await requestOnce(target, init.method ?? "GET", deadline);
+    const response = await requestOnce(target, init, deadline);
 
     const location = response.headers.location;
     const isRedirect = response.status >= 300 && response.status < 400 && typeof location === "string";
@@ -216,7 +259,8 @@ export async function guardedFetch(
 }
 
 /** One hop: connect to an already-validated address, bounded in time and size. */
-function requestOnce(target: SafeTarget, method: string, deadline: number): Promise<GuardedResponse> {
+function requestOnce(target: SafeTarget, init: GuardedFetchInit, deadline: number): Promise<GuardedResponse> {
+  const method = init.method ?? "GET";
   return new Promise<GuardedResponse>((resolve, reject) => {
     const isHttps = target.url.protocol === "https:";
     const pinned = target.addresses[0]!;
@@ -255,7 +299,8 @@ function requestOnce(target: SafeTarget, method: string, deadline: number): Prom
       path: `${target.url.pathname}${target.url.search}`,
       lookup,
       // Redirects are followed by hand above so each hop is re-validated.
-      headers: { host: target.url.host, "accept-encoding": "identity" },
+      // Caller headers first, so the two that matter can never be overridden by them.
+      headers: { ...callerHeaders(init.headers), host: target.url.host, "accept-encoding": "identity" },
     };
 
     const send = isHttps ? httpsRequest : httpRequest;
@@ -282,19 +327,7 @@ function requestOnce(target: SafeTarget, method: string, deadline: number): Prom
       const chunks: Buffer[] = [];
       let received = 0;
 
-      res.on("data", (chunk: Buffer) => {
-        received += chunk.length;
-        // Checked AS IT STREAMS. Buffering the whole body and measuring after
-        // means a hostile server can make us allocate whatever it likes before
-        // we notice — the cap would bound what we KEEP, not what we accept.
-        if (received > MAX_RESPONSE_BYTES) {
-          fail(new Error("guarded-fetch: response exceeded the size cap"));
-          return;
-        }
-        chunks.push(chunk);
-      });
-
-      res.on("end", () => {
+      const finish = (truncated: boolean): void => {
         if (settled) return;
         settled = true;
         clearTimeout(totalTimer);
@@ -303,8 +336,33 @@ function requestOnce(target: SafeTarget, method: string, deadline: number): Prom
           headers: res.headers,
           body: Buffer.concat(chunks),
           finalUrl: target.url.toString(),
+          truncated,
         });
+      };
+
+      res.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        received += chunk.length;
+        // Checked AS IT STREAMS. Buffering the whole body and measuring after
+        // means a hostile server can make us allocate whatever it likes before
+        // we notice — the cap would bound what we KEEP, not what we accept.
+        if (received > MAX_RESPONSE_BYTES) {
+          if (init.truncateAtCap === true) {
+            // Keep exactly the cap, stop reading, and SAY SO. The socket is torn down so a hostile server cannot keep
+            // us receiving what we have decided not to keep.
+            const room = MAX_RESPONSE_BYTES - (received - chunk.length);
+            if (room > 0) chunks.push(chunk.subarray(0, room));
+            finish(true);
+            req.destroy();
+            return;
+          }
+          fail(new Error("guarded-fetch: response exceeded the size cap"));
+          return;
+        }
+        chunks.push(chunk);
       });
+
+      res.on("end", () => finish(false));
 
       res.on("error", (error) => fail(error));
     });
