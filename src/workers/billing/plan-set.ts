@@ -3,7 +3,9 @@ import type { ClientBase, PoolClient } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { createPgPool } from "../../db/pg-pool.js";
 import { applyPlanChange, planKeyOnly, type BillingInterval, type PlanChangeOutcome } from "../../lib/billing/apply-plan.js";
+import { reconcileAndRecordDowngradePause, sendDowngradeNotices } from "../../lib/billing/downgrade-pause-record.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
+import { selectEmailSender } from "../../modules/identity/email-sender.selector.js";
 import type { EmailMessage } from "../../modules/identity/ports/email-sender.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -157,7 +159,9 @@ async function activeMemberCount(client: PoolClient, workspaceId: string): Promi
 
 /**
  * Everything `plan:set` writes, inside the CALLER's tenant-context transaction (exported so it is testable against a
- * real database without the CLI's own pool): the Stripe-tracked refusal under the workspace lock, then the plan write.
+ * real database without the CLI's own pool): the Stripe-tracked refusal under the workspace lock, then the plan write,
+ * then STORY-077's downgrade-pause reconcile (a comp after a cancellation to Free resumes what the cut-over paused).
+ * Returns the notices for the caller to send AFTER its transaction commits.
  */
 export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): Promise<{ outcome: PlanChangeOutcome; notices: EmailMessage[] }> {
   await assertNotStripeTracked(tx, args.workspaceId);
@@ -168,7 +172,10 @@ export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): P
     { requestId: args.ticket, operator: args.operator, reason: args.reason },
     { allowNegotiatedTier: args.allowNegotiatedTier },
   );
-  return { outcome, notices: [] };
+  const notices = outcome.changed
+    ? await reconcileAndRecordDowngradePause(tx, args.workspaceId, { requestId: args.ticket, operator: args.operator })
+    : [];
+  return { outcome, notices };
 }
 
 export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void = console.log): Promise<void> {
@@ -181,7 +188,7 @@ export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void 
   try {
     const client = await pool.connect();
     try {
-      const { outcome } = await withTenantContext(
+      const { outcome, notices } = await withTenantContext(
         client,
         { workspaceId: args.workspaceId, actorId: SYSTEM_ACTOR_ID },
         async (tx) => await planSetInTransaction(tx, args),
@@ -193,6 +200,12 @@ export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void 
       }
 
       log(`${args.workspaceId}: ${outcome.from} -> ${outcome.to}`);
+      // Committed: only now may the downgrade-pause notices go out (a rolled-back change never emails).
+      if (notices.length > 0) {
+        const sender = selectEmailSender();
+        await sendDowngradeNotices((message) => sender.send(message), args.workspaceId, notices);
+        log(`downgrade-pause notice(s) sent: ${String(notices.length)}`);
+      }
       log(`entitlement_version now ${String(outcome.entitlementVersion)}`);
       log(
         outcome.creditsToppedUp > 0
