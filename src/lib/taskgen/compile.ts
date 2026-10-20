@@ -46,14 +46,19 @@ export function effectiveWindowDays(windowDays: number, cadence: unknown): numbe
 
 /**
  * The cells a run must hold to be a run at all, from the same cadence data as `effectiveWindowDays`: the window's sample floor
- * (`min_n`) divided by the runs the window is expected to hold (`span / interval`), `ceil(min_n * interval / span)`, never under 1.
- * About 17 cells at Starter (30 / 1.87), 9 at Growth (30 / 3.73), 5 at Business (30 / 7) and 1 at Enterprise. With no usable cadence the
- * window is assumed to hold one run a day, `ceil(min_n / span)`.
+ * (`min_n`) divided by the MOST runs the window can hold (`ceil(span / interval)`), never under 1. A project whose runs all reach the
+ * window's `min_n` between them (two Starter runs of 15 cells) therefore always has runs that count, while a remnant of a run does not.
+ * 15 cells at Starter (2 runs), 8 at Growth (4), 5 at Business (7) and 1 at Enterprise. With no usable cadence the window is assumed to
+ * hold one run a day, `ceil(min_n / span)`.
  */
 export function runFloorCells(minN: number, span: number, cadence: unknown): number {
   const intervalDays = runIntervalDays(cadence) ?? 1;
-  return Math.max(1, Math.ceil((minN * intervalDays) / span - 1e-9));
+  const runsHeld = Math.max(1, Math.ceil(span / intervalDays - 1e-9));
+  return Math.max(1, Math.ceil(minN / runsHeld - 1e-9));
 }
+
+/** Slack on every threshold comparison: a change exactly AT the threshold counts ("at least"), though 0.9 - 0.8 is 0.0999... in floating point. */
+const THRESHOLD_EPSILON = 1e-9;
 
 export interface CompileParams {
   readonly projectId: string;
@@ -109,8 +114,8 @@ const CHANGE_SQL: Record<MetricWindowCondition["change"], Record<MetricWindowCon
  *    still being captured, and its first cells are neither a run nor a breach until it finishes;
  *  - it measured at least half of the cells it planned for the engine (`planned_cells` over the `engine_keys` it covered): a run that
  *    lost most of its cells to failures is an outage, not a sample; and
- *  - it holds at least the cadence floor (`runFloorCells`: `ceil(min_n / runs expected in the window)`, from the same cadence data as the
- *    window), so a remnant cannot be "the second of both recent runs".
+ *  - it holds at least the cadence floor (`runFloorCells`: `ceil(min_n / most runs the window can hold)`, from the same cadence data as
+ *    the window), so a remnant cannot be "the second of both recent runs".
  * A run that is none of those is simply absent: not counted in `current_runs`, not a breach.
  *
  * A CAPTURE RUN IS NOT A DATE, AND BELONGS TO EXACTLY ONE WINDOW. `metric_daily` is keyed by the workspace-local date of a capture,
@@ -122,9 +127,15 @@ const CHANGE_SQL: Record<MetricWindowCondition["change"], Record<MetricWindowCon
  * rate, so that can move a window value slightly. The sample floor and the threshold bound the effect.)
  *  - The change needs TWO OR MORE runs in the current window (a single run is a single sample: there is no shared-baseline path).
  *    The window change must reach the threshold, and it must hold on at least `min(sustained_days, runs_in_window)` runs, each compared
- *    with the prior window's value, AND those breaching runs must cover at least `min(sustained_days, distinct dates the window's runs
- *    start on)` distinct local dates. Runs prove it is not one sample; dates prove it lasted. At Enterprise one local date holds 25
- *    runs, so counting runs alone made three hours of one bad day "sustained".
+ *    with the prior window's value, AND at least `min(sustained_days, distinct dates the window's runs start on)` distinct local DATES
+ *    must breach. Runs prove it is not one sample; dates prove it lasted. At Enterprise one local date holds 25 runs, so counting runs
+ *    alone made three hours of one bad day "sustained".
+ *    A DATE IS JUDGED ON THE POOLED CELLS of every qualifying run that starts on it (`rundates`: the runs' cells summed, one rate, compared
+ *    with the prior value like a run). One run is a sample; a date's pool is 25 runs at Enterprise (about 1,250 cells), so ordinary
+ *    per-run sampling noise on a few hours cannot make a date count, only a real collapse of the day can. With one run on a date (Starter,
+ *    Growth, Business) the pool is that run and nothing changes. A scheduled run plus a manual run on one date is one date.
+ *
+ * Every comparison with the threshold is inclusive with a 1e-9 slack: a change exactly at the threshold counts.
  *
  * A RUN IS JUDGED ON ITS OWN CELLS, ALL OF THEM. The per-run rate is read from `answer_captures` grouped by `(engine_key, run_id)`:
  * presence is the cells with `brand_present`, share the mean of `sov` over the run's cells, owned citations `owned_citation_count`
@@ -196,6 +207,11 @@ WITH eng AS (
   SELECT engine_key, bucket, (count(*))::int AS runs, (count(DISTINCT first_date))::int AS run_dates
     FROM runs
    GROUP BY engine_key, bucket
+), rundates AS (
+  SELECT engine_key, bucket, first_date,
+         sum(cells) AS cells, sum(present) AS present, sum(sov_w) AS sov_w, sum(owned) AS owned
+    FROM runs
+   GROUP BY engine_key, bucket, first_date
 ), winr AS (
   SELECT w.*, COALESCE(r.runs, 0) AS runs, COALESCE(r.run_dates, 0) AS run_dates
     FROM win w
@@ -215,27 +231,37 @@ WITH eng AS (
          CASE WHEN prior_value IS NULL OR cur_value IS NULL THEN NULL ELSE ${change("cur_value", "prior_value")} END AS change_value
     FROM pair
 ), breached AS (
-  SELECT r.engine_key, (count(*))::int AS runs_breached, (count(DISTINCT r.first_date))::int AS dates_breached
+  SELECT r.engine_key, (count(*))::int AS runs_breached
     FROM runs r
     JOIN scored s ON s.engine_key = r.engine_key
    WHERE r.bucket = 0
      AND s.prior_value IS NOT NULL
      ${priorGuard}
-     AND ${change(v("r"), "s.prior_value")} >= $6::float8
+     AND ${change(v("r"), "s.prior_value")} >= $6::float8 - ${THRESHOLD_EPSILON}
    GROUP BY r.engine_key
+), dates_breached AS (
+  SELECT d.engine_key, (count(*))::int AS dates_breached
+    FROM rundates d
+    JOIN scored s ON s.engine_key = d.engine_key
+   WHERE d.bucket = 0
+     AND s.prior_value IS NOT NULL
+     ${priorGuard}
+     AND ${change(v("d"), "s.prior_value")} >= $6::float8 - ${THRESHOLD_EPSILON}
+   GROUP BY d.engine_key
 )
 SELECT s.engine_key, s.n_current, s.n_prior, s.cur_value, s.prior_value, s.change_value
   FROM scored s
   LEFT JOIN breached y ON y.engine_key = s.engine_key
+  LEFT JOIN dates_breached z ON z.engine_key = s.engine_key
  WHERE s.n_current >= $5::float8
    AND s.n_prior   >= $5::float8
    AND s.cur_value IS NOT NULL
    AND s.prior_value IS NOT NULL
    AND s.current_runs >= 2
    ${priorGuard}
-   AND s.change_value >= $6::float8
+   AND s.change_value >= $6::float8 - ${THRESHOLD_EPSILON}
    AND COALESCE(y.runs_breached, 0) >= LEAST($7::int, s.current_runs)
-   AND COALESCE(y.dates_breached, 0) >= LEAST($7::int, s.current_dates)
+   AND COALESCE(z.dates_breached, 0) >= LEAST($7::int, s.current_dates)
  ORDER BY s.engine_key`;
   return { text, values };
 }

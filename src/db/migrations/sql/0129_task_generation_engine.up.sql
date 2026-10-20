@@ -44,10 +44,10 @@ $$;
 -- seeded DISABLED with a `pending_analysis` condition: enabling one early generates nothing. The alert is NOT approximated
 -- with mentions_negative / mentions_total, which is a different formula (scoring-models.md §6).
 --
--- Every metric_window rule carries `sustained_days` 3: the change must also hold on `sustained_days` capture RUNS
--- (capped by the runs the window holds): a window needs two or more runs, and the drop must hold on min(sustained_days, runs) runs,
--- in the window derived from the plan's cadence, so a single bad run or day cannot carry the aggregate. The exact definition is
--- compileMetricWindow in src/lib/taskgen/compile.ts.
+-- Every metric_window rule carries `sustained_days` 3. "Sustained" is defined in one place, compileMetricWindow in
+-- src/lib/taskgen/compile.ts, and has three parts: only FINISHED, representative runs count (run floors: at least half the
+-- planned cells and the cadence floor), at least min(sustained_days, runs) of them breach in the window derived from the
+-- plan's cadence, and at least min(sustained_days, start dates) distinct DATES breach, each date judged on its pooled runs.
 INSERT INTO task_generation_rules
   (code, category, title_template, description_template, trigger_kind, condition, default_priority, impact_weight,
    effort_band, opens_alignment, playbook_slug, cooldown_days, rule_version, enabled)
