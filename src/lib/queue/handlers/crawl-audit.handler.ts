@@ -115,7 +115,8 @@ export interface CrawlAuditDeps {
   readonly wallClockBudgetMs?: number;
 }
 
-type Fetched = { readonly responded: true; readonly status: number; readonly file: SiteFile } | { readonly responded: false };
+/** `raw` is the body exactly as fetched: `file.body` is a utf8 decode, which is lossy for a body that is not valid utf8. */
+type Fetched = { readonly responded: true; readonly status: number; readonly file: SiteFile; readonly raw: Buffer } | { readonly responded: false };
 
 /** All 34 rule codes, from the reference (§2). */
 const ALL_RULE_CODES: readonly string[] = Array.from({ length: 34 }, (_, i) => `AUX-R-${String(i + 1).padStart(3, "0")}`);
@@ -180,7 +181,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
   const toFetched = (res: GuardedResponse | null): Fetched =>
     res === null
       ? { responded: false }
-      : { responded: true, status: res.status, file: { status: res.status, body: res.body.toString("utf8"), byteLength: res.body.length } };
+      : { responded: true, status: res.status, file: { status: res.status, body: res.body.toString("utf8"), byteLength: res.body.length }, raw: res.body };
 
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const startedMs = Date.now();
@@ -247,8 +248,10 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // The hard cap is the arithmetic of what the audit may legitimately need: robots, two llms files, the sitemap files,
     // two fetches per page, and the two probe requests.
     const wallClockBudgetMs = deps.wallClockBudgetMs ?? CRAWL_WALL_CLOCK_BUDGET_MS;
+    // A page costs two requests (plain and rendered), or one when no renderer is installed: nothing is sent for the second.
+    const requestsPerPage = renderer.available === false ? 1 : 2;
     const budget = new PolitenessBudget({
-      hardCap: 3 + MAX_SITEMAP_FILES + 2 * pageCap + 2,
+      hardCap: 3 + MAX_SITEMAP_FILES + requestsPerPage * pageCap + 2,
       wallClockBudgetMs,
       ...(deps.nowMs === undefined ? {} : { now: deps.nowMs }),
       sleep,
@@ -344,10 +347,10 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       targetUrls: payload.targetUrls ?? [],
     });
 
-    // THE WALL-CLOCK BUDGET, UP FRONT. Each page costs two requests (plain and rendered) at the interval now in force, which a
+    // THE WALL-CLOCK BUDGET, UP FRONT. Each page costs two requests (plain and rendered; one with no renderer installed) at the interval now in force, which a
     // hostile Crawl-delay has already stretched to its clamp. Shrink the list to what fits, and record what was not attempted.
     const probeReserve = verified ? PROBE_REQUESTS : 0;
-    const affordablePages = Math.max(0, Math.floor((budget.affordableRequests() - probeReserve) / 2));
+    const affordablePages = Math.max(0, Math.floor((budget.affordableRequests() - probeReserve) / requestsPerPage));
     const delaySkipped = selection.urls.length > affordablePages ? selection.urls.slice(affordablePages) : [];
     const pagesToCrawl = delaySkipped.length > 0 ? selection.urls.slice(0, affordablePages) : selection.urls;
     const delaySkippedRecords = delaySkipped.map((u) => ({ url: sanitiseText(u, 2048), reason: "crawl_delay_budget" }));
@@ -546,7 +549,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         payload.auditId, status, pagesCrawled, failed + pagesFailed,
         // The snapshot is stored verbatim except for what Postgres text cannot hold; the hash is of the bytes as fetched.
         robotsOk ? sanitiseText(robotsBody) : null,
-        robotsOk ? createHash("sha256").update(robots.file.body).digest() : null,
+        robotsOk ? createHash("sha256").update(robots.raw).digest() : null,
         llmsPresent, sitemapCount, capped, JSON.stringify({ crawler_access: subscore }),
         counts.critical, counts.high, counts.medium, counts.low, finishedAt,
         [...new Set([...Object.values(urls), sitemapUrl, ...pagesToCrawl])], [...excluded], domObjectPrefix, errorSummary,

@@ -39,7 +39,14 @@ export interface ProbeResponse {
 export interface ProbeInput {
   readonly url: string;
   readonly budget: PolitenessBudget;
-  readonly fetch: (url: string, init: { readonly headers: Record<string, string> }) => Promise<ProbeResponse>;
+  /**
+   * `followRedirect` is always `() => false`: the probe observes the response the TARGET gives at this URL, so a 3xx is
+   * returned, not followed (see `send`).
+   */
+  readonly fetch: (
+    url: string,
+    init: { readonly headers: Record<string, string>; readonly followRedirect?: (nextUrl: string) => boolean },
+  ) => Promise<ProbeResponse>;
 }
 
 const CHALLENGE_BODY = /<title>\s*just a moment|cf-chl-|attention required!\s*\|\s*cloudflare|captcha-delivery|px-captcha/i;
@@ -56,7 +63,11 @@ const okForBrowser = (r: ProbeResponse): boolean => r.status >= 200 && r.status 
 async function send(input: ProbeInput, userAgent: string): Promise<ProbeResponse | null> {
   await input.budget.acquire("probe");
   try {
-    return await input.fetch(input.url, { headers: { "user-agent": userAgent } });
+    // NEVER FOLLOW A REDIRECT. The page fetch vets every hop so that no request reaches a third party; the probe must hold
+    // to the same rule. Following a root redirect to another host would send the spoofed agent string to that host and
+    // classify ITS response as the target's AUX-R-005 input. A 3xx therefore comes back as a 3xx, which neither half of the
+    // verdict accepts (browser not 2xx, agent not 2xx and not refused): the probe is `inconclusive`.
+    return await input.fetch(input.url, { headers: { "user-agent": userAgent }, followRedirect: () => false });
   } catch {
     return null;
   }

@@ -71,4 +71,30 @@ describe("STORY-049 AC8 · differential probe", () => {
     expect(h.seen).toHaveLength(0);
     expect(h.budget.used).toBe(0);
   });
+
+  // Review round 2 — the page fetch vets every redirect hop; the probe must too. Following a root redirect to another
+  // host would send the spoofed agent UA to a third party and judge THEIR response as the site's.
+  it("never follows a redirect: the fetch is told to stop at the first 3xx, whatever the target", async () => {
+    const h = harness({ browser: { status: 200 }, agent: { status: 200 } });
+    const vetoes: boolean[] = [];
+    await runDifferentialProbe({
+      url: "https://acme.com/",
+      budget: h.budget,
+      fetch: async (url, init) => {
+        vetoes.push(init.followRedirect?.("https://evil.example/") ?? true);
+        return h.fetch(url, init);
+      },
+    });
+    expect(vetoes).toEqual([false, false]);
+  });
+
+  it.each([
+    [{ status: 302 }, { status: 302 }],
+    [{ status: 200 }, { status: 301 }],
+    [{ status: 307 }, { status: 200 }],
+  ] as const)("a 3xx on either half (%j / %j) is inconclusive, never hostile or consistent", async (browser, agent) => {
+    const h = harness({ browser, agent });
+    const r = await runDifferentialProbe({ url: "https://acme.com/", budget: h.budget, fetch: h.fetch });
+    expect(r.outcome).toBe("inconclusive");
+  });
 });

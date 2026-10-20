@@ -194,7 +194,11 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
     }
 
     // (b) RENDERED: only for a page the plain fetch could read. An error page has nothing to compare.
-    if (rawOk) {
+    if (rawOk && deps.renderer.available === false) {
+      // Known up front: no request would be sent, so none is charged to the politeness budget (it would only burn an
+      // interval slot and a hard-cap unit, and halve the pages the wall-clock budget admits).
+      failures.push({ stage: "rendered", reason: "renderer_unavailable", http_status: null });
+    } else if (rawOk) {
       let timer: NodeJS.Timeout | undefined;
       try {
         await deps.budget.acquire("page");

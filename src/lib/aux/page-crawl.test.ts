@@ -5,7 +5,7 @@ import { GuardedFetchRefusal, type GuardedResponse } from "../net/guarded-fetch.
 import { crawlPages, NOMINARA_USER_AGENT, type PageCrawlDeps } from "./page-crawl.js";
 import { PolitenessBudget } from "./politeness.js";
 import { parseRobots } from "./robots.js";
-import { RendererUnavailable, type Renderer } from "./renderer.js";
+import { RendererUnavailable, unavailableRenderer, type Renderer } from "./renderer.js";
 
 const sha = (b: Buffer | string): string => createHash("sha256").update(b).digest("hex");
 
@@ -187,6 +187,30 @@ describe("STORY-049 · crawlPages", () => {
     expect(pages[0]!.raw).toBeTruthy();
     expect(pages[0]!.rendered).toBeUndefined();
     expect([...h.stored.keys()]).toHaveLength(1);
+  });
+
+  // Review round 2 — a renderer known to be unavailable must not be charged to the politeness budget: the request is
+  // never sent, but an interval slot (up to the clamped Crawl-delay) and a hard-cap unit were spent on it.
+  it("with the unavailable renderer a page costs ONE budget request (the plain fetch), and the renderer is never called", async () => {
+    const h = harness({ renderer: unavailableRenderer });
+    const { pages } = await crawlPages(["https://acme.com/a", "https://acme.com/b", "https://acme.com/c"], h.deps);
+    expect(h.deps.budget.usedBy("page")).toBe(3);
+    for (const page of pages) {
+      expect(page).toMatchObject({ outcome: "partial", failures: [{ stage: "rendered", reason: "renderer_unavailable" }] });
+    }
+  });
+
+  it("with the unavailable renderer no interval is slept for the render that never happens", async () => {
+    const h = harness({ renderer: unavailableRenderer, crawlDelaySeconds: 10 });
+    await crawlPages(["https://acme.com/a", "https://acme.com/b"], h.deps);
+    // one wait between the two plain fetches, none for a render
+    expect(h.sleeps).toHaveLength(1);
+  });
+
+  it("a renderer that IS installed still costs two requests per page", async () => {
+    const h = harness();
+    await crawlPages(["https://acme.com/a"], h.deps);
+    expect(h.deps.budget.usedBy("page")).toBe(2);
   });
 
   it("a renderer that hangs is cut at the render timeout and recorded as render_timeout", async () => {

@@ -27,6 +27,17 @@ export type RequestDecision = { readonly allow: true } | { readonly allow: false
 export type RenderRequestGuard = (requestUrl: string) => Promise<RequestDecision>;
 
 export interface Renderer {
+  /**
+   * False when this renderer cannot render at all (no browser is installed). The crawl then records `renderer_unavailable`
+   * WITHOUT charging the politeness budget for a request that is never sent (an interval slot of up to the clamped
+   * Crawl-delay, and a hard-cap unit). Absent means available.
+   *
+   * AN ADAPTER THAT DOES RENDER MUST CHARGE ITS SUBRESOURCES. `render` is one budget request, but a real browser makes up to
+   * MAX_RENDER_REQUESTS (100) further requests to the same host for one page. The reference caps the host at 2 requests per
+   * second, so each request the guard ALLOWS must also be charged to the crawl's `PolitenessBudget`; until an adapter does,
+   * the per-host cap holds for the plain fetches only. The Playwright story inherits this as a requirement.
+   */
+  readonly available?: boolean;
   /** `guard` MUST be consulted for every request the page makes, including the navigation and every redirect. */
   render(url: string, guard: RenderRequestGuard): Promise<RenderedPage>;
 }
@@ -40,6 +51,7 @@ export class RendererUnavailable extends Error {
 }
 
 export const unavailableRenderer: Renderer = {
+  available: false,
   render: () => Promise.reject(new RendererUnavailable()),
 };
 

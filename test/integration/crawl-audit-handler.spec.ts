@@ -14,6 +14,8 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { gunzipSync } from "node:zlib";
 import { createCrawlAuditHandler, type CrawlAuditDeps } from "../../src/lib/queue/handlers/crawl-audit.handler.js";
 import { AGENT_PROBE_USER_AGENT, BROWSER_PROBE_USER_AGENT } from "../../src/lib/aux/differential-probe.js";
+import { unavailableRenderer } from "../../src/lib/aux/renderer.js";
+import { createHash } from "node:crypto";
 import { crawlManifestSchema } from "../../contracts/aux/index.js";
 import { handlerFor } from "../../src/lib/queue/handlers.js";
 import type { GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
@@ -374,6 +376,52 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect((await manifestOf()).probe).toMatchObject({ outcome: "hostile", browser_status: 200, agent_status: 403 });
   });
 
+  it("review r2 · a root that redirects OFF-SITE during the probe is not followed: nothing is sent to the third party, and the probe is inconclusive", async () => {
+    await verifyDomain();
+    const requested: string[] = [];
+    const deps = depsServing(withSitemap(SITEMAP_PAGES), requested);
+    const inner = deps.fetch!;
+    const evil = "https://evil.example/landing";
+    await run(job(), {
+      ...deps,
+      fetch: async (url, init) => {
+        const ua = init?.headers?.["user-agent"];
+        if (ua !== BROWSER_PROBE_USER_AGENT && ua !== AGENT_PROBE_USER_AGENT) return inner(url, init);
+        // what guardedFetch does with the veto: a 3xx whose next hop is vetoed is RETURNED, an allowed hop is followed
+        const follow = (init as { followRedirect?: (next: string) => boolean } | undefined)?.followRedirect;
+        if (follow === undefined || follow(evil)) {
+          requested.push(evil);
+          return { status: 200, headers: {}, body: Buffer.from("third party"), finalUrl: evil };
+        }
+        return { status: 302, headers: { location: evil }, body: Buffer.from(""), finalUrl: url };
+      },
+    });
+    expect(requested.filter((u) => u.includes("evil.example"))).toEqual([]);
+    expect((await manifestOf()).probe).toMatchObject({ outcome: "inconclusive", browser_status: 302, agent_status: 302 });
+  });
+
+  it("review r2 · robots_hash is the sha256 of the bytes as fetched, even when robots.txt is not valid UTF-8", async () => {
+    const raw = Buffer.concat([Buffer.from(`${OPEN}# `), Buffer.from([0xff, 0xfe, 0xc3]), Buffer.from("\n")]);
+    expect(raw.toString("utf8")).not.toBe(raw.toString("latin1")); // the bytes cannot round-trip through a utf8 string
+    const deps = depsServing(healthy(OPEN));
+    const inner = deps.fetch!;
+    await run(job(), { ...deps, fetch: async (url, init) => (new URL(url).pathname === "/robots.txt" ? { status: 200, headers: {}, body: raw, finalUrl: url } : inner(url, init)) });
+    const [a] = await audits();
+    expect(Buffer.from(a.robots_hash).equals(createHash("sha256").update(raw).digest())).toBe(true);
+  });
+
+  it("review r2 · with no renderer installed the up-front shrink counts ONE request per page, so the wall-clock budget admits twice the pages", async () => {
+    await verifyDomain();
+    const delayRobots = "User-agent: *\nCrawl-delay: 86400\nAllow: /\n";
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, delayRobots), [], 10_000, { wallClockBudgetMs: 100_000 }));
+    const withRenderer = (await audits())[0]!.error_summary.crawl_delay_limited.pages_skipped as number;
+    await db.query("TRUNCATE aux_audits CASCADE");
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, delayRobots), [], 10_000, { wallClockBudgetMs: 100_000, renderer: unavailableRenderer }));
+    const [a] = await audits();
+    expect(withRenderer).toBe(1);
+    expect(a.error_summary?.crawl_delay_limited?.pages_skipped ?? 0).toBe(0);
+  });
+
   it("STORY-049 AC7 · every request carries the identified NominaraBot user agent, the pages and the site files alike", async () => {
     await verifyDomain();
     await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
@@ -447,6 +495,10 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     }
     const a = (await audits()).at(-1)!;
     expect(a.error_summary.skipped_pages.map((p: { reason: string }) => p.reason)).toContain("robots_unavailable");
+    // NO page was crawled, so the audit must still say the page crawl did not run (review round 2: naming it only when no
+    // page was crawled is the other half of the AC2.1 assertion that it is NOT named when one was)
+    expect(a.pages_crawled).toBe(0);
+    expect(a.excluded_rules).toContain("page_crawl");
   });
 
   it("STORY-049 AC7 · a robots.txt that is simply absent (404) is not a prohibition: the pages are fetched", async () => {

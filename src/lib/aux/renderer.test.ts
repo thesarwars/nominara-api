@@ -64,3 +64,11 @@ describe("STORY-049 AC6/AC10 · the renderer that is not available", () => {
     await expect(unavailableRenderer.render("https://acme.com/", async () => ({ allow: true }))).rejects.toBeInstanceOf(RendererUnavailable);
   });
 });
+
+describe("STORY-049 review round 2 · the renderer port says whether it can render at all", () => {
+  it("the default renderer reports itself unavailable, so the crawl does not charge a request that is never sent", async () => {
+    const { unavailableRenderer } = await import("./renderer.js");
+    expect(unavailableRenderer.available).toBe(false);
+  });
+});
+
