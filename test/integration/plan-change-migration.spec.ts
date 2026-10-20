@@ -53,7 +53,14 @@ describe("STORY-184 · migration 0128 — subscriptions.pending_plan_change", ()
   });
 
   it("the down removes the column", async () => {
-    await rollbackLast(client, MIGRATIONS_DIR);
+    // Roll back UNTIL 0128 by name, so the test does not depend on 0128 being the newest migration.
+    let reached = false;
+    for (let step = 0; step < 200 && !reached; step += 1) {
+      const name = await rollbackLast(client, MIGRATIONS_DIR);
+      expect(name, "0128 must be applied on a fully migrated database").not.toBeNull();
+      reached = name?.startsWith("0128") ?? false;
+    }
+    expect(reached).toBe(true);
     const col = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'subscriptions' AND column_name = 'pending_plan_change'");
     expect(col.rowCount).toBe(0);
   });

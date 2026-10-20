@@ -8,7 +8,7 @@
 // migration breaks the build in every service that reads it.
 
 import { sql } from "drizzle-orm";
-import { boolean, date, jsonb, numeric, pgTable, real, smallint, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { boolean, date, integer, jsonb, numeric, pgTable, real, smallint, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { bytea } from "./columns.js";
 
 export const goals = pgTable("goals", {
@@ -58,6 +58,7 @@ export const taskGenerationRules = pgTable("task_generation_rules", {
   cooldownDays: smallint("cooldown_days").notNull().default(sql`14`),
   ruleVersion: text("rule_version").notNull(),
   enabled: boolean("enabled").notNull().default(sql`true`),
+  enabledSince: timestamp("enabled_since", { withTimezone: true }),
 });
 
 export const tasks = pgTable("tasks", {
@@ -99,4 +100,6 @@ export const tasks = pgTable("tasks", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  recurrenceCount: integer("recurrence_count").notNull().default(sql`0`),
+  lastEvidenceAt: timestamp("last_evidence_at", { withTimezone: true }),
 });

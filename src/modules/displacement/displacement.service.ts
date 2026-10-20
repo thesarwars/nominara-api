@@ -12,8 +12,9 @@ import { Page, pageFrom } from "../../api/pagination/page.js";
 import { ConflictError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
 import { dataSourceOf } from "../../lib/analytics/data-source.js";
-import { authorityTargets, authorityTaskFingerprint, recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
+import { actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint, linkDisplacementToTask, recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
 import type { Task } from "../../../contracts/tasks/index.js";
+import { acquireAdvisoryXactLock, projectQueueLockKey } from "../../lib/queue/locks.js";
 import { TasksService } from "../tasks/tasks.service.js";
 import { SOURCE_INDEX_WINDOWS } from "../../lib/rollup/refresh-project-source-index.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -213,6 +214,13 @@ export class DisplacementService {
    */
   async recoveryPlan(displacementId: string): Promise<Task[]> {
     const { client, context } = this.store();
+    // LOCK ORDER (the worker's, STORY-063): the project's task.generate lock, THEN the fingerprint locks and the displacement row.
+    // The generator takes them in that order; taking the displacement row first here would let a recovery plan and a generation
+    // job each hold what the other wants (40P01). The project is read unlocked only to name the lock; `lock()` re-reads it.
+    const peek = await client.query<{ project_id: string }>("SELECT project_id FROM displacement_events WHERE id = $1 AND workspace_id = $2", [
+      displacementId, context.workspaceId,
+    ]);
+    if (peek.rows[0] !== undefined) await acquireAdvisoryXactLock(client, projectQueueLockKey("task.generate", peek.rows[0].project_id));
     const state = await this.lock(displacementId);
     const gap = citationGapSchema.parse(state.citation_gap);
 
@@ -241,9 +249,7 @@ export class DisplacementService {
 
     // The displacement's `task_id` is the plan's first task, set once and never replaced.
     if (tasks.length > 0 && state.task_id === null) {
-      await client.query("UPDATE displacement_events SET task_id = $3 WHERE id = $1 AND workspace_id = $2 AND task_id IS NULL", [
-        displacementId, context.workspaceId, tasks[0]!.id,
-      ]);
+      await linkDisplacementToTask(client, context.workspaceId, displacementId, tasks[0]!.id);
     }
 
     incrementCounter("nominara_displacement_recovery_plans_total", { outcome: created > 0 ? "created" : "unchanged" });
@@ -264,20 +270,8 @@ export class DisplacementService {
    * Returns lower-cased domain to `source_domains.id`.
    */
   private async actionableDomains(projectId: string, domains: readonly string[]): Promise<Map<string, string>> {
-    const found = new Map<string, string>();
-    if (domains.length === 0) return found;
     const { client, context } = this.store();
-    const rows = await client.query<{ id: string; domain: string }>(
-      `SELECT sd.id, lower(sd.domain) AS domain
-         FROM source_domains sd
-         JOIN project_source_index psi ON psi.source_domain_id = sd.id
-        WHERE sd.workspace_id = $1 AND sd.is_seedable AND lower(sd.domain) = ANY($3::text[])
-          AND psi.workspace_id = $1 AND psi.project_id = $2 AND psi.engine_key = 'all' AND psi.window_days = $4
-          AND psi.gap_severity IN ('critical', 'high')`,
-      [context.workspaceId, projectId, domains, AUTHORITY_TASK_WINDOW_DAYS],
-    );
-    for (const row of rows.rows) found.set(row.domain, row.id);
-    return found;
+    return actionableAuthorityDomains(client, context.workspaceId, projectId, domains, AUTHORITY_TASK_WINDOW_DAYS);
   }
 
   private store() {

@@ -48,8 +48,12 @@ const payloadSchema = z
 /** Enqueues one `source.verify_presence` job. Injected in tests; production builds a producer from env on first use. */
 export type EnqueueVerifyPresence = (workspaceId: string, payload: { projectId: string }, idempotencyKey: string) => Promise<unknown>;
 
+/** STORY-063 — enqueues one `task.generate` job for a project and workspace-local day. Injected in tests. */
+export type EnqueueTaskGenerate = (workspaceId: string, payload: { projectId: string; metricDate: string }, idempotencyKey: string) => Promise<unknown>;
+
 export interface RollupMetricDailyDeps {
   readonly enqueueVerifyPresence?: EnqueueVerifyPresence;
+  readonly enqueueTaskGenerate?: EnqueueTaskGenerate;
 }
 
 export function createRollupMetricDailyHandler(context: QueueHandlerContext, deps?: RollupMetricDailyDeps): JobProcessor {
@@ -68,6 +72,17 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
         signingKeysFromEnv(context.env),
       );
       return producer.enqueueTenantJob("source.verify_presence", workspaceId, payload, { idempotencyKey });
+    });
+
+  const enqueueTaskGenerate: EnqueueTaskGenerate =
+    deps?.enqueueTaskGenerate ??
+    (async (workspaceId, payload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob("task.generate", workspaceId, payload, { idempotencyKey });
     });
 
   return async (tx: ClientBase, job: Job): Promise<void> => {
@@ -133,6 +148,40 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
       if (currentTenantStore() !== undefined) {
         const today = await localToday(tx, timezone);
         const { projectId, workspaceId } = payload;
+
+        // STORY-063 AC3 — generation runs after each rollup, on the latest day it rolled up. A separate job, queued once this
+        // transaction has committed (so it reads what this run wrote), because the rule evaluation is its own unit of
+        // work with its own retries. The key carries this job's id: a redelivery of THIS rollup queues nothing more, while
+        // a later rollup of the same day (a dirty-date reprocess) queues a fresh evaluation, which is safe because
+        // generation is idempotent. A failed enqueue is logged, never thrown: the rollup is durable.
+        //
+        // The day evaluated is never earlier than TODAY: a dirty-date or from/to reprocess of past days ends on an old date, and a
+        // trailing window anchored there would raise tasks from a period that may be weeks old and already recovered. Event rules
+        // (displacement, AUX) do not depend on the date at all, so nothing is lost by evaluating the present.
+        //
+        // No `triggerKinds` is passed on purpose (AC3, "rules whose trigger matches the changed facts"): a rollup changes every metric a
+        // windowed rule reads and the event rules read their own tables, so the changed facts of a rollup match every trigger kind.
+        // Narrowing is for a producer that knows ONE kind of change (the AUX audit), which is what the payload field is for.
+        const lastDate = dates[dates.length - 1];
+        if (lastDate !== undefined) {
+          const evaluateDate = lastDate > today ? lastDate : today;
+          const runKey = job.id ?? today;
+          afterCommit(() => {
+            void enqueueTaskGenerate(workspaceId, { projectId, metricDate: evaluateDate }, `taskgen:${projectId}:${evaluateDate}:${runKey}`)
+              .then(() => {
+                incrementCounter("nominara_taskgen_requested_total");
+              })
+              .catch((error: unknown) => {
+                incrementCounter("nominara_taskgen_request_failed_total");
+                logger.error({
+                  event: "taskgen.request_failed",
+                  workspace_id: workspaceId,
+                  project_id: projectId,
+                  error: error instanceof Error ? error.name : "unknown",
+                });
+              });
+          });
+        }
         afterCommit(() => {
           void enqueueVerifyPresence(workspaceId, { projectId }, `srcver:${projectId}:${today}`)
             .then(() => {

@@ -75,6 +75,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "retention.purge",
       "rollup.metric_daily",
       "source.verify_presence",
+      "task.generate",
     ]);
     // Topology order, not alphabetical — `liveQueueNames` filters
     // QUEUE_TOPOLOGY, and the capture queues are declared before the crawl
@@ -87,6 +88,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       // NEW-C-9 — after crawl.fingerprint (inert), before the embed group.
       "crawl.audit",
       "rollup.metric_daily",
+      // STORY-063 — declared after topic.cluster in topology.ts, i.e. between the rollup and credit entries.
+      "task.generate",
       "credit.reconcile",
       "maintenance.partition",
       // Declared after maintenance.partition in topology.ts — STORY-143's

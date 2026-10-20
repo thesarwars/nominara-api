@@ -316,7 +316,7 @@ describe("NEW-A-7 · rollup requested from the parse completion path", () => {
     const a = await seedCapture(workspaceId, projectId, promptId, runId);
     await parseInTenant(a);
 
-    const rollup = createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { enqueueVerifyPresence: async () => undefined });
+    const rollup = createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { enqueueVerifyPresence: async () => undefined, enqueueTaskGenerate: async () => undefined });
     const rollupJob = (project: string, ws: string): Job =>
       ({ data: { payload: { workspaceId: ws, kid: "k", projectId: project, metricDate: "2026-03-11" } } }) as unknown as Job;
 
