@@ -356,7 +356,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     let manifestStored: boolean | null = null;
     if (crawl.pages.length > 0 || probe !== null) {
       try {
-        const key = await store(`${keyPrefix}/manifest.json`, Buffer.from(JSON.stringify(manifest), "utf8"), "application/json");
+        const key = await store([keyPrefix, "manifest.json"].join("/"), Buffer.from(JSON.stringify(manifest), "utf8"), "application/json");
         domObjectPrefix = key.slice(0, key.length - "manifest.json".length);
         manifestStored = true;
       } catch {

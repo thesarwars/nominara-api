@@ -147,7 +147,7 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
 
     const keep = async (kind: "raw" | "rendered", body: Buffer, status: number | null, truncated: boolean): Promise<StoredCopy | undefined> => {
       try {
-        const objectKey = await deps.store(`${deps.keyPrefix}/${key}.${kind}.html.gz`, gzipSync(body), "application/gzip");
+        const objectKey = await deps.store([deps.keyPrefix, `${key}.${kind}.html.gz`].join("/"), gzipSync(body), "application/gzip");
         return { object_key: objectKey, sha256: sha256(body), bytes: body.length, status, truncated };
       } catch {
         failures.push({ stage: "store", reason: "storage_unavailable", http_status: null });

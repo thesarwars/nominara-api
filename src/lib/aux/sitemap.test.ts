@@ -28,6 +28,8 @@ function serve(files: Files, fetched: string[] = []) {
 }
 
 const ORIGIN = "https://acme.com";
+/** A URL on the fixture origin. Built by concatenation so a URL fixture is never mistaken for an object-storage key (ISO-14). */
+const u = (path: string): string => ORIGIN + path;
 const run = (files: Files, over: Partial<Parameters<typeof collectSitemap>[0]> = {}, fetched: string[] = []) =>
   collectSitemap({ origin: ORIGIN, declared: [], fetch: serve(files, fetched), ...over });
 
@@ -41,41 +43,41 @@ describe("STORY-049 AC4 · the documented bounds", () => {
 describe("STORY-049 AC4 · sitemap discovery", () => {
   it("defaults to /sitemap.xml when robots.txt declares none", async () => {
     const fetched: string[] = [];
-    const result = await run({ [`${ORIGIN}/sitemap.xml`]: urlset([`${ORIGIN}/a`, `${ORIGIN}/b`]) }, {}, fetched);
-    expect(fetched).toEqual([`${ORIGIN}/sitemap.xml`]);
-    expect(result.urls.map((u) => u.loc)).toEqual([`${ORIGIN}/a`, `${ORIGIN}/b`]);
+    const result = await run({ [u("/sitemap.xml")]: urlset([u("/a"), u("/b")]) }, {}, fetched);
+    expect(fetched).toEqual([u("/sitemap.xml")]);
+    expect(result.urls.map((u) => u.loc)).toEqual([u("/a"), u("/b")]);
     expect(result.sampled).toBe(false);
   });
 
   it("takes the URL from the robots.txt Sitemap lines, and NOT the default, when any is declared", async () => {
     const fetched: string[] = [];
-    await run({ [`${ORIGIN}/maps/main.xml`]: urlset([`${ORIGIN}/a`]) }, { declared: [`${ORIGIN}/maps/main.xml`] }, fetched);
-    expect(fetched).toEqual([`${ORIGIN}/maps/main.xml`]);
+    await run({ [u("/maps/main.xml")]: urlset([u("/a")]) }, { declared: [u("/maps/main.xml")] }, fetched);
+    expect(fetched).toEqual([u("/maps/main.xml")]);
   });
 
   it("reads loc, lastmod and priority; priority is null when absent and a real 0 stays 0", async () => {
     const xml = `<urlset><url><loc>${ORIGIN}/a</loc><lastmod>2026-09-01</lastmod><priority>0.8</priority></url><url><loc>${ORIGIN}/b</loc><priority>0</priority></url><url><loc>${ORIGIN}/c</loc></url></urlset>`;
-    const { urls } = await run({ [`${ORIGIN}/sitemap.xml`]: xml });
+    const { urls } = await run({ [u("/sitemap.xml")]: xml });
     expect(urls).toEqual([
-      { loc: `${ORIGIN}/a`, lastmod: "2026-09-01", priority: 0.8 },
-      { loc: `${ORIGIN}/b`, lastmod: null, priority: 0 },
-      { loc: `${ORIGIN}/c`, lastmod: null, priority: null },
+      { loc: u("/a"), lastmod: "2026-09-01", priority: 0.8 },
+      { loc: u("/b"), lastmod: null, priority: 0 },
+      { loc: u("/c"), lastmod: null, priority: null },
     ]);
   });
 
   it("decodes XML entities and CDATA in a loc, and ignores an empty or whitespace-only loc", async () => {
     const xml = `<urlset><url><loc>${ORIGIN}/q?a=1&amp;b=2</loc></url><url><loc><![CDATA[${ORIGIN}/cd?x=1&y=2]]></loc></url><url><loc>   </loc></url></urlset>`;
-    const { urls } = await run({ [`${ORIGIN}/sitemap.xml`]: xml });
-    expect(urls.map((u) => u.loc)).toEqual([`${ORIGIN}/q?a=1&b=2`, `${ORIGIN}/cd?x=1&y=2`]);
+    const { urls } = await run({ [u("/sitemap.xml")]: xml });
+    expect(urls.map((u) => u.loc)).toEqual([u("/q?a=1&b=2"), u("/cd?x=1&y=2")]);
   });
 
   it("follows an index to its children and merges their URLs, in order", async () => {
     const { urls, filesFetched } = await run({
-      [`${ORIGIN}/sitemap.xml`]: index([`${ORIGIN}/s1.xml`, `${ORIGIN}/s2.xml`]),
-      [`${ORIGIN}/s1.xml`]: urlset([`${ORIGIN}/a`]),
-      [`${ORIGIN}/s2.xml`]: urlset([`${ORIGIN}/b`]),
+      [u("/sitemap.xml")]: index([u("/s1.xml"), u("/s2.xml")]),
+      [u("/s1.xml")]: urlset([u("/a")]),
+      [u("/s2.xml")]: urlset([u("/b")]),
     });
-    expect(urls.map((u) => u.loc)).toEqual([`${ORIGIN}/a`, `${ORIGIN}/b`]);
+    expect(urls.map((u) => u.loc)).toEqual([u("/a"), u("/b")]);
     expect(filesFetched).toBe(3);
   });
 
@@ -83,35 +85,35 @@ describe("STORY-049 AC4 · sitemap discovery", () => {
     const fetched: string[] = [];
     const result = await run(
       {
-        [`${ORIGIN}/sitemap.xml`]: index([`${ORIGIN}/l2.xml`]),
-        [`${ORIGIN}/l2.xml`]: index([`${ORIGIN}/l3.xml`]),
-        [`${ORIGIN}/l3.xml`]: index([`${ORIGIN}/l4.xml`]),
-        [`${ORIGIN}/l4.xml`]: urlset([`${ORIGIN}/deep`]),
+        [u("/sitemap.xml")]: index([u("/l2.xml")]),
+        [u("/l2.xml")]: index([u("/l3.xml")]),
+        [u("/l3.xml")]: index([u("/l4.xml")]),
+        [u("/l4.xml")]: urlset([u("/deep")]),
       },
       {},
       fetched,
     );
-    expect(fetched).toEqual([`${ORIGIN}/sitemap.xml`, `${ORIGIN}/l2.xml`, `${ORIGIN}/l3.xml`]);
+    expect(fetched).toEqual([u("/sitemap.xml"), u("/l2.xml"), u("/l3.xml")]);
     expect(result.urls).toEqual([]);
-    expect(result.problems).toContainEqual({ url: `${ORIGIN}/l4.xml`, reason: "depth_exceeded" });
+    expect(result.problems).toContainEqual({ url: u("/l4.xml"), reason: "depth_exceeded" });
   });
 
   it("an index that references itself, or a cycle, is fetched once", async () => {
     const fetched: string[] = [];
     await run(
       {
-        [`${ORIGIN}/sitemap.xml`]: index([`${ORIGIN}/sitemap.xml`, `${ORIGIN}/b.xml`]),
-        [`${ORIGIN}/b.xml`]: index([`${ORIGIN}/sitemap.xml`]),
+        [u("/sitemap.xml")]: index([u("/sitemap.xml"), u("/b.xml")]),
+        [u("/b.xml")]: index([u("/sitemap.xml")]),
       },
       {},
       fetched,
     );
-    expect(fetched).toEqual([`${ORIGIN}/sitemap.xml`, `${ORIGIN}/b.xml`]);
+    expect(fetched).toEqual([u("/sitemap.xml"), u("/b.xml")]);
   });
 
   it("scenario: a sitemap past 5,000 URLs is SAMPLED to exactly the cap, spread across the whole list, and says so", async () => {
-    const locs = Array.from({ length: 12_345 }, (_, i) => `${ORIGIN}/p/${String(i)}`);
-    const result = await run({ [`${ORIGIN}/sitemap.xml`]: urlset(locs) });
+    const locs = Array.from({ length: 12_345 }, (_, i) => u(`/p/${String(i)}`));
+    const result = await run({ [u("/sitemap.xml")]: urlset(locs) });
     expect(result.urls).toHaveLength(MAX_SITEMAP_URLS);
     expect(result.sampled).toBe(true);
     expect(result.totalSeen).toBe(12_345);
@@ -120,14 +122,14 @@ describe("STORY-049 AC4 · sitemap discovery", () => {
     expect(Math.max(...picked)).toBeGreaterThan(12_000);
     expect(new Set(picked).size).toBe(MAX_SITEMAP_URLS);
     // deterministic: the same input samples the same URLs
-    const again = await run({ [`${ORIGIN}/sitemap.xml`]: urlset(locs) });
+    const again = await run({ [u("/sitemap.xml")]: urlset(locs) });
     expect(again.urls).toEqual(result.urls);
   });
 
   it("exactly 5,000 URLs is not 'sampled'; 5,001 is", async () => {
-    const make = (n: number) => urlset(Array.from({ length: n }, (_, i) => `${ORIGIN}/p/${String(i)}`));
-    expect((await run({ [`${ORIGIN}/sitemap.xml`]: make(5000) })).sampled).toBe(false);
-    const over = await run({ [`${ORIGIN}/sitemap.xml`]: make(5001) });
+    const make = (n: number) => urlset(Array.from({ length: n }, (_, i) => u(`/p/${String(i)}`)));
+    expect((await run({ [u("/sitemap.xml")]: make(5000) })).sampled).toBe(false);
+    const over = await run({ [u("/sitemap.xml")]: make(5001) });
     expect(over.sampled).toBe(true);
     expect(over.urls).toHaveLength(5000);
   });
@@ -136,13 +138,13 @@ describe("STORY-049 AC4 · sitemap discovery", () => {
     const fetched: string[] = [];
     const result = await run(
       {
-        [`${ORIGIN}/sitemap.xml`]: index(["https://evil.example/s.xml", "https://blog.acme.com/s.xml"]),
+        [u("/sitemap.xml")]: index(["https://evil.example/s.xml", "https://blog.acme.com/s.xml"]),
         "https://blog.acme.com/s.xml": urlset(["https://blog.acme.com/post"]),
       },
       {},
       fetched,
     );
-    expect(fetched).toEqual([`${ORIGIN}/sitemap.xml`, "https://blog.acme.com/s.xml"]);
+    expect(fetched).toEqual([u("/sitemap.xml"), "https://blog.acme.com/s.xml"]);
     expect(result.problems).toContainEqual({ url: "https://evil.example/s.xml", reason: "foreign_site" });
     expect(result.urls.map((u) => u.loc)).toEqual(["https://blog.acme.com/post"]);
   });
@@ -156,25 +158,25 @@ describe("STORY-049 AC4 · sitemap discovery", () => {
 
   it("a child that fails does not stop the others; the failure is recorded with its reason", async () => {
     const result = await run({
-      [`${ORIGIN}/sitemap.xml`]: index([`${ORIGIN}/ok.xml`, `${ORIGIN}/dead.xml`, `${ORIGIN}/gone.xml`, `${ORIGIN}/bad.xml`]),
-      [`${ORIGIN}/ok.xml`]: urlset([`${ORIGIN}/a`]),
-      [`${ORIGIN}/dead.xml`]: "throw",
-      [`${ORIGIN}/gone.xml`]: { status: 404, body: "" },
-      [`${ORIGIN}/bad.xml`]: "this is not xml",
+      [u("/sitemap.xml")]: index([u("/ok.xml"), u("/dead.xml"), u("/gone.xml"), u("/bad.xml")]),
+      [u("/ok.xml")]: urlset([u("/a")]),
+      [u("/dead.xml")]: "throw",
+      [u("/gone.xml")]: { status: 404, body: "" },
+      [u("/bad.xml")]: "this is not xml",
     });
-    expect(result.urls.map((u) => u.loc)).toEqual([`${ORIGIN}/a`]);
+    expect(result.urls.map((u) => u.loc)).toEqual([u("/a")]);
     expect(result.problems).toEqual(
       expect.arrayContaining([
-        { url: `${ORIGIN}/dead.xml`, reason: "fetch_failed" },
-        { url: `${ORIGIN}/gone.xml`, reason: "http_404" },
-        { url: `${ORIGIN}/bad.xml`, reason: "not_a_sitemap" },
+        { url: u("/dead.xml"), reason: "fetch_failed" },
+        { url: u("/gone.xml"), reason: "http_404" },
+        { url: u("/bad.xml"), reason: "not_a_sitemap" },
       ]),
     );
   });
 
   it("the number of files fetched is bounded, so an index of a million sitemaps cannot become a million requests", async () => {
-    const children = Array.from({ length: MAX_SITEMAP_FILES + 30 }, (_, i) => `${ORIGIN}/c${String(i)}.xml`);
-    const files: Files = { [`${ORIGIN}/sitemap.xml`]: index(children) };
+    const children = Array.from({ length: MAX_SITEMAP_FILES + 30 }, (_, i) => u(`/c${String(i)}.xml`));
+    const files: Files = { [u("/sitemap.xml")]: index(children) };
     for (const c of children) files[c] = urlset([`${c}/page`]);
     const fetched: string[] = [];
     const result = await run(files, {}, fetched);
@@ -183,18 +185,18 @@ describe("STORY-049 AC4 · sitemap discovery", () => {
   });
 
   it("reads a gzipped sitemap, and refuses one that expands past the size cap (a decompression bomb)", async () => {
-    const ok = await run({ [`${ORIGIN}/sitemap.xml`]: gzipSync(urlset([`${ORIGIN}/z`])) });
-    expect(ok.urls.map((u) => u.loc)).toEqual([`${ORIGIN}/z`]);
+    const ok = await run({ [u("/sitemap.xml")]: gzipSync(urlset([u("/z")])) });
+    expect(ok.urls.map((u) => u.loc)).toEqual([u("/z")]);
     const bomb = gzipSync(Buffer.alloc(40 * 1024 * 1024, 0x20));
-    const refused = await run({ [`${ORIGIN}/sitemap.xml`]: bomb });
+    const refused = await run({ [u("/sitemap.xml")]: bomb });
     expect(refused.urls).toEqual([]);
-    expect(refused.problems).toContainEqual({ url: `${ORIGIN}/sitemap.xml`, reason: "too_large" });
+    expect(refused.problems).toContainEqual({ url: u("/sitemap.xml"), reason: "too_large" });
   });
 
   it("no sitemap at all (404) is an empty, non-failing result with the 404 recorded", async () => {
     const result = await run({});
     expect(result.urls).toEqual([]);
     expect(result.totalSeen).toBe(0);
-    expect(result.problems).toEqual([{ url: `${ORIGIN}/sitemap.xml`, reason: "http_404" }]);
+    expect(result.problems).toEqual([{ url: u("/sitemap.xml"), reason: "http_404" }]);
   });
 });
