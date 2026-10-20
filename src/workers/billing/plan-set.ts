@@ -2,7 +2,7 @@ import { fileURLToPath } from "node:url";
 import type { ClientBase, PoolClient } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { createPgPool } from "../../db/pg-pool.js";
-import { applyPlanChange, planKeyOnly, type BillingInterval } from "../../lib/billing/apply-plan.js";
+import { applyPlanChange, planKeyOnly, type BillingInterval, type PlanChangeOutcome } from "../../lib/billing/apply-plan.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -154,6 +154,22 @@ async function activeMemberCount(client: PoolClient, workspaceId: string): Promi
   return rows.rows[0]?.count ?? "?";
 }
 
+/**
+ * Everything `plan:set` writes, inside the CALLER's tenant-context transaction (exported so it is testable against a
+ * real database without the CLI's own pool): the Stripe-tracked refusal under the workspace lock, then the plan write.
+ */
+export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): Promise<{ outcome: PlanChangeOutcome }> {
+  await assertNotStripeTracked(tx, args.workspaceId);
+  const outcome = await applyPlanChange(
+    tx,
+    args.workspaceId,
+    planKeyOnly(args.planKey, args.billingInterval),
+    { requestId: args.ticket, operator: args.operator, reason: args.reason },
+    { allowNegotiatedTier: args.allowNegotiatedTier },
+  );
+  return { outcome };
+}
+
 export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void = console.log): Promise<void> {
   const env = loadEnv();
   // The same role and the same tenant context an ordinary request uses. The
@@ -164,19 +180,10 @@ export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void 
   try {
     const client = await pool.connect();
     try {
-      const outcome = await withTenantContext(
+      const { outcome } = await withTenantContext(
         client,
         { workspaceId: args.workspaceId, actorId: SYSTEM_ACTOR_ID },
-        async (tx) => {
-          await assertNotStripeTracked(tx, args.workspaceId);
-          return await applyPlanChange(
-            tx,
-            args.workspaceId,
-            planKeyOnly(args.planKey, args.billingInterval),
-            { requestId: args.ticket, operator: args.operator, reason: args.reason },
-            { allowNegotiatedTier: args.allowNegotiatedTier },
-          );
-        },
+        async (tx) => await planSetInTransaction(tx, args),
       );
 
       if (!outcome.changed) {
