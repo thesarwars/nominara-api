@@ -24,6 +24,11 @@ describe("STORY-049 AC12 · aux_audits.error_summary (jsonb)", () => {
     expect(auxErrorSummarySchema.parse({}).pages_over_cap).toBeUndefined();
   });
 
+  it("manifest_stored is only ever written as false", () => {
+    expect(auxErrorSummarySchema.parse({ manifest_stored: false }).manifest_stored).toBe(false);
+    expect(auxErrorSummarySchema.safeParse({ manifest_stored: true }).success).toBe(false);
+  });
+
   it("refuses an unknown key, an unknown stage, and a failure with no reason", () => {
     expect(auxErrorSummarySchema.safeParse({ stack: "..." }).success).toBe(false);
     expect(auxErrorSummarySchema.safeParse({ failed_pages: [{ url: "u", failures: [{ stage: "dns", reason: "x", http_status: null }] }] }).success).toBe(false);

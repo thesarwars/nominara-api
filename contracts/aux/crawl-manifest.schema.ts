@@ -39,6 +39,8 @@ export const auxErrorSummarySchema = z
     /** Valid pages the scope selected that did not fit under the page cap. 0 is "none cut", absent is "not measured". */
     pages_over_cap: z.number().int().min(0).optional(),
     stopped_at_cap: z.boolean().optional(),
+    /** Written only as `false`: the manifest could not be stored, so the audit cannot be reproduced from storage. */
+    manifest_stored: z.literal(false).optional(),
   })
   .strict();
 export type AuxErrorSummary = z.infer<typeof auxErrorSummarySchema>;

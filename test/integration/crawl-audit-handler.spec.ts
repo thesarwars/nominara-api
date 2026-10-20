@@ -5,7 +5,10 @@ import { Client } from "pg";
 import type { Job } from "bullmq";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { gunzipSync } from "node:zlib";
 import { createCrawlAuditHandler, type CrawlAuditDeps } from "../../src/lib/queue/handlers/crawl-audit.handler.js";
+import { AGENT_PROBE_USER_AGENT, BROWSER_PROBE_USER_AGENT } from "../../src/lib/aux/differential-probe.js";
+import { crawlManifestSchema } from "../../contracts/aux/index.js";
 import { handlerFor } from "../../src/lib/queue/handlers.js";
 import type { GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
 
@@ -33,19 +36,33 @@ const OPEN = "User-agent: *\nAllow: /\nSitemap: https://acme.com/sitemap.xml\n";
 const LLMS = "# Acme\n- [Docs](https://acme.com/docs)\n";
 const SITEMAP = `<urlset><url><loc>https://acme.com/</loc><lastmod>2026-10-01</lastmod></url></urlset>`;
 const healthy = (robots: string): Served => ({
+  "/": { status: 200, body: "<html><body>home</body></html>" },
   "/robots.txt": { status: 200, body: robots },
   "/llms.txt": { status: 200, body: LLMS },
   "/.well-known/llms.txt": { status: 404, body: "" },
   "/sitemap.xml": { status: 200, body: SITEMAP },
 });
 
-function depsServing(served: Served, requested: string[] = [], timeoutMs = 10_000): CrawlAuditDeps {
+// What the crawl stored (relative key -> bytes) and what it asked the renderer for. Reset per test.
+const stored = new Map<string, Buffer>();
+const rendered: string[] = [];
+const sleeps: number[] = [];
+let clockMs = 0;
+const requestedUas: { url: string; ua: string | undefined }[] = [];
+
+function depsServing(served: Served, requested: string[] = [], timeoutMs = 10_000, extra: Partial<CrawlAuditDeps> = {}): CrawlAuditDeps {
   return {
     now: () => new Date("2026-10-07T00:00:00Z"),
-    sleep: async () => undefined,
+    // A virtual clock the politeness budget reads, advanced by the sleeps it asks for: no real waiting, and the spacing is exact.
+    nowMs: () => clockMs,
+    sleep: async (ms: number) => { sleeps.push(ms); clockMs += ms; },
     timeoutMs,
-    fetch: async (url: string): Promise<GuardedResponse> => {
+    renderer: { render: async (url) => { rendered.push(url); return { html: `<html>rendered ${url}</html>`, finalUrl: url, status: 200 }; } },
+    store: async (relative, body) => { stored.set(relative, body); return `crawl/test/ws/${relative}`; },
+    ...extra,
+    fetch: async (url: string, init?: { headers?: Record<string, string> }): Promise<GuardedResponse> => {
       requested.push(url);
+      requestedUas.push({ url, ua: init?.headers?.["user-agent"] });
       const hit = served[new URL(url).pathname];
       if (hit === undefined || hit === "throw") throw new Error("connection refused");
       if (hit === "hang") return new Promise<GuardedResponse>(() => undefined);
@@ -71,6 +88,11 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
 
   beforeEach(async () => {
     counters.length = 0;
+    stored.clear();
+    rendered.length = 0;
+    sleeps.length = 0;
+    clockMs = 0;
+    requestedUas.length = 0;
     await db.query("TRUNCATE workspaces CASCADE");
     workspaceId = (await db.query("INSERT INTO workspaces (name, slug, plan_key) VALUES ('W','w-c9','free') RETURNING id")).rows[0].id;
     projectId = (await db.query(
@@ -79,6 +101,13 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     )).rows[0].id;
   });
 
+  const verifyDomain = async (): Promise<void> => {
+    await db.query(
+      `INSERT INTO domain_verifications (id, workspace_id, project_id, domain, method, nonce, verified_at, last_checked_at)
+       VALUES ($1,$2,$3,'acme.com','dns_txt','nonce-c9',now(),now())`,
+      [randomUUID(), workspaceId, projectId],
+    );
+  };
   const job = (over: Record<string, unknown> = {}): Job =>
     ({ data: { payload: { projectId, auditId: randomUUID(), trigger: "onboarding", workspaceId, kid: "k1", ...over } } }) as unknown as Job;
   const run = async (j: Job, deps: CrawlAuditDeps): Promise<void> => {
@@ -94,10 +123,11 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(handlerFor("crawl.audit")).toBeDefined();
   });
 
-  it("NEW-C-9 AC1.2 · fetches robots.txt, llms.txt, /.well-known/llms.txt and sitemap.xml, and nothing else", async () => {
+  it("NEW-C-9 AC1.2 · an unverified domain: the four site files and the supplied URL, and nothing else", async () => {
     const requested: string[] = [];
     await run(job(), depsServing(healthy(OPEN), requested));
     expect(requested.sort()).toEqual([
+      "https://acme.com/",
       "https://acme.com/.well-known/llms.txt",
       "https://acme.com/llms.txt",
       "https://acme.com/robots.txt",
@@ -114,17 +144,17 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(await findings()).toHaveLength(0);
   });
 
-  it("NEW-C-9 AC2.1 · writes a domain_root audit with the trigger, snapshot, hash and site-file facts", async () => {
+  it("NEW-C-9 AC2.1 · writes a public_surface audit (unverified) with the trigger, snapshot, hash, site-file facts and the one page", async () => {
     await run(job({ trigger: "scheduled" }), depsServing(healthy(OPEN)));
     const [a] = await audits();
-    expect(a).toMatchObject({ trigger: "scheduled", scope: "domain_root", status: "completed", llms_txt_present: true, sitemap_url_count: 1, pages_crawled: 0, pages_failed: 0 });
+    expect(a).toMatchObject({ trigger: "scheduled", scope: "public_surface", status: "completed", llms_txt_present: true, sitemap_url_count: 1, pages_crawled: 1, pages_failed: 0 });
     expect(a.robots_snapshot).toBe(OPEN);
     expect(Buffer.isBuffer(a.robots_hash) && a.robots_hash.length === 32).toBe(true);
     expect(a.started_at).not.toBeNull();
     expect(a.finished_at).not.toBeNull();
   });
 
-  it("NEW-C-9 AC2.2 · excluded_rules names every rule that did not run: 27 outside crawler_access, AUX-R-005 and AUX-R-006, and the page crawl", async () => {
+  it("NEW-C-9 AC2.2 · excluded_rules names every rule that did not run: 27 outside crawler_access, AUX-R-005 and AUX-R-006 (the page-level rules wait for STORY-051)", async () => {
     await run(job(), depsServing(healthy(OPEN)));
     const [a] = await audits();
     const excluded: string[] = a.excluded_rules;
@@ -135,7 +165,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(excluded).toContain("AUX-R-006");
     expect(excluded).toContain("AUX-R-008");
     expect(excluded).toContain("AUX-R-034");
-    expect(excluded).toContain("page_crawl");
+    expect(excluded).not.toContain("page_crawl"); // a page WAS crawled: naming it as not run would be false
   });
 
   it("NEW-C-9 AC5.1 · publishes the crawler_access subscore, no aux_score; a critical finding sets the capped flag", async () => {
@@ -235,6 +265,255 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   it("NEW-C-9 AC6.1 · counts the audit by status and trigger, and the log line carries ids, never the domain's file text", async () => {
     await run(job(), depsServing(healthy(BLOCKED)));
     expect(counters).toContainEqual({ name: "nominara_aux_audits_total", labels: { status: "completed", trigger: "onboarding" } });
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------
+  // STORY-049 — authorisation by verification state, page selection, the two fetches, politeness, failures that do not abort
+  // ------------------------------------------------------------------------------------------------------------------
+  const SITEMAP_PAGES = `<urlset>
+    <url><loc>https://acme.com/</loc></url>
+    <url><loc>https://acme.com/pricing</loc><priority>0.9</priority></url>
+    <url><loc>https://acme.com/about</loc><priority>0.3</priority></url>
+  </urlset>`;
+  const withSitemap = (xml: string, robots = OPEN): Served => ({
+    ...healthy(robots),
+    "/sitemap.xml": { status: 200, body: xml },
+    "/pricing": { status: 200, body: "<html>pricing</html>" },
+    "/about": { status: 200, body: "<html>about</html>" },
+  });
+  const manifestOf = async (): Promise<ReturnType<typeof crawlManifestSchema.parse>> => {
+    const [a] = await audits();
+    const key = [...stored.keys()].find((k) => k.endsWith("manifest.json"))!;
+    expect(key).toBeDefined();
+    expect(a.dom_object_prefix).toBe(`crawl/test/ws/${a.id}/`);
+    return crawlManifestSchema.parse(JSON.parse(stored.get(key)!.toString("utf8")));
+  };
+
+  it("STORY-049 scenario 10 · an unverified domain is public_surface: the supplied URL and the site files, the pages of the sitemap NOT fetched", async () => {
+    const requested: string[] = [];
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES), requested));
+    const [a] = await audits();
+    expect(a.scope).toBe("public_surface");
+    expect(requested).not.toContain("https://acme.com/pricing");
+    expect(requested).not.toContain("https://acme.com/about");
+    expect(a.target_urls).toContain("https://acme.com/");
+    expect(a.excluded_rules).toContain("AUX-R-008");
+  });
+
+  it("STORY-049 scenario 10 · an unverified domain gets no differential probe: it would send a spoofed agent string to a site nobody proved they own", async () => {
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
+    expect(requestedUas.some((r) => r.ua === AGENT_PROBE_USER_AGENT || r.ua === BROWSER_PROBE_USER_AGENT)).toBe(false);
+  });
+
+  it("STORY-049 AC9 · a payload cannot escalate an unverified domain: scope key_pages is still public_surface", async () => {
+    const requested: string[] = [];
+    await run(job({ scope: "key_pages" }), depsServing(withSitemap(SITEMAP_PAGES), requested));
+    expect((await audits())[0]!.scope).toBe("public_surface");
+    expect(requested).not.toContain("https://acme.com/pricing");
+  });
+
+  it("STORY-049 AC9 · the mirror alone is not authority: projects.domain_verified_at set with no verified domain_verifications row is still public_surface", async () => {
+    await db.query("UPDATE projects SET domain_verified_at = now() WHERE id = $1", [projectId]);
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
+    expect((await audits())[0]!.scope).toBe("public_surface");
+  });
+
+  it("STORY-049 AC9 · a verification that has lapsed (verified_at cleared) is public_surface again", async () => {
+    await verifyDomain();
+    await db.query("UPDATE domain_verifications SET verified_at = NULL WHERE project_id = $1", [projectId]);
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
+    expect((await audits())[0]!.scope).toBe("public_surface");
+  });
+
+  it("STORY-049 scenario 9 · a verified domain is key_pages: the root and the sitemap's pages, both copies of each", async () => {
+    await verifyDomain();
+    const requested: string[] = [];
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES), requested));
+    const [a] = await audits();
+    expect(a).toMatchObject({ scope: "key_pages", status: "completed", pages_crawled: 3, pages_failed: 0 });
+    expect(requested).toEqual(expect.arrayContaining(["https://acme.com/", "https://acme.com/pricing", "https://acme.com/about"]));
+    expect(rendered.sort()).toEqual(["https://acme.com/", "https://acme.com/about", "https://acme.com/pricing"]);
+    expect([...stored.keys()].filter((k) => k.endsWith(".raw.html.gz"))).toHaveLength(3);
+    expect([...stored.keys()].filter((k) => k.endsWith(".rendered.html.gz"))).toHaveLength(3);
+    expect(a.target_urls).toEqual(expect.arrayContaining(["https://acme.com/pricing", "https://acme.com/robots.txt"]));
+  });
+
+  it("STORY-049 scenario 7 · the stored copies are the gunzipped bytes as fetched, and the manifest names them with their hashes", async () => {
+    await verifyDomain();
+    await run(job({ scope: "single_url", targetUrls: ["https://acme.com/pricing"] }), depsServing(withSitemap(SITEMAP_PAGES)));
+    const m = await manifestOf();
+    expect(m.scope).toBe("single_url");
+    const page = m.pages.find((p) => p.url === "https://acme.com/pricing")!;
+    expect(page.outcome).toBe("ok");
+    const rawKey = page.raw!.object_key.replace("crawl/test/ws/", "");
+    expect(gunzipSync(stored.get(rawKey)!).toString()).toBe("<html>pricing</html>");
+    expect(m.sitemap).toMatchObject({ files_fetched: 1, total_seen: 3 });
+  });
+
+  it("STORY-049 AC8 / scenario 9 · a verified domain runs the differential probe: BOTH requests are issued and recorded in the manifest", async () => {
+    await verifyDomain();
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
+    const uas = requestedUas.map((r) => r.ua);
+    expect(uas).toContain(BROWSER_PROBE_USER_AGENT);
+    expect(uas).toContain(AGENT_PROBE_USER_AGENT);
+    expect((await manifestOf()).probe).toMatchObject({ outcome: "consistent", browserStatus: 200, agentStatus: 200 });
+  });
+
+  it("STORY-049 AC8 · a WAF that refuses the agent UA but serves the browser is recorded as hostile", async () => {
+    await verifyDomain();
+    const served = withSitemap(SITEMAP_PAGES);
+    const deps = depsServing(served);
+    const inner = deps.fetch!;
+    await run(job(), { ...deps, fetch: async (url, init) => (init?.headers?.["user-agent"] === AGENT_PROBE_USER_AGENT ? { status: 403, headers: {}, body: Buffer.from("denied"), finalUrl: url } : inner(url, init)) });
+    expect((await manifestOf()).probe).toMatchObject({ outcome: "hostile", browserStatus: 200, agentStatus: 403 });
+  });
+
+  it("STORY-049 AC7 · every request carries the identified NominaraBot user agent, the pages and the site files alike", async () => {
+    await verifyDomain();
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
+    const nonProbe = requestedUas.filter((r) => r.ua !== AGENT_PROBE_USER_AGENT && r.ua !== BROWSER_PROBE_USER_AGENT);
+    expect(nonProbe.length).toBeGreaterThanOrEqual(7);
+    for (const r of nonProbe) expect(r.ua).toBe("NominaraBot/1.0 (+https://nominara.com/bot)");
+  });
+
+  it("STORY-049 scenario 8 · a declared Crawl-delay is honoured between requests, and the interval is never below 500 ms", async () => {
+    await verifyDomain();
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nCrawl-delay: 3\nAllow: /\n")));
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(Math.min(...sleeps)).toBeGreaterThanOrEqual(500);
+    expect(sleeps).toContain(3000);
+  });
+
+  it("STORY-049 AC7 · the page cap is a hard stop: with a cap of 2, two pages are fetched and the rest are counted as over the cap", async () => {
+    await verifyDomain();
+    const requested: string[] = [];
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES), requested, 10_000, { pageCap: 2 }));
+    const [a] = await audits();
+    expect(a.pages_crawled).toBe(2);
+    expect(requested).not.toContain("https://acme.com/about");
+    expect(a.error_summary).toMatchObject({ pages_over_cap: 1 });
+    expect((await manifestOf()).pages_over_cap).toBe(1);
+  });
+
+  it("STORY-049 AC4 · the sitemap URL comes from the robots Sitemap: line, and /sitemap.xml is not requested when one is declared", async () => {
+    const requested: string[] = [];
+    const served: Served = {
+      ...healthy("User-agent: *\nAllow: /\nSitemap: https://acme.com/maps/main.xml\n"),
+      "/maps/main.xml": { status: 200, body: SITEMAP_PAGES },
+    };
+    await run(job(), depsServing(served, requested));
+    expect(requested).toContain("https://acme.com/maps/main.xml");
+    expect(requested).not.toContain("https://acme.com/sitemap.xml");
+    expect((await audits())[0]!.sitemap_url_count).toBe(3);
+  });
+
+  it("STORY-049 AC4 · a sitemap index is followed to its children, and a child on another registrable domain is not", async () => {
+    const requested: string[] = [];
+    const served: Served = {
+      ...healthy(OPEN),
+      "/sitemap.xml": { status: 200, body: `<sitemapindex><sitemap><loc>https://acme.com/s1.xml</loc></sitemap><sitemap><loc>https://rival.com/s2.xml</loc></sitemap></sitemapindex>` },
+      "/s1.xml": { status: 200, body: SITEMAP_PAGES },
+    };
+    await run(job(), depsServing(served, requested));
+    expect(requested).toContain("https://acme.com/s1.xml");
+    expect(requested).not.toContain("https://rival.com/s2.xml");
+    expect((await audits())[0]!.sitemap_url_count).toBe(3);
+  });
+
+  it("STORY-049 AC7 · a page robots.txt disallows for NominaraBot is skipped and recorded, and is not a failure", async () => {
+    await verifyDomain();
+    const robots = "User-agent: NominaraBot\nDisallow: /pricing\n";
+    const requested: string[] = [];
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, robots), requested));
+    const [a] = await audits();
+    expect(requested).not.toContain("https://acme.com/pricing");
+    expect(a).toMatchObject({ status: "completed", pages_failed: 0, pages_crawled: 2 });
+    expect(a.error_summary).toMatchObject({ skipped_pages: [{ url: "https://acme.com/pricing", reason: "robots_disallowed" }] });
+  });
+
+  it("STORY-049 scenario 11 · a page returning an error is recorded as failed with its reason, the audit CONTINUES and ends partial", async () => {
+    await verifyDomain();
+    const served = { ...withSitemap(SITEMAP_PAGES), "/pricing": { status: 500, body: "boom" } } as Served;
+    await run(job(), depsServing(served));
+    const [a] = await audits();
+    expect(a).toMatchObject({ status: "partial", pages_crawled: 2, pages_failed: 1 });
+    expect(a.error_summary.failed_pages).toEqual([{ url: "https://acme.com/pricing", failures: [{ stage: "raw", reason: "http_500", http_status: 500 }] }]);
+    expect(rendered).toContain("https://acme.com/about"); // the page after the failed one was still crawled
+  });
+
+  it("STORY-049 AC6 / AC12 · with no renderer installed the plain copy is kept, the page is recorded failed at the rendered stage, and the audit is partial", async () => {
+    const { renderer: _installed, ...deps } = depsServing(healthy(OPEN));
+    void _installed;
+    await run(job(), deps);
+    const [a] = await audits();
+    expect(a.status).toBe("partial");
+    expect(a.error_summary.failed_pages[0].failures).toEqual([{ stage: "rendered", reason: "renderer_unavailable", http_status: null }]);
+    expect([...stored.keys()].some((k) => k.endsWith(".raw.html.gz"))).toBe(true);
+    expect([...stored.keys()].some((k) => k.endsWith(".rendered.html.gz"))).toBe(false);
+  });
+
+  it("STORY-049 AC11 · a robots.txt with a NUL byte does not fail the audit write: the snapshot is sanitised, the hash is of the bytes as fetched", async () => {
+    const hostile = "User-agent: *\u0000\nAllow: /\n";
+    await run(job(), depsServing(healthy(hostile)));
+    const [a] = await audits();
+    expect(a.status === "completed" || a.status === "partial").toBe(true);
+    expect(a.robots_snapshot).not.toContain("\u0000");
+    expect(a.robots_hash.toString("hex")).toBe((await import("node:crypto")).createHash("sha256").update(hostile).digest("hex"));
+  });
+
+  it("STORY-049 AC12 · storage that is not configured fails the pages (storage_unavailable), not the audit: the site-file findings are still written", async () => {
+    const { store: _configured, ...deps } = depsServing(healthy(BLOCKED));
+    void _configured;
+    await run(job(), deps);
+    const [a] = await audits();
+    expect(a.status).toBe("partial");
+    expect(a.error_summary.failed_pages[0].failures.map((f: { reason: string }) => f.reason)).toContain("storage_unavailable");
+    expect(await findings()).toHaveLength(1);
+  });
+
+  it("STORY-049 AC5 · key_pages puts the pages the customer's own evidence points at ahead of the sitemap: an owned citation and an open task", async () => {
+    await verifyDomain();
+    const promptId = randomUUID();
+    const url = "https://acme.com/cited";
+    await db.query(
+      `INSERT INTO citation_facts (workspace_id, project_id, result_id, prompt_id, engine_key, captured_at, slot_index, raw_url, normalized_url,
+          url_hash, domain, is_owned, is_competitor, http_status, position_weight)
+       VALUES ($1,$2,$3,$4,'gemini', now() - interval '3 days', 1,$5,$5,$6,'acme.com',true,false,200,1)`,
+      [workspaceId, projectId, randomUUID(), promptId, url, (await import("node:crypto")).createHash("sha256").update(url).digest()],
+    );
+    await db.query(
+      `INSERT INTO tasks (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status, affected_url)
+       VALUES ($1,$2,$3,'T-c9','technical',sha256(random()::text::bytea),'t','d','todo','https://acme.com/tasked')`,
+      [randomUUID(), workspaceId, projectId],
+    );
+    // A closed task's URL is not "named in an open task".
+    await db.query(
+      `INSERT INTO tasks (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status, affected_url)
+       VALUES ($1,$2,$3,'T-c9b','technical',sha256(random()::text::bytea),'t','d','done','https://acme.com/finished')`,
+      [randomUUID(), workspaceId, projectId],
+    );
+    const requested: string[] = [];
+    const served: Served = { ...withSitemap(SITEMAP_PAGES), "/cited": { status: 200, body: "c" }, "/tasked": { status: 200, body: "t" }, "/finished": { status: 200, body: "f" } };
+    await run(job(), depsServing(served, requested, 10_000, { pageCap: 3 }));
+    const pages = requested.filter((u) => !/robots|llms|sitemap/.test(u));
+    expect(pages).toContain("https://acme.com/cited");
+    expect(pages).toContain("https://acme.com/tasked");
+    expect(pages).not.toContain("https://acme.com/finished");
+    expect(pages).not.toContain("https://acme.com/about");
+  });
+
+  it("STORY-049 AC5 · the default page cap comes from the plan (provisional constant until the entitlement key exists)", async () => {
+    await verifyDomain();
+    const many = `<urlset>${Array.from({ length: 40 }, (_, i) => `<url><loc>https://acme.com/p${i}</loc></url>`).join("")}</urlset>`;
+    const served: Served = { ...withSitemap(many), ...Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`/p${i}`, { status: 200, body: "p" }])) };
+    await run(job(), depsServing(served));
+    expect((await audits())[0]!.pages_crawled).toBe(25);
+  });
+
+  it("STORY-049 · counts the pages crawled by outcome", async () => {
+    await verifyDomain();
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
+    expect(counters.filter((c) => c.name === "nominara_aux_crawl_pages_total").map((c) => c.labels.outcome)).toContain("ok");
   });
 
   it("NEW-C-9 AC1.8 · the handler source adds no workspace_id predicate of its own", () => {

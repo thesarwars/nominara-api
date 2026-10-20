@@ -58,7 +58,7 @@ function harness(
     renderer,
     renderTimeoutMs: opts.renderTimeoutMs ?? 1000,
     fetch: async (url, init) => {
-      fetched.push({ url, headers: init.headers, truncateAtCap: init.truncateAtCap });
+      fetched.push({ url, headers: { ...init.headers }, truncateAtCap: init.truncateAtCap });
       const hit = (opts.pages ?? {})[new URL(url).pathname] ?? { status: 200, body: `<html>raw ${url}</html>` };
       if (hit === "refuse") throw new GuardedFetchRefusal("address_not_global");
       if (hit === "throw") throw new Error("connect ECONNREFUSED 10.0.0.5:443");

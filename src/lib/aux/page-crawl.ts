@@ -66,7 +66,7 @@ export interface PageCrawlDeps {
   readonly renderTimeoutMs?: number;
   readonly fetch: (url: string, init: GuardedFetchInit) => Promise<GuardedResponse>;
   /** Writes gzipped bytes under the audit's prefix and returns the FULL stored key. */
-  readonly store: (relative: string, body: Buffer) => Promise<string>;
+  readonly store: (relative: string, body: Buffer, contentType: string) => Promise<string>;
   /** Relative path every object of this audit lives under, e.g. the audit id. */
   readonly keyPrefix: string;
 }
@@ -127,7 +127,7 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
 
     const keep = async (kind: "raw" | "rendered", body: Buffer, status: number | null, truncated: boolean): Promise<StoredCopy | undefined> => {
       try {
-        const objectKey = await deps.store(`${deps.keyPrefix}/${key}.${kind}.html.gz`, gzipSync(body));
+        const objectKey = await deps.store(`${deps.keyPrefix}/${key}.${kind}.html.gz`, gzipSync(body), "application/gzip");
         return { object_key: objectKey, sha256: sha256(body), bytes: body.length, status, truncated };
       } catch {
         failures.push({ stage: "store", reason: "storage_unavailable", http_status: null });
