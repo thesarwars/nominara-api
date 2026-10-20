@@ -20,8 +20,8 @@ const id = (n: number) => `0194a3d2-0000-7000-8000-${String(n).padStart(12, "0")
 
 /** The microsecond UTC key the SQL reads (`MICROS_FORMAT`): lexicographic order is creation order. */
 const key = (hours: number, micros = 0) => at(hours).toISOString().replace("Z", `${String(micros).padStart(3, "0")}Z`);
-const project = (n: number, over: Partial<PauseProject> = {}): PauseProject => ({ id: id(n), createdAt: at(n), createdKey: key(n), status: "active", pausedByDowngrade: false, ...over } as PauseProject);
-const prompt = (n: number, projectId: string, over: Partial<PausePrompt> = {}): PausePrompt => ({ id: id(1000 + n), projectId, createdAt: at(n), createdKey: key(n), status: "active", pausedByDowngrade: false, ...over } as PausePrompt);
+const project = (n: number, over: Partial<PauseProject> = {}): PauseProject => ({ id: id(n), createdKey: key(n), status: "active", pausedByDowngrade: false, ...over });
+const prompt = (n: number, projectId: string, over: Partial<PausePrompt> = {}): PausePrompt => ({ id: id(1000 + n), projectId, createdKey: key(n), status: "active", pausedByDowngrade: false, ...over });
 const limits = (over: Partial<PauseLimits> = {}): PauseLimits => ({ projects: null, promptsTotal: null, promptsPerProject: null, ...over });
 
 describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED excess", () => {
@@ -36,7 +36,7 @@ describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED 
     const ps = [project(5), project(1), project(4), project(2), project(3)];
     expect(planDowngradePause(limits({ projects: 3 }), ps, []).pauseProjects).toEqual([id(5), id(4)]);
     // A created_at tie is broken by id, descending — the same order the preview lists them in.
-    const tied = [project(1, { createdAt: at(0), createdKey: key(0) } as Partial<PauseProject>), project(2, { createdAt: at(0), createdKey: key(0) } as Partial<PauseProject>), project(3, { createdAt: at(0), createdKey: key(0) } as Partial<PauseProject>)];
+    const tied = [project(1, { createdKey: key(0) }), project(2, { createdKey: key(0) }), project(3, { createdKey: key(0) })];
     expect(planDowngradePause(limits({ projects: 1 }), tied, []).pauseProjects).toEqual([id(3), id(2)]);
   });
 
@@ -44,13 +44,13 @@ describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED 
     // Same millisecond, different microseconds: id(1) is the NEWER row though its id is smaller. A millisecond Date would
     // tie and fall back to id, pausing id(2) - not the project the preview named.
     const ps = [
-      project(1, { createdAt: at(0), createdKey: key(0, 900) } as Partial<PauseProject>),
-      project(2, { createdAt: at(0), createdKey: key(0, 100) } as Partial<PauseProject>),
+      project(1, { createdKey: key(0, 900) }),
+      project(2, { createdKey: key(0, 100) }),
     ];
     expect(planDowngradePause(limits({ projects: 1 }), ps, []).pauseProjects).toEqual([id(1)]);
     const prompts = [
-      prompt(1, id(1), { createdAt: at(0), createdKey: key(0, 900) } as Partial<PausePrompt>),
-      prompt(2, id(1), { createdAt: at(0), createdKey: key(0, 100) } as Partial<PausePrompt>),
+      prompt(1, id(1), { createdKey: key(0, 900) }),
+      prompt(2, id(1), { createdKey: key(0, 100) }),
     ];
     expect(planDowngradePause(limits({ promptsPerProject: 1 }), [project(1)], prompts).pausePrompts).toEqual([id(1001)]);
   });

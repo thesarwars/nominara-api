@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { structuralLimitFrom } from "../entitlements/classification.js";
 import { resolveEntitlements } from "../entitlements/resolution.js";
@@ -20,7 +21,7 @@ import { PROMPT_OCCUPIES_SLOT } from "../entitlements/structural-usage.js";
 // of the pause order), a full upgrade resumes everything, and a second delivery of the same state is a fixed point.
 //
 // ⚠ A PERSON'S PAUSE IS NEVER OURS. A row a person paused carries no marker: it is never marked (not taken over), and
-// never resumed by billing. It still OCCUPIES its slot (PROMPT_OCCUPIES_SLOT counts paused prompts; every live project
+// never resumed by billing. It still OCCUPIES its slot (PROMPT_OCCUPIES_SLOT counts paused prompts; every non-deleted project, archived included,
 // counts), so it is in the counts and the excess like any other row — the cap is not bypassed by pausing.
 //
 // ⚠ COUNTS ARE NOT CHANGED BY A DOWNGRADE PAUSE (planner open question 1, option a): a paused row still occupies its
@@ -38,7 +39,8 @@ export interface PauseLimits {
 
 export interface PauseProject {
   readonly id: string;
-  readonly createdAt: Date;
+  /** `created_at` as a microsecond UTC key (`MICROS_FORMAT`): sorts lexicographically in creation order, as the SQL does. */
+  readonly createdKey: string;
   readonly status: "initializing" | "active" | "paused" | "archived";
   readonly pausedByDowngrade: boolean;
 }
@@ -47,7 +49,8 @@ export interface PauseProject {
 export interface PausePrompt {
   readonly id: string;
   readonly projectId: string;
-  readonly createdAt: Date;
+  /** As `PauseProject.createdKey`. */
+  readonly createdKey: string;
   readonly status: "active" | "paused";
   readonly pausedByDowngrade: boolean;
 }
@@ -77,21 +80,28 @@ export function pauseLimitsFrom(entitlements: Readonly<Record<string, { readonly
   };
 }
 
-/** Newest first: created_at descending, then id descending — the order the preview names the excess in. */
-function newestFirst<T extends { readonly id: string; readonly createdAt: Date }>(rows: readonly T[]): T[] {
-  return [...rows].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+/**
+ * Newest first: created_at descending, then id descending — the order the preview names the excess in (SQL `ORDER BY
+ * created_at DESC, id DESC`). Compared on the MICROSECOND key, never a JS Date: a Date keeps milliseconds, so two rows in
+ * the same millisecond would fall back to id here while the preview's SQL still tells them apart.
+ */
+function newestFirst<T extends { readonly id: string; readonly createdKey: string }>(rows: readonly T[]): T[] {
+  const desc = (a: string, b: string) => (a < b ? 1 : a > b ? -1 : 0);
+  return [...rows].sort((a, b) => desc(a.createdKey, b.createdKey) || desc(a.id, b.id));
 }
 
 /** The newest `count - limit` of `rows` (all of them for a limit of 0; none when unlimited or within it). */
-function excessOf<T extends { readonly id: string; readonly createdAt: Date }>(rows: readonly T[], limit: number | null): T[] {
+function excessOf<T extends { readonly id: string; readonly createdKey: string }>(rows: readonly T[], limit: number | null): T[] {
   if (limit === null || rows.length <= limit) return [];
   return newestFirst(rows).slice(0, rows.length - limit);
 }
 
 /** Pure: what the cut-over (or a later upgrade) must pause and resume. */
 export function planDowngradePause(limits: PauseLimits, projects: readonly PauseProject[], prompts: readonly PausePrompt[]): DowngradePausePlan {
-  const live = projects.filter((p) => p.status !== "archived");
-  const excessProjects = new Set(excessOf(live, limits.projects).map((p) => p.id));
+  // EVERY non-deleted project counts, archived included: the guard (structural-usage COUNTERS["projects.max"]) and the
+  // preview (readExcessUsage) count exactly that, so the excess here is the excess the confirmation named. An archived
+  // project in it is counted, never paused (only active/initializing rows are).
+  const excessProjects = new Set(excessOf(projects, limits.projects).map((p) => p.id));
 
   const excessPrompts = new Set<string>();
   for (const prompt of excessOf(prompts, limits.promptsTotal)) excessPrompts.add(prompt.id);
@@ -103,7 +113,7 @@ export function planDowngradePause(limits: PauseLimits, projects: readonly Pause
   }
   for (const list of byProject.values()) for (const prompt of excessOf(list, limits.promptsPerProject)) excessPrompts.add(prompt.id);
 
-  const ordered = newestFirst(live);
+  const ordered = newestFirst(projects);
   const orderedPrompts = newestFirst(prompts);
   return {
     pauseProjects: ordered.filter((p) => excessProjects.has(p.id) && (p.status === "active" || p.status === "initializing")).map((p) => p.id),
@@ -127,20 +137,21 @@ export async function reconcileDowngradePause(tx: ClientBase, workspaceId: strin
   const resolved = await resolveEntitlements(tx, workspaceId);
   const limits = pauseLimitsFrom(resolved.entitlements);
 
-  const projectRows = await tx.query<{ id: string; name: string; created_at: Date; status: PauseProject["status"]; paused_by_downgrade_at: Date | null }>(
-    "SELECT id, name, created_at, status, paused_by_downgrade_at FROM projects WHERE workspace_id = $1 AND deleted_at IS NULL FOR UPDATE",
+  const projectRows = await tx.query<{ id: string; name: string; created_key: string; status: PauseProject["status"]; paused_by_downgrade_at: Date | null }>(
+    `SELECT id, name, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_key, status, paused_by_downgrade_at
+       FROM projects WHERE workspace_id = $1 AND deleted_at IS NULL FOR UPDATE`,
     [workspaceId],
   );
-  const promptRows = await tx.query<{ id: string; project_id: string; text: string; created_at: Date; status: "active" | "paused"; paused_by_downgrade_at: Date | null }>(
-    `SELECT id, project_id, text, created_at, status, paused_by_downgrade_at FROM tracked_prompts
+  const promptRows = await tx.query<{ id: string; project_id: string; text: string; created_key: string; status: "active" | "paused"; paused_by_downgrade_at: Date | null }>(
+    `SELECT id, project_id, text, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_key, status, paused_by_downgrade_at FROM tracked_prompts
       WHERE workspace_id = $1 AND ${PROMPT_OCCUPIES_SLOT} FOR UPDATE`,
     [workspaceId],
   );
 
   const plan = planDowngradePause(
     limits,
-    projectRows.rows.map((r) => ({ id: r.id, createdAt: r.created_at, status: r.status, pausedByDowngrade: r.paused_by_downgrade_at !== null })),
-    promptRows.rows.map((r) => ({ id: r.id, projectId: r.project_id, createdAt: r.created_at, status: r.status, pausedByDowngrade: r.paused_by_downgrade_at !== null })),
+    projectRows.rows.map((r) => ({ id: r.id, createdKey: r.created_key, status: r.status, pausedByDowngrade: r.paused_by_downgrade_at !== null })),
+    promptRows.rows.map((r) => ({ id: r.id, projectId: r.project_id, createdKey: r.created_key, status: r.status, pausedByDowngrade: r.paused_by_downgrade_at !== null })),
   );
 
   const nameOf = new Map(projectRows.rows.map((r) => [r.id, r.name]));
