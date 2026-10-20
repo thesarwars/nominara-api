@@ -40,7 +40,9 @@ function resolverReturning(entitlements: Record<string, { value: unknown }>): En
   return { resolveForWorkspace: vi.fn(async () => ({ entitlements })) } as unknown as EntitlementResolver;
 }
 
-const GENEROUS = { "prompts.max_per_project": { value: 40 }, "scan.priority_subset_size": { value: 50 } };
+// Every resolved map carries `prompts.max_total` (each plan row in db/seed/plan-entitlements.ts defines it; a missing
+// structural key reads fail-closed as 0 in active-limit.ts). Business's 250: none of these per-project cases reach it.
+const GENEROUS = { "prompts.max_per_project": { value: 40 }, "prompts.max_total": { value: 250 }, "scan.priority_subset_size": { value: 50 } };
 
 interface Scenario {
   readonly status?: string;
