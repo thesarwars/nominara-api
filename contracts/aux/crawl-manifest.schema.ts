@@ -39,6 +39,19 @@ export const auxErrorSummarySchema = z
     /** Valid pages the scope selected that did not fit under the page cap. 0 is "none cut", absent is "not measured". */
     pages_over_cap: z.number().int().min(0).optional(),
     stopped_at_cap: z.boolean().optional(),
+    /** Pages with ONE stored copy and a recorded failure for the other (e.g. raw stored, no renderer). Not counted in `aux_audits.pages_failed`. */
+    pages_partial: z.number().int().min(0).optional(),
+    /**
+     * The target's declared Crawl-delay (clamped to our maximum) or the job's wall-clock budget limited what was fetched.
+     * NOT FROM THE REFERENCE: a safety bound so a hostile robots.txt cannot pin a worker.
+     */
+    crawl_delay_limited: z
+      .object({
+        crawl_delay_seconds: z.number().min(0),
+        pages_skipped: z.number().int().min(0),
+      })
+      .strict()
+      .optional(),
     /** Written only as `false`: the manifest could not be stored, so the audit cannot be reproduced from storage. */
     manifest_stored: z.literal(false).optional(),
   })
@@ -59,8 +72,8 @@ const storedCopySchema = z
 export const crawlProbeResultSchema = z
   .object({
     outcome: z.enum(["consistent", "hostile", "inconclusive", "skipped_budget"]),
-    browserStatus: z.number().int().nullable(),
-    agentStatus: z.number().int().nullable(),
+    browser_status: z.number().int().nullable(),
+    agent_status: z.number().int().nullable(),
   })
   .strict();
 
