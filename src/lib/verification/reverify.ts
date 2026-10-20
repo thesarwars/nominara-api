@@ -6,7 +6,7 @@ import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { uuidV7 } from "../ids/uuidv7.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { runCheck, type CheckDeps, type CheckOutcome } from "./checkers.js";
-import { applyCheckOutcome, type VerificationRow } from "./transition.js";
+import { applyCheckOutcome, lockProject, type VerificationRow } from "./transition.js";
 import type { VerificationMethod } from "../../../contracts/projects/index.js";
 
 // STORY-048 AC7 — the periodic re-verification: find every verified domain that is due, check it WITHOUT any
@@ -25,7 +25,7 @@ import type { VerificationMethod } from "../../../contracts/projects/index.js";
 // does not lock before its network wait (that would hold a row lock across an external await, KAD-06); the lock
 // inside the transition is what makes it safe. An outcome computed BEFORE a newer check committed is discarded.
 //
-// OUR OUTAGE IS NOT THEIR ABSENCE. A resolver or network failure on our side (`inconclusive`) records the attempt
+// OUR OUTAGE IS NOT THEIR ABSENCE. A resolver or network failure on our side (`inconclusive`), by ANY method, records the attempt
 // and changes nothing else: no scope change, no notification, no audit row. Without this one resolver outage at
 // 02:20 UTC would de-verify every DNS-verified domain in the fleet.
 
@@ -97,7 +97,7 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
         const outcome = outcomes[index]!;
         const isInconclusive = !outcome.ok && outcome.inconclusive === true;
         if (isInconclusive) inconclusive += 1;
-        if (await applyOne(pool, candidate, outcome, now, checkStartedAt)) lost += 1;
+        if (await applyOne(pool, candidate, outcome, checkStartedAt)) lost += 1;
         incrementCounter("nominara_domain_reverify_checked_total", {
           outcome: outcome.ok ? "verified" : isInconclusive ? "inconclusive" : "failed",
         });
@@ -124,12 +124,13 @@ async function applyOne(
   pool: Pool,
   candidate: Candidate,
   outcome: CheckOutcome,
-  now: Date,
   checkStartedAt: Date,
 ): Promise<boolean> {
   const client = await pool.connect();
   try {
     return await withTenantContext(client, { workspaceId: candidate.workspace_id, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+      // The project first, then the row: the same order as `applyCheckOutcome`, so no pair of writers can deadlock.
+      await lockProject(tx, candidate.project_id);
       // RLS scopes this; no workspace predicate. Locked, so a concurrent manual check serialises with us and
       // the loss is detected exactly once. A row gone or already unverified is simply not ours to change.
       const locked = await tx.query<VerificationRow>(
@@ -141,19 +142,16 @@ async function applyOne(
       if (row === undefined) return false;
       // A newer check (a manual one) committed while ours was in flight: its evidence is fresher than ours.
       if (row.last_checked_at !== null && row.last_checked_at.getTime() > checkStartedAt.getTime()) return false;
-      // Our side failed, not theirs: record that we looked and leave scope, mirror, inbox and audit alone.
-      if (!outcome.ok && outcome.inconclusive === true) {
-        await tx.query("UPDATE domain_verifications SET last_checked_at = $2 WHERE id = $1", [row.id, now]);
-        return false;
-      }
-
       const applied = await applyCheckOutcome(tx, {
         workspaceId: candidate.workspace_id,
         projectId: candidate.project_id,
         domain: candidate.domain,
         row,
         outcome,
-        now,
+        // The time of THIS check, not of the run's start: a 500-row run can take tens of minutes, and a manual check
+        // that committed in between must not be moved backwards past by our write. (An inconclusive outcome is
+        // handled inside the transition: attempt recorded, scope kept, no notification, no audit row.)
+        now: checkStartedAt,
       });
       if (applied.methodLost) {
         // AC10 — the controller's @Audit does not exist on a worker path, so the row is written here, on the

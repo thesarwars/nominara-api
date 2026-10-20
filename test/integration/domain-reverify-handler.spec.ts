@@ -11,6 +11,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { handlerFor, type QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { createDomainReverifyHandler, MIN_RECHECK_INTERVAL_MS } from "../../src/lib/queue/handlers/domain-reverify.handler.js";
 import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
+import { GuardedFetchRefusal } from "../../src/lib/net/guarded-fetch.js";
 import { TXT_PREFIX, type CheckDeps } from "../../src/lib/verification/checkers.js";
 import { applyCheckOutcome, type VerificationRow } from "../../src/lib/verification/transition.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
@@ -292,6 +293,102 @@ describe("STORY-048 AC7 · domain.reverify (periodic re-verification)", () => {
     await run({ now: () => later });
     expect(resolveCalls).toHaveLength(2);
     expect((await verification(s)).verified_at).toBeNull();
+    expect(await notifications(s)).toHaveLength(1);
+  });
+
+  it("review r2 · a FILE-verified domain survives a resolver outage in the guarded fetcher: scope kept, nothing sent", async () => {
+    const s = await seed("file-outage", { method: "well_known_file" });
+    const outage: CheckDeps = {
+      ...checks(),
+      fetch: async () => {
+        throw new GuardedFetchRefusal("dns_resolution_failed", "EAI_AGAIN");
+      },
+    };
+    const result = await run({ checks: outage });
+
+    expect((await verification(s, "well_known_file")).verified_at).not.toBeNull();
+    expect(await mirror(s)).not.toBeNull();
+    expect(await notifications(s)).toHaveLength(0);
+    expect(await auditRows(s)).toHaveLength(0);
+    expect(result).toMatchObject({ checked: 1, lost: 0, inconclusive: 1 });
+  });
+
+  it("review r2 · a name that does NOT exist (ENOTFOUND in the guarded fetcher) is conclusive: the file method is lost", async () => {
+    const s = await seed("file-gone", { method: "well_known_file" });
+    const gone: CheckDeps = {
+      ...checks(),
+      fetch: async () => {
+        throw new GuardedFetchRefusal("dns_resolution_failed", "ENOTFOUND");
+      },
+    };
+    await run({ checks: gone });
+    expect((await verification(s, "well_known_file")).verified_at).toBeNull();
+    expect(await notifications(s)).toHaveLength(1);
+  });
+
+  it("review r2 · a MANUAL re-check that is inconclusive keeps verified_at and notifies nobody (same rule as the sweep)", async () => {
+    const s = await seed("manual-outage");
+    const row = (await db.query("SELECT id, domain, method, nonce, verified_at, last_checked_at, failure_reason FROM domain_verifications WHERE project_id=$1", [s.project])).rows[0] as VerificationRow;
+    const client = await pool.connect();
+    try {
+      const applied = await withTenantContext(client, { workspaceId: s.ws, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+        applyCheckOutcome(tx, {
+          workspaceId: s.ws, projectId: s.project, domain: s.domain, row,
+          outcome: { ok: false, reason: "record_absent", inconclusive: true }, now: NOW,
+        }),
+      );
+      expect(applied).toMatchObject({ methodLost: false, scopeLost: false });
+    } finally {
+      client.release();
+    }
+    const after = await verification(s);
+    expect(after.verified_at).not.toBeNull();
+    expect(after.failure_reason).toBe("record_absent");
+    expect(await mirror(s)).not.toBeNull();
+    expect(await notifications(s)).toHaveLength(0);
+  });
+
+  it("review r2 · the sweep writes the time of ITS check, not the run's start (a manual check in between is never moved backwards past)", async () => {
+    const s = await seed("clock");
+    publish(s);
+    const checkAt = new Date(NOW.getTime() + 30 * 60 * 1000);
+    let calls = 0;
+    await run({ now: () => (calls++ === 0 ? NOW : checkAt) }); // the first reading is the run start; later ones are the chunk's check
+    expect(new Date((await verification(s)).last_checked_at).getTime()).toBe(checkAt.getTime());
+  });
+
+  it("review r2 · two losses on DIFFERENT methods of one project, interleaved, still leave the mirror cleared and notify once", async () => {
+    const s = await seed("two-methods");
+    await addMethod(s, "well_known_file", new Date(NOW.getTime() - 3 * 24 * HOUR), 30);
+    const rowOf = async (method: string) =>
+      (await db.query("SELECT id, domain, method, nonce, verified_at, last_checked_at, failure_reason FROM domain_verifications WHERE project_id=$1 AND method=$2", [s.project, method])).rows[0] as VerificationRow;
+    const [dns, file] = [await rowOf("dns_txt"), await rowOf("well_known_file")];
+    const lose = (row: VerificationRow) => async (tx: Parameters<Parameters<typeof withTenantContext>[2]>[0]) =>
+      applyCheckOutcome(tx, { workspaceId: s.ws, projectId: s.project, domain: s.domain, row, outcome: { ok: false, reason: "record_absent" }, now: NOW });
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const c1 = await pool.connect();
+    const c2 = await pool.connect();
+    try {
+      // T1 applies its loss and then HOLDS its transaction open; T2 starts while it is held.
+      const first = withTenantContext(c1, { workspaceId: s.ws, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        const applied = await lose(dns)(tx);
+        await gate;
+        return applied;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const second = withTenantContext(c2, { workspaceId: s.ws, actorId: SYSTEM_ACTOR_ID }, lose(file));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      release();
+      const [a, b] = await Promise.all([first, second]);
+      expect([a.scopeLost, b.scopeLost].filter(Boolean)).toHaveLength(1);
+    } finally {
+      release();
+      c1.release();
+      c2.release();
+    }
+    expect(await mirror(s)).toBeNull();
     expect(await notifications(s)).toHaveLength(1);
   });
 

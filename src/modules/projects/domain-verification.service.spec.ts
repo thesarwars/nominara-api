@@ -180,6 +180,39 @@ describe("STORY-048 · DomainVerificationService", () => {
     expect(calls.some((c) => c.sql.includes("INSERT INTO notifications"))).toBe(false);
   });
 
+  // Review round 2 — the manual path and the sweep must treat an outage on OUR side the same way.
+  it.each(["ETIMEOUT", "ESERVFAIL"])(
+    "a manual re-check of a VERIFIED domain during OUR resolver outage (%s) keeps verified_at and sends nothing",
+    async (code) => {
+      const verifiedAt = new Date("2026-09-01");
+      const verified = {
+        id: "v1", domain: "hubspot.com", method: "dns_txt", nonce: "n1",
+        verified_at: verifiedAt, last_checked_at: new Date("2026-09-01"), failure_reason: null,
+      };
+      const failing = vi.fn(async () => { throw Object.assign(new Error(code), { code }); });
+      const state = await harness({ resolveTxt: failing }, [verified]).check(PROJECT, "dns_txt");
+
+      expect(calls.some((c) => c.sql.includes("INSERT INTO notifications"))).toBe(false);
+      const update = calls.find((c) => c.sql.includes("UPDATE domain_verifications"))!;
+      expect(update.params[1]).toEqual(verifiedAt);
+      expect(state.verified).toBe(true);
+      // the customer who clicked re-check is still told why it did not verify
+      expect(state.failure_reason).toBe("record_absent");
+    },
+  );
+
+  it("serialises every transition per project by locking the project row first", async () => {
+    const existing = {
+      id: "v1", domain: "hubspot.com", method: "dns_txt", nonce: "n1",
+      verified_at: null, last_checked_at: null, failure_reason: null,
+    };
+    await harness({ resolveTxt: vi.fn(async () => [[`${TXT_PREFIX}n1`]]) }, [existing]).check(PROJECT, "dns_txt");
+    const lock = calls.findIndex((c) => /FROM projects WHERE id = \$1 FOR UPDATE/.test(c.sql));
+    const firstWrite = calls.findIndex((c) => c.sql.includes("UPDATE domain_verifications"));
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(lock).toBeLessThan(firstWrite);
+  });
+
   // A check that fails twice must not notify twice.
   it("does NOT notify when a check fails on a domain that was never verified", async () => {
     const neverVerified = {

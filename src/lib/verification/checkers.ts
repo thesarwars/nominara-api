@@ -31,6 +31,18 @@ export type CheckOutcome =
 
 const INCONCLUSIVE = true as const;
 
+/**
+ * A refusal that is OUR resolver failing, not a policy decision and not the customer's name being absent. The
+ * guarded fetcher reports every resolution failure as a refusal; ENOTFOUND/ENODATA are a conclusive "no such name"
+ * (the same rule as the DNS-TXT method), anything else (EAI_AGAIN, ESERVFAIL, ETIMEOUT, ECONNREFUSED, no errno) is
+ * an outage on our side. A policy refusal (private address, port, scheme) has no `resolverCode` and stays conclusive.
+ */
+const isResolverOutage = (error: unknown): boolean =>
+  error instanceof GuardedFetchRefusal &&
+  error.resolverCode !== undefined &&
+  error.resolverCode !== "ENOTFOUND" &&
+  error.resolverCode !== "ENODATA";
+
 /** Statuses that say "the server could not answer now", not "the file is not there". */
 const isTransientStatus = (status: number): boolean => status >= 500 || status === 429 || status === 408;
 
@@ -105,6 +117,7 @@ export async function checkWellKnownFile(domain: string, nonce: string, deps: Ch
     // WITHOUT its reason: the caller chose this URL, so echoing which check
     // fired would turn verification into the address oracle STORY-131 exists
     // to deny.
+    if (isResolverOutage(error)) return { ok: false, reason: "fetch_refused", inconclusive: INCONCLUSIVE };
     if (error instanceof GuardedFetchRefusal) return { ok: false, reason: "fetch_refused" };
     return { ok: false, reason: "file_absent", inconclusive: INCONCLUSIVE };
   }
@@ -136,6 +149,7 @@ export async function checkMetaTag(domain: string, nonce: string, deps: CheckDep
   try {
     response = await deps.fetch(`https://${domain}/`);
   } catch (error) {
+    if (isResolverOutage(error)) return { ok: false, reason: "fetch_refused", inconclusive: INCONCLUSIVE };
     if (error instanceof GuardedFetchRefusal) return { ok: false, reason: "fetch_refused" };
     return { ok: false, reason: "tag_absent", inconclusive: INCONCLUSIVE };
   }

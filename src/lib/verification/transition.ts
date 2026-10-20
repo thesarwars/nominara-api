@@ -41,8 +41,19 @@ export interface ApplyCheckInput {
   readonly now: Date;
 }
 
+/**
+ * Serialises every transition of one project's verification state. Two methods of the same project each lock only
+ * their own row, so without this a pair of concurrent losses can each read the OTHER as still verified, and the last
+ * writer leaves `projects.domain_verified_at` set with every method unverified and nobody notified. Always taken
+ * BEFORE any `domain_verifications` row lock, by every caller, so the order is the same everywhere (no deadlock).
+ */
+export async function lockProject(client: ClientBase, projectId: string): Promise<void> {
+  await client.query("SELECT 1 FROM projects WHERE id = $1 FOR UPDATE", [projectId]);
+}
+
 export async function applyCheckOutcome(client: ClientBase, input: ApplyCheckInput): Promise<AppliedTransition> {
   const { row, outcome } = input;
+  await lockProject(client, input.projectId);
   // The prior state is read HERE, under a row lock held to the end of the caller's transaction, never taken from
   // the caller's copy: that copy may have been read before a network wait during which another writer (the daily
   // sweep, a second manual check) committed a loss, and trusting it would notify that loss twice.
@@ -53,6 +64,9 @@ export async function applyCheckOutcome(client: ClientBase, input: ApplyCheckInp
   const priorVerifiedAt = prior.rows[0]?.verified_at ?? null;
   const wasVerified = priorVerifiedAt !== null;
   const reason: VerificationFailure | null = outcome.ok ? null : outcome.reason;
+  // OUR outage is not their absence, for whichever caller found it (the daily sweep OR a manual re-check): record the
+  // attempt and the reason, but keep `verified_at`, and below do not notify.
+  const inconclusive = !outcome.ok && outcome.inconclusive === true;
 
   const updated = await client.query<VerificationRow>(
     `UPDATE domain_verifications
@@ -62,7 +76,7 @@ export async function applyCheckOutcome(client: ClientBase, input: ApplyCheckInp
     // Cleared on failure, not left standing: AC7's whole point is that a domain which stops verifying stops
     // being verified. Keeping the old timestamp would leave full scope in place on evidence that no longer
     // holds. On success an existing verified time is kept: it is when control was FIRST proved.
-    [row.id, outcome.ok ? (priorVerifiedAt ?? input.now) : null, reason, input.now],
+    [row.id, outcome.ok ? (priorVerifiedAt ?? input.now) : inconclusive ? priorVerifiedAt : null, reason, input.now],
   );
 
   // `projects.domain_verified_at` mirrors "any method currently verified". Denormalised deliberately: the
@@ -75,7 +89,7 @@ export async function applyCheckOutcome(client: ClientBase, input: ApplyCheckInp
   const stillVerified = any.rows[0]?.verified_at ?? null;
   await client.query("UPDATE projects SET domain_verified_at = $2, updated_at = now() WHERE id = $1", [input.projectId, stillVerified]);
 
-  const methodLost = wasVerified && !outcome.ok;
+  const methodLost = wasVerified && !outcome.ok && !inconclusive;
   // Scenario 10 — and only on an actual transition: a check that fails twice must not notify twice. And only
   // when the scope really went: the message says audits are limited to public-surface scope, which is false
   // while another method still verifies the domain.

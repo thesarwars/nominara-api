@@ -36,11 +36,23 @@ import {
 
 /** A refusal that maps to `422 unsafe_target`. Carries the reason, never the address. */
 export class GuardedFetchRefusal extends Error {
-  constructor(readonly reason: UnsafeTargetReason) {
+  /**
+   * Set ONLY when the refusal is a failure to RESOLVE the name (`dns_resolution_failed`, or a redirect hop that
+   * failed that way): the errno the resolver gave, `"UNKNOWN"` when it gave none. A caller that must tell "the name
+   * does not exist" (ENOTFOUND/ENODATA) from "our resolver is down" (EAI_AGAIN, ESERVFAIL, ETIMEOUT ...) reads it.
+   * Never part of the message: it is not a public surface.
+   */
+  readonly resolverCode?: string;
+
+  constructor(
+    readonly reason: UnsafeTargetReason,
+    resolverCode?: string,
+  ) {
     // The MESSAGE is part of the refusal's public surface. It names the check
     // and nothing else — no hostname, no resolved address. Scenario 13.
     super(`unsafe_target: ${reason}`);
     this.name = "GuardedFetchRefusal";
+    if (resolverCode !== undefined) this.resolverCode = resolverCode;
   }
 }
 
@@ -113,12 +125,13 @@ async function resolveAll(hostname: string): Promise<string[]> {
   try {
     const results = await dnsLookup(bare, { all: true, verbatim: true });
     return results.map((entry) => entry.address);
-  } catch {
+  } catch (error) {
     // An IP literal is not resolvable on some platforms; treat the literal as
     // its own answer so it still reaches the address check rather than
     // escaping as a resolution failure.
     if (/^[0-9a-f:.]+$/i.test(bare)) return [bare];
-    throw new GuardedFetchRefusal("dns_resolution_failed");
+    const code = (error as { code?: unknown } | null)?.code;
+    throw new GuardedFetchRefusal("dns_resolution_failed", typeof code === "string" ? code : "UNKNOWN");
   }
 }
 
@@ -194,7 +207,9 @@ export async function guardedFetch(
       // 302 to loopback reports `address_not_global`, which reads as though
       // the ORIGINAL url was refused — and someone debugging looks at the
       // wrong URL.
-      if (error instanceof GuardedFetchRefusal) throw new GuardedFetchRefusal("redirect_target_refused");
+      // The resolver errno survives the relabel: "the redirect target's name did not resolve" and "our resolver
+      // failed on the redirect target" are still different facts to a caller that has to decide what to do.
+      if (error instanceof GuardedFetchRefusal) throw new GuardedFetchRefusal("redirect_target_refused", error.resolverCode);
       throw error;
     }
   }
