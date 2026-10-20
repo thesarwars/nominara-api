@@ -88,7 +88,7 @@ const LAST_SCAN_JOIN = `LEFT JOIN LATERAL (
             LIMIT 1
          ) ls ON true`;
 
-const PROJECT_LIST_SELECT = `SELECT id, name, slug::text AS slug, root_domain, kind, status, discovery_status,
+const PROJECT_LIST_SELECT = `SELECT id, name, slug::text AS slug, root_domain, kind, status, paused_by_downgrade_at, discovery_status,
               prompts_active, prompts_cap, open_task_count, open_tasks_by_severity,
               domain_verified_at, created_at,
               visibility_blended, visibility_delta_30d, rendering_quality, rendering_delta_30d,
@@ -686,6 +686,8 @@ interface ProjectRow extends LastScanRow {
   root_domain: string;
   kind: string;
   status: string;
+  /** STORY-077 — set when a downgrade's cut-over paused this project. */
+  paused_by_downgrade_at: Date | null;
   discovery_status: string;
   prompts_active: number;
   prompts_cap: number;
@@ -738,6 +740,7 @@ function toProjectListItem(row: ProjectRow): ProjectListItem {
     root_domain: row.root_domain,
     kind: row.kind as ProjectListItem["kind"],
     status: row.status,
+    paused_by_downgrade_at: row.paused_by_downgrade_at?.toISOString() ?? null,
     discovery_status: row.discovery_status as ProjectListItem["discovery_status"],
     prompts_active: row.prompts_active,
     prompts_cap: row.prompts_cap,

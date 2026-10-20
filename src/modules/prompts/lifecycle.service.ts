@@ -192,7 +192,8 @@ export class PromptLifecycleService {
     // The old row's TEXT is never rewritten — that is exactly what would fake
     // continuity across two different questions.
     await client.query(
-      `UPDATE tracked_prompts SET status = 'archived', superseded_by = $2, updated_at = now() WHERE id = $1`,
+      // STORY-077: an archived row never carries the downgrade-pause marker (ck_tracked_prompts_paused_by_downgrade).
+      `UPDATE tracked_prompts SET status = 'archived', superseded_by = $2, paused_by_downgrade_at = NULL, updated_at = now() WHERE id = $1`,
       [prompt.id, row.id],
     );
 
@@ -240,9 +241,14 @@ export class PromptLifecycleService {
       ? await this.chargeFirstActivation(client, context, prompt, prompt.id, prompt.generation_source, confirmedCredits)
       : 0;
 
+    // STORY-077 AC5 — a person who sets the status of a prompt a downgrade paused makes it THEIRS: the marker is
+    // cleared, so a later upgrade never resumes (or re-pauses) what a person decided. A priority-only change keeps it.
     await client.query(
-      `UPDATE tracked_prompts SET status = $2, is_priority = $3, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`,
-      [prompt.id, status, isPriority],
+      `UPDATE tracked_prompts
+          SET status = $2, is_priority = $3, updated_at = now(),
+              paused_by_downgrade_at = CASE WHEN $4::boolean THEN NULL ELSE paused_by_downgrade_at END
+        WHERE id = $1 AND deleted_at IS NULL`,
+      [prompt.id, status, isPriority, request.status !== undefined],
     );
 
     const counts = await this.refreshCounts(client, prompt.project_id);

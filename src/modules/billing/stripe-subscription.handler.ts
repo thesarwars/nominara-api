@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger } from "@nestjs/common";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
@@ -12,6 +12,9 @@ import { BillingAddonsService } from "./billing-addons.service.js";
 import { DegradedError } from "../../api/errors/domain-errors.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
+import { reconcileDowngradePause } from "../../lib/billing/downgrade-pause.js";
+import { downgradeNoticeContact, downgradePausedEmail, downgradeResumedEmail } from "../../lib/billing/downgrade-pause-notice.js";
+import { EMAIL_SENDER, type EmailMessage, type EmailSender } from "../identity/ports/email-sender.js";
 
 // STORY-075a / STORY-075 AC4 — the ONLY customer-reachable path to
 // `applyPlanChange`, and the one the plan-change-import-surface gate names.
@@ -42,9 +45,12 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
 
   private readonly logger = new Logger(StripeSubscriptionHandler.name);
 
-  constructor(private readonly addons: BillingAddonsService) {}
+  constructor(
+    private readonly addons: BillingAddonsService,
+    @Inject(EMAIL_SENDER) private readonly email: EmailSender,
+  ) {}
 
-  async handle({ tx, workspaceId, event, object, fetchStartedAt }: StripeEventContext): Promise<void> {
+  async handle({ tx, workspaceId, event, object, fetchStartedAt, afterCommit }: StripeEventContext): Promise<void> {
     // checkout.session.completed is also the credit-pack event (mode=payment,
     // STORY-076a); the service has already followed a subscription-mode
     // session to its subscription, so anything else here is not ours.
@@ -172,7 +178,7 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
 
     // STORY-076b — the add-on items of THIS fresh fetch, mirrored wholesale (the
     // only writer of `subscription_addons`). An ended subscription holds none.
-    await this.addons.reconcile(tx, {
+    const addonOutcome = await this.addons.reconcile(tx, {
       workspaceId,
       stripeSubscriptionId: desired.state.providerSubscriptionId,
       items: desired.state.planKey === "free" ? [] : addonItemsFromSubscription(object.raw),
@@ -180,6 +186,12 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       eventType: event.type,
       versionAlreadyBumped: outcome.changed,
     });
+
+    // STORY-077 slice A — plans-and-entitlements.md §14 at the cut-over: AFTER the plan and the add-ons are adopted (the
+    // limits are the resolved ones), in this same transaction. Only when what the workspace is entitled to MOVED (the
+    // plan or the add-ons): a redelivery, or a phase-0 event while a downgrade is still pending, changes nothing here, and
+    // a workspace that was already over its limits before this slice shipped is not paused by an unrelated event.
+    if (outcome.changed || addonOutcome.changed) await this.reconcilePause(tx, workspaceId, event.id, afterCommit);
 
     // The charge this subscription was verified at is frozen on the row, so a
     // later catalog price change cannot turn it into a "mismatch". Only the
@@ -252,6 +264,67 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       to: outcome.to,
       entitlement_version: outcome.entitlementVersion,
     });
+  }
+
+  /**
+   * STORY-077 — pauses the most recently created excess projects and prompts (never deletes), resumes what an earlier
+   * downgrade paused once the limits allow it (oldest first), audits each, and emails the list AFTER the commit.
+   */
+  private async reconcilePause(tx: StripeEventContext["tx"], workspaceId: string, eventId: string, afterCommit: StripeEventContext["afterCommit"]): Promise<void> {
+    const result = await reconcileDowngradePause(tx, workspaceId);
+    const pausedCount = result.paused.projects.length + result.paused.prompts.length;
+    const resumedCount = result.resumed.projects.length + result.resumed.prompts;
+    if (pausedCount === 0 && resumedCount === 0) return;
+
+    const audit = new AuditChainService();
+    const append = (action: string, afterState: Record<string, unknown>) =>
+      audit.append(tx, {
+        workspaceId,
+        actorType: "system",
+        actorId: SYSTEM_ACTOR_ID,
+        actorIp: null,
+        actorUa: `operator:${WEBHOOK_OPERATOR}`,
+        action,
+        resourceType: "workspace",
+        resourceId: workspaceId,
+        beforeState: null,
+        afterState,
+        requestId: eventId,
+        supportGrantId: null,
+        severity: "notice",
+      });
+    if (pausedCount > 0) {
+      // NAMES and counts, not ids: the audit redactor (lib/crypto/redact.ts) treats any long high-entropy string as a
+      // secret, so a UUID in before/after_state is stored as "[redacted]". The rows themselves carry the marker.
+      await append("billing.downgrade.paused", { project_count: result.paused.projects.length, project_names: result.paused.projects.map((p) => p.name), prompt_count: result.paused.prompts.length });
+      incrementCounter("nominara_billing_downgrade_pause_total", { direction: "paused" });
+    }
+    if (resumedCount > 0) {
+      await append("billing.downgrade.resumed", { project_count: result.resumed.projects.length, project_names: result.resumed.projects.map((p) => p.name), prompt_count: result.resumed.prompts });
+      incrementCounter("nominara_billing_downgrade_pause_total", { direction: "resumed" });
+    }
+    this.logger.log({ message: "downgrade pause reconciled", event_id: eventId, workspace_id: workspaceId, paused: pausedCount, resumed: resumedCount });
+
+    const contact = await downgradeNoticeContact(tx, workspaceId);
+    if (contact === null) {
+      incrementCounter("nominara_billing_downgrade_notice_failed_total", { reason: "no_billing_contact" });
+      this.logger.error({ message: "downgrade pause reconciled but nobody could be emailed: no billing contact", workspace_id: workspaceId });
+      return;
+    }
+    const plan = await tx.query<{ display_name: string }>("SELECT p.display_name FROM workspaces w JOIN plans p ON p.key = w.plan_key WHERE w.id = $1", [workspaceId]);
+    const planName = plan.rows[0]?.display_name ?? "new";
+    const messages = [downgradePausedEmail(contact, planName, result.paused), downgradeResumedEmail(contact, planName, result.resumed)].filter((m): m is EmailMessage => m !== null);
+    for (const message of messages) {
+      afterCommit.push(async () => {
+        try {
+          await this.email.send(message);
+        } catch {
+          // The pause is committed and audited, and the product still shows it. Logged and counted, never thrown.
+          incrementCounter("nominara_billing_downgrade_notice_failed_total", { reason: "send_failed" });
+          this.logger.error({ message: "downgrade pause notice could not be sent", workspace_id: workspaceId });
+        }
+      });
+    }
   }
 
   /**

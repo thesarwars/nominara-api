@@ -9,9 +9,10 @@ import { ADDON_CATALOG } from "./addon-catalog.js";
 // STORY-184 T5 — what a downgrade would cost the customer, named exactly.
 //
 // plans-and-entitlements.md §14: "the confirmation screen names exactly what exceeds the new limits", and no downgrade
-// path destroys data without a named warning. Until the STORY-077 pause machinery exists, a STRUCTURAL excess BLOCKS
-// the downgrade (owner decision 2026-10-16: refuse until usage is reduced); features lost, add-ons dropped and a
-// shortened retention window are named and do not block.
+// path destroys data without a named warning. STORY-077 slice A: a projects or prompts excess no longer blocks — it is
+// PAUSED at the cut-over (`effect: paused_at_period_end`, see downgrade-pause.ts). Seats, competitors and API keys,
+// which §14 does not name as pausable, still block until usage is reduced (`effect: must_reduce`, STORY-184's refusal
+// kept for these keys only). Features lost, add-ons dropped and a shortened retention window are named and never block.
 //
 // ⚠ THE LIMIT A USAGE IS CHECKED AGAINST IS THE TARGET'S RESOLVED ONE, not the bare plan's. It is computed with the
 // SAME `mergeEntitlements` the guards resolve through: the add-ons that survive the move still raise it, an add-on the
@@ -24,6 +25,9 @@ import { ADDON_CATALOG } from "./addon-catalog.js";
 const WORKSPACE_KEYS = ["projects.max", "prompts.max_total", "seats.max", "api.keys_max"] as const satisfies readonly StructuralLimitKey[];
 const PROJECT_KEYS = ["prompts.max_per_project", "competitors.max_per_project"] as const satisfies readonly StructuralLimitKey[];
 const RETENTION_KEYS = ["retention.raw_captures_days", "retention.rollups_days"] as const;
+/** §14: the structural keys the cut-over PAUSES (projects and prompts). Every other structural key must be reduced first. */
+export const PAUSABLE_KEYS: ReadonlySet<StructuralLimitKey> = new Set<StructuralLimitKey>(["projects.max", "prompts.max_total", "prompts.max_per_project"]);
+const effectOf = (key: StructuralLimitKey): "paused_at_period_end" | "must_reduce" => (PAUSABLE_KEYS.has(key) ? "paused_at_period_end" : "must_reduce");
 /** The most excess projects named; the list is for the confirmation screen, the count is exact regardless. */
 const MAX_NAMED_PROJECTS = 100;
 
@@ -45,11 +49,13 @@ export interface ExcessInput {
 }
 
 export interface DowngradeExcess {
-  /** Structural: the downgrade is refused while any of these exists. */
+  /** Every structural excess, each with its `effect`, in a stable order. */
+  readonly structural: DowngradeExcessItem[];
+  /** The `must_reduce` structural entries: the downgrade is refused while any of these exists. */
   readonly blocking: DowngradeExcessItem[];
   /** Named, never blocking: features lost, add-ons dropped, retention shortened. */
   readonly informational: DowngradeExcessItem[];
-  /** `blocking` then `informational`. */
+  /** `structural` then `informational`. */
   readonly all: DowngradeExcessItem[];
 }
 
@@ -78,7 +84,7 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
   const current = mergeEntitlements(input.currentPlan, input.heldAddons, input.overrides);
   const target = mergeEntitlements(input.targetPlan, surviving, input.overrides);
 
-  const blocking: DowngradeExcessItem[] = [];
+  const structural: DowngradeExcessItem[] = [];
   const limitOf = (key: StructuralLimitKey): number | null => {
     const limit = structuralLimitFrom(target[key]?.value ?? null);
     return limit === undefined || limit.kind === "unlimited" ? null : limit.limit;
@@ -92,9 +98,9 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
     if (key === "projects.max") {
       // The projects to reduce first are the most recently created ones, exactly the order §14 pauses them in.
       const items = input.usage.projects.slice(0, Math.min(excess, MAX_NAMED_PROJECTS)).map((p) => ({ id: p.id, name: p.name }));
-      blocking.push({ kind: "structural", key, limit, current: used, excess, items });
+      structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key), items });
     } else {
-      blocking.push({ kind: "structural", key, limit, current: used, excess });
+      structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key) });
     }
   }
   for (const project of input.usage.projects) {
@@ -102,7 +108,7 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
       const limit = limitOf(key);
       const used = key === "prompts.max_per_project" ? project.prompts : project.competitors;
       if (limit === null || used <= limit) continue;
-      blocking.push({ kind: "structural", key, project_id: project.id, limit, current: used, excess: used - limit });
+      structural.push({ kind: "structural", key, project_id: project.id, limit, current: used, excess: used - limit, effect: effectOf(key) });
     }
   }
 
@@ -123,7 +129,8 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
     if (to < from) informational.push({ kind: "retention_shortened", key, from_days: Number.isFinite(from) ? from : null, to_days: to });
   }
 
-  return { blocking, informational, all: [...blocking, ...informational] };
+  const blocking = structural.filter((entry) => entry.kind === "structural" && entry.effect === "must_reduce");
+  return { structural, blocking, informational, all: [...structural, ...informational] };
 }
 
 /**

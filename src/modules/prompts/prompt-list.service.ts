@@ -42,6 +42,8 @@ interface PromptRow {
   intent_archetype: string;
   funnel_stage: string;
   status: string;
+  /** STORY-077 — set when a downgrade's cut-over paused this prompt. */
+  paused_by_downgrade_at: Date | null;
   is_priority: boolean;
   generation_source: string;
   generation_batch_id: string | null;
@@ -94,7 +96,7 @@ export class PromptListService {
     const limitPlaceholder = `$${String(params.length)}`;
 
     const result = await client.query<PromptRow>(
-      `SELECT id, text, text_hash, intent_archetype, funnel_stage, status, is_priority,
+      `SELECT id, text, text_hash, intent_archetype, funnel_stage, status, paused_by_downgrade_at, is_priority,
               generation_source, generation_batch_id, cluster_id, stability_score,
               last_captured_at::text AS last_captured_at, created_at::text AS created_at,
               to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_at_key
@@ -178,6 +180,8 @@ export class PromptListService {
       intent_archetype: row.intentArchetype,
       funnel_stage: row.funnelStage,
       status: row.status,
+      // A prompt a person just created was never paused by a downgrade.
+      paused_by_downgrade_at: null,
       is_priority: row.isPriority,
       generation_source: row.generationSource,
       generation_batch_id: row.generationBatchId,
@@ -273,6 +277,7 @@ function toPromptListItem(row: PromptRow): PromptListItem {
     intent_archetype: row.intent_archetype as PromptListItem["intent_archetype"],
     funnel_stage: row.funnel_stage as PromptListItem["funnel_stage"],
     status: row.status as PromptListItem["status"],
+    paused_by_downgrade_at: row.paused_by_downgrade_at?.toISOString() ?? null,
     is_priority: row.is_priority,
     generation_source: row.generation_source as PromptListItem["generation_source"],
     generation_batch_id: row.generation_batch_id,

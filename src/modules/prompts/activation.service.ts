@@ -209,7 +209,7 @@ export class PromptActivationService {
       // path, for no benefit.
       await client.query(
         `UPDATE tracked_prompts
-            SET status = 'active', updated_at = now()
+            SET status = 'active', paused_by_downgrade_at = NULL, updated_at = now()
           WHERE id = ANY($1::uuid[]) AND project_id = $2 AND deleted_at IS NULL`,
         [toActivate.map((prompt) => prompt.id), projectId],
       );
