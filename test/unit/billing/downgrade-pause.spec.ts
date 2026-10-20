@@ -18,8 +18,10 @@ const T0 = Date.parse("2026-01-01T00:00:00.000Z");
 const at = (hours: number) => new Date(T0 + hours * 3_600_000);
 const id = (n: number) => `0194a3d2-0000-7000-8000-${String(n).padStart(12, "0")}`;
 
-const project = (n: number, over: Partial<PauseProject> = {}): PauseProject => ({ id: id(n), createdAt: at(n), status: "active", pausedByDowngrade: false, ...over });
-const prompt = (n: number, projectId: string, over: Partial<PausePrompt> = {}): PausePrompt => ({ id: id(1000 + n), projectId, createdAt: at(n), status: "active", pausedByDowngrade: false, ...over });
+/** The microsecond UTC key the SQL reads (`MICROS_FORMAT`): lexicographic order is creation order. */
+const key = (hours: number, micros = 0) => at(hours).toISOString().replace("Z", `${String(micros).padStart(3, "0")}Z`);
+const project = (n: number, over: Partial<PauseProject> = {}): PauseProject => ({ id: id(n), createdAt: at(n), createdKey: key(n), status: "active", pausedByDowngrade: false, ...over } as PauseProject);
+const prompt = (n: number, projectId: string, over: Partial<PausePrompt> = {}): PausePrompt => ({ id: id(1000 + n), projectId, createdAt: at(n), createdKey: key(n), status: "active", pausedByDowngrade: false, ...over } as PausePrompt);
 const limits = (over: Partial<PauseLimits> = {}): PauseLimits => ({ projects: null, promptsTotal: null, promptsPerProject: null, ...over });
 
 describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED excess", () => {
@@ -34,8 +36,33 @@ describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED 
     const ps = [project(5), project(1), project(4), project(2), project(3)];
     expect(planDowngradePause(limits({ projects: 3 }), ps, []).pauseProjects).toEqual([id(5), id(4)]);
     // A created_at tie is broken by id, descending — the same order the preview lists them in.
-    const tied = [project(1, { createdAt: at(0) }), project(2, { createdAt: at(0) }), project(3, { createdAt: at(0) })];
+    const tied = [project(1, { createdAt: at(0), createdKey: key(0) } as Partial<PauseProject>), project(2, { createdAt: at(0), createdKey: key(0) } as Partial<PauseProject>), project(3, { createdAt: at(0), createdKey: key(0) } as Partial<PauseProject>)];
     expect(planDowngradePause(limits({ projects: 1 }), tied, []).pauseProjects).toEqual([id(3), id(2)]);
+  });
+
+  it("MICROSECONDS decide, as in the preview's SQL (ORDER BY created_at DESC, id DESC): two rows in the same millisecond are not ordered by id", () => {
+    // Same millisecond, different microseconds: id(1) is the NEWER row though its id is smaller. A millisecond Date would
+    // tie and fall back to id, pausing id(2) - not the project the preview named.
+    const ps = [
+      project(1, { createdAt: at(0), createdKey: key(0, 900) } as Partial<PauseProject>),
+      project(2, { createdAt: at(0), createdKey: key(0, 100) } as Partial<PauseProject>),
+    ];
+    expect(planDowngradePause(limits({ projects: 1 }), ps, []).pauseProjects).toEqual([id(1)]);
+    const prompts = [
+      prompt(1, id(1), { createdAt: at(0), createdKey: key(0, 900) } as Partial<PausePrompt>),
+      prompt(2, id(1), { createdAt: at(0), createdKey: key(0, 100) } as Partial<PausePrompt>),
+    ];
+    expect(planDowngradePause(limits({ promptsPerProject: 1 }), [project(1)], prompts).pausePrompts).toEqual([id(1001)]);
+  });
+
+  it("an ARCHIVED project counts toward the excess exactly as the guard and the preview count it (every non-deleted project), and is never itself paused", () => {
+    // The guard (structural-usage COUNTERS["projects.max"]) and the preview count 4 projects against 2, and the preview
+    // names the two newest: P4 and P3. Leaving the archived P2 out would count 3 and pause only P4.
+    const ps = [project(1), project(2, { status: "archived" }), project(3), project(4)];
+    expect(planDowngradePause(limits({ projects: 2 }), ps, []).pauseProjects).toEqual([id(4), id(3)]);
+    // An archived project in the excess is not tracking anything: it is counted, not paused.
+    const newestArchived = [project(1), project(2), project(3, { status: "archived" })];
+    expect(planDowngradePause(limits({ projects: 2 }), newestArchived, []).pauseProjects).toEqual([]);
   });
 
   it("BOUNDARY · usage exactly at the limit pauses nothing; one over pauses exactly one", () => {
