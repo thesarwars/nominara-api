@@ -1,6 +1,9 @@
-import { EntitlementExceededError } from "../../api/errors/domain-errors.js";
+import type { ClientBase } from "pg";
+import { DegradedError, EntitlementExceededError } from "../../api/errors/domain-errors.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
+import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 
 // STORY-077 (review round 1, blocker) — THE ONE RULE BOTH DOORS INTO `active` APPLY.
 //
@@ -14,6 +17,24 @@ import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 // In a workspace within its limits this never refuses anything the slot check allowed (active <= occupying <= cap), so
 // the rule only binds where the occupancy premise is already broken. It applies to EVERY paused prompt, not only a
 // downgrade-paused one: a person's own pause in an over-limit workspace is the same hole.
+
+// ⚠ THE COUNT IS WORKSPACE-WIDE, SO THE LOCK MUST BE TOO (review round 2). Both doors lock only the PROJECT row, so
+// two resumes in DIFFERENT projects each read the same workspace count, both pass `prompts.max_total`, and the
+// workspace ends above its cap - the cut-over undone. `lockWorkspaceForActivation` takes the workspace row lock, the
+// same bounded one every billing writer takes, BEFORE the project lock: the order the Stripe webhook and plan:set use
+// (workspace, then projects, then prompts), so it adds no inversion. It also serialises a resume against the cut-over
+// itself. Every caller of `assertActiveWithinLimits` must hold it.
+
+/**
+ * Takes the workspace row lock (bounded: `WORKSPACE_LOCK_WAIT_MS`) before a move INTO `active`. Call it before the
+ * project row lock. A wait past the bound - a billing holder inside a Stripe call - is a retryable 503, never a queue.
+ */
+export async function lockWorkspaceForActivation(client: ClientBase, workspaceId: string): Promise<void> {
+  await lockWorkspaceBounded(client, workspaceId, () => {
+    incrementCounter("nominara_workspace_lock_wait_exceeded_total", { path: "prompt_activation" });
+    return new DegradedError({ message: "the workspace is being changed: retry shortly" });
+  });
+}
 
 /** A prompt that is tracked right now. */
 export const PROMPT_IS_ACTIVE = "status = 'active' AND deleted_at IS NULL";
@@ -32,7 +53,8 @@ function limitOf(entitlements: Entitlements, key: string): number | null {
 
 /**
  * Refuses (403 `entitlement_exceeded`, naming the key) when `becomingActive` more prompts in `projectId` would take
- * the project's or the workspace's ACTIVE count above its resolved limit. A no-op for 0.
+ * the project's or the workspace's ACTIVE count above its resolved limit. A no-op for 0. The caller holds the workspace
+ * lock (`lockWorkspaceForActivation`), or two concurrent calls can both pass.
  */
 export async function assertActiveWithinLimits(
   client: Client,

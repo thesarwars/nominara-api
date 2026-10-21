@@ -19,7 +19,7 @@ import { chargeForActivation, quoteActivation, type ActivationCandidate } from "
 import { nextRunAfter } from "../../lib/capture/scheduler.js";
 import type { ProjectCadence } from "../../lib/capture/dispatch-cells.js";
 import { canonicalUuid } from "../../api/canonical-uuid.js";
-import { assertActiveWithinLimits } from "./active-limit.js";
+import { assertActiveWithinLimits, lockWorkspaceForActivation } from "./active-limit.js";
 
 // STORY-046 — `POST /v1/projects/{id}/prompts/activate`.
 // plans-and-entitlements.md §10, api-specification.md §3.
@@ -157,6 +157,9 @@ export class PromptActivationService {
     // from the recomputed charge.
     const confirmedCredits = parseConfirmedCredits(confirmed);
 
+    // STORY-077 review round 2: the workspace lock BEFORE the project lock - the active-count check below is
+    // workspace-wide (active-limit.ts), and this is the billing writers' lock order.
+    await lockWorkspaceForActivation(store.client as ClientBase, store.context.workspaceId);
     await this.assertProjectExists(client, projectId);
 
     const resolved = await this.entitlements.resolveForWorkspace(store.context.workspaceId);

@@ -13,7 +13,7 @@ import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { chargeForActivation, inheritFirstActivation } from "../../lib/promptgen/activation-charge.js";
 import { insertPromptStatement } from "../../lib/promptgen/persist.js";
 import { promptTextHash } from "../../lib/promptgen/text-hash.js";
-import { assertActiveWithinLimits } from "./active-limit.js";
+import { assertActiveWithinLimits, lockWorkspaceForActivation } from "./active-limit.js";
 import { assertProjectInScope } from "../../tenancy/project-scope.js";
 import { currentTenantStore, type TenantContext } from "../../tenancy/tenant-context.js";
 
@@ -87,6 +87,10 @@ export class PromptLifecycleService {
     // The id names a prompt, not a project: a scoped member is checked against the row's own project, BEFORE the
     // lock, so a caller outside that project's scope cannot hold its row lock. A prompt never changes project.
     await assertProjectInScope(store.client, found.project_id);
+    // STORY-077 review round 2: a move INTO `active` is checked against the workspace-wide active count, so it takes the
+    // workspace lock first (active-limit.ts). Decided from the request, before the re-read: taking it for any PATCH that
+    // asks for `active` is a superset of the moves that need it.
+    if (request.status === "active" && found.status !== "active") await lockWorkspaceForActivation(store.client as ClientBase, store.context.workspaceId);
     await client.query("SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE", [found.project_id]);
     const prompt = await this.load(client, promptId);
 
@@ -242,14 +246,15 @@ export class PromptLifecycleService {
       ? await this.chargeFirstActivation(client, context, prompt, prompt.id, prompt.generation_source, confirmedCredits)
       : 0;
 
-    // STORY-077 AC5 — a person who sets the status of a prompt a downgrade paused makes it THEIRS: the marker is
-    // cleared, so a later upgrade never resumes (or re-pauses) what a person decided. A priority-only change keeps it.
+    // STORY-077 AC5 — a person who CHANGES the status of a prompt a downgrade paused makes it THEIRS: the marker is
+    // cleared, so a later upgrade never resumes (or re-pauses) what a person decided. A priority-only change, or a
+    // status that does not change (paused -> paused), keeps it: a no-op must not take the prompt out of auto-resume.
     await client.query(
       `UPDATE tracked_prompts
           SET status = $2, is_priority = $3, updated_at = now(),
               paused_by_downgrade_at = CASE WHEN $4::boolean THEN NULL ELSE paused_by_downgrade_at END
         WHERE id = $1 AND deleted_at IS NULL`,
-      [prompt.id, status, isPriority, request.status !== undefined],
+      [prompt.id, status, isPriority, request.status !== undefined && request.status !== prompt.status],
     );
 
     const counts = await this.refreshCounts(client, prompt.project_id);
