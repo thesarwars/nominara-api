@@ -205,6 +205,12 @@ describe("STORY-049 AC4 · sitemap discovery", () => {
 
 // Review round 2 — the parser used to scan with lazy-quantifier regexes, so a file of UNCLOSED tags made every start
 // position scan to the end of the input: quadratic, about 11 minutes for a 5 MB file, on a synchronous call.
+//
+// WHY A FIXED 5000 ms BOUND STILL MEANS SOMETHING (measured at review, round 2): the pre-fcccc94 regex implementation on
+// these same inputs did not finish. The urlset regex over 400k unclosed `<url>` was killed at 40 s; the 5 MB case takes
+// about 11 minutes. The linear implementation takes tens of milliseconds, so 5000 ms is ~100x headroom for a loaded host
+// and still ~8x below the point where the quadratic version had not yet returned. If a future change makes this bound
+// flake, widen it with a new measurement here; do not remove the test.
 describe("STORY-049 AC4 · a hostile sitemap cannot make the parser quadratic", () => {
   const timed = async <T>(fn: () => Promise<T>): Promise<{ value: T; ms: number }> => {
     const start = performance.now();

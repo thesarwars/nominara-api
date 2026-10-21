@@ -190,7 +190,7 @@ describe("STORY-049 · crawlPages", () => {
   });
 
   // Review round 2 — a renderer known to be unavailable must not be charged to the politeness budget: the request is
-  // never sent, but an interval slot (up to the clamped Crawl-delay) and a hard-cap unit were spent on it.
+  // never sent, but an interval slot (up to the declared Crawl-delay) and a hard-cap unit were spent on it.
   it("with the unavailable renderer a page costs ONE budget request (the plain fetch), and the renderer is never called", async () => {
     const h = harness({ renderer: unavailableRenderer });
     const { pages } = await crawlPages(["https://acme.com/a", "https://acme.com/b", "https://acme.com/c"], h.deps);
@@ -299,7 +299,7 @@ describe("STORY-049 · crawlPages", () => {
   });
 
   it("a crawl that runs out of wall-clock budget skips the rest as crawl_delay_budget, finishing in bounded virtual time", async () => {
-    const h = harness({ crawlDelaySeconds: 1e9, wallClockBudgetMs: 25_000 });
+    const h = harness({ crawlDelaySeconds: 10, wallClockBudgetMs: 25_000 });
     const urls = Array.from({ length: 10 }, (_, i) => `https://acme.com/p${String(i)}`);
     const result = await crawlPages(urls, h.deps);
     expect(result.stoppedAtDeadline).toBe(true);
@@ -309,5 +309,16 @@ describe("STORY-049 · crawlPages", () => {
     expect(h.sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(25_000);
     expect(result.pages.filter((p) => p.outcome === "skipped").every((p) => p.skipped_reason === "crawl_delay_budget")).toBe(true);
     expect(result.pages).toHaveLength(10);
+  });
+
+  it("a hostile Crawl-delay is honoured, not clamped: one request goes out, nothing is slept, and every other page is recorded as skipped", async () => {
+    const h = harness({ crawlDelaySeconds: 1e9, wallClockBudgetMs: 25_000 });
+    const urls = Array.from({ length: 10 }, (_, i) => `https://acme.com/p${String(i)}`);
+    const result = await crawlPages(urls, h.deps);
+    expect(result.stoppedAtDeadline).toBe(true);
+    expect(h.budget.used).toBe(1);
+    expect(h.sleeps).toEqual([]);
+    expect(result.pages).toHaveLength(10);
+    expect(result.pages.filter((p) => p.outcome === "skipped").every((p) => p.skipped_reason === "crawl_delay_budget")).toBe(true);
   });
 });

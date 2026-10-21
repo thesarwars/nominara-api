@@ -5,7 +5,6 @@ import {
   PolitenessDeadlineReached,
   MIN_INTERVAL_MS,
   MAX_REQUESTS_PER_SECOND,
-  MAX_CRAWL_DELAY_SECONDS,
 } from "./politeness.js";
 
 // STORY-049 AC7 / AC8 / scenarios 8 and 9 — the crawl's politeness budget: <= 2 requests per second per host, a 500 ms
@@ -174,36 +173,47 @@ describe("STORY-049 AC7 · hard stop", () => {
   });
 });
 
-// REVIEW FINDING (blocker) — the target's robots.txt is untrusted input and is read even for an UNVERIFIED project. An
-// unbounded Crawl-delay kept one crawl.audit job asleep for days inside an open tenant transaction. MAX_CRAWL_DELAY_SECONDS
-// and the wall-clock deadline are NOT FROM THE REFERENCE: they are safety bounds, and these tests are written from the
-// hostile value, not from the implementation.
-describe("politeness · a hostile Crawl-delay cannot pin a worker", () => {
-  it("the maximum honoured delay is a stated constant", () => {
-    expect(MAX_CRAWL_DELAY_SECONDS).toBe(10);
-  });
-
-  it.each([86_400, 1e9, 10.0001])("a declared Crawl-delay of %s is clamped to the maximum", async (seconds) => {
+// REVIEW FINDING — the target's robots.txt is untrusted input and is read even for an UNVERIFIED project. aux-and-geo-analysis.md
+// §1 says the crawl "honours Crawl-delay": a site that asks for 86400 s between requests must not be crawled faster. A
+// hostile value cannot pin a worker WITHOUT a clamp, because `acquire` refuses (it never sleeps) when the wait would pass the
+// wall-clock deadline, and `affordableRequests` shrinks the page list up front. These tests are written from that hazard.
+describe("politeness · a declared Crawl-delay is honoured exactly and a hostile one still cannot pin a worker", () => {
+  it.each([86_400, 1e9, 10.0001, 11, 60])("a declared Crawl-delay of %s s is the interval, not a smaller number", (seconds) => {
     const clock = fakeClock();
-    const b = budget(clock, { crawlDelaySeconds: seconds });
-    expect(b.intervalMs).toBe(MAX_CRAWL_DELAY_SECONDS * 1000);
-    await b.acquire("site_file");
-    await b.acquire("site_file");
-    expect(clock.sleeps).toEqual([MAX_CRAWL_DELAY_SECONDS * 1000]);
-  });
-
-  it("a delay at or under the maximum is honoured exactly (the clamp does not lower it)", () => {
-    const clock = fakeClock();
-    expect(budget(clock, { crawlDelaySeconds: 10 }).intervalMs).toBe(10_000);
+    expect(budget(clock, { crawlDelaySeconds: seconds }).intervalMs).toBe(seconds * 1000);
     const b = budget(clock);
-    b.setCrawlDelay(1e9);
-    expect(b.intervalMs).toBe(10_000);
+    b.setCrawlDelay(seconds);
+    expect(b.intervalMs).toBe(seconds * 1000);
   });
 
-  it("a whole crawl under a hostile delay finishes in bounded virtual time: the deadline stops it, without sleeping past it", async () => {
+  it("with no deadline, a 60 s delay is slept in full, never shortened", async () => {
+    const clock = fakeClock();
+    const b = budget(clock, { crawlDelaySeconds: 60 });
+    await b.acquire("site_file");
+    await b.acquire("site_file");
+    expect(clock.sleeps).toEqual([60_000]);
+  });
+
+  it.each([Number.NaN, -5, Number.POSITIVE_INFINITY, 0, 0.1])("an unusable or sub-floor declared delay (%s) leaves the 500 ms floor", (seconds) => {
+    const clock = fakeClock();
+    expect(budget(clock, { crawlDelaySeconds: seconds }).intervalMs).toBe(MIN_INTERVAL_MS);
+  });
+
+  it.each([86_400, 1e9])("Crawl-delay %s under a wall-clock budget: no request after the first is granted and nothing is slept", async (seconds) => {
     const clock = fakeClock();
     const start = clock.now();
-    const b = budget(clock, { hardCap: 1_000, crawlDelaySeconds: 1e9, wallClockBudgetMs: 60_000 });
+    const b = budget(clock, { hardCap: 1_000, crawlDelaySeconds: seconds, wallClockBudgetMs: 60_000 });
+    await b.acquire("site_file"); // robots.txt: the first request, no wait
+    await expect(b.acquire("page")).rejects.toBeInstanceOf(PolitenessDeadlineReached);
+    expect(clock.sleeps).toEqual([]); // refused BEFORE sleeping: never a sleep shorter than the declared delay
+    expect(clock.now() - start).toBe(0);
+    expect(b.used).toBe(1);
+    expect(b.affordableRequests()).toBe(0);
+  });
+
+  it("a delay that fits the deadline is slept in full, and the deadline refuses the request after it", async () => {
+    const clock = fakeClock();
+    const b = budget(clock, { hardCap: 1_000, crawlDelaySeconds: 20, wallClockBudgetMs: 60_000 });
     let granted = 0;
     let stopped: unknown;
     for (let i = 0; i < 1_000; i += 1) {
@@ -216,9 +226,9 @@ describe("politeness · a hostile Crawl-delay cannot pin a worker", () => {
       }
     }
     expect(stopped).toBeInstanceOf(PolitenessDeadlineReached);
-    expect(granted).toBe(7); // t = 0, 10, ... 60 s
-    expect(clock.now() - start).toBeLessThanOrEqual(60_000);
-    expect(b.used).toBe(7); // the refused request is not counted as made
+    expect(granted).toBe(4); // t = 0, 20, 40, 60 s
+    expect(clock.sleeps).toEqual([20_000, 20_000, 20_000]);
+    expect(b.used).toBe(4); // the refused request is not counted as made
   });
 
   it("the deadline is a distinct condition from the request cap, and is checked even for the first request", async () => {

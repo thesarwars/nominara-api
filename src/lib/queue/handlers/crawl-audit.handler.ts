@@ -63,7 +63,7 @@ import type { JobProcessor } from "../worker-factory.js";
 // crawl makes that minutes long. Moving the network out of the transaction changes the worker-factory pattern, which is an
 // architectural decision, not something to slip into this story: it is OPEN, and needs the architect before merge (see
 // docs/plans/docs-carry/STORY-049.md). Until it is made, the exposure is BOUNDED rather than accepted open-ended:
-//   - the honoured Crawl-delay is clamped (politeness.ts), so a hostile robots.txt cannot stretch the waits;
+//   - the declared Crawl-delay is honoured exactly (politeness.ts); a hostile robots.txt cannot stretch the waits past the wall-clock budget, because a request that would start after it is refused, never slept for;
 //   - the whole crawl has a wall-clock budget (CRAWL_WALL_CLOCK_BUDGET_MS); a request that would start after it is refused,
 //     the page list is shrunk UP FRONT to what fits, and what was not fetched is recorded (`crawl_delay_limited`);
 //   - the transaction carries a transaction-local idle_in_transaction_session_timeout, a backstop above that budget so a
@@ -352,7 +352,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     });
 
     // THE WALL-CLOCK BUDGET, UP FRONT. Each page costs two requests (plain and rendered; one with no renderer installed) at the interval now in force, which a
-    // hostile Crawl-delay has already stretched to its clamp. Shrink the list to what fits, and record what was not attempted.
+    // declared Crawl-delay has already stretched. Shrink the list to what fits, and record what was not attempted.
     const probeReserve = verified ? PROBE_REQUESTS : 0;
     const affordablePages = Math.max(0, Math.floor((budget.affordableRequests() - probeReserve) / requestsPerPage));
     const delaySkipped = selection.urls.length > affordablePages ? selection.urls.slice(affordablePages) : [];

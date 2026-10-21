@@ -17,14 +17,6 @@ export const MIN_INTERVAL_MS = 500;
 /** aux-and-geo-analysis.md §1: at most 2 requests per second per host. */
 export const MAX_REQUESTS_PER_SECOND = 2;
 
-/**
- * NOT FROM THE REFERENCE. The reference says the crawl "honours Crawl-delay" and names no upper bound; robots.txt is
- * untrusted input, read even for an unverified project, and an unbounded delay kept one crawl.audit job asleep for days
- * inside an open tenant transaction. The honoured delay is clamped here; a longer declared value is treated as this.
- * 10 s is already 20x the 500 ms floor. Provisional until the architect names a number.
- */
-export const MAX_CRAWL_DELAY_SECONDS = 10;
-
 export type RequestKind = "site_file" | "page" | "probe";
 
 /** The hard cap is spent. A typed error, never a silent skip: the caller records what it did not fetch. */
@@ -91,11 +83,14 @@ export class PolitenessBudget {
 
   /**
    * robots.txt is the FIRST request, so its `Crawl-delay` is only known after it: call this once it is parsed. An unusable
-   * value (negative, NaN, Infinity) is ignored; no declared delay can LOWER the 500 ms floor, and none can RAISE the
-   * interval above MAX_CRAWL_DELAY_SECONDS.
+   * value (negative, NaN, Infinity) is ignored; no declared delay can LOWER the 500 ms floor. The declared delay is
+   * honoured EXACTLY, with no upper clamp (a crawler that goes faster than the site asked is not "honouring" it). A hostile
+   * 86400 s cannot pin a worker anyway: `acquire` refuses before sleeping when the wait would pass the wall-clock
+   * deadline, and `affordableRequests` shrinks the page list up front.
    */
   setCrawlDelay(seconds: number | null): void {
-    this.crawlDelayMs = seconds !== null && Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, MAX_CRAWL_DELAY_SECONDS) * 1000 : 0;
+    const ms = seconds === null ? 0 : seconds * 1000;
+    this.crawlDelayMs = Number.isFinite(ms) && ms > 0 ? ms : 0;
   }
 
   get used(): number {

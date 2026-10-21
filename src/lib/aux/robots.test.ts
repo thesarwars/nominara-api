@@ -84,6 +84,11 @@ describe("STORY-049 AC7 · robots.txt for the NominaraBot agent", () => {
 // pattern into a backtracking regex, so `/*a*a*a*a*a*a*a*a*a*a*b` against a long run of `a` took exponential time on a
 // SYNCHRONOUS call (no timer, budget or lock renewal can interrupt it). Both inputs belong to the target site: the file
 // and, through sitemap <loc> entries and redirect Locations, the path.
+//
+// WHY A FIXED 5000 ms BOUND STILL MEANS SOMETHING (measured at review, round 2): the pre-fcccc94 regex matcher on the
+// pathological pattern `/(*a){12}*b` against a 2048-character path was killed at 20 s without finishing. The bounded
+// matcher takes milliseconds. If the bound ever flakes on a loaded host, widen it with a new measurement here; do not
+// remove the test.
 describe("STORY-049 · robots.txt matching is linear-time on hostile input", () => {
   const timed = <T>(fn: () => T): { value: T; ms: number } => {
     const start = performance.now();

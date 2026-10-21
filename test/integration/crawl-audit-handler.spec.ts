@@ -433,7 +433,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
 
   it("review r2 · with no renderer installed the up-front shrink counts ONE request per page, so the wall-clock budget admits twice the pages", async () => {
     await verifyDomain();
-    const delayRobots = "User-agent: *\nCrawl-delay: 86400\nAllow: /\n";
+    const delayRobots = "User-agent: *\nCrawl-delay: 10\nAllow: /\n";
     await run(job(), depsServing(withSitemap(SITEMAP_PAGES, delayRobots), [], 10_000, { wallClockBudgetMs: 100_000 }));
     const withRenderer = (await audits())[0]!.error_summary.crawl_delay_limited.pages_skipped as number;
     await db.query("TRUNCATE aux_audits CASCADE");
@@ -622,25 +622,27 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   // REVIEW ROUND 1 — a hostile robots.txt, the open transaction, partial vs failed, and the runtime role
   // ------------------------------------------------------------------------------------------------------------------
   it.each(["86400", "1000000000"])(
-    "REVIEW · a robots.txt with Crawl-delay %s cannot pin the worker: the wait is clamped, the audit finishes in bounded virtual time, and what it did not fetch is recorded",
+    "REVIEW · a robots.txt with Crawl-delay %s is HONOURED: nothing is sent after robots.txt, no sleep is shorter than the delay, and everything skipped is recorded",
     async (delay) => {
       await verifyDomain();
       const budgetMs = 100_000;
-      await run(job(), depsServing(withSitemap(SITEMAP_PAGES, `User-agent: *\nCrawl-delay: ${delay}\nAllow: /\n`), [], 10_000, { wallClockBudgetMs: budgetMs }));
+      const requested: string[] = [];
+      await run(job(), depsServing(withSitemap(SITEMAP_PAGES, `User-agent: *\nCrawl-delay: ${delay}\nAllow: /\n`), requested, 10_000, { wallClockBudgetMs: budgetMs }));
       const [a] = await audits();
-      expect(["completed", "partial"]).toContain(a.status);
-      expect(Math.max(...sleeps)).toBeLessThanOrEqual(10_000);
+      expect(["completed", "partial", "failed"]).toContain(a.status);
+      // returns in bounded virtual time without ever crawling faster than asked
       expect(clockMs).toBeLessThanOrEqual(budgetMs);
-      expect(a.error_summary.crawl_delay_limited).toEqual({ crawl_delay_ms: 10_000, pages_skipped: 1 });
-      expect(a.error_summary.skipped_pages).toContainEqual({ url: expect.stringMatching(/^https:\/\/acme\.com\//), reason: "crawl_delay_budget" });
-      const skipped = (await manifestOf()).selection_skipped.filter((x) => x.reason === "crawl_delay_budget");
-      expect(skipped).toHaveLength(1);
+      for (const s of sleeps) expect(s).toBeGreaterThanOrEqual(Number(delay) * 1000);
+      expect(requested).toEqual(["https://acme.com/robots.txt"]); // the only request that does not wait out the delay
+      expect(a.error_summary.crawl_delay_limited).toMatchObject({ crawl_delay_ms: Number(delay) * 1000 });
+      expect(a.error_summary.crawl_delay_limited.pages_skipped).toBeGreaterThanOrEqual(1);
+      expect((await manifestOf()).selection_skipped.filter((x) => x.reason === "crawl_delay_budget").length).toBeGreaterThanOrEqual(1);
     },
   );
 
   it("REVIEW · an UNVERIFIED project is bounded too: robots.txt is read before any verification matters", async () => {
     await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nCrawl-delay: 86400\n"), [], 10_000, { wallClockBudgetMs: 100_000 }));
-    expect(Math.max(...sleeps)).toBeLessThanOrEqual(10_000);
+    for (const s of sleeps) expect(s).toBeGreaterThanOrEqual(86_400_000);
     expect(clockMs).toBeLessThanOrEqual(100_000);
     expect((await audits())[0]!.status).not.toBe("running");
   });
