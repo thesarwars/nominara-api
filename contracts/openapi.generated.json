@@ -13648,6 +13648,11 @@
                                       "must_reduce"
                                     ]
                                   },
+                                  "paused": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
                                   "items": {
                                     "maxItems": 100,
                                     "type": "array",
@@ -13661,6 +13666,11 @@
                                         },
                                         "name": {
                                           "type": "string"
+                                        },
+                                        "prompts": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
                                         }
                                       },
                                       "required": [

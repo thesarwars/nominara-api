@@ -34,8 +34,24 @@ export const downgradeExcessItemSchema = z.discriminatedUnion("kind", [
       excess: z.number().int().positive(),
       /** STORY-077: what the cut-over does with it. Only `must_reduce` blocks the downgrade. */
       effect: z.enum(STRUCTURAL_EXCESS_EFFECTS),
-      /** `projects.max` only: the projects that exceed, most recently created first (the ones paused at the cut-over). */
-      items: z.array(z.object({ id: z.uuid(), name: z.string() }).strict()).max(100).optional(),
+      /**
+       * STORY-077 (review round 3), `paused_at_period_end` entries only: EXACTLY how many rows the cut-over pauses for
+       * this entry, worked out by the same reconcile the cut-over runs (a dry run), so the confirmation never names
+       * fewer than the cut-over pauses. `current`/`excess` are the guard's slot counts and can differ from it.
+       *   projects.max              the projects the cut-over pauses;
+       *   prompts.max_per_project   the prompts in `project_id` paused by the per-project limit;
+       *   prompts.max_total         the prompts paused by the workspace-wide limit, beyond the two above.
+       * A project's own prompts paused WITH it are counted on its `items[].prompts`, not here. The prompts the cut-over
+       * pauses in all = the sum of `items[].prompts` and of `paused` on the two prompt keys.
+       */
+      paused: z.number().int().nonnegative().optional(),
+      /**
+       * `projects.max` only: the projects that exceed, most recently created first (the ones paused at the cut-over).
+       * `prompts`: how many of that project's active prompts the cut-over pauses WITH it (0 for a project a downgrade
+       * already paused: its prompts are paused already). Always set by this server; optional on the wire so the
+       * addition is a minor client bump (STORY-023 AC5).
+       */
+      items: z.array(z.object({ id: z.uuid(), name: z.string(), prompts: z.number().int().nonnegative().optional() }).strict()).max(100).optional(),
     })
     .strict(),
   z.object({ kind: z.literal("feature_lost"), key: z.string().min(1) }).strict(),
