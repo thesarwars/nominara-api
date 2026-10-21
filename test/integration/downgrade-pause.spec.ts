@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { Client } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
+import { reconcileDowngradePause } from "../../src/lib/billing/downgrade-pause.js";
+import { CONFIRMED_CREDITS_HEADER } from "../../src/lib/credits/confirmed-credits.js";
 import { LoggingEmailSenderAdapter } from "../../src/modules/identity/adapters/logging-email-sender.adapter.js";
 import type { EmailMessage } from "../../src/modules/identity/ports/email-sender.js";
 import { dataOf } from "../support/envelope.js";
@@ -101,8 +104,8 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     const preview = planChangePreviewResponseSchema.parse(dataOf(await f.post(owner, PREVIEW, { plan_key: "growth" })));
     expect(preview).toMatchObject({ effective: "period_end", blocked_by: null });
     expect(preview.exceeds.filter((e) => e.kind === "structural")).toEqual([
-      { kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", items: [{ id: ids[4], name: "P4" }, { id: ids[3], name: "P3" }] },
-      { kind: "structural", key: "prompts.max_per_project", project_id: ids[0], limit: 40, current: 45, excess: 5, effect: "paused_at_period_end" },
+      { kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", paused: 2, items: [{ id: ids[4], name: "P4", prompts: 0 }, { id: ids[3], name: "P3", prompts: 0 }] },
+      { kind: "structural", key: "prompts.max_per_project", project_id: ids[0], limit: 40, current: 45, excess: 5, effect: "paused_at_period_end", paused: 5 },
     ]);
 
     const res = await f.post(owner, CHANGE, { plan_key: "growth" });
@@ -493,5 +496,100 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     expect(active, "never above the cap").toBeLessThanOrEqual(10);
     expect(results.map((r) => r.statusCode).sort(), "exactly one resume fits").toEqual([200, 403, 403]);
     for (const r of results.filter((x) => x.statusCode !== 200)) expect(JSON.parse(r.body)).toMatchObject({ error: { code: "entitlement_exceeded", details: { key: "prompts.max_total" } } });
+  });
+  // ---- review round 3 ---------------------------------------------------------------------------------------------
+
+  it("review round 3 · the confirmation names EXACTLY what the cut-over pauses (Growth -> Starter, A=20, B=20 newer): B with all 20 of its prompts, the total row none beyond them", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    const [a, b] = await f.projects(workspaceId, 2);
+    await promptsAt(workspaceId, a!, 20, 3000);
+    await promptsAt(workspaceId, b!, 20, 2000);
+    const preview = planChangePreviewResponseSchema.parse(dataOf(await f.post(owner, PREVIEW, { plan_key: "starter" })));
+    const structural = preview.exceeds.filter((e) => e.kind === "structural");
+    expect(structural).toEqual([
+      { kind: "structural", key: "projects.max", limit: 1, current: 2, excess: 1, effect: "paused_at_period_end", paused: 1, items: [{ id: b, name: "P1", prompts: 20 }] },
+      { kind: "structural", key: "prompts.max_total", limit: 30, current: 40, excess: 10, effect: "paused_at_period_end", paused: 0 },
+    ]);
+
+    spyEmail();
+    await downgradeAtCutOver(workspaceId, owner, "starter");
+    const pausedNow = (await db().query<{ n: number }>("SELECT count(*)::int AS n FROM tracked_prompts WHERE workspace_id = $1 AND paused_by_downgrade_at IS NOT NULL", [workspaceId])).rows[0]!.n;
+    expect(pausedNow, "the cut-over paused what the preview named: 20 + 0").toBe(20);
+    expect(await markedProjects(workspaceId)).toEqual([b]);
+  });
+
+  it("review round 3 · rewording a downgrade-paused prompt (text only) keeps it the plan's: the replacement carries the marker, and an upgrade resumes it", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const [p] = await f.projects(workspaceId, 1);
+    const ps = await promptsAt(workspaceId, p!, 41, 3000);
+    spyEmail();
+    await downgradeAtCutOver(workspaceId, owner, "growth");
+    const newest = ps[40]!;
+    expect((await promptRows(p!)).find((r) => r.id === newest)?.paused_by_downgrade_at).not.toBeNull();
+
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    const res = await patchPrompt(actor, newest, { text: `reworded ${randomUUID()}` });
+    expect(res.statusCode, res.body).toBe(200);
+    const replacement = (dataOf(res) as { prompt_id: string }).prompt_id;
+    expect((await promptRows(p!)).find((r) => r.id === replacement), "only the wording changed, not who paused it").toMatchObject({ status: "paused" });
+    expect((await promptRows(p!)).find((r) => r.id === replacement)?.paused_by_downgrade_at).not.toBeNull();
+    expect((await promptRows(p!)).find((r) => r.id === newest)).toMatchObject({ status: "archived", paused_by_downgrade_at: null });
+
+    await upgradeTo(workspaceId, "business");
+    expect((await promptRows(p!)).find((r) => r.id === replacement)).toMatchObject({ status: "active", paused_by_downgrade_at: null });
+  });
+
+  // ⚠ THE HAZARD (review round 3, major): a lock-order inversion. The cut-over transaction locks the workspace, then the
+  // wallet (applyPlanChange), then every project row (reconcileDowngradePause). A charged archived -> paused PATCH that
+  // took the PROJECT lock without the workspace lock, then debited the wallet, closed a cycle: Postgres aborts one of
+  // them with 40P01 and either the customer's charged change or the cut-over dies. Deterministic: the "webhook" holds
+  // the workspace and wallet locks FIRST, the PATCH is seen waiting, and only then does the reconcile take the projects.
+  it("review round 3 · a charged archived -> paused PATCH racing the cut-over never deadlocks (40P01): both commit", async () => {
+    const { workspaceId } = await f.newWorkspace("growth");
+    const [p] = await f.projects(workspaceId, 1);
+    // The free ten are spent, so leaving `archived` is charged (1 credit) and debits the wallet.
+    const free = await promptsAt(workspaceId, p!, 10, 500);
+    await db().query("UPDATE tracked_prompts SET first_activated_at = now() WHERE id = ANY($1::uuid[])", [free]);
+    const [candidate] = await promptsAt(workspaceId, p!, 1, 100);
+    await db().query("UPDATE tracked_prompts SET status = 'archived' WHERE id = $1", [candidate]);
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+
+    const webhook = new Client({ connectionString: process.env.DATABASE_URL });
+    await webhook.connect();
+    let webhookError: unknown;
+    try {
+      await webhook.query("BEGIN");
+      await webhook.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+      await webhook.query("SELECT 1 FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE", [workspaceId]);
+
+      const patch = harness.app().inject({
+        method: "PATCH",
+        url: apiUrl(`/prompts/${candidate!}`),
+        cookies: f.cookies(actor),
+        headers: { [CSRF_HEADER_NAME]: actor.csrfToken, "content-type": "application/json", "idempotency-key": randomUUID(), [CONFIRMED_CREDITS_HEADER]: "1" },
+        payload: { status: "paused" },
+      });
+      // Wait until the PATCH is blocked on a lock the "webhook" holds.
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const waiting = (await db().query<{ n: number }>("SELECT count(*)::int AS n FROM pg_locks WHERE NOT granted")).rows[0]!.n;
+        if (waiting > 0) break;
+        if (Date.now() > deadline) throw new Error("the PATCH never waited on the webhook's locks");
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      try {
+        await reconcileDowngradePause(webhook, workspaceId);
+        await webhook.query("COMMIT");
+      } catch (error) {
+        webhookError = error;
+        await webhook.query("ROLLBACK");
+      }
+      const res = await patch;
+      expect((webhookError as { code?: string } | undefined)?.code, "the cut-over is never the deadlock victim").toBeUndefined();
+      expect(res.statusCode, res.body).toBe(200);
+      expect(dataOf(res)).toMatchObject({ status: "paused", credits_charged: 1 });
+    } finally {
+      await webhook.end();
+    }
   });
 });

@@ -106,6 +106,32 @@ describe("STORY-046 · PromptLifecycleService.update", () => {
     expect(calls.some((call) => /UPDATE|INSERT/.test(call.sql))).toBe(false);
   });
 
+  // STORY-077 review round 3 — ONE LOCK ORDER ON EVERY PATH: workspace, then project, then wallet. The cut-over locks
+  // workspace -> wallet -> every project; a PATCH that took the project lock first and then debited the wallet (archived
+  // -> paused, charged) deadlocked with it. And the decision must come from the REQUEST, not from a status read before
+  // any lock: a prompt read as `active` can be paused by the cut-over before the project lock, and its resume would then
+  // run the workspace-wide active check without the workspace lock.
+  describe("review round 3 · the workspace lock comes before the project lock for every status move or edit", () => {
+    const order = () => {
+      const workspace = calls.findIndex((c) => /FROM workspaces WHERE id = \$1 FOR UPDATE/.test(c.sql));
+      const project = calls.findIndex((c) => /FROM projects WHERE id = \$1 AND deleted_at IS NULL FOR UPDATE/.test(c.sql));
+      return { workspace, project };
+    };
+    for (const [label, status, request] of [
+      ["a resume whose first read says `active` (the cut-over can pause it before the project lock)", "active", { status: "active" }],
+      ["archived -> paused (a charged activation that debits the wallet)", "archived", { status: "paused" }],
+      ["active -> archived", "active", { status: "archived" }],
+      ["a text-only edit (it archives one row and inserts another)", "paused", { text: "Which crm would you recommend for a fifty person team?" }],
+    ] as const) {
+      it(label, async () => {
+        await setup({ status }).update(PROMPT, request, "1").catch(() => undefined);
+        const { workspace, project } = order();
+        expect(workspace, "workspace lock taken").toBeGreaterThanOrEqual(0);
+        expect(project).toBeGreaterThan(workspace);
+      });
+    }
+  });
+
   // ---------------------------------------------------------------------------
   // Scenarios 9 and 10 — pause frees nothing, archive frees a slot.
   // ---------------------------------------------------------------------------

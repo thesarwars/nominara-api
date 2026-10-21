@@ -75,7 +75,7 @@ describe("STORY-184 · in-app plan change", () => {
     expect(preview).toMatchObject({ direction: "downgrade", effective: "period_end", amount_due_now: "0.00", quote: null, blocked_by: null, purchased_credits_kept: true });
     expect(preview.effective_at).not.toBeNull();
     const structural = preview.exceeds.filter((e) => e.kind === "structural");
-    expect(structural).toEqual([{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", items: [{ id: ids[4], name: "P4" }, { id: ids[3], name: "P3" }] }]);
+    expect(structural).toEqual([{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", paused: 2, items: [{ id: ids[4], name: "P4", prompts: 0 }, { id: ids[3], name: "P3", prompts: 0 }] }]);
     expect(gateway.downgradeAttempts).toHaveLength(0);
   });
 
