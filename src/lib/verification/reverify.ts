@@ -89,12 +89,16 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
     const chunk = candidates.slice(start, start + CHECK_CONCURRENCY);
     // No transaction is open here: this is the external wait. Outcomes are only as fresh as this instant.
     const checkStartedAt = deps.now();
-    const outcomes = await Promise.all(
+    // allSettled: one check that throws must not abandon the run (oldest-checked-first ordering would then starve
+    // every other domain on every retry and every later day).
+    const outcomes = await Promise.allSettled(
       chunk.map(async (candidate): Promise<CheckOutcome> => runCheck(candidate.method, candidate.domain, candidate.nonce, deps.checks)),
     );
     for (const [index, candidate] of chunk.entries()) {
       try {
-        const outcome = outcomes[index]!;
+        const settled = outcomes[index]!;
+        if (settled.status === "rejected") throw settled.reason;
+        const outcome = settled.value;
         const isInconclusive = !outcome.ok && outcome.inconclusive === true;
         if (isInconclusive) inconclusive += 1;
         if (await applyOne(pool, candidate, outcome, checkStartedAt)) lost += 1;

@@ -179,3 +179,15 @@ describe("STORY-048 · inconclusive outcomes (our outage is not their absence)",
     await expect(checkMetaTag(DOMAIN, NONCE, refuse)).resolves.toEqual({ ok: false, reason: "fetch_refused" });
   });
 });
+
+describe("STORY-048 review r3 · a non-object rejection from the resolver", () => {
+  it.each([undefined, null, "boom", 42])("dns_txt · rejecting with %s is inconclusive, never a TypeError", async (reason) => {
+    const outcome = await checkDnsTxt("site.test", "n1", {
+      resolveTxt: () => Promise.reject(reason),
+      fetch: async () => {
+        throw new Error("no http");
+      },
+    });
+    expect(outcome).toMatchObject({ ok: false, inconclusive: true });
+  });
+});

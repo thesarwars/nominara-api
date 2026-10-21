@@ -86,7 +86,10 @@ export async function checkDnsTxt(domain: string, nonce: string, deps: CheckDeps
     // ENOTFOUND and ENODATA both mean "no such record": conclusive absence. Anything else (ETIMEOUT, ESERVFAIL,
     // ECONNREFUSED to the resolver) is a failure to ASK, not an answer, and is marked inconclusive so the
     // periodic sweep cannot de-verify a fleet on one resolver outage. The customer-facing reason is unchanged.
-    const code = (error as { code?: unknown }).code ?? (error as Error).message;
+    const code =
+      typeof error === "object" && error !== null
+        ? ((error as { code?: unknown }).code ?? (error as Error).message)
+        : undefined;
     if (code === "ENOTFOUND" || code === "ENODATA") return { ok: false, reason: "record_absent" };
     return { ok: false, reason: "record_absent", inconclusive: INCONCLUSIVE };
   }

@@ -488,6 +488,28 @@ describe("STORY-048 AC7 · domain.reverify (periodic re-verification)", () => {
     expect(text).not.toContain(bad.domain);
   });
 
+  it("review r3 · a check that THROWS is that candidate's failure, not the run's: the other domains are still checked and the status is partial", async () => {
+    const broken = await seed("throws", { lastCheckedHoursAgo: 40 });
+    const gone = await seed("gone", { lastCheckedHoursAgo: 30 });
+    const base = checks();
+    const errors: string[] = [];
+    const spy = vi.spyOn(Logger.prototype, "error").mockImplementation((m: unknown) => void errors.push(JSON.stringify(m)));
+    let result: unknown;
+    try {
+      // a malformed answer (not an array) throws OUTSIDE the resolver try/catch inside the checker
+      result = await run({
+        checks: { ...base, resolveTxt: async (name: string) => (name.includes(broken.domain) ? (null as never) : base.resolveTxt(name)) },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(result).toMatchObject({ status: "partial", checked: 2, lost: 1, failed: 1 });
+    expect((await verification(gone)).verified_at).toBeNull();
+    expect((await verification(broken)).verified_at).not.toBeNull();
+    expect(errors.join("\n")).toContain(broken.ws);
+    expect(errors.join("\n")).not.toContain(broken.domain);
+  });
+
   it("single-flight · yields when another replica holds the lock, checking nothing", async () => {
     await seed("locked");
     expect(await tryAdvisorySessionLock(db, globalQueueLockKey("domain.reverify"))).toBe(true);
