@@ -11,19 +11,26 @@
 --                             'active', so it needs none.
 --
 -- Existing RLS policies on projects and tracked_prompts cover the new columns; no policy changes.
+--
+-- ⚠ EVERY CHECK IS ADDED NOT VALID, and 0131 validates them in a file (a transaction) of its own, as 0085/0086 do.
+-- projects and tracked_prompts are hot tenant tables: a validating ADD CONSTRAINT scans every row under ACCESS
+-- EXCLUSIVE, blocking reads and writes for the whole scan. NOT VALID still enforces the CHECK on every new or updated
+-- row from this migration on; VALIDATE takes only SHARE UPDATE EXCLUSIVE.
 ALTER TABLE projects
   ADD COLUMN IF NOT EXISTS paused_by_downgrade_at timestamptz,
-  ADD COLUMN IF NOT EXISTS paused_by_downgrade_from text
-    CONSTRAINT ck_projects_paused_by_downgrade_from CHECK (paused_by_downgrade_from IN ('active', 'initializing'));
+  ADD COLUMN IF NOT EXISTS paused_by_downgrade_from text;
+
+ALTER TABLE projects
+  ADD CONSTRAINT ck_projects_paused_by_downgrade_from CHECK (paused_by_downgrade_from IN ('active', 'initializing')) NOT VALID;
 
 ALTER TABLE projects
   ADD CONSTRAINT ck_projects_paused_by_downgrade CHECK (
     (paused_by_downgrade_at IS NULL AND paused_by_downgrade_from IS NULL)
     OR (paused_by_downgrade_at IS NOT NULL AND paused_by_downgrade_from IS NOT NULL AND status = 'paused')
-  );
+  ) NOT VALID;
 
 ALTER TABLE tracked_prompts
   ADD COLUMN IF NOT EXISTS paused_by_downgrade_at timestamptz;
 
 ALTER TABLE tracked_prompts
-  ADD CONSTRAINT ck_tracked_prompts_paused_by_downgrade CHECK (paused_by_downgrade_at IS NULL OR status = 'paused');
+  ADD CONSTRAINT ck_tracked_prompts_paused_by_downgrade CHECK (paused_by_downgrade_at IS NULL OR status = 'paused') NOT VALID;
