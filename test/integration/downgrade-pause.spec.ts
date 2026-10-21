@@ -344,11 +344,13 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
   });
 
   it("AC5 · the WORKSPACE-WIDE cap (prompts.max_total) also binds a resume, on both doors, even when the project has room", async () => {
-    const { workspaceId, owner } = await f.newWorkspace("business");
+    const { workspaceId } = await f.newWorkspace("business");
     // growth: 40 per project, 120 in total. An operator override allows 4 projects, so the workspace-wide cap is the ONLY
     // one that binds here (review round 2: with growth's own 3, P3 would be in the project excess and the cut-over now
     // pauses its prompts with it, so the max_total excess would never reach P0 - the shape this test needs).
     await overrideEntitlements(workspaceId, { "projects.max": 4 });
+    // The override bumps entitlement_version, so a session minted before it is stale (401 entitlement_stale): enter after.
+    const owner = await f.enter(await f.ownerOf(workspaceId), workspaceId);
     const ids = await f.projects(workspaceId, 4);
     // P0's last five are the NEWEST prompts in the workspace, so the max_total excess (125 - 120) lands in P0, an
     // ACTIVE project with room under its own 40.
