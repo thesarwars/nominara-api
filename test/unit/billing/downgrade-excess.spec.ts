@@ -14,7 +14,7 @@ const P5 = "0194a3d2-0000-7000-8000-000000000005";
 function usage(over: Partial<ExcessUsage> = {}): ExcessUsage {
   return { workspace: { "projects.max": 0, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [], ...over };
 }
-const project = (id: string, name: string, prompts = 0, competitors = 0) => ({ id, name, prompts, competitors });
+const project = (id: string, name: string, prompts = 0, competitors = 0, status: "active" | "initializing" | "paused" | "archived" = "active", pausedByDowngrade = false) => ({ id, name, prompts, competitors, status, pausedByDowngrade });
 
 function run(from: "free" | "starter" | "growth" | "business" | "enterprise", to: typeof from, u: ExcessUsage, opts: { held?: { extra_project?: number; extra_seat?: number }; overrides?: Record<string, number | string | boolean | null> } = {}) {
   return computeDowngradeExcess({ currentPlan: PLAN_ENTITLEMENTS[from], targetPlan: PLAN_ENTITLEMENTS[to], heldAddons: opts.held ?? {}, overrides: opts.overrides ?? {}, usage: u });
@@ -25,6 +25,18 @@ describe("STORY-184 · computeDowngradeExcess — structural limits", () => {
     // business allows 5, growth allows 3; five projects, listed newest first.
     const r = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e"), project(P4, "d"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
     expect(r.structural).toEqual([{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", items: [{ id: P5, name: "e" }, { id: P4, name: "d" }] }]);
+  });
+
+  it("STORY-077 review round 2 · the named items are the projects the cut-over PAUSES: an archived or person-paused project in the excess is counted, never named as paused", () => {
+    // Five projects against growth's 3: the excess is the two newest, e (archived) and d. The guard counts e, so the count
+    // is exact, but planDowngradePause pauses only d - so only d is named under "paused at period end".
+    const r = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e", 0, 0, "archived"), project(P4, "d"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
+    expect(r.structural).toEqual([{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", items: [{ id: P4, name: "d" }] }]);
+    const personPaused = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e", 0, 0, "paused"), project(P4, "d", 0, 0, "initializing"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
+    expect(personPaused.structural[0]).toMatchObject({ excess: 2, items: [{ id: P4, name: "d" }] });
+    // One a downgrade already paused stays paused: it is named.
+    const already = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e", 0, 0, "paused", true), project(P4, "d"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
+    expect(already.structural[0]).toMatchObject({ items: [{ id: P5, name: "e" }, { id: P4, name: "d" }] });
   });
 
   it("BOUNDARY · usage exactly at the target's limit is not an excess; one over is", () => {

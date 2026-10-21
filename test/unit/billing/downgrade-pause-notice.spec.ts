@@ -5,7 +5,7 @@ import { downgradePausedEmail, downgradeResumedEmail } from "../../../src/lib/bi
 // paused nothing; a list that leaves out what was paused; a count that disagrees with the list once it is bounded.
 
 const project = (n: number) => ({ id: `p${String(n)}`, name: `Project ${String(n)}` });
-const prompt = (n: number) => ({ id: `q${String(n)}`, projectName: "Project 0", text: `best tool number ${String(n)}` });
+const prompt = (n: number, withProject = false) => ({ id: `q${String(n)}`, projectName: withProject ? "Project 4" : "Project 0", text: `best tool number ${String(n)}`, withProject });
 
 describe("STORY-077 scenario 3 · the pause-list email", () => {
   it("nothing paused: no email at all", () => {
@@ -40,5 +40,15 @@ describe("STORY-077 scenario 3 · the pause-list email", () => {
     expect(body).toContain("1 project resumed");
     expect(body).toContain("Project 3");
     expect(body).toContain("5 prompts resumed");
+  });
+
+  it("STORY-077 review round 2 · prompts paused WITH their project are not listed one by one: the project line covers them, and the prompt list names only prompts paused in a kept project", () => {
+    const body = downgradePausedEmail("a@example.com", "Starter", { projects: [project(4)], prompts: [prompt(1), prompt(2, true), prompt(3, true)] })!.textBody;
+    expect(body).toContain("1 project paused");
+    expect(body).toContain("Project 4 (and its 2 prompts)");
+    expect(body).toContain("1 prompt paused");
+    expect(body).toContain("best tool number 1");
+    expect(body).not.toContain("best tool number 2");
+    expect(body).not.toContain("best tool number 3");
   });
 });

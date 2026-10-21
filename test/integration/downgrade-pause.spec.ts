@@ -264,6 +264,12 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     expect(marked.every((p) => p.status === "paused")).toBe(true);
   });
 
+  /** Operator overrides (absolute, the final word in resolution), with the version bump that invalidates the memo. */
+  async function overrideEntitlements(workspaceId: string, overrides: Record<string, number>): Promise<void> {
+    await db().query("UPDATE workspaces SET entitlement_overrides = $2::jsonb, entitlement_version = entitlement_version + 1 WHERE id = $1", [workspaceId, JSON.stringify(overrides)]);
+  }
+  const activeCount = async (projectId: string) => (await promptRows(projectId)).filter((p) => p.status === "active").length;
+
   /** PATCH /prompts/{id} as `actor`. */
   const patchPrompt = (actor: Actor, promptId: string, payload: Record<string, unknown>) =>
     harness.app().inject({
@@ -339,7 +345,11 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
 
   it("AC5 · the WORKSPACE-WIDE cap (prompts.max_total) also binds a resume, on both doors, even when the project has room", async () => {
     const { workspaceId, owner } = await f.newWorkspace("business");
-    const ids = await f.projects(workspaceId, 4); // growth: 3 projects, 40 per project, 120 in total
+    // growth: 40 per project, 120 in total. An operator override allows 4 projects, so the workspace-wide cap is the ONLY
+    // one that binds here (review round 2: with growth's own 3, P3 would be in the project excess and the cut-over now
+    // pauses its prompts with it, so the max_total excess would never reach P0 - the shape this test needs).
+    await overrideEntitlements(workspaceId, { "projects.max": 4 });
+    const ids = await f.projects(workspaceId, 4);
     // P0's last five are the NEWEST prompts in the workspace, so the max_total excess (125 - 120) lands in P0, an
     // ACTIVE project with room under its own 40.
     const p0 = [...(await promptsAt(workspaceId, ids[0]!, 35, 2000)), ...(await promptsAt(workspaceId, ids[0]!, 5, 5))];
@@ -375,5 +385,94 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
     const refused = await patchPrompt(actor, mine, { status: "active" });
     expect(refused.statusCode, refused.body).toBe(403);
+  });
+
+  // ---- review round 2 ------------------------------------------------------------------------------------------------
+  // The hazards: the customer left tracking FEWER prompts than the plan allows (the per-project and workspace excesses
+  // unioned; a paused project's prompts holding the active room of the projects the customer kept); a reconcile that
+  // lowers nothing re-pausing a person's resume; two concurrent resumes both fitting the workspace cap.
+
+  it("review round 2 · per-project and workspace excess together (seed values, Business -> Growth): A=50, B=40, C=40 with B the newest leaves 40/40/40 = all 120 tracked", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const [a, b, c] = await f.projects(workspaceId, 3);
+    await promptsAt(workspaceId, a!, 50, 3000);
+    await promptsAt(workspaceId, c!, 40, 2000);
+    const bIds = await promptsAt(workspaceId, b!, 40, 1000);
+    spyEmail();
+    await downgradeAtCutOver(workspaceId, owner, "growth");
+    expect([await activeCount(a!), await activeCount(b!), await activeCount(c!)]).toEqual([40, 40, 40]);
+    expect((await promptRows(b!)).filter((p) => p.status === "active").map((p) => p.id)).toEqual(bIds);
+  });
+
+  it("review round 2 · a project the cut-over pauses takes its prompts with it (Growth -> Starter): the KEPT project, with prompts newer than the paused one's, still tracks all 30 Starter allows; an upgrade brings both back", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("growth");
+    const [a, b] = await f.projects(workspaceId, 2);
+    const aOld = await promptsAt(workspaceId, a!, 20, 3000);
+    const bIds = await promptsAt(workspaceId, b!, 20, 2000);
+    const aNew = await promptsAt(workspaceId, a!, 10, 100);
+    spyEmail();
+    await downgradeAtCutOver(workspaceId, owner, "starter");
+
+    expect(await markedProjects(workspaceId)).toEqual([b]);
+    expect((await promptRows(a!)).filter((p) => p.status === "active").map((p) => p.id)).toEqual([...aOld, ...aNew]);
+    const bState = await promptRows(b!);
+    expect(bState.every((p) => p.status === "paused" && p.paused_by_downgrade_at !== null), "nothing in the paused project holds the active room").toBe(true);
+
+    // The kept project's own person-paused prompt is not blocked by B's untracked prompts: there is no room because A is
+    // at 30, not because B holds it. Archive one and the resume fits.
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    expect((await patchPrompt(actor, aOld[0]!, { status: "paused" })).statusCode).toBe(200);
+    expect((await patchPrompt(actor, aOld[0]!, { status: "active" })).statusCode, "A has room for its own 30").toBe(200);
+
+    await upgradeTo(workspaceId, "growth");
+    expect(await markedProjects(workspaceId)).toEqual([]);
+    expect((await promptRows(b!)).filter((p) => p.status === "active").map((p) => p.id)).toEqual(bIds);
+  });
+
+  it("review round 2 · a person's resume is theirs: the cut-over leaves the plan's full 40 tracked, and a later reconcile that lowers no limit (a seat add-on) never re-pauses what the person resumed", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const [p] = await f.projects(workspaceId, 1);
+    const mine = await promptsAt(workspaceId, p!, 1, 5000);
+    await db().query("UPDATE tracked_prompts SET status = 'paused' WHERE id = $1", [mine[0]]);
+    const ps = await promptsAt(workspaceId, p!, 41, 3000);
+    spyEmail();
+    await downgradeAtCutOver(workspaceId, owner, "growth");
+    expect(await activeCount(p!), "40 allowed, 41 active before: one paused, not two").toBe(40);
+    const newest = ps[40]!;
+    expect((await promptRows(p!)).filter((r) => r.paused_by_downgrade_at !== null).map((r) => r.id)).toEqual([newest]);
+
+    // The person swaps: pauses an old one, resumes the newest (its marker cleared - now theirs).
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    expect((await patchPrompt(actor, ps[0]!, { status: "paused" })).statusCode).toBe(200);
+    expect((await patchPrompt(actor, newest, { status: "active" })).statusCode).toBe(200);
+
+    // A seat add-on changes what the workspace is entitled to (addonOutcome.changed), so the reconcile runs - under the
+    // SAME prompt limits.
+    f.stripeSubscription(workspaceId, { plan: "growth", held: [{ kind: "extra_seat", quantity: 1 }] });
+    expect((await f.reconcile(workspaceId)).statusCode).toBe(200);
+    expect((await promptRows(p!)).find((r) => r.id === newest)).toMatchObject({ status: "active", paused_by_downgrade_at: null });
+    expect((await promptRows(p!)).find((r) => r.id === ps[0])).toMatchObject({ status: "paused", paused_by_downgrade_at: null });
+    expect(await f.auditActions(workspaceId, "billing.downgrade.paused")).toHaveLength(1);
+  });
+
+  it("review round 2 · CONCURRENT resumes in different projects cannot both take the last workspace-wide slot (prompts.max_total)", async () => {
+    const { workspaceId } = await f.newWorkspace("growth");
+    // An over-limit workspace: 3 projects, each 3 active + 1 paused; the override caps the workspace at 10 active, so
+    // 9 are active and ONE resume fits. Every project has room under its own 40.
+    await overrideEntitlements(workspaceId, { "prompts.max_total": 10 });
+    const ids = await f.projects(workspaceId, 3);
+    const paused: string[] = [];
+    for (const projectId of ids) {
+      await promptsAt(workspaceId, projectId, 3, 500);
+      const [extra] = await promptsAt(workspaceId, projectId, 1, 100);
+      await db().query("UPDATE tracked_prompts SET status = 'paused' WHERE id = $1", [extra]);
+      paused.push(extra!);
+    }
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    const results = await Promise.all(paused.map((id) => patchPrompt(actor, id, { status: "active" })));
+    const active = (await db().query<{ n: number }>("SELECT count(*)::int AS n FROM tracked_prompts WHERE workspace_id = $1 AND status = 'active' AND deleted_at IS NULL", [workspaceId])).rows[0]!.n;
+    expect(active, "never above the cap").toBeLessThanOrEqual(10);
+    expect(results.map((r) => r.statusCode).sort(), "exactly one resume fits").toEqual([200, 403, 403]);
+    for (const r of results.filter((x) => x.statusCode !== 200)) expect(JSON.parse(r.body)).toMatchObject({ error: { code: "entitlement_exceeded", details: { key: "prompts.max_total" } } });
   });
 });
