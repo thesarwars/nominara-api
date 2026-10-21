@@ -37,7 +37,15 @@ export interface ExcessUsage {
   /** The workspace-wide counts, by structural key. */
   readonly workspace: Readonly<Record<WorkspaceKey, number>>;
   /** Live projects, NEWEST FIRST, each with its own prompt and competitor counts. */
-  readonly projects: ReadonlyArray<{ readonly id: string; readonly name: string; readonly prompts: number; readonly competitors: number }>;
+  readonly projects: ReadonlyArray<{
+    readonly id: string;
+    readonly name: string;
+    readonly prompts: number;
+    readonly competitors: number;
+    readonly status: "initializing" | "active" | "paused" | "archived";
+    /** Already paused by an earlier downgrade (`paused_by_downgrade_at`). */
+    readonly pausedByDowngrade: boolean;
+  }>;
 }
 
 export interface ExcessInput {
@@ -96,8 +104,14 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
     if (limit === null || used <= limit) continue;
     const excess = used - limit;
     if (key === "projects.max") {
-      // The projects to reduce first are the most recently created ones, exactly the order §14 pauses them in.
-      const items = input.usage.projects.slice(0, Math.min(excess, MAX_NAMED_PROJECTS)).map((p) => ({ id: p.id, name: p.name }));
+      // The excess is the most recently created ones, exactly the order §14 pauses them in. Every one is COUNTED (the
+      // guard's count), but only those the cut-over pauses - or a downgrade already paused - are NAMED as paused: an
+      // archived or person-paused project in the excess is not tracked and is never paused (downgrade-pause.ts).
+      const items = input.usage.projects
+        .slice(0, excess)
+        .filter((p) => p.pausedByDowngrade || p.status === "active" || p.status === "initializing")
+        .slice(0, MAX_NAMED_PROJECTS)
+        .map((p) => ({ id: p.id, name: p.name }));
       structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key), items });
     } else {
       structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key) });
@@ -141,8 +155,9 @@ export async function readExcessUsage(tx: ClientBase, workspaceId: string): Prom
   const workspace = {} as Record<WorkspaceKey, number>;
   for (const key of WORKSPACE_KEYS) workspace[key] = await countStructural(tx, key, workspaceId);
 
-  const rows = await tx.query<{ id: string; name: string }>(
-    "SELECT id, name FROM projects WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC",
+  const rows = await tx.query<{ id: string; name: string; status: ExcessUsage["projects"][number]["status"]; paused_by_downgrade: boolean }>(
+    `SELECT id, name, status, paused_by_downgrade_at IS NOT NULL AS paused_by_downgrade
+       FROM projects WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC`,
     [workspaceId],
   );
   const projects: Array<ExcessUsage["projects"][number]> = [];
@@ -150,6 +165,8 @@ export async function readExcessUsage(tx: ClientBase, workspaceId: string): Prom
     projects.push({
       id: row.id,
       name: row.name,
+      status: row.status,
+      pausedByDowngrade: row.paused_by_downgrade,
       prompts: await countStructural(tx, "prompts.max_per_project", workspaceId, row.id),
       competitors: await countStructural(tx, "competitors.max_per_project", workspaceId, row.id),
     });
