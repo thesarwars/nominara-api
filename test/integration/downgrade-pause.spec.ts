@@ -455,6 +455,23 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     expect(await f.auditActions(workspaceId, "billing.downgrade.paused")).toHaveLength(1);
   });
 
+  it("review round 2 · a PATCH that leaves a downgrade-paused prompt paused (paused -> paused) keeps the marker, so a later upgrade still resumes it", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const [p] = await f.projects(workspaceId, 1);
+    const ps = await promptsAt(workspaceId, p!, 41, 3000);
+    spyEmail();
+    await downgradeAtCutOver(workspaceId, owner, "growth");
+    const newest = ps[40]!;
+    expect((await promptRows(p!)).find((r) => r.id === newest)?.paused_by_downgrade_at).not.toBeNull();
+
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    expect((await patchPrompt(actor, newest, { status: "paused" })).statusCode).toBe(200);
+    expect((await promptRows(p!)).find((r) => r.id === newest)?.paused_by_downgrade_at, "a no-op status is not a person's decision").not.toBeNull();
+
+    await upgradeTo(workspaceId, "business");
+    expect((await promptRows(p!)).find((r) => r.id === newest)).toMatchObject({ status: "active", paused_by_downgrade_at: null });
+  });
+
   it("review round 2 · CONCURRENT resumes in different projects cannot both take the last workspace-wide slot (prompts.max_total)", async () => {
     const { workspaceId } = await f.newWorkspace("growth");
     // An over-limit workspace: 3 projects, each 3 active + 1 paused; the override caps the workspace at 10 active, so
