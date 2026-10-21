@@ -518,6 +518,18 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     expect(await markedProjects(workspaceId)).toEqual([b]);
   });
 
+  it("review round 3 · a pause caused by an ADD-ON removal (the plan did not move) emails that the add-ons changed, never that the workspace moved plan", async () => {
+    const { workspaceId } = await f.newWorkspace("growth", { held: [{ kind: "extra_project", quantity: 1 }] });
+    const ids = await f.projects(workspaceId, 4); // growth's 3 + the extra project
+    const sent = spyEmail();
+    f.stripeSubscription(workspaceId, { plan: "growth" }); // the extra project removed in the portal
+    expect((await f.reconcile(workspaceId)).statusCode).toBe(200);
+    expect(await markedProjects(workspaceId)).toEqual([ids[3]]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.textBody).toMatch(/add-ons changed/);
+    expect(sent[0]!.textBody).not.toMatch(/moved to the|changed plan/);
+  });
+
   it("review round 3 · rewording a downgrade-paused prompt (text only) keeps it the plan's: the replacement carries the marker, and an upgrade resumes it", async () => {
     const { workspaceId, owner } = await f.newWorkspace("business");
     const [p] = await f.projects(workspaceId, 1);
