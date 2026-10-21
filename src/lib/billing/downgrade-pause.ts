@@ -13,20 +13,24 @@ import { PROMPT_OCCUPIES_SLOT } from "../entitlements/structural-usage.js";
 //    later upgrade."
 //
 // ⚠ ONE RULE FOR BOTH DIRECTIONS. Given the workspace's RESOLVED limits (plan + surviving add-ons + overrides, the
-// guards' own `resolveEntitlements`), the EXCESS is the newest N rows by (created_at, id) — exactly what the preview
-// names (downgrade-excess.ts orders projects the same way). Then:
-//   * an `active`/`initializing` row in the excess is paused and MARKED (`paused_by_downgrade_at`);
-//   * a MARKED row no longer in the excess is resumed and unmarked.
-// So a downgrade pauses the newest, a partial upgrade resumes the oldest-paused first up to the new limit (the inverse
-// of the pause order), a full upgrade resumes everything, and a second delivery of the same state is a fixed point.
+// guards' own `resolveEntitlements`), `planDowngradePause` works out the state the limits allow, and pauses or resumes
+// only what differs: a downgrade pauses the newest, a partial upgrade resumes the oldest-paused first up to the new
+// limit, a full upgrade resumes everything, and a second delivery of the same state is a fixed point.
 //
-// ⚠ A PERSON'S PAUSE IS NEVER OURS. A row a person paused carries no marker: it is never marked (not taken over), and
-// never resumed by billing. It still OCCUPIES its slot (PROMPT_OCCUPIES_SLOT counts paused prompts; every non-deleted project, archived included,
-// counts), so it is in the counts and the excess like any other row — the cap is not bypassed by pausing.
+// ⚠ PROJECTS are counted as the guard and the preview count them (every non-deleted project, archived included), so
+// the paused projects are the ones the confirmation named.
 //
-// ⚠ COUNTS ARE NOT CHANGED BY A DOWNGRADE PAUSE (planner open question 1, option a): a paused row still occupies its
-// slot, so the workspace stays over its ceiling and the guards refuse the NEXT creation until the customer deletes or
-// upgrades. The pause stops tracking (the scheduler only claims `status = 'active'` projects) and keeps every row.
+// ⚠ PROMPTS are reconciled on the ACTIVE count (review round 2), the count the resume guard (active-limit.ts) holds a
+// person to. The customer is left tracking exactly what the plan allows, never fewer: a paused project takes its
+// prompts with it, the per-project excess counts toward the workspace excess, and a prompt a person paused or resumed
+// is theirs. A reconcile that lowers no limit pauses nothing.
+//
+// ⚠ A PERSON'S PAUSE IS NEVER OURS. A row a person paused carries no marker: it is never marked (not taken over) and
+// never resumed by billing.
+//
+// ⚠ SLOT COUNTS ARE NOT CHANGED BY A DOWNGRADE PAUSE (planner open question 1, option a): a paused row still occupies
+// its slot, so the creation guards refuse the NEXT creation until the customer deletes or upgrades. The pause stops
+// tracking (the scheduler only claims `status = 'active'` projects) and keeps every row.
 
 export interface PauseLimits {
   /** `projects.max`; null = unlimited. */
@@ -96,35 +100,99 @@ function excessOf<T extends { readonly id: string; readonly createdKey: string }
   return newestFirst(rows).slice(0, rows.length - limit);
 }
 
-/** Pure: what the cut-over (or a later upgrade) must pause and resume. */
-export function planDowngradePause(limits: PauseLimits, projects: readonly PauseProject[], prompts: readonly PausePrompt[]): DowngradePausePlan {
-  // EVERY non-deleted project counts, archived included: the guard (structural-usage COUNTERS["projects.max"]) and the
-  // preview (readExcessUsage) count exactly that, so the excess here is the excess the confirmation named. An archived
-  // project in it is counted, never paused (only active/initializing rows are).
-  const excessProjects = new Set(excessOf(projects, limits.projects).map((p) => p.id));
+/** Oldest first: the inverse of `newestFirst`. */
+function oldestFirst<T extends { readonly id: string; readonly createdKey: string }>(rows: readonly T[]): T[] {
+  return newestFirst(rows).reverse();
+}
 
-  const excessPrompts = new Set<string>();
-  for (const prompt of excessOf(prompts, limits.promptsTotal)) excessPrompts.add(prompt.id);
+/**
+ * Pure: what the cut-over (or a later upgrade) must pause and resume.
+ *
+ * PROJECTS: the excess is the newest N of every non-deleted project (the guard's and the preview's count). An
+ * active/initializing project in it is paused and marked; a marked project out of it is resumed.
+ *
+ * PROMPTS (review round 2): the target is the ACTIVE count, never the slot count, so the customer is left tracking
+ * exactly what the new limits allow - never fewer:
+ *   1. a project the downgrade pauses (or keeps paused) takes its active prompts with it: nothing tracks them, so they
+ *      must not hold the workspace's active room;
+ *   2. per project: pause the newest (active - per-project limit) active prompts; with room, resume the oldest marked;
+ *   3. workspace-wide, over what step 2 left active: pause (active - total) more, taken first from projects nothing
+ *      tracks (person-paused, archived), newest first; with room, resume marked prompts oldest first, tracked projects
+ *      first.
+ * A person's pause is never marked and never resumed, and it does not count (it is not active). A reconcile that lowers
+ * no limit finds the active count already within it and pauses nothing - so a prompt a person resumed stays resumed.
+ */
+export function planDowngradePause(limits: PauseLimits, projects: readonly PauseProject[], prompts: readonly PausePrompt[]): DowngradePausePlan {
+  const excessProjects = new Set(excessOf(projects, limits.projects).map((p) => p.id));
+  const ordered = newestFirst(projects);
+  const pauseProjects = ordered.filter((p) => excessProjects.has(p.id) && !p.pausedByDowngrade && (p.status === "active" || p.status === "initializing")).map((p) => p.id);
+  const resumeProjects = ordered.filter((p) => p.pausedByDowngrade && !excessProjects.has(p.id)).map((p) => p.id).reverse();
+
+  // Each project's state once the plan above is applied.
+  const stateOf = new Map<string, "downgrade_paused" | "tracking" | "untracked">();
+  for (const p of projects) {
+    if (p.pausedByDowngrade) stateOf.set(p.id, excessProjects.has(p.id) ? "downgrade_paused" : "tracking");
+    else if (p.status === "active" || p.status === "initializing") stateOf.set(p.id, excessProjects.has(p.id) ? "downgrade_paused" : "tracking");
+    else stateOf.set(p.id, "untracked");
+  }
+
+  const pause = new Set<string>();
+  const resume = new Set<string>();
   const byProject = new Map<string, PausePrompt[]>();
   for (const prompt of prompts) {
+    if (stateOf.get(prompt.projectId) === "downgrade_paused") {
+      // 1. Paused with its project; a marked or person-paused prompt there stays as it is.
+      if (prompt.status === "active") pause.add(prompt.id);
+      continue;
+    }
     const list = byProject.get(prompt.projectId);
     if (list === undefined) byProject.set(prompt.projectId, [prompt]);
     else list.push(prompt);
   }
-  for (const list of byProject.values()) for (const prompt of excessOf(list, limits.promptsPerProject)) excessPrompts.add(prompt.id);
 
-  const ordered = newestFirst(projects);
+  // 2. Per project, on the active count.
+  const stillActive: PausePrompt[] = [];
+  const resumable: PausePrompt[] = [];
+  for (const list of byProject.values()) {
+    const active = list.filter((p) => p.status === "active");
+    const marked = list.filter((p) => p.status === "paused" && p.pausedByDowngrade);
+    const over = excessOf(active, limits.promptsPerProject);
+    for (const p of over) pause.add(p.id);
+    stillActive.push(...active.filter((p) => !pause.has(p.id)));
+    if (over.length === 0) {
+      const room = limits.promptsPerProject === null ? marked.length : limits.promptsPerProject - active.length;
+      resumable.push(...oldestFirst(marked).slice(0, Math.max(0, room)));
+    }
+  }
+
+  // 3. Workspace-wide, over what step 2 left active.
+  const total = limits.promptsTotal;
+  if (total !== null && stillActive.length > total) {
+    const untracked = newestFirst(stillActive.filter((p) => stateOf.get(p.projectId) === "untracked"));
+    const tracked = newestFirst(stillActive.filter((p) => stateOf.get(p.projectId) !== "untracked"));
+    for (const p of [...untracked, ...tracked].slice(0, stillActive.length - total)) pause.add(p.id);
+  } else {
+    const room = total === null ? resumable.length : total - stillActive.length;
+    const tracked = oldestFirst(resumable.filter((p) => stateOf.get(p.projectId) !== "untracked"));
+    const untracked = oldestFirst(resumable.filter((p) => stateOf.get(p.projectId) === "untracked"));
+    for (const p of [...tracked, ...untracked].slice(0, room)) resume.add(p.id);
+  }
+
   const orderedPrompts = newestFirst(prompts);
   return {
-    pauseProjects: ordered.filter((p) => excessProjects.has(p.id) && (p.status === "active" || p.status === "initializing")).map((p) => p.id),
-    resumeProjects: ordered.filter((p) => p.pausedByDowngrade && !excessProjects.has(p.id)).map((p) => p.id).reverse(),
-    pausePrompts: orderedPrompts.filter((p) => excessPrompts.has(p.id) && p.status === "active").map((p) => p.id),
-    resumePrompts: orderedPrompts.filter((p) => p.pausedByDowngrade && !excessPrompts.has(p.id)).map((p) => p.id).reverse(),
+    pauseProjects,
+    resumeProjects,
+    pausePrompts: orderedPrompts.filter((p) => pause.has(p.id)).map((p) => p.id),
+    resumePrompts: orderedPrompts.filter((p) => resume.has(p.id)).map((p) => p.id).reverse(),
   };
 }
 
 export interface DowngradePauseOutcome {
-  readonly paused: { readonly projects: ReadonlyArray<{ id: string; name: string }>; readonly prompts: ReadonlyArray<{ id: string; projectName: string; text: string }> };
+  readonly paused: {
+    readonly projects: ReadonlyArray<{ id: string; name: string }>;
+    /** `withProject`: paused because its project was paused in the same step (the email names the project, not each prompt). */
+    readonly prompts: ReadonlyArray<{ id: string; projectName: string; text: string; withProject: boolean }>;
+  };
   readonly resumed: { readonly projects: ReadonlyArray<{ id: string; name: string }>; readonly prompts: number };
 }
 
@@ -155,6 +223,7 @@ export async function reconcileDowngradePause(tx: ClientBase, workspaceId: strin
   );
 
   const nameOf = new Map(projectRows.rows.map((r) => [r.id, r.name]));
+  const pausedProjects = new Set(plan.pauseProjects);
   const promptById = new Map(promptRows.rows.map((r) => [r.id, r]));
 
   if (plan.pauseProjects.length > 0) {
@@ -193,7 +262,7 @@ export async function reconcileDowngradePause(tx: ClientBase, workspaceId: strin
       projects: plan.pauseProjects.map((id) => ({ id, name: nameOf.get(id) ?? "" })),
       prompts: plan.pausePrompts.map((id) => {
         const row = promptById.get(id)!;
-        return { id, projectName: nameOf.get(row.project_id) ?? "", text: row.text };
+        return { id, projectName: nameOf.get(row.project_id) ?? "", text: row.text, withProject: pausedProjects.has(row.project_id) };
       }),
     },
     resumed: { projects: plan.resumeProjects.map((id) => ({ id, name: nameOf.get(id) ?? "" })), prompts: plan.resumePrompts.length },

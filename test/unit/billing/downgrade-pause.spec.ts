@@ -102,10 +102,14 @@ describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED 
     expect(plan.pausePrompts).toEqual([id(1004), id(1003)]);
   });
 
-  it("a prompt a person paused occupies its slot and counts, but is never marked", () => {
+  it("a prompt a person paused is never marked and never holds tracked room: the project still tracks all its limit allows", () => {
     const a = id(1);
-    const prompts = [prompt(1, a), prompt(2, a), prompt(3, a, { status: "paused" })];
-    expect(planDowngradePause(limits({ promptsPerProject: 1 }), [project(1)], prompts).pausePrompts).toEqual([id(1002)]);
+    // The person's pause is the OLDEST row: counting it would push the excess onto a tracked prompt.
+    const prompts = [prompt(1, a, { status: "paused" }), prompt(2, a), prompt(3, a)];
+    const plan = planDowngradePause(limits({ promptsPerProject: 2, promptsTotal: 2 }), [project(1)], prompts);
+    expect(plan.pausePrompts, "2 active against 2 allowed: nothing to pause").toEqual([]);
+    expect(plan.resumePrompts, "a person's pause is never resumed by billing").toEqual([]);
+    expect(planDowngradePause(limits({ promptsPerProject: 1 }), [project(1)], prompts).pausePrompts, "one over: only the newest active").toEqual([id(1003)]);
   });
 
   it("the per-project and workspace-wide excesses are one set: a prompt in both is paused once", () => {
