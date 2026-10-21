@@ -123,6 +123,22 @@ function oldestFirst<T extends { readonly id: string; readonly createdKey: strin
  * no limit finds the active count already within it and pauses nothing - so a prompt a person resumed stays resumed.
  */
 export function planDowngradePause(limits: PauseLimits, projects: readonly PauseProject[], prompts: readonly PausePrompt[]): DowngradePausePlan {
+  const { pausedFor: _reasons, ...plan } = planDowngradePauseWithReasons(limits, projects, prompts);
+  return plan;
+}
+
+/** Which step of `planDowngradePause` pauses a prompt: with its project (1), the per-project limit (2), the workspace-wide limit (3). */
+export type PromptPauseReason = "with_project" | "per_project" | "total";
+
+/**
+ * `planDowngradePause`, plus WHY each paused prompt is paused. The preview (downgrade-excess.ts, review round 3) runs
+ * this same planner as a dry run, so the counts the confirmation names are the cut-over's own, never a second rule.
+ */
+export function planDowngradePauseWithReasons(
+  limits: PauseLimits,
+  projects: readonly PauseProject[],
+  prompts: readonly PausePrompt[],
+): DowngradePausePlan & { readonly pausedFor: ReadonlyMap<string, PromptPauseReason> } {
   const excessProjects = new Set(excessOf(projects, limits.projects).map((p) => p.id));
   const ordered = newestFirst(projects);
   const pauseProjects = ordered.filter((p) => excessProjects.has(p.id) && !p.pausedByDowngrade && (p.status === "active" || p.status === "initializing")).map((p) => p.id);
@@ -136,13 +152,13 @@ export function planDowngradePause(limits: PauseLimits, projects: readonly Pause
     else stateOf.set(p.id, "untracked");
   }
 
-  const pause = new Set<string>();
+  const pause = new Map<string, PromptPauseReason>();
   const resume = new Set<string>();
   const byProject = new Map<string, PausePrompt[]>();
   for (const prompt of prompts) {
     if (stateOf.get(prompt.projectId) === "downgrade_paused") {
       // 1. Paused with its project; a marked or person-paused prompt there stays as it is.
-      if (prompt.status === "active") pause.add(prompt.id);
+      if (prompt.status === "active") pause.set(prompt.id, "with_project");
       continue;
     }
     const list = byProject.get(prompt.projectId);
@@ -157,7 +173,7 @@ export function planDowngradePause(limits: PauseLimits, projects: readonly Pause
     const active = list.filter((p) => p.status === "active");
     const marked = list.filter((p) => p.status === "paused" && p.pausedByDowngrade);
     const over = excessOf(active, limits.promptsPerProject);
-    for (const p of over) pause.add(p.id);
+    for (const p of over) pause.set(p.id, "per_project");
     stillActive.push(...active.filter((p) => !pause.has(p.id)));
     if (over.length === 0) {
       const room = limits.promptsPerProject === null ? marked.length : limits.promptsPerProject - active.length;
@@ -170,7 +186,7 @@ export function planDowngradePause(limits: PauseLimits, projects: readonly Pause
   if (total !== null && stillActive.length > total) {
     const untracked = newestFirst(stillActive.filter((p) => stateOf.get(p.projectId) === "untracked"));
     const tracked = newestFirst(stillActive.filter((p) => stateOf.get(p.projectId) !== "untracked"));
-    for (const p of [...untracked, ...tracked].slice(0, stillActive.length - total)) pause.add(p.id);
+    for (const p of [...untracked, ...tracked].slice(0, stillActive.length - total)) pause.set(p.id, "total");
   } else {
     const room = total === null ? resumable.length : total - stillActive.length;
     const tracked = oldestFirst(resumable.filter((p) => stateOf.get(p.projectId) !== "untracked"));
@@ -184,6 +200,7 @@ export function planDowngradePause(limits: PauseLimits, projects: readonly Pause
     resumeProjects,
     pausePrompts: orderedPrompts.filter((p) => pause.has(p.id)).map((p) => p.id),
     resumePrompts: orderedPrompts.filter((p) => resume.has(p.id)).map((p) => p.id).reverse(),
+    pausedFor: pause,
   };
 }
 
@@ -191,7 +208,7 @@ export interface DowngradePauseOutcome {
   readonly paused: {
     readonly projects: ReadonlyArray<{ id: string; name: string }>;
     /** `withProject`: paused because its project was paused in the same step (the email names the project, not each prompt). */
-    readonly prompts: ReadonlyArray<{ id: string; projectName: string; text: string; withProject: boolean }>;
+    readonly prompts: ReadonlyArray<{ id: string; projectId: string; projectName: string; text: string; withProject: boolean }>;
   };
   readonly resumed: { readonly projects: ReadonlyArray<{ id: string; name: string }>; readonly prompts: number };
 }
@@ -262,7 +279,7 @@ export async function reconcileDowngradePause(tx: ClientBase, workspaceId: strin
       projects: plan.pauseProjects.map((id) => ({ id, name: nameOf.get(id) ?? "" })),
       prompts: plan.pausePrompts.map((id) => {
         const row = promptById.get(id)!;
-        return { id, projectName: nameOf.get(row.project_id) ?? "", text: row.text, withProject: pausedProjects.has(row.project_id) };
+        return { id, projectId: row.project_id, projectName: nameOf.get(row.project_id) ?? "", text: row.text, withProject: pausedProjects.has(row.project_id) };
       }),
     },
     resumed: { projects: plan.resumeProjects.map((id) => ({ id, name: nameOf.get(id) ?? "" })), prompts: plan.resumePrompts.length },

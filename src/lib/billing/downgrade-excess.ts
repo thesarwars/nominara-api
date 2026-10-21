@@ -1,10 +1,12 @@
 import type { ClientBase } from "pg";
+import { MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import type { DowngradeExcessItem } from "../../../contracts/common/downgrade-excess.schema.js";
 import type { Entitlement, EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { FEATURE_FLAG_KEYS, isFeatureGranted, structuralLimitFrom, type StructuralLimitKey } from "../entitlements/classification.js";
 import { ADDON_KINDS, mergeEntitlements, type AddonKind, type AddonQuantities } from "../entitlements/resolution.js";
-import { countStructural } from "../entitlements/structural-usage.js";
+import { countStructural, PROMPT_OCCUPIES_SLOT } from "../entitlements/structural-usage.js";
 import { ADDON_CATALOG } from "./addon-catalog.js";
+import { pauseLimitsFrom, planDowngradePauseWithReasons, type PausePrompt } from "./downgrade-pause.js";
 
 // STORY-184 T5 — what a downgrade would cost the customer, named exactly.
 //
@@ -21,6 +23,13 @@ import { ADDON_CATALOG } from "./addon-catalog.js";
 // about to disappear.
 //
 // ⚠ THE COUNTS ARE THE GUARDS' OWN (`countStructural`), not a second set of predicates.
+//
+// ⚠ WHAT IS PAUSED IS THE CUT-OVER'S OWN (STORY-077 review round 3). `current`/`excess` are the guard's slot counts, but
+// the cut-over reconciles prompts on the ACTIVE count and a paused project takes its active prompts with it, so the
+// number of rows it pauses can differ from `excess` in either direction. Each `paused_at_period_end` entry therefore
+// carries `paused`, and each named project its `prompts`, from a DRY RUN of the cut-over's own planner
+// (`planDowngradePauseWithReasons`) on the target's resolved limits - the confirmation never names fewer (or more) than
+// the cut-over pauses.
 
 const WORKSPACE_KEYS = ["projects.max", "prompts.max_total", "seats.max", "api.keys_max"] as const satisfies readonly StructuralLimitKey[];
 const PROJECT_KEYS = ["prompts.max_per_project", "competitors.max_per_project"] as const satisfies readonly StructuralLimitKey[];
@@ -45,7 +54,11 @@ export interface ExcessUsage {
     readonly status: "initializing" | "active" | "paused" | "archived";
     /** Already paused by an earlier downgrade (`paused_by_downgrade_at`). */
     readonly pausedByDowngrade: boolean;
+    /** `created_at` as the planner's microsecond key (downgrade-pause.ts `PauseProject.createdKey`). */
+    readonly createdKey: string;
   }>;
+  /** Every slot-occupying prompt (`PROMPT_OCCUPIES_SLOT`), as the cut-over's planner reads them. */
+  readonly slotPrompts: readonly PausePrompt[];
 }
 
 export interface ExcessInput {
@@ -92,6 +105,19 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
   const current = mergeEntitlements(input.currentPlan, input.heldAddons, input.overrides);
   const target = mergeEntitlements(input.targetPlan, surviving, input.overrides);
 
+  // The cut-over's own plan, dry run on the target's resolved limits (review round 3).
+  const plan = planDowngradePauseWithReasons(
+    pauseLimitsFrom(target),
+    input.usage.projects.map((p) => ({ id: p.id, createdKey: p.createdKey, status: p.status, pausedByDowngrade: p.pausedByDowngrade })),
+    input.usage.slotPrompts,
+  );
+  const projectOf = new Map(input.usage.slotPrompts.map((p) => [p.id, p.projectId]));
+  const pausedPrompts = (reason: "with_project" | "per_project" | "total", projectId?: string): number => {
+    let n = 0;
+    for (const [id, why] of plan.pausedFor) if (why === reason && (projectId === undefined || projectOf.get(id) === projectId)) n += 1;
+    return n;
+  };
+
   const structural: DowngradeExcessItem[] = [];
   const limitOf = (key: StructuralLimitKey): number | null => {
     const limit = structuralLimitFrom(target[key]?.value ?? null);
@@ -111,8 +137,10 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
         .slice(0, excess)
         .filter((p) => p.pausedByDowngrade || p.status === "active" || p.status === "initializing")
         .slice(0, MAX_NAMED_PROJECTS)
-        .map((p) => ({ id: p.id, name: p.name }));
-      structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key), items });
+        .map((p) => ({ id: p.id, name: p.name, prompts: pausedPrompts("with_project", p.id) }));
+      structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key), paused: plan.pauseProjects.length, items });
+    } else if (key === "prompts.max_total") {
+      structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key), paused: pausedPrompts("total") });
     } else {
       structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key) });
     }
@@ -122,7 +150,11 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
       const limit = limitOf(key);
       const used = key === "prompts.max_per_project" ? project.prompts : project.competitors;
       if (limit === null || used <= limit) continue;
-      structural.push({ kind: "structural", key, project_id: project.id, limit, current: used, excess: used - limit, effect: effectOf(key) });
+      if (key === "prompts.max_per_project") {
+        structural.push({ kind: "structural", key, project_id: project.id, limit, current: used, excess: used - limit, effect: effectOf(key), paused: pausedPrompts("per_project", project.id) });
+      } else {
+        structural.push({ kind: "structural", key, project_id: project.id, limit, current: used, excess: used - limit, effect: effectOf(key) });
+      }
     }
   }
 
@@ -155,8 +187,8 @@ export async function readExcessUsage(tx: ClientBase, workspaceId: string): Prom
   const workspace = {} as Record<WorkspaceKey, number>;
   for (const key of WORKSPACE_KEYS) workspace[key] = await countStructural(tx, key, workspaceId);
 
-  const rows = await tx.query<{ id: string; name: string; status: ExcessUsage["projects"][number]["status"]; paused_by_downgrade: boolean }>(
-    `SELECT id, name, status, paused_by_downgrade_at IS NOT NULL AS paused_by_downgrade
+  const rows = await tx.query<{ id: string; name: string; created_key: string; status: ExcessUsage["projects"][number]["status"]; paused_by_downgrade: boolean }>(
+    `SELECT id, name, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_key, status, paused_by_downgrade_at IS NOT NULL AS paused_by_downgrade
        FROM projects WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC`,
     [workspaceId],
   );
@@ -167,9 +199,17 @@ export async function readExcessUsage(tx: ClientBase, workspaceId: string): Prom
       name: row.name,
       status: row.status,
       pausedByDowngrade: row.paused_by_downgrade,
+      createdKey: row.created_key,
       prompts: await countStructural(tx, "prompts.max_per_project", workspaceId, row.id),
       competitors: await countStructural(tx, "competitors.max_per_project", workspaceId, row.id),
     });
   }
-  return { workspace, projects };
+  // The same rows, read the same way, as the cut-over's reconcile (downgrade-pause.ts), without its row locks.
+  const prompts = await tx.query<{ id: string; project_id: string; created_key: string; status: "active" | "paused"; paused_by_downgrade: boolean }>(
+    `SELECT id, project_id, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_key, status, paused_by_downgrade_at IS NOT NULL AS paused_by_downgrade
+       FROM tracked_prompts WHERE workspace_id = $1 AND ${PROMPT_OCCUPIES_SLOT}`,
+    [workspaceId],
+  );
+  const slotPrompts = prompts.rows.map((r) => ({ id: r.id, projectId: r.project_id, createdKey: r.created_key, status: r.status, pausedByDowngrade: r.paused_by_downgrade }));
+  return { workspace, projects, slotPrompts };
 }

@@ -60,6 +60,7 @@ interface PromptRow {
   first_activated_at: Date | null;
   activation_credits: number;
   superseded_by: string | null;
+  paused_by_downgrade_at: Date | null;
 }
 
 type TenantClient = { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> };
@@ -87,10 +88,14 @@ export class PromptLifecycleService {
     // The id names a prompt, not a project: a scoped member is checked against the row's own project, BEFORE the
     // lock, so a caller outside that project's scope cannot hold its row lock. A prompt never changes project.
     await assertProjectInScope(store.client, found.project_id);
-    // STORY-077 review round 2: a move INTO `active` is checked against the workspace-wide active count, so it takes the
-    // workspace lock first (active-limit.ts). Decided from the request, before the re-read: taking it for any PATCH that
-    // asks for `active` is a superset of the moves that need it.
-    if (request.status === "active" && found.status !== "active") await lockWorkspaceForActivation(store.client as ClientBase, store.context.workspaceId);
+    // STORY-077 review rounds 2 and 3 — ONE LOCK ORDER ON EVERY PATH: workspace, then project, then wallet (the cut-over
+    // locks workspace -> wallet -> every project). A move INTO `active` is checked against the workspace-wide active
+    // count (active-limit.ts), and leaving `archived` can debit the wallet: a PATCH that took the project lock first and
+    // then the wallet closed a cycle with the cut-over (40P01). So EVERY status change or edit takes the workspace lock
+    // first, decided from the REQUEST alone - never from the status read before any lock, which the cut-over can change
+    // (a prompt read as `active` may be paused by the time the project lock is held). A priority-only change touches
+    // neither the active count nor the wallet and keeps to the project lock.
+    if (request.status !== undefined || request.text !== undefined) await lockWorkspaceForActivation(store.client as ClientBase, store.context.workspaceId);
     await client.query("SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE", [found.project_id]);
     const prompt = await this.load(client, promptId);
 
@@ -201,6 +206,14 @@ export class PromptLifecycleService {
       `UPDATE tracked_prompts SET status = 'archived', superseded_by = $2, paused_by_downgrade_at = NULL, updated_at = now() WHERE id = $1`,
       [prompt.id, row.id],
     );
+
+    // STORY-077 review round 3 — a rewording changes the words, not who paused the prompt. A downgrade-paused prompt
+    // reworded while it stays paused (no status in the request, or the same one) keeps the marker on its replacement, so
+    // a later upgrade still resumes it. A status CHANGE in the same request is a person's decision, as in applyInPlace.
+    const keepsMarker = prompt.paused_by_downgrade_at != null && status === "paused" && (request.status === undefined || request.status === prompt.status);
+    if (keepsMarker) {
+      await client.query("UPDATE tracked_prompts SET paused_by_downgrade_at = $2 WHERE id = $1 AND status = 'paused'", [row.id, prompt.paused_by_downgrade_at]);
+    }
 
     // The reworded row is the SAME QUESTION, so it inherits whether - and at
     // what price - the question was first activated: re-activating it later is
@@ -375,7 +388,8 @@ export class PromptLifecycleService {
     const result = await client.query<PromptRow>(
       `SELECT p.id, p.project_id, p.workspace_id, p.status, p.is_priority, p.text,
               p.intent_archetype, p.funnel_stage, p.generation_source,
-              p.generation_batch_id, p.generator_meta, p.first_activated_at, p.activation_credits, p.superseded_by
+              p.generation_batch_id, p.generator_meta, p.first_activated_at, p.activation_credits, p.superseded_by,
+              p.paused_by_downgrade_at
          FROM tracked_prompts p
         WHERE p.id = $1 AND p.deleted_at IS NULL`,
       [promptId],

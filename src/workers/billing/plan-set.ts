@@ -173,7 +173,7 @@ export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): P
     { allowNegotiatedTier: args.allowNegotiatedTier },
   );
   const notices = outcome.changed
-    ? await reconcileAndRecordDowngradePause(tx, args.workspaceId, { requestId: args.ticket, operator: args.operator })
+    ? await reconcileAndRecordDowngradePause(tx, args.workspaceId, { requestId: args.ticket, operator: args.operator, planChanged: outcome.from !== outcome.to })
     : [];
   return { outcome, notices };
 }
