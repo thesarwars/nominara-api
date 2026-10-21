@@ -21,9 +21,14 @@ export const TXT_PREFIX = "nominara-verify=";
 export const META_TAG_NAME = "nominara-verify";
 
 /**
- * `inconclusive` marks a failure on OUR side of the wire (resolver outage, network error, timeout, 5xx/429), as
- * opposed to the customer's proof being absent or wrong. The manual `/check` treats it as the failure it reports
- * (the customer retries); the unattended re-verification must NOT read it as "the domain stopped verifying".
+ * `inconclusive` marks a failure of OUR resolver (the DNS-TXT errno rule, or a resolution failure reported by the
+ * guarded fetcher), as opposed to the customer's proof being absent or wrong. Neither the sweep nor a manual check
+ * may read it as "the domain stopped verifying".
+ *
+ * A failure on the TARGET's side (connect, TLS, timeout, 5xx/429/408) is deliberately NOT inconclusive: that is what
+ * a domain that has changed hands looks like, and an unbounded "keep full scope" would let it keep scope forever
+ * (AC7). Whether such a failure earns a grace period before the loss path applies is an OWNER decision
+ * (`inconclusive_since`), recorded in docs-carry; until it is made these stay conclusive, as on main.
  */
 export type CheckOutcome =
   | { readonly ok: true }
@@ -42,9 +47,6 @@ const isResolverOutage = (error: unknown): boolean =>
   error.resolverCode !== undefined &&
   error.resolverCode !== "ENOTFOUND" &&
   error.resolverCode !== "ENODATA";
-
-/** Statuses that say "the server could not answer now", not "the file is not there". */
-const isTransientStatus = (status: number): boolean => status >= 500 || status === 429 || status === 408;
 
 export interface CheckDeps {
   /** TXT lookup. Separate from the guarded fetcher's `lookup`, which resolves A/AAAA only. */
@@ -122,7 +124,7 @@ export async function checkWellKnownFile(domain: string, nonce: string, deps: Ch
     // to deny.
     if (isResolverOutage(error)) return { ok: false, reason: "fetch_refused", inconclusive: INCONCLUSIVE };
     if (error instanceof GuardedFetchRefusal) return { ok: false, reason: "fetch_refused" };
-    return { ok: false, reason: "file_absent", inconclusive: INCONCLUSIVE };
+    return { ok: false, reason: "file_absent" };
   }
 
   // Scenario 5 — a redirect is NOT proof. The file must be served by this
@@ -130,7 +132,6 @@ export async function checkWellKnownFile(domain: string, nonce: string, deps: Ch
   // of the domain being verified, and following it is how this check would
   // become forgeable.
   if (response.status >= 300 && response.status < 400) return { ok: false, reason: "file_redirected" };
-  if (isTransientStatus(response.status)) return { ok: false, reason: "file_absent", inconclusive: INCONCLUSIVE };
   if (response.status !== 200) return { ok: false, reason: "file_absent" };
 
   const body = response.body.toString("utf8").trim();
@@ -154,10 +155,9 @@ export async function checkMetaTag(domain: string, nonce: string, deps: CheckDep
   } catch (error) {
     if (isResolverOutage(error)) return { ok: false, reason: "fetch_refused", inconclusive: INCONCLUSIVE };
     if (error instanceof GuardedFetchRefusal) return { ok: false, reason: "fetch_refused" };
-    return { ok: false, reason: "tag_absent", inconclusive: INCONCLUSIVE };
+    return { ok: false, reason: "tag_absent" };
   }
 
-  if (isTransientStatus(response.status)) return { ok: false, reason: "tag_absent", inconclusive: INCONCLUSIVE };
   if (response.status !== 200) return { ok: false, reason: "tag_absent" };
 
   const html = response.body.toString("utf8");

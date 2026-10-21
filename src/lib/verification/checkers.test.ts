@@ -154,23 +154,31 @@ describe("STORY-048 · inconclusive outcomes (our outage is not their absence)",
     await expect(checkDnsTxt(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "record_absent" });
   });
 
-  it("a network error or timeout fetching the file is inconclusive", async () => {
-    const d = deps({ fetch: vi.fn(async () => { throw new Error("socket hang up"); }) });
-    await expect(checkWellKnownFile(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "file_absent", inconclusive: true });
+  // AC7 review: a failure on the TARGET's side (connect, TLS, timeout, 5xx) is what a domain that changed hands looks
+  // like, so it is conclusive (the manual path and the sweep clear verified_at, as on main). Only OUR resolver is
+  // inconclusive, until the owner decides a grace period.
+  it.each([
+    ["socket hang up"],
+    ["ETIMEDOUT"],
+    ["ECONNREFUSED"],
+    ["CERT_HAS_EXPIRED"],
+  ])("a target-side %s fetching the file is conclusive", async (message) => {
+    const d = deps({ fetch: vi.fn(async () => { throw new Error(message); }) });
+    await expect(checkWellKnownFile(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "file_absent" });
   });
 
-  it.each([500, 502, 503, 429])("a %d fetching the file or tag is inconclusive", async (status) => {
+  it.each([500, 502, 503, 429, 408])("a %d fetching the file or tag is conclusive", async (status) => {
     await expect(checkWellKnownFile(DOMAIN, NONCE, deps({ fetch: serving(status, "") }))).resolves.toEqual({
-      ok: false, reason: "file_absent", inconclusive: true,
+      ok: false, reason: "file_absent",
     });
     await expect(checkMetaTag(DOMAIN, NONCE, deps({ fetch: serving(status, "") }))).resolves.toEqual({
-      ok: false, reason: "tag_absent", inconclusive: true,
+      ok: false, reason: "tag_absent",
     });
   });
 
-  it("a network error fetching the root page is inconclusive", async () => {
-    const d = deps({ fetch: vi.fn(async () => { throw new Error("ETIMEDOUT"); }) });
-    await expect(checkMetaTag(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "tag_absent", inconclusive: true });
+  it.each(["ETIMEDOUT", "ECONNREFUSED", "CERT_HAS_EXPIRED"])("a target-side %s fetching the root page is conclusive", async (message) => {
+    const d = deps({ fetch: vi.fn(async () => { throw new Error(message); }) });
+    await expect(checkMetaTag(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "tag_absent" });
   });
 
   it("a 404 and a guard refusal stay conclusive", async () => {
