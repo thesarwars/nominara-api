@@ -1,6 +1,6 @@
 # STORY-049 — per-AC status, decisions taken, and what is open (carry to the docs repo)
 
-Update `stories/aux/STORY-049-crawl-pipeline-and-ssrf-guard.md` status from `Partial — 2 of 12 ACs` to **`Partial — 9 of 12 ACs (3 and 10 open; 6 half met)`**, replacing the 2026-10-12 table with the one below. **Do not mark AC6 or AC10 met**: with the default renderer every production audit that crawls a page ends `partial`.
+Update `stories/aux/STORY-049-crawl-pipeline-and-ssrf-guard.md` status from `Partial — 2 of 12 ACs` to **`Partial — 8 of 12 ACs (3 and 10 open; 5 partial; 6 half met)`**, replacing the 2026-10-12 table with the one below. **Do not mark AC6 or AC10 met**: with the default renderer every production audit that crawls a page ends `partial`.
 
 | AC | State | Evidence / what is missing |
 |---|---|---|
@@ -8,7 +8,7 @@ Update `stories/aux/STORY-049-crawl-pipeline-and-ssrf-guard.md` status from `Par
 | 2 Guarded fetcher enforces every control | Met | unchanged; round 1 adds an opt-in `followRedirect` veto (a caller can stop a hop BEFORE it is requested; SSRF validation of every followed hop is untouched) |
 | 3 Egress via a dedicated path with no identity role | **Open — infrastructure (D4)** | nothing in this repo can deliver it; no code change here claims it |
 | 4 Site files: robots verbatim + hash, agent-guidance file, sitemap with bounded recursion and sampling cap | Met | `site-files.ts`, `sitemap.ts` (`MAX_SITEMAP_FILES`, depth limit, sampling cap) |
-| 5 Page selection by every scope, page cap from the plan | Met | `page-selection.ts`; the cap is **provisional** (below) |
+| 5 Page selection by every scope, page cap from the plan | **Partial** | `page-selection.ts`; `pageCapForPlan` returns the provisional 25 for EVERY plan, so the cap is not yet resolved from the plan. Met only when `plans-and-entitlements.md` has a page-cap key |
 | 6 Two fetches per page, both stored compressed | **Half met: port-only for the rendered copy** | the plain copy is fetched and stored. The rendered copy goes through the `Renderer` port; the default is `unavailableRenderer` because Playwright (a new dependency) has not been approved. The 2026-10-19 owner decisions cover the queue and STORY-053's parser, not Playwright. Tests use a fake renderer |
 | 7 Politeness: rate, interval, crawl-delay, identified agent, hard cap | Met | `politeness.ts`; round 1 clamps the honoured Crawl-delay and adds a wall-clock budget (below) |
 | 8 Differential probe, both requests budgeted | Met | `differential-probe.ts` |
@@ -42,3 +42,15 @@ Update `stories/aux/STORY-049-crawl-pipeline-and-ssrf-guard.md` status from `Par
 ## Second-engineer review
 
 `dangerous-area-auditor` must review both 048 and 049 before merge: 049 changes the SSRF guard (`guarded-fetch.ts`), adds a renderer request guard, reads `domain_verifications` under RLS to decide scope and writes tenant-prefixed object keys; 048 adds cross-tenant discovery on the owner connection and writes per tenant from a worker, including the hash-chained `audit_log`.
+
+## Review round 3 (carry into STORY-049's technical notes)
+
+- **Probe agent string (decision 10 is superseded).** `AGENT_PROBE_USER_AGENT` is now `... compatible; NominaraAIProbe/1.0; +https://nominara.com/bot`: AI-agent-shaped, identifying Nominara, impersonating no company. Trade-off the owner should know: a WAF rule written for a specific named bot (GPTBot) will not match this string, so the probe detects only generic AI-agent rules. If the owner wants named-bot fidelity, that is a product/legal sign-off, not a code default. Test: `differential-probe.test.ts` (review r3).
+- **Off-site redirects (decision 12 is superseded).** Site-file and sitemap fetches carry `followRedirect: sameSite(next, origin)`; a redirect off the verified site is not followed, nothing is sent to the third party and no foreign body is parsed. The 3xx is recorded like any non-2xx. Test: `crawl-audit-handler.spec.ts` (review r3).
+- **AC5 is Partial** (table above). Bounds invented here, for the architect to replace: `PROVISIONAL_PAGE_CAP = 25` (`page-selection.ts`), `MAX_SITEMAP_FILES = 25` (`sitemap.ts`), `MAX_CRAWL_DELAY_SECONDS = 10` (`politeness.ts`), `CRAWL_WALL_CLOCK_BUDGET_MS = 10 min` and `IDLE_IN_TRANSACTION_TIMEOUT_MS = 15 min` (`crawl-audit.handler.ts`).
+- **Politeness clamp.** A declared `Crawl-delay` above 10 s is honoured as 10 s, so such a site is crawled faster than it asked. It exists only to bound the open transaction (KAD-06 item below) and is a policy loosening the owner has not stated. Open: either honour the declared delay and shrink the page list once the transaction is out of the crawl, or the owner states the clamp as policy. Recording declared vs honoured delay separately in `error_summary` needs a change to `auxErrorSummarySchema` (a contract change), so it is not made here.
+- **`robots_snapshot` is not verbatim.** It stores sanitised text while `robots_hash` is over the raw bytes, so the snapshot cannot be checked against the hash. Options: store the raw gzipped bytes under `dom_object_prefix` (an object-store layout the story did not name) or add a second hash over the stored text. Open for the owner/architect; not changed.
+- **Renderer.** AC6 stays half met and AC10 open. Every production audit that crawls a page ends `partial` while the renderer is `unavailableRenderer`; STORY-082 and the UI must not treat a `partial` caused by `renderer_unavailable` as a failure. Playwright needs an approved dependency (stopped for the owner).
+- **KAD-06 blocker: NOT resolved, stopped for the architect.** Both candidate fixes are an architectural change: a prepare/run/commit processor shape in `worker-factory.ts` (a new queue pattern, which needs an ADR) or a fetch-then-short-transaction split. This round deliberately does not pick one. The branch must not merge until it is decided. Required test with the fix: no transaction is open during a fetch, mirroring `KAD-06 · no transaction is open while a domain is being checked` in `domain-reverify-handler.spec.ts`.
+- **ISO-14.** The hostile-sitemap fixtures build their URLs by join (as ebd1f97 did), so the namespacing scanner reads no key-shaped literal; no allow-list entry was added.
+- **Timing assertions.** The linear-time tests assert `< 5000 ms` (was 500, and 50 for one); the quadratic input they guard takes minutes, so the loose bound still discriminates and no longer flakes on a loaded host.

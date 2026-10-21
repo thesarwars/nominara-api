@@ -148,6 +148,9 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
   const timeoutMs = deps.timeoutMs ?? FETCH_TIMEOUT_MS;
   const renderer = deps.renderer ?? unavailableRenderer;
   const identified: GuardedFetchInit = { headers: { "user-agent": NOMINARA_USER_AGENT } };
+  // Site files and sitemaps stay on the verified site: a redirect off it is not followed, so no request is sent to a
+  // third party and no foreign body is parsed. (A refused redirect returns the 3xx, recorded like any non-2xx.)
+  const onSite = (origin: string): GuardedFetchInit => ({ ...identified, followRedirect: (next) => sameSite(next, origin) });
 
   /** One bounded, identified request. A refusal, a DNS failure and a timeout are all `null`: OUR fetch failed. */
   async function bounded(url: string, init: GuardedFetchInit = identified): Promise<GuardedResponse | null> {
@@ -201,6 +204,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     }
     const { root_domain: rootDomain, root_url: rootUrl, plan_key: planKey } = project.rows[0]!;
     const origin = `https://${rootDomain}`;
+    const siteFileInit = onSite(origin);
 
     // AUTHORIZE (step 1). Fails closed: no verified row, no full scope.
     const verifiedRow = await tx.query(
@@ -267,7 +271,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         if (error instanceof PolitenessDeadlineReached || error instanceof PolitenessCapReached) return { responded: false };
         throw error;
       }
-      return toFetched(await bounded(url));
+      return toFetched(await bounded(url, siteFileInit));
     };
     const robots = await siteFile(urls.robots);
     const robotsOk = robots.responded && robots.status >= 200 && robots.status < 300;
@@ -288,7 +292,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       declared: declaredOnSite,
       fetch: async (url) => {
         await budget.acquire("site_file");
-        const res = await bounded(url);
+        const res = await bounded(url, siteFileInit);
         first.value ??= { url, fetched: toFetched(res) };
         if (res === null) throw new Error("sitemap fetch failed");
         return { status: res.status, body: res.body };

@@ -98,3 +98,10 @@ describe("STORY-049 AC8 · differential probe", () => {
     expect(r.outcome).toBe("inconclusive");
   });
 });
+
+describe("STORY-049 review r3 · the probe does not impersonate a named company's crawler", () => {
+  it("identifies Nominara and names no third party's bot", () => {
+    expect(AGENT_PROBE_USER_AGENT).toContain("Nominara");
+    expect(AGENT_PROBE_USER_AGENT).not.toMatch(/GPTBot|openai|ClaudeBot|anthropic|PerplexityBot|Google/i);
+  });
+});

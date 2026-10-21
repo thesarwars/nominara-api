@@ -16,10 +16,12 @@ import type { PolitenessBudget } from "./politeness.js";
 export const BROWSER_PROBE_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 /**
- * An AI-crawler agent string: the one a WAF's "block AI bots" rule matches. Not named in the reference; GPTBot is the
- * crawler AUX-R-001 lists first and the one such rules are most often written for.
+ * An AI-agent-shaped string that identifies Nominara. AUX-R-005 says only "an AI user agent". It deliberately does NOT
+ * copy a named company's crawler string (GPTBot et al.): impersonating another company's bot is a product and legal
+ * call nobody has signed off, and a site that verifies that bot by IP range would see us as a fake. Trade-off: a WAF
+ * rule written for a specific named bot will not match this string, so the probe sees "AI-agent-shaped" rules only.
  */
-export const AGENT_PROBE_USER_AGENT = "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.1; +https://openai.com/gptbot)";
+export const AGENT_PROBE_USER_AGENT = "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; NominaraAIProbe/1.0; +https://nominara.com/bot)";
 
 export type ProbeOutcome = "consistent" | "hostile" | "inconclusive" | "skipped_budget";
 

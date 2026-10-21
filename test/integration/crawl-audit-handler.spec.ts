@@ -18,7 +18,7 @@ import { unavailableRenderer } from "../../src/lib/aux/renderer.js";
 import { createHash } from "node:crypto";
 import { crawlManifestSchema } from "../../contracts/aux/index.js";
 import { handlerFor } from "../../src/lib/queue/handlers.js";
-import type { GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
+import type { GuardedFetchInit, GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
 
 // NEW-C-9 — the crawl.audit handler, site-file stage, against a real Postgres.
 // The handler is handed a plain client as `tx` (as withTenantJob would hand it
@@ -37,7 +37,7 @@ vi.mock("../../src/lib/telemetry/metrics.js", async () => {
   };
 });
 
-type Served = Record<string, { status: number; body?: string } | "throw" | "hang">;
+type Served = Record<string, { status: number; body?: string; location?: string } | "throw" | "hang">;
 
 const BLOCKED = "User-agent: GPTBot\nDisallow: /\n";
 const OPEN = "User-agent: *\nAllow: /\nSitemap: https://acme.com/sitemap.xml\n";
@@ -68,13 +68,19 @@ function depsServing(served: Served, requested: string[] = [], timeoutMs = 10_00
     renderer: { render: async (url) => { rendered.push(url); return { html: `<html>rendered ${url}</html>`, finalUrl: url, status: 200 }; } },
     store: async (relative, body) => { stored.set(relative, body); return `crawl/test/ws/${relative}`; },
     ...extra,
-    fetch: async (url: string, init?: { headers?: Record<string, string> }): Promise<GuardedResponse> => {
+    // Behaves like guardedFetch for redirects: a 3xx is followed (and the next request recorded) unless the caller's
+    // `followRedirect` refuses it, in which case the 3xx itself is returned.
+    fetch: async function stub(url: string, init?: GuardedFetchInit): Promise<GuardedResponse> {
       requested.push(url);
       requestedUas.push({ url, ua: init?.headers?.["user-agent"] });
       const hit = served[new URL(url).pathname];
       if (hit === undefined || hit === "throw") throw new Error("connection refused");
       if (hit === "hang") return new Promise<GuardedResponse>(() => undefined);
-      return { status: hit.status, headers: {}, body: Buffer.from(hit.body ?? ""), finalUrl: url };
+      if (hit.location !== undefined) {
+        const next = new URL(hit.location, url).toString();
+        if (init?.followRedirect === undefined || init.followRedirect(next)) return stub(next, init);
+      }
+      return { status: hit.status, headers: hit.location === undefined ? {} : { location: hit.location }, body: Buffer.from(hit.body ?? ""), finalUrl: url };
     },
   };
 }
@@ -126,6 +132,21 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   const audits = async (): Promise<any[]> => (await db.query("SELECT * FROM aux_audits ORDER BY created_at")).rows;
   const findings = async (): Promise<any[]> => (await db.query("SELECT * FROM aux_findings ORDER BY created_at")).rows;
   /* eslint-enable @typescript-eslint/no-explicit-any */
+
+  it("review r3 · a site file or sitemap that redirects OFF the verified site is never requested from the third party", async () => {
+    const requested: string[] = [];
+    const served: Served = {
+      ...healthy(OPEN),
+      "/robots.txt": { status: 302, location: "https://thirdparty.example/stolen-robots.txt" },
+      "/llms.txt": { status: 302, location: "https://thirdparty.example/stolen-llms.txt" },
+      "/sitemap.xml": { status: 302, location: "https://thirdparty.example/stolen-sitemap.xml" },
+      "/stolen-robots.txt": { status: 200, body: OPEN },
+      "/stolen-llms.txt": { status: 200, body: LLMS },
+      "/stolen-sitemap.xml": { status: 200, body: SITEMAP },
+    };
+    await run(job(), depsServing(served, requested));
+    expect(requested.filter((u) => !u.startsWith("https://acme.com/"))).toEqual([]);
+  });
 
   it("NEW-C-9 AC1.1 · is registered as the crawl.audit handler", () => {
     expect(handlerFor("crawl.audit")).toBeDefined();
