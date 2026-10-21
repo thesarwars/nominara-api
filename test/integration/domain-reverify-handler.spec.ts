@@ -462,6 +462,65 @@ describe("STORY-048 AC7 · domain.reverify (periodic re-verification)", () => {
     expect(openTxDuringCheck.every((n) => n === 0)).toBe(true);
   });
 
+  it("review r4 AC7 · a target that now answers 503 is a conclusive failure: the file method is lost and the customer is told once", async () => {
+    const s = await seed("file-5xx", { method: "well_known_file" });
+    const down: CheckDeps = { ...checks(), fetch: async () => ({ status: 503, headers: {}, body: Buffer.from("") }) as never };
+    const result = await run({ checks: down });
+    expect((await verification(s, "well_known_file")).verified_at).toBeNull();
+    expect(await mirror(s)).toBeNull();
+    expect(await notifications(s)).toHaveLength(1);
+    expect(result).toMatchObject({ checked: 1, lost: 1, inconclusive: 0 });
+  });
+
+  it("review r4 AC7 · a manual ok whose check STARTED before a sweep recorded the loss cannot restore scope on the older evidence", async () => {
+    const s = await seed("stale-ok");
+    const row = (await db.query("SELECT id, domain, method, nonce, verified_at, last_checked_at, failure_reason FROM domain_verifications WHERE project_id=$1", [s.project])).rows[0] as VerificationRow;
+    await run(); // nothing published: the sweep commits the loss at NOW and notifies once
+    expect(await notifications(s)).toHaveLength(1);
+
+    const client = await pool.connect();
+    try {
+      const applied = await withTenantContext(client, { workspaceId: s.ws, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+        applyCheckOutcome(tx, {
+          workspaceId: s.ws, projectId: s.project, domain: s.domain, row, outcome: { ok: true },
+          checkStartedAt: new Date(NOW.getTime() - 60_000), now: new Date(NOW.getTime() + 1_000),
+        }),
+      );
+      expect(applied).toMatchObject({ methodLost: false, scopeLost: false });
+    } finally {
+      client.release();
+    }
+    expect((await verification(s)).verified_at).toBeNull();
+    expect(await mirror(s)).toBeNull();
+    expect(new Date((await verification(s)).last_checked_at).getTime()).toBe(NOW.getTime());
+    expect(await notifications(s)).toHaveLength(1);
+  });
+
+  it("review r4 NFR-SEC-01 · cross-tenant discovery on the owner connection never selects a nonce; the nonce is read under the tenant's own RLS", async () => {
+    const s = await seed("no-nonce");
+    publish(s);
+    const spy = new Client({ connectionString: container.getConnectionUri() });
+    await spy.connect();
+    const texts: string[] = [];
+    const original = spy.query.bind(spy) as (...args: unknown[]) => unknown;
+    (spy as unknown as { query: (...args: unknown[]) => unknown }).query = (...args: unknown[]) => {
+      const first = args[0];
+      texts.push(typeof first === "string" ? first : String((first as { text?: string }).text ?? ""));
+      return original(...args);
+    };
+    try {
+      const { runDomainReverification } = await import("../../src/lib/verification/reverify.js");
+      const result = await runDomainReverification(spy, pool, { checks: checks(), now: () => NOW });
+      // the check still used the right nonce: a published, matching record stays verified
+      expect(result).toMatchObject({ checked: 1, lost: 0, failed: 0 });
+      expect((await verification(s)).verified_at).not.toBeNull();
+    } finally {
+      await spy.end();
+    }
+    expect(texts.length).toBeGreaterThan(0);
+    expect(texts.filter((t) => /nonce/i.test(t))).toEqual([]);
+  });
+
   it("AC7 · one project that cannot be written does not stop the others: an explicit partial status, counted and logged by ID", async () => {
     const bad = await seed("poison");
     const good = await seed("clean");

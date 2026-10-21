@@ -39,6 +39,12 @@ export interface ApplyCheckInput {
   readonly row: VerificationRow;
   readonly outcome: CheckOutcome;
   readonly now: Date;
+  /**
+   * When the check that produced `outcome` BEGAN (captured before its network wait). If a newer check committed in
+   * between, the locked row's `last_checked_at` is later than this and the outcome is discarded: older evidence must
+   * not overwrite a loss (or a success) a fresher check already recorded. Absent = no freshness guard.
+   */
+  readonly checkStartedAt?: Date;
 }
 
 /**
@@ -57,11 +63,21 @@ export async function applyCheckOutcome(client: ClientBase, input: ApplyCheckInp
   // The prior state is read HERE, under a row lock held to the end of the caller's transaction, never taken from
   // the caller's copy: that copy may have been read before a network wait during which another writer (the daily
   // sweep, a second manual check) committed a loss, and trusting it would notify that loss twice.
-  const prior = await client.query<{ verified_at: Date | null }>(
-    "SELECT verified_at FROM domain_verifications WHERE id = $1 FOR UPDATE",
+  const prior = await client.query<VerificationRow>(
+    "SELECT id, domain, method, nonce, verified_at, last_checked_at, failure_reason FROM domain_verifications WHERE id = $1 FOR UPDATE",
     [row.id],
   );
-  const priorVerifiedAt = prior.rows[0]?.verified_at ?? null;
+  const locked = prior.rows[0];
+  if (
+    locked !== undefined &&
+    input.checkStartedAt !== undefined &&
+    locked.last_checked_at !== null &&
+    locked.last_checked_at.getTime() > input.checkStartedAt.getTime()
+  ) {
+    // Stale evidence: a newer check already committed. Change nothing and notify nobody.
+    return { row: locked, methodLost: false, scopeLost: false };
+  }
+  const priorVerifiedAt = locked?.verified_at ?? null;
   const wasVerified = priorVerifiedAt !== null;
   const reason: VerificationFailure | null = outcome.ok ? null : outcome.reason;
   // OUR outage is not their absence, for whichever caller found it (the daily sweep OR a manual re-check): record the

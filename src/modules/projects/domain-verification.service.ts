@@ -86,8 +86,10 @@ export class DomainVerificationService {
     }
 
     const row = found.rows[0]!;
+    // Captured BEFORE the network wait: `applyCheckOutcome` discards this outcome if a newer check committed meanwhile.
+    const checkStartedAt = new Date();
     const outcome = await runCheck(method, domain, row.nonce, this.checks);
-    const applied = await applyCheckOutcome(client, { workspaceId, projectId, domain, row, outcome, now: new Date() });
+    const applied = await applyCheckOutcome(client, { workspaceId, projectId, domain, row, outcome, now: new Date(), checkStartedAt });
     return toState(applied.row);
   }
 

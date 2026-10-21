@@ -37,7 +37,7 @@ describe("STORY-048 · DomainVerificationService", () => {
           if (sql.includes("max(verified_at)")) return { rows: [{ verified_at: aggregateVerifiedAt }] };
           // The transition reads the PRIOR state itself, under a row lock, instead of trusting the caller's copy.
           if (sql.includes("FROM domain_verifications WHERE id = $1 FOR UPDATE")) {
-            return { rows: rowStore.filter((r) => r.id === params[0]).map((r) => ({ verified_at: r.verified_at })) };
+            return { rows: rowStore.filter((r) => r.id === params[0]) };
           }
           if (sql.includes("FROM domain_verifications WHERE project_id")) return { rows: rowStore };
           if (sql.includes("INSERT INTO domain_verifications")) {

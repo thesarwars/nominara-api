@@ -22,8 +22,11 @@ import type { VerificationMethod } from "../../../contracts/projects/index.js";
 //
 // RACES. `applyCheckOutcome` takes the row `FOR UPDATE` and works out the prior state itself, so whichever of
 // this sweep and a manual check commits first, the loss notifies exactly once. `DomainVerificationService.check`
-// does not lock before its network wait (that would hold a row lock across an external await, KAD-06); the lock
-// inside the transition is what makes it safe. An outcome computed BEFORE a newer check committed is discarded.
+// takes no row lock before its network wait; the lock inside the transition is what makes it safe. NOTE it is NOT
+// KAD-06-compliant: the request path runs `runCheck` inside the request's own ambient tenant transaction, so that
+// transaction IS open across the DNS/HTTPS wait (pre-existing on main; follow-up: check before the transaction, apply in
+// a short one, or move it to the queue). Only THIS worker path keeps every transaction closed during a check. An
+// outcome computed BEFORE a newer check committed is discarded, on both paths (`checkStartedAt`).
 //
 // OUR OUTAGE IS NOT THEIR ABSENCE. A resolver or network failure on our side (`inconclusive`), by ANY method, records the attempt
 // and changes nothing else: no scope change, no notification, no audit row. Without this one resolver outage at
@@ -59,14 +62,15 @@ interface Candidate {
   readonly project_id: string;
   readonly domain: string;
   readonly method: VerificationMethod;
-  readonly nonce: string;
 }
 
 /** Previously-verified methods for a live project's CURRENT domain, longest-unchecked first. Pending methods are not due: there is nothing to lose. */
 async function dueCandidates(owner: ClientBase, now: Date, limit: number): Promise<Candidate[]> {
   const cutoff = new Date(now.getTime() - MIN_RECHECK_INTERVAL_MS);
   const result = await owner.query<Candidate>(
-    `SELECT dv.id, dv.workspace_id, dv.project_id, dv.domain, dv.method, dv.nonce
+    // No nonce here: a proof-of-control secret is not read across tenants on the owner connection. It is re-read
+    // under RLS in the row's own tenant context (`readNonce`).
+    `SELECT dv.id, dv.workspace_id, dv.project_id, dv.domain, dv.method
        FROM domain_verifications dv
        JOIN projects p ON p.id = dv.project_id AND p.deleted_at IS NULL AND p.root_domain = dv.domain
       WHERE dv.verified_at IS NOT NULL
@@ -92,7 +96,12 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
     // allSettled: one check that throws must not abandon the run (oldest-checked-first ordering would then starve
     // every other domain on every retry and every later day).
     const outcomes = await Promise.allSettled(
-      chunk.map(async (candidate): Promise<CheckOutcome> => runCheck(candidate.method, candidate.domain, candidate.nonce, deps.checks)),
+      chunk.map(async (candidate): Promise<CheckOutcome> => {
+        // A short tenant transaction, closed before the network wait.
+        const nonce = await readNonce(pool, candidate);
+        if (nonce === null) return { ok: false, reason: "record_absent", inconclusive: true }; // row gone: nothing to apply
+        return runCheck(candidate.method, candidate.domain, nonce, deps.checks);
+      }),
     );
     for (const [index, candidate] of chunk.entries()) {
       try {
@@ -121,6 +130,19 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
   }
 
   return { status: failed === 0 ? "complete" : "partial", checked: candidates.length, lost, failed, inconclusive };
+}
+
+/** The row's nonce, read as `nominara_app` inside its own workspace context (RLS live). null = the row is gone. */
+async function readNonce(pool: Pool, candidate: Candidate): Promise<string | null> {
+  const client = await pool.connect();
+  try {
+    return await withTenantContext(client, { workspaceId: candidate.workspace_id, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+      const found = await tx.query<{ nonce: string }>("SELECT nonce FROM domain_verifications WHERE id = $1", [candidate.id]);
+      return found.rows[0]?.nonce ?? null;
+    });
+  } finally {
+    client.release();
+  }
 }
 
 /** Applies one outcome in the row's own tenant context. Returns true when the method stopped verifying. */
