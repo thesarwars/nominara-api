@@ -51,4 +51,13 @@ describe("STORY-077 scenario 3 · the pause-list email", () => {
     expect(body).not.toContain("best tool number 2");
     expect(body).not.toContain("best tool number 3");
   });
+
+  it("review round 2 · no plan name (the plan join missed): the copy names no plan rather than 'the new plan plan'", () => {
+    const paused = downgradePausedEmail("a@example.com", null, { projects: [project(1)], prompts: [] })!.textBody;
+    const resumed = downgradeResumedEmail("a@example.com", null, { projects: [project(1)], prompts: 0 })!.textBody;
+    for (const body of [paused, resumed]) {
+      expect(body).not.toMatch(/plan plan|null|undefined/);
+      expect(body).toContain("Your workspace changed plan");
+    }
+  });
 });

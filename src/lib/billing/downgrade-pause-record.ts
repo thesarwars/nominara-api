@@ -72,7 +72,7 @@ export async function reconcileAndRecordDowngradePause(tx: ClientBase, workspace
         return [];
       }
       const plan = await tx.query<{ display_name: string }>("SELECT p.display_name FROM workspaces w JOIN plans p ON p.key = w.plan_key WHERE w.id = $1", [workspaceId]);
-      const planName = plan.rows[0]?.display_name ?? "new";
+      const planName = plan.rows[0]?.display_name ?? null;
       return [downgradePausedEmail(contact, planName, result.paused), downgradeResumedEmail(contact, planName, result.resumed)].filter((m): m is EmailMessage => m !== null);
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });
