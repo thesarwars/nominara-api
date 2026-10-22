@@ -193,14 +193,14 @@ describe("STORY-064 AC12 · TasksService.bulkUpdateTasks — real SQL", () => {
     }
   });
 
-  it("a snooze date in the past, or further out than a dismissal's 180 days, refuses the whole batch", async () => {
+  it("a snooze date in the past refuses the whole batch; any date in the future is accepted (no cap beyond \"in the future\" — none is specified)", async () => {
     const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
     const a = await createTask(ws, p);
-    for (const bad of [inDays(-1), new Date(Date.now() - 1000).toISOString(), inDays(181)]) {
+    for (const bad of [inDays(-1), new Date(Date.now() - 1000).toISOString()]) {
       await expect(bulk(CTX(ws, actor), { action: "snooze", task_ids: [a], reason: "r", snooze_until: bad })).rejects.toBeInstanceOf(ValidationFailedError);
     }
     expect((await row(a)).status).toBe("todo");
-    await expect(bulk(CTX(ws, actor), { action: "snooze", task_ids: [a], reason: "r", snooze_until: inDays(179) })).resolves.toMatchObject({ updated: 1 });
+    await expect(bulk(CTX(ws, actor), { action: "snooze", task_ids: [a], reason: "r", snooze_until: inDays(400) })).resolves.toMatchObject({ updated: 1 });
   });
 
   it("re-snoozing a snoozed task moves its date and writes a second event", async () => {

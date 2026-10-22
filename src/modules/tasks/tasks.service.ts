@@ -488,8 +488,7 @@ export class TasksService {
    * same actor, from and to. A task already in the requested state writes nothing and is not counted in `updated`.
    *
    * SNOOZE is a dismissal with the caller's date: reason and date are both required (the contract), the date must be in the future
-   * and no further out than a dismissal's own re-surface period (a snooze cannot hide a task for longer than a dismissal can), and
-   * the `dismissed` event carries `snooze: true`. The task leaves the open count and returns through the same sweep as a dismissal.
+   * (no upper bound: none is specified), and the `dismissed` event carries `snooze: true`. The task leaves the open count and returns through the same sweep as a dismissal.
    */
   async bulkUpdateTasks(body: BulkTaskRequest): Promise<BulkTaskResponse> {
     const store = currentTenantStore()!;
@@ -504,10 +503,10 @@ export class TasksService {
     } else {
       const until = new Date(body.snooze_until);
       const now = Date.now();
-      if (until.getTime() <= now || until.getTime() > now + TASK_RESURFACE_DAYS * 86_400_000) {
+      if (until.getTime() <= now) {
         throw new ValidationFailedError({
-          message: `snooze_until must be in the future and within ${String(TASK_RESURFACE_DAYS)} days`,
-          details: { issues: [{ path: ["snooze_until"], message: `must be in the future and within ${String(TASK_RESURFACE_DAYS)} days` }] },
+          message: "snooze_until must be in the future",
+          details: { issues: [{ path: ["snooze_until"], message: "must be in the future" }] },
         });
       }
       patch = { status: "dismissed", dismiss_reason: body.reason };

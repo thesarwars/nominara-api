@@ -87,12 +87,7 @@ describe("STORY-169 · TasksService.listActionItems", () => {
     expect(calls[0]!.sql).toContain("t.status IN ('todo', 'in_progress')");
   });
 
-  // FR-GD-02 (the reference) over STORY-089's "impact within severity"
-  // wording — see tasks.service.ts's own comment on the conflict.
-  it("orders impact DESC, then severity rank, then age, then id", async () => {
-    await serviceReading([]).listActionItems({ limit: 50 } as never);
-    expect(calls[0]!.sql).toContain("ORDER BY r.impact_score DESC, r.severity_rank ASC, r.created_at ASC, r.id ASC");
-  });
+  // Ordering (FR-GD-02) is asserted on real rows in test/integration/action-items.spec.ts, not as an SQL substring here.
 
   it("an empty workspace is an empty array, not an error", async () => {
     await expect(serviceReading([]).listActionItems({ limit: 50 } as never)).resolves.toMatchObject({ items: [] });
