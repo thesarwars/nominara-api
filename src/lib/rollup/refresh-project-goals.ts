@@ -16,9 +16,8 @@ import { CROSS_ENGINE_KEY } from "./roll-up-day.js";
 // ONLY here, and `achieved` is set ONLY here. This is a rollup STEP, written like `refreshProjectTaskCounts`: it takes the
 // tenant transaction the rollup already holds and reads only this database (no network call).
 //
-// ⚠ NOT YET CALLED BY THE ROLLUP. The rollup handler (`queue/handlers/rollup-metric-daily.handler.ts`) belongs to another
-// stream in this wave and is not edited here. The wiring is ONE line, after `denormalizeProject` (the goals read what it wrote):
-// `await refreshProjectGoals(tx, payload.projectId);`. Until it lands, `current` does not move and no goal is achieved.
+// Called by the rollup handler (`queue/handlers/rollup-metric-daily.handler.ts`) after `denormalizeProject`, whose figures the
+// goals read, inside the same tenant transaction and project lock.
 //
 // ONE SOURCE PER METRIC, all STORED figures (the same ones the dashboard reads), each with the CELL COUNT behind it so a
 // goal can say "not enough data" instead of a number (`GOAL_MIN_CELLS`, scoring-models.md confidence band). A value that is
@@ -149,16 +148,31 @@ async function engineWindow(tx: ClientBase, projectId: string, engineKey: string
   return { value: result.rows[0]?.value ?? null, cells: result.rows[0]?.cells ?? null };
 }
 
-/** `up` unless the stored target says `down` (a goal created before direction existed reads as `up`). */
+/** Which way a metric must move to reach its target. */
 export type GoalDirection = "up" | "down";
 
 /**
- * Direction is DERIVED AT CREATION from baseline versus target and stored in the target jsonb (no column): `down` when the target is
- * below the baseline, else `up` — including an unmeasured baseline (every goal metric today is higher-is-better) and a target equal
- * to it. It decides what "reaching" means; deriving it from where the goal started keeps it from being a second thing to get wrong.
+ * Direction is a property of the METRIC, not of where a goal happened to start. Every goal metric today is higher-is-better
+ * (visibility_score, citation_share, rendering_quality, sentiment_score, presence_rate), so there is no `down` entry: a target typed
+ * below a noisy baseline must never turn into a goal that is "achieved" by the metric getting WORSE, and the record of
+ * achievement is the strongest reporting artifact. A lower-is-better metric earns its entry here when one exists.
  */
-export function deriveGoalDirection(baseline: number | null, targetValue: number): GoalDirection {
-  return baseline !== null && targetValue < baseline ? "down" : "up";
+export const GOAL_METRIC_DIRECTION: Readonly<Record<GoalMetric, GoalDirection>> = {
+  visibility_score: "up",
+  citation_share: "up",
+  rendering_quality: "up",
+  sentiment_score: "up",
+  presence_rate: "up",
+};
+
+/** The direction of a goal's metric (`up` when the target carries none, which no creatable goal does). */
+export function goalDirectionOf(metric: GoalMetric | undefined): GoalDirection {
+  return metric === undefined ? "up" : GOAL_METRIC_DIRECTION[metric];
+}
+
+/** A baseline the creation check may rely on: measured, on at least `GOAL_MIN_CELLS` cells. */
+export function isSufficientMeasurement(measured: GoalMeasurement): boolean {
+  return measured.value !== null && measured.cells !== null && measured.cells >= GOAL_MIN_CELLS;
 }
 
 /** Reaching the target is inclusive: at it, or beyond it in the goal's direction. */
@@ -190,7 +204,7 @@ interface ActiveGoalRow {
   id: string;
   workspace_id: string;
   kind: string;
-  target: GoalSubject["target"] & { target_value: number; direction?: GoalDirection };
+  target: GoalSubject["target"] & { target_value: number };
   baseline: { value: number | null } | null;
 }
 
@@ -218,8 +232,8 @@ export async function refreshProjectGoals(tx: ClientBase, projectId: string): Pr
       const achieved: string[] = [];
       for (const goal of goals.rows) {
         const measured = await measureGoal(tx, projectId, goal);
-        const direction = goal.target.direction ?? "up";
-        const sufficient = measured.value !== null && measured.cells !== null && measured.cells >= GOAL_MIN_CELLS;
+        const direction = goalDirectionOf(goal.target.metric);
+        const sufficient = isSufficientMeasurement(measured);
         const reached = sufficient && goalReached(direction, measured.value as number, goal.target.target_value);
         const progress = sufficient ? goalProgressPct(direction, goal.baseline?.value ?? null, measured.value as number, goal.target.target_value) : null;
         const snapshot = { value: measured.value, cells: measured.cells, at: new Date().toISOString() };

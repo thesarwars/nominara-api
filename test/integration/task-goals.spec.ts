@@ -11,6 +11,9 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ConflictError, NotFoundError, ValidationFailedError } from "../../src/api/errors/domain-errors.js";
 import { ProjectOutOfScopeException } from "../../src/tenancy/errors.js";
 import { GoalsService } from "../../src/modules/tasks/goals.service.js";
+import type { Job } from "bullmq";
+import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
+import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { refreshProjectGoals } from "../../src/lib/rollup/refresh-project-goals.js";
 import { currentTenantStore, withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
 import { createGoalRequestSchema, updateGoalRequestSchema } from "../../contracts/tasks/index.js";
@@ -416,19 +419,25 @@ describe("STORY-065-A · goals — real SQL", () => {
     });
   });
 
-  describe("direction is derived at creation from baseline versus target and stored in the target", () => {
-    it("up when the target is above the baseline, down when below, and up when the baseline is unmeasured or equal", async () => {
+  describe("direction is fixed per metric (every goal metric is higher-is-better) and a target at or below a measured baseline is refused", () => {
+    it("stores direction up for every metric, and refuses a target at or below a measured, sufficient baseline (nothing is inserted)", async () => {
       const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 120);
       const up = await create(CTX(ws, actor), p, engineGoal());
       expect(await storedTarget(up.id)).toMatchObject({ direction: "up", metric: "visibility_score", target_value: 60 });
-      const down = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 30));
-      expect(await storedTarget(down.id)).toMatchObject({ direction: "down" });
-      const equal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 42.5));
-      expect(await storedTarget(equal.id)).toMatchObject({ direction: "up" });
-      const q = await createProject(ws, null, null);
-      const unmeasured = await create(CTX(ws, actor), q, engineGoal());
+      for (const target of [30, 42.5]) {
+        await expect(create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", target))).rejects.toBeInstanceOf(ValidationFailedError);
+      }
+      expect((await client.query("SELECT 1 FROM goals")).rowCount).toBe(1);
+    });
+
+    it("an unmeasured or under-sampled baseline cannot say the target is behind it, so the goal is created (direction up)", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws);
+      const unmeasured = await create(CTX(ws, actor), await createProject(ws, null, null), engineGoal());
       expect(await storedTarget(unmeasured.id)).toMatchObject({ direction: "up" });
-      expect((await list(CTX(ws, actor), p)).find((g) => g.id === down.id)!.target).toMatchObject({ direction: "down" });
+      const noisy = await create(CTX(ws, actor), await createProject(ws, 60, 29), kindGoal("engine_score", "visibility_score", 40));
+      expect(await storedTarget(noisy.id)).toMatchObject({ direction: "up" });
+      const boundary = await createProject(ws, 60, 30);
+      await expect(create(CTX(ws, actor), boundary, kindGoal("engine_score", "visibility_score", 40))).rejects.toBeInstanceOf(ValidationFailedError);
     });
   });
 
@@ -583,16 +592,55 @@ describe("STORY-065-A · goals — real SQL", () => {
       expect((await row(goal.id)).status).toBe("achieved");
     });
 
-    it("a goal that moves DOWN (target below baseline) is achieved at or below the target, and progress runs the other way", async () => {
+    it("a regression is never recorded as achieved: a metric that gets worse than the baseline stays active at 0% progress, with no achieved_at and no audit row", async () => {
       const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 60, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 80));
+      for (const worse of [59, 40, 0]) {
+        await client.query("UPDATE projects SET visibility_blended = $2 WHERE id = $1", [p, worse]);
+        expect(await refresh(CTX(ws, actor), p)).toMatchObject({ refreshed: 1, achieved: [] });
+      }
+      const after = await row(goal.id);
+      expect(after.status).toBe("active");
+      expect(after.achieved_at).toBeNull();
+      expect(Number(after.progress_pct)).toBe(0);
+      expect((await client.query("SELECT 1 FROM audit_log WHERE action = 'goal.achieved'")).rowCount).toBe(0);
+    });
+
+    it("a goal created on an under-sampled baseline already above its target is achieved only once measured on a sufficient sample", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 60, 10);
       const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 40));
-      await client.query("UPDATE projects SET visibility_blended = 50 WHERE id = $1", [p]);
       await refresh(CTX(ws, actor), p);
-      expect(Number((await row(goal.id)).progress_pct)).toBe(50);
       expect((await row(goal.id)).status).toBe("active");
-      await client.query("UPDATE projects SET visibility_blended = 40 WHERE id = $1", [p]);
+      await client.query("UPDATE projects SET cells_30d = 30 WHERE id = $1", [p]);
       await refresh(CTX(ws, actor), p);
       expect((await row(goal.id)).status).toBe("achieved");
+    });
+
+    it("direction comes from the metric, not from the stored jsonb: a stored `down` is ignored", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await client.query(`UPDATE goals SET target = jsonb_set(target, '{direction}', '"down"') WHERE id = $1`, [goal.id]);
+      await client.query("UPDATE projects SET visibility_blended = 10 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      expect((await row(goal.id)).status).toBe("active");
+    });
+
+    it("[STORY-065 #11] the ROLLUP HANDLER (not the step alone) moves current and achieves a goal that has reached its target", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 120);
+      await metricDay(ws, p, "all", "2026-09-27", { citationShare: 0.42, cells: 40 });
+      const goal = await create(CTX(ws, actor), p, kindGoal("citation_presence", "citation_share", 60));
+      const before = await row(goal.id);
+      await client.query("UPDATE metric_daily SET citation_share = 0.7 WHERE project_id = $1", [p]);
+      const handler = createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, {
+        enqueueVerifyPresence: async () => undefined, enqueueTaskGenerate: async () => undefined });
+      await inTenant(CTX(ws, actor), () =>
+        handler(currentTenantStore()!.client, { data: { payload: { workspaceId: ws, kid: "k", projectId: p } } } as unknown as Job));
+      const after = await row(goal.id);
+      expect(after.current!.value).toBe(70);
+      expect(after.current!.at).not.toBe(before.current!.at);
+      expect(after.status).toBe("achieved");
+      expect(after.achieved_at).not.toBeNull();
+      expect((await client.query("SELECT 1 FROM audit_log WHERE action = 'goal.achieved' AND workspace_id = $1", [ws])).rowCount).toBe(1);
     });
 
     it("is idempotent: a second refresh neither re-stamps achieved_at, nor writes a second audit row, nor moves an achieved goal's current", async () => {

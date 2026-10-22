@@ -2,18 +2,15 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { goalMetricSchema } from "../../../contracts/tasks/index.js";
 import { GOAL_CONTRIBUTES_SQL, GOAL_METRIC_TRIGGERS } from "../../../src/lib/goals/contribution.js";
-import { deriveGoalDirection, goalProgressPct, goalReached } from "../../../src/lib/rollup/refresh-project-goals.js";
+import { GOAL_METRIC_DIRECTION, goalProgressPct, goalReached } from "../../../src/lib/rollup/refresh-project-goals.js";
 
 // STORY-065 — the pure parts of the goal refresh and the contribution table. The SQL halves are in
 // test/integration/task-goals.spec.ts and project-tasks.spec.ts.
 describe("STORY-065 · goal direction, reaching and progress", () => {
-  it("direction is `down` only when the target is strictly below a measured baseline", () => {
-    expect(deriveGoalDirection(40, 60)).toBe("up");
-    expect(deriveGoalDirection(60, 40)).toBe("down");
-    expect(deriveGoalDirection(50, 50)).toBe("up");
-    expect(deriveGoalDirection(null, 50)).toBe("up");
-    expect(deriveGoalDirection(0, 0)).toBe("up");
-    expect(deriveGoalDirection(0.0001, 0)).toBe("down");
+  it("direction is fixed per metric and no metric is lower-is-better, so no metric maps to `down`", () => {
+    for (const metric of goalMetricSchema.options) expect(GOAL_METRIC_DIRECTION[metric], metric).toBe("up");
+    expect(Object.keys(GOAL_METRIC_DIRECTION).sort()).toEqual([...goalMetricSchema.options].sort());
+    expect(Object.values(GOAL_METRIC_DIRECTION)).not.toContain("down");
   });
 
   it("[STORY-065 #6] reaching the target is inclusive, in the goal's direction", () => {

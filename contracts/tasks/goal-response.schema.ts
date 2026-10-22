@@ -38,9 +38,9 @@ export const goalMeasurementSchema = z
 export const goalDirectionSchema = z.enum(["up", "down"]);
 
 /**
- * `direction` is DERIVED BY THE SERVER AT CREATION and stored here: `up` when the target is at or above the baseline, `down`
- * when below. It decides what "reaching the target" means (a value at or above it, or at or below it) and which way progress
- * runs. Absent on a goal created before it existed, which reads as `up`.
+ * `direction` is set by the SERVER from the metric at creation and stored here. Every goal metric is higher-is-better, so it is `up`;
+ * `down` stays in the enum for a future lower-is-better metric. It decides what "reaching the target" means. Absent on a goal
+ * created before it existed, which reads as `up`.
  */
 export const goalTargetSchema = z
   .object({

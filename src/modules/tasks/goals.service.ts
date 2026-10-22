@@ -8,7 +8,7 @@ import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
-import { deriveGoalDirection, GOAL_MIN_CELLS, measureGoal } from "../../lib/rollup/refresh-project-goals.js";
+import { goalDirectionOf, GOAL_MIN_CELLS, isSufficientMeasurement, measureGoal } from "../../lib/rollup/refresh-project-goals.js";
 
 // scoring-models.md "Confidence band": a goal metric under `GOAL_MIN_CELLS` cells (or unmeasured) is `insufficient`.
 // Defined beside the refresh that also needs it; re-exported for the callers that already import it from here.
@@ -72,8 +72,8 @@ export class GoalsService {
    * kind's own metric, never from the caller — `measureGoal` is the same function the rollup step uses for `current`, so baseline
    * and current are one measurement taken at two times. `current` starts as the same snapshot; only the rollup moves it.
    *
-   * `direction` is DERIVED here from baseline versus target and stored in the target jsonb (see `deriveGoalDirection`); the request
-   * cannot carry it (the contract is strict). A cluster must belong to THIS project (a foreign, other-tenant or unknown cluster is a
+   * `direction` comes from the metric (`GOAL_METRIC_DIRECTION`, all `up`) and is stored in the target jsonb; the request cannot
+   * carry it (the contract is strict). A target at or below a sufficiently measured baseline is a 400. A cluster must belong to THIS project (a foreign, other-tenant or unknown cluster is a
    * 400, never a goal on nothing) and an `engine_key` must name a catalogued engine.
    */
   async createGoal(projectId: string, body: CreateGoalRequest): Promise<Goal> {
@@ -102,7 +102,16 @@ export class GoalsService {
 
     const measured = await measureGoal(client, projectId, body);
     const snapshot: Measurement = { value: measured.value, cells: measured.cells, at: new Date().toISOString() };
-    const target = { ...body.target, direction: deriveGoalDirection(measured.value, body.target.target_value) };
+    // Every goal metric is higher-is-better, so a target at or below a baseline measured on a sufficient sample is already met or
+    // behind it: refused, never stored as a goal that regressing would "achieve". An unmeasured or under-sampled baseline cannot
+    // say so (null/insufficient is not a number), so the goal is created and judged only once a sufficient sample exists.
+    if (isSufficientMeasurement(measured) && body.target.target_value <= (measured.value as number)) {
+      throw new ValidationFailedError({
+        message: "target_value must be above the current measured value",
+        details: { issues: [{ path: ["target", "target_value"], message: "at or below the current measured value" }] },
+      });
+    }
+    const target = { ...body.target, direction: goalDirectionOf(body.target.metric) };
 
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO goals (workspace_id, project_id, title, kind, target, baseline, current, target_date, created_by)
