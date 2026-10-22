@@ -13,7 +13,7 @@ import { createPgPool, isConnectionClassFailure } from "./db/pg-pool.js";
 import { SchedulerSweepRuntime } from "./lib/capture/scheduler-sweep.js";
 import { cacheKeyNamespace } from "./lib/cache/key-namespace.js";
 import { rollupDirtyKey } from "./lib/cache/valkey-keys.js";
-import { RollupDirtySet } from "./lib/rollup/dirty-dates.js";
+import { RollupDirtySet, type DirtyEntry } from "./lib/rollup/dirty-dates.js";
 import { RollupSweepRuntime } from "./lib/rollup/rollup-sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
@@ -312,6 +312,16 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
         engineLease = captureEngineLeaseOptions(env, new TokenBucket(leaseRedis));
       }
 
+      // STORY-042 AC6 — the parse handler marks late facts in the `rollup_dirty` set on the QUEUE instance (noeviction). The
+      // group owns that connection (closed with the leases on shutdown) so the handler never opens one of its own.
+      let markRollupDirty: ((dirtyEntry: DirtyEntry) => Promise<void>) | undefined;
+      if (entry.name === "capture.parse") {
+        const dirtyRedis = createQueueMonitorConnection(env.QUEUE_REDIS_URL);
+        leaseConnections.push(dirtyRedis);
+        const dirtySet = new RollupDirtySet(dirtyRedis, rollupDirtyKey(cacheKeyNamespace()));
+        markRollupDirty = (dirtyEntry) => dirtySet.mark(dirtyEntry);
+      }
+
       const worker = buildWorker(entry, {
         connection: createQueueWorkerConnection(env.QUEUE_REDIS_URL),
         prefix,
@@ -326,7 +336,7 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
         // to undefined are different things, and an unhandled queue has no
         // client to give back — its getClient throws first.
         ...(handler ? { releaseClient: (client: ClientBase, failure?: unknown) => (client as PoolClient).release(isConnectionClassFailure(failure) ? (failure as Error) : undefined) } : {}),
-        process: handler ? handler({ pool, env }) : () => notImplementedHandler(entry.name),
+        process: handler ? handler({ pool, env, ...(markRollupDirty ? { markRollupDirty } : {}) }) : () => notImplementedHandler(entry.name),
       });
       attachDeadLetterHandler(worker, dlqQueue, entry);
       workers.push(worker);

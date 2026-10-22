@@ -4,6 +4,7 @@ import { z } from "zod";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { afterCommit } from "../../tenancy/tenant-context.js";
 import { isRealIsoDate } from "./iso-date.js";
+import { validTimezoneSql } from "./timezone.js";
 
 // STORY-042 AC6 / EC-12 — the `rollup_dirty` set: late-arriving facts mark their workspace-local date dirty, and the
 // dirty-date sweep (rollup-sweep.ts) reprocesses it within 15 minutes. Upserts are idempotent, so reprocessing is safe.
@@ -43,6 +44,7 @@ export interface DirtyEntry {
 export interface DirtySetRedis {
   eval(script: string, numKeys: number, ...args: Array<string | number>): Promise<unknown>;
   zrem(key: string, ...members: string[]): Promise<number>;
+  zscore(key: string, member: string): Promise<string | null>;
   zrange(key: string, start: number, stop: string, withScores: "WITHSCORES"): Promise<string[]>;
 }
 
@@ -123,6 +125,12 @@ export class RollupDirtySet {
     return { entries, malformed: bad.length };
   }
 
+  /** Whether the entry's member is still there with a version other than the one read: a real re-mark, as opposed to another replica having cleared it. */
+  async wasRemarked(entry: PeekedDirtyEntry): Promise<boolean> {
+    const current = await this.redis.zscore(this.key, encodeDirtyEntry(entry));
+    return current !== null && Number(current) !== entry.version;
+  }
+
   /** Removes each entry only if nothing re-marked it since it was read. Returns how many were removed. */
   async clear(entries: readonly PeekedDirtyEntry[]): Promise<number> {
     if (entries.length === 0) return 0;
@@ -145,16 +153,23 @@ export async function markDateDirtyIfLate(
   logger: Logger,
   retryDelaysMs: readonly number[] = DIRTY_MARK_RETRY_DELAYS_MS,
 ): Promise<boolean> {
-  const found = await tx.query<{ metric_date: string; closed: boolean }>(
-    `SELECT to_char(d.local_date, 'YYYY-MM-DD') AS metric_date,
-            d.local_date < (now() AT TIME ZONE w.timezone)::date AS closed
-       FROM workspaces w
-      CROSS JOIN LATERAL (SELECT ($2::timestamptz AT TIME ZONE w.timezone)::date AS local_date) d
-      WHERE w.id = $1`,
+  // CASE is evaluated lazily, so an unrecognised stored zone yields `valid = false` instead of failing the parse's transaction
+  // (`workspaces.timezone` is free text). That workspace's late facts are not marked; the skip is counted below.
+  const found = await tx.query<{ valid: boolean; metric_date: string | null; closed: boolean | null }>(
+    `SELECT z.valid,
+            CASE WHEN z.valid THEN to_char(($2::timestamptz AT TIME ZONE z.timezone)::date, 'YYYY-MM-DD') END AS metric_date,
+            CASE WHEN z.valid THEN ($2::timestamptz AT TIME ZONE z.timezone)::date < (now() AT TIME ZONE z.timezone)::date END AS closed
+       FROM (SELECT w.timezone, ${validTimezoneSql("w.timezone")} AS valid FROM workspaces w WHERE w.id = $1) z`,
     [fact.workspaceId, fact.capturedAt],
   );
   const row = found.rows[0];
-  if (row === undefined || !row.closed) return false;
+  if (row === undefined) return false;
+  if (!row.valid) {
+    incrementCounter("nominara_rollup_dirty_invalid_timezone_total");
+    logger.warn({ event: "rollup.dirty_invalid_timezone", workspace_id: fact.workspaceId });
+    return false;
+  }
+  if (row.closed !== true || row.metric_date === null) return false;
 
   const entry: DirtyEntry = { workspaceId: fact.workspaceId, projectId: fact.projectId, metricDate: row.metric_date };
   afterCommit(() => {

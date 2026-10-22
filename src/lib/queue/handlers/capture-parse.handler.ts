@@ -8,12 +8,10 @@ import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import { defaultParseAlertMonitor, observationFrom, type ParseAlertMonitor } from "../../parser/parse-alerts.js";
 import type { SentimentArbiter } from "../../parser/sentiment/arbiter.js";
 import { SCORING_VERSION } from "../../scoring/index.js";
-import { cacheKeyNamespace } from "../../cache/key-namespace.js";
-import { rollupDirtyKey } from "../../cache/valkey-keys.js";
-import { markDateDirtyIfLate, RollupDirtySet, type DirtyEntry } from "../../rollup/dirty-dates.js";
+import { markDateDirtyIfLate, type DirtyEntry } from "../../rollup/dirty-dates.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { afterCommit } from "../../../tenancy/tenant-context.js";
-import { createQueueMonitorConnection, createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { requestRollupIfRunComplete as requestRunRollup } from "./run-rollup-request.js";
@@ -57,7 +55,7 @@ export interface CaptureParseDeps {
     payload: Record<string, unknown>,
     idempotencyKey: string,
   ) => Promise<unknown>;
-  /** STORY-042 AC6 — adds a late fact's (workspace, project, date) to the `rollup_dirty` set. Injected in tests; production writes to the queue-instance Valkey. */
+  /** STORY-042 AC6 — adds a late fact's (workspace, project, date) to the `rollup_dirty` set. Injected in tests; production gets it from the worker group through the handler context. */
   readonly markRollupDirty?: (entry: DirtyEntry) => Promise<void>;
 }
 
@@ -105,14 +103,14 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       return producer.enqueueTenantJob(queue, workspaceId, rollupPayload, { idempotencyKey });
     });
 
-  // STORY-042 AC6 — built on the first late fact, like the producer above. The queue instance (noeviction), not the
-  // cache one: this set is a work list and must survive memory pressure and restarts.
-  let dirtySet: RollupDirtySet | undefined;
+  // STORY-042 AC6 — the dirty-set writer belongs to the worker group (it owns the connection and closes it on shutdown), so
+  // the handler never opens a connection of its own. With none supplied the mark FAILS visibly (retried, then logged and
+  // counted as `nominara_rollup_dirty_mark_failed_total`) rather than quietly dialling a default Valkey.
   const markRollupDirty =
     deps?.markRollupDirty ??
-    (async (entry: DirtyEntry): Promise<void> => {
-      dirtySet ??= new RollupDirtySet(createQueueMonitorConnection(_context.env.QUEUE_REDIS_URL), rollupDirtyKey(cacheKeyNamespace()));
-      await dirtySet.mark(entry);
+    _context.markRollupDirty ??
+    (async (): Promise<void> => {
+      throw new Error("no dirty-set writer was supplied to the capture.parse handler");
     });
 
   /** NEW-A-7 — see run-rollup-request.ts. FROM HERE AND NOT FROM THE FINALISATION: finalisation precedes parsing, so a rollup requested there would read facts that do not exist yet. */

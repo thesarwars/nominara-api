@@ -6,6 +6,7 @@ import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { measurementStatusSql } from "./aggregate-day.js";
 import { RollupDirtySet, type PeekedDirtyEntry } from "./dirty-dates.js";
+import { validTimezoneSql } from "./timezone.js";
 
 // STORY-042 AC2 + AC6 — the rollup worker's two sweeps, modelled on SchedulerSweepRuntime (src/lib/capture/scheduler-sweep.ts).
 //
@@ -31,7 +32,10 @@ import { RollupDirtySet, type PeekedDirtyEntry } from "./dirty-dates.js";
 //   re-marked meanwhile, so neither a crash nor a concurrent late fact loses a mark.
 //
 // Several replicas all tick; the keys make that safe. A failed enqueue is counted, logged with ids, and reported as
-// `partial` — never silent; the entry (or the still-unrolled day) is simply found again next tick.
+// `partial` — never silent; the entry (or the still-unrolled day) is found again next tick. ONE EXCEPTION: a closed-day job
+// that fails terminally (after its retries) keeps its key, and the queue's TTL dedup hands that failed job back instead of
+// creating a new one, so later ticks count it as enqueued. Recovery then goes through the DLQ (replay + alert) or
+// `rollup:rebuild` — it is not silent, but it is not the sweep that retries it.
 //
 // NO ROW LOCKS ARE HELD: unlike the capture sweep it claims nothing, so there is no transaction to hold across the queue.
 
@@ -135,6 +139,15 @@ interface ClosedDayTarget {
   readonly metricDate: string;
 }
 
+/** Workspaces whose stored zone cannot be resolved are skipped by the sweep: say so, with ids only (never the zone text or a name). */
+async function reportInvalidTimezones(client: ClientBase): Promise<void> {
+  const bad = await client.query<{ id: string }>(`SELECT w.id FROM workspaces w WHERE w.deleted_at IS NULL AND NOT ${validTimezoneSql("w.timezone")}`);
+  for (const row of bad.rows) {
+    incrementCounter("nominara_rollup_sweep_invalid_timezone_total", { sweep: "closed_day" });
+    logger.warn({ event: "rollup.sweep.invalid_timezone", workspace_id: row.id });
+  }
+}
+
 /**
  * The closed days due for a rollup at `now`. Reads ids and a date only — never a name, a prompt or a plan.
  *
@@ -143,14 +156,20 @@ interface ClosedDayTarget {
  * quiet project is not re-enqueued every tick), and `measurementStatusSql` is the one definition the rollup itself uses.
  */
 async function findClosedDayTargets(client: ClientBase, now: Date): Promise<ClosedDayTarget[]> {
+  await reportInvalidTimezones(client);
+  // `valid_ws` is MATERIALIZED so the zone is only ever used on a workspace already proved to name a real one: Postgres
+  // gives no order between a WHERE qual and a lateral `AT TIME ZONE`, and one unrecognised zone must not fail the statement
+  // for every tenant (`workspaces.timezone` is free text; PATCH /workspaces accepts any non-empty string).
   const result = await client.query<{ workspace_id: string; project_id: string; metric_date: string }>(
-    `SELECT p.workspace_id, p.id AS project_id, to_char(t.today - 1, 'YYYY-MM-DD') AS metric_date
+    `WITH valid_ws AS MATERIALIZED (
+            SELECT w.id, w.timezone FROM workspaces w
+             WHERE w.deleted_at IS NULL AND ${validTimezoneSql("w.timezone")})
+     SELECT p.workspace_id, p.id AS project_id, to_char(t.today - 1, 'YYYY-MM-DD') AS metric_date
        FROM projects p
-       JOIN workspaces w ON w.id = p.workspace_id
+       JOIN valid_ws w ON w.id = p.workspace_id
       CROSS JOIN LATERAL (SELECT ($1::timestamptz AT TIME ZONE w.timezone) AS local_now) ln
       CROSS JOIN LATERAL (SELECT ln.local_now::date AS today) t
       WHERE p.deleted_at IS NULL
-        AND w.deleted_at IS NULL
         AND ln.local_now >= t.today::timestamp + make_interval(mins => $4::int)
         AND EXISTS (
               SELECT 1 FROM answer_captures c
@@ -241,7 +260,8 @@ export async function runDirtyDateSweep(set: RollupDirtySet, enqueue: EnqueueRol
       key: dirtyDateJobKey(e.projectId, e.metricDate, e.version),
     }),
     async (e) => {
-      if ((await set.clear([e])) === 0) {
+      // 0 removed means the member was re-marked (a higher score) OR another replica cleared the same version first; only the former is a re-mark.
+      if ((await set.clear([e])) === 0 && (await set.wasRemarked(e))) {
         incrementCounter("nominara_rollup_dirty_remarked_total");
         logger.log({ event: "rollup.sweep.dirty_remarked", workspace_id: e.workspaceId, project_id: e.projectId, metric_date: e.metricDate });
       }
