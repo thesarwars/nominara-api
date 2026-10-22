@@ -218,7 +218,9 @@ export const featureNotInPlanDetailsSchema = z
 //   prompt_superseded                   STORY-046: the prompt was reworded; the live row is the one that replaced it
 // STORY-184 — the in-app plan change (`/billing/subscription/change*`):
 //   quote_changed                       the echoed quote no longer matches Stripe's re-preview, or is stale; nothing charged
-//   downgrade_exceeds_limits            usage is above the target plan's limits; `details.excess[]` is the exact list
+//   downgrade_exceeds_limits            usage of a key §14 does not pause (seats, competitors, API keys) is above the
+//                                       target plan's limits; `details.excess[]` is the exact list (`effect: must_reduce`).
+//                                       Projects and prompts never refuse: they are paused at the cut-over (STORY-077).
 //   downgrade_already_effective         cancelling a scheduled downgrade that has already taken effect
 //   subscription_past_due               an unpaid subscription cannot change plan
 //   cancellation_pending                `cancel_at_period_end` is set: resume it in the billing portal first
@@ -251,7 +253,7 @@ export const conflictDetailsSchema = z
   .object({
     current_state: z.string().min(1).optional(),
     reason: z.enum(CONFLICT_REASONS).optional(),
-    /** STORY-184 — present with `reason = downgrade_exceeds_limits`: the exact structural excess, so the client renders it without a second request. */
+    /** STORY-184 — present with `reason = downgrade_exceeds_limits`: the exact `must_reduce` structural excess, so the client renders it without a second request. */
     excess: z.array(downgradeExcessItemSchema).optional(),
   })
   .strict();

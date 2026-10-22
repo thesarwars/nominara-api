@@ -41,6 +41,7 @@ function project(overrides: Partial<ProjectListItem> = {}): ProjectListItem {
     root_domain: "p.com",
     kind: "brand",
     status: "active",
+    paused_by_downgrade_at: null,
     discovery_status: "completed",
     prompts_active: 5,
     prompts_cap: 30,

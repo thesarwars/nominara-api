@@ -6,9 +6,19 @@ import { z } from "zod";
 // preview's `exceeds[]` (billing) and the `details.excess[]` of the
 // `409 downgrade_exceeds_limits` refusal (error details).
 //
-// Only `structural` entries BLOCK a downgrade (plans-and-entitlements.md §14,
-// as read by STORY-184: refuse until usage is reduced). The other three are
-// the "named warning" §14 requires and never block.
+// STORY-077 slice A — plans-and-entitlements.md §14: a downgrade is ACCEPTED
+// and, at the cut-over, the most recently created excess projects and prompts
+// are PAUSED (never deleted). So a `structural` entry says what happens to it
+// in `effect`:
+//   paused_at_period_end  projects and prompts (`projects.max`,
+//                         `prompts.max_total`, `prompts.max_per_project`):
+//                         named, never blocking; paused at the cut-over.
+//   must_reduce           seats, competitors and API keys, which §14 does not
+//                         name as pausable: these still BLOCK the downgrade
+//                         (STORY-184's refusal, kept for these keys only)
+//                         until usage is reduced.
+// The other three kinds are the "named warning" §14 requires and never block.
+export const STRUCTURAL_EXCESS_EFFECTS = ["paused_at_period_end", "must_reduce"] as const;
 export const downgradeExcessItemSchema = z.discriminatedUnion("kind", [
   z
     .object({
@@ -22,8 +32,29 @@ export const downgradeExcessItemSchema = z.discriminatedUnion("kind", [
       current: z.number().int().nonnegative(),
       /** `current - limit`, always positive: an entry exists only when usage is above the ceiling. */
       excess: z.number().int().positive(),
-      /** `projects.max` only: the projects that exceed, most recently created first (the ones to reduce first). */
-      items: z.array(z.object({ id: z.uuid(), name: z.string() }).strict()).max(100).optional(),
+      /** STORY-077: what the cut-over does with it. Only `must_reduce` blocks the downgrade. */
+      effect: z.enum(STRUCTURAL_EXCESS_EFFECTS),
+      /**
+       * STORY-077 (review round 3), `paused_at_period_end` entries only: EXACTLY how many rows the cut-over pauses for
+       * this entry, worked out by the same reconcile the cut-over runs (a dry run), so the confirmation never names
+       * fewer than the cut-over pauses. `current`/`excess` are the guard's slot counts and can differ from it.
+       *   projects.max              the projects the cut-over pauses;
+       *   prompts.max_per_project   the prompts in `project_id` paused by the per-project limit;
+       *   prompts.max_total         the prompts paused by the workspace-wide limit, beyond the two above.
+       * A project's own prompts paused WITH it are counted on its `items[].prompts`, not here. The prompts the cut-over
+       * pauses in all = the sum of `items[].prompts` and of `paused` on the two prompt keys - ONLY while `items` names
+       * every paused project (`items.length` equals the `projects.max` entry's `paused`). `items` is cut at 100, so above
+       * 100 paused projects that sum undercounts and no total can be derived from this entry (a client shows none).
+       */
+      paused: z.number().int().nonnegative().optional(),
+      /**
+       * `projects.max` only: the projects that exceed, most recently created first (the ones paused at the cut-over),
+       * AT MOST 100 of them - `paused` stays exact past that, so `items.length < paused` means the list was cut.
+       * `prompts`: how many of that project's active prompts the cut-over pauses WITH it (0 for a project a downgrade
+       * already paused: its prompts are paused already). Always set by this server; optional on the wire so the
+       * addition is a minor client bump (STORY-023 AC5).
+       */
+      items: z.array(z.object({ id: z.uuid(), name: z.string(), prompts: z.number().int().nonnegative().optional() }).strict()).max(100).optional(),
     })
     .strict(),
   z.object({ kind: z.literal("feature_lost"), key: z.string().min(1) }).strict(),

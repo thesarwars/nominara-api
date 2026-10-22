@@ -1270,7 +1270,7 @@ describe("STORY-072 AC13 · the billing-cycle roll", () => {
 
     let fetchAt = Date.now();
     async function deliver(workspaceId: string, eventId: string, raw: Record<string, unknown>): Promise<void> {
-      const handler = new StripeSubscriptionHandler({ reconcile: async () => undefined } as unknown as BillingAddonsService);
+      const handler = new StripeSubscriptionHandler({ reconcile: async () => ({ changed: false }) } as unknown as BillingAddonsService, {} as never);
       fetchAt += 1000;
       await inCtx(workspaceId, (tx) =>
         handler.handle({

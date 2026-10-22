@@ -1,4 +1,5 @@
 import { Injectable } from "@nestjs/common";
+import type { ClientBase } from "pg";
 import { decodeTimestampIdCursor, MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
 import type {
@@ -14,6 +15,7 @@ import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver
 import { insertPromptStatement, manualPromptRow } from "../../lib/promptgen/persist.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { assertActiveWithinLimits, lockWorkspaceForActivation } from "./active-limit.js";
 
 // STORY-134 — `GET /projects/{id}/prompts` and `POST /projects/{id}/prompts`.
 // api-specification.md §3, page-inventory.md §6. Closes `G9`.
@@ -42,6 +44,8 @@ interface PromptRow {
   intent_archetype: string;
   funnel_stage: string;
   status: string;
+  /** STORY-077 — set when a downgrade's cut-over paused this prompt. */
+  paused_by_downgrade_at: Date | null;
   is_priority: boolean;
   generation_source: string;
   generation_batch_id: string | null;
@@ -94,7 +98,7 @@ export class PromptListService {
     const limitPlaceholder = `$${String(params.length)}`;
 
     const result = await client.query<PromptRow>(
-      `SELECT id, text, text_hash, intent_archetype, funnel_stage, status, is_priority,
+      `SELECT id, text, text_hash, intent_archetype, funnel_stage, status, paused_by_downgrade_at, is_priority,
               generation_source, generation_batch_id, cluster_id, stability_score,
               last_captured_at::text AS last_captured_at, created_at::text AS created_at,
               to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_at_key
@@ -134,6 +138,14 @@ export class PromptListService {
     const { client, workspaceId } = this.tenant();
     await this.assertProjectExists(client, projectId);
 
+    // STORY-077 review round 4 — A MANUAL PROMPT IS INSERTED `active`, so it is a door into `active` like a resume and is
+    // held to the same rule (active-limit.ts): after a cut-over that paused prompts for `prompts.max_total`, a create in
+    // any project with slot room would otherwise put the workspace back above its plan. The same lock order as the PATCH
+    // and the activate route - workspace, then project - so the workspace-wide count cannot be read twice by two creates
+    // in different projects, and the slot count below is read under the project lock.
+    await lockWorkspaceForActivation(client as unknown as ClientBase, workspaceId);
+    await client.query("SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE", [projectId]);
+
     const cap = await this.resolveCap(workspaceId);
     const occupying = await this.countOccupying(client, projectId);
 
@@ -145,6 +157,9 @@ export class PromptListService {
         remediation: { kind: "increase_limit", url: "/settings/billing" },
       });
     }
+
+    const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
+    await assertActiveWithinLimits(client, { workspaceId, projectId, becomingActive: 1, entitlements: resolved.entitlements });
 
     const row = manualPromptRow({ workspaceId, projectId, text: request.text });
     const { sql, params } = insertPromptStatement(row);
@@ -178,6 +193,8 @@ export class PromptListService {
       intent_archetype: row.intentArchetype,
       funnel_stage: row.funnelStage,
       status: row.status,
+      // A prompt a person just created was never paused by a downgrade.
+      paused_by_downgrade_at: null,
       is_priority: row.isPriority,
       generation_source: row.generationSource,
       generation_batch_id: row.generationBatchId,
@@ -273,6 +290,7 @@ function toPromptListItem(row: PromptRow): PromptListItem {
     intent_archetype: row.intent_archetype as PromptListItem["intent_archetype"],
     funnel_stage: row.funnel_stage as PromptListItem["funnel_stage"],
     status: row.status as PromptListItem["status"],
+    paused_by_downgrade_at: row.paused_by_downgrade_at?.toISOString() ?? null,
     is_priority: row.is_priority,
     generation_source: row.generation_source as PromptListItem["generation_source"],
     generation_batch_id: row.generation_batch_id,

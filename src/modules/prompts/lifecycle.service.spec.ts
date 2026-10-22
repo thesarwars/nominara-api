@@ -40,7 +40,9 @@ function resolverReturning(entitlements: Record<string, { value: unknown }>): En
   return { resolveForWorkspace: vi.fn(async () => ({ entitlements })) } as unknown as EntitlementResolver;
 }
 
-const GENEROUS = { "prompts.max_per_project": { value: 40 }, "scan.priority_subset_size": { value: 50 } };
+// Every resolved map carries `prompts.max_total` (each plan row in db/seed/plan-entitlements.ts defines it; a missing
+// structural key reads fail-closed as 0 in active-limit.ts). Business's 250: none of these per-project cases reach it.
+const GENEROUS = { "prompts.max_per_project": { value: 40 }, "prompts.max_total": { value: 250 }, "scan.priority_subset_size": { value: 50 } };
 
 interface Scenario {
   readonly status?: string;
@@ -102,6 +104,32 @@ describe("STORY-046 · PromptLifecycleService.update", () => {
   it("REQ-019-scope-out: refuses a prompt outside the member's project scope and writes nothing", async () => {
     await expect(setup({ inScope: false }).update(PROMPT, { status: "paused" })).rejects.toBeInstanceOf(ProjectOutOfScopeException);
     expect(calls.some((call) => /UPDATE|INSERT/.test(call.sql))).toBe(false);
+  });
+
+  // STORY-077 review round 3 — ONE LOCK ORDER ON EVERY PATH: workspace, then project, then wallet. The cut-over locks
+  // workspace -> wallet -> every project; a PATCH that took the project lock first and then debited the wallet (archived
+  // -> paused, charged) deadlocked with it. And the decision must come from the REQUEST, not from a status read before
+  // any lock: a prompt read as `active` can be paused by the cut-over before the project lock, and its resume would then
+  // run the workspace-wide active check without the workspace lock.
+  describe("review round 3 · the workspace lock comes before the project lock for every status move or edit", () => {
+    const order = () => {
+      const workspace = calls.findIndex((c) => /FROM workspaces WHERE id = \$1 FOR UPDATE/.test(c.sql));
+      const project = calls.findIndex((c) => /FROM projects WHERE id = \$1 AND deleted_at IS NULL FOR UPDATE/.test(c.sql));
+      return { workspace, project };
+    };
+    for (const [label, status, request] of [
+      ["a resume whose first read says `active` (the cut-over can pause it before the project lock)", "active", { status: "active" }],
+      ["archived -> paused (a charged activation that debits the wallet)", "archived", { status: "paused" }],
+      ["active -> archived", "active", { status: "archived" }],
+      ["a text-only edit (it archives one row and inserts another)", "paused", { text: "Which crm would you recommend for a fifty person team?" }],
+    ] as const) {
+      it(label, async () => {
+        await setup({ status }).update(PROMPT, request, "1").catch(() => undefined);
+        const { workspace, project } = order();
+        expect(workspace, "workspace lock taken").toBeGreaterThanOrEqual(0);
+        expect(project).toBeGreaterThan(workspace);
+      });
+    }
   });
 
   // ---------------------------------------------------------------------------

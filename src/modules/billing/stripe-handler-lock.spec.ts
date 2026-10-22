@@ -30,7 +30,7 @@ const context = (tx: ClientBase, kind: "subscription" | "invoice"): StripeEventC
   ({ tx, workspaceId: WS, event: { id: "evt_1", type: "x", objectId: "o" }, object: { kind, id: "o", metadata: {}, raw: {} }, fetchStartedAt: new Date(), afterCommit: [] }) as unknown as StripeEventContext;
 
 describe.each([
-  ["StripeSubscriptionHandler", () => new StripeSubscriptionHandler({} as never), "subscription"],
+  ["StripeSubscriptionHandler", () => new StripeSubscriptionHandler({} as never, {} as never), "subscription"],
   ["StripeInvoiceHandler", () => new StripeInvoiceHandler({} as never), "invoice"],
 ] as const)("STORY-075 checkpoint-5 · %s bounds its workspace lock wait", (_name, make, kind) => {
   it("sets a transaction-local lock_timeout BEFORE the lock, and a timeout is a retryable degraded (never a hang or a 500), counted", async () => {

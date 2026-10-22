@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger } from "@nestjs/common";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
@@ -12,6 +12,8 @@ import { BillingAddonsService } from "./billing-addons.service.js";
 import { DegradedError } from "../../api/errors/domain-errors.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
+import { reconcileAndRecordDowngradePause, sendDowngradeNotices } from "../../lib/billing/downgrade-pause-record.js";
+import { EMAIL_SENDER, type EmailSender } from "../identity/ports/email-sender.js";
 
 // STORY-075a / STORY-075 AC4 — the ONLY customer-reachable path to
 // `applyPlanChange`, and the one the plan-change-import-surface gate names.
@@ -42,9 +44,12 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
 
   private readonly logger = new Logger(StripeSubscriptionHandler.name);
 
-  constructor(private readonly addons: BillingAddonsService) {}
+  constructor(
+    private readonly addons: BillingAddonsService,
+    @Inject(EMAIL_SENDER) private readonly email: EmailSender,
+  ) {}
 
-  async handle({ tx, workspaceId, event, object, fetchStartedAt }: StripeEventContext): Promise<void> {
+  async handle({ tx, workspaceId, event, object, fetchStartedAt, afterCommit }: StripeEventContext): Promise<void> {
     // checkout.session.completed is also the credit-pack event (mode=payment,
     // STORY-076a); the service has already followed a subscription-mode
     // session to its subscription, so anything else here is not ours.
@@ -172,7 +177,7 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
 
     // STORY-076b — the add-on items of THIS fresh fetch, mirrored wholesale (the
     // only writer of `subscription_addons`). An ended subscription holds none.
-    await this.addons.reconcile(tx, {
+    const addonOutcome = await this.addons.reconcile(tx, {
       workspaceId,
       stripeSubscriptionId: desired.state.providerSubscriptionId,
       items: desired.state.planKey === "free" ? [] : addonItemsFromSubscription(object.raw),
@@ -180,6 +185,12 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       eventType: event.type,
       versionAlreadyBumped: outcome.changed,
     });
+
+    // STORY-077 slice A — plans-and-entitlements.md §14 at the cut-over: AFTER the plan and the add-ons are adopted (the
+    // limits are the resolved ones), in this same transaction. Only when what the workspace is entitled to MOVED (the
+    // plan or the add-ons): a redelivery, or a phase-0 event while a downgrade is still pending, changes nothing here, and
+    // a workspace that was already over its limits before this slice shipped is not paused by an unrelated event.
+    if (outcome.changed || addonOutcome.changed) await this.reconcilePause(tx, workspaceId, event.id, { planChanged: outcome.changed && outcome.from !== outcome.to, addonsChanged: addonOutcome.changed }, afterCommit);
 
     // The charge this subscription was verified at is frozen on the row, so a
     // later catalog price change cannot turn it into a "mismatch". Only the
@@ -252,6 +263,22 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       to: outcome.to,
       entitlement_version: outcome.entitlementVersion,
     });
+  }
+
+  /**
+   * STORY-077 — pauses the most recently created excess projects and prompts (never deletes), resumes what an earlier
+   * downgrade paused once the limits allow it (oldest first), audits each, and emails the list AFTER the commit. The
+   * same step `plan:set` runs (downgrade-pause-record.ts).
+   */
+  private async reconcilePause(
+    tx: StripeEventContext["tx"],
+    workspaceId: string,
+    eventId: string,
+    moved: { readonly planChanged: boolean; readonly addonsChanged: boolean },
+    afterCommit: StripeEventContext["afterCommit"],
+  ): Promise<void> {
+    const notices = await reconcileAndRecordDowngradePause(tx, workspaceId, { requestId: eventId, operator: WEBHOOK_OPERATOR, ...moved });
+    if (notices.length > 0) afterCommit.push(async () => await sendDowngradeNotices((message) => this.email.send(message), workspaceId, notices));
   }
 
   /**

@@ -385,7 +385,9 @@ export class PlanChangeService {
   private async downgrade(ctx: Context, fresh: Fresh, replay: PendingPlanChange | null): Promise<PlanChangeResponse> {
     const { workspaceId, sub, target } = ctx;
     if (replay === null) {
-      // ⚠ REFUSED UNTIL USAGE IS REDUCED (owner decision 2026-10-16, Q3 = refuse), before any Stripe call and any write.
+      // ⚠ REFUSED UNTIL USAGE IS REDUCED, before any Stripe call and any write — for the structural keys §14 does NOT
+      // pause only (seats, competitors, API keys: `effect: must_reduce`). A projects or prompts excess is accepted and
+      // paused at the cut-over by the webhook (STORY-077 slice A, downgrade-pause.ts).
       const excess = await this.excessFor(ctx);
       if (excess.blocking.length > 0) {
         this.outcome("downgrade", "exceeds_limits");

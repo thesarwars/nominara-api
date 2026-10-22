@@ -80,6 +80,11 @@ export const projectListItemSchema = z
     root_domain: z.string(),
     kind: z.enum(["brand", "product_line"]),
     status: z.string(),
+    /**
+     * STORY-077 — set (with `status: "paused"`) when a downgrade paused this project at its cut-over; null otherwise,
+     * including when a person paused it. A downgrade pause resumes automatically on a later upgrade.
+     */
+    paused_by_downgrade_at: z.string().nullable(),
     discovery_status: z.enum(DISCOVERY_STATUSES),
 
     prompts_active: z.number().int().nonnegative(),

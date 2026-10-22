@@ -43,10 +43,14 @@ function clientAnsweringWith(calls: Recorded[], answers: { match: string; rows: 
   };
 }
 
+// The resolver always returns EVERY key (each plan row in db/seed/plan-entitlements.ts defines `prompts.max_total`), and a
+// missing structural key reads fail-closed as 0 (capFrom, active-limit.ts). So the mock carries the workspace-wide key too
+// - business's 250, which none of these per-project cases reach.
 function resolverReturning(limit: number | string): EntitlementResolver {
+  const entitlements = { "prompts.max_per_project": { value: limit }, "prompts.max_total": { value: 250 } };
   return {
-    resolveForWorkspace: vi.fn(async () => ({ entitlements: { "prompts.max_per_project": { value: limit } } })),
-    resolve: vi.fn(async () => ({ entitlements: { "prompts.max_per_project": { value: limit } } })),
+    resolveForWorkspace: vi.fn(async () => ({ entitlements })),
+    resolve: vi.fn(async () => ({ entitlements })),
   } as unknown as EntitlementResolver;
 }
 

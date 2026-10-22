@@ -58,6 +58,12 @@ export const promptListItemSchema = z
     intent_archetype: intentArchetypeSchema,
     funnel_stage: funnelStageSchema,
     status: z.enum(["active", "paused", "archived"]),
+    /**
+     * STORY-077 — set (with `status: "paused"`) when a downgrade paused this prompt at its cut-over; null otherwise,
+     * including when a person paused it. A downgrade pause resumes automatically on a later upgrade; a person changing
+     * the prompt's status clears it.
+     */
+    paused_by_downgrade_at: z.string().nullable(),
     is_priority: z.boolean(),
     /** `generated` is distinct from `manual` on the wire because §6 renders them differently. */
     generation_source: z.enum(["discovery", "generated", "manual", "imported", "tool_conversion", "gsc_query"]),

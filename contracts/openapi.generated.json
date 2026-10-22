@@ -13641,6 +13641,18 @@
                                     "exclusiveMinimum": 0,
                                     "maximum": 9007199254740991
                                   },
+                                  "effect": {
+                                    "type": "string",
+                                    "enum": [
+                                      "paused_at_period_end",
+                                      "must_reduce"
+                                    ]
+                                  },
+                                  "paused": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
                                   "items": {
                                     "maxItems": 100,
                                     "type": "array",
@@ -13654,6 +13666,11 @@
                                         },
                                         "name": {
                                           "type": "string"
+                                        },
+                                        "prompts": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
                                         }
                                       },
                                       "required": [
@@ -13669,7 +13686,8 @@
                                   "key",
                                   "limit",
                                   "current",
-                                  "excess"
+                                  "excess",
+                                  "effect"
                                 ],
                                 "additionalProperties": false
                               },
@@ -24359,6 +24377,16 @@
                           "status": {
                             "type": "string"
                           },
+                          "paused_by_downgrade_at": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "discovery_status": {
                             "type": "string",
                             "enum": [
@@ -24684,6 +24712,7 @@
                           "root_domain",
                           "kind",
                           "status",
+                          "paused_by_downgrade_at",
                           "discovery_status",
                           "prompts_active",
                           "prompts_cap",
@@ -34085,6 +34114,16 @@
                                   "archived"
                                 ]
                               },
+                              "paused_by_downgrade_at": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "is_priority": {
                                 "type": "boolean"
                               },
@@ -34154,6 +34193,7 @@
                               "intent_archetype",
                               "funnel_stage",
                               "status",
+                              "paused_by_downgrade_at",
                               "is_priority",
                               "generation_source",
                               "generation_batch_id",
@@ -34625,6 +34665,16 @@
                             "archived"
                           ]
                         },
+                        "paused_by_downgrade_at": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "is_priority": {
                           "type": "boolean"
                         },
@@ -34694,6 +34744,7 @@
                         "intent_archetype",
                         "funnel_stage",
                         "status",
+                        "paused_by_downgrade_at",
                         "is_priority",
                         "generation_source",
                         "generation_batch_id",
@@ -55930,6 +55981,16 @@
                               "status": {
                                 "type": "string"
                               },
+                              "paused_by_downgrade_at": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "discovery_status": {
                                 "type": "string",
                                 "enum": [
@@ -56271,6 +56332,7 @@
                               "root_domain",
                               "kind",
                               "status",
+                              "paused_by_downgrade_at",
                               "discovery_status",
                               "prompts_active",
                               "prompts_cap",

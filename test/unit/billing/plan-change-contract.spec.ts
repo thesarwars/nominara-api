@@ -46,7 +46,7 @@ describe("STORY-184 · plan-change contract", () => {
       quote: null,
       credit_estimate: { basis: "estimate", top_up_now: 0, grant_at_next_cycle: 1200 },
       purchased_credits_kept: true,
-      exceeds: [{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2 }],
+      exceeds: [{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end" }],
       blocked_by: "exceeds_limits",
     };
     expect(planChangePreviewResponseSchema.safeParse(base).success).toBe(true);
@@ -64,8 +64,12 @@ describe("STORY-184 · plan-change contract", () => {
         exceeds, blocked_by: null,
       }).success;
     expect(row([{ kind: "feature_lost", key: "whitelabel.custom_domain" }, { kind: "addon_dropped", addon: "extra_seat", quantity: 2 }, { kind: "retention_shortened", key: "retention.raw_captures_days", from_days: 395, to_days: 180 }])).toBe(true);
-    expect(row([{ kind: "structural", key: "seats.max", limit: 7, current: 7, excess: 0 }])).toBe(false);
-    expect(row([{ kind: "structural", key: "seats.max", limit: 7, current: 9, excess: 2, surprise: true }])).toBe(false);
+    expect(row([{ kind: "structural", key: "seats.max", limit: 7, current: 7, excess: 0, effect: "must_reduce" }])).toBe(false);
+    expect(row([{ kind: "structural", key: "seats.max", limit: 7, current: 9, excess: 2, effect: "must_reduce", surprise: true }])).toBe(false);
+    // STORY-077: every structural entry says what the cut-over does with it, from a closed set.
+    expect(row([{ kind: "structural", key: "seats.max", limit: 7, current: 9, excess: 2 }])).toBe(false);
+    expect(row([{ kind: "structural", key: "seats.max", limit: 7, current: 9, excess: 2, effect: "deleted" }])).toBe(false);
+    expect(row([{ kind: "structural", key: "seats.max", limit: 7, current: 9, excess: 2, effect: "must_reduce" }])).toBe(true);
     expect(row([{ kind: "pause_everything" }])).toBe(false);
   });
 
@@ -88,7 +92,7 @@ describe("STORY-184 · plan-change contract", () => {
     }
     expect(PRECONDITION_UNMET_REASONS).toContain("payment_failed");
     expect(PRECONDITION_UNMET_REASONS).toContain("cancel_in_portal");
-    const excess = [{ kind: "structural", key: "seats.max", limit: 7, current: 9, excess: 2 }];
+    const excess = [{ kind: "structural", key: "seats.max", limit: 7, current: 9, excess: 2, effect: "must_reduce" }];
     expect(conflictDetailsSchema.safeParse({ reason: "downgrade_exceeds_limits", excess }).success).toBe(true);
     expect(conflictDetailsSchema.safeParse({ reason: "made_up" }).success).toBe(false);
   });
