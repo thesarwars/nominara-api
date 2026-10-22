@@ -7,7 +7,7 @@ import { downgradePausedEmail, downgradeResumedEmail } from "../../../src/lib/bi
 const project = (n: number) => ({ id: `p${String(n)}`, name: `Project ${String(n)}` });
 const prompt = (n: number, withProject = false) => ({ id: `q${String(n)}`, projectId: withProject ? "p4" : "p0", projectName: withProject ? "Project 4" : "Project 0", text: `best tool number ${String(n)}`, withProject });
 /** The plan moved (the opening names it), as at a cut-over. */
-const plan = (planName: string | null) => ({ planName, planChanged: true });
+const plan = (planName: string | null) => ({ planName, planChanged: true, addonsChanged: false });
 
 describe("STORY-077 scenario 3 · the pause-list email", () => {
   it("nothing paused: no email at all", () => {
@@ -73,12 +73,22 @@ describe("STORY-077 scenario 3 · the pause-list email", () => {
   });
 
   it("review round 3 · a pause after an ADD-ON change (the plan did not move) does not claim the workspace moved plan", () => {
-    const change = { planName: "Growth", planChanged: false };
+    const change = { planName: "Growth", planChanged: false, addonsChanged: true };
     const paused = downgradePausedEmail("a@example.com", change, { projects: [project(1)], prompts: [] })!.textBody;
     const resumed = downgradeResumedEmail("a@example.com", change, { projects: [project(1)], prompts: 0 })!.textBody;
     for (const body of [paused, resumed]) {
       expect(body).not.toMatch(/moved to the|changed plan/);
       expect(body).toMatch(/add-ons/);
+    }
+  });
+
+  it("review round 4 · a reconcile where NEITHER the plan NOR the add-ons moved (an interval change, an entitlement re-grant) claims neither: it says the limits changed", () => {
+    const change = { planName: "Growth", planChanged: false, addonsChanged: false };
+    const paused = downgradePausedEmail("a@example.com", change, { projects: [project(1)], prompts: [] })!.textBody;
+    const resumed = downgradeResumedEmail("a@example.com", change, { projects: [project(1)], prompts: 0 })!.textBody;
+    for (const body of [paused, resumed]) {
+      expect(body).not.toMatch(/moved to the|changed plan|add-ons/);
+      expect(body.startsWith("Your workspace's limits changed")).toBe(true);
     }
   });
 });
