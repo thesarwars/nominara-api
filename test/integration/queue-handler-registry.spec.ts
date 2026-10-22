@@ -3,7 +3,7 @@ import { Client } from "pg";
 import { Logger } from "@nestjs/common";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../../src/lib/queue/connection.js";
-import { QUEUE_HANDLERS, type QueueHandlerFactory, type QueueName } from "../../src/lib/queue/handlers.js";
+import { handlerFor, QUEUE_HANDLERS, type QueueHandlerFactory, type QueueName } from "../../src/lib/queue/handlers.js";
 import { buildQueue, enqueueJob } from "../../src/lib/queue/queue-factory.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
@@ -12,7 +12,7 @@ import { startValkeyFixture, type ValkeyFixture } from "../support/valkey-fixtur
 import { waitFor } from "../support/queue-test-harness.js";
 import { loadEnv } from "../../src/config/env.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
-import { signingKeysFromEnv } from "../../src/lib/queue/worker-factory.js";
+import { phasesOf, signingKeysFromEnv } from "../../src/lib/queue/worker-factory.js";
 
 // STORY-124 — the registry, end to end through a real BullMQ worker built
 // by the real bootstrapWorker(), against a real Valkey and a real Postgres.
@@ -119,6 +119,19 @@ describe("STORY-124 · the queue-handler registry", () => {
     } finally {
       await app.close();
     }
+  });
+
+  // ---- ADR-0003 ----------------------------------------------------------
+
+  it("ADR-0003 — the REGISTERED crawl.audit handler is a phased processor, so it can never fall back to the one-transaction composed shape unnoticed", () => {
+    const factory = handlerFor("crawl.audit");
+    expect(factory, "crawl.audit must be registered").toBeDefined();
+    const processor = factory!({ pool: {} as never, env: {} as never });
+    const phases = phasesOf(processor);
+    expect(phases).toBeDefined();
+    expect(typeof phases!.prepare).toBe("function");
+    expect(typeof phases!.run).toBe("function");
+    expect(typeof phases!.commit).toBe("function");
   });
 
   // ---- scenario 3 --------------------------------------------------------

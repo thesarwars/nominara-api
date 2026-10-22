@@ -301,3 +301,28 @@ describe("NEW-C-8 AC2 · evaluateSiteFiles observability", () => {
     spy.mockRestore();
   });
 });
+
+// Review round 2 — the same unclosed-tag shape the sitemap collector had: this evaluator sees the same input.
+describe("NEW-C-8 · AUX-R-007 is linear-time on a hostile sitemap", () => {
+  const ctx = { now: NOW, declaredInRobots: false };
+  const timed = (body: string): number => {
+    const start = performance.now();
+    evaluateSitemap(ok(body), ctx);
+    return performance.now() - start;
+  };
+
+  it("2 MB of unclosed <url> tags finishes in quickly (linear-time)", () => {
+    expect(timed(`<urlset>${"<url>".repeat(400_000)}`)).toBeLessThan(5000);
+  });
+
+  it("an unclosed <lastmod> followed by a megabyte of whitespace finishes in quickly (linear-time)", () => {
+    expect(timed(`<urlset><url><lastmod>${" ".repeat(1_000_000)}</url></urlset>`)).toBeLessThan(5000);
+  });
+
+  it("still counts and dates the well-formed entries", () => {
+    const old = new Date(NOW.getTime() - 400 * 86_400_000).toISOString();
+    const body = `<urlset><url><loc>a</loc><lastmod>${old}</lastmod></url><url><loc>b</loc><lastmod>${old}</lastmod></url></urlset>`;
+    expect(codes(evaluateSitemap(ok(body), ctx))).toEqual(["AUX-R-007"]);
+  });
+});
+

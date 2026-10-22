@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { MAX_RESPONSE_BYTES } from "./address-rules.js";
 import { assertSafeUrl, defaultDepsAreStrict, GuardedFetchRefusal, guardedFetch } from "./guarded-fetch.js";
 
 // STORY-131 — the refusal scenarios need no server; the redirect, cap and
@@ -125,6 +126,10 @@ describe("STORY-131 · guardedFetch — the loop, against a real server", () => 
           res.end();
         };
         pump();
+      } else if (url === "/echo-headers") {
+        // What the server actually received: the agent string, and the Host it was addressed by.
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ua: req.headers["user-agent"] ?? null, host: req.headers.host ?? null, accept: req.headers.accept ?? null }));
       } else if (url === "/never") {
         // Headers, then silence — the total-timeout case.
         res.writeHead(200, { "content-type": "text/plain" });
@@ -187,6 +192,67 @@ describe("STORY-131 · guardedFetch — the loop, against a real server", () => 
     const before = bigRequests;
     await expect(guardedFetch(at("/big"), {}, permitTestOrigin)).rejects.toThrow(/size cap/);
     expect(bigRequests).toBe(before + 1); // it really did hit the server
+  });
+
+  // STORY-049 AC11 / scenario 5 — "Oversized response: truncated at the cap and recorded". The default (verification,
+  // site files) still REJECTS, because a half-read proof or robots file must never be mistaken for the whole of one; only
+  // a caller that asks for it, a page fetch, gets the first MAX_RESPONSE_BYTES and a flag saying so.
+  it("STORY-049 scenario 5 — with truncateAtCap, an oversized body is cut at the cap and flagged, not thrown", async () => {
+    const before = bigRequests;
+    const response = await guardedFetch(at("/big"), { truncateAtCap: true }, permitTestOrigin);
+    expect(response.truncated).toBe(true);
+    expect(response.body.length).toBe(MAX_RESPONSE_BYTES);
+    expect(response.status).toBe(200);
+    expect(bigRequests).toBe(before + 1);
+  });
+
+  it("STORY-049 scenario 5 — a body under the cap is not flagged truncated, in either mode", async () => {
+    expect((await guardedFetch(at("/"), {}, permitTestOrigin)).truncated).toBe(false);
+    expect((await guardedFetch(at("/"), { truncateAtCap: true }, permitTestOrigin)).truncated).toBe(false);
+  });
+
+  // STORY-049 AC7 — "an identified agent string". guardedFetch used to send none, so a crawled site saw Node's default.
+  it("STORY-049 AC7 — sends the caller's headers, so the crawl can identify itself", async () => {
+    const response = await guardedFetch(
+      at("/echo-headers"),
+      { headers: { "user-agent": "NominaraBot/1.0 (+https://nominara.com/bot)", accept: "text/html" } },
+      permitTestOrigin,
+    );
+    expect(JSON.parse(response.body.toString())).toMatchObject({ ua: "NominaraBot/1.0 (+https://nominara.com/bot)", accept: "text/html" });
+  });
+
+  // The guard pins the address and sets Host from the validated URL. A caller header must not be able to re-point it:
+  // a Host that disagrees with the validated name is how a validated request is steered at another virtual host.
+  it("STORY-049 AC2 — a caller-supplied Host (any case) cannot override the validated host", async () => {
+    const response = await guardedFetch(at("/echo-headers"), { headers: { Host: "internal.example", HOST: "other.example" } }, permitTestOrigin);
+    expect(JSON.parse(response.body.toString()).host).toBe(new URL(origin).host);
+  });
+
+  it("STORY-049 AC2 — a redirect target is still re-validated when the caller supplies headers", async () => {
+    await expect(
+      guardedFetch(at("/to-metadata"), { headers: { "user-agent": "NominaraBot/1.0" } }, permitTestOrigin),
+    ).rejects.toMatchObject({ reason: "redirect_target_refused" });
+  });
+
+  // REVIEW FINDING — a crawl followed redirects to any public host before deciding the target was off-site, so an off-site
+  // redirect still sent a NominaraBot request to a third party. The caller can now veto a hop BEFORE it is requested.
+  it("STORY-049 — a caller that vetoes a redirect hop gets the redirect response back and the target is never requested", async () => {
+    const seen: string[] = [];
+    const response = await guardedFetch(
+      at("/relative"),
+      { followRedirect: (next) => { seen.push(next); return false; } },
+      permitTestOrigin,
+    );
+    expect(seen).toEqual([at("/landed")]);
+    expect(response.status).toBe(302);
+    expect(response.finalUrl).toBe(at("/relative"));
+    expect(response.body.toString()).not.toBe("landed");
+  });
+
+  it("STORY-049 — a caller that permits the hop still gets it followed", async () => {
+    const response = await guardedFetch(at("/relative"), { followRedirect: () => true }, permitTestOrigin);
+    expect(response.status).toBe(200);
+    expect(response.finalUrl).toBe(at("/landed"));
   });
 
   // Scenario 15 — headers arrive, body never does.
