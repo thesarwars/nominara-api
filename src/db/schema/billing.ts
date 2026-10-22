@@ -193,6 +193,7 @@ export const subscriptions = pgTable("subscriptions", {
   chargedInterval: text("charged_interval"),
   pendingAddonChanges: jsonb("pending_addon_changes"),
   pendingPlanChange: jsonb("pending_plan_change"),
+  downgradeKeep: jsonb("downgrade_keep"),
 });
 
 export const usageCounters = pgTable("usage_counters", {

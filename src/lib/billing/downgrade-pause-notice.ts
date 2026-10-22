@@ -2,8 +2,8 @@ import type { ClientBase } from "pg";
 import type { EmailMessage } from "../../modules/identity/ports/email-sender.js";
 import type { DowngradePauseOutcome } from "./downgrade-pause.js";
 
-// STORY-077 slice A — plans-and-entitlements.md §14: the cut-over "pauses — never deletes — the most recently created
-// excess projects and prompts, retains all their data under the new retention tier, and emails the list". The story's
+// STORY-077 slice A — plans-and-entitlements.md §14: the cut-over "pauses — never deletes — the [least recently active,
+// STORY-077 D2] excess projects and prompts, retains all their data under the new retention tier, and emails the list". The story's
 // technical note: "Emailing the list means the customer can immediately correct a wrong guess." So the email names
 // every paused project and prompt (up to a bound; the count is always exact), says nothing was deleted, and says how to
 // get them back. A later upgrade that resumes them says which came back (planner recommendation, partial upgrade).
@@ -25,6 +25,8 @@ export interface LimitChange {
   readonly planName: string | null;
   readonly planChanged: boolean;
   readonly addonsChanged: boolean;
+  /** STORY-077 D2: the cut-over honoured the customer's keep choice; absent or false, the default rule chose. */
+  readonly byChoice?: boolean;
 }
 
 /** The opening clause; a missing plan name (the plan join missed) names no plan rather than inventing one. */
@@ -39,7 +41,7 @@ export function downgradePausedEmail(to: string, change: LimitChange, paused: Do
   if (projects.length === 0 && prompts.length === 0) return null;
   const lines: string[] = [
     `${openingOf(change)}, which allows fewer projects or prompts than you had. ` +
-      "Nothing has been deleted: the most recently created items above the new limits are paused, and all their data is kept.",
+      `Nothing has been deleted: ${change.byChoice === true ? "the items you did not choose to keep" : "the least recently active items above the new limits"} are paused, and all their data is kept.`,
     "",
   ];
   // A prompt paused WITH its project is covered by the project's line; the prompt list names only prompts paused in a

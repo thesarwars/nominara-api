@@ -5,7 +5,7 @@ import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import type { EmailMessage } from "../../modules/identity/ports/email-sender.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { incrementCounter } from "../telemetry/metrics.js";
-import { reconcileDowngradePause } from "./downgrade-pause.js";
+import { reconcileDowngradePause, type KeepChoice } from "./downgrade-pause.js";
 import { downgradeNoticeContact, downgradePausedEmail, downgradeResumedEmail } from "./downgrade-pause-notice.js";
 
 // STORY-077 slice A — the cut-over (and any later upgrade) as ONE step that EVERY plan writer runs, inside its own
@@ -31,10 +31,10 @@ export interface PauseProvenance {
 }
 
 /** Reconciles, audits and returns the emails to send after the commit (none when nothing moved). */
-export async function reconcileAndRecordDowngradePause(tx: ClientBase, workspaceId: string, provenance: PauseProvenance): Promise<EmailMessage[]> {
+export async function reconcileAndRecordDowngradePause(tx: ClientBase, workspaceId: string, provenance: PauseProvenance, keep?: KeepChoice): Promise<EmailMessage[]> {
   return await tracer.startActiveSpan("billing.downgrade_pause.reconcile", async (span) => {
     try {
-      const result = await reconcileDowngradePause(tx, workspaceId);
+      const result = await reconcileDowngradePause(tx, workspaceId, keep);
       const pausedCount = result.paused.projects.length + result.paused.prompts.length;
       const resumedCount = result.resumed.projects.length + result.resumed.prompts;
       span.setAttributes({ "nominara.downgrade_pause.paused": pausedCount, "nominara.downgrade_pause.resumed": resumedCount });
@@ -77,7 +77,7 @@ export async function reconcileAndRecordDowngradePause(tx: ClientBase, workspace
       }
       const plan = await tx.query<{ display_name: string }>("SELECT p.display_name FROM workspaces w JOIN plans p ON p.key = w.plan_key WHERE w.id = $1", [workspaceId]);
       const planName = plan.rows[0]?.display_name ?? null;
-      const change = { planName, planChanged: provenance.planChanged, addonsChanged: provenance.addonsChanged };
+      const change = { planName, planChanged: provenance.planChanged, addonsChanged: provenance.addonsChanged, byChoice: keep !== undefined };
       return [downgradePausedEmail(contact, change, result.paused), downgradeResumedEmail(contact, change, result.resumed)].filter((m): m is EmailMessage => m !== null);
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });
