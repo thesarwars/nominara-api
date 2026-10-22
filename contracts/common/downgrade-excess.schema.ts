@@ -42,11 +42,14 @@ export const downgradeExcessItemSchema = z.discriminatedUnion("kind", [
        *   prompts.max_per_project   the prompts in `project_id` paused by the per-project limit;
        *   prompts.max_total         the prompts paused by the workspace-wide limit, beyond the two above.
        * A project's own prompts paused WITH it are counted on its `items[].prompts`, not here. The prompts the cut-over
-       * pauses in all = the sum of `items[].prompts` and of `paused` on the two prompt keys.
+       * pauses in all = the sum of `items[].prompts` and of `paused` on the two prompt keys - ONLY while `items` names
+       * every paused project (`items.length` equals the `projects.max` entry's `paused`). `items` is cut at 100, so above
+       * 100 paused projects that sum undercounts and no total can be derived from this entry (a client shows none).
        */
       paused: z.number().int().nonnegative().optional(),
       /**
-       * `projects.max` only: the projects that exceed, most recently created first (the ones paused at the cut-over).
+       * `projects.max` only: the projects that exceed, most recently created first (the ones paused at the cut-over),
+       * AT MOST 100 of them - `paused` stays exact past that, so `items.length < paused` means the list was cut.
        * `prompts`: how many of that project's active prompts the cut-over pauses WITH it (0 for a project a downgrade
        * already paused: its prompts are paused already). Always set by this server; optional on the wire so the
        * addition is a minor client bump (STORY-023 AC5).
