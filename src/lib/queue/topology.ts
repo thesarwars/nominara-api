@@ -407,6 +407,23 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "retpurge:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // ⚠ THE SIXTH-AND-LATER QUEUE §4 DOES NOT CONTAIN, added by the same precedent. STORY-048 AC7 / OWNER DECISION
+  // 2026-10-19 (adding a queue to the topology is a specification change, and this one is approved): a verified
+  // domain is re-verified daily, and one that stops verifying loses full scope with a notification. The DNS and
+  // HTTPS checks are network calls that may never run on a request path (KAD-06). Crawl group, with the other
+  // outbound fetchers. NOT tenant-scoped: the tick has no workspace to name, so discovery runs cross-tenant on the
+  // owner connection and each outcome is applied in ONE tenant's context as the runtime role (`verification/reverify.ts`).
+  // Advisory-locked single-flight; a domain checked inside the minimum interval is skipped, which is the idempotency.
+  {
+    name: "domain.reverify",
+    producer: "cron daily (STORY-048 AC7; not in §4)",
+    workerGroup: "crawl",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "domreverify:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",

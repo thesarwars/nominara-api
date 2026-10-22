@@ -72,6 +72,12 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // nothing is stale, so a missed day costs nothing the next day does not cure.
   { queue: "identity.sweep_unverified", cron: "50 2 * * *", statedAs: "STORY-173: sweep stale unverified accounts daily" },
 
+  // ⚠ NOT FROM §4 — STORY-048 AC7, owner decision 2026-10-19: verified domains are re-verified daily so a domain that stops
+  // verifying loses full scope with a notification. THE HOUR IS A CHOICE, NOT A TRANSCRIPTION: 02:20 UTC, the front of the
+  // same quiet window as `credit.housekeeping` (02:30), `audit.verify` (02:40) and the partition tick (03:20); the job is
+  // network-bound, not database-bound, so it does not contend with them. :20 and not :00 for the reason §6.1 gives `capture.plan` :05.
+  { queue: "domain.reverify", cron: "20 2 * * *", statedAs: "STORY-048 AC7: re-verify verified domains daily" },
+
   // ⚠ NOT FROM §4 — STORY-076 AC4 / STORY-071 AC10. Two credit jobs that existed with no caller: FIFO expiry of
   // purchased credits and the nightly purge of daily counters. The data model says "nightly" for the purge and no
   // reference gives expiry a cadence (twelve-month granularity makes a day immaterial). THE HOUR IS A CHOICE, NOT A

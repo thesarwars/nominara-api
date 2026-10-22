@@ -70,6 +70,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "crawl.discover",
       "credit.housekeeping",
       "credit.reconcile",
+      "domain.reverify",
       "identity.sweep_unverified",
       "maintenance.partition",
       "retention.purge",
@@ -106,6 +107,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       // STORY-076 / STORY-071 and STORY-077 R4 — declared after billing.customer_email in topology.ts.
       "credit.housekeeping",
       "retention.purge",
+      // STORY-048 AC7 — declared after retention.purge in topology.ts.
+      "domain.reverify",
     ]);
   });
 

@@ -138,3 +138,64 @@ describe("STORY-048 · meta tag", () => {
     await expect(checkMetaTag("127.0.0.1", NONCE, d)).resolves.toEqual({ ok: false, reason: "fetch_refused" });
   });
 });
+
+// Review finding — a failure on OUR side is not evidence the customer removed the proof. The periodic sweep
+// must be able to tell the two apart, so every checker marks it `inconclusive`.
+describe("STORY-048 · inconclusive outcomes (our outage is not their absence)", () => {
+  const code = (c: string) => Object.assign(new Error(c), { code: c });
+
+  it.each(["ETIMEOUT", "ESERVFAIL", "ECONNREFUSED", "EREFUSED"])("a resolver %s is inconclusive", async (c) => {
+    const d = deps({ resolveTxt: vi.fn(async () => { throw code(c); }) });
+    await expect(checkDnsTxt(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "record_absent", inconclusive: true });
+  });
+
+  it.each(["ENOTFOUND", "ENODATA"])("a resolver %s is conclusive absence", async (c) => {
+    const d = deps({ resolveTxt: vi.fn(async () => { throw code(c); }) });
+    await expect(checkDnsTxt(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "record_absent" });
+  });
+
+  // AC7 review: a failure on the TARGET's side (connect, TLS, timeout, 5xx) is what a domain that changed hands looks
+  // like, so it is conclusive (the manual path and the sweep clear verified_at, as on main). Only OUR resolver is
+  // inconclusive, until the owner decides a grace period.
+  it.each([
+    ["socket hang up"],
+    ["ETIMEDOUT"],
+    ["ECONNREFUSED"],
+    ["CERT_HAS_EXPIRED"],
+  ])("a target-side %s fetching the file is conclusive", async (message) => {
+    const d = deps({ fetch: vi.fn(async () => { throw new Error(message); }) });
+    await expect(checkWellKnownFile(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "file_absent" });
+  });
+
+  it.each([500, 502, 503, 429, 408])("a %d fetching the file or tag is conclusive", async (status) => {
+    await expect(checkWellKnownFile(DOMAIN, NONCE, deps({ fetch: serving(status, "") }))).resolves.toEqual({
+      ok: false, reason: "file_absent",
+    });
+    await expect(checkMetaTag(DOMAIN, NONCE, deps({ fetch: serving(status, "") }))).resolves.toEqual({
+      ok: false, reason: "tag_absent",
+    });
+  });
+
+  it.each(["ETIMEDOUT", "ECONNREFUSED", "CERT_HAS_EXPIRED"])("a target-side %s fetching the root page is conclusive", async (message) => {
+    const d = deps({ fetch: vi.fn(async () => { throw new Error(message); }) });
+    await expect(checkMetaTag(DOMAIN, NONCE, d)).resolves.toEqual({ ok: false, reason: "tag_absent" });
+  });
+
+  it("a 404 and a guard refusal stay conclusive", async () => {
+    await expect(checkMetaTag(DOMAIN, NONCE, deps({ fetch: serving(404, "") }))).resolves.toEqual({ ok: false, reason: "tag_absent" });
+    const refuse = deps({ fetch: vi.fn(async () => { throw new GuardedFetchRefusal("address_not_global"); }) });
+    await expect(checkMetaTag(DOMAIN, NONCE, refuse)).resolves.toEqual({ ok: false, reason: "fetch_refused" });
+  });
+});
+
+describe("STORY-048 review r3 · a non-object rejection from the resolver", () => {
+  it.each([undefined, null, "boom", 42])("dns_txt · rejecting with %s is inconclusive, never a TypeError", async (reason) => {
+    const outcome = await checkDnsTxt("site.test", "n1", {
+      resolveTxt: () => Promise.reject(reason),
+      fetch: async () => {
+        throw new Error("no http");
+      },
+    });
+    expect(outcome).toMatchObject({ ok: false, inconclusive: true });
+  });
+});

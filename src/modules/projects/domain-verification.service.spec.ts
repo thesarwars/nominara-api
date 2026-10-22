@@ -19,7 +19,11 @@ describe("STORY-048 · DomainVerificationService", () => {
   let calls: Recorded[];
   let rowStore: Record<string, unknown>[];
 
-  function harness(deps: Partial<CheckDeps> = {}, existingRows: Record<string, unknown>[] = []) {
+  function harness(
+    deps: Partial<CheckDeps> = {},
+    existingRows: Record<string, unknown>[] = [],
+    aggregateVerifiedAt: Date | null = null,
+  ) {
     calls = [];
     rowStore = existingRows;
     vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
@@ -28,6 +32,12 @@ describe("STORY-048 · DomainVerificationService", () => {
           calls.push({ sql, params });
           if (sql.includes("SELECT workspace_id, root_domain")) {
             return { rows: [{ workspace_id: WS, root_domain: "hubspot.com" }] };
+          }
+          // Before the generic read below: the aggregate also reads `FROM domain_verifications WHERE project_id`.
+          if (sql.includes("max(verified_at)")) return { rows: [{ verified_at: aggregateVerifiedAt }] };
+          // The transition reads the PRIOR state itself, under a row lock, instead of trusting the caller's copy.
+          if (sql.includes("FROM domain_verifications WHERE id = $1 FOR UPDATE")) {
+            return { rows: rowStore.filter((r) => r.id === params[0]) };
           }
           if (sql.includes("FROM domain_verifications WHERE project_id")) return { rows: rowStore };
           if (sql.includes("INSERT INTO domain_verifications")) {
@@ -47,7 +57,6 @@ describe("STORY-048 · DomainVerificationService", () => {
               rows: [{ ...rowStore[0], verified_at: params[1], failure_reason: params[2], last_checked_at: new Date() }],
             };
           }
-          if (sql.includes("max(verified_at)")) return { rows: [{ verified_at: null }] };
           return { rows: [] };
         }),
       },
@@ -154,6 +163,83 @@ describe("STORY-048 · DomainVerificationService", () => {
     const notify = calls.find((c) => c.sql.includes("INSERT INTO notifications"));
     expect(notify, "losing verification must notify, not silently downgrade").toBeDefined();
     expect(notify!.sql).toContain("domain.verification_lost");
+  });
+
+  // STORY-048 AC7 — the notification says audits are limited to public-surface scope. That is only true when NO method
+  // still verifies the domain; telling a customer they lost scope they still have is a false alarm.
+  it("AC7 — does NOT claim scope was lost when another method still verifies the domain", async () => {
+    const verified = {
+      id: "v1", domain: "hubspot.com", method: "dns_txt", nonce: "n1",
+      verified_at: new Date("2026-09-01"), last_checked_at: new Date("2026-09-01"), failure_reason: null,
+    };
+    const stillVerifiedByFile = new Date("2026-09-02");
+    await harness({ resolveTxt: vi.fn(async () => { throw new Error("ENOTFOUND"); }) }, [verified], stillVerifiedByFile).check(
+      PROJECT,
+      "dns_txt",
+    );
+    expect(calls.some((c) => c.sql.includes("INSERT INTO notifications"))).toBe(false);
+  });
+
+  // Review r5 — both writers stamp the time their check BEGAN, so the freshness guard compares like with like. A manual
+  // check that began first and committed first must not hide a later sweep's loss behind its (later) finish time.
+  it("review r5 — a manual check records the time it STARTED, not the time it finished, and passes it as the freshness guard", async () => {
+    const started = new Date("2026-10-20T10:00:00Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(started);
+      const verified = {
+        id: "v1", domain: "hubspot.com", method: "dns_txt", nonce: "n1",
+        verified_at: new Date("2026-09-01"), last_checked_at: new Date("2026-09-01"), failure_reason: null,
+      };
+      const service = harness(
+        {
+          resolveTxt: vi.fn(async () => {
+            vi.setSystemTime(new Date(started.getTime() + 20_000)); // the slow network wait
+            return [[`${TXT_PREFIX}n1`]];
+          }),
+        },
+        [verified],
+        new Date("2026-09-01"),
+      );
+      await service.check(PROJECT, "dns_txt");
+    } finally {
+      vi.useRealTimers();
+    }
+    const update = calls.find((c) => c.sql.includes("UPDATE domain_verifications"))!;
+    expect((update.params[3] as Date).getTime()).toBe(started.getTime());
+  });
+
+  // Review round 2 — the manual path and the sweep must treat an outage on OUR side the same way.
+  it.each(["ETIMEOUT", "ESERVFAIL"])(
+    "a manual re-check of a VERIFIED domain during OUR resolver outage (%s) keeps verified_at and sends nothing",
+    async (code) => {
+      const verifiedAt = new Date("2026-09-01");
+      const verified = {
+        id: "v1", domain: "hubspot.com", method: "dns_txt", nonce: "n1",
+        verified_at: verifiedAt, last_checked_at: new Date("2026-09-01"), failure_reason: null,
+      };
+      const failing = vi.fn(async () => { throw Object.assign(new Error(code), { code }); });
+      const state = await harness({ resolveTxt: failing }, [verified]).check(PROJECT, "dns_txt");
+
+      expect(calls.some((c) => c.sql.includes("INSERT INTO notifications"))).toBe(false);
+      const update = calls.find((c) => c.sql.includes("UPDATE domain_verifications"))!;
+      expect(update.params[1]).toEqual(verifiedAt);
+      expect(state.verified).toBe(true);
+      // the customer who clicked re-check is still told why it did not verify
+      expect(state.failure_reason).toBe("record_absent");
+    },
+  );
+
+  it("serialises every transition per project by locking the project row first", async () => {
+    const existing = {
+      id: "v1", domain: "hubspot.com", method: "dns_txt", nonce: "n1",
+      verified_at: null, last_checked_at: null, failure_reason: null,
+    };
+    await harness({ resolveTxt: vi.fn(async () => [[`${TXT_PREFIX}n1`]]) }, [existing]).check(PROJECT, "dns_txt");
+    const lock = calls.findIndex((c) => /FROM projects WHERE id = \$1 FOR UPDATE/.test(c.sql));
+    const firstWrite = calls.findIndex((c) => c.sql.includes("UPDATE domain_verifications"));
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(lock).toBeLessThan(firstWrite);
   });
 
   // A check that fails twice must not notify twice.

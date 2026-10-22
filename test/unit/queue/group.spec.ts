@@ -13,7 +13,7 @@ import { QUEUE_TOPOLOGY, QUEUE_WORKER_GROUPS } from "../../../src/lib/queue/topo
 const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
   capture: ["capture.plan", "capture.execute", "lookup.execute"],
   parse: ["capture.parse", "capture.arbitrate"],
-  crawl: ["crawl.discover", "crawl.fingerprint", "crawl.audit", "gsc.sync", "source.verify_presence"],
+  crawl: ["crawl.discover", "crawl.fingerprint", "crawl.audit", "gsc.sync", "source.verify_presence", "domain.reverify"],
   embed: ["embed.batch", "topic.cluster"],
   rollup: [
     "rollup.metric_daily",

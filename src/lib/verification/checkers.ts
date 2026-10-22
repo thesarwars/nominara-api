@@ -20,7 +20,33 @@ import {
 export const TXT_PREFIX = "nominara-verify=";
 export const META_TAG_NAME = "nominara-verify";
 
-export type CheckOutcome = { readonly ok: true } | { readonly ok: false; readonly reason: VerificationFailure };
+/**
+ * `inconclusive` marks a failure of OUR resolver (the DNS-TXT errno rule, or a resolution failure reported by the
+ * guarded fetcher), as opposed to the customer's proof being absent or wrong. Neither the sweep nor a manual check
+ * may read it as "the domain stopped verifying".
+ *
+ * A failure on the TARGET's side (connect, TLS, timeout, 5xx/429/408) is deliberately NOT inconclusive: that is what
+ * a domain that has changed hands looks like, and an unbounded "keep full scope" would let it keep scope forever
+ * (AC7). Whether such a failure earns a grace period before the loss path applies is an OWNER decision
+ * (`inconclusive_since`), recorded in docs-carry; until it is made these stay conclusive, as on main.
+ */
+export type CheckOutcome =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: VerificationFailure; readonly inconclusive?: true };
+
+const INCONCLUSIVE = true as const;
+
+/**
+ * A refusal that is OUR resolver failing, not a policy decision and not the customer's name being absent. The
+ * guarded fetcher reports every resolution failure as a refusal; ENOTFOUND/ENODATA are a conclusive "no such name"
+ * (the same rule as the DNS-TXT method), anything else (EAI_AGAIN, ESERVFAIL, ETIMEOUT, ECONNREFUSED, no errno) is
+ * an outage on our side. A policy refusal (private address, port, scheme) has no `resolverCode` and stays conclusive.
+ */
+const isResolverOutage = (error: unknown): boolean =>
+  error instanceof GuardedFetchRefusal &&
+  error.resolverCode !== undefined &&
+  error.resolverCode !== "ENOTFOUND" &&
+  error.resolverCode !== "ENODATA";
 
 export interface CheckDeps {
   /** TXT lookup. Separate from the guarded fetcher's `lookup`, which resolves A/AAAA only. */
@@ -58,12 +84,16 @@ export async function checkDnsTxt(domain: string, nonce: string, deps: CheckDeps
   let records: string[][];
   try {
     records = await deps.resolveTxt(dnsRecordName(domain));
-  } catch {
-    // ENOTFOUND and ENODATA both mean "no such record", which is the
-    // overwhelmingly common case and is actionable; a genuine resolver outage
-    // is indistinguishable here and reads the same to the customer, who should
-    // simply try again.
-    return { ok: false, reason: "record_absent" };
+  } catch (error) {
+    // ENOTFOUND and ENODATA both mean "no such record": conclusive absence. Anything else (ETIMEOUT, ESERVFAIL,
+    // ECONNREFUSED to the resolver) is a failure to ASK, not an answer, and is marked inconclusive so the
+    // periodic sweep cannot de-verify a fleet on one resolver outage. The customer-facing reason is unchanged.
+    const code =
+      typeof error === "object" && error !== null
+        ? ((error as { code?: unknown }).code ?? (error as Error).message)
+        : undefined;
+    if (code === "ENOTFOUND" || code === "ENODATA") return { ok: false, reason: "record_absent" };
+    return { ok: false, reason: "record_absent", inconclusive: INCONCLUSIVE };
   }
 
   // A TXT record arrives as an array of string CHUNKS — a value over 255 bytes
@@ -92,6 +122,7 @@ export async function checkWellKnownFile(domain: string, nonce: string, deps: Ch
     // WITHOUT its reason: the caller chose this URL, so echoing which check
     // fired would turn verification into the address oracle STORY-131 exists
     // to deny.
+    if (isResolverOutage(error)) return { ok: false, reason: "fetch_refused", inconclusive: INCONCLUSIVE };
     if (error instanceof GuardedFetchRefusal) return { ok: false, reason: "fetch_refused" };
     return { ok: false, reason: "file_absent" };
   }
@@ -122,6 +153,7 @@ export async function checkMetaTag(domain: string, nonce: string, deps: CheckDep
   try {
     response = await deps.fetch(`https://${domain}/`);
   } catch (error) {
+    if (isResolverOutage(error)) return { ok: false, reason: "fetch_refused", inconclusive: INCONCLUSIVE };
     if (error instanceof GuardedFetchRefusal) return { ok: false, reason: "fetch_refused" };
     return { ok: false, reason: "tag_absent" };
   }

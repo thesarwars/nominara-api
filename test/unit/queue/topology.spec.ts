@@ -291,6 +291,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "request path (KAD-06) nor inside the rollup transaction. A queue of its own, in the crawl group with the other outbound fetchers, so a DLQ " +
       "entry names the job that failed. NEW-C-15.",
   },
+  "domain.reverify": {
+    workerGroup: "crawl",
+    because:
+      "STORY-048 AC7 (owner decision 2026-10-19): a verified domain is re-verified daily and a domain that stops verifying loses full scope with a " +
+      "notification. The DNS and HTTP checks are network calls an operator must never see on a request path (KAD-06), and §4's table allocates no " +
+      "queue to them. A queue of its own, in the crawl group with the other outbound fetchers, so a DLQ entry names the job that failed.",
+  },
   "billing.auto_topup": {
     workerGroup: "rollup",
     because:
@@ -401,7 +408,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     }
   });
 
-  it("marks tenantScoped=false only for the six cross-tenant system jobs; true for every other queue", () => {
+  it("marks tenantScoped=false only for the seven cross-tenant system jobs; true for every other queue", () => {
     // ⚠ THE SHORT LIST IS THE ASSERTION. A tenant-scoped queue cannot be
     // driven by a bare cron tick — `createJobProcessor` verifies a signature
     // before the handler is reached — so this set is exactly the set of
@@ -413,6 +420,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
       "audit.verify",
       "credit.housekeeping",
       "credit.reconcile",
+      "domain.reverify",
       "identity.sweep_unverified",
       "maintenance.partition",
       "retention.purge",
