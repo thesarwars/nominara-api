@@ -42,12 +42,15 @@ export const auxErrorSummarySchema = z
     /** Pages with ONE stored copy and a recorded failure for the other (e.g. raw stored, no renderer). Not counted in `aux_audits.pages_failed`. */
     pages_partial: z.number().int().min(0).optional(),
     /**
-     * The target's declared Crawl-delay (clamped to our maximum) or the job's wall-clock budget limited what was fetched.
-     * NOT FROM THE REFERENCE: a safety bound so a hostile robots.txt cannot pin a worker.
+     * The target's declared Crawl-delay or the job's wall-clock budget limited what was fetched. `crawl_delay_ms` is the
+     * interval HONOURED; `declared_crawl_delay_ms` is present only when the declared delay was longer than the cap and was
+     * shortened to it (NOT FROM THE REFERENCE: MAX_HONOURED_CRAWL_DELAY_MS, so a hostile robots.txt cannot cost the audit its
+     * site files). `pages_skipped` counts pages only; a site file the budget did not allow is in `skipped_pages`.
      */
     crawl_delay_limited: z
       .object({
         crawl_delay_ms: z.number().int().min(0),
+        declared_crawl_delay_ms: z.number().int().min(0).optional(),
         pages_skipped: z.number().int().min(0),
       })
       .strict()
@@ -69,13 +72,12 @@ const storedCopySchema = z
   })
   .strict();
 
-export const crawlProbeResultSchema = z
-  .object({
-    outcome: z.enum(["consistent", "hostile", "inconclusive", "skipped_budget"]),
-    browser_status: z.number().int().nullable(),
-    agent_status: z.number().int().nullable(),
-  })
-  .strict();
+/**
+ * What robots.txt says about ONE AI crawler token for the crawl's root path (STORY-049 AC8, owner decision 2026-10-22).
+ * Nominara sends no request under any other crawler's name, so a firewall or CDN rule that blocks by user agent cannot be
+ * observed here: AUX-R-005 stays unevaluated and is named in `excluded_rules`. Only what the site PUBLISHED is judged.
+ */
+export const crawlAiBotAccessSchema = z.object({ agent: z.string().min(1).max(100), allowed: z.boolean() }).strict();
 
 export const crawlManifestSchema = z
   .object({
@@ -107,8 +109,8 @@ export const crawlManifestSchema = z
       })
       .strict()
       .nullable(),
-    /** null = the probe did not run (an unverified domain, or no budget). Never "consistent" by default. */
-    probe: crawlProbeResultSchema.nullable(),
+    /** null = robots.txt could not be judged (unreachable or unreadable). Never "allowed" by default. */
+    ai_bot_access: z.array(crawlAiBotAccessSchema).nullable(),
   })
   .strict();
 export type CrawlManifest = z.infer<typeof crawlManifestSchema>;
