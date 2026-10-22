@@ -15,6 +15,7 @@ import { createIdentitySweepUnverifiedHandler } from "./handlers/identity-sweep-
 import { createMaintenancePartitionHandler } from "./handlers/maintenance-partition.handler.js";
 import { createCrawlAuditHandler } from "./handlers/crawl-audit.handler.js";
 import { createDomainReverifyHandler } from "./handlers/domain-reverify.handler.js";
+import { createTaskResurfaceHandler } from "./handlers/task-resurface.handler.js";
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { createRollupMetricDailyHandler } from "./handlers/rollup-metric-daily.handler.js";
 import { createSourceVerifyPresenceHandler } from "./handlers/source-verify-presence.handler.js";
@@ -110,6 +111,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "source.verify_presence": (context) => createSourceVerifyPresenceHandler(context),
   "task.generate": (context) => createTaskGenerateHandler(context),
   "domain.reverify": (context) => createDomainReverifyHandler(context),
+  "task.resurface": (context) => createTaskResurfaceHandler(context),
   "billing.auto_topup": (context) => createBillingAutoTopupHandler(context),
   "billing.customer_email": (context) => createBillingCustomerEmailHandler(context),
   "billing.downgrade_notice": (context) => createBillingDowngradeNoticeHandler(context),

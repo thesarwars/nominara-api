@@ -78,6 +78,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "rollup.metric_daily",
       "source.verify_presence",
       "task.generate",
+      "task.resurface",
     ]);
     // Topology order, not alphabetical — `liveQueueNames` filters
     // QUEUE_TOPOLOGY, and the capture queues are declared before the crawl
@@ -112,6 +113,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "retention.purge",
       // STORY-048 AC7 — declared after retention.purge in topology.ts.
       "domain.reverify",
+      // STORY-064 AC5 — declared after domain.reverify in topology.ts.
+      "task.resurface",
     ]);
   });
 
