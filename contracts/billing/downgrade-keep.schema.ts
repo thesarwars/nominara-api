@@ -15,10 +15,18 @@ import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 // choice is not in it, so it is paused unless room is left.
 //
 // ⚠ THE CHOICE IS VALIDATED AGAINST THE TARGET PLAN'S RESOLVED LIMITS (the plan, the add-ons that survive the move, and
-// the workspace's overrides): at most `limits.projects` projects, at most `limits.prompts_per_project` prompts in any one
-// project, at most `limits.prompts_total` in all; every prompt must belong to a project in `project_ids`. A choice over a
-// limit is `400 validation_failed` naming the field. If the limits fall further before the cut-over (an add-on removed),
-// the cut-over keeps the most recently active of the chosen items up to the new limit.
+// the workspace's overrides): at most `limits.projects_keepable` projects, at most `limits.prompts_per_project` prompts in
+// any one project, at most `limits.prompts_total` in all; every prompt must belong to a project in `project_ids`. A choice
+// over a limit is `400 validation_failed` naming the field. If the limits fall further before the cut-over (an add-on
+// removed), the cut-over keeps the most recently active of the chosen items up to the new limit.
+//
+// ⚠ A PROJECT THAT IS NOT TRACKING STILL HOLDS ITS SLOT. `projects.max` counts every non-deleted project (§14, the
+// guards' count), so an ARCHIVED project, or one a PERSON paused, uses one of the target's project slots whatever its
+// activity, and is never paused or resumed by billing. `limits.projects_keepable` is what is left for tracking projects:
+// `limits.projects` minus those (never below 0; null = unlimited). The cut-over ranks them first, with or without a
+// choice, so the default and the choice agree and a later reconcile under the same limits changes nothing. A chosen
+// project a person pauses or archives after the choice is made holds its slot the same way: the cut-over does not give
+// that slot to another project.
 //
 // ⚠ WITH NO CHOICE, the cut-over keeps the MOST RECENTLY ACTIVE items (owner decision 2026-10-20) and pauses the rest of
 // the excess. "Last active" (`last_active_at`) is, for a project, its latest finished capture run (`capture_runs.finished_at`,
@@ -90,6 +98,8 @@ export const downgradeKeepResponseSchema = z
     limits: z
       .object({
         projects: z.number().int().nonnegative().nullable(),
+        /** How many of `projects` a choice may name: `projects` minus the archived and person-paused projects, which hold their slots. */
+        projects_keepable: z.number().int().nonnegative().nullable(),
         prompts_total: z.number().int().nonnegative().nullable(),
         prompts_per_project: z.number().int().nonnegative().nullable(),
       })

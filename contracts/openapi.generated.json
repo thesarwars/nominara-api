@@ -13524,6 +13524,18 @@
                                 }
                               ]
                             },
+                            "projects_keepable": {
+                              "anyOf": [
+                                {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "prompts_total": {
                               "anyOf": [
                                 {
@@ -13551,6 +13563,7 @@
                           },
                           "required": [
                             "projects",
+                            "projects_keepable",
                             "prompts_total",
                             "prompts_per_project"
                           ],
@@ -14024,6 +14037,18 @@
                                 }
                               ]
                             },
+                            "projects_keepable": {
+                              "anyOf": [
+                                {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "prompts_total": {
                               "anyOf": [
                                 {
@@ -14051,6 +14076,7 @@
                           },
                           "required": [
                             "projects",
+                            "projects_keepable",
                             "prompts_total",
                             "prompts_per_project"
                           ],
