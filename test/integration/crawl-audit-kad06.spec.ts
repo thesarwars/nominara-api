@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
@@ -96,6 +97,7 @@ describe("KAD-06 · crawl.audit holds no transaction and no connection across a 
   beforeEach(async () => {
     await db.query("TRUNCATE workspaces CASCADE");
     await db.query("DROP TRIGGER IF EXISTS poison_findings ON aux_findings");
+    await db.query("DROP TRIGGER IF EXISTS slow_findings ON aux_findings");
     observed = [];
     fetched = [];
     putKeys = [];
@@ -196,7 +198,8 @@ describe("KAD-06 · crawl.audit holds no transaction and no connection across a 
     await processor(deps())(signedJob(wsA, projA));
     const [a] = await audits();
     expect(a).toMatchObject({ workspace_id: wsA, project_id: projA, status: "completed", pages_crawled: 3, pages_failed: 0, scope: "key_pages" });
-    expect(a.dom_object_prefix).toBe(`crawl/test/ws/${a.id}/`);
+    // R1: every delivery stores under its OWN run id, and the committed row names the winner's prefix.
+    expect(a.dom_object_prefix).toMatch(new RegExp(`^crawl/test/ws/${a.id}/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}/$`));
     expect((await audits(wsB)).length).toBe(0);
   });
 
@@ -255,6 +258,106 @@ describe("KAD-06 · crawl.audit holds no transaction and no connection across a 
     const rows = await findings();
     expect(rows.length).toBeGreaterThan(0);
     for (const r of rows) expect(r.occurrence_count, `${r.rule_code} counted once`).toBe(1);
+    // S2: each delivery stored a manifest under its own run prefix; exactly one of them is the committed audit's
+    const [a] = await audits();
+    const manifests = putKeys.filter((k) => k.endsWith("/manifest.json")).map((k) => `crawl/test/ws/${k}`);
+    expect(new Set(manifests).size).toBe(2);
+    expect(manifests.filter((k) => k.startsWith(a.dom_object_prefix))).toHaveLength(1);
+  });
+
+  // A store where the LAST writer of a key wins, as an object store does. Each call to `lww()` shares one backing map.
+  const lww = (): { objects: Map<string, Buffer>; store: NonNullable<CrawlAuditDeps["store"]> } => {
+    const objects = new Map<string, Buffer>();
+    return { objects, store: async (relative, body) => { objects.set(`crawl/test/ws/${relative}`, body); return `crawl/test/ws/${relative}`; } };
+  };
+
+  it("R1 · a duplicate delivery that finishes its run AFTER the winner committed cannot overwrite the winner's stored copies or manifest", async () => {
+    const { objects, store } = lww();
+    const auditId = randomUUID();
+    const job = signedJob(wsA, projA, auditId);
+    const bodyOf = (tag: string): Record<string, string> => ({ ...BODY, "/": `<html>delivery ${tag}</html>` });
+    const serving = (tag: string, gatePage?: Promise<void>): CrawlAuditDeps =>
+      deps({
+        store,
+        fetch: async (url) => {
+          const path = new URL(url).pathname;
+          if (path === "/" && gatePage !== undefined) await gatePage;
+          const hit = bodyOf(tag)[path];
+          return hit === undefined ? { status: 404, headers: {}, body: Buffer.from(""), finalUrl: url } : { status: 200, headers: {}, body: Buffer.from(hit), finalUrl: url };
+        },
+      });
+    let releaseLoser!: () => void;
+    const loserGate = new Promise<void>((resolve) => (releaseLoser = resolve));
+    const winner = processor(serving("winner"))(job);
+    const loser = processor(serving("loser", loserGate))(job);
+    await winner; // the winner commits while the loser is still inside `run`...
+    releaseLoser(); // ...and only then does the loser finish its run, writing its copies and manifest LAST
+    await loser;
+
+    const [a] = await audits();
+    expect(await audits()).toHaveLength(1);
+    const manifest = JSON.parse(objects.get(`${a.dom_object_prefix}manifest.json`)!.toString("utf8")) as { pages: { url: string; raw?: { object_key: string; sha256: string } }[] };
+    const home = manifest.pages.find((p) => p.url === "https://acme.com/")!;
+    // the manifest at the committed prefix is the WINNER's: it names the winner's bytes, and those bytes are what is stored under it
+    expect(home.raw!.sha256).toBe(createHash("sha256").update("<html>delivery winner</html>").digest("hex"));
+    expect(home.raw!.object_key.startsWith(a.dom_object_prefix)).toBe(true);
+    expect(gunzipSync(objects.get(home.raw!.object_key)!).toString("utf8")).toBe("<html>delivery winner</html>");
+    // S2: exactly one manifest lives under the committed prefix; the loser's is an orphan under a prefix of its own
+    const manifests = [...objects.keys()].filter((k) => k.endsWith("/manifest.json"));
+    expect(manifests).toHaveLength(2);
+    expect(manifests.filter((k) => k.startsWith(a.dom_object_prefix))).toHaveLength(1);
+  });
+
+  it("S1 · a project soft-deleted while the crawl ran gets NO audit and NO finding written (commit re-checks and locks the project)", async () => {
+    const body = { ...BODY };
+    delete body["/llms.txt"];
+    let deleted = false;
+    await processor(
+      deps({
+        fetch: async (url) => {
+          if (!deleted) {
+            deleted = true;
+            await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [projA]);
+          }
+          const hit = body[new URL(url).pathname];
+          return hit === undefined ? { status: 404, headers: {}, body: Buffer.from(""), finalUrl: url } : { status: 200, headers: {}, body: Buffer.from(hit), finalUrl: url };
+        },
+      }),
+    )(signedJob(wsA, projA));
+    expect(deleted).toBe(true);
+    expect(await audits()).toEqual([]);
+    expect(await findings()).toEqual([]);
+    expect(counters.filter((c) => c.name === "nominara_aux_crawl_commit_total").map((c) => c.labels.outcome)).toEqual(["project_gone"]);
+  });
+
+  it("S1 · two audits of ONE project reconcile one after the other: the second commit redetects the first's finding instead of failing on the fingerprint", async () => {
+    const body = { ...BODY };
+    delete body["/llms.txt"];
+    // A finding insert takes 600 ms, so without a lock the second commit has read "no findings yet" before the first one's lands.
+    await db.query(`CREATE OR REPLACE FUNCTION slow_findings() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.6); RETURN NEW; END $$`);
+    await db.query("CREATE TRIGGER slow_findings BEFORE INSERT ON aux_findings FOR EACH ROW EXECUTE FUNCTION slow_findings()");
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      let arrived = 0;
+      const gated = deps({
+        fetch: async (url) => {
+          if (new URL(url).pathname === "/robots.txt") {
+            arrived += 1;
+            if (arrived === 2) release();
+            await gate;
+          }
+          const hit = body[new URL(url).pathname];
+          return hit === undefined ? { status: 404, headers: {}, body: Buffer.from(""), finalUrl: url } : { status: 200, headers: {}, body: Buffer.from(hit), finalUrl: url };
+        },
+      });
+      await Promise.all([processor(gated)(signedJob(wsA, projA)), processor(gated)(signedJob(wsA, projA))]);
+      expect(await audits()).toHaveLength(2);
+      const missing = (await db.query("SELECT occurrence_count FROM aux_findings WHERE rule_code = 'AUX-R-004'")).rows;
+      expect(missing).toEqual([{ occurrence_count: 2 }]);
+    } finally {
+      await db.query("DROP TRIGGER slow_findings ON aux_findings");
+    }
   });
 
   it("a run that throws leaves NO audit row (no orphan 'running'), no connection, and the retry completes", async () => {

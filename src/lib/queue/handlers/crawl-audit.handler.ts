@@ -31,6 +31,7 @@ import { sanitiseText } from "../../aux/sanitise.js";
 import { AI_CRAWLER_AGENTS, evaluateSiteFiles, type SiteFile } from "../../aux/site-files.js";
 import { collectSitemap, MAX_SITEMAP_FILES, SitemapFetchSkipped, type SitemapResult } from "../../aux/sitemap.js";
 import { guardedFetch, type GuardedFetchInit, type GuardedResponse } from "../../net/guarded-fetch.js";
+import { uuidV7 } from "../../ids/uuidv7.js";
 import { toRegistrableDomain } from "../../net/registrable-domain.js";
 import { auxScore, type AuxCountedFinding } from "../../scoring/aux.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
@@ -71,9 +72,13 @@ import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-facto
 // at-least-once delivery moved with the write: `prepare` skips an audit that already finished (no request is made for it), and
 // `commit` claims the audit row with `INSERT ... ON CONFLICT (id) DO NOTHING`, then locks it and writes nothing when another
 // delivery finished it first, so two deliveries racing through `run` leave one audit and each finding counted once. A job that
-// fails in `run` leaves no row at all (it never inserted one); stored page copies are keyed under the audit id, so a retry
-// overwrites them, and what a job that exhausts its retries leaves behind is orphaned objects under crawl/{env}/{workspace_id}/
-// {audit_id}/ with no row pointing at them: a retention sweep by prefix owns that, and no tenant data is exposed by it.
+// fails in `run` leaves no row at all (it never inserted one). Every DELIVERY mints its own run id in `prepare` and stores everything
+// under crawl/{env}/{workspace_id}/{audit_id}/{run_id}/, so a duplicate delivery cannot overwrite the winner's stored copies or
+// manifest: the winning `commit` records ITS prefix in `dom_object_prefix`, and every other prefix (a losing duplicate, a retry's
+// earlier attempt, a run that outlived a project's deletion) is an orphan with no row pointing at it. There is NO sweep for orphans:
+// the bound is the crawl/ lifecycle rule in system-architecture.md's retention table (nominara-infra, STORY-003, not built), and until
+// that lands orphans are unbounded (ADR-0003). `commit` first re-checks and locks the project, writing nothing for one that was
+// soft-deleted during `run`, and serialising the reconciliation of two audits of one project.
 // The wall-clock budget (CRAWL_WALL_CLOCK_BUDGET_MS) still bounds how long a worker SLOT is held, and the declared Crawl-delay is
 // honoured up to MAX_HONOURED_CRAWL_DELAY_MS (politeness.ts); both numbers are NOT FROM THE REFERENCE.
 
@@ -211,6 +216,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     readonly pageCap: number;
     readonly startedAt: Date;
     readonly startedMs: number;
+    /** Minted per DELIVERY: every object this delivery stores lies under {audit_id}/{run_id}/, so a duplicate cannot overwrite the winner's. */
+    readonly runId: string;
     readonly evidence: { readonly citations: string[]; readonly tasks: string[] };
     readonly store: StoreFn;
   }
@@ -305,6 +312,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       pageCap: deps.pageCap ?? pageCapForPlan(planKey),
       startedAt,
       startedMs,
+      runId: uuidV7(),
       evidence,
       // Bound to THIS workspace here, inside the tenant context; the writer works later with no context and no transaction.
       store: deps.store ?? bindDefaultStore(context, deps.storagePort),
@@ -330,7 +338,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
   }
 
   async function fetchPhase(prepared: Prepared): Promise<Outcome> {
-    const { payload, rootUrl, origin, scope, pageCap, evidence, store } = prepared;
+    const { payload, rootUrl, origin, scope, pageCap, evidence, store, runId } = prepared;
     const siteFileInit = onSite(origin);
     const urls = {
       robots: new URL("/robots.txt", origin).href,
@@ -440,7 +448,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // RFC 9309: a robots.txt that errored (5xx, unreachable) means "assume disallow"; a 4xx means "no rules".
     const robotsForCrawl: ParsedRobots | "unavailable" | null =
       parsedRobots !== null ? parsedRobots : robots.responded && robots.status >= 400 && robots.status < 500 ? null : "unavailable";
-    const keyPrefix = payload.auditId;
+    const keyPrefix = `${payload.auditId}/${runId}`;
     const crawl = await crawlPages(pagesToCrawl, {
       rootUrl,
       budget,
@@ -600,6 +608,15 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
    */
   async function commit(tx: ClientBase, prepared: Prepared, outcome: Outcome): Promise<void> {
     const { payload, origin, scope, startedAt, startedMs } = prepared;
+    // Re-check and LOCK the project first. `run` held no transaction, so the project may have been soft-deleted since `prepare`: write
+    // nothing for it. FOR NO KEY UPDATE also serialises the reconciliation of two audits of one project (the second waits here, then
+    // reads the first's findings) and does not block the foreign-key share locks other writers take on the project.
+    const project = await tx.query("SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE", [payload.projectId]);
+    if (project.rows.length === 0) {
+      incrementCounter("nominara_aux_crawl_commit_total", { outcome: "project_gone" });
+      logger.log(`project ${payload.projectId} was deleted during audit ${payload.auditId}; writing nothing`);
+      return;
+    }
     const claimed = await claimAudit(tx, prepared, outcome);
     if (!claimed) {
       incrementCounter("nominara_aux_crawl_commit_total", { outcome: "duplicate" });

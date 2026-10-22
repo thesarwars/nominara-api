@@ -314,7 +314,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     const [a] = await audits();
     const key = [...stored.keys()].find((k) => k.endsWith("manifest.json"))!;
     expect(key).toBeDefined();
-    expect(a.dom_object_prefix).toBe(`crawl/test/ws/${a.id}/`);
+    expect(a.dom_object_prefix).toMatch(new RegExp(`^crawl/test/ws/${a.id}/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}/$`)); // {audit}/{run}/ (ADR-0003, R1)
     return crawlManifestSchema.parse(JSON.parse(stored.get(key)!.toString("utf8")));
   };
 
