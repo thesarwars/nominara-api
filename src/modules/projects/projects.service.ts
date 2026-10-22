@@ -139,8 +139,24 @@ export class ProjectsService {
       throw error;
     }
 
+    const projectId = uuidV7();
+
+    // STORY-077 review round 4 — SUPPLIED PROMPTS ARE INSERTED `active`, so a creation that carries them is a door into
+    // `active` and is held to the rule a resume is (active-limit.ts): after a cut-over that paused prompts for
+    // `prompts.max_total`, a new project's prompts would otherwise put the workspace back above its plan. Counted after
+    // the same hash dedupe the insert applies, so a repeated prompt is not refused for a slot it never takes. The
+    // workspace lock is taken first, as on every other door, and only when there is something to count: a creation
+    // without prompts waits on nothing.
+    //
+    // Review round 5 — and EVERY limit this creation checks is resolved AFTER that lock, from the committed version
+    // (`resolveForWorkspace`), never the version the guard pinned when the request started. A creation that waited on
+    // the lock while a cut-over lowered the plan would otherwise count the post-cut-over actives against the OLD plan's
+    // `prompts.max_total` and `prompts.max_per_project` and insert above the plan, with nothing left to re-pause it.
+    const supplied = distinctSuppliedPrompts(workspaceId, projectId, input);
+    if (supplied.length > 0) await lockWorkspaceForActivation(client as ClientBase, workspaceId);
+
     const resolved =
-      entitlementVersion === undefined
+      entitlementVersion === undefined || supplied.length > 0
         ? await this.entitlements.resolveForWorkspace(workspaceId)
         : await this.entitlements.resolve(workspaceId, entitlementVersion);
 
@@ -163,17 +179,7 @@ export class ProjectsService {
     // STORY-043 AC2), mapped onto what projects.cadence allows.
     const startingCadence = startingCadenceFor(resolved.entitlements["scan.cadence"]?.value);
 
-    const projectId = uuidV7();
-
-    // STORY-077 review round 4 — SUPPLIED PROMPTS ARE INSERTED `active`, so a creation that carries them is a door into
-    // `active` and is held to the rule a resume is (active-limit.ts): after a cut-over that paused prompts for
-    // `prompts.max_total`, a new project's prompts would otherwise put the workspace back above its plan. Counted after
-    // the same hash dedupe the insert applies, so a repeated prompt is not refused for a slot it never takes. The
-    // workspace lock is taken first, as on every other door, and only when there is something to count: a creation
-    // without prompts waits on nothing.
-    const supplied = distinctSuppliedPrompts(workspaceId, projectId, input);
     if (supplied.length > 0) {
-      await lockWorkspaceForActivation(client as ClientBase, workspaceId);
       await assertActiveWithinLimits(client, { workspaceId, projectId, becomingActive: supplied.length, entitlements: resolved.entitlements });
     }
 
