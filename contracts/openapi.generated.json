@@ -32282,11 +32282,25 @@
                               "metric": {
                                 "type": "string",
                                 "enum": [
-                                  "visibility_score"
+                                  "visibility_score",
+                                  "citation_share",
+                                  "rendering_quality",
+                                  "sentiment_score",
+                                  "presence_rate"
                                 ]
                               },
                               "target_value": {
                                 "type": "number"
+                              },
+                              "direction": {
+                                "type": "string",
+                                "enum": [
+                                  "up",
+                                  "down"
+                                ]
+                              },
+                              "engine_key": {
+                                "type": "string"
                               },
                               "prompt_cluster_id": {
                                 "type": "string",
@@ -32816,11 +32830,25 @@
                             "metric": {
                               "type": "string",
                               "enum": [
-                                "visibility_score"
+                                "visibility_score",
+                                "citation_share",
+                                "rendering_quality",
+                                "sentiment_score",
+                                "presence_rate"
                               ]
                             },
                             "target_value": {
                               "type": "number"
+                            },
+                            "direction": {
+                              "type": "string",
+                              "enum": [
+                                "up",
+                                "down"
+                              ]
+                            },
+                            "engine_key": {
+                              "type": "string"
                             },
                             "prompt_cluster_id": {
                               "type": "string",
@@ -33265,8 +33293,12 @@
                   "kind": {
                     "type": "string",
                     "enum": [
+                      "prompt_recommendation",
                       "engine_score",
-                      "topic_authority"
+                      "topic_authority",
+                      "citation_presence",
+                      "rendering_quality",
+                      "sentiment_recovery"
                     ]
                   },
                   "target": {
@@ -33275,13 +33307,21 @@
                       "metric": {
                         "type": "string",
                         "enum": [
-                          "visibility_score"
+                          "visibility_score",
+                          "citation_share",
+                          "rendering_quality",
+                          "sentiment_score",
+                          "presence_rate"
                         ]
                       },
                       "target_value": {
                         "type": "number",
                         "minimum": 0,
                         "maximum": 100
+                      },
+                      "engine_key": {
+                        "type": "string",
+                        "pattern": "^[a-z0-9_]{1,64}$"
                       },
                       "prompt_cluster_id": {
                         "type": "string",
@@ -33357,11 +33397,25 @@
                             "metric": {
                               "type": "string",
                               "enum": [
-                                "visibility_score"
+                                "visibility_score",
+                                "citation_share",
+                                "rendering_quality",
+                                "sentiment_score",
+                                "presence_rate"
                               ]
                             },
                             "target_value": {
                               "type": "number"
+                            },
+                            "direction": {
+                              "type": "string",
+                              "enum": [
+                                "up",
+                                "down"
+                              ]
+                            },
+                            "engine_key": {
+                              "type": "string"
                             },
                             "prompt_cluster_id": {
                               "type": "string",
