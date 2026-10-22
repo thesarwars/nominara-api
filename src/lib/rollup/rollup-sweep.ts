@@ -5,7 +5,7 @@ import type { EnqueueRollup } from "../queue/handlers/run-rollup-request.js";
 import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { measurementStatusSql } from "./aggregate-day.js";
-import { RollupDirtySet, type DirtyEntry } from "./dirty-dates.js";
+import { RollupDirtySet, type PeekedDirtyEntry } from "./dirty-dates.js";
 
 // STORY-042 AC2 + AC6 — the rollup worker's two sweeps, modelled on SchedulerSweepRuntime (src/lib/capture/scheduler-sweep.ts).
 //
@@ -15,14 +15,20 @@ import { RollupDirtySet, type DirtyEntry } from "./dirty-dates.js";
 // across every workspace on the OWNER connection and enqueues ONE SIGNED job per project and date, each carrying its own
 // workspace. It never writes tenant data itself.
 //
-// ONE TICK EVERY 15 MINUTES (ci-cd-and-environments.md: dirty-date reprocess "every 15 min, backlog depth"), serving both:
+// A TICK EVERY 5 MINUTES; the two sweeps run on different phases of it:
 //
-//   CLOSED-DAY (EC-11): the closed day of a project whose WORKSPACE-LOCAL clock has passed 00:20, that has measured cells
-//   on that day and no `metric_daily` row computed after that 00:20. Keyed `rollup:{project}:closed:{date}`. The 20 minutes
-//   are settling time for late cells of the day; a row written inside them does not count as the closed-day rollup.
+//   CLOSED-DAY (EC-11): on the :05/:20/:35/:50 ticks only. Every real timezone offset is a multiple of 15 minutes, so
+//   00:20 workspace-local falls on one of those ticks in every zone and the closed day runs AT 00:20, not at the next
+//   quarter hour. It targets the closed day of a project whose WORKSPACE-LOCAL clock has passed 00:20, that has measured
+//   cells on that day and no `metric_daily` row computed after that 00:20. Keyed `rollup:{project}:closed:{date}`. The 20
+//   minutes are settling time for late cells of the day; a row written inside them does not count as the closed-day rollup.
+//   It only ever looks at yesterday: an older day nobody rolled up is reached by a late-fact mark or by the
+//   `rollup:rebuild` CLI (the runbook's recovery step after a rollup-group outage longer than a day).
 //
-//   DIRTY-DATE (EC-12): the entries a late fact left in the `rollup_dirty` set. Keyed per project, date and 15-minute
-//   window. An entry is removed only AFTER its job is enqueued, so a crash re-enqueues (idempotent) and never loses a mark.
+//   DIRTY-DATE (EC-12): on every tick, the entries a late fact left in the `rollup_dirty` set. The wait from a mark to its
+//   enqueue is at most one tick (5 minutes), so the 15-minute objective keeps ten minutes for the queue and the run. Keyed
+//   per project, date and mark VERSION. An entry is removed only AFTER its job is enqueued, and only if it was not
+//   re-marked meanwhile, so neither a crash nor a concurrent late fact loses a mark.
 //
 // Several replicas all tick; the keys make that safe. A failed enqueue is counted, logged with ids, and reported as
 // `partial` — never silent; the entry (or the still-unrolled day) is simply found again next tick.
@@ -32,7 +38,9 @@ import { RollupDirtySet, type DirtyEntry } from "./dirty-dates.js";
 const logger = new Logger("rollup.sweep");
 const tracer = trace.getTracer("nominara-api");
 
-const QUARTER_MS = 15 * 60 * 1000;
+const SWEEP_STEP_MS = 5 * 60 * 1000;
+/** The closed-day sweep runs on the ticks whose minute is :05 within its quarter hour (:05/:20/:35/:50). */
+const CLOSED_DAY_PHASE_MINUTE = 5;
 /** EC-11 / ci-cd-and-environments.md: the daily rollup for a date runs at 00:20 workspace-local. */
 export const CLOSED_DAY_GRACE_MINUTES = 20;
 /** One tick's bound on closed-day projects; an unrolled backlog drains as jobs complete. */
@@ -70,15 +78,27 @@ export function closedDayJobKey(projectId: string, metricDate: string): string {
   return `rollup:${projectId}:closed:${metricDate}`;
 }
 
-/** One key per project, date and 15-minute window: replicas ticking the same window ask for the same job. */
-export function dirtyDateJobKey(projectId: string, metricDate: string, now: Date): string {
-  const window = new Date(Math.floor(now.getTime() / QUARTER_MS) * QUARTER_MS).toISOString();
-  return `rollup:${projectId}:dirty:${metricDate}:${window}`;
+/**
+ * One key per project, date and mark version: replicas that read the same mark ask for the same job, and a NEWER mark is a
+ * new job — BullMQ's dedup (kept for the completed-job retention window) cannot hand it back onto the job that missed it.
+ */
+export function dirtyDateJobKey(projectId: string, metricDate: string, version: number): string {
+  return `rollup:${projectId}:dirty:${metricDate}:${version}`;
 }
 
-/** The next :00/:15/:30/:45 UTC strictly after `now`. */
+/** The next 5-minute boundary strictly after `now`. */
 export function nextRollupSweepAfter(now: Date): Date {
-  return new Date((Math.floor(now.getTime() / QUARTER_MS) + 1) * QUARTER_MS);
+  return new Date((Math.floor(now.getTime() / SWEEP_STEP_MS) + 1) * SWEEP_STEP_MS);
+}
+
+/** The tick a timer that fired a hair early or late was aiming for. */
+function sweepSlot(now: Date): Date {
+  return new Date(Math.round(now.getTime() / SWEEP_STEP_MS) * SWEEP_STEP_MS);
+}
+
+/** Whether the closed-day sweep runs on this tick: only :05/:20/:35/:50, so 00:20 workspace-local is always a due tick. */
+export function closedDaySweepDue(now: Date): boolean {
+  return sweepSlot(now).getUTCMinutes() % 15 === CLOSED_DAY_PHASE_MINUTE;
 }
 
 function withTimeout<T>(fn: () => Promise<T>, ms: number, what = "the enqueue"): Promise<T> {
@@ -189,7 +209,7 @@ async function enqueueAll<T extends { workspaceId: string; projectId: string; me
 function finish(sweep: "closed_day" | "dirty_date", found: number, enqueued: number, failed: number): RollupSweepResult {
   const status = failed === 0 ? "complete" : "partial";
   incrementCounter("nominara_rollup_sweep_runs_total", { sweep, status });
-  // `found` is the backlog depth (ci-cd-and-environments.md: dirty-date reprocess "every 15 min, backlog depth").
+  // `found` is the backlog depth (ci-cd-and-environments.md: dirty-date reprocess, backlog depth).
   logger.log({ event: `rollup.sweep.${sweep}`, status, found, enqueued, failed });
   return { status, found, enqueued, failed };
 }
@@ -205,22 +225,27 @@ export async function runClosedDaySweep(client: ClientBase, enqueue: EnqueueRoll
   return finish("closed_day", targets.length, enqueued, failed);
 }
 
-/** AC6 — one tick of the dirty-date sweep. An entry leaves the set only once its job is enqueued. */
-export async function runDirtyDateSweep(set: RollupDirtySet, enqueue: EnqueueRollup, now: Date): Promise<RollupSweepResult> {
+/** AC6 — one tick of the dirty-date sweep. An entry leaves the set only once its job is enqueued, and only if it was not re-marked since it was read. */
+export async function runDirtyDateSweep(set: RollupDirtySet, enqueue: EnqueueRollup, _now: Date): Promise<RollupSweepResult> {
   const { entries, malformed } = await set.peek();
   if (malformed > 0) {
     incrementCounter("nominara_rollup_dirty_malformed_total");
     logger.warn({ event: "rollup.sweep.dirty_malformed_dropped", count: malformed });
   }
-  const { enqueued, failed } = await enqueueAll<DirtyEntry>(
+  const { enqueued, failed } = await enqueueAll<PeekedDirtyEntry>(
     "dirty_date",
     entries,
     enqueue,
     (e) => ({
       payload: { projectId: e.projectId, metricDate: e.metricDate, reason: "dirty_date" },
-      key: dirtyDateJobKey(e.projectId, e.metricDate, now),
+      key: dirtyDateJobKey(e.projectId, e.metricDate, e.version),
     }),
-    (e) => set.clear([e]),
+    async (e) => {
+      if ((await set.clear([e])) === 0) {
+        incrementCounter("nominara_rollup_dirty_remarked_total");
+        logger.log({ event: "rollup.sweep.dirty_remarked", workspace_id: e.workspaceId, project_id: e.projectId, metric_date: e.metricDate });
+      }
+    },
   );
   return finish("dirty_date", entries.length, enqueued, failed);
 }
@@ -238,7 +263,7 @@ export interface RollupSweepRuntimeOptions {
 }
 
 /**
- * The in-process timer the rollup worker owns: sleeps to the next quarter hour, ticks, re-arms. Best-effort — an outage
+ * The in-process timer the rollup worker owns: sleeps to the next 5-minute boundary, ticks, re-arms. Best-effort — an outage
  * skips this tick and the next one retries; it never crashes the worker. The two sweeps are independent: a database
  * outage does not stop dirty dates being reprocessed, and a Valkey outage does not stop the closed day.
  */
@@ -257,11 +282,13 @@ export class RollupSweepRuntime {
     return this.running;
   }
 
+  /** `closedDay` is null when it was not due on this tick or it failed (the `failed` run counter tells the two apart). */
   async tick(): Promise<{ closedDay: RollupSweepResult | null; dirtyDate: RollupSweepResult | null }> {
     return tracer.startActiveSpan("rollup.sweep.tick", async (span) => {
       try {
-        const now = this.clock();
-        const closedDay = await this.closedDayTick(now);
+        // The slot, not the raw clock: a timer that fires 1 ms before :20 must still be the :20 tick, or 00:20 is missed.
+        const now = sweepSlot(this.clock());
+        const closedDay = closedDaySweepDue(now) ? await this.closedDayTick(now) : null;
         const dirtyDate = await withTimeout(() => runDirtyDateSweep(this.options.dirty, this.options.enqueue, now), this.sweepTimeoutMs, "the dirty-date sweep").catch((error: unknown) => {
           incrementCounter("nominara_rollup_sweep_runs_total", { sweep: "dirty_date", status: "failed" });
           logger.error({ event: "rollup.sweep.dirty_failed", error: error instanceof Error ? error.name : "unknown" });

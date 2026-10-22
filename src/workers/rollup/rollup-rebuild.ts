@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ClientBase, PoolClient } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { createPgPool } from "../../db/pg-pool.js";
+import { isRealIsoDate } from "../../lib/rollup/iso-date.js";
 import { createQueueReaderConnection, queueKeyPrefix } from "../../lib/queue/connection.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { signingKeysFromEnv } from "../../lib/queue/worker-factory.js";
@@ -26,7 +28,8 @@ import { withTenantContext } from "../../tenancy/tenant-context.js";
 // deleted), appends a hash-chained audit row naming operator and ticket, and COMMITS; only then does it enqueue ONE signed
 // range job on `rollup.metric_daily`, whose handler (Scenario 11) rebuilds every date with facts in the range. The audit
 // row therefore exists even if the enqueue fails (exit 1): the attempt is on the record. No transaction is held across
-// the queue call. The handler is idempotent (upserts), so re-running the same command is safe and asks for the same key.
+// the queue call. The handler is idempotent (upserts), so re-running the same command is safe — and it IS a second job
+// (the key carries a per-invocation nonce), because a re-run exists to pick up facts the first one predates.
 //
 // Usage:
 //   pnpm rollup:rebuild --workspace <uuid> --project <uuid> --from YYYY-MM-DD --to YYYY-MM-DD \
@@ -56,12 +59,6 @@ export class RollupRebuildProjectNotFoundError extends Error {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-const DATE = /^\d{4}-\d{2}-\d{2}$/u;
-
-function validDate(value: string): boolean {
-  return DATE.test(value) && new Date(`${value}T00:00:00Z`).toISOString().startsWith(value);
-}
-
 /** Exported so every refusal is testable without a database. EVERY flag is mandatory: a rebuild nobody can attribute is the thing the audit row exists to prevent. */
 export function parseRollupRebuildArgs(argv: readonly string[]): RollupRebuildArgs {
   const flags = new Map<string, string>();
@@ -83,15 +80,19 @@ export function parseRollupRebuildArgs(argv: readonly string[]): RollupRebuildAr
   const toDate = flags.get("to")!;
   if (!UUID.test(workspaceId)) throw new RollupRebuildUsageError(`--workspace must be a uuid, got ${workspaceId}`);
   if (!UUID.test(projectId)) throw new RollupRebuildUsageError(`--project must be a uuid, got ${projectId}`);
-  if (!validDate(fromDate)) throw new RollupRebuildUsageError(`--from must be a real YYYY-MM-DD date, got ${fromDate}`);
-  if (!validDate(toDate)) throw new RollupRebuildUsageError(`--to must be a real YYYY-MM-DD date, got ${toDate}`);
+  if (!isRealIsoDate(fromDate)) throw new RollupRebuildUsageError(`--from must be a real YYYY-MM-DD date, got ${fromDate}`);
+  if (!isRealIsoDate(toDate)) throw new RollupRebuildUsageError(`--to must be a real YYYY-MM-DD date, got ${toDate}`);
   if (fromDate > toDate) throw new RollupRebuildUsageError(`--from ${fromDate} is after --to ${toDate}`);
   return { workspaceId, projectId, fromDate, toDate, operator: flags.get("operator")!, ticket: flags.get("ticket")! };
 }
 
-/** One key per project, range and ticket: running the same command again is not a second rebuild. */
-export function rebuildJobKey(projectId: string, fromDate: string, toDate: string, ticket: string): string {
-  return `rollup:${projectId}:rebuild:${fromDate}:${toDate}:${ticket}`;
+/**
+ * One key per INVOCATION (project, range, ticket and a nonce). A re-run is deliberately not deduplicated: BullMQ keeps a
+ * deduplication key for the completed-job retention window, so a re-run after a re-parse finished would otherwise print
+ * "requested" and rebuild nothing. The handler upserts, so a second rebuild is safe.
+ */
+export function rebuildJobKey(projectId: string, fromDate: string, toDate: string, ticket: string, nonce: string): string {
+  return `rollup:${projectId}:rebuild:${fromDate}:${toDate}:${ticket}:${nonce}`;
 }
 
 export type RebuildEnqueue = (queue: "rollup.metric_daily", workspaceId: string, payload: Record<string, unknown>, idempotencyKey: string) => Promise<unknown>;
@@ -100,6 +101,8 @@ export interface RollupRebuildDeps {
   /** A connection to run the tenant-context transaction on (a pooled client in production). */
   readonly client: PoolClient | ClientBase;
   readonly enqueue: RebuildEnqueue;
+  /** One per invocation; injectable so a test can name the key. */
+  readonly nonce?: () => string;
 }
 
 export async function runRollupRebuild(args: RollupRebuildArgs, deps: RollupRebuildDeps, log: (line: string) => void = console.log): Promise<void> {
@@ -130,7 +133,7 @@ export async function runRollupRebuild(args: RollupRebuildArgs, deps: RollupRebu
     "rollup.metric_daily",
     args.workspaceId,
     { projectId: args.projectId, fromDate: args.fromDate, toDate: args.toDate, reason: "rebuild" },
-    rebuildJobKey(args.projectId, args.fromDate, args.toDate, args.ticket),
+    rebuildJobKey(args.projectId, args.fromDate, args.toDate, args.ticket, (deps.nonce ?? randomUUID)()),
   );
   incrementCounter("nominara_rollup_rebuild_requested_total");
   log(`rebuild of project ${args.projectId} ${args.fromDate}..${args.toDate} requested (ticket ${args.ticket}); workspace ${args.workspaceId}`);

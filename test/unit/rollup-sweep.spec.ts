@@ -51,9 +51,9 @@ class FakeRedis implements DirtySetRedis {
     for (const m of members) if (this.scores.delete(m)) removed += 1;
     return removed;
   }
-  async zrange(_key: string, _start: number, stop: number, _withScores: "WITHSCORES"): Promise<string[]> {
+  async zrange(_key: string, _start: number, stop: string, _withScores: "WITHSCORES"): Promise<string[]> {
     if (this.failRead) throw new Error("valkey down");
-    const ordered = [...this.scores].sort((a, b) => a[1] - b[1]).slice(0, stop + 1);
+    const ordered = [...this.scores].sort((a, b) => a[1] - b[1]).slice(0, Number(stop) + 1);
     return ordered.flatMap(([member, score]) => [member, String(score)]);
   }
 }

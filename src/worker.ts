@@ -77,7 +77,7 @@ export const ROLLUP_MONITOR_RUNTIME = "ROLLUP_MONITOR_RUNTIME";
 /** NEW-A-13 — DI token for the capture group's scheduler sweep (hourly at :05 UTC). Capture group only. */
 export const CAPTURE_SCHEDULER_SWEEP = "CAPTURE_SCHEDULER_SWEEP";
 
-/** STORY-042 — DI token for the rollup group's closed-day and dirty-date sweep (every 15 minutes). Rollup group only. */
+/** STORY-042 — DI token for the rollup group's closed-day and dirty-date sweep (a tick every 5 minutes). Rollup group only. */
 export const ROLLUP_SWEEP_RUNTIME = "ROLLUP_SWEEP_RUNTIME";
 
 class WorkerGroupRuntime implements OnModuleDestroy {
@@ -442,7 +442,7 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   }
 
   // STORY-042 AC2/AC6 — the closed-day (00:20 workspace-local) and dirty-date sweep, in-process in the rollup group, every
-  // 15 minutes. It enqueues signed `rollup.metric_daily` jobs (consumed by this same group) through the group's shared
+  // 5 minutes. It enqueues signed `rollup.metric_daily` jobs (consumed by this same group) through the group's shared
   // producer-side connection, reads projects on the OWNER connection (it must see across tenants) and keeps the dirty set on
   // the QUEUE instance (noeviction, persistent) over its own always-reconnecting connection.
   if (env.WORKER_GROUP === "rollup") {
