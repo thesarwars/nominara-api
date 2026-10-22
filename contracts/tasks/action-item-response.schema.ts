@@ -10,9 +10,12 @@ import { z } from "zod";
 // Deduplicated across projects when the same rule code and affected URL
 // recur, collapsing into one row with a project-count badge."
 //
-// The cross-project dedup half of FR-GD-02 is DEFERRED — see
-// tasks.service.ts's listActionItems for why. This schema carries no
-// project-count field because of that; adding one later is additive.
+// STORY-064 AC10 — the dedup half of FR-GD-02. Tasks sharing a rule code AND an
+// affected URL across projects collapse into ONE row: the highest-impact task is
+// the row, `project_count` counts the projects it stands for and `projects` names
+// them. A task with no code or no URL never collapses (`project_count` 1). Only
+// projects the caller can read are counted, so the badge cannot reveal a project
+// outside a scoped role's reach.
 //
 // `tasks` HAS NO SEVERITY COLUMN (schemas/tasks-and-goals.md: `priority` is
 // a 1-5 ranking, not a severity). The only two derivations the spec names
@@ -87,6 +90,12 @@ export const actionItemPrimaryActionSchema = z
   })
   .strict();
 
+/** One project a collapsed queue row stands for. */
+export const actionItemProjectSchema = z
+  .object({ id: z.string().uuid(), name: z.string(), slug: z.string() })
+  .strict();
+export type ActionItemProject = z.infer<typeof actionItemProjectSchema>;
+
 export const actionItemSchema = z
   .object({
     id: z.string().uuid(),
@@ -106,6 +115,10 @@ export const actionItemSchema = z
     effort: actionItemEffortSchema.nullable(),
     primary_action: actionItemPrimaryActionSchema,
     created_at: z.string(),
+    /** >= 1. 1 is an uncollapsed row; more is the number of readable projects sharing this rule code and affected URL. */
+    project_count: z.number().int().min(1),
+    /** Every readable project the row stands for, the row's own project first, then by name. Length equals `project_count`. */
+    projects: z.array(actionItemProjectSchema).min(1),
   })
   .strict();
 

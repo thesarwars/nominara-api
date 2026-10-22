@@ -1082,6 +1082,8 @@ function toActionItem(row: ActionItemRow): ActionItem {
     effort: normalizeEffort(row.effort_band),
     primary_action: derivePrimaryAction(row),
     created_at: row.created_at.toISOString(),
+    project_count: 1,
+    projects: [{ id: row.project_id, name: row.project_name, slug: row.project_slug }],
   };
 }
 
