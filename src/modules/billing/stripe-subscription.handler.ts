@@ -190,7 +190,7 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     // limits are the resolved ones), in this same transaction. Only when what the workspace is entitled to MOVED (the
     // plan or the add-ons): a redelivery, or a phase-0 event while a downgrade is still pending, changes nothing here, and
     // a workspace that was already over its limits before this slice shipped is not paused by an unrelated event.
-    if (outcome.changed || addonOutcome.changed) await this.reconcilePause(tx, workspaceId, event.id, outcome.changed && outcome.from !== outcome.to, afterCommit);
+    if (outcome.changed || addonOutcome.changed) await this.reconcilePause(tx, workspaceId, event.id, { planChanged: outcome.changed && outcome.from !== outcome.to, addonsChanged: addonOutcome.changed }, afterCommit);
 
     // The charge this subscription was verified at is frozen on the row, so a
     // later catalog price change cannot turn it into a "mismatch". Only the
@@ -270,8 +270,14 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
    * downgrade paused once the limits allow it (oldest first), audits each, and emails the list AFTER the commit. The
    * same step `plan:set` runs (downgrade-pause-record.ts).
    */
-  private async reconcilePause(tx: StripeEventContext["tx"], workspaceId: string, eventId: string, planChanged: boolean, afterCommit: StripeEventContext["afterCommit"]): Promise<void> {
-    const notices = await reconcileAndRecordDowngradePause(tx, workspaceId, { requestId: eventId, operator: WEBHOOK_OPERATOR, planChanged });
+  private async reconcilePause(
+    tx: StripeEventContext["tx"],
+    workspaceId: string,
+    eventId: string,
+    moved: { readonly planChanged: boolean; readonly addonsChanged: boolean },
+    afterCommit: StripeEventContext["afterCommit"],
+  ): Promise<void> {
+    const notices = await reconcileAndRecordDowngradePause(tx, workspaceId, { requestId: eventId, operator: WEBHOOK_OPERATOR, ...moved });
     if (notices.length > 0) afterCommit.push(async () => await sendDowngradeNotices((message) => this.email.send(message), workspaceId, notices));
   }
 

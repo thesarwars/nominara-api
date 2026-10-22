@@ -24,8 +24,10 @@ export interface PauseProvenance {
   readonly requestId: string;
   /** "stripe-webhook" or the operator: `audit_log.actor_ua` is `operator:<this>`. */
   readonly operator: string;
-  /** The plan itself moved (false: only the add-ons changed). The email says which (review round 3). */
+  /** The plan itself moved. The email says what moved (review rounds 3 and 4). */
   readonly planChanged: boolean;
+  /** The add-ons moved (the webhook's `addonOutcome.changed`); plan:set never changes them. */
+  readonly addonsChanged: boolean;
 }
 
 /** Reconciles, audits and returns the emails to send after the commit (none when nothing moved). */
@@ -75,7 +77,7 @@ export async function reconcileAndRecordDowngradePause(tx: ClientBase, workspace
       }
       const plan = await tx.query<{ display_name: string }>("SELECT p.display_name FROM workspaces w JOIN plans p ON p.key = w.plan_key WHERE w.id = $1", [workspaceId]);
       const planName = plan.rows[0]?.display_name ?? null;
-      const change = { planName, planChanged: provenance.planChanged };
+      const change = { planName, planChanged: provenance.planChanged, addonsChanged: provenance.addonsChanged };
       return [downgradePausedEmail(contact, change, result.paused), downgradeResumedEmail(contact, change, result.resumed)].filter((m): m is EmailMessage => m !== null);
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });

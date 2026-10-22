@@ -16,19 +16,21 @@ const MAX_NAMED_PROMPTS = 50;
 
 const plural = (n: number, one: string, many: string): string => `${String(n)} ${n === 1 ? one : many}`;
 /**
- * What moved the limits. `planChanged` false: the plan stayed and only the add-ons changed (an add-on removed in the
- * billing portal, review round 3) - the copy must not claim the workspace moved plan.
+ * What moved the limits. The copy names only what actually moved (review rounds 3 and 4): the plan; else the add-ons (one
+ * removed in the billing portal); else neither - the reconcile also runs on a change of billing interval or a re-grant
+ * of the same plan - and then it says only that the limits changed, never that the plan or the add-ons did.
  */
 export interface LimitChange {
   /** The plan now held; null when the plan join missed. */
   readonly planName: string | null;
   readonly planChanged: boolean;
+  readonly addonsChanged: boolean;
 }
 
 /** The opening clause; a missing plan name (the plan join missed) names no plan rather than inventing one. */
 const openingOf = (change: LimitChange): string => {
-  if (!change.planChanged) return "Your workspace's add-ons changed";
-  return change.planName === null ? "Your workspace changed plan" : `Your workspace moved to the ${change.planName} plan`;
+  if (change.planChanged) return change.planName === null ? "Your workspace changed plan" : `Your workspace moved to the ${change.planName} plan`;
+  return change.addonsChanged ? "Your workspace's add-ons changed" : "Your workspace's limits changed";
 };
 
 /** The pause-list email, or null when nothing was paused. */
