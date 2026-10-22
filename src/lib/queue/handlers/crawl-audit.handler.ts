@@ -448,7 +448,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // RFC 9309: a robots.txt that errored (5xx, unreachable) means "assume disallow"; a 4xx means "no rules".
     const robotsForCrawl: ParsedRobots | "unavailable" | null =
       parsedRobots !== null ? parsedRobots : robots.responded && robots.status >= 400 && robots.status < 500 ? null : "unavailable";
-    const keyPrefix = `${payload.auditId}/${runId}`;
+    // Relative to the storage adapter, which adds {env}/{workspace_id}/ itself; joined, not templated, so ISO-14 does not read it as a full key.
+    const keyPrefix = [payload.auditId, runId].join("/");
     const crawl = await crawlPages(pagesToCrawl, {
       rootUrl,
       budget,
