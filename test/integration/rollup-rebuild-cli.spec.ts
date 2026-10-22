@@ -50,14 +50,14 @@ describe("STORY-042 AC10 · pnpm rollup:rebuild", () => {
   const args = () => ({ workspaceId, projectId, fromDate: "2026-09-01", toDate: "2026-09-30", operator: "ana", ticket: "OPS-42" });
 
   it("STORY-042 AC10 · enqueues ONE signed-range rebuild job for the project and writes an audit row naming operator and ticket", async () => {
-    await runRollupRebuild(args(), { client: db, enqueue });
+    await runRollupRebuild(args(), { client: db, enqueue, nonce: () => "n-1" });
 
     expect(calls).toEqual([
       {
         queue: "rollup.metric_daily",
         workspaceId,
         payload: { projectId, fromDate: "2026-09-01", toDate: "2026-09-30", reason: "rebuild" },
-        key: rebuildJobKey(projectId, "2026-09-01", "2026-09-30", "OPS-42"),
+        key: rebuildJobKey(projectId, "2026-09-01", "2026-09-30", "OPS-42", "n-1"),
       },
     ]);
     const audit = await db.query("SELECT action, resource_type, resource_id, actor_ua, request_id, after_state FROM audit_log WHERE workspace_id = $1", [workspaceId]);
@@ -66,10 +66,11 @@ describe("STORY-042 AC10 · pnpm rollup:rebuild", () => {
     expect(audit.rows[0].after_state).toMatchObject({ from_date: "2026-09-01", to_date: "2026-09-30", ticket: "OPS-42", operator: "ana" });
   }, 60_000);
 
-  it("STORY-042 AC10 · the same command twice asks for the same job key (a re-run is not a second rebuild)", async () => {
+  it("STORY-042 AC10 · the same command twice is TWO jobs: a re-run after a re-parse must rebuild, not be deduplicated onto the first", async () => {
     await runRollupRebuild(args(), { client: db, enqueue });
     await runRollupRebuild(args(), { client: db, enqueue });
-    expect(new Set(calls.map((c) => c.key)).size).toBe(1);
+    expect(new Set(calls.map((c) => c.key)).size).toBe(2);
+    expect((await db.query("SELECT 1 FROM audit_log WHERE workspace_id = $1 AND action = 'rollup.rebuild_requested'", [workspaceId])).rowCount).toBe(2);
   }, 60_000);
 
   it("STORY-042 AC10 · a project that is not in the named workspace is refused: no audit row, nothing enqueued", async () => {

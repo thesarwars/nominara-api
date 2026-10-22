@@ -162,6 +162,16 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
       expect(closedDayJobKey(tokyo.projectId, "2026-10-22")).toBe(`rollup:${tokyo.projectId}:closed:2026-10-22`);
     }, 60_000);
 
+    it("STORY-042 AC2 · the boundary is exactly 00:20 workspace-local: due at 00:20:00, not at 00:19:59", async () => {
+      const ids = await seedProject("Asia/Kolkata");
+      // Kolkata is +05:30: 2026-10-22 local is 10-21T18:30Z..10-22T18:30Z, so 00:20 on the 23rd is 18:50Z on the 22nd.
+      await seedCapture(ids, "2026-10-22T06:00:00Z");
+      await runClosedDaySweep(sweepDb, collector, new Date("2026-10-22T18:49:59Z"));
+      expect(enqueued, "00:19:59 local").toEqual([]);
+      await runClosedDaySweep(sweepDb, collector, new Date("2026-10-22T18:50:00Z"));
+      expect(enqueued.map((e) => e.payload.metricDate), "00:20:00 local").toEqual(["2026-10-22"]);
+    }, 60_000);
+
     it("STORY-042 AC2 · the sweep run twice for the same instant asks for the same key (one job per project and date)", async () => {
       const ids = await seedProject("UTC");
       await seedCapture(ids, "2026-10-21T12:00:00Z");
@@ -258,6 +268,7 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
         if (workspaceId === a.workspaceId) throw new Error("queue down");
         await collector(queue, workspaceId, payload, key);
       };
+      const bVersion = (await dirty.peek(10)).entries.find((e) => e.workspaceId === b.workspaceId)!.version;
       const result = await runDirtyDateSweep(dirty, flaky, now);
       expect(result).toMatchObject({ status: "partial", found: 2, enqueued: 1, failed: 1 });
       expect(enqueued).toHaveLength(1);
@@ -265,22 +276,35 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
         queue: "rollup.metric_daily",
         workspaceId: b.workspaceId,
         payload: { projectId: b.projectId, metricDate: "2026-10-21", reason: "dirty_date" },
-        idempotencyKey: dirtyDateJobKey(b.projectId, "2026-10-21", now),
+        idempotencyKey: dirtyDateJobKey(b.projectId, "2026-10-21", bVersion),
       });
       // b is gone from the set, a is still waiting for the next tick.
-      expect((await dirty.peek(10)).entries).toEqual([a]);
+      expect((await dirty.peek(10)).entries).toMatchObject([a]);
       expect((await runDirtyDateSweep(dirty, collector, new Date(now.getTime() + 15 * 60_000))).enqueued).toBe(1);
       expect((await dirty.peek(10)).entries).toEqual([]);
     }, 60_000);
 
-    it("STORY-042 AC6 · two replicas sweeping the same tick ask for the same key per entry", async () => {
+    it("STORY-042 AC6 · a mark that lands between the sweep's enqueue and its clear survives (real Valkey, atomic compare-and-remove)", async () => {
       const a = entry(await seedProject("UTC"));
       await dirty.mark(a);
-      const now = new Date("2026-10-22T09:15:00Z");
-      await runDirtyDateSweep(dirty, collector, now);
+      const racing: EnqueueRollup = async (queue, workspaceId, payload, key) => {
+        await collector(queue, workspaceId, payload, key);
+        await dirty.mark(a); // a late fact commits while the job is already reading facts
+      };
+      await runDirtyDateSweep(dirty, racing, new Date("2026-10-22T09:15:00Z"));
+      expect((await dirty.peek(10)).entries, "the re-marked entry is still waiting").toMatchObject([a]);
+      await runDirtyDateSweep(dirty, collector, new Date("2026-10-22T09:20:00Z"));
+      expect(new Set(enqueued.map((e) => e.idempotencyKey)).size, "the newer mark is a NEW job, not deduplicated onto the one that missed it").toBe(2);
+      expect((await dirty.peek(10)).entries).toEqual([]);
+    }, 60_000);
+
+    it("STORY-042 AC6 · replicas that read the same version ask for the same key", async () => {
+      const a = entry(await seedProject("UTC"));
       await dirty.mark(a);
-      await runDirtyDateSweep(dirty, collector, new Date(now.getTime() + 60_000));
-      expect(new Set(enqueued.map((e) => e.idempotencyKey)).size, "same 15-minute window, same key").toBe(1);
+      const [seen] = (await dirty.peek(10)).entries;
+      expect(dirtyDateJobKey(a.projectId, "2026-10-21", seen!.version)).toBe(dirtyDateJobKey(a.projectId, "2026-10-21", seen!.version));
+      await runDirtyDateSweep(dirty, collector, new Date("2026-10-22T09:15:00Z"));
+      expect(enqueued[0]!.idempotencyKey).toBe(dirtyDateJobKey(a.projectId, "2026-10-21", seen!.version));
     }, 60_000);
 
     it("STORY-042 AC6 · an empty set is a complete sweep of nothing", async () => {
@@ -336,20 +360,33 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
       expect(marks).toEqual([]);
     }, 60_000);
 
-    it("STORY-042 AC6 · a closed day NOT yet rolled up is not marked (the closed-day sweep owns it), nor is the open day", async () => {
+    it("STORY-042 AC6 · the OPEN day is not marked: the next run's rollup carries it", async () => {
       const ids = await seedProject("UTC");
-      const closed = "2026-03-10T12:00:00.000Z";
-      const notRolled = await seedCapture(ids, closed, "captured");
       const marks: DirtyEntry[] = [];
-      await parseInTenant(ids, notRolled, closed, async (e) => void marks.push(e));
-      expect(marks).toEqual([]);
-
       const today = new Date().toISOString();
       await seedCapture(ids, today, "parsed");
       await rollUpDay(db, ids.workspaceId, ids.projectId, today.slice(0, 10), "UTC");
       const lateToday = await seedCapture(ids, today, "captured");
       await parseInTenant(ids, lateToday, today, async (e) => void marks.push(e));
-      expect(marks, "today is still open: the next run's rollup carries it").toEqual([]);
+      expect(marks).toEqual([]);
+    }, 60_000);
+
+    it("STORY-042 AC6 · a closed day with NO row is marked too: a fact landing while the day's first rollup is mid-flight is never missed (an extra reprocess is idempotent)", async () => {
+      const ids = await seedProject("UTC");
+      const closed = "2026-03-10T12:00:00.000Z";
+      const notRolled = await seedCapture(ids, closed, "captured");
+      const marks: DirtyEntry[] = [];
+      await parseInTenant(ids, notRolled, closed, async (e) => void marks.push(e));
+      expect(marks).toEqual([{ workspaceId: ids.workspaceId, projectId: ids.projectId, metricDate: "2026-03-10" }]);
+    }, 60_000);
+
+    it("STORY-042 AC6 · a fact on a day three days back that was never rolled up is marked — the closed-day sweep only looks at yesterday", async () => {
+      const ids = await seedProject("UTC");
+      const old = new Date(Date.now() - 3 * 86_400_000).toISOString();
+      const late = await seedCapture(ids, old, "captured");
+      const marks: DirtyEntry[] = [];
+      await parseInTenant(ids, late, old, async (e) => void marks.push(e));
+      expect(marks.map((m) => m.metricDate)).toEqual([old.slice(0, 10)]);
     }, 60_000);
 
     it("STORY-042 AC6 · a failed mark is logged and counted, and never fails the parse", async () => {
@@ -369,6 +406,26 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
       await vi.waitFor(() => expect(JSON.stringify(errors)).toContain("rollup.dirty_mark_failed"));
       expect(JSON.stringify(logs)).toContain("nominara_rollup_dirty_mark_failed_total");
       expect((await db.query("SELECT status FROM answer_captures WHERE id = $1", [late])).rows[0].status).toBe("parsed");
+    }, 60_000);
+
+    it("STORY-042 AC6 · a mark that fails once is retried in-process and lands: nothing is lost, nothing is reported failed", async () => {
+      const ids = await seedProject("UTC");
+      const at = "2026-03-10T12:00:00.000Z";
+      await seedCapture(ids, at, "parsed");
+      await rollUpDay(db, ids.workspaceId, ids.projectId, "2026-03-10", "UTC");
+      const late = await seedCapture(ids, at, "captured");
+      const errors: unknown[] = [];
+      vi.spyOn(Logger.prototype, "error").mockImplementation((message: unknown) => void errors.push(message));
+      let attempts = 0;
+      const marks: DirtyEntry[] = [];
+      await parseInTenant(ids, late, at, async (e) => {
+        attempts += 1;
+        if (attempts < 3) throw new Error("valkey blip");
+        marks.push(e);
+      });
+      await vi.waitFor(() => expect(marks).toHaveLength(1));
+      expect(attempts).toBe(3);
+      expect(JSON.stringify(errors)).not.toContain("rollup.dirty_mark_failed");
     }, 60_000);
 
     it("STORY-042 Scenario 7 · a fact landing after the day closed is marked dirty and REPROCESSED by the next dirty sweep", async () => {
