@@ -311,7 +311,7 @@ describe("STORY-049 · crawlPages", () => {
     expect(result.pages).toHaveLength(10);
   });
 
-  it("a hostile Crawl-delay is honoured, not clamped: one request goes out, nothing is slept, and every other page is recorded as skipped", async () => {
+  it("a hostile Crawl-delay capped at 60 s still exceeds a 25 s budget: one request goes out, nothing is slept, and every other page is recorded as skipped", async () => {
     const h = harness({ crawlDelaySeconds: 1e9, wallClockBudgetMs: 25_000 });
     const urls = Array.from({ length: 10 }, (_, i) => `https://acme.com/p${String(i)}`);
     const result = await crawlPages(urls, h.deps);

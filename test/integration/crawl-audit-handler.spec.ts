@@ -13,7 +13,7 @@ import type { ObjectStoragePort } from "../../src/lib/storage/storage.port.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { gunzipSync } from "node:zlib";
 import { createCrawlAuditHandler, type CrawlAuditDeps } from "../../src/lib/queue/handlers/crawl-audit.handler.js";
-import { AGENT_PROBE_USER_AGENT, BROWSER_PROBE_USER_AGENT } from "../../src/lib/aux/differential-probe.js";
+import { NOMINARA_USER_AGENT } from "../../src/lib/aux/page-crawl.js";
 import { unavailableRenderer } from "../../src/lib/aux/renderer.js";
 import { createHash } from "node:crypto";
 import { crawlManifestSchema } from "../../contracts/aux/index.js";
@@ -329,9 +329,10 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(a.excluded_rules).toContain("AUX-R-008");
   });
 
-  it("STORY-049 scenario 10 · an unverified domain gets no differential probe: it would send a spoofed agent string to a site nobody proved they own", async () => {
+  it("STORY-049 AC8 (owner decision 2026-10-22) · an unverified domain's audit sends every request as NominaraBot and under no other crawler's name", async () => {
     await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
-    expect(requestedUas.some((r) => r.ua === AGENT_PROBE_USER_AGENT || r.ua === BROWSER_PROBE_USER_AGENT)).toBe(false);
+    expect(requestedUas.length).toBeGreaterThan(0);
+    for (const r of requestedUas) expect(r.ua).toBe(NOMINARA_USER_AGENT);
   });
 
   it("STORY-049 AC9 · a payload cannot escalate an unverified domain: scope key_pages is still public_surface", async () => {
@@ -379,46 +380,46 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(m.sitemap).toMatchObject({ files_fetched: 1, total_seen: 3 });
   });
 
-  it("STORY-049 AC8 / scenario 9 · a verified domain runs the differential probe: BOTH requests are issued and recorded in the manifest", async () => {
+  it("STORY-049 AC8 · a verified domain sends no impersonating request: every request is NominaraBot, the page count is exactly the site files plus the pages, and the manifest has no probe", async () => {
     await verifyDomain();
     await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
-    const uas = requestedUas.map((r) => r.ua);
-    expect(uas).toContain(BROWSER_PROBE_USER_AGENT);
-    expect(uas).toContain(AGENT_PROBE_USER_AGENT);
-    expect((await manifestOf()).probe).toMatchObject({ outcome: "consistent", browser_status: 200, agent_status: 200 });
+    expect(requestedUas).toHaveLength(7); // robots, llms, well-known llms, sitemap, and three pages: no probe request
+    for (const r of requestedUas) expect(r.ua).toBe(NOMINARA_USER_AGENT);
+    expect(await manifestOf()).not.toHaveProperty("probe");
   });
 
-  it("STORY-049 AC8 · a WAF that refuses the agent UA but serves the browser is recorded as hostile", async () => {
+  it("STORY-049 AC8 · AI-bot access is judged from robots.txt for each AI crawler token: a named Disallow reads false, every other token reads true", async () => {
     await verifyDomain();
-    const served = withSitemap(SITEMAP_PAGES);
-    const deps = depsServing(served);
-    const inner = deps.fetch!;
-    await run(job(), { ...deps, fetch: async (url, init) => (init?.headers?.["user-agent"] === AGENT_PROBE_USER_AGENT ? { status: 403, headers: {}, body: Buffer.from("denied"), finalUrl: url } : inner(url, init)) });
-    expect((await manifestOf()).probe).toMatchObject({ outcome: "hostile", browser_status: 200, agent_status: 403 });
-  });
-
-  it("review r2 · a root that redirects OFF-SITE during the probe is not followed: nothing is sent to the third party, and the probe is inconclusive", async () => {
-    await verifyDomain();
-    const requested: string[] = [];
-    const deps = depsServing(withSitemap(SITEMAP_PAGES), requested);
-    const inner = deps.fetch!;
-    const evil = "https://evil.example/landing";
-    await run(job(), {
-      ...deps,
-      fetch: async (url, init) => {
-        const ua = init?.headers?.["user-agent"];
-        if (ua !== BROWSER_PROBE_USER_AGENT && ua !== AGENT_PROBE_USER_AGENT) return inner(url, init);
-        // what guardedFetch does with the veto: a 3xx whose next hop is vetoed is RETURNED, an allowed hop is followed
-        const follow = (init as { followRedirect?: (next: string) => boolean } | undefined)?.followRedirect;
-        if (follow === undefined || follow(evil)) {
-          requested.push(evil);
-          return { status: 200, headers: {}, body: Buffer.from("third party"), finalUrl: evil };
-        }
-        return { status: 302, headers: { location: evil }, body: Buffer.from(""), finalUrl: url };
-      },
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, BLOCKED)));
+    const access = (await manifestOf()).ai_bot_access;
+    expect(access).not.toBeNull();
+    const byAgent = Object.fromEntries(access!.map((x) => [x.agent, x.allowed]));
+    expect(byAgent).toEqual({
+      GPTBot: false, ClaudeBot: true, PerplexityBot: true, "Google-Extended": true,
+      "Applebot-Extended": true, Bytespider: true, CCBot: true, "meta-externalagent": true,
     });
-    expect(requested.filter((u) => u.includes("evil.example"))).toEqual([]);
-    expect((await manifestOf()).probe).toMatchObject({ outcome: "inconclusive", browser_status: 302, agent_status: 302 });
+  });
+
+  it("STORY-049 AC8 · a wildcard Disallow binds a token no group names (RFC 9309 group selection), and a named Allow overrides it", async () => {
+    await verifyDomain();
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nDisallow: /\n\nUser-agent: ClaudeBot\nAllow: /\n")));
+    const byAgent = Object.fromEntries((await manifestOf()).ai_bot_access!.map((x) => [x.agent, x.allowed]));
+    expect(byAgent.GPTBot).toBe(false);
+    expect(byAgent.ClaudeBot).toBe(true);
+  });
+
+  it("STORY-049 AC8 · with robots.txt unreachable the AI-bot verdict is null (not judged), never 'allowed'", async () => {
+    await verifyDomain();
+    await run(job(), depsServing({ ...withSitemap(SITEMAP_PAGES), "/robots.txt": "throw" }));
+    expect((await manifestOf()).ai_bot_access).toBeNull();
+  });
+
+  it("STORY-049 AC8 · LIMITATION pinned: a WAF that refuses an AI user agent is NOT detectable, so AUX-R-005 is named in excluded_rules and is never a finding", async () => {
+    await verifyDomain();
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
+    const [a] = await audits();
+    expect(a.excluded_rules).toContain("AUX-R-005");
+    expect((await findings()).map((f) => f.rule_code)).not.toContain("AUX-R-005");
   });
 
   it("review r2 · robots_hash is the sha256 of the bytes as fetched, even when robots.txt is not valid UTF-8", async () => {
@@ -434,10 +435,11 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   it("review r2 · with no renderer installed the up-front shrink counts ONE request per page, so the wall-clock budget admits twice the pages", async () => {
     await verifyDomain();
     const delayRobots = "User-agent: *\nCrawl-delay: 10\nAllow: /\n";
-    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, delayRobots), [], 10_000, { wallClockBudgetMs: 100_000 }));
+    // 80 s: after the four site files (t = 0..30 s) five more requests start before the deadline: two pages with a renderer, three without.
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, delayRobots), [], 10_000, { wallClockBudgetMs: 80_000 }));
     const withRenderer = (await audits())[0]!.error_summary.crawl_delay_limited.pages_skipped as number;
     await db.query("TRUNCATE aux_audits CASCADE");
-    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, delayRobots), [], 10_000, { wallClockBudgetMs: 100_000, renderer: unavailableRenderer }));
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, delayRobots), [], 10_000, { wallClockBudgetMs: 80_000, renderer: unavailableRenderer }));
     const [a] = await audits();
     expect(withRenderer).toBe(1);
     expect(a.error_summary?.crawl_delay_limited?.pages_skipped ?? 0).toBe(0);
@@ -446,9 +448,8 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   it("STORY-049 AC7 · every request carries the identified NominaraBot user agent, the pages and the site files alike", async () => {
     await verifyDomain();
     await run(job(), depsServing(withSitemap(SITEMAP_PAGES)));
-    const nonProbe = requestedUas.filter((r) => r.ua !== AGENT_PROBE_USER_AGENT && r.ua !== BROWSER_PROBE_USER_AGENT);
-    expect(nonProbe.length).toBeGreaterThanOrEqual(7);
-    for (const r of nonProbe) expect(r.ua).toBe("NominaraBot/1.0 (+https://nominara.com/bot)");
+    expect(requestedUas).toHaveLength(7);
+    for (const r of requestedUas) expect(r.ua).toBe("NominaraBot/1.0 (+https://nominara.com/bot)");
   });
 
   it("STORY-049 scenario 8 · a declared Crawl-delay is honoured between requests, and the interval is never below 500 ms", async () => {
@@ -621,61 +622,82 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   // ------------------------------------------------------------------------------------------------------------------
   // REVIEW ROUND 1 — a hostile robots.txt, the open transaction, partial vs failed, and the runtime role
   // ------------------------------------------------------------------------------------------------------------------
+  // OWNER DECISION 2026-10-22: a declared Crawl-delay is honoured up to MAX_HONOURED_CRAWL_DELAY_MS (60 s) and honoured as that
+  // beyond it, with the declared value reported. Pinned from the hazard: a hostile 86400 s must not cost the audit its site files.
   it.each(["86400", "1000000000"])(
-    "REVIEW · a robots.txt with Crawl-delay %s is HONOURED: nothing is sent after robots.txt, no sleep is shorter than the delay, and everything skipped is recorded",
+    "REVIEW · a robots.txt with Crawl-delay %s is CAPPED at 60 s: llms.txt is fetched after one full 60 s wait, what the 100 s budget cannot cover is recorded as crawl_delay_budget (never as a failure), and every rule that did not run is named",
     async (delay) => {
       await verifyDomain();
-      const budgetMs = 100_000;
       const requested: string[] = [];
-      await run(job(), depsServing(withSitemap(SITEMAP_PAGES, `User-agent: *\nCrawl-delay: ${delay}\nAllow: /\n`), requested, 10_000, { wallClockBudgetMs: budgetMs }));
+      await run(job(), depsServing(withSitemap(SITEMAP_PAGES, `User-agent: *\nCrawl-delay: ${delay}\nAllow: /\n`), requested, 10_000, { wallClockBudgetMs: 100_000 }));
       const [a] = await audits();
-      expect(["completed", "partial", "failed"]).toContain(a.status);
-      // returns in bounded virtual time without ever crawling faster than asked
-      expect(clockMs).toBeLessThanOrEqual(budgetMs);
-      for (const s of sleeps) expect(s).toBeGreaterThanOrEqual(Number(delay) * 1000);
-      expect(requested).toEqual(["https://acme.com/robots.txt"]); // the only request that does not wait out the delay
-      expect(a.error_summary.crawl_delay_limited).toMatchObject({ crawl_delay_ms: Number(delay) * 1000 });
-      expect(a.error_summary.crawl_delay_limited.pages_skipped).toBeGreaterThanOrEqual(1);
-      expect((await manifestOf()).selection_skipped.filter((x) => x.reason === "crawl_delay_budget").length).toBeGreaterThanOrEqual(1);
+      expect(a.status).toBe("partial");
+      expect(requested).toEqual(["https://acme.com/robots.txt", "https://acme.com/llms.txt"]);
+      expect(sleeps).toEqual([60_000]);
+      expect(clockMs).toBe(60_000);
+      // skipped is not failed: nothing in site_files_failed, and the skipped files are not counted as failed pages
+      expect(a.error_summary.site_files_failed).toBeUndefined();
+      expect(a.pages_failed).toBe(0);
+      expect(a.error_summary.skipped_pages).toEqual([
+        { url: "https://acme.com/.well-known/llms.txt", reason: "crawl_delay_budget" },
+        { url: "https://acme.com/sitemap.xml", reason: "crawl_delay_budget" },
+        { url: "https://acme.com/", reason: "crawl_delay_budget" },
+      ]);
+      expect(a.error_summary.crawl_delay_limited).toEqual({ crawl_delay_ms: 60_000, declared_crawl_delay_ms: Number(delay) * 1000, pages_skipped: 1 });
+      const m = await manifestOf();
+      expect(m.selection_skipped.filter((x) => x.reason === "crawl_delay_budget")).toHaveLength(1);
+      expect(m.sitemap).toMatchObject({ files_fetched: 0, total_seen: 0, problems: [{ url: "https://acme.com/sitemap.xml", reason: "crawl_delay_budget" }] });
+      // AUX-R-004 (needs both llms files) and AUX-R-007 (needs the sitemap) did not run, so they are named
+      expect(a.excluded_rules).toEqual(expect.arrayContaining(["AUX-R-004", "AUX-R-007"]));
+      expect(a.excluded_rules).not.toContain("AUX-R-001"); // robots.txt was read: these ran
+      expect((await findings()).map((f) => f.rule_code)).not.toContain("AUX-R-007");
     },
   );
 
-  it("REVIEW · an UNVERIFIED project is bounded too: robots.txt is read before any verification matters", async () => {
-    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nCrawl-delay: 86400\n"), [], 10_000, { wallClockBudgetMs: 100_000 }));
-    for (const s of sleeps) expect(s).toBeGreaterThanOrEqual(86_400_000);
-    expect(clockMs).toBeLessThanOrEqual(100_000);
-    expect((await audits())[0]!.status).not.toBe("running");
+  it("REVIEW · with the real 10-minute budget a 86400 s Crawl-delay still fetches all four site files, each after a 60 s wait, and reports both delays", async () => {
+    await verifyDomain();
+    const requested: string[] = [];
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nCrawl-delay: 86400\nAllow: /\n"), requested));
+    const [a] = await audits();
+    expect(requested.slice(0, 4)).toEqual([
+      "https://acme.com/robots.txt", "https://acme.com/llms.txt", "https://acme.com/.well-known/llms.txt", "https://acme.com/sitemap.xml",
+    ]);
+    for (const s of sleeps) expect(s).toBe(60_000);
+    expect(a.error_summary?.site_files_failed).toBeUndefined();
+    expect((a.error_summary?.skipped_pages ?? []).filter((x: { url: string }) => /llms|sitemap/.test(x.url))).toEqual([]);
+    expect(a.error_summary.crawl_delay_limited).toMatchObject({ crawl_delay_ms: 60_000, declared_crawl_delay_ms: 86_400_000 });
+    expect(a.excluded_rules).not.toContain("AUX-R-004");
+    expect(a.excluded_rules).not.toContain("AUX-R-007");
+  });
+
+  it("REVIEW · an UNVERIFIED project is bounded too: robots.txt is read before any verification matters, then llms.txt after the capped wait and nothing more", async () => {
+    const requested: string[] = [];
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nCrawl-delay: 86400\n"), requested, 10_000, { wallClockBudgetMs: 100_000 }));
+    const [a] = await audits();
+    expect(a.status).toBe("partial");
+    expect(sleeps).toEqual([60_000]);
+    expect(requested).toEqual(["https://acme.com/robots.txt", "https://acme.com/llms.txt"]);
+    expect(clockMs).toBe(60_000);
   });
 
   it("REVIEW · a budget too short for even the site files ends the audit instead of throwing out of the handler", async () => {
     await verifyDomain();
-    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nCrawl-delay: 5\n"), [], 10_000, { wallClockBudgetMs: 6_000 }));
+    const requested: string[] = [];
+    await run(job(), depsServing(withSitemap(SITEMAP_PAGES, "User-agent: *\nCrawl-delay: 5\n"), requested, 10_000, { wallClockBudgetMs: 6_000 }));
     const [a] = await audits();
-    expect(["completed", "partial", "failed"]).toContain(a.status);
-    expect(clockMs).toBeLessThanOrEqual(6_000);
+    expect(a.status).toBe("partial");
+    expect(requested).toEqual(["https://acme.com/robots.txt", "https://acme.com/llms.txt"]);
+    expect(sleeps).toEqual([5_000]);
+    expect(a.error_summary.site_files_failed).toBeUndefined();
+    expect(a.error_summary.skipped_pages.map((x: { reason: string }) => x.reason)).toEqual(["crawl_delay_budget", "crawl_delay_budget", "crawl_delay_budget"]);
+    expect(a.error_summary.crawl_delay_limited).toEqual({ crawl_delay_ms: 5_000, pages_skipped: 1 });
   });
 
-  it("REVIEW · the transaction-local idle_in_transaction_session_timeout is set before the crawl begins, and does not outlive the transaction", async () => {
-    await verifyDomain();
-    const during: string[] = [];
-    const deps = depsServing(withSitemap(SITEMAP_PAGES));
-    const inner = deps.fetch!;
-    await db.query("BEGIN");
-    try {
-      await run(job(), {
-        ...deps,
-        fetch: async (url, init) => {
-          during.push((await db.query("SELECT current_setting('idle_in_transaction_session_timeout') AS v")).rows[0].v as string);
-          return inner(url, init);
-        },
-      });
-    } finally {
-      await db.query("COMMIT");
-    }
-    expect(during.length).toBeGreaterThan(0);
-    expect(new Set(during)).toEqual(new Set(["15min"]));
-    expect((await db.query("SELECT current_setting('idle_in_transaction_session_timeout') AS v")).rows[0].v).toBe("0");
-  });
+  // The test that stood here pinned a transaction-local idle_in_transaction_session_timeout (15 min) set before the crawl, the
+  // backstop for a transaction held open across the crawl. There is no such transaction any more (ADR-0003): the fetch phase holds
+  // none, and the two short ones never wait on the network. test/integration/crawl-audit-kad06.spec.ts proves that directly
+  // (no `idle in transaction` backend and no checked-out client during any fetch, render or object-store write), which is
+  // strictly stronger than a timeout that only ends the hold.
 
   it("REVIEW · a page that hangs is bounded by the same timeout as the site files, recorded as a timeout, and the crawl continues", async () => {
     await verifyDomain();

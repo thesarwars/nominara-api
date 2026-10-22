@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf } from "./robots.js";
+import { crawlDelayFor, isAllowed, MAX_PATTERN_LENGTH, parseRobots, sitemapUrlsOf } from "./robots.js";
 
 // STORY-049 AC7 — "honours Crawl-delay, respects the target's own robots.txt for the NominaraBot user agent"
 // (aux-and-geo-analysis.md §1, Politeness). The group choice is RFC 9309's: a group that NAMES the agent wins outright
@@ -147,3 +147,28 @@ describe("STORY-049 · robots.txt matching is linear-time on hostile input", () 
   });
 });
 
+
+// review r5 — a pattern over MAX_PATTERN_LENGTH is cut to a plain prefix. For a Disallow that blocks a SUPERSET (fail closed). For an
+// Allow it would match a superset too, and its raw length would still win longest-match against a shorter Disallow: a hostile
+// site could loosen its own rules for us (fail open). A cut Allow therefore does not match at all.
+describe("review r5 · an over-long Allow pattern never fails open", () => {
+  const long = "b".repeat(MAX_PATTERN_LENGTH + 50);
+
+  it("an Allow over the cap does not override a shorter Disallow, even for a path its 2048-character prefix matches", () => {
+    const parsed = parseRobots(`User-agent: *\nDisallow: /a\nAllow: /a${long}$\n`);
+    expect(isAllowed(parsed, "NominaraBot", `/a${long}c`)).toBe(false); // not what the anchored full pattern says; the cut prefix would have allowed it
+    expect(isAllowed(parsed, "NominaraBot", `/a${long}`)).toBe(false); // even the exact path: an unusable rule is ignored, the Disallow stands
+  });
+
+  it("an Allow of EXACTLY the cap length still works (the bound is on what is cut, not on what is long)", () => {
+    const exact = "/a" + "b".repeat(MAX_PATTERN_LENGTH - 2);
+    expect(exact.length).toBe(MAX_PATTERN_LENGTH);
+    const parsed = parseRobots(`User-agent: *\nDisallow: /a\nAllow: ${exact}\n`);
+    expect(isAllowed(parsed, "NominaraBot", `${exact}zzz`)).toBe(true);
+  });
+
+  it("a Disallow over the cap still blocks (the fail-closed side is unchanged)", () => {
+    const parsed = parseRobots(`User-agent: *\nDisallow: /a${long}$\n`);
+    expect(isAllowed(parsed, "NominaraBot", `/a${long}c`)).toBe(false);
+  });
+});

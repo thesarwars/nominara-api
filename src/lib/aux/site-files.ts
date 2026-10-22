@@ -10,7 +10,7 @@ import { blockingRule, parseRobots, rulesFor, type RobotsRule } from "./robots.j
 //
 // PURE: the fetched bodies go in, findings come out. No network, no clock (the
 // caller passes `now`), no database. Fetching is the crawl worker's job behind
-// the queue boundary (KAD-06). AUX-R-005 (differential probe) and AUX-R-006
+// the queue boundary (KAD-06). AUX-R-005 (bot-hostile edge rules: not observable without impersonating a crawler) and AUX-R-006
 // (noai directives) need live responses / page headers and are not here.
 //
 // Every number is the reference's, exactly; migration 0070 stores the same

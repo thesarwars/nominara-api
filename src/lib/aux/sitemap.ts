@@ -42,6 +42,7 @@ export type SitemapProblemReason =
   | "depth_exceeded"
   | "foreign_site"
   | "file_budget_exhausted"
+  | "crawl_delay_budget"
   | "too_large"
   | `http_${number}`;
 
@@ -59,6 +60,18 @@ export interface SitemapResult {
   readonly totalSeen: number;
   readonly filesFetched: number;
   readonly problems: SitemapProblem[];
+}
+
+/**
+ * Thrown by `SitemapInput.fetch` when it did NOT send the request because the crawl's wall-clock budget cannot cover it (the
+ * politeness wait would pass the deadline). It is a skip, not a failure: the file is recorded as `crawl_delay_budget` and is
+ * not counted in `filesFetched`, because no request was made.
+ */
+export class SitemapFetchSkipped extends Error {
+  constructor() {
+    super("sitemap fetch skipped: the crawl's wall-clock budget cannot cover it");
+    this.name = "SitemapFetchSkipped";
+  }
 }
 
 export interface SitemapInput {
@@ -155,15 +168,21 @@ export async function collectSitemap(input: SitemapInput): Promise<SitemapResult
         problems.push({ url, reason: "file_budget_exhausted" });
         continue;
       }
-      filesFetched += 1;
 
       let response: Awaited<ReturnType<SitemapInput["fetch"]>>;
       try {
         response = await input.fetch(url);
-      } catch {
+      } catch (error) {
+        if (error instanceof SitemapFetchSkipped) {
+          // Nothing was sent: not a failed fetch, and not counted as a file fetched.
+          problems.push({ url, reason: "crawl_delay_budget" });
+          continue;
+        }
+        filesFetched += 1;
         problems.push({ url, reason: "fetch_failed" });
         continue;
       }
+      filesFetched += 1;
       if (response.status < 200 || response.status >= 300) {
         problems.push({ url, reason: `http_${response.status}` });
         continue;

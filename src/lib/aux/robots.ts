@@ -72,7 +72,7 @@ export function parseRobots(body: string): ParsedRobots {
 /**
  * Bounds that keep matching cheap on hostile input. NOT FROM THE REFERENCE: chosen so one match is at most a few
  * million character comparisons. A pattern longer than the cap is cut to it and treated as a plain prefix (a Disallow
- * cut this way blocks a superset, which is the fail-closed side); a path longer than the cap is matched on its first
+ * cut this way blocks a superset, which is the fail-closed side; an Allow over the cap is IGNORED, since a cut Allow would fail open); a path longer than the cap is matched on its first
  * MAX_MATCH_PATH_LENGTH characters, and cannot satisfy a `$` anchor (it does not end where the pattern says).
  */
 export const MAX_PATTERN_LENGTH = 2048;
@@ -118,6 +118,9 @@ function decidingRule(rules: readonly RobotsRule[], path: string): RobotsRule | 
   let best: RobotsRule | null = null;
   for (const rule of rules) {
     if (rule.pattern === "") continue;
+    // A cut Allow would match a superset of what it says and, by its raw length, outrank a shorter Disallow: fail OPEN. An
+    // over-long Allow is ignored instead (a cut Disallow stays: it blocks a superset, the fail-closed side).
+    if (rule.allow && rule.pattern.length > MAX_PATTERN_LENGTH) continue;
     if (!patternMatches(rule.pattern, target)) continue;
     if (best === null || rule.pattern.length > best.pattern.length || (rule.pattern.length === best.pattern.length && rule.allow && !best.allow)) {
       best = rule;

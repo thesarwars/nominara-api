@@ -4,10 +4,8 @@
 // ... and hard-stops at the page cap". Nominara crawls only domains the customer verified, and a crawler that hammers a
 // customer's site is a worse outcome than a crawler that is slow.
 //
-// ONE BUDGET FOR EVERY KIND OF REQUEST. The site files, the pages (both fetches) and BOTH halves of the differential probe
-// draw from the same budget (the story's AC8: "both count against the politeness budget"). The probe doubles request
-// volume on the pages it runs against; exempting it would breach politeness on exactly the sites most likely to be
-// sensitive about crawling.
+// ONE BUDGET FOR EVERY KIND OF REQUEST. The site files and the pages (both fetches) draw from the same budget. (The
+// differential probe that once drew from it was removed on 2026-10-22: Nominara sends no request under another crawler's name.)
 //
 // 2 req/s and a 500 ms interval are the same constraint stated twice (an interval of 500 ms is at most 2 starts in any
 // 1000 ms window), so ONE interval enforces both; a unit test checks the window directly rather than trusting the algebra.
@@ -17,7 +15,18 @@ export const MIN_INTERVAL_MS = 500;
 /** aux-and-geo-analysis.md §1: at most 2 requests per second per host. */
 export const MAX_REQUESTS_PER_SECOND = 2;
 
-export type RequestKind = "site_file" | "page" | "probe";
+/**
+ * NOT FROM THE REFERENCE (OWNER DECISION 2026-10-22). The longest Crawl-delay honoured. A declared delay up to this is honoured
+ * exactly; a longer one is honoured as this, and the declared value is reported (`declaredCrawlDelayMs`,
+ * `error_summary.crawl_delay_limited.declared_crawl_delay_ms`) so a reader can see the crawl was faster than asked. Why a cap
+ * at all: honoured exactly, a hostile or careless `Crawl-delay: 86400` costs the audit llms.txt, the sitemap and every page,
+ * because three waits that long fit no wall-clock budget. 60 s lets robots.txt, both llms files and the sitemap (about 4
+ * minutes of waiting) fit inside CRAWL_WALL_CLOCK_BUDGET_MS with room for pages. Crawl-delay is not part of RFC 9309 and
+ * Google ignores it entirely, so a 60 s ceiling is within common practice; the owner may change the number.
+ */
+export const MAX_HONOURED_CRAWL_DELAY_MS = 60_000;
+
+export type RequestKind = "site_file" | "page";
 
 /** The hard cap is spent. A typed error, never a silent skip: the caller records what it did not fetch. */
 export class PolitenessCapReached extends Error {
@@ -60,11 +69,12 @@ export class PolitenessBudget {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private crawlDelayMs = 0;
+  private declaredDelayMs = 0;
   private readonly deadline: number | null;
   private readonly wallClockBudgetMs: number;
   private lastStart: number | null = null;
   private count = 0;
-  private readonly byKind: Record<RequestKind, number> = { site_file: 0, page: 0, probe: 0 };
+  private readonly byKind: Record<RequestKind, number> = { site_file: 0, page: 0 };
   /** Callers are serialised on this chain, so two concurrent acquire() calls can never be released at the same instant. */
   private tail: Promise<void> = Promise.resolve();
 
@@ -83,14 +93,21 @@ export class PolitenessBudget {
 
   /**
    * robots.txt is the FIRST request, so its `Crawl-delay` is only known after it: call this once it is parsed. An unusable
-   * value (negative, NaN, Infinity) is ignored; no declared delay can LOWER the 500 ms floor. The declared delay is
-   * honoured EXACTLY, with no upper clamp (a crawler that goes faster than the site asked is not "honouring" it). A hostile
-   * 86400 s cannot pin a worker anyway: `acquire` refuses before sleeping when the wait would pass the wall-clock
-   * deadline, and `affordableRequests` shrinks the page list up front.
+   * value (negative, NaN, Infinity) is ignored; no declared delay can LOWER the 500 ms floor. A declared delay up to
+   * MAX_HONOURED_CRAWL_DELAY_MS is honoured EXACTLY, rounded UP to a whole millisecond (a crawler that goes faster than the
+   * site asked is not "honouring" it, and every duration in the audit record is an integer); a longer one is honoured as the
+   * cap and reported by `declaredCrawlDelayMs`. A hostile 86400 s cannot pin a worker either way: `acquire` refuses before
+   * sleeping when the wait would pass the wall-clock deadline, and `affordableRequests` shrinks the page list up front.
    */
   setCrawlDelay(seconds: number | null): void {
-    const ms = seconds === null ? 0 : seconds * 1000;
-    this.crawlDelayMs = Number.isFinite(ms) && ms > 0 ? ms : 0;
+    const ms = seconds === null ? 0 : Math.ceil(seconds * 1000);
+    this.declaredDelayMs = Number.isFinite(ms) && ms > 0 ? ms : 0;
+    this.crawlDelayMs = Math.min(this.declaredDelayMs, MAX_HONOURED_CRAWL_DELAY_MS);
+  }
+
+  /** The declared Crawl-delay in ms when it was longer than the cap and was shortened to it; null when honoured as declared. */
+  get declaredCrawlDelayMs(): number | null {
+    return this.declaredDelayMs > MAX_HONOURED_CRAWL_DELAY_MS ? this.declaredDelayMs : null;
   }
 
   get used(): number {

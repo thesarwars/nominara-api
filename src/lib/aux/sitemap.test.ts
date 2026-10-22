@@ -1,6 +1,6 @@
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
-import { collectSitemap, MAX_SITEMAP_DEPTH, MAX_SITEMAP_URLS, MAX_SITEMAP_FILES } from "./sitemap.js";
+import { collectSitemap, MAX_SITEMAP_DEPTH, MAX_SITEMAP_URLS, MAX_SITEMAP_FILES, SitemapFetchSkipped } from "./sitemap.js";
 
 // STORY-049 AC4 — "the sitemap with bounded index recursion and a sampling cap" (aux-and-geo-analysis.md §1:
 // "GET /sitemap.xml (+ index recursion, max 3 levels, max 5,000 URLs sampled)"). The source is the robots.txt `Sitemap:`
@@ -247,3 +247,43 @@ describe("STORY-049 AC4 · a hostile sitemap cannot make the parser quadratic", 
   });
 });
 
+
+describe("review r5 · a sitemap file the wall-clock budget did not allow is a SKIP, not a failure", () => {
+  it("records crawl_delay_budget, counts no file as fetched, and never reports fetch_failed", async () => {
+    const result = await collectSitemap({
+      origin: ORIGIN,
+      declared: [],
+      fetch: async () => {
+        throw new SitemapFetchSkipped();
+      },
+    });
+    expect(result.problems).toEqual([{ url: at("sitemap.xml"), reason: "crawl_delay_budget" }]);
+    expect(result.filesFetched).toBe(0);
+    expect(result.urls).toEqual([]);
+  });
+
+  it("a skipped child does not stop its siblings, and only the requests actually made are counted", async () => {
+    const files: Files = {
+      [at("sitemap.xml")]: index([at("a.xml"), at("b.xml")]),
+      [at("b.xml")]: urlset([at("p")]),
+    };
+    const inner = serve(files);
+    const result = await collectSitemap({
+      origin: ORIGIN,
+      declared: [],
+      fetch: async (url) => {
+        if (url === at("a.xml")) throw new SitemapFetchSkipped();
+        return inner(url);
+      },
+    });
+    expect(result.problems).toEqual([{ url: at("a.xml"), reason: "crawl_delay_budget" }]);
+    expect(result.filesFetched).toBe(2); // the index and b.xml; a.xml was never requested
+    expect(result.urls.map((e) => e.loc)).toEqual([at("p")]);
+  });
+
+  it("a fetch that FAILED (as opposed to skipped) is still counted as a file fetched and reported as fetch_failed", async () => {
+    const result = await run({ [at("sitemap.xml")]: "throw" });
+    expect(result.problems).toEqual([{ url: at("sitemap.xml"), reason: "fetch_failed" }]);
+    expect(result.filesFetched).toBe(1);
+  });
+});
