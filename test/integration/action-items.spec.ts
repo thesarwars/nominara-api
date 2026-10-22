@@ -6,8 +6,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { RUNTIME_ROLES, BREAKGLASS_ROLE } from "../../src/db/conventions.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { TasksService } from "../../src/modules/tasks/tasks.service.js";
-import { withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
+import { ACTION_ITEMS_SQL, TasksService } from "../../src/modules/tasks/tasks.service.js";
+import { SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS } from "../../src/lib/rollup/refresh-project-task-counts.js";
+import { currentTenantStore, withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
 import type { PaginationRequest } from "../../contracts/common/pagination.schema.js";
 
 // STORY-169 (API step 2/3) — GET /v1/workspaces/{id}/action-items, real SQL.
@@ -200,6 +201,7 @@ describe("STORY-169 · TasksService.listActionItems — real SQL", () => {
     playbookSlug: string | null;
     createdAt: string | null;
     title: string;
+    affectedUrl: string | null;
   }
 
   async function createTask(
@@ -223,15 +225,16 @@ describe("STORY-169 · TasksService.listActionItems — real SQL", () => {
       playbookSlug = null,
       createdAt = null,
       title = `Task ${seq}`,
+      affectedUrl = null,
     } = overrides;
     if (ruleCode !== null) await createTaskGenerationRule(ruleCode);
     const result = await client.query<{ id: string }>(
       `INSERT INTO tasks
          (workspace_id, project_id, short_ref, kind, rule_code, dedupe_fingerprint, title, description, status,
           deleted_at, impact_score, effort_band, source_finding_id, source_domain_id, source_displacement_id,
-          playbook_slug, created_at)
+          playbook_slug, created_at, affected_url)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'Description', $8, $9, $10, $11, $12, $13, $14, $15,
-               COALESCE($16::timestamptz, now()))
+               COALESCE($16::timestamptz, now()), $17)
        RETURNING id`,
       [
         workspaceId,
@@ -250,6 +253,7 @@ describe("STORY-169 · TasksService.listActionItems — real SQL", () => {
         sourceDisplacementId,
         playbookSlug,
         createdAt,
+        affectedUrl,
       ],
     );
     return result.rows[0]!.id;
@@ -612,6 +616,135 @@ describe("STORY-169 · TasksService.listActionItems — real SQL", () => {
     expect(seen).toHaveLength(4);
     expect(new Set(seen).size).toBe(4);
     expect(new Set(seen)).toEqual(new Set(ids));
+  });
+
+  // ---- STORY-064 AC10 / AC9: cross-project dedupe and the single index ----------
+
+  describe("STORY-064 · cross-project dedupe on (rule code, affected URL)", () => {
+    const URL_A = "https://shared.example.com/pricing";
+
+    it("[STORY-064 #11] the same rule and URL in three projects collapse to ONE row with project_count 3", async () => {
+      const ws = await createWorkspace();
+      const [p1, p2, p3] = [await createProject(ws, { name: "Alpha" }), await createProject(ws, { name: "Beta" }), await createProject(ws, { name: "Gamma" })];
+      await createTask(ws, p1, { ruleCode: "TG-DUP", affectedUrl: URL_A, impactScore: 30 });
+      const best = await createTask(ws, p2, { ruleCode: "TG-DUP", affectedUrl: URL_A, impactScore: 70 });
+      await createTask(ws, p3, { ruleCode: "TG-DUP", affectedUrl: URL_A, impactScore: 50 });
+
+      const page = await listAll(CTX(ws));
+      expect(page.items).toHaveLength(1);
+      const row = page.items[0]!;
+      expect(row.id).toBe(best);
+      expect(row.project_id).toBe(p2);
+      expect(row.impact).toBe(70);
+      expect(row.project_count).toBe(3);
+      expect(row.projects.map((p) => p.id)).toEqual([p2, p1, p3]);
+    });
+
+    it("a different URL or a different rule code never collapses", async () => {
+      const ws = await createWorkspace();
+      const [p1, p2] = [await createProject(ws), await createProject(ws)];
+      await createTask(ws, p1, { ruleCode: "TG-DUP", affectedUrl: URL_A });
+      await createTask(ws, p2, { ruleCode: "TG-DUP", affectedUrl: "https://shared.example.com/other" });
+      await createTask(ws, p2, { ruleCode: "TG-OTHER", affectedUrl: URL_A });
+      const page = await listAll(CTX(ws));
+      expect(page.items).toHaveLength(3);
+      expect(page.items.every((i) => i.project_count === 1)).toBe(true);
+    });
+
+    it("a task with no affected_url or no rule code is never collapsed, even when its twin is identical", async () => {
+      const ws = await createWorkspace();
+      const [p1, p2] = [await createProject(ws), await createProject(ws)];
+      await createTask(ws, p1, { ruleCode: "TG-DUP", affectedUrl: null });
+      await createTask(ws, p2, { ruleCode: "TG-DUP", affectedUrl: null });
+      await createTask(ws, p1, { ruleCode: null, affectedUrl: URL_A });
+      await createTask(ws, p2, { ruleCode: null, affectedUrl: URL_A });
+      const page = await listAll(CTX(ws));
+      expect(page.items).toHaveLength(4);
+      expect(page.items.every((i) => i.project_count === 1 && i.projects.length === 1)).toBe(true);
+    });
+
+    it("[STORY-064 #12] project_count counts only the caller's in-scope projects, and an all-out-of-scope group is absent", async () => {
+      const ws = await createWorkspace();
+      const [p1, p2, p3] = [await createProject(ws), await createProject(ws), await createProject(ws)];
+      for (const p of [p1, p2, p3]) await createTask(ws, p, { ruleCode: "TG-DUP", affectedUrl: URL_A });
+      const scoped = await listAll(CTX(ws, [p1, p2]));
+      expect(scoped.items).toHaveLength(1);
+      expect(scoped.items[0]!.project_count).toBe(2);
+      expect(scoped.items[0]!.projects.map((p) => p.id).sort()).toEqual([p1, p2].sort());
+      const one = await listAll(CTX(ws, [p3]));
+      expect(one.items[0]!.project_count).toBe(1);
+      const none = await listAll(CTX(ws, [await createProject(ws)]));
+      expect(none.items).toEqual([]);
+    });
+
+    it("done, dismissed and soft-deleted twins are not counted", async () => {
+      const ws = await createWorkspace();
+      const [p1, p2, p3, p4] = [await createProject(ws), await createProject(ws), await createProject(ws), await createProject(ws, { deletedAt: new Date() })];
+      await createTask(ws, p1, { ruleCode: "TG-DUP", affectedUrl: URL_A });
+      await createTask(ws, p2, { ruleCode: "TG-DUP", affectedUrl: URL_A, status: "dismissed" });
+      await createTask(ws, p3, { ruleCode: "TG-DUP", affectedUrl: URL_A, deletedAt: new Date() });
+      await createTask(ws, p4, { ruleCode: "TG-DUP", affectedUrl: URL_A });
+      const page = await listAll(CTX(ws));
+      expect(page.items).toHaveLength(1);
+      expect(page.items[0]!.project_count).toBe(1);
+    });
+
+    it("a group with two tasks in ONE project is one row and counts that project once", async () => {
+      const ws = await createWorkspace();
+      const p1 = await createProject(ws);
+      await createTask(ws, p1, { ruleCode: "TG-DUP", affectedUrl: URL_A, impactScore: 20 });
+      await createTask(ws, p1, { ruleCode: "TG-DUP", affectedUrl: URL_A, impactScore: 60 });
+      const page = await listAll(CTX(ws));
+      expect(page.items).toHaveLength(1);
+      expect(page.items[0]!.project_count).toBe(1);
+      expect(page.items[0]!.impact).toBe(60);
+    });
+
+    it("the aux finding's rule code is the code a collapsed row groups on (the code the caller sees)", async () => {
+      const ws = await createWorkspace();
+      const [p1, p2] = [await createProject(ws), await createProject(ws)];
+      const f1 = await createAuxFinding(ws, p1, { ruleCode: "AUX-SHARED" });
+      const f2 = await createAuxFinding(ws, p2, { ruleCode: "AUX-SHARED" });
+      await createTask(ws, p1, { sourceFindingId: f1, affectedUrl: URL_A });
+      await createTask(ws, p2, { sourceFindingId: f2, affectedUrl: URL_A });
+      const page = await listAll(CTX(ws));
+      expect(page.items).toHaveLength(1);
+      expect(page.items[0]!.code).toBe("AUX-SHARED");
+      expect(page.items[0]!.project_count).toBe(2);
+    });
+
+    it("paging over collapsed rows returns every group exactly once, with the page size counted in rows not tasks", async () => {
+      const ws = await createWorkspace();
+      const ps = [await createProject(ws), await createProject(ws), await createProject(ws)];
+      for (let g = 0; g < 5; g += 1) {
+        for (const p of ps) await createTask(ws, p, { ruleCode: `TG-G${g}`, affectedUrl: `https://x.example.com/${g}`, impactScore: 90 - g * 10 });
+      }
+      const seen: string[] = [];
+      let cursor: string | undefined;
+      for (let i = 0; i < 10; i += 1) {
+        const page = await listAll(CTX(ws), { limit: 2, ...(cursor === undefined ? {} : { cursor }) } as PaginationRequest);
+        seen.push(...page.items.map((r) => r.code ?? ""));
+        expect(page.items.every((r) => r.project_count === 3)).toBe(true);
+        if (!page.pagination.has_more) break;
+        cursor = page.pagination.cursor_next!;
+      }
+      expect(seen).toEqual(["TG-G0", "TG-G1", "TG-G2", "TG-G3", "TG-G4"]);
+    });
+  });
+
+  it("[STORY-064 #10] the queue's task scan is one scan of ix_tasks_open (inner scan, planner steered off a seq scan)", async () => {
+    const ws = await createWorkspace();
+    const p1 = await createProject(ws);
+    for (let i = 0; i < 20; i += 1) await createTask(ws, p1, { impactScore: i });
+    const plan = await inTenant(CTX(ws), async () => {
+      const store = currentTenantStore()!;
+      await store.client.query("SET LOCAL enable_seqscan = off");
+      const r = await store.client.query<{ "QUERY PLAN": unknown }>(`EXPLAIN (FORMAT JSON) ${ACTION_ITEMS_SQL}`, [SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS, null, null, null, null, 51]);
+      return JSON.stringify(r.rows[0]!["QUERY PLAN"]);
+    });
+    const scans = [...plan.matchAll(/"Relation Name":"tasks"/g)];
+    expect(scans).toHaveLength(1);
+    expect(plan).toMatch(/"Index Name":"ix_tasks_open"/);
   });
 
   it("an empty workspace is an empty array, not an error", async () => {

@@ -1,5 +1,7 @@
-import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query, Req } from "@nestjs/common";
 import {
+  bulkTaskRequestSchema,
+  bulkTaskResponseSchema,
   completeTaskResponseSchema,
   createCommentRequestSchema,
   createTaskRequestSchema,
@@ -10,6 +12,8 @@ import {
   taskListResponseSchema,
   taskSchema,
   updateTaskRequestSchema,
+  type BulkTaskRequest,
+  type BulkTaskResponse,
   type CompleteTaskResponse,
   type CreateCommentRequest,
   type CreateTaskRequest,
@@ -27,6 +31,8 @@ import { Audit } from "../../api/decorators/audit.decorator.js";
 import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
+import { assertMatchesTenant } from "../../tenancy/assert-matches-tenant.js";
+import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import { TasksService } from "./tasks.service.js";
 
 // A controller resolves the request, calls one service method, and returns
@@ -135,5 +141,26 @@ export class TasksController {
     @Query(new ZodValidationPipe(taskEventListQuerySchema)) query: TaskEventListQuery,
   ): Promise<Page<TaskEvent>> {
     return this.service.listTaskEvents(id, query);
+  }
+
+  // STORY-064 AC12 — `POST /workspaces/{id}/tasks/bulk`, `task:move`. Bulk assign, status change and snooze over the cross-project
+  // queue, so the route is the workspace's (the URL id is checked against the token's workspace). The URL names a WORKSPACE, not a
+  // project: `@ScopedByQuery` lets a non-empty scope through and the service checks EVERY id against that scope, refusing the whole
+  // batch (403) when any is out of scope — still refusing an empty scope in the guard. Idempotent: a replayed key returns the first
+  // response. The batch has no resource id of its own, so the audit row names the workspace.
+  @Post("workspaces/:id/tasks/bulk")
+  @HttpCode(200)
+  @Idempotent()
+  @RequirePermission("task:move")
+  @ScopedByQuery()
+  @Audit({ action: "task.bulk_updated", resourceType: "workspace", resourceIdFrom: "workspace" })
+  @ApiContract({ operationId: "bulkUpdateTasks", requestSchema: bulkTaskRequestSchema, responseSchema: bulkTaskResponseSchema })
+  bulk(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(bulkTaskRequestSchema)) body: BulkTaskRequest,
+  ): Promise<BulkTaskResponse> {
+    assertMatchesTenant(id, req.tenant!.workspaceId);
+    return this.service.bulkUpdateTasks(body);
   }
 }

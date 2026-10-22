@@ -59,6 +59,8 @@ describe("STORY-169 · TasksService.listActionItems", () => {
       source_displacement_id: null,
       created_at: new Date("2026-09-01T00:00:00Z"),
       created_at_key: "2026-09-01 00:00:00+00",
+      project_count: 1,
+      projects: [{ id: "0195e5b7-0000-7000-8000-0000000000f1", name: "HubSpot CRM", slug: "hubspot-crm" }],
       ...over,
     };
   }
@@ -89,7 +91,7 @@ describe("STORY-169 · TasksService.listActionItems", () => {
   // wording — see tasks.service.ts's own comment on the conflict.
   it("orders impact DESC, then severity rank, then age, then id", async () => {
     await serviceReading([]).listActionItems({ limit: 50 } as never);
-    expect(calls[0]!.sql).toContain("ORDER BY impact_score DESC, severity_rank ASC, created_at ASC, id ASC");
+    expect(calls[0]!.sql).toContain("ORDER BY r.impact_score DESC, r.severity_rank ASC, r.created_at ASC, r.id ASC");
   });
 
   it("an empty workspace is an empty array, not an error", async () => {
@@ -118,7 +120,26 @@ describe("STORY-169 · TasksService.listActionItems", () => {
       impact: 74,
       effort: "s",
       created_at: "2026-09-01T00:00:00.000Z",
+      project_count: 1,
+      projects: [{ id: "0195e5b7-0000-7000-8000-0000000000f1", name: "HubSpot CRM", slug: "hubspot-crm" }],
     });
+  });
+
+  // STORY-064 AC10 — `jsonb_agg` returns the projects unordered; the wire order is the row's own project first, then by name.
+  it("[STORY-064 #11] orders a collapsed row's projects: its own first, then by name", async () => {
+    const own = "0195e5b7-0000-7000-8000-0000000000f1";
+    const page = await serviceReading([
+      row({
+        project_count: 3,
+        projects: [
+          { id: "0195e5b7-0000-7000-8000-0000000000f3", name: "Zeta", slug: "zeta" },
+          { id: own, name: "Mid", slug: "mid" },
+          { id: "0195e5b7-0000-7000-8000-0000000000f2", name: "Alpha", slug: "alpha" },
+        ],
+      }),
+    ]).listActionItems({ limit: 50 } as never);
+    expect(page.items[0]!.project_count).toBe(3);
+    expect(page.items[0]!.projects.map((p) => p.name)).toEqual(["Mid", "Alpha", "Zeta"]);
   });
 
   // STORY-169 review — REMOVED: a unit test here that fed `severity: null`
