@@ -23,6 +23,50 @@ const logger = new Logger("queue-worker");
 
 export type JobProcessor<T = unknown> = (tx: ClientBase, job: Job) => Promise<T>;
 
+// ADR-0003 — a PHASED tenant job, for a handler whose middle is the network (KAD-06: no handler holds a transaction, or the
+// pooled connection under it, across an await on an external service).
+//
+//   prepare(tx)  one SHORT tenant transaction: read what the job needs, decide whether there is anything to do. Committed, and the
+//                connection is released, BEFORE `run` starts.
+//   run(state)   NO transaction, NO client. This is where fetches, renders and object-store writes happen. It gets only what
+//                `prepare` returned and the job's already-verified payload; it cannot read tenant data, because it has no client.
+//   commit(tx)   a second SHORT tenant transaction, in the same workspace, that writes the result.
+//
+// The order that makes it safe is unchanged: the signature is verified FIRST, before any client is acquired, and both
+// transactions set the tenant context from that verified payload (`set_config(..., true)`), so neither phase can name a
+// workspace of its own. Idempotency under at-least-once delivery is the handler's: `commit` may run for a job that another
+// delivery already completed, and must say so by writing nothing.
+
+/** What `prepare` returns to end the job without a `run`/`commit` (nothing to do, or already done). */
+export const PHASES_DONE: unique symbol = Symbol("nominara.phases.done");
+
+export interface JobPhases<Prepared, Fetched> {
+  prepare(tx: ClientBase, job: Job): Promise<Prepared | typeof PHASES_DONE>;
+  run(prepared: Prepared, job: Job): Promise<Fetched>;
+  commit(tx: ClientBase, prepared: Prepared, fetched: Fetched, job: Job): Promise<void>;
+}
+
+const PHASES: unique symbol = Symbol("nominara.job-phases");
+
+/**
+ * Wraps `phases` as a JobProcessor. Called as a plain function (a test, a tool) it composes the three phases on the ONE client
+ * it is handed, which is the pre-ADR shape. `createJobProcessor` recognises it and splits the transaction instead.
+ */
+export function phasedProcessor<Prepared, Fetched>(phases: JobPhases<Prepared, Fetched>): JobProcessor<void> {
+  const composed: JobProcessor<void> = async (tx, job) => {
+    const prepared = await phases.prepare(tx, job);
+    if (prepared === PHASES_DONE) return;
+    const fetched = await phases.run(prepared, job);
+    await phases.commit(tx, prepared, fetched, job);
+  };
+  return Object.assign(composed, { [PHASES]: phases });
+}
+
+/** The phases behind a processor built with `phasedProcessor`, or undefined for an ordinary one. */
+export function phasesOf(processor: JobProcessor): JobPhases<unknown, unknown> | undefined {
+  return (processor as { [PHASES]?: JobPhases<unknown, unknown> })[PHASES];
+}
+
 export interface JobProcessorOptions {
   readonly keys: RotatingSigningKeys;
   /** Acquires the client this job's transaction runs on. Called AFTER signature verification for a tenant-scoped queue — never before. */
@@ -50,6 +94,11 @@ export interface JobProcessorOptions {
  */
 export function createJobProcessor(entry: QueueTopologyEntry, options: JobProcessorOptions): (job: Job) => Promise<unknown> {
   const verify = rotatingHmacJobVerifier(options.keys);
+  const phases = phasesOf(options.process);
+  // A phased job IS two tenant transactions; a queue with no tenant has none to split. Fail at construction, not at the first job.
+  if (phases !== undefined && !entry.tenantScoped) {
+    throw new Error(`queue "${entry.name}" is not tenant-scoped: a phased processor needs a tenant context for each of its two transactions`);
+  }
 
   // STORY-124 — release on EVERY exit path, including a throwing handler.
   // A job that fails is exactly the job most likely to be retried, so a
@@ -80,15 +129,30 @@ export function createJobProcessor(entry: QueueTopologyEntry, options: JobProces
     // shape is the one change ISO-11 exists to prevent.
     verify(tenantJob);
 
-    const client = await options.getClient();
-    let failure: unknown;
-    try {
-      return await withTenantJob(client, tenantJob, verify, (tx) => options.process(tx, job));
-    } catch (error) {
-      failure = error;
-      throw error;
-    } finally {
-      release(client, failure);
+    // ADR-0003: two short tenant transactions around a run that holds neither a transaction nor a connection.
+    if (phases !== undefined) {
+      const prepared = await inTenantTransaction((tx) => phases.prepare(tx, job));
+      if (prepared === PHASES_DONE) return undefined;
+      const fetched = await phases.run(prepared, job);
+      await inTenantTransaction((tx) => phases.commit(tx, prepared, fetched, job));
+      return undefined;
+    }
+
+    return inTenantTransaction((tx) => options.process(tx, job));
+
+    // Each call acquires its OWN client AFTER verification and returns it before the next begins; `withTenantJob` verifies again
+    // (cheap, and it keeps `withTenantJob` safe to call from anywhere) and sets the context from the verified payload.
+    async function inTenantTransaction<T>(fn: (tx: ClientBase) => Promise<T>): Promise<T> {
+      const client = await options.getClient();
+      let failure: unknown;
+      try {
+        return await withTenantJob(client, tenantJob, verify, fn);
+      } catch (error) {
+        failure = error;
+        throw error;
+      } finally {
+        release(client, failure);
+      }
     }
   };
 }
