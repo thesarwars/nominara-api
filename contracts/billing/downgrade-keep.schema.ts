@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-077 D2 — the customer chooses what to keep before a downgrade's cut-over (owner approved 2026-10-20).
 //   GET /v1/billing/subscription/change/keep   (billing:read)   what can be kept, the target's limits, the default, the choice
@@ -22,8 +23,9 @@ import { z } from "zod";
 // ⚠ WITH NO CHOICE, the cut-over keeps the MOST RECENTLY ACTIVE items (owner decision 2026-10-20) and pauses the rest of
 // the excess. "Last active" (`last_active_at`) is, for a project, its latest finished capture run (`capture_runs.finished_at`,
 // status `completed` or `partial`); for a prompt, its latest answer capture (`answer_captures.captured_at`, status
-// `captured` or `parsed`); null when there is none, which ranks below any activity. Equal activity (or none) falls back to
-// the slice-A rule: the older row is kept, the most recently created is paused first. `default` is that dry run, today.
+// `captured`, `parsed` or a reused `skipped` cell - the rule freshness uses); null when there is none, which ranks below
+// any activity. Equal activity (or none) falls back to the slice-A rule: the older row is kept, the most recently created
+// is paused first. `default` is that dry run, today.
 //
 // The choice is cleared with the downgrade it was made for: cancelling it, or its cut-over, clears it.
 
@@ -33,7 +35,7 @@ export const DOWNGRADE_KEEP_MAX_PROMPTS = 5_000;
 
 const uniqueIds = (max: number) =>
   z
-    .array(z.uuid())
+    .array(lowercaseUuidSchema)
     .max(max)
     .refine((ids) => new Set(ids).size === ids.length, { message: "ids must be unique" });
 
