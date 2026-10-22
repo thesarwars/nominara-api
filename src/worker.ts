@@ -11,6 +11,10 @@ import { announceAlertRouting, drainAlertEmails } from "./lib/alerts/alerts.js";
 import { connect, withKeepalives } from "./db/client.js";
 import { createPgPool, isConnectionClassFailure } from "./db/pg-pool.js";
 import { SchedulerSweepRuntime } from "./lib/capture/scheduler-sweep.js";
+import { cacheKeyNamespace } from "./lib/cache/key-namespace.js";
+import { rollupDirtyKey } from "./lib/cache/valkey-keys.js";
+import { RollupDirtySet } from "./lib/rollup/dirty-dates.js";
+import { RollupSweepRuntime } from "./lib/rollup/rollup-sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
 import { TokenBucket } from "./lib/engines/token-bucket.js";
@@ -72,6 +76,9 @@ export const ROLLUP_MONITOR_RUNTIME = "ROLLUP_MONITOR_RUNTIME";
 
 /** NEW-A-13 — DI token for the capture group's scheduler sweep (hourly at :05 UTC). Capture group only. */
 export const CAPTURE_SCHEDULER_SWEEP = "CAPTURE_SCHEDULER_SWEEP";
+
+/** STORY-042 — DI token for the rollup group's closed-day and dirty-date sweep (every 15 minutes). Rollup group only. */
+export const ROLLUP_SWEEP_RUNTIME = "ROLLUP_SWEEP_RUNTIME";
 
 class WorkerGroupRuntime implements OnModuleDestroy {
   constructor(
@@ -212,6 +219,21 @@ class RollupMonitorHolder implements OnModuleDestroy {
     await Promise.all(this.readers.map((queue) => queue.close().catch(() => undefined)));
     // The monitor's own long-lived connection (not the group's shared producer-side one).
     await this.connection.quit().catch(() => this.connection.disconnect());
+  }
+}
+
+/** STORY-042 — owns the rollup sweep's timer, its producer, and the connection holding the dirty set. */
+class RollupSweepHolder implements OnModuleDestroy {
+  constructor(
+    public readonly runtime: RollupSweepRuntime,
+    private readonly producer: QueueProducer,
+    private readonly dirtyConnection: Redis,
+  ) {}
+
+  async onModuleDestroy(): Promise<void> {
+    this.runtime.stop();
+    await this.producer.onModuleDestroy();
+    await this.dirtyConnection.quit().catch(() => this.dirtyConnection.disconnect());
   }
 }
 
@@ -417,6 +439,23 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       provide: ROLLUP_MONITOR_RUNTIME,
       useValue: new RollupMonitorHolder(monitorRuntime, [...dlqReaders.values(), ...interactiveReaders.values()], monitorConnection),
     });
+  }
+
+  // STORY-042 AC2/AC6 — the closed-day (00:20 workspace-local) and dirty-date sweep, in-process in the rollup group, every
+  // 15 minutes. It enqueues signed `rollup.metric_daily` jobs (consumed by this same group) through the group's shared
+  // producer-side connection, reads projects on the OWNER connection (it must see across tenants) and keeps the dirty set on
+  // the QUEUE instance (noeviction, persistent) over its own always-reconnecting connection.
+  if (env.WORKER_GROUP === "rollup") {
+    if (scheduleConnection === undefined) throw new WorkerGroupError("rollup sweep: the producer-side connection was not built");
+    const rollupProducer = new QueueProducer(scheduleConnection, prefix, keys);
+    const dirtyConnection = createQueueMonitorConnection(env.QUEUE_REDIS_URL);
+    const rollupSweep = new RollupSweepRuntime({
+      connect: () => connect(withKeepalives(env.DATABASE_URL)),
+      enqueue: (queue, workspaceId, payload, idempotencyKey) => rollupProducer.enqueueTenantJob(queue, workspaceId, payload, { idempotencyKey }),
+      dirty: new RollupDirtySet(dirtyConnection, rollupDirtyKey(cacheKeyNamespace())),
+    });
+    rollupSweep.start();
+    providers.push({ provide: ROLLUP_SWEEP_RUNTIME, useValue: new RollupSweepHolder(rollupSweep, rollupProducer, dirtyConnection) });
   }
 
   @Module({ providers })

@@ -8,9 +8,12 @@ import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import { defaultParseAlertMonitor, observationFrom, type ParseAlertMonitor } from "../../parser/parse-alerts.js";
 import type { SentimentArbiter } from "../../parser/sentiment/arbiter.js";
 import { SCORING_VERSION } from "../../scoring/index.js";
+import { cacheKeyNamespace } from "../../cache/key-namespace.js";
+import { rollupDirtyKey } from "../../cache/valkey-keys.js";
+import { markDateDirtyIfLate, RollupDirtySet, type DirtyEntry } from "../../rollup/dirty-dates.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { afterCommit } from "../../../tenancy/tenant-context.js";
-import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
+import { createQueueMonitorConnection, createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { requestRollupIfRunComplete as requestRunRollup } from "./run-rollup-request.js";
@@ -54,6 +57,8 @@ export interface CaptureParseDeps {
     payload: Record<string, unknown>,
     idempotencyKey: string,
   ) => Promise<unknown>;
+  /** STORY-042 AC6 — adds a late fact's (workspace, project, date) to the `rollup_dirty` set. Injected in tests; production writes to the queue-instance Valkey. */
+  readonly markRollupDirty?: (entry: DirtyEntry) => Promise<void>;
 }
 
 interface CaptureRecord {
@@ -98,6 +103,16 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
         signingKeysFromEnv(_context.env),
       );
       return producer.enqueueTenantJob(queue, workspaceId, rollupPayload, { idempotencyKey });
+    });
+
+  // STORY-042 AC6 — built on the first late fact, like the producer above. The queue instance (noeviction), not the
+  // cache one: this set is a work list and must survive memory pressure and restarts.
+  let dirtySet: RollupDirtySet | undefined;
+  const markRollupDirty =
+    deps?.markRollupDirty ??
+    (async (entry: DirtyEntry): Promise<void> => {
+      dirtySet ??= new RollupDirtySet(createQueueMonitorConnection(_context.env.QUEUE_REDIS_URL), rollupDirtyKey(cacheKeyNamespace()));
+      await dirtySet.mark(entry);
     });
 
   /** NEW-A-7 — see run-rollup-request.ts. FROM HERE AND NOT FROM THE FINALISATION: finalisation precedes parsing, so a rollup requested there would read facts that do not exist yet. */
@@ -227,6 +242,10 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
 
     // Stage 6 — the facts and the capture, in the job's own transaction.
     await persistParse(tx, capture, result, aliasFingerprint);
+
+    // STORY-042 AC6 / EC-12 — facts written onto a day that is already closed and rolled up make that rollup stale:
+    // mark the workspace-local date dirty (after commit) so the dirty-date sweep reprocesses it within 15 minutes.
+    await markDateDirtyIfLate(tx, { workspaceId: payload.workspaceId, projectId: record.project_id, capturedAt: record.captured_at }, markRollupDirty, logger);
 
     // STORY-037 AC10 / STORY-038 AC12 / STORY-039 AC8 — feed the three alert meters from what was just persisted.
     // AFTER COMMIT: the meters are cumulative, so observing inside the transaction counts an attempt that then rolls

@@ -51,6 +51,9 @@ export type EnqueueVerifyPresence = (workspaceId: string, payload: { projectId: 
 /** STORY-063 — enqueues one `task.generate` job for a project and workspace-local day. Injected in tests. */
 export type EnqueueTaskGenerate = (workspaceId: string, payload: { projectId: string; metricDate: string }, idempotencyKey: string) => Promise<unknown>;
 
+/** SLO-14: parse to metric visible, p95 at most 15 minutes. */
+export const ROLLUP_FRESHNESS_SLO_SECONDS = 15 * 60;
+
 export interface RollupMetricDailyDeps {
   readonly enqueueVerifyPresence?: EnqueueVerifyPresence;
   readonly enqueueTaskGenerate?: EnqueueTaskGenerate;
@@ -146,6 +149,21 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
       // enqueue is logged, never thrown: the rollup is durable and the next day's run asks again.
       // No ambient tenant transaction (a direct call outside the worker) means no commit to wait for.
       if (currentTenantStore() !== undefined) {
+        // STORY-042 AC11 / SLO-14 — freshness: how long from the enqueue (which the parse path makes after the run's last
+        // parse COMMITS, so it stands for "parse completed") until this rollup's rows are visible, i.e. committed. Nothing
+        // stores a parse-completion time, so job age is the faithful proxy. ONLY a parse-triggered rollup: the closed-day,
+        // dirty-date and rebuild jobs are scheduled work, not parse-to-metric latency. No enqueue time means no figure —
+        // never a 0. The objective is a p95 over a fleet; this emits the per-rollup observation it is computed from.
+        if (payload.reason === "run_parsed" && typeof job.timestamp === "number") {
+          const enqueuedAt = job.timestamp;
+          const { projectId, workspaceId } = payload;
+          afterCommit(() => {
+            const lagSeconds = Math.max(0, Date.now() - enqueuedAt) / 1000;
+            const withinSlo = lagSeconds <= ROLLUP_FRESHNESS_SLO_SECONDS;
+            incrementCounter("nominara_rollup_freshness_observations_total", { within_slo: String(withinSlo) });
+            logger.log({ event: "rollup.freshness", workspace_id: workspaceId, project_id: projectId, lag_seconds: lagSeconds, within_slo: withinSlo });
+          });
+        }
         const today = await localToday(tx, timezone);
         const { projectId, workspaceId } = payload;
 

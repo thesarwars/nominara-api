@@ -203,3 +203,16 @@ export function entitlementsKey(env: string, workspaceId: string, entitlementVer
 export function refreshGraceSlotKey(env: string, sessionId: string): string {
   return globalKey(env, "refresh-grace", sessionId);
 }
+
+/**
+ * `{env}:global:rollup_dirty` — STORY-042 AC6 / EC-12: the set of `workspace|project|date` triples whose `metric_daily`
+ * rows a late fact has made stale. Platform-wide work list holding identifiers only (no tenant content), so it is a
+ * `global` key; it is read by one sweep across every workspace, which a per-workspace key could not serve without a SCAN.
+ *
+ * ⚠ IT LIVES ON THE QUEUE INSTANCE (`QUEUE_REDIS_URL`: noeviction, persistent), NOT THE CACHE ONE. This key is a work
+ * list, and `allkeys-lru` with no persistence would drop a mark under memory pressure or a restart: a late fact would
+ * then never be reprocessed, with nothing to say so. Only the key NAME is built here.
+ */
+export function rollupDirtyKey(env: string): string {
+  return globalKey(env, "rollup_dirty");
+}
