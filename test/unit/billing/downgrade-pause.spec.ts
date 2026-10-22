@@ -60,9 +60,11 @@ describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED 
     // names the two newest: P4 and P3. Leaving the archived P2 out would count 3 and pause only P4.
     const ps = [project(1), project(2, { status: "archived" }), project(3), project(4)];
     expect(planDowngradePause(limits({ projects: 2 }), ps, []).pauseProjects).toEqual([id(4), id(3)]);
-    // An archived project in the excess is not tracking anything: it is counted, not paused.
+    // An archived project is counted, never paused, and HOLDS its slot (STORY-077 D2 review round 1): it ranks first
+    // whatever its age or activity, so a newest archived project no longer soaks up the excess for an active one. Slice A
+    // let it (nothing paused here); with a keep choice that made the cut-over and the next reconcile disagree.
     const newestArchived = [project(1), project(2), project(3, { status: "archived" })];
-    expect(planDowngradePause(limits({ projects: 2 }), newestArchived, []).pauseProjects).toEqual([]);
+    expect(planDowngradePause(limits({ projects: 2 }), newestArchived, []).pauseProjects).toEqual([id(2)]);
   });
 
   it("BOUNDARY · usage exactly at the limit pauses nothing; one over pauses exactly one", () => {

@@ -17,7 +17,11 @@ import { usePlanChangeFixture, type Actor, type PlanName } from "../support/plan
 //   * the choice outlives its downgrade (a cancel, or the cut-over itself, leaves it behind for the next one);
 //   * with no choice, a project captured yesterday is paused because it was created last;
 //   * the preview names projects the cut-over will not pause;
-//   * someone without billing:write records a choice.
+//   * someone without billing:write records a choice;
+//   * (review round 1) an archived or person-paused project soaks up the excess behind the choice, so the next reconcile
+//     (an add-on change after the cut-over) pauses a project the customer chose;
+//   * a record left with ANOTHER intent's id is honoured at the cut-over;
+//   * the email says "the items you did not choose to keep" when chosen items were paused because the limits fell.
 
 describe("STORY-077 D2 · the keep choice and the most-recently-active default", () => {
   const f = usePlanChangeFixture();
@@ -115,20 +119,21 @@ describe("STORY-077 D2 · the keep choice and the most-recently-active default",
     await finishedRun(workspaceId, ids[4]!, 60);
     await finishedRun(workspaceId, ids[3]!, 120);
     await finishedRun(workspaceId, ids[2]!, 10, "failed"); // a failed run is not activity
-    const big = await prompts(workspaceId, ids[0]!, 45);
-    await captured(workspaceId, ids[0]!, big[0]!, 30);
+    const big = await prompts(workspaceId, ids[4]!, 45);
+    await captured(workspaceId, ids[4]!, big[0]!, 30);
     await scheduleDowngrade(owner, "growth");
 
     const view = downgradeKeepResponseSchema.parse(dataOf(await f.get(owner, KEEP)));
     expect(view.target_plan_key).toBe("growth");
-    expect(view.limits).toEqual({ projects: 3, prompts_total: 120, prompts_per_project: 40 });
+    // The person-paused P5 holds one of growth's 3 project slots (review round 1): two are left to choose.
+    expect(view.limits).toEqual({ projects: 3, projects_keepable: 2, prompts_total: 120, prompts_per_project: 40 });
     expect(view.projects.map((p) => p.id), "keepable, most recently active first").toEqual([ids[4], ids[3], ids[0], ids[1], ids[2]]);
     expect(view.projects[0]!.last_active_at).not.toBeNull();
     expect(view.projects.find((p) => p.id === ids[2])!.last_active_at, "a failed run is not activity").toBeNull();
-    expect(view.projects.find((p) => p.id === ids[0])!.prompts.map((p) => p.id)[0], "the captured prompt first").toBe(big[0]);
-    // Six projects (the person-paused one counts) against 3: P4 and P3 (activity), then P0 (oldest) are kept.
-    expect(view.default.project_ids).toEqual([ids[4], ids[3], ids[0]]);
-    expect(view.default.prompt_ids, "P0 keeps its captured prompt and the 39 oldest of the rest").toEqual([big[0], ...big.slice(1, 40)]);
+    expect(view.projects.find((p) => p.id === ids[4])!.prompts.map((p) => p.id)[0], "the captured prompt first").toBe(big[0]);
+    // Six projects against 3: the person-paused P5 holds a slot, then P4 and P3 (activity) are kept; P0 is paused.
+    expect(view.default.project_ids).toEqual([ids[4], ids[3]]);
+    expect(view.default.prompt_ids, "P4 keeps its captured prompt and the 39 oldest of the rest").toEqual([big[0], ...big.slice(1, 40)]);
     expect(view.choice).toBeNull();
   });
 
@@ -221,6 +226,79 @@ describe("STORY-077 D2 · the keep choice and the most-recently-active default",
     const preview = planChangePreviewResponseSchema.parse(dataOf(await f.post(owner, PREVIEW, { plan_key: "growth" })));
     const projects = preview.exceeds.find((e) => e.kind === "structural" && e.key === "projects.max");
     expect(projects).toMatchObject({ paused: 2, items: [{ id: ids[2], name: "P2" }, { id: ids[1], name: "P1" }] });
+  });
+
+  it("review round 1 · an archived project holds its slot: the choice is bounded by what is left, and an add-on change after the cut-over leaves the chosen alone", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const ids = await f.projects(workspaceId, 5);
+    // P4 is archived, and the most recently active: by activity alone it would outrank every chosen project.
+    await finishedRun(workspaceId, ids[4]!, 1);
+    await db().query("UPDATE projects SET status = 'archived' WHERE id = $1", [ids[4]]);
+    await finishedRun(workspaceId, ids[0]!, 30);
+    await scheduleDowngrade(owner, "growth");
+
+    const view = downgradeKeepResponseSchema.parse(dataOf(await f.get(owner, KEEP)));
+    expect(view.limits).toMatchObject({ projects: 3, projects_keepable: 2 });
+    expect(view.default.project_ids, "P4 holds a slot, P0 (activity) and P1 (the oldest of the rest) are kept").toEqual([ids[0], ids[1]]);
+    const over = await f.put(owner, KEEP, { project_ids: [ids[1], ids[2], ids[3]], prompt_ids: [] });
+    expect(over.statusCode, over.body).toBe(400);
+    expect(JSON.stringify(errorOf(over).details)).toContain("project_ids");
+
+    const put = await f.put(owner, KEEP, { project_ids: [ids[2], ids[3]], prompt_ids: [] });
+    expect(put.statusCode, put.body).toBe(200);
+    await cutOver(workspaceId, "growth");
+    const afterCutOver = (await projectState(workspaceId)).map((p) => [p.id, p.status, p.marked]);
+    expect(afterCutOver).toEqual([
+      [ids[0], "paused", true],
+      [ids[1], "paused", true],
+      [ids[2], "active", false],
+      [ids[3], "active", false],
+      [ids[4], "archived", false],
+    ]);
+
+    // An add-on change (an extra seat) reconciles again with no choice: it must change nothing.
+    const sent = spyEmail();
+    f.stripeSubscription(workspaceId, { plan: "growth", held: [{ kind: "extra_seat", quantity: 1 }] });
+    const delivered = await f.reconcile(workspaceId);
+    expect(delivered.statusCode, delivered.body).toBe(200);
+    expect((await projectState(workspaceId)).map((p) => [p.id, p.status, p.marked]), "the chosen still track").toEqual(afterCutOver);
+    expect(sent, "nothing was paused or resumed").toHaveLength(0);
+  });
+
+  it("review round 1 · a record left with ANOTHER intent's id is not honoured: the cut-over applies the default", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const ids = await f.projects(workspaceId, 5);
+    await finishedRun(workspaceId, ids[0]!, 5);
+    await finishedRun(workspaceId, ids[1]!, 6);
+    await finishedRun(workspaceId, ids[2]!, 7);
+    await scheduleDowngrade(owner, "growth");
+    // Written straight to the row: the opposite of the default, for an intent that is not the one being adopted.
+    const stale = { intent_id: randomUUID(), project_ids: [ids[3], ids[4]], prompt_ids: [], chosen_at: new Date().toISOString() };
+    await db().query("UPDATE subscriptions SET downgrade_keep = $2::jsonb WHERE workspace_id = $1", [workspaceId, JSON.stringify(stale)]);
+    expect(downgradeKeepResponseSchema.parse(dataOf(await f.get(owner, KEEP))).choice, "the GET does not show it either").toBeNull();
+
+    const sent = spyEmail();
+    await cutOver(workspaceId, "growth");
+    expect((await projectState(workspaceId)).filter((p) => p.marked).map((p) => p.id), "the default: the least recently active").toEqual([ids[3], ids[4]]);
+    expect(sent[0]!.textBody).toMatch(/least recently active/);
+    expect(await keepColumn(workspaceId), "cleared with the intent").toBeNull();
+  });
+
+  it("review round 1 · limits that fell after the choice (an add-on removed at the cut-over) pause chosen items too, and the email says so", async () => {
+    const { workspaceId, owner } = await f.newWorkspace("business", { held: [{ kind: "extra_project", quantity: 1 }] });
+    const ids = await f.projects(workspaceId, 5);
+    await scheduleDowngrade(owner, "growth");
+    const view = downgradeKeepResponseSchema.parse(dataOf(await f.get(owner, KEEP)));
+    expect(view.limits.projects, "growth's 3 plus the extra project that survives the move").toBe(4);
+    expect((await f.put(owner, KEEP, { project_ids: ids.slice(1), prompt_ids: [] })).statusCode).toBe(200);
+
+    const sent = spyEmail();
+    await cutOver(workspaceId, "growth"); // Stripe's new phase carries no add-on: the limit is 3
+    const marked = (await projectState(workspaceId)).filter((p) => p.marked).map((p) => p.id);
+    expect(marked, "the unchosen P0, and the newest of the chosen").toEqual([ids[0], ids[4]]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.textBody).toMatch(/you did not choose to keep/);
+    expect(sent[0]!.textBody).toMatch(/limits fell after you chose/);
   });
 
   it("cancelling the downgrade clears the choice, and a new downgrade starts with none", async () => {

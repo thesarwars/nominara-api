@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { planDowngradePause, type DowngradePausePlan, type PauseLimits, type PauseProject, type PausePrompt } from "../../../src/lib/billing/downgrade-pause.js";
-import { keptAfter, validateKeepChoice } from "../../../src/lib/billing/downgrade-keep.js";
+import { keptAfter, pausedAnyChosen, projectSlotsKeepable, validateKeepChoice } from "../../../src/lib/billing/downgrade-keep.js";
 import { downgradePausedEmail } from "../../../src/lib/billing/downgrade-pause-notice.js";
 
 // STORY-077 D2 — the keep choice (scenario 2) and the default order when no choice is made (owner decision 2026-10-20:
@@ -15,7 +15,11 @@ import { downgradePausedEmail } from "../../../src/lib/billing/downgrade-pause-n
 //   * the choice is ignored for a project or prompt the default would have paused, or a chosen paused item stays paused;
 //   * a choice smaller than the allowance is undone by the next reconcile (not a fixed point);
 //   * the limits fall after the choice (an add-on removed) and the cut-over keeps more than the plan allows;
-//   * a choice over the target's limits, or naming a prompt outside the kept projects, or a person's pause, is accepted.
+//   * a choice over the target's limits, or naming a prompt outside the kept projects, or a person's pause, is accepted;
+//   * (review round 1) an ARCHIVED or PERSON-PAUSED project, which holds a slot (§14 counts every non-deleted project), is
+//     ranked behind the choice at the cut-over, so it soaks up the excess, and the next reconcile with no choice (any
+//     add-on change, an operator plan:set) ranks it by activity and pauses a project the customer chose;
+//   * the email says "the items you did not choose to keep" although chosen items were paused too (the limits fell).
 
 const T0 = Date.parse("2026-01-01T00:00:00.000Z");
 const key = (hours: number) => new Date(T0 + hours * 3_600_000).toISOString().replace("Z", "000Z");
@@ -164,8 +168,10 @@ describe("STORY-077 D2 · what the cut-over would keep (the GET's default)", () 
     const ps = [project(1), project(2, { activityKey: key(50) }), project(3), project(4, { status: "paused" })];
     const prompts = [prompt(1, id(1)), prompt(2, id(2)), prompt(3, id(3)), prompt(4, id(2), { status: "paused", pausedByDowngrade: true }), prompt(5, id(4))];
     const plan = planDowngradePause(limits({ projects: 3 }), ps, prompts);
-    // Count 4 against 3 (the person-paused P4 counts): the excess is the least kept-worthy, P4, then nothing else is paused.
-    expect(keptAfter(plan, ps, prompts)).toEqual({ projectIds: [id(2), id(1), id(3)], promptIds: [id(1002), id(1004), id(1001), id(1003)] });
+    // Count 4 against 3. The person-paused P4 holds its slot (review round 1: a project that is not tracking ranks first,
+    // whatever its activity), so two slots are left: P2 (activity) and P1 (the older); P3 is paused with its prompt.
+    expect(plan.pauseProjects).toEqual([id(3)]);
+    expect(keptAfter(plan, ps, prompts)).toEqual({ projectIds: [id(2), id(1)], promptIds: [id(1002), id(1004), id(1001)] });
   });
 });
 
@@ -178,42 +184,66 @@ describe("STORY-077 D2 · the choice is validated against the target plan's limi
   const l = limits({ projects: 2, promptsPerProject: 2, promptsTotal: 3 });
 
   it("a choice within every limit has no issue", () => {
-    expect(validateKeepChoice({ project_ids: [id(1), id(2)], prompt_ids: [id(1001), id(1002), id(1004)] }, keepable, l)).toEqual([]);
+    expect(validateKeepChoice({ project_ids: [id(1), id(2)], prompt_ids: [id(1001), id(1002), id(1004)] }, keepable, l, 0)).toEqual([]);
   });
 
   it("more projects than the target allows is refused on project_ids", () => {
-    const issues = validateKeepChoice({ project_ids: [id(1), id(2), id(3)], prompt_ids: [] }, keepable, l);
+    const issues = validateKeepChoice({ project_ids: [id(1), id(2), id(3)], prompt_ids: [] }, keepable, l, 0);
     expect(issues).toEqual([{ path: ["project_ids"], message: "the target plan keeps at most 2 projects" }]);
   });
 
   it("more prompts in one project, or in all, than the target allows is refused on prompt_ids", () => {
-    expect(validateKeepChoice({ project_ids: [id(1)], prompt_ids: [id(1001), id(1002), id(1003)] }, keepable, l)).toEqual([
+    expect(validateKeepChoice({ project_ids: [id(1)], prompt_ids: [id(1001), id(1002), id(1003)] }, keepable, l, 0)).toEqual([
       { path: ["prompt_ids"], message: "the target plan keeps at most 2 prompts in one project" },
     ]);
     const wide = new Map<string, ReadonlySet<string>>([
       [id(1), new Set([id(1001), id(1002)])],
       [id(2), new Set([id(1004), id(1005)])],
     ]);
-    expect(validateKeepChoice({ project_ids: [id(1), id(2)], prompt_ids: [id(1001), id(1002), id(1004), id(1005)] }, wide, l)).toEqual([
+    expect(validateKeepChoice({ project_ids: [id(1), id(2)], prompt_ids: [id(1001), id(1002), id(1004), id(1005)] }, wide, l, 0)).toEqual([
       { path: ["prompt_ids"], message: "the target plan keeps at most 3 prompts in all" },
     ]);
   });
 
   it("an id that cannot be kept (unknown, deleted, archived, a person's pause) is refused at its index", () => {
-    expect(validateKeepChoice({ project_ids: [id(1), id(9)], prompt_ids: [id(1009)] }, keepable, l)).toEqual([
+    expect(validateKeepChoice({ project_ids: [id(1), id(9)], prompt_ids: [id(1009)] }, keepable, l, 0)).toEqual([
       { path: ["project_ids", 1], message: "not a project that can be kept" },
       { path: ["prompt_ids", 0], message: "not a prompt that can be kept" },
     ]);
   });
 
   it("a prompt whose project is not kept is refused: it would be paused with its project", () => {
-    expect(validateKeepChoice({ project_ids: [id(2)], prompt_ids: [id(1001)] }, keepable, l)).toEqual([
+    expect(validateKeepChoice({ project_ids: [id(2)], prompt_ids: [id(1001)] }, keepable, l, 0)).toEqual([
       { path: ["prompt_ids", 0], message: "its project is not in project_ids" },
     ]);
   });
 
+  it("review round 1 · the projects a choice may name are the target's limit LESS the slots archived and person-paused projects hold", () => {
+    // Limit 2, one slot held by an archived project: one project may be chosen, the message says why.
+    expect(validateKeepChoice({ project_ids: [id(1)], prompt_ids: [] }, keepable, l, 1)).toEqual([]);
+    expect(validateKeepChoice({ project_ids: [id(1), id(2)], prompt_ids: [] }, keepable, l, 1)).toEqual([
+      { path: ["project_ids"], message: "the target plan keeps at most 1 more project: 1 of its 2 project slots is held by archived or paused projects" },
+    ]);
+    // Every slot held: nothing can be chosen, an empty choice is still valid.
+    expect(validateKeepChoice({ project_ids: [], prompt_ids: [] }, keepable, l, 3)).toEqual([]);
+    expect(validateKeepChoice({ project_ids: [id(3)], prompt_ids: [] }, keepable, l, 3)).toHaveLength(1);
+  });
+
+  it("review round 1 · projectSlotsKeepable: the limit less every non-deleted project that is not tracking and not downgrade-paused, never below 0", () => {
+    const ps = [
+      project(1),
+      project(2, { status: "initializing" }),
+      project(3, { status: "paused", pausedByDowngrade: true }),
+      project(4, { status: "archived" }),
+      project(5, { status: "paused" }),
+    ];
+    expect(projectSlotsKeepable(limits({ projects: 3 }), ps)).toBe(1);
+    expect(projectSlotsKeepable(limits({ projects: 1 }), ps)).toBe(0);
+    expect(projectSlotsKeepable(limits(), ps)).toBeNull();
+  });
+
   it("unlimited (null) limits bound nothing", () => {
-    expect(validateKeepChoice({ project_ids: [id(1), id(2), id(3)], prompt_ids: [id(1001), id(1002), id(1003), id(1004)] }, keepable, limits())).toEqual([]);
+    expect(validateKeepChoice({ project_ids: [id(1), id(2), id(3)], prompt_ids: [id(1001), id(1002), id(1003), id(1004)] }, keepable, limits(), 0)).toEqual([]);
   });
 });
 
@@ -228,5 +258,114 @@ describe("STORY-077 scenario 3 · the pause email says WHICH rule chose what was
     const body = downgradePausedEmail("a@example.com", { planName: "Growth", planChanged: true, addonsChanged: false, byChoice: true }, paused)!.textBody;
     expect(body).toMatch(/you did not choose to keep/);
     expect(body).not.toMatch(/most recently created/);
+  });
+});
+
+describe("STORY-077 review round 1 · a project that is not tracking holds its slot, with or without a choice", () => {
+  it("the reviewer's case: a choice plus an ARCHIVED project, then a reconcile with no choice under the same limits, changes NOTHING", () => {
+    // Limit 2: A active (activity at 10h), B active (none), X archived (activity at 50h). X holds one slot whatever the
+    // choice, so the choice {A} keeps A and pauses B, and the next reconcile (an add-on change, plan:set) agrees.
+    const [A, B, X] = [project(1, { activityKey: key(10) }), project(2), project(3, { status: "archived", activityKey: key(50) })];
+    const l = limits({ projects: 2 });
+    for (const chosen of [[A.id], [B.id], [A.id, B.id]]) {
+      const plan = planDowngradePause(l, [A, B, X], [], keep(chosen));
+      expect(plan.pauseProjects, `choice ${chosen.join(",")}: X is never paused`).not.toContain(X.id);
+      const after = applied(plan, [A, B, X], []);
+      expect(strip(planDowngradePause(l, after.projects, after.prompts)), `choice ${chosen.join(",")}`).toEqual(NOTHING);
+    }
+    // A choice within the allowance is kept, the other is paused.
+    expect(planDowngradePause(l, [A, B, X], [], keep([B.id])).pauseProjects).toEqual([A.id]);
+  });
+
+  it("the default ranks a person-paused or archived project FIRST too, so the GET's default and the cut-over agree", () => {
+    // Slice A's newest-archived case, now: the archived P3 holds its slot, and P2 (the newer) is paused.
+    const ps = [project(1), project(2), project(3, { status: "archived" })];
+    expect(planDowngradePause(limits({ projects: 2 }), ps, []).pauseProjects).toEqual([id(2)]);
+    const personPaused = [project(1, { activityKey: key(90) }), project(2, { status: "paused" })];
+    expect(planDowngradePause(limits({ projects: 1 }), personPaused, []).pauseProjects).toEqual([id(1)]);
+  });
+
+  it("PINNED · a chosen project a person pauses after choosing still holds its slot: the cut-over does not hand it to another", () => {
+    // Starter (1 project): A chosen, then paused by a person; B active. A's slot is held, so B is paused, and a later
+    // reconcile with no choice agrees. Nothing is deleted; resuming A needs room, an upgrade resumes B.
+    const ps = [project(1, { status: "paused" }), project(2, { activityKey: key(5) })];
+    const plan = planDowngradePause(limits({ projects: 1 }), ps, [], keep([id(1)]));
+    expect(plan.pauseProjects).toEqual([id(2)]);
+    const after = applied(plan, ps, []);
+    expect(strip(planDowngradePause(limits({ projects: 1 }), after.projects, after.prompts))).toEqual(NOTHING);
+  });
+
+  /** mulberry32, as in downgrade-pause.spec.ts: the same cases on every run. */
+  function rng(seed: number) {
+    let s = seed >>> 0;
+    return () => {
+      s = (s + 0x6d2b79f5) >>> 0;
+      let t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  it("over random workspaces: any VALID choice is kept in full, and the next reconcile with no choice under the same limits changes nothing", () => {
+    let checked = 0;
+    for (let seed = 1; seed <= 400; seed++) {
+      const r = rng(seed);
+      const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(r() * xs.length)]!;
+      const maybeKey = () => (r() < 0.5 ? null : key(Math.floor(r() * 100)));
+      const ps: PauseProject[] = Array.from({ length: 1 + Math.floor(r() * 5) }, (_, i) => {
+        const status = pick(["active", "active", "initializing", "paused", "archived"] as const);
+        return project(i + 1, { createdKey: key(Math.floor(r() * 50)), status, pausedByDowngrade: status === "paused" && r() < 0.5, activityKey: maybeKey() });
+      });
+      const prs: PausePrompt[] = [];
+      for (let i = 0; i < Math.floor(r() * 30); i++) {
+        const roll = r();
+        const over: Partial<PausePrompt> = roll < 0.65 ? {} : roll < 0.85 ? { status: "paused", pausedByDowngrade: true } : { status: "paused" };
+        prs.push(prompt(i, pick(ps).id, { createdKey: key(Math.floor(r() * 50)), activityKey: maybeKey(), ...over }));
+      }
+      const capOrNull = (max: number) => (r() < 0.2 ? null : Math.floor(r() * max));
+      const l = limits({ projects: capOrNull(5), promptsTotal: capOrNull(20), promptsPerProject: capOrNull(8) });
+
+      // What the route would accept: keepable rows only, within the limits less the held slots.
+      const keepableProjects = ps.filter((p) => p.pausedByDowngrade || p.status === "active" || p.status === "initializing");
+      const allowance = projectSlotsKeepable(l, ps);
+      const chosenProjects = keepableProjects.filter(() => r() < 0.6).slice(0, allowance ?? undefined);
+      const chosenPrompts = prs.filter((q) => chosenProjects.some((p) => p.id === q.projectId) && (q.status === "active" || q.pausedByDowngrade) && r() < 0.6);
+      const keepableMap = new Map(keepableProjects.map((p) => [p.id, new Set(prs.filter((q) => q.projectId === p.id && (q.status === "active" || q.pausedByDowngrade)).map((q) => q.id))]));
+      const request = { project_ids: chosenProjects.map((p) => p.id), prompt_ids: chosenPrompts.map((q) => q.id) };
+      if (validateKeepChoice(request, keepableMap, l, ps.length - keepableProjects.length).length > 0) continue;
+      checked += 1;
+
+      const ctx = `seed ${String(seed)} limits ${JSON.stringify(l)}`;
+      const plan = planDowngradePause(l, ps, prs, keep(request.project_ids, request.prompt_ids));
+      const after = applied(plan, ps, prs);
+      for (const p of after.projects.filter((x) => request.project_ids.includes(x.id))) {
+        expect(p.status === "active" || p.status === "initializing", `${ctx}: chosen project ${p.id} is not tracking`).toBe(true);
+      }
+      for (const q of after.prompts.filter((x) => request.prompt_ids.includes(x.id))) expect(q.status, `${ctx}: chosen prompt ${q.id} is paused`).toBe("active");
+      expect(strip(planDowngradePause(l, after.projects, after.prompts)), `${ctx}: the next reconcile undoes the choice`).toEqual(NOTHING);
+    }
+    expect(checked, "enough valid choices were exercised").toBeGreaterThan(100);
+  });
+});
+
+describe("STORY-077 review round 1 · the email says when chosen items were paused because the limits fell", () => {
+  const chosen = keep([id(1)], [id(1001)]);
+  const outcome = (projects: string[], prompts: string[]) => ({
+    projects: projects.map((p) => ({ id: p, name: p })),
+    prompts: prompts.map((p) => ({ id: p, projectId: id(9), projectName: "P9", text: p, withProject: false })),
+  });
+  it("pausedAnyChosen is true only when something chosen was paused", () => {
+    expect(pausedAnyChosen(chosen, outcome([id(2)], [id(1002)]))).toBe(false);
+    expect(pausedAnyChosen(chosen, outcome([id(1)], []))).toBe(true);
+    expect(pausedAnyChosen(chosen, outcome([], [id(1001)]))).toBe(true);
+  });
+  it("with chosen items paused, the email says the limits fell after the choice; without, it does not", () => {
+    const paused = { projects: [{ id: "p1", name: "Project 1" }], prompts: [] };
+    const fell = downgradePausedEmail("a@example.com", { planName: "Growth", planChanged: true, addonsChanged: true, byChoice: true, choiceOverLimit: true }, paused)!.textBody;
+    expect(fell).toMatch(/you did not choose to keep/);
+    expect(fell).toMatch(/limits fell after you chose/);
+    const exact = downgradePausedEmail("a@example.com", { planName: "Growth", planChanged: true, addonsChanged: false, byChoice: true }, paused)!.textBody;
+    expect(exact).not.toMatch(/limits fell/);
   });
 });
