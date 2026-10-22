@@ -626,6 +626,74 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     expect(await projectCount()).toBe(5);
   });
 
+  // ---- review round 5 -------------------------------------------------------------------------------------------
+  // ⚠ THE HAZARD (round-4 review, major): POST /projects with supplied prompts checked the caps against the entitlements
+  // the guard pinned when the request STARTED, resolved before it took the workspace lock. A creation that waited on the
+  // lock while a cut-over lowered the plan then counted the post-cut-over actives against the OLD plan's limits and
+  // inserted its prompts `active`, leaving the workspace above the plan with nothing to re-pause it. Deterministic: the
+  // "webhook" holds the workspace lock FIRST, the creation is seen waiting on it, and only then is the plan lowered.
+  it("review round 5 · POST /projects with supplied prompts that waited on the cut-over's workspace lock is held to the NEW limits (prompts.max_total), not the ones it started with", async () => {
+    const { workspaceId } = await f.newWorkspace("growth");
+    // Before: max_total 14 with 12 active, so the creation's 2 prompts fit. The cut-over lowers it to 10 and pauses 2.
+    await overrideEntitlements(workspaceId, { "prompts.max_total": 14, "projects.max": 10 });
+    const ids = await f.projects(workspaceId, 3);
+    for (const [i, projectId] of ids.entries()) await promptsAt(workspaceId, projectId, 4, 3000 - i * 100);
+    expect(await workspaceActive(workspaceId)).toBe(12);
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    vi.spyOn(UrlGuard.prototype, "validateAndNormalize").mockResolvedValue({ rootDomain: "example.com" });
+
+    const webhook = new Client({ connectionString: process.env.DATABASE_URL });
+    await webhook.connect();
+    try {
+      const webhookPid = (await webhook.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!.pid;
+      await webhook.query("BEGIN");
+      await webhook.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+
+      const create = f.post(actor, "/projects", { root_url: "https://example.com", prompts: [{ text: `seed ${randomUUID()}` }, { text: `seed ${randomUUID()}` }] });
+      // Blocked BY THE "WEBHOOK" BACKEND, not by any other spec's waiter (see the round-3 deadlock case below).
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const waiting = (await db().query<{ n: number }>("SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid))", [webhookPid])).rows[0]!.n;
+        if (waiting > 0) break;
+        if (Date.now() > deadline) throw new Error("the creation never waited on the webhook's workspace lock");
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      // The cut-over: the entitlement version bump apply-plan.ts makes, then the reconcile, in the one transaction.
+      await webhook.query("UPDATE workspaces SET entitlement_overrides = $2::jsonb, entitlement_version = entitlement_version + 1 WHERE id = $1", [
+        workspaceId,
+        JSON.stringify({ "prompts.max_total": 10, "projects.max": 10 }),
+      ]);
+      await reconcileDowngradePause(webhook, workspaceId);
+      await webhook.query("COMMIT");
+
+      const res = await create;
+      expect(res.statusCode, res.body).toBe(403);
+      expect(JSON.parse(res.body)).toMatchObject({ error: { code: "entitlement_exceeded", details: { key: "prompts.max_total", limit: 10, current: 10 } } });
+      expect(await workspaceActive(workspaceId), "never above the plan the cut-over adopted").toBe(10);
+      expect((await projectRows(workspaceId)).length, "the whole creation is refused").toBe(3);
+    } finally {
+      await webhook.end();
+    }
+  });
+
+  it("review round 5 · CONCURRENT POST /projects with supplied prompts cannot both take the last workspace-wide slot (prompts.max_total)", async () => {
+    const { workspaceId } = await f.newWorkspace("growth");
+    // 3 projects, 3 active each = 9; the override caps the workspace at 10 active, so ONE creation's prompt fits.
+    await overrideEntitlements(workspaceId, { "prompts.max_total": 10, "projects.max": 10 });
+    const ids = await f.projects(workspaceId, 3);
+    for (const projectId of ids) await promptsAt(workspaceId, projectId, 3, 500);
+    const actor = await f.enter(await f.ownerOf(workspaceId), workspaceId);
+    // A distinct domain per creation, so a slug race cannot stand in for the cap.
+    vi.spyOn(UrlGuard.prototype, "validateAndNormalize").mockImplementation(async (url: string) => ({ rootDomain: new URL(url).hostname }));
+    const results = await Promise.all(
+      ["a", "b", "c"].map((d) => f.post(actor, "/projects", { root_url: `https://${d}-${randomUUID().slice(0, 8)}.example.com`, prompts: [{ text: `seed ${randomUUID()}` }] })),
+    );
+    expect(await workspaceActive(workspaceId), "never above the cap").toBeLessThanOrEqual(10);
+    expect(results.map((r) => r.statusCode).sort(), "exactly one creation fits").toEqual([202, 403, 403]);
+    for (const r of results.filter((x) => x.statusCode !== 202)) expect(JSON.parse(r.body)).toMatchObject({ error: { code: "entitlement_exceeded", details: { key: "prompts.max_total" } } });
+    expect((await projectRows(workspaceId)).length, "the refused creations create no project").toBe(4);
+  });
+
   it("review round 4 · the shared row PATCH's EDIT door: rewording a downgrade-paused prompt AND resuming it in one request is held to prompts.max_total, and changes nothing when refused", async () => {
     const { workspaceId, ids, paused, actor } = await atTheWorkspaceCap(4);
     const target = paused[0]!;
