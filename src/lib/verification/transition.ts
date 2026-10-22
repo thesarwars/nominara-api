@@ -13,6 +13,17 @@ import type { VerificationFailure } from "../../../contracts/projects/index.js";
 
 const logger = new Logger("domain.verification");
 
+/**
+ * How long a verified method may stay INCONCLUSIVE (our resolver could not answer) before it is treated as lost.
+ * OWNER DECISION 2026-10-22; 7 days is the proposal recorded in the STORY-048 carry note, not a reference number.
+ * The window runs from the first inconclusive result of an unbroken run (`domain_verifications.inconclusive_since`) and
+ * ends when `now - inconclusive_since >= INCONCLUSIVE_GRACE_MS`, so with a daily sweep the loss lands on the run at day 7.
+ * A conclusive result of either kind clears it. Clock source: `now` is the checking process's clock (see `checkStartedAt`);
+ * skew between the API and worker hosts moves the end of a 7-day window by the skew, which is far below the sweep's
+ * 24-hour granularity.
+ */
+export const INCONCLUSIVE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+
 export interface VerificationRow {
   id: string;
   domain: string;
@@ -63,8 +74,8 @@ export async function applyCheckOutcome(client: ClientBase, input: ApplyCheckInp
   // The prior state is read HERE, under a row lock held to the end of the caller's transaction, never taken from
   // the caller's copy: that copy may have been read before a network wait during which another writer (the daily
   // sweep, a second manual check) committed a loss, and trusting it would notify that loss twice.
-  const prior = await client.query<VerificationRow>(
-    "SELECT id, domain, method, nonce, verified_at, last_checked_at, failure_reason FROM domain_verifications WHERE id = $1 FOR UPDATE",
+  const prior = await client.query<VerificationRow & { inconclusive_since: Date | null }>(
+    "SELECT id, domain, method, nonce, verified_at, last_checked_at, failure_reason, inconclusive_since FROM domain_verifications WHERE id = $1 FOR UPDATE",
     [row.id],
   );
   const locked = prior.rows[0];
@@ -81,18 +92,32 @@ export async function applyCheckOutcome(client: ClientBase, input: ApplyCheckInp
   const wasVerified = priorVerifiedAt !== null;
   const reason: VerificationFailure | null = outcome.ok ? null : outcome.reason;
   // OUR outage is not their absence, for whichever caller found it (the daily sweep OR a manual re-check): record the
-  // attempt and the reason, but keep `verified_at`, and below do not notify.
-  const inconclusive = !outcome.ok && outcome.inconclusive === true;
+  // attempt and the reason, but keep `verified_at` and do not notify... for a BOUNDED time. The first inconclusive
+  // result of an unbroken run starts a clock (`inconclusive_since`); once INCONCLUSIVE_GRACE_MS has elapsed with no
+  // conclusive result the method is treated as lost, through the same path as any other loss (AC7).
+  const inconclusiveRaw = !outcome.ok && outcome.inconclusive === true;
+  // Only a method that is verified has anything to lose, so only it carries a clock.
+  const since = inconclusiveRaw && wasVerified ? (locked?.inconclusive_since ?? input.now) : null;
+  const graceExpired = since !== null && input.now.getTime() - since.getTime() >= INCONCLUSIVE_GRACE_MS;
+  const inconclusive = inconclusiveRaw && !graceExpired;
 
   const updated = await client.query<VerificationRow>(
     `UPDATE domain_verifications
-        SET verified_at = $2, last_checked_at = $4, failure_reason = $3
+        SET verified_at = $2, last_checked_at = $4, failure_reason = $3, inconclusive_since = $5
       WHERE id = $1
       RETURNING id, domain, method, nonce, verified_at, last_checked_at, failure_reason`,
     // Cleared on failure, not left standing: AC7's whole point is that a domain which stops verifying stops
     // being verified. Keeping the old timestamp would leave full scope in place on evidence that no longer
-    // holds. On success an existing verified time is kept: it is when control was FIRST proved.
-    [row.id, outcome.ok ? (priorVerifiedAt ?? input.now) : inconclusive ? priorVerifiedAt : null, reason, input.now],
+    // holds. On success an existing verified time is kept: it is when control was FIRST proved. The inconclusive
+    // clock is kept while the result stays inconclusive and cleared by every other outcome (including the loss that
+    // its expiry causes).
+    [
+      row.id,
+      outcome.ok ? (priorVerifiedAt ?? input.now) : inconclusive ? priorVerifiedAt : null,
+      reason,
+      input.now,
+      inconclusive ? since : null,
+    ],
   );
 
   // `projects.domain_verified_at` mirrors "any method currently verified". Denormalised deliberately: the

@@ -89,7 +89,10 @@ export class DomainVerificationService {
     // Captured BEFORE the network wait: `applyCheckOutcome` discards this outcome if a newer check committed meanwhile.
     const checkStartedAt = new Date();
     const outcome = await runCheck(method, domain, row.nonce, this.checks);
-    const applied = await applyCheckOutcome(client, { workspaceId, projectId, domain, row, outcome, now: new Date(), checkStartedAt });
+    // `now` is the time the check BEGAN, exactly as the sweep records it: both writers stamp `last_checked_at` with the
+    // start of their evidence, so the freshness guard compares like with like (a manual check that began first and
+    // committed first must not hide a later sweep's loss behind its finish time).
+    const applied = await applyCheckOutcome(client, { workspaceId, projectId, domain, row, outcome, now: checkStartedAt, checkStartedAt });
     return toState(applied.row);
   }
 

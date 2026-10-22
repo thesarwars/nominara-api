@@ -13,7 +13,7 @@ import { createDomainReverifyHandler, MIN_RECHECK_INTERVAL_MS } from "../../src/
 import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
 import { GuardedFetchRefusal } from "../../src/lib/net/guarded-fetch.js";
 import { TXT_PREFIX, type CheckDeps } from "../../src/lib/verification/checkers.js";
-import { applyCheckOutcome, type VerificationRow } from "../../src/lib/verification/transition.js";
+import { applyCheckOutcome, INCONCLUSIVE_GRACE_MS, type VerificationRow } from "../../src/lib/verification/transition.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import type { Env } from "../../src/config/env.schema.js";
@@ -494,6 +494,167 @@ describe("STORY-048 AC7 · domain.reverify (periodic re-verification)", () => {
     expect(await mirror(s)).toBeNull();
     expect(new Date((await verification(s)).last_checked_at).getTime()).toBe(NOW.getTime());
     expect(await notifications(s)).toHaveLength(1);
+  });
+
+  // ---- review r5: an inconclusive result is bounded (AC7) ----------------------------------------------------------
+  // A resolver outage must not de-verify the fleet in one night (round 1), but a domain whose DNS keeps failing is not
+  // verified for ever either: the first inconclusive result of a run starts a clock, and when INCONCLUSIVE_GRACE_MS has
+  // elapsed with no conclusive success the method is lost through the ordinary loss path.
+  const sinceOf = async (s: Seeded, method = "dns_txt") =>
+    (await db.query("SELECT inconclusive_since FROM domain_verifications WHERE project_id=$1 AND method=$2", [s.project, method])).rows[0].inconclusive_since as Date | null;
+  const manualApply = async (s: Seeded, input: { outcome: Parameters<typeof applyCheckOutcome>[1]["outcome"]; now: Date; checkStartedAt?: Date }, method = "dns_txt"): Promise<Awaited<ReturnType<typeof applyCheckOutcome>>> => {
+    const row = (await db.query("SELECT id, domain, method, nonce, verified_at, last_checked_at, failure_reason FROM domain_verifications WHERE project_id=$1 AND method=$2", [s.project, method])).rows[0] as VerificationRow;
+    const client = await pool.connect();
+    try {
+      return await withTenantContext(client, { workspaceId: s.ws, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+        applyCheckOutcome(tx, { workspaceId: s.ws, projectId: s.project, domain: s.domain, row, ...input }),
+      );
+    } finally {
+      client.release();
+    }
+  };
+  const day = (k: number): Date => new Date(NOW.getTime() + k * 24 * HOUR);
+
+  it("review r5 AC7 · a method that stays inconclusive for the whole grace window is lost on the first run at or after its end: cleared, mirrored, notified once, audited", async () => {
+    const s = await seed("grace");
+    resolverFails[s.domain] = "ESERVFAIL";
+    const days = INCONCLUSIVE_GRACE_MS / (24 * HOUR);
+    for (let k = 0; k < days; k += 1) {
+      const result = await run({ now: () => day(k) });
+      expect(result).toMatchObject({ checked: 1, lost: 0, inconclusive: 1 });
+      expect((await verification(s)).verified_at, `still verified on day ${k}`).not.toBeNull();
+      expect(await notifications(s)).toHaveLength(0);
+    }
+    // The clock started on day 0 and does not move while the result stays inconclusive.
+    expect(new Date((await sinceOf(s))!).getTime()).toBe(day(0).getTime());
+
+    const last = await run({ now: () => day(days) });
+    expect(last).toMatchObject({ checked: 1, lost: 1 });
+    expect((await verification(s)).verified_at).toBeNull();
+    expect(await mirror(s)).toBeNull();
+    expect(await notifications(s)).toHaveLength(1);
+    expect((await auditRows(s)).map((r) => r.action)).toEqual(["project.domain_verification_lost"]);
+    expect(await sinceOf(s)).toBeNull();
+
+    await run({ now: () => day(days + 1) }); // never verified again: not a candidate, nothing repeats
+    expect(await notifications(s)).toHaveLength(1);
+  });
+
+  it("review r5 AC7 · the window is exactly INCONCLUSIVE_GRACE_MS: one millisecond short keeps the method, the full window loses it", async () => {
+    const s = await seed("boundary");
+    const first = await manualApply(s, { outcome: { ok: false, reason: "record_absent", inconclusive: true }, now: NOW });
+    expect(first).toMatchObject({ methodLost: false });
+    const short = await manualApply(s, {
+      outcome: { ok: false, reason: "record_absent", inconclusive: true }, now: new Date(NOW.getTime() + INCONCLUSIVE_GRACE_MS - 1),
+    });
+    expect(short).toMatchObject({ methodLost: false, scopeLost: false });
+    expect((await verification(s)).verified_at).not.toBeNull();
+    const full = await manualApply(s, {
+      outcome: { ok: false, reason: "record_absent", inconclusive: true }, now: new Date(NOW.getTime() + INCONCLUSIVE_GRACE_MS),
+    });
+    expect(full).toMatchObject({ methodLost: true, scopeLost: true });
+    expect((await verification(s)).verified_at).toBeNull();
+    expect(await mirror(s)).toBeNull();
+    expect(await notifications(s)).toHaveLength(1);
+  });
+
+  it("review r5 AC7 · a conclusive success clears the clock, so the window is measured from the NEXT inconclusive result", async () => {
+    const s = await seed("reset");
+    resolverFails[s.domain] = "ESERVFAIL";
+    await run({ now: () => day(0) });
+    expect(await sinceOf(s)).not.toBeNull();
+    delete resolverFails[s.domain];
+    publish(s);
+    await run({ now: () => day(3) });
+    expect(await sinceOf(s)).toBeNull();
+    resolverFails[s.domain] = "ESERVFAIL";
+    // Day 7 is 7 days after the FIRST spell began but only 3 after the second began on day 4: still verified.
+    await run({ now: () => day(4) });
+    await run({ now: () => day(7) });
+    expect((await verification(s)).verified_at).not.toBeNull();
+    expect(new Date((await sinceOf(s))!).getTime()).toBe(day(4).getTime());
+  });
+
+  it("review r5 AC7 · a conclusive failure after an inconclusive spell is an ordinary loss and leaves no clock behind", async () => {
+    const s = await seed("conclusive-after");
+    resolverFails[s.domain] = "ESERVFAIL";
+    await run({ now: () => day(0) });
+    delete resolverFails[s.domain]; // ENOTFOUND now: the record is gone
+    await run({ now: () => day(1) });
+    expect((await verification(s)).verified_at).toBeNull();
+    expect(await sinceOf(s)).toBeNull();
+    expect(await notifications(s)).toHaveLength(1);
+  });
+
+  it("review r5 AC7 · an inconclusive result on a method that was never verified starts no clock", async () => {
+    const s = await seed("never", { verified: false });
+    const applied = await manualApply(s, { outcome: { ok: false, reason: "record_absent", inconclusive: true }, now: NOW });
+    expect(applied).toMatchObject({ methodLost: false, scopeLost: false });
+    expect(await sinceOf(s)).toBeNull();
+  });
+
+  it("review r5 AC7 · the window applies per method: losing one of two on grace expiry keeps full scope and notifies nobody", async () => {
+    const s = await seed("two-methods");
+    await addMethod(s, "meta_tag", new Date(NOW.getTime() - 3 * 24 * HOUR), 30);
+    await manualApply(s, { outcome: { ok: false, reason: "record_absent", inconclusive: true }, now: NOW });
+    const lost = await manualApply(s, {
+      outcome: { ok: false, reason: "record_absent", inconclusive: true }, now: new Date(NOW.getTime() + INCONCLUSIVE_GRACE_MS),
+    });
+    expect(lost).toMatchObject({ methodLost: true, scopeLost: false });
+    expect(await notifications(s)).toHaveLength(0);
+    expect(await mirror(s)).not.toBeNull();
+  });
+
+  it("review r5 AC7 · the window cannot be reached by a stale outcome: an older check discarded by freshness leaves the clock alone", async () => {
+    const s = await seed("stale-clock");
+    await manualApply(s, { outcome: { ok: false, reason: "record_absent", inconclusive: true }, now: NOW });
+    const stale = await manualApply(s, {
+      outcome: { ok: false, reason: "record_absent", inconclusive: true },
+      now: new Date(NOW.getTime() + INCONCLUSIVE_GRACE_MS + 1_000),
+      checkStartedAt: new Date(NOW.getTime() - 60_000), // started before the check committed at NOW
+    });
+    expect(stale).toMatchObject({ methodLost: false, scopeLost: false });
+    expect((await verification(s)).verified_at).not.toBeNull();
+  });
+
+  it("review r5 AC7 · a manual check that STARTED first but committed first does not hide a sweep loss that started later", async () => {
+    const s = await seed("manual-first");
+    const manualStart = new Date(NOW.getTime() - 5 * 60 * 1000);
+    const interleaved: CheckDeps = {
+      ...checks(),
+      resolveTxt: async () => {
+        // The sweep's check began at NOW. While it is in flight a manual check that began EARLIER (manualStart) commits ok.
+        await manualApply(s, { outcome: { ok: true }, now: manualStart, checkStartedAt: manualStart });
+        throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }); // the sweep found the record gone
+      },
+    };
+    const result = await run({ checks: interleaved });
+    expect(result).toMatchObject({ checked: 1, lost: 1 });
+    expect((await verification(s)).verified_at).toBeNull();
+    expect(await mirror(s)).toBeNull();
+    expect(await notifications(s)).toHaveLength(1);
+  });
+
+  it("review r5 · a verification row that vanishes between discovery and the check is skipped and counted as 'gone', not as a resolver outage", async () => {
+    const s = await seed("vanished");
+    let first = true;
+    // The first pooled connection is the nonce read, which happens after discovery: the row is deleted just before it.
+    const racing = {
+      connect: async () => {
+        if (first) {
+          first = false;
+          await db.query("DELETE FROM domain_verifications WHERE project_id=$1", [s.project]);
+        }
+        return pool.connect();
+      },
+    } as unknown as Pool;
+    const context = { pool: racing, env } as unknown as QueueHandlerContext;
+    const result = await createDomainReverifyHandler(context, {
+      now: () => NOW,
+      checks: { ...checks(), resolveTxt: async () => { throw new Error("must not be checked: the row is gone"); } },
+    })(db, tick());
+    expect(result).toMatchObject({ checked: 1, lost: 0, failed: 0, inconclusive: 0, gone: 1 });
+    expect(counters.filter((c) => c.name === "nominara_domain_reverify_checked_total").map((c) => c.labels.outcome)).toEqual(["gone"]);
   });
 
   it("review r4 NFR-SEC-01 · cross-tenant discovery on the owner connection never selects a nonce; the nonce is read under the tenant's own RLS", async () => {

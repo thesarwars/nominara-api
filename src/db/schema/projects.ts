@@ -38,6 +38,7 @@ export const domainVerifications = pgTable("domain_verifications", {
   lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
   failureReason: text("failure_reason"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  inconclusiveSince: timestamp("inconclusive_since", { withTimezone: true }),
 });
 
 export const projectEngines = pgTable("project_engines", {

@@ -28,11 +28,16 @@ import type { VerificationMethod } from "../../../contracts/projects/index.js";
 // a short one, or move it to the queue). Only THIS worker path keeps every transaction closed during a check. An
 // outcome computed BEFORE a newer check committed is discarded, on both paths (`checkStartedAt`).
 //
-// OUR OUTAGE IS NOT THEIR ABSENCE. A resolver or network failure on our side (`inconclusive`), by ANY method, records the attempt
-// and changes nothing else: no scope change, no notification, no audit row. Without this one resolver outage at
-// 02:20 UTC would de-verify every DNS-verified domain in the fleet.
+// OUR OUTAGE IS NOT THEIR ABSENCE, FOR A WHILE. A failure of OUR resolver (`inconclusive`), by ANY method, records the
+// attempt and changes nothing else: no scope change, no notification, no audit row. Without this one resolver outage at
+// 02:20 UTC would de-verify every DNS-verified domain in the fleet. It is BOUNDED (AC7): the first inconclusive result
+// starts `inconclusive_since`, and INCONCLUSIVE_GRACE_MS later (`transition.ts`) the method is lost through the ordinary
+// path, so a domain that stopped verifying cannot keep full scope for ever behind a failure that never clears.
 
 const logger = new Logger("domain.reverify");
+
+/** A candidate whose row no longer exists when its nonce is read. */
+const GONE = Symbol("gone");
 
 /** A domain checked more recently than this is not re-checked: the daily tick is idempotent under redelivery. */
 export const MIN_RECHECK_INTERVAL_MS = 20 * 60 * 60 * 1000;
@@ -52,8 +57,10 @@ export interface ReverifyResult {
   readonly checked: number;
   readonly lost: number;
   readonly failed: number;
-  /** Checks that could not reach a verdict (our resolver/network): scope untouched, re-checked next run. */
+  /** Checks that could not reach a verdict (our resolver/network): scope untouched until the grace window ends, re-checked next run. */
   readonly inconclusive: number;
+  /** Rows that were deleted between discovery and the check: skipped, neither a verdict nor an outage. */
+  readonly gone: number;
 }
 
 interface Candidate {
@@ -89,6 +96,7 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
   let lost = 0;
   let failed = 0;
   let inconclusive = 0;
+  let gone = 0;
   for (let start = 0; start < candidates.length; start += CHECK_CONCURRENCY) {
     const chunk = candidates.slice(start, start + CHECK_CONCURRENCY);
     // No transaction is open here: this is the external wait. Outcomes are only as fresh as this instant.
@@ -96,10 +104,10 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
     // allSettled: one check that throws must not abandon the run (oldest-checked-first ordering would then starve
     // every other domain on every retry and every later day).
     const outcomes = await Promise.allSettled(
-      chunk.map(async (candidate): Promise<CheckOutcome> => {
+      chunk.map(async (candidate): Promise<CheckOutcome | typeof GONE> => {
         // A short tenant transaction, closed before the network wait.
         const nonce = await readNonce(pool, candidate);
-        if (nonce === null) return { ok: false, reason: "record_absent", inconclusive: true }; // row gone: nothing to apply
+        if (nonce === null) return GONE; // row gone: nothing to check and nothing to apply, and not a resolver outage
         return runCheck(candidate.method, candidate.domain, nonce, deps.checks);
       }),
     );
@@ -108,6 +116,11 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
         const settled = outcomes[index]!;
         if (settled.status === "rejected") throw settled.reason;
         const outcome = settled.value;
+        if (outcome === GONE) {
+          gone += 1;
+          incrementCounter("nominara_domain_reverify_checked_total", { outcome: "gone" });
+          continue;
+        }
         const isInconclusive = !outcome.ok && outcome.inconclusive === true;
         if (isInconclusive) inconclusive += 1;
         if (await applyOne(pool, candidate, outcome, checkStartedAt)) lost += 1;
@@ -129,7 +142,7 @@ export async function runDomainReverification(owner: ClientBase, pool: Pool, dep
     }
   }
 
-  return { status: failed === 0 ? "complete" : "partial", checked: candidates.length, lost, failed, inconclusive };
+  return { status: failed === 0 ? "complete" : "partial", checked: candidates.length, lost, failed, inconclusive, gone };
 }
 
 /** The row's nonce, read as `nominara_app` inside its own workspace context (RLS live). null = the row is gone. */

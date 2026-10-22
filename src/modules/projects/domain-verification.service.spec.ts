@@ -180,6 +180,35 @@ describe("STORY-048 · DomainVerificationService", () => {
     expect(calls.some((c) => c.sql.includes("INSERT INTO notifications"))).toBe(false);
   });
 
+  // Review r5 — both writers stamp the time their check BEGAN, so the freshness guard compares like with like. A manual
+  // check that began first and committed first must not hide a later sweep's loss behind its (later) finish time.
+  it("review r5 — a manual check records the time it STARTED, not the time it finished, and passes it as the freshness guard", async () => {
+    const started = new Date("2026-10-20T10:00:00Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(started);
+      const verified = {
+        id: "v1", domain: "hubspot.com", method: "dns_txt", nonce: "n1",
+        verified_at: new Date("2026-09-01"), last_checked_at: new Date("2026-09-01"), failure_reason: null,
+      };
+      const service = harness(
+        {
+          resolveTxt: vi.fn(async () => {
+            vi.setSystemTime(new Date(started.getTime() + 20_000)); // the slow network wait
+            return [[`${TXT_PREFIX}n1`]];
+          }),
+        },
+        [verified],
+        new Date("2026-09-01"),
+      );
+      await service.check(PROJECT, "dns_txt");
+    } finally {
+      vi.useRealTimers();
+    }
+    const update = calls.find((c) => c.sql.includes("UPDATE domain_verifications"))!;
+    expect((update.params[3] as Date).getTime()).toBe(started.getTime());
+  });
+
   // Review round 2 — the manual path and the sweep must treat an outage on OUR side the same way.
   it.each(["ETIMEOUT", "ESERVFAIL"])(
     "a manual re-check of a VERIFIED domain during OUR resolver outage (%s) keeps verified_at and sends nothing",

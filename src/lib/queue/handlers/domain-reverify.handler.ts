@@ -37,6 +37,10 @@ export function createDomainReverifyHandler(context: QueueHandlerContext, deps: 
   // Built on first use: QUEUE_HANDLERS is evaluated for every worker group at boot.
   let checks: CheckDeps | undefined = deps.checks;
 
+  // `_client` is the pooled connection `createJobProcessor` checks out for a non-tenant queue. This handler does not use it
+  // (discovery runs on its own owner connection, every write on a pool connection inside one tenant's context), yet it
+  // stays checked out for the run. Accepted: the queue has concurrency 1, so the cost is one idle pooled connection; the
+  // factory has no "release before run" shape and adding one is a worker-factory change this story does not own.
   return async (_client: ClientBase, _job: Job): Promise<DomainReverifyOutcome> => {
     const owner = await connect(withKeepalives(context.env.DATABASE_URL));
     const lockKey = globalQueueLockKey("domain.reverify");
@@ -62,10 +66,11 @@ export function createDomainReverifyHandler(context: QueueHandlerContext, deps: 
           span.setAttribute("nominara.domain_reverify.lost", result.lost);
           span.setAttribute("nominara.domain_reverify.failed", result.failed);
           span.setAttribute("nominara.domain_reverify.inconclusive", result.inconclusive);
+          span.setAttribute("nominara.domain_reverify.gone", result.gone);
           incrementCounter("nominara_domain_reverify_runs_total", { status: result.status });
           for (let i = 0; i < result.lost; i += 1) incrementCounter("nominara_domain_reverify_lost_total");
           // Counts only — never a domain or an address.
-          logger.log({ event: "domain.reverify.run", status: result.status, checked: result.checked, lost: result.lost, failed: result.failed, inconclusive: result.inconclusive });
+          logger.log({ event: "domain.reverify.run", status: result.status, checked: result.checked, lost: result.lost, failed: result.failed, inconclusive: result.inconclusive, gone: result.gone });
           return result;
         } catch (error) {
           span.setStatus({ code: SpanStatusCode.ERROR });
