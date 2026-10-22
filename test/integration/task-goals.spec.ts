@@ -1,7 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { Logger } from "@nestjs/common";
+import { trace } from "@opentelemetry/api";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { RUNTIME_ROLES, BREAKGLASS_ROLE } from "../../src/db/conventions.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
@@ -9,7 +11,8 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { ConflictError, NotFoundError, ValidationFailedError } from "../../src/api/errors/domain-errors.js";
 import { ProjectOutOfScopeException } from "../../src/tenancy/errors.js";
 import { GoalsService } from "../../src/modules/tasks/goals.service.js";
-import { withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
+import { refreshProjectGoals } from "../../src/lib/rollup/refresh-project-goals.js";
+import { currentTenantStore, withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
 import { createGoalRequestSchema, updateGoalRequestSchema } from "../../contracts/tasks/index.js";
 
 // STORY-065-A — goals: baseline captured at creation, progress as
@@ -297,5 +300,333 @@ describe("STORY-065-A · goals — real SQL", () => {
     const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
     await create(CTX(ws, actor), p, engineGoal({ title: "a" }));
     await expect(inTenant(CTX(ws, actor), () => service.listGoals(p, { limit: 2, cursor: "bm90LWEtY3Vyc29y" }))).rejects.toBeInstanceOf(ValidationFailedError);
+  });
+  // ---- STORY-065 AC1/AC2/AC6/AC11 — six kinds, the rollup refresh, achievement ------------------------------
+
+  async function metricDay(ws: string, p: string, engine: string, date: string, o: Partial<{ cells: number; visibility: number; citationShare: number; rendering: number | null; sentiment: number | null }> = {}): Promise<void> {
+    const { cells = 20, visibility = 50, citationShare = 0.2, rendering = null, sentiment = null } = o;
+    await client.query(
+      `INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date, cells_total, visibility_score, citation_share, rendering_quality, sentiment_score, scoring_version)
+       VALUES ($1, $2, $3, 'brand', $2, $4::date, $5, $6, $7, $8, $9, 'v1')`,
+      [ws, p, engine, date, cells, visibility, citationShare, rendering, sentiment]);
+  }
+  async function trackedPrompt(ws: string, p: string, cluster: string | null, o: { deleted?: boolean } = {}): Promise<string> {
+    seq += 1;
+    const r = await client.query<{ id: string }>(
+      `INSERT INTO tracked_prompts (workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, cluster_id, deleted_at)
+       VALUES ($1, $2, $3, $4, 'recommendation', 'decision', $5, $6) RETURNING id`,
+      [ws, p, `prompt ${seq}`, createHash("sha256").update(`p-${seq}-${randomUUID()}`).digest(), cluster, o.deleted ? new Date() : null]);
+    return r.rows[0]!.id;
+  }
+  async function stability(ws: string, prompt: string, engine: string, windowStart: string, presence: number, samples: number): Promise<void> {
+    await client.query(
+      `INSERT INTO prompt_stability (workspace_id, prompt_id, engine_key, window_start, sample_count, presence_rate, sov_median, sov_iqr, entity_set_jsd)
+       VALUES ($1, $2, $3, $4::date, $5, $6, 0, 0, 0)`, [ws, prompt, engine, windowStart, samples, presence]);
+  }
+  const kindGoal = (kind: string, metric: string, targetValue: number, extra: Record<string, unknown> = {}) =>
+    createGoalRequestSchema.parse({ title: `${kind} goal`, kind, target: { metric, target_value: targetValue, ...extra } });
+  const storedTarget = async (goalId: string) =>
+    (await client.query<{ target: Record<string, unknown> }>("SELECT target FROM goals WHERE id = $1", [goalId])).rows[0]!.target;
+  const refresh = (ctx: TenantContext, projectId: string) => inTenant(ctx, () => refreshProjectGoals(currentTenantStore()!.client, projectId));
+  const row = async (goalId: string) =>
+    (await client.query<{ status: string; achieved_at: Date | null; progress_pct: string; current: { value: number | null; cells: number | null; at: string } | null; updated_at: Date }>(
+      "SELECT status, achieved_at, progress_pct, current, updated_at FROM goals WHERE id = $1", [goalId])).rows[0]!;
+
+  describe("[STORY-065 #1] a goal of each kind captures its baseline at creation, from that kind's own metric", () => {
+    it("citation_presence reads the cross-engine citation_share (a fraction, stated as a percentage) and the 30-day cell count", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+      await metricDay(ws, p, "all", "2026-09-26", { citationShare: 0.1, cells: 20 });
+      await metricDay(ws, p, "all", "2026-09-27", { citationShare: 0.42, cells: 20 });
+      await metricDay(ws, p, "gemini", "2026-09-27", { citationShare: 0.9, cells: 500 });
+      const goal = await create(CTX(ws, actor), p, kindGoal("citation_presence", "citation_share", 60));
+      expect(goal.baseline).toMatchObject({ value: 42, cells: 40 });
+      expect(goal.current).toMatchObject({ value: 42, cells: 40 });
+      expect(goal.target).toMatchObject({ metric: "citation_share", target_value: 60 });
+    });
+
+    it("an engine scope reads THAT engine's rows only, never the cross-engine blend or another engine", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 120);
+      await metricDay(ws, p, "gemini", "2026-09-27", { visibility: 71.25, cells: 35 });
+      await metricDay(ws, p, "gemini", "2026-09-26", { visibility: 10, cells: 5 });
+      await metricDay(ws, p, "chatgpt", "2026-09-27", { visibility: 5, cells: 500 });
+      const scoped = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 90, { engine_key: "gemini" }));
+      expect(scoped.baseline).toMatchObject({ value: 71.25, cells: 40 });
+      expect(scoped.target).toMatchObject({ engine_key: "gemini" });
+      // an engine with no rows is unmeasured (null), never the project's figure
+      const none = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 90, { engine_key: "google_ai_mode" }));
+      expect(none.baseline).toMatchObject({ value: null, cells: null });
+      expect(none.sample_state).toBe("insufficient");
+      expect(none.progress_pct).toBeNull();
+    });
+
+    it("an unknown engine_key is a 400, never a goal on nothing", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+      await expect(create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 90, { engine_key: "nosuchengine" }))).rejects.toBeInstanceOf(ValidationFailedError);
+      expect((await client.query("SELECT 1 FROM goals")).rowCount).toBe(0);
+    });
+
+    it("rendering_quality reads projects.rendering_quality with the ATTRIBUTE-CAPABLE engines' cells, not the project's whole n", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 500);
+      await client.query("UPDATE projects SET rendering_quality = 61.5 WHERE id = $1", [p]);
+      await metricDay(ws, p, "google_ai_mode", "2026-09-27", { cells: 40, rendering: 61.5 });
+      await metricDay(ws, p, "chatgpt", "2026-09-27", { cells: 460 });
+      const goal = await create(CTX(ws, actor), p, kindGoal("rendering_quality", "rendering_quality", 80));
+      expect(goal.baseline).toMatchObject({ value: 61.5, cells: 40 });
+      expect(goal.sample_state).toBe("sufficient");
+    });
+
+    it("sentiment_recovery reads projects.sentiment_score; null when there were no mentions reads as insufficient (never 50, never 0)", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 80);
+      await client.query("UPDATE projects SET sentiment_score = 35 WHERE id = $1", [p]);
+      const measured = await create(CTX(ws, actor), p, kindGoal("sentiment_recovery", "sentiment_score", 60));
+      expect(measured.baseline).toMatchObject({ value: 35, cells: 80 });
+      await client.query("UPDATE projects SET sentiment_score = NULL WHERE id = $1", [p]);
+      const unmeasured = await create(CTX(ws, actor), p, kindGoal("sentiment_recovery", "sentiment_score", 60));
+      expect(unmeasured.baseline).toMatchObject({ value: null });
+      expect(unmeasured.sample_state).toBe("insufficient");
+      expect(unmeasured.progress_pct).toBeNull();
+    });
+
+    it("prompt_recommendation reads the presence rate of the cluster's prompts: latest window per prompt and engine, weighted by sample count, as a percentage", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws);
+      const c = await createCluster(ws, p);
+      const [p1, p2] = [await trackedPrompt(ws, p, c), await trackedPrompt(ws, p, c)];
+      const outside = await trackedPrompt(ws, p, null); const gone = await trackedPrompt(ws, p, c, { deleted: true });
+      await stability(ws, p1, "gemini", "2026-09-28", 0.5, 20);
+      await stability(ws, p1, "gemini", "2026-09-21", 1, 20); // an older window: superseded
+      await stability(ws, p2, "gemini", "2026-09-28", 0.25, 20);
+      await stability(ws, p2, "chatgpt", "2026-09-28", 0.75, 10);
+      await stability(ws, outside, "gemini", "2026-09-28", 1, 100);
+      await stability(ws, gone, "gemini", "2026-09-28", 1, 100);
+      const all = await create(CTX(ws, actor), p, kindGoal("prompt_recommendation", "presence_rate", 80, { prompt_cluster_id: c }));
+      expect(all.baseline).toMatchObject({ value: 45, cells: 50 });
+      const one = await create(CTX(ws, actor), p, kindGoal("prompt_recommendation", "presence_rate", 80, { prompt_cluster_id: c, engine_key: "gemini" }));
+      expect(one.baseline).toMatchObject({ value: 37.5, cells: 40 });
+    });
+
+    it("prompt_recommendation on an empty or unmeasured cluster is value=null, insufficient; a foreign or unknown cluster is a 400", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws); const q = await createProject(ws);
+      const c = await createCluster(ws, p);
+      const goal = await create(CTX(ws, actor), p, kindGoal("prompt_recommendation", "presence_rate", 80, { prompt_cluster_id: c }));
+      expect(goal.baseline).toMatchObject({ value: null, cells: null });
+      expect(goal.sample_state).toBe("insufficient");
+      const other = await createCluster(ws, q, 10, "Other");
+      await expect(create(CTX(ws, actor), p, kindGoal("prompt_recommendation", "presence_rate", 80, { prompt_cluster_id: other }))).rejects.toBeInstanceOf(ValidationFailedError);
+      await expect(create(CTX(ws, actor), p, kindGoal("prompt_recommendation", "presence_rate", 80, { prompt_cluster_id: randomUUID() }))).rejects.toBeInstanceOf(ValidationFailedError);
+    });
+  });
+
+  describe("direction is derived at creation from baseline versus target and stored in the target", () => {
+    it("up when the target is above the baseline, down when below, and up when the baseline is unmeasured or equal", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 120);
+      const up = await create(CTX(ws, actor), p, engineGoal());
+      expect(await storedTarget(up.id)).toMatchObject({ direction: "up", metric: "visibility_score", target_value: 60 });
+      const down = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 30));
+      expect(await storedTarget(down.id)).toMatchObject({ direction: "down" });
+      const equal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 42.5));
+      expect(await storedTarget(equal.id)).toMatchObject({ direction: "up" });
+      const q = await createProject(ws, null, null);
+      const unmeasured = await create(CTX(ws, actor), q, engineGoal());
+      expect(await storedTarget(unmeasured.id)).toMatchObject({ direction: "up" });
+      expect((await list(CTX(ws, actor), p)).find((g) => g.id === down.id)!.target).toMatchObject({ direction: "down" });
+    });
+  });
+
+  describe("[STORY-065 #2] the rollup step refreshes current and progress; a read never does", () => {
+    it("moves current to the live metric, computes progress between baseline and target, and leaves a goal under n=30 as its sample state", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await client.query("UPDATE projects SET visibility_blended = 50, cells_30d = 150 WHERE id = $1", [p]);
+      expect(await refresh(CTX(ws, actor), p)).toMatchObject({ refreshed: 1, achieved: [] });
+      const stored = await row(goal.id);
+      expect(stored.current).toMatchObject({ value: 50, cells: 150 });
+      expect(Number(stored.progress_pct)).toBe(50);
+      const [read] = await list(CTX(ws, actor), p);
+      expect(read!.current).toMatchObject({ value: 50, cells: 150 });
+      expect(read!.baseline).toMatchObject({ value: 40, cells: 100 });
+      expect(read!.progress_pct).toBe(50);
+      expect(read!.sample_state).toBe("sufficient");
+      // under-sampled: current is refreshed (the customer sees the n), progress is not a number
+      await client.query("UPDATE projects SET visibility_blended = 55, cells_30d = 29 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      const thin = (await list(CTX(ws, actor), p))[0]!;
+      expect(thin.current).toMatchObject({ value: 55, cells: 29 });
+      expect(thin.sample_state).toBe("insufficient");
+      expect(thin.progress_pct).toBeNull();
+    });
+
+    it("progress is clamped to 0..100: a regression below the baseline is 0, never negative", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await client.query("UPDATE projects SET visibility_blended = 30 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      expect(Number((await row(goal.id)).progress_pct)).toBe(0);
+    });
+
+    it("a goal whose baseline was unmeasured shows no progress percentage (nothing to measure from), until it is achieved", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, null, null);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await client.query("UPDATE projects SET visibility_blended = 50, cells_30d = 100 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      const read = (await list(CTX(ws, actor), p))[0]!;
+      expect(read.current).toMatchObject({ value: 50, cells: 100 });
+      expect(read.sample_state).toBe("sufficient");
+      expect(read.progress_pct).toBeNull();
+      expect(read.status).toBe("active");
+      await client.query("UPDATE projects SET visibility_blended = 61 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      const done = (await list(CTX(ws, actor), p))[0]!;
+      expect(done.status).toBe("achieved");
+      expect(done.progress_pct).toBe(100);
+      expect(goal.id).toBe(done.id);
+    });
+
+    it("[STORY-065 #12] reading twice without a refresh recomputes nothing, even after the live metric moved", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await refresh(CTX(ws, actor), p);
+      const before = await row(goal.id);
+      await client.query("UPDATE projects SET visibility_blended = 99, cells_30d = 900 WHERE id = $1", [p]);
+      const a = await list(CTX(ws, actor), p); const b = await list(CTX(ws, actor), p);
+      expect(b).toEqual(a);
+      expect(await row(goal.id)).toEqual(before);
+    });
+
+    it("an abandoned goal is not refreshed, and a project with no goals is a no-op", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100); const empty = await createProject(ws);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await abandon(CTX(ws, actor), p, goal.id);
+      const before = await row(goal.id);
+      await client.query("UPDATE projects SET visibility_blended = 99, cells_30d = 900 WHERE id = $1", [p]);
+      expect(await refresh(CTX(ws, actor), p)).toMatchObject({ refreshed: 0, achieved: [] });
+      expect(await row(goal.id)).toEqual(before);
+      expect(await refresh(CTX(ws, actor), empty)).toMatchObject({ refreshed: 0, achieved: [] });
+    });
+
+    it("refreshes every kind from its own source in one pass (citation share and prompt presence)", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const c = await createCluster(ws, p); const pr = await trackedPrompt(ws, p, c);
+      await metricDay(ws, p, "all", "2026-09-27", { citationShare: 0.2, cells: 40 });
+      const cit = await create(CTX(ws, actor), p, kindGoal("citation_presence", "citation_share", 60));
+      const rec = await create(CTX(ws, actor), p, kindGoal("prompt_recommendation", "presence_rate", 90, { prompt_cluster_id: c }));
+      await metricDay(ws, p, "all", "2026-09-28", { citationShare: 0.3, cells: 40 });
+      await stability(ws, pr, "gemini", "2026-09-28", 0.5, 40);
+      await refresh(CTX(ws, actor), p);
+      expect((await row(cit.id)).current).toMatchObject({ value: 30, cells: 80 });
+      expect((await row(rec.id)).current).toMatchObject({ value: 50, cells: 40 });
+    });
+  });
+
+  describe("[STORY-065 #6] reaching the target sets achieved and achieved_at, in the rollup step only, and the goal is retained", () => {
+    it("observability: a span, the refreshed and achieved counters, and a log line carrying IDs and counts only (never the title)", async () => {
+      const exporter = new InMemorySpanExporter();
+      trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }));
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const goal = await create(CTX(ws, actor), p, createGoalRequestSchema.parse({ title: "SECRET GOAL TITLE", kind: "engine_score", target: { metric: "visibility_score", target_value: 60 } }));
+      await client.query("UPDATE projects SET visibility_blended = 61 WHERE id = $1", [p]);
+      const spy = vi.spyOn(Logger.prototype, "log");
+      try {
+        await refresh(CTX(ws, actor), p);
+        const logged = JSON.stringify(spy.mock.calls);
+        expect(logged).toContain("nominara_goals_refreshed_total");
+        expect(logged).toContain("nominara_goals_achieved_total");
+        expect(logged).toContain("goals.refresh.run");
+        expect(logged).toContain(p);
+        expect(logged).not.toContain("SECRET GOAL TITLE");
+      } finally { spy.mockRestore(); }
+      const span = exporter.getFinishedSpans().find((x) => x.name === "goals.refresh");
+      expect(span).toBeDefined();
+      expect(span!.attributes["nominara.goals_refresh.achieved"]).toBe(1);
+      expect(goal.id).toBeDefined();
+    });
+
+    it("achieves at the target exactly (inclusive), stamps achieved_at, retains the goal, and writes a system-actor audit row", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      expect((await row(goal.id)).status).toBe("active");
+      await client.query("UPDATE projects SET visibility_blended = 60 WHERE id = $1", [p]);
+      expect(await refresh(CTX(ws, actor), p)).toMatchObject({ refreshed: 1, achieved: [goal.id] });
+      const stored = await row(goal.id);
+      expect(stored.status).toBe("achieved");
+      expect(stored.achieved_at).not.toBeNull();
+      expect(Number(stored.progress_pct)).toBe(100);
+      const [read] = await list(CTX(ws, actor), p);
+      expect(read).toMatchObject({ id: goal.id, status: "achieved", progress_pct: 100 });
+      expect(read!.achieved_at).not.toBeNull();
+      const audit = (await client.query<{ actor_type: string; actor_id: string | null; action: string; resource_type: string; resource_id: string; workspace_id: string; after_state: Record<string, unknown> }>(
+        "SELECT actor_type, actor_id, action, resource_type, resource_id, workspace_id, after_state FROM audit_log WHERE action = 'goal.achieved'")).rows;
+      expect(audit).toHaveLength(1);
+      expect(audit[0]).toMatchObject({ actor_type: "system", action: "goal.achieved", resource_type: "goal", resource_id: goal.id, workspace_id: ws });
+      expect(audit[0]!.after_state).toMatchObject({ status: "achieved" });
+      expect(JSON.stringify(audit[0]!.after_state)).not.toContain(goal.title);
+    });
+
+    it("a value just short of the target is not achieved", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await client.query("UPDATE projects SET visibility_blended = 59.999 WHERE id = $1", [p]);
+      expect(await refresh(CTX(ws, actor), p)).toMatchObject({ achieved: [] });
+      expect((await row(goal.id)).status).toBe("active");
+    });
+
+    it("an under-sampled value past the target is NOT achieved (no achievement on precision theatre), and neither is an unmeasured one", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await client.query("UPDATE projects SET visibility_blended = 95, cells_30d = 29 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      expect((await row(goal.id)).status).toBe("active");
+      await client.query("UPDATE projects SET visibility_blended = NULL, cells_30d = 500 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      expect((await row(goal.id)).status).toBe("active");
+      await client.query("UPDATE projects SET visibility_blended = 95, cells_30d = 30 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      expect((await row(goal.id)).status).toBe("achieved");
+    });
+
+    it("a goal that moves DOWN (target below baseline) is achieved at or below the target, and progress runs the other way", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 60, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 40));
+      await client.query("UPDATE projects SET visibility_blended = 50 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      expect(Number((await row(goal.id)).progress_pct)).toBe(50);
+      expect((await row(goal.id)).status).toBe("active");
+      await client.query("UPDATE projects SET visibility_blended = 40 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      expect((await row(goal.id)).status).toBe("achieved");
+    });
+
+    it("is idempotent: a second refresh neither re-stamps achieved_at, nor writes a second audit row, nor moves an achieved goal's current", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await client.query("UPDATE projects SET visibility_blended = 70 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      const first = await row(goal.id);
+      await client.query("UPDATE projects SET visibility_blended = 10 WHERE id = $1", [p]);
+      expect(await refresh(CTX(ws, actor), p)).toMatchObject({ refreshed: 0, achieved: [] });
+      expect(await row(goal.id)).toEqual(first);
+      expect((await client.query("SELECT 1 FROM audit_log WHERE action = 'goal.achieved'")).rowCount).toBe(1);
+    });
+
+    it("one pass achieves each reaching goal and leaves the others active; a user cannot set achieved through abandon", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const a = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 55, {}));
+      const b = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 90, {}));
+      await client.query("UPDATE projects SET visibility_blended = 56 WHERE id = $1", [p]);
+      expect(await refresh(CTX(ws, actor), p)).toMatchObject({ refreshed: 2, achieved: [a.id] });
+      expect((await row(a.id)).status).toBe("achieved");
+      expect((await row(b.id)).status).toBe("active");
+      await expect(abandon(CTX(ws, actor), p, a.id)).rejects.toBeInstanceOf(ConflictError);
+    });
+
+    it("tenancy: refreshing another tenant's project touches nothing (RLS), and the audit row lands in the project's own workspace chain", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 100);
+      const other = await createWorkspace(); const otherActor = await createUser(other);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await client.query("UPDATE projects SET visibility_blended = 70 WHERE id = $1", [p]);
+      expect(await refresh(CTX(other, otherActor), p)).toMatchObject({ refreshed: 0, achieved: [] });
+      expect((await row(goal.id)).status).toBe("active");
+      await refresh(CTX(ws, actor), p);
+      expect((await client.query<{ workspace_id: string }>("SELECT workspace_id FROM audit_log WHERE action = 'goal.achieved'")).rows.map((r) => r.workspace_id)).toEqual([ws]);
+    });
   });
 });

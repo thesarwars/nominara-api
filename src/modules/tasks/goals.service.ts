@@ -8,12 +8,11 @@ import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
-/**
- * scoring-models.md "Confidence band": `confidence = 'low' if n < 30`, and a
- * low-confidence score is shown with its sample state, never as a headline
- * number. A goal metric under this many cells (or unmeasured) is `insufficient`.
- */
-export const GOAL_MIN_CELLS = 30;
+import { deriveGoalDirection, GOAL_MIN_CELLS, measureGoal } from "../../lib/rollup/refresh-project-goals.js";
+
+// scoring-models.md "Confidence band": a goal metric under `GOAL_MIN_CELLS` cells (or unmeasured) is `insufficient`.
+// Defined beside the refresh that also needs it; re-exported for the callers that already import it from here.
+export { GOAL_MIN_CELLS };
 
 interface Measurement {
   value: number | null;
@@ -39,10 +38,11 @@ interface GoalRow {
   tasks_total: string;
 }
 
-// STORY-065 (step A) — owns `goals` (schemas/tasks-and-goals.md). Goals are a
+// STORY-065 — owns `goals` (schemas/tasks-and-goals.md). Goals are a
 // RECORD: nothing here deletes one, and a read never recomputes progress —
-// `current` and `progress_pct` change only through the rollup (deferred), so
-// two reads with no rollup between them are identical (STORY-065 test #12).
+// `current`, `progress_pct` and `achieved` change only through the rollup step
+// (`lib/rollup/refresh-project-goals.ts`), so two reads with no rollup between
+// them are identical (STORY-065 test #12).
 @Injectable()
 export class GoalsService {
   private readonly logger = new Logger(GoalsService.name);
@@ -68,44 +68,47 @@ export class GoalsService {
   }
 
   /**
-   * `POST /v1/projects/{id}/goals`. THE BASELINE IS CAPTURED HERE, from the
-   * stored measured value (with its cell count), never from the caller.
-   * `current` starts as the same snapshot; only the rollup moves it.
+   * `POST /v1/projects/{id}/goals`. THE BASELINE IS CAPTURED HERE, from the stored measured value (with its cell count) of the
+   * kind's own metric, never from the caller — `measureGoal` is the same function the rollup step uses for `current`, so baseline
+   * and current are one measurement taken at two times. `current` starts as the same snapshot; only the rollup moves it.
+   *
+   * `direction` is DERIVED here from baseline versus target and stored in the target jsonb (see `deriveGoalDirection`); the request
+   * cannot carry it (the contract is strict). A cluster must belong to THIS project (a foreign, other-tenant or unknown cluster is a
+   * 400, never a goal on nothing) and an `engine_key` must name a catalogued engine.
    */
   async createGoal(projectId: string, body: CreateGoalRequest): Promise<Goal> {
     const store = currentTenantStore()!;
     const client = store.client;
     await this.assertProject(client, projectId);
 
-    const project = await client.query<{ value: number | null; cells: number | null }>(
-      `SELECT visibility_blended::float8 AS value, cells_30d AS cells FROM projects WHERE id = $1`,
-      [projectId],
-    );
-    let value = project.rows[0]!.value;
-    let cells = project.rows[0]!.cells;
-    if (body.kind === "topic_authority") {
-      const cluster = await client.query<{ value: number | null }>(
-        `SELECT visibility_score::float8 AS value FROM topic_clusters WHERE id = $1 AND project_id = $2`,
-        [body.target.prompt_cluster_id, projectId],
-      );
+    if (body.target.prompt_cluster_id !== undefined) {
+      const cluster = await client.query(`SELECT 1 FROM topic_clusters WHERE id = $1 AND project_id = $2`, [body.target.prompt_cluster_id, projectId]);
       if (cluster.rows.length === 0) {
         throw new ValidationFailedError({
           message: "prompt_cluster_id must be a topic cluster of this project",
           details: { issues: [{ path: ["target", "prompt_cluster_id"], message: "not a topic cluster of this project" }] },
         });
       }
-      value = cluster.rows[0]!.value;
-      // A cluster has no cell count of its own; the project's n is NOT the
-      // cluster's n. null reads as `insufficient` until a cluster-level n exists.
-      cells = null;
     }
-    const snapshot: Measurement = { value, cells, at: new Date().toISOString() };
+    if (body.target.engine_key !== undefined) {
+      const engine = await client.query(`SELECT 1 FROM engines WHERE key = $1`, [body.target.engine_key]);
+      if (engine.rows.length === 0) {
+        throw new ValidationFailedError({
+          message: "engine_key must be a known engine",
+          details: { issues: [{ path: ["target", "engine_key"], message: "not a known engine" }] },
+        });
+      }
+    }
+
+    const measured = await measureGoal(client, projectId, body);
+    const snapshot: Measurement = { value: measured.value, cells: measured.cells, at: new Date().toISOString() };
+    const target = { ...body.target, direction: deriveGoalDirection(measured.value, body.target.target_value) };
 
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO goals (workspace_id, project_id, title, kind, target, baseline, current, target_date, created_by)
        VALUES (app.current_workspace(), $1, $2, $3, $4::jsonb, $5::jsonb, $5::jsonb, $6, $7)
        RETURNING id`,
-      [projectId, body.title, body.kind, JSON.stringify(body.target), JSON.stringify(snapshot), body.target_date ?? null, store.context.actorId],
+      [projectId, body.title, body.kind, JSON.stringify(target), JSON.stringify(snapshot), body.target_date ?? null, store.context.actorId],
     );
     const goal = await this.readGoal(client, inserted.rows[0]!.id);
     incrementCounter("nominara_goals_created_total", { kind: body.kind, sample_state: goal.sample_state });
@@ -176,8 +179,9 @@ function toGoal(row: GoalRow): Goal {
     target: row.target,
     baseline: row.baseline,
     current: row.current,
-    // null, never 0, when the sample cannot support a percentage.
-    progress_pct: sufficient ? Number(row.progress_pct) : null,
+    // null, never 0, when the sample cannot support a percentage — or when there was no measured baseline to measure from (an
+    // achieved goal is 100 by definition).
+    progress_pct: sufficient && (row.baseline?.value != null || row.status === "achieved") ? Number(row.progress_pct) : null,
     sample_state: sufficient ? "sufficient" : "insufficient",
     status: row.status,
     target_date: row.target_date,
