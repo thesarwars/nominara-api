@@ -27,7 +27,17 @@ export interface LimitChange {
   readonly addonsChanged: boolean;
   /** STORY-077 D2: the cut-over honoured the customer's keep choice; absent or false, the default rule chose. */
   readonly byChoice?: boolean;
+  /** With `byChoice`: some chosen items were paused too, because the limits fell after the choice (an add-on removed). */
+  readonly choiceOverLimit?: boolean;
 }
+
+/** Which rule chose what was paused, as the email says it. */
+const ruleOf = (change: LimitChange): string => {
+  if (change.byChoice !== true) return "the least recently active items above the new limits";
+  return change.choiceOverLimit === true
+    ? "the items you did not choose to keep, and the least recently active of the ones you chose (your limits fell after you chose),"
+    : "the items you did not choose to keep";
+};
 
 /** The opening clause; a missing plan name (the plan join missed) names no plan rather than inventing one. */
 const openingOf = (change: LimitChange): string => {
@@ -41,7 +51,7 @@ export function downgradePausedEmail(to: string, change: LimitChange, paused: Do
   if (projects.length === 0 && prompts.length === 0) return null;
   const lines: string[] = [
     `${openingOf(change)}, which allows fewer projects or prompts than you had. ` +
-      `Nothing has been deleted: ${change.byChoice === true ? "the items you did not choose to keep" : "the least recently active items above the new limits"} are paused, and all their data is kept.`,
+      `Nothing has been deleted: ${ruleOf(change)} are paused, and all their data is kept.`,
     "",
   ];
   // A prompt paused WITH its project is covered by the project's line; the prompt list names only prompts paused in a

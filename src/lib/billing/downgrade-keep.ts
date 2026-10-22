@@ -1,6 +1,6 @@
 import type { ClientBase } from "pg";
 import { downgradeKeepRecordSchema, type DowngradeKeepRecord, type DowngradeKeepRequest } from "../../../contracts/billing/downgrade-keep.schema.js";
-import { keepOrder, type DowngradePausePlan, type KeepChoice, type PauseLimits, type PauseProject, type PausePrompt } from "./downgrade-pause.js";
+import { holdsSlotUntracked, keepOrder, type DowngradePauseOutcome, type DowngradePausePlan, type KeepChoice, type PauseLimits, type PauseProject, type PausePrompt } from "./downgrade-pause.js";
 
 // STORY-077 D2 — the customer's keep choice for a pending downgrade (owner approved 2026-10-20). Pure helpers for the
 // route (downgrade-keep.service.ts) and the cut-over (stripe-subscription.handler.ts). The contract
@@ -12,11 +12,23 @@ export interface KeepIssue {
 }
 
 /**
+ * How many projects a choice may name (`limits.projects_keepable`): the target's project limit less the slots held by
+ * projects that are not tracking and not ours to resume (archived, or paused by a person: `holdsSlotUntracked`), which the
+ * cut-over ranks first (review round 1). Never below 0; null = unlimited.
+ */
+export function projectSlotsKeepable(limits: PauseLimits, projects: ReadonlyArray<Pick<PauseProject, "status" | "pausedByDowngrade">>): number | null {
+  if (limits.projects === null) return null;
+  return Math.max(0, limits.projects - projects.filter(holdsSlotUntracked).length);
+}
+
+/**
  * Checks a choice against what can be kept and the target plan's resolved limits. `keepable` maps each keepable project
  * (tracking now, or paused by an earlier downgrade) to its keepable prompts (active, or paused by an earlier downgrade).
+ * `heldSlots` is the number of non-deleted projects that cannot be kept (archived, or paused by a person): they hold
+ * their slots, so at most `limits.projects - heldSlots` projects may be chosen (review round 1).
  * An id that cannot be kept is named at its index; only a choice whose every id can be kept is counted against the limits.
  */
-export function validateKeepChoice(request: DowngradeKeepRequest, keepable: ReadonlyMap<string, ReadonlySet<string>>, limits: PauseLimits): KeepIssue[] {
+export function validateKeepChoice(request: DowngradeKeepRequest, keepable: ReadonlyMap<string, ReadonlySet<string>>, limits: PauseLimits, heldSlots: number): KeepIssue[] {
   const issues: KeepIssue[] = [];
   request.project_ids.forEach((projectId, index) => {
     if (!keepable.has(projectId)) issues.push({ path: ["project_ids", index], message: "not a project that can be kept" });
@@ -33,8 +45,18 @@ export function validateKeepChoice(request: DowngradeKeepRequest, keepable: Read
   });
   if (issues.length > 0) return issues;
 
-  if (limits.projects !== null && request.project_ids.length > limits.projects) {
-    issues.push({ path: ["project_ids"], message: `the target plan keeps at most ${String(limits.projects)} projects` });
+  if (limits.projects !== null) {
+    const held = Math.min(heldSlots, limits.projects);
+    const allowed = limits.projects - held;
+    if (request.project_ids.length > allowed) {
+      issues.push({
+        path: ["project_ids"],
+        message:
+          held === 0
+            ? `the target plan keeps at most ${String(limits.projects)} projects`
+            : `the target plan keeps at most ${String(allowed)} more ${allowed === 1 ? "project" : "projects"}: ${String(held)} of its ${String(limits.projects)} project slots ${held === 1 ? "is" : "are"} held by archived or paused projects`,
+      });
+    }
   }
   const perProjectLimit = limits.promptsPerProject;
   if (perProjectLimit !== null && [...perProject.values()].some((n) => n > perProjectLimit)) {
@@ -89,4 +111,9 @@ export async function keepChoiceForAdoption(tx: ClientBase, workspaceId: string,
   const record = readKeepRecord(row.rows[0]?.downgrade_keep);
   if (record === null || record.intent_id !== intentId) return undefined;
   return { projectIds: new Set(record.project_ids), promptIds: new Set(record.prompt_ids) };
+}
+
+/** True when the cut-over paused something the customer chose (the limits fell after the choice): the email says so. */
+export function pausedAnyChosen(keep: KeepChoice, paused: DowngradePauseOutcome["paused"]): boolean {
+  return paused.projects.some((p) => keep.projectIds.has(p.id)) || paused.prompts.some((p) => keep.promptIds.has(p.id));
 }

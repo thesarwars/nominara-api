@@ -27,7 +27,10 @@ import { answeredStatusSql } from "../rollup/aggregate-day.js";
 // reconcile never swaps a tracked row for a paused one: their activity stopped when they were paused.
 //
 // ⚠ PROJECTS are counted as the guard and the preview count them (every non-deleted project, archived included), so
-// the paused projects are the ones the confirmation named.
+// the paused projects are the ones the confirmation named. A project that is NOT TRACKING and not ours to resume (archived,
+// or paused by a person) HOLDS ITS SLOT: `projectKeepOrder` ranks it ahead of everything, the choice included (review
+// round 1). Ranked by activity it could soak up the excess behind a choice, and the next reconcile with no choice (an
+// add-on change, plan:set) would rank it back and pause a chosen project; ranked first, the default and the choice agree.
 //
 // ⚠ PROMPTS are reconciled on the ACTIVE count (review round 2), the count the resume guard (active-limit.ts) holds a
 // person to. The customer is left tracking exactly what the plan allows, never fewer: a paused project takes its
@@ -133,6 +136,19 @@ export function keepOrder<T extends Rankable>(rows: readonly T[], kept?: Readonl
   });
 }
 
+/** A project that occupies a slot without tracking and that billing never pauses or resumes: archived, or paused by a person. */
+export function holdsSlotUntracked(project: Pick<PauseProject, "status" | "pausedByDowngrade">): boolean {
+  return project.status === "archived" || (project.status === "paused" && !project.pausedByDowngrade);
+}
+
+/**
+ * The order for PROJECTS (review round 1): those that hold their slot without tracking (`holdsSlotUntracked`) first, so
+ * they never take the excess in place of a tracking project, then `keepOrder` (the choice first) for the rest.
+ */
+export function projectKeepOrder<T extends PauseProject>(projects: readonly T[], kept?: ReadonlySet<string>): T[] {
+  return [...keepOrder(projects.filter(holdsSlotUntracked), kept), ...keepOrder(projects.filter((p) => !holdsSlotUntracked(p)), kept)];
+}
+
 /** The order a pause takes rows in: the end of `keepOrder` first. */
 function pauseOrder<T extends Rankable>(rows: readonly T[], kept?: ReadonlySet<string>): T[] {
   return keepOrder(rows, kept).reverse();
@@ -147,8 +163,9 @@ function excessOf<T extends Rankable>(rows: readonly T[], limit: number | null, 
 /**
  * Pure: what the cut-over (or a later upgrade) must pause and resume.
  *
- * PROJECTS: the excess is the last N in `keepOrder` of every non-deleted project (the guard's and the preview's count). An
- * active/initializing project in it is paused and marked; a marked project out of it is resumed.
+ * PROJECTS: the excess is the last N in `projectKeepOrder` of every non-deleted project (the guard's and the preview's
+ * count; archived and person-paused first, as they hold their slots). An active/initializing project in it is paused and
+ * marked; a marked project out of it is resumed.
  *
  * PROMPTS (review round 2): the target is the ACTIVE count, never the slot count, so the customer is left tracking
  * exactly what the new limits allow - never fewer:
@@ -186,10 +203,11 @@ export function planDowngradePauseWithReasons(
   prompts: readonly PausePrompt[],
   keep?: KeepChoice,
 ): DowngradePausePlan & { readonly pausedFor: ReadonlyMap<string, PromptPauseReason>; readonly excessProjects: readonly string[] } {
-  const excess = new Set(excessOf(projects, limits.projects, keep?.projectIds).map((p) => p.id));
-  const projectsToPause = pauseOrder(projects, keep?.projectIds);
+  const rankedProjects = projectKeepOrder(projects, keep?.projectIds);
+  const excess = new Set(limits.projects === null || rankedProjects.length <= limits.projects ? [] : rankedProjects.slice(limits.projects).map((p) => p.id));
+  const projectsToPause = [...rankedProjects].reverse();
   const pauseProjects = projectsToPause.filter((p) => excess.has(p.id) && !p.pausedByDowngrade && (p.status === "active" || p.status === "initializing")).map((p) => p.id);
-  const resumeProjects = keepOrder(projects, keep?.projectIds).filter((p) => p.pausedByDowngrade && !excess.has(p.id)).map((p) => p.id);
+  const resumeProjects = rankedProjects.filter((p) => p.pausedByDowngrade && !excess.has(p.id)).map((p) => p.id);
 
   // Each project's state once the plan above is applied.
   const stateOf = new Map<string, "downgrade_paused" | "tracking" | "untracked">();

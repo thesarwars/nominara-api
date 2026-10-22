@@ -82,10 +82,12 @@ describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED 
   });
 
   it("a project a PERSON paused is never marked: it is not taken over by the downgrade, and it still counts toward the excess", () => {
-    // The newest is user-paused. The excess is the two newest (as the preview named them); only the active one is marked.
+    // The newest is user-paused. It counts and HOLDS its slot (STORY-077 D2 review round 1: a project that is not tracking
+    // ranks first, so it never soaks up the excess for an active one), so the two newest ACTIVE are paused and marked; it
+    // is not. Slice A let it take the excess (pausing only P3); with a keep choice that made a later reconcile disagree.
     const ps = [project(1), project(2), project(3), project(4, { status: "paused" })];
     const plan = planDowngradePause(limits({ projects: 2 }), ps, []);
-    expect(plan.pauseProjects).toEqual([id(3)]);
+    expect(plan.pauseProjects).toEqual([id(3), id(2)]);
   });
 
   it("per project: the newest prompts beyond prompts.max_per_project are paused, project by project", () => {

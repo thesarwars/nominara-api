@@ -231,10 +231,12 @@ describe("STORY-077 D2 · the keep choice and the most-recently-active default",
   it("review round 1 · an archived project holds its slot: the choice is bounded by what is left, and an add-on change after the cut-over leaves the chosen alone", async () => {
     const { workspaceId, owner } = await f.newWorkspace("business");
     const ids = await f.projects(workspaceId, 5);
-    // P4 is archived, and the most recently active: by activity alone it would outrank every chosen project.
-    await finishedRun(workspaceId, ids[4]!, 1);
+    // P0 (never chosen) is the most recently active and the archived P4 next: by activity alone both outrank the chosen P2
+    // and P3. Ranked behind the choice, P4 would soak up the excess at the cut-over while P0 kept tracking, and the next
+    // reconcile, ranking by activity, would keep P0 and P4 and pause the chosen P3.
+    await finishedRun(workspaceId, ids[4]!, 10);
     await db().query("UPDATE projects SET status = 'archived' WHERE id = $1", [ids[4]]);
-    await finishedRun(workspaceId, ids[0]!, 30);
+    await finishedRun(workspaceId, ids[0]!, 1);
     await scheduleDowngrade(owner, "growth");
 
     const view = downgradeKeepResponseSchema.parse(dataOf(await f.get(owner, KEEP)));

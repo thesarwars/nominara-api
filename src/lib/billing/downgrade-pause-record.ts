@@ -5,6 +5,7 @@ import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import type { EmailMessage } from "../../modules/identity/ports/email-sender.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { incrementCounter } from "../telemetry/metrics.js";
+import { pausedAnyChosen } from "./downgrade-keep.js";
 import { reconcileDowngradePause, type KeepChoice } from "./downgrade-pause.js";
 import { downgradeNoticeContact, downgradePausedEmail, downgradeResumedEmail } from "./downgrade-pause-notice.js";
 
@@ -77,7 +78,7 @@ export async function reconcileAndRecordDowngradePause(tx: ClientBase, workspace
       }
       const plan = await tx.query<{ display_name: string }>("SELECT p.display_name FROM workspaces w JOIN plans p ON p.key = w.plan_key WHERE w.id = $1", [workspaceId]);
       const planName = plan.rows[0]?.display_name ?? null;
-      const change = { planName, planChanged: provenance.planChanged, addonsChanged: provenance.addonsChanged, byChoice: keep !== undefined };
+      const change = { planName, planChanged: provenance.planChanged, addonsChanged: provenance.addonsChanged, byChoice: keep !== undefined, choiceOverLimit: keep !== undefined && pausedAnyChosen(keep, result.paused) };
       return [downgradePausedEmail(contact, change, result.paused), downgradeResumedEmail(contact, change, result.resumed)].filter((m): m is EmailMessage => m !== null);
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });

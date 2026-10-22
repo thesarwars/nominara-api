@@ -31,12 +31,15 @@ describe("STORY-184 · computeDowngradeExcess — structural limits", () => {
   });
 
   it("STORY-077 review round 2 · the named items are the projects the cut-over PAUSES: an archived or person-paused project in the excess is counted, never named as paused", () => {
-    // Five projects against growth's 3: the excess is the two newest, e (archived) and d. The guard counts e, so the count
-    // is exact, but planDowngradePause pauses only d - so only d is named under "paused at period end".
+    // Five projects against growth's 3. The guard counts the archived e, so the count is exact; e holds its slot (STORY-077
+    // D2 review round 1: a project that is not tracking ranks first), so the cut-over pauses the two newest TRACKING
+    // projects, d and c, and exactly those are named under "paused at period end" - never e.
     const r = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e", 0, 0, "archived"), project(P4, "d"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
-    expect(r.structural).toEqual([{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", paused: 1, items: [{ id: P4, name: "d", prompts: 0 }] }]);
+    expect(r.structural).toEqual([
+      { kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", paused: 2, items: [{ id: P4, name: "d", prompts: 0 }, { id: P3, name: "c", prompts: 0 }] },
+    ]);
     const personPaused = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e", 0, 0, "paused"), project(P4, "d", 0, 0, "initializing"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
-    expect(personPaused.structural[0]).toMatchObject({ excess: 2, items: [{ id: P4, name: "d" }] });
+    expect(personPaused.structural[0]).toMatchObject({ excess: 2, paused: 2, items: [{ id: P4, name: "d" }, { id: P3, name: "c" }] });
     // One a downgrade already paused stays paused: it is named.
     const already = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e", 0, 0, "paused", true), project(P4, "d"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
     expect(already.structural[0]).toMatchObject({ items: [{ id: P5, name: "e" }, { id: P4, name: "d" }] });

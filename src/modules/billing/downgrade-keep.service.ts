@@ -8,7 +8,7 @@ import { MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import { ConflictError, PreconditionUnmetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import type { Entitlement, EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { splitAddons } from "../../lib/billing/downgrade-excess.js";
-import { keptAfter, readKeepRecord, validateKeepChoice } from "../../lib/billing/downgrade-keep.js";
+import { keptAfter, projectSlotsKeepable, readKeepRecord, validateKeepChoice } from "../../lib/billing/downgrade-keep.js";
 import { keepOrder, pauseLimitsFrom, planDowngradePause, readActivityKeys, type PauseLimits, type PauseProject, type PausePrompt } from "../../lib/billing/downgrade-pause.js";
 import { readPendingPlanChange } from "../../lib/billing/plan-change-intent.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
@@ -60,7 +60,8 @@ export class DowngradeKeepService {
         return new ConflictError({ message: "another billing change for this workspace is in progress: retry shortly" });
       });
       const ctx = await this.context(client, workspaceId);
-      const issues = validateKeepChoice(request, keepableOf(ctx), ctx.limits);
+      const keepable = keepableOf(ctx);
+      const issues = validateKeepChoice(request, keepable, ctx.limits, ctx.projects.length - keepable.size);
       if (issues.length > 0) {
         this.outcome("invalid");
         throw new ValidationFailedError({ message: "the choice does not fit the plan you are moving to", details: { issues } });
@@ -147,7 +148,7 @@ export class DowngradeKeepService {
     return {
       target_plan_key: ctx.intent.to_plan_key,
       effective_at: ctx.intent.effective_at,
-      limits: { projects: ctx.limits.projects, prompts_total: ctx.limits.promptsTotal, prompts_per_project: ctx.limits.promptsPerProject },
+      limits: { projects: ctx.limits.projects, projects_keepable: projectSlotsKeepable(ctx.limits, ctx.projects), prompts_total: ctx.limits.promptsTotal, prompts_per_project: ctx.limits.promptsPerProject },
       projects: projects.map((p) => ({
         id: p.id,
         name: p.name,
