@@ -195,6 +195,8 @@ export function usePlanChangeFixture(options: { readonly widenRateLimit?: boolea
       headers: { [CSRF_HEADER_NAME]: a.csrfToken, "content-type": "application/json", ...(key === null ? {} : { "idempotency-key": key }) },
       payload: payload as object,
     });
+  const put = (a: Actor, path: string, payload: unknown) =>
+    harness.app().inject({ method: "PUT", url: apiUrl(path), cookies: cookies(a), headers: { [CSRF_HEADER_NAME]: a.csrfToken, "content-type": "application/json" }, payload: payload as object });
   const del = (a: Actor, path: string) => harness.app().inject({ method: "DELETE", url: apiUrl(path), cookies: cookies(a), headers: { [CSRF_HEADER_NAME]: a.csrfToken } });
 
   const planOf = async (workspaceId: string) =>
@@ -238,6 +240,6 @@ export function usePlanChangeFixture(options: { readonly widenRateLimit?: boolea
 
   return {
     ownerOf, gateway, harness, meta, nowSeconds, periodStart, periodEnd, createUser, enter, memberIn, newWorkspace, stripeSubscription, subIdOf,
-    eventBody, deliver, reconcile, cookies, get, post, del, planOf, intentOf, auditActions, walletFor, includedOf, ledgerRows, projects,
+    eventBody, deliver, reconcile, cookies, get, post, put, del, planOf, intentOf, auditActions, walletFor, includedOf, ledgerRows, projects,
   };
 }
