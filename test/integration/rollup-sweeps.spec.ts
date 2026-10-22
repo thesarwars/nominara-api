@@ -234,6 +234,24 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
       expect(enqueued.map((e) => e.workspaceId)).toEqual([b.workspaceId]);
     }, 60_000);
 
+    it("STORY-042 AC2 · one workspace with an unrecognised stored timezone is skipped and counted; every other tenant's closed day is still enqueued", async () => {
+      const bad = await seedProject("US/Eastrn");
+      const good = await seedProject("UTC");
+      await seedCapture(bad, "2026-10-21T12:00:00Z");
+      await seedCapture(good, "2026-10-21T12:00:00Z");
+      const lines: unknown[] = [];
+      vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => void lines.push(message));
+      vi.spyOn(Logger.prototype, "warn").mockImplementation((message: unknown) => void lines.push(message));
+
+      const result = await runClosedDaySweep(sweepDb, collector, new Date("2026-10-22T09:00:00Z"));
+      expect(enqueued.map((e) => e.workspaceId)).toEqual([good.workspaceId]);
+      expect(result).toMatchObject({ status: "complete", found: 1, enqueued: 1, failed: 0 });
+      const text = JSON.stringify(lines);
+      expect(text).toContain("nominara_rollup_sweep_invalid_timezone_total");
+      expect(text).toContain(bad.workspaceId);
+      expect(text).not.toContain("US/Eastrn");
+    }, 60_000);
+
     it("STORY-042 AC2 · a connection that cannot see across tenants is refused before it reads anything", async () => {
       const ids = await seedProject("UTC");
       await seedCapture(ids, "2026-10-21T12:00:00Z");
@@ -343,6 +361,35 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
       });
       expect(markedBeforeCommit, "marked inside the transaction").toBe(false);
       expect(marks).toEqual([{ workspaceId: ids.workspaceId, projectId: ids.projectId, metricDate: "2026-03-11" }]);
+    }, 60_000);
+
+    it("STORY-042 AC6 · a workspace with an unrecognised stored timezone does not fail its parses: nothing is marked, and the skip is counted with the workspace id", async () => {
+      const ids = await seedProject("US/Eastrn");
+      const at = "2026-03-10T12:00:00.000Z";
+      const late = await seedCapture(ids, at, "captured");
+      const lines: unknown[] = [];
+      vi.spyOn(Logger.prototype, "warn").mockImplementation((message: unknown) => void lines.push(message));
+      vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => void lines.push(message));
+      const marks: DirtyEntry[] = [];
+      await parseInTenant(ids, late, at, async (e) => void marks.push(e));
+      expect((await db.query("SELECT status FROM answer_captures WHERE id = $1", [late])).rows[0].status).toBe("parsed");
+      expect(marks).toEqual([]);
+      expect(JSON.stringify(lines)).toContain("nominara_rollup_dirty_invalid_timezone_total");
+      expect(JSON.stringify(lines)).toContain(ids.workspaceId);
+    }, 60_000);
+
+    it("STORY-042 AC6 · the parse worker group hands the handler its dirty-set writer through the context; the handler opens no connection of its own", async () => {
+      const ids = await seedProject("UTC");
+      const at = "2026-03-10T12:00:00.000Z";
+      await seedCapture(ids, at, "parsed");
+      await rollUpDay(db, ids.workspaceId, ids.projectId, "2026-03-10", "UTC");
+      const late = await seedCapture(ids, at, "captured");
+      const marks: DirtyEntry[] = [];
+      const context = { pool: undefined, env: {}, markRollupDirty: async (e: DirtyEntry) => void marks.push(e) } as unknown as QueueHandlerContext;
+      await withTenantContext(db, { workspaceId: ids.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        await createCaptureParseHandler(context, { enqueueRollup: async () => undefined })(tx, parseJob(ids, late, at));
+      });
+      await vi.waitFor(() => expect(marks).toHaveLength(1));
     }, 60_000);
 
     it("STORY-042 AC6 · a parse that rolls back marks nothing", async () => {

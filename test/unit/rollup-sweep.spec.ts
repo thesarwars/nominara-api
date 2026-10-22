@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import { describe, expect, it, vi } from "vitest";
 import { rollupDirtyKey } from "../../src/lib/cache/valkey-keys.js";
 import {
@@ -50,6 +51,10 @@ class FakeRedis implements DirtySetRedis {
     let removed = 0;
     for (const m of members) if (this.scores.delete(m)) removed += 1;
     return removed;
+  }
+  async zscore(_key: string, member: string): Promise<string | null> {
+    const score = this.scores.get(member);
+    return score === undefined ? null : String(score);
   }
   async zrange(_key: string, _start: number, stop: string, _withScores: "WITHSCORES"): Promise<string[]> {
     if (this.failRead) throw new Error("valkey down");
@@ -153,6 +158,23 @@ describe("STORY-042 AC6 · a mark that lands between the sweep's enqueue and its
     await runDirtyDateSweep(set, async (_q, _w, _p, key) => void keys.push(key), new Date("2026-10-22T09:16:00Z"));
     expect(new Set(keys).size, "a newer mark is a new job — not deduplicated onto the one that missed it").toBe(2);
     expect((await set.peek(10)).entries).toEqual([]);
+  });
+
+  it("a mark another replica already cleared is not reported as a re-mark; a genuinely newer mark still is", async () => {
+    const logs: unknown[] = [];
+    vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => void logs.push(message));
+    const set = new RollupDirtySet(new FakeRedis(), "k");
+    await set.mark(entry, 1_000);
+    // Replica B peeked the same version and clears it while replica A's enqueue is in flight.
+    const otherReplicaClears = async (): Promise<void> => {
+      await set.clear((await set.peek(10)).entries);
+    };
+    await runDirtyDateSweep(set, otherReplicaClears, new Date("2026-10-22T09:15:00Z"));
+    expect(JSON.stringify(logs), "cleared by another replica, nothing re-marked").not.toContain("dirty_remarked");
+
+    await set.mark(entry, 3_000);
+    await runDirtyDateSweep(set, async () => void (await set.mark(entry, 4_000)), new Date("2026-10-22T09:20:00Z"));
+    expect(JSON.stringify(logs), "a newer mark is a real re-mark").toContain("dirty_remarked");
   });
 
   it("the same version asks for the same key (replicas ticking one window dedupe), a newer version does not", () => {
