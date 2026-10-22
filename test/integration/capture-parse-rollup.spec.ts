@@ -129,6 +129,8 @@ describe("NEW-A-7 · rollup requested from the parse completion path", () => {
   function parseHandler() {
     const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
     return createCaptureParseHandler(context, {
+      // These tests are about run-completion rollups; a late-fact dirty mark (STORY-042) must not reach a real Valkey.
+      markRollupDirty: async () => undefined,
       enqueueRollup: async (queue, ws, payload, idempotencyKey) => {
         enqueued.push({ queue, workspaceId: ws, payload, idempotencyKey });
       },
@@ -296,6 +298,7 @@ describe("NEW-A-7 · rollup requested from the parse completion path", () => {
     // B's facts exist and are parsed by B's own context.
     await withTenantContext(db, { workspaceId: b.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
       await createCaptureParseHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, {
+        markRollupDirty: async () => undefined,
         enqueueRollup: async () => undefined,
       })(tx, {
         data: {
