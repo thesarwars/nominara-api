@@ -9,6 +9,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { handlerFor, type QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import { runTaskResurface } from "../../src/lib/rollup/resurface-dismissed-tasks.js";
 import { createTaskResurfaceHandler } from "../../src/lib/queue/handlers/task-resurface.handler.js";
 import { globalQueueLockKey, tryAdvisorySessionLock } from "../../src/lib/queue/locks.js";
 import type { Env } from "../../src/config/env.schema.js";
@@ -216,6 +217,26 @@ describe("STORY-064 AC5 · task.resurface (dismissed tasks return after resurfac
     const t = await task(ws, p);
     await db.query("UPDATE tasks SET status = 'in_progress', dismissed_reason = NULL, resurface_at = NULL WHERE id = $1", [t]);
     expect(await run()).toMatchObject({ reopened: 0 });
+    expect(await events(t)).toEqual([]);
+  });
+
+  // The race the UPDATE's own re-check exists for: the task is reopened by a person AFTER discovery listed it and BEFORE the write.
+  // `reopenedAfterDiscovery` runs a hand reopen on a second connection the moment discovery's query returns. One case clears
+  // `resurface_at` (what PATCH does), the other leaves a stale date behind, so each predicate is tested on its own.
+  it.each([
+    ["clears resurface_at, as a PATCH reopen does", "resurface_at = NULL"],
+    ["leaves a stale resurface_at behind (the status check alone must hold)", "resurface_at = resurface_at"],
+  ])("a task reopened by hand BETWEEN discovery and the write is not reopened again and writes no event (%s)", async (_label, resurfaceSet) => {
+    const ws = await workspace(); const p = await project(ws);
+    const t = await task(ws, p);
+    const racing = { query: async (...args: unknown[]) => {
+      const result = await (db.query as (...a: unknown[]) => Promise<unknown>)(...args);
+      if (String(args[0]).includes("JOIN projects")) await db.query(`UPDATE tasks SET status = 'in_progress', dismissed_reason = NULL, ${resurfaceSet} WHERE id = $1`, [t]);
+      return result;
+    } } as unknown as Client;
+    const outcome = await runTaskResurface(racing, pool, { now: () => NOW });
+    expect(outcome).toMatchObject({ reopened: 0 });
+    expect((await state(t)).status).toBe("in_progress");
     expect(await events(t)).toEqual([]);
   });
 
