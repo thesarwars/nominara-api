@@ -12,7 +12,8 @@ import { PAGINATION_LIMIT_DEFAULT, PAGINATION_LIMIT_MAX } from "../common/pagina
 //   impact   (default)  impact_score DESC, priority DESC, oldest first
 //   priority            priority DESC, impact_score DESC, oldest first
 //   age                 oldest first (created_at ASC)
-//   goal                goal-linked tasks first, grouped by goal, impact DESC within
+//   goal                goal-linked tasks first, grouped by goal; within a goal, tasks that feed the goal's metric first
+//                       (contribution, STORY-065), then the rest; impact DESC within each tier
 export const TASK_SORTS = ["impact", "priority", "age", "goal"] as const;
 export const taskSortSchema = z.enum(TASK_SORTS);
 export type TaskSort = z.infer<typeof taskSortSchema>;

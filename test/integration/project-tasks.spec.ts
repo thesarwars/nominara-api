@@ -71,6 +71,17 @@ describe("STORY-064 · TasksService.listProjectTasks — real SQL", () => {
        VALUES ($1, $2, 'Goal', 'custom', '{}'::jsonb, $3) RETURNING id`, [workspaceId, projectId, createdAt]);
     return r.rows[0]!.id;
   }
+  async function createGoalOf(workspaceId: string, projectId: string, createdAt: string, kind: string, target: Record<string, unknown>): Promise<string> {
+    const r = await client.query<{ id: string }>(
+      `INSERT INTO goals (workspace_id, project_id, title, kind, target, created_at)
+       VALUES ($1, $2, 'Goal', $3, $4::jsonb, $5) RETURNING id`, [workspaceId, projectId, kind, JSON.stringify(target), createdAt]);
+    return r.rows[0]!.id;
+  }
+  async function createRule(code: string, trigger: string): Promise<void> {
+    await client.query(
+      `INSERT INTO task_generation_rules (code, category, title_template, description_template, trigger_kind, condition, default_priority, impact_weight, effort_band, rule_version)
+       VALUES ($1, 'content', 'T', 'D', $2, '{}'::jsonb, 3, 1.0, 'm', 'v1') ON CONFLICT (code) DO NOTHING`, [code, trigger]);
+  }
   async function createFinding(workspaceId: string, projectId: string, severity: string): Promise<string> {
     seq += 1;
     await client.query(
@@ -87,18 +98,20 @@ describe("STORY-064 · TasksService.listProjectTasks — real SQL", () => {
   }
 
   interface T { impact: number; priority: number; createdAt: string; status: string; goalId: string | null;
-    findingId: string | null; deletedAt: Date | null; title: string }
+    findingId: string | null; deletedAt: Date | null; title: string;
+    ruleCode: string | null; engines: string[]; clusterId: string | null }
   async function createTask(workspaceId: string, projectId: string, o: Partial<T> = {}): Promise<string> {
     seq += 1;
     const { impact = 50, priority = 3, createdAt = "2026-08-01T00:00:00Z", status = "todo", goalId = null,
-      findingId = null, deletedAt = null, title = `Task ${seq}` } = o;
+      findingId = null, deletedAt = null, title = `Task ${seq}`, ruleCode = null, engines = [], clusterId = null } = o;
     const r = await client.query<{ id: string }>(
       `INSERT INTO tasks (workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status,
-          dismissed_reason, resurface_at, impact_score, priority, goal_id, source_finding_id, deleted_at, created_at)
-       VALUES ($1, $2, $3, 'content', $4, $5, 'D', $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz) RETURNING id`,
+          dismissed_reason, resurface_at, impact_score, priority, goal_id, source_finding_id, deleted_at, created_at,
+          rule_code, affected_engines, prompt_cluster_id)
+       VALUES ($1, $2, $3, 'content', $4, $5, 'D', $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15, $16::text[], $17) RETURNING id`,
       [workspaceId, projectId, `HUB-${seq}`, createHash("sha256").update(`t-${seq}-${randomUUID()}`).digest(), title,
         status, status === "dismissed" ? "noise" : null, status === "dismissed" ? "2027-02-01T00:00:00Z" : null,
-        impact, priority, goalId, findingId, deletedAt, createdAt]);
+        impact, priority, goalId, findingId, deletedAt, createdAt, ruleCode, engines, clusterId]);
     return r.rows[0]!.id;
   }
 
@@ -146,6 +159,110 @@ describe("STORY-064 · TasksService.listProjectTasks — real SQL", () => {
     const g1high = await createTask(ws, p, { goalId: g1, impact: 80 });
     const page = await list(CTX(ws), p, { sort: "goal" });
     expect(page.items.map((i) => i.id)).toEqual([g1high, g1low, g2low, unlinked]);
+  });
+
+  // ---- STORY-065 AC4/AC5 — contribution ordering inside a goal ------------------------------------------------
+  //
+  // "Contribution ordering uses the task's impact score relative to the goal's metric, so a task irrelevant to the goal ranks low
+  // even if its absolute impact is high." TIERED (planner recommendation): inside a goal, tasks whose rule feeds the goal's metric
+  // — and whose engine / cluster scope the goal covers — come first, by impact; everything else follows, by impact.
+  describe("STORY-065 · contribution ordering (sort=goal)", () => {
+    const VIS = { metric: "visibility_score", target_value: 60 };
+
+    it("[STORY-065 #5] a high-impact task irrelevant to the goal ranks BELOW a lower-impact task that feeds the goal's metric", async () => {
+      const ws = await createWorkspace(); const p = await createProject(ws);
+      await createRule("TG-SOV", "sov_drop"); await createRule("TG-AUX", "aux_finding");
+      const g = await createGoalOf(ws, p, "2026-01-01T00:00:00Z", "engine_score", VIS);
+      const irrelevantHigh = await createTask(ws, p, { goalId: g, impact: 95, ruleCode: "TG-AUX" });
+      const manual = await createTask(ws, p, { goalId: g, impact: 90 }); // no rule: no metric to contribute to
+      const relevantLow = await createTask(ws, p, { goalId: g, impact: 20, ruleCode: "TG-SOV" });
+      const relevantMid = await createTask(ws, p, { goalId: g, impact: 60, ruleCode: "TG-SOV" });
+      const page = await list(CTX(ws), p, { sort: "goal" });
+      expect(page.items.map((i) => i.id)).toEqual([relevantMid, relevantLow, irrelevantHigh, manual]);
+    });
+
+    it("[STORY-065 #4] grouping by goal is kept: every task of the older goal precedes the newer goal's, contribution orders within each, unlinked last", async () => {
+      const ws = await createWorkspace(); const p = await createProject(ws);
+      await createRule("TG-SOV", "sov_drop"); await createRule("TG-SENT", "sentiment_negative");
+      const g1 = await createGoalOf(ws, p, "2026-01-01T00:00:00Z", "engine_score", VIS);
+      const g2 = await createGoalOf(ws, p, "2026-02-01T00:00:00Z", "sentiment_recovery", { metric: "sentiment_score", target_value: 60 });
+      const unlinked = await createTask(ws, p, { impact: 100, ruleCode: "TG-SOV" });
+      const g2irrelevant = await createTask(ws, p, { goalId: g2, impact: 80, ruleCode: "TG-SOV" });
+      const g2relevant = await createTask(ws, p, { goalId: g2, impact: 10, ruleCode: "TG-SENT" });
+      const g1irrelevant = await createTask(ws, p, { goalId: g1, impact: 70, ruleCode: "TG-SENT" });
+      const g1relevant = await createTask(ws, p, { goalId: g1, impact: 5, ruleCode: "TG-SOV" });
+      const page = await list(CTX(ws), p, { sort: "goal" });
+      expect(page.items.map((i) => i.id)).toEqual([g1relevant, g1irrelevant, g2relevant, g2irrelevant, unlinked]);
+    });
+
+    it("an engine-scoped goal counts a task that affects its engine or every engine, not one that affects only another engine", async () => {
+      const ws = await createWorkspace(); const p = await createProject(ws);
+      await createRule("TG-SOV", "sov_drop");
+      const g = await createGoalOf(ws, p, "2026-01-01T00:00:00Z", "engine_score", { ...VIS, engine_key: "gemini" });
+      const otherEngine = await createTask(ws, p, { goalId: g, impact: 80, ruleCode: "TG-SOV", engines: ["chatgpt"] });
+      const projectWide = await createTask(ws, p, { goalId: g, impact: 20, ruleCode: "TG-SOV", engines: [] });
+      const includes = await createTask(ws, p, { goalId: g, impact: 40, ruleCode: "TG-SOV", engines: ["chatgpt", "gemini"] });
+      const page = await list(CTX(ws), p, { sort: "goal" });
+      expect(page.items.map((i) => i.id)).toEqual([includes, projectWide, otherEngine]);
+    });
+
+    it("a cluster-scoped goal counts a task of its cluster or of no cluster, not one tied to another cluster", async () => {
+      const ws = await createWorkspace(); const p = await createProject(ws);
+      await createRule("TG-PRES", "presence_loss");
+      const mine = randomUUID(); const theirs = randomUUID();
+      const g = await createGoalOf(ws, p, "2026-01-01T00:00:00Z", "prompt_recommendation", { metric: "presence_rate", target_value: 50, prompt_cluster_id: mine });
+      const other = await createTask(ws, p, { goalId: g, impact: 90, ruleCode: "TG-PRES", clusterId: theirs });
+      const none = await createTask(ws, p, { goalId: g, impact: 10, ruleCode: "TG-PRES", clusterId: null });
+      const same = await createTask(ws, p, { goalId: g, impact: 30, ruleCode: "TG-PRES", clusterId: mine });
+      const page = await list(CTX(ws), p, { sort: "goal" });
+      expect(page.items.map((i) => i.id)).toEqual([same, none, other]);
+    });
+
+    it("each metric is fed by its own rules: a citation goal counts citation_gap and source_absence, not sov_drop; a rendering goal counts render_downgrade and aux_finding", async () => {
+      const ws = await createWorkspace(); const p = await createProject(ws);
+      await createRule("TG-CIT", "citation_gap"); await createRule("TG-SRC", "source_absence"); await createRule("TG-SOV", "sov_drop");
+      await createRule("TG-REN", "render_downgrade"); await createRule("TG-AUX", "aux_finding");
+      const gc = await createGoalOf(ws, p, "2026-01-01T00:00:00Z", "citation_presence", { metric: "citation_share", target_value: 50 });
+      const gr = await createGoalOf(ws, p, "2026-02-01T00:00:00Z", "rendering_quality", { metric: "rendering_quality", target_value: 50 });
+      const cSov = await createTask(ws, p, { goalId: gc, impact: 99, ruleCode: "TG-SOV" });
+      const cCit = await createTask(ws, p, { goalId: gc, impact: 10, ruleCode: "TG-CIT" });
+      const cSrc = await createTask(ws, p, { goalId: gc, impact: 20, ruleCode: "TG-SRC" });
+      const rSov = await createTask(ws, p, { goalId: gr, impact: 99, ruleCode: "TG-SOV" });
+      const rAux = await createTask(ws, p, { goalId: gr, impact: 10, ruleCode: "TG-AUX" });
+      const rRen = await createTask(ws, p, { goalId: gr, impact: 30, ruleCode: "TG-REN" });
+      const page = await list(CTX(ws), p, { sort: "goal" });
+      expect(page.items.map((i) => i.id)).toEqual([cSrc, cCit, cSov, rRen, rAux, rSov]);
+    });
+
+    it("a goal with no recognisable metric (an older goal, an empty target) orders its tasks by impact alone, as before", async () => {
+      const ws = await createWorkspace(); const p = await createProject(ws);
+      await createRule("TG-SOV", "sov_drop");
+      const g = await createGoalOf(ws, p, "2026-01-01T00:00:00Z", "custom", {});
+      const low = await createTask(ws, p, { goalId: g, impact: 5, ruleCode: "TG-SOV" });
+      const high = await createTask(ws, p, { goalId: g, impact: 80 });
+      const page = await list(CTX(ws), p, { sort: "goal" });
+      expect(page.items.map((i) => i.id)).toEqual([high, low]);
+    });
+
+    it("contribution ordering pages without skipping or repeating a row (limit 2, ties across tiers)", async () => {
+      const ws = await createWorkspace(); const p = await createProject(ws);
+      await createRule("TG-SOV", "sov_drop"); await createRule("TG-AUX", "aux_finding");
+      const g = await createGoalOf(ws, p, "2026-01-01T00:00:00Z", "engine_score", VIS);
+      for (let i = 0; i < 9; i++) {
+        await createTask(ws, p, { goalId: g, impact: (i % 3) * 10, ruleCode: i % 2 === 0 ? "TG-SOV" : "TG-AUX", createdAt: `2026-08-0${(i % 2) + 1}T00:00:00Z` });
+      }
+      const seen: string[] = [];
+      let cursor: string | undefined;
+      for (let guard = 0; guard < 12; guard++) {
+        const page = await list(CTX(ws), p, { sort: "goal", limit: 2, ...(cursor ? { cursor } : {}) });
+        seen.push(...page.items.map((i) => i.id));
+        if (!page.pagination.has_more) break;
+        cursor = page.pagination.cursor_next!;
+      }
+      const full = (await list(CTX(ws), p, { sort: "goal" })).items.map((i) => i.id);
+      expect(seen).toEqual(full);
+      expect(new Set(seen).size).toBe(9);
+    });
   });
 
   it("paginates every sort without skipping or repeating a row (limit 2, 7 tasks with ties)", async () => {
