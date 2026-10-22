@@ -7,6 +7,7 @@ export * from "./auto-topup.schema.js";
 export * from "./checkout-session.schema.js";
 export * from "./credit-pack-purchase.schema.js";
 export * from "./credit-pack.schema.js";
+export * from "./downgrade-keep.schema.js";
 export * from "./invoice.schema.js";
 export * from "./money.schema.js";
 export * from "./plan-change.schema.js";
