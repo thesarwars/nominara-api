@@ -1,4 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common";
+import type { ClientBase } from "pg";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type {
   ConfirmDiscoveryRequest,
@@ -21,7 +22,8 @@ import { UnparsableHostError } from "../../lib/net/registrable-domain.js";
 import { lockProjectCompetitors } from "./competitor-cap-lock.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
-import { insertPromptStatement, manualPromptRow } from "../../lib/promptgen/persist.js";
+import { insertPromptStatement, manualPromptRow, type PromptRow } from "../../lib/promptgen/persist.js";
+import { assertActiveWithinLimits, lockWorkspaceForActivation } from "../prompts/active-limit.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -162,6 +164,19 @@ export class ProjectsService {
     const startingCadence = startingCadenceFor(resolved.entitlements["scan.cadence"]?.value);
 
     const projectId = uuidV7();
+
+    // STORY-077 review round 4 — SUPPLIED PROMPTS ARE INSERTED `active`, so a creation that carries them is a door into
+    // `active` and is held to the rule a resume is (active-limit.ts): after a cut-over that paused prompts for
+    // `prompts.max_total`, a new project's prompts would otherwise put the workspace back above its plan. Counted after
+    // the same hash dedupe the insert applies, so a repeated prompt is not refused for a slot it never takes. The
+    // workspace lock is taken first, as on every other door, and only when there is something to count: a creation
+    // without prompts waits on nothing.
+    const supplied = distinctSuppliedPrompts(workspaceId, projectId, input);
+    if (supplied.length > 0) {
+      await lockWorkspaceForActivation(client as ClientBase, workspaceId);
+      await assertActiveWithinLimits(client, { workspaceId, projectId, becomingActive: supplied.length, entitlements: resolved.entitlements });
+    }
+
     const slug = await nextFreeSlug(client, rootDomain);
     await client.query(
       `INSERT INTO projects
@@ -213,7 +228,7 @@ export class ProjectsService {
       throw error;
     });
 
-    await this.insertSuppliedSeeds(client, workspaceId, projectId, input);
+    await this.insertSuppliedSeeds(client, workspaceId, projectId, input, supplied);
 
     const fieldsSupplied = suppliedFields(input);
 
@@ -590,6 +605,7 @@ export class ProjectsService {
     workspaceId: string,
     projectId: string,
     input: CreateProjectRequest,
+    prompts: readonly PromptRow[],
   ): Promise<void> {
     // DEDUPED BY LOWERCASED NAME FIRST, for the reason the prompts loop below
     // records about hashes: `ux_competitors_project_name` is unique on
@@ -631,16 +647,27 @@ export class ProjectsService {
     // casing or spacing would collide and fail the whole creation. The
     // project is brand new here, so there is nothing else to collide with and
     // an in-memory dedupe is complete — no ON CONFLICT needed.
-    const seen = new Set<string>();
-    for (const prompt of input.prompts ?? []) {
-      const row = manualPromptRow({ workspaceId, projectId, text: prompt.text });
-      const key = row.textHash.toString("hex");
-      if (seen.has(key)) continue;
-      seen.add(key);
+    // (`prompts` is that deduped list: `distinctSuppliedPrompts`, computed once so the active-cap check counts exactly
+    // the rows inserted here.)
+    for (const row of prompts) {
       const { sql, params } = insertPromptStatement(row);
       await client.query(sql, [...params]);
     }
   }
+}
+
+/** The supplied prompts as rows, DEDUPED BY HASH (see `insertSuppliedSeeds`): the rows a creation inserts, in order. */
+function distinctSuppliedPrompts(workspaceId: string, projectId: string, input: CreateProjectRequest): PromptRow[] {
+  const seen = new Set<string>();
+  const rows: PromptRow[] = [];
+  for (const prompt of input.prompts ?? []) {
+    const row = manualPromptRow({ workspaceId, projectId, text: prompt.text });
+    const key = row.textHash.toString("hex");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push(row);
+  }
+  return rows;
 }
 
 /** The lateral join's columns (LAST_SCAN_JOIN); every one is null when the project has no run. */
