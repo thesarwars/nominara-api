@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { Client } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { downgradeKeepResponseSchema, planChangePreviewResponseSchema } from "../../contracts/billing/index.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
@@ -301,6 +302,58 @@ describe("STORY-077 D2 · the keep choice and the most-recently-active default",
     expect(sent).toHaveLength(1);
     expect(sent[0]!.textBody).toMatch(/you did not choose to keep/);
     expect(sent[0]!.textBody).toMatch(/limits fell after you chose/);
+  });
+
+  // Review round 2 · a PUT racing another writer of the intent. The workspace lock already serialises the PUT with the
+  // cancel and the cut-over; this case takes that lock out of play (the other writer here does not take it) so the PUT's
+  // UPDATE predicate on the intent id is the only guard left. The other writer rewrites the subscription row in an open
+  // transaction; the PUT reads the committed intent and blocks in its UPDATE on the row lock (seen in pg_stat_activity);
+  // the other writer then commits. Under READ COMMITTED the UPDATE re-reads the row: it must match nothing (409), never
+  // write a record bound to the intent that is gone.
+  it.each([
+    ["a cancel (the intent and the choice cleared)", "UPDATE subscriptions SET pending_plan_change = NULL, downgrade_keep = NULL WHERE workspace_id = $1"],
+    [
+      "a new intent (another downgrade written)",
+      "UPDATE subscriptions SET pending_plan_change = jsonb_set(pending_plan_change, '{id}', to_jsonb($2::text)), downgrade_keep = NULL WHERE workspace_id = $1",
+    ],
+  ])("review round 2 · a PUT whose intent is replaced by %s while it waits is refused 409 and leaves no stale choice", async (_label, rewrite) => {
+    const { workspaceId, owner } = await f.newWorkspace("business");
+    const ids = await f.projects(workspaceId, 4);
+    await scheduleDowngrade(owner, "growth");
+    const readIntentId = String((await f.intentOf(workspaceId))!.id);
+
+    const main = db();
+    const other = new Client({ host: main.host, port: main.port, user: main.user, password: main.password, database: main.database });
+    await other.connect();
+    try {
+      await other.query("BEGIN");
+      const replacement = uuidV7();
+      await other.query(rewrite, rewrite.includes("$2") ? [workspaceId, replacement] : [workspaceId]);
+
+      const put = f.put(owner, KEEP, { project_ids: ids.slice(1), prompt_ids: [] });
+      const blocked = async () =>
+        Number(
+          (await main.query<{ n: string }>(
+            "SELECT count(*) AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'UPDATE subscriptions SET downgrade_keep%'",
+          )).rows[0]!.n,
+        );
+      const deadline = Date.now() + 10_000;
+      while ((await blocked()) === 0) {
+        expect(Date.now(), "the PUT never reached its UPDATE behind the other writer").toBeLessThan(deadline);
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      await other.query("COMMIT");
+
+      const res = await put;
+      expect(res.statusCode, res.body).toBe(409);
+      expect(errorOf(res).details).toMatchObject({ reason: "plan_change_not_pending" });
+      const left = await keepColumn(workspaceId);
+      expect(left === null || left.intent_id !== readIntentId, `no record bound to the replaced intent ${readIntentId}: ${JSON.stringify(left)}`).toBe(true);
+      expect(left, "the other writer's clear stands").toBeNull();
+    } finally {
+      await other.query("ROLLBACK").catch(() => undefined);
+      await other.end();
+    }
   });
 
   it("cancelling the downgrade clears the choice, and a new downgrade starts with none", async () => {
