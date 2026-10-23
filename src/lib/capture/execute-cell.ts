@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { Logger } from "@nestjs/common";
 import { SCORING_VERSION } from "../scoring/index.js";
 import type { ClientBase } from "pg";
 import type { Cache } from "../cache/cache.port.js";
@@ -8,6 +9,12 @@ import { adapterMajorOf } from "./l1-exact-hash.js";
 import type { CaptureAdapter, CaptureContext, RawCapture } from "../engines/contract.js";
 import { CaptureFailureError, classifyCaptureFailure } from "../engines/failure-taxonomy.js";
 import { EngineRefusalError, resolveEngine } from "../engines/registry.js";
+import { uuidV7 } from "../ids/uuidv7.js";
+import { incrementCounter } from "../telemetry/metrics.js";
+import { encodeRawObject, rawObjectRelativeKey } from "./raw-object.js";
+import type { BoundRawObjects } from "./raw-object-store.js";
+
+const logger = new Logger("capture.raw-object");
 
 // STORY-034 — one cell, captured and recorded.
 //
@@ -137,6 +144,11 @@ export async function captureCell(
    * unreadable) — that fails closed and reaches the retry ladder.
    */
   ceilingReached?: (engineKey: string) => Promise<boolean>,
+  /**
+   * STORY-181 - where the verbatim raw answer is retained. Absent only when object storage is not configured outside production
+   * (the legacy payload-only path); the handler throws in production rather than pass nothing.
+   */
+  rawObjects?: Pick<BoundRawObjects, "put" | "deleteStored">,
 ): Promise<CaptureCellOutcome> {
   // IDEMPOTENT PER CELL, BEFORE ANY VENDOR CALL. A job redelivered after its
   // transaction committed (stalled-job path) would otherwise call the engine
@@ -247,13 +259,13 @@ export async function captureCell(
         // this, rather than repeating the taxonomy code in a second vocabulary.
         flags: ["engine_refused_to_answer"],
       },
-    });
+    }, rawObjects);
     await ledgerCost();
     return { kind: "captured", latencyMs: 0 };
   }
 
   await meterSpend();
-  await writeCell(tx, input, now, { status: "captured", adapter, raw });
+  await writeCell(tx, input, now, { status: "captured", adapter, raw }, rawObjects);
   await ledgerCost();
 
   // SEED L1 ONLY AFTER THE ROW IS WRITTEN, and only on a real answer.
@@ -324,16 +336,69 @@ type CellWrite =
  * the alias set that made reuse safe, and a live capture has not been matched
  * against any alias set yet. The parser stamps it when it runs.
  */
-async function writeCell(tx: ClientBase, input: CaptureCellInput, now: Date, write: CellWrite): Promise<void> {
+async function writeCell(
+  tx: ClientBase,
+  input: CaptureCellInput,
+  now: Date,
+  write: CellWrite,
+  rawObjects?: Pick<BoundRawObjects, "put" | "deleteStored">,
+): Promise<void> {
   const captured = write.status === "captured";
   const text = captured ? write.raw.text : "";
+
+  // STORY-181 AC1 - THE VERBATIM RAW ANSWER IS RETAINED IN OBJECT STORAGE, UPLOAD FIRST. The key is recorded only after the PUT
+  // succeeded, so no row ever points at a missing object, and a failed PUT throws: the job retries and no row exists to find.
+  // The row id is minted here (not by the column default) because the key embeds it.
+  //
+  // THIS PUT RUNS INSIDE THE CELL'S TRANSACTION, which is the shape `capture.execute` already has: that transaction spans the vendor
+  // call, held on purpose (the run's `FOR KEY SHARE` and the cell's advisory lock, SCANFIX D5). Phasing this handler is a separate,
+  // larger decision (it would give up those two locks); it is recorded in ADR-0003's list of violators, not hidden here.
+  //
+  // DUAL WRITE: `payload` keeps the text too. The document, the L1/L2 reuse paths and the legacy fallback read it; the object is
+  // the verbatim retained copy the parser and the raw download read.
+  const resultId = uuidV7();
+  let rawObjectKey: string | null = null;
+  if (captured && rawObjects !== undefined) {
+    try {
+      rawObjectKey = await rawObjects.put(rawObjectRelativeKey(now, resultId), encodeRawObject(rawPayload(write.raw)));
+    } catch (error) {
+      incrementCounter("nominara_capture_raw_objects_total", { outcome: "upload_failed" });
+      logger.error({ event: "capture.raw_object.upload_failed", workspace_id: input.workspaceId, run_id: input.runId, error: error instanceof Error ? error.name : "unknown" });
+      throw error;
+    }
+  }
+
+  try {
+    await insertCell(tx, input, now, write, resultId, rawObjectKey, text);
+  } catch (error) {
+    // The object was written but the row was not: an orphan in this workspace's own prefix. Removed best-effort; the lifecycle rule
+    // (STORY-003) is the backstop for the delete that also fails, or for a rollback that happens after this function returned.
+    if (rawObjectKey !== null) await rawObjects!.deleteStored(rawObjectKey).catch(() => undefined);
+    throw error;
+  }
+  if (rawObjectKey !== null) {
+    incrementCounter("nominara_capture_raw_objects_total", { outcome: "written" });
+    logger.log({ event: "capture.raw_object.written", workspace_id: input.workspaceId, run_id: input.runId, result_id: resultId, bytes_before_gzip: Buffer.byteLength(text, "utf8") });
+  }
+}
+
+async function insertCell(
+  tx: ClientBase,
+  input: CaptureCellInput,
+  now: Date,
+  write: CellWrite,
+  resultId: string,
+  rawObjectKey: string | null,
+  text: string,
+): Promise<void> {
+  const captured = write.status === "captured";
   await tx.query(
     `INSERT INTO answer_captures
-       (workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
+       (id, workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
         capture_mode, adapter_version, normalizer_version, model_fingerprint, latency_ms,
-        response_tokens_est, truncated, content_hash, response_excerpt, payload,
+        response_tokens_est, truncated, content_hash, response_excerpt, payload, raw_object_key,
         flags, cache_layer, status, error_code, scoring_version)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::text[],'live',$19,$20,$21)`,
+     VALUES ($22,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$23,$18::text[],'live',$19,$20,$21)`,
     [
       input.workspaceId,
       input.projectId,
@@ -359,6 +424,8 @@ async function writeCell(tx: ClientBase, input: CaptureCellInput, now: Date, wri
       write.status,
       captured ? null : write.errorCode,
       SCORING_VERSION,
+      resultId,
+      rawObjectKey,
     ],
   );
 }

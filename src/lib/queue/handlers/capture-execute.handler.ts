@@ -12,6 +12,8 @@ import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { engineKeySchema } from "../../engines/contract.js";
 import { SpendMeter, ValkeySpendMeterStore } from "../../engines/spend-meter.js";
+import { rawObjectStores, type RawObjectStores } from "../../capture/raw-object-store.js";
+import type { ObjectStoragePort } from "../../storage/storage.port.js";
 import { captureCell, recordExhaustedCell, type CaptureCellInput, type CaptureCellOutcome } from "../../capture/execute-cell.js";
 import { finalizeRun } from "../../capture/finalize-run.js";
 import { readRunProgress } from "../../capture/run-progress.js";
@@ -60,6 +62,8 @@ export interface CaptureExecuteDeps {
   readonly enqueueRollup?: EnqueueRollup;
   /** Injected in tests; production builds the Valkey-backed meter from env on first use. */
   readonly spendMeter?: SpendMeter;
+  /** STORY-181 - the object-storage port the raw capture objects are written through (S3 from env when absent). Injectable so a test sees a real key or a failing upload. */
+  readonly storagePort?: ObjectStoragePort;
 }
 
 /** What `capture.parse` needs to find and re-read the row this handler wrote. */
@@ -107,6 +111,8 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
   // E2E-B6 — the platform spend meter (EC-08), built on first use. RECORDING fails open inside the
   // meter (the money is already spent); the PRE-CALL gate below fails closed on an unreadable or corrupt
   // total (an absent total is zero spent, which is why the meter must live where a key cannot vanish).
+  let stores: RawObjectStores | undefined;
+  const rawStores = (): RawObjectStores => (stores ??= rawObjectStores(context.env, deps?.storagePort));
   let spendMeter: SpendMeter | undefined = deps?.spendMeter;
   const meter = (): SpendMeter => (spendMeter ??= buildSpendMeter(context.env, (message) => logger.warn(message)));
   const ceilingReached = async (engineKey: string): Promise<boolean> => {
@@ -243,7 +249,9 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     };
     let outcome: CaptureCellOutcome;
     try {
-      outcome = await captureCell(tx, liveCache, cellInput, undefined, recordSpend, ceilingReached);
+      // STORY-181: bound HERE, inside the job's tenant context (it only reads the workspace id; no I/O), and handed to the cell so the
+      // raw object lands in this workspace's prefix and nowhere else.
+      outcome = await captureCell(tx, liveCache, cellInput, undefined, recordSpend, ceilingReached, rawStores().bindForWrite());
     } catch (error) {
       // SCANFIX D1 - THE LAST ATTEMPT RECORDS INSTEAD OF DYING. Until this, a cell whose retry ladder ran
       // out threw its way into the dead-letter queue and left NO row: `captured + failed + skipped` never

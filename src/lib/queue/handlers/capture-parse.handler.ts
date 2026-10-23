@@ -15,7 +15,11 @@ import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { requestRollupIfRunComplete as requestRunRollup } from "./run-rollup-request.js";
-import { signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
+import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
+import { decodeRawObject, type RawObjectBody } from "../../capture/raw-object.js";
+import { rawObjectStores, type BoundRawObjects, type RawObjectStores } from "../../capture/raw-object-store.js";
+import { StorageTenancyError } from "../../storage/storage-keys.js";
+import type { ObjectStoragePort } from "../../storage/storage.port.js";
 
 // STORY-135 — `capture.parse`, the second real entry in STORY-124's registry.
 //
@@ -57,6 +61,20 @@ export interface CaptureParseDeps {
   ) => Promise<unknown>;
   /** STORY-042 AC6 — adds a late fact's (workspace, project, date) to the `rollup_dirty` set. Injected in tests; production gets it from the worker group through the handler context. */
   readonly markRollupDirty?: (entry: DirtyEntry) => Promise<void>;
+  /** STORY-181 - the object-storage port the raw capture object is read through (S3 from env when absent). */
+  readonly storagePort?: ObjectStoragePort;
+}
+
+/**
+ * STORY-181 AC2 / ADR-0003 - this job is PHASED: `prepare` is one short transaction, `run` reads the raw object with NO transaction
+ * and NO pooled connection, and `commit` is a second short transaction that parses and writes. The tenant binding of the object
+ * store is taken in `prepare` (it only reads the workspace id) and works in `run` with no context at all.
+ */
+interface ParsePrepared {
+  readonly payload: z.infer<typeof payloadSchema>;
+  /** The object to read, or null: a legacy row (`raw_object_key` NULL, read from `payload`), a reused row, or a cell with nothing to parse. */
+  readonly objectKey: string | null;
+  readonly reader: BoundRawObjects | null;
 }
 
 interface CaptureRecord {
@@ -128,8 +146,50 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
     logger.log({ event: "capture.rematch", outcome, workspace_id: workspaceId, result_id: resultId });
   };
 
-  return async (tx: ClientBase, job: Job): Promise<void> => {
+  let stores: RawObjectStores | undefined;
+  const rawStores = (): RawObjectStores => (stores ??= rawObjectStores(_context.env, deps?.storagePort));
+
+  const prepare = async (tx: ClientBase, job: Job): Promise<ParsePrepared | typeof PHASES_DONE> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
+    const found = await tx.query<{ raw_object_key: string | null; status: string; cache_layer: string }>(
+      "SELECT raw_object_key, status, cache_layer FROM answer_captures WHERE id = $1",
+      [payload.resultId],
+    );
+    const row = found.rows[0];
+    if (row === undefined) {
+      // Deleted by retention, or invisible under RLS. Nothing to parse and nothing wrong.
+      logger.log(`capture ${payload.resultId} is gone; skipping parse`);
+      return PHASES_DONE;
+    }
+    // Only a row that will actually be parsed needs its object. A failed/blocked cell has none, and a reused row (`skipped`) reads
+    // its text from its own payload or its source (L1/L2), never from an object of its own.
+    const parseable = row.status === "captured" || row.status === "parsed";
+    if (row.raw_object_key === null || !parseable) return { payload, objectKey: null, reader: null };
+    // Bound HERE, inside the tenant context. Unconfigured storage with a row that names an object is an error: it cannot be read.
+    return { payload, objectKey: row.raw_object_key, reader: rawStores().bindForRead() };
+  };
+
+  const run = async (prepared: ParsePrepared): Promise<RawObjectBody | null> => {
+    if (prepared.objectKey === null || prepared.reader === null) return null;
+    try {
+      const bytes = await prepared.reader.getStored(prepared.objectKey);
+      incrementCounter("nominara_capture_raw_object_reads_total", { outcome: "ok" });
+      return decodeRawObject(bytes);
+    } catch (error) {
+      if (error instanceof StorageTenancyError) {
+        // A stored key outside this workspace's prefix: corruption or an attack. IDs only; never the key. The parse fails (it is
+        // retried, then dead-lettered) and writes nothing - it must not fall back to payload, which would hide the violation.
+        incrementCounter("nominara_capture_raw_object_reads_total", { outcome: "tenancy_refused" });
+        logger.warn({ event: "raw_object_tenancy_refused", workspace_id: prepared.payload.workspaceId, result_id: prepared.payload.resultId });
+      } else {
+        incrementCounter("nominara_capture_raw_object_reads_total", { outcome: "failed" });
+      }
+      throw error;
+    }
+  };
+
+  const commit = async (tx: ClientBase, prepared: ParsePrepared, rawObject: RawObjectBody | null): Promise<void> => {
+    const payload = prepared.payload;
 
     const found = await tx.query<CaptureRecord>(
       `SELECT id, project_id, run_id, prompt_id, engine_key, captured_at, status, content_hash,
@@ -194,7 +254,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       return;
     }
 
-    const text = reused ? await reusedTextOf(tx, record, payload.workspaceId) : textOf(record);
+    const text = reused ? await reusedTextOf(tx, record, payload.workspaceId) : textOf(record, rawObject);
     if (text === null && reused) {
       // The answer cannot be recovered. NOT marked parsed (that would count the cell twice) and not left looking
       // pending (that would hold the run's rollup for ever): flagged, unscored, still skipped.
@@ -230,7 +290,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       capturedAt: record.captured_at,
       text,
       flags: record.flags.filter((flag) => flag !== REMATCH_UNAVAILABLE_FLAG),
-      ...structuredOf(record),
+      ...structuredOf(record, rawObject),
     };
 
     const result = await parseCapture(capture, {
@@ -265,6 +325,8 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       `parsed ${record.id}: ${String(result.mentions.length)} mentions, ${String(result.citations.length)} citations`,
     );
   };
+
+  return phasedProcessor<ParsePrepared, RawObjectBody | null>({ prepare, run, commit: (tx, prepared, rawObject) => commit(tx, prepared, rawObject) });
 }
 
 /** The prior parse's identity, or null when this row has never been parsed. */
@@ -286,13 +348,12 @@ function priorOf(record: CaptureRecord): Parameters<typeof decideL3>[1] {
 /**
  * The answer text.
  *
- * FROM `payload.text`, NEVER FROM `response_excerpt`. The excerpt is 280
- * characters written for a preview; parsing it would produce offsets into a
- * truncation and report every entity past character 280 as absent — a
- * silently wrong answer rather than a missing one.
+ * FROM THE RAW OBJECT WHEN THE ROW HAS ONE (STORY-181 AC2), else from `payload.text` (a legacy row). NEVER FROM
+ * `response_excerpt`. The excerpt is 280 characters written for a preview; parsing it would produce offsets into a
+ * truncation and report every entity past character 280 as absent — a silently wrong answer rather than a missing one.
  */
-function textOf(record: CaptureRecord): string | null {
-  const text = record.payload?.text;
+function textOf(record: CaptureRecord, rawObject: RawObjectBody | null): string | null {
+  const text = rawObject !== null ? rawObject.text : record.payload?.text;
   return typeof text === "string" && text.length > 0 ? text : null;
 }
 
@@ -309,7 +370,7 @@ function textOf(record: CaptureRecord): string | null {
  * by id does; one read per reused cell, and the planner already paid the larger scan.
  */
 async function reusedTextOf(tx: ClientBase, record: CaptureRecord, workspaceId: string): Promise<string | null> {
-  const own = textOf(record);
+  const own = textOf(record, null);
   if (own !== null || record.source_result_id === null) return own;
   const source = await tx.query<{ payload: CaptureRecord["payload"] }>(
     "SELECT payload FROM answer_captures WHERE id = $1 AND workspace_id = $2 AND project_id = $3",
@@ -319,9 +380,9 @@ async function reusedTextOf(tx: ClientBase, record: CaptureRecord, workspaceId: 
   return typeof text === "string" && text.length > 0 ? text : null;
 }
 
-function structuredOf(record: CaptureRecord): Partial<Pick<CaptureRow, "structuredCitations" | "structuredElements">> {
-  const citations = record.payload?.structured_citations;
-  const elements = record.payload?.structured_elements;
+function structuredOf(record: CaptureRecord, rawObject: RawObjectBody | null): Partial<Pick<CaptureRow, "structuredCitations" | "structuredElements">> {
+  const citations = rawObject !== null ? rawObject.structured_citations : record.payload?.structured_citations;
+  const elements = rawObject !== null ? rawObject.structured_elements : record.payload?.structured_elements;
   return {
     ...(Array.isArray(citations) ? { structuredCitations: citations as NonNullable<CaptureRow["structuredCitations"]> } : {}),
     ...(Array.isArray(elements) ? { structuredElements: elements as NonNullable<CaptureRow["structuredElements"]> } : {}),
