@@ -127,6 +127,9 @@ describe("STORY-053 · patches — real SQL under RLS", () => {
       "UPDATE patches SET risk_flags = '[\"x\"]' WHERE id = $1",
       "UPDATE patches SET finding_id = gen_random_uuid() WHERE id = $1",
       "UPDATE patches SET requires_human_review = true, review_reason = 'x' WHERE id = $1",
+      // The one allowed change is the foreign key's own SET NULL on finding_id; riding other changes along with it is not.
+      "UPDATE patches SET finding_id = NULL, content_after = 'tampered' WHERE id = $1",
+      "UPDATE patches SET created_at = now() - interval '1 year' WHERE id = $1",
     ]) {
       await expect(client.query(sql, [id]), sql).rejects.toMatchObject({ code: "23000" });
     }
