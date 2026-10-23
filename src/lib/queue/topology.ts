@@ -379,7 +379,10 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
   // in `downgrade_notices` inside its transaction and enqueues one signed tenant job per row after the commit; the
   // handler is PHASED (ADR-0003: the send runs with no transaction), sends with a provider idempotency key derived from
   // the row, and marks it sent. A failed send fails the job down this ladder; a sent row is never sent again. Keyed by
-  // the Stripe event id (or the operator's ticket) and the kind, hashed. Same `rollup` group as the other billing jobs.
+  // the Stripe event id (or, for plan:set, the ticket and the change's entitlement version) and the kind, hashed. Same
+  // `rollup` group as the other billing jobs. THE LADDER IS SHORT (about a minute); a notice still unsent after it
+  // is re-enqueued hourly, for up to 23 hours, by the relay (lib/billing/downgrade-notice-relay.ts) under an
+  // hour-suffixed key of the same pattern, which keeps every re-send inside Resend's 24-hour idempotency window.
   {
     name: "billing.downgrade_notice",
     producer: "Stripe webhook cut-over and plan:set, after commit (STORY-077; not in §4)",

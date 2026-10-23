@@ -198,7 +198,7 @@ async function enqueueRecordedNotices(env: ReturnType<typeof loadEnv>, args: Pla
   }
   log(
     failed
-      ? "downgrade-pause notice job(s) could NOT be enqueued: the notices stay recorded and unsent in downgrade_notices; re-enqueue them"
+      ? "downgrade-pause notice job(s) could NOT be enqueued: the notices stay recorded in downgrade_notices and the capture worker's hourly relay re-enqueues them (nothing to do by hand)"
       : "downgrade-pause notice job(s) enqueued: the worker sends them",
   );
 }
