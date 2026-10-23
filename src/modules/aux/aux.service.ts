@@ -248,7 +248,12 @@ export class AuxService {
     const audit = await this.latestAuditFacts(projectId);
     const grouped = new Map<string, (PatchRow & { rn: number })[]>();
     for (const row of rows.rows) grouped.set(row.finding_id!, [...(grouped.get(row.finding_id!) ?? []), row]);
-    for (const [findingId, list] of grouped) out.set(findingId, toPatch(list[0]!, audit, list.slice(1).map((r) => r.id)));
+    for (const [findingId, list] of grouped) {
+      const patch = toPatch(list[0]!, audit, list.slice(1).map((r) => r.id));
+      // A latest patch made against a file that has since changed is not offered on the finding: the audit would have made a new one, so
+      // its absence means today's gate refused or found nothing. It stays readable by id.
+      if (patch.page_matches !== false) out.set(findingId, patch);
+    }
     incrementCounter("nominara_aux_patch_reads_total", { route: "finding" });
     return out;
   }

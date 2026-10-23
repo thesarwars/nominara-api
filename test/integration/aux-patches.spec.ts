@@ -193,6 +193,19 @@ describe("STORY-053 · patches — real SQL under RLS", () => {
     expect(await read()).toBeNull(); // a failed audit observed nothing
   });
 
+  it("STORY-053 scenario 9 · a finding whose latest patch no longer matches the file (regeneration refused) serves patch null, and GET /patches/{id} still returns it", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(); const p = await createProject(ws);
+    const f = await createFinding(ws, p, await createAudit(ws, p, { created: "2026-10-01T00:00:00Z" }));
+    const id = await createPatch(ws, p, f, { before: sha("robots-v1") });
+    await createAudit(ws, p, { robotsHash: sha("robots-v1"), created: "2026-10-05T00:00:00Z" });
+    const served = (): Promise<unknown> => inTenant(CTX(ws, actor), async () => (await service.listProjectFindings(p, { limit: 10 })).items[0]!.patch);
+    expect(await served()).toMatchObject({ patch_id: id, page_matches: true });
+    // The file changed and today's gate refused to make a new patch: the old one is not offered on the finding.
+    await createAudit(ws, p, { robotsHash: sha("robots-v2"), created: "2026-10-06T00:00:00Z" });
+    expect(await served()).toBeNull();
+    expect((await inTenant(CTX(ws, actor), () => service.getPatch(id))).page_matches).toBe(false);
+  });
+
   it("STORY-053 scenario 9 · a project with no finished audit reads null", async () => {
     const ws = await createWorkspace(); const actor = await createUser(); const p = await createProject(ws);
     const id = await createPatch(ws, p, null);
