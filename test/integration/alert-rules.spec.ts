@@ -343,7 +343,9 @@ describe("STORY-068 · alert rules raised after each rollup", () => {
     const emails = (await db.query("SELECT * FROM notification_emails WHERE kind = 'immediate' ORDER BY created_at")).rows;
     expect(emails).toHaveLength(2);
     expect(emails.every((e) => e.user_id === ownerId && e.status === "pending")).toBe(true);
-    expect(enqueued.map((e) => e.payload)).toEqual(emails.map((e) => ({ kind: "email", emailId: e.id })));
+    // Both rows share one transaction's now(), so they are compared as sets, not by created_at order.
+    const ids = (rows: readonly unknown[]) => rows.map((row) => JSON.stringify(row)).sort();
+    expect(ids(enqueued.map((e) => e.payload))).toEqual(ids(emails.map((e) => ({ kind: "email", emailId: e.id }))));
     // A later evaluation (another rollup) does not alert on the same events again.
     await evaluate();
     expect(await alerts("alert.displacement_detected")).toHaveLength(2);

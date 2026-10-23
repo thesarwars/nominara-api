@@ -4,11 +4,14 @@ import type { ClientBase } from "pg";
 import { z } from "zod";
 import { TasksService } from "../../../modules/tasks/tasks.service.js";
 import { ValkeyRealtimePublisher, type RealtimePublisher } from "../../cache/realtime-publisher.js";
-import { generateTasksForProject, type GenerationSummary } from "../../taskgen/generate.js";
-import { withProjectQueueLock } from "../locks.js";
+import { raiseAlertsForDrafts, raiseDisplacementAlerts } from "../../alert-rules/evaluate.js";
 import type { EnqueueNotifyDispatch } from "../../notifications/routing.js";
+import { generateTasksForProject, type FiredDraft, type GenerationSummary } from "../../taskgen/generate.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
+import { withProjectQueueLock } from "../locks.js";
+import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
-import type { JobProcessor } from "../worker-factory.js";
+import { signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
 
 // STORY-063 — `task.generate`: evaluate the rule catalog for one project and one workspace-local day.
 //
@@ -21,6 +24,10 @@ import type { JobProcessor } from "../worker-factory.js";
 //
 // No network call (KAD-06): generation reads this database only. The one thing that leaves the process is the realtime
 // `task.created` notice, which `TasksService` defers until after COMMIT.
+//
+// STORY-068 — the §15 ALERTS are raised here, in the same transaction, from the drafts this very evaluation acted on (and
+// from the displacement events for the no-cooldown rule): one evaluator. A critical alert's emails are recorded in the
+// outbox and their `notify.dispatch` jobs enqueued AFTER COMMIT; nothing is sent from this job.
 
 const payloadSchema = z
   .object({
@@ -36,7 +43,7 @@ const payloadSchema = z
 
 export interface TaskGenerateDeps {
   readonly realtime?: RealtimePublisher;
-  /** STORY-068 RED stub: the notify.dispatch enqueue the alert writer uses after commit. */
+  /** STORY-068 — the `notify.dispatch` enqueue a critical alert's emails use after commit. Injected in tests. */
   readonly enqueueNotify?: EnqueueNotifyDispatch;
 }
 
@@ -48,6 +55,15 @@ export function createTaskGenerateHandler(context: QueueHandlerContext, deps: Ta
     tasks ??= new TasksService(deps.realtime ?? new ValkeyRealtimePublisher(context.env.VALKEY_CACHE_URL));
     return tasks;
   };
+
+  // Built on the first critical alert, not at boot (a worker group without a reachable queue must still boot).
+  let producer: QueueProducer | undefined;
+  const enqueueNotify: EnqueueNotifyDispatch =
+    deps.enqueueNotify ??
+    (async (queue, workspaceId, payload, options): Promise<unknown> => {
+      producer ??= new QueueProducer(createQueueWorkerConnection(context.env.QUEUE_REDIS_URL), queueKeyPrefix(context.env.NODE_ENV), signingKeysFromEnv(context.env));
+      return producer.enqueueTenantJob(queue, workspaceId, payload, options);
+    });
 
   return async (tx: ClientBase, job: Job): Promise<GenerationSummary> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
@@ -63,11 +79,27 @@ export function createTaskGenerateHandler(context: QueueHandlerContext, deps: Ta
       logger.log({ event: "task.generate.project_gone", workspace_id: payload.workspaceId, project_id: payload.projectId });
       return { rulesEvaluated: 0, rulesSkipped: 0, created: 0, refreshed: 0, deduplicated: 0, suppressed: 0 };
     }
-    return generateTasksForProject(tx, tasksService(), {
-      projectId: payload.projectId,
-      metricDate,
-      ...(payload.triggerKinds === undefined ? {} : { triggerKinds: payload.triggerKinds }),
+    const fired: FiredDraft[] = [];
+    const summary = await generateTasksForProject(
+      tx,
+      tasksService(),
+      { projectId: payload.projectId, metricDate, ...(payload.triggerKinds === undefined ? {} : { triggerKinds: payload.triggerKinds }) },
+      { onFired: (item) => void fired.push(item) },
+    );
+    // AFTER generation, so a displacement's task is already linked and every alert can name the task it generated.
+    const alertCtx = { workspaceId: payload.workspaceId, projectId: payload.projectId, metricDate };
+    const writer = { enqueue: enqueueNotify, ...(context.env.WEBAUTHN_ORIGIN === undefined ? {} : { appOrigin: context.env.WEBAUTHN_ORIGIN }) };
+    const content = await raiseAlertsForDrafts(tx, alertCtx, fired, writer);
+    const displacement = payload.triggerKinds === undefined || payload.triggerKinds.includes("displacement") ? await raiseDisplacementAlerts(tx, alertCtx, writer) : { raised: 0, cooledDown: 0, duplicate: 0 };
+    logger.log({
+      event: "task.generate.alerts",
+      workspace_id: payload.workspaceId,
+      project_id: payload.projectId,
+      raised: content.raised + displacement.raised,
+      cooled_down: content.cooledDown,
+      duplicate: content.duplicate + displacement.duplicate,
     });
+    return summary;
   }
 }
 

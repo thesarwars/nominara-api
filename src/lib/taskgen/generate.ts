@@ -37,6 +37,22 @@ export interface GenerateRequest {
   readonly triggerKinds?: readonly string[];
 }
 
+/**
+ * STORY-068 — one draft the evaluation acted on, handed to the alert catalog so an alert is raised from the SAME
+ * evaluation that made (or refreshed, deduplicated or suppressed) its task: one evaluator, never a second one.
+ */
+export interface FiredDraft {
+  readonly ruleCode: string;
+  readonly draft: TaskDraft;
+  readonly taskId: string;
+  readonly title: string;
+  readonly description: string;
+}
+
+export interface GenerationHooks {
+  readonly onFired?: (fired: FiredDraft) => void;
+}
+
 export interface GenerationSummary {
   rulesEvaluated: number;
   rulesSkipped: number;
@@ -51,10 +67,10 @@ const DO_NOT: readonly string[] = [
   "Contribute without the disclosure the platform requires.",
 ];
 
-export async function generateTasksForProject(tx: ClientBase, tasks: TasksService, request: GenerateRequest): Promise<GenerationSummary> {
+export async function generateTasksForProject(tx: ClientBase, tasks: TasksService, request: GenerateRequest, hooks: GenerationHooks = {}): Promise<GenerationSummary> {
   return tracer.startActiveSpan("taskgen.evaluate", async (span) => {
     try {
-      const summary = await generate(tx, tasks, request);
+      const summary = await generate(tx, tasks, request, hooks);
       span.setAttribute("nominara.taskgen.rules_evaluated", summary.rulesEvaluated);
       span.setAttribute("nominara.taskgen.tasks_created", summary.created);
       return summary;
@@ -67,7 +83,7 @@ export async function generateTasksForProject(tx: ClientBase, tasks: TasksServic
   });
 }
 
-async function generate(tx: ClientBase, tasks: TasksService, request: GenerateRequest): Promise<GenerationSummary> {
+async function generate(tx: ClientBase, tasks: TasksService, request: GenerateRequest, hooks: GenerationHooks): Promise<GenerationSummary> {
   const summary: GenerationSummary = { rulesEvaluated: 0, rulesSkipped: 0, created: 0, refreshed: 0, deduplicated: 0, suppressed: 0 };
 
   // Under RLS another tenant's project is simply absent: nothing is read and nothing is written for it.
@@ -127,6 +143,7 @@ async function generate(tx: ClientBase, tasks: TasksService, request: GenerateRe
       const input = await toTaskInput(tx, rule, draft, ctx, evidenceAt, baselines);
       const result = await tasks.createGeneratedTask(input);
       summary[result.outcome === "created" ? "created" : result.outcome] += 1;
+      hooks.onFired?.({ ruleCode: rule.code, draft, taskId: result.task.id, title: input.title, description: input.description });
       incrementCounter("nominara_taskgen_tasks_total", { outcome: result.outcome });
       if (draft.displacementId !== undefined && result.outcome !== "suppressed") {
         // The displacement points at its task, so it is planned once. The first task wins and is never replaced.
