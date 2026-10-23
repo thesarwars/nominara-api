@@ -6,6 +6,7 @@ import { TasksService } from "../../../modules/tasks/tasks.service.js";
 import { ValkeyRealtimePublisher, type RealtimePublisher } from "../../cache/realtime-publisher.js";
 import { generateTasksForProject, type GenerationSummary } from "../../taskgen/generate.js";
 import { withProjectQueueLock } from "../locks.js";
+import type { EnqueueNotifyDispatch } from "../../notifications/routing.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 
@@ -35,6 +36,8 @@ const payloadSchema = z
 
 export interface TaskGenerateDeps {
   readonly realtime?: RealtimePublisher;
+  /** STORY-068 RED stub: the notify.dispatch enqueue the alert writer uses after commit. */
+  readonly enqueueNotify?: EnqueueNotifyDispatch;
 }
 
 export function createTaskGenerateHandler(context: QueueHandlerContext, deps: TaskGenerateDeps = {}): JobProcessor {
