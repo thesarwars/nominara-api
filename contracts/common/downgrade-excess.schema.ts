@@ -50,11 +50,12 @@ export const downgradeExcessItemSchema = z.discriminatedUnion("kind", [
        */
       paused: z.number().int().nonnegative().optional(),
       /**
-       * `projects.max` only: the projects that exceed, in the order the cut-over pauses them (least recently active first),
+       * `projects.max` only: the projects the cut-over pauses, in the order it pauses them (least recently active first),
        * AT MOST 100 of them - `paused` stays exact past that, so `items.length < paused` means the list was cut.
-       * `prompts`: how many of that project's active prompts the cut-over pauses WITH it (0 for a project a downgrade
-       * already paused: its prompts are paused already). Always set by this server; optional on the wire so the
-       * addition is a minor client bump (STORY-023 AC5).
+       * `projects.max` counts TRACKING projects only (active or initializing; owner decision 2026-10-23): an archived or
+       * person-paused project uses no slot and is never named, and neither is one an earlier downgrade already paused.
+       * `prompts`: how many of that project's active prompts the cut-over pauses WITH it. Always set by this server;
+       * optional on the wire so the addition is a minor client bump (STORY-023 AC5).
        */
       items: z.array(z.object({ id: z.uuid(), name: z.string(), prompts: z.number().int().nonnegative().optional() }).strict()).max(100).optional(),
     })
