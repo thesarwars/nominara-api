@@ -298,6 +298,14 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "notification. The DNS and HTTP checks are network calls an operator must never see on a request path (KAD-06), and §4's table allocates no " +
       "queue to them. A queue of its own, in the crawl group with the other outbound fetchers, so a DLQ entry names the job that failed.",
   },
+  "task.resurface": {
+    workerGroup: "rollup",
+    because:
+      "STORY-064 AC5 (mechanism: a workspace-agnostic scheduled sweep, not a rollup step): a dismissed or snoozed task returns when its resurface_at passes, and nothing but a " +
+      "scheduled sweep can bring it back — a read cannot write the audited 'reopened' event. The tick has no workspace to name, so the queue is not " +
+      "tenant-scoped: discovery runs cross-tenant on the owner connection and each reopen is applied in ONE tenant's context as the runtime role. " +
+      "A queue of its own (not a rollup step) so a DLQ entry names the job that failed.",
+  },
   "billing.auto_topup": {
     workerGroup: "rollup",
     because:
@@ -415,7 +423,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     }
   });
 
-  it("marks tenantScoped=false only for the seven cross-tenant system jobs; true for every other queue", () => {
+  it("marks tenantScoped=false only for the eight cross-tenant system jobs; true for every other queue", () => {
     // ⚠ THE SHORT LIST IS THE ASSERTION. A tenant-scoped queue cannot be
     // driven by a bare cron tick — `createJobProcessor` verifies a signature
     // before the handler is reached — so this set is exactly the set of
@@ -431,6 +439,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
       "identity.sweep_unverified",
       "maintenance.partition",
       "retention.purge",
+      "task.resurface",
     ]);
   });
 

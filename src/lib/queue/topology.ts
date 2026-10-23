@@ -443,6 +443,23 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "domreverify:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // ⚠ AN ADDED QUEUE §4 DOES NOT CONTAIN, by the same precedent. STORY-064 AC5: a dismissed or snoozed task returns when its
+  // `resurface_at` passes, with an audited system 'reopened' event (a read cannot write one, so a read-time rule would break the
+  // timeline). The mechanism is a workspace-agnostic scheduled sweep, NOT a step of the rollup: a rollup only visits a project on
+  // the days it rolls up, so a quiet project's dismissed tasks would never return. Rollup group, with the other owner-connection
+  // ticks. NOT tenant-scoped: the tick has no workspace to name, so discovery runs cross-tenant on the owner connection and each
+  // reopen is applied in ONE tenant's context as the runtime role (`rollup/resurface-dismissed-tasks.ts`). Advisory-locked
+  // single-flight; a second run finds nothing due, which is the idempotency.
+  {
+    name: "task.resurface",
+    producer: "cron daily (STORY-064 AC5; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "taskresurf:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",

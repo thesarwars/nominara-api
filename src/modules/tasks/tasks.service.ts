@@ -3,6 +3,8 @@ import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import type { RealtimeEventPayloads } from "../../../contracts/events/catalog.schema.js";
 import type {
+  BulkTaskRequest,
+  BulkTaskResponse,
   CompleteTaskResponse,
   CreateCommentRequest,
   CreateTaskRequest,
@@ -316,6 +318,31 @@ export class TasksService {
    */
   async updateTask(taskId: string, body: UpdateTaskRequest): Promise<Task> {
     const store = currentTenantStore()!;
+    const dirtyProjects = new Set<string>();
+    await this.applyUpdate(store, taskId, body, {}, dirtyProjects);
+    await this.refreshOpenCounts(store.client, dirtyProjects);
+    return this.readTask(store.client, taskId);
+  }
+
+  /** The open count of every project a change touched, refreshed once per project. */
+  private async refreshOpenCounts(client: ClientBase, projectIds: ReadonlySet<string>): Promise<void> {
+    for (const projectId of projectIds) await refreshProjectTaskCounts(client, projectId);
+  }
+
+  /**
+   * One task's patch inside the caller's transaction — the body of `updateTask`, shared with the bulk endpoint so a batch
+   * writes EXACTLY the events a single patch would. Returns whether anything changed. A project whose open count a change
+   * moved is added to `dirtyProjects`; the caller refreshes it (once per project, however many tasks of it moved).
+   *
+   * `opts` is how a snooze differs from a dismissal: the caller-chosen re-surface date and the `snooze` mark on the event.
+   */
+  private async applyUpdate(
+    store: NonNullable<ReturnType<typeof currentTenantStore>>,
+    taskId: string,
+    body: UpdateTaskRequest,
+    opts: { readonly resurfaceAt?: Date; readonly snooze?: boolean },
+    dirtyProjects: Set<string>,
+  ): Promise<boolean> {
     const client = store.client;
     const actorId = store.context.actorId;
 
@@ -324,7 +351,7 @@ export class TasksService {
     }
 
     const found = await client.query<CurrentTaskRow>(
-      `SELECT t.id, t.project_id, t.status, t.assignee_id, t.priority, t.due_at, t.goal_id, t.dismissed_reason,
+      `SELECT t.id, t.project_id, t.status, t.assignee_id, t.priority, t.due_at, t.goal_id, t.dismissed_reason, t.resurface_at,
               (cardinality(app.current_scope_projects()) = 0 OR t.project_id = ANY(app.current_scope_projects())) AS in_scope
          FROM tasks t
         WHERE t.id = $1 AND t.deleted_at IS NULL
@@ -348,13 +375,28 @@ export class TasksService {
     };
 
     if (body.status !== undefined) {
-      const redismiss = body.status === "dismissed" && current.status === "dismissed" && body.dismiss_reason !== current.dismissed_reason;
+      const redismiss =
+        body.status === "dismissed" &&
+        current.status === "dismissed" &&
+        (body.dismiss_reason !== current.dismissed_reason ||
+          (opts.resurfaceAt !== undefined && opts.resurfaceAt.getTime() !== current.resurface_at?.getTime()));
       if (body.status !== current.status || redismiss) {
         set("status", body.status);
         if (body.status === "dismissed") {
           set("dismissed_reason", body.dismiss_reason);
-          sets.push(`resurface_at = now() + make_interval(days => ${TASK_RESURFACE_DAYS})`);
-          events.push({ event: "dismissed", from: current.status, to: "dismissed", payload: { reason: body.dismiss_reason, resurface_days: TASK_RESURFACE_DAYS } });
+          if (opts.resurfaceAt !== undefined) {
+            // A snooze: the caller's date (already bounded by the service), and the event says so.
+            set("resurface_at", opts.resurfaceAt);
+            events.push({
+              event: "dismissed",
+              from: current.status,
+              to: "dismissed",
+              payload: { reason: body.dismiss_reason, snooze: true, resurface_at: opts.resurfaceAt.toISOString() },
+            });
+          } else {
+            sets.push(`resurface_at = now() + make_interval(days => ${TASK_RESURFACE_DAYS})`);
+            events.push({ event: "dismissed", from: current.status, to: "dismissed", payload: { reason: body.dismiss_reason, resurface_days: TASK_RESURFACE_DAYS } });
+          }
         } else {
           if (current.status === "dismissed") {
             sets.push("dismissed_reason = NULL", "resurface_at = NULL");
@@ -413,7 +455,7 @@ export class TasksService {
         incrementCounter("nominara_tasks_events_written_total", { event: e.event });
       }
       if (events.some((e) => e.event === "dismissed" || e.event === "reopened" || e.event === "status_changed")) {
-        await refreshProjectTaskCounts(client, current.project_id);
+        dirtyProjects.add(current.project_id);
       }
       const moved = events.find((e) => e.event === "dismissed" || e.event === "reopened" || e.event === "status_changed");
       if (moved !== undefined && actorId !== undefined) {
@@ -430,7 +472,73 @@ export class TasksService {
       events: events.map((e) => e.event),
     });
 
-    return this.readTask(client, taskId);
+    return events.length > 0;
+  }
+
+  /**
+   * `POST /v1/workspaces/{id}/tasks/bulk` — STORY-064 AC12. Bulk assign, status change and snooze.
+   *
+   * ALL-OR-NOTHING, in the caller's one ambient transaction. Every id is locked (`FOR UPDATE`, in id order, so two batches over
+   * overlapping ids cannot deadlock) and checked BEFORE anything is written: an id that is absent, another tenant's (RLS makes it
+   * absent), or soft-deleted is a 404 for the whole batch; an id in a project outside a scoped caller's scope is the 403 that names
+   * the scope. A mixed batch therefore cannot touch an out-of-scope task, and a refusal part-way (a non-member assignee, a `done`
+   * task) rolls back the writes already made, events included.
+   *
+   * Each task is then patched by the SAME code a single `PATCH /tasks/{id}` runs, so the timeline records the same events with the
+   * same actor, from and to. A task already in the requested state writes nothing and is not counted in `updated`.
+   *
+   * SNOOZE is a dismissal with the caller's date: reason and date are both required (the contract), the date must be in the future
+   * (no upper bound: none is specified), and the `dismissed` event carries `snooze: true`. The task leaves the open count and returns through the same sweep as a dismissal.
+   */
+  async bulkUpdateTasks(body: BulkTaskRequest): Promise<BulkTaskResponse> {
+    const store = currentTenantStore()!;
+    const client = store.client;
+
+    let opts: { resurfaceAt?: Date; snooze?: boolean } = {};
+    let patch: UpdateTaskRequest;
+    if (body.action === "assign") {
+      patch = { assignee_id: body.assignee_id };
+    } else if (body.action === "status") {
+      patch = { status: body.status };
+    } else {
+      const until = new Date(body.snooze_until);
+      const now = Date.now();
+      if (until.getTime() <= now) {
+        throw new ValidationFailedError({
+          message: "snooze_until must be in the future",
+          details: { issues: [{ path: ["snooze_until"], message: "must be in the future" }] },
+        });
+      }
+      patch = { status: "dismissed", dismiss_reason: body.reason };
+      opts = { resurfaceAt: until, snooze: true };
+    }
+
+    const locked = await client.query<{ id: string; in_scope: boolean }>(
+      `SELECT t.id,
+              (cardinality(app.current_scope_projects()) = 0 OR t.project_id = ANY(app.current_scope_projects())) AS in_scope
+         FROM tasks t
+        WHERE t.id = ANY($1::uuid[]) AND t.deleted_at IS NULL
+        ORDER BY t.id
+        FOR UPDATE OF t`,
+      [body.task_ids],
+    );
+    if (locked.rows.length !== body.task_ids.length) throw new NotFoundError({ message: "no such task" });
+    if (locked.rows.some((r) => !r.in_scope)) throw new ProjectOutOfScopeException();
+
+    const dirtyProjects = new Set<string>();
+    let updated = 0;
+    for (const taskId of body.task_ids) {
+      if (await this.applyUpdate(store, taskId, patch, opts, dirtyProjects)) updated += 1;
+    }
+    await this.refreshOpenCounts(client, dirtyProjects);
+
+    const tasks: Task[] = [];
+    for (const taskId of body.task_ids) tasks.push(await this.readTask(client, taskId));
+
+    incrementCounter("nominara_tasks_bulk_total", { action: body.action });
+    // Workspace ID, the action and counts only — never a title, a reason or an assignee.
+    this.logger.log({ message: "tasks bulk updated", workspace_id: store.context.workspaceId, action: body.action, requested: body.task_ids.length, updated });
+    return { updated, tasks };
   }
 
   private async readTask(client: ClientBase, taskId: string): Promise<Task> {
@@ -836,13 +944,10 @@ export class TasksService {
    * wrong. This implements FR-GD-02's order; STORY-089 needs a matching
    * fix, carried to the docs repo by hand (no `.git` in the snapshot here).
    *
-   * DEDUP IS DEFERRED. FR-GD-02's second sentence — "deduplicated across
-   * projects when the same rule code and affected URL recur, collapsing
-   * into one row with a project-count badge" — is NOT implemented here.
-   * The `task.generate` handler exists now (STORY-063), but its catalog is
-   * per-project work and nothing yet produces two tasks sharing a rule code
-   * and `affected_url` across projects to prove a dedup query against;
-   * building it now would be exercised by nothing. Each task is its own row.
+   * DEDUP (STORY-064 AC10). FR-GD-02's second sentence — "deduplicated across projects when the same rule code and affected URL
+   * recur, collapsing into one row with a project-count badge" — is `ACTION_ITEMS_SQL`'s `groups`/`reps`: the highest-impact task
+   * stands for the group, `project_count` counts the readable projects behind it, and a task with no code or no URL never collapses.
+   * The count is taken AFTER the scope predicate, so it cannot reveal a project outside a scoped role's reach.
    *
    * SEVERITY has no column on `tasks` (`priority` is a 1-5 ranking, not a
    * severity — schemas/tasks-and-goals.md). The only two derivations the
@@ -872,74 +977,15 @@ export class TasksService {
     const client = currentTenantStore()!.client;
     const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, "tasks.action_items", 4);
 
-    const result = await client.query<ActionItemRow>(
-      `WITH items AS (
-         SELECT
-           t.id,
-           t.short_ref,
-           t.project_id,
-           p.name AS project_name,
-           p.slug::text AS project_slug,
-           COALESCE(af.rule_code, t.rule_code) AS code,
-           t.title,
-           CASE WHEN COALESCE(af.severity, psi.gap_severity) IN ('critical', 'high', 'medium', 'low')
-                THEN COALESCE(af.severity, psi.gap_severity)
-           END AS severity,
-           CASE COALESCE(af.severity, psi.gap_severity)
-             WHEN 'critical' THEN 0
-             WHEN 'high'     THEN 1
-             WHEN 'medium'   THEN 2
-             WHEN 'low'      THEN 3
-             ELSE 4
-           END AS severity_rank,
-           t.kind,
-           t.impact_score,
-           t.impact_score::text AS impact_key,
-           t.effort_band,
-           t.playbook_slug,
-           t.source_finding_id,
-           t.source_domain_id,
-           t.source_displacement_id,
-           t.created_at,
-           t.created_at::text AS created_at_key
-         FROM tasks t
-         JOIN projects p ON p.id = t.project_id
-         LEFT JOIN aux_findings af ON af.id = t.source_finding_id
-         LEFT JOIN LATERAL (
-           SELECT gap_severity
-             FROM project_source_index
-            WHERE source_domain_id = t.source_domain_id
-              AND project_id = t.project_id
-              AND engine_key = $1
-              AND window_days = $2
-            ORDER BY window_start DESC
-            LIMIT 1
-         ) psi ON t.source_domain_id IS NOT NULL
-         WHERE t.status IN ('todo', 'in_progress')
-           AND t.deleted_at IS NULL
-           AND p.deleted_at IS NULL
-           AND (cardinality(app.current_scope_projects()) = 0
-                OR p.id = ANY(app.current_scope_projects()))
-       )
-       SELECT *
-         FROM items
-        WHERE ($3::real IS NULL
-               OR impact_score < $3::real
-               OR (impact_score = $3::real AND severity_rank > $4::int)
-               OR (impact_score = $3::real AND severity_rank = $4::int AND created_at > $5::timestamptz)
-               OR (impact_score = $3::real AND severity_rank = $4::int AND created_at = $5::timestamptz AND id > $6::uuid))
-        ORDER BY impact_score DESC, severity_rank ASC, created_at ASC, id ASC
-        LIMIT $7`,
-      [
-        SOURCE_INDEX_ENGINE_KEY,
-        SOURCE_INDEX_WINDOW_DAYS,
-        after?.[0] ?? null,
-        after?.[1] ?? null,
-        after?.[2] ?? null,
-        after?.[3] ?? null,
-        pagination.limit + 1,
-      ],
-    );
+    const result = await client.query<ActionItemRow>(ACTION_ITEMS_SQL, [
+      SOURCE_INDEX_ENGINE_KEY,
+      SOURCE_INDEX_WINDOW_DAYS,
+      after?.[0] ?? null,
+      after?.[1] ?? null,
+      after?.[2] ?? null,
+      after?.[3] ?? null,
+      pagination.limit + 1,
+    ]);
 
     return pageFrom(result.rows, pagination.limit, "tasks.action_items", toActionItem, (row) => [
       row.impact_key,
@@ -952,6 +998,7 @@ export class TasksService {
 
 interface CurrentTaskRow {
   id: string;
+  resurface_at: Date | null;
   project_id: string;
   status: string;
   assignee_id: string | null;
@@ -989,7 +1036,113 @@ interface ActionItemRow {
   source_displacement_id: string | null;
   created_at: Date;
   created_at_key: string;
+  project_count: number;
+  /** `jsonb_agg` — unordered; `toActionItem` puts the row's own project first, then by name. */
+  projects: { id: string; name: string; slug: string }[];
 }
+
+/**
+ * The queue's one statement. $1/$2 are the source-index reading, $3..$6 the keyset cursor (impact key, severity rank, created_at, id
+ * of the LAST ROW of the previous page) and $7 the limit + 1. Exported so the test can EXPLAIN exactly what runs.
+ *
+ * STORY-064 AC9/AC10 — ONE SCAN of `tasks`, DEDUPED across projects:
+ *  - `open_tasks` is the ONE scan of `tasks`: the open, live rows of the workspace (`ix_tasks_open`, the cross-project index — its
+ *    partial predicate is this statement's WHERE, and RLS supplies the workspace column it leads with). It is a CTE of its own,
+ *    MATERIALIZED, so the planner cannot fold it into a projects-driven join that would read `tasks` by another index. Its ORDER BY is
+ *    the index's own key order (`impact_score DESC, priority DESC` after the workspace column): it costs nothing there and is what
+ *    makes `ix_tasks_open` the cheapest way in. Without it the partial unique index `ux_tasks_dedupe` is an equally cheap full scan
+ *    of the same rows and the planner may pick either; the AC names `ix_tasks_open`.
+ *  - `items` joins those rows to their project (live, in scope), finding and source gap. It is referenced twice below, so
+ *    Postgres materialises it too.
+ *  - `group_key` is what two tasks must share to collapse: the displayed `code` AND the `affected_url`, both present. A task missing
+ *    either is keyed on its own id and so NEVER collapses. The code is length-prefixed so no (code, url) pair can spell another's key.
+ *  - `groups` counts the DISTINCT projects of each key and lists them. It aggregates `items`, which the scope predicate has already
+ *    narrowed, so a scoped role's count and list name only projects it can read (AC11).
+ *  - `reps` keeps ONE row per key: the highest-impact task, ties broken by the queue's own order (severity, age, id). That row is
+ *    what the page ranks and what the cursor is keyed on, so paging over collapsed rows skips and repeats nothing.
+ * Aggregation reads every open task of the workspace before the first row can be returned (the price of a count that is true);
+ * the scan itself stays the single index read.
+ */
+export const ACTION_ITEMS_SQL = `WITH open_tasks AS MATERIALIZED (
+         SELECT t.id, t.short_ref, t.project_id, t.rule_code, t.title, t.kind, t.impact_score, t.effort_band, t.playbook_slug,
+                t.source_finding_id, t.source_domain_id, t.source_displacement_id, t.created_at, t.affected_url
+           FROM tasks t
+          WHERE t.status IN ('todo', 'in_progress')
+            AND t.deleted_at IS NULL
+          ORDER BY t.impact_score DESC, t.priority DESC
+       ),
+       items AS (
+         SELECT
+           t.id,
+           t.short_ref,
+           t.project_id,
+           p.name AS project_name,
+           p.slug::text AS project_slug,
+           COALESCE(af.rule_code, t.rule_code) AS code,
+           t.title,
+           CASE WHEN COALESCE(af.severity, psi.gap_severity) IN ('critical', 'high', 'medium', 'low')
+                THEN COALESCE(af.severity, psi.gap_severity)
+           END AS severity,
+           CASE COALESCE(af.severity, psi.gap_severity)
+             WHEN 'critical' THEN 0
+             WHEN 'high'     THEN 1
+             WHEN 'medium'   THEN 2
+             WHEN 'low'      THEN 3
+             ELSE 4
+           END AS severity_rank,
+           t.kind,
+           t.impact_score,
+           t.impact_score::text AS impact_key,
+           t.effort_band,
+           t.playbook_slug,
+           t.source_finding_id,
+           t.source_domain_id,
+           t.source_displacement_id,
+           t.created_at,
+           t.created_at::text AS created_at_key,
+           CASE WHEN COALESCE(af.rule_code, t.rule_code) IS NOT NULL AND t.affected_url IS NOT NULL
+                THEN length(COALESCE(af.rule_code, t.rule_code))::text || ':' || COALESCE(af.rule_code, t.rule_code) || t.affected_url
+                ELSE 'task:' || t.id::text
+           END AS group_key
+         FROM open_tasks t
+         JOIN projects p ON p.id = t.project_id
+         LEFT JOIN aux_findings af ON af.id = t.source_finding_id
+         LEFT JOIN LATERAL (
+           SELECT gap_severity
+             FROM project_source_index
+            WHERE source_domain_id = t.source_domain_id
+              AND project_id = t.project_id
+              AND engine_key = $1
+              AND window_days = $2
+            ORDER BY window_start DESC
+            LIMIT 1
+         ) psi ON t.source_domain_id IS NOT NULL
+         WHERE p.deleted_at IS NULL
+           AND (cardinality(app.current_scope_projects()) = 0
+                OR p.id = ANY(app.current_scope_projects()))
+       ),
+       groups AS (
+         SELECT group_key,
+                count(DISTINCT project_id)::int AS project_count,
+                jsonb_agg(DISTINCT jsonb_build_object('id', project_id, 'name', project_name, 'slug', project_slug)) AS projects
+           FROM items
+          GROUP BY group_key
+       ),
+       reps AS (
+         SELECT DISTINCT ON (group_key) *
+           FROM items
+          ORDER BY group_key, impact_score DESC, severity_rank ASC, created_at ASC, id ASC
+       )
+       SELECT r.*, g.project_count, g.projects
+         FROM reps r
+         JOIN groups g USING (group_key)
+        WHERE ($3::real IS NULL
+               OR r.impact_score < $3::real
+               OR (r.impact_score = $3::real AND r.severity_rank > $4::int)
+               OR (r.impact_score = $3::real AND r.severity_rank = $4::int AND r.created_at > $5::timestamptz)
+               OR (r.impact_score = $3::real AND r.severity_rank = $4::int AND r.created_at = $5::timestamptz AND r.id > $6::uuid))
+        ORDER BY r.impact_score DESC, r.severity_rank ASC, r.created_at ASC, r.id ASC
+        LIMIT $7`;
 
 const VALID_SEVERITIES: ReadonlySet<string> = new Set(["critical", "high", "medium", "low"]);
 
@@ -1082,6 +1235,12 @@ function toActionItem(row: ActionItemRow): ActionItem {
     effort: normalizeEffort(row.effort_band),
     primary_action: derivePrimaryAction(row),
     created_at: row.created_at.toISOString(),
+    project_count: row.project_count,
+    projects: [...row.projects].sort((a, b) => {
+      if ((a.id === row.project_id) !== (b.id === row.project_id)) return a.id === row.project_id ? -1 : 1;
+      if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    }),
   };
 }
 
