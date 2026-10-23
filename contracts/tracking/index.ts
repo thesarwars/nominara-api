@@ -5,3 +5,5 @@ export * from "./matrix-response.schema.js";
 export * from "./result-document.schema.js";
 export * from "./run-undo-response.schema.js";
 export * from "./capture-plan-job.schema.js";
+export * from "./results-list.schema.js";
+export * from "./reparse-response.schema.js";
