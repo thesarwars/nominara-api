@@ -173,6 +173,13 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
       [workspaceId, `hold_${label}_${i}`],
     );
   }
+  // STORY-077 (migration 0134) — a recorded downgrade email per row.
+  for (let i = 0; i < R; i++) {
+    await client.query(
+      "INSERT INTO downgrade_notices (workspace_id, request_id, kind, recipient, subject, text_body) VALUES ($1, $2, 'paused', $3, 'paused', 'body')",
+      [workspaceId, `evt_${label}_${i}`, `billing-${label}@example.test`],
+    );
+  }
   // credit_wallets: PRIMARY KEY (workspace_id) alone — structurally ONE row per tenant.
   await client.query("INSERT INTO credit_wallets (workspace_id, cycle_start, cycle_end) VALUES ($1, CURRENT_DATE, CURRENT_DATE + INTERVAL '30 days')", [
     workspaceId,

@@ -25,7 +25,7 @@ import { usePlanChangeFixture } from "../support/plan-change-fixture.js";
 // connection per phase, a signed envelope. Enqueueing is observed (and stubbed) on QueueProducer.
 
 describe("STORY-077 owner decision 2026-10-23 · the downgrade email goes through a retried, idempotent tenant job", () => {
-  const f = usePlanChangeFixture({ drainNotices: false } as never);
+  const f = usePlanChangeFixture({ drainNotices: false });
   const { gateway, harness } = f;
   const db = () => harness.db();
   const KEYS: RotatingSigningKeys = { current: { kid: "dgnotice-it", key: Buffer.alloc(32, 3) } };
@@ -125,20 +125,20 @@ describe("STORY-077 owner decision 2026-10-23 · the downgrade email goes throug
           if (fail) throw new Error("resend 503");
         },
       };
-      const process = processorFor(pool, sender);
+      const runJob = processorFor(pool, sender);
 
-      await expect(process(job), "the first attempt fails the job, so the queue retries it").rejects.toThrow("resend 503");
+      await expect(runJob(job), "the first attempt fails the job, so the queue retries it").rejects.toThrow("resend 503");
       expect((await notices(workspaceId))[0]!.sent_at, "still unsent").toBeNull();
 
       fail = false;
-      await process(job);
+      await runJob(job);
       expect((await notices(workspaceId))[0]!.sent_at, "marked sent").not.toBeNull();
       expect(attempts.map((m) => [m.to, m.subject, m.idempotencyKey])).toEqual([
         [notice!.recipient, notice!.subject, `downgrade-notice/${notice!.id}`],
         [notice!.recipient, notice!.subject, `downgrade-notice/${notice!.id}`],
       ]);
 
-      await process(job);
+      await runJob(job);
       expect(attempts, "a sent notice is never sent again").toHaveLength(2);
 
       // Stripe redelivers the SAME event: no second notice, no second job.

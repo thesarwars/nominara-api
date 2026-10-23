@@ -14,6 +14,12 @@ export interface EmailMessage {
   readonly textBody: string;
   /** Optional HTML alternative. Nothing renders one today (no email template/branding exists); the Resend adapter passes it through when present. */
   readonly htmlBody?: string;
+  /**
+   * STORY-077 (owner 2026-10-23): a key the provider de-duplicates on, stable across RETRIES of the same logical email (a
+   * queue job's attempts). Absent, the Resend adapter mints one per send() call, which only protects its own in-call
+   * retries. Never part of the delivered message.
+   */
+  readonly idempotencyKey?: string;
 }
 
 export interface EmailSender {

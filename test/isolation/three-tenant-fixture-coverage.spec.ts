@@ -22,7 +22,8 @@ describe("STORY-012 T5 · three-tenant fixture coverage", () => {
       // 61 since NEW-E-1 added `scheduled_report_deliveries` (migration 0051).
       // 62 since NEW-D-2 checkpoint-1 added `stripe_subscription_syncs` (migration 0074).
       // 63 since STORY-072 AC13 added `credit_hold_carries` (migration 0125).
-      expect(tenantTables.length).toBe(63);
+      // 64 since STORY-077 (owner 2026-10-23) added `downgrade_notices` (migration 0134).
+      expect(tenantTables.length).toBe(64);
 
       for (const tenant of [ctx.fixture.a, ctx.fixture.b, ctx.fixture.c]) {
         for (const table of tenantTables) {

@@ -3,10 +3,12 @@ import type { ClientBase, PoolClient } from "pg";
 import { loadEnv } from "../../config/env.js";
 import { createPgPool } from "../../db/pg-pool.js";
 import { applyPlanChange, planKeyOnly, type BillingInterval, type PlanChangeOutcome } from "../../lib/billing/apply-plan.js";
-import { reconcileAndRecordDowngradePause, sendDowngradeNotices } from "../../lib/billing/downgrade-pause-record.js";
+import { enqueueDowngradeNotices, type RecordedNotice } from "../../lib/billing/downgrade-notice-outbox.js";
+import { reconcileAndRecordDowngradePause } from "../../lib/billing/downgrade-pause-record.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
-import { selectEmailSender } from "../../modules/identity/email-sender.selector.js";
-import type { EmailMessage } from "../../modules/identity/ports/email-sender.js";
+import { createQueueReaderConnection, queueKeyPrefix } from "../../lib/queue/connection.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
+import { signingKeysFromEnv } from "../../lib/queue/worker-factory.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 
@@ -161,9 +163,9 @@ async function activeMemberCount(client: PoolClient, workspaceId: string): Promi
  * Everything `plan:set` writes, inside the CALLER's tenant-context transaction (exported so it is testable against a
  * real database without the CLI's own pool): the Stripe-tracked refusal under the workspace lock, then the plan write,
  * then STORY-077's downgrade-pause reconcile (a comp after a cancellation to Free resumes what the cut-over paused).
- * Returns the notices for the caller to send AFTER its transaction commits.
+ * Returns the notices it RECORDED (keyed by the ticket), for the caller to enqueue AFTER its transaction commits.
  */
-export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): Promise<{ outcome: PlanChangeOutcome; notices: EmailMessage[] }> {
+export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): Promise<{ outcome: PlanChangeOutcome; notices: RecordedNotice[] }> {
   await assertNotStripeTracked(tx, args.workspaceId);
   const outcome = await applyPlanChange(
     tx,
@@ -176,6 +178,29 @@ export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): P
     ? await reconcileAndRecordDowngradePause(tx, args.workspaceId, { requestId: args.ticket, operator: args.operator, planChanged: outcome.from !== outcome.to, addonsChanged: false })
     : [];
   return { outcome, notices };
+}
+
+/** One `billing.downgrade_notice` job per recorded notice, through a producer built for this run and closed after it. */
+async function enqueueRecordedNotices(env: ReturnType<typeof loadEnv>, args: PlanSetArgs, notices: readonly RecordedNotice[], log: (line: string) => void): Promise<void> {
+  const connection = createQueueReaderConnection(env.QUEUE_REDIS_URL);
+  const producer = new QueueProducer(connection, queueKeyPrefix(env.NODE_ENV), signingKeysFromEnv(env));
+  let failed = false;
+  try {
+    await enqueueDowngradeNotices((...a) => producer.enqueueTenantJob(...a), args.workspaceId, args.ticket, notices, {
+      log: () => undefined,
+      error: () => {
+        failed = true;
+      },
+    });
+  } finally {
+    await producer.onModuleDestroy();
+    connection.disconnect();
+  }
+  log(
+    failed
+      ? "downgrade-pause notice job(s) could NOT be enqueued: the notices stay recorded and unsent in downgrade_notices; re-enqueue them"
+      : "downgrade-pause notice job(s) enqueued: the worker sends them",
+  );
 }
 
 export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void = console.log): Promise<void> {
@@ -200,11 +225,11 @@ export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void 
       }
 
       log(`${args.workspaceId}: ${outcome.from} -> ${outcome.to}`);
-      // Committed: only now may the downgrade-pause notices go out (a rolled-back change never emails).
+      // Committed: only now may the downgrade-pause notices be queued (a rolled-back change never emails). The worker
+      // sends them and retries a failed send (STORY-077, owner decision 2026-10-23).
       if (notices.length > 0) {
-        const sender = selectEmailSender();
-        await sendDowngradeNotices((message) => sender.send(message), args.workspaceId, notices);
-        log(`downgrade-pause notice(s) sent: ${String(notices.length)}`);
+        log(`downgrade-pause notice(s) recorded: ${String(notices.length)} (${notices.map((n) => n.id).join(", ")})`);
+        await enqueueRecordedNotices(env, args, notices, log);
       }
       log(`entitlement_version now ${String(outcome.entitlementVersion)}`);
       log(

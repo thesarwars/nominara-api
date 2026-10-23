@@ -41,6 +41,7 @@ export const TENANT_TABLES: ReadonlySet<string> = new Set([
   "custom_domains",
   "displacement_events",
   "domain_verifications",
+  "downgrade_notices",
   "entity_nodes",
   "geo_alignments",
   "geo_analyses",

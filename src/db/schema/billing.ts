@@ -103,6 +103,18 @@ export const creditWallets = pgTable("credit_wallets", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
 });
 
+export const downgradeNotices = pgTable("downgrade_notices", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: uuid("workspace_id").notNull(),
+  requestId: text("request_id").notNull(),
+  kind: text("kind").notNull(),
+  recipient: text("recipient").notNull(),
+  subject: text("subject").notNull(),
+  textBody: text("text_body").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  sentAt: timestamp("sent_at", { withTimezone: true }),
+});
+
 export const invoices = pgTable("invoices", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   workspaceId: uuid("workspace_id").notNull(),

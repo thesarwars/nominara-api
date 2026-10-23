@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
@@ -14,8 +14,9 @@ import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
 import { keepChoiceForAdoption } from "../../lib/billing/downgrade-keep.js";
 import type { KeepChoice } from "../../lib/billing/downgrade-pause.js";
-import { reconcileAndRecordDowngradePause, sendDowngradeNotices } from "../../lib/billing/downgrade-pause-record.js";
-import { EMAIL_SENDER, type EmailSender } from "../identity/ports/email-sender.js";
+import { enqueueDowngradeNotices } from "../../lib/billing/downgrade-notice-outbox.js";
+import { reconcileAndRecordDowngradePause } from "../../lib/billing/downgrade-pause-record.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
 
 // STORY-075a / STORY-075 AC4 — the ONLY customer-reachable path to
 // `applyPlanChange`, and the one the plan-change-import-surface gate names.
@@ -48,7 +49,9 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
 
   constructor(
     private readonly addons: BillingAddonsService,
-    @Inject(EMAIL_SENDER) private readonly email: EmailSender,
+    // STORY-077 (owner 2026-10-23): the downgrade email is a queued job. Optional, as in CreditInterceptor: a process
+    // with no producer still adopts the plan and records the notice; it is counted and logged as not enqueued.
+    @Optional() private readonly producer?: QueueProducer,
   ) {}
 
   async handle({ tx, workspaceId, event, object, fetchStartedAt, afterCommit }: StripeEventContext): Promise<void> {
@@ -274,8 +277,9 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
 
   /**
    * STORY-077 — pauses the excess projects and prompts (never deletes; the customer's keep choice, else the least recently active), resumes what an earlier
-   * downgrade paused once the limits allow it (oldest first), audits each, and emails the list AFTER the commit. The
-   * same step `plan:set` runs (downgrade-pause-record.ts).
+   * downgrade paused once the limits allow it (oldest first), audits each, and records the email keyed by this event id;
+   * AFTER the commit one `billing.downgrade_notice` job per email sends it, retried on failure (owner decision
+   * 2026-10-23). The same step `plan:set` runs (downgrade-pause-record.ts).
    */
   private async reconcilePause(
     tx: StripeEventContext["tx"],
@@ -286,7 +290,11 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     keep?: KeepChoice,
   ): Promise<void> {
     const notices = await reconcileAndRecordDowngradePause(tx, workspaceId, { requestId: eventId, operator: WEBHOOK_OPERATOR, ...moved }, keep);
-    if (notices.length > 0) afterCommit.push(async () => await sendDowngradeNotices((message) => this.email.send(message), workspaceId, notices));
+    if (notices.length > 0) {
+      const producer = this.producer;
+      const enqueue = producer === undefined ? undefined : (...args: Parameters<QueueProducer["enqueueTenantJob"]>) => producer.enqueueTenantJob(...args);
+      afterCommit.push(async () => await enqueueDowngradeNotices(enqueue, workspaceId, eventId, notices, this.logger));
+    }
   }
 
   /**

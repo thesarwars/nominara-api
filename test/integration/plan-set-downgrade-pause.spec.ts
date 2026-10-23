@@ -3,6 +3,7 @@ import { Client, Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { recordDowngradeNotices } from "../../src/lib/billing/downgrade-notice-outbox.js";
 import { DowngradeNotSupportedError } from "../../src/lib/billing/errors.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
@@ -124,9 +125,16 @@ describe("STORY-077 · plan:set resumes what a downgrade paused", () => {
       [ws],
     );
     expect(recorded.rows).toEqual([{ id: result.notices[0]!.id, request_id: "TICKET-77", kind: "resumed", recipient: "billing@example.com", sent_at: null }]);
-    // The same ticket run again records nothing new (and so enqueues nothing new).
-    await planSet(ws, "growth");
-    await planSet(ws, "starter");
+    // The same ticket recording again records nothing new (and so enqueues nothing new): (workspace, request, kind) is the key.
+    const client = await pool.connect();
+    try {
+      const again = await withTenantContext(client, { workspaceId: ws, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+        recordDowngradeNotices(tx, ws, "TICKET-77", [{ kind: "resumed", message: { to: "billing@example.com", subject: "s", textBody: "b" } }]),
+      );
+      expect(again).toEqual([]);
+    } finally {
+      client.release();
+    }
     expect((await db.query("SELECT 1 FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'resumed'", [ws])).rowCount).toBe(1);
   });
 

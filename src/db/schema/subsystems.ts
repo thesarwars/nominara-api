@@ -45,6 +45,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "invoices",
     "stripe_webhook_events",
     "stripe_subscription_syncs",
+    "downgrade_notices",
   ],
   projects: ["projects", "project_engines", "competitors", "domain_verifications"],
   prompts: ["tracked_prompts", "prompt_stability", "topic_clusters"],
