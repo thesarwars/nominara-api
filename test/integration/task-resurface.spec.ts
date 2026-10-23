@@ -240,6 +240,19 @@ describe("STORY-064 AC5 · task.resurface (dismissed tasks return after resurfac
     expect(await events(t)).toEqual([]);
   });
 
+  it("a project soft-deleted BETWEEN discovery and the write keeps its dismissed task dismissed, with no event", async () => {
+    const ws = await workspace(); const p = await project(ws);
+    const t = await task(ws, p);
+    const racing = { query: async (...args: unknown[]) => {
+      const result = await (db.query as (...a: unknown[]) => Promise<unknown>)(...args);
+      if (String(args[0]).includes("JOIN projects")) await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [p]);
+      return result;
+    } } as unknown as Client;
+    expect(await runTaskResurface(racing, pool, { now: () => NOW })).toMatchObject({ reopened: 0 });
+    expect((await state(t)).status).toBe("dismissed");
+    expect(await events(t)).toEqual([]);
+  });
+
   it("is single-flight: a replica that does not get the advisory lock yields and touches nothing", async () => {
     const ws = await workspace(); const p = await project(ws);
     const t = await task(ws, p);

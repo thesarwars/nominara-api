@@ -16,8 +16,7 @@ import { TASK_DISMISS_REASON_MAX } from "./update-task-request.schema.js";
 // SNOOZE IS A DISMISSAL WITH A CALLER-CHOSEN RE-SURFACE DATE (no new column, no fifth status): the task leaves the open
 // count, is audited with a `dismissed` event marked `{snooze: true}`, and re-surfaces through the same sweep as a
 // dismissal. The reason and the date are BOTH required; the date is checked against the clock in the service (it must
-// be in the future and no later than TASK_RESURFACE_DAYS ahead, so a snooze cannot hide a task for longer than a
-// dismissal can).
+// be in the future, with no upper bound because none is specified).
 //
 // `status` offers `todo` and `in_progress` only. `done` is its own endpoint (completion captures a baseline), and a
 // bulk dismissal is a snooze, which carries its own date.

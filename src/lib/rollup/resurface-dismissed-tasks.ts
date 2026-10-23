@@ -101,6 +101,7 @@ async function resurfaceInWorkspace(pool: Pool, workspaceId: string, ids: readon
           WHERE id IN (
                   SELECT id FROM tasks
                    WHERE id = ANY($1::uuid[]) AND status = 'dismissed' AND resurface_at <= $2 AND deleted_at IS NULL
+                     AND EXISTS (SELECT 1 FROM projects p WHERE p.id = tasks.project_id AND p.deleted_at IS NULL)
                    ORDER BY id
                    FOR UPDATE SKIP LOCKED)
         RETURNING id, project_id`,
