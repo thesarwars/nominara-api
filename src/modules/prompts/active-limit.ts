@@ -25,13 +25,17 @@ import { incrementCounter } from "../../lib/telemetry/metrics.js";
 // (workspace, then projects, then prompts), so it adds no inversion. It also serialises a resume against the cut-over
 // itself. Every caller of `assertActiveWithinLimits` must hold it.
 
+/** The door a lock-wait timeout is counted under (STORY-077 review round 2: project doors were counted as prompt ones). */
+export type ActivationLockPath = "prompt_activation" | "project_create" | "project_reactivation";
+
 /**
  * Takes the workspace row lock (bounded: `WORKSPACE_LOCK_WAIT_MS`) before a move INTO `active`. Call it before the
- * project row lock. A wait past the bound - a billing holder inside a Stripe call - is a retryable 503, never a queue.
+ * project row lock. A wait past the bound - a billing holder inside a Stripe call - is a retryable 503, never a queue,
+ * counted as `nominara_workspace_lock_wait_exceeded_total{path}` under the caller's door.
  */
-export async function lockWorkspaceForActivation(client: ClientBase, workspaceId: string): Promise<void> {
+export async function lockWorkspaceForActivation(client: ClientBase, workspaceId: string, path: ActivationLockPath = "prompt_activation"): Promise<void> {
   await lockWorkspaceBounded(client, workspaceId, () => {
-    incrementCounter("nominara_workspace_lock_wait_exceeded_total", { path: "prompt_activation" });
+    incrementCounter("nominara_workspace_lock_wait_exceeded_total", { path });
     return new DegradedError({ message: "the workspace is being changed: retry shortly" });
   });
 }

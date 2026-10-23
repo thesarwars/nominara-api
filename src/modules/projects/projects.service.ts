@@ -159,7 +159,7 @@ export class ProjectsService {
     // runs before any lock, so a creation and a reactivation could each see the last slot free. Every creation therefore
     // takes the workspace lock and re-counts `projects.max` under it (`assertProjectSlotFree`), as a reactivation does.
     const supplied = distinctSuppliedPrompts(workspaceId, projectId, input);
-    await lockWorkspaceForActivation(client as ClientBase, workspaceId);
+    await lockWorkspaceForActivation(client as ClientBase, workspaceId, "project_create");
 
     const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
     await assertProjectSlotFree(client as ClientBase, workspaceId, resolved.entitlements);
