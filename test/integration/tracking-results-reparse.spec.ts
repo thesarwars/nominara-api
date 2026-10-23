@@ -301,6 +301,24 @@ describe("STORY-034 · results list, re-parse and retention", () => {
     expect((await list(projectId)).items.map((i) => i.result_id)).toEqual([fresh]);
   });
 
+  it("034-AC10f · a window that ENDS before the retention boundary is 507 even with no `from`, not an empty page", async () => {
+    await seed({ capturedAt: new Date(Date.now() - 10 * DAY) });
+    const before = new Date(Date.now() - 200 * DAY).toISOString(); // growth keeps 180 days
+    await expect(list(projectId, { to: before })).rejects.toBeInstanceOf(RetentionExceededError);
+    // an upper bound inside the window is still served
+    expect((await list(projectId, { to: new Date(Date.now() + DAY).toISOString() })).items).toHaveLength(1);
+  });
+
+  it("034-AC10g · run_id of a run whose captures are all past retention is 507, not an empty page; a recent or unknown run is not", async () => {
+    const oldRun = uuidV7();
+    const recentRun = uuidV7();
+    await seed({ runId: oldRun, capturedAt: new Date(Date.now() - 200 * DAY) });
+    await seed({ runId: recentRun, capturedAt: new Date(Date.now() - 5 * DAY) });
+    await expect(list(projectId, { run_id: oldRun })).rejects.toBeInstanceOf(RetentionExceededError);
+    expect((await list(projectId, { run_id: recentRun })).items).toHaveLength(1);
+    expect((await list(projectId, { run_id: uuidV7() })).items).toEqual([]); // a run with no captures is "nothing yet", not "expired"
+  });
+
   it("034-AC10d · the result document past retention is 507, and inside it is served", async () => {
     const old = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
     const recent = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 5 * DAY) });
