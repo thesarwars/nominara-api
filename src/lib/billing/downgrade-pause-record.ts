@@ -23,8 +23,13 @@ const tracer = trace.getTracer("nominara-api");
 const logger = new Logger("billing.downgrade_pause");
 
 export interface PauseProvenance {
-  /** The provider's event id or the operator's ticket: `audit_log.request_id`, and the notices' idempotency key. */
+  /** The provider's event id or the operator's ticket: `audit_log.request_id`, and the notices' idempotency key unless `noticeRequestId` is given. */
   readonly requestId: string;
+  /**
+   * The notices' idempotency key when it must differ from `requestId` (review round 2): plan:set's ticket is free text an
+   * operator reuses across changes on one support case, so its notices are keyed per CHANGE (`planSetNoticeRequestId`).
+   */
+  readonly noticeRequestId?: string;
   /** "stripe-webhook" or the operator: `audit_log.actor_ua` is `operator:<this>`. */
   readonly operator: string;
   /** The plan itself moved. The email says what moved (review rounds 3 and 4). */
@@ -85,7 +90,7 @@ export async function reconcileAndRecordDowngradePause(tx: ClientBase, workspace
         { kind: "paused" as DowngradeNoticeKind, message: downgradePausedEmail(contact, change, result.paused) },
         { kind: "resumed" as DowngradeNoticeKind, message: downgradeResumedEmail(contact, change, result.resumed) },
       ].filter((m): m is { kind: DowngradeNoticeKind; message: NonNullable<typeof m.message> } => m.message !== null);
-      return await recordDowngradeNotices(tx, workspaceId, provenance.requestId, messages);
+      return await recordDowngradeNotices(tx, workspaceId, provenance.noticeRequestId ?? provenance.requestId, messages);
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });
       throw error;

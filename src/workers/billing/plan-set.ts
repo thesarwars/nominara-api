@@ -163,9 +163,10 @@ async function activeMemberCount(client: PoolClient, workspaceId: string): Promi
  * Everything `plan:set` writes, inside the CALLER's tenant-context transaction (exported so it is testable against a
  * real database without the CLI's own pool): the Stripe-tracked refusal under the workspace lock, then the plan write,
  * then STORY-077's downgrade-pause reconcile (a comp after a cancellation to Free resumes what the cut-over paused).
- * Returns the notices it RECORDED (keyed by the ticket), for the caller to enqueue AFTER its transaction commits.
+ * Returns the notices it RECORDED, keyed by THIS change (`planSetNoticeRequestId`), for the caller to enqueue AFTER its
+ * transaction commits under the same key.
  */
-export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): Promise<{ outcome: PlanChangeOutcome; notices: RecordedNotice[] }> {
+export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): Promise<{ outcome: PlanChangeOutcome; notices: RecordedNotice[]; noticeRequestId: string }> {
   await assertNotStripeTracked(tx, args.workspaceId);
   const outcome = await applyPlanChange(
     tx,
@@ -174,19 +175,37 @@ export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): P
     { requestId: args.ticket, operator: args.operator, reason: args.reason },
     { allowNegotiatedTier: args.allowNegotiatedTier },
   );
+  const noticeRequestId = planSetNoticeRequestId(args.ticket, outcome.entitlementVersion);
   const notices = outcome.changed
-    ? await reconcileAndRecordDowngradePause(tx, args.workspaceId, { requestId: args.ticket, operator: args.operator, planChanged: outcome.from !== outcome.to, addonsChanged: false })
+    ? await reconcileAndRecordDowngradePause(tx, args.workspaceId, {
+        requestId: args.ticket,
+        noticeRequestId,
+        operator: args.operator,
+        planChanged: outcome.from !== outcome.to,
+        addonsChanged: false,
+      })
     : [];
-  return { outcome, notices };
+  return { outcome, notices, noticeRequestId };
+}
+
+/**
+ * STORY-077 review round 2 — plan:set's notice key: the ticket AND the entitlement version this change produced. The
+ * ticket alone is free text an operator reuses across changes on one support case, and a second change under it that
+ * paused or resumed something hit ON CONFLICT DO NOTHING and its email was dropped. Every changing plan write bumps
+ * `entitlement_version` under the workspace lock, so the pair names exactly one change. plan:set has no redelivery to
+ * deduplicate against (the Stripe webhook keeps the event id).
+ */
+export function planSetNoticeRequestId(ticket: string, entitlementVersion: number): string {
+  return `${ticket}#v${String(entitlementVersion)}`;
 }
 
 /** One `billing.downgrade_notice` job per recorded notice, through a producer built for this run and closed after it. */
-async function enqueueRecordedNotices(env: ReturnType<typeof loadEnv>, args: PlanSetArgs, notices: readonly RecordedNotice[], log: (line: string) => void): Promise<void> {
+async function enqueueRecordedNotices(env: ReturnType<typeof loadEnv>, args: PlanSetArgs, noticeRequestId: string, notices: readonly RecordedNotice[], log: (line: string) => void): Promise<void> {
   const connection = createQueueReaderConnection(env.QUEUE_REDIS_URL);
   const producer = new QueueProducer(connection, queueKeyPrefix(env.NODE_ENV), signingKeysFromEnv(env));
   let failed = false;
   try {
-    await enqueueDowngradeNotices((...a) => producer.enqueueTenantJob(...a), args.workspaceId, args.ticket, notices, {
+    await enqueueDowngradeNotices((...a) => producer.enqueueTenantJob(...a), args.workspaceId, noticeRequestId, notices, {
       log: () => undefined,
       error: () => {
         failed = true;
@@ -213,7 +232,7 @@ export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void 
   try {
     const client = await pool.connect();
     try {
-      const { outcome, notices } = await withTenantContext(
+      const { outcome, notices, noticeRequestId } = await withTenantContext(
         client,
         { workspaceId: args.workspaceId, actorId: SYSTEM_ACTOR_ID },
         async (tx) => await planSetInTransaction(tx, args),
@@ -229,7 +248,7 @@ export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void 
       // sends them and retries a failed send (STORY-077, owner decision 2026-10-23).
       if (notices.length > 0) {
         log(`downgrade-pause notice(s) recorded: ${String(notices.length)} (${notices.map((n) => n.id).join(", ")})`);
-        await enqueueRecordedNotices(env, args, notices, log);
+        await enqueueRecordedNotices(env, args, noticeRequestId, notices, log);
       }
       log(`entitlement_version now ${String(outcome.entitlementVersion)}`);
       log(
