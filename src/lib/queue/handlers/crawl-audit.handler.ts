@@ -102,6 +102,11 @@ const TOKENIZER = "none"; // aux_audits.tokenizer is NOT NULL; no text is tokeni
 const RAN_RULES = ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"] as const;
 const TERMINAL_STATUSES = ["completed", "partial", "failed"];
 const OPEN_STATUSES = ["open", "acknowledged", "in_progress", "regressed"];
+/**
+ * The statuses the published crawler_access subscore and the critical cap read. A STALE finding is one we could not re-observe, not one
+ * that was fixed: it must score exactly as it did while open, or an unreachable file reads as a fix (STORY-052 "stale versus resolved").
+ */
+const SCORED_STATUSES = [...OPEN_STATUSES, "stale"];
 /** Owned citations from the last 90 days name pages a key_pages audit must look at (aux-and-geo-analysis.md §1 step 3). */
 const CITATION_WINDOW_DAYS = 90;
 /** A bound on what one project's evidence can add to the candidate list; the page cap does the real limiting. */
@@ -573,7 +578,14 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // finding from a file we failed to fetch (or never asked for) is not evidence, and a missing
     // finding from one is not a resolution.
     const covered = new Set<string>();
-    if (robots.responded) ["AUX-R-001", "AUX-R-002", "AUX-R-003"].forEach((c) => covered.add(c));
+    // AUX-R-003 is about the answer itself, so any answer covers it. AUX-R-001/002 are about the directives, and only a 2xx file or a
+    // definitive "no file" (404/410) says what they are: a 5xx or other error is "we could not see it" (RFC 9309 treats an unreachable
+    // robots.txt as disallow-all), so it must not resolve a blocking finding.
+    if (robots.responded) covered.add("AUX-R-003");
+    if (robots.responded && ((robots.status >= 200 && robots.status < 300) || robots.status === 404 || robots.status === 410)) {
+      covered.add("AUX-R-001");
+      covered.add("AUX-R-002");
+    }
     if (llms.responded && llmsWellKnown.responded) covered.add("AUX-R-004");
     if (sitemap.responded) covered.add("AUX-R-007");
 
@@ -739,28 +751,34 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
 
     // TASK GENERATION (AC10): a finding that is NEW, or RETURNED (a regression raises its band), and sits at or above its rule's task
     // threshold asks for one `task.generate` evaluation of the project, narrowed to the AUX finding rules. A re-detection of a finding
-    // already known asks for nothing: its task, if it earned one, exists or was dismissed. One job per audit, keyed by the audit: the
-    // evaluation is project-wide and idempotent, so a job per finding would only repeat it. After COMMIT, so the evaluator sees the
-    // findings; a failed enqueue is logged and counted, never thrown, because the findings are durable and the daily rollup's un-narrowed `task.generate` is the recovery path.
+    // already known asks for nothing: its task, if it earned one, exists or was dismissed. One job per qualifying finding, keyed as the
+    // topology row says (`taskgen:{project}:{rule}:{fingerprint}`, system-architecture.md section 4), so a redelivered audit enqueues the
+    // same ids. After COMMIT, so the evaluator sees the findings; a failed enqueue is logged and counted, never thrown, because the
+    // findings are durable and the daily rollup's un-narrowed `task.generate` is the recovery path.
     const atThreshold = (ruleCode: string, severity: string): boolean =>
       (SEVERITY_ORDER[severity] ?? -1) >= (SEVERITY_ORDER[taskThresholds.get(ruleCode) ?? "high"] ?? SEVERITY_ORDER.high!);
-    const wantsTasks = actions.some((a) =>
-      a.kind === "insert" ? atThreshold(a.finding.ruleCode, a.finding.severity)
-      : a.kind === "regress" ? atThreshold(existing.find((e) => e.id === a.id)!.ruleCode, a.severity)
-      : false,
-    );
-    if (wantsTasks && currentTenantStore() !== undefined) {
+    const wanting: { ruleCode: string; fingerprint: string }[] = [];
+    for (const a of actions) {
+      if (a.kind === "insert" && atThreshold(a.finding.ruleCode, a.finding.severity)) wanting.push({ ruleCode: a.finding.ruleCode, fingerprint: a.finding.fingerprint });
+      else if (a.kind === "regress") {
+        const row = existing.find((e) => e.id === a.id)!;
+        if (atThreshold(row.ruleCode, a.severity)) wanting.push({ ruleCode: row.ruleCode, fingerprint: row.fingerprint });
+      }
+    }
+    if (wanting.length > 0 && currentTenantStore() !== undefined) {
       const { projectId, workspaceId, auditId } = payload;
       afterCommit(() => {
-        void enqueueTaskGenerate(workspaceId, { projectId, triggerKinds: ["aux_finding"] }, `taskgen:${projectId}:aux:${auditId}`)
-          .then(() => {
-            incrementCounter("nominara_aux_taskgen_requested_total", {});
-            logger.log({ event: "aux.taskgen.requested", workspace_id: workspaceId, project_id: projectId, audit_id: auditId });
-          })
-          .catch((error: unknown) => {
-            incrementCounter("nominara_aux_taskgen_request_failed_total", {});
-            logger.error({ event: "aux.taskgen.request_failed", workspace_id: workspaceId, project_id: projectId, audit_id: auditId, error: error instanceof Error ? error.name : "unknown" });
-          });
+        for (const { ruleCode, fingerprint } of wanting) {
+          void enqueueTaskGenerate(workspaceId, { projectId, triggerKinds: ["aux_finding"] }, `taskgen:${projectId}:${ruleCode}:${fingerprint}`)
+            .then(() => {
+              incrementCounter("nominara_aux_taskgen_requested_total", {});
+              logger.log({ event: "aux.taskgen.requested", workspace_id: workspaceId, project_id: projectId, audit_id: auditId, rule_code: ruleCode });
+            })
+            .catch((error: unknown) => {
+              incrementCounter("nominara_aux_taskgen_request_failed_total", {});
+              logger.error({ event: "aux.taskgen.request_failed", workspace_id: workspaceId, project_id: projectId, audit_id: auditId, rule_code: ruleCode, error: error instanceof Error ? error.name : "unknown" });
+            });
+        }
       });
     }
 
@@ -769,11 +787,11 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     for (const d of detected) if (d.severity in counts) counts[d.severity as keyof typeof counts] += 1;
 
     // The crawler_access subscore over every finding still open for the
-    // project (including ones whose file we could not re-fetch). Site-file
+    // project (including ones whose file we could not re-fetch, and stale ones: stale is not fixed). Site-file
     // findings are domain-wide, so scope is 1 (affected 1 of 1).
     const open = await tx.query<{ rule_code: string; severity: AuxSeverityBand }>(
       "SELECT rule_code, severity FROM aux_findings WHERE project_id = $1 AND status = ANY($2::text[]) AND rule_code = ANY($3::text[])",
-      [payload.projectId, OPEN_STATUSES, [...RAN_RULES]],
+      [payload.projectId, SCORED_STATUSES, [...RAN_RULES]],
     );
     const counted: AuxCountedFinding[] = open.rows.map((r) => ({
       category: "crawler_access",
