@@ -115,7 +115,7 @@ describe("STORY-053 scenario 4 · a directive patch that would block an agent is
   });
 
   it("a block that only restates what is already blocked is not a reduction", () => {
-    expect(() => assertAccessNotReduced(BLOCKED, `${BLOCKED}\nUser-agent: GPTBot\nDisallow: /secret\n`)).not.toThrow();
+    expect(() => assertAccessNotReduced(BLOCKED, [BLOCKED, "\nUser-agent: GPTBot\nDisallow: /secret\n"].join(""))).not.toThrow();
   });
 
   it("rejects an appended block that does not parse", () => {
@@ -134,7 +134,7 @@ describe("STORY-053 scenario 5 · a directive patch that only permits is accepte
     const d = finaliseRobotsPatch({
       ruleCode: "AUX-R-002", targetUrl: URL, before, beforeHash: sha(before), appended: "\nUser-agent: GPTBot\nAllow: /\n", explanation: "e",
     });
-    expect(d.contentAfter).toBe(`${before}\nUser-agent: GPTBot\nAllow: /\n`);
+    expect(d.contentAfter).toBe([before, "\nUser-agent: GPTBot\nAllow: /\n"].join(""));
     expect(evaluateRobotsTxt({ status: 200, body: d.contentAfter }, ["/"]).some((f) => f.rule_code === "AUX-R-003")).toBe(false);
   });
 

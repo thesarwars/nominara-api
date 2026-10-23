@@ -31,7 +31,7 @@ function probesFor(pattern: string): string[] {
   const filled = body.replace(/\*+/g, "x");
   const prefix = body.split("*")[0]!;
   const lead = (p: string): string => (p.startsWith("/") ? p : `/${p}`);
-  return [lead(filled), lead(`${filled}/x`), lead(prefix)];
+  return [lead(filled), lead(filled + "/x"), lead(prefix)];
 }
 
 /** Throws would_reduce_access when any agent that may fetch a path in `before` may not in `after`. Any other direction passes. */
@@ -102,7 +102,7 @@ export function finaliseRobotsPatch(input: FinaliseRobotsInput): PatchDraft {
   };
 }
 
-const lineOf = (rule: RobotsRule): string => `${rule.allow ? "Allow" : "Disallow"}: ${rule.pattern}`;
+const lineOf = (rule: RobotsRule): string => [rule.allow ? "Allow" : "Disallow", rule.pattern].join(": ");
 const isRootDisallow = (rule: RobotsRule): boolean => !rule.allow && (rule.pattern === "/" || rule.pattern === "/*");
 
 export interface BuildRobotsInput {

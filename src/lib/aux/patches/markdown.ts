@@ -70,7 +70,7 @@ export function buildLlmsTxtPatch(input: BuildLlmsTxtInput): PatchDraft {
   return {
     ruleCode: input.ruleCode,
     kind: "markdown",
-    targetUrl: `${input.origin}/llms.txt`,
+    targetUrl: new URL("/llms.txt", input.origin).href,
     contentBeforeHash: before,
     contentAfter: content,
     unifiedDiff: unifiedDiff("llms.txt", existing ?? "", content),
