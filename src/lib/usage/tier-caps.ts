@@ -315,8 +315,15 @@ export async function meterInternalUsage(
   );
 }
 
-/** The two thresholds `usage_counters` has columns for. */
-export const WARNING_THRESHOLDS = [80, 90] as const;
+/**
+ * The two warning thresholds: scoring-models.md §15 `quota_threshold`, "metered usage crosses 80% / 95%".
+ *
+ * STORY-068, owner decision 2026-10-23: 80 and 95 (STORY-070 shipped 80/90). `warned_at_95` arrived in migration 0135;
+ * `warned_at_90` stays in the table (expand phase) and is no longer written.
+ */
+export const WARNING_THRESHOLDS = [80, 95] as const;
+
+const WARNING_COLUMN: Readonly<Record<(typeof WARNING_THRESHOLDS)[number], string>> = { 80: "warned_at_80", 95: "warned_at_95" };
 
 export type WarningThreshold = (typeof WARNING_THRESHOLDS)[number];
 
@@ -346,7 +353,7 @@ export async function crossedWarningThresholds(
 ): Promise<WarningThreshold[]> {
   const crossed: WarningThreshold[] = [];
   for (const threshold of WARNING_THRESHOLDS) {
-    const column = threshold === 80 ? "warned_at_80" : "warned_at_90";
+    const column = WARNING_COLUMN[threshold];
     const result = await tx.query(
       `UPDATE usage_counters
           SET ${column} = now()

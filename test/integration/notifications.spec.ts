@@ -365,10 +365,12 @@ describe("STORY-068 · notifications, read state, digests and dispatch", () => {
   });
 
   it("[STORY-068 #7 / AC7] a credit threshold (25% / 10% of the grant) notifies once per threshold per cycle, stamped on the wallet row, never by a page view", async () => {
-    // Growth grants 450 credits a cycle: under 112.5 is below 25%, under 45 is below 10%.
+    // The plan's own grant, read rather than assumed: 20% of it is under 25% and over 10%; 5% is under both.
+    const grant = Number((await owner.query("SELECT entitlements->'credits.included_per_cycle'->>'value' AS g FROM plans WHERE key = 'growth'")).rows[0].g);
+    expect(grant).toBeGreaterThan(0);
     await owner.query(
-      "INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, cycle_start, cycle_end) VALUES ($1, 100, 0, '2026-10-01', '2026-11-01')",
-      [workspaceId],
+      "INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, cycle_start, cycle_end) VALUES ($1, $2, 0, '2026-10-01', '2026-11-01')",
+      [workspaceId, Math.floor(grant * 0.2)],
     );
     const { sender } = recordingSender();
     const run = processor(sender);
@@ -380,7 +382,7 @@ describe("STORY-068 · notifications, read state, digests and dispatch", () => {
     expect(rows.map((r) => [r.kind, r.severity, r.payload.threshold])).toEqual([["credits.threshold", "warning", 25]]);
     expect((await owner.query("SELECT warned_at_25pct IS NOT NULL AS w25, warned_at_10pct IS NULL AS n10 FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rows[0]).toEqual({ w25: true, n10: true });
 
-    await owner.query("UPDATE credit_wallets SET included_balance = 40 WHERE workspace_id = $1", [workspaceId]);
+    await owner.query("UPDATE credit_wallets SET included_balance = $2 WHERE workspace_id = $1", [workspaceId, Math.floor(grant * 0.05)]);
     await check();
     await check();
     rows = (await owner.query("SELECT kind, severity, payload FROM notifications ORDER BY created_at")).rows;
@@ -393,5 +395,38 @@ describe("STORY-068 · notifications, read state, digests and dispatch", () => {
     await check();
     await check();
     expect((await owner.query("SELECT count(*)::int AS n FROM notifications WHERE kind = 'credits.threshold'")).rows[0].n).toBe(4);
+  });
+
+  it("[STORY-068 #7 / AC7] the sweep asks a credit check of a wallet that may owe a warning, and stops once both are stamped this cycle", async () => {
+    const grant = Number((await owner.query("SELECT entitlements->'credits.included_per_cycle'->>'value' AS g FROM plans WHERE key = 'growth'")).rows[0].g);
+    await owner.query(
+      "INSERT INTO credit_wallets (workspace_id, included_balance, purchased_balance, cycle_start, cycle_end) VALUES ($1, $2, 0, '2026-10-01', '2026-11-01')",
+      [workspaceId, grant],
+    );
+    const asked = async () => {
+      const enqueued: NotifyDispatchPayload[] = [];
+      await runNotifySweep(owner, async (_q, ws, payload) => void (ws === workspaceId && enqueued.push(payload)), new Date("2026-10-19T09:00:00Z"));
+      return enqueued.filter((p) => p.kind === "credit_check").length;
+    };
+    expect(await asked(), "a full wallet owes nothing").toBe(0);
+    await owner.query("UPDATE credit_wallets SET included_balance = $2 WHERE workspace_id = $1", [workspaceId, Math.floor(grant * 0.05)]);
+    expect(await asked()).toBe(1);
+    const { sender } = recordingSender();
+    await processor(sender)(jobFor(workspaceId, { kind: "credit_check" }));
+    expect(await asked(), "both thresholds stamped this cycle: nothing more to ask").toBe(0);
+  });
+
+  it("[owner 2026-10-23] a member reads and sets THEIR OWN digest cadence; null restores the role default; another member is untouched", async () => {
+    const prefs = (name: string, role: string) => inTenant(workspaceId, users[name]!, () => service.preferences(viewer(name, role)));
+    expect(await prefs("owner", "owner")).toEqual({ digest_cadence: "weekly", is_default: true });
+    expect(await prefs("analyst", "analyst")).toEqual({ digest_cadence: "off", is_default: true });
+    expect(await inTenant(workspaceId, users.owner!, () => service.updatePreferences(viewer("owner", "owner"), { digest_cadence: "daily" }))).toEqual({ digest_cadence: "daily", is_default: false });
+    expect(await prefs("owner", "owner")).toEqual({ digest_cadence: "daily", is_default: false });
+    expect(await prefs("admin", "admin"), "another member's preference is not touched").toEqual({ digest_cadence: "weekly", is_default: true });
+    expect(await inTenant(workspaceId, users.owner!, () => service.updatePreferences(viewer("owner", "owner"), { digest_cadence: null }))).toEqual({ digest_cadence: "weekly", is_default: true });
+  });
+
+  it("[hazard] marking a non-id read is a 404, not a server error", async () => {
+    await expect(inTenant(workspaceId, users.owner!, () => service.markRead(viewer("owner", "owner"), "not-a-uuid"))).rejects.toMatchObject({ code: "not_found" });
   });
 });

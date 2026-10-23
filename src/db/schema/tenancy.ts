@@ -99,6 +99,7 @@ export const workspaceMembers = pgTable("workspace_members", {
   lastActiveAt: timestamp("last_active_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  digestCadence: text("digest_cadence"),
 });
 
 export const workspaces = pgTable("workspaces", {

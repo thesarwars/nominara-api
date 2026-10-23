@@ -24,7 +24,7 @@ function createFakeClient() {
 }
 
 describe("STORY-011 · fix pass item 11 — TENANT_TABLES is a real, generated 59-member set", () => {
-  it("has EXACTLY 64 members and includes representative tables from every migration", () => {
+  it("has EXACTLY 66 members and includes representative tables from every migration", () => {
     // Fix pass (second pass) — tightened from toBeGreaterThanOrEqual(59):
     // a table silently added to the set in the future (e.g. a future
     // migration's table misclassified as tenant-scoped, or vice versa)
@@ -36,7 +36,8 @@ describe("STORY-011 · fix pass item 11 — TENANT_TABLES is a real, generated 5
     // a tenant table, so query-guard must know about it. 63 with STORY-072's
     // `credit_hold_carries` (migration 0125, the per-hold carry across a cycle roll). 64 with STORY-077's
     // `downgrade_notices` (migration 0134, the downgrade email outbox).
-    expect(TENANT_TABLES.size).toBe(64);
+    // 66 with STORY-068's `notification_reads` and `notification_emails` (migration 0135).
+    expect(TENANT_TABLES.size).toBe(66);
     for (const name of [
       "workspaces",
       "projects",

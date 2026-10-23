@@ -76,6 +76,31 @@ export const nicheReports = pgTable("niche_reports", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
 });
 
+export const notificationEmails = pgTable("notification_emails", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: uuid("workspace_id").notNull(),
+  userId: uuid("user_id").notNull(),
+  kind: text("kind").notNull(),
+  dedupeKey: text("dedupe_key").notNull(),
+  notificationId: uuid("notification_id"),
+  cadence: text("cadence"),
+  periodStart: timestamp("period_start", { withTimezone: true }),
+  periodEnd: timestamp("period_end", { withTimezone: true }),
+  notificationCount: integer("notification_count").notNull().default(sql`0`),
+  status: text("status").notNull(),
+  subject: text("subject"),
+  textBody: text("text_body"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  sentAt: timestamp("sent_at", { withTimezone: true }),
+});
+
+export const notificationReads = pgTable("notification_reads", {
+  workspaceId: uuid("workspace_id").notNull(),
+  notificationId: uuid("notification_id").notNull(),
+  userId: uuid("user_id").notNull(),
+  readAt: timestamp("read_at", { withTimezone: true }).notNull().default(sql`now()`),
+}, (table) => [primaryKey({ columns: [table.notificationId, table.userId] })]);
+
 export const notifications = pgTable("notifications", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   workspaceId: uuid("workspace_id").notNull(),
@@ -90,6 +115,7 @@ export const notifications = pgTable("notifications", {
   readAt: timestamp("read_at", { withTimezone: true }),
   dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  eventKey: text("event_key"),
 });
 
 export const platformMetrics = pgTable("platform_metrics", {

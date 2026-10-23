@@ -14,6 +14,7 @@ import { ReportsModule } from "../modules/reports/reports.module.js";
 import { AnalyticsModule } from "../modules/analytics/analytics.module.js";
 import { AuxModule } from "../modules/aux/aux.module.js";
 import { TasksModule } from "../modules/tasks/tasks.module.js";
+import { NotificationsModule } from "../modules/notifications/notifications.module.js";
 import { GeoModule } from "../modules/geo/geo.module.js";
 import { DisplacementModule } from "../modules/displacement/displacement.module.js";
 import { IntegrationsModule } from "../modules/integrations/integrations.module.js";
@@ -72,6 +73,7 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     AnalyticsModule,
     AuxModule,
     TasksModule,
+    NotificationsModule,
     GeoModule,
     DisplacementModule,
     IntegrationsModule,

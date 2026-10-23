@@ -58,7 +58,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "citation_facts",
     "displacement_events",
   ],
-  rollups: ["metric_daily", "milestones", "notifications", "platform_metrics", "niche_reports", "ref_counters"],
+  rollups: ["metric_daily", "milestones", "notifications", "notification_reads", "notification_emails", "platform_metrics", "niche_reports", "ref_counters"],
   aux: ["aux_rule_catalog", "aux_audits", "aux_findings", "source_domains", "project_source_index"],
   tasks: ["task_generation_rules", "tasks", "goals", "task_events"],
   geo: [

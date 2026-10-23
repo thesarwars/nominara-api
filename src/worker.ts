@@ -15,6 +15,7 @@ import { cacheKeyNamespace } from "./lib/cache/key-namespace.js";
 import { rollupDirtyKey } from "./lib/cache/valkey-keys.js";
 import { RollupDirtySet, type DirtyEntry } from "./lib/rollup/dirty-dates.js";
 import { RollupSweepRuntime } from "./lib/rollup/rollup-sweep.js";
+import { NotifySweepRuntime } from "./lib/notifications/notify-sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
 import { TokenBucket } from "./lib/engines/token-bucket.js";
@@ -79,6 +80,9 @@ export const CAPTURE_SCHEDULER_SWEEP = "CAPTURE_SCHEDULER_SWEEP";
 
 /** STORY-042 — DI token for the rollup group's closed-day and dirty-date sweep (a tick every 5 minutes). Rollup group only. */
 export const ROLLUP_SWEEP_RUNTIME = "ROLLUP_SWEEP_RUNTIME";
+
+/** STORY-068 — DI token for the rollup group's notify sweep (digests and the email relay; elected, every 5 minutes). Rollup group only. */
+export const NOTIFY_SWEEP_RUNTIME = "NOTIFY_SWEEP_RUNTIME";
 
 class WorkerGroupRuntime implements OnModuleDestroy {
   constructor(
@@ -234,6 +238,15 @@ class RollupSweepHolder implements OnModuleDestroy {
     this.runtime.stop();
     await this.producer.onModuleDestroy();
     await this.dirtyConnection.quit().catch(() => this.dirtyConnection.disconnect());
+  }
+}
+
+/** STORY-068 — owns the notify sweep's timer (the producer is the rollup sweep's, closed by its holder). */
+class NotifySweepHolder implements OnModuleDestroy {
+  constructor(public readonly runtime: NotifySweepRuntime) {}
+
+  onModuleDestroy(): void {
+    this.runtime.stop();
   }
 }
 
@@ -468,6 +481,16 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
     });
     rollupSweep.start();
     providers.push({ provide: ROLLUP_SWEEP_RUNTIME, useValue: new RollupSweepHolder(rollupSweep, rollupProducer, dirtyConnection) });
+
+    // STORY-068 — the notify sweep: each member's digest at their cadence and the email outbox relay, enqueueing signed
+    // `notify.dispatch` jobs (consumed by this group). Elected by a session advisory lock on its own DIRECT connection per
+    // tick (DATABASE_URL is the direct connection: env.schema.ts refuses the pooler there); no transaction is held.
+    const notifySweep = new NotifySweepRuntime({
+      connect: () => connect(withKeepalives(env.DATABASE_URL)),
+      enqueue: (queue, workspaceId, payload, options) => rollupProducer.enqueueTenantJob(queue, workspaceId, payload, options),
+    });
+    notifySweep.start();
+    providers.push({ provide: NOTIFY_SWEEP_RUNTIME, useValue: new NotifySweepHolder(notifySweep) });
   }
 
   @Module({ providers })
