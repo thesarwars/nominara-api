@@ -855,13 +855,42 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(await statusOf()).toEqual(["wont_fix"]);
     });
 
-    it("STORY-052 scenario 10 · a stale finding leaves the crawler_access subscore and the cap (it is not open)", async () => {
+    it("STORY-052 scenario 10 · a STALE finding stays in the crawler_access subscore and the cap: stale must not score like a fix", async () => {
       await runAsTenant(healthy(BLOCKED));
+      const before = (await audits()).at(-1);
+      expect(before.score_capped).toBe(true);
       await runAsTenant(robotsDown);
       await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["stale"]);
       const a = (await audits()).at(-1);
-      expect(a.score_capped).toBe(false);
-      expect(Number(a.score_breakdown.crawler_access)).toBe(1);
+      expect(a.score_capped).toBe(true);
+      expect(Number(a.score_breakdown.crawler_access)).toBe(Number(before.score_breakdown.crawler_access));
+      expect(Number(a.score_breakdown.crawler_access)).toBeLessThan(1);
+    });
+
+    const robots503: Served = { ...healthy(OPEN), "/robots.txt": { status: 503, body: "" } };
+    it("STORY-052 AC8 · a robots.txt that answers 503 is not an observation: a critical AUX-R-001 is not resolved, pins no milestone, and stays capped", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robots503);
+      expect(await statusOf()).toEqual(["open"]);
+      expect(await milestones()).toHaveLength(0);
+      expect((await audits()).at(-1).score_capped).toBe(true);
+    });
+
+    it("STORY-052 AC8 · two 503 robots.txt audits in a row make the critical finding stale, still capped, still no milestone", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robots503);
+      await runAsTenant(robots503);
+      expect(await statusOf()).toEqual(["stale"]);
+      expect(await milestones()).toHaveLength(0);
+      expect((await audits()).at(-1).score_capped).toBe(true);
+    });
+
+    it("STORY-052 AC8 · a robots.txt that is definitively absent (404) still lets an open AUX-R-001 resolve", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant({ ...healthy(OPEN), "/robots.txt": { status: 404, body: "" } });
+      const rows = await findings();
+      expect(rows.find((f) => f.rule_code === "AUX-R-001")!.status).toBe("resolved");
     });
 
     it("STORY-052 scenario 11 · a new finding at or above its rule's task threshold enqueues task.generate AFTER commit, narrowed to aux_finding", async () => {
@@ -874,7 +903,9 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       await runAsTenant(healthy(BLOCKED), { enqueueTaskGenerate });
       await vi.waitFor(() => expect(calls).toHaveLength(1));
       expect(calls[0]).toMatchObject({ workspace: workspaceId, payload: { projectId, triggerKinds: ["aux_finding"] }, visibleAtEnqueue: 1 });
-      expect(calls[0]!.key.startsWith(`taskgen:${projectId}:`)).toBe(true);
+      const [f] = await findings();
+      // The reference topology row: taskgen:{project}:{rule}:{fingerprint}.
+      expect(calls[0]!.key).toBe(`taskgen:${projectId}:${f.rule_code}:${Buffer.from(f.fingerprint).toString("hex")}`);
     });
 
     it("STORY-052 scenario 11 · a finding BELOW its rule's task threshold enqueues nothing (AUX-R-004 absent is low, its threshold is medium)", async () => {
