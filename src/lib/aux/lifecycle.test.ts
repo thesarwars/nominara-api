@@ -81,8 +81,13 @@ describe("NEW-C-9 AC3 · reconcileFindings", () => {
     expect(reconcileFindings({ existing: [existing()], detected: [], inScope: () => false })).toEqual([]);
   });
 
-  it("NEW-C-9 AC3.10 · wont_fix and stale are never resolved by absence", () => {
-    expect(reconcileFindings({ existing: [existing({ status: "wont_fix" }), existing({ id: "f2", status: "stale" })], detected: [], inScope })).toEqual([]);
+  it("NEW-C-9 AC3.10 · wont_fix is never resolved by absence, and a stale finding is not resolved by an audit that could not look", () => {
+    expect(reconcileFindings({ existing: [existing({ status: "wont_fix" }), existing({ id: "f2", status: "stale" })], detected: [], inScope: () => (false) })).toEqual([]);
+    expect(reconcileFindings({ existing: [existing({ status: "wont_fix" })], detected: [], inScope })).toEqual([]);
+  });
+
+  it("STORY-052 AC8 · a stale finding that a later audit OBSERVED and did not reproduce is resolved", () => {
+    expect(reconcileFindings({ existing: [existing({ id: "f2", status: "stale" })], detected: [], inScope })).toEqual([{ kind: "resolve", id: "f2" }]);
   });
 
   it("NEW-C-9 AC3.11 · a defect returning after resolution regresses the resolved row, one band higher", () => {

@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import type { Job } from "bullmq";
+import type { TaskGenerateJobPayload } from "../../../../contracts/tasks/index.js";
 import {
   auxErrorSummarySchema,
   crawlAuditJobPayloadSchema,
@@ -111,7 +112,7 @@ const tracer = trace.getTracer("nominara.crawl-audit");
 type StoreFn = (relative: string, body: Buffer, contentType: string) => Promise<string>;
 
 /** STORY-052 AC10 — enqueues one `task.generate` job for a project, narrowed to the AUX finding rules. Injected in tests. */
-export type EnqueueTaskGenerate = (workspaceId: string, payload: { projectId: string; triggerKinds: string[] }, idempotencyKey: string) => Promise<unknown>;
+export type EnqueueTaskGenerate = (workspaceId: string, payload: Omit<TaskGenerateJobPayload, "workspaceId" | "kid">, idempotencyKey: string) => Promise<unknown>;
 
 /** Severity bands in order, for "at or above the rule's task threshold" (aux-and-geo-analysis.md section 2, the `Task` column). */
 const SEVERITY_ORDER: Readonly<Record<string, number>> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -688,10 +689,11 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // STALE (AC8): the audits just before this one that also could not observe the place a finding lives. `excluded_rules` is the record
     // of which rules had no answer from their input file (a site file that did not respond, or an audit that reached nothing), so it
     // is read, not re-derived: no new column. Counted back from the latest and stopping at the first audit that DID observe it, so two
-    // CONSECUTIVE audits are required, never two in a window. Only audits that finished count; this audit's own row is excluded.
+    // CONSECUTIVE audits are required, never two in a window. Only audits that finished count, and only those strictly BEFORE this one: a redelivered older job must not read a newer audit as its predecessor.
     const history = await tx.query<{ excluded_rules: string[] }>(
       `SELECT excluded_rules FROM aux_audits
         WHERE project_id = $1 AND id <> $2 AND status = ANY($3::text[])
+          AND (created_at, id) < (SELECT created_at, id FROM aux_audits WHERE id = $2)
         ORDER BY created_at DESC, id DESC LIMIT $4`,
       [payload.projectId, payload.auditId, TERMINAL_STATUSES, STALE_AFTER_AUDITS - 1],
     );
@@ -739,7 +741,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // threshold asks for one `task.generate` evaluation of the project, narrowed to the AUX finding rules. A re-detection of a finding
     // already known asks for nothing: its task, if it earned one, exists or was dismissed. One job per audit, keyed by the audit: the
     // evaluation is project-wide and idempotent, so a job per finding would only repeat it. After COMMIT, so the evaluator sees the
-    // findings; a failed enqueue is logged and counted, never thrown, because the findings are durable and the next audit asks again.
+    // findings; a failed enqueue is logged and counted, never thrown, because the findings are durable and the daily rollup's un-narrowed `task.generate` is the recovery path.
     const atThreshold = (ruleCode: string, severity: string): boolean =>
       (SEVERITY_ORDER[severity] ?? -1) >= (SEVERITY_ORDER[taskThresholds.get(ruleCode) ?? "high"] ?? SEVERITY_ORDER.high!);
     const wantsTasks = actions.some((a) =>

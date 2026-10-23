@@ -11,8 +11,11 @@ import { createHash } from "node:crypto";
 //     finding. No API path exists for a client to set it.
 //   * `regressed` re-opens the resolved row (original first_detected_at kept)
 //     and raises its severity one band.
-//   * `stale` and `wont_fix` are never resolved by absence: "the page is gone"
-//     and "the customer accepted it" are not "the problem is gone".
+//   * `wont_fix` is never resolved by absence: "the customer accepted it" is
+//     not "the problem is gone".
+//   * `stale` is resolved ONLY by an audit that LOOKED (inScope) and did not
+//     reproduce the finding. An audit that could not look leaves it stale. A
+//     stale finding that comes back after such a resolution regresses, one band up.
 //   * `stale` is the OTHER outcome of absence: a finding this audit could not
 //     observe (its file or page did not answer), and the audit before it could not
 //     either, goes stale. Resolved needs an audit that LOOKED and did not find it;
@@ -66,8 +69,10 @@ export type LifecycleAction =
   | { readonly kind: "resolve"; readonly id: string }
   | { readonly kind: "stale"; readonly id: string };
 
-/** Statuses a later clean audit may close, or that go stale when the place they live cannot be observed. */
-const RESOLVABLE: ReadonlySet<FindingStatus> = new Set(["open", "acknowledged", "in_progress", "regressed"]);
+/** Statuses that go stale when the place they live cannot be observed. A stale finding is not staled again. */
+const STALEABLE: ReadonlySet<FindingStatus> = new Set(["open", "acknowledged", "in_progress", "regressed"]);
+/** Statuses a later audit that DID look, and did not reproduce the finding, may close. Stale is included: nobody could look before, now somebody did. */
+const RESOLVABLE: ReadonlySet<FindingStatus> = new Set([...STALEABLE, "stale"]);
 
 export type MilestoneKind = "aux_status_change" | "schema_fixed";
 
@@ -126,7 +131,7 @@ export function reconcileFindings(input: {
     if (!RESOLVABLE.has(row.status)) continue;
     if (input.inScope(row)) {
       actions.push({ kind: "resolve", id: row.id });
-    } else if (input.unobservedBefore !== undefined && input.unobservedBefore(row) + 1 >= STALE_AFTER_AUDITS) {
+    } else if (STALEABLE.has(row.status) && input.unobservedBefore !== undefined && input.unobservedBefore(row) + 1 >= STALE_AFTER_AUDITS) {
       actions.push({ kind: "stale", id: row.id });
     }
   }

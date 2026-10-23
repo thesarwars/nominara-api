@@ -821,6 +821,32 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(await statusOf()).toEqual(["open"]);
     });
 
+    it("STORY-052 AC8 · a stale finding that a later audit OBSERVED clean is RESOLVED, pins one milestone, and a return regresses it", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["stale"]);
+      await runAsTenant(healthy(OPEN));
+      const [f] = await findings();
+      expect(f.status).toBe("resolved");
+      expect(f.resolved_at).not.toBeNull();
+      expect(await milestones()).toHaveLength(1);
+      await runAsTenant(healthy(BLOCKED));
+      const [back] = await findings();
+      expect(back.status).toBe("regressed");
+      expect(back.resolved_at).toBeNull();
+      expect(await findings()).toHaveLength(1);
+    });
+
+    it("STORY-052 AC8 · a stale finding stays stale while the file is still unobservable", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["stale"]);
+      expect(await milestones()).toHaveLength(0);
+    });
+
     it("STORY-052 scenario 10 · a wont_fix finding is not staled by an unobserved run", async () => {
       await runAsTenant(healthy(BLOCKED));
       await db.query("UPDATE aux_findings SET status = 'wont_fix', wont_fix_reason = 'accepted'");
