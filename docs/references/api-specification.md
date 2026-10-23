@@ -246,6 +246,17 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | `GET` | `/tasks/{id}/events` | `task:read` | timeline |
 | `POST` | `/tasks/{id}/complete` ✚ | `task:move` | emits a milestone and schedules +48 h / +14 d verification |
 
+### Notifications
+
+| Method | Path | Permission | Notes |
+|---|---|---|---|
+| `GET` | `/workspaces/{id}/notifications` | `workspace:read` | **The caller's inbox (STORY-068).** Cursor-paged, newest first; `unread=true` lists only what the caller has not read. Body `{notifications, unread_count}`: `unread_count` is the caller's over the whole inbox (the bell badge). Each item: `id, project_id, kind, severity (info\|warning\|critical), title, body, audience (workspace\|user), deep_link {path, query} \| null, task_id, read, read_at, created_at`. **Read state is per user**: `read`/`read_at` are the caller's, so one member reading never clears it for the team. A member sees workspace-wide rows, rows addressed to them, and only the projects their role may read (a scoped manager or viewer: their `project_scope`). `deep_link` names the surface that diagnoses an alert with its filters (`/p/{project_id}/prompts?engines=gemini&tf=7d`). Never for an API key (`403`) |
+| `POST` | `/workspaces/{id}/notifications/{notification_id}/read` | `workspace:read` | marks one notification read **for the caller**; idempotent (the first read time is kept). `200 {id, read_at, unread_count}`; `404` for a notification the caller cannot see (another user's, another project's, another tenant's). Audited as `notification.read` |
+| `POST` | `/workspaces/{id}/notifications/read-all` | `workspace:read` | marks everything the caller can see read, for the caller only. `200 {marked, unread_count}`. Audited as `notification.read_all` on the workspace |
+| `GET`/`PATCH` | `/workspaces/{id}/notification-preferences` | `workspace:read` | **the caller's own email digest cadence** (owner decision 2026-10-23). `{digest_cadence: off\|daily\|weekly, is_default}`; `PATCH {digest_cadence}` (`null` restores the role default). Default **weekly** for owner, admin and manager, **off** for analyst and viewer. `off` also stops the immediate email for critical alerts. Audited as `notification_preferences.updated` |
+
+Alerts are the §15 catalog of `scoring-models.md`, raised after each rollup by `task.generate` (kind `alert.<rule>`); usage warnings at 80% and 95% are `usage.quota_threshold`, credit warnings at 25% and 10% of the cycle's grant are `credits.threshold`; each fires once per threshold per cycle. **Severity is the channel:** `critical` is emailed at once, `warning` and `info` wait for the member's digest, which coalesces the period into one email and is **not sent when empty**. Email goes out through `notify.dispatch` (one outbox, idempotent by event key).
+
 ### Tools
 
 One resource family for all six tools. `tool_key` selects behaviour; lifecycle, history, and the conversion contract are shared.
