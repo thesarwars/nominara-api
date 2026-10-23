@@ -8,6 +8,9 @@ import type {
   UpdateAuxFindingRequest,
 } from "../../../contracts/aux/index.js";
 import { AUX_CATEGORIES } from "../../../contracts/aux/index.js";
+import type { AuxPatch } from "../../../contracts/aux/index.js";
+import { guidanceFor } from "../../lib/aux/patches/guidance.js";
+import { pageMatches, sha256Tag, type LatestAuditFacts } from "../../lib/aux/patches/precondition.js";
 import { ConflictError, NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -70,6 +73,15 @@ const FINDING_SELECT = `
     FROM aux_findings f
     LEFT JOIN aux_rule_catalog c ON c.code = f.rule_code`;
 
+/** STORY-053: how many earlier patches a patch names. Patches are never deleted, so the read is bounded rather than the table. */
+const EARLIER_PATCHES_MAX = 20;
+
+const PATCH_SELECT = `
+  SELECT p.id, p.finding_id, p.project_id, p.rule_code, p.kind, p.target_url, p.content_before_hash, p.content_after, p.unified_diff,
+         p.jsonld_blocks, p.reversal, p.preconditions, p.explanation, p.derivation, p.requires_human_review, p.review_reason,
+         p.risk_flags, p.created_at
+    FROM patches p`;
+
 @Injectable()
 export class AuxService {
   private readonly logger = new Logger(AuxService.name);
@@ -121,7 +133,8 @@ export class AuxService {
       [projectId, query.severity ?? null, query.status ?? null, query.rule_code ?? null, query.url ?? null, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
     incrementCounter("nominara_aux_finding_reads_total", { filtered: String(query.severity !== undefined || query.status !== undefined || query.rule_code !== undefined || query.url !== undefined) });
-    return pageFrom(result.rows, query.limit, "aux.findings", toFinding, (row) => [row.severity_rank, row.id]);
+    const patches = await this.latestPatches(projectId, result.rows.slice(0, query.limit).map((r) => r.id));
+    return pageFrom(result.rows, query.limit, "aux.findings", (row) => toFinding(row, patches.get(row.id) ?? null), (row) => [row.severity_rank, row.id]);
   }
 
   /**
@@ -185,7 +198,69 @@ export class AuxService {
     this.logger.log({ message: "aux finding updated", workspace_id: store.context.workspaceId, finding_id: findingId, from: current.status, to: body.status });
 
     const read = await client.query<FindingRow>(`${FINDING_SELECT} WHERE f.id = $1`, [findingId]);
-    return toFinding(read.rows[0]!);
+    const row = read.rows[0]!;
+    return toFinding(row, (await this.latestPatches(row.project_id, [row.id])).get(row.id) ?? null);
+  }
+
+  /**
+   * `GET /v1/patches/{id}` — one immutable patch, including one a later audit has since superseded (the artifact a customer
+   * copied is always reconstructable). A permission denial is a 403, never a 404; a patch in another workspace is simply absent (RLS).
+   */
+  async getPatch(patchId: string): Promise<AuxPatch> {
+    const client = currentTenantStore()!.client;
+    const found = await client.query<PatchRow>(
+      `${PATCH_SELECT}
+        WHERE p.id = $1 AND EXISTS (SELECT 1 FROM projects pr WHERE pr.id = p.project_id AND pr.deleted_at IS NULL)`,
+      [patchId],
+    );
+    const row = found.rows[0];
+    if (row === undefined) throw new NotFoundError({ message: "no such patch" });
+    const visible = await client.query(`SELECT 1 WHERE ${SCOPE_OK.replace("%P%", "$1::uuid")}`, [row.project_id]);
+    if (visible.rows.length === 0) throw new ProjectOutOfScopeException();
+    const audit = await this.latestAuditFacts(row.project_id);
+    const earlier = await client.query<{ id: string }>(
+      `SELECT id FROM patches WHERE finding_id = $1 AND (created_at, id) < ($2::timestamptz, $3::uuid)
+        ORDER BY created_at DESC, id DESC LIMIT ${EARLIER_PATCHES_MAX}`,
+      [row.finding_id, row.created_at, row.id],
+    );
+    incrementCounter("nominara_aux_patch_reads_total", { route: "get" });
+    return toPatch(row, audit, row.finding_id === null ? [] : earlier.rows.map((r) => r.id));
+  }
+
+  /**
+   * The newest patch of each finding, with the ids of the ones before it. One bounded query for the page (21 rows a finding at most), and
+   * one for the project's latest audit, which is what `page_matches` is judged against.
+   */
+  private async latestPatches(projectId: string, findingIds: readonly string[]): Promise<Map<string, AuxPatch>> {
+    const out = new Map<string, AuxPatch>();
+    if (findingIds.length === 0) return out;
+    const client = currentTenantStore()!.client;
+    const rows = await client.query<PatchRow & { rn: number }>(
+      `SELECT * FROM (
+         SELECT p.*, row_number() OVER (PARTITION BY p.finding_id ORDER BY p.created_at DESC, p.id DESC) AS rn
+           FROM (${PATCH_SELECT} WHERE p.finding_id = ANY($1::uuid[])) p
+       ) ranked WHERE rn <= ${EARLIER_PATCHES_MAX + 1} ORDER BY finding_id, rn`,
+      [findingIds],
+    );
+    if (rows.rows.length === 0) return out;
+    const audit = await this.latestAuditFacts(projectId);
+    const grouped = new Map<string, (PatchRow & { rn: number })[]>();
+    for (const row of rows.rows) grouped.set(row.finding_id!, [...(grouped.get(row.finding_id!) ?? []), row]);
+    for (const [findingId, list] of grouped) out.set(findingId, toPatch(list[0]!, audit, list.slice(1).map((r) => r.id)));
+    incrementCounter("nominara_aux_patch_reads_total", { route: "finding" });
+    return out;
+  }
+
+  /** What the project's most recent finished audit saw of the files a patch is judged against. null = no audit has finished. */
+  private async latestAuditFacts(projectId: string): Promise<LatestAuditFacts | null> {
+    const audit = await currentTenantStore()!.client.query<{ robots_hash: Buffer | null; llms_txt_present: boolean | null }>(
+      `SELECT robots_hash, llms_txt_present FROM aux_audits
+        WHERE project_id = $1 AND status IN ('completed', 'partial')
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+      [projectId],
+    );
+    const row = audit.rows[0];
+    return row === undefined ? null : { robotsHash: row.robots_hash, llmsTxtPresent: row.llms_txt_present };
   }
 
   /** The project lookup is the 404: RLS and the scope predicate make a foreign or out-of-scope project simply absent. */
@@ -254,6 +329,54 @@ interface FindingRow {
   severity_rank: number;
 }
 
+interface PatchRow {
+  id: string;
+  finding_id: string | null;
+  project_id: string;
+  rule_code: string | null;
+  kind: AuxPatch["kind"];
+  target_url: string;
+  content_before_hash: Buffer;
+  content_after: string;
+  unified_diff: string | null;
+  jsonld_blocks: AuxPatch["jsonld_blocks"];
+  reversal: AuxPatch["reversal"];
+  preconditions: AuxPatch["preconditions"];
+  explanation: string | null;
+  derivation: string | null;
+  requires_human_review: boolean;
+  review_reason: string | null;
+  risk_flags: string[];
+  created_at: Date;
+}
+
+function toPatch(row: PatchRow, audit: LatestAuditFacts | null, earlier: string[]): AuxPatch {
+  return {
+    patch_id: row.id,
+    finding_id: row.finding_id,
+    project_id: row.project_id,
+    rule_code: row.rule_code,
+    kind: row.kind,
+    target_url: row.target_url,
+    content_before_hash: sha256Tag(row.content_before_hash),
+    content_after: row.content_after,
+    unified_diff: row.unified_diff,
+    jsonld_blocks: row.jsonld_blocks,
+    reversal: row.reversal,
+    preconditions: row.preconditions,
+    explanation: row.explanation,
+    derivation: row.derivation,
+    requires_human_review: row.requires_human_review,
+    review_reason: row.review_reason,
+    risk_flags: row.risk_flags,
+    page_matches: pageMatches({ kind: row.kind, contentBeforeHash: row.content_before_hash, preconditions: row.preconditions }, audit),
+    earlier_patch_ids: earlier,
+    free: true,
+    credits_charged: 0,
+    created_at: row.created_at.toISOString(),
+  };
+}
+
 /** `numeric` arrives as a string; null (not measured) stays null and "0" stays 0. */
 const num = (value: string | null): number | null => (value === null ? null : Number(value));
 const iso = (value: Date | null): string | null => (value === null ? null : value.toISOString());
@@ -288,7 +411,7 @@ function toAudit(row: AuditRow): AuxAudit {
   };
 }
 
-function toFinding(row: FindingRow): AuxFinding {
+function toFinding(row: FindingRow, patch: AuxPatch | null): AuxFinding {
   return {
     finding_id: row.id,
     audit_id: row.audit_id,
@@ -317,5 +440,8 @@ function toFinding(row: FindingRow): AuxFinding {
     occurrence_count: row.occurrence_count,
     rule_version: row.rule_version,
     task_id: row.task_id,
+    patch,
+    // A rule with no patch carries structured guidance and an alignment link instead (STORY-053 AC9).
+    guidance: patch === null ? guidanceFor(row.rule_code, { projectId: row.project_id, url: row.url }) : null,
   };
 }

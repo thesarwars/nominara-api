@@ -164,9 +164,9 @@ describe("NEW-C-10 · controller", () => {
     expect(meta(AUDIT_METADATA_KEY, "updateFinding")).toMatchObject({ action: "aux_finding.updated", resourceType: "aux_finding" });
   });
 
-  it("[NEW-C-10 AC1] no route can set resolved: the controller has exactly the four reads/actions", () => {
+  it("[NEW-C-10 AC1] no route can set resolved: the controller has exactly the reads and the one finding action (a patch is read, never written, by a client)", () => {
     const routes = Object.getOwnPropertyNames(AuxController.prototype).filter((n) => n !== "constructor").sort();
-    expect(routes).toEqual(["getAudit", "listProjectAudits", "listProjectFindings", "updateFinding"]);
+    expect(routes).toEqual(["getAudit", "getPatch", "listProjectAudits", "listProjectFindings", "updateFinding"]);
   });
 });
 
@@ -251,7 +251,7 @@ describe("NEW-C-10 · AuxService.listProjectAudits", () => {
 });
 
 describe("NEW-C-10 · AuxService.listProjectFindings", () => {
-  const projectThen = (rows: unknown[]) => (sql: string) => (/FROM aux_findings/.test(sql) ? rows : [{ id: PROJECT_ID }]);
+  const projectThen = (rows: unknown[]) => (sql: string) => (/FROM patches/.test(sql) ? [] : /FROM aux_findings/.test(sql) ? rows : [{ id: PROJECT_ID }]);
 
   it("[NEW-C-10 AC4] maps a demo-seeded finding (selector/snippet evidence, null measured, no wont_fix) and a task link", async () => {
     const page = await serviceWith(projectThen([findingRow({ task_id: "0195e5b7-0000-7000-8000-0000000000e1" })])).listProjectFindings(PROJECT_ID, { limit: 50 } as never);
