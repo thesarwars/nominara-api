@@ -24,7 +24,8 @@ function segmentLabel(segment: string): string {
   } catch {
     // a malformed escape stays as written
   }
-  return capitalise(decoded.replace(/\.(html?|php|aspx?)$/i, "").replace(/[-_+]+/g, " ").trim());
+  // A decoded %0A is a real line break: one line only, or a segment could start a heading or a list item of its own.
+  return capitalise(oneLine(decoded).replace(/\.(html?|php|aspx?)$/i, "").replace(/[-_+]+/g, " ").trim());
 }
 
 export interface BuildLlmsTxtInput {

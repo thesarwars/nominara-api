@@ -1,4 +1,5 @@
 import { parseFragment, serialize } from "parse5";
+import { isClaimKey, textIsComplianceClaim } from "./jsonld.js";
 import { sha256Of, sha256Tag } from "./precondition.js";
 import { PatchRejectedError, type PatchDraft } from "./types.js";
 
@@ -39,6 +40,7 @@ const prohibited = (message: string, detail: Record<string, unknown>): PatchReje
 interface ParsedNode {
   readonly nodeName: string;
   readonly attrs?: readonly { name: string; value: string }[];
+  readonly value?: string;
   readonly childNodes?: readonly ParsedNode[];
 }
 
@@ -92,6 +94,20 @@ export function sanitiseFragment(html: string): string {
   return serialize(tree);
 }
 
+/** AC4: the fragment states a compliance, metric or pricing value, in its text, in any attribute value, or by naming one (itemprop / meta name or property). */
+function fragmentTouchesClaim(node: ParsedNode): boolean {
+  for (const child of node.childNodes ?? []) {
+    if (child.nodeName === "#text" && textIsComplianceClaim(child.value ?? "")) return true;
+    for (const attr of child.attrs ?? []) {
+      const name = attr.name.toLowerCase();
+      if (textIsComplianceClaim(attr.value)) return true;
+      if ((name === "itemprop" || (child.nodeName === "meta" && (name === "name" || name === "property"))) && isClaimKey(attr.value.trim())) return true;
+    }
+    if (fragmentTouchesClaim(child)) return true;
+  }
+  return false;
+}
+
 export type FragmentInsertion = "head_append" | "body_prepend" | "body_append";
 const INSERTION_TEXT: Readonly<Record<FragmentInsertion, string>> = {
   head_append: "Add it at the end of the page's <head>.",
@@ -112,6 +128,7 @@ export interface BuildHtmlFragmentInput {
 
 export function buildHtmlFragmentPatch(input: BuildHtmlFragmentInput): PatchDraft {
   const clean = sanitiseFragment(input.fragment);
+  const claim = fragmentTouchesClaim(parseFragment(clean) as unknown as ParsedNode);
   const before = sha256Of(input.pageHtml);
   return {
     ruleCode: input.ruleCode,
@@ -125,8 +142,8 @@ export function buildHtmlFragmentPatch(input: BuildHtmlFragmentInput): PatchDraf
     preconditions: [{ kind: "page_hash", value: sha256Tag(before) }],
     explanation: `${input.explanation} ${INSERTION_TEXT[input.insertion]}`,
     derivation: input.derivation,
-    requiresHumanReview: false,
-    reviewReason: null,
-    riskFlags: [],
+    requiresHumanReview: claim,
+    reviewReason: claim ? "Compliance, metric and pricing claims must be confirmed accurate before publishing." : null,
+    riskFlags: claim ? ["claim_requires_review"] : [],
   };
 }

@@ -98,3 +98,13 @@ describe("STORY-053 scenario 1 · a structure patch (AUX-R-023) is a Nominara te
     expect(() => buildStructurePatch({ ruleCode: "AUX-R-023", targetUrl: "https://acme.com/", markdown: "just text\n" })).toThrowError(/no_heading|heading/);
   });
 });
+
+describe("STORY-053 AC6 · a sitemap path segment cannot inject a line into the generated file", () => {
+  it("an encoded newline and heading in a sitemap URL stays on its one link line", () => {
+    const d = buildLlmsTxtPatch({ ...input, pageUrls: ["https://acme.com/a%0A%23%20Injected", "https://acme.com/b%0D%0A-%20[x](https://evil.example)"] });
+    const lines = d.contentAfter.split("\n");
+    expect(lines.filter((l) => l.startsWith("#")).sort()).toEqual(["# Acme", "## Pages"].sort());
+    expect(lines.filter((l) => l.startsWith("- ")).length).toBe(2);
+    expect(d.contentAfter).not.toMatch(/\n# Injected/);
+  });
+});

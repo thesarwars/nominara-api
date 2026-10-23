@@ -93,6 +93,11 @@ function assertDerived(value: unknown, pageText: string, templates: ReadonlySet<
   throw new PatchRejectedError("underived_value", `"${String(value).slice(0, 80)}" is not in the page's own content`, { value: String(value).slice(0, 200) });
 }
 
+/** True when a plain string reads as a compliance claim. Shared with the html_fragment generator. */
+export const textIsComplianceClaim = (text: string): boolean => COMPLIANCE_VALUE.test(text);
+/** True when a key (or an HTML itemprop / meta name) names a price, a metric or a credential. Shared with the html_fragment generator. */
+export const isClaimKey = (key: string): boolean => !key.startsWith("@") && CLAIM_KEYS.has(key.toLowerCase());
+
 function touchesClaim(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(touchesClaim);
   if (isObject(value)) return Object.entries(value).some(([key, v]) => (!key.startsWith("@") && CLAIM_KEYS.has(key.toLowerCase())) || touchesClaim(v));

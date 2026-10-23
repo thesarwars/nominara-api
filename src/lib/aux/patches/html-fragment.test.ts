@@ -134,3 +134,31 @@ describe("STORY-053 AC6 · a <link> may only declare a canonical or alternate re
     expect(sanitiseFragment('<link rel="canonical" href="https://acme.com/">')).toContain("canonical");
   });
 });
+
+describe("STORY-053 AC4 · a fragment that carries a compliance, metric or pricing claim sets the review flag", () => {
+  const page = "<html><head><title>T</title></head><body></body></html>";
+  const build = (fragment: string) =>
+    buildHtmlFragmentPatch({ ruleCode: "AUX-R-024", targetUrl: "https://acme.com/", pageHtml: page, fragment, insertion: "head_append", explanation: "e", derivation: "d" });
+
+  it("a compliance value in a meta content attribute", () => {
+    const d = build('<meta name="description" content="SOC 2 certified">');
+    expect(d.requiresHumanReview).toBe(true);
+    expect(d.reviewReason).not.toBeNull();
+    expect(d.riskFlags).toContain("claim_requires_review");
+  });
+
+  it("a compliance value in text", () => {
+    expect(build("<p>We are HIPAA compliant.</p>").requiresHumanReview).toBe(true);
+  });
+
+  it("a pricing itemprop", () => {
+    expect(build('<span itemprop="price">9</span>').requiresHumanReview).toBe(true);
+  });
+
+  it("a plain fragment is not flagged", () => {
+    const d = build('<meta name="robots" content="index, follow">');
+    expect(d.requiresHumanReview).toBe(false);
+    expect(d.reviewReason).toBeNull();
+    expect(d.riskFlags).toEqual([]);
+  });
+});
