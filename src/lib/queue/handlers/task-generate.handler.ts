@@ -1,7 +1,7 @@
 import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
-import { z } from "zod";
+import { taskGenerateJobPayloadSchema, type TaskGenerateJobPayload } from "../../../../contracts/tasks/index.js";
 import { TasksService } from "../../../modules/tasks/tasks.service.js";
 import { ValkeyRealtimePublisher, type RealtimePublisher } from "../../cache/realtime-publisher.js";
 import { generateTasksForProject, type GenerationSummary } from "../../taskgen/generate.js";
@@ -21,17 +21,8 @@ import type { JobProcessor } from "../worker-factory.js";
 // No network call (KAD-06): generation reads this database only. The one thing that leaves the process is the realtime
 // `task.created` notice, which `TasksService` defers until after COMMIT.
 
-const payloadSchema = z
-  .object({
-    workspaceId: z.string().uuid(),
-    kid: z.string(),
-    projectId: z.string().uuid(),
-    /** `YYYY-MM-DD`, workspace-local. Absent means "today in the workspace's zone". */
-    metricDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).optional(),
-    /** A producer that knows only one kind of change (a new AUX finding) narrows the rules evaluated. */
-    triggerKinds: z.array(z.string()).min(1).optional(),
-  })
-  .strict();
+// The payload's shape is a contract (contracts/tasks/task-generate-job.schema.ts), shared with both producers.
+const payloadSchema = taskGenerateJobPayloadSchema;
 
 export interface TaskGenerateDeps {
   readonly realtime?: RealtimePublisher;
@@ -54,7 +45,7 @@ export function createTaskGenerateHandler(context: QueueHandlerContext, deps: Ta
     return withProjectQueueLock(tx, "task.generate", payload.projectId, () => run(tx, payload));
   };
 
-  async function run(tx: ClientBase, payload: z.infer<typeof payloadSchema>): Promise<GenerationSummary> {
+  async function run(tx: ClientBase, payload: TaskGenerateJobPayload): Promise<GenerationSummary> {
     const metricDate = payload.metricDate ?? (await localToday(tx, payload.projectId));
     if (metricDate === undefined) {
       logger.log({ event: "task.generate.project_gone", workspace_id: payload.workspaceId, project_id: payload.projectId });

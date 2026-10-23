@@ -13,9 +13,17 @@ import { createHash } from "node:crypto";
 //     and raises its severity one band.
 //   * `stale` and `wont_fix` are never resolved by absence: "the page is gone"
 //     and "the customer accepted it" are not "the problem is gone".
+//   * `stale` is the OTHER outcome of absence: a finding this audit could not
+//     observe (its file or page did not answer), and the audit before it could not
+//     either, goes stale. Resolved needs an audit that LOOKED and did not find it;
+//     stale is "nobody could look, twice running". The two are different facts and a
+//     deleted page must never read as a fix (STORY-052 AC8).
 
 export type AuxSeverityBand = "critical" | "high" | "medium" | "low" | "info";
 const BANDS: readonly AuxSeverityBand[] = ["info", "low", "medium", "high", "critical"];
+
+/** aux-and-geo-analysis.md section 3: "not seen in 2 consecutive audits of the same URL". */
+export const STALE_AFTER_AUDITS = 2;
 
 export function raiseOneBand(severity: AuxSeverityBand): AuxSeverityBand {
   return BANDS[Math.min(BANDS.indexOf(severity) + 1, BANDS.length - 1)]!;
@@ -55,16 +63,34 @@ export type LifecycleAction =
   | { readonly kind: "insert"; readonly finding: DetectedFinding }
   | { readonly kind: "redetect"; readonly id: string; readonly reopen: boolean }
   | { readonly kind: "regress"; readonly id: string; readonly severity: AuxSeverityBand }
-  | { readonly kind: "resolve"; readonly id: string };
+  | { readonly kind: "resolve"; readonly id: string }
+  | { readonly kind: "stale"; readonly id: string };
 
-/** Statuses a later clean audit may close. */
+/** Statuses a later clean audit may close, or that go stale when the place they live cannot be observed. */
 const RESOLVABLE: ReadonlySet<FindingStatus> = new Set(["open", "acknowledged", "in_progress", "regressed"]);
+
+export type MilestoneKind = "aux_status_change" | "schema_fixed";
+
+/**
+ * scoring-models.md section 13: a critical or high finding that is resolved pins `aux_status_change`; the resolution of a
+ * `structured_data` finding pins `schema_fixed`. `ux_milestones_source` allows one pin per finding, so a structured_data
+ * finding that qualifies for both gets `schema_fixed`, the more specific. null = this resolution pins nothing.
+ */
+export function milestoneKindFor(severity: AuxSeverityBand, category: string | null): MilestoneKind | null {
+  if (category === "structured_data") return "schema_fixed";
+  return severity === "critical" || severity === "high" ? "aux_status_change" : null;
+}
 
 export function reconcileFindings(input: {
   readonly existing: readonly ExistingFinding[];
   readonly detected: readonly DetectedFinding[];
   /** True when this audit looked in the place (rule AND url) the finding lives, and got a reliable answer. */
   readonly inScope: (finding: ExistingFinding) => boolean;
+  /**
+   * How many audits IMMEDIATELY BEFORE this one also could not observe the place the finding lives, counted back from the latest
+   * and stopping at the first that could. Absent = no history is known, and nothing goes stale.
+   */
+  readonly unobservedBefore?: (finding: ExistingFinding) => number;
 }): LifecycleAction[] {
   const live = new Map<string, ExistingFinding>();
   const resolved = new Map<string, ExistingFinding>();
@@ -97,7 +123,12 @@ export function reconcileFindings(input: {
 
   for (const row of live.values()) {
     if (seen.has(row.fingerprint)) continue;
-    if (RESOLVABLE.has(row.status) && input.inScope(row)) actions.push({ kind: "resolve", id: row.id });
+    if (!RESOLVABLE.has(row.status)) continue;
+    if (input.inScope(row)) {
+      actions.push({ kind: "resolve", id: row.id });
+    } else if (input.unobservedBefore !== undefined && input.unobservedBefore(row) + 1 >= STALE_AFTER_AUDITS) {
+      actions.push({ kind: "stale", id: row.id });
+    }
   }
   return actions;
 }
