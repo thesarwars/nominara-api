@@ -7,7 +7,7 @@ import { buildJsonLdPatch } from "./jsonld.js";
 // @type, derived only from the page's own text, and flagged for human review when it touches a compliance, metric or pricing value.
 
 const PAGE_HTML = "<html><body><h1>Acme CRM</h1><h2>Pipeline analytics</h2><h2>Workflow automation</h2><h2>Custom reporting</h2></body></html>";
-const PAGE_TEXT = "Acme CRM\nPipeline analytics\nWorkflow automation\nCustom reporting\nSOC 2 Type II certified\nStarts at 49 USD per month";
+const PAGE_TEXT = "Acme CRM\nPipeline analytics\nWorkflow automation\nCustom reporting\nSOC 2 Type II certified\nStarts at 18 USD per month";
 const base = { ruleCode: "AUX-R-014", targetUrl: "https://acme.com/crm", pageHtml: PAGE_HTML, pageText: PAGE_TEXT, existingBlocks: [] as Record<string, unknown>[], explanation: "e", derivation: "d" };
 const sa = (props: Record<string, unknown>): Record<string, unknown> => ({ "@context": "https://schema.org", "@type": "SoftwareApplication", ...props });
 
@@ -48,7 +48,7 @@ describe("STORY-053 scenario 2 · every derived value is traceable to the page's
 
   it("matches the page text ignoring case and runs of whitespace, but never a different word", () => {
     expect(() => buildJsonLdPatch({ ...base, proposed: sa({ featureList: ["pipeline   ANALYTICS"] }) })).not.toThrow();
-    expect(() => buildJsonLdPatch({ ...base, proposed: sa({ featureList: ["Pipeline analytic"] }) })).toThrowError(PatchRejectedError); // whole words only: "49" is not in "149"
+    expect(() => buildJsonLdPatch({ ...base, proposed: sa({ featureList: ["Pipeline analytic"] }) })).toThrowError(PatchRejectedError); // whole words only: a prefix of a word is not page text
     expect(() => buildJsonLdPatch({ ...base, proposed: sa({ featureList: ["Pipeline forecasting"] }) })).toThrowError(PatchRejectedError);
   });
 
@@ -62,9 +62,13 @@ describe("STORY-053 scenario 2 · every derived value is traceable to the page's
     expect(() => buildJsonLdPatch({ ...base, proposed: sa({ publisher: { "@type": "Organization", name: "Invented Corp" } }) })).toThrowError(PatchRejectedError);
   });
 
+  it("a number is matched as a whole token: 8 is not in 18", () => {
+    expect(() => buildJsonLdPatch({ ...base, proposed: sa({ offers: { "@type": "Offer", price: 8, priceCurrency: "USD" } }) })).toThrowError(PatchRejectedError);
+  });
+
   it("a number or boolean is a claim and must appear in the text as written", () => {
-    expect(() => buildJsonLdPatch({ ...base, proposed: sa({ offers: { "@type": "Offer", price: 49, priceCurrency: "USD" } }) })).not.toThrow(); // "49" and "USD" are in the page text
-    expect(() => buildJsonLdPatch({ ...base, proposed: sa({ offers: { "@type": "Offer", price: 59, priceCurrency: "USD" } }) })).toThrowError(PatchRejectedError);
+    expect(() => buildJsonLdPatch({ ...base, proposed: sa({ offers: { "@type": "Offer", price: 18, priceCurrency: "USD" } }) })).not.toThrow(); // "18" and "USD" are in the page text
+    expect(() => buildJsonLdPatch({ ...base, proposed: sa({ offers: { "@type": "Offer", price: 19, priceCurrency: "USD" } }) })).toThrowError(PatchRejectedError);
   });
 });
 
@@ -77,7 +81,7 @@ describe("STORY-053 scenario 3 · a patch asserting a compliance, metric or pric
   });
 
   it("an offer (pricing) sets it", () => {
-    const d = buildJsonLdPatch({ ...base, ruleCode: "AUX-R-012", proposed: sa({ offers: { "@type": "Offer", price: 49, priceCurrency: "USD" } }) });
+    const d = buildJsonLdPatch({ ...base, ruleCode: "AUX-R-012", proposed: sa({ offers: { "@type": "Offer", price: 18, priceCurrency: "USD" } }) });
     expect(d.requiresHumanReview).toBe(true);
     expect(d.riskFlags).toContain("claim_requires_review");
   });

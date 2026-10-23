@@ -73,7 +73,7 @@ describe("STORY-053 scenario 2 · every value is the site's own, or a template w
 });
 
 describe("STORY-053 scenario 1 · a structure patch (AUX-R-023) is a Nominara template with the page's own heading", () => {
-  const md = "# Acme CRM\n\nAcme CRM tracks your pipeline.\n\n## Pricing\n\nFrom 49 USD.\n";
+  const md = "# Acme CRM\n\nAcme CRM tracks your pipeline.\n\n## Pricing\n\nFrom 18 USD.\n";
   const d = buildStructurePatch({ ruleCode: "AUX-R-023", targetUrl: "https://acme.com/crm", markdown: md });
 
   it("is kind markdown, inserts a summary slot after the first heading, and states the diff", () => {

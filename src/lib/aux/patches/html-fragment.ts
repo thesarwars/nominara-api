@@ -13,10 +13,10 @@ import { PatchRejectedError, type PatchDraft } from "./types.js";
 /** NOT FROM THE REFERENCE: the cap on one fragment. A rule patch is a few elements; 200 KB is two orders of magnitude of slack. */
 export const MAX_FRAGMENT_CHARS = 200_000;
 
-const GLOBAL_ATTRIBUTES: ReadonlySet<string> = new Set(["id", "class", "lang", "itemscope", "itemtype", "itemprop"]);
+export const GLOBAL_ATTRIBUTES: ReadonlySet<string> = new Set(["id", "class", "lang", "itemscope", "itemtype", "itemprop"]);
 
 /** Every element a patch may carry, with the attributes it may carry on top of the global ones. Anything else is refused. */
-const ALLOWED_ELEMENTS: ReadonlyMap<string, ReadonlySet<string>> = new Map(
+export const ALLOWED_ELEMENTS: ReadonlyMap<string, ReadonlySet<string>> = new Map(
   Object.entries({
     p: [], h1: [], h2: [], h3: [], h4: [], h5: [], h6: [], ul: [], ol: [], li: [], dl: [], dt: [], dd: [],
     a: ["href", "rel", "title", "hreflang"], strong: [], em: [], b: [], i: [], u: [], br: [], hr: [], blockquote: [], code: [], pre: [],

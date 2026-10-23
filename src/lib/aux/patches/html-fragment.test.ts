@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { PatchRejectedError } from "./types.js";
-import { buildHtmlFragmentPatch, sanitiseFragment } from "./html-fragment.js";
+import { ALLOWED_ELEMENTS, GLOBAL_ATTRIBUTES, buildHtmlFragmentPatch, sanitiseFragment } from "./html-fragment.js";
 
 // STORY-053 AC6 — a markup fragment is sanitised against a strict allow-list, and a script, style, frame or event attribute is
 // a HARD ERROR. A silently stripped fragment is a patch that does not do what the diff showed.
@@ -57,6 +57,16 @@ describe("STORY-053 scenario 6 · prohibited markup is a hard error, not a strip
 
   it("a comment is a hard error (it can carry conditional content a reader never sees)", () => {
     expect(reasonOf("<p>a</p><!--[if IE]><script>x</script><![endif]-->").reason).toBe("prohibited_markup");
+  });
+});
+
+describe("STORY-053 AC6 · the allow-list itself", () => {
+  it("never lists an event-handler attribute, a script-bearing element or a style hook, so an edit to the list cannot reopen the hole the explicit checks close", () => {
+    const attributes = [...GLOBAL_ATTRIBUTES, ...[...ALLOWED_ELEMENTS.values()].flatMap((set) => [...set])];
+    expect(attributes.filter((a) => a.startsWith("on") || a === "style" || a === "srcdoc" || a === "formaction")).toEqual([]);
+    for (const banned of ["script", "style", "iframe", "frame", "frameset", "object", "embed", "applet", "form", "svg", "math", "template", "noscript", "base", "html", "head", "body"]) {
+      expect(ALLOWED_ELEMENTS.has(banned), banned).toBe(false);
+    }
   });
 });
 
