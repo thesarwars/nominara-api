@@ -20,7 +20,7 @@ describe("STORY-053 scenario 1 · the generator produces a patch per fixable sit
     const r1 = generateSiteFilePatch(input("AUX-R-001"));
     expect(r1.outcome).toBe("patch");
     if (r1.outcome === "patch") expect(r1.draft.kind).toBe("robots");
-    const r2 = generateSiteFilePatch(input("AUX-R-002", { robots: { body: "User-agent: *\nDisallow: /private\n", hash: sha("w") } }));
+    const r2 = generateSiteFilePatch(input("AUX-R-002", { robots: { body: "User-agent: *\nDisallow: /private\n", hash: sha("w") }, trackedPaths: ["/private"] }));
     expect(r2.outcome).toBe("patch");
   });
 

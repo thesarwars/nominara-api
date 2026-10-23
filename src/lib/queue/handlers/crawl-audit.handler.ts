@@ -101,6 +101,8 @@ export const CRAWL_WALL_CLOCK_BUDGET_MS = 10 * 60 * 1000;
 /** aux-and-geo-analysis.md §1: a 500 ms minimum interval between requests to one host. */
 export { MIN_INTERVAL_MS as POLITENESS_INTERVAL_MS } from "../../aux/politeness.js";
 const TOKENIZER = "none"; // aux_audits.tokenizer is NOT NULL; no text is tokenised in this stage.
+/** The one path every audit can speak for is the root. The same list is judged by evaluateRobotsTxt and used by the robots patch. */
+const AUDIT_TRACKED_PATHS: readonly string[] = ["/"];
 const RAN_RULES = ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"] as const;
 const TERMINAL_STATUSES = ["completed", "partial", "failed"];
 const OPEN_STATUSES = ["open", "acknowledged", "in_progress", "regressed"];
@@ -574,7 +576,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       sitemap: asFile(sitemap),
       sitemapDeclaredInRobots: declaredOnSite.length > 0,
       // The one path every audit can speak for is the root.
-      trackedPaths: ["/"],
+      trackedPaths: AUDIT_TRACKED_PATHS,
       now: finishedAt,
     });
 
@@ -766,6 +768,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       llms: isOk(outcome.llms) ? { body: outcome.llms.file.body } : null,
       // Only /llms.txt is judged. Absent means it answered 404 or 410 AND the well-known location has no file either (llms_txt_present,
       // which page_matches reads, counts both). An error answer says nothing about whether a file exists behind it.
+      trackedPaths: AUDIT_TRACKED_PATHS,
       llmsPatchable: isOk(outcome.llms) || (isGone(outcome.llms) && !isOk(outcome.llmsWellKnown)),
     };
     const patchStats = await tracer.startActiveSpan("crawl.audit.patches", async (span) => {

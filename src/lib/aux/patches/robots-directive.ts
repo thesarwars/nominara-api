@@ -1,5 +1,5 @@
 import { isAllowed, parseRobots, type ParsedRobots, type RobotsRule } from "../robots.js";
-import { AI_CRAWLER_AGENTS } from "../site-files.js";
+import { AI_CRAWLER_AGENTS, evaluateRobotsTxt } from "../site-files.js";
 import { unifiedDiff } from "./diff.js";
 import { sha256Tag } from "./precondition.js";
 import { PatchRejectedError, type PatchDraft } from "./types.js";
@@ -114,31 +114,50 @@ export interface BuildRobotsInput {
   readonly body: string;
   /** sha256 of the bytes as fetched (the audit's `robots_hash`). */
   readonly bodyHash: Buffer;
+  /** The paths the audit judged the file against (the same ones passed to evaluateRobotsTxt). Default: the root, which is all an audit can speak for today. */
+  readonly trackedPaths?: readonly string[];
+}
+
+const SEVERITY_RANK: Readonly<Record<string, number>> = { medium: 1, high: 2, critical: 3 };
+
+/** The worst severity per rule among AUX-R-001 / 002 that the audit's own evaluator reports for `body`; absent = 0. */
+function accessFindingRanks(body: string, trackedPaths: readonly string[]): Record<string, number> {
+  const ranks: Record<string, number> = {};
+  for (const f of evaluateRobotsTxt({ status: 200, body }, trackedPaths)) {
+    if (f.rule_code === "AUX-R-001" || f.rule_code === "AUX-R-002") ranks[f.rule_code] = Math.max(ranks[f.rule_code] ?? 0, SEVERITY_RANK[f.severity] ?? 0);
+  }
+  return ranks;
 }
 
 /**
- * AUX-R-001 / AUX-R-002: open the AI crawler tokens the file excludes. null when there is nothing to open.
+ * AUX-R-001 / AUX-R-002: open the AI crawler tokens the file excludes from the tracked paths. null when there is nothing to open.
  *
- * A token the file NAMES already has its own group, so an `Allow: /` appended to it wins the tie against a `Disallow: /`. A token the
- * file does not name inherits `*`, and a group that names it REPLACES `*` for it: so its block carries over the wildcard's other rules,
- * or opening "/" would also open the paths the site restricted for everyone.
+ * Each block opens exactly the tracked paths that agent cannot fetch (the root, or a path below it) with one explicit `Allow` line
+ * per path, and says so in the explanation. A token the file NAMES already has its own group, so an `Allow` appended to it wins the
+ * tie against a `Disallow` of the same length. A token the file does not name inherits `*`, and a group that names it REPLACES `*`
+ * for it: so its block carries over the wildcard's other rules, or opening a path would also open the ones the site restricted for everyone.
+ *
+ * The outcome is judged by the audit's own evaluator on the patched file: the rule being fixed must no longer fire, and no
+ * AUX-R-001 / 002 finding may appear or get worse (naming an agent the file did not name turns a medium AUX-R-002 into a high AUX-R-001
+ * unless its paths are opened). A patch that cannot do that is rejected as `ineffective`, never offered.
  */
 export function buildRobotsPatch(input: BuildRobotsInput): PatchDraft | null {
+  const trackedPaths = input.trackedPaths ?? ["/"];
   const parsed = parseRobots(input.body);
   const wildcardRules = parsed.groups.filter((g) => g.agents.includes("*")).flatMap((g) => g.rules);
-  const restrictiveWildcard = wildcardRules.some((r) => !r.allow && r.pattern !== "");
   const carried = wildcardRules.filter((r) => !isRootDisallow(r) && r.pattern !== "");
 
   const blocks: string[] = [];
   const opened: string[] = [];
+  const openedPaths = new Set<string>();
   for (const agent of AI_CRAWLER_AGENTS) {
     const named = parsed.groups.some((g) => g.agents.includes(agent.toLowerCase()));
-    const blockedAtRoot = !isAllowed(parsed, agent, "/");
-    const inherits = !named && restrictiveWildcard;
-    if (!blockedAtRoot && !(input.ruleCode === "AUX-R-002" && inherits)) continue;
-    const lines = [`User-agent: ${agent}`, ...(named ? [] : carried.map(lineOf)), "Allow: /"];
+    const restricted = [...new Set(["/", ...trackedPaths])].filter((p) => !isAllowed(parsed, agent, p));
+    if (restricted.length === 0) continue;
+    const lines = [`User-agent: ${agent}`, ...(named ? [] : carried.map(lineOf)), ...restricted.map((p) => `Allow: ${p}`)];
     blocks.push(lines.join("\n"));
     opened.push(agent);
+    for (const p of restricted) openedPaths.add(p);
   }
   if (blocks.length === 0) return null;
 
@@ -149,14 +168,22 @@ export function buildRobotsPatch(input: BuildRobotsInput): PatchDraft | null {
     beforeHash: input.bodyHash,
     appended: `\n${blocks.join("\n\n")}\n`,
     explanation:
-      `${opened.join(", ")} ${opened.length === 1 ? "is" : "are"} currently excluded by robots.txt. ` +
+      `${opened.join(", ")} ${opened.length === 1 ? "cannot" : "cannot each"} fetch ${[...openedPaths].join(", ")} under the current robots.txt. ` +
+      `The patch adds an explicit Allow for exactly ${openedPaths.size === 1 ? "that path" : "those paths"} to each named agent and nothing else. ` +
       "Explicit Allow blocks for named agents take precedence in every major crawler's matching algorithm.",
   });
-  // A patch that does not do what it says is worse than none: every token it claims to open must now be allowed at the root.
+  // A patch that does not do what it says is worse than none: every token it claims to open must now be allowed on what it opened.
   const after = parseRobots(draft.contentAfter);
-  const stillBlocked = opened.filter((agent) => !isAllowed(after, agent, "/"));
+  const stillBlocked = opened.filter((agent) => [...openedPaths].some((p) => !isAllowed(parsed, agent, p) && !isAllowed(after, agent, p)));
   if (stillBlocked.length > 0) {
-    throw new PatchRejectedError("ineffective", `an Allow: / block would not open ${stillBlocked.join(", ")}`, { agents: stillBlocked });
+    throw new PatchRejectedError("ineffective", `an Allow block would not open ${stillBlocked.join(", ")}`, { agents: stillBlocked });
+  }
+  // And it is judged by the audit's own evaluator: the rule it was made for is gone, and nothing in this family appears or gets worse.
+  const rankBefore = accessFindingRanks(input.body, trackedPaths);
+  const rankAfter = accessFindingRanks(draft.contentAfter, trackedPaths);
+  const worse = Object.keys(rankAfter).filter((code) => rankAfter[code]! > (rankBefore[code] ?? 0) || code === input.ruleCode);
+  if (worse.length > 0) {
+    throw new PatchRejectedError("ineffective", `the patched file would still raise ${worse.join(", ")}`, { rules: worse });
   }
   return draft;
 }

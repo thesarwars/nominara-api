@@ -49,14 +49,45 @@ describe("STORY-053 scenario 1 · a robots patch has a reversal and a preconditi
     expect(d.contentAfter).not.toContain("User-agent: Googlebot\nAllow");
   });
 
-  it("AUX-R-002: names the AI agents that only inherit a restrictive wildcard", () => {
-    const d = buildRobotsPatch({ ruleCode: "AUX-R-002", targetUrl: URL, body: "User-agent: *\nDisallow: /private\n", bodyHash: sha("x") })!;
-    // The named group REPLACES the wildcard for that agent, so the wildcard's other restrictions are carried over: opening "/" must not
-    // also open the paths the site restricted for everyone.
-    for (const agent of ["GPTBot", "ClaudeBot", "PerplexityBot", "Google-Extended"]) expect(d.contentAfter).toContain(`User-agent: ${agent}\nDisallow: /private\nAllow: /\n`);
+  it("AUX-R-002: names the AI agents that only inherit a restrictive wildcard, carries its other rules, and opens exactly the tracked path", () => {
+    const d = buildRobotsPatch({ ruleCode: "AUX-R-002", targetUrl: URL, body: "User-agent: *\nDisallow: /private\nDisallow: /other\n", bodyHash: sha("x"), trackedPaths: ["/private"] })!;
+    // The named group REPLACES the wildcard for that agent, so the wildcard's other restrictions are carried over; only the tracked path is opened.
+    for (const agent of ["GPTBot", "ClaudeBot", "PerplexityBot", "Google-Extended"]) expect(d.contentAfter).toContain(`User-agent: ${agent}\nDisallow: /private\nDisallow: /other\nAllow: /private\n`);
     const after = parseRobots(d.contentAfter);
-    expect(isAllowed(after, "GPTBot", "/")).toBe(true);
-    expect(isAllowed(after, "GPTBot", "/private")).toBe(false);
+    expect(isAllowed(after, "GPTBot", "/private")).toBe(true);
+    expect(isAllowed(after, "GPTBot", "/other")).toBe(false);
+    expect(d.explanation).toContain("/private");
+  });
+
+  it("AUX-R-002 hazard · the patched file clears AUX-R-002 and raises no AUX-R-001 for the tracked paths (a patch must not swap a medium finding for a high one)", () => {
+    const body = "User-agent: *\nDisallow: /blog\n";
+    const tracked = ["/blog/post"];
+    const codes = (text: string): string[] => evaluateRobotsTxt({ status: 200, body: text }, tracked).map((f) => f.rule_code);
+    expect(codes(body)).toContain("AUX-R-002");
+    const d = buildRobotsPatch({ ruleCode: "AUX-R-002", targetUrl: URL, body, bodyHash: sha(body), trackedPaths: tracked })!;
+    expect(codes(d.contentAfter)).not.toContain("AUX-R-002");
+    expect(codes(d.contentAfter)).not.toContain("AUX-R-001");
+  });
+
+  it("AUX-R-002 is rejected as ineffective when a carried restriction would still beat the Allow on a tracked path", () => {
+    const body = "User-agent: *\nDisallow: /a/b$\n";
+    try {
+      buildRobotsPatch({ ruleCode: "AUX-R-002", targetUrl: URL, body, bodyHash: sha(body), trackedPaths: ["/a/b"] });
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(PatchRejectedError);
+      expect((e as PatchRejectedError).reason).toBe("ineffective");
+    }
+  });
+
+  it("AUX-R-001 high (path_disallow) · an agent blocked on a tracked path, not at the root, gets an Allow for that path and the finding clears", () => {
+    const body = "User-agent: GPTBot\nDisallow: /blog\n";
+    const tracked = ["/blog"];
+    const codes = (text: string): string[] => evaluateRobotsTxt({ status: 200, body: text }, tracked).map((f) => f.rule_code);
+    expect(codes(body)).toContain("AUX-R-001");
+    const d = buildRobotsPatch({ ruleCode: "AUX-R-001", targetUrl: URL, body, bodyHash: sha(body), trackedPaths: tracked })!;
+    expect(d.contentAfter).toContain("User-agent: GPTBot\nAllow: /blog\n");
+    expect(codes(d.contentAfter)).not.toContain("AUX-R-001");
   });
 
   it("a file with nothing to open yields no patch (null is not an empty patch)", () => {

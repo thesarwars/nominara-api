@@ -27,6 +27,8 @@ export interface SiteInputs {
    * then be wrong or judged `changed` at once, so none is offered.
    */
   readonly llmsPatchable: boolean;
+  /** The paths the audit judged robots.txt against (what it passed to evaluateRobotsTxt). Default: the root. */
+  readonly trackedPaths?: readonly string[];
 }
 
 export interface GenerateInput {
@@ -51,7 +53,7 @@ export function generateSiteFilePatch(input: GenerateInput): Generated {
   }
   if (ruleCode === "AUX-R-001" || ruleCode === "AUX-R-002") {
     if (site.robots === null) return { outcome: "none" };
-    const draft = buildRobotsPatch({ ruleCode, targetUrl: input.targetUrl, body: site.robots.body, bodyHash: site.robots.hash });
+    const draft = buildRobotsPatch({ ruleCode, targetUrl: input.targetUrl, body: site.robots.body, bodyHash: site.robots.hash, ...(site.trackedPaths === undefined ? {} : { trackedPaths: site.trackedPaths }) });
     return draft === null ? { outcome: "none" } : { outcome: "patch", draft };
   }
   if (ruleCode === "AUX-R-004") {
