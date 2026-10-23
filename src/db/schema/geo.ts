@@ -130,6 +130,12 @@ export const patches = pgTable("patches", {
   alignmentProjected: real("alignment_projected"),
   createdBy: uuid("created_by"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  ruleCode: text("rule_code"),
+  requiresHumanReview: boolean("requires_human_review").notNull().default(sql`false`),
+  reviewReason: text("review_reason"),
+  explanation: text("explanation"),
+  derivation: text("derivation"),
+  preconditions: jsonb("preconditions").notNull().default(sql`'[]'::jsonb`),
 });
 
 export const semanticNodes = pgTable("semantic_nodes", {
