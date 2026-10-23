@@ -55,16 +55,14 @@ describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED 
     expect(planDowngradePause(limits({ promptsPerProject: 1 }), [project(1)], prompts).pausePrompts).toEqual([id(1001)]);
   });
 
-  it("an ARCHIVED project counts toward the excess exactly as the guard and the preview count it (every non-deleted project), and is never itself paused", () => {
-    // The guard (structural-usage COUNTERS["projects.max"]) and the preview count 4 projects against 2, and the preview
-    // names the two newest: P4 and P3. Leaving the archived P2 out would count 3 and pause only P4.
+  it("OWNER 2026-10-23 · an ARCHIVED project uses no plan slot: it is neither counted toward the excess nor paused", () => {
+    // Replaces the old rule (every non-deleted project counted, an archived one holding its slot). Four projects, one
+    // archived, against 2: only the three TRACKING count, so one is paused - the newest tracking P4 - never two.
     const ps = [project(1), project(2, { status: "archived" }), project(3), project(4)];
-    expect(planDowngradePause(limits({ projects: 2 }), ps, []).pauseProjects).toEqual([id(4), id(3)]);
-    // An archived project is counted, never paused, and HOLDS its slot (STORY-077 D2 review round 1): it ranks first
-    // whatever its age or activity, so a newest archived project no longer soaks up the excess for an active one. Slice A
-    // let it (nothing paused here); with a keep choice that made the cut-over and the next reconcile disagree.
+    expect(planDowngradePause(limits({ projects: 2 }), ps, []).pauseProjects).toEqual([id(4)]);
+    // Two tracking and a newest archived against 2: nothing is over, nothing is paused.
     const newestArchived = [project(1), project(2), project(3, { status: "archived" })];
-    expect(planDowngradePause(limits({ projects: 2 }), newestArchived, []).pauseProjects).toEqual([id(2)]);
+    expect(planDowngradePause(limits({ projects: 2 }), newestArchived, []).pauseProjects).toEqual([]);
   });
 
   it("BOUNDARY · usage exactly at the limit pauses nothing; one over pauses exactly one", () => {
@@ -81,13 +79,22 @@ describe("STORY-077 scenario 3 · the cut-over pauses the MOST RECENTLY CREATED 
     expect(planDowngradePause(limits({ projects: 1 }), ps, []).pauseProjects).toEqual([id(2)]);
   });
 
-  it("a project a PERSON paused is never marked: it is not taken over by the downgrade, and it still counts toward the excess", () => {
-    // The newest is user-paused. It counts and HOLDS its slot (STORY-077 D2 review round 1: a project that is not tracking
-    // ranks first, so it never soaks up the excess for an active one), so the two newest ACTIVE are paused and marked; it
-    // is not. Slice A let it take the excess (pausing only P3); with a keep choice that made a later reconcile disagree.
+  it("OWNER 2026-10-23 · a project a PERSON paused is never marked and uses no plan slot: only the tracking projects count toward the excess", () => {
+    // Replaces the old rule (it counted and held its slot, so the two newest active were paused). Three tracking and one
+    // person-paused against 2: one tracking project is over, so only P3 is paused, and P4 is left exactly as it was.
     const ps = [project(1), project(2), project(3), project(4, { status: "paused" })];
     const plan = planDowngradePause(limits({ projects: 2 }), ps, []);
-    expect(plan.pauseProjects).toEqual([id(3), id(2)]);
+    expect(plan.pauseProjects).toEqual([id(3)]);
+    expect(plan.resumeProjects).toEqual([]);
+  });
+
+  it("OWNER 2026-10-23 · an upgrade resumes a downgrade-paused project into the room an archived or person-paused project does not take", () => {
+    // Limit 2: one tracking, one archived, one person-paused, one paused by an earlier downgrade. Only the tracking one
+    // uses a slot, so the downgrade-paused project resumes; under the old rule the two untracked held both slots.
+    const ps = [project(1), project(2, { status: "archived" }), project(3, { status: "paused" }), project(4, { status: "paused", pausedByDowngrade: true })];
+    const plan = planDowngradePause(limits({ projects: 2 }), ps, []);
+    expect(plan.resumeProjects).toEqual([id(4)]);
+    expect(plan.pauseProjects).toEqual([]);
   });
 
   it("per project: the newest prompts beyond prompts.max_per_project are paused, project by project", () => {
@@ -356,6 +363,15 @@ describe("STORY-077 review round 2 · invariants over random workspaces (seeded,
       const after = applied(plan, projects, prompts);
       const ctx = `seed ${String(seed)} limits ${JSON.stringify(l)}`;
       const markedProjects = new Set(after.projects.filter((p) => p.pausedByDowngrade).map((p) => p.id));
+      // OWNER 2026-10-23: only TRACKING projects (active, initializing) use a slot. After any plan they fit the limit, and a
+      // project a downgrade still holds paused is left paused only because the tracking ones fill it; an archived or
+      // person-paused project is never touched.
+      const trackingAfter = after.projects.filter((p) => p.status === "active" || p.status === "initializing").length;
+      if (l.projects !== null) expect(trackingAfter, `${ctx}: tracking projects above projects.max`).toBeLessThanOrEqual(l.projects);
+      if (markedProjects.size > 0) expect(l.projects !== null && trackingAfter >= l.projects, `${ctx}: a downgrade-paused project left paused although a slot is free`).toBe(true);
+      for (const before of projects.filter((x) => x.status === "archived" || (x.status === "paused" && !x.pausedByDowngrade))) {
+        expect(after.projects.find((x) => x.id === before.id), `${ctx}: an archived or person-paused project was touched`).toEqual(before);
+      }
       const wsActive = activeIn(after.prompts);
 
       if (l.promptsTotal !== null) expect(wsActive, ctx).toBeLessThanOrEqual(l.promptsTotal);

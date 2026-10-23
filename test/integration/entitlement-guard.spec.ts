@@ -191,6 +191,29 @@ describe("STORY-069 · EntitlementGuard: structural limits and feature flags nev
     expect(refusal.remediation).toEqual({ kind: "increase_limit" });
   });
 
+  it("OWNER 2026-10-23 · an archived, person-paused or downgrade-paused project uses no slot: projects.max counts the tracking ones", async () => {
+    // Replaces the old count (every non-deleted project). Growth allows 3: three tracking projects refuse the next, and
+    // archiving one, pausing one, or a downgrade pausing one each frees a slot. The refusal's `current` is the same count.
+    await addProjects(3);
+    await db.query("UPDATE projects SET status = 'active' WHERE workspace_id = $1", [workspaceId]);
+    expect((await refusalFrom(() => guard.canActivate(makeContext(request(), CreateProjectRoute)))).details).toEqual({ key: "projects.max", limit: 3, current: 3 });
+
+    await db.query("UPDATE projects SET status = 'archived' WHERE id = $1", [projectId]);
+    await expect(guard.canActivate(makeContext(request(), CreateProjectRoute))).resolves.toBe(true);
+
+    const [paused, downgradePaused] = [uuidV7(), uuidV7()];
+    for (const [id, slug] of [[paused, "pp"], [downgradePaused, "dp"]] as const) {
+      await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, status) VALUES ($1, $2, $3, $3, 'https://example.com', 'example.com', 'active')`, [id, workspaceId, slug]);
+    }
+    expect((await refusalFrom(() => guard.canActivate(makeContext(request(), CreateProjectRoute)))).details).toEqual({ key: "projects.max", limit: 3, current: 4 });
+    await db.query("UPDATE projects SET status = 'paused' WHERE id = $1", [paused]);
+    await db.query("UPDATE projects SET paused_by_downgrade_from = status, status = 'paused', paused_by_downgrade_at = now() WHERE id = $1", [downgradePaused]);
+    await expect(guard.canActivate(makeContext(request(), CreateProjectRoute))).resolves.toBe(true);
+    // An initializing project is tracking (onboarding): it counts.
+    await db.query("INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, status) VALUES ($1, $2, 'init', 'init', 'https://example.com', 'example.com', 'initializing')", [uuidV7(), workspaceId]);
+    expect((await refusalFrom(() => guard.canActivate(makeContext(request(), CreateProjectRoute)))).details).toEqual({ key: "projects.max", limit: 3, current: 3 });
+  });
+
   it("reports `current` as counted even when a downgrade has left it above the limit", async () => {
     await addProjects(5);
     await db.query("UPDATE workspaces SET plan_key = 'starter' WHERE id = $1", [workspaceId]); // 1 project
