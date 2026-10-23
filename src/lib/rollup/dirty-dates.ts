@@ -153,6 +153,32 @@ export async function markDateDirtyIfLate(
   logger: Logger,
   retryDelaysMs: readonly number[] = DIRTY_MARK_RETRY_DELAYS_MS,
 ): Promise<boolean> {
+  return scheduleDirtyMark(tx, fact, mark, logger, retryDelaysMs, false);
+}
+
+/**
+ * STORY-034 AC9 - a RE-PARSE rewrites the facts of a capture that may sit on ANY day, the open one included, so unlike a fresh
+ * fact it marks the date whether or not the day is closed: nothing else would tell the rollup that today's stored figures just
+ * moved. Same deferral (after commit), same bounded retry, same counters as `markDateDirtyIfLate`.
+ */
+export async function markDateDirty(
+  tx: ClientBase,
+  fact: { workspaceId: string; projectId: string; capturedAt: Date },
+  mark: (entry: DirtyEntry) => Promise<void>,
+  logger: Logger,
+  retryDelaysMs: readonly number[] = DIRTY_MARK_RETRY_DELAYS_MS,
+): Promise<boolean> {
+  return scheduleDirtyMark(tx, fact, mark, logger, retryDelaysMs, true);
+}
+
+async function scheduleDirtyMark(
+  tx: ClientBase,
+  fact: { workspaceId: string; projectId: string; capturedAt: Date },
+  mark: (entry: DirtyEntry) => Promise<void>,
+  logger: Logger,
+  retryDelaysMs: readonly number[],
+  includeOpenDay: boolean,
+): Promise<boolean> {
   // CASE is evaluated lazily, so an unrecognised stored zone yields `valid = false` instead of failing the parse's transaction
   // (`workspaces.timezone` is free text). That workspace's late facts are not marked; the skip is counted below.
   const found = await tx.query<{ valid: boolean; metric_date: string | null; closed: boolean | null }>(
@@ -169,7 +195,7 @@ export async function markDateDirtyIfLate(
     logger.warn({ event: "rollup.dirty_invalid_timezone", workspace_id: fact.workspaceId });
     return false;
   }
-  if (row.closed !== true || row.metric_date === null) return false;
+  if (row.metric_date === null || (!includeOpenDay && row.closed !== true)) return false;
 
   const entry: DirtyEntry = { workspaceId: fact.workspaceId, projectId: fact.projectId, metricDate: row.metric_date };
   afterCommit(() => {

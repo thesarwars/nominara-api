@@ -38,6 +38,8 @@ import type { RotatingSigningKeys } from "./signing.js";
     },
     QueueProducer,
   ],
-  exports: [QueueProducer],
+  // QUEUE_PRODUCER_CONNECTION is exported for the one non-job write the API makes to the queue instance: the `rollup_dirty` mark
+  // a re-parse leaves (STORY-034 AC9). The module still owns, and closes, the connection.
+  exports: [QueueProducer, QUEUE_PRODUCER_CONNECTION],
 })
 export class QueueProducerModule {}

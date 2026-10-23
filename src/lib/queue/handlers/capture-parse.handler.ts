@@ -191,12 +191,15 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
   const commit = async (tx: ClientBase, prepared: ParsePrepared, rawObject: RawObjectBody | null): Promise<void> => {
     const payload = prepared.payload;
 
+    // FOR UPDATE (STORY-034 AC9): a customer's re-parse of this capture and this job both delete-then-insert its facts; the row
+    // lock makes the second wait for the first's commit instead of interleaving with it.
     const found = await tx.query<CaptureRecord>(
       `SELECT id, project_id, run_id, prompt_id, engine_key, captured_at, status, content_hash,
               payload, response_excerpt, flags, normalizer_version, scoring_version, alias_fingerprint,
               cache_layer, source_result_id, brand_present
          FROM answer_captures
-        WHERE id = $1`,
+        WHERE id = $1
+        FOR UPDATE`,
       [payload.resultId],
     );
     const record = found.rows[0];

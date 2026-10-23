@@ -9,6 +9,7 @@ import { RESULT_DOCUMENT_SCHEMA } from "../../../contracts/tracking/index.js";
 import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
 import { assertProjectInScope } from "../../tenancy/project-scope.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { assertWithinRawRetention } from "./raw-retention.js";
 
 // STORY-034 AC7 — `GET /v1/results/{id}`, §6's parser document.
 //
@@ -41,7 +42,7 @@ interface CaptureRow {
   truncated: boolean;
   content_hash: Buffer;
   raw_object_key: string | null;
-  payload: { text?: unknown; format?: unknown } | null;
+  payload: { text?: unknown; format?: unknown; raw_expired?: unknown } | null;
   status: "captured" | "parsed" | "failed" | "blocked" | "skipped";
   error_code: string | null;
   cache_layer: "live" | "l1" | "l2";
@@ -112,6 +113,9 @@ export class ResultDocumentService {
     if (capture === undefined) throw new NotFoundError({ message: "no such result" });
     // The id names a result, not a project: a scoped member is checked against the row's own project.
     await assertProjectInScope(store.client, capture.project_id);
+    // STORY-034 AC10 - past the plan's raw-capture retention the document is gone BY POLICY: 507, never a document with the answer
+    // quietly missing and never an empty result.
+    await assertWithinRawRetention(store.client, store.context.workspaceId, { capturedAt: capture.captured_at, rawExpired: capture.payload?.raw_expired }, "result_document");
 
     const text = typeof capture.payload?.text === "string" ? capture.payload.text : "";
 

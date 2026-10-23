@@ -1,13 +1,21 @@
 import { Module } from "@nestjs/common";
+import type { Redis } from "ioredis";
 import { CacheModule } from "../../lib/cache/cache.module.js";
 import { EntitlementsModule } from "../entitlements/entitlements.module.js";
 import { MatrixController } from "./matrix.controller.js";
 import { MatrixService } from "./matrix.service.js";
 import { StorageModule } from "../../lib/storage/storage.module.js";
 import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
+import { QUEUE_PRODUCER_CONNECTION } from "../../lib/queue/queue-producer.js";
+import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
+import { rollupDirtyKey } from "../../lib/cache/valkey-keys.js";
+import { RollupDirtySet } from "../../lib/rollup/dirty-dates.js";
 import { RunEstimateService } from "./run-estimate.service.js";
 import { RunLifecycleService } from "./run-lifecycle.service.js";
 import { RawDownloadService } from "./raw-download.service.js";
+import { REPARSE_DIRTY_MARKER, ReparseService, type DirtyMarker } from "./reparse.service.js";
+import { ResultsListController } from "./results-list.controller.js";
+import { ResultsListService } from "./results-list.service.js";
 import { ResultDocumentService } from "./result-document.service.js";
 import { ResultsController } from "./results.controller.js";
 import { RunsController } from "./runs.controller.js";
@@ -30,7 +38,26 @@ import { TrackingService } from "./tracking.service.js";
 // download (STORY-181) is the first request path to need the TenantObjectStore.
 @Module({
   imports: [CacheModule, EntitlementsModule, QueueProducerModule, StorageModule],
-  controllers: [TrackingController, RunsController, MatrixController, ResultsController],
-  providers: [TrackingService, RunEstimateService, RunLifecycleService, MatrixService, ResultDocumentService, RawDownloadService],
+  controllers: [TrackingController, RunsController, MatrixController, ResultsController, ResultsListController],
+  providers: [
+    TrackingService,
+    RunEstimateService,
+    RunLifecycleService,
+    MatrixService,
+    ResultDocumentService,
+    RawDownloadService,
+    ResultsListService,
+    ReparseService,
+    {
+      // STORY-034 AC9 - a re-parse marks its capture's date dirty on the QUEUE instance (noeviction, persistent), the same set the
+      // capture.parse worker writes. The API process holds no other handle on it.
+      provide: REPARSE_DIRTY_MARKER,
+      useFactory: (redis: Redis): DirtyMarker => {
+        const set = new RollupDirtySet(redis, rollupDirtyKey(cacheKeyNamespace()));
+        return (entry) => set.mark(entry);
+      },
+      inject: [QUEUE_PRODUCER_CONNECTION],
+    },
+  ],
 })
 export class TrackingModule {}

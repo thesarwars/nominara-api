@@ -1,9 +1,9 @@
 import { Injectable, Logger } from "@nestjs/common";
-import { NotFoundError, RetentionExceededError } from "../../api/errors/domain-errors.js";
+import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { StorageTenancyError } from "../../lib/storage/storage-keys.js";
 import { TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
-import { resolveRetentionCutoff, resolveWorkspaceRetention } from "../../workers/rollup/retention.js";
+import { assertWithinRawRetention } from "./raw-retention.js";
 import { assertProjectInScope } from "../../tenancy/project-scope.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 
@@ -40,12 +40,7 @@ export class RawDownloadService {
 
     // RETENTION BEFORE EXISTENCE. Past the plan's raw-capture window the answer is gone BY POLICY, which is 507, not "never had one".
     // Two ways to be past it: the row is older than the window, or the retention sweep already expired it (key nulled, flagged).
-    const retention = await resolveWorkspaceRetention(tenant.client, tenant.context.workspaceId);
-    const cutoff = resolveRetentionCutoff(retention.rawCapturesDays, new Date());
-    if (capture.raw_expired === "true" || (cutoff !== null && capture.captured_at < cutoff)) {
-      incrementCounter("nominara_capture_raw_download_total", { outcome: "retention_exceeded" });
-      throw new RetentionExceededError({ message: "this capture is past the workspace's raw-capture retention" });
-    }
+    await assertWithinRawRetention(tenant.client, tenant.context.workspaceId, { capturedAt: capture.captured_at, rawExpired: capture.raw_expired }, "raw_download");
 
     // A legacy row (captured before raw objects existed) or a reused row has no object of its own: nothing to redirect to. A reused
     // row is NEVER pointed at its source's object, which may belong to another workspace's shared-cache entry.
