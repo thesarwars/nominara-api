@@ -118,24 +118,46 @@ describe("STORY-077 · plan:set resumes what a downgrade paused", () => {
     expect(result.notices[0]).toMatchObject({ to: "billing@example.com" });
     expect(result.notices[0]!.textBody).toContain("P0");
 
-    // STORY-077 owner decision 2026-10-23 (2): the email is RECORDED in the same transaction, keyed by the operator's
-    // ticket, for the billing.downgrade_notice job to send (and retry); nothing is sent yet.
+    // STORY-077 owner decision 2026-10-23 (2): the email is RECORDED in the same transaction, for the
+    // billing.downgrade_notice job to send (and retry); nothing is sent yet. Review round 2: keyed by the PLAN CHANGE
+    // (the ticket and the entitlement version the change produced), never by the free-text ticket alone, which an
+    // operator reuses across changes on one support case.
+    const key = `TICKET-77#v${String(result.outcome.entitlementVersion)}`;
+    expect(result.noticeRequestId).toBe(key);
     const recorded = await db.query<{ id: string; request_id: string; kind: string; recipient: string; sent_at: Date | null }>(
       "SELECT id, request_id, kind, recipient, sent_at FROM downgrade_notices WHERE workspace_id = $1",
       [ws],
     );
-    expect(recorded.rows).toEqual([{ id: result.notices[0]!.id, request_id: "TICKET-77", kind: "resumed", recipient: "billing@example.com", sent_at: null }]);
-    // The same ticket recording again records nothing new (and so enqueues nothing new): (workspace, request, kind) is the key.
+    expect(recorded.rows).toEqual([{ id: result.notices[0]!.id, request_id: key, kind: "resumed", recipient: "billing@example.com", sent_at: null }]);
+    // The same plan change recording again records nothing new (and so enqueues nothing new): (workspace, request, kind) is the key.
     const client = await pool.connect();
     try {
       const again = await withTenantContext(client, { workspaceId: ws, actorId: SYSTEM_ACTOR_ID }, (tx) =>
-        recordDowngradeNotices(tx, ws, "TICKET-77", [{ kind: "resumed", message: { to: "billing@example.com", subject: "s", textBody: "b" } }]),
+        recordDowngradeNotices(tx, ws, key, [{ kind: "resumed", message: { to: "billing@example.com", subject: "s", textBody: "b" } }]),
       );
       expect(again).toEqual([]);
     } finally {
       client.release();
     }
     expect((await db.query("SELECT 1 FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'resumed'", [ws])).rowCount).toBe(1);
+  });
+
+  // Review round 2 (minor): the notice used to be keyed by the ticket alone, so a SECOND plan change under the same
+  // support ticket that also resumed something hit ON CONFLICT DO NOTHING and its email was dropped without a trace.
+  // The old assertion ("the same ticket recording again records nothing new") encoded that; it is replaced by this one.
+  it("a SECOND plan:set under the SAME ticket that resumes more records and returns its OWN resume notice", async () => {
+    // An operator-billed workspace: on a Stripe row the first comp makes it Stripe-tracked and plan:set refuses the second.
+    const ws = await cancelledToFree("operator");
+    await downgradePausedProjects(ws, 3); // starter allows 1, growth 3
+    const first = await planSet(ws, "starter");
+    expect(first.notices).toHaveLength(1);
+    const second = await planSet(ws, "growth");
+    expect(second.outcome).toMatchObject({ changed: true, from: "starter", to: "growth" });
+    expect(second.notices, "the second change's email is recorded, not swallowed by the first").toHaveLength(1);
+    expect(second.notices[0]!.textBody).toContain("P1");
+    expect(second.noticeRequestId).not.toBe(first.noticeRequestId);
+    const rows = await db.query<{ request_id: string }>("SELECT request_id FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'resumed' ORDER BY created_at", [ws]);
+    expect(rows.rows.map((r) => r.request_id)).toEqual([first.noticeRequestId, second.noticeRequestId]);
   });
 
   it("a full comp (growth: 3 projects) resumes every paused project", async () => {

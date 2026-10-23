@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { ProjectsService } from "./projects.service.js";
 import { DomainError } from "../../api/errors/domain-errors.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
@@ -8,6 +9,8 @@ import { GuardedFetchRefusal } from "../../lib/net/guarded-fetch.js";
 import { isGloballyReachable } from "../../lib/net/address-rules.js";
 import { toRegistrableDomain } from "../../lib/net/registrable-domain.js";
 import type { UrlGuard } from "../../lib/net/url-guard.service.js";
+
+vi.mock("../../lib/telemetry/metrics.js", () => ({ incrementCounter: vi.fn() }));
 
 // STORY-043 — the unit-level half. Scenarios needing real RLS and a real
 // worker are integration; these are the ones about ORDER and REFUSAL, which
@@ -151,6 +154,25 @@ describe("STORY-043 · ProjectsService.create", () => {
     expect((error as DomainError).code).toBe("entitlement_exceeded");
     expect((error as DomainError).details).toEqual({ key: "projects.max", limit: 3, current: 3 });
     expect(calls.some((c) => c.sql.includes("INSERT INTO projects")), "nothing is inserted").toBe(false);
+  });
+
+  // Review round 2 (minor): every creation now takes the workspace lock, and a wait past its bound was counted as
+  // nominara_workspace_lock_wait_exceeded_total{path="prompt_activation"}, so POST /projects' 503s were reported under
+  // the wrong path. The creation names its own.
+  it("STORY-077 — a creation's lock-wait timeout is a 503 counted under path=\"project_create\"", async () => {
+    vi.mocked(incrementCounter).mockClear();
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes("FROM workspaces WHERE id = $1 FOR UPDATE")) throw Object.assign(new Error("lock timeout"), { code: "55P03" });
+          return { rows: [{ "?column?": 1 }] };
+        }),
+      },
+    } as never);
+    const error = await service().create(WS, ACTOR, { root_url: "https://hubspot.com" }, 1).catch((e: unknown) => e);
+    expect((error as DomainError).code).toBe("degraded");
+    expect(vi.mocked(incrementCounter)).toHaveBeenCalledWith("nominara_workspace_lock_wait_exceeded_total", { path: "project_create" });
+    expect(vi.mocked(incrementCounter)).not.toHaveBeenCalledWith("nominara_workspace_lock_wait_exceeded_total", { path: "prompt_activation" });
   });
 
   it("a failing enqueue does not fail the creation — the project already exists", async () => {

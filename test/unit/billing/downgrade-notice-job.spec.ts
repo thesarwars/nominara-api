@@ -1,6 +1,9 @@
+import { Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import type { Job } from "bullmq";
 import type { ClientBase, Pool } from "pg";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { downgradeNoticeJobKey } from "../../../src/lib/billing/downgrade-notice-outbox.js";
 import { signQueueJobPayload } from "../../../src/lib/queue/envelope.js";
 import { handlerFor, type QueueHandlerContext } from "../../../src/lib/queue/handlers.js";
@@ -143,5 +146,42 @@ describe("STORY-077 owner decision 2026-10-23 · the downgrade notice is a signe
     expect(downgradeNoticeJobKey(WS, "evt_1", "paused")).not.toBe(downgradeNoticeJobKey(WS, "evt_1", "resumed"));
     expect(downgradeNoticeJobKey(WS, "evt_1", "paused")).not.toBe(downgradeNoticeJobKey(WS, "evt_2", "paused"));
     expect(downgradeNoticeJobKey(WS, "evt_1", "paused")).toMatch(new RegExp(`^dgnotice:${WS}:[0-9a-f]+:paused$`));
+  });
+
+  // Review round 2 (minor): the observability convention is one span and log lines that carry the workspace id. The
+  // handler's lines carried the notice id only, and it opened no span, unlike billing-customer-email.handler.
+  describe("observability", () => {
+    const exporter = new InMemorySpanExporter();
+    beforeAll(() => {
+      trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }));
+    });
+    afterEach(() => {
+      exporter.reset();
+      vi.restoreAllMocks();
+    });
+    function captureLogs(): unknown[] {
+      const lines: unknown[] = [];
+      for (const level of ["log", "warn", "error"] as const) vi.spyOn(Logger.prototype, level).mockImplementation((message: unknown) => void lines.push(message));
+      return lines;
+    }
+
+    it("a sent notice: the 'sent' line carries workspace_id, and one 'billing.downgrade_notice.send' span names the workspace", async () => {
+      const lines = captureLogs();
+      await processor(harness(ROW), senderThat(async () => undefined))(signedJob());
+      expect(lines).toContainEqual(expect.objectContaining({ event: "billing.downgrade_notice.sent", notice_id: NOTICE, workspace_id: WS }));
+      const spans = exporter.getFinishedSpans().filter((s) => s.name === "billing.downgrade_notice.send");
+      expect(spans).toHaveLength(1);
+      expect(spans[0]!.attributes["nominara.workspace_id"]).toBe(WS);
+      expect(spans[0]!.status.code).not.toBe(SpanStatusCode.ERROR);
+    });
+
+    it("a failed send: the 'send_failed' line carries workspace_id, and the span is marked ERROR", async () => {
+      const lines = captureLogs();
+      await expect(processor(harness(ROW), senderThat(async () => Promise.reject(new Error("resend 503"))))(signedJob())).rejects.toThrow("resend 503");
+      expect(lines).toContainEqual(expect.objectContaining({ event: "billing.downgrade_notice.send_failed", notice_id: NOTICE, workspace_id: WS }));
+      const spans = exporter.getFinishedSpans().filter((s) => s.name === "billing.downgrade_notice.send");
+      expect(spans).toHaveLength(1);
+      expect(spans[0]!.status.code).toBe(SpanStatusCode.ERROR);
+    });
   });
 });
