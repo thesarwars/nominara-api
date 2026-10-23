@@ -1,8 +1,9 @@
 import "reflect-metadata";
-import { APP_INTERCEPTOR } from "@nestjs/core";
+import { APP_FILTER, APP_INTERCEPTOR } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { Test } from "@nestjs/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ProblemFilter } from "../../api/filters/problem.filter.js";
 import { ResponseEnvelopeInterceptor } from "../../api/interceptors/response-envelope.interceptor.js";
 import { NotFoundError, RetentionExceededError } from "../../api/errors/domain-errors.js";
 import { RawDownloadService } from "./raw-download.service.js";
@@ -27,6 +28,7 @@ describe("STORY-181 AC4 · GET /results/{id}/raw on the wire", () => {
         { provide: ResultDocumentService, useValue: {} },
         { provide: RawDownloadService, useValue: { signedUrl: () => outcome() } },
         { provide: APP_INTERCEPTOR, useClass: ResponseEnvelopeInterceptor },
+        { provide: APP_FILTER, useClass: ProblemFilter },
       ],
     }).compile();
     app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
@@ -51,14 +53,17 @@ describe("STORY-181 AC4 · GET /results/{id}/raw on the wire", () => {
     expect(response.headers["cache-control"]).toBe("no-store");
   });
 
-  it("181-H3 · a refusal is not a redirect: 404 and 507 carry no Location", async () => {
+  it("181-H3 · a refusal is not a redirect: 404 not_found and 507 retention_exceeded on the wire, with no Location", async () => {
     outcome = () => Promise.reject(new NotFoundError({ message: "this capture has no stored raw object" }));
     const missing = await app.inject({ method: "GET", url: "/results/0197a000-0000-7000-8000-0000000000aa/raw" });
-    expect(missing.statusCode).not.toBe(302);
+    expect(missing.statusCode).toBe(404);
     expect(missing.headers.location).toBeUndefined();
+    expect(missing.json()).toMatchObject({ error: { code: "not_found" } });
 
     outcome = () => Promise.reject(new RetentionExceededError({ message: "past retention" }));
     const expired = await app.inject({ method: "GET", url: "/results/0197a000-0000-7000-8000-0000000000aa/raw" });
+    expect(expired.statusCode).toBe(507);
     expect(expired.headers.location).toBeUndefined();
+    expect(expired.json()).toMatchObject({ error: { code: "retention_exceeded" } });
   });
 });
