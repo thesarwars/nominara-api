@@ -26,11 +26,12 @@ import { answeredStatusSql } from "../rollup/aggregate-day.js";
 // rule, so with no activity anywhere nothing changes), then id. Downgrade-paused rows rank after the rest so a later
 // reconcile never swaps a tracked row for a paused one: their activity stopped when they were paused.
 //
-// ⚠ PROJECTS are counted as the guard and the preview count them (every non-deleted project, archived included), so
-// the paused projects are the ones the confirmation named. A project that is NOT TRACKING and not ours to resume (archived,
-// or paused by a person) HOLDS ITS SLOT: `projectKeepOrder` ranks it ahead of everything, the choice included (review
-// round 1). Ranked by activity it could soak up the excess behind a choice, and the next reconcile with no choice (an
-// add-on change, plan:set) would rank it back and pause a chosen project; ranked first, the default and the choice agree.
+// ⚠ PROJECTS (owner decision 2026-10-23, replacing review round 1's "holds its slot"): an ARCHIVED project, or one a
+// PERSON paused, USES NO PLAN SLOT (`usesNoSlot`). The planner ranks only the projects billing may pause or resume - the
+// tracking ones (active, initializing) and the ones a downgrade paused - so after any plan the TRACKING count is within
+// `projects.max`, exactly what the creation guard counts (structural-usage.ts `PROJECT_USES_SLOT`) and the preview
+// names. The other half of the rule is project-reactivation.ts: leaving archived or paused needs room, so archiving is
+// not a way around the limit.
 //
 // ⚠ PROMPTS are reconciled on the ACTIVE count (review round 2), the count the resume guard (active-limit.ts) holds a
 // person to. The customer is left tracking exactly what the plan allows, never fewer: a paused project takes its
@@ -40,9 +41,10 @@ import { answeredStatusSql } from "../rollup/aggregate-day.js";
 // ⚠ A PERSON'S PAUSE IS NEVER OURS. A row a person paused carries no marker: it is never marked (not taken over) and
 // never resumed by billing.
 //
-// ⚠ SLOT COUNTS ARE NOT CHANGED BY A DOWNGRADE PAUSE (planner open question 1, option a): a paused row still occupies
-// its slot, so the creation guards refuse the NEXT creation until the customer deletes or upgrades. The pause stops
-// tracking (the scheduler only claims `status = 'active'` projects) and keeps every row.
+// ⚠ A DOWNGRADE PAUSE (planner open question 1, option a) keeps every row. A paused PROMPT still occupies its slot
+// (PROMPT_OCCUPIES_SLOT). A paused PROJECT no longer counts (owner 2026-10-23), but the cut-over leaves exactly
+// `projects.max` tracking, so the creation guard still refuses the NEXT project until the customer archives, deletes or
+// upgrades. The pause stops tracking (the scheduler only claims `status = 'active'` projects).
 
 export interface PauseLimits {
   /** `projects.max`; null = unlimited. */
@@ -136,17 +138,12 @@ export function keepOrder<T extends Rankable>(rows: readonly T[], kept?: Readonl
   });
 }
 
-/** A project that occupies a slot without tracking and that billing never pauses or resumes: archived, or paused by a person. */
-export function holdsSlotUntracked(project: Pick<PauseProject, "status" | "pausedByDowngrade">): boolean {
-  return project.status === "archived" || (project.status === "paused" && !project.pausedByDowngrade);
-}
-
 /**
- * The order for PROJECTS (review round 1): those that hold their slot without tracking (`holdsSlotUntracked`) first, so
- * they never take the excess in place of a tracking project, then `keepOrder` (the choice first) for the rest.
+ * A project that USES NO PLAN SLOT (owner decision 2026-10-23): archived, or paused by a person. Billing never counts,
+ * pauses or resumes it; leaving that state needs room under `projects.max` (project-reactivation.ts).
  */
-export function projectKeepOrder<T extends PauseProject>(projects: readonly T[], kept?: ReadonlySet<string>): T[] {
-  return [...keepOrder(projects.filter(holdsSlotUntracked), kept), ...keepOrder(projects.filter((p) => !holdsSlotUntracked(p)), kept)];
+export function usesNoSlot(project: Pick<PauseProject, "status" | "pausedByDowngrade">): boolean {
+  return project.status === "archived" || (project.status === "paused" && !project.pausedByDowngrade);
 }
 
 /** The order a pause takes rows in: the end of `keepOrder` first. */
@@ -163,9 +160,9 @@ function excessOf<T extends Rankable>(rows: readonly T[], limit: number | null, 
 /**
  * Pure: what the cut-over (or a later upgrade) must pause and resume.
  *
- * PROJECTS: the excess is the last N in `projectKeepOrder` of every non-deleted project (the guard's and the preview's
- * count; archived and person-paused first, as they hold their slots). An active/initializing project in it is paused and
- * marked; a marked project out of it is resumed.
+ * PROJECTS: the excess is the last N in `keepOrder` of the projects that use a slot or were paused by a downgrade
+ * (`usesNoSlot` excludes archived and person-paused ones: owner decision 2026-10-23). An active/initializing project in
+ * it is paused and marked; a marked project out of it is resumed.
  *
  * PROMPTS (review round 2): the target is the ACTIVE count, never the slot count, so the customer is left tracking
  * exactly what the new limits allow - never fewer:
@@ -180,7 +177,7 @@ function excessOf<T extends Rankable>(rows: readonly T[], limit: number | null, 
  * no limit finds the active count already within it and pauses nothing - so a prompt a person resumed stays resumed.
  */
 export function planDowngradePause(limits: PauseLimits, projects: readonly PauseProject[], prompts: readonly PausePrompt[], keep?: KeepChoice): DowngradePausePlan {
-  const { pausedFor: _reasons, excessProjects: _excess, ...plan } = planDowngradePauseWithReasons(limits, projects, prompts, keep);
+  const { pausedFor: _reasons, ...plan } = planDowngradePauseWithReasons(limits, projects, prompts, keep);
   return plan;
 }
 
@@ -188,7 +185,7 @@ export function planDowngradePause(limits: PauseLimits, projects: readonly Pause
 export type PromptPauseReason = "with_project" | "per_project" | "total";
 
 /**
- * `planDowngradePause`, plus WHY each paused prompt is paused and which projects are the excess. The preview
+ * `planDowngradePause`, plus WHY each paused prompt is paused. The preview
  * (downgrade-excess.ts, review round 3) and the keep view (downgrade-keep.service.ts) run this same planner as a dry run,
  * so what they name is the cut-over's own, never a second rule.
  *
@@ -202,8 +199,11 @@ export function planDowngradePauseWithReasons(
   projects: readonly PauseProject[],
   prompts: readonly PausePrompt[],
   keep?: KeepChoice,
-): DowngradePausePlan & { readonly pausedFor: ReadonlyMap<string, PromptPauseReason>; readonly excessProjects: readonly string[] } {
-  const rankedProjects = projectKeepOrder(projects, keep?.projectIds);
+): DowngradePausePlan & { readonly pausedFor: ReadonlyMap<string, PromptPauseReason> } {
+  const rankedProjects = keepOrder(
+    projects.filter((p) => !usesNoSlot(p)),
+    keep?.projectIds,
+  );
   const excess = new Set(limits.projects === null || rankedProjects.length <= limits.projects ? [] : rankedProjects.slice(limits.projects).map((p) => p.id));
   const projectsToPause = [...rankedProjects].reverse();
   const pauseProjects = projectsToPause.filter((p) => excess.has(p.id) && !p.pausedByDowngrade && (p.status === "active" || p.status === "initializing")).map((p) => p.id);
@@ -281,7 +281,6 @@ export function planDowngradePauseWithReasons(
     pausePrompts: pauseOrder(prompts, keptPrompts).filter((p) => pause.has(p.id)).map((p) => p.id),
     resumePrompts: keepOrder(prompts, keptPrompts).filter((p) => resume.has(p.id)).map((p) => p.id),
     pausedFor: pause,
-    excessProjects: projectsToPause.filter((p) => excess.has(p.id)).map((p) => p.id),
   };
 }
 

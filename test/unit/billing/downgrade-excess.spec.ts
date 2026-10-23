@@ -240,14 +240,16 @@ describe("STORY-077 review round 3 · the preview's paused counts are the cut-ov
     expect(previewedPrompts(r.structural)).toBe(cutOverPauses("growth", u, { "prompts.max_total": 100 }).pausePrompts.length);
   });
 
-  it("a project a downgrade ALREADY paused is named with 0 prompts (they are paused already); seats and other must_reduce keys carry no `paused`", () => {
+  it("OWNER 2026-10-23 · a project a downgrade ALREADY paused uses no slot: it is not counted, and with one tracking project against 1 there is no projects.max entry; seats and other must_reduce keys carry no `paused`", () => {
+    // Replaces the old assertion (B counted, named with 0 prompts, `paused: 0`): the guard's count is now the ONE tracking
+    // project, which fits Starter's 1, so the cut-over pauses no project and none is named.
     const u = usage({
-      workspace: { "projects.max": 2, "prompts.max_total": 10, "seats.max": 9, "api.keys_max": 0 },
+      workspace: { "projects.max": 1, "prompts.max_total": 10, "seats.max": 9, "api.keys_max": 0 },
       projects: [project(P2, "B", 5, 0, "paused", true, at(1)), project(P1, "A", 5, 0, "active", false, at(0))],
       slotPrompts: [...rows(P1, 5, 10), ...rows(P2, 5, 100, "paused", true)],
     });
     const r = run("growth", "starter", u);
-    expect(r.structural[0]).toEqual({ kind: "structural", key: "projects.max", limit: 1, current: 2, excess: 1, effect: "paused_at_period_end", paused: 0, items: [{ id: P2, name: "B", prompts: 0 }] });
+    expect(r.structural.find((e) => e.kind === "structural" && e.key === "projects.max")).toBeUndefined();
     const seats = r.structural.find((e) => e.kind === "structural" && e.key === "seats.max");
     expect(seats).toBeDefined();
     expect(seats).not.toHaveProperty("paused");

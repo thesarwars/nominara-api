@@ -203,7 +203,7 @@ describe("STORY-069 · EntitlementGuard: structural limits and feature flags nev
 
     const [paused, downgradePaused] = [uuidV7(), uuidV7()];
     for (const [id, slug] of [[paused, "pp"], [downgradePaused, "dp"]] as const) {
-      await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, status) VALUES ($1, $2, $3, $3, 'https://example.com', 'example.com', 'active')`, [id, workspaceId, slug]);
+      await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, status) VALUES ($1, $2, $3, $4, 'https://example.com', 'example.com', 'active')`, [id, workspaceId, slug, slug]);
     }
     expect((await refusalFrom(() => guard.canActivate(makeContext(request(), CreateProjectRoute)))).details).toEqual({ key: "projects.max", limit: 3, current: 4 });
     await db.query("UPDATE projects SET status = 'paused' WHERE id = $1", [paused]);

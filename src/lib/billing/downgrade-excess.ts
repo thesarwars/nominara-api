@@ -132,13 +132,12 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
     if (limit === null || used <= limit) continue;
     const excess = used - limit;
     if (key === "projects.max") {
-      // The excess is the planner's own (STORY-077 D2: the least recently active, in the order the cut-over pauses them).
-      // Every one is COUNTED (the guard's count), but only those the cut-over pauses - or a downgrade already paused - are
-      // NAMED as paused: an archived or person-paused project in the excess is not tracked and is never paused.
+      // The planner's own (STORY-077 D2: the least recently active, in the order the cut-over pauses them). The guard
+      // counts TRACKING projects (owner decision 2026-10-23), so the excess is exactly what the cut-over pauses: an
+      // archived, person-paused or already downgrade-paused project is neither counted nor named.
       const byId = new Map(input.usage.projects.map((p) => [p.id, p]));
-      const items = plan.excessProjects
+      const items = plan.pauseProjects
         .map((id) => byId.get(id)!)
-        .filter((p) => p.pausedByDowngrade || p.status === "active" || p.status === "initializing")
         .slice(0, MAX_NAMED_PROJECTS)
         .map((p) => ({ id: p.id, name: p.name, prompts: pausedPrompts("with_project", p.id) }));
       structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key), paused: plan.pauseProjects.length, items });

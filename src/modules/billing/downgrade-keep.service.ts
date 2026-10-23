@@ -61,7 +61,7 @@ export class DowngradeKeepService {
       });
       const ctx = await this.context(client, workspaceId);
       const keepable = keepableOf(ctx);
-      const issues = validateKeepChoice(request, keepable, ctx.limits, ctx.projects.length - keepable.size);
+      const issues = validateKeepChoice(request, keepable, ctx.limits);
       if (issues.length > 0) {
         this.outcome("invalid");
         throw new ValidationFailedError({ message: "the choice does not fit the plan you are moving to", details: { issues } });
@@ -148,7 +148,7 @@ export class DowngradeKeepService {
     return {
       target_plan_key: ctx.intent.to_plan_key,
       effective_at: ctx.intent.effective_at,
-      limits: { projects: ctx.limits.projects, projects_keepable: projectSlotsKeepable(ctx.limits, ctx.projects), prompts_total: ctx.limits.promptsTotal, prompts_per_project: ctx.limits.promptsPerProject },
+      limits: { projects: ctx.limits.projects, projects_keepable: projectSlotsKeepable(ctx.limits), prompts_total: ctx.limits.promptsTotal, prompts_per_project: ctx.limits.promptsPerProject },
       projects: projects.map((p) => ({
         id: p.id,
         name: p.name,
