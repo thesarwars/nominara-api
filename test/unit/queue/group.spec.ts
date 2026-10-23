@@ -32,6 +32,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "billing.auto_topup",
     // STORY-021 (ownership transfer) — not in §4 either; see ADDED_BEYOND_REFERENCE.
     "billing.customer_email",
+    // STORY-077 (owner decision 2026-10-23) — not in §4 either; see ADDED_BEYOND_REFERENCE.
+    "billing.downgrade_notice",
     // STORY-076 AC4 / STORY-071 AC10 and STORY-077 R4 — not in §4 either; see ADDED_BEYOND_REFERENCE.
     "credit.housekeeping",
     "retention.purge",

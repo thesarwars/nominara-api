@@ -119,6 +119,17 @@ describe("Resend adapter · request shape", () => {
     await adapter.send(MESSAGE);
     expect(f.calls[0]!.init.headers["Idempotency-Key"]).not.toBe(f.calls[1]!.init.headers["Idempotency-Key"]);
   });
+
+  it("STORY-077 (owner 2026-10-23) · a message that CARRIES an idempotency key sends exactly that key on every attempt and every send, so a retried job cannot deliver twice", async () => {
+    const f = fakeFetch([jsonResponse(503, { name: "application_error" }), jsonResponse(200, { id: "msg_1" })]);
+    const { adapter } = make(f.impl);
+    const keyed = { ...MESSAGE, idempotencyKey: "downgrade-notice/55555555-5555-7555-8555-555555555555" };
+    await adapter.send(keyed);
+    await adapter.send(keyed); // the job's retry: a second send() of the same notice
+    expect(f.calls.map((c) => c.init.headers["Idempotency-Key"])).toEqual(Array(3).fill(keyed.idempotencyKey));
+    expect((f.calls[0]!.body.headers as Record<string, string>)["X-Entity-Ref-ID"]).toBe(keyed.idempotencyKey);
+    expect(f.calls[0]!.body, "the key is not part of the message body").not.toHaveProperty("idempotencyKey");
+  });
 });
 
 describe("Resend adapter · retries", () => {

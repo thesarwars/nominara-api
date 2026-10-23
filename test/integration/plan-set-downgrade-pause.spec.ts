@@ -116,6 +116,18 @@ describe("STORY-077 · plan:set resumes what a downgrade paused", () => {
     expect(result.notices).toHaveLength(1);
     expect(result.notices[0]).toMatchObject({ to: "billing@example.com" });
     expect(result.notices[0]!.textBody).toContain("P0");
+
+    // STORY-077 owner decision 2026-10-23 (2): the email is RECORDED in the same transaction, keyed by the operator's
+    // ticket, for the billing.downgrade_notice job to send (and retry); nothing is sent yet.
+    const recorded = await db.query<{ id: string; request_id: string; kind: string; recipient: string; sent_at: Date | null }>(
+      "SELECT id, request_id, kind, recipient, sent_at FROM downgrade_notices WHERE workspace_id = $1",
+      [ws],
+    );
+    expect(recorded.rows).toEqual([{ id: result.notices[0]!.id, request_id: "TICKET-77", kind: "resumed", recipient: "billing@example.com", sent_at: null }]);
+    // The same ticket run again records nothing new (and so enqueues nothing new).
+    await planSet(ws, "growth");
+    await planSet(ws, "starter");
+    expect((await db.query("SELECT 1 FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'resumed'", [ws])).rowCount).toBe(1);
   });
 
   it("a full comp (growth: 3 projects) resumes every paused project", async () => {
