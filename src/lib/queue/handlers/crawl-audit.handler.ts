@@ -14,6 +14,8 @@ import {
   type SiteFileFinding,
 } from "../../../../contracts/aux/index.js";
 import { loadAuxCatalog, type AuxCatalog } from "../../aux/catalog.js";
+import { generateSiteFilePatch, type SiteInputs } from "../../aux/patches/generate.js";
+import { PatchRejectedError, type PatchDraft } from "../../aux/patches/types.js";
 import {
   findingFingerprint,
   milestoneKindFor,
@@ -261,6 +263,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     readonly llmsWellKnown: Fetched;
     readonly sitemap: Fetched;
     readonly sitemapUrl: string;
+    /** The site's own page URLs from its sitemap: the only source a generated llms.txt takes links from. */
+    readonly sitemapUrls: readonly string[];
     readonly allSiteFileUrls: string[];
     readonly detected: (DetectedFinding & { readonly source: SiteFileFinding })[];
     readonly covered: ReadonlySet<string>;
@@ -617,6 +621,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       llmsWellKnown,
       sitemap,
       sitemapUrl,
+      sitemapUrls: sitemapResult.urls.map((e) => e.loc),
       allSiteFileUrls: [...Object.values(urls), sitemapUrl, ...pagesToCrawl],
       detected,
       covered,
@@ -647,7 +652,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // Re-check and LOCK the project first. `run` held no transaction, so the project may have been soft-deleted since `prepare`: write
     // nothing for it. FOR NO KEY UPDATE also serialises the reconciliation of two audits of one project (the second waits here, then
     // reads the first's findings) and does not block the foreign-key share locks other writers take on the project.
-    const project = await tx.query("SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE", [payload.projectId]);
+    const project = await tx.query<{ name: string }>("SELECT name FROM projects WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE", [payload.projectId]);
     if (project.rows.length === 0) {
       incrementCounter("nominara_aux_crawl_commit_total", { outcome: "project_gone" });
       logger.log(`project ${payload.projectId} was deleted during audit ${payload.auditId}; writing nothing`);
@@ -749,6 +754,30 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     }
     if (milestonesPinned > 0) for (let i = 0; i < milestonesPinned; i += 1) incrementCounter("nominara_aux_milestones_pinned_total", {});
 
+    // COPY-READY PATCHES (STORY-053). Pure CPU over what the crawl already fetched: no request, no model, no charge.
+    const isOk = (f: Fetched): f is Extract<Fetched, { responded: true }> => f.responded && f.status >= 200 && f.status < 300;
+    const site: SiteInputs = {
+      origin,
+      siteName: project.rows[0]!.name,
+      projectId: payload.projectId,
+      pageUrls: outcome.sitemapUrls,
+      robots: isOk(outcome.robots) && outcome.robotsHash !== null ? { body: outcome.robots.file.body, hash: outcome.robotsHash } : null,
+      llms: isOk(outcome.llms) ? { body: outcome.llms.file.body } : null,
+    };
+    const patchStats = await tracer.startActiveSpan("crawl.audit.patches", async (span) => {
+      try {
+        const stats = await writePatches(tx, { payload, detected, site, logger });
+        span.setAttribute("nominara.aux.patches_written", stats.written);
+        span.setAttribute("nominara.aux.patches_rejected", stats.rejected);
+        return stats;
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+
     // TASK GENERATION (AC10): a finding that is NEW, or RETURNED (a regression raises its band), and sits at or above its rule's task
     // threshold asks for one `task.generate` evaluation of the project, narrowed to the AUX finding rules. A re-detection of a finding
     // already known asks for nothing: its task, if it earned one, exists or was dismissed. One job per qualifying finding, keyed as the
@@ -844,6 +873,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       resolved: actions.filter((a) => a.kind === "resolve").length,
       staled: actions.filter((a) => a.kind === "stale").length,
       milestones: milestonesPinned,
+      patches: patchStats.written,
+      patches_rejected: patchStats.rejected,
       regressed: actions.filter((a) => a.kind === "regress").length,
       duration_ms: Date.now() - startedMs,
       started_at: startedAt.toISOString(),
@@ -971,4 +1002,72 @@ async function applyAction(
       return (pinned.rowCount ?? 0) > 0;
     }
   }
+}
+
+/**
+ * Writes the copy-ready patch for each finding this audit DETECTED and that is still live (open, acknowledged, in progress,
+ * regressed; a will-not-fix finding is excluded from the score and from the work, so no patch is offered for it).
+ *
+ * A patch is IMMUTABLE: a finding re-detected with the same content and the same precondition writes nothing, and one whose
+ * content or precondition changed gets a NEW row, so the artifact the customer already copied stays retrievable. A generator whose
+ * own output fails a gate (it would block an agent, the markup is prohibited) is recorded and counted and offers NO patch: the audit
+ * and its findings are unaffected. Anything else a generator throws is a bug and fails the job.
+ */
+async function writePatches(
+  tx: ClientBase,
+  args: { payload: { projectId: string; workspaceId: string }; detected: readonly DetectedFinding[]; site: SiteInputs; logger: Logger },
+): Promise<{ written: number; rejected: number }> {
+  const { payload, detected, site, logger } = args;
+  if (detected.length === 0) return { written: 0, rejected: 0 };
+  const live = await tx.query<{ id: string; fp: string; rule_code: string; url: string | null }>(
+    `SELECT id, encode(fingerprint, 'hex') AS fp, rule_code, url FROM aux_findings
+      WHERE project_id = $1 AND fingerprint = ANY($2::bytea[]) AND status = ANY($3::text[])`,
+    [payload.projectId, detected.map((d) => Buffer.from(d.fingerprint, "hex")), OPEN_STATUSES],
+  );
+  let written = 0;
+  let rejected = 0;
+  for (const row of live.rows) {
+    let draft: PatchDraft | null = null;
+    try {
+      const generated = generateSiteFilePatch({ ruleCode: row.rule_code, targetUrl: row.url ?? site.origin, url: row.url, site });
+      if (generated.outcome === "patch") draft = generated.draft;
+    } catch (error) {
+      if (!(error instanceof PatchRejectedError)) throw error;
+      rejected += 1;
+      incrementCounter("nominara_aux_patch_rejected_total", { reason: error.reason });
+      // IDs and the reason code only: never the file's text.
+      logger.warn({ event: "aux.patch.rejected", workspace_id: payload.workspaceId, project_id: payload.projectId, finding_id: row.id, rule_code: row.rule_code, reason: error.reason });
+      continue;
+    }
+    if (draft === null) continue;
+
+    const latest = await tx.query<{ kind: string; target_url: string; content_before_hash: Buffer; content_after: string }>(
+      "SELECT kind, target_url, content_before_hash, content_after FROM patches WHERE finding_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+      [row.id],
+    );
+    const prior = latest.rows[0];
+    if (
+      prior !== undefined &&
+      prior.kind === draft.kind &&
+      prior.target_url === draft.targetUrl &&
+      prior.content_after === draft.contentAfter &&
+      prior.content_before_hash.equals(draft.contentBeforeHash)
+    ) {
+      continue;
+    }
+    await tx.query(
+      `INSERT INTO patches
+         (workspace_id, project_id, finding_id, rule_code, target_url, kind, unified_diff, content_before_hash, content_after, jsonld_blocks,
+          reversal, preconditions, explanation, derivation, requires_human_review, review_reason, risk_flags)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17::jsonb)`,
+      [
+        payload.workspaceId, payload.projectId, row.id, draft.ruleCode, draft.targetUrl, draft.kind, draft.unifiedDiff, draft.contentBeforeHash,
+        draft.contentAfter, draft.jsonldBlocks === null ? null : JSON.stringify(draft.jsonldBlocks), JSON.stringify(draft.reversal),
+        JSON.stringify(draft.preconditions), draft.explanation, draft.derivation, draft.requiresHumanReview, draft.reviewReason, JSON.stringify(draft.riskFlags),
+      ],
+    );
+    written += 1;
+    incrementCounter("nominara_aux_patches_generated_total", { kind: draft.kind, rule_code: draft.ruleCode });
+  }
+  return { written, rejected };
 }
