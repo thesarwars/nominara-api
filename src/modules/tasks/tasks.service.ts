@@ -24,6 +24,7 @@ import {
   type TaskBaselineMetrics,
   type TaskPlaybookPayload,
 } from "../../../contracts/tasks/index.js";
+import { GOAL_CONTRIBUTES_SQL } from "../../lib/goals/contribution.js";
 import { refreshProjectTaskCounts } from "../../lib/rollup/refresh-project-task-counts.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type { ActionItem, ActionItemEffort, ActionItemPrimaryActionKind, ActionItemSource } from "../../../contracts/tasks/index.js";
@@ -189,6 +190,7 @@ export class TasksService {
            ${SORT_KEYS[query.sort]}
          FROM tasks t
          LEFT JOIN goals g ON g.id = t.goal_id
+         LEFT JOIN task_generation_rules r ON r.code = t.rule_code
          LEFT JOIN aux_findings af ON af.id = t.source_finding_id
          LEFT JOIN LATERAL (
            SELECT gap_severity
@@ -1253,15 +1255,17 @@ function toActionItem(row: ActionItemRow): ActionItem {
  *   impact   -impact, -priority, 0,            created_at
  *   priority -priority, -impact, 0,            created_at
  *   age      0, 0, 0,                          created_at   (oldest first)
- *   goal     unlinked-flag, goal created epoch, -impact, created_at
+ *   goal     goal created epoch (1e18 unlinked), contribution tier, -impact, created_at
  */
 const SORT_KEYS: Record<TaskSort, string> = {
   impact: "(-t.impact_score)::float8 AS k1, (-t.priority)::float8 AS k2, 0::float8 AS k3, t.created_at AS k4",
   priority: "(-t.priority)::float8 AS k1, (-t.impact_score)::float8 AS k2, 0::float8 AS k3, t.created_at AS k4",
   age: "0::float8 AS k1, 0::float8 AS k2, 0::float8 AS k3, t.created_at AS k4",
   goal:
-    "(CASE WHEN t.goal_id IS NULL THEN 1 ELSE 0 END)::float8 AS k1, " +
-    "COALESCE(EXTRACT(EPOCH FROM g.created_at), 0)::float8 AS k2, (-t.impact_score)::float8 AS k3, t.created_at AS k4",
+    // k1 groups by goal (older goal first; an unlinked task's 1e18 sorts it after every goal). k2 is the CONTRIBUTION TIER inside a
+    // goal (STORY-065): 0 for a task whose rule feeds the goal's metric within the goal's scope, 1 for the rest. k3 is impact.
+    "(CASE WHEN t.goal_id IS NULL THEN 1e18::float8 ELSE COALESCE(EXTRACT(EPOCH FROM g.created_at), 0)::float8 END) AS k1, " +
+    `(CASE WHEN ${GOAL_CONTRIBUTES_SQL} THEN 0 ELSE 1 END)::float8 AS k2, (-t.impact_score)::float8 AS k3, t.created_at AS k4`,
 };
 
 interface TaskRow {

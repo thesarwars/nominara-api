@@ -10,8 +10,9 @@ import { goalMetricSchema } from "./create-goal-request.schema.js";
 // when `sample_state` is `insufficient` (precision theatre otherwise). A
 // null `value` inside baseline/current is "not measured", never 0.
 //
-// `current` is written by the rollup (deferred); a read never recomputes it.
-// At creation it equals the baseline snapshot.
+// `current` is written by the rollup step (`refreshProjectGoals`); a read never
+// recomputes it. At creation it equals the baseline snapshot. `status`
+// `achieved` and `achieved_at` are set by that same step, never by a request.
 export const goalKindSchema = z.enum([
   "prompt_recommendation",
   "engine_score",
@@ -34,10 +35,19 @@ export const goalMeasurementSchema = z
   })
   .strict();
 
+export const goalDirectionSchema = z.enum(["up", "down"]);
+
+/**
+ * `direction` is set by the SERVER from the metric at creation and stored here. Every goal metric is higher-is-better, so it is `up`;
+ * `down` stays in the enum for a future lower-is-better metric. It decides what "reaching the target" means. Absent on a goal
+ * created before it existed, which reads as `up`.
+ */
 export const goalTargetSchema = z
   .object({
     metric: goalMetricSchema,
     target_value: z.number(),
+    direction: goalDirectionSchema.optional(),
+    engine_key: z.string().optional(),
     prompt_cluster_id: z.string().uuid().optional(),
   })
   .strict();

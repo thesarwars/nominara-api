@@ -52,14 +52,41 @@ describe("STORY-065-A · goal contracts", () => {
     expect(createGoalRequestSchema.safeParse({ ...ok, target: { ...ok.target, target_value: 100.5 } }).success).toBe(false);
     expect(createGoalRequestSchema.safeParse({ ...ok, target: { ...ok.target, target_value: -1 } }).success).toBe(false);
     expect(createGoalRequestSchema.safeParse({ ...ok, baseline: { value: 1 } }).success).toBe(false);
-    expect(createGoalRequestSchema.safeParse({ ...ok, target: { ...ok.target, engine_key: "gemini" } }).success).toBe(false);
   });
 
-  it("[STORY-065-A kinds] only engine_score and topic_authority are creatable: each of the other five kinds in the table's CHECK is refused (owner decision 2026-10-08)", () => {
-    for (const kind of ["prompt_recommendation", "citation_presence", "rendering_quality", "sentiment_recovery", "custom"]) {
-      expect(createGoalRequestSchema.safeParse({ ...ok, kind }).success, kind).toBe(false);
-      expect(createGoalRequestSchema.safeParse({ ...ok, kind, target: { ...ok.target, prompt_cluster_id: CLUSTER } }).success, `${kind} with a cluster`).toBe(false);
-    }
+  // STORY-065 AC1 — one metric per kind (planner recommendation). Each row: the kind, its metric, whether it needs a cluster, whether an engine scope is allowed.
+  const KINDS = [
+    { kind: "engine_score", metric: "visibility_score", cluster: false, engine: true },
+    { kind: "topic_authority", metric: "visibility_score", cluster: true, engine: false },
+    { kind: "citation_presence", metric: "citation_share", cluster: false, engine: true },
+    { kind: "rendering_quality", metric: "rendering_quality", cluster: false, engine: true },
+    { kind: "sentiment_recovery", metric: "sentiment_score", cluster: false, engine: true },
+    { kind: "prompt_recommendation", metric: "presence_rate", cluster: true, engine: true },
+  ] as const;
+
+  it.each(KINDS)("[STORY-065 #1] a $kind goal measures $metric: accepted with it, refused with another metric", ({ kind, metric, cluster }) => {
+    const target = { metric, target_value: 60, ...(cluster ? { prompt_cluster_id: CLUSTER } : {}) };
+    expect(createGoalRequestSchema.safeParse({ ...ok, kind, target }).success).toBe(true);
+    const wrong = metric === "visibility_score" ? "citation_share" : "visibility_score";
+    expect(createGoalRequestSchema.safeParse({ ...ok, kind, target: { ...target, metric: wrong } }).success).toBe(false);
+  });
+
+  it.each(KINDS)("[STORY-065 #1] a $kind goal: cluster required=$cluster, engine scope allowed=$engine", ({ kind, metric, cluster, engine }) => {
+    const base = { metric, target_value: 60 };
+    const withCluster = { ...base, prompt_cluster_id: CLUSTER };
+    // the cluster is required exactly where the kind is measured over one, and refused elsewhere
+    expect(createGoalRequestSchema.safeParse({ ...ok, kind, target: base }).success).toBe(!cluster);
+    expect(createGoalRequestSchema.safeParse({ ...ok, kind, target: withCluster }).success).toBe(cluster);
+    // an engine scope is accepted only where a per-engine source exists
+    const scoped = { ...(cluster ? withCluster : base), engine_key: "gemini" };
+    expect(createGoalRequestSchema.safeParse({ ...ok, kind, target: scoped }).success).toBe(engine);
+  });
+
+  it("[STORY-065-A kinds] custom stays refused until a metric source exists, and the server-derived direction is not accepted from a caller", () => {
+    expect(createGoalRequestSchema.safeParse({ ...ok, kind: "custom" }).success).toBe(false);
+    expect(createGoalRequestSchema.safeParse({ ...ok, kind: "custom", target: { metric: "custom", target_value: 5 } }).success).toBe(false);
+    expect(createGoalRequestSchema.safeParse({ ...ok, target: { ...ok.target, direction: "down" } }).success).toBe(false);
+    expect(createGoalRequestSchema.safeParse({ ...ok, target: { ...ok.target, engine_key: "Not A Key" } }).success).toBe(false);
   });
 
   it("abandon is the only caller transition: achieved, an empty body and extra keys are refused", () => {

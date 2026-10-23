@@ -3,6 +3,7 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
 import { denormalizeProject } from "../../rollup/denormalize.js";
+import { refreshProjectGoals } from "../../rollup/refresh-project-goals.js";
 import { refreshProjectGeoWindows } from "../../rollup/refresh-project-geo.js";
 import { datesWithFacts } from "../../rollup/aggregate-day.js";
 import { refreshProjectDisplacements } from "../../rollup/refresh-project-displacements.js";
@@ -141,6 +142,11 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
       // so the read endpoints only read. Same transaction and lock; reads only this
       // database (no network call), free and unmetered.
       await refreshProjectGeoWindows(tx, payload.projectId);
+
+      // STORY-065 AC2 / AC6 / AC11 — goal progress is refreshed HERE, never on read, after the denormalised figures the goals read
+      // were written. Same transaction and lock; an achievement and its system audit row commit together or not at all. It is the
+      // LAST step: an achievement's audit append takes the workspace's audit-chain lock until commit, and no later step may wait on it.
+      await refreshProjectGoals(tx, payload.projectId);
 
       // NEW-C-15 — owner decision 2026-10-08: brand presence is verified AFTER the rollup. The verify
       // job fetches third-party pages, so it may not run inside this transaction (KAD-06); it is queued
