@@ -76,6 +76,12 @@ export interface ApiContractOptions {
    * absent schema now fails `contracts:generate` instead.
    */
   readonly voidResponse?: boolean;
+  /**
+   * STORY-181 - the route answers with a REDIRECT (`@HttpCode(302)`): the contract is the status and the required `Location` header, and
+   * the body is the ordinary void envelope (`data: null`). Declared, never inferred, like `voidResponse`; it excludes `responseSchema`
+   * and `voidResponse`, and the route is NOT `@NoEnvelope()` (that marker is for the health probes alone).
+   */
+  readonly redirect?: boolean;
 }
 
 export const API_CONTRACT_KEY = "apiContract";

@@ -314,12 +314,31 @@ function buildOperation(route: DiscoveredContractRoute): OpenApiOperation {
   if (parameters.length > 0) operation.parameters = parameters;
 
   const status = String(route.httpStatus);
-  operation.responses[status] = {
-    description: `${contract.operationId} response`,
-    content: {
-      "application/json": { schema: toJsonSchema(responseSchemaFor(route), RESPONSE_JSON_SCHEMA_OPTIONS) },
-    },
-  };
+  if (contract.redirect === true) {
+    // STORY-181 - a redirect is its status, its `Location` header and the ordinary void envelope (`data: null`): the envelope is on every
+    // response but the health probes' (section 1), and the generator refuses any other description of a redirect (a body schema would
+    // document bytes the server never sends).
+    if (contract.responseSchema !== undefined || contract.voidResponse === true || route.envelopeExempt || route.httpStatus < 300 || route.httpStatus > 399) {
+      throw new Error(
+        `contracts:generate - route "${contract.operationId}" declares redirect: true, which requires a 3xx @HttpCode, an enveloped response ` +
+          "(no @NoEnvelope()), and neither a responseSchema nor voidResponse.",
+      );
+    }
+    operation.responses[status] = {
+      description: `${contract.operationId} redirect`,
+      headers: { Location: { required: true, schema: { type: "string", format: "uri" } } },
+      content: {
+        "application/json": { schema: toJsonSchema(envelopeSchema(z.null()).omit({ pagination: true }), RESPONSE_JSON_SCHEMA_OPTIONS) },
+      },
+    };
+  } else {
+    operation.responses[status] = {
+      description: `${contract.operationId} response`,
+      content: {
+        "application/json": { schema: toJsonSchema(responseSchemaFor(route), RESPONSE_JSON_SCHEMA_OPTIONS) },
+      },
+    };
+  }
 
   if (contract.emitsEntityTag) {
     operation.responses[status]!.headers = {
