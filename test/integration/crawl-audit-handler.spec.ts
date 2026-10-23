@@ -1025,6 +1025,18 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(patch.unified_diff).toContain("+User-agent: GPTBot");
     });
 
+    it("STORY-053 scenario 1 · an /llms.txt that answers with an error status other than 404 or 410 gets NO patch (a file may exist behind it)", async () => {
+      await runAsTenant({ ...healthy(OPEN), "/llms.txt": { status: 403 }, "/.well-known/llms.txt": { status: 404 } });
+      expect((await findings()).map((f) => f.rule_code)).toContain("AUX-R-004");
+      expect(await patchRows()).toHaveLength(0);
+    });
+
+    it("STORY-053 scenario 1 · an /llms.txt that is absent while an invalid one sits at /.well-known/llms.txt gets NO 'there is no /llms.txt' patch", async () => {
+      await runAsTenant({ ...healthy(OPEN), "/llms.txt": { status: 404 }, "/.well-known/llms.txt": { status: 200, body: "not the llms format" } });
+      expect((await findings()).map((f) => f.rule_code)).toContain("AUX-R-004");
+      expect(await patchRows()).toHaveLength(0);
+    });
+
     it("STORY-053 scenario 1 · the patch is on the finding, free, and the page still matches", async () => {
       await runAsTenant(healthy(BLOCKED));
       const [f] = await readFindings();

@@ -17,11 +17,14 @@ import { PatchRejectedError, type PatchDraft } from "./types.js";
 /** An agent no group names: it is bound by `*` alone, so it stands for "every agent the file does not mention". */
 const UNLISTED_AGENT = "nominara-unlisted-agent";
 /**
- * NOT FROM THE REFERENCE. Bounds on what the comparison will verify, chosen so it is a few tens of millions of comparisons at worst.
- * A file over them is refused rather than waved through: an unverifiable patch is not a safe one.
+ * NOT FROM THE REFERENCE. Bounds on what the comparison will verify. The work is agents x paths x (rules in both files): with
+ * paths <= 2 + 3 x 2 x rules, the worst case is 100 x 1202 x 400 = about 48 million matcher calls. (At 1000 rules and 200 agents it
+ * was about 2.4 billion, which would hold the project lock far too long.) A file over them is refused rather than waved through:
+ * an unverifiable patch is not a safe one.
  */
-const MAX_VERIFIABLE_RULES = 1000;
-const MAX_VERIFIABLE_AGENTS = 200;
+export const VERIFICATION_BOUNDS = Object.freeze({ rules: 200, agents: 100 });
+const MAX_VERIFIABLE_RULES = VERIFICATION_BOUNDS.rules;
+const MAX_VERIFIABLE_AGENTS = VERIFICATION_BOUNDS.agents;
 
 const rulesOf = (parsed: ParsedRobots): RobotsRule[] => parsed.groups.flatMap((g) => g.rules);
 

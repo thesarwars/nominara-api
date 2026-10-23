@@ -120,3 +120,17 @@ describe("STORY-053 scenario 1 · an html_fragment patch has a reversal and a pr
     ).toThrowError(PatchRejectedError);
   });
 });
+
+describe("STORY-053 AC6 · a <link> may only declare a canonical or alternate relation", () => {
+  it.each(["stylesheet", "preload", "import", "modulepreload", "prefetch", "icon"])("rejects rel=%s (it loads a resource)", (rel) => {
+    expect(() => sanitiseFragment(`<link rel="${rel}" href="https://x.example/a.css">`)).toThrowError(PatchRejectedError);
+  });
+  it("rejects a link with no rel, and a rel list that carries a loading relation", () => {
+    expect(() => sanitiseFragment('<link href="https://x.example/a">')).toThrowError(PatchRejectedError);
+    expect(() => sanitiseFragment('<link rel="canonical stylesheet" href="https://x.example/a">')).toThrowError(PatchRejectedError);
+  });
+  it("passes canonical and alternate, in any case", () => {
+    expect(sanitiseFragment('<link rel="Alternate" hreflang="fr" href="https://acme.com/fr">')).toContain("Alternate");
+    expect(sanitiseFragment('<link rel="canonical" href="https://acme.com/">')).toContain("canonical");
+  });
+});

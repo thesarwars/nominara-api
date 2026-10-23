@@ -386,3 +386,25 @@ describe("NEW-C-10 · AuxService.updateFinding", () => {
     expect(calls[0]!.sql).toMatch(/FOR UPDATE/);
   });
 });
+
+describe("STORY-053 · a patch row is parsed with its contract on the way out", () => {
+  const patchRow = (over: Record<string, unknown> = {}) => ({
+    id: "0195e5b7-0000-7000-8000-0000000000a1", finding_id: FINDING_ID, project_id: PROJECT_ID, rule_code: "AUX-R-001", kind: "robots",
+    target_url: "https://example.com/robots.txt", content_before_hash: Buffer.alloc(32, 1), content_after: "x", unified_diff: null, jsonld_blocks: null,
+    reversal: { operation: "remove_block", content: "x" }, preconditions: [{ kind: "file_hash", value: `sha256:${"1".repeat(64)}` }], explanation: "e", derivation: "d",
+    requires_human_review: false, review_reason: null, risk_flags: [], created_at: new Date("2026-10-01T00:00:00Z"), rn: 1, ...over,
+  });
+  const route = (row: unknown) => (sql: string): unknown[] | undefined =>
+    /FROM aux_audits/.test(sql) ? [{ robots_hash: null, llms_txt_present: null }] : /FROM patches|FROM \(\s*SELECT p\./.test(sql) || /patches p/.test(sql) ? [row] : /FROM aux_findings/.test(sql) ? [findingRow()] : [{ id: PROJECT_ID }];
+  it("a well-formed row is served", async () => {
+    const page = await serviceWith(route(patchRow())).listProjectFindings(PROJECT_ID, { limit: 50 } as never);
+    expect(page.items[0]!.patch?.reversal).toEqual({ operation: "remove_block", content: "x" });
+  });
+  it.each([
+    ["reversal", { reversal: { operation: "rm_rf", content: null } }],
+    ["preconditions", { preconditions: [{ kind: "file_hash", value: "not-a-hash" }] }],
+    ["risk_flags", { risk_flags: [""] }],
+  ])("a malformed %s column fails closed rather than reaching the wire", async (_name, over) => {
+    await expect(serviceWith(route(patchRow(over))).listProjectFindings(PROJECT_ID, { limit: 50 } as never)).rejects.toBeDefined();
+  });
+});

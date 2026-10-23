@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { isAllowed, parseRobots } from "../robots.js";
 import { evaluateRobotsTxt } from "../site-files.js";
 import { PatchRejectedError } from "./types.js";
-import { assertAccessNotReduced, buildRobotsPatch, finaliseRobotsPatch } from "./robots-directive.js";
+import { VERIFICATION_BOUNDS, assertAccessNotReduced, buildRobotsPatch, finaliseRobotsPatch } from "./robots-directive.js";
 
 // STORY-053 AC5 (aux-and-geo-analysis.md section 5, schemas/geo-and-vectors.md `kind='robots'`) — a crawler-directive patch is
 // parsed and re-serialised, must parse cleanly, and must not reduce access for ANY agent relative to the file it patches. The
@@ -143,5 +143,29 @@ describe("STORY-053 scenario 5 · a directive patch that only permits is accepte
     expect(() =>
       finaliseRobotsPatch({ ruleCode: "AUX-R-001", targetUrl: URL, before, beforeHash: sha(before), appended: "\nUser-agent: GPTBot\nAllow: /\n", explanation: "e" }),
     ).not.toThrow();
+  });
+});
+
+describe("STORY-053 AC5 · the verification is bounded so it cannot hold the commit lock for long", () => {
+  const rules = (n: number): string => Array.from({ length: n }, (_, i) => `Disallow: /p${i}`).join("\n");
+  it("the worst case at the bounds is under one hundred million matcher calls", () => {
+    const { rules: r, agents: a } = VERIFICATION_BOUNDS;
+    // paths: 2 fixed + 3 probes per rule, over before AND after; each check evaluates two files of up to `r` rules.
+    const calls = a * (2 + 3 * 2 * r) * 2 * r;
+    expect(calls).toBeLessThan(100_000_000);
+  });
+  it("refuses a file one rule over the bound, and accepts one at it", () => {
+    const at = `User-agent: *\n${rules(VERIFICATION_BOUNDS.rules)}\n`;
+    expect(() => assertAccessNotReduced(at, at)).not.toThrow();
+    const over = `User-agent: *\n${rules(VERIFICATION_BOUNDS.rules + 1)}\n`;
+    expect(() => assertAccessNotReduced(over, over)).toThrowError(PatchRejectedError);
+  });
+  it("finishes a file at both bounds quickly", () => {
+    const named = VERIFICATION_BOUNDS.agents - 20; // plus the eight AI tokens, `*` and the unlisted stand-in
+    const agents = Array.from({ length: named }, (_, i) => `User-agent: bot${i}\nDisallow: /a\n`).join("\n");
+    const file = `${agents}\nUser-agent: *\n${rules(VERIFICATION_BOUNDS.rules - named - 1)}\n`;
+    const started = Date.now();
+    assertAccessNotReduced(file, `${file}\nUser-agent: extra\nAllow: /\n`);
+    expect(Date.now() - started).toBeLessThan(10_000);
   });
 });

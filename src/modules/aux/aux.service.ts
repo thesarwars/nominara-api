@@ -1,4 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common";
+import { z } from "zod";
 import { AUX_CATEGORY_WEIGHTS } from "../../lib/scoring/aux.js";
 import type {
   AuxAudit,
@@ -8,6 +9,7 @@ import type {
   UpdateAuxFindingRequest,
 } from "../../../contracts/aux/index.js";
 import { AUX_CATEGORIES } from "../../../contracts/aux/index.js";
+import { patchJsonldBlockSchema, patchPreconditionSchema, patchReversalSchema, patchRiskFlagSchema } from "../../../contracts/aux/index.js";
 import type { AuxPatch } from "../../../contracts/aux/index.js";
 import { guidanceFor } from "../../lib/aux/patches/guidance.js";
 import { pageMatches, sha256Tag, type LatestAuditFacts } from "../../lib/aux/patches/precondition.js";
@@ -361,14 +363,14 @@ function toPatch(row: PatchRow, audit: LatestAuditFacts | null, earlier: string[
     content_before_hash: sha256Tag(row.content_before_hash),
     content_after: row.content_after,
     unified_diff: row.unified_diff,
-    jsonld_blocks: row.jsonld_blocks,
-    reversal: row.reversal,
-    preconditions: row.preconditions,
+    jsonld_blocks: row.jsonld_blocks === null ? null : z.array(patchJsonldBlockSchema).parse(row.jsonld_blocks),
+    reversal: row.reversal === null ? null : patchReversalSchema.parse(row.reversal),
+    preconditions: z.array(patchPreconditionSchema).parse(row.preconditions),
     explanation: row.explanation,
     derivation: row.derivation,
     requires_human_review: row.requires_human_review,
     review_reason: row.review_reason,
-    risk_flags: row.risk_flags,
+    risk_flags: z.array(patchRiskFlagSchema).parse(row.risk_flags),
     page_matches: pageMatches({ kind: row.kind, contentBeforeHash: row.content_before_hash, preconditions: row.preconditions }, audit),
     earlier_patch_ids: earlier,
     free: true,

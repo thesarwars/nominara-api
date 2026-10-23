@@ -9,7 +9,7 @@ const sha = (s: string): Buffer => createHash("sha256").update(s).digest();
 const BLOCKED = "User-agent: GPTBot\nDisallow: /\n";
 const site = (over: Partial<Parameters<typeof generateSiteFilePatch>[0]["site"]> = {}) => ({
   origin: "https://acme.com", siteName: "Acme", projectId: "p1", pageUrls: ["https://acme.com/", "https://acme.com/pricing"],
-  robots: { body: BLOCKED, hash: sha(BLOCKED) }, llms: null as { body: string } | null, ...over,
+  robots: { body: BLOCKED, hash: sha(BLOCKED) }, llms: null as { body: string } | null, llmsPatchable: true, ...over,
 });
 const input = (ruleCode: string, over: Partial<Parameters<typeof generateSiteFilePatch>[0]["site"]> = {}) => ({
   ruleCode, targetUrl: "https://acme.com/robots.txt", url: "https://acme.com/robots.txt", site: site(over),
@@ -27,6 +27,11 @@ describe("STORY-053 scenario 1 · the generator produces a patch per fixable sit
   it("AUX-R-004 produces a markdown llms.txt patch", () => {
     const r = generateSiteFilePatch({ ...input("AUX-R-004"), targetUrl: "https://acme.com/llms.txt" });
     expect(r.outcome === "patch" && r.draft.kind === "markdown" && r.draft.targetUrl).toBe("https://acme.com/llms.txt");
+  });
+
+  it("AUX-R-004 offers no patch when the judged /llms.txt cannot be told absent or present (an error answer, or the file lives elsewhere)", () => {
+    const r = generateSiteFilePatch({ ...input("AUX-R-004", { llmsPatchable: false }), targetUrl: "https://acme.com/llms.txt" });
+    expect(r.outcome).toBe("none");
   });
 
   it("every draft carries a reversal and a 32-byte precondition hash", () => {

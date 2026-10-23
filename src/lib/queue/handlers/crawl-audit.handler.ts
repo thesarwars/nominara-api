@@ -756,6 +756,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
 
     // COPY-READY PATCHES (STORY-053). Pure CPU over what the crawl already fetched: no request, no model, no charge.
     const isOk = (f: Fetched): f is Extract<Fetched, { responded: true }> => f.responded && f.status >= 200 && f.status < 300;
+    const isGone = (f: Fetched): boolean => f.responded && (f.status === 404 || f.status === 410);
     const site: SiteInputs = {
       origin,
       siteName: project.rows[0]!.name,
@@ -763,6 +764,9 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       pageUrls: outcome.sitemapUrls,
       robots: isOk(outcome.robots) && outcome.robotsHash !== null ? { body: outcome.robots.file.body, hash: outcome.robotsHash } : null,
       llms: isOk(outcome.llms) ? { body: outcome.llms.file.body } : null,
+      // Only /llms.txt is judged. Absent means it answered 404 or 410 AND the well-known location has no file either (llms_txt_present,
+      // which page_matches reads, counts both). An error answer says nothing about whether a file exists behind it.
+      llmsPatchable: isOk(outcome.llms) || (isGone(outcome.llms) && !isOk(outcome.llmsWellKnown)),
     };
     const patchStats = await tracer.startActiveSpan("crawl.audit.patches", async (span) => {
       try {

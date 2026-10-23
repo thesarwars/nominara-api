@@ -28,6 +28,9 @@ export const ALLOWED_ELEMENTS: ReadonlyMap<string, ReadonlySet<string>> = new Ma
   }).map(([tag, attrs]) => [tag, new Set(attrs)]),
 );
 
+/** A <link> in a patch only DECLARES a relation; any other rel (stylesheet, preload, import, icon...) makes the browser load something. */
+const LINK_RELATIONS: ReadonlySet<string> = new Set(["canonical", "alternate"]);
+
 const URL_ATTRIBUTES: ReadonlySet<string> = new Set(["href", "src"]);
 const SAFE_SCHEMES: ReadonlySet<string> = new Set(["http", "https", "mailto", "tel"]);
 
@@ -60,6 +63,13 @@ function check(node: ParsedNode): void {
       if (URL_ATTRIBUTES.has(name)) {
         const scheme = schemeOf(attr.value);
         if (scheme !== null && !SAFE_SCHEMES.has(scheme)) throw prohibited(`a ${scheme}: URL is not allowed`, { attribute: name, element: child.nodeName, scheme });
+      }
+    }
+    if (child.nodeName === "link") {
+      const rel = (child.attrs ?? []).find((a) => a.name.toLowerCase() === "rel")?.value ?? "";
+      const tokens = rel.toLowerCase().split(/\s+/u).filter((t) => t !== "");
+      if (tokens.length === 0 || !tokens.every((t) => LINK_RELATIONS.has(t))) {
+        throw prohibited("a <link> may only be rel=canonical or rel=alternate", { element: "link", attribute: "rel" });
       }
     }
     check(child);

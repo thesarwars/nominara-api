@@ -21,6 +21,12 @@ export interface SiteInputs {
   readonly robots: { readonly body: string; readonly hash: Buffer } | null;
   /** The /llms.txt the site serves now: null when there is none. */
   readonly llms: { readonly body: string } | null;
+  /**
+   * False when /llms.txt cannot be told absent or present: it answered with an error status other than 404 or 410, or it is absent
+   * but the same audit found one at /.well-known/llms.txt. A "file_absent" patch (or a replacement of a file we never read) would
+   * then be wrong or judged `changed` at once, so none is offered.
+   */
+  readonly llmsPatchable: boolean;
 }
 
 export interface GenerateInput {
@@ -49,6 +55,7 @@ export function generateSiteFilePatch(input: GenerateInput): Generated {
     return draft === null ? { outcome: "none" } : { outcome: "patch", draft };
   }
   if (ruleCode === "AUX-R-004") {
+    if (!site.llmsPatchable) return { outcome: "none" };
     return { outcome: "patch", draft: buildLlmsTxtPatch({ ruleCode, origin: site.origin, siteName: site.siteName, pageUrls: site.pageUrls, existing: site.llms?.body ?? null }) };
   }
   return { outcome: "none" };
