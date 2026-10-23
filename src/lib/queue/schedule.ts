@@ -52,6 +52,10 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // scheduled-capture hot path. Five past the hour, not on it — the tick
   // reads a watermark the hourly rollup writes.
   { queue: "capture.plan", cron: "5 * * * *", statedAs: "scheduler cron, API · §6.1 cron(:05 hourly)" },
+  // STORY-042 — INERT BY DESIGN: the queue is tenant-scoped, so a bare cron cannot feed it (the registrar refuses the row).
+  // Its real producers are the run-completion request (run-rollup-request.ts) and the 5-minute RollupSweepRuntime
+  // (src/lib/rollup/rollup-sweep.ts), which enqueues one SIGNED job per project for the closed day at 00:20
+  // workspace-local and for dirty dates. This row is kept because it is what §4 states.
   { queue: "rollup.metric_daily", cron: "0 * * * *", statedAs: "cron hourly, parse" },
   { queue: "attribution.rollup", cron: "0 * * * *", statedAs: "cron hourly, ingest watermark" },
   { queue: "credit.reconcile", cron: "*/10 * * * *", statedAs: "cron every 10 min" },

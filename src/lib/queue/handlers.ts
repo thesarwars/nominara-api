@@ -5,6 +5,7 @@ import { createBillingCustomerEmailHandler } from "./handlers/billing-customer-e
 import { createBillingDowngradeNoticeHandler } from "./handlers/billing-downgrade-notice.handler.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCapturePlanHandler } from "./handlers/capture-plan.handler.js";
+import type { DirtyEntry } from "../rollup/dirty-dates.js";
 import { createCaptureParseHandler } from "./handlers/capture-parse.handler.js";
 import { createCreditHousekeepingHandler } from "./handlers/credit-housekeeping.handler.js";
 import { createCreditReconcileHandler } from "./handlers/credit-reconcile.handler.js";
@@ -46,6 +47,8 @@ export type QueueName = (typeof QUEUE_TOPOLOGY)[number]["name"];
 export interface QueueHandlerContext {
   readonly pool: Pool;
   readonly env: Env;
+  /** STORY-042 AC6 — the dirty-set writer the worker group owns (set for `capture.parse` only). */
+  readonly markRollupDirty?: (entry: DirtyEntry) => Promise<void>;
 }
 
 export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor;
