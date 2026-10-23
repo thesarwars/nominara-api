@@ -7,8 +7,8 @@ import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 // `{metric, target_value, engine_key?, prompt_cluster_id?}`. The baseline is
 // NEVER accepted from the caller: the server captures it at creation, from the
 // measured value, so "before" cannot be typed in. Neither is `direction`: the
-// server derives it at creation from baseline versus target and stores it in the
-// target (see `goalTargetSchema`).
+// server takes it from the metric (`GOAL_METRIC_DIRECTION`, always `up`) and stores
+// it in the target (see `goalTargetSchema`), never from baseline versus target.
 //
 // ONE METRIC PER KIND (planner recommendation, STORY-065 plan). A kind names the
 // question; the metric is the stored, measured number that answers it, and the

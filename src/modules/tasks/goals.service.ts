@@ -180,6 +180,7 @@ const SELECT_GOALS = `
 function toGoal(row: GoalRow): Goal {
   const measured = row.current;
   const sufficient = measured !== null && measured.value !== null && measured.cells !== null && measured.cells >= GOAL_MIN_CELLS;
+  const baselineSufficient = row.baseline !== null && row.baseline.value !== null && row.baseline.cells !== null && row.baseline.cells >= GOAL_MIN_CELLS;
   return {
     id: row.id,
     project_id: row.project_id,
@@ -188,9 +189,10 @@ function toGoal(row: GoalRow): Goal {
     target: row.target,
     baseline: row.baseline,
     current: row.current,
-    // null, never 0, when the sample cannot support a percentage — or when there was no measured baseline to measure from (an
-    // achieved goal is 100 by definition).
-    progress_pct: sufficient && (row.baseline?.value != null || row.status === "achieved") ? Number(row.progress_pct) : null,
+    // null, never 0, when the sample cannot support a percentage — or when there was no measured baseline to measure from, or the
+    // baseline itself rested on fewer than GOAL_MIN_CELLS (a percentage from a noisy starting point is the same precision problem).
+    // An achieved goal is 100 by definition.
+    progress_pct: sufficient && (row.status === "achieved" || baselineSufficient) ? Number(row.progress_pct) : null,
     sample_state: sufficient ? "sufficient" : "insufficient",
     status: row.status,
     target_date: row.target_date,

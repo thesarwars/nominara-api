@@ -18,6 +18,20 @@ import { refreshProjectGoals } from "../../src/lib/rollup/refresh-project-goals.
 import { currentTenantStore, withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
 import { createGoalRequestSchema, updateGoalRequestSchema } from "../../contracts/tasks/index.js";
 
+const steps = vi.hoisted(() => ({ order: [] as string[] }));
+vi.mock("../../src/lib/rollup/refresh-project-goals.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/lib/rollup/refresh-project-goals.js")>();
+  return { ...actual, refreshProjectGoals: (...args: Parameters<typeof actual.refreshProjectGoals>) => { steps.order.push("goals"); return actual.refreshProjectGoals(...args); } };
+});
+vi.mock("../../src/lib/rollup/refresh-project-geo.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/lib/rollup/refresh-project-geo.js")>();
+  return { ...actual, refreshProjectGeoWindows: (...args: Parameters<typeof actual.refreshProjectGeoWindows>) => { steps.order.push("geo"); return actual.refreshProjectGeoWindows(...args); } };
+});
+vi.mock("../../src/lib/rollup/refresh-project-source-index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/lib/rollup/refresh-project-source-index.js")>();
+  return { ...actual, refreshProjectSourceIndex: (...args: Parameters<typeof actual.refreshProjectSourceIndex>) => { steps.order.push("source_index"); return actual.refreshProjectSourceIndex(...args); } };
+});
+
 // STORY-065-A — goals: baseline captured at creation, progress as
 // baseline/current/target, sample state, abandon. Real SQL as `nominara_app`
 // (RLS in force). Tenant write path: dangerous area.
@@ -306,12 +320,12 @@ describe("STORY-065-A · goals — real SQL", () => {
   });
   // ---- STORY-065 AC1/AC2/AC6/AC11 — six kinds, the rollup refresh, achievement ------------------------------
 
-  async function metricDay(ws: string, p: string, engine: string, date: string, o: Partial<{ cells: number; visibility: number; citationShare: number; rendering: number | null; sentiment: number | null }> = {}): Promise<void> {
-    const { cells = 20, visibility = 50, citationShare = 0.2, rendering = null, sentiment = null } = o;
+  async function metricDay(ws: string, p: string, engine: string, date: string, o: Partial<{ cells: number; visibility: number; citationShare: number; rendering: number | null; sentiment: number | null; mentions: number }> = {}): Promise<void> {
+    const { cells = 20, visibility = 50, citationShare = 0.2, rendering = null, sentiment = null, mentions = 0 } = o;
     await client.query(
-      `INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date, cells_total, visibility_score, citation_share, rendering_quality, sentiment_score, scoring_version)
-       VALUES ($1, $2, $3, 'brand', $2, $4::date, $5, $6, $7, $8, $9, 'v1')`,
-      [ws, p, engine, date, cells, visibility, citationShare, rendering, sentiment]);
+      `INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date, cells_total, visibility_score, citation_share, rendering_quality, sentiment_score, mentions_total, scoring_version)
+       VALUES ($1, $2, $3, 'brand', $2, $4::date, $5, $6, $7, $8, $9, $10, 'v1')`,
+      [ws, p, engine, date, cells, visibility, citationShare, rendering, sentiment, mentions]);
   }
   async function trackedPrompt(ws: string, p: string, cluster: string | null, o: { deleted?: boolean } = {}): Promise<string> {
     seq += 1;
@@ -378,16 +392,32 @@ describe("STORY-065-A · goals — real SQL", () => {
       expect(goal.sample_state).toBe("sufficient");
     });
 
-    it("sentiment_recovery reads projects.sentiment_score; null when there were no mentions reads as insufficient (never 50, never 0)", async () => {
-      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 80);
-      await client.query("UPDATE projects SET sentiment_score = 35 WHERE id = $1", [p]);
+    it("sentiment_recovery reads the cross-engine day's sentiment with the MENTIONS behind it, never the cell count; no mentions reads as insufficient (never 50, never 0)", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 800);
+      await metricDay(ws, p, "all", "2026-09-27", { cells: 800, sentiment: 35, mentions: 80 });
       const measured = await create(CTX(ws, actor), p, kindGoal("sentiment_recovery", "sentiment_score", 60));
       expect(measured.baseline).toMatchObject({ value: 35, cells: 80 });
-      await client.query("UPDATE projects SET sentiment_score = NULL WHERE id = $1", [p]);
+      await client.query("DELETE FROM metric_daily WHERE project_id = $1", [p]);
+      await metricDay(ws, p, "all", "2026-09-27", { cells: 800, sentiment: null, mentions: 0 });
       const unmeasured = await create(CTX(ws, actor), p, kindGoal("sentiment_recovery", "sentiment_score", 60));
       expect(unmeasured.baseline).toMatchObject({ value: null });
       expect(unmeasured.sample_state).toBe("insufficient");
       expect(unmeasured.progress_pct).toBeNull();
+    });
+
+    it("[STORY-065 #9] sentiment n is the mentions, not the cells: cells_30d=1200 with 4 mentions on the value's day is insufficient, project-wide and per engine, and 30 mentions is sufficient", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 1200);
+      await metricDay(ws, p, "all", "2026-09-27", { cells: 40, sentiment: 80, mentions: 4 });
+      await metricDay(ws, p, "all", "2026-09-26", { cells: 1160, sentiment: 10, mentions: 400 });
+      await metricDay(ws, p, "gemini", "2026-09-27", { cells: 900, sentiment: 80, mentions: 4 });
+      const wide = await create(CTX(ws, actor), p, kindGoal("sentiment_recovery", "sentiment_score", 60));
+      expect(wide.baseline).toMatchObject({ value: 80, cells: 4 });
+      expect(wide.sample_state).toBe("insufficient");
+      const scoped = await create(CTX(ws, actor), p, kindGoal("sentiment_recovery", "sentiment_score", 90, { engine_key: "gemini" }));
+      expect(scoped.baseline).toMatchObject({ value: 80, cells: 4 });
+      expect(scoped.sample_state).toBe("insufficient");
+      await client.query("UPDATE metric_daily SET mentions_total = 30 WHERE project_id = $1 AND metric_date = '2026-09-27' AND engine_key = 'all'", [p]);
+      expect((await create(CTX(ws, actor), p, kindGoal("sentiment_recovery", "sentiment_score", 95))).sample_state).toBe("sufficient");
     });
 
     it("prompt_recommendation reads the presence rate of the cluster's prompts: latest window per prompt and engine, weighted by sample count, as a percentage", async () => {
@@ -592,6 +622,23 @@ describe("STORY-065-A · goals — real SQL", () => {
       expect((await row(goal.id)).status).toBe("achieved");
     });
 
+    it("[STORY-065 #6/#9] a sentiment goal is NOT achieved (no audit row) on a few mentions when the cell count is large, project-wide or per engine; it is once the mentions are sufficient", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 40, 1200);
+      await metricDay(ws, p, "all", "2026-09-27", { cells: 1200, sentiment: 30, mentions: 100 });
+      await metricDay(ws, p, "gemini", "2026-09-27", { cells: 1200, sentiment: 30, mentions: 100 });
+      const wide = await create(CTX(ws, actor), p, kindGoal("sentiment_recovery", "sentiment_score", 60));
+      const scoped = await create(CTX(ws, actor), p, kindGoal("sentiment_recovery", "sentiment_score", 60, { engine_key: "gemini" }));
+      await client.query("UPDATE projects SET sentiment_score = 90, cells_30d = 1200 WHERE id = $1", [p]);
+      await client.query("UPDATE metric_daily SET sentiment_score = 90, mentions_total = 4 WHERE project_id = $1 AND metric_date = '2026-09-27'", [p]);
+      expect(await refresh(CTX(ws, actor), p)).toMatchObject({ refreshed: 2, achieved: [] });
+      expect((await row(wide.id)).status).toBe("active");
+      expect((await row(scoped.id)).status).toBe("active");
+      expect((await row(wide.id)).current).toMatchObject({ value: 90, cells: 4 });
+      expect((await client.query("SELECT 1 FROM audit_log WHERE action = 'goal.achieved'")).rowCount).toBe(0);
+      await client.query("UPDATE metric_daily SET mentions_total = 30 WHERE project_id = $1 AND metric_date = '2026-09-27'", [p]);
+      expect((await refresh(CTX(ws, actor), p)).achieved).toHaveLength(2);
+    });
+
     it("a regression is never recorded as achieved: a metric that gets worse than the baseline stays active at 0% progress, with no achieved_at and no audit row", async () => {
       const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 60, 100);
       const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 80));
@@ -614,6 +661,29 @@ describe("STORY-065-A · goals — real SQL", () => {
       await client.query("UPDATE projects SET cells_30d = 30 WHERE id = $1", [p]);
       await refresh(CTX(ws, actor), p);
       expect((await row(goal.id)).status).toBe("achieved");
+    });
+
+    it("a goal whose baseline was thin (n<30) shows no progress percentage until achieved, though its current sample is sufficient", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 20, 10);
+      const goal = await create(CTX(ws, actor), p, kindGoal("engine_score", "visibility_score", 60));
+      await client.query("UPDATE projects SET visibility_blended = 40, cells_30d = 100 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      const read = (await list(CTX(ws, actor), p))[0]!;
+      expect(read).toMatchObject({ sample_state: "sufficient", status: "active" });
+      expect(read.progress_pct).toBeNull();
+      await client.query("UPDATE projects SET visibility_blended = 61 WHERE id = $1", [p]);
+      await refresh(CTX(ws, actor), p);
+      expect((await list(CTX(ws, actor), p))[0]).toMatchObject({ id: goal.id, status: "achieved", progress_pct: 100 });
+    });
+
+    it("the goal refresh is the LAST rollup step, so the audit-chain lock an achievement takes is held for no later step", async () => {
+      const ws = await createWorkspace(); const actor = await createUser(ws); const p = await createProject(ws, 42.5, 120);
+      steps.order.length = 0;
+      const handler = createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, {
+        enqueueVerifyPresence: async () => undefined, enqueueTaskGenerate: async () => undefined });
+      await inTenant(CTX(ws, actor), () =>
+        handler(currentTenantStore()!.client, { data: { payload: { workspaceId: ws, kid: "k", projectId: p } } } as unknown as Job));
+      expect(steps.order).toEqual(["source_index", "geo", "goals"]);
     });
 
     it("direction comes from the metric, not from the stored jsonb: a stored `down` is ignored", async () => {

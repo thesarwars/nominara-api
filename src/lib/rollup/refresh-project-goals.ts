@@ -54,8 +54,9 @@ export interface GoalSubject {
  *                        the cluster's, so `cells` is null (insufficient) until a cluster-level n exists.
  *  - `prompt_recommendation`  presence over the cluster's live prompts from `prompt_stability`: the latest window per prompt
  *                        and engine, weighted by its sample count, as a percentage. `cells` is the summed sample count.
- *  - an engine scope     that engine's `metric_daily` brand rows: the latest day's value, the 30-day cell count.
- *  - otherwise           the project's denormalised figure (`visibility_blended`, `rendering_quality`, `sentiment_score`) with
+ *  - an engine scope     that engine's `metric_daily` brand rows: the latest day's value, the 30-day cell count. For
+ *                        `sentiment_score` (here and project-wide, on the `all` row) the n is the latest day's MENTION count.
+ *  - otherwise           the project's denormalised figure (`visibility_blended`, `rendering_quality`) with
  *                        its own n, or the cross-engine (`all`) `metric_daily` row for `citation_share`.
  *
  * Shares and rates are stored as fractions and read as percentages (every goal value is on a 0-100 scale), rounded to 3 places.
@@ -93,7 +94,7 @@ export async function measureGoal(tx: ClientBase, projectId: string, goal: GoalS
 
   if (metric === undefined) return { value: null, cells: null };
 
-  if (engineKey !== null || metric === "citation_share") {
+  if (engineKey !== null || metric === "citation_share" || metric === "sentiment_score") {
     return engineWindow(tx, projectId, engineKey ?? CROSS_ENGINE_KEY, metric);
   }
 
@@ -113,9 +114,9 @@ export async function measureGoal(tx: ClientBase, projectId: string, goal: GoalS
     return { value: rendering.rows[0]?.value ?? null, cells: rendering.rows[0]?.cells ?? null };
   }
 
-  // engine_score and sentiment_recovery, project-wide: the denormalised block and its own n.
+  // engine_score, project-wide: the denormalised block and its own n.
   const project = await tx.query<{ value: number | null; cells: number | null }>(
-    `SELECT CASE $2 WHEN 'visibility_score' THEN visibility_blended::float8 WHEN 'sentiment_score' THEN sentiment_score::float8 END AS value,
+    `SELECT CASE $2 WHEN 'visibility_score' THEN visibility_blended::float8 END AS value,
             cells_30d AS cells
        FROM projects WHERE id = $1`,
     [projectId, metric],
@@ -139,10 +140,18 @@ async function engineWindow(tx: ClientBase, projectId: string, engineKey: string
                FROM metric_daily md, latest
               WHERE md.project_id = $1 AND md.engine_key = $2 AND md.entity_type = 'brand' AND md.scoring_version = $3
                 AND md.metric_date = latest.d) AS value,
-            (SELECT sum(md.cells_total)::int
-               FROM metric_daily md, latest
-              WHERE md.project_id = $1 AND md.engine_key = $2 AND md.entity_type = 'brand' AND md.scoring_version = $3
-                AND md.metric_date > latest.d - ${String(WINDOW_DAYS)}) AS cells`,
+            CASE WHEN $4 = 'sentiment_score'
+                 -- Sentiment is computed from MENTIONS only (scoring/aggregate.ts), so the n behind it is the mention count, on the
+                 -- SAME day as the value; the cell count says nothing about how many mentions the figure rests on.
+                 THEN (SELECT md.mentions_total
+                         FROM metric_daily md, latest
+                        WHERE md.project_id = $1 AND md.engine_key = $2 AND md.entity_type = 'brand' AND md.scoring_version = $3
+                          AND md.metric_date = latest.d)
+                 ELSE (SELECT sum(md.cells_total)::int
+                         FROM metric_daily md, latest
+                        WHERE md.project_id = $1 AND md.engine_key = $2 AND md.entity_type = 'brand' AND md.scoring_version = $3
+                          AND md.metric_date > latest.d - ${String(WINDOW_DAYS)})
+            END AS cells`,
     [projectId, engineKey, SCORING_VERSION, metric],
   );
   return { value: result.rows[0]?.value ?? null, cells: result.rows[0]?.cells ?? null };
