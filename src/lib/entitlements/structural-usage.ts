@@ -43,10 +43,18 @@ interface StructuralCounter {
 // occupies a slot.
 export const PROMPT_OCCUPIES_SLOT = "status <> 'archived' AND deleted_at IS NULL";
 
+/**
+ * A project uses a `projects.max` slot while it is TRACKING: active, or initializing (onboarding). Owner decision
+ * 2026-10-23: an archived project, or one paused by a person or by a downgrade, uses none. Leaving archived or paused is
+ * therefore a move into a slot and needs room (src/modules/projects/project-reactivation.ts), or archiving would be a
+ * way around the limit. The downgrade planner (downgrade-pause.ts `usesNoSlot`) and the preview count the same rows.
+ */
+export const PROJECT_USES_SLOT = "status IN ('active', 'initializing') AND deleted_at IS NULL";
+
 const COUNTERS: Record<StructuralLimitKey, StructuralCounter> = {
   "projects.max": {
     scope: "workspace",
-    sql: "SELECT count(*)::int AS n FROM projects WHERE workspace_id = $1 AND deleted_at IS NULL",
+    sql: `SELECT count(*)::int AS n FROM projects WHERE workspace_id = $1 AND ${PROJECT_USES_SLOT}`,
   },
   "prompts.max_total": {
     scope: "workspace",

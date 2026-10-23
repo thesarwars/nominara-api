@@ -164,7 +164,8 @@ describe("STORY-077 · downgrade: accepted, paused at the cut-over, resumed on u
     const sent = spyEmail();
 
     await downgradeAtCutOver(workspaceId, owner, "growth");
-    // The excess is the two newest (as the confirmation named them); the person's pause stays the person's.
+    // The person's pause stays the person's and uses NO slot (owner decision 2026-10-23, replacing review round 1's "holds
+    // its slot"): four tracking projects against 3, so only the newest tracking project is paused.
     expect(await markedProjects(workspaceId)).toEqual([ids[3]]);
     expect((await projectRows(workspaceId)).find((p) => p.id === ids[4])).toMatchObject({ status: "paused", paused_by_downgrade_at: null });
 

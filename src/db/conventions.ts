@@ -325,6 +325,8 @@ export const POLICY_IN_OWN_MIGRATION: readonly string[] = [
   "stripe_subscription_syncs",
   // 0125_credit_hold_carries.up.sql — STORY-072 AC13; tenant-scoped, NOT portal-readable.
   "credit_hold_carries",
+  // 0134_downgrade_notices.up.sql — STORY-077 (owner 2026-10-23); tenant-scoped, NOT portal-readable.
+  "downgrade_notices",
 ];
 
 // STORY-011 — which runtime roles receive which generated policy. Every

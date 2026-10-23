@@ -133,7 +133,8 @@ export class ResendEmailSenderAdapter implements EmailSender {
   private async deliver(message: EmailMessage, span: Span): Promise<void> {
     const recipient = this.toOverride ?? message.to;
     const recipientHash = hashEmailKey(normalizeEmail(recipient), this.pepper).toString("hex");
-    const idempotencyKey = uuidV7();
+    // A caller-supplied key (a queue job's, stable across its attempts) wins; otherwise one per send().
+    const idempotencyKey = message.idempotencyKey ?? uuidV7();
     const payload = JSON.stringify({
       from: this.from,
       to: [recipient],

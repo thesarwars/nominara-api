@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { pendingCheckoutSchema } from "../../../contracts/billing/pending-checkout.schema.js";
@@ -12,8 +12,11 @@ import { BillingAddonsService } from "./billing-addons.service.js";
 import { DegradedError } from "../../api/errors/domain-errors.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import type { StripeEventContext, StripeEventHandler } from "./stripe-event-handler.js";
-import { reconcileAndRecordDowngradePause, sendDowngradeNotices } from "../../lib/billing/downgrade-pause-record.js";
-import { EMAIL_SENDER, type EmailSender } from "../identity/ports/email-sender.js";
+import { keepChoiceForAdoption } from "../../lib/billing/downgrade-keep.js";
+import type { KeepChoice } from "../../lib/billing/downgrade-pause.js";
+import { enqueueDowngradeNotices } from "../../lib/billing/downgrade-notice-outbox.js";
+import { reconcileAndRecordDowngradePause } from "../../lib/billing/downgrade-pause-record.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
 
 // STORY-075a / STORY-075 AC4 — the ONLY customer-reachable path to
 // `applyPlanChange`, and the one the plan-change-import-surface gate names.
@@ -46,7 +49,9 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
 
   constructor(
     private readonly addons: BillingAddonsService,
-    @Inject(EMAIL_SENDER) private readonly email: EmailSender,
+    // STORY-077 (owner 2026-10-23): the downgrade email is a queued job. Optional, as in CreditInterceptor: a process
+    // with no producer still adopts the plan and records the notice; it is counted and logged as not enqueued.
+    @Optional() private readonly producer?: QueueProducer,
   ) {}
 
   async handle({ tx, workspaceId, event, object, fetchStartedAt, afterCommit }: StripeEventContext): Promise<void> {
@@ -190,7 +195,12 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     // limits are the resolved ones), in this same transaction. Only when what the workspace is entitled to MOVED (the
     // plan or the add-ons): a redelivery, or a phase-0 event while a downgrade is still pending, changes nothing here, and
     // a workspace that was already over its limits before this slice shipped is not paused by an unrelated event.
-    if (outcome.changed || addonOutcome.changed) await this.reconcilePause(tx, workspaceId, event.id, { planChanged: outcome.changed && outcome.from !== outcome.to, addonsChanged: addonOutcome.changed }, afterCommit);
+    // STORY-077 D2: when this event adopts an in-app downgrade whose customer chose what to keep, that choice is honoured
+    // (read before the intent is spent below, which clears the choice with it).
+    if (outcome.changed || addonOutcome.changed) {
+      const keep = await keepChoiceForAdoption(tx, workspaceId, desired.state.providerSubscriptionId, object.metadata.plan_change_intent_id ?? "", desired.state.planKey);
+      await this.reconcilePause(tx, workspaceId, event.id, { planChanged: outcome.changed && outcome.from !== outcome.to, addonsChanged: addonOutcome.changed }, afterCommit, keep);
+    }
 
     // The charge this subscription was verified at is frozen on the row, so a
     // later catalog price change cannot turn it into a "mismatch". Only the
@@ -235,7 +245,7 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     // subscription's intent, and only when the plan it names is the plan now held AND the subscription names this intent's id: an event that left the row where it was
     // (a phase-0 event while a downgrade is pending) must leave the intent where it is too.
     await tx.query(
-      `UPDATE subscriptions SET pending_plan_change = NULL, updated_at = now()
+      `UPDATE subscriptions SET pending_plan_change = NULL, downgrade_keep = NULL, updated_at = now()
         WHERE workspace_id = $1 AND stripe_subscription_id = $2 AND status IN ('trialing','active','past_due')
           AND pending_plan_change IS NOT NULL
           AND ((pending_plan_change ->> 'to_plan_key' = $3 AND pending_plan_change ->> 'id' = $4) OR $3 = 'free')`,
@@ -266,9 +276,10 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
   }
 
   /**
-   * STORY-077 — pauses the most recently created excess projects and prompts (never deletes), resumes what an earlier
-   * downgrade paused once the limits allow it (oldest first), audits each, and emails the list AFTER the commit. The
-   * same step `plan:set` runs (downgrade-pause-record.ts).
+   * STORY-077 — pauses the excess projects and prompts (never deletes; the customer's keep choice, else the least recently active), resumes what an earlier
+   * downgrade paused once the limits allow it (oldest first), audits each, and records the email keyed by this event id;
+   * AFTER the commit one `billing.downgrade_notice` job per email sends it, retried on failure (owner decision
+   * 2026-10-23). The same step `plan:set` runs (downgrade-pause-record.ts).
    */
   private async reconcilePause(
     tx: StripeEventContext["tx"],
@@ -276,9 +287,14 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     eventId: string,
     moved: { readonly planChanged: boolean; readonly addonsChanged: boolean },
     afterCommit: StripeEventContext["afterCommit"],
+    keep?: KeepChoice,
   ): Promise<void> {
-    const notices = await reconcileAndRecordDowngradePause(tx, workspaceId, { requestId: eventId, operator: WEBHOOK_OPERATOR, ...moved });
-    if (notices.length > 0) afterCommit.push(async () => await sendDowngradeNotices((message) => this.email.send(message), workspaceId, notices));
+    const notices = await reconcileAndRecordDowngradePause(tx, workspaceId, { requestId: eventId, operator: WEBHOOK_OPERATOR, ...moved }, keep);
+    if (notices.length > 0) {
+      const producer = this.producer;
+      const enqueue = producer === undefined ? undefined : (...args: Parameters<QueueProducer["enqueueTenantJob"]>) => producer.enqueueTenantJob(...args);
+      afterCommit.push(async () => await enqueueDowngradeNotices(enqueue, workspaceId, eventId, notices, this.logger));
+    }
   }
 
   /**

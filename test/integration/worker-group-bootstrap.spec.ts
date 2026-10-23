@@ -39,6 +39,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "retention.purge",
     // STORY-021 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "billing.customer_email",
+    // STORY-077 (owner decision 2026-10-23) — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "billing.downgrade_notice",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],

@@ -6,6 +6,8 @@ import {
   runSchedulerSweep,
   sweepIdempotencyKey,
 } from "../../src/lib/capture/scheduler-sweep.js";
+import { downgradeNoticeJobKey } from "../../src/lib/billing/downgrade-notice-outbox.js";
+import { downgradeNoticeRelayJobKey } from "../../src/lib/billing/downgrade-notice-relay.js";
 
 // NEW-A-13 — the sweep's clock and its dedup identity, with no database.
 
@@ -280,5 +282,63 @@ describe("NEW-A-13 checkpoint-3 · every wait the sweep makes is bounded", () =>
       project_id: "project-0",
       error: "EnqueueTimeoutError",
     });
+  });
+});
+
+// STORY-077 review round 2 (major) — the downgrade-notice RELAY rides this hourly tick (the owner connection it already
+// opens sees across tenants). It runs AFTER the claim transaction, best-effort: a relay failure never fails the sweep.
+describe("STORY-077 · the hourly tick relays unsent downgrade notices", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  function relayClient(options: { failRelay?: boolean } = {}) {
+    const statements: string[] = [];
+    const client = {
+      query: async (sql: string) => {
+        statements.push(sql);
+        if (sql.includes("pg_roles")) return { rows: [{ can_see: true, who: "owner" }] };
+        if (sql.includes("FROM downgrade_notices") && sql.includes("sent_at IS NULL") && /^\s*SELECT\s+id/i.test(sql)) {
+          if (options.failRelay === true) throw new Error("relay read failed");
+          return { rows: [{ id: "55555555-5555-7555-8555-555555555555", workspace_id: "11111111-1111-7111-8111-111111111111", request_id: "evt_1", kind: "paused" }] };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      end: async () => undefined,
+    };
+    return { client, statements };
+  }
+
+  it("with a notice enqueuer, one tick re-enqueues each unsent notice on billing.downgrade_notice under an hour-suffixed key", async () => {
+    const { client } = relayClient();
+    const calls: unknown[][] = [];
+    const runtime = new SchedulerSweepRuntime({
+      connect: async () => client as never,
+      enqueue: async () => undefined,
+      enqueueDowngradeNotice: async (...args) => void calls.push(args),
+      clock: () => new Date("2026-10-23T10:05:00.000Z"),
+    });
+    await runtime.tick();
+    expect(calls).toHaveLength(1);
+    const [queue, workspaceId, payload, options] = calls[0] as [string, string, unknown, { idempotencyKey: string }];
+    expect([queue, workspaceId, payload]).toEqual(["billing.downgrade_notice", "11111111-1111-7111-8111-111111111111", { noticeId: "55555555-5555-7555-8555-555555555555" }]);
+    expect(options.idempotencyKey).toMatch(/^dgnotice:11111111-1111-7111-8111-111111111111:[0-9a-f]+:paused$/);
+    expect(options.idempotencyKey).not.toBe(downgradeNoticeJobKey("11111111-1111-7111-8111-111111111111", "evt_1", "paused"));
+  });
+
+  it("a relay failure is logged and never fails the sweep", async () => {
+    vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
+    const { client } = relayClient({ failRelay: true });
+    const runtime = new SchedulerSweepRuntime({
+      connect: async () => client as never,
+      enqueue: async () => undefined,
+      enqueueDowngradeNotice: async () => undefined,
+      clock: () => new Date("2026-10-23T10:05:00.000Z"),
+    });
+    await expect(runtime.tick()).resolves.toMatchObject({ status: "complete" });
+  });
+
+  it("the relay key is stable within an hour and new each hour", () => {
+    const at = (iso: string) => downgradeNoticeRelayJobKey("11111111-1111-7111-8111-111111111111", "evt_1", "paused", new Date(iso));
+    expect(at("2026-10-23T10:05:00.000Z")).toBe(at("2026-10-23T10:59:59.000Z"));
+    expect(at("2026-10-23T10:05:00.000Z")).not.toBe(at("2026-10-23T11:05:00.000Z"));
   });
 });

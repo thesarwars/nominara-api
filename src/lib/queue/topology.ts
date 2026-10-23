@@ -374,6 +374,25 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "custmail:{workspace}:{owner}:{transfer}",
     tenantScoped: true,
   },
+  // ⚠ A QUEUE §4 DOES NOT CONTAIN, added by the same precedent and approved by the owner (STORY-077, decision 2026-10-23):
+  // the downgrade pause/resume email must be retried on failure and never sent twice. The plan writer records each email
+  // in `downgrade_notices` inside its transaction and enqueues one signed tenant job per row after the commit; the
+  // handler is PHASED (ADR-0003: the send runs with no transaction), sends with a provider idempotency key derived from
+  // the row, and marks it sent. A failed send fails the job down this ladder; a sent row is never sent again. Keyed by
+  // the Stripe event id (or, for plan:set, the ticket and the change's entitlement version) and the kind, hashed. Same
+  // `rollup` group as the other billing jobs. THE LADDER IS SHORT (about a minute); a notice still unsent after it
+  // is re-enqueued hourly, for up to 23 hours, by the relay (lib/billing/downgrade-notice-relay.ts) under an
+  // hour-suffixed key of the same pattern, which keeps every re-send inside Resend's 24-hour idempotency window.
+  {
+    name: "billing.downgrade_notice",
+    producer: "Stripe webhook cut-over and plan:set, after commit (STORY-077; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 2,
+    retry: { delaysMs: doubling(5) },
+    priority: 6,
+    idempotencyKeyPattern: "dgnotice:{workspace}:{request}:{kind}",
+    tenantScoped: true,
+  },
   // ⚠ THE FIFTH QUEUE §4 DOES NOT CONTAIN, added by the same precedent. STORY-076 AC4 / STORY-071 AC10: purchased
   // credits expire FIFO twelve months after purchase (`plans-and-entitlements.md` §5) and `credit_daily_counters` rows
   // older than 35 days are purged nightly (`schemas/billing-and-credits.md`). `expireCredits` and `purgeDailyCounters`

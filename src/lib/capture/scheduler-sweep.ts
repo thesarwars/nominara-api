@@ -1,6 +1,8 @@
 import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { incrementCounter } from "../telemetry/metrics.js";
+import type { EnqueueDowngradeNotice } from "../billing/downgrade-notice-outbox.js";
+import { relayUnsentDowngradeNotices } from "../billing/downgrade-notice-relay.js";
 import { claimDueProjectRefs } from "./scheduler.js";
 import type { EnqueueRollup } from "../queue/handlers/run-rollup-request.js";
 import { reapStaleQueuedRuns } from "./stale-run-reaper.js";
@@ -264,6 +266,11 @@ export interface SweepRuntimeOptions {
   readonly enqueue: SweepEnqueue;
   /** SCANFIX D4 - requests `rollup.metric_daily`; without it the stuck-run reaper does not run. */
   readonly enqueueRollup?: EnqueueRollup;
+  /**
+   * STORY-077 review round 2 - enqueues `billing.downgrade_notice`; without it the downgrade-notice relay does not run.
+   * The relay rides this tick because it needs the same thing: an owner connection that sees across tenants, hourly.
+   */
+  readonly enqueueDowngradeNotice?: EnqueueDowngradeNotice;
   readonly clock?: () => Date;
   /** Overrides for DEFAULT_RUNTIME_LIMITS. */
   readonly limits?: Partial<RuntimeLimits>;
@@ -282,11 +289,14 @@ export class SchedulerSweepRuntime {
   private readonly limits: RuntimeLimits;
   /** The enqueue the runtime ticks with (exposed so the worker's production closure can be tested). */
   readonly enqueue: SweepEnqueue;
+  /** The downgrade-notice relay's enqueue (exposed for the same reason). */
+  readonly enqueueDowngradeNotice: EnqueueDowngradeNotice | undefined;
 
   constructor(private readonly options: SweepRuntimeOptions) {
     this.clock = options.clock ?? (() => new Date());
     this.limits = { ...DEFAULT_RUNTIME_LIMITS, ...options.limits };
     this.enqueue = options.enqueue;
+    this.enqueueDowngradeNotice = options.enqueueDowngradeNotice;
   }
 
   /** True between start() and stop(): the timer is armed (momentarily unset only while a tick runs). */
@@ -345,6 +355,13 @@ export class SchedulerSweepRuntime {
       if (this.options.enqueueRollup !== undefined) {
         await reapStuckRuns(client, this.clock(), { enqueueRollup: this.options.enqueueRollup }).catch((error: unknown) => {
           logger.error({ event: "capture.scheduler.reap_stuck_failed", error: error instanceof Error ? error.name : "unknown" });
+        });
+      }
+      // STORY-077 review round 2 - the downgrade-notice relay (lib/billing/downgrade-notice-relay.ts), best-effort and
+      // after the claim has committed, the same discipline: it must never hold up, or fail, the sweep.
+      if (this.enqueueDowngradeNotice !== undefined) {
+        await relayUnsentDowngradeNotices(client, this.enqueueDowngradeNotice, this.clock()).catch((error: unknown) => {
+          logger.error({ event: "capture.scheduler.downgrade_notice_relay_failed", error: error instanceof Error ? error.name : "unknown" });
         });
       }
       return result;

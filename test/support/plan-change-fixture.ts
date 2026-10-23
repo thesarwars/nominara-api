@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
+import type { Job } from "bullmq";
+import { Client, Pool } from "pg";
 import { afterEach, beforeEach, vi } from "vitest";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
@@ -16,6 +17,10 @@ import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
+import { createBillingDowngradeNoticeHandler } from "../../src/lib/queue/handlers/billing-downgrade-notice.handler.js";
+import { LoggingEmailSenderAdapter } from "../../src/modules/identity/adapters/logging-email-sender.adapter.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { useApiHarness } from "./api-harness.js";
 import { apiUrl } from "./api-url.js";
 import { FakeStripeGateway, signFakeStripePayload } from "./fake-stripe-gateway.js";
@@ -64,7 +69,15 @@ function widenedPlanChangeDocument(): string {
   );
 }
 
-export function usePlanChangeFixture(options: { readonly widenRateLimit?: boolean } = {}) {
+/**
+ * STORY-077 (owner decision 2026-10-23) — the downgrade email is recorded by the webhook and sent by the
+ * `billing.downgrade_notice` worker, which this harness does not run. With `drainNotices` (the default) every webhook
+ * delivery is followed by what the worker would do: each UNSENT notice is processed once by the job's own handler,
+ * through a `LoggingEmailSenderAdapter` (so a spy on its prototype sees the email) - a notice already sent is never sent
+ * again, so "a redelivery emails nothing more" still means what it says. downgrade-notice-outbox.spec.ts turns it off to
+ * observe the job itself.
+ */
+export function usePlanChangeFixture(options: { readonly widenRateLimit?: boolean; readonly drainNotices?: boolean } = {}) {
   const gateway = new FakeStripeGateway();
   const harness = useApiHarness({
     env: () => {
@@ -171,8 +184,27 @@ export function usePlanChangeFixture(options: { readonly widenRateLimit?: boolea
   }
 
   const eventBody = (id: string, type: string, objectId: string): string => JSON.stringify({ id, object: "event", type, data: { object: { id: objectId } } });
-  const deliver = (body: string) =>
-    harness.app().inject({ method: "POST", url: apiUrl("/webhooks/stripe"), headers: { "content-type": "application/json", "stripe-signature": signFakeStripePayload(body) }, payload: body });
+  /** Runs the downgrade-notice job's handler once for every unsent notice, as the worker would. */
+  async function drainDowngradeNotices(): Promise<void> {
+    const pending = await harness.db().query<{ id: string; workspace_id: string }>("SELECT id, workspace_id FROM downgrade_notices WHERE sent_at IS NULL ORDER BY created_at, id");
+    if (pending.rows.length === 0) return;
+    const client = new Client({ connectionString: process.env.DATABASE_URL });
+    await client.connect();
+    try {
+      const handle = createBillingDowngradeNoticeHandler({ pool: undefined as never, env: {} as never }, { sender: new LoggingEmailSenderAdapter() });
+      for (const row of pending.rows) {
+        const job = { data: { payload: { workspaceId: row.workspace_id, kid: "fixture", noticeId: row.id } } } as unknown as Job;
+        await withTenantContext(client, { workspaceId: row.workspace_id, actorId: SYSTEM_ACTOR_ID }, (tx) => handle(tx, job));
+      }
+    } finally {
+      await client.end();
+    }
+  }
+  const deliver = async (body: string) => {
+    const res = await harness.app().inject({ method: "POST", url: apiUrl("/webhooks/stripe"), headers: { "content-type": "application/json", "stripe-signature": signFakeStripePayload(body) }, payload: body });
+    if (options.drainNotices !== false) await drainDowngradeNotices();
+    return res;
+  };
   const reconcile = (workspaceId: string, eventId = `evt_${randomUUID()}`) => deliver(eventBody(eventId, "customer.subscription.updated", subIdOf(workspaceId)));
 
   /** A workspace on `plan`, its Stripe subscription adopted through the real webhook, plus its owner (re-entered after the version bump). */
@@ -195,6 +227,8 @@ export function usePlanChangeFixture(options: { readonly widenRateLimit?: boolea
       headers: { [CSRF_HEADER_NAME]: a.csrfToken, "content-type": "application/json", ...(key === null ? {} : { "idempotency-key": key }) },
       payload: payload as object,
     });
+  const put = (a: Actor, path: string, payload: unknown) =>
+    harness.app().inject({ method: "PUT", url: apiUrl(path), cookies: cookies(a), headers: { [CSRF_HEADER_NAME]: a.csrfToken, "content-type": "application/json" }, payload: payload as object });
   const del = (a: Actor, path: string) => harness.app().inject({ method: "DELETE", url: apiUrl(path), cookies: cookies(a), headers: { [CSRF_HEADER_NAME]: a.csrfToken } });
 
   const planOf = async (workspaceId: string) =>
@@ -238,6 +272,6 @@ export function usePlanChangeFixture(options: { readonly widenRateLimit?: boolea
 
   return {
     ownerOf, gateway, harness, meta, nowSeconds, periodStart, periodEnd, createUser, enter, memberIn, newWorkspace, stripeSubscription, subIdOf,
-    eventBody, deliver, reconcile, cookies, get, post, del, planOf, intentOf, auditActions, walletFor, includedOf, ledgerRows, projects,
+    eventBody, deliver, reconcile, cookies, get, post, put, del, planOf, intentOf, auditActions, walletFor, includedOf, ledgerRows, projects,
   };
 }

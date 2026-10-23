@@ -312,6 +312,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "never be made on a request path (KAD-06), so the accept enqueues one signed tenant job after commit; the worker reads the live owner and customer. §4's " +
       "table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed.",
   },
+  "billing.downgrade_notice": {
+    workerGroup: "rollup",
+    because:
+      "STORY-077 / owner decision 2026-10-23: the downgrade pause/resume email must be retried on failure and never sent twice. The cut-over records each " +
+      "email in downgrade_notices inside its transaction (keyed by the Stripe event id or the operator's ticket) and enqueues one signed tenant job after " +
+      "commit; the worker sends it with no transaction open (ADR-0003). §4's table allocates no queue to it. A queue of its own so a DLQ entry names it.",
+  },
   "credit.housekeeping": {
     workerGroup: "rollup",
     because:

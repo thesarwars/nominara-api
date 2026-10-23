@@ -699,7 +699,8 @@ export class PlanChangeService {
   private async writeIntent(workspaceId: string, intent: PendingPlanChange): Promise<void> {
     await this.inOwnTransaction(workspaceId, async (tx) => {
       const result = await tx.query(
-        "UPDATE subscriptions SET pending_plan_change = $2::jsonb, updated_at = now() WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')",
+        // A new intent starts with no keep choice (STORY-077 D2): a choice belongs to the downgrade it was made for.
+        "UPDATE subscriptions SET pending_plan_change = $2::jsonb, downgrade_keep = NULL, updated_at = now() WHERE workspace_id = $1 AND status IN ('trialing','active','past_due')",
         [workspaceId, JSON.stringify(intent)],
       );
       if (result.rowCount !== 1) throw new PreconditionUnmetError({ message: "this workspace has no billing subscription yet: start one first" });
@@ -719,7 +720,8 @@ export class PlanChangeService {
   /** Clears THIS intent (matched by id): a newer one written by another request is left alone. */
   private async clearIntent(workspaceId: string, intentId: string): Promise<void> {
     await this.inOwnTransaction(workspaceId, async (tx) => {
-      await tx.query("UPDATE subscriptions SET pending_plan_change = NULL, updated_at = now() WHERE workspace_id = $1 AND pending_plan_change ->> 'id' = $2", [workspaceId, intentId]);
+      // The keep choice goes with its intent (STORY-077 D2).
+      await tx.query("UPDATE subscriptions SET pending_plan_change = NULL, downgrade_keep = NULL, updated_at = now() WHERE workspace_id = $1 AND pending_plan_change ->> 'id' = $2", [workspaceId, intentId]);
     });
   }
 

@@ -385,6 +385,8 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       // SCANFIX D4 - the stuck-run reaper asks for the rollup of a run it finishes.
       enqueueRollup: (queue, workspaceId, payload, idempotencyKey) =>
         sweepProducer.enqueueTenantJob(queue, workspaceId, payload, { idempotencyKey }),
+      // STORY-077 review round 2 - the downgrade-notice relay re-enqueues unsent notices (consumed by the rollup group).
+      enqueueDowngradeNotice: (queue, workspaceId, payload, options) => sweepProducer.enqueueTenantJob(queue, workspaceId, payload, options),
     });
     sweepRuntime.start();
     providers.push({

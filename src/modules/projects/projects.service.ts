@@ -24,6 +24,7 @@ import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { insertPromptStatement, manualPromptRow, type PromptRow } from "../../lib/promptgen/persist.js";
 import { assertActiveWithinLimits, lockWorkspaceForActivation } from "../prompts/active-limit.js";
+import { assertProjectSlotFree } from "./project-reactivation.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -116,7 +117,8 @@ export class ProjectsService {
     workspaceId: string,
     actorId: string,
     input: CreateProjectRequest,
-    entitlementVersion: number | undefined,
+    // Unread since STORY-077 (owner 2026-10-23): every creation resolves after the workspace lock, never the pinned version.
+    _entitlementVersion: number | undefined,
   ): Promise<CreateProjectResponse> {
     const client = currentTenantStore()!.client;
 
@@ -145,20 +147,22 @@ export class ProjectsService {
     // `active` and is held to the rule a resume is (active-limit.ts): after a cut-over that paused prompts for
     // `prompts.max_total`, a new project's prompts would otherwise put the workspace back above its plan. Counted after
     // the same hash dedupe the insert applies, so a repeated prompt is not refused for a slot it never takes. The
-    // workspace lock is taken first, as on every other door, and only when there is something to count: a creation
-    // without prompts waits on nothing.
+    // workspace lock is taken first, as on every other door.
     //
     // Review round 5 — and EVERY limit this creation checks is resolved AFTER that lock, from the committed version
     // (`resolveForWorkspace`), never the version the guard pinned when the request started. A creation that waited on
     // the lock while a cut-over lowered the plan would otherwise count the post-cut-over actives against the OLD plan's
     // `prompts.max_total` and `prompts.max_per_project` and insert above the plan, with nothing left to re-pause it.
+    //
+    // STORY-077, owner decision 2026-10-23 — the PROJECT itself is a door into a `projects.max` slot too, now that an
+    // archived or paused project uses none and leaving that state needs room (project-reactivation.ts). The guard's count
+    // runs before any lock, so a creation and a reactivation could each see the last slot free. Every creation therefore
+    // takes the workspace lock and re-counts `projects.max` under it (`assertProjectSlotFree`), as a reactivation does.
     const supplied = distinctSuppliedPrompts(workspaceId, projectId, input);
-    if (supplied.length > 0) await lockWorkspaceForActivation(client as ClientBase, workspaceId);
+    await lockWorkspaceForActivation(client as ClientBase, workspaceId, "project_create");
 
-    const resolved =
-      entitlementVersion === undefined || supplied.length > 0
-        ? await this.entitlements.resolveForWorkspace(workspaceId)
-        : await this.entitlements.resolve(workspaceId, entitlementVersion);
+    const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
+    await assertProjectSlotFree(client as ClientBase, workspaceId, resolved.entitlements);
 
     const promptsCap = resolveCap(resolved.entitlements["prompts.max_per_project"]?.value);
     const competitorsCap = resolveCap(resolved.entitlements["competitors.max_per_project"]?.value);

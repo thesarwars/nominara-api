@@ -30,16 +30,19 @@ describe("STORY-184 · computeDowngradeExcess — structural limits", () => {
     expect(r.structural).toEqual([{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", paused: 2, items: [{ id: P5, name: "e", prompts: 0 }, { id: P4, name: "d", prompts: 0 }] }]);
   });
 
-  it("STORY-077 review round 2 · the named items are the projects the cut-over PAUSES: an archived or person-paused project in the excess is counted, never named as paused", () => {
-    // Five projects against growth's 3: the excess is the two newest, e (archived) and d. The guard counts e, so the count
-    // is exact, but planDowngradePause pauses only d - so only d is named under "paused at period end".
-    const r = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e", 0, 0, "archived"), project(P4, "d"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
-    expect(r.structural).toEqual([{ kind: "structural", key: "projects.max", limit: 3, current: 5, excess: 2, effect: "paused_at_period_end", paused: 1, items: [{ id: P4, name: "d", prompts: 0 }] }]);
-    const personPaused = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e", 0, 0, "paused"), project(P4, "d", 0, 0, "initializing"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
-    expect(personPaused.structural[0]).toMatchObject({ excess: 2, items: [{ id: P4, name: "d" }] });
-    // One a downgrade already paused stays paused: it is named.
-    const already = run("business", "growth", usage({ workspace: { "projects.max": 5, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 }, projects: [project(P5, "e", 0, 0, "paused", true), project(P4, "d"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
-    expect(already.structural[0]).toMatchObject({ items: [{ id: P5, name: "e" }, { id: P4, name: "d" }] });
+  it("OWNER 2026-10-23 · projects.max counts TRACKING projects: an archived, person-paused or already downgrade-paused project is neither counted nor named", () => {
+    // Replaces review round 2 (the archived e counted and held its slot, so d AND c were paused). The guard's count is now
+    // the four tracking projects against growth's 3: one is over, the cut-over pauses d, and only d is named.
+    const ws = { "projects.max": 4, "prompts.max_total": 0, "seats.max": 1, "api.keys_max": 0 };
+    const r = run("business", "growth", usage({ workspace: ws, projects: [project(P5, "e", 0, 0, "archived"), project(P4, "d"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
+    expect(r.structural).toEqual([
+      { kind: "structural", key: "projects.max", limit: 3, current: 4, excess: 1, effect: "paused_at_period_end", paused: 1, items: [{ id: P4, name: "d", prompts: 0 }] },
+    ]);
+    const personPaused = run("business", "growth", usage({ workspace: ws, projects: [project(P5, "e", 0, 0, "paused"), project(P4, "d", 0, 0, "initializing"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
+    expect(personPaused.structural[0]).toMatchObject({ excess: 1, paused: 1, items: [{ id: P4, name: "d" }] });
+    // One a downgrade already paused is not counted (it is not tracking) and is not named: it is not paused again.
+    const already = run("business", "growth", usage({ workspace: ws, projects: [project(P5, "e", 0, 0, "paused", true), project(P4, "d"), project(P3, "c"), project(P2, "b"), project(P1, "a")] }));
+    expect(already.structural[0]).toMatchObject({ excess: 1, paused: 1, items: [{ id: P4, name: "d" }] });
   });
 
   it("BOUNDARY · usage exactly at the target's limit is not an excess; one over is", () => {
@@ -237,14 +240,16 @@ describe("STORY-077 review round 3 · the preview's paused counts are the cut-ov
     expect(previewedPrompts(r.structural)).toBe(cutOverPauses("growth", u, { "prompts.max_total": 100 }).pausePrompts.length);
   });
 
-  it("a project a downgrade ALREADY paused is named with 0 prompts (they are paused already); seats and other must_reduce keys carry no `paused`", () => {
+  it("OWNER 2026-10-23 · a project a downgrade ALREADY paused uses no slot: it is not counted, and with one tracking project against 1 there is no projects.max entry; seats and other must_reduce keys carry no `paused`", () => {
+    // Replaces the old assertion (B counted, named with 0 prompts, `paused: 0`): the guard's count is now the ONE tracking
+    // project, which fits Starter's 1, so the cut-over pauses no project and none is named.
     const u = usage({
-      workspace: { "projects.max": 2, "prompts.max_total": 10, "seats.max": 9, "api.keys_max": 0 },
+      workspace: { "projects.max": 1, "prompts.max_total": 10, "seats.max": 9, "api.keys_max": 0 },
       projects: [project(P2, "B", 5, 0, "paused", true, at(1)), project(P1, "A", 5, 0, "active", false, at(0))],
       slotPrompts: [...rows(P1, 5, 10), ...rows(P2, 5, 100, "paused", true)],
     });
     const r = run("growth", "starter", u);
-    expect(r.structural[0]).toEqual({ kind: "structural", key: "projects.max", limit: 1, current: 2, excess: 1, effect: "paused_at_period_end", paused: 0, items: [{ id: P2, name: "B", prompts: 0 }] });
+    expect(r.structural.find((e) => e.kind === "structural" && e.key === "projects.max")).toBeUndefined();
     const seats = r.structural.find((e) => e.kind === "structural" && e.key === "seats.max");
     expect(seats).toBeDefined();
     expect(seats).not.toHaveProperty("paused");

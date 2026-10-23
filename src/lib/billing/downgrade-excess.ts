@@ -6,7 +6,7 @@ import { FEATURE_FLAG_KEYS, isFeatureGranted, structuralLimitFrom, type Structur
 import { ADDON_KINDS, mergeEntitlements, type AddonKind, type AddonQuantities } from "../entitlements/resolution.js";
 import { countStructural, PROMPT_OCCUPIES_SLOT } from "../entitlements/structural-usage.js";
 import { ADDON_CATALOG } from "./addon-catalog.js";
-import { pauseLimitsFrom, planDowngradePauseWithReasons, type PausePrompt } from "./downgrade-pause.js";
+import { pauseLimitsFrom, planDowngradePauseWithReasons, readActivityKeys, type PausePrompt } from "./downgrade-pause.js";
 
 // STORY-184 T5 — what a downgrade would cost the customer, named exactly.
 //
@@ -56,6 +56,8 @@ export interface ExcessUsage {
     readonly pausedByDowngrade: boolean;
     /** `created_at` as the planner's microsecond key (downgrade-pause.ts `PauseProject.createdKey`). */
     readonly createdKey: string;
+    /** STORY-077 D2: the planner's activity key (latest finished capture run); null or absent: never. */
+    readonly activityKey?: string | null;
   }>;
   /** Every slot-occupying prompt (`PROMPT_OCCUPIES_SLOT`), as the cut-over's planner reads them. */
   readonly slotPrompts: readonly PausePrompt[];
@@ -108,7 +110,7 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
   // The cut-over's own plan, dry run on the target's resolved limits (review round 3).
   const plan = planDowngradePauseWithReasons(
     pauseLimitsFrom(target),
-    input.usage.projects.map((p) => ({ id: p.id, createdKey: p.createdKey, status: p.status, pausedByDowngrade: p.pausedByDowngrade })),
+    input.usage.projects.map((p) => ({ id: p.id, createdKey: p.createdKey, status: p.status, pausedByDowngrade: p.pausedByDowngrade, activityKey: p.activityKey ?? null })),
     input.usage.slotPrompts,
   );
   const projectOf = new Map(input.usage.slotPrompts.map((p) => [p.id, p.projectId]));
@@ -130,12 +132,12 @@ export function computeDowngradeExcess(input: ExcessInput): DowngradeExcess {
     if (limit === null || used <= limit) continue;
     const excess = used - limit;
     if (key === "projects.max") {
-      // The excess is the most recently created ones, exactly the order §14 pauses them in. Every one is COUNTED (the
-      // guard's count), but only those the cut-over pauses - or a downgrade already paused - are NAMED as paused: an
-      // archived or person-paused project in the excess is not tracked and is never paused (downgrade-pause.ts).
-      const items = input.usage.projects
-        .slice(0, excess)
-        .filter((p) => p.pausedByDowngrade || p.status === "active" || p.status === "initializing")
+      // The planner's own (STORY-077 D2: the least recently active, in the order the cut-over pauses them). The guard
+      // counts TRACKING projects (owner decision 2026-10-23), so the excess is exactly what the cut-over pauses: an
+      // archived, person-paused or already downgrade-paused project is neither counted nor named.
+      const byId = new Map(input.usage.projects.map((p) => [p.id, p]));
+      const items = plan.pauseProjects
+        .map((id) => byId.get(id)!)
         .slice(0, MAX_NAMED_PROJECTS)
         .map((p) => ({ id: p.id, name: p.name, prompts: pausedPrompts("with_project", p.id) }));
       structural.push({ kind: "structural", key, limit, current: used, excess, effect: effectOf(key), paused: plan.pauseProjects.length, items });
@@ -187,6 +189,7 @@ export async function readExcessUsage(tx: ClientBase, workspaceId: string): Prom
   const workspace = {} as Record<WorkspaceKey, number>;
   for (const key of WORKSPACE_KEYS) workspace[key] = await countStructural(tx, key, workspaceId);
 
+  const activity = await readActivityKeys(tx, workspaceId);
   const rows = await tx.query<{ id: string; name: string; created_key: string; status: ExcessUsage["projects"][number]["status"]; paused_by_downgrade: boolean }>(
     `SELECT id, name, to_char(created_at AT TIME ZONE 'UTC', ${MICROS_FORMAT}) AS created_key, status, paused_by_downgrade_at IS NOT NULL AS paused_by_downgrade
        FROM projects WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC`,
@@ -200,6 +203,7 @@ export async function readExcessUsage(tx: ClientBase, workspaceId: string): Prom
       status: row.status,
       pausedByDowngrade: row.paused_by_downgrade,
       createdKey: row.created_key,
+      activityKey: activity.projects.get(row.id) ?? null,
       prompts: await countStructural(tx, "prompts.max_per_project", workspaceId, row.id),
       competitors: await countStructural(tx, "competitors.max_per_project", workspaceId, row.id),
     });
@@ -210,6 +214,13 @@ export async function readExcessUsage(tx: ClientBase, workspaceId: string): Prom
        FROM tracked_prompts WHERE workspace_id = $1 AND ${PROMPT_OCCUPIES_SLOT}`,
     [workspaceId],
   );
-  const slotPrompts = prompts.rows.map((r) => ({ id: r.id, projectId: r.project_id, createdKey: r.created_key, status: r.status, pausedByDowngrade: r.paused_by_downgrade }));
+  const slotPrompts = prompts.rows.map((r) => ({
+    id: r.id,
+    projectId: r.project_id,
+    createdKey: r.created_key,
+    status: r.status,
+    pausedByDowngrade: r.paused_by_downgrade,
+    activityKey: activity.prompts.get(r.id) ?? null,
+  }));
   return { workspace, projects, slotPrompts };
 }

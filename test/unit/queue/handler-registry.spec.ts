@@ -63,6 +63,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "audit.verify",
       "billing.auto_topup",
       "billing.customer_email",
+      "billing.downgrade_notice",
       "capture.execute",
       "capture.parse",
       "capture.plan",
@@ -104,7 +105,9 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "billing.auto_topup",
       // STORY-021 (ownership transfer) — declared after billing.auto_topup in topology.ts.
       "billing.customer_email",
-      // STORY-076 / STORY-071 and STORY-077 R4 — declared after billing.customer_email in topology.ts.
+      // STORY-077 (owner decision 2026-10-23) — declared after billing.customer_email in topology.ts.
+      "billing.downgrade_notice",
+      // STORY-076 / STORY-071 and STORY-077 R4 — declared after billing.downgrade_notice in topology.ts.
       "credit.housekeeping",
       "retention.purge",
       // STORY-048 AC7 — declared after retention.purge in topology.ts.

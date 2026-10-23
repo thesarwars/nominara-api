@@ -95,6 +95,36 @@ describe("NEW-A-13 · bootstrapWorker wires the scheduler sweep ONLY for WORKER_
     }
   }, 30_000);
 
+  // STORY-077 review round 2 (major): the downgrade-notice relay rides the capture sweep's tick. The production closure
+  // must put a SIGNED tenant job on billing.downgrade_notice (consumed by the rollup group), carrying the notice id only.
+  it("STORY-077 · the PRODUCTION downgrade-notice enqueuer puts one signed billing.downgrade_notice job per key", async () => {
+    process.env.WORKER_GROUP = "capture";
+    const { bootstrapWorker, CAPTURE_SCHEDULER_SWEEP } = await import("../../src/worker.js");
+
+    const app = await bootstrapWorker();
+    const connection = createQueueWorkerConnection(fixture.connectionString);
+    const reader = new Queue("billing.downgrade_notice", { connection, prefix: queueKeyPrefix(loadEnv().NODE_ENV) });
+    try {
+      const holder = app.get(CAPTURE_SCHEDULER_SWEEP) as {
+        runtime: { enqueueDowngradeNotice?: (queue: "billing.downgrade_notice", workspaceId: string, payload: { noticeId: string }, options: { idempotencyKey: string }) => Promise<unknown> };
+      };
+      expect(holder.runtime.enqueueDowngradeNotice, "the capture worker wires the relay's enqueuer").toBeDefined();
+      const workspaceId = "0192f0a0-0000-7000-8000-000000000001";
+      const noticeId = "0192f0a0-0000-7000-8000-000000000003";
+      await holder.runtime.enqueueDowngradeNotice!("billing.downgrade_notice", workspaceId, { noticeId }, { idempotencyKey: `dgnotice:${workspaceId}:abc:paused` });
+      await holder.runtime.enqueueDowngradeNotice!("billing.downgrade_notice", workspaceId, { noticeId }, { idempotencyKey: `dgnotice:${workspaceId}:abc:paused` });
+      const jobs = await reader.getJobs(["waiting", "prioritized", "delayed", "active", "completed", "failed"]);
+      expect(jobs, "the same key adds no second job").toHaveLength(1);
+      const envelope = jobs[0]!.data as { payload: Record<string, unknown>; signature: string };
+      expect(envelope.signature.length).toBeGreaterThan(0);
+      expect(envelope.payload).toMatchObject({ workspaceId, noticeId });
+    } finally {
+      await reader.close();
+      connection.disconnect();
+      await app.close();
+    }
+  }, 30_000);
+
   it.each(["parse", "crawl", "embed", "rollup", "report", "deploy"])(
     "NEW-A-13 AC1 · WORKER_GROUP=%s never starts a scheduler sweep",
     async (group) => {
