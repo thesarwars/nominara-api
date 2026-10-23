@@ -1,4 +1,5 @@
 import { Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
@@ -24,10 +25,15 @@ import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-facto
 //
 // The payload is `.strict()` and carries the notice id ONLY: the address, subject and body are read from the row.
 
+// Review round 2: one span around the send (the job's only network I/O) and every log line carrying the workspace id,
+// as billing-customer-email.handler does. Ids only: never the address, the subject or the body.
+const tracer = trace.getTracer("nominara.billing-downgrade-notice");
+
 const payloadSchema = z.object({ workspaceId: z.string().uuid(), kid: z.string(), noticeId: z.string().uuid() }).strict();
 
 interface Prepared {
   readonly id: string;
+  readonly workspaceId: string;
   readonly to: string;
   readonly subject: string;
   readonly textBody: string;
@@ -55,24 +61,35 @@ export function createBillingDowngradeNoticeHandler(_context: QueueHandlerContex
         incrementCounter("nominara_billing_downgrade_notice_jobs_total", { outcome: "already_sent" });
         return PHASES_DONE;
       }
-      return { id: row.id, to: row.recipient, subject: row.subject, textBody: row.text_body };
+      return { id: row.id, workspaceId: payload.workspaceId, to: row.recipient, subject: row.subject, textBody: row.text_body };
     },
 
     async run(prepared: Prepared) {
-      try {
-        await senderFor().send({ to: prepared.to, subject: prepared.subject, textBody: prepared.textBody, idempotencyKey: downgradeNoticeIdempotencyKey(prepared.id) });
-      } catch (error) {
-        incrementCounter("nominara_billing_downgrade_notice_failed_total", { reason: "send_failed" });
-        logger.warn({ event: "billing.downgrade_notice.send_failed", notice_id: prepared.id, error: error instanceof Error ? error.name : "unknown" });
-        throw error;
-      }
-      return true as const;
+      return await tracer.startActiveSpan("billing.downgrade_notice.send", async (span) => {
+        span.setAttributes({ "nominara.workspace_id": prepared.workspaceId, "nominara.downgrade_notice.id": prepared.id });
+        try {
+          await senderFor().send({ to: prepared.to, subject: prepared.subject, textBody: prepared.textBody, idempotencyKey: downgradeNoticeIdempotencyKey(prepared.id) });
+        } catch (error) {
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          incrementCounter("nominara_billing_downgrade_notice_failed_total", { reason: "send_failed" });
+          logger.warn({
+            event: "billing.downgrade_notice.send_failed",
+            workspace_id: prepared.workspaceId,
+            notice_id: prepared.id,
+            error: error instanceof Error ? error.name : "unknown",
+          });
+          throw error;
+        } finally {
+          span.end();
+        }
+        return true as const;
+      });
     },
 
     async commit(tx: ClientBase, prepared: Prepared) {
       await tx.query("UPDATE downgrade_notices SET sent_at = now() WHERE id = $1 AND sent_at IS NULL", [prepared.id]);
       incrementCounter("nominara_billing_downgrade_notice_jobs_total", { outcome: "sent" });
-      logger.log({ event: "billing.downgrade_notice.sent", notice_id: prepared.id });
+      logger.log({ event: "billing.downgrade_notice.sent", workspace_id: prepared.workspaceId, notice_id: prepared.id });
     },
   });
 }
