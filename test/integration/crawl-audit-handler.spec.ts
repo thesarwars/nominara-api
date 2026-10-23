@@ -868,11 +868,12 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(Number(a.score_breakdown.crawler_access)).toBeLessThan(1);
     });
 
+    const r001Status = async (): Promise<string[]> => (await findings()).filter((f) => f.rule_code === "AUX-R-001").map((f) => f.status as string);
     const robots503: Served = { ...healthy(OPEN), "/robots.txt": { status: 503, body: "" } };
     it("STORY-052 AC8 · a robots.txt that answers 503 is not an observation: a critical AUX-R-001 is not resolved, pins no milestone, and stays capped", async () => {
       await runAsTenant(healthy(BLOCKED));
       await runAsTenant(robots503);
-      expect(await statusOf()).toEqual(["open"]);
+      expect(await r001Status()).toEqual(["open"]);
       expect(await milestones()).toHaveLength(0);
       expect((await audits()).at(-1).score_capped).toBe(true);
     });
@@ -881,7 +882,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       await runAsTenant(healthy(BLOCKED));
       await runAsTenant(robots503);
       await runAsTenant(robots503);
-      expect(await statusOf()).toEqual(["stale"]);
+      expect(await r001Status()).toEqual(["stale"]);
       expect(await milestones()).toHaveLength(0);
       expect((await audits()).at(-1).score_capped).toBe(true);
     });
