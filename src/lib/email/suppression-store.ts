@@ -37,8 +37,10 @@ export function sharedSuppressionStore(): SuppressionStore {
     let pool: Pool | undefined;
     shared = new PgSuppressionStore({
       query: (text, values) => {
-        pool ??= new Pool({ connectionString: loadEnv().DATABASE_URL_POOLED, max: 2, idleTimeoutMillis: 10_000, connectionTimeoutMillis: 3_000, query_timeout: 3_000, allowExitOnIdle: true });
-        pool.on("error", () => undefined);
+        if (pool === undefined) {
+          pool = new Pool({ connectionString: loadEnv().DATABASE_URL_POOLED, max: 2, idleTimeoutMillis: 10_000, connectionTimeoutMillis: 3_000, query_timeout: 3_000, allowExitOnIdle: true });
+          pool.on("error", () => undefined); // once, when the pool is built: an idle client's error must not crash the process
+        }
         return pool.query(text, values) as never;
       },
     });
