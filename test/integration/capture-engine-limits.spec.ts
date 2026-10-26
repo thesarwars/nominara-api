@@ -480,7 +480,7 @@ describe("STORY-031 · engine limits in the live capture path", () => {
       await sweepEngineSkipRefunds(db, new Date());
       // Settled directly too, so the sweep's own candidate filter cannot be what keeps the refund at zero.
       const direct = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => settleEngineSkippedCells(tx, { workspaceId, runId }));
-      expect(direct).toEqual({ refunded: 0, skippedCells: 0 });
+      expect(direct).toEqual({ refunded: 0, skippedCells: 0, debitBeforeCurrentCycle: false });
       expect(await refundedTotal()).toBe(0);
     });
 

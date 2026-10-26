@@ -48,9 +48,17 @@ export interface EngineSkipRefundInput {
 export interface EngineSkipRefundOutcome {
   readonly refunded: number;
   readonly skippedCells: number;
+  /**
+   * True when the debit was made before the wallet's CURRENT cycle began, i.e. the refund lands after a cycle roll (normally it
+   * lands within the hour; this takes repeated sweep failures). STORY-031 review fix - DISCLOSED, NOT CHANGED: the included share
+   * still goes back to `included`, into the new cycle, although the original included credits lapsed at the roll. Owner decision
+   * 10 says the credits are refunded; withholding them, or sending them to the durable bucket (the undo.ts exploit), would each be
+   * a new policy, so the case is reported (here, logged, counted) for the owner to rule on.
+   */
+  readonly debitBeforeCurrentCycle: boolean;
 }
 
-const NOTHING: EngineSkipRefundOutcome = { refunded: 0, skippedCells: 0 };
+const NOTHING: EngineSkipRefundOutcome = { refunded: 0, skippedCells: 0, debitBeforeCurrentCycle: false };
 
 /** Must run inside the run's tenant transaction (RLS scopes every statement), in a transaction that does no network I/O. */
 export async function settleEngineSkippedCells(tx: ClientBase, input: EngineSkipRefundInput): Promise<EngineSkipRefundOutcome> {
@@ -67,12 +75,13 @@ export async function settleEngineSkippedCells(tx: ClientBase, input: EngineSkip
   );
   const skippedCells = Math.min(Number(skipped.rows[0]?.n ?? 0), row.planned_cells);
   if (skippedCells === 0) return NOTHING;
+  const partial = { skippedCells, debitBeforeCurrentCycle: false };
 
   const debit = await refundableDebitFor(tx, input.workspaceId, input.runId);
-  if (debit === null || debit.credits === 0 || debit.alreadyRefunded) return { refunded: 0, skippedCells };
+  if (debit === null || debit.credits === 0 || debit.alreadyRefunded) return { refunded: 0, ...partial };
 
   const amount = Math.floor((debit.credits * skippedCells) / row.planned_cells);
-  if (amount === 0) return { refunded: 0, skippedCells };
+  if (amount === 0) return { refunded: 0, ...partial };
   const toIncluded = Math.min(amount, debit.fromIncluded);
   const toPurchased = Math.min(amount - toIncluded, debit.fromPurchased);
 
@@ -97,7 +106,21 @@ export async function settleEngineSkippedCells(tx: ClientBase, input: EngineSkip
     );
     if (outcome.applied) refunded += credits;
   }
-  if (refunded === 0) return { refunded: 0, skippedCells };
+  if (refunded === 0) return { refunded: 0, ...partial };
+
+  // `cycle_start` is a UTC date (credit_wallets); the debit is the run's commit entry refundableDebitFor found.
+  const crossed = await tx.query<{ before: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM credit_ledger c JOIN credit_wallets w ON w.workspace_id = c.workspace_id
+        WHERE c.workspace_id = $1 AND c.entry_type = 'commit' AND c.reference_type = 'run' AND c.reference_id = $2
+          AND c.idempotency_key = $3 AND c.occurred_at < (w.cycle_start::timestamp AT TIME ZONE 'UTC')) AS before`,
+    [input.workspaceId, input.runId, debit.idempotencyKey],
+  );
+  const debitBeforeCurrentCycle = crossed.rows[0]?.before === true;
+  if (debitBeforeCurrentCycle) {
+    incrementCounter("nominara_credits_engine_skip_refund_after_cycle_roll_total", {});
+    logger.warn({ event: "credits.engine_skip_refund.after_cycle_roll", workspace_id: input.workspaceId, run_id: input.runId, credits: refunded });
+  }
 
   await new AuditChainService().append(tx, {
     workspaceId: input.workspaceId,
@@ -116,5 +139,5 @@ export async function settleEngineSkippedCells(tx: ClientBase, input: EngineSkip
   });
   incrementCounter("nominara_credits_run_refunded_total", { reason: "engine_unavailable" });
   logger.log({ event: "credits.run.refunded", workspace_id: input.workspaceId, run_id: input.runId, credits: refunded, reason: "engine_unavailable", skipped_cells: skippedCells });
-  return { refunded, skippedCells };
+  return { refunded, skippedCells, debitBeforeCurrentCycle };
 }

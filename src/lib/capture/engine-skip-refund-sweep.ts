@@ -32,27 +32,51 @@ export interface EngineSkipRefundSweepResult {
   readonly refundedRuns: number;
 }
 
-/** `client` is the sweep's OWNER connection, with no transaction open on it. */
-export async function sweepEngineSkipRefunds(client: ClientBase, now: Date, options: { readonly lookbackMs?: number } = {}): Promise<EngineSkipRefundSweepResult> {
+/**
+ * `client` is the sweep's OWNER connection, with no transaction open on it.
+ *
+ * PAGES THROUGH EVERY CANDIDATE (STORY-031 review fix). A candidate that settles to nothing - no debit, a share that floors to 0 -
+ * still matches "no refund yet" on every tick, so a single oldest-first page could fill with those and starve every newer run of
+ * its refund for the whole lookback. Keyset paging on (finished_at, id) visits each candidate once per tick.
+ */
+export async function sweepEngineSkipRefunds(
+  client: ClientBase,
+  now: Date,
+  options: { readonly lookbackMs?: number; readonly batchLimit?: number } = {},
+): Promise<EngineSkipRefundSweepResult> {
   const since = new Date(now.getTime() - (options.lookbackMs ?? ENGINE_SKIP_REFUND_LOOKBACK_MS));
-  const candidates = await client.query<{ id: string; workspace_id: string }>(
-    `SELECT r.id, r.workspace_id
-       FROM capture_runs r
-      WHERE r.status = 'partial'
-        AND r.trigger = 'manual'
-        AND r.finished_at >= $1
-        AND EXISTS (SELECT 1 FROM answer_captures a
-                     WHERE a.run_id = r.id AND ${blockedStatusSql("a.status")} AND a.error_code = ANY($2::text[]))
-        AND NOT EXISTS (SELECT 1 FROM credit_ledger l
-                         WHERE l.workspace_id = r.workspace_id AND l.entry_type = 'refund'
-                           AND l.reference_type = 'run' AND l.reference_id = r.id)
-      ORDER BY r.finished_at
-      LIMIT $3`,
-    [since, [...ENGINE_UNAVAILABLE_SKIP_CODES], BATCH_LIMIT],
-  );
-
+  const batchLimit = options.batchLimit ?? BATCH_LIMIT;
   let refundedRuns = 0;
-  for (const candidate of candidates.rows) {
+  // The cursor's timestamp is carried as TEXT: a JS Date drops the microseconds, and a truncated cursor would re-select its own row.
+  let after: { finishedAt: string; id: string } | null = null;
+  for (;;) {
+    const candidates: { rows: { id: string; workspace_id: string; finished_at: string }[] } = await client.query<{ id: string; workspace_id: string; finished_at: string }>(
+      `SELECT r.id, r.workspace_id, r.finished_at::text AS finished_at
+         FROM capture_runs r
+        WHERE r.status = 'partial'
+          AND r.trigger = 'manual'
+          AND r.finished_at >= $1
+          AND ($4::timestamptz IS NULL OR (r.finished_at, r.id) > ($4::timestamptz, $5::uuid))
+          AND EXISTS (SELECT 1 FROM answer_captures a
+                       WHERE a.run_id = r.id AND ${blockedStatusSql("a.status")} AND a.error_code = ANY($2::text[]))
+          AND NOT EXISTS (SELECT 1 FROM credit_ledger l
+                           WHERE l.workspace_id = r.workspace_id AND l.entry_type = 'refund'
+                             AND l.reference_type = 'run' AND l.reference_id = r.id)
+        ORDER BY r.finished_at, r.id
+        LIMIT $3`,
+      [since, [...ENGINE_UNAVAILABLE_SKIP_CODES], batchLimit, after?.finishedAt ?? null, after?.id ?? null],
+    );
+    refundedRuns += await settleCandidates(client, candidates.rows);
+    const last = candidates.rows.at(-1);
+    if (last === undefined || candidates.rows.length < batchLimit) break;
+    after = { finishedAt: last.finished_at, id: last.id };
+  }
+  return { refundedRuns };
+}
+
+async function settleCandidates(client: ClientBase, rows: readonly { id: string; workspace_id: string }[]): Promise<number> {
+  let refundedRuns = 0;
+  for (const candidate of rows) {
     try {
       const outcome = await withTenantContext(client, { workspaceId: candidate.workspace_id, actorId: SYSTEM_ACTOR_ID }, (tx) =>
         settleEngineSkippedCells(tx, { workspaceId: candidate.workspace_id, runId: candidate.id }),
@@ -63,5 +87,5 @@ export async function sweepEngineSkipRefunds(client: ClientBase, now: Date, opti
       logger.error({ event: "credits.engine_skip_refund.failed", workspace_id: candidate.workspace_id, run_id: candidate.id, error: error instanceof Error ? error.name : "unknown" });
     }
   }
-  return { refundedRuns };
+  return refundedRuns;
 }
