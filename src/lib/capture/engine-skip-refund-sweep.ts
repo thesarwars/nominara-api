@@ -52,6 +52,16 @@ export async function sweepEngineSkipRefunds(
   now: Date,
   options: { readonly lookbackMs?: number; readonly batchLimit?: number } = {},
 ): Promise<EngineSkipRefundSweepResult> {
+  // STORY-031 review round 2: the candidate query runs with no tenant context. On an RLS-bound role it finds no rows and the sweep
+  // would report "nothing to refund" while a refund is owed. The scheduler tick already refuses such a connection before it gets
+  // here; the sweep refuses it too, so no caller can make it silently blind.
+  const role = await client.query<{ can_see: boolean; who: string }>(
+    "SELECT (rolsuper OR rolbypassrls) AS can_see, rolname AS who FROM pg_roles WHERE rolname = current_user",
+  );
+  if (role.rows[0]?.can_see !== true) {
+    incrementCounter("nominara_credits_engine_skip_refund_sweep_blind_total", {});
+    throw new EngineSkipRefundSweepBlindError(role.rows[0]?.who ?? "unknown");
+  }
   const since = new Date(now.getTime() - (options.lookbackMs ?? ENGINE_SKIP_REFUND_LOOKBACK_MS));
   const batchLimit = options.batchLimit ?? BATCH_LIMIT;
   let refundedRuns = 0;

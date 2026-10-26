@@ -71,14 +71,33 @@ Owner decision 2026-10-26 (10) is an exception to "a partial run is charged in f
    existing `emitProgress`, folded into the wave-4 NFR-ARCH-04 follow-up ("Valkey writes inside capture commit tx"); a rollback
    after the publish can send one stale, self-correcting event (the client re-reads `GET /engines/status` on it).
 10. **Files outside the plan's `files_touched`** (disclosed): `src/lib/credits/engine-skip-refund.ts`, `src/lib/capture/engine-skip-refund-sweep.ts`, `src/lib/capture/scheduler-sweep.ts`, `src/lib/engines/capture-engine-gate.ts`, `src/lib/rollup/aggregate-day.ts` (new named rule), `test/unit/analytics/measurement-status-shared.spec.ts` (pins the new rule by value), `src/modules/health/engines-status.controller.ts`, `test/support/open-engine-gate.ts` and the seven existing capture specs that now inject it; round 1 adds
-   `test/integration/engine-ladder-status-ownership.spec.ts`. Client: `lib/api/engines.ts`, `lib/api/contract.ts`,
+   `test/integration/engine-ladder-status-ownership.spec.ts`; round 2 adds `test/integration/engine-skip-refund-sweep-rls.spec.ts`. Client: `lib/api/engines.ts`, `lib/api/contract.ts`,
    `components/project/useDegradedEngines.ts`, `lib/query/keys.ts`, `lib/query/realtime-map.ts`, `lib/demo/routes/engines.ts`,
    `lib/demo/routes.ts`, `tests/guards.test.ts` (comment), `tests/shell-query-wiring.test.ts`.
+11. **The refund sweep refuses an RLS-bound connection** (review round 2). Its candidate query runs with no tenant context; on a
+   NOBYPASSRLS role under FORCE RLS it found nothing and returned "0 refunded" while a refund was owed (proven by
+   `test/integration/engine-skip-refund-sweep-rls.spec.ts` against `nominara_worker`). The scheduler tick already refused such a
+   connection (`assertSweepCanSee`) before reaching the sweep; the sweep now refuses it itself
+   (`EngineSkipRefundSweepBlindError`, `nominara_credits_engine_skip_refund_sweep_blind_total`). Production still depends on the
+   owner connection's identity, the same open question as the stuck-run reaper (README G-4).
+12. **Engines left out of the plan because they were already `degraded` at trigger time are not refunded** (review round 2, owner
+   question). The planner plans only engines the entitled view returns (`e.status = 'active'`, `engine-cadence.ts`), so for an engine already `degraded` at trigger time the cells never exist as `blocked` rows
+   and `settleEngineSkippedCells` never sees them: the customer pays the flat `deep_scan.credits` for fewer engines, whereas the
+   same scan planned minutes earlier (before stage 5) is refunded for the skipped cells. Decision 10's text covers cells "skipped
+   during" a scan and the flat price for unplanned engines predates this story (STORY-034), so behaviour is unchanged here.
+   **Owner to rule:** price or refund engines excluded at trigger time, or state in `plans-and-entitlements.md` §5 that they are not.
+13. **The client's degraded warning is the EC-06 stage-5 state only; an open breaker on an `active` engine reads "delayed"** (review
+   round 2). EC-06 puts the warning at stage 5 (`degraded`); at stage 4 cells are re-queued, not lost. The pip shows
+   "degraded — <engine>" for `status = degraded` or a realtime `engine.degraded` push, and "delayed — <engine>" for a breaker that is
+   `open` while the catalog still says `active`. A realtime push no longer outlives a newer status read that reports the engine
+   healthy (the API publishes no recovery event; the read is the authority once it is newer than the push).
 
 ## 6. Not done here
 
 - AC2 host limiter in the crawl handlers (crawl.discover, crawl.audit, source.verify_presence): deferred out of the capture-path
   stream, recorded in `plans-7day/followups-2026-10-19-d1.md` for the orchestrator/owner to schedule as its own item.
 - Owner confirmation still needed for section 5 items 3 (hard stop as a uniform priority filter) and 4 (refund scope excludes
-  spend-ceiling-blocked cells), and item 7 (refund after a cycle roll).
+  spend-ceiling-blocked cells), item 7 (refund after a cycle roll) and item 12 (engines excluded at trigger time).
+- Second-engineer review by `dangerous-area-auditor` (credit ledger refund, the sweep's per-candidate tenant context, breaker and
+  `engines.status` ownership) is still outstanding.
 - After the API merges: regenerate the client copy (`client:generate`, build) and refresh the client's `clientDistSha256`.
