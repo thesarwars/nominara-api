@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   findingFingerprint,
+  milestoneKindFor,
   raiseOneBand,
+  STALE_AFTER_AUDITS,
   reconcileFindings,
   type DetectedFinding,
   type ExistingFinding,
@@ -79,8 +81,13 @@ describe("NEW-C-9 AC3 · reconcileFindings", () => {
     expect(reconcileFindings({ existing: [existing()], detected: [], inScope: () => false })).toEqual([]);
   });
 
-  it("NEW-C-9 AC3.10 · wont_fix and stale are never resolved by absence", () => {
-    expect(reconcileFindings({ existing: [existing({ status: "wont_fix" }), existing({ id: "f2", status: "stale" })], detected: [], inScope })).toEqual([]);
+  it("NEW-C-9 AC3.10 · wont_fix is never resolved by absence, and a stale finding is not resolved by an audit that could not look", () => {
+    expect(reconcileFindings({ existing: [existing({ status: "wont_fix" }), existing({ id: "f2", status: "stale" })], detected: [], inScope: () => (false) })).toEqual([]);
+    expect(reconcileFindings({ existing: [existing({ status: "wont_fix" })], detected: [], inScope })).toEqual([]);
+  });
+
+  it("STORY-052 AC8 · a stale finding that a later audit OBSERVED and did not reproduce is resolved", () => {
+    expect(reconcileFindings({ existing: [existing({ id: "f2", status: "stale" })], detected: [], inScope })).toEqual([{ kind: "resolve", id: "f2" }]);
   });
 
   it("NEW-C-9 AC3.11 · a defect returning after resolution regresses the resolved row, one band higher", () => {
@@ -123,5 +130,64 @@ describe("NEW-C-9 AC3 · reconcileFindings", () => {
 
   it("NEW-C-9 AC3.16 · duplicates in the detected set insert once", () => {
     expect(reconcileFindings({ existing: [], detected: [detected(), detected()], inScope })).toHaveLength(1);
+  });
+});
+
+describe("STORY-052 AC8 · stale is distinct from resolved", () => {
+  const notObserved = (): boolean => false;
+
+  it("STORY-052 scenario 10 · the documented number of consecutive audits is 2", () => {
+    expect(STALE_AFTER_AUDITS).toBe(2);
+  });
+
+  it("STORY-052 scenario 10 · not observed in this audit and in the one before: stale, NOT resolved", () => {
+    const actions = reconcileFindings({ existing: [existing()], detected: [], inScope: notObserved, unobservedBefore: () => 1 });
+    expect(actions).toEqual([{ kind: "stale", id: "f1" }]);
+  });
+
+  it("STORY-052 scenario 10 · the first audit that cannot see the page is not yet stale (one miss is not two)", () => {
+    expect(reconcileFindings({ existing: [existing()], detected: [], inScope: notObserved, unobservedBefore: () => 0 })).toEqual([]);
+  });
+
+  it("STORY-052 scenario 10 · with no history function supplied nothing goes stale (fails closed to the old behaviour)", () => {
+    expect(reconcileFindings({ existing: [existing()], detected: [], inScope: notObserved })).toEqual([]);
+  });
+
+  it("STORY-052 scenario 10 · a prior streak longer than needed is still stale, once", () => {
+    expect(reconcileFindings({ existing: [existing()], detected: [], inScope: notObserved, unobservedBefore: () => 5 })).toEqual([{ kind: "stale", id: "f1" }]);
+  });
+
+  it("STORY-052 scenario 10 · a finding the audit DID observe and did not reproduce is resolved however long it was unobserved before", () => {
+    expect(reconcileFindings({ existing: [existing()], detected: [], inScope, unobservedBefore: () => 9 })).toEqual([{ kind: "resolve", id: "f1" }]);
+  });
+
+  it.each(["open", "acknowledged", "in_progress", "regressed"] as const)("STORY-052 scenario 10 · a %s finding can go stale", (status) => {
+    expect(reconcileFindings({ existing: [existing({ status })], detected: [], inScope: notObserved, unobservedBefore: () => 1 })).toEqual([{ kind: "stale", id: "f1" }]);
+  });
+
+  it.each(["wont_fix", "stale", "resolved"] as const)("STORY-052 scenario 10 · a %s finding is left alone by the stale rule", (status) => {
+    const row = existing({ status, resolvedAt: status === "resolved" ? new Date() : null });
+    expect(reconcileFindings({ existing: [row], detected: [], inScope: notObserved, unobservedBefore: () => 1 })).toEqual([]);
+  });
+
+  it("STORY-052 scenario 10 · a detected finding is never staled, whatever its history", () => {
+    expect(reconcileFindings({ existing: [existing()], detected: [detected()], inScope: notObserved, unobservedBefore: () => 3 })).toEqual([
+      { kind: "redetect", id: "f1", reopen: false },
+    ]);
+  });
+});
+
+describe("STORY-052 AC11 · which resolutions pin a milestone", () => {
+  it.each(["critical", "high"] as const)("STORY-052 scenario 12 · a %s finding closed is an aux_status_change", (severity) => {
+    expect(milestoneKindFor(severity, "crawler_access")).toBe("aux_status_change");
+  });
+
+  it.each(["medium", "low", "info"] as const)("STORY-052 scenario 12 · a %s finding closed pins nothing", (severity) => {
+    expect(milestoneKindFor(severity, "crawler_access")).toBeNull();
+  });
+
+  it("scoring-models.md 13 · a structured_data resolution is schema_fixed at any severity, and wins over aux_status_change (one pin per source)", () => {
+    expect(milestoneKindFor("critical", "structured_data")).toBe("schema_fixed");
+    expect(milestoneKindFor("low", "structured_data")).toBe("schema_fixed");
   });
 });

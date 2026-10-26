@@ -773,6 +773,210 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       for (const key of puts) expect(key.startsWith(`crawl/test/${workspaceId}/`)).toBe(true);
       expect(puts.some((k) => k.endsWith("/manifest.json"))).toBe(true);
     });
+
+    // ---- STORY-052 -------------------------------------------------------------------------------------------------------
+    const noLlms: Served = { ...healthy(OPEN), "/llms.txt": { status: 404 }, "/.well-known/llms.txt": { status: 404 } };
+    const robotsDown: Served = { ...healthy(OPEN), "/robots.txt": "throw" };
+    type Enqueue = NonNullable<CrawlAuditDeps["enqueueTaskGenerate"]>;
+    // The queue is never touched by default: a test that cares about the enqueue passes its own.
+    const runAsTenant = async (served: Served, extra: Partial<CrawlAuditDeps> = {}): Promise<void> => {
+      await asTenant(workspaceId, (tx) => createCrawlAuditHandler({ pool: {} as never, env: {} as never }, depsServing(served, [], 10_000, { enqueueTaskGenerate: async () => undefined, ...extra }))(tx, job()));
+    };
+    const statusOf = async (): Promise<string[]> => (await findings()).map((f) => f.status as string);
+    const milestones = async (): Promise<any[]> => (await db.query("SELECT * FROM milestones ORDER BY created_at")).rows; // eslint-disable-line @typescript-eslint/no-explicit-any
+
+    it("STORY-052 scenario 10 · a finding whose file could not be fetched in two consecutive audits is STALE, not resolved", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["open"]);
+      await runAsTenant(robotsDown);
+      const [f] = await findings();
+      expect(f.status).toBe("stale");
+      expect(f.resolved_at).toBeNull();
+    });
+
+    it("STORY-052 scenario 10 · one unobserved audit followed by an audit that CAN see the file and does not reproduce it is resolved (the history resets)", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      await runAsTenant(healthy(OPEN));
+      const [f] = await findings();
+      expect(f.status).toBe("resolved");
+      expect(f.resolved_at).not.toBeNull();
+    });
+
+    it("STORY-052 scenario 10 · an observed audit between two unobserved ones breaks the run: not two CONSECUTIVE audits", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["open"]);
+    });
+
+    it("STORY-052 scenario 10 · a stale finding that is seen again reopens, keeping one row", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["stale"]);
+      await runAsTenant(healthy(BLOCKED));
+      expect(await statusOf()).toEqual(["open"]);
+    });
+
+    it("STORY-052 AC8 · a stale finding that a later audit OBSERVED clean is RESOLVED, pins one milestone, and a return regresses it", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["stale"]);
+      await runAsTenant(healthy(OPEN));
+      const [f] = await findings();
+      expect(f.status).toBe("resolved");
+      expect(f.resolved_at).not.toBeNull();
+      expect(await milestones()).toHaveLength(1);
+      await runAsTenant(healthy(BLOCKED));
+      const [back] = await findings();
+      expect(back.status).toBe("regressed");
+      expect(back.resolved_at).toBeNull();
+      expect(await findings()).toHaveLength(1);
+    });
+
+    it("STORY-052 AC8 · a stale finding stays stale while the file is still unobservable", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["stale"]);
+      expect(await milestones()).toHaveLength(0);
+    });
+
+    it("STORY-052 scenario 10 · a wont_fix finding is not staled by an unobserved run", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await db.query("UPDATE aux_findings SET status = 'wont_fix', wont_fix_reason = 'accepted'");
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["wont_fix"]);
+    });
+
+    it("STORY-052 scenario 10 · a STALE finding stays in the crawler_access subscore and the cap: stale must not score like a fix", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      const before = (await audits()).at(-1);
+      expect(before.score_capped).toBe(true);
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      expect(await statusOf()).toEqual(["stale"]);
+      const a = (await audits()).at(-1);
+      expect(a.score_capped).toBe(true);
+      expect(Number(a.score_breakdown.crawler_access)).toBe(Number(before.score_breakdown.crawler_access));
+      expect(Number(a.score_breakdown.crawler_access)).toBeLessThan(1);
+    });
+
+    const r001Status = async (): Promise<string[]> => (await findings()).filter((f) => f.rule_code === "AUX-R-001").map((f) => f.status as string);
+    const robots503: Served = { ...healthy(OPEN), "/robots.txt": { status: 503, body: "" } };
+    it("STORY-052 AC8 · a robots.txt that answers 503 is not an observation: a critical AUX-R-001 is not resolved, pins no milestone, and stays capped", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robots503);
+      expect(await r001Status()).toEqual(["open"]);
+      expect(await milestones()).toHaveLength(0);
+      expect((await audits()).at(-1).score_capped).toBe(true);
+    });
+
+    it("STORY-052 AC8 · two 503 robots.txt audits in a row make the critical finding stale, still capped, still no milestone", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robots503);
+      await runAsTenant(robots503);
+      expect(await r001Status()).toEqual(["stale"]);
+      expect(await milestones()).toHaveLength(0);
+      expect((await audits()).at(-1).score_capped).toBe(true);
+    });
+
+    it("STORY-052 AC8 · a robots.txt that is definitively absent (404) still lets an open AUX-R-001 resolve", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant({ ...healthy(OPEN), "/robots.txt": { status: 404, body: "" } });
+      const rows = await findings();
+      expect(rows.find((f) => f.rule_code === "AUX-R-001")!.status).toBe("resolved");
+    });
+
+    it("STORY-052 scenario 11 · a new finding at or above its rule's task threshold enqueues task.generate AFTER commit, narrowed to aux_finding", async () => {
+      const calls: { workspace: string; payload: unknown; key: string; visibleAtEnqueue: number }[] = [];
+      const enqueueTaskGenerate: Enqueue = async (workspace, payload, key) => {
+        // A separate connection: it sees the finding only if the audit's transaction has COMMITTED.
+        const seen = await db.query("SELECT count(*)::int AS n FROM aux_findings");
+        calls.push({ workspace, payload, key, visibleAtEnqueue: seen.rows[0].n });
+      };
+      await runAsTenant(healthy(BLOCKED), { enqueueTaskGenerate });
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      expect(calls[0]).toMatchObject({ workspace: workspaceId, payload: { projectId, triggerKinds: ["aux_finding"] }, visibleAtEnqueue: 1 });
+      const [f] = await findings();
+      // The reference topology row: taskgen:{project}:{rule}:{fingerprint}.
+      expect(calls[0]!.key).toBe(`taskgen:${projectId}:${f.rule_code}:${Buffer.from(f.fingerprint).toString("hex")}`);
+    });
+
+    it("STORY-052 scenario 11 · a finding BELOW its rule's task threshold enqueues nothing (AUX-R-004 absent is low, its threshold is medium)", async () => {
+      const enqueueTaskGenerate = vi.fn<Enqueue>(async () => undefined);
+      await runAsTenant(noLlms, { enqueueTaskGenerate });
+      expect((await findings())[0]).toMatchObject({ rule_code: "AUX-R-004", severity: "low" });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(enqueueTaskGenerate).not.toHaveBeenCalled();
+    });
+
+    it("STORY-052 scenario 11 · a re-detection of a finding already known enqueues nothing more", async () => {
+      const enqueueTaskGenerate = vi.fn<Enqueue>(async () => undefined);
+      await runAsTenant(healthy(BLOCKED), { enqueueTaskGenerate });
+      await vi.waitFor(() => expect(enqueueTaskGenerate).toHaveBeenCalledTimes(1));
+      await runAsTenant(healthy(BLOCKED), { enqueueTaskGenerate });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(enqueueTaskGenerate).toHaveBeenCalledTimes(1);
+    });
+
+    it("STORY-052 scenario 11 · a regression that RAISES the finding to its threshold enqueues (low becomes medium, threshold medium)", async () => {
+      const enqueueTaskGenerate = vi.fn<Enqueue>(async () => undefined);
+      await runAsTenant(noLlms, { enqueueTaskGenerate });
+      await runAsTenant(healthy(OPEN), { enqueueTaskGenerate });
+      await runAsTenant(noLlms, { enqueueTaskGenerate });
+      expect((await findings())[0]).toMatchObject({ status: "regressed", severity: "medium" });
+      await vi.waitFor(() => expect(enqueueTaskGenerate).toHaveBeenCalledTimes(1));
+    });
+
+    it("STORY-052 scenario 11 · a failed enqueue is counted and logged, and never fails the audit (the findings are durable)", async () => {
+      const enqueueTaskGenerate: Enqueue = async () => { throw new Error("valkey down"); };
+      await runAsTenant(healthy(BLOCKED), { enqueueTaskGenerate });
+      expect((await audits())[0]!.status).toBe("completed");
+      expect(await findings()).toHaveLength(1);
+      await vi.waitFor(() => expect(counters.some((c) => c.name === "nominara_aux_taskgen_request_failed_total")).toBe(true));
+    });
+
+    it("STORY-052 scenario 12 · closing a critical finding pins an aux_status_change milestone sourced to the finding", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(healthy(OPEN));
+      const [f] = await findings();
+      const pins = await milestones();
+      expect(pins).toHaveLength(1);
+      expect(pins[0]).toMatchObject({ kind: "aux_status_change", source_type: "aux_finding", source_id: f.id, severity: "positive", project_id: projectId, workspace_id: workspaceId });
+      expect(pins[0].occurred_at).toEqual(f.resolved_at);
+    });
+
+    it("STORY-052 scenario 12 · closing a LOW finding pins nothing", async () => {
+      await runAsTenant(noLlms);
+      await runAsTenant(healthy(OPEN));
+      expect(await statusOf()).toEqual(["resolved"]);
+      expect(await milestones()).toHaveLength(0);
+    });
+
+    it("STORY-052 scenario 12 · a stale finding is not a closure: no milestone", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(robotsDown);
+      await runAsTenant(robotsDown);
+      expect(await milestones()).toHaveLength(0);
+    });
+
+    it("STORY-052 scenario 12 · resolve, regress, resolve again keeps ONE pin per finding (ux_milestones_source), and does not fail the audit", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(healthy(OPEN));
+      await runAsTenant(healthy(BLOCKED));
+      expect(await statusOf()).toEqual(["regressed"]);
+      await runAsTenant(healthy(OPEN));
+      expect(await statusOf()).toEqual(["resolved"]);
+      expect(await milestones()).toHaveLength(1);
+      expect((await audits()).at(-1)!.status).toBe("completed");
+    });
   });
 
   it("NEW-C-9 AC1.8 · the handler source adds no workspace_id predicate of its own", () => {

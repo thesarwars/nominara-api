@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import type { Job } from "bullmq";
+import type { TaskGenerateJobPayload } from "../../../../contracts/tasks/index.js";
 import {
   auxErrorSummarySchema,
   crawlAuditJobPayloadSchema,
@@ -15,7 +16,9 @@ import {
 import { loadAuxCatalog, type AuxCatalog } from "../../aux/catalog.js";
 import {
   findingFingerprint,
+  milestoneKindFor,
   reconcileFindings,
+  STALE_AFTER_AUDITS,
   type AuxSeverityBand,
   type DetectedFinding,
   type ExistingFinding,
@@ -39,8 +42,11 @@ import { resolveStorageConfig } from "../../storage/storage-config.js";
 import type { ObjectStoragePort } from "../../storage/storage.port.js";
 import { TenantObjectStore } from "../../storage/tenant-object-store.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
+import { afterCommit, currentTenantStore } from "../../../tenancy/tenant-context.js";
+import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import type { QueueHandlerContext } from "../handlers.js";
-import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-factory.js";
+import { QueueProducer } from "../queue-producer.js";
+import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
 
 // NEW-C-9 / STORY-049 — `crawl.audit`: authorisation by verification state, the site files, page selection, two fetches
 // per page, and the finding lifecycle (STORY-052, aux-and-geo-analysis.md §3).
@@ -96,6 +102,11 @@ const TOKENIZER = "none"; // aux_audits.tokenizer is NOT NULL; no text is tokeni
 const RAN_RULES = ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"] as const;
 const TERMINAL_STATUSES = ["completed", "partial", "failed"];
 const OPEN_STATUSES = ["open", "acknowledged", "in_progress", "regressed"];
+/**
+ * The statuses the published crawler_access subscore and the critical cap read. A STALE finding is one we could not re-observe, not one
+ * that was fixed: it must score exactly as it did while open, or an unreachable file reads as a fix (STORY-052 "stale versus resolved").
+ */
+const SCORED_STATUSES = [...OPEN_STATUSES, "stale"];
 /** Owned citations from the last 90 days name pages a key_pages audit must look at (aux-and-geo-analysis.md §1 step 3). */
 const CITATION_WINDOW_DAYS = 90;
 /** A bound on what one project's evidence can add to the candidate list; the page cap does the real limiting. */
@@ -105,7 +116,15 @@ const tracer = trace.getTracer("nominara.crawl-audit");
 
 type StoreFn = (relative: string, body: Buffer, contentType: string) => Promise<string>;
 
+/** STORY-052 AC10 — enqueues one `task.generate` job for a project, narrowed to the AUX finding rules. Injected in tests. */
+export type EnqueueTaskGenerate = (workspaceId: string, payload: Omit<TaskGenerateJobPayload, "workspaceId" | "kid">, idempotencyKey: string) => Promise<unknown>;
+
+/** Severity bands in order, for "at or above the rule's task threshold" (aux-and-geo-analysis.md section 2, the `Task` column). */
+const SEVERITY_ORDER: Readonly<Record<string, number>> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
+
 export interface CrawlAuditDeps {
+  /** Default: a producer built from env on first use. A failed enqueue is logged and counted, never thrown. */
+  readonly enqueueTaskGenerate?: EnqueueTaskGenerate;
   /** The SSRF-guarded fetcher by default; injectable so tests touch no network. */
   readonly fetch?: (url: string, init?: GuardedFetchInit) => Promise<GuardedResponse>;
   readonly now?: () => Date;
@@ -164,6 +183,15 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
   const now = deps.now ?? (() => new Date());
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const timeoutMs = deps.timeoutMs ?? FETCH_TIMEOUT_MS;
+  // Built on the first job that needs it, inside the promise: constructing a producer at registration would open a connection in every
+  // process that merely imports the registry, and a synchronous throw would escape the caller's `.catch`.
+  let producer: QueueProducer | undefined;
+  const enqueueTaskGenerate: EnqueueTaskGenerate =
+    deps.enqueueTaskGenerate ??
+    (async (workspaceId, payload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(createQueueWorkerConnection(context.env.QUEUE_REDIS_URL), queueKeyPrefix(context.env.NODE_ENV), signingKeysFromEnv(context.env));
+      return producer.enqueueTenantJob("task.generate", workspaceId, payload, { idempotencyKey });
+    });
   const renderer = deps.renderer ?? unavailableRenderer;
   const identified: GuardedFetchInit = { headers: { "user-agent": NOMINARA_USER_AGENT } };
   // Site files and sitemaps stay on the verified site: a redirect off it is not followed, so no request is sent to a
@@ -550,7 +578,14 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // finding from a file we failed to fetch (or never asked for) is not evidence, and a missing
     // finding from one is not a resolution.
     const covered = new Set<string>();
-    if (robots.responded) ["AUX-R-001", "AUX-R-002", "AUX-R-003"].forEach((c) => covered.add(c));
+    // AUX-R-003 is about the answer itself, so any answer covers it. AUX-R-001/002 are about the directives, and only a 2xx file or a
+    // definitive "no file" (404/410) says what they are: a 5xx or other error is "we could not see it" (RFC 9309 treats an unreachable
+    // robots.txt as disallow-all), so it must not resolve a blocking finding.
+    if (robots.responded) covered.add("AUX-R-003");
+    if (robots.responded && ((robots.status >= 200 && robots.status < 300) || robots.status === 404 || robots.status === 410)) {
+      covered.add("AUX-R-001");
+      covered.add("AUX-R-002");
+    }
     if (llms.responded && llmsWellKnown.responded) covered.add("AUX-R-004");
     if (sitemap.responded) covered.add("AUX-R-007");
 
@@ -638,40 +673,113 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     }
 
     // The catalog is versioned data: assert its weights on every load (NFR-AUX-03).
-    const catalogRows = await tx.query<{ code: string; category: string; title: string; weight: number; rule_version: string; thresholds: Record<string, unknown> }>(
-      "SELECT code, category, title, weight, rule_version, thresholds FROM aux_rule_catalog WHERE category = 'crawler_access'",
+    const catalogRows = await tx.query<{ code: string; category: string; title: string; weight: number; rule_version: string; thresholds: Record<string, unknown>; task_threshold: string }>(
+      "SELECT code, category, title, weight, rule_version, thresholds, task_threshold FROM aux_rule_catalog WHERE category = 'crawler_access'",
     );
     const catalog: AuxCatalog = loadAuxCatalog(
       catalogRows.rows.map((r) => ({ code: r.code, category: r.category, weight: r.weight, ruleVersion: r.rule_version, thresholds: r.thresholds })),
     );
     const titles = new Map(catalogRows.rows.map((r) => [r.code, r.title]));
+    const taskThresholds = new Map(catalogRows.rows.map((r) => [r.code, r.task_threshold]));
 
     const { detected, covered, finishedAt } = outcome;
     // Read HERE, under the lock on this audit row, so a delivery that committed a moment ago is already visible.
     const existingRows = await tx.query<{
-      id: string; fp: string; rule_code: string; url: string | null; severity: AuxSeverityBand; status: FindingStatus; occurrence_count: number; resolved_at: Date | null;
+      id: string; fp: string; rule_code: string; url: string | null; severity: AuxSeverityBand; status: FindingStatus; occurrence_count: number; resolved_at: Date | null; category: string | null;
     }>(
-      `SELECT id, encode(fingerprint, 'hex') AS fp, rule_code, url, severity, status, occurrence_count, resolved_at
-         FROM aux_findings WHERE project_id = $1 AND rule_code = ANY($2::text[])`,
+      `SELECT f.id, encode(f.fingerprint, 'hex') AS fp, f.rule_code, f.url, f.severity, f.status, f.occurrence_count, f.resolved_at,
+              (SELECT c.category FROM aux_rule_catalog c WHERE c.code = f.rule_code) AS category
+         FROM aux_findings f WHERE f.project_id = $1 AND f.rule_code = ANY($2::text[])`,
       [payload.projectId, [...RAN_RULES]],
     );
     const existing: ExistingFinding[] = existingRows.rows.map((r) => ({
       id: r.id, fingerprint: r.fp, ruleCode: r.rule_code, url: r.url, severity: r.severity, status: r.status, occurrenceCount: r.occurrence_count, resolvedAt: r.resolved_at,
     }));
 
-    const actions = reconcileFindings({
-      existing,
-      detected,
-      inScope: (row) => covered.has(row.ruleCode) && (row.url === null || row.url.startsWith(origin)),
-    });
+    const inScope = (row: ExistingFinding): boolean => covered.has(row.ruleCode) && (row.url === null || row.url.startsWith(origin));
+
+    // STALE (AC8): the audits just before this one that also could not observe the place a finding lives. `excluded_rules` is the record
+    // of which rules had no answer from their input file (a site file that did not respond, or an audit that reached nothing), so it
+    // is read, not re-derived: no new column. Counted back from the latest and stopping at the first audit that DID observe it, so two
+    // CONSECUTIVE audits are required, never two in a window. Only audits that finished count, and only those strictly BEFORE this one: a redelivered older job must not read a newer audit as its predecessor.
+    const history = await tx.query<{ excluded_rules: string[] }>(
+      `SELECT excluded_rules FROM aux_audits
+        WHERE project_id = $1 AND id <> $2 AND status = ANY($3::text[])
+          AND (created_at, id) < (SELECT created_at, id FROM aux_audits WHERE id = $2)
+        ORDER BY created_at DESC, id DESC LIMIT $4`,
+      [payload.projectId, payload.auditId, TERMINAL_STATUSES, STALE_AFTER_AUDITS - 1],
+    );
+    const unobservedBefore = (row: ExistingFinding): number => {
+      let run = 0;
+      for (const audit of history.rows) {
+        if (!audit.excluded_rules.includes(row.ruleCode)) break;
+        run += 1;
+      }
+      return run;
+    };
+
+    const actions = reconcileFindings({ existing, detected, inScope, unobservedBefore });
     const byFingerprint = new Map(detected.map((d) => [d.fingerprint, d.source]));
     const sourceFor = (id: string): SiteFileFinding | undefined => {
       const row = existing.find((e) => e.id === id);
       return row === undefined ? undefined : byFingerprint.get(row.fingerprint);
     };
 
+    const categoryOf = new Map(existingRows.rows.map((r) => [r.id, r.category]));
+    const severityOf = new Map(existing.map((e) => [e.id, e.severity]));
+    let milestonesPinned = 0;
+    await tracer.startActiveSpan("crawl.audit.reconcile", async (span) => {
+      try {
+        for (const action of actions) {
+          const pinned = await applyAction(tx, action, { payload, titles, ruleVersion: RULE_VERSION, at: finishedAt, sourceFor, categoryOf, severityOf });
+          if (pinned) milestonesPinned += 1;
+        }
+        span.setAttribute("nominara.aux.actions", actions.length);
+        span.setAttribute("nominara.aux.staled", actions.filter((a) => a.kind === "stale").length);
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
     for (const action of actions) {
-      await applyAction(tx, action, { payload, titles, ruleVersion: RULE_VERSION, at: finishedAt, sourceFor });
+      if (action.kind === "stale") incrementCounter("nominara_aux_findings_staled_total", {});
+      if (action.kind === "resolve") incrementCounter("nominara_aux_findings_resolved_total", {});
+    }
+    if (milestonesPinned > 0) for (let i = 0; i < milestonesPinned; i += 1) incrementCounter("nominara_aux_milestones_pinned_total", {});
+
+    // TASK GENERATION (AC10): a finding that is NEW, or RETURNED (a regression raises its band), and sits at or above its rule's task
+    // threshold asks for one `task.generate` evaluation of the project, narrowed to the AUX finding rules. A re-detection of a finding
+    // already known asks for nothing: its task, if it earned one, exists or was dismissed. One job per qualifying finding, keyed as the
+    // topology row says (`taskgen:{project}:{rule}:{fingerprint}`, system-architecture.md section 4), so a redelivered audit enqueues the
+    // same ids. After COMMIT, so the evaluator sees the findings; a failed enqueue is logged and counted, never thrown, because the
+    // findings are durable and the daily rollup's un-narrowed `task.generate` is the recovery path.
+    const atThreshold = (ruleCode: string, severity: string): boolean =>
+      (SEVERITY_ORDER[severity] ?? -1) >= (SEVERITY_ORDER[taskThresholds.get(ruleCode) ?? "high"] ?? SEVERITY_ORDER.high!);
+    const wanting: { ruleCode: string; fingerprint: string }[] = [];
+    for (const a of actions) {
+      if (a.kind === "insert" && atThreshold(a.finding.ruleCode, a.finding.severity)) wanting.push({ ruleCode: a.finding.ruleCode, fingerprint: a.finding.fingerprint });
+      else if (a.kind === "regress") {
+        const row = existing.find((e) => e.id === a.id)!;
+        if (atThreshold(row.ruleCode, a.severity)) wanting.push({ ruleCode: row.ruleCode, fingerprint: row.fingerprint });
+      }
+    }
+    if (wanting.length > 0 && currentTenantStore() !== undefined) {
+      const { projectId, workspaceId, auditId } = payload;
+      afterCommit(() => {
+        for (const { ruleCode, fingerprint } of wanting) {
+          void enqueueTaskGenerate(workspaceId, { projectId, triggerKinds: ["aux_finding"] }, `taskgen:${projectId}:${ruleCode}:${fingerprint}`)
+            .then(() => {
+              incrementCounter("nominara_aux_taskgen_requested_total", {});
+              logger.log({ event: "aux.taskgen.requested", workspace_id: workspaceId, project_id: projectId, audit_id: auditId, rule_code: ruleCode });
+            })
+            .catch((error: unknown) => {
+              incrementCounter("nominara_aux_taskgen_request_failed_total", {});
+              logger.error({ event: "aux.taskgen.request_failed", workspace_id: workspaceId, project_id: projectId, audit_id: auditId, rule_code: ruleCode, error: error instanceof Error ? error.name : "unknown" });
+            });
+        }
+      });
     }
 
     // Audit-level counts: what THIS audit detected, by severity.
@@ -679,11 +787,11 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     for (const d of detected) if (d.severity in counts) counts[d.severity as keyof typeof counts] += 1;
 
     // The crawler_access subscore over every finding still open for the
-    // project (including ones whose file we could not re-fetch). Site-file
+    // project (including ones whose file we could not re-fetch, and stale ones: stale is not fixed). Site-file
     // findings are domain-wide, so scope is 1 (affected 1 of 1).
     const open = await tx.query<{ rule_code: string; severity: AuxSeverityBand }>(
       "SELECT rule_code, severity FROM aux_findings WHERE project_id = $1 AND status = ANY($2::text[]) AND rule_code = ANY($3::text[])",
-      [payload.projectId, OPEN_STATUSES, [...RAN_RULES]],
+      [payload.projectId, SCORED_STATUSES, [...RAN_RULES]],
     );
     const counted: AuxCountedFinding[] = open.rows.map((r) => ({
       category: "crawler_access",
@@ -734,6 +842,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       requests: outcome.requests,
       detected: detected.length,
       resolved: actions.filter((a) => a.kind === "resolve").length,
+      staled: actions.filter((a) => a.kind === "stale").length,
+      milestones: milestonesPinned,
       regressed: actions.filter((a) => a.kind === "regress").length,
       duration_ms: Date.now() - startedMs,
       started_at: startedAt.toISOString(),
@@ -788,8 +898,16 @@ function toManifestPage(p: PageRecord): CrawlManifest["pages"][number] {
 async function applyAction(
   tx: ClientBase,
   action: LifecycleAction,
-  ctx: { payload: { auditId: string; projectId: string; workspaceId: string }; titles: Map<string, string>; ruleVersion: string; at: Date; sourceFor: (id: string) => SiteFileFinding | undefined },
-): Promise<void> {
+  ctx: {
+    payload: { auditId: string; projectId: string; workspaceId: string };
+    titles: Map<string, string>;
+    ruleVersion: string;
+    at: Date;
+    sourceFor: (id: string) => SiteFileFinding | undefined;
+    categoryOf: Map<string, string | null>;
+    severityOf: Map<string, AuxSeverityBand>;
+  },
+): Promise<boolean> {
   const { payload, at } = ctx;
   switch (action.kind) {
     case "insert": {
@@ -805,7 +923,7 @@ async function applyAction(
           src.measured_value, src.threshold_value, ctx.ruleVersion, at,
         ],
       );
-      return;
+      return false;
     }
     case "redetect": {
       const src = ctx.sourceFor(action.id);
@@ -817,7 +935,7 @@ async function applyAction(
           WHERE id = $1`,
         [action.id, payload.auditId, at, action.reopen, src === undefined ? null : JSON.stringify(src.evidence), src?.measured_value ?? null, src?.threshold_value ?? null],
       );
-      return;
+      return false;
     }
     case "regress": {
       const src = ctx.sourceFor(action.id);
@@ -829,10 +947,28 @@ async function applyAction(
           WHERE id = $1`,
         [action.id, action.severity, at, payload.auditId, src === undefined ? null : JSON.stringify(src.evidence), src?.measured_value ?? null, src?.threshold_value ?? null],
       );
-      return;
+      return false;
     }
-    case "resolve":
+    case "stale":
+      // Not resolved: nobody could look. `resolved_at` stays NULL, and a later audit that sees the finding again reopens it.
+      await tx.query("UPDATE aux_findings SET status = 'stale' WHERE id = $1", [action.id]);
+      return false;
+    case "resolve": {
       await tx.query("UPDATE aux_findings SET status = 'resolved', resolved_at = $2 WHERE id = $1", [action.id, at]);
-      return;
+      // AC11: closing a critical or high finding (or any structured_data one) pins a milestone to the Growth Map. ONE pin per finding for
+      // ever (`ux_milestones_source` on (source_type, source_id)): a redelivery cannot double-pin, and a finding that resolves, regresses
+      // and resolves again keeps its first pin, because the regression is already visible on the finding itself. `ON CONFLICT DO
+      // NOTHING` is what makes that a quiet no-op rather than an error that would fail the whole audit.
+      const kind = milestoneKindFor(ctx.severityOf.get(action.id) ?? "info", ctx.categoryOf.get(action.id) ?? null);
+      if (kind === null) return false;
+      const pinned = await tx.query(
+        `INSERT INTO milestones (workspace_id, project_id, occurred_at, kind, title, severity, source_type, source_id)
+         SELECT f.workspace_id, f.project_id, $2, $3, 'Resolved: ' || f.title, 'positive', 'aux_finding', f.id
+           FROM aux_findings f WHERE f.id = $1
+         ON CONFLICT (source_type, source_id) WHERE source_id IS NOT NULL DO NOTHING`,
+        [action.id, at, kind],
+      );
+      return (pinned.rowCount ?? 0) > 0;
+    }
   }
 }
