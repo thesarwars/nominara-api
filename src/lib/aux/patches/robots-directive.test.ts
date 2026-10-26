@@ -237,7 +237,7 @@ describe("STORY-053 AC5 · the verification is bounded so it cannot hold the com
     const agents = Array.from({ length: named }, (_, i) => `User-agent: bot${i}\nDisallow: /a\n`).join("\n");
     const file = `${agents}\nUser-agent: *\n${rules(VERIFICATION_BOUNDS.rules - named - 1)}\n`;
     const started = Date.now();
-    assertAccessNotReduced(file, `${file}\nUser-agent: extra\nAllow: /\n`);
+    assertAccessNotReduced(file, [file, "User-agent: extra", "Allow: /", ""].join("\n"));
     expect(Date.now() - started).toBeLessThan(10_000);
   });
 });
