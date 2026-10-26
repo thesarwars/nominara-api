@@ -35814,7 +35814,57 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "timeframe",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": "90d",
+              "type": "string",
+              "enum": [
+                "24h",
+                "7d",
+                "30d",
+                "90d",
+                "180d",
+                "365d"
+              ]
+            }
+          },
+          {
+            "name": "entities",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "engines",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "granularity",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "hour",
+                "day",
+                "week"
+              ]
+            }
+          }
+        ]
       }
     },
     "/v1/projects/{id}/matrix": {
