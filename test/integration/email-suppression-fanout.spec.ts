@@ -176,4 +176,43 @@ describe("STORY-178 · suppression fan-out", () => {
     expect(await runSuppressionFanout(owner, tenantWrite, PEPPER, 2)).toMatchObject({ claimed: 1, notified: 1 });
     expect(await notes(a)).toHaveLength(3);
   });
+
+  it("LEAST PRIVILEGE: the owner connection reads workspace ids only, never a report's name or recipients; those are read in the workspace's own transaction", async () => {
+    const a = await workspace();
+    await report(a, "Acme monthly", [ADDRESS]);
+    await suppress(ADDRESS);
+    const ownerSql: string[] = [];
+    const recording = new Proxy(owner, {
+      get(target, prop, receiver) {
+        if (prop === "query") {
+          return (sql: unknown, ...rest: unknown[]) => {
+            ownerSql.push(typeof sql === "string" ? sql : JSON.stringify(sql));
+            return (target.query as (...a: unknown[]) => unknown)(sql, ...rest);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const tenantSql: string[] = [];
+    const spy: TenantWrite = (workspaceId, fn) =>
+      tenantWrite(workspaceId, (tx) =>
+        fn(
+          new Proxy(tx, {
+            get(target, prop, receiver) {
+              if (prop === "query") {
+                return (sql: unknown, ...rest: unknown[]) => {
+                  tenantSql.push(typeof sql === "string" ? sql : JSON.stringify(sql));
+                  return (target.query as (...a: unknown[]) => unknown)(sql, ...rest);
+                };
+              }
+              return Reflect.get(target, prop, receiver);
+            },
+          }),
+        ),
+      );
+    expect(await runSuppressionFanout(recording, spy, PEPPER)).toMatchObject({ claimed: 1, notified: 1, failed: 0 });
+    expect(ownerSql.filter((q) => /scheduled_reports/i.test(q)).every((q) => !/recipients|\bname\b/i.test(q))).toBe(true);
+    expect(tenantSql.some((q) => /scheduled_reports/i.test(q) && /recipients/i.test(q))).toBe(true);
+    expect((await notes(a))[0]!.body).toContain("Acme monthly");
+  });
 });

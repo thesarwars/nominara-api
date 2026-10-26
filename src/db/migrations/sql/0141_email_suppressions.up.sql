@@ -7,6 +7,12 @@
 -- (the same hash the OTP rate-limit ledger and the mail adapter's log line use), so a read of this table cannot enumerate
 -- who bounced without the pepper.
 --
+-- PEPPER ROTATION. `recipient_hash` is keyed on OTP_EMAIL_HASH_PEPPER. Changing that secret re-keys every address, so every
+-- existing row would stop matching (a bounced address would be mailed again) and the operator command could no longer find a
+-- row to lift. A rotation must therefore re-hash this table's addresses first, which cannot be done from here (the addresses
+-- are not stored): either keep the old pepper for suppression lookups or accept losing the list. The API and the report worker
+-- must also run the SAME pepper, or the worker's sends skip the check the API's webhook wrote.
+--
 --   kind               `bounce` (a PERMANENT bounce; a transient one never lands here, it is a metric) or `complaint`.
 --                      A bounce suppresses all mail; a complaint suppresses only non-transactional mail.
 --   provider_event_id  Svix's message id (`svix-id`). With the hash it is UNIQUE, so a redelivered event is a no-op; the pair

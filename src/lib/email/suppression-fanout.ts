@@ -12,16 +12,19 @@ import { incrementCounter } from "../telemetry/metrics.js";
 // WHY A SWEEP STEP AND NOT THE WEBHOOK. The webhook route is tenant-less and runs as `nominara_app`, which RLS confines to one
 // workspace at a time; it cannot (and must not) ask "whose reports include this address?". It records the suppression with
 // `fanned_out_at` NULL. The report worker's sweep, which already holds an elected owner connection that sees across tenants,
-// calls this once per tick. The owner connection only READS (the suppression hashes and each active report's id, workspace,
-// name and recipients); every notification is written by `tenantWrite`, which opens that workspace's OWN tenant transaction
-// as the runtime role. Nothing is written to a tenant table from the owner connection.
+// calls this once per tick. LEAST PRIVILEGE: the owner connection reads the suppression hashes and the ids of the workspaces
+// that have an active report, and nothing else (no report name, no recipient). Everything about a workspace's reports is
+// read, matched and written inside `tenantWrite`, which opens that workspace's OWN tenant transaction as the runtime role, so
+// tenant content never crosses a tenant boundary and nothing is written to a tenant table from the owner connection.
 //
-// MATCHING is by the peppered hash: each recipient of each active report is hashed in memory and compared. The address is
-// never stored, logged, or put in a notification; the notification names the REPORT and the KIND.
+// MATCHING is by the peppered hash: each recipient of each active report is hashed in memory, inside that workspace's
+// transaction, and compared. The address is never stored, logged, or put in a notification; the notification names the
+// REPORT and the KIND.
 //
 // IDEMPOTENT AND RETRYABLE. A notification's event key is `(suppression, report)`, so a retried pass writes nothing twice. A
-// suppression is marked `fanned_out_at` only when every workspace it touched was written; if one failed it stays unmarked and
-// the next tick finishes it. A batch is bounded; the rest waits.
+// workspace's pass is one transaction. The batch's suppressions are marked `fanned_out_at` only when every workspace was
+// written; if one failed they all stay unmarked (a failed workspace's matches are not known) and the next tick finishes it.
+// A batch is bounded; the rest waits.
 //
 // A report that is PAUSED is not told about (it sends nothing); a suppression no report includes is still marked done.
 
@@ -63,7 +66,6 @@ export class SuppressionFanoutBlindError extends Error {
 
 interface ReportRow {
   readonly id: string;
-  readonly workspace_id: string;
   readonly name: string;
   readonly recipients: string[];
 }
@@ -95,52 +97,58 @@ export async function runSuppressionFanout(
       );
       if (pending.rows.length === 0) return { claimed: 0, notified: 0, failed: 0 } as const;
 
-      const reports = await client.query<ReportRow>("SELECT id, workspace_id, name, recipients::text[] AS recipients FROM scheduled_reports WHERE active");
-      // hash (hex) -> the reports that mail it
-      const byHash = new Map<string, ReportRow[]>();
-      for (const report of reports.rows) {
-        const seen = new Set<string>();
-        for (const address of report.recipients) {
-          const hex = hashEmailKey(normalizeEmail(address), pepper).toString("hex");
-          if (seen.has(hex)) continue;
-          seen.add(hex);
-          const list = byHash.get(hex) ?? [];
-          list.push(report);
-          byHash.set(hex, list);
-        }
+      // Ids only: which workspaces have an active report. Their content is read inside their own tenant transactions below.
+      const workspaces = await client.query<{ workspace_id: string }>("SELECT DISTINCT workspace_id FROM scheduled_reports WHERE active ORDER BY workspace_id");
+      // hash (hex) -> its suppressions (the same address can be suppressed as a bounce and as a complaint)
+      const wanted = new Map<string, Array<(typeof pending.rows)[number]>>();
+      for (const row of pending.rows) {
+        const hex = row.recipient_hash.toString("hex");
+        wanted.set(hex, [...(wanted.get(hex) ?? []), row]);
       }
 
       let notified = 0;
       let failed = 0;
-      for (const suppression of pending.rows) {
-        let suppressionFailed = false;
-        for (const report of byHash.get(suppression.recipient_hash.toString("hex")) ?? []) {
-          try {
-            await tenantWrite(report.workspace_id, async (tx) => {
-              await writeNotification(tx, {
-                workspaceId: report.workspace_id,
-                projectId: null,
-                userId: null,
-                kind: "report.recipient_suppressed",
-                severity: "warning",
-                title: "A scheduled report has a recipient that can no longer be mailed",
-                body: `"${report.name}" has a recipient that is ${KIND_TEXT[suppression.kind]}. It will be skipped on every send until it is replaced. Remove or replace it in the report's recipients.`,
-                eventKey: `email.suppressed:${suppression.id}:${report.id}`,
-                facts: { scheduled_report_id: report.id, suppression_kind: suppression.kind },
-              });
-            });
-            notified += 1;
-            incrementCounter("nominara_email_suppression_fanout_notifications_total", { kind: suppression.kind });
-          } catch (error) {
-            suppressionFailed = true;
-            failed += 1;
-            // Ids only: never a report name, an address or the hash.
-            logger.error({ event: "email.suppression.fanout.write_failed", workspace_id: report.workspace_id, scheduled_report_id: report.id, error: error instanceof Error ? error.name : "unknown" });
-          }
+      for (const { workspace_id: workspaceId } of workspaces.rows) {
+        try {
+          let written = 0;
+          await tenantWrite(workspaceId, async (tx) => {
+            written = 0;
+            // RLS confines this read to the workspace the transaction was opened for.
+            const reports = await tx.query<ReportRow>("SELECT id, name, recipients::text[] AS recipients FROM scheduled_reports WHERE active");
+            for (const report of reports.rows) {
+              const seen = new Set<string>();
+              for (const address of report.recipients) {
+                const hex = hashEmailKey(normalizeEmail(address), pepper).toString("hex");
+                const matches = wanted.get(hex);
+                if (matches === undefined || seen.has(hex)) continue;
+                seen.add(hex);
+                for (const suppression of matches) {
+                  await writeNotification(tx, {
+                    workspaceId,
+                    projectId: null,
+                    userId: null,
+                    kind: "report.recipient_suppressed",
+                    severity: "warning",
+                    title: "A scheduled report has a recipient that can no longer be mailed",
+                    body: `"${report.name}" has a recipient that is ${KIND_TEXT[suppression.kind]}. It will be skipped on every send until it is replaced. Remove or replace it in the report's recipients.`,
+                    eventKey: `email.suppressed:${suppression.id}:${report.id}`,
+                    facts: { scheduled_report_id: report.id, suppression_kind: suppression.kind },
+                  });
+                  written += 1;
+                  incrementCounter("nominara_email_suppression_fanout_notifications_total", { kind: suppression.kind });
+                }
+              }
+            }
+          });
+          notified += written;
+        } catch (error) {
+          failed += 1;
+          // Ids only: never a report name, an address or the hash.
+          logger.error({ event: "email.suppression.fanout.write_failed", workspace_id: workspaceId, error: error instanceof Error ? error.name : "unknown" });
         }
-        if (!suppressionFailed) {
-          await client.query("UPDATE email_suppressions SET fanned_out_at = now() WHERE id = $1 AND fanned_out_at IS NULL", [suppression.id]);
-        }
+      }
+      if (failed === 0) {
+        await client.query("UPDATE email_suppressions SET fanned_out_at = now() WHERE id = ANY($1::uuid[]) AND fanned_out_at IS NULL", [pending.rows.map((row) => row.id)]);
       }
       incrementCounter("nominara_email_suppression_fanout_runs_total", { status: failed === 0 ? "complete" : "partial" });
       span.setAttributes({ "nominara.email.fanout.claimed": pending.rows.length, "nominara.email.fanout.notified": notified, "nominara.email.fanout.failed": failed });

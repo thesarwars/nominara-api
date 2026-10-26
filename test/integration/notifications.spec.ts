@@ -16,7 +16,7 @@ import type { RotatingSigningKeys } from "../../src/lib/queue/signing.js";
 import { topologyFor } from "../../src/lib/queue/topology.js";
 import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
 import { NotificationsService, type Viewer } from "../../src/modules/notifications/notifications.service.js";
-import type { EmailMessage, EmailSender } from "../../src/modules/identity/ports/email-sender.js";
+import { EmailSuppressedError, type EmailMessage, type EmailSender } from "../../src/modules/identity/ports/email-sender.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
@@ -215,6 +215,21 @@ describe("STORY-068 · notifications, read state, digests and dispatch", () => {
     expect(emails.map((e) => e.user_id).sort()).toEqual([users.owner, users.analyst].sort());
     expect(outcome.emailIds).toHaveLength(2);
     expect(emails[0].subject).toContain("Urgent");
+  });
+
+  it("[STORY-178 AC3] a SUPPRESSED recipient ends the dispatch job normally: it does not throw (so no retry ladder, no dead-letter entry), counts as suppressed, and the outbox row is not marked sent", async () => {
+    const outcome = await write({ eventKey: "suppressed", severity: "critical", userId: users.owner! });
+    const [emailId] = outcome.emailIds;
+    const attempts: string[] = [];
+    const sender: EmailSender = {
+      send: async (m) => {
+        attempts.push(m.to);
+        throw new EmailSuppressedError("bounce");
+      },
+    };
+    await expect(processor(sender)(jobFor(workspaceId, { kind: "email", emailId: emailId! }))).resolves.toBeUndefined();
+    expect(attempts).toHaveLength(1);
+    expect((await owner.query("SELECT status, sent_at FROM notification_emails WHERE id = $1", [emailId])).rows[0]).toMatchObject({ status: "pending", sent_at: null });
   });
 
   it("[STORY-068 #11 / AC11] a retried dispatch job sends once: a failed send is retried with the SAME provider key, and a job for a sent email sends nothing", async () => {

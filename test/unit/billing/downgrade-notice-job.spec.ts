@@ -11,7 +11,9 @@ import { createBillingDowngradeNoticeHandler } from "../../../src/lib/queue/hand
 import type { RotatingSigningKeys } from "../../../src/lib/queue/signing.js";
 import { topologyFor } from "../../../src/lib/queue/topology.js";
 import { createJobProcessor, phasesOf } from "../../../src/lib/queue/worker-factory.js";
-import type { EmailMessage, EmailSender } from "../../../src/modules/identity/ports/email-sender.js";
+import type { SuppressionKind, SuppressionStore } from "../../../src/lib/email/suppression-store.js";
+import { SuppressingEmailSender } from "../../../src/modules/identity/adapters/suppressing-email-sender.js";
+import { EmailSuppressedError, type EmailMessage, type EmailSender } from "../../../src/modules/identity/ports/email-sender.js";
 
 // STORY-077 — OWNER DECISION 2026-10-23 (2): the downgrade pause/resume email is RETRIED on failure. The cut-over records
 // each email in `downgrade_notices` inside its own transaction (keyed by the Stripe event id or the operator's ticket, and
@@ -104,7 +106,7 @@ describe("STORY-077 owner decision 2026-10-23 · the downgrade notice is a signe
       expect(h.checkedOut, "no pooled connection is held across the send").toBe(0);
     });
     await processor(h, sender)(signedJob());
-    expect(sender.calls).toEqual([{ to: ROW.recipient, subject: ROW.subject, textBody: ROW.text_body, idempotencyKey: `downgrade-notice/${NOTICE}` }]);
+    expect(sender.calls).toEqual([{ to: ROW.recipient, subject: ROW.subject, textBody: ROW.text_body, idempotencyKey: `downgrade-notice/${NOTICE}`, transactional: true }]);
     const update = h.statements.find((s) => /UPDATE\s+downgrade_notices/i.test(s));
     expect(update, "marked sent").toBeDefined();
     expect(update!, "only if still unsent").toMatch(/sent_at IS NULL/);
@@ -125,6 +127,40 @@ describe("STORY-077 owner decision 2026-10-23 · the downgrade notice is a signe
     expect(ok.calls).toHaveLength(1);
     expect(ok.calls[0]!.idempotencyKey).toBe(failing.calls[0]!.idempotencyKey);
     expect(h.statements.some((s) => /UPDATE\s+downgrade_notices/i.test(s))).toBe(true);
+  });
+
+  it("STORY-178 · a SUPPRESSED recipient ends the job normally (no throw, so no retry ladder and no dead-letter entry); the notice is not marked sent", async () => {
+    const h = harness(ROW);
+    const suppressed = senderThat(async () => Promise.reject(new EmailSuppressedError("bounce")));
+    await expect(processor(h, suppressed)(signedJob())).resolves.toBeUndefined();
+    expect(suppressed.calls).toHaveLength(1);
+    expect(h.statements.some((s) => /UPDATE\s+downgrade_notices/i.test(s)), "not marked sent: it was not").toBe(false);
+    expect(h.checkedOut).toBe(0);
+  });
+
+  describe("STORY-178 · the notice is TRANSACTIONAL (owner decision 8: a complaint suppresses reports, digests and alerts only)", () => {
+    const store = (kinds: SuppressionKind[]): SuppressionStore => ({ activeKinds: async () => kinds }) as unknown as SuppressionStore;
+    const PEPPER = "unit-test-pepper-0000000000000000";
+    const wrapped = (kinds: SuppressionKind[]) => {
+      const inner = senderThat(async () => undefined);
+      return { inner, sender: new SuppressingEmailSender(inner, store(kinds), PEPPER) };
+    };
+
+    it("a COMPLAINT on the billing contact does not stop the notice", async () => {
+      const h = harness(ROW);
+      const { inner, sender } = wrapped(["complaint"]);
+      await processor(h, sender)(signedJob());
+      expect(inner.calls).toHaveLength(1);
+      expect(h.statements.some((s) => /UPDATE\s+downgrade_notices/i.test(s))).toBe(true);
+    });
+
+    it("a hard BOUNCE does stop it, and that ends the job without a throw", async () => {
+      const h = harness(ROW);
+      const { inner, sender } = wrapped(["bounce"]);
+      await expect(processor(h, sender)(signedJob())).resolves.toBeUndefined();
+      expect(inner.calls).toHaveLength(0);
+      expect(h.statements.some((s) => /UPDATE\s+downgrade_notices/i.test(s))).toBe(false);
+    });
   });
 
   it("a notice already sent (a redelivery, a duplicate enqueue) sends nothing", async () => {
