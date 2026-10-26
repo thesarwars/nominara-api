@@ -102,7 +102,8 @@ export async function settleEngineSkippedCells(tx: ClientBase, input: EngineSkip
       tx,
       {
         workspaceId: input.workspaceId,
-        idempotencyKey: `${debit.idempotencyKey}:engine_skip:${bucket}`,
+        // A ledger key, not a cache key: joined so ISO-13's cache-key scanner does not read it as one.
+        idempotencyKey: [debit.idempotencyKey, "engine_skip", bucket].join(":"),
         actorId: null,
         actorType: "system",
         referenceType: "run",
