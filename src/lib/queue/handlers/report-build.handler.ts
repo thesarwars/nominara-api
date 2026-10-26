@@ -124,11 +124,22 @@ export function createReportBuildHandler(context: QueueHandlerContext, deps: Rep
       const parsed = payloadSchema.safeParse((job.data as { payload: unknown }).payload);
       if (!parsed.success) return false;
       const { workspaceId, reportId } = parsed.data;
+      const period = new Date(parsed.data.period);
+      const settleFailed = (sentUnknown: boolean) => settleAfterFailure(tx, runDeps(), { workspaceId, reportId, period, error: failure.error, sentUnknown });
       if (failure.phase === "commit" && failure.prepared !== undefined && failure.fetched !== undefined) {
-        // The emails went out: settle with what really happened rather than calling the period failed.
-        await commitPreparedRun(tx, runDeps(), failure.prepared, failure.fetched);
+        // The emails went out: settle with what really happened rather than calling the period failed. A fault that recurs in this
+        // fresh transaction must not wedge the period, so the attempt runs behind a savepoint and falls back to a failed settlement.
+        await tx.query("SAVEPOINT report_recover");
+        try {
+          await commitPreparedRun(tx, runDeps(), failure.prepared, failure.fetched);
+          await tx.query("RELEASE SAVEPOINT report_recover");
+        } catch {
+          await tx.query("ROLLBACK TO SAVEPOINT report_recover");
+          await settleFailed(true);
+        }
       } else {
-        await settleAfterFailure(tx, runDeps(), { workspaceId, reportId, period: new Date(parsed.data.period), error: failure.error });
+        // A run-phase throw may have mailed some recipients first: the count is unknown, not zero.
+        await settleFailed(failure.phase === "run");
       }
       incrementCounter("nominara_reports_build_jobs_total", { outcome: "recovered" });
       logger.warn({ event: "report.build.recovered", workspace_id: workspaceId, scheduled_report_id: reportId, phase: failure.phase, error: failure.error instanceof Error ? failure.error.name : "unknown" });

@@ -432,7 +432,7 @@ export async function commitPreparedRun(tx: ClientBase, deps: ReportRunDeps, pre
  * `failed` with a generic reason, `next_send_at` advances and the workspace is told. Runs in a FRESH tenant transaction. A period
  * that is no longer the report's due one (already settled, edited, paused, or the report gone) changes nothing.
  */
-export async function settleAfterFailure(tx: ClientBase, deps: ReportRunDeps, input: { workspaceId: string; reportId: string; period: Date; error: unknown }): Promise<void> {
+export async function settleAfterFailure(tx: ClientBase, deps: ReportRunDeps, input: { workspaceId: string; reportId: string; period: Date; error: unknown; sentUnknown?: boolean }): Promise<void> {
   const { workspaceId, reportId, period } = input;
   const found = await tx.query<ScheduledReportRow>(`SELECT ${SCHEDULED_REPORT_COLUMNS} FROM scheduled_reports WHERE id = $1 FOR UPDATE`, [reportId]);
   const report = found.rows[0];
@@ -442,7 +442,7 @@ export async function settleAfterFailure(tx: ClientBase, deps: ReportRunDeps, in
     period,
     deliveryId: scheduledRunDeliveryId(reportId, period),
     status: "failed",
-    reason: failureReason(input.error),
+    reason: input.sentUnknown === true ? `${failureReason(input.error)}; some recipients may already have been mailed` : failureReason(input.error),
     sent: 0,
     artifactId: null,
     notification: "failed",
