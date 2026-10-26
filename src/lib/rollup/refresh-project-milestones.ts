@@ -49,9 +49,9 @@ export const PROMPT_SET_CATCH_UP_DAYS = 365;
  * PROMPT_SET_CATCH_UP_DAYS. Pure; dates are `YYYY-MM-DD` calendar days.
  */
 export function promptSetDaysToEvaluate(previousRolledUp: string | null, metricDate: string): string[] {
-  const end = Date.parse(`${metricDate}T00:00:00Z`);
+  const end = utcMidnight(metricDate);
   const floor = end - PROMPT_SET_CATCH_UP_DAYS * DAY_MS;
-  const previous = previousRolledUp === null ? end : Date.parse(`${previousRolledUp}T00:00:00Z`);
+  const previous = previousRolledUp === null ? end : utcMidnight(previousRolledUp);
   const start = Math.max(Math.min(previous, end), floor);
   const days: string[] = [];
   for (let at = start; at <= end; at += DAY_MS) days.push(new Date(at).toISOString().slice(0, 10));
@@ -59,6 +59,15 @@ export function promptSetDaysToEvaluate(previousRolledUp: string | null, metricD
 }
 
 const DAY_MS = 86_400_000;
+
+/**
+ * A `YYYY-MM-DD` calendar day as the epoch ms of its UTC midnight. ECMAScript parses the date-only ISO form as UTC (never local
+ * time), so no time suffix is appended — and no `${day}T…` template literal is built, which ISO-13's key-construction scanner
+ * cannot tell from a cache key.
+ */
+function utcMidnight(day: string): number {
+  return Date.parse(day);
+}
 
 async function pinPromptSetChanges(tx: ClientBase, workspaceId: string, projectId: string, metricDate: string, timezone: string): Promise<number> {
   // The previous day this project was rolled up: the latest metric_daily date before this one (RLS scopes the read).
