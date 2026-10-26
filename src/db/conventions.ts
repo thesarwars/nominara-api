@@ -112,6 +112,10 @@ export const GLOBAL_TABLES = [
   // table is reachable and merely filtered, and no FK to workspaces so a
   // tombstone outlives its workspace. Migration 0123_audit_chain_marks.up.sql.
   "audit_chain_marks",
+  // STORY-178 — addresses that must not be mailed (a permanent bounce, a complaint), platform-wide: a bounce is a property
+  // of the address and the sending reputation it protects is shared. Holds the peppered hash only, no address and no
+  // workspace; the Resend webhook that writes it resolves no tenant. Migration 0141_email_suppressions.up.sql.
+  "email_suppressions",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -434,6 +438,13 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
   // STORY-143 AC7 — owner-only: not even SELECT. A mark readable by the
   // application is a mark the application can learn how to forge around.
   if (table === "audit_chain_marks") return NO_PRIVILEGES;
+  // STORY-178 — the webhook route (nominara_app) appends and every sender reads; a worker only reads (it sends reports and
+  // alerts); the report and portal roles send nothing. Lifting a suppression is the operator's, on the owner connection.
+  if (table === "email_suppressions") {
+    if (role === "nominara_app") return APPEND_ONLY;
+    if (role === "nominara_worker") return READ_ONLY;
+    return NO_PRIVILEGES;
+  }
   if (table === "audit_log") {
     if (role === "nominara_app" || role === "nominara_worker") return APPEND_ONLY;
     if (role === "nominara_report" || role === "nominara_portal") return READ_ONLY;

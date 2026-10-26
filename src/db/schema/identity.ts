@@ -31,6 +31,16 @@ export const emailOtpRequests = pgTable("email_otp_requests", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
 });
 
+export const emailSuppressions = pgTable("email_suppressions", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  recipientHash: bytea("recipient_hash").notNull(),
+  kind: text("kind").notNull(),
+  providerEventId: text("provider_event_id").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  fannedOutAt: timestamp("fanned_out_at", { withTimezone: true }),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+});
+
 export const oauthAuthorizationRequests = pgTable("oauth_authorization_requests", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   provider: text("provider").notNull(),
