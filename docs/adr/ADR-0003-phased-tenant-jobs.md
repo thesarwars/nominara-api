@@ -76,6 +76,15 @@ the pattern that class documents; the bound writer works in `run` with no contex
   - `crawl.discover` holds a job transaction across its fetches.
   All four can adopt `phasedProcessor`; the billing two also need their second connection removed. Until then the claim "no
   handler holds a transaction across an external await" is false for them, and only `crawl.audit` is proven by test.
+- **`capture.execute` is phased (STORY-181, round 4, 2026-10-26).** It had held its job transaction across the vendor call by design
+  (SCANFIX D5: the run's `FOR KEY SHARE` and the cell's advisory lock) and, with STORY-181, across the raw-object PUT, which had no
+  timeout. `prepare` reads the run and finds a settled cell; `run` calls the vendor, charges the spend meter and PUTs the object;
+  `commit` re-reads the run under `FOR KEY SHARE`, takes the advisory lock and writes the row. What the long transaction guaranteed is
+  rebuilt: the commit-time re-read refuses a cell on a run the reaper finalised, and a 90-second cache claim per cell (the loser throws
+  `CellInFlightError` and is retried) keeps two deliveries from paying twice. The price is an orphaned raw object when a commit fails
+  or a duplicate wins (no delete is attempted inside the commit transaction), bounded to the workspace's prefix like the crawl
+  orphans above. Tests: `capture-raw-object.spec.ts` 181-AC1h..j, `capture-gemini-end-to-end.spec.ts` E2E-B6f audit 1,
+  `queue-handler-registry.spec.ts`.
 - Rejected: accepting the single-transaction shape with a named follow-up (it leaves the exposure and the follow-up never lands);
   opening the transaction inside the handler (it would make the handler the thing that sets tenant context, which is
   `createJobProcessor`'s job and the reason ISO-11 exists).
