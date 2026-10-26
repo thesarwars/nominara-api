@@ -19,9 +19,12 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 // and the rollup cron is tenant-scoped so nothing else covers it.
 
 // A terminal failure, driven through the real handler: the cell row a real
-// failed capture writes, and the outcome `captureCell` returns for it.
+// failed capture writes, and the outcome `commitCell` returns for it. The handler is phased
+// (ADR-0003), so the seam is three functions: nothing settled, nothing fetched, and the commit that writes the row.
 vi.mock("../../src/lib/capture/execute-cell.js", () => ({
-  captureCell: async (
+  settledCell: async () => undefined,
+  fetchCell: async () => ({}),
+  commitCell: async (
     tx: import("pg").ClientBase,
     _cache: unknown,
     input: { workspaceId: string; projectId: string; runId: string; promptId: string; engineKey: string; sampleIndex: number },

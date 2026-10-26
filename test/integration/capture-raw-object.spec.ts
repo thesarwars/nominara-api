@@ -34,14 +34,16 @@ import { TEST_SIGNING_KEYS } from "../support/queue-test-harness.js";
 //
 // Run under the shared docker lock: a Postgres AND a LocalStack (S3 only, signature validation on).
 //
-// WHAT IS DELIBERATELY NOT CLAIMED. `capture.execute` is a single-transaction job and its transaction ALREADY spans the vendor
-// call (SCANFIX D5 relies on it: the run row is held `FOR KEY SHARE` for the whole cell). The object PUT happens inside that
-// same transaction, immediately after the vendor answers and before the row is inserted. `capture.parse` has no such history and
-// is PHASED (ADR-0003): its object read runs with no transaction and no pooled connection, which the KAD-06 test below proves.
+// BOTH WORKERS ARE PHASED (ADR-0003). `capture.parse` reads the object with no transaction and no pooled connection; `capture.execute`
+// makes its vendor call and PUTs the object with none either, then writes the row in a second short transaction. The KAD-06 tests
+// below observe Postgres and the pool at the instant of every vendor call, PUT and read, through the REAL job processor.
 
 const ANSWER = "## Best CRMs\n\n1. **HubSpot** - we recommend it for most teams.\n2. Salesforce - deeper reporting.\n";
 const TAMPERED = "Zoho CRM is the only thing worth buying.";
 const KEY_ENV = "inttest";
+
+/** Called at the instant of every vendor call, so a test can look at Postgres from inside it. */
+const vendor = vi.hoisted(() => ({ onCall: undefined as undefined | (() => Promise<void>) }));
 
 vi.mock("../../src/lib/engines/registry.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/lib/engines/registry.js")>();
@@ -54,8 +56,9 @@ vi.mock("../../src/lib/engines/registry.js", async (importOriginal) => {
       supportsCitations: true,
       concurrencyPerTask: 1,
       healthProbe: () => Promise.resolve({ ok: true, latencyMs: 1 }),
-      capture: (input: { promptText: string }) =>
-        Promise.resolve(
+      capture: async (input: { promptText: string }) => {
+        await vendor.onCall?.();
+        return (
           input.promptText.startsWith("refuse")
             ? { text: "", format: "plaintext", truncated: false, responseTokensEst: 0, latencyMs: 1, costUsd: 0, flags: ["engine_refused_to_answer"] }
             : {
@@ -67,8 +70,9 @@ vi.mock("../../src/lib/engines/registry.js", async (importOriginal) => {
                 costUsd: 0,
                 structuredCitations: [{ url: "https://example.test/a", slot: 0 }],
                 vendorRequestId: "req-1",
-              },
-        ),
+              }
+        );
+      },
     }),
   };
 });
@@ -86,6 +90,7 @@ vi.mock("../../src/lib/telemetry/metrics.js", async () => {
 });
 
 const ENTRY = QUEUE_TOPOLOGY.find((e) => e.name === "capture.parse")!;
+const EXECUTE_ENTRY = QUEUE_TOPOLOGY.find((e) => e.name === "capture.execute")!;
 const noopPublisher: RealtimePublisher = { toWorkspace: () => undefined, toProject: () => undefined, memberChanged: () => undefined };
 const stubMeter = {
   isCeilingReached: () => Promise.resolve(false),
@@ -149,6 +154,7 @@ describe("STORY-181 · raw capture objects", () => {
     promptId = randomUUID();
     runId = uuidV7();
     observed = [];
+    vendor.onCall = undefined;
     counters.length = 0;
     parseJobs.length = 0;
     for (const id of [workspaceId, otherWorkspaceId]) {
@@ -370,6 +376,96 @@ describe("STORY-181 · raw capture objects", () => {
     await db.query("UPDATE capture_runs SET status = 'queued', captured_cells = 0, finished_at = NULL WHERE id = $1", [runId]);
     await expect(execute({ env: { ...unconfigured, NODE_ENV: "production" } })).rejects.toThrow(/object storage is not configured/);
     expect(await captureRows()).toEqual([]);
+  });
+
+  // ------------------------------------- ADR-0003: capture.execute is phased (round 3, finding 1)
+
+  /** The execute handler through the REAL job processor, as `nominara_app`, so a held transaction or connection is visible. */
+  function executeThroughProcessor(storagePort?: ObjectStoragePort, text = "best crm"): Promise<unknown> {
+    const processor = createJobProcessor(EXECUTE_ENTRY, {
+      keys: TEST_SIGNING_KEYS,
+      getClient: () => pool.connect(),
+      releaseClient: (client) => (client as unknown as { release: () => void }).release(),
+      process: createCaptureExecuteHandler(context(), {
+        cache: new InMemoryCacheAdapter(),
+        realtime: noopPublisher,
+        enqueueParse: (payload) => {
+          parseJobs.push(payload);
+          return Promise.resolve();
+        },
+        spendMeter: stubMeter,
+        enqueueRollup: () => Promise.resolve(),
+        ...(storagePort !== undefined ? { storagePort } : {}),
+      }),
+    });
+    const job = {
+      data: signQueueJobPayload(
+        { workspaceId, kid: TEST_SIGNING_KEYS.current.kid, projectId, runId, promptId, promptText: text, engineKey: "gemini", sampleIndex: 0, adapterVersion: "1.0.0", ttlSeconds: 3600, locale: "en-US", personaHint: null },
+        TEST_SIGNING_KEYS.current.key,
+      ),
+    } as unknown as Job;
+    return processor(job);
+  }
+
+  it("181-AC1h · KAD-06: no transaction is open and no pooled connection is checked out during the vendor call or the raw-object PUT", async () => {
+    const what: string[] = [];
+    const watched: ObjectStoragePort = {
+      put: async (r: PutObjectRequest) => {
+        await observe();
+        what.push("put");
+        return s3.put(r);
+      },
+      get: s3.get.bind(s3),
+      head: s3.head.bind(s3),
+      delete: s3.delete.bind(s3),
+      presignGet: s3.presignGet.bind(s3),
+    };
+    vendor.onCall = async () => {
+      await observe();
+      what.push("vendor");
+    };
+    await executeThroughProcessor(watched);
+
+    expect(what).toEqual(["vendor", "put"]); // not vacuous: both outbound awaits happened, and were observed
+    for (const o of observed) expect(o).toEqual({ idleInTx: 0, checkedOut: 0 });
+    expect(pool.totalCount - pool.idleCount).toBe(0);
+    const [row] = await captureRows();
+    expect(row!.status).toBe("captured");
+    expect(row!.raw_object_key).not.toBeNull(); // and the short commit transaction still recorded the key
+    expect(parseJobs).toHaveLength(1);
+  });
+
+  it("181-AC1i · SCANFIX-D5 survives the phasing: a run the reaper finalised while the vendor was answering takes no captured answer", async () => {
+    vendor.onCall = async () => {
+      await db.query("UPDATE capture_runs SET status = 'failed', finished_at = now() WHERE id = $1", [runId]);
+    };
+    await executeThroughProcessor();
+
+    expect(await captureRows()).toEqual([]); // no captured answer on a refunded run
+    const run = await db.query<{ status: string; captured_cells: number }>("SELECT status, captured_cells FROM capture_runs WHERE id = $1", [runId]);
+    expect(run.rows[0]).toEqual({ status: "failed", captured_cells: 0 });
+    expect(parseJobs).toEqual([]);
+  });
+
+  it("181-AC1j · a commit that fails after the PUT leaves an orphan object and NO row, and makes no storage call while its transaction is open", async () => {
+    await db.query(`CREATE OR REPLACE FUNCTION refuse_capture_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit refused'; END $$`);
+    await db.query("CREATE TRIGGER refuse_capture_insert BEFORE INSERT ON answer_captures FOR EACH ROW EXECUTE FUNCTION refuse_capture_insert()");
+    const calls: string[] = [];
+    const watched: ObjectStoragePort = {
+      put: (r: PutObjectRequest) => (calls.push("put"), s3.put(r)),
+      get: s3.get.bind(s3),
+      head: s3.head.bind(s3),
+      delete: (b, k) => (calls.push("delete"), s3.delete(b, k)),
+      presignGet: s3.presignGet.bind(s3),
+    };
+    try {
+      await expect(executeThroughProcessor(watched)).rejects.toThrow(/commit refused/);
+    } finally {
+      await db.query("DROP TRIGGER refuse_capture_insert ON answer_captures");
+    }
+    expect(await captureRows()).toEqual([]);
+    expect(calls).toEqual(["put"]); // the orphan is KNOWN and left: a delete would be a storage call inside the commit transaction
+    expect(counters.filter((c) => c.name === "nominara_capture_raw_objects_total").map((c) => c.labels.outcome)).not.toContain("written");
   });
 
   // --------------------------------------------------- AC2/AC3: the parser read

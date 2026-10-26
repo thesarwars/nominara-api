@@ -116,60 +116,34 @@ async function recordUsageCost(tx: ClientBase, input: CaptureCellInput, usd: num
 }
 
 /**
- * Capture one cell and write its row. Returns what happened.
+ * STORY-034 / ADR-0003 - A CELL IS THREE PHASES, and the three are the whole shape of `capture.execute`.
  *
- * RETRYABLE FAILURES THROW, terminal ones return. That split is the retry
- * ladder's interface: BullMQ retries a job that throws and gives up on one
- * that returns, so a `timeout` must reach the ladder and an `auth_failed`
- * must not — retrying a bad credential four times produces four identical
- * failures and a dead-letter entry that says nothing the first attempt did
- * not.
+ *   settledCell(tx)   PREPARE, one short transaction: has this cell already been settled by an earlier delivery?
+ *   fetchCell(...)    RUN, NO transaction and NO client: the vendor call, the spend meter, the raw-object PUT.
+ *   commitCell(tx)    COMMIT, a second short transaction: the advisory lock, the re-check, the row, the usage ledger, the L1 seed.
  *
- * `content_policy_refusal` IS NEITHER. `NFR-SIM-07`: it is data, not a
- * failure, and is never retried — the engine answered, and its answer was
- * that it would not answer. It is recorded as a capture carrying the flag,
- * because "the engine refused to discuss this" is a real measurement about a
- * prompt and losing it would misreport the prompt as never asked.
+ * The vendor call and the object PUT used to run INSIDE one transaction that held the run `FOR KEY SHARE` and the cell's advisory
+ * lock (SCANFIX D5); NFR-ARCH-04 forbids a transaction across an external await, and the S3 client has no say in how long a PUT
+ * takes. What the held locks bought is rebuilt without a transaction: see `commitCell` (the terminal-run re-check under
+ * `FOR KEY SHARE` at commit) and the handler's in-flight claim (two deliveries of one cell no longer pay twice).
+ *
+ * RETRYABLE FAILURES THROW from `fetchCell`, terminal ones become a row. That split is the retry ladder's interface: BullMQ retries
+ * a job that throws and gives up on one that returns, so a `timeout` must reach the ladder and an `auth_failed` must not.
+ *
+ * `content_policy_refusal` IS NEITHER. `NFR-SIM-07`: it is data, not a failure, and is never retried - it is recorded as a capture
+ * carrying the flag, because "the engine refused to discuss this" is a real measurement about a prompt.
  */
-export async function captureCell(
-  tx: ClientBase,
-  cache: Cache,
-  input: CaptureCellInput,
-  now: Date = new Date(),
-  /** Feeds the platform-wide spend meter (Valkey); fails open, so it can never fail a capture. */
-  recordSpend?: (engineKey: string, usd: number) => Promise<void>,
-  /**
-   * The pre-call spend gate: true means the engine's monthly ceiling is
-   * reached and the vendor must not be called. It may THROW (meter
-   * unreadable) — that fails closed and reaches the retry ladder.
-   */
-  ceilingReached?: (engineKey: string) => Promise<boolean>,
-  /**
-   * STORY-181 - where the verbatim raw answer is retained. Absent only when object storage is not configured outside production
-   * (the legacy payload-only path); the handler throws in production rather than pass nothing.
-   */
-  rawObjects?: Pick<BoundRawObjects, "put" | "deleteStored">,
-): Promise<CaptureCellOutcome> {
-  // IDEMPOTENT PER CELL, BEFORE ANY VENDOR CALL. A job redelivered after its
-  // transaction committed (stalled-job path) would otherwise call the engine
-  // again, write a second capture and ledger row, and double-count the cell.
-  // Any existing live row means the cell is settled; a retryable failure
-  // throws and rolls back, so it never leaves a row to find here.
-  //
-  // CHECK-THEN-INSERT ALONE IS NOT ENOUGH, so the check is made under a lock.
-  // A redelivery that starts while the original is still in flight would find
-  // no row and pay for the cell twice. `answer_captures` is partitioned on
-  // `captured_at`, so no unique index on the cell can exist (every unique
-  // index must include the partition key, and `captured_at` differs between
-  // attempts); the database-enforced mutual exclusion is a transaction-scoped
-  // advisory lock on the cell's identity. The second delivery blocks here
-  // until the first commits (then finds its row and replays) or rolls back
-  // (then proceeds as the one real attempt). The lock is released at COMMIT
-  // or ROLLBACK, never leaked. A hash collision only serialises two unrelated
-  // cells; it can never let two attempts at one cell through.
-  await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-    ["capture.cell", input.runId, input.promptId, input.engineKey, String(input.sampleIndex)].join("|"),
-  ]);
+
+/** The lock that makes check-then-insert safe: taken in `commitCell`, released at COMMIT or ROLLBACK, never leaked. */
+function cellLockKey(input: CaptureCellInput): string {
+  return ["capture.cell", input.runId, input.promptId, input.engineKey, String(input.sampleIndex)].join("|");
+}
+
+/** The outcome an earlier delivery already recorded for this cell, or undefined when the cell has no row yet. */
+export async function settledCell(tx: ClientBase, input: CaptureCellInput): Promise<CaptureCellOutcome | undefined> {
+  // IDEMPOTENT PER CELL, BEFORE ANY VENDOR CALL. A job redelivered after its transaction committed (stalled-job path) would
+  // otherwise call the engine again, write a second capture and ledger row, and double-count the cell. A retryable failure throws
+  // and writes no row, so it never leaves one to find here.
   const existing = await tx.query<{ status: string; error_code: string | null }>(
     `SELECT status, error_code FROM answer_captures
       WHERE run_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = $4
@@ -177,47 +151,72 @@ export async function captureCell(
     [input.runId, input.promptId, input.engineKey, input.sampleIndex],
   );
   const prior = existing.rows[0];
-  if (prior !== undefined) {
-    if (prior.status === "blocked") return { kind: "blocked", errorCode: prior.error_code ?? "blocked" };
-    if (prior.status === "failed") return { kind: "failed", errorCode: prior.error_code ?? "failed" };
-    return { kind: "captured", latencyMs: 0, replayed: true };
-  }
+  if (prior === undefined) return undefined;
+  if (prior.status === "blocked") return { kind: "blocked", errorCode: prior.error_code ?? "blocked" };
+  if (prior.status === "failed") return { kind: "failed", errorCode: prior.error_code ?? "failed" };
+  return { kind: "captured", latencyMs: 0, replayed: true };
+}
 
+/** What the RUN phase hands the COMMIT phase: everything needed to write the row, and nothing that needs a connection. */
+export interface CellFetched {
+  readonly write: CellWrite;
+  /** The row id, minted in the run phase because the raw object's key embeds it. A retried attempt mints a new one. */
+  readonly resultId: string;
+  /** The FULL key of the object already stored, or null (nothing to store, or storage unconfigured outside production). */
+  readonly rawObjectKey: string | null;
+  /** What the vendor billed, for `usage_ledger`. Already charged to the spend meter. */
+  readonly costUsd: number;
+  /** The answer to seed L1 with: a real live answer only. */
+  readonly seed: RawCapture | undefined;
+  readonly now: Date;
+  readonly outcome: CaptureCellOutcome;
+}
+
+export interface FetchCellPorts {
+  /** Feeds the platform-wide spend meter (Valkey); fails open, so it can never fail a capture. */
+  readonly recordSpend?: (engineKey: string, usd: number) => Promise<void>;
+  /** The pre-call spend gate: true means the engine's monthly ceiling is reached and the vendor must not be called. It may THROW (meter unreadable) - that fails closed and reaches the retry ladder. */
+  readonly ceilingReached?: (engineKey: string) => Promise<boolean>;
+  /**
+   * STORY-181 - where the verbatim raw answer is retained. Absent only when object storage is not configured outside production
+   * (the legacy payload-only path); the handler throws in production rather than pass nothing.
+   */
+  readonly rawObjects?: Pick<BoundRawObjects, "put">;
+}
+
+/**
+ * Capture one cell and store its raw object. NO TRANSACTION, NO CLIENT: this function has none to use.
+ *
+ * The object is written BEFORE the row, under a key that embeds the attempt's own row id. That is what ADR-0003 asks for and it
+ * keeps the old guarantee: the row is inserted only after the PUT succeeded, so no row ever points at a missing object. The price
+ * is an ORPHAN when the commit then fails or a duplicate delivery wins the cell: the object stays, inside the workspace's own prefix
+ * (recorded in `docs/plans/docs-carry/STORY-181.md`; no delete is attempted because a delete is a storage call and the commit phase
+ * holds a transaction).
+ */
+export async function fetchCell(input: CaptureCellInput, ports: FetchCellPorts = {}, now: Date = new Date()): Promise<CellFetched> {
+  const { recordSpend, ceilingReached, rawObjects } = ports;
   let adapter: CaptureAdapter;
   try {
     adapter = resolveEngine(input.engineKey);
   } catch (error) {
     if (!(error instanceof EngineRefusalError)) throw error;
-    // A DISABLED ENGINE IS NOT A FAILURE OF THE RUN. The plan resolved the
-    // engine from `project_engines` and the registry disagreed — a catalog
-    // that moved under a queued job. Recorded as `blocked` so the matrix can
-    // say "we could not ask", and returned rather than thrown so the retry
-    // ladder does not chase a configuration state.
-    await writeCell(tx, input, now, { status: "blocked", errorCode: `engine_${error.reason}` });
-    return { kind: "blocked", errorCode: `engine_${error.reason}` };
+    // A DISABLED ENGINE IS NOT A FAILURE OF THE RUN. The plan resolved the engine from `project_engines` and the registry disagreed -
+    // a catalog that moved under a queued job. Recorded as `blocked` so the matrix can say "we could not ask", and not thrown so the
+    // retry ladder does not chase a configuration state.
+    return unansweredCell({ status: "blocked", errorCode: `engine_${error.reason}` }, { kind: "blocked", errorCode: `engine_${error.reason}` }, now);
   }
 
-  // THE HARD STOP (EC-08). Terminal and distinct: a `blocked` row with its own
-  // code, returned not thrown, so the ceiling is not chased by the retry ladder.
-  if ((await ceilingReached?.(input.engineKey)) === true) {
-    await writeCell(tx, input, now, { status: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED });
-    return { kind: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED };
-  }
+  // THE HARD STOP (EC-08). Terminal and distinct: a `blocked` row with its own code, so the ceiling is not chased by the retry ladder.
+  if ((await ceilingReached?.(input.engineKey)) === true) return unansweredCell({ status: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED }, { kind: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED }, now);
 
   const controller = new AbortController();
   const costs = { usd: 0 };
-  // METERING ORDER, PINNED (E2E-B6 audit): the Valkey spend meter is charged the moment the vendor call
-  // RETURNS (or throws), before any database write and independent of the job's commit. The money is
-  // spent when the vendor answers; a rollback or a crash afterwards does not un-spend it, and the retry
-  // will pay again. So a rollback leaves the meter ahead of `usage_ledger`, which errs toward blocking
-  // sooner. Charging after the commit would instead lose the spend of every call whose commit never
-  // happens, which errs toward overspend. `usage_ledger` is written with the cell, so it commits or
-  // rolls back with it.
+  // METERING ORDER, PINNED (E2E-B6 audit): the Valkey spend meter is charged the moment the vendor call RETURNS (or throws), before any
+  // database write and independent of the job's commit. The money is spent when the vendor answers; a rollback or a crash afterwards
+  // does not un-spend it, and the retry will pay again. So a rollback leaves the meter ahead of `usage_ledger`, which errs toward
+  // blocking sooner. `usage_ledger` is written with the cell, so it commits or rolls back with it.
   const meterSpend = async (): Promise<void> => {
     if (costs.usd > 0) await recordSpend?.(input.engineKey, costs.usd).catch(() => undefined);
-  };
-  const ledgerCost = async (): Promise<void> => {
-    if (costs.usd > 0) await recordUsageCost(tx, input, costs.usd);
   };
   let raw: RawCapture;
   try {
@@ -238,49 +237,92 @@ export async function captureCell(
     const classification = classifyCaptureFailure(error.code);
     if (classification === "retryable") throw error;
     if (classification === "terminal") {
-      await writeCell(tx, input, now, { status: "failed", errorCode: error.code });
-      await ledgerCost();
-      return { kind: "failed", errorCode: error.code };
+      return unansweredCell({ status: "failed", errorCode: error.code }, { kind: "failed", errorCode: error.code }, now, costs.usd);
     }
-    // `content_policy_refusal` — the engine answered, and the answer was a
-    // refusal. Stored as a capture with no text and the flag, so the parser
-    // sees an answer that mentioned nobody rather than a missing cell.
-    await writeCell(tx, input, now, {
-      status: "captured",
-      adapter,
-      raw: {
-        text: "",
-        format: "plaintext",
-        truncated: false,
-        responseTokensEst: 0,
-        latencyMs: 0,
-        costUsd: 0,
-        // `engine_refused_to_answer` — the contract's own flag for exactly
-        // this, rather than repeating the taxonomy code in a second vocabulary.
-        flags: ["engine_refused_to_answer"],
-      },
-    }, rawObjects);
-    await ledgerCost();
-    return { kind: "captured", latencyMs: 0 };
+    // `content_policy_refusal` - the engine answered, and the answer was a refusal. Stored as a capture with no text and the flag, so
+    // the parser sees an answer that mentioned nobody rather than a missing cell.
+    const refusal: RawCapture = {
+      text: "",
+      format: "plaintext",
+      truncated: false,
+      responseTokensEst: 0,
+      latencyMs: 0,
+      costUsd: 0,
+      // `engine_refused_to_answer` - the contract's own flag for exactly this, rather than repeating the taxonomy code in a second vocabulary.
+      flags: ["engine_refused_to_answer"],
+    };
+    const stored = await storeRawObject(input, now, rawObjects, refusal);
+    return { write: { status: "captured", adapter, raw: refusal }, ...stored, costUsd: costs.usd, seed: undefined, now, outcome: { kind: "captured", latencyMs: 0 } };
   }
 
   await meterSpend();
-  await writeCell(tx, input, now, { status: "captured", adapter, raw }, rawObjects);
-  await ledgerCost();
+  const stored = await storeRawObject(input, now, rawObjects, raw);
+  return { write: { status: "captured", adapter, raw }, ...stored, costUsd: costs.usd, seed: raw, now, outcome: { kind: "captured", latencyMs: raw.latencyMs } };
+}
+
+/** A cell with no answer to store (blocked or failed): a row, no object, and whatever the vendor billed. */
+function unansweredCell(write: CellWrite, outcome: CaptureCellOutcome, now: Date, costUsd = 0): CellFetched {
+  return { write, resultId: uuidV7(), rawObjectKey: null, costUsd, seed: undefined, now, outcome };
+}
+
+/**
+ * STORY-181 AC1 - THE VERBATIM RAW ANSWER IS RETAINED IN OBJECT STORAGE, UPLOAD FIRST. A failed PUT throws: the job retries and no row
+ * exists to find. The row id is minted here (not by the column default) because the key embeds it.
+ *
+ * DUAL WRITE: `payload` keeps the text too. The document, the L1/L2 reuse paths and the legacy fallback read it; the object is the
+ * verbatim retained copy the parser and the raw download read.
+ */
+async function storeRawObject(
+  input: CaptureCellInput,
+  now: Date,
+  rawObjects: Pick<BoundRawObjects, "put"> | undefined,
+  raw: RawCapture,
+): Promise<{ resultId: string; rawObjectKey: string | null }> {
+  const resultId = uuidV7();
+  if (rawObjects === undefined) return { resultId, rawObjectKey: null };
+  try {
+    const rawObjectKey = await rawObjects.put(rawObjectRelativeKey(now, resultId), encodeRawObject(rawPayload(raw)));
+    return { resultId, rawObjectKey };
+  } catch (error) {
+    incrementCounter("nominara_capture_raw_objects_total", { outcome: "upload_failed" });
+    logger.error({ event: "capture.raw_object.upload_failed", workspace_id: input.workspaceId, run_id: input.runId, error: error instanceof Error ? error.name : "unknown" });
+    throw error;
+  }
+}
+
+/**
+ * Write the row the RUN phase prepared. A SHORT transaction: only database statements, plus the best-effort L1 seed.
+ *
+ * CHECK-THEN-INSERT ALONE IS NOT ENOUGH, so the check is made under a lock. `answer_captures` is partitioned on `captured_at`, so no
+ * unique index on the cell can exist; the database-enforced mutual exclusion is a transaction-scoped advisory lock on the cell's
+ * identity, taken HERE (it can no longer span the vendor call). A delivery that reaches commit second blocks until the first
+ * commits, then finds its row and REPLAYS: nothing is written and the caller must not count the cell again. The object it stored
+ * is then an orphan. A hash collision only serialises two unrelated cells.
+ */
+export async function commitCell(tx: ClientBase, cache: Cache, input: CaptureCellInput, fetched: CellFetched): Promise<CaptureCellOutcome> {
+  await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [cellLockKey(input)]);
+  const prior = await settledCell(tx, input);
+  if (prior !== undefined) {
+    if (fetched.rawObjectKey !== null) incrementCounter("nominara_capture_raw_objects_total", { outcome: "orphaned_by_replay" });
+    return prior;
+  }
+
+  await insertCell(tx, input, fetched.now, fetched.write, fetched.resultId, fetched.rawObjectKey, fetched.write.status === "captured" ? fetched.write.raw.text : "");
+  if (fetched.rawObjectKey !== null) {
+    incrementCounter("nominara_capture_raw_objects_total", { outcome: "written" });
+    logger.log({ event: "capture.raw_object.written", workspace_id: input.workspaceId, run_id: input.runId, result_id: fetched.resultId, bytes_before_gzip: Buffer.byteLength(fetched.write.status === "captured" ? fetched.write.raw.text : "", "utf8") });
+  }
+  if (fetched.costUsd > 0) await recordUsageCost(tx, input, fetched.costUsd);
 
   // SEED L1 ONLY AFTER THE ROW IS WRITTEN, and only on a real answer.
   //
-  // The cache is a shared read-through: another tenant's planner may take
-  // this entry as an L1 hit and suppress its own cell. Publishing before the
-  // row existed would let a second run reuse an answer this one had not
-  // durably recorded — and if this transaction then rolled back, the shared
-  // cache would hold an answer belonging to a capture that never happened.
+  // The cache is a shared read-through: another tenant's planner may take this entry as an L1 hit and suppress its own cell.
+  // Publishing before the row existed would let a second run reuse an answer this one had not durably recorded - and if this
+  // transaction then rolled back, the shared cache would hold an answer belonging to a capture that never happened.
   //
-  // Best-effort: a cache write that fails costs a future run one engine call,
-  // which is not worth failing a completed capture over.
-  await seedSharedCache(cache, input, raw, now).catch(() => undefined);
-
-  return { kind: "captured", latencyMs: raw.latencyMs };
+  // Best-effort: a cache write that fails costs a future run one engine call, which is not worth failing a completed capture over.
+  if (fetched.seed !== undefined) await seedSharedCache(cache, input, fetched.seed, fetched.now).catch(() => undefined);
+  return fetched.outcome;
 }
 
 /** The `error_code` of a cell whose retries ran out on an error that carried no engine code of its own. */
@@ -296,7 +338,7 @@ export const RETRIES_EXHAUSTED = "retries_exhausted";
  * code (`rate_limited`, `timeout`, `upstream_5xx`) or `retries_exhausted` for an unclassified fault.
  *
  * Idempotent: if the cell already has a row (a throw AFTER the row was written) nothing is added.
- * Runs in the same transaction as the attempt that just threw, whose advisory lock is still held.
+ * Runs in the COMMIT phase's transaction, under the cell's advisory lock.
  */
 export async function recordExhaustedCell(
   tx: ClientBase,
@@ -304,6 +346,9 @@ export async function recordExhaustedCell(
   error: unknown,
   now: Date = new Date(),
 ): Promise<CaptureCellOutcome> {
+  // The same lock `commitCell` takes: the exhausted record is a check-then-insert too, and no longer runs under the lock of a transaction
+  // that spanned the attempt. A winner's answer committed first is found below and kept.
+  await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [cellLockKey(input)]);
   const existing = await tx.query<{ status: string; error_code: string | null }>(
     `SELECT status, error_code FROM answer_captures
       WHERE run_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = $4
@@ -321,65 +366,21 @@ export async function recordExhaustedCell(
   return { kind: "failed", errorCode };
 }
 
-type CellWrite =
+export type CellWrite =
   | { readonly status: "captured"; readonly adapter: CaptureAdapter; readonly raw: RawCapture }
   | { readonly status: "blocked" | "failed"; readonly errorCode: string };
 
 /**
- * One row per cell.
+ * One row per cell, for a cell that never had a vendor answer (the exhausted-retries record). Nothing to store, so no object.
  *
- * NO `workspace_id` PREDICATE and no tenant filter — this runs inside the
- * job's tenant context, so RLS scopes the write (`NFR-SEC-01`). The column is
- * still supplied because it is NOT NULL and the policy checks it.
+ * NO `workspace_id` PREDICATE and no tenant filter - this runs inside the job's tenant context, so RLS scopes the write
+ * (`NFR-SEC-01`). The column is still supplied because it is NOT NULL and the policy checks it.
  *
- * `alias_fingerprint` is deliberately absent: it stamps a SUPPRESSED row with
- * the alias set that made reuse safe, and a live capture has not been matched
- * against any alias set yet. The parser stamps it when it runs.
+ * `alias_fingerprint` is deliberately absent: it stamps a SUPPRESSED row with the alias set that made reuse safe, and a live
+ * capture has not been matched against any alias set yet. The parser stamps it when it runs.
  */
-async function writeCell(
-  tx: ClientBase,
-  input: CaptureCellInput,
-  now: Date,
-  write: CellWrite,
-  rawObjects?: Pick<BoundRawObjects, "put" | "deleteStored">,
-): Promise<void> {
-  const captured = write.status === "captured";
-  const text = captured ? write.raw.text : "";
-
-  // STORY-181 AC1 - THE VERBATIM RAW ANSWER IS RETAINED IN OBJECT STORAGE, UPLOAD FIRST. The key is recorded only after the PUT
-  // succeeded, so no row ever points at a missing object, and a failed PUT throws: the job retries and no row exists to find.
-  // The row id is minted here (not by the column default) because the key embeds it.
-  //
-  // THIS PUT RUNS INSIDE THE CELL'S TRANSACTION, which is the shape `capture.execute` already has: that transaction spans the vendor
-  // call, held on purpose (the run's `FOR KEY SHARE` and the cell's advisory lock, SCANFIX D5). Phasing this handler is a separate,
-  // larger decision (it would give up those two locks); it is recorded in ADR-0003's list of violators, not hidden here.
-  //
-  // DUAL WRITE: `payload` keeps the text too. The document, the L1/L2 reuse paths and the legacy fallback read it; the object is
-  // the verbatim retained copy the parser and the raw download read.
-  const resultId = uuidV7();
-  let rawObjectKey: string | null = null;
-  if (captured && rawObjects !== undefined) {
-    try {
-      rawObjectKey = await rawObjects.put(rawObjectRelativeKey(now, resultId), encodeRawObject(rawPayload(write.raw)));
-    } catch (error) {
-      incrementCounter("nominara_capture_raw_objects_total", { outcome: "upload_failed" });
-      logger.error({ event: "capture.raw_object.upload_failed", workspace_id: input.workspaceId, run_id: input.runId, error: error instanceof Error ? error.name : "unknown" });
-      throw error;
-    }
-  }
-
-  try {
-    await insertCell(tx, input, now, write, resultId, rawObjectKey, text);
-  } catch (error) {
-    // The object was written but the row was not: an orphan in this workspace's own prefix. Removed best-effort; the lifecycle rule
-    // (STORY-003) is the backstop for the delete that also fails, or for a rollback that happens after this function returned.
-    if (rawObjectKey !== null) await rawObjects!.deleteStored(rawObjectKey).catch(() => undefined);
-    throw error;
-  }
-  if (rawObjectKey !== null) {
-    incrementCounter("nominara_capture_raw_objects_total", { outcome: "written" });
-    logger.log({ event: "capture.raw_object.written", workspace_id: input.workspaceId, run_id: input.runId, result_id: resultId, bytes_before_gzip: Buffer.byteLength(text, "utf8") });
-  }
+async function writeCell(tx: ClientBase, input: CaptureCellInput, now: Date, write: CellWrite): Promise<void> {
+  await insertCell(tx, input, now, write, uuidV7(), null, "");
 }
 
 async function insertCell(
