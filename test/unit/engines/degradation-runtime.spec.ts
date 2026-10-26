@@ -1,4 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const counters = vi.hoisted(() => [] as { name: string; labels: Record<string, string> | undefined }[]);
+vi.mock("../../../src/lib/telemetry/metrics.js", () => ({
+  incrementCounter: (name: string, labels?: Record<string, string>) => counters.push({ name, labels }),
+}));
 import type { EngineKey } from "../../../src/lib/engines/contract.js";
 import { DEGRADATION_STAGE_5_OPEN_DURATION_MS } from "../../../src/lib/engines/degradation.js";
 import { DegradationRuntime } from "../../../src/lib/engines/degradation-runtime.js";
@@ -14,7 +19,12 @@ import type { EngineBreakerDetail } from "../../../src/lib/engines/engine-breake
 const NOW = 50_000_000_000;
 const closed: EngineBreakerDetail = { state: "closed", openedAt: null, since: null, reason: null };
 
-function harness(details: Partial<Record<EngineKey, EngineBreakerDetail>>, ratios: Partial<Record<EngineKey, number>> = {}, failing: EngineKey[] = []) {
+function harness(
+  details: Partial<Record<EngineKey, EngineBreakerDetail>>,
+  ratios: Partial<Record<EngineKey, number>> = {},
+  failing: EngineKey[] = [],
+  changes: (key: EngineKey) => boolean = () => true,
+) {
   const degraded: EngineKey[] = [];
   const recovered: EngineKey[] = [];
   const observed: [EngineKey, number][] = [];
@@ -29,7 +39,7 @@ function harness(details: Partial<Record<EngineKey, EngineBreakerDetail>>, ratio
     status: {
       markDegraded: (key) => {
         degraded.push(key);
-        return Promise.resolve();
+        return Promise.resolve(changes(key));
       },
       markRecovered: (key) => {
         recovered.push(key);
@@ -96,5 +106,25 @@ describe("STORY-031 · the evaluator is best-effort", () => {
     await expect(h.runtime.tick()).resolves.toBeInstanceOf(Map);
     expect(h.degraded).toEqual(["claude"]);
     expect(h.recovered).toEqual(["chatgpt"]);
+  });
+});
+
+// REVIEW FIX (stream A-engines, round 1) - `nominara_engine_ladder_stage5_total` counted TICKS: +1 every 30 s on every replica for
+// as long as an engine sat at stage 5. It now counts TRANSITIONS - only a tick whose markDegraded actually changed the row.
+describe("STORY-031 AC6 · the stage-5 counter counts transitions, not ticks", () => {
+  beforeEach(() => {
+    counters.length = 0;
+  });
+  const longOpen: EngineBreakerDetail = { state: "open", openedAt: NOW - 1_000, since: NOW - DEGRADATION_STAGE_5_OPEN_DURATION_MS - 1, reason: "ratio" };
+  const stage5 = () => counters.filter((c) => c.name === "nominara_engine_ladder_stage5_total");
+
+  it("increments once when the mark changes the row", async () => {
+    await harness({ gemini: longOpen }).runtime.tick();
+    expect(stage5()).toEqual([{ name: "nominara_engine_ladder_stage5_total", labels: { engine_key: "gemini" } }]);
+  });
+
+  it("does not increment on a tick where the engine was already degraded (the mark changed nothing)", async () => {
+    await harness({ gemini: longOpen }, {}, [], () => false).runtime.tick();
+    expect(stage5()).toEqual([]);
   });
 });

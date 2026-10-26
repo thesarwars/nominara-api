@@ -10,6 +10,7 @@ import type { RealtimePublisher } from "../../src/lib/cache/realtime-publisher.j
 import { sweepEngineSkipRefunds } from "../../src/lib/capture/engine-skip-refund-sweep.js";
 import { ENGINE_SPEND_CEILING_REACHED } from "../../src/lib/capture/execute-cell.js";
 import { provisionWalletWithGrant } from "../../src/lib/credits/balance.js";
+import { rollIncludedCycle } from "../../src/lib/credits/cycle-roll.js";
 import { settleEngineSkippedCells } from "../../src/lib/credits/engine-skip-refund.js";
 import { appendLedgerEntry } from "../../src/lib/credits/ledger.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
@@ -409,20 +410,64 @@ describe("STORY-031 · engine limits in the live capture path", () => {
       expect((await db.query("SELECT 1 FROM audit_log WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(1);
     });
 
-    it("is idempotent under concurrency: two settlers racing on two connections refund once", async () => {
+    it("is idempotent under concurrency: twenty settlers (direct settles and sweeps) racing on twenty connections refund once", async () => {
       await partialScanWithTwoSkipped();
-      const a = new Client({ connectionString: container.getConnectionUri() });
-      const b = new Client({ connectionString: container.getConnectionUri() });
-      await Promise.all([a.connect(), b.connect()]);
+      const clients = Array.from({ length: 20 }, () => new Client({ connectionString: container.getConnectionUri() }));
+      await Promise.all(clients.map((c) => c.connect()));
       try {
-        const settle = (c: Client) => withTenantContext(c, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => settleEngineSkippedCells(tx, { workspaceId, runId }));
-        const outcomes = await Promise.all([settle(a), settle(b)]);
-        expect(outcomes.map((o) => o.refunded).sort()).toEqual([0, 250]);
+        // Half settle directly in their own tenant transaction, half run the whole sweep on an owner connection.
+        const outcomes = await Promise.all(
+          clients.map((c, i) =>
+            i % 2 === 0
+              ? withTenantContext(c, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => settleEngineSkippedCells(tx, { workspaceId, runId })).then((o) => o.refunded)
+              : sweepEngineSkipRefunds(c, new Date()).then((r) => (r.refundedRuns > 0 ? 250 : 0)),
+          ),
+        );
+        expect(outcomes.reduce((sum, n) => sum + n, 0)).toBe(250);
       } finally {
-        await Promise.all([a.end(), b.end()]);
+        await Promise.all(clients.map((c) => c.end()));
       }
       expect(await refundedTotal()).toBe(250);
+      // Exactly one refund row per bucket: the whole debit came from `included`, so one row, keyed `<debit>:engine_skip:included`.
+      expect(await refunds()).toEqual([{ credits: "250", idempotency_key: "deep:engine_skip:included" }]);
+      expect((await db.query("SELECT 1 FROM audit_log WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(1);
       expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+    });
+
+    // REVIEW FIX (round 1) - a candidate that settles to nothing (no debit, a share that floors to 0) stays a candidate on every
+    // tick, because the predicate is "no refund yet". With one oldest-first page of BATCH_LIMIT, enough of those would starve every
+    // newer run of its refund for the whole lookback. The sweep pages through ALL candidates.
+    it("a candidate that refunds nothing never starves a newer run: the sweep pages past it", async () => {
+      const refundable = runId;
+      runId = uuidV7();
+      await addRun(2); // manual, never charged: settles to nothing on every tick
+      await seedParsed(await addPrompt("fine"));
+      await openOnQuota();
+      await execute(job(await addPrompt("fine"), "fine"));
+      expect(await runStatus()).toBe("partial");
+      await db.query("UPDATE capture_runs SET finished_at = now() - interval '1 day' WHERE id = $1", [runId]);
+      runId = refundable;
+      await partialScanWithTwoSkipped();
+      await sweepEngineSkipRefunds(db, new Date(), { batchLimit: 1 });
+      expect(await refundedTotal()).toBe(250);
+    });
+
+    // REVIEW FIX (round 1) - DISCLOSED, NOT WITHHELD: a refund that lands after the wallet rolled onto a new cycle still returns the
+    // included share to `included` (owner decision 10 says the credits are refunded; withholding them, or sending them to the
+    // durable bucket, would each be a new policy). The outcome says so, and it is logged and counted, so the owner can see it.
+    it("a refund for a debit made before the wallet's current cycle is still paid, and reported as crossing the roll", async () => {
+      await partialScanWithTwoSkipped();
+      const { start, end } = (await db.query<{ start: string; end: string }>("SELECT (current_date + 1)::text AS start, (current_date + 32)::text AS end")).rows[0]!;
+      await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => rollIncludedCycle(tx, { workspaceId, grant: 1_000, cycleStart: start, cycleEnd: end }));
+      const outcome = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => settleEngineSkippedCells(tx, { workspaceId, runId }));
+      expect(outcome).toMatchObject({ refunded: 250, debitBeforeCurrentCycle: true });
+      expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+    });
+
+    it("a refund inside the debit's own cycle is not reported as crossing the roll", async () => {
+      await partialScanWithTwoSkipped();
+      const outcome = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => settleEngineSkippedCells(tx, { workspaceId, runId }));
+      expect(outcome).toMatchObject({ refunded: 250, debitBeforeCurrentCycle: false });
     });
 
     it("refunds ONLY skipped cells: a cell that reached the vendor and failed (quota hit, rate limited) is not refunded", async () => {

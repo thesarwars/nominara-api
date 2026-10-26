@@ -7,7 +7,13 @@ import {
   ENGINE_SKIP_QUOTA_EXHAUSTED,
   type EngineBreakerView,
 } from "../../../src/lib/engines/capture-engine-gate.js";
-import type { EngineBreakerDetail, EngineOutcome } from "../../../src/lib/engines/engine-breaker.js";
+import {
+  ENGINE_BREAKER_OPEN_DURATION_MS,
+  EngineBreaker,
+  type EngineBreakerDetail,
+  type EngineBreakerEpisode,
+  type EngineOutcome,
+} from "../../../src/lib/engines/engine-breaker.js";
 import { DEGRADATION_STAGE_5_OPEN_DURATION_MS } from "../../../src/lib/engines/degradation.js";
 
 // STORY-031 — what the CUSTOMER capture path asks the breaker before it dispatches a cell, and what it tells the breaker and
@@ -110,7 +116,9 @@ describe("STORY-031 AC3/AC4/AC6 · every customer attempt feeds the breaker and 
     await g.record("gemini", { outcome: "failure", code: "timeout" });
     await g.record("gemini", { outcome: "failure", code: "rate_limited" });
     await g.record("gemini", { outcome: "failure", code: "upstream_5xx" });
-    expect(recorded).toEqual(["blocked", "other_failure", "other_failure", "other_failure"]);
+    // The retryable transport codes (failure-taxonomy.ts) are `transient_failure`: an attempt in the ratio's denominator, never
+    // evidence that re-opens a half-open breaker (see the half-open block below).
+    expect(recorded).toEqual(["blocked", "transient_failure", "transient_failure", "transient_failure"]);
     expect(health.map((e) => e.outcome)).toEqual(["blocked", "timeout", "rate_limited", "other_failure"]);
   });
 
@@ -125,5 +133,65 @@ describe("STORY-031 AC3/AC4/AC6 · every customer attempt feeds the breaker and 
   it("recording never throws, whatever is down (it must never fail the cell that was just captured)", async () => {
     await expect(gate(closed, { failing: true }).record("gemini", { outcome: "failure", code: "rate_limited" })).resolves.toBeUndefined();
     await expect(gate(closed, { failing: true }).record("gemini", { outcome: "success", latencyMs: 1 })).resolves.toBeUndefined();
+  });
+});
+
+// REVIEW FIX (stream A-engines, round 1) - EC-06 makes `rate_limited` a STAGE-2 trigger (halve the refill), and stage 4 opens on
+// the BLOCK RATIO. A half-open breaker therefore re-opens only on evidence that would have opened a closed one: `blocked` (or
+// `quota_exhausted`, which opens from any state, EC-08). The retryable transport codes - rate_limited, timeout, upstream_5xx
+// (failure-taxonomy.ts, reviewed here as D7 asks) - never open a closed breaker, so they must not re-open a half-open one either.
+// Otherwise every cell stage 4 re-delayed arrives back exactly as the breaker half-opens (both are 20 minutes), one 429 among them
+// re-opens it for another full window, the episode passes 30 minutes and the one real engine is marked degraded under ordinary load.
+describe("STORY-031 AC3/AC6 · a half-open breaker is re-opened only by a block or a quota, never by a transient vendor failure", () => {
+  function halfOpen() {
+    const opened = NOW - ENGINE_BREAKER_OPEN_DURATION_MS - 1;
+    const state = { value: opened as number | null };
+    const episode = { value: { since: opened, reason: "ratio" } as EngineBreakerEpisode | null };
+    const breaker = new EngineBreaker(
+      "gemini",
+      { read: () => Promise.resolve(state.value), write: (_k, v) => Promise.resolve(void (state.value = v)) },
+      { record: () => Promise.resolve({ attempts: 1, blocks: 0 }), peek: () => Promise.resolve({ attempts: 0, blocks: 0 }) },
+      () => NOW,
+      { read: () => Promise.resolve(episode.value), write: (_k, v) => Promise.resolve(void (episode.value = v)) },
+    );
+    const refill: string[] = [];
+    const g = new BreakerCaptureEngineGate({
+      breakers: { for: () => breaker },
+      health: { recordAttempt: () => Promise.resolve() },
+      refill: { trigger: (engineKey) => Promise.resolve(void refill.push(engineKey)) },
+      clock: () => NOW,
+    });
+    return { g, breaker, state, opened, refill };
+  }
+
+  it("one rate_limited customer cell leaves the breaker half-open (not re-opened) and triggers the refill reduction", async () => {
+    const h = halfOpen();
+    expect((await h.breaker.detail()).state).toBe("half_open");
+    await h.g.record("gemini", { outcome: "failure", code: "rate_limited" });
+    expect(h.state.value).toBe(h.opened);
+    expect((await h.breaker.detail()).state).toBe("half_open");
+    expect(h.refill).toEqual(["gemini"]);
+  });
+
+  it.each(["timeout", "upstream_5xx"] as const)("a %s customer cell leaves the breaker half-open", async (code) => {
+    const h = halfOpen();
+    await h.g.record("gemini", { outcome: "failure", code });
+    expect(h.state.value).toBe(h.opened);
+    expect((await h.breaker.detail()).state).toBe("half_open");
+  });
+
+  it("a blocked customer cell DOES re-open it for another full window, keeping the episode (control)", async () => {
+    const h = halfOpen();
+    await h.g.record("gemini", { outcome: "failure", code: "blocked" });
+    expect(h.state.value).toBe(NOW);
+    expect(await h.breaker.detail()).toMatchObject({ state: "open", since: h.opened });
+  });
+
+  it("a success after a transient failure still closes it", async () => {
+    const h = halfOpen();
+    await h.g.record("gemini", { outcome: "failure", code: "rate_limited" });
+    await h.g.record("gemini", { outcome: "success", latencyMs: 300 });
+    expect(h.state.value).toBeNull();
+    expect((await h.breaker.detail()).state).toBe("closed");
   });
 });
