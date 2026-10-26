@@ -225,6 +225,42 @@ describe("STORY-097 · agency theme over HTTP", () => {
     expect((await put(a, { font_family: "Geist" })).statusCode).toBe(200);
   });
 
+  it("STORY-100 AC10 · the Reply-To and display name round-trip, an absent field keeps them, null clears them, and the default shows both null", async () => {
+    const a = await owner("growth");
+    const first = data<Array<Record<string, unknown>>>(await get(a));
+    expect(first[0]).toMatchObject({ email_from_name: null, email_reply_to: null });
+
+    const saved = await put(a, { name: "Acme", email_from_name: "Acme Agency", email_reply_to: "team@acme.example" });
+    expect(saved.statusCode, saved.body).toBe(200);
+    expect(data(saved)).toMatchObject({ email_from_name: "Acme Agency", email_reply_to: "team@acme.example" });
+    const themeId = data<{ theme_id: string }>(saved).theme_id;
+
+    const kept = await put(a, { theme_id: themeId, color_primary: "#0f5132" });
+    expect(data(kept)).toMatchObject({ email_from_name: "Acme Agency", email_reply_to: "team@acme.example" });
+
+    const cleared = await put(a, { theme_id: themeId, email_reply_to: null });
+    expect(data(cleared)).toMatchObject({ email_from_name: "Acme Agency", email_reply_to: null });
+    const stored = await harness.db().query(`SELECT email_reply_to FROM brand_themes WHERE workspace_id = $1`, [a.workspaceId]);
+    expect((stored.rows[0] as { email_reply_to: string | null }).email_reply_to).toBeNull();
+  });
+
+  it("STORY-100 AC10 · a Reply-To or display name that could break out of a mail header is 400 and stores nothing", async () => {
+    const a = await owner("growth");
+    for (const payload of [
+      { email_reply_to: "a@acme.example\r\nBcc: x@evil.example" },
+      { email_reply_to: "not an address" },
+      { email_reply_to: "Name <a@acme.example>" },
+      { email_from_name: "Acme\r\nBcc: x@evil.example" },
+      { email_from_name: "Acme <evil@evil.example>" },
+      { email_from_name: "" },
+    ]) {
+      const res = await put(a, payload);
+      expect(res.statusCode, JSON.stringify(payload)).toBe(400);
+    }
+    const rows = await harness.db().query(`SELECT count(*)::int AS n FROM brand_themes WHERE workspace_id = $1`, [a.workspaceId]);
+    expect((rows.rows[0] as { n: number }).n).toBe(0);
+  });
+
   it("STORY-097 scenario 4 · hide_nominara_brand without whitelabel.remove_branding is 403 feature_not_in_plan", async () => {
     const a = await owner("growth");
     const res = await put(a, { hide_nominara_brand: true });

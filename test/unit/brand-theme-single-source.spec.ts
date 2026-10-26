@@ -56,7 +56,7 @@ function statements(code: string): Statement[] {
 /** The only symbols that may name a branding field without querying the theme row: the row's own definition, its contract, and pure helpers over its values. */
 const THEME_SYMBOLS: Readonly<Record<string, readonly string[]>> = {
   "src/db/schema/tools.ts": ["brandThemes"],
-  "contracts/agency/theme.schema.ts": ["agencyThemeSchema", "updateAgencyThemeRequestSchema"],
+  "contracts/agency/theme.schema.ts": ["agencyThemeSchema", "agencyThemeAdminSchema", "updateAgencyThemeRequestSchema"],
   "src/lib/theme/contrast.ts": ["PLATFORM_DEFAULT_COLORS", "ThemeColorField", "PAIRS", "validateThemeContrast"],
   "src/lib/theme/export-palette.ts": ["StoredThemeValues", "exportPaletteFrom"],
   "src/modules/agency/agency.service.ts": ["COLOR_FIELDS", "ThemeRow", "COLUMNS", "toTheme", "platformDefaultTheme", "mergedColors"],

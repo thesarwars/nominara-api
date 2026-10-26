@@ -268,18 +268,19 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
       const next = (await state(r.id)).next_send_at!;
       const local = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", hourCycle: "h23" }).formatToParts(next);
       expect(local.find((p) => p.type === "weekday")!.value).toBe("Wed");
-      expect(local.find((p) => p.type === "hour")!.value).toBe("9");
+      expect(Number(local.find((p) => p.type === "hour")!.value)).toBe(9);
     }, 60_000);
 
     it("STORY-100 s7 · a BIWEEKLY report repeats a fortnight after the period that fired (not a week)", async () => {
       const ws = await workspace();
-      const due = new Date(Date.now() - 60_000);
+      // The period that fired is a real Friday 06:00 UTC fire, within the last week: the next one is exactly 14 days on.
+      const due = new Date(Date.now() - 3_600_000);
+      due.setUTCHours(6, 0, 0, 0);
+      while (due.getUTCDay() !== 5 || due.getTime() > Date.now() - 60_000) due.setUTCDate(due.getUTCDate() - 1);
       const r = await report(ws, [await project(ws)], { cadence: "biweekly", day: 5, hour: 6, due });
       await processorFor(recordingSender())(jobFor(ws, r.id, due));
       const next = (await state(r.id)).next_send_at!;
-      // Strictly on the fortnight phase of the period that fired, at its local hour.
-      expect((next.getTime() - due.getTime()) % (14 * 86_400_000)).toBeLessThan(2 * 3_600_000);
-      expect(next.getTime() - due.getTime()).toBeGreaterThanOrEqual(13 * 86_400_000);
+      expect(next.getTime() - due.getTime()).toBe(14 * 86_400_000);
     }, 60_000);
 
     it("STORY-100 s7 · a REDELIVERED job (same period) finds the period already moved on: nothing is sent or recorded twice", async () => {
@@ -400,7 +401,7 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
     }, 60_000);
 
     it("STORY-100 s10 · at the cap the period is SKIPPED with a notification naming the cap and the reset date, and advances", async () => {
-      const ws = await workspace();
+      const ws = await workspace("growth");
       const first = await report(ws, [await project(ws)]);
       await processorFor(recordingSender())(jobFor(ws, first.id, first.due)); // creates the counter
       await db.query("UPDATE usage_counters SET used_value = limit_value WHERE workspace_id = $1 AND metric = 'pdf_exports'", [ws]);

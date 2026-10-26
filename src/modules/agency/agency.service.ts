@@ -3,6 +3,7 @@ import type { ClientBase } from "pg";
 import {
   contrastRejectionDetailsSchema,
   type AgencyTheme,
+  type AgencyThemeAdmin,
   type AgencyThemeListQuery,
   type UpdateAgencyThemeRequest,
 } from "../../../contracts/agency/index.js";
@@ -42,9 +43,11 @@ interface ThemeRow {
   readonly color_fg: string | null;
   readonly font_family: string;
   readonly hide_nominara_brand: boolean;
+  readonly email_from_name: string | null;
+  readonly email_reply_to: string | null;
 }
 
-const COLUMNS = "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand";
+const COLUMNS = "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to";
 
 const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -62,7 +65,7 @@ function ratioText(n: number): string {
   return String(n) + ":1";
 }
 
-function toTheme(row: ThemeRow): AgencyTheme {
+function toTheme(row: ThemeRow): AgencyThemeAdmin {
   return {
     theme_id: row.id,
     name: row.name,
@@ -75,6 +78,8 @@ function toTheme(row: ThemeRow): AgencyTheme {
     // Asset upload is week 2 (STORY-097 scenarios 9-11): no logo is ever stored yet.
     logo_url: null,
     hide_nominara_brand: row.hide_nominara_brand,
+    email_from_name: row.email_from_name,
+    email_reply_to: row.email_reply_to,
   };
 }
 
@@ -96,7 +101,7 @@ export class AgencyService {
    * an explicit two-branch predicate rather than a row comparison. A workspace with no stored theme still gets the
    * unsaved platform default as the one item of its first page.
    */
-  async listThemes(query: AgencyThemeListQuery): Promise<Page<AgencyTheme>> {
+  async listThemes(query: AgencyThemeListQuery): Promise<Page<AgencyThemeAdmin>> {
     const { client } = this.store();
     const after = query.cursor === undefined ? undefined : themeCursorKeyOf(query.cursor);
     const result = await client.query<ThemeRow & { created_at_key: string }>(
@@ -125,15 +130,36 @@ export class AgencyService {
       [pinnedThemeId],
     );
     const row = result.rows[0];
-    return row === undefined ? platformDefaultTheme() : toTheme(row);
+    return this.forPortal(row === undefined ? platformDefaultTheme() : toTheme(row));
   }
+
+  /**
+   * The portal's view of a theme, by an explicit field list (default deny): the agency's mail configuration (display name,
+   * Reply-To) is never part of what a portal viewer is sent, so a field added to the editor's theme later stays out of the
+   * portal until it is named here.
+   */
+  private forPortal(theme: AgencyThemeAdmin): AgencyTheme {
+    return {
+      theme_id: theme.theme_id,
+      name: theme.name,
+      is_default: theme.is_default,
+      color_primary: theme.color_primary,
+      color_accent: theme.color_accent,
+      color_bg: theme.color_bg,
+      color_fg: theme.color_fg,
+      font_family: theme.font_family,
+      logo_url: theme.logo_url,
+      hide_nominara_brand: theme.hide_nominara_brand,
+    };
+  }
+
 
   /**
    * Creates (no `theme_id`, or the platform-default id) or updates a theme.
    * Everything is checked here, not in the editor: a direct API call must not
    * be able to save what the interface would refuse (STORY-097 scenario 8).
    */
-  async saveTheme(body: UpdateAgencyThemeRequest): Promise<AgencyTheme> {
+  async saveTheme(body: UpdateAgencyThemeRequest): Promise<AgencyThemeAdmin> {
     const { client, workspaceId } = this.store();
 
     if (body.font_family !== undefined && !(CURATED_FONT_FAMILIES as readonly string[]).includes(body.font_family)) {
@@ -173,6 +199,9 @@ export class AgencyService {
     const font = body.font_family ?? existing?.font_family ?? DEFAULT_FONT_FAMILY;
     const hide = body.hide_nominara_brand ?? existing?.hide_nominara_brand ?? false;
     const name = body.name ?? existing?.name ?? DEFAULT_THEME_NAME;
+    // Absent keeps the stored value; an explicit null clears it (the Reply-To header is then omitted).
+    const emailFromName = body.email_from_name !== undefined ? body.email_from_name : (existing?.email_from_name ?? null);
+    const emailReplyTo = body.email_reply_to !== undefined ? body.email_reply_to : (existing?.email_reply_to ?? null);
 
     const hasDefault = await this.hasDefault(client, existing?.id);
     if (existing?.is_default === true && body.is_default === false) {
@@ -189,7 +218,7 @@ export class AgencyService {
 
     let row: ThemeRow;
     try {
-      row = await this.write(client, workspaceId, existing, { name, makeDefault, colors, font, hide });
+      row = await this.write(client, workspaceId, existing, { name, makeDefault, colors, font, hide, emailFromName, emailReplyTo });
     } catch (error) {
       // The lock above makes this unreachable between our own requests; if the index still fires (a writer that
       // bypassed this service) it is a conflict the caller can retry, never a 500.
@@ -207,26 +236,26 @@ export class AgencyService {
     client: ClientBase,
     workspaceId: string,
     existing: ThemeRow | undefined,
-    v: { name: string; makeDefault: boolean; colors: ThemeColors; font: string; hide: boolean },
+    v: { name: string; makeDefault: boolean; colors: ThemeColors; font: string; hide: boolean; emailFromName: string | null; emailReplyTo: string | null },
   ): Promise<ThemeRow> {
-    const { name, makeDefault, colors, font, hide } = v;
+    const { name, makeDefault, colors, font, hide, emailFromName, emailReplyTo } = v;
     let row: ThemeRow;
     if (existing === undefined) {
       const inserted = await client.query<ThemeRow>(
-        `INSERT INTO brand_themes (workspace_id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand)
-         VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8)
+        `INSERT INTO brand_themes (workspace_id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to)
+         VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8, $10, $11)
          RETURNING ${COLUMNS}`,
-        [name, makeDefault, colors.color_primary, colors.color_accent, colors.color_bg, colors.color_fg, font, hide, workspaceId],
+        [name, makeDefault, colors.color_primary, colors.color_accent, colors.color_bg, colors.color_fg, font, hide, workspaceId, emailFromName, emailReplyTo],
       );
       row = inserted.rows[0]!;
     } else {
       const updated = await client.query<ThemeRow>(
         `UPDATE brand_themes
             SET name = $2, is_default = $3, color_primary = $4, color_accent = $5, color_bg = $6, color_fg = $7,
-                font_family = $8, hide_nominara_brand = $9
+                font_family = $8, hide_nominara_brand = $9, email_from_name = $10, email_reply_to = $11
           WHERE id = $1
           RETURNING ${COLUMNS}`,
-        [existing.id, name, makeDefault, colors.color_primary, colors.color_accent, colors.color_bg, colors.color_fg, font, hide],
+        [existing.id, name, makeDefault, colors.color_primary, colors.color_accent, colors.color_bg, colors.color_fg, font, hide, emailFromName, emailReplyTo],
       );
       row = updated.rows[0]!;
     }
@@ -268,7 +297,7 @@ function isUniqueViolation(error: unknown, constraint: string): boolean {
   return pg?.code === "23505" && pg.constraint === constraint;
 }
 
-function platformDefaultTheme(): AgencyTheme {
+function platformDefaultTheme(): AgencyThemeAdmin {
   return {
     theme_id: PLATFORM_DEFAULT_THEME_ID,
     name: DEFAULT_THEME_NAME,
@@ -280,6 +309,8 @@ function platformDefaultTheme(): AgencyTheme {
     font_family: DEFAULT_FONT_FAMILY,
     logo_url: null,
     hide_nominara_brand: false,
+    email_from_name: null,
+    email_reply_to: null,
   };
 }
 
