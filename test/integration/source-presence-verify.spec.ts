@@ -9,6 +9,7 @@ import type { GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
 import { verifyProjectSourcePresence } from "../../src/lib/sources/verify-presence.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import { createSourceVerifyPresenceHandler } from "../../src/lib/queue/handlers/source-verify-presence.handler.js";
+import { withProjectQueueLock } from "../../src/lib/queue/locks.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import type { Job } from "bullmq";
 
@@ -364,16 +365,76 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
       expect(await pins()).toEqual([]);
     });
 
-    it("pins nothing for an open task, a non-authority task, a task with no target, or a target without the brand", async () => {
+    it("review round 2 — a SOURCE-GAP task (affected_url NULL, exactly what the source-gap rule writes) is verified against the domain's most-cited indexed page and pins", async () => {
+      await cite("reviews.dev", 1); // the index's most-cited page on the domain is https://reviews.dev/best
+      await reindex();
+      await verify(vi.fn().mockResolvedValue(html("Only Globex")), new Date(NOW.getTime() - 2 * DAY)); // verified absent, cached
+      const completedAt = new Date(NOW.getTime() - DAY);
+      const task = await authorityTask("reviews.dev", "done", { affectedUrl: null, completedAt });
+      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics now answers here"));
+      await seededJob(task, fetch);
+      expect(fetch).toHaveBeenCalledWith("https://reviews.dev/best");
+      const [pin, ...rest] = await pins();
+      expect(rest).toEqual([]);
+      expect(pin).toMatchObject({ kind: "source_seeded", source_type: "system" });
+      expect(pin!.occurred_at.toISOString()).toBe(completedAt.toISOString());
+      for (const r of await rows("reviews.dev")) expect(r.brand_present_on_domain).toBe(true);
+    });
+
+    it("pins nothing for an open task, a non-authority task, or a target without the brand", async () => {
       await cite("reviews.dev", 1);
       await reindex();
       const fetch = vi.fn().mockImplementation((url: string) => Promise.resolve(html(url.endsWith("/without") ? "Only Globex" : "Acme Analytics")));
       await seededJob(await authorityTask("reviews.dev", "in_progress"), fetch);
       await seededJob(await authorityTask("reviews.dev", "done", { kind: "content" }), fetch);
-      await seededJob(await authorityTask("reviews.dev", "done", { affectedUrl: null }), fetch);
       await seededJob(await authorityTask("reviews.dev", "done", { affectedUrl: "https://reviews.dev/without" }), fetch);
       expect(fetch).toHaveBeenCalledTimes(1); // only the last one has a target to fetch
       expect(await pins()).toEqual([]);
+    });
+
+    // Review round 2 — LOST UPDATE. The rollup's source-index refresh reads the carried presence, DELETEs and re-inserts the
+    // project's index under the rollup's per-project advisory lock. A presence commit that skips that lock UPDATEs rows the open
+    // rollup already deleted (0 rows) and then carries the rollup's stale "absent" over: the pin commits, the gap stays open.
+    /** Holds a rollup-shaped transaction open past its index rebuild, runs `write` against it, then commits the rollup. */
+    async function racingRollup(write: () => Promise<unknown>): Promise<void> {
+      const rollupTx = new Client({ connectionString: container.getConnectionUri() });
+      await rollupTx.connect();
+      try {
+        await rollupTx.query("BEGIN");
+        await withProjectQueueLock(rollupTx, "rollup.metric_daily", projectId, () => refreshProjectSourceIndex(rollupTx, projectId, TODAY));
+        const pending = write();
+        // Wait (bounded) until the write is blocked on the rollup — on its advisory lock with the fix, on the deleted rows without.
+        for (let i = 0; i < 100; i += 1) {
+          const waiting = await rollupTx.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_locks WHERE NOT granted");
+          if (waiting.rows[0]!.n > 0) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await rollupTx.query("COMMIT");
+        await pending;
+      } finally {
+        await rollupTx.end();
+      }
+    }
+
+    it("review round 2 — a seeded commit racing a rollup's index rebuild leaves the domain PRESENT once both commit", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      await verify(vi.fn().mockResolvedValue(html("Only Globex")), new Date(NOW.getTime() - 2 * DAY)); // absent, cached
+      const task = await authorityTask("reviews.dev", "done");
+      await racingRollup(() => seededJob(task, vi.fn().mockResolvedValue(html("Acme Analytics"))));
+      expect(await pins()).toHaveLength(1);
+      const after = await rows("reviews.dev");
+      expect(after.length).toBeGreaterThan(0);
+      for (const r of after) expect(r.brand_present_on_domain).toBe(true);
+    });
+
+    it("review round 2 — a periodic presence commit racing a rollup's index rebuild keeps its verified value", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      await racingRollup(() => verify(vi.fn().mockResolvedValue(html("Acme Analytics is reviewed here"))));
+      const after = await rows("reviews.dev");
+      expect(after.length).toBeGreaterThan(0);
+      for (const r of after) expect(r.brand_present_on_domain).toBe(true);
     });
 
     it("another workspace's context cannot verify (or fetch for) this project's task", async () => {

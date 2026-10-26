@@ -9,6 +9,7 @@ import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import { GrowthMapService } from "../../src/modules/analytics/growth-map.service.js";
+import { SCORING_VERSION } from "../../src/lib/scoring/index.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-066 AC7–AC10, scenarios 7, 8, 9, 10, 11 — the two configuration pins the
@@ -216,6 +217,29 @@ describe("STORY-066 · configuration milestones from the rollup", () => {
       await prompts(1, daysAgo(0, 2));
       await rollup();
       expect(await pins("prompt_set_change")).toEqual([]);
+    });
+
+    // Review round 2 — the rollup visits only days with captures (a parse batch, the closed-day sweep's "has measured cells",
+    // a dirty date). A weekly or manual project that changes its prompt set on a day with NO capture would otherwise never be
+    // evaluated for that day, and the next capture day counts the change in `before`: the jump shows with no marker (AC9).
+    it("AC9 — prompts changed on a day with no capture still pin, dated that day, when the next capture day is rolled up", async () => {
+      await prompts(20, daysAgo(10));
+      const previous = daysAgo(5).slice(0, 10);
+      await db.query(
+        `INSERT INTO metric_daily (workspace_id,project_id,engine_key,entity_type,entity_id,metric_date,cells_total,cells_present,
+                                   presence_rate,sov,visibility_score,live_capture_ratio,scoring_version)
+         VALUES ($1,$2,'all','brand',$2,$3::date,10,5,0.5,0.2,50,1,$4)`,
+        [workspaceId, projectId, previous, SCORING_VERSION],
+      ); // the previous rolled-up (capture) day
+      await prompts(3, daysAgo(3, 10)); // the change, on a day nothing rolls up
+      await capture(daysAgo(0, 1), "gemini", "fp-a");
+      await rollup(); // the next capture day, as a parse batch or the closed-day sweep would roll it up
+      const [pin, ...rest] = await pins("prompt_set_change");
+      expect(rest).toEqual([]);
+      expect(pin!.detail).toBe("3 added, 0 removed of 20");
+      expect(pin!.occurred_at.toISOString()).toBe(new Date(daysAgo(3, 10)).toISOString());
+      await rollup();
+      expect(await pins("prompt_set_change"), "a re-run of the capture day pins nothing more").toHaveLength(1);
     });
 
     it("scenario 8 — re-running the rollup cannot double-pin", async () => {
