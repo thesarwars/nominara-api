@@ -13,6 +13,7 @@ import { StructuralUsage } from "../../entitlements/structural-usage.js";
 import {
   commitPreparedRun,
   prepareScheduledRun,
+  settleAfterFailure,
   sendPreparedRun,
   type PreparedRun,
   type ReportRunDeps,
@@ -114,6 +115,24 @@ export function createReportBuildHandler(context: QueueHandlerContext, deps: Rep
       await commitPreparedRun(tx, runDeps(), prepared, outcome);
       incrementCounter("nominara_reports_build_jobs_total", { outcome: outcome.failed > 0 ? "failed" : "sent" });
       logger.log({ event: "report.build.done", workspace_id: prepared.workspaceId, scheduled_report_id: prepared.reportId, failed: outcome.failed });
+    },
+
+    // Owner decision 7 for ANY failure on the last attempt: advance the period and notify, in a fresh transaction. Before the
+    // last attempt this declines, so the error reaches the queue and its ladder.
+    async recover(tx: ClientBase, job: Job, failure) {
+      if (!isFinalAttempt(job)) return false;
+      const parsed = payloadSchema.safeParse((job.data as { payload: unknown }).payload);
+      if (!parsed.success) return false;
+      const { workspaceId, reportId } = parsed.data;
+      if (failure.phase === "commit" && failure.prepared !== undefined && failure.fetched !== undefined) {
+        // The emails went out: settle with what really happened rather than calling the period failed.
+        await commitPreparedRun(tx, runDeps(), failure.prepared, failure.fetched);
+      } else {
+        await settleAfterFailure(tx, runDeps(), { workspaceId, reportId, period: new Date(parsed.data.period), error: failure.error });
+      }
+      incrementCounter("nominara_reports_build_jobs_total", { outcome: "recovered" });
+      logger.warn({ event: "report.build.recovered", workspace_id: workspaceId, scheduled_report_id: reportId, phase: failure.phase, error: failure.error instanceof Error ? failure.error.name : "unknown" });
+      return true;
     },
   });
 }

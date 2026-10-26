@@ -32,11 +32,17 @@ import { advanceNextSendAt, type ScheduleCadence } from "./next-send-at.js";
 //
 // IDEMPOTENCY. The period moves on only in the transaction that settles it, so a redelivered job finds `next_send_at` no
 // longer equal to its period and ends with nothing done. A retry after a failed send finds the delivery still `sending`
-// (its id is derived from report and period, never random): it rebuilds the artifacts but does NOT reserve a second unit.
+// (its id is derived from report and period, never random): it REUSES the artifacts the first prepare recorded (never rebuilds
+// them: a rebuild mints new artifact ids, so the email body would differ under the same provider key, which Resend refuses
+// with 409 invalid_idempotent_request) and does NOT reserve a second unit. Only when those artifacts are gone (purged) does it
+// rebuild.
 //
 // FAILURE (owner decision 7): at the FINAL attempt a failure advances `next_send_at` (the period is skipped, so a broken
 // report cannot retry forever or block later periods) and writes a notification naming the REASON. The reason is a domain
-// error's own message or the error's class name, never raw text from the provider or an address.
+// error's own message or the error's class name, never raw text from the provider or an address. The rule holds for ANY failure
+// on the final attempt, not only a build or a send one: the `report.build` handler's `recover` hook runs `settleAfterFailure`
+// in a fresh transaction (a prepare or commit fault otherwise leaves a terminally failed job that wedges the report for
+// `removeOnFail`'s 7 days and then runs a stale period late).
 
 const logger = new Logger("reports.scheduled");
 
@@ -130,6 +136,32 @@ export async function buildReportArtifacts(exporter: ReportExporter, report: Sch
         undefined,
       );
       ids.push(out.export_id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * The artifacts the FIRST prepare of this delivery built, in the order `buildReportArtifacts` builds them, or undefined when any
+ * is gone. They are found by what they are (project, format) and by when they were made: the first prepare's transaction made
+ * the artifacts and the delivery row at the same `now()`, so the earliest artifact at or after the delivery's `attempted_at` is
+ * that prepare's. Reusing them keeps a retried email byte-identical, which the provider's idempotency key requires.
+ */
+async function recordedArtifacts(tx: ClientBase, report: ScheduledReportRow, deliveryId: string): Promise<string[] | undefined> {
+  const formats = report.format === "both" ? (["pdf", "csv"] as const) : ([report.format] as const);
+  const ids: string[] = [];
+  for (const projectId of report.project_ids) {
+    for (const format of formats) {
+      const found = await tx.query<{ id: string }>(
+        `SELECT a.id FROM report_artifacts a
+           JOIN scheduled_report_deliveries d ON d.id = $1
+          WHERE a.project_ids = ARRAY[$2]::uuid[] AND a.format = $3 AND a.created_at >= d.attempted_at AND a.expires_at > now()
+          ORDER BY a.created_at, a.id LIMIT 1`,
+        [deliveryId, projectId, format],
+      );
+      const id = found.rows[0]?.id;
+      if (id === undefined) return undefined;
+      ids.push(id);
     }
   }
   return ids;
@@ -306,7 +338,7 @@ export async function prepareScheduledRun(tx: ClientBase, deps: ReportRunDeps, i
   await tx.query("SAVEPOINT scheduled_report_build");
   let artifacts: string[];
   try {
-    artifacts = await buildReportArtifacts(deps.exports, report);
+    artifacts = (resuming ? await recordedArtifacts(tx, report, deliveryId) : undefined) ?? (await buildReportArtifacts(deps.exports, report));
     await tx.query("RELEASE SAVEPOINT scheduled_report_build");
   } catch (error) {
     await tx.query("ROLLBACK TO SAVEPOINT scheduled_report_build");
@@ -395,6 +427,29 @@ export async function commitPreparedRun(tx: ClientBase, deps: ReportRunDeps, pre
   });
 }
 
+/**
+ * The last resort of the FINAL attempt: whatever broke (a pool or DB error in prepare, a fault in commit), the period is settled
+ * `failed` with a generic reason, `next_send_at` advances and the workspace is told. Runs in a FRESH tenant transaction. A period
+ * that is no longer the report's due one (already settled, edited, paused, or the report gone) changes nothing.
+ */
+export async function settleAfterFailure(tx: ClientBase, deps: ReportRunDeps, input: { workspaceId: string; reportId: string; period: Date; error: unknown }): Promise<void> {
+  const { workspaceId, reportId, period } = input;
+  const found = await tx.query<ScheduledReportRow>(`SELECT ${SCHEDULED_REPORT_COLUMNS} FROM scheduled_reports WHERE id = $1 FOR UPDATE`, [reportId]);
+  const report = found.rows[0];
+  if (report === undefined || !report.active || report.next_send_at === null || new Date(report.next_send_at).getTime() !== period.getTime()) return;
+  await settleRun(tx, deps, report, {
+    workspaceId,
+    period,
+    deliveryId: scheduledRunDeliveryId(reportId, period),
+    status: "failed",
+    reason: failureReason(input.error),
+    sent: 0,
+    artifactId: null,
+    notification: "failed",
+  });
+  incrementCounter("nominara_reports_build_attempts_total", { outcome: "recovered" });
+}
+
 type SettleNotification = "failed" | "none";
 
 /** `workspaces.timezone` is free text; a zone Intl rejects must not stop a settled period from advancing (UTC is the fallback). */
@@ -450,7 +505,7 @@ async function settleRun(tx: ClientBase, deps: ReportRunDeps, report: ScheduledR
     });
   }
 
-  const zone = await tx.query<{ timezone: string }>("SELECT timezone FROM workspaces LIMIT 1");
+  const zone = await tx.query<{ timezone: string }>("SELECT timezone FROM workspaces WHERE id = $1", [workspaceId]);
   const next = advanceNextSendAt(
     { cadence: report.cadence, day: report.day_of_period, hour: report.send_hour_local, timezone: usableZone(zone.rows[0]?.timezone) },
     s.period,

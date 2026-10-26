@@ -10,6 +10,8 @@ import { createReportBuildHandler } from "../../src/lib/queue/handlers/report-bu
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
+import { ExportService } from "../../src/modules/reports/export.service.js";
+import { MethodologyService } from "../../src/modules/reports/methodology.service.js";
 import { EntitlementResolver } from "../../src/lib/entitlements/entitlement-resolver.js";
 import { StructuralUsage } from "../../src/lib/entitlements/structural-usage.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
@@ -142,6 +144,13 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
   function jobFor(workspaceId: string, reportId: string, period: Date, attemptsMade = 0, extra: Record<string, unknown> = {}): Job {
     const envelope = signQueueJobPayload({ workspaceId, kid: TEST_SIGNING_KEYS.current.kid, reportId, period: period.toISOString(), ...extra }, TEST_SIGNING_KEYS.current.key);
     return { data: envelope, attemptsMade, opts: { attempts: ATTEMPTS } } as unknown as Job;
+  }
+
+  /** The real services over the app pool: what the handler builds for itself, handed over so a test can add a clock. */
+  function realRun(): ReportRunDeps {
+    const resolver = new EntitlementResolver(new InMemoryCacheAdapter(), appPool);
+    const usage = new StructuralUsage(appPool);
+    return { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, appPool) };
   }
 
   /** Real services over the app pool, but a build that always throws (a stand-in for a renderer fault). */
@@ -548,6 +557,142 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
       sender.failNext = 1;
       await expect(processorFor(sender)(jobFor(ws, r.id, r.due, 0))).rejects.toThrow(/1 of 2/);
       expect((await deliveries(r.id))[0]!.status).toBe("sending");
+    }, 60_000);
+  });
+
+  describe("a retried send (the provider's key AND payload rule)", () => {
+    /** Resend's rule: a key reused with a DIFFERENT payload is a 409 invalid_idempotent_request; the same payload replays the first answer. */
+    function resendLikeSender(failFirstFor: string[] = []) {
+      const accepted = new Map<string, string>();
+      const failed = new Set<string>();
+      const sender: EmailSender & { calls: number; delivers: boolean } = {
+        calls: 0,
+        delivers: true,
+        async send(message: EmailMessage): Promise<void> {
+          sender.calls += 1;
+          const body = JSON.stringify([message.to, message.subject, message.textBody, message.fromName, message.replyTo]);
+          const key = message.idempotencyKey!;
+          const prior = accepted.get(key);
+          if (prior !== undefined) {
+            if (prior !== body) throw new Error("409 invalid_idempotent_request");
+            return;
+          }
+          if (failFirstFor.includes(message.to) && !failed.has(message.to)) {
+            failed.add(message.to);
+            throw new Error("503 transient");
+          }
+          accepted.set(key, body);
+        },
+      };
+      return sender;
+    }
+    const artifactRows = async () => Number((await db.query("SELECT count(*)::int AS n FROM report_artifacts")).rows[0].n);
+
+    it("STORY-100 s13 · a partial failure then a retry sends a byte-identical message under the same key: the period ends `delivered`, not `failed`", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)], { recipients: ["a@example.test", "b@example.test"] });
+      const sender = resendLikeSender(["b@example.test"]);
+      const process = processorFor(sender);
+      await expect(process(jobFor(ws, r.id, r.due, 0))).rejects.toThrow(/1 of 2/);
+      const afterFirst = await artifactRows();
+      await process(jobFor(ws, r.id, r.due, 1));
+      expect((await deliveries(r.id)).map((d) => d.status)).toEqual(["delivered"]);
+      expect(await notes(ws, "report.failed")).toEqual([]);
+      expect(await artifactRows()).toBe(afterFirst);
+    }, 90_000);
+
+    it("STORY-100 s13 · a retry of a two-format, two-project report reuses EVERY recorded artifact (no orphan rows)", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws), await project(ws)], { format: "both", recipients: ["a@example.test", "b@example.test"] });
+      const sender = resendLikeSender(["b@example.test"]);
+      const process = processorFor(sender);
+      await expect(process(jobFor(ws, r.id, r.due, 0))).rejects.toThrow();
+      expect(await artifactRows()).toBe(4);
+      await process(jobFor(ws, r.id, r.due, 1));
+      expect(await artifactRows()).toBe(4);
+      expect((await deliveries(r.id)).map((d) => d.status)).toEqual(["delivered"]);
+    }, 90_000);
+
+    it("STORY-100 s13 · a delivery whose recorded artifacts are gone is rebuilt rather than mailed with dead links", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)], { recipients: ["a@example.test"] });
+      const sender = recordingSender();
+      sender.failNext = 1;
+      const process = processorFor(sender);
+      await expect(process(jobFor(ws, r.id, r.due, 0))).rejects.toThrow();
+      await db.query("DELETE FROM report_artifacts");
+      await process(jobFor(ws, r.id, r.due, 1));
+      expect(sender.sent).toHaveLength(1);
+      expect(sender.sent[0]!.textBody).toContain("/report-artifacts/");
+      expect(await artifactRows()).toBe(1);
+    }, 90_000);
+
+    it("STORY-100 s13 · a period settled `failed` after a fully failed send keeps the one PDF unit consumed, on purpose (as send-now does)", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)]);
+      const sender = recordingSender();
+      sender.failNext = 99;
+      await processorFor(sender)(jobFor(ws, r.id, r.due, ATTEMPTS - 1));
+      expect((await deliveries(r.id))[0]!.status).toBe("failed");
+      expect(await unitsUsed(ws)).toEqual({ used: 1, reserved: 0 });
+    }, 60_000);
+  });
+
+  describe("any failure on the FINAL attempt settles the period (owner decision 7)", () => {
+    function throwingResolver(): ReportRunDeps {
+      const real = failingBuild();
+      return { ...real, resolver: { resolveForWorkspace: () => Promise.reject(new Error("connection terminated unexpectedly for client@example.test")) } };
+    }
+
+    it("STORY-100 s13 · an error in prepare OUTSIDE the build (before the final attempt) still throws so the queue retries", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)]);
+      await expect(processorFor(recordingSender(), throwingResolver())(jobFor(ws, r.id, r.due, 0))).rejects.toThrow();
+      expect((await state(r.id)).next_send_at!.getTime()).toBe(r.due.getTime());
+    }, 60_000);
+
+    it("STORY-100 s13 · an error in prepare outside the build ON THE FINAL attempt advances the period and notifies, with a generic reason", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)]);
+      const sender = recordingSender();
+      await processorFor(sender, throwingResolver())(jobFor(ws, r.id, r.due, ATTEMPTS - 1));
+      expect(sender.sent).toEqual([]);
+      expect((await deliveries(r.id))[0]).toMatchObject({ status: "failed", reason: "report build failed (Error)" });
+      const [note] = await notes(ws, "report.failed");
+      expect(note!.body).toContain("report build failed (Error)");
+      expect(JSON.stringify(note)).not.toContain("client@example.test");
+      expect((await state(r.id)).next_send_at!.getTime()).toBeGreaterThan(Date.now());
+    }, 60_000);
+
+    it("STORY-100 s13 · a COMMIT that throws on the final attempt is retried once in a fresh transaction: the period advances, the delivery is recorded as sent", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)]);
+      let nowCalls = 0;
+      // The first `now()` is the commit phase's settle; making it throw is a stand-in for a commit-phase fault.
+      const now = () => { nowCalls += 1; if (nowCalls === 1) throw new Error("commit exploded"); return new Date(); };
+      const sender = recordingSender();
+      await processorFor(sender, { ...realRun(), now })(jobFor(ws, r.id, r.due, ATTEMPTS - 1));
+      expect(sender.sent).toHaveLength(1);
+      expect((await deliveries(r.id))[0]!.status).toBe("delivered");
+      expect(await notes(ws, "report.failed")).toEqual([]);
+      expect((await state(r.id)).next_send_at!.getTime()).toBeGreaterThan(Date.now());
+    }, 60_000);
+
+    it("STORY-100 s13 · a commit that throws BEFORE the final attempt still throws (the queue retries)", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)]);
+      const sender = recordingSender();
+      let nowCalls = 0;
+      const now = () => { nowCalls += 1; if (nowCalls === 1) throw new Error("commit exploded"); return new Date(); };
+      await expect(processorFor(sender, { ...realRun(), now })(jobFor(ws, r.id, r.due, 0))).rejects.toThrow(/commit exploded/);
+      expect((await state(r.id)).next_send_at!.getTime()).toBe(r.due.getTime());
+    }, 60_000);
+
+    it("STORY-100 s13 · a recovery that itself cannot settle rethrows the ORIGINAL error (nothing is hidden)", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)]);
+      const now = () => { throw new Error("clock is down"); };
+      await expect(processorFor(recordingSender(), { ...realRun(), now })(jobFor(ws, r.id, r.due, ATTEMPTS - 1))).rejects.toThrow(/clock is down/);
     }, 60_000);
   });
 
