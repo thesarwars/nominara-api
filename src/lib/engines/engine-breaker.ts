@@ -34,7 +34,13 @@ export const ENGINE_BREAKER_OPEN_DURATION_MS = 20 * 60 * 1000;
  */
 export const ENGINE_BREAKER_RATIO_WINDOW_MS = 15 * 60 * 1000;
 
-export type EngineOutcome = "success" | "blocked" | "quota_exhausted" | "other_failure";
+/**
+ * `transient_failure` (STORY-031 review fix) is a retryable transport failure - rate_limited, timeout, upstream_5xx
+ * (failure-taxonomy.ts). Closed, it is an attempt in the ratio's denominator like any other non-block; HALF-OPEN it is NEUTRAL:
+ * it neither closes nor re-opens the breaker, because it is not evidence that would have opened a closed one (EC-06 stage 4 opens
+ * on the block ratio; `rate_limited` is a stage-2 trigger). `other_failure` keeps its meaning for every other failure.
+ */
+export type EngineOutcome = "success" | "blocked" | "quota_exhausted" | "transient_failure" | "other_failure";
 
 export interface EngineBreakerDecision {
   readonly state: CircuitState;
@@ -360,7 +366,9 @@ export class EngineBreaker {
         this.breaker = this.freshBreaker();
         return { state: "closed", retry: true };
       }
-      // Any failure recorded while half_open reopens for another full
+      // A transient vendor failure is no verdict on the probe: the breaker stays half-open for the next attempt to decide.
+      if (outcome === "transient_failure") return { state: "half_open", retry: true };
+      // Any other failure recorded while half_open reopens for another full
       // window — "half-open probing" per the AC. No single-trial gate:
       // concurrent half-open calls are all admitted (see admit()'s
       // docstring); this only governs what recordOutcome() itself does.

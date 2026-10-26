@@ -4,7 +4,7 @@ import { incrementCounter } from "../telemetry/metrics.js";
 import type { EngineKey } from "./contract.js";
 import type { EngineBreakerDecision, EngineBreakerDetail, EngineOutcome } from "./engine-breaker.js";
 import { DEGRADATION_STAGE_5_OPEN_DURATION_MS } from "./degradation.js";
-import type { CaptureFailureCode } from "./failure-taxonomy.js";
+import { classifyCaptureFailure, type CaptureFailureCode } from "./failure-taxonomy.js";
 
 // STORY-031 AC3/AC4/AC6/AC7/AC8 — the customer capture path's view of the engine breaker and the health telemetry.
 //
@@ -76,6 +76,20 @@ export interface CaptureEngineGateDeps {
   readonly clock?: () => number;
 }
 
+/**
+ * STORY-031 review fix - the D7 split (failure-taxonomy.ts) REVIEWED for the breaker, as D7 asks. A half-open breaker re-opens only
+ * on evidence that would have opened a closed one: `blocked` (EC-06 stage 4, the block ratio) or `quota_exhausted` (EC-08, from any
+ * state). The RETRYABLE transport codes - rate_limited, timeout, upstream_5xx - are `transient_failure`: counted as attempts while
+ * closed, neutral while half-open. `rate_limited` is EC-06's stage-2 trigger (the refill reduction, below), not a circuit trigger,
+ * and timeout / upstream_5xx never open a closed breaker either. Without this, every cell stage 4 re-delayed comes back on the same
+ * 20 minutes the breaker takes to half-open, and one 429 among them re-opens it until stage 5 marks the engine degraded. The
+ * terminal non-block codes (auth_failed, malformed_response) keep re-opening a half-open breaker, as before.
+ */
+function breakerOutcomeFor(code: CaptureFailureCode): EngineOutcome {
+  if (code === "blocked" || code === "quota_exhausted") return code;
+  return classifyCaptureFailure(code) === "retryable" ? "transient_failure" : "other_failure";
+}
+
 export class BreakerCaptureEngineGate implements CaptureEngineGate {
   constructor(private readonly deps: CaptureEngineGateDeps) {}
 
@@ -103,7 +117,7 @@ export class BreakerCaptureEngineGate implements CaptureEngineGate {
 
   async record(engineKey: EngineKey, attempt: CaptureAttempt): Promise<void> {
     const code = attempt.outcome === "failure" ? attempt.code : undefined;
-    const breakerOutcome: EngineOutcome = code === undefined ? "success" : code === "blocked" ? "blocked" : code === "quota_exhausted" ? "quota_exhausted" : "other_failure";
+    const breakerOutcome: EngineOutcome = code === undefined ? "success" : breakerOutcomeFor(code);
     const healthOutcome: EngineHealthOutcome =
       code === undefined ? "success" : code === "blocked" || code === "timeout" || code === "rate_limited" ? code : "other_failure";
     let circuitState: EngineBreakerDecision["state"] = "closed";
