@@ -69,6 +69,47 @@ describe("STORY-053 scenario 1 · a robots patch has a reversal and a preconditi
     expect(codes(d.contentAfter)).not.toContain("AUX-R-001");
   });
 
+  it("AUX-R-001/002 property · over a corpus of files and tracked paths, every emitted patch removes its target finding and leaves no AUX-R-001/002 finding worse than before", () => {
+    const rank: Record<string, number> = { medium: 1, high: 2, critical: 3 };
+    const worst = (text: string, tracked: string[], rule: string): number =>
+      Math.max(0, ...evaluateRobotsTxt({ status: 200, body: text }, tracked).filter((f) => f.rule_code === rule).map((f) => rank[f.severity] ?? 0));
+    const bodies = [
+      "User-agent: GPTBot\nDisallow: /\n",
+      "User-agent: *\nDisallow: /\n",
+      "User-agent: *\nDisallow: /blog\n",
+      "User-agent: *\nDisallow: /blog\nDisallow: /private\n",
+      "User-agent: *\nDisallow: /*\n",
+      "User-agent: GPTBot\nDisallow: /blog\n",
+      "User-agent: *\nDisallow: /\n\nUser-agent: ClaudeBot\nDisallow: /blog\n",
+      "User-agent: *\nDisallow: /a\nAllow: /a/b\n",
+      "User-agent: PerplexityBot\nDisallow: /\n\nUser-agent: *\nDisallow: /private\n",
+    ];
+    const trackedSets = [["/"], ["/blog/post"], ["/", "/blog/post"], ["/a/b", "/private/x"]];
+    let emitted = 0;
+    for (const body of bodies) {
+      for (const tracked of trackedSets) {
+        for (const ruleCode of ["AUX-R-001", "AUX-R-002"]) {
+          if (worst(body, tracked, ruleCode) === 0) continue;
+          let draft: ReturnType<typeof buildRobotsPatch>;
+          try {
+            draft = buildRobotsPatch({ ruleCode, targetUrl: URL, body, bodyHash: sha(body), trackedPaths: tracked });
+          } catch (e) {
+            expect(e).toBeInstanceOf(PatchRejectedError); // not offering a patch is allowed; offering a worse one is not
+            continue;
+          }
+          if (draft === null) continue;
+          emitted += 1;
+          const label = `${ruleCode} on ${JSON.stringify(body)} tracking ${tracked.join(",")}`;
+          expect(worst(draft.contentAfter, tracked, ruleCode), label).toBe(0);
+          for (const rule of ["AUX-R-001", "AUX-R-002"]) {
+            expect(worst(draft.contentAfter, tracked, rule), `${label}: ${rule}`).toBeLessThanOrEqual(worst(body, tracked, rule));
+          }
+        }
+      }
+    }
+    expect(emitted).toBeGreaterThan(5);
+  });
+
   it("AUX-R-002 is rejected as ineffective when a carried restriction would still beat the Allow on a tracked path", () => {
     const body = "User-agent: *\nDisallow: /a/b$\n";
     try {

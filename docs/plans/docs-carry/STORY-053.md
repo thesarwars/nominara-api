@@ -60,7 +60,7 @@ The list names `-005 -013 -019 -020 -021 -025 -026 -027 -028 -029 -031 -033`. Th
 7. **A named `Allow: /` block wins a tie against `Disallow: /`** (the repo's robots matcher: longest pattern wins, a tie goes to Allow). A block for an agent that inherits the `*` group carries the wildcard's other rules with it, because a named group REPLACES `*` for that agent: otherwise opening `/` would also open the paths the site restricted for everyone. A patch that would not actually open an agent (`Disallow: /*` outranks `Allow: /`) is rejected as `ineffective` rather than offered.
 8. **Bounds not from the reference:** `MAX_VERIFIABLE_RULES = 1000` and `MAX_VERIFIABLE_AGENTS = 200` (a robots.txt past them is refused for a patch, not waved through), `MAX_FRAGMENT_CHARS = 200_000`, `MAX_JSONLD_CHARS = 100_000`, `MAX_JSONLD_DEPTH = 10`, `LLMS_TXT_MAX_LINKS = 50`, `MAX_DIFF_LINES = 5000`. The architect should confirm or replace them.
 
-## New dependency (OWNER APPROVAL NOT YET RECORDED: record it in the decisions file before merge)
+## New dependency (owner-approved: decisions-2026-10-26.md item 1)
 
 `parse5@8.0.1` (MIT, zero runtime dependencies beyond `entities`, released 2026-04-19). Chosen over `sanitize-html` because the story requires a HARD ERROR on prohibited markup, not a strip, and `sanitize-html` is a stripper (and brings postcss and htmlparser2 with it). `parse5` is the HTML5 specification's own parse algorithm, so what is checked is what a browser would build, and the tree can be walked and refused node by node.
 
@@ -79,6 +79,6 @@ The list names `-005 -013 -019 -020 -021 -025 -026 -027 -028 -029 -031 -033`. Th
 10. **An `html_fragment` patch sets the review flag** from the same detector as `jsonld` (compliance wording in text or any attribute value; a price/metric/credential `itemprop` or meta name), with `risk_flags: ['claim_requires_review']`. A `markdown` sitemap segment is reduced to one line so an encoded newline cannot start a heading in `llms.txt`.
 11. **Future coupling, for the STORY-059 plan:** the `patches_immutable` trigger rejects every UPDATE except `finding_id` going NULL. The optimizer (`applied_node_ids`, alignment columns) must record a change as a NEW row or through an explicit trigger exception in a new migration, never an UPDATE of an existing patch.
 
-## OWNER APPROVAL STILL REQUIRED BEFORE MERGE: the `parse5` dependency
+## The `parse5` dependency is owner-approved
 
-`parse5@8.0.1` (MIT, pinned) is the AC6 sanitiser's parser. The plan's `external_blocker` for this story says an HTML parser needs owner approval, and no decision in `plans-7day/decisions-*.md` records it. This builder cannot record the approval; the owner must, citing it here. If it is not approved, the AC6 sanitiser needs a different decided approach.
+`plans-7day/decisions-2026-10-26.md` item 1 records the owner's approval of an HTML parsing library at the D1 kickoff ("add an HTML library"); the library used is `parse5@8.0.1` (MIT, pinned). It satisfies `minimumReleaseAge`: the registry publish time is 2026-04-19T20:16:16Z, months older than the 24 h rule, and `pnpm install --offline` needed no relaxation.
