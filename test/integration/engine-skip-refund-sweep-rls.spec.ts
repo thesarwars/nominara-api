@@ -2,7 +2,10 @@ import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { EngineSkipRefundSweepBlindError, sweepEngineSkipRefunds } from "../../src/lib/capture/engine-skip-refund-sweep.js";
+import { settleEngineSkippedCells } from "../../src/lib/credits/engine-skip-refund.js";
 import { ENGINE_SKIP_QUOTA_EXHAUSTED } from "../../src/lib/engines/capture-engine-gate.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { addCapture, addPrompt, addRun, addTenant, chargeRun, refundsFor, startRaceDb, truncateAll, type RaceDb, type Tenant } from "../support/run-race-fixture.js";
 
 // STORY-031 review round 2 - the engine-skip refund sweep's CANDIDATE query, on a connection that RLS binds.
@@ -45,13 +48,17 @@ describe("STORY-031 · the engine-skip refund sweep refuses a connection that ca
 
   /** A finished, charged, partial manual run with one cell skipped because the engine's quota was exhausted: owed a refund. */
   async function owedRefund(): Promise<Tenant> {
+    return (await owedRefundRun()).t;
+  }
+
+  async function owedRefundRun(): Promise<{ t: Tenant; run: string }> {
     const t = await addTenant(rig.db);
     const run = await addRun(rig.db, t, { ageHours: 2, planned: 2, status: "partial" });
     await chargeRun(rig.db, t, run);
     await addCapture(rig.db, t, run, await addPrompt(rig.db, t), { ageHours: 2, sampleIndex: 0 });
     await addCapture(rig.db, t, run, await addPrompt(rig.db, t), { ageHours: 2, sampleIndex: 0, status: "blocked" });
     await rig.db.query("UPDATE answer_captures SET error_code = $2 WHERE run_id = $1 AND status = 'blocked'", [run, ENGINE_SKIP_QUOTA_EXHAUSTED]);
-    return t;
+    return { t, run };
   }
 
   it("the worker connection really is RLS-bound (so the refusal below cannot pass vacuously)", async () => {
@@ -69,5 +76,20 @@ describe("STORY-031 · the engine-skip refund sweep refuses a connection that ca
     const t = await owedRefund();
     await expect(sweepEngineSkipRefunds(rig.db, new Date())).resolves.toEqual({ refundedRuns: 1 });
     expect((await refundsFor(rig.db, t.ws)).length).toBe(1);
+  });
+
+  // Review round 3. The sweep refuses an RLS-bound connection, so the per-candidate tenant transaction runs on a connection that
+  // BYPASSES RLS: the tenant context is defence in depth there, not the boundary. Every read the settlement makes must therefore
+  // carry the workspace itself. Hazard: a caller passing a workspace that does not own the run must settle nothing for it - not
+  // count the other tenant's skipped cells, not lock the other tenant's run row.
+  it("on the owner connection, a run passed with a workspace that does not own it is not read: nothing counted, nothing refunded", async () => {
+    const owner = await owedRefundRun();
+    const other = await addTenant(rig.db);
+    const outcome = await withTenantContext(rig.db, { workspaceId: other.ws, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+      settleEngineSkippedCells(tx, { workspaceId: other.ws, runId: owner.run }),
+    );
+    expect(outcome).toEqual({ refunded: 0, skippedCells: 0, debitBeforeCurrentCycle: false });
+    expect(await refundsFor(rig.db, owner.t.ws)).toEqual([]);
+    expect(await refundsFor(rig.db, other.ws)).toEqual([]);
   });
 });
