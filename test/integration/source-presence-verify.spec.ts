@@ -381,6 +381,17 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
       for (const r of await rows("reviews.dev")) expect(r.brand_present_on_domain).toBe(true);
     });
 
+    it("review round 3 — a SOURCE-GAP task on a domain whose index rows come only from demo-marked captures fetches nothing (the periodic run's demo exclusion)", async () => {
+      await cite("reviews.dev", 1, "gemini", await demoCapture("gemini")); // a live engine's key, but a demo-seeded capture
+      await reindex();
+      expect((await rows("reviews.dev")).length).toBeGreaterThan(0); // the index row (and its top URL) exists
+      const task = await authorityTask("reviews.dev", "done", { affectedUrl: null });
+      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics"));
+      await seededJob(task, fetch);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(await pins()).toEqual([]);
+    });
+
     it("pins nothing for an open task, a non-authority task, or a target without the brand", async () => {
       await cite("reviews.dev", 1);
       await reindex();
