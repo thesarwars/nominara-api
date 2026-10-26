@@ -127,6 +127,12 @@ export interface ReportSweepRuntimeOptions {
   /** A NEW direct (never pooled, never pgBouncer) owner-role connection per tick; the runtime ends it. */
   readonly connect: () => Promise<SweepClient>;
   readonly enqueue: EnqueueReportBuild;
+  /**
+   * STORY-178 — an extra step run on the SAME elected connection after the sweep (the suppression fan-out: tell the workspaces
+   * whose reports mail an address that just bounced). Best-effort and independent: a failure is counted and logged and never
+   * changes the sweep's result or stops the next tick.
+   */
+  readonly after?: (client: ClientBase) => Promise<unknown>;
   readonly clock?: () => Date;
 }
 
@@ -159,7 +165,9 @@ export class ReportSweepRuntime {
         incrementCounter("nominara_reports_sweep_runs_total", { status: "not_elected" });
         return null;
       }
-      return await runReportSweep(client, this.options.enqueue, this.clock());
+      const result = await runReportSweep(client, this.options.enqueue, this.clock());
+      await this.runAfter(client);
+      return result;
     } catch (error) {
       incrementCounter("nominara_reports_sweep_runs_total", { status: "failed" });
       logger.error({ event: "reports.sweep.failed", error: error instanceof Error ? error.name : "unknown" });
@@ -168,6 +176,16 @@ export class ReportSweepRuntime {
       if (client !== undefined && locked) await releaseAdvisorySessionLock(client, REPORT_SWEEP_LOCK).catch(() => false);
       await client?.end().catch(() => undefined);
       this.inFlight = false;
+    }
+  }
+
+  private async runAfter(client: ClientBase): Promise<void> {
+    if (this.options.after === undefined) return;
+    try {
+      await this.options.after(client);
+    } catch (error) {
+      incrementCounter("nominara_reports_sweep_after_failures_total");
+      logger.error({ event: "reports.sweep.after_failed", error: error instanceof Error ? error.name : "unknown" });
     }
   }
 

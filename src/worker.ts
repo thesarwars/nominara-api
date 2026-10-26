@@ -16,6 +16,7 @@ import { rollupDirtyKey } from "./lib/cache/valkey-keys.js";
 import { RollupDirtySet, type DirtyEntry } from "./lib/rollup/dirty-dates.js";
 import { RollupSweepRuntime } from "./lib/rollup/rollup-sweep.js";
 import { NotifySweepRuntime } from "./lib/notifications/notify-sweep.js";
+import { poolTenantWrite, runSuppressionFanout } from "./lib/email/suppression-fanout.js";
 import { ReportSweepRuntime } from "./lib/reports/report-sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
@@ -521,6 +522,9 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
     const reportSweep = new ReportSweepRuntime({
       connect: () => connect(withKeepalives(env.DATABASE_URL)),
       enqueue: (queue, workspaceId, payload, options) => reportProducer.enqueueTenantJob(queue, workspaceId, payload, options),
+      // STORY-178 — on the same elected tick: tell the workspaces whose reports mail an address that just bounced or complained.
+      // The owner connection only reads; each notification is written on the runtime pool in that workspace's own tenant transaction.
+      after: (client) => runSuppressionFanout(client, poolTenantWrite(pool), env.OTP_EMAIL_HASH_PEPPER),
     });
     reportSweep.start();
     providers.push({ provide: REPORT_SWEEP_RUNTIME, useValue: new ReportSweepHolder(reportSweep, reportProducer) });
