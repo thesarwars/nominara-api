@@ -622,7 +622,8 @@ The 15 archetypes, their funnel stage, and their required slots are specified in
   "annotations": {
     "data_gaps": [ { "from": "2026-06-14", "to": "2026-06-15", "reason": "engine_unavailable",
                      "engines": ["gemini"] } ],
-    "cadence_changes": [ { "at": "2026-07-01", "from": "weekly", "to": "daily" } ] },
+    "cadence_changes": [ { "at": "2026-07-01", "from": "weekly", "to": "daily" } ],
+    "scoring_version_changes": [] },
   "summary": { "visibility_start": 61.4, "visibility_end": 74.5, "visibility_delta": 13.1,
                "best_engine": "perplexity", "worst_engine": "claude",
                "competitor_gap_start": -16.8, "competitor_gap_end": -3.7 } },
@@ -630,6 +631,10 @@ The 15 archetypes, their funnel stage, and their required slots are specified in
 ```
 
 `measured_impact.caveat` is **mandatory** on every milestone with a computed delta and is rendered in the tooltip. A day with `cells_total = 0` is `null` in `points` and appears in `annotations.data_gaps` — **it is never interpolated**.
+
+**Timeframes and granularity (STORY-066).** `timeframe` is one of `24h`, `7d`, `30d`, `90d` (default), `180d`, `365d`. `granularity` is **auto-selected** (`scoring-models.md` §13): `24h → hour`, `7d/30d/90d → day`, `180d/365d → week`; it may be omitted, and a value the timeframe does not select is a `400 validation_failed`, never a silent substitution. A point's `d` is the workspace-local date at `day`; the first workspace-local date of its seven-day bucket at `week` (buckets end on the window's last day, so the first may be shorter; a week is the **mean of its measured daily values**, null when none was measured, and a weekly `data_gaps.to` is the last day of its last bucket); and the UTC instant the hour starts (`YYYY-MM-DDTHH:00:00Z`) at `hour`, which is read from `answer_captures` bounded to the 24 hours on `captured_at` (partition-pruned) and only under the current scoring version. A custom range is STORY-090's.
+
+`annotations.cadence_changes` is read from the pins the `record_cadence_change` trigger writes. `annotations.scoring_version_changes` (STORY-066 AC12, always present) marks each change of `scoring_version` between consecutive measured buckets of the brand series, `at` being the first bucket under `to`: a day is plotted under the current version where it has one, otherwise under the most recently computed older version.
 
 ## 8. GEO alignment payload
 
