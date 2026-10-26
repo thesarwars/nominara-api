@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import type { ClientBase } from "pg";
@@ -16,7 +16,8 @@ import { createCrawlAuditHandler, type CrawlAuditDeps } from "../../src/lib/queu
 import { NOMINARA_USER_AGENT } from "../../src/lib/aux/page-crawl.js";
 import { unavailableRenderer } from "../../src/lib/aux/renderer.js";
 import { createHash } from "node:crypto";
-import { crawlManifestSchema } from "../../contracts/aux/index.js";
+import { crawlManifestSchema, type AuxFinding, type AuxPatch } from "../../contracts/aux/index.js";
+import { AuxService } from "../../src/modules/aux/aux.service.js";
 import { handlerFor } from "../../src/lib/queue/handlers.js";
 import type { GuardedFetchInit, GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
 
@@ -976,6 +977,168 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(await statusOf()).toEqual(["resolved"]);
       expect(await milestones()).toHaveLength(1);
       expect((await audits()).at(-1)!.status).toBe("completed");
+    });
+
+    // ---- STORY-053 -------------------------------------------------------------------------------------------------------
+    const BLOCKED_TWO = "User-agent: GPTBot\nDisallow: /\n\nUser-agent: ClaudeBot\nDisallow: /\n";
+    const patchRows = async (): Promise<any[]> => (await db.query("SELECT * FROM patches ORDER BY created_at, id")).rows; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const sha = (s: string): Buffer => createHash("sha256").update(s).digest();
+    const service = new AuxService();
+    const readPatch = async (id: string): Promise<AuxPatch> => {
+      const client = await pool.connect();
+      try {
+        let out!: AuxPatch;
+        await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async () => { out = await service.getPatch(id); });
+        return out;
+      } finally {
+        client.release();
+      }
+    };
+    const readFindings = async (): Promise<AuxFinding[]> => {
+      const client = await pool.connect();
+      try {
+        let out: AuxFinding[] = [];
+        await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async () => { out = [...(await service.listProjectFindings(projectId, { limit: 50 })).items]; });
+        return out;
+      } finally {
+        client.release();
+      }
+    };
+
+    it("STORY-053 scenario 1 · a blocked robots.txt gets a robots patch: written by the audit, with its provenance, reversal and the hash of the file it was made from", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      const [f] = await findings();
+      const rows = await patchRows();
+      expect(rows).toHaveLength(1);
+      const [patch] = rows;
+      expect(patch).toMatchObject({
+        workspace_id: workspaceId, project_id: projectId, finding_id: f.id, rule_code: "AUX-R-001", kind: "robots", target_url: "https://acme.com/robots.txt",
+        requires_human_review: false, review_reason: null, created_by: null,
+      });
+      expect(patch.content_after).toBe(`${BLOCKED}\nUser-agent: GPTBot\nAllow: /\n`);
+      expect(patch.reversal).toEqual({ operation: "remove_block", content: "\nUser-agent: GPTBot\nAllow: /\n" });
+      expect(patch.derivation.length).toBeGreaterThan(10);
+      expect(patch.explanation.length).toBeGreaterThan(10);
+      const [a] = await audits();
+      expect(patch.content_before_hash.equals(a.robots_hash)).toBe(true);
+      expect(patch.preconditions).toEqual([{ kind: "file_hash", value: `sha256:${a.robots_hash.toString("hex")}` }]);
+      expect(patch.unified_diff).toContain("+User-agent: GPTBot");
+    });
+
+    it("STORY-053 scenario 1 · an /llms.txt that answers with an error status other than 404 or 410 gets NO patch (a file may exist behind it)", async () => {
+      await runAsTenant({ ...healthy(OPEN), "/llms.txt": { status: 403 }, "/.well-known/llms.txt": { status: 404 } });
+      expect((await findings()).map((f) => f.rule_code)).toContain("AUX-R-004");
+      expect(await patchRows()).toHaveLength(0);
+    });
+
+    it("STORY-053 scenario 1 · an /llms.txt that is absent while an invalid one sits at /.well-known/llms.txt gets NO 'there is no /llms.txt' patch", async () => {
+      await runAsTenant({ ...healthy(OPEN), "/llms.txt": { status: 404 }, "/.well-known/llms.txt": { status: 200, body: "not the llms format" } });
+      expect((await findings()).map((f) => f.rule_code)).toContain("AUX-R-004");
+      expect(await patchRows()).toHaveLength(0);
+    });
+
+    it("STORY-053 scenario 1 · the patch is on the finding, free, and the page still matches", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      const [f] = await readFindings();
+      expect(f!.patch).toMatchObject({ kind: "robots", free: true, credits_charged: 0, page_matches: true, earlier_patch_ids: [] });
+      expect(f!.guidance).toBeNull();
+      expect((await readPatch(f!.patch!.patch_id)).content_after).toContain("Allow: /");
+    });
+
+    it("STORY-053 scenario 11 · generating a patch charges nothing: the audit writes no credit ledger row", async () => {
+      const before = (await db.query("SELECT count(*)::int AS n FROM credit_ledger")).rows[0].n;
+      await runAsTenant(healthy(BLOCKED));
+      expect(await patchRows()).toHaveLength(1);
+      expect((await db.query("SELECT count(*)::int AS n FROM credit_ledger")).rows[0].n).toBe(before);
+    });
+
+    it("STORY-053 scenario 8 · the same defect in the next audit writes NO second patch, and a changed file writes a NEW one that leaves the first untouched", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await runAsTenant(healthy(BLOCKED));
+      expect(await patchRows()).toHaveLength(1);
+      const [first] = await patchRows();
+      await runAsTenant(healthy(BLOCKED_TWO));
+      const rows = await patchRows();
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toEqual(first);
+      expect(rows[1].content_after).toContain("User-agent: ClaudeBot\nAllow: /\n");
+      const [f] = await readFindings();
+      expect(f!.patch).toMatchObject({ patch_id: rows[1].id, earlier_patch_ids: [first.id] });
+      expect((await readPatch(first.id)).content_after).toBe(first.content_after);
+    });
+
+    it("STORY-053 scenario 9 · after the customer changes robots.txt the old patch reads page_matches false, and an unreadable robots.txt reads null", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      const [first] = await patchRows();
+      expect((await readPatch(first.id)).page_matches).toBe(true);
+      await runAsTenant(healthy(BLOCKED_TWO));
+      expect((await readPatch(first.id)).page_matches).toBe(false);
+      await runAsTenant(robotsDown);
+      expect((await readPatch(first.id)).page_matches).toBeNull();
+    });
+
+    it("STORY-053 scenario 4 · a generator whose output would not do what it says is REJECTED, recorded, and does not abort the audit or its findings", async () => {
+      // `Disallow: /*` outranks an `Allow: /`, so opening GPTBot with an Allow block cannot work: the gate refuses rather than offering it.
+      await runAsTenant(healthy("User-agent: GPTBot\nDisallow: /*\n"));
+      expect((await audits())[0]!.status).toBe("completed");
+      expect(await findings()).toHaveLength(1);
+      expect(await patchRows()).toHaveLength(0);
+      expect(counters.some((c) => c.name === "nominara_aux_patch_rejected_total" && c.labels.reason === "ineffective")).toBe(true);
+    });
+
+    it("STORY-053 scenario 10 · AUX-R-003 (robots.txt malformed) has no patch: the finding carries guidance and an alignment link instead", async () => {
+      await runAsTenant(healthy("User-agent: *\nAllow: /\nthis line is not a directive\n"));
+      const [f] = await findings();
+      expect(f.rule_code).toBe("AUX-R-003");
+      expect(await patchRows()).toHaveLength(0);
+      const [read] = await readFindings();
+      expect(read!.patch).toBeNull();
+      expect(read!.guidance!.steps.length).toBeGreaterThan(0);
+      expect(read!.guidance!.alignment_link).toEqual({ path: "/geo/alignment", target_url: "https://acme.com/robots.txt" });
+    });
+
+    it("STORY-053 scenario 1 · a missing llms.txt gets a markdown patch built from the site's own sitemap, valid by the rule's own check", async () => {
+      await runAsTenant(noLlms);
+      const rows = await patchRows();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ kind: "markdown", rule_code: "AUX-R-004", target_url: "https://acme.com/llms.txt", preconditions: [{ kind: "file_absent", value: null }] });
+      expect(rows[0].reversal).toEqual({ operation: "delete_file", content: null });
+      expect(rows[0].content_before_hash.equals(sha(""))).toBe(true);
+      expect(rows[0].content_after).toContain("# P");
+      expect(rows[0].content_after).toContain("(https://acme.com/)");
+      expect((await readPatch(rows[0].id)).page_matches).toBe(true);
+      // The audit that finds the file now present says the precondition no longer holds.
+      await runAsTenant(healthy(OPEN));
+      expect((await readPatch(rows[0].id)).page_matches).toBe(false);
+    });
+
+    it("STORY-053 · a finding the customer set to will-not-fix is not worked on: no new patch for it", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      await db.query("UPDATE aux_findings SET status = 'wont_fix', wont_fix_reason = 'accepted'");
+      await runAsTenant(healthy(BLOCKED_TWO));
+      expect(await patchRows()).toHaveLength(1);
+    });
+
+    it("STORY-053 · the patch is written in the job's tenant context: another workspace cannot see it", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      const [patch] = await patchRows();
+      const wsB = (await db.query("INSERT INTO workspaces (name, slug, plan_key) VALUES ('B','w-c9-b53','free') RETURNING id")).rows[0].id as string;
+      const client = await pool.connect();
+      try {
+        await withTenantContext(client, { workspaceId: wsB, actorId: SYSTEM_ACTOR_ID }, async () => {
+          expect((await client.query("SELECT id FROM patches WHERE id = $1", [patch.id])).rows).toHaveLength(0);
+        });
+      } finally {
+        client.release();
+      }
+    });
+
+    it("STORY-053 · generation makes no network call and holds no I/O: the patch modules import nothing that can fetch", () => {
+      const dir = new URL("../../src/lib/aux/patches/", import.meta.url);
+      for (const file of readdirSync(dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))) {
+        const src = readFileSync(new URL(file, dir), "utf8");
+        expect(src, file).not.toMatch(/guarded-fetch|node:http|node:https|node:net|node:dns|\bfetch\(|storage|\bpg\b/);
+      }
     });
   });
 

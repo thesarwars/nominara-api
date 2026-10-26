@@ -4,11 +4,13 @@ import {
   auxAuditSchema,
   auxFindingListQuerySchema,
   auxFindingSchema,
+  auxPatchSchema,
   updateAuxFindingRequestSchema,
   type AuxAudit,
   type AuxAuditListQuery,
   type AuxFinding,
   type AuxFindingListQuery,
+  type AuxPatch,
   type UpdateAuxFindingRequest,
 } from "../../../contracts/aux/index.js";
 import type { Page } from "../../api/pagination/page.js";
@@ -59,6 +61,16 @@ export class AuxController {
     @Query(new ZodValidationPipe(auxFindingListQuerySchema)) query: AuxFindingListQuery,
   ): Promise<Page<AuxFinding>> {
     return this.service.listProjectFindings(id, query);
+  }
+
+  // STORY-053: a patch is made by the audit and read here; there is no route that creates, regenerates or edits one. The URL names a
+  // patch, not a project: scope is enforced by the service against the patch's project (403 out-of-scope).
+  @Get("patches/:id")
+  @RequirePermission("aux:read")
+  @ScopedByQuery()
+  @ApiContract({ operationId: "getAuxPatch", responseSchema: auxPatchSchema })
+  getPatch(@Param("id") id: string): Promise<AuxPatch> {
+    return this.service.getPatch(id);
   }
 
   // The URL names a finding, not a project: scope is enforced by the service

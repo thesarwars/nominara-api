@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { PAGINATION_LIMIT_DEFAULT, PAGINATION_LIMIT_MAX } from "../common/pagination.schema.js";
 import { auxCategorySchema } from "./aux-audit.schema.js";
+import { auxGuidanceSchema, auxPatchSchema } from "./patch.schema.js";
 import { auxFindingSeveritySchema, siteFileEvidenceSchema } from "./site-file-finding.schema.js";
 
 // NEW-C-10 (STORY-052; api-specification.md "AUX") — a finding on the wire, the
@@ -74,6 +75,14 @@ export const auxFindingSchema = z
     rule_version: z.string(),
     /** The task a promotion created, if any. */
     task_id: z.string().uuid().nullable(),
+    /**
+     * STORY-053 — the latest copy-ready patch the audit made for this finding. null = none yet (nothing to offer, the rule has no
+     * patch, or the patch was refused by a gate). Earlier ones are `patch.earlier_patch_ids`. Always sent by the server; OPTIONAL in the
+     * contract only so that adding it is an additive change (NFR-API-04), as `wont_fix.resurfaces_at` was.
+     */
+    patch: auxPatchSchema.nullable().optional(),
+    /** STORY-053 — structured guidance and an alignment link, for a rule whose fix needs a human. null where the rule has a patch. */
+    guidance: auxGuidanceSchema.nullable().optional(),
   })
   .strict();
 
