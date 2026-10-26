@@ -10,6 +10,8 @@ import { IdentityController } from "./identity.controller.js";
 import { IdentityService } from "./identity.service.js";
 import { OauthController } from "./oauth.controller.js";
 import { OauthService } from "./oauth.service.js";
+import { ResendWebhookController } from "./resend-webhook.controller.js";
+import { ResendWebhookService } from "./resend-webhook.service.js";
 import { EMAIL_SENDER } from "./ports/email-sender.js";
 import { OAUTH_CLIENT } from "./ports/oauth-client.js";
 import { SessionService } from "./session.service.js";
@@ -39,12 +41,13 @@ import { SessionService } from "./session.service.js";
 // (session.service.ts's header says why it is not in Postgres).
 @Module({
   imports: [DbModule, CacheModule, TenancyAccessModule],
-  controllers: [IdentityController, OauthController, EmailOtpController],
+  controllers: [IdentityController, OauthController, EmailOtpController, ResendWebhookController],
   providers: [
     IdentityService,
     SessionService,
     OauthService,
     EmailOtpService,
+    ResendWebhookService,
     { provide: OAUTH_CLIENT, useClass: OpenidClientAdapter },
     // STORY-127 — chosen at boot, not hardcoded. DevEmailSenderAdapter logs
     // the one-time code in plaintext so local sign-in is possible at all;
