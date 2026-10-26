@@ -6,7 +6,9 @@ import type { EngineKey } from "../../src/lib/engines/contract.js";
 import { DEGRADATION_STAGE_5_OPEN_DURATION_MS } from "../../src/lib/engines/degradation.js";
 import { DegradationRuntime } from "../../src/lib/engines/degradation-runtime.js";
 import type { EngineBreakerDetail } from "../../src/lib/engines/engine-breaker.js";
-import { EngineStatusService } from "../../src/modules/health/engine-status.service.js";
+import { Redis } from "ioredis";
+import { EngineStatusService, ValkeyLadderDegradedMarks } from "../../src/modules/health/engine-status.service.js";
+import { testCacheRedisUrl } from "../support/test-valkey.js";
 
 // REVIEW FIX (stream A-engines, round 1) - `engines.status` is OPERATOR state (migration 0027: "an incident responder sets
 // 'degraded' when a vendor is down. Re-seeding it back to 'active' resumes scheduling against a broken vendor, silently"). The
@@ -26,11 +28,13 @@ const longOpen: EngineBreakerDetail = { state: "open", openedAt: NOW - 1_000, si
 class MemoryMarks {
   readonly marks = new Map<string, string>();
   failReads = false;
+  failWrites = false;
   read(engineKey: EngineKey): Promise<string | null> {
     if (this.failReads) return Promise.reject(new Error("cache down"));
     return Promise.resolve(this.marks.get(engineKey) ?? null);
   }
   write(engineKey: EngineKey, stamp: string): Promise<void> {
+    if (this.failWrites) return Promise.reject(new Error("cache down"));
     this.marks.set(engineKey, stamp);
     return Promise.resolve();
   }
@@ -144,5 +148,42 @@ describe("STORY-031 AC7 · the ladder never overwrites operator-owned engines.st
     breaker = {};
     await ladder.tick();
     expect(await status("claude")).toBe("degraded");
+  });
+
+  it("a mark that cannot be written undoes the degraded write: no `degraded` is left that nobody owns", async () => {
+    await seed("claude", "active");
+    marks.failWrites = true;
+    breaker = { claude: longOpen };
+    await ladder.tick();
+    expect(await status("claude")).toBe("active");
+    marks.failWrites = false;
+    await ladder.tick();
+    expect(await status("claude")).toBe("degraded");
+  });
+
+  it("the Valkey marks round-trip the stamp, and the ladder recovers through them", async () => {
+    const redis = new Redis(testCacheRedisUrl());
+    try {
+      await redis.flushdb();
+      const valkey = new ValkeyLadderDegradedMarks(redis);
+      const runtime = new DegradationRuntime({
+        engines: ["claude"],
+        breakers: { for: (key) => ({ detail: () => Promise.resolve(breaker[key as EngineKey] ?? closed), blockRatio: () => Promise.resolve(0) }) },
+        status: new EngineStatusService(pool, valkey),
+        shaping: { onRatioObserved: () => Promise.resolve() },
+        clock: () => NOW,
+      });
+      await seed("claude", "active");
+      breaker = { claude: longOpen };
+      await runtime.tick();
+      const stamp = (await pool.query<{ stamp: string }>("SELECT updated_at::text AS stamp FROM engines WHERE key = 'claude'")).rows[0]!.stamp;
+      expect(await valkey.read("claude")).toBe(stamp);
+      breaker = {};
+      await runtime.tick();
+      expect(await status("claude")).toBe("active");
+      expect(await valkey.read("claude")).toBeNull();
+    } finally {
+      await redis.quit().catch(() => undefined);
+    }
   });
 });

@@ -12,9 +12,11 @@ import type { EngineBreakerDetail } from "./engine-breaker.js";
 //     stage 3 — `RequestShapingCoordinator.onRatioObserved` (rotates once per breach through the default port until
 //               STORY-028/029 bring real shaping profiles; it also resets the breach once the ratio falls back),
 //     stage 5 — `engines.status = 'degraded'` once the episode is older than 30 minutes,
-//   and hands a degraded engine back to `active` once its breaker has CLOSED. The ladder owns `degraded` in both directions:
-//   the planner excludes a degraded engine (`engines.status = 'active'`, plan-cells.ts), so a one-way mark would drop the engine
-//   from every future run for good. An operator who wants an engine out uses `disabled`, which this never touches.
+//   and hands a degraded engine back to `active` once its breaker has CLOSED - but ONLY a `degraded` the ladder itself wrote
+//   (EngineStatusService: stage 5 moves only `active` -> `degraded`, and recovery reverts only the ladder's own, untouched write).
+//   `engines.status` is operator state (migration 0027): an operator's `degraded`, `disabled` or `beta` is never changed here.
+//   The planner excludes a degraded engine (`engines.status = 'active'`, plan-cells.ts), which is why the ladder must undo what
+//   it did, and why it must never undo what an operator did.
 //
 // Not here: stage 1 is the backoff ladder (backoff.ts), stage 2 is triggered per attempt (capture-engine-gate.ts) and applied at
 // the lease, stage 4 is the breaker itself, stage 6 (blackout paging) is STORY-179's monitor. `engine.degraded` is published per
@@ -32,7 +34,8 @@ export const DEGRADATION_POLL_INTERVAL_MS = 30_000;
 export interface DegradationRuntimeOptions {
   readonly engines: readonly EngineKey[];
   readonly breakers: { for(engineKey: string): { detail(): Promise<EngineBreakerDetail>; blockRatio(): Promise<number> } };
-  readonly status: { markDegraded(engineKey: EngineKey): Promise<void>; markRecovered(engineKey: EngineKey): Promise<void> };
+  /** markDegraded resolves true only when it changed the row (the stage-5 counter counts transitions, not ticks). */
+  readonly status: { markDegraded(engineKey: EngineKey): Promise<boolean>; markRecovered(engineKey: EngineKey): Promise<void> };
   readonly shaping: { onRatioObserved(engineKey: EngineKey, blockRatio: number): Promise<void> };
   readonly clock?: () => number;
   readonly pollIntervalMs?: number;
@@ -56,8 +59,7 @@ export class DegradationRuntime {
         stages.set(engineKey, stage);
         await this.options.shaping.onRatioObserved(engineKey, blockRatio);
         if (stage !== null && stage >= 5) {
-          await this.options.status.markDegraded(engineKey);
-          incrementCounter("nominara_engine_ladder_stage5_total", { engine_key: engineKey });
+          if (await this.options.status.markDegraded(engineKey)) incrementCounter("nominara_engine_ladder_stage5_total", { engine_key: engineKey });
         } else if (detail.state === "closed") {
           await this.options.status.markRecovered(engineKey);
         }

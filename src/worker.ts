@@ -23,7 +23,7 @@ import { EngineBreakerRegistry } from "./lib/engines/engine-breaker-registry.js"
 import { defaultRequestShapingRotator } from "./lib/engines/ports.js";
 import { RefillReductionTracker, ValkeyRefillReductionStore } from "./lib/engines/refill-reduction.js";
 import { RequestShapingCoordinator, ValkeyBreachTrackerStore } from "./lib/engines/request-shaping-coordinator.js";
-import { EngineStatusService } from "./modules/health/engine-status.service.js";
+import { EngineStatusService, ValkeyLadderDegradedMarks } from "./modules/health/engine-status.service.js";
 import { TokenBucket } from "./lib/engines/token-bucket.js";
 import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
 import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
@@ -422,7 +422,7 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
     const ladder = new DegradationRuntime({
       engines: ACTIVE_ENGINE_KEYS,
       breakers: new EngineBreakerRegistry(cacheRedis),
-      status: new EngineStatusService(pool),
+      status: new EngineStatusService(pool, new ValkeyLadderDegradedMarks(cacheRedis)),
       shaping: new RequestShapingCoordinator(defaultRequestShapingRotator, new ValkeyBreachTrackerStore(cacheRedis)),
     });
     ladder.start();
