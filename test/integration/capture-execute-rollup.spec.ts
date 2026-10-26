@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { OPEN_ENGINE_GATE } from "../support/open-engine-gate.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client } from "pg";
@@ -23,7 +24,8 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 // (ADR-0003), so the seam is three functions: nothing settled, nothing fetched, and the commit that writes the row.
 vi.mock("../../src/lib/capture/execute-cell.js", () => ({
   settledCell: async () => undefined,
-  fetchCell: async () => ({}),
+  // The RUN phase's outcome, matching what `commitCell` below writes (STORY-031: the handler reports it to the engine gate).
+  fetchCell: async () => ({ outcome: { kind: "failed", errorCode: "auth_failed" } }),
   commitCell: async (
     tx: import("pg").ClientBase,
     _cache: unknown,
@@ -143,6 +145,7 @@ describe("NEW-A-7 · rollup requested when the last cell fails terminally", () =
     const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
     const handler = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
+      engineGate: OPEN_ENGINE_GATE,
       realtime: publisher,
       enqueueParse: async () => undefined,
       enqueueRollup: async (queue, _ws, payload, idempotencyKey) => {

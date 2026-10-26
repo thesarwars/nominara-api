@@ -65,6 +65,12 @@ export interface CaptureCellInput {
   readonly locale: string;
   readonly personaHint: string | null;
   readonly normalizerVersion: string;
+  /**
+   * STORY-031 AC9 - whether the cell's prompt is in the project's priority subset (`tracked_prompts.is_priority`), read by the
+   * handler inside the job's tenant context. At the spend hard stop (EC-08) priority cells are still captured and the rest are
+   * refused, in every tenant alike. Absent is "not priority".
+   */
+  readonly isPriority?: boolean;
 }
 
 export type CaptureCellOutcome =
@@ -207,7 +213,14 @@ export async function fetchCell(input: CaptureCellInput, ports: FetchCellPorts =
   }
 
   // THE HARD STOP (EC-08). Terminal and distinct: a `blocked` row with its own code, so the ceiling is not chased by the retry ladder.
-  if ((await ceilingReached?.(input.engineKey)) === true) return unansweredCell({ status: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED }, { kind: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED }, now);
+  //
+  // STORY-031 AC9 - "a hard stop that degrades to the priority prompt subset across all tenants proportionally - never by starving
+  // one tenant to serve another". Applied per cell, at dispatch (planner recommendation (a)): past the ceiling a PRIORITY cell is
+  // still captured and every other cell is refused. The same rule holds in every workspace, so each keeps exactly its own priority
+  // subset (bounded per project by `priority_prompt_limit`) - the share is proportional to each tenant's priority set by
+  // construction, and no tenant's cells are spent to serve another's. The gate is still read for a priority cell, so an unreadable
+  // meter still fails closed for it.
+  if ((await ceilingReached?.(input.engineKey)) === true && input.isPriority !== true) return unansweredCell({ status: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED }, { kind: "blocked", errorCode: ENGINE_SPEND_CEILING_REACHED }, now);
 
   const controller = new AbortController();
   const costs = { usd: 0 };
@@ -258,6 +271,14 @@ export async function fetchCell(input: CaptureCellInput, ports: FetchCellPorts =
   await meterSpend();
   const stored = await storeRawObject(input, now, rawObjects, raw);
   return { write: { status: "captured", adapter, raw }, ...stored, costUsd: costs.usd, seed: raw, now, outcome: { kind: "captured", latencyMs: raw.latencyMs } };
+}
+
+/**
+ * STORY-031 AC7/AC8 - a cell its engine could not take (breaker open on quota, or degraded): `blocked` with the gate's code, never
+ * sent to the vendor. Written through `commitCell` like any other cell, so it is idempotent under the cell's advisory lock.
+ */
+export function engineSkippedCell(errorCode: string, now: Date = new Date()): CellFetched {
+  return unansweredCell({ status: "blocked", errorCode }, { kind: "blocked", errorCode }, now);
 }
 
 /** A cell with no answer to store (blocked or failed): a row, no object, and whatever the vendor billed. */

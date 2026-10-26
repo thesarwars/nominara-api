@@ -121,6 +121,41 @@ export class ValkeyEngineBreakerStateStore implements EngineBreakerStateStore {
   }
 }
 
+/**
+ * STORY-031 - the breaker's episode beside its state key, with the same TTL posture. Reads THROW (the breaker falls back to
+ * `openedAt` as the episode start); writes are best-effort and never fail the job, like the state store's.
+ */
+export class ValkeyEngineBreakerEpisodeStore implements EngineBreakerEpisodeStore {
+  private static readonly KEY_PREFIX = "engine-breaker:episode";
+  private static readonly TTL_SECONDS = 6 * 60 * 60;
+
+  constructor(private readonly redis: Redis) {}
+
+  private key(engineKey: EngineKey): string {
+    return `${ValkeyEngineBreakerEpisodeStore.KEY_PREFIX}:${engineKey}`;
+  }
+
+  async read(engineKey: EngineKey): Promise<EngineBreakerEpisode | null> {
+    const raw = await this.redis.get(this.key(engineKey));
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as { since?: unknown; reason?: unknown };
+    if (typeof parsed.since !== "number" || (parsed.reason !== "quota" && parsed.reason !== "ratio")) return null;
+    return { since: parsed.since, reason: parsed.reason };
+  }
+
+  async write(engineKey: EngineKey, episode: EngineBreakerEpisode | null): Promise<void> {
+    try {
+      if (episode === null) {
+        await this.redis.del(this.key(engineKey));
+      } else {
+        await this.redis.set(this.key(engineKey), JSON.stringify(episode), "EX", ValkeyEngineBreakerEpisodeStore.TTL_SECONDS);
+      }
+    } catch (error) {
+      logger.warn(`failed to persist breaker episode for engine '${engineKey}' — best-effort, job unaffected: ${(error as Error).message}`);
+    }
+  }
+}
+
 // Mirrors a tumbling (not sliding) window: once `now - windowStart` exceeds
 // `windowMs`, the window resets to just this one event rather than
 // continuously sliding — a disclosed simplification, not a reference
@@ -176,6 +211,13 @@ export class ValkeyEngineBreakerRatioCounter implements EngineBreakerRatioCounte
     if (typeof this.redis.engineBreakerRecordOutcome !== "function") {
       this.redis.defineCommand("engineBreakerRecordOutcome", { numberOfKeys: 1, lua: LUA_RECORD_OUTCOME });
     }
+  }
+
+  /** Throws on a store outage: the ladder evaluator skips the engine rather than reading "no blocks". */
+  async peek(engineKey: EngineKey): Promise<{ attempts: number; blocks: number }> {
+    const [attempts, blocks, windowStart] = await this.redis.hmget(`${ValkeyEngineBreakerRatioCounter.KEY_PREFIX}:${engineKey}`, "attempts", "blocks", "windowStart");
+    if (attempts === null || windowStart === null || this.clock() - Number(windowStart) > this.windowMs) return { attempts: 0, blocks: 0 };
+    return { attempts: Number(attempts), blocks: Number(blocks ?? 0) };
   }
 
   async record(engineKey: EngineKey, isBlocked: boolean): Promise<{ attempts: number; blocks: number }> {
@@ -245,14 +287,41 @@ export class EngineBreaker {
     }
   }
 
-  /** RED: the episode read lands with the implementation. */
-  detail(): Promise<EngineBreakerDetail> {
-    return Promise.reject(new Error(`not implemented${this.episodes === null ? "" : ""}`));
+  /**
+   * The state plus the current episode. An unreadable episode store never fails it: the episode start falls back to the open
+   * window's start and the reason to null (the capture path then treats the breaker as ratio-opened: re-queue, not skip).
+   */
+  async detail(): Promise<EngineBreakerDetail> {
+    await this.sync();
+    const state = this.breaker.state;
+    if (state === "closed" || this.lastKnownOpenedAt === null) return { state: "closed", openedAt: null, since: null, reason: null };
+    const episode = await this.readEpisode();
+    return { state, openedAt: this.lastKnownOpenedAt, since: Math.min(episode?.since ?? this.lastKnownOpenedAt, this.lastKnownOpenedAt), reason: episode?.reason ?? null };
   }
 
-  /** RED: blocks/attempts over the rolling window, 0 with no attempts. */
-  blockRatio(): Promise<number> {
-    return Promise.reject(new Error("not implemented"));
+  /** blocks/attempts over the rolling window WITHOUT recording an attempt; 0 with no attempts (never NaN). Throws on a store outage. */
+  async blockRatio(): Promise<number> {
+    const totals = this.ratioCounter.peek === undefined ? { attempts: 0, blocks: 0 } : await this.ratioCounter.peek(this.engineKey);
+    return totals.attempts > 0 ? totals.blocks / totals.attempts : 0;
+  }
+
+  private async readEpisode(): Promise<EngineBreakerEpisode | null> {
+    if (this.episodes === null) return null;
+    try {
+      return await this.episodes.read(this.engineKey);
+    } catch (error) {
+      logger.warn(`breaker episode store unreadable for engine '${this.engineKey}' — using the open window's start: ${(error as Error).message}`);
+      return null;
+    }
+  }
+
+  private async writeEpisode(episode: EngineBreakerEpisode | null): Promise<void> {
+    if (this.episodes === null) return;
+    try {
+      await this.episodes.write(this.engineKey, episode);
+    } catch (error) {
+      logger.warn(`failed to persist breaker episode for engine '${this.engineKey}' — best-effort: ${(error as Error).message}`);
+    }
   }
 
   async state(): Promise<CircuitState> {
@@ -286,6 +355,7 @@ export class EngineBreaker {
     if (this.breaker.state === "half_open") {
       if (outcome === "success") {
         await this.store.write(this.engineKey, null);
+        await this.writeEpisode(null);
         this.lastKnownOpenedAt = null;
         this.breaker = this.freshBreaker();
         return { state: "closed", retry: true };
@@ -309,9 +379,13 @@ export class EngineBreaker {
 
   private async open(retry: boolean): Promise<EngineBreakerDecision> {
     const at = this.clock();
+    // The episode starts when the breaker LEAVES closed. A re-open from half_open (or a quota open while already open) keeps it.
+    const wasClosed = this.breaker.state === "closed";
+    const prior = wasClosed ? null : await this.readEpisode();
     this.breaker.forceOpen(at);
     this.lastKnownOpenedAt = at;
     await this.store.write(this.engineKey, at);
+    await this.writeEpisode({ since: prior?.since ?? at, reason: retry ? "ratio" : "quota" });
     return { state: "open", retry };
   }
 }

@@ -18,6 +18,12 @@ import { RollupSweepRuntime } from "./lib/rollup/rollup-sweep.js";
 import { NotifySweepRuntime } from "./lib/notifications/notify-sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
+import { DegradationRuntime } from "./lib/engines/degradation-runtime.js";
+import { EngineBreakerRegistry } from "./lib/engines/engine-breaker-registry.js";
+import { defaultRequestShapingRotator } from "./lib/engines/ports.js";
+import { RefillReductionTracker, ValkeyRefillReductionStore } from "./lib/engines/refill-reduction.js";
+import { RequestShapingCoordinator, ValkeyBreachTrackerStore } from "./lib/engines/request-shaping-coordinator.js";
+import { EngineStatusService } from "./modules/health/engine-status.service.js";
 import { TokenBucket } from "./lib/engines/token-bucket.js";
 import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
 import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
@@ -185,10 +191,13 @@ class CaptureCanaryRuntimeHolder implements OnModuleDestroy {
   constructor(
     public readonly runtime: CanaryRuntime,
     private readonly cacheRedis: Redis,
+    /** STORY-031 AC6/AC7 - the ladder evaluator, sharing the canary's cache connection. */
+    public readonly ladder?: DegradationRuntime,
   ) {}
 
   async onModuleDestroy(): Promise<void> {
     this.runtime.stop();
+    this.ladder?.stop();
     await this.cacheRedis.quit().catch(() => undefined);
     // STORY-124 — the Postgres pool is WorkerGroupRuntime's now, shared
     // with every registered queue handler, and closed there.
@@ -322,7 +331,9 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
           new Logger("bootstrap").warn(`capture.execute engine lease: cache Valkey connection error: ${error.message}`);
         });
         leaseConnections.push(leaseRedis);
-        engineLease = captureEngineLeaseOptions(env, new TokenBucket(leaseRedis));
+        // STORY-031 AC6 - EC-06 stage 2: the reduction a `rate_limited` attempt triggers (capture-engine-gate.ts) is read here,
+        // on the same cache instance, so the lease spends from the halved bucket for its 15 minutes.
+        engineLease = { ...captureEngineLeaseOptions(env, new TokenBucket(leaseRedis)), refillReduction: new RefillReductionTracker(new ValkeyRefillReductionStore(leaseRedis)) };
       }
 
       // STORY-042 AC6 — the parse handler marks late facts in the `rollup_dirty` set on the QUEUE instance (noeviction). The
@@ -407,7 +418,15 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
     // than opening a second. WorkerGroupRuntime owns closing it.
     const canaryRuntime = new CanaryRuntime({ pool, cacheRedis });
     canaryRuntime.start();
-    providers.push({ provide: CAPTURE_CANARY_RUNTIME, useValue: new CaptureCanaryRuntimeHolder(canaryRuntime, cacheRedis) });
+    // STORY-031 AC6/AC7 - the degradation ladder, evaluated on its own clock beside the canary (degradation-runtime.ts).
+    const ladder = new DegradationRuntime({
+      engines: ACTIVE_ENGINE_KEYS,
+      breakers: new EngineBreakerRegistry(cacheRedis),
+      status: new EngineStatusService(pool),
+      shaping: new RequestShapingCoordinator(defaultRequestShapingRotator, new ValkeyBreachTrackerStore(cacheRedis)),
+    });
+    ladder.start();
+    providers.push({ provide: CAPTURE_CANARY_RUNTIME, useValue: new CaptureCanaryRuntimeHolder(canaryRuntime, cacheRedis, ladder) });
 
     // NEW-A-13 — the scheduler sweep, in-process in the capture worker, hourly
     // at :05 UTC. It enqueues signed `capture.plan` jobs (consumed by this same

@@ -10,6 +10,7 @@ import type {
   QueueDepth,
   ReadinessResponse,
 } from "../../../contracts/common/health.schema.js";
+import { ENGINE_CATALOG_STATUSES, type EngineStatusEntry, type EngineStatusResponse } from "../../../contracts/engines/index.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { appliedMigrationNames, listMigrationFiles } from "../../db/migrate-runner.js";
 import { ACTIVE_ENGINE_KEYS } from "../../lib/engines/registry.js";
@@ -17,6 +18,7 @@ import { EngineBreakerRegistry } from "../../lib/engines/engine-breaker-registry
 import { CircuitBreaker } from "../../lib/resilience/circuit-breaker.js";
 import { buildQueue } from "../../lib/queue/queue-factory.js";
 import { QUEUE_TOPOLOGY } from "../../lib/queue/topology.js";
+import { EngineHealthService, PER_ENGINE_STATUS_WINDOW_MS } from "./engine-health.service.js";
 
 // STORY-022 — HealthModule (system-architecture.md §5): "Liveness,
 // readiness, circuit-breaker state, queue depth" with `@nestjs/terminus` as
@@ -67,6 +69,7 @@ export class HealthService implements OnModuleDestroy {
   private lastMigrationState: MigrationState = { applied: null, expected: null, matches: false };
   private queuesByName: ReadonlyMap<string, Queue> | undefined;
   private readonly breakers: EngineBreakerRegistry;
+  private readonly engineHealth: EngineHealthService;
 
   constructor(
     @Inject(PG_POOL) private readonly pool: Pool,
@@ -78,6 +81,36 @@ export class HealthService implements OnModuleDestroy {
     @Inject(CACHE_CONNECTION_TOKEN) private readonly cacheConnection: Redis,
   ) {
     this.breakers = new EngineBreakerRegistry(this.cacheConnection);
+    this.engineHealth = new EngineHealthService(this.pool);
+  }
+
+  /**
+   * STORY-031 AC11 - `GET /v1/engines/status`: one entry per active engine. GLOBAL data only (`engines`, `engine_health`, the
+   * breaker), read on the pool like the probes, so the body is the same for every workspace. Unlike the probe's `engines[]` a
+   * failure here is NOT swallowed: an empty list would tell a customer every engine is fine.
+   */
+  async engineStatus(nowMs: number = Date.now()): Promise<EngineStatusResponse> {
+    const engines = await Promise.all(
+      ACTIVE_ENGINE_KEYS.map(async (engineKey): Promise<EngineStatusEntry> => {
+        const [health, breaker] = await Promise.all([this.engineHealth.perEngineStatus(engineKey, nowMs), this.breakers.for(engineKey).detail()]);
+        const status = (ENGINE_CATALOG_STATUSES as readonly string[]).includes(health.status) ? (health.status as EngineStatusEntry["status"]) : "active";
+        return {
+          engine_key: engineKey,
+          status,
+          circuit_state: breaker.state,
+          unavailable_since: breaker.since === null ? null : new Date(breaker.since).toISOString(),
+          window_minutes: PER_ENGINE_STATUS_WINDOW_MS / 60_000,
+          attempts: health.attempts,
+          successes: health.successes,
+          blocks: health.blocks,
+          timeouts: health.timeouts,
+          rate_limited: health.rateLimited,
+          p50_latency_ms: health.p50LatencyMs,
+          p95_latency_ms: health.p95LatencyMs,
+        };
+      }),
+    );
+    return { engines, generated_at: new Date(nowMs).toISOString() };
   }
 
   async onModuleDestroy(): Promise<void> {

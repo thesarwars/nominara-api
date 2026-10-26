@@ -4,6 +4,7 @@ import { Redis } from "ioredis";
 import { loadEnv } from "../../config/env.js";
 import { MIGRATIONS_DIR } from "../../db/migrate-runner.js";
 import { createQueueReaderConnection, queueKeyPrefix } from "../../lib/queue/connection.js";
+import { EnginesStatusController } from "./engines-status.controller.js";
 import { HealthController } from "./health.controller.js";
 import {
   CACHE_CONNECTION_TOKEN,
@@ -41,7 +42,7 @@ function createHealthCacheConnection(url: string): Redis {
 
 @Module({
   imports: [TerminusModule],
-  controllers: [HealthController],
+  controllers: [HealthController, EnginesStatusController],
   providers: [
     HealthService,
     { provide: MIGRATIONS_DIR_TOKEN, useValue: MIGRATIONS_DIR },

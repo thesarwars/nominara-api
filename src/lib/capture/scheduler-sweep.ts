@@ -7,6 +7,7 @@ import { claimDueProjectRefs } from "./scheduler.js";
 import type { EnqueueRollup } from "../queue/handlers/run-rollup-request.js";
 import { reapStaleQueuedRuns } from "./stale-run-reaper.js";
 import { reapStuckRuns } from "./stuck-run-reaper.js";
+import { sweepEngineSkipRefunds } from "./engine-skip-refund-sweep.js";
 
 // NEW-A-13 — the scheduler sweep: the producer `capture.plan` has always
 // declared and nothing ran. OWNER DECISION 2026-10-08, "Option A".
@@ -357,6 +358,12 @@ export class SchedulerSweepRuntime {
           logger.error({ event: "capture.scheduler.reap_stuck_failed", error: error instanceof Error ? error.name : "unknown" });
         });
       }
+      // STORY-031 (owner decision 2026-10-26, 10) - refund the engine-skipped cells of finished paid deep scans, each in its own
+      // tenant transaction that does no network I/O (engine-skip-refund-sweep.ts). After the reapers, so a run the stuck-run
+      // reaper just finalised as partial is settled on this same tick. Best-effort, the same discipline.
+      await sweepEngineSkipRefunds(client, this.clock()).catch((error: unknown) => {
+        logger.error({ event: "capture.scheduler.engine_skip_refund_failed", error: error instanceof Error ? error.name : "unknown" });
+      });
       // STORY-077 review round 2 - the downgrade-notice relay (lib/billing/downgrade-notice-relay.ts), best-effort and
       // after the claim has committed, the same discipline: it must never hold up, or fail, the sweep.
       if (this.enqueueDowngradeNotice !== undefined) {

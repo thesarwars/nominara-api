@@ -24,4 +24,16 @@ export class EngineStatusService {
       this.logger.warn(`failed to mark engine '${engineKey}' degraded: ${(error as Error).message}`);
     }
   }
+
+  /**
+   * STORY-031 AC7 - the ladder's way back: `degraded` -> `active` once the breaker has closed. ONLY from `degraded`: a `disabled`
+   * or `beta` engine is an operator's or the catalog's decision and is never touched. Idempotent and best-effort like the mark.
+   */
+  async markRecovered(engineKey: EngineKey): Promise<void> {
+    try {
+      await this.pool.query("UPDATE engines SET status = 'active' WHERE key = $1 AND status = 'degraded'", [engineKey]);
+    } catch (error) {
+      this.logger.warn(`failed to mark engine '${engineKey}' recovered: ${(error as Error).message}`);
+    }
+  }
 }

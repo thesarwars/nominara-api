@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { OPEN_ENGINE_GATE } from "../support/open-engine-gate.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client } from "pg";
@@ -169,6 +170,7 @@ describe("SCANFIX · a cell that exhausts its retries is a terminal failure, and
     const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
     const handler = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
+      engineGate: OPEN_ENGINE_GATE,
       realtime: publisher(emitted),
       enqueueParse: () => Promise.resolve(),
       // No spend meter is wanted here (and building the real one would dial a Valkey).

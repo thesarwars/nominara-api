@@ -14,10 +14,14 @@ import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { engineKeySchema } from "../../engines/contract.js";
 import { SpendMeter, ValkeySpendMeterStore } from "../../engines/spend-meter.js";
-import type { CaptureEngineGate } from "../../engines/capture-engine-gate.js";
+import { BreakerCaptureEngineGate, EngineRedelayError, type CaptureEngineGate, type EngineUnavailableSkipCode } from "../../engines/capture-engine-gate.js";
+import { EngineBreakerRegistry } from "../../engines/engine-breaker-registry.js";
+import { CaptureFailureError, captureFailureCodeSchema } from "../../engines/failure-taxonomy.js";
+import { RefillReductionTracker, ValkeyRefillReductionStore } from "../../engines/refill-reduction.js";
+import { EngineHealthService } from "../../../modules/health/engine-health.service.js";
 import { rawObjectStores, type BoundRawObjects, type RawObjectStores } from "../../capture/raw-object-store.js";
 import type { ObjectStoragePort } from "../../storage/storage.port.js";
-import { commitCell, fetchCell, recordExhaustedCell, settledCell, type CaptureCellInput, type CaptureCellOutcome, type CellFetched } from "../../capture/execute-cell.js";
+import { commitCell, engineSkippedCell, fetchCell, recordExhaustedCell, settledCell, type CaptureCellInput, type CaptureCellOutcome, type CellFetched } from "../../capture/execute-cell.js";
 import { finalizeRun } from "../../capture/finalize-run.js";
 import { readRunProgress } from "../../capture/run-progress.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
@@ -97,6 +101,24 @@ export function buildSpendMeter(
 }
 
 /**
+ * STORY-031 - the production engine gate: the shared breaker and the refill-reduction state on the CACHE instance (STORY-031 D6,
+ * where the canary's breaker and the lease's bucket already live), and `engine_health` through the worker's pool (a global
+ * table, no tenant context). The connection rejects rather than blocks, and every read fails open (D19).
+ */
+export function buildCaptureEngineGate(context: QueueHandlerContext, onError: (message: string) => void = () => undefined): CaptureEngineGate {
+  const redis = new Redis(context.env.VALKEY_CACHE_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
+  redis.on("error", (error) => onError(`engine gate connection error: ${error.message}`));
+  return new BreakerCaptureEngineGate({
+    breakers: new EngineBreakerRegistry(redis),
+    health: new EngineHealthService(context.pool),
+    refill: new RefillReductionTracker(new ValkeyRefillReductionStore(redis)),
+  });
+}
+
+/** §11: `engine.degraded` is coalesced at <= 1 / min / engine (here per workspace too: each workspace is its own audience). */
+const ENGINE_DEGRADED_COALESCE_MS = 60_000;
+
+/**
  * The in-flight claim's lifetime. It covers the longest vendor call (the Gemini adapter times out at 30 s) plus the object PUT and
  * the commit, and it is shorter than the retry ladder's reach (5 s, 15 s, 45 s, 120 s), so a delivery that lost the claim is retried
  * after the winner is done, or after a winner that died has let it lapse.
@@ -123,6 +145,8 @@ interface ExecutePrepared {
 
 type ExecuteFetched =
   | { readonly kind: "settled" }
+  /** STORY-031: the engine could not take the cell (breaker open on quota, or degraded). A row is written; the vendor was never called. */
+  | { readonly kind: "engine_skipped"; readonly cell: CellFetched; readonly errorCode: EngineUnavailableSkipCode; readonly since: Date }
   | { readonly kind: "fetched"; readonly cell: CellFetched; readonly claim: { readonly key: string; readonly token: string } }
   | { readonly kind: "exhausted"; readonly error: unknown };
 
@@ -150,6 +174,8 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
   const rawStores = (): RawObjectStores => (stores ??= rawObjectStores(context.env, deps?.storagePort));
   let spendMeter: SpendMeter | undefined = deps?.spendMeter;
   const meter = (): SpendMeter => (spendMeter ??= buildSpendMeter(context.env, (message) => logger.warn(message)));
+  let engineGate: CaptureEngineGate | undefined = deps?.engineGate;
+  const gate = (): CaptureEngineGate => (engineGate ??= buildCaptureEngineGate(context, (message) => logger.warn(message)));
   const ceilingReached = async (engineKey: string): Promise<boolean> => {
     const key = engineKeySchema.safeParse(engineKey);
     if (!key.success) return false;
@@ -281,10 +307,14 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     };
     // IDEMPOTENT PER CELL, BEFORE ANY VENDOR CALL: a cell an earlier delivery settled is replayed, not captured again.
     const settled = await settledCell(tx, cellInput);
+    // STORY-031 AC9 - the priority flag the spend hard stop reads, from the prompt row (RLS-scoped; the signed payload is unchanged).
+    const isPriority =
+      settled === undefined &&
+      (await tx.query<{ is_priority: boolean }>("SELECT is_priority FROM tracked_prompts WHERE id = $1", [payload.promptId])).rows[0]?.is_priority === true;
     // STORY-181: bound HERE, inside the job's tenant context (it only reads the workspace id; no I/O), so the raw object lands in this
     // workspace's prefix and nowhere else. Not bound for a settled cell: a replay stores nothing.
     const rawObjects = settled === undefined ? rawStores().bindForWrite() : undefined;
-    return { payload, runStartedAt: runRow.started_at, cellInput, settled, rawObjects };
+    return { payload, runStartedAt: runRow.started_at, cellInput: isPriority ? { ...cellInput, isPriority } : cellInput, settled, rawObjects };
   };
 
   // ADR-0003 RUN: NO transaction and NO pooled client. The vendor call, the spend meter and the raw-object PUT happen here.
@@ -292,6 +322,17 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     if (prepared.settled !== undefined) return { kind: "settled" };
     const { cache: liveCache } = connections();
     const { cellInput, payload } = prepared;
+    const engineKey = engineKeySchema.safeParse(payload.engineKey);
+
+    // STORY-031 AC3/AC7/AC8 - THE BREAKER IS ASKED BEFORE ANY VENDOR CALL (capture-engine-gate.ts says what each answer means).
+    // Outside the try below on purpose: a re-delay is not a failed attempt, so it must never become the final attempt's
+    // exhausted record. An engine key the registry does not know is left to `fetchCell`, which records it `blocked`.
+    if (engineKey.success) {
+      const admission = await gate().admit(engineKey.data);
+      if (admission.kind === "redelay") throw new EngineRedelayError(engineKey.data, admission.delayMs);
+      if (admission.kind === "skip") return { kind: "engine_skipped", cell: engineSkippedCell(admission.errorCode), errorCode: admission.errorCode, since: admission.since };
+    }
+
     // THE IN-FLIGHT CLAIM. The cell's advisory lock used to span the vendor call, so two deliveries of one cell (a stalled-job
     // redelivery, an admin replay) paid once. A transaction can no longer span the call, so the same guarantee is a short-lived claim
     // on the cache: the loser throws CellInFlightError (retried later, by which time the winner's row exists) instead of paying twice.
@@ -307,7 +348,24 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
         incrementCounter("nominara_capture_cell_claim_lost_total", { engine_key: payload.engineKey });
         throw new CellInFlightError();
       }
-      const cell = await fetchCell(cellInput, { recordSpend, ceilingReached, ...(prepared.rawObjects !== undefined ? { rawObjects: prepared.rawObjects } : {}) });
+      let cell: CellFetched;
+      try {
+        cell = await fetchCell(cellInput, { recordSpend, ceilingReached, ...(prepared.rawObjects !== undefined ? { rawObjects: prepared.rawObjects } : {}) });
+      } catch (error) {
+        // STORY-031 AC3/AC4 - a retryable vendor failure is an attempt too: the breaker and the health buckets hear of it before
+        // the retry ladder does. A non-vendor error (storage, an unclassified fault) is not an engine outcome and is not recorded.
+        if (engineKey.success && error instanceof CaptureFailureError) await gate().record(engineKey.data, { outcome: "failure", code: error.code });
+        throw error;
+      }
+      // STORY-031 AC3/AC4/AC8 - every answered or terminally failed vendor call feeds the breaker (quota_exhausted opens it at once,
+      // EC-08) and `engine_health`. A `blocked` cell never reached the vendor (disabled engine, spend ceiling) and is not an attempt.
+      if (engineKey.success) {
+        if (cell.outcome.kind === "captured") await gate().record(engineKey.data, { outcome: "success", latencyMs: cell.outcome.latencyMs });
+        if (cell.outcome.kind === "failed") {
+          const code = captureFailureCodeSchema.safeParse(cell.outcome.errorCode);
+          if (code.success) await gate().record(engineKey.data, { outcome: "failure", code: code.data });
+        }
+      }
       return { kind: "fetched", cell, claim };
     } catch (error) {
       if (claimed) await liveCache.deleteIf(claim.key, claim.token).catch(() => undefined);
@@ -342,7 +400,7 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
         return;
       }
       try {
-        outcome = fetched.kind === "fetched" ? await commitCell(tx, liveCache, cellInput, fetched.cell) : await recordExhaustedCell(tx, cellInput, fetched.error);
+        outcome = fetched.kind === "exhausted" ? await recordExhaustedCell(tx, cellInput, fetched.error) : await commitCell(tx, liveCache, cellInput, fetched.cell);
       } catch (error) {
         // The claim is released so this job's own retry is not locked out by its failed attempt.
         if (fetched.kind === "fetched") await liveCache.deleteIf(fetched.claim.key, fetched.claim.token).catch(() => undefined);
@@ -365,6 +423,29 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       }
     }
     const runRow = { started_at: prepared.runStartedAt };
+
+    // STORY-031 AC7/AC11 - THE ENGINE.DEGRADED EVENT, published to THIS workspace when one of its cells is skipped because the
+    // engine is unavailable (§11: `{engine_key, circuit_state, since, affected_projects}`). Published here rather than by the ladder
+    // evaluator because only here is the tenant known: `affected_projects` is this workspace's own unfinished runs on the engine,
+    // counted under RLS. Coalesced across processes per workspace and engine (SET NX, like run.progress); an unreachable cache
+    // emits. Fire-and-forget; the authoritative read is GET /engines/status.
+    if (fetched.kind === "engine_skipped") {
+      const won = await liveCache
+        .set(`rt:engine-degraded:${payload.workspaceId}:${payload.engineKey}`, "1", { ttlMs: ENGINE_DEGRADED_COALESCE_MS, onlyIfAbsent: true })
+        .catch(() => true);
+      if (won) {
+        const affected = await tx.query<{ n: string }>(
+          "SELECT count(DISTINCT project_id)::text AS n FROM capture_runs WHERE status IN ('queued','running') AND $1 = ANY(engine_keys)",
+          [payload.engineKey],
+        );
+        livePublisher.toWorkspace(payload.workspaceId, "engine.degraded", {
+          engine_key: payload.engineKey,
+          circuit_state: "open",
+          since: fetched.since.toISOString(),
+          affected_projects: Number(affected.rows[0]?.n ?? 0),
+        });
+      }
+    }
 
     // E2E-B6a — `captured_cells` counts LIVE captures only (captures-and-facts.md).
     // An atomic increment, not a recount: concurrent cells each run in their own

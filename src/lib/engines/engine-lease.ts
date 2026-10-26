@@ -1,6 +1,7 @@
 import { DelayedError, type Job } from "bullmq";
 import { engineTokenBucketsSchema, type EngineTokenBuckets } from "../../config/env.schema.js";
 import { engineKeySchema, type EngineKey } from "./contract.js";
+import { EngineRedelayError } from "./capture-engine-gate.js";
 import { CaptureFailureError } from "./failure-taxonomy.js";
 import type { TokenBucket, TokenBucketConfig } from "./token-bucket.js";
 
@@ -89,7 +90,9 @@ export function withEngineLease(
 
   return async (job: Job, token?: string): Promise<unknown> => {
     const engineKey = options.resolveEngineKey(job);
-    const config = options.configFor(engineKey);
+    const base = options.configFor(engineKey);
+    // STORY-031 AC6 - EC-06 stage 2: while a `rate_limited` reduction is active the bucket refills at half the rate.
+    const config = options.refillReduction === undefined ? base : await options.refillReduction.effectiveConfig(engineKey, base);
     const lease = await options.tokenBucket.tryAcquire(engineKey, config);
 
     if (!lease.granted) {
@@ -97,11 +100,16 @@ export function withEngineLease(
       throw new DelayedError();
     }
 
-    if (options.rateLimitDeferral === undefined) return processor(job);
-
     try {
       return await processor(job);
     } catch (error) {
+      // STORY-031 AC3 - EC-06 stage 4: the engine's breaker is open, so the cell is RE-QUEUED with the delay the handler names,
+      // through the same DelayedError path a denied lease takes: no attempt spent, no dead-letter entry, no 429 deferral counted.
+      if (error instanceof EngineRedelayError) {
+        await job.moveToDelayed(clock() + error.delayMs, token);
+        throw new DelayedError();
+      }
+      if (options.rateLimitDeferral === undefined) throw error;
       // SCANFIX D3 - A 429 IS "COME BACK LATER", NOT A FAILED ATTEMPT. Defer the job by the vendor's own
       // Retry-After (or one quota window when it named none) through the same DelayedError path a denied
       // lease takes: no DLQ entry, `attemptsMade` untouched. Bounded - the count rides in `job.progress`
