@@ -6,6 +6,7 @@ import { matchEntities, type AliasEntry } from "../parser/entity-matcher.js";
 import { refreshProjectSourceIndex } from "../rollup/refresh-project-source-index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
+import { nameUuid } from "../ids/name-uuid.js";
 
 // NEW-C-15 / STORY-054 AC4 + AC11 (scenarios 5, 6, 7) — brand presence on a cited
 // domain is VERIFIED BY FETCHING the cited URL and matching it against the
@@ -241,8 +242,10 @@ export async function verifyProjectSourcePresence(tx: ClientBase, projectId: str
       [projectId, candidate.sourceDomainId, outcome.status === "present", now],
     );
     wrote = true;
-    if (outcome.status === "present") summary.present += 1;
-    else summary.absent += 1;
+    if (outcome.status === "present") {
+      summary.present += 1;
+      await pinSourceSeeded(tx, row.workspace_id, projectId, candidate, now);
+    } else summary.absent += 1;
     incrementCounter("nominara_sources_presence_checks_total", { outcome: outcome.status });
   }
   for (const [reason, count] of Object.entries(skipped)) {
@@ -263,4 +266,34 @@ export async function verifyProjectSourcePresence(tx: ClientBase, projectId: str
     skipped,
   });
   return summary;
+}
+
+/**
+ * STORY-066 AC8 — `source_seeded` (`scoring-models.md` §13: "completion of an
+ * authority task with a verified target URL"). A completed authority task
+ * whose target domain this run VERIFIED by fetch to carry the brand pins the
+ * Growth Map, at the verification — the moment the seeding became a fact.
+ *
+ * ONE PIN PER TASK FOR EVER, named from the task (`source_type` `system`: the
+ * task's own `(task, id)` source is its `task_completed` pin). A later
+ * re-verification past the cache hits the unique index and pins nothing more.
+ *
+ * Titled by the DOMAIN, never the task: a task born of a displacement names a
+ * competitor in its title, and the portal's competitor exclusion recognises
+ * that only on a `task`-sourced pin.
+ */
+async function pinSourceSeeded(tx: ClientBase, workspaceId: string, projectId: string, source: PresenceCandidate, at: Date): Promise<void> {
+  const tasks = await tx.query<{ id: string }>(
+    `SELECT id::text FROM tasks
+      WHERE project_id = $1 AND source_domain_id = $2 AND kind = 'authority' AND status = 'done' AND deleted_at IS NULL`,
+    [projectId, source.sourceDomainId],
+  );
+  for (const task of tasks.rows) {
+    await tx.query(
+      `INSERT INTO milestones (workspace_id, project_id, occurred_at, kind, title, severity, source_type, source_id, visible_in_portal)
+       VALUES ($1, $2, $3, 'source_seeded', $4, 'positive', 'system', $5, true)
+       ON CONFLICT (source_type, source_id) WHERE source_id IS NOT NULL DO NOTHING`,
+      [workspaceId, projectId, at, `Source seeded: ${source.domain}`, nameUuid("source_seeded", projectId, task.id)],
+    );
+  }
 }

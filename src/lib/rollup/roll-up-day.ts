@@ -222,11 +222,18 @@ export async function upsertCrossEngineRows(
   }
 
   for (const [, rows] of byEntity) {
-    const weightTotal = rows.reduce((total, row) => total + Number(row.weight), 0);
-    const cellsTotal = rows.reduce((total, row) => total + Number(row.cells_total), 0);
     const cellsPresent = rows.reduce((total, row) => total + Number(row.cells_present), 0);
     const mentionsTotal = rows.reduce((total, row) => total + Number(row.mentions_total), 0);
-    const liveCells = rows.reduce((total, row) => total + Number(row.live_cells), 0);
+    const blended = blendEngineParts(
+      rows.map((row) => ({
+        weight: Number(row.weight),
+        cellsTotal: Number(row.cells_total),
+        sovWeighted: Number(row.sov_weighted),
+        visibilityScore: Number(row.visibility_score),
+        liveCells: Number(row.live_cells),
+      })),
+    );
+    const cellsTotal = blended.cellsTotal;
 
     // Weighted means, over the engines that HAVE a value. An engine whose
     // sentiment is null contributed no mentions, and averaging it in as zero
@@ -242,7 +249,7 @@ export async function upsertCrossEngineRows(
         cellsTotal,
         cellsPresent,
         presenceRate: cellsTotal === 0 ? 0 : cellsPresent / cellsTotal,
-        sov: weightTotal === 0 ? 0 : rows.reduce((total, row) => total + Number(row.sov_weighted), 0) / weightTotal,
+        sov: blended.sov,
         avgProminence: weightedMean(rows.map((row) => ({ value: Number(row.visibility_score), weight: Number(row.weight) }))) ?? 0,
         avgRankPosition: null,
         mentionsTotal,
@@ -260,15 +267,47 @@ export async function upsertCrossEngineRows(
             : rows.reduce((total, row) => total + Number(row.cit_owned_pw), 0) /
               rows.reduce((total, row) => total + Number(row.cit_pw_total), 0),
         // §3's own cross-engine formula, from the scoring library.
-        visibilityScore:
-          blendAcrossEngines(rows.map((row) => ({ score: Number(row.visibility_score), engineWeight: Number(row.weight) }))) ?? 0,
+        visibilityScore: blended.visibilityScore,
         renderingQuality: weightedMean(
           renderingRows.map((row) => ({ value: Number(row.rendering_quality), weight: Number(row.weight) })),
         ),
-        liveCaptureRatio: cellsTotal === 0 ? 1 : liveCells / cellsTotal,
+        liveCaptureRatio: blended.liveCaptureRatio,
       },
     ]);
   }
+}
+
+/** One engine's contribution to a cross-engine blend. `sovWeighted` is `sov · weight`. */
+export interface EnginePart {
+  readonly weight: number;
+  readonly cellsTotal: number;
+  readonly sovWeighted: number;
+  readonly visibilityScore: number;
+  readonly liveCells: number;
+}
+
+/**
+ * §14's cross-engine blend of the four figures a chart point carries, from the
+ * per-engine figures. ONE implementation: the stored `engine_key='all'` row
+ * and STORY-066's hourly view (which has no stored row) both call it, so an
+ * hour and a day can never be blended by two different formulas.
+ */
+export function blendEngineParts(parts: readonly EnginePart[]): {
+  cellsTotal: number;
+  sov: number;
+  visibilityScore: number;
+  liveCaptureRatio: number;
+} {
+  const weightTotal = parts.reduce((total, part) => total + part.weight, 0);
+  const cellsTotal = parts.reduce((total, part) => total + part.cellsTotal, 0);
+  const liveCells = parts.reduce((total, part) => total + part.liveCells, 0);
+  return {
+    cellsTotal,
+    sov: weightTotal === 0 ? 0 : parts.reduce((total, part) => total + part.sovWeighted, 0) / weightTotal,
+    // §3's own cross-engine formula, from the scoring library.
+    visibilityScore: blendAcrossEngines(parts.map((part) => ({ score: part.visibilityScore, engineWeight: part.weight }))) ?? 0,
+    liveCaptureRatio: cellsTotal === 0 ? 1 : liveCells / cellsTotal,
+  };
 }
 
 function weightedMean(parts: readonly { value: number; weight: number }[]): number | null {

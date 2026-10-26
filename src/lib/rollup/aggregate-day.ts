@@ -264,6 +264,7 @@ export async function aggregateRange(
   toDate: string,
   timezone: string,
   scoringVersion: string | null,
+  instants?: { readonly from: string; readonly to: string },
 ): Promise<DayAggregate[]> {
   const result = await tx.query<Record<string, string | null>>(
     `WITH day_cells AS (
@@ -281,6 +282,13 @@ export async function aggregateRange(
                 ON pe.project_id = c.project_id AND pe.engine_key = c.engine_key
         WHERE c.project_id = $1
           AND (c.captured_at AT TIME ZONE $3)::date BETWEEN $2::date AND $4::date
+          -- STORY-066 AC1 — the optional [from, to) INSTANT bounds on the raw
+          -- partition key. The date predicate above is an expression over
+          -- captured_at and cannot prune a partition; these can, and the 24h
+          -- view relies on them to touch only the one or two partitions a day
+          -- spans. Unbound (NULL) for every other caller.
+          AND ($6::timestamptz IS NULL OR c.captured_at >= $6::timestamptz)
+          AND ($7::timestamptz IS NULL OR c.captured_at <  $7::timestamptz)
           -- A FAILED CELL IS NOT A MEASUREMENT. §2.5 excludes it from both
           -- numerator and denominator; a refusal ('parsed' with the flag) is
           -- data and stays in. The predicate is measurementStatusSql(), declared
@@ -393,7 +401,7 @@ export async function aggregateRange(
             -- neither owned nor foreign.
             AND f.http_status IS NOT NULL
        ) cit`,
-    [projectId, fromDate, timezone, toDate, scoringVersion],
+    [projectId, fromDate, timezone, toDate, scoringVersion, instants?.from ?? null, instants?.to ?? null],
   );
 
   return result.rows.map((row) => ({

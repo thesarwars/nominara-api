@@ -96,6 +96,34 @@ export async function engineDataSourcesForDates(
 }
 
 /**
+ * STORY-066 AC1 — `engineDataSourcesForDates` over a [from, to) INSTANT range,
+ * for the 24h view. The predicate is on the raw partition key, so the read
+ * prunes to the partitions the range spans; the date form above cannot.
+ */
+export async function engineDataSourcesForInstants(
+  tx: ClientBase,
+  projectId: string,
+  fromInstant: string,
+  toInstant: string,
+  scoringVersion: string | null,
+): Promise<Map<string, DataSource>> {
+  const result = await tx.query<CountRow>(
+    `SELECT c.engine_key,
+            count(*) FILTER (WHERE c.normalizer_version <> $4)::text AS live,
+            count(*) FILTER (WHERE c.normalizer_version = $4)::text  AS demo
+       FROM answer_captures c
+      WHERE c.project_id = $1
+        AND ${measurementStatusSql()}
+        AND c.captured_at >= $2::timestamptz
+        AND c.captured_at <  $3::timestamptz
+        AND ($5::text IS NULL OR c.scoring_version = $5::text)
+      GROUP BY c.engine_key`,
+    [projectId, fromInstant, toInstant, DEMO_SEED_MARKER, scoringVersion],
+  );
+  return toMap(result.rows);
+}
+
+/**
  * `engineDataSourcesForDates` for MANY projects in one statement (NEW-B-2: the
  * Command Center matrix must not cost a query per project). Same predicate and
  * date boundary; a project with nothing measured maps to an empty Map, never

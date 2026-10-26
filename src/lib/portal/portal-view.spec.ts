@@ -21,7 +21,7 @@ function growth(): GrowthMapResponse {
     ],
     engines: [{ engine_key: "gemini", data_source: "live" }],
     milestones: [],
-    annotations: { data_gaps: [], cadence_changes: [] },
+    annotations: { data_gaps: [], cadence_changes: [], scoring_version_changes: [] },
     summary: { visibility_start: 40, visibility_end: null, visibility_delta: null, best_engine: null, worst_engine: null, competitor_gap_start: 10, competitor_gap_end: null },
     point_count: 8,
   };
