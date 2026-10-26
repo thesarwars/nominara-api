@@ -73,7 +73,8 @@ Owner decision 2026-10-26 (10) is an exception to "a partial run is charged in f
 10. **Files outside the plan's `files_touched`** (disclosed): `src/lib/credits/engine-skip-refund.ts`, `src/lib/capture/engine-skip-refund-sweep.ts`, `src/lib/capture/scheduler-sweep.ts`, `src/lib/engines/capture-engine-gate.ts`, `src/lib/rollup/aggregate-day.ts` (new named rule), `test/unit/analytics/measurement-status-shared.spec.ts` (pins the new rule by value), `src/modules/health/engines-status.controller.ts`, `test/support/open-engine-gate.ts` and the seven existing capture specs that now inject it; round 1 adds
    `test/integration/engine-ladder-status-ownership.spec.ts`; round 2 adds `test/integration/engine-skip-refund-sweep-rls.spec.ts`. Client: `lib/api/engines.ts`, `lib/api/contract.ts`,
    `components/project/useDegradedEngines.ts`, `lib/query/keys.ts`, `lib/query/realtime-map.ts`, `lib/demo/routes/engines.ts`,
-   `lib/demo/routes.ts`, `tests/guards.test.ts` (comment), `tests/shell-query-wiring.test.ts`.
+   `lib/demo/routes.ts`, `tests/guards.test.ts` (comment), `tests/shell-query-wiring.test.ts`; round 3 adds
+   `components/shell/RealtimeBridge.tsx`, `lib/stores/useLiveStore.ts`, `lib/copy/engine-status.ts`, `tests/engine-status-recovery.test.tsx`.
 11. **The refund sweep refuses an RLS-bound connection** (review round 2). Its candidate query runs with no tenant context; on a
    NOBYPASSRLS role under FORCE RLS it found nothing and returned "0 refunded" while a refund was owed (proven by
    `test/integration/engine-skip-refund-sweep-rls.spec.ts` against `nominara_worker`). The scheduler tick already refused such a
@@ -91,13 +92,31 @@ Owner decision 2026-10-26 (10) is an exception to "a partial run is charged in f
    "degraded — <engine>" for `status = degraded` or a realtime `engine.degraded` push, and "delayed — <engine>" for a breaker that is
    `open` while the catalog still says `active`. A realtime push no longer outlives a newer status read that reports the engine
    healthy (the API publishes no recovery event; the read is the authority once it is newer than the push).
+   Round 3: "newer" is a shared observation counter, not two wall-clock reads; the bridge records the push before the frame's
+   own re-read starts, so that re-read settles a quota push on an `active` engine on "delayed"; and while any warning shows the
+   client re-reads `GET /engines/status` every 30 s (its max-age), not at all otherwise, so recovery is observed without a reload.
+   **Owner to confirm (new customer-facing word):** EC-06 defines no user-visible stage-4 state. Either confirm "delayed — <engine>"
+   (now in `lib/copy/engine-status.ts`) and add it to EC-06 / the ui-ux vocabulary, or rule that stage 4 shows nothing.
+   **Wording gap, owner to rule:** a QUOTA-opened breaker (EC-08) on an `active` engine also reads "delayed", although its cells
+   are skipped `blocked` / `quota_exhausted` and refunded, not re-queued. The status contract carries no breaker reason, so the
+   client cannot tell the two apart; showing quota as "degraded"/"unavailable" needs a `circuit_reason` field (contract change).
+14. **The engine-skip settlement scopes its reads to the workspace** (review round 3). Because the sweep refuses an RLS-bound
+   connection, the per-candidate tenant transaction runs on a role that bypasses RLS: the tenant context is defence in depth
+   there, not the boundary. The `capture_runs` FOR UPDATE read and the `answer_captures` count now carry `workspace_id`, so a
+   workspace that does not own the run settles nothing (`engine-skip-refund-sweep-rls.spec.ts`).
+15. **The pg_roles visibility check is not extracted into a shared helper** (review round 3, minor, declined here). Six copies
+   exist (`scheduler-sweep`, `rollup-sweep`, `unverified-sweep`, `notify-sweep`, `audit-verify`, this sweep); five are on main in
+   files outside STORY-031's scope, each with its own error type and counter. A shared `assertOwnerConnectionCanSee` belongs in
+   its own refactor story touching all six, with their specs re-run; recorded as a follow-up.
 
 ## 6. Not done here
 
 - AC2 host limiter in the crawl handlers (crawl.discover, crawl.audit, source.verify_presence): deferred out of the capture-path
   stream, recorded in `plans-7day/followups-2026-10-19-d1.md` for the orchestrator/owner to schedule as its own item.
 - Owner confirmation still needed for section 5 items 3 (hard stop as a uniform priority filter) and 4 (refund scope excludes
-  spend-ceiling-blocked cells), item 7 (refund after a cycle roll) and item 12 (engines excluded at trigger time).
+  spend-ceiling-blocked cells), item 7 (refund after a cycle roll), item 12 (engines excluded at trigger time) and item 13 (the
+  "delayed" stage-4 word, and quota-opened breakers reading "delayed").
+- Follow-up story: one shared owner-connection visibility check for the six sweeps (section 5, item 15).
 - Second-engineer review by `dangerous-area-auditor` (credit ledger refund, the sweep's per-candidate tenant context, breaker and
   `engines.status` ownership) is still outstanding.
 - After the API merges: regenerate the client copy (`client:generate`, build) and refresh the client's `clientDistSha256`.
