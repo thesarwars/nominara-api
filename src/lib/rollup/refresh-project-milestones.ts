@@ -127,6 +127,18 @@ async function pinPromptSetChange(tx: ClientBase, workspaceId: string, projectId
   // `before` is the set that existed when the day began; a prompt counts as
   // REMOVED that day when it was deleted, or archived (the archive is the
   // status change, stamped by `updated_at`), during it.
+  //
+  // ⚠ KNOWN LIMITS, open for an owner decision (STORY-066 review round 1):
+  //   1. `tracked_prompts` has no status-change timestamp, so `updated_at`
+  //      stands in for the archive time. `touch_updated_at` bumps it on ANY
+  //      later update of an archived row, so such an update moves the
+  //      prompt's "removed" day, and a re-roll of that later day can pin a
+  //      spurious change (and a re-roll of an earlier day counts the prompt
+  //      in `before`). The fix is a schema change (a status-change timestamp
+  //      or record), which the story does not name.
+  //   2. `paused` (a downgrade or retention pause) is not counted as a
+  //      removal, and paused prompts stay in `before`. Whether the "prompt
+  //      set" of §13 is the measured (active) set is not settled.
   const counts = await tx.query<{ before: number; added: number; removed: number; last_change: Date | null }>(
     `WITH d AS (SELECT ${DAY_BOUNDS}),
      p AS (
