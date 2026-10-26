@@ -1,4 +1,5 @@
 import { Logger } from "@nestjs/common";
+import { OPEN_ENGINE_GATE } from "../support/open-engine-gate.js";
 import type { Job } from "bullmq";
 import { Redis } from "ioredis";
 import { Pool } from "pg";
@@ -225,6 +226,7 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     const parseSeen = new Set<string>();
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
+      engineGate: OPEN_ENGINE_GATE,
       realtime: publisher,
       ...(opts.spendMeter !== undefined ? { spendMeter: opts.spendMeter } : {}),
       // The real queue dedupes on idempotencyKey `parse:<resultId>`; so does this one.
@@ -379,6 +381,7 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
     const rollupRequests: Array<{ workspaceId: string; payload: Record<string, unknown> }> = [];
     const execute = createCaptureExecuteHandler(context, {
       cache: new InMemoryCacheAdapter(),
+      engineGate: OPEN_ENGINE_GATE,
       realtime: publisher,
       enqueueParse: async () => undefined,
       enqueueRollup: async (_q, workspaceId, payload) => {

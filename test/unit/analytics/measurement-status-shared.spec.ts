@@ -196,6 +196,9 @@ describe("STORY-152 · answer_captures.status has named rules and no hand-writte
     hasFactsStatusSql: "c.status = 'parsed'",
     // STORY-032 AC7 — the reused (L1/L2) rows. They stay `skipped`; see the rule's own comment.
     reusedStatusSql: "c.status = 'skipped'",
+    // STORY-031 — the never-sent cell. An equality, NOT the non-measurement list: the engine-skip refund pairs it with the skip
+    // error codes, and a `failed` row can carry `quota_exhausted` too (the call that hit the quota, which is not refunded).
+    blockedStatusSql: "c.status = 'blocked'",
   };
 
   it("⚠ every exported rule is pinned by value — a new one cannot arrive unpinned", () => {

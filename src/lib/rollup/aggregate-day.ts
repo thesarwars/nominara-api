@@ -252,6 +252,19 @@ export function reusedStatusSql(statusColumn = "c.status"): string {
 }
 
 /**
+ * "This cell was never sent: we could not ask" — STORY-031. The status of a cell refused before any vendor call (a disabled
+ * engine, the spend hard stop, and the engine-unavailable skips: a quota-opened breaker, a degraded engine).
+ *
+ * ⚠ A SEVENTH QUESTION, AND AN EQUALITY: it names exactly one status, and it is deliberately NOT `nonMeasurementStatusSql`. The
+ * engine-skip refund (credits/engine-skip-refund.ts) pairs it with the skip `error_code`s, and a `failed` row can carry the same
+ * code (`quota_exhausted` on the call that HIT the quota, which reached the vendor and is not refunded). Widening this to the
+ * non-measurement list would refund that call too.
+ */
+export function blockedStatusSql(statusColumn = "c.status"): string {
+  return `${statusColumn} = 'blocked'`;
+}
+
+/**
  * `scoringVersion` — STORY-136 AC9. When given, only rows stamped with that version are read: a capture, and each of
  * its mentions, written under another scoring version is not part of a score reported under this one. `null` (never
  * a default: callers say it) reads every version; the scorecards, panel and rollup pass the library's

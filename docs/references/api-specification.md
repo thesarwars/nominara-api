@@ -204,6 +204,7 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | `GET` | `/results/{id}/raw` | `tracking:read` | 302 to a 60-second pre-signed URL (STORY-181; `Location` header, `Cache-Control: no-store`; the body is the ordinary envelope with `data: null`, because `@NoEnvelope` is reserved for the health probes). `404 not_found` when the capture has no stored raw object (captured before raw objects existed, or a reused L1/L2 row); `507 retention_exceeded` past the plan's raw-capture retention; a stored key outside the caller's workspace is refused (a security event, `500`) and never resolved |
 | `POST` | `/results/{id}/reparse` ✚ | `tracking:trigger`, and the owner or admin role | **STORY-034.** Re-runs the parser on the stored raw object (the dual-written `payload` only for a capture that has none), **saves** the corrected facts, marks the capture's workspace-local date dirty for the rollup, charges **0 credits**, audited (`result.reparsed`). Requires `Idempotency-Key`; no body. Returns `{result_id, scoring_version, changed, credits_charged: 0, before, after}`, each snapshot being the capture's figures plus one entry per entity. `404` / `403` (not owner or admin, or `project_out_of_scope`) / `409 conflict` (the stored answer changed while starting) / `422 precondition_unmet` (a cell that was not captured, a refusal, a reused row with no text of its own, or a stored raw object that is missing) / `507 retention_exceeded`. Citations are not re-fetched: each keeps its recorded resolution |
 | `GET` | `/projects/{id}/matrix` | `tracking:read` | prompt × engine grid |
+| `GET` | `/engines/status` | `workspace:read` (any member) | **Per-engine status, so a customer can tell a platform problem from a vendor one (STORY-031 AC11).** `{engines[], generated_at}`, one entry per active engine: `engine_key`, `status` (`engines.status`), `circuit_state` (the live breaker), `unavailable_since` (when the breaker left `closed`; null while closed), `window_minutes` (60) with `attempts`, `successes`, `blocks`, `timeouts`, `rate_limited` from `engine_health`, and `p50_latency_ms` / `p95_latency_ms` from the latest bucket (null when none was observed). Global data only, no tenant field; `Cache-Control: private, max-age=30`. The client reads it on first paint and again on each `engine.degraded` event (§11) |
 
 ### Analytics
 
@@ -287,14 +288,15 @@ One resource family for all six tools. `tool_key` selects behaviour; lifecycle, 
 
 | Method | Path | Permission | Notes |
 |---|---|---|---|
-| `GET`/`PUT` | `/agency/theme` ⛨ | `agency:branding` | contrast validated server-side on save |
+| `GET`/`PUT` | `/agency/theme` ⛨ | `agency:branding` | contrast validated server-side on save. The theme carries `email_from_name` (the display name on report email) and `email_reply_to` (STORY-100, owner decision 2026-10-26: nullable, no control character, ≤ 254 characters; `Reply-To` is **omitted** when null). Both are served to the agency editor only, never to a portal read. On `PUT` an omitted field keeps its value and `null` clears it |
 | `POST` | `/agency/theme/assets` ⛨ | `agency:branding` | pre-signed upload, ≤ 2 MB, PNG/SVG/WebP, SVG sanitised |
 | `GET`/`POST`/`DELETE` | `/agency/domains` ↑ ⛨ | `agency:custom_domain` | returns CNAME and TXT records |
 | `POST` | `/agency/domains/{id}/verify` | `agency:custom_domain` | requires **both** records |
 | `GET`/`POST` | `/share-tokens` ✚ ⛨ | `share_token:mint` | secret returned once |
 | `PATCH`/`DELETE` | `/share-tokens/{id}` | `share_token:revoke` | revocation is immediate |
 | `GET` | `/share-tokens/{id}/views` | `share_token:mint` | access telemetry |
-| `GET`/`POST`/`PATCH`/`DELETE` | `/scheduled-reports` · `POST /{id}/send-now` ✚ | `agency:branding` | send-now answers `200` with the delivery in `status: "sending"`; the emails go out after commit — see [Scheduled-report delivery](#scheduled-report-delivery) |
+| `GET`/`POST`/`PATCH`/`DELETE` | `/scheduled-reports` · `POST /{id}/send-now` ✚ | `agency:branding` | send-now answers `200` with the delivery in `status: "sending"`; the emails go out after commit; the cadence path is a `report.build` job (STORY-100) — see [Scheduled-report delivery](#scheduled-report-delivery) |
+| `POST` | `/webhooks/resend` | Svix-signature-verified public route | **STORY-178.** Resend's `email.bounced` and `email.complained` events. The signature (`svix-id`, `svix-timestamp`, `svix-signature`) is verified over the **raw body** with a 300 s timestamp tolerance before anything is read (in-house, `node:crypto`; owner decision 2026-10-26). A **permanent** bounce records `bounce`, a complaint records `complaint` in the platform-wide `email_suppressions` (peppered address hash, never the address); transient or undetermined bounces and delivery delays are counted and ignored. Idempotent on (`svix-id`, recipient hash): a redelivered event is a no-op. `200 {received: true, outcome}` with `outcome` ∈ `suppressed` · `duplicate` · `ignored`; a bad or stale signature is `400 validation_failed` and writes nothing; `503 degraded` and nothing written while `RESEND_WEBHOOK_SECRET` is unset (production refuses to boot with Resend configured and no secret) |
 | `POST` | `/portal/session` | token secret + password | → a short-lived scoped cookie (4 h) |
 | `GET` | `/portal/overview` · `/growth-map` · `/sources` · `/tasks` · `/matrix` · `/report.pdf` | portal cookie | the origin sets `app.current_scope_projects` from the cookie |
 
@@ -317,7 +319,9 @@ Answering after the sends was rejected: the response cannot outlive the intercep
 - **Recipients** are the ones captured at request time. A report deleted mid-send takes its delivery with it (cascade), and the finalisation updates nothing.
 - **Counted once.** `nominara_reports_scheduled_deliveries_total` counts each delivery at its final status, never at `sending`.
 - **Contract.** `deliveryStatusSchema` gained `sending`; `contracts:diff` classifies the change as **patch** (a response-side enum widening). The frontend's delivery-status union must gain `sending`.
-- **Content as built.** Plain text, one link per built artifact, no attachment. The agency display name and reply-to, the attachment up to 8 MB and the oversize signed link are not built ([`integrations-and-sharing.md` §5](./integrations-and-sharing.md#5-scheduled-reports)).
+- **Content as built.** Plain text, one link per built artifact, no attachment. Since STORY-100 the `From` display name is the theme's `email_from_name` on the platform-authenticated sender and `Reply-To` is the theme's `email_reply_to` (omitted when null). The attachment up to 8 MB and the oversize signed link are not built ([STORY-180](../stories/agency/STORY-180-report-artifacts-in-object-storage.md); [`integrations-and-sharing.md` §5](./integrations-and-sharing.md#5-scheduled-reports)).
+- **Cadence path (STORY-100).** A report sweep in the report worker (every 5 minutes, elected by a session advisory lock, reading only `id`, `workspace_id` and `next_send_at` on the owner connection) enqueues one signed `report.build` job per due report and period, keyed `rep:{report}:{period}`. The job is phased (ADR-0003) and is the only writer of `next_send_at`. It is attempted up to 4 times (3 retries); a resumed delivery reuses the artifacts its first attempt built, so the retried email body and its idempotency key are identical. On the **final** failure, whatever the cause, the period is settled `failed` with its reason, `next_send_at` advances (the period is skipped) and the workspace is notified with the reason (owner decision 2026-10-26). The cadence path keeps **one delivery row per period**, not one per attempt.
+- **Suppressed recipients (STORY-178).** Every send goes through the suppression check inside the one send path. A suppressed scheduled-report recipient counts as not sent and the delivery says why; the workspaces whose reports include a newly suppressed address are notified by the report worker's sweep (naming the report, never the address).
 
 ### Integrations (post-launch)
 
@@ -622,7 +626,8 @@ The 15 archetypes, their funnel stage, and their required slots are specified in
   "annotations": {
     "data_gaps": [ { "from": "2026-06-14", "to": "2026-06-15", "reason": "engine_unavailable",
                      "engines": ["gemini"] } ],
-    "cadence_changes": [ { "at": "2026-07-01", "from": "weekly", "to": "daily" } ] },
+    "cadence_changes": [ { "at": "2026-07-01", "from": "weekly", "to": "daily" } ],
+    "scoring_version_changes": [] },
   "summary": { "visibility_start": 61.4, "visibility_end": 74.5, "visibility_delta": 13.1,
                "best_engine": "perplexity", "worst_engine": "claude",
                "competitor_gap_start": -16.8, "competitor_gap_end": -3.7 } },
@@ -630,6 +635,10 @@ The 15 archetypes, their funnel stage, and their required slots are specified in
 ```
 
 `measured_impact.caveat` is **mandatory** on every milestone with a computed delta and is rendered in the tooltip. A day with `cells_total = 0` is `null` in `points` and appears in `annotations.data_gaps` — **it is never interpolated**.
+
+**Timeframes and granularity (STORY-066).** `timeframe` is one of `24h`, `7d`, `30d`, `90d` (default), `180d`, `365d`. `granularity` is **auto-selected** (`scoring-models.md` §13): `24h → hour`, `7d/30d/90d → day`, `180d/365d → week`; it may be omitted, and a value the timeframe does not select is a `400 validation_failed`, never a silent substitution. A point's `d` is the workspace-local date at `day`; the first workspace-local date of its seven-day bucket at `week` (buckets end on the window's last day, so the first may be shorter; a week is the **mean of its measured daily values**, null when none was measured, and a weekly `data_gaps.to` is the last day of its last bucket); and the UTC instant the hour starts (`YYYY-MM-DDTHH:00:00Z`) at `hour`, which is read from `answer_captures` bounded to the 24 hours on `captured_at` (partition-pruned) and only under the current scoring version. A custom range is STORY-090's.
+
+`annotations.cadence_changes` is read from the pins the `record_cadence_change` trigger writes. `annotations.scoring_version_changes` (STORY-066 AC12, always present) marks each change of `scoring_version` between consecutive measured buckets of the brand series, `at` being the first bucket under `to`: a day is plotted under the current version where it has one, otherwise under the most recently computed older version. **Two versions are never averaged:** a week is the mean of only its days under the version of its latest measured day, and `summary.visibility_delta` is `null` when the first and last scored points were computed under different versions (`visibility_start` and `visibility_end` are still reported). `best_engine`/`worst_engine` and the series' `data_source` use the same version pick.
 
 ## 8. GEO alignment payload
 
@@ -738,6 +747,8 @@ Namespace `/rt`; rooms `ws:{workspace_id}` and `proj:{project_id}`.
 | `engine.degraded` | `{engine_key, circuit_state, since, affected_projects}` | worker-capture | ≤ 1 / min / engine |
 | `member.changed` | `{workspace_id, user_id, role, status}` | api | — (forces socket re-auth) |
 | `server.draining` | `{reconnect_after_ms}` | gateway | — |
+
+**`engine.degraded` as built (STORY-031).** Published to a workspace when one of its cells is skipped because the engine is unavailable (the breaker open on quota exhaustion, or the engine `degraded`); `affected_projects` counts that workspace's unfinished runs on the engine; coalesced per workspace and engine. It is **not a complete signal on its own**: a degraded engine is no longer planned, so it stops skipping cells and stops producing the event. The client therefore reads `GET /engines/status` on first paint and re-reads it on this event. No recovery event is published; the status read is the authority once it is newer than the push.
 
 **STORY-026.** `run.progress` previously read `eta_seconds`, which `NFR-API-05` forbids — "all durations are integer milliseconds with a `_ms` suffix". The unconditional requirement wins over a single table cell, the same way it did for `expires_in_seconds` in STORY-117; shipping both spellings would put two duration units on the wire and make the `_ms` convention mean nothing. `eta_ms` is **nullable**: an estimate is not always computable, and zero is a real estimate rather than a missing one.
 

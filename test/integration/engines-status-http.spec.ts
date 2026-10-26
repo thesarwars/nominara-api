@@ -1,0 +1,100 @@
+import { randomUUID } from "node:crypto";
+import { Redis } from "ioredis";
+import { Pool } from "pg";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { engineStatusResponseSchema, type EngineStatusResponse } from "../../contracts/engines/index.js";
+import { resolvePassword } from "../../src/db/dev-credentials.js";
+import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
+import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
+import { EngineBreakerRegistry } from "../../src/lib/engines/engine-breaker-registry.js";
+import { healthBucketStart } from "../../src/lib/engines/engine-health.js";
+import { ACTIVE_ENGINE_KEYS } from "../../src/lib/engines/registry.js";
+import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
+import { SessionService } from "../../src/modules/identity/session.service.js";
+import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
+import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
+import { WorkspacesService } from "../../src/modules/workspaces/workspaces.service.js";
+import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
+import { useApiHarness } from "../support/api-harness.js";
+import { apiUrl } from "../support/api-url.js";
+import { dataOf } from "../support/envelope.js";
+import { testCacheRedisUrl } from "../support/test-valkey.js";
+
+// STORY-031 AC11 / test scenario 10 — "Inspect the status surface: per-engine health visible and accurate." The customer-facing
+// read: `GET /v1/engines/status`, any member (`workspace:read`), global data only, cacheable. The breaker state is the LIVE one
+// from the shared breaker store, the catalog status is `engines.status`, the counters are `engine_health`'s trailing window.
+
+const meta = { ip: "127.0.0.1", ua: "vitest", requestId: randomUUID() };
+
+describe("STORY-031 AC11 · GET /v1/engines/status", () => {
+  const harness = useApiHarness({
+    env: () => {
+      const url = new URL(process.env.DATABASE_URL!);
+      url.username = "nominara_app";
+      url.password = resolvePassword("nominara_app", {});
+      return { DATABASE_URL_POOLED: url.toString(), VALKEY_CACHE_URL: testCacheRedisUrl() };
+    },
+  });
+
+  let pool: Pool;
+  let redis: Redis;
+  let sessions: SessionService;
+  let workspaces: WorkspacesService;
+
+  beforeEach(async () => {
+    await harness.db().query(`ALTER ROLE nominara_app PASSWORD '${resolvePassword("nominara_app", {})}'`);
+    redis = new Redis(testCacheRedisUrl());
+    await redis.flushdb();
+    pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    const membership = new MembershipService(new MembershipCacheService());
+    sessions = new SessionService(pool, membership, new InMemoryCacheAdapter());
+    workspaces = new WorkspacesService(pool, new LocalDekProvisioner(Buffer.alloc(32, 7), "local:dev"), new AuditChainService(), membership, sessions, new NoopRealtimePublisher());
+  });
+
+  afterEach(async () => {
+    await redis.quit().catch(() => undefined);
+    await pool.end();
+  });
+
+  async function viewer(): Promise<{ accessToken: string; csrfToken: string }> {
+    const ownerId = (await harness.db().query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`o-${randomUUID()}@example.com`])).rows[0]!.id;
+    const ws = await workspaces.create(ownerId, { name: `W ${randomUUID()}` }, meta);
+    const userId = (await harness.db().query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`v-${randomUUID()}@example.com`])).rows[0]!.id;
+    await harness.db().query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1,$2,'viewer','active')", [ws.id, userId]);
+    const tokens = await sessions.createSession(userId);
+    return workspaces.switchTo(userId, tokens.sid, ws.id, meta);
+  }
+
+  it("a viewer sees every active engine with its catalog status, live breaker state, episode start and trailing counters", async () => {
+    const actor = await viewer();
+    await harness.db().query("UPDATE engines SET status = 'degraded' WHERE key = 'gemini'");
+    const bucket = healthBucketStart(Date.now()).toISOString();
+    await harness.db().query(
+      `INSERT INTO engine_health (engine_key, bucket_start, attempts, successes, blocks, timeouts, rate_limited, p50_latency_ms, p95_latency_ms, circuit_state)
+       VALUES ('gemini', $1, 10, 4, 5, 1, 0, 900, 2100, 'open')`,
+      [bucket],
+    );
+    const before = Date.now();
+    await new EngineBreakerRegistry(redis).for("gemini").recordOutcome("quota_exhausted");
+
+    const response = await harness.app().inject({ method: "GET", url: apiUrl("/engines/status"), cookies: { [ACCESS_COOKIE_NAME]: actor.accessToken, [CSRF_COOKIE_NAME]: actor.csrfToken } });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).toBe("private, max-age=30");
+    const body = dataOf<EngineStatusResponse>(response);
+    expect(engineStatusResponseSchema.safeParse(body).success).toBe(true);
+    expect(body.engines.map((e) => e.engine_key)).toEqual([...ACTIVE_ENGINE_KEYS]);
+
+    const gemini = body.engines.find((e) => e.engine_key === "gemini")!;
+    expect(gemini).toMatchObject({ status: "degraded", circuit_state: "open", window_minutes: 60, attempts: 10, successes: 4, blocks: 5, timeouts: 1, rate_limited: 0, p50_latency_ms: 900, p95_latency_ms: 2100 });
+    expect(Date.parse(gemini.unavailable_since!)).toBeGreaterThanOrEqual(before - 1_000);
+
+    const chatgpt = body.engines.find((e) => e.engine_key === "chatgpt")!;
+    expect(chatgpt).toMatchObject({ status: "active", circuit_state: "closed", unavailable_since: null, attempts: 0, p50_latency_ms: null });
+  });
+
+  it("refuses an anonymous caller", async () => {
+    const response = await harness.app().inject({ method: "GET", url: apiUrl("/engines/status") });
+    expect(response.statusCode).toBe(401);
+  });
+});

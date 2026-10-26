@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { OPEN_ENGINE_GATE } from "../support/open-engine-gate.js";
 import { gunzipSync } from "node:zlib";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Logger } from "@nestjs/common";
@@ -192,6 +193,7 @@ describe("STORY-181 · raw capture objects", () => {
   function execute(over: { storagePort?: ObjectStoragePort; env?: Record<string, unknown>; text?: string } = {}): Promise<void> {
     const handler = createCaptureExecuteHandler(context(over.env), {
       cache: new InMemoryCacheAdapter(),
+      engineGate: OPEN_ENGINE_GATE,
       realtime: noopPublisher,
       enqueueParse: (payload) => {
         parseJobs.push(payload);
@@ -388,6 +390,7 @@ describe("STORY-181 · raw capture objects", () => {
       releaseClient: (client) => (client as unknown as { release: () => void }).release(),
       process: createCaptureExecuteHandler(context(), {
         cache: new InMemoryCacheAdapter(),
+        engineGate: OPEN_ENGINE_GATE,
         realtime: noopPublisher,
         enqueueParse: (payload) => {
           parseJobs.push(payload);

@@ -34,12 +34,46 @@ export const ENGINE_BREAKER_OPEN_DURATION_MS = 20 * 60 * 1000;
  */
 export const ENGINE_BREAKER_RATIO_WINDOW_MS = 15 * 60 * 1000;
 
-export type EngineOutcome = "success" | "blocked" | "quota_exhausted" | "other_failure";
+/**
+ * `transient_failure` (STORY-031 review fix) is a retryable transport failure - rate_limited, timeout, upstream_5xx
+ * (failure-taxonomy.ts). Closed, it is an attempt in the ratio's denominator like any other non-block; HALF-OPEN it is NEUTRAL:
+ * it neither closes nor re-opens the breaker, because it is not evidence that would have opened a closed one (EC-06 stage 4 opens
+ * on the block ratio; `rate_limited` is a stage-2 trigger). `other_failure` keeps its meaning for every other failure.
+ */
+export type EngineOutcome = "success" | "blocked" | "quota_exhausted" | "transient_failure" | "other_failure";
 
 export interface EngineBreakerDecision {
   readonly state: CircuitState;
   /** false ONLY for quota_exhausted (EC-08's "zero retries") — never for a ratio-driven or half-open-trial-driven open. */
   readonly retry: boolean;
+}
+
+/** Why the breaker last opened: EC-08 quota exhaustion, or the EC-06 stage-4 block ratio (or a failed half-open probe). */
+export type EngineBreakerOpenReason = "quota" | "ratio";
+
+/**
+ * STORY-031 AC6/AC7 - the breaker's current EPISODE: when it left `closed`, and why it last opened. `since` survives the
+ * half-open probe that fails and re-opens the breaker, so "circuit open > 30 min" (EC-06 stage 5) is measured across
+ * re-opens, not reset by each one.
+ */
+export interface EngineBreakerDetail {
+  readonly state: CircuitState;
+  /** The current open window's start (epoch ms), or null when closed. */
+  readonly openedAt: number | null;
+  /** When the breaker left `closed` for this episode (epoch ms), or null when closed. */
+  readonly since: number | null;
+  readonly reason: EngineBreakerOpenReason | null;
+}
+
+export interface EngineBreakerEpisode {
+  readonly since: number;
+  readonly reason: EngineBreakerOpenReason;
+}
+
+/** Where the episode lives (Valkey in production, next to the state key). Best-effort like the state store's writes. */
+export interface EngineBreakerEpisodeStore {
+  read(engineKey: EngineKey): Promise<EngineBreakerEpisode | null>;
+  write(engineKey: EngineKey, episode: EngineBreakerEpisode | null): Promise<void>;
 }
 
 export interface EngineBreakerStateStore {
@@ -51,6 +85,8 @@ export interface EngineBreakerStateStore {
 export interface EngineBreakerRatioCounter {
   /** Records one attempt (and, if `isBlocked`, one block) into the rolling window; returns the window's current totals. */
   record(engineKey: EngineKey, isBlocked: boolean): Promise<{ attempts: number; blocks: number }>;
+  /** STORY-031 AC6 - the window's current totals WITHOUT recording an attempt (the ladder evaluator reads, it never counts). */
+  peek?(engineKey: EngineKey): Promise<{ attempts: number; blocks: number }>;
 }
 
 /**
@@ -87,6 +123,41 @@ export class ValkeyEngineBreakerStateStore implements EngineBreakerStateStore {
       }
     } catch (error) {
       logger.warn(`failed to persist breaker state for engine '${engineKey}' — best-effort, job unaffected: ${(error as Error).message}`);
+    }
+  }
+}
+
+/**
+ * STORY-031 - the breaker's episode beside its state key, with the same TTL posture. Reads THROW (the breaker falls back to
+ * `openedAt` as the episode start); writes are best-effort and never fail the job, like the state store's.
+ */
+export class ValkeyEngineBreakerEpisodeStore implements EngineBreakerEpisodeStore {
+  private static readonly KEY_PREFIX = "engine-breaker:episode";
+  private static readonly TTL_SECONDS = 6 * 60 * 60;
+
+  constructor(private readonly redis: Redis) {}
+
+  private key(engineKey: EngineKey): string {
+    return `${ValkeyEngineBreakerEpisodeStore.KEY_PREFIX}:${engineKey}`;
+  }
+
+  async read(engineKey: EngineKey): Promise<EngineBreakerEpisode | null> {
+    const raw = await this.redis.get(this.key(engineKey));
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as { since?: unknown; reason?: unknown };
+    if (typeof parsed.since !== "number" || (parsed.reason !== "quota" && parsed.reason !== "ratio")) return null;
+    return { since: parsed.since, reason: parsed.reason };
+  }
+
+  async write(engineKey: EngineKey, episode: EngineBreakerEpisode | null): Promise<void> {
+    try {
+      if (episode === null) {
+        await this.redis.del(this.key(engineKey));
+      } else {
+        await this.redis.set(this.key(engineKey), JSON.stringify(episode), "EX", ValkeyEngineBreakerEpisodeStore.TTL_SECONDS);
+      }
+    } catch (error) {
+      logger.warn(`failed to persist breaker episode for engine '${engineKey}' — best-effort, job unaffected: ${(error as Error).message}`);
     }
   }
 }
@@ -148,6 +219,13 @@ export class ValkeyEngineBreakerRatioCounter implements EngineBreakerRatioCounte
     }
   }
 
+  /** Throws on a store outage: the ladder evaluator skips the engine rather than reading "no blocks". */
+  async peek(engineKey: EngineKey): Promise<{ attempts: number; blocks: number }> {
+    const [attempts, blocks, windowStart] = await this.redis.hmget(`${ValkeyEngineBreakerRatioCounter.KEY_PREFIX}:${engineKey}`, "attempts", "blocks", "windowStart");
+    if (attempts === null || windowStart === null || this.clock() - Number(windowStart) > this.windowMs) return { attempts: 0, blocks: 0 };
+    return { attempts: Number(attempts), blocks: Number(blocks ?? 0) };
+  }
+
   async record(engineKey: EngineKey, isBlocked: boolean): Promise<{ attempts: number; blocks: number }> {
     try {
       const [attempts, blocks] = await this.redis.engineBreakerRecordOutcome!(
@@ -181,6 +259,7 @@ export class EngineBreaker {
     private readonly store: EngineBreakerStateStore,
     private readonly ratioCounter: EngineBreakerRatioCounter,
     private readonly clock: () => number = () => Date.now(),
+    private readonly episodes: EngineBreakerEpisodeStore | null = null,
   ) {
     this.breaker = this.freshBreaker();
   }
@@ -211,6 +290,43 @@ export class EngineBreaker {
     this.breaker = this.freshBreaker();
     if (openedAt !== null) {
       this.breaker.forceOpen(openedAt);
+    }
+  }
+
+  /**
+   * The state plus the current episode. An unreadable episode store never fails it: the episode start falls back to the open
+   * window's start and the reason to null (the capture path then treats the breaker as ratio-opened: re-queue, not skip).
+   */
+  async detail(): Promise<EngineBreakerDetail> {
+    await this.sync();
+    const state = this.breaker.state;
+    if (state === "closed" || this.lastKnownOpenedAt === null) return { state: "closed", openedAt: null, since: null, reason: null };
+    const episode = await this.readEpisode();
+    return { state, openedAt: this.lastKnownOpenedAt, since: Math.min(episode?.since ?? this.lastKnownOpenedAt, this.lastKnownOpenedAt), reason: episode?.reason ?? null };
+  }
+
+  /** blocks/attempts over the rolling window WITHOUT recording an attempt; 0 with no attempts (never NaN). Throws on a store outage. */
+  async blockRatio(): Promise<number> {
+    const totals = this.ratioCounter.peek === undefined ? { attempts: 0, blocks: 0 } : await this.ratioCounter.peek(this.engineKey);
+    return totals.attempts > 0 ? totals.blocks / totals.attempts : 0;
+  }
+
+  private async readEpisode(): Promise<EngineBreakerEpisode | null> {
+    if (this.episodes === null) return null;
+    try {
+      return await this.episodes.read(this.engineKey);
+    } catch (error) {
+      logger.warn(`breaker episode store unreadable for engine '${this.engineKey}' — using the open window's start: ${(error as Error).message}`);
+      return null;
+    }
+  }
+
+  private async writeEpisode(episode: EngineBreakerEpisode | null): Promise<void> {
+    if (this.episodes === null) return;
+    try {
+      await this.episodes.write(this.engineKey, episode);
+    } catch (error) {
+      logger.warn(`failed to persist breaker episode for engine '${this.engineKey}' — best-effort: ${(error as Error).message}`);
     }
   }
 
@@ -245,11 +361,14 @@ export class EngineBreaker {
     if (this.breaker.state === "half_open") {
       if (outcome === "success") {
         await this.store.write(this.engineKey, null);
+        await this.writeEpisode(null);
         this.lastKnownOpenedAt = null;
         this.breaker = this.freshBreaker();
         return { state: "closed", retry: true };
       }
-      // Any failure recorded while half_open reopens for another full
+      // A transient vendor failure is no verdict on the probe: the breaker stays half-open for the next attempt to decide.
+      if (outcome === "transient_failure") return { state: "half_open", retry: true };
+      // Any other failure recorded while half_open reopens for another full
       // window — "half-open probing" per the AC. No single-trial gate:
       // concurrent half-open calls are all admitted (see admit()'s
       // docstring); this only governs what recordOutcome() itself does.
@@ -268,9 +387,13 @@ export class EngineBreaker {
 
   private async open(retry: boolean): Promise<EngineBreakerDecision> {
     const at = this.clock();
+    // The episode starts when the breaker LEAVES closed. A re-open from half_open (or a quota open while already open) keeps it.
+    const wasClosed = this.breaker.state === "closed";
+    const prior = wasClosed ? null : await this.readEpisode();
     this.breaker.forceOpen(at);
     this.lastKnownOpenedAt = at;
     await this.store.write(this.engineKey, at);
+    await this.writeEpisode({ since: prior?.since ?? at, reason: retry ? "ratio" : "quota" });
     return { state: "open", retry };
   }
 }

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { OPEN_ENGINE_GATE } from "../support/open-engine-gate.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client } from "pg";
@@ -154,6 +155,7 @@ describe("STORY-034 · capture.execute moves a cell", () => {
     // `parseJobs` below asserts.
     return createCaptureExecuteHandler(context, {
       cache,
+      engineGate: OPEN_ENGINE_GATE,
       realtime: recordingPublisher(emissions),
       enqueueParse: (payload) => {
         parseJobs.push(payload);

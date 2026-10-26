@@ -2,6 +2,7 @@ import type { Redis } from "ioredis";
 import {
   EngineBreaker,
   ENGINE_BREAKER_RATIO_WINDOW_MS,
+  ValkeyEngineBreakerEpisodeStore,
   ValkeyEngineBreakerRatioCounter,
   ValkeyEngineBreakerStateStore,
 } from "./engine-breaker.js";
@@ -41,6 +42,7 @@ export class EngineBreakerRegistry {
         new ValkeyEngineBreakerStateStore(this.redis),
         new ValkeyEngineBreakerRatioCounter(this.redis, ENGINE_BREAKER_RATIO_WINDOW_MS, this.clock),
         this.clock,
+        new ValkeyEngineBreakerEpisodeStore(this.redis),
       );
       this.breakers.set(key, breaker);
     }

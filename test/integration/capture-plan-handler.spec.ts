@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { OPEN_ENGINE_GATE } from "../support/open-engine-gate.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
@@ -378,6 +379,7 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
         { pool: undefined, env: {} } as unknown as QueueHandlerContext,
         {
           cache: new InMemoryCacheAdapter(),
+          engineGate: OPEN_ENGINE_GATE,
           realtime: { toWorkspace: () => undefined, toProject: () => undefined, memberChanged: () => undefined },
           enqueueParse: () => Promise.resolve(),
           enqueueRollup: () => Promise.resolve(),

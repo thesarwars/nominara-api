@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { OPEN_ENGINE_GATE } from "./open-engine-gate.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client } from "pg";
@@ -153,6 +154,7 @@ export function executeOn(client: Client, t: Tenant, job: Job, emitted: Emitted[
   };
   const handler = createCaptureExecuteHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, {
     cache: new InMemoryCacheAdapter(),
+    engineGate: OPEN_ENGINE_GATE,
     realtime: publisher,
     enqueueParse: () => Promise.resolve(),
     spendMeter: { isCeilingReached: () => Promise.resolve(false), recordCost: () => Promise.resolve({ newAlerts: [], totalUsd: 0, ceilingUsd: 100, hardStopped: false }) } as unknown as SpendMeter,
