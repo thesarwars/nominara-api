@@ -7,6 +7,7 @@ import { ProblemFilter } from "../../api/filters/problem.filter.js";
 import { ResponseEnvelopeInterceptor } from "../../api/interceptors/response-envelope.interceptor.js";
 import { NotFoundError, RetentionExceededError } from "../../api/errors/domain-errors.js";
 import { RawDownloadService } from "./raw-download.service.js";
+import { ReparseService } from "./reparse.service.js";
 import { ResultDocumentService } from "./result-document.service.js";
 import { ResultsController } from "./results.controller.js";
 
@@ -26,6 +27,7 @@ describe("STORY-181 AC4 · GET /results/{id}/raw on the wire", () => {
       controllers: [ResultsController],
       providers: [
         { provide: ResultDocumentService, useValue: {} },
+        { provide: ReparseService, useValue: {} },
         { provide: RawDownloadService, useValue: { signedUrl: () => outcome() } },
         { provide: APP_INTERCEPTOR, useClass: ResponseEnvelopeInterceptor },
         { provide: APP_FILTER, useClass: ProblemFilter },

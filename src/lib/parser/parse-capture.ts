@@ -8,7 +8,7 @@ import {
   type AnswerForm,
   type PositionClass,
 } from "./answer-structure.js";
-import { dedupeWithinResponse, extractCitations, resolveCitation, type ResolvedCitation } from "./citations.js";
+import { dedupeWithinResponse, extractCitations, resolveCitation, type ResolveContext, type ResolvedCitation } from "./citations.js";
 import { buildMatcher, matchEntities, type AliasEntry, type Mention } from "./entity-matcher.js";
 import { normalize, NORMALIZER_VERSION } from "./normalize.js";
 import { classifyRendering, type RenderingResult } from "./rendering.js";
@@ -71,6 +71,11 @@ export interface ParseContext {
   /** Unbound in production — see sentiment/arbiter.ts. */
   readonly arbiter?: SentimentArbiter;
   readonly now?: () => Date;
+  /**
+   * How a citation URL is resolved. Absent, the guarded network fetcher (the capture worker). The request-path RE-PARSE (STORY-034
+   * AC9) supplies one that answers from the resolutions already recorded, so a request handler never calls a citation's host.
+   */
+  readonly fetch?: NonNullable<ResolveContext["fetch"]>;
 }
 
 export interface ParsedMention {
