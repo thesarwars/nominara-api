@@ -66,3 +66,20 @@ describe("STORY-066 AC5/AC12 · growth-map annotations", () => {
     expect(growthMapResponseSchema.safeParse({ ...payload, granularity: "month" }).success).toBe(false);
   });
 });
+
+// Review round 1: the client derives its timeframe list from `@nominara/client`, so the published document must carry the
+// query parameters — without them the client copies the enum by hand and the two drift silently.
+describe("STORY-066 AC1/AC2 · the published growth-map operation documents its query", () => {
+  it("getProjectGrowthMap lists timeframe (the six values) and granularity (hour, day, week) as query parameters", async () => {
+    const { readFileSync } = await import("node:fs");
+    const document = JSON.parse(readFileSync(new URL("../openapi.generated.json", import.meta.url), "utf8")) as {
+      paths: Record<string, Record<string, { operationId?: string; parameters?: { in: string; name: string; schema?: { enum?: string[] } }[] }>>;
+    };
+    const operation = Object.values(document.paths)
+      .flatMap((item) => Object.values(item))
+      .find((op) => op.operationId === "getProjectGrowthMap");
+    const query = new Map((operation?.parameters ?? []).filter((p) => p.in === "query").map((p) => [p.name, p.schema?.enum]));
+    expect(query.get("timeframe")).toEqual(["24h", "7d", "30d", "90d", "180d", "365d"]);
+    expect(query.get("granularity")).toEqual(["hour", "day", "week"]);
+  });
+});
