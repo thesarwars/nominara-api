@@ -329,9 +329,13 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
   // like `crawl.audit`; a queue of its own so a DLQ entry names the job that
   // failed. Tenant-scoped (signed payload, RLS context). Its producer is
   // `rollup.metric_daily`, which enqueues it after its own transaction commits.
+  // STORY-066 AC8 adds a second producer: `TasksService.completeTask` enqueues
+  // one job per completed authority task (payload `taskId`), after its commit,
+  // keyed `srcver:seeded:{task}:{completed_at_ms}` — the pattern below is the rollup's key.
+  // Phased (ADR-0003): no transaction is held across either kind of fetch.
   {
     name: "source.verify_presence",
-    producer: "API, rollup (STORY-054; not in §4)",
+    producer: "API (task completion, STORY-066), rollup (STORY-054; not in §4)",
     workerGroup: "crawl",
     concurrency: 2,
     retry: { delaysMs: doubling(2) },

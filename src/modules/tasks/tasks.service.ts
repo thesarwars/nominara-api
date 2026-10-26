@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import type { RealtimeEventPayloads } from "../../../contracts/events/catalog.schema.js";
 import type {
@@ -27,6 +27,7 @@ import {
 import { GOAL_CONTRIBUTES_SQL } from "../../lib/goals/contribution.js";
 import { refreshProjectTaskCounts } from "../../lib/rollup/refresh-project-task-counts.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import type { ActionItem, ActionItemEffort, ActionItemPrimaryActionKind, ActionItemSource } from "../../../contracts/tasks/index.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -145,7 +146,15 @@ export class TasksService {
   // STORY-064 (step D): `task.moved` / `task.created` are published to the
   // workspace room AFTER the transaction commits (`afterCommit`), never from
   // inside it, so a rolled-back change announces nothing.
-  constructor(@Inject(REALTIME_PUBLISHER) private readonly realtime: RealtimePublisher) {}
+  //
+  // STORY-066 AC8: completing an authority task asks `source.verify_presence`
+  // to verify its target, also after commit. `queues` is optional so the
+  // callers that never complete a task (the task.generate worker, specs) need
+  // none; the API's DI always supplies it (QueueProducerModule is global).
+  constructor(
+    @Inject(REALTIME_PUBLISHER) private readonly realtime: RealtimePublisher,
+    @Optional() @Inject(QueueProducer) private readonly queues?: Pick<QueueProducer, "enqueueTenantJob">,
+  ) {}
 
   /**
    * `GET /v1/projects/{id}/tasks` — STORY-064 (step A). api-specification.md
@@ -791,8 +800,8 @@ export class TasksService {
     const client = store.client;
     const actorId = store.context.actorId;
 
-    const found = await client.query<{ project_id: string; status: string; title: string; in_scope: boolean }>(
-      `SELECT t.project_id, t.status, t.title,
+    const found = await client.query<{ project_id: string; status: string; title: string; in_scope: boolean; kind: string; source_domain_id: string | null }>(
+      `SELECT t.project_id, t.status, t.title, t.kind, t.source_domain_id,
               (cardinality(app.current_scope_projects()) = 0 OR t.project_id = ANY(app.current_scope_projects())) AS in_scope
          FROM tasks t
          JOIN projects p ON p.id = t.project_id
@@ -830,12 +839,49 @@ export class TasksService {
     // IDs only — never the title.
     this.logger.log({ message: "task completed", workspace_id: store.context.workspaceId, task_id: taskId, project_id: current.project_id, milestone_id: pinned.id });
     this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id });
+    if (current.kind === "authority" && current.source_domain_id !== null) {
+      this.requestSeededVerification(store.context.workspaceId, current.project_id, taskId, pinned.occurred_at);
+    }
 
     return {
       task: await this.readTask(client, taskId),
       milestone: { id: pinned.id, kind: "task_completed", occurred_at: pinned.occurred_at.toISOString() },
       verification: null,
     };
+  }
+
+  /**
+   * STORY-066 AC8 — `source_seeded` fires on "completion of an authority task with a verified target URL" (`scoring-models.md`
+   * §13). The fetch is never the request's (KAD-06): this enqueues `source.verify_presence` for THIS task AFTER COMMIT (a job
+   * enqueued inside the transaction could run before the `done` row is visible; a rolled-back completion asks for nothing). One
+   * job per COMPLETION: the key is the task's and its `completed_at`, so a double click (a 409 the second time) cannot queue two,
+   * while a task reopened and completed again is verified again rather than deduplicated by the first job's id. At most one pin
+   * still holds: the job skips a task already pinned, and `ux_milestones_source` is unique over the per-task source id. A failed enqueue is logged, never thrown — the
+   * completion is durable, and the domain's next periodic verification still records its presence.
+   */
+  private requestSeededVerification(workspaceId: string, projectId: string, taskId: string, completedAt: Date): void {
+    const queues = this.queues;
+    if (queues === undefined) {
+      this.logger.warn({ message: "no queue producer: the completed authority task's target is not verified", workspace_id: workspaceId, task_id: taskId });
+      return;
+    }
+    afterCommit(() => {
+      void queues
+        .enqueueTenantJob("source.verify_presence", workspaceId, { projectId, taskId }, { idempotencyKey: `srcver:seeded:${taskId}:${completedAt.getTime()}` })
+        .then(() => {
+          incrementCounter("nominara_sources_seeded_requested_total", {});
+        })
+        .catch((error: unknown) => {
+          incrementCounter("nominara_sources_seeded_request_failed_total", {});
+          this.logger.error({
+            message: "seeded verification request failed",
+            workspace_id: workspaceId,
+            project_id: projectId,
+            task_id: taskId,
+            error: error instanceof Error ? error.name : "unknown",
+          });
+        });
+    });
   }
 
   /**

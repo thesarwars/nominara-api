@@ -19,7 +19,7 @@ export class GrowthMapController {
   @Get()
   @RequirePermission("tracking:read")
   @ProjectParam("id")
-  @ApiContract({ operationId: "getProjectGrowthMap", responseSchema: growthMapResponseSchema })
+  @ApiContract({ operationId: "getProjectGrowthMap", querySchema: growthMapQuerySchema, responseSchema: growthMapResponseSchema })
   growthMap(
     @Param("id") projectId: string,
     @Query(new ZodValidationPipe(growthMapQuerySchema)) query: GrowthMapQuery,

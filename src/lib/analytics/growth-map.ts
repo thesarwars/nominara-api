@@ -176,3 +176,250 @@ export function firstAndLastScored(points: readonly GrowthMapPoint[]): { start: 
     end: scored[scored.length - 1]?.visibility_score ?? null,
   };
 }
+
+// ───────────────────────── STORY-066 — the series contract ─────────────────────────
+
+/** One `>90d` bucket: seven calendar days (the first may be shorter), labelled by its first day. */
+export interface WeekBucket {
+  readonly label: string;
+  readonly start: string;
+  readonly end: string;
+  readonly days: readonly string[];
+}
+
+/**
+ * §13 — `>90d → week`. Seven-day buckets that END ON THE WINDOW'S LAST DAY,
+ * so the most recent bucket is always a whole week and today is in it; the
+ * first bucket takes the remainder and may be shorter.
+ */
+export function weekBuckets(days: readonly string[]): WeekBucket[] {
+  const buckets: WeekBucket[] = [];
+  for (let end = days.length; end > 0; end -= 7) {
+    const slice = days.slice(Math.max(0, end - 7), end);
+    buckets.unshift({ label: slice[0]!, start: slice[0]!, end: slice[slice.length - 1]!, days: slice });
+  }
+  return buckets;
+}
+
+function mean(values: readonly number[]): number | null {
+  return values.length === 0 ? null : values.reduce((total, value) => total + value, 0) / values.length;
+}
+
+/** The scoring version a day's value was computed under, or null when the day carries none. */
+export type VersionOf = (day: string) => string | null;
+
+/**
+ * AC12 / STORY-136 AC9 — the ONE scoring version each week is plotted under: the version of its latest measured day (null for a
+ * week with no measured day). A week straddling a cut-over is therefore a week of the NEW version, which is also where
+ * `versionChanges` puts the boundary marker.
+ */
+export function weekVersions(buckets: readonly WeekBucket[], points: readonly GrowthMapPoint[], versionOf: VersionOf): (string | null)[] {
+  const byDay = new Map(points.map((point) => [point.d, point]));
+  return buckets.map((bucket) => {
+    let latest: string | null = null;
+    for (const d of bucket.days) {
+      const point = byDay.get(d);
+      if (point === undefined || point.visibility_score === null) continue;
+      latest = versionOf(d) ?? latest;
+    }
+    return latest;
+  });
+}
+
+/**
+ * §13 / AC2 — a week is THE MEAN OF ITS DAILY VALUES, never a resampled last
+ * value. A last-value resample plots whichever day happened to close the
+ * bucket, so one good or bad Sunday becomes the whole week.
+ *
+ * Only MEASURED days enter the mean: a null day is a gap, not a zero, and a
+ * week with no measured day is null with zero cells — never carried across.
+ * `points` must be the daily points over exactly the buckets' days, in order.
+ *
+ * AC12 / STORY-136 AC9 — TWO SCORING VERSIONS ARE NEVER AVERAGED. With
+ * `versionOf`, only the days under the week's own version (`weekVersions`)
+ * enter its mean: the mean of a v0 day and a v1 day is a number no version
+ * produced.
+ */
+export function resampleWeekly(buckets: readonly WeekBucket[], points: readonly GrowthMapPoint[], versionOf?: VersionOf): GrowthMapPoint[] {
+  const byDay = new Map(points.map((point) => [point.d, point]));
+  const versions = versionOf === undefined ? null : weekVersions(buckets, points, versionOf);
+  return buckets.map((bucket, index) => {
+    const version = versions?.[index] ?? null;
+    const measured = bucket.days
+      .filter((d) => versionOf === undefined || version === null || versionOf(d) === version)
+      .map((d) => byDay.get(d))
+      .filter((point): point is GrowthMapPoint => point !== undefined && point.visibility_score !== null);
+    if (measured.length === 0) return { d: bucket.label, visibility_score: null, sov: null, cells: 0, live_ratio: null };
+    return {
+      d: bucket.label,
+      visibility_score: mean(measured.map((point) => point.visibility_score!)),
+      sov: mean(measured.map((point) => point.sov).filter((value): value is number => value !== null)),
+      cells: measured.reduce((total, point) => total + point.cells, 0),
+      live_ratio: mean(measured.map((point) => point.live_ratio).filter((value): value is number => value !== null)),
+    };
+  });
+}
+
+/**
+ * §7's `summary.visibility_delta` — end − start over the plotted points, NULL when the first and last scored points were computed
+ * under different scoring versions (`versions[i]` is point i's). A v1 figure minus a v0 figure measures the change of formula as
+ * much as any change of visibility (STORY-136 AC9); the start and end themselves are still reported.
+ */
+export function summaryDelta(points: readonly GrowthMapPoint[], versions: readonly (string | null)[]): number | null {
+  let first = -1;
+  let last = -1;
+  points.forEach((point, index) => {
+    if (point.visibility_score === null) return;
+    if (first === -1) first = index;
+    last = index;
+  });
+  if (first === -1) return null;
+  if ((versions[first] ?? null) !== (versions[last] ?? null)) return null;
+  return points[last]!.visibility_score! - points[first]!.visibility_score!;
+}
+
+/** The bucket a day falls in, by label. */
+function bucketLabelOf(buckets: readonly WeekBucket[], day: string): string | undefined {
+  return buckets.find((bucket) => day >= bucket.start && day <= bucket.end)?.label;
+}
+
+/** Failure days re-keyed to their week's label, so `dataGaps` can name the engines behind a missing week. */
+export function bucketFailures(failures: readonly FailureDay[], buckets: readonly WeekBucket[]): FailureDay[] {
+  return failures.flatMap((failure) => {
+    const label = bucketLabelOf(buckets, failure.metricDate);
+    return label === undefined ? [] : [{ metricDate: label, engineKey: failure.engineKey }];
+  });
+}
+
+/** A weekly gap's `to` is the LAST DAY of its last bucket, not that bucket's label — the gap covers the whole week. */
+export function extendGapsToBucketEnds(gaps: readonly DataGap[], buckets: readonly WeekBucket[]): DataGap[] {
+  const endOf = new Map(buckets.map((bucket) => [bucket.label, bucket.end]));
+  return gaps.map((gap) => ({ ...gap, to: endOf.get(gap.to) ?? gap.to }));
+}
+
+/** A week's label for any day in it (the day itself when it is in no bucket). */
+export function weekLabelFor(buckets: readonly WeekBucket[], day: string): string {
+  return bucketLabelOf(buckets, day) ?? day;
+}
+
+const HOUR_MS = 3_600_000;
+
+/** The UTC instant an hour starts, as §7's `d` label: `YYYY-MM-DDTHH:00:00Z`. */
+export function hourLabel(at: number): string {
+  // Floored to the hour, so the milliseconds are always `.000`; dropping them
+  // gives the label without building a colon-bearing template (see `calendarDays`).
+  return new Date(Math.floor(at / HOUR_MS) * HOUR_MS).toISOString().replace(".000Z", "Z");
+}
+
+/**
+ * §13 — `24h → hour`: the 24 UTC hours ending with the current one.
+ *
+ * INSTANTS, not wall-clock hours: on the night the clocks go back a local
+ * 01:00 happens twice, and two points with one label would be drawn on top of
+ * each other.
+ */
+export function hourBuckets(now: number): string[] {
+  const current = Math.floor(now / HOUR_MS) * HOUR_MS;
+  return Array.from({ length: 24 }, (_, index) => hourLabel(current - (23 - index) * HOUR_MS));
+}
+
+/** `projects.cadence`'s CHECK — the only words the trigger can write. */
+const CADENCES = "hourly|daily|twice_weekly|weekly|manual";
+const CADENCE_CHANGE = new RegExp(`^(${CADENCES}) to (${CADENCES})$`, "u");
+
+/**
+ * AC5 — reads `app.record_cadence_change()`'s own `format('%s to %s', OLD, NEW)`
+ * detail (migration 0017). STRICT: anything that is not exactly two known
+ * cadences around " to " is not a cadence change, and returns null rather
+ * than a guess. A wrong annotation explains a trend break that did not
+ * happen, which is worse than none.
+ */
+export function parseCadenceChange(detail: string | null): { from: string; to: string } | null {
+  const match = detail === null ? null : CADENCE_CHANGE.exec(detail);
+  if (match === null || match[1] === match[2]) return null;
+  return { from: match[1]!, to: match[2]! };
+}
+
+/** A `metric_daily` row with the scoring version it was computed under. */
+export interface VersionedSeriesRow extends DailySeriesRow {
+  readonly scoringVersion: string;
+  /** `computed_at`, epoch ms — which of two older versions is the more recent. */
+  readonly computedAt: number;
+}
+
+/**
+ * AC12 — ONE row per (entity, day): the current scoring version where the day
+ * has it, otherwise the most recently computed older version.
+ *
+ * A series filtered to the current version alone would draw everything before
+ * a cut-over as a gap, although it was measured — and history past raw-capture
+ * retention can never be re-scored. Plotting the older figure and MARKING THE
+ * BOUNDARY (`versionChanges`) keeps both facts on the chart.
+ */
+export function pickScoringVersion<Row extends VersionedSeriesRow>(rows: readonly Row[], current: string): Row[] {
+  const picked = new Map<string, Row>();
+  for (const row of rows) {
+    const key = `${row.entityId}|${row.metricDate}`;
+    const held = picked.get(key);
+    if (held === undefined) {
+      picked.set(key, row);
+      continue;
+    }
+    const heldCurrent = held.scoringVersion === current;
+    const rowCurrent = row.scoringVersion === current;
+    if (rowCurrent && !heldCurrent) picked.set(key, row);
+    else if (rowCurrent === heldCurrent && row.computedAt > held.computedAt) picked.set(key, row);
+  }
+  return [...picked.values()];
+}
+
+/**
+ * AC12 — every change of scoring version between consecutive MEASURED
+ * buckets; `at` is the first bucket under the new version. A null (unmeasured)
+ * bucket is skipped, so a gap between two versions still marks the change.
+ */
+export function versionChanges(labels: readonly string[], versions: readonly (string | null)[]): { at: string; from: string; to: string }[] {
+  const changes: { at: string; from: string; to: string }[] = [];
+  let previous: string | null = null;
+  labels.forEach((label, index) => {
+    const version = versions[index] ?? null;
+    if (version === null) return;
+    if (previous !== null && version !== previous) changes.push({ at: label, from: previous, to: version });
+    previous = version;
+  });
+  return changes;
+}
+
+/** §13 — `prompt_set_change`: "≥ 10% of the prompt set added or removed in one day". */
+export const PROMPT_SET_CHANGE_THRESHOLD = 0.1;
+
+/**
+ * Whether one day's additions and removals are a material change to the set
+ * that existed at its start. A project's FIRST prompt set (nothing before) is
+ * not a change to anything. Division rather than `before * 0.1`: the product
+ * of an integer and 0.1 can land just above the true value (30 × 0.1 =
+ * 3.0000000000000004) and miss an exact 10 %.
+ */
+export function isMaterialPromptSetChange(change: { before: number; added: number; removed: number }): boolean {
+  if (change.before <= 0) return false;
+  return (change.added + change.removed) / change.before >= PROMPT_SET_CHANGE_THRESHOLD;
+}
+
+/**
+ * `engine_model_change` — one transition per change of the vendor-reported
+ * fingerprint, in capture order. `previous` is the last fingerprint seen
+ * before these captures; with none, the first one seen is where tracking
+ * starts, not a change.
+ */
+export function fingerprintTransitions(
+  previous: string | null,
+  captures: readonly { fingerprint: string; at: Date }[],
+): { from: string; to: string; at: Date }[] {
+  const transitions: { from: string; to: string; at: Date }[] = [];
+  let current = previous;
+  for (const capture of captures) {
+    if (current !== null && capture.fingerprint !== current) transitions.push({ from: current, to: capture.fingerprint, at: capture.at });
+    current = capture.fingerprint;
+  }
+  return transitions;
+}

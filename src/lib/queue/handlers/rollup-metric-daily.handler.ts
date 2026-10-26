@@ -8,6 +8,7 @@ import { refreshProjectGeoWindows } from "../../rollup/refresh-project-geo.js";
 import { datesWithFacts } from "../../rollup/aggregate-day.js";
 import { refreshProjectDisplacements } from "../../rollup/refresh-project-displacements.js";
 import { refreshProjectSourceIndex } from "../../rollup/refresh-project-source-index.js";
+import { refreshProjectMilestones } from "../../rollup/refresh-project-milestones.js";
 import { rollUpDay } from "../../rollup/roll-up-day.js";
 import { afterCommit, currentTenantStore } from "../../../tenancy/tenant-context.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
@@ -124,6 +125,9 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
         // order (recovery needs the earlier event to exist). Idempotent on a
         // dirty date: the pair's unique key makes a re-run an update.
         await refreshProjectDisplacements(tx, payload.projectId, date, timezone);
+        // STORY-066 AC8/AC9 — the configuration pins (model fingerprint change, material prompt-set change) for the
+        // day. Idempotent by a named source, so a re-run of the date pins nothing more.
+        await refreshProjectMilestones(tx, payload.workspaceId, payload.projectId, date, timezone);
       }
 
       // AC9 — ONCE, after every date. Denormalising per date would write the

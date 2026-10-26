@@ -3,9 +3,10 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { growthMapResponseSchema } from "../../contracts/analytics/index.js";
+import { growthMapResponseSchema, type GrowthMapTimeframe } from "../../contracts/analytics/index.js";
 import { GrowthMapService, MILESTONE_IMPACT_CAVEAT } from "../../src/modules/analytics/growth-map.service.js";
 import { rollUpDay } from "../../src/lib/rollup/roll-up-day.js";
+import { SCORING_VERSION } from "../../src/lib/scoring/index.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 
@@ -33,6 +34,18 @@ describe("STORY-137 · growth map", () => {
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
     await migrateUp(db);
+    // STORY-066 scenario 1 — twelve monthly partitions BEFORE the ones the
+    // migration made, so "bounded to one day" is measured against a table that
+    // has history to prune.
+    const now = new Date();
+    for (let monthsBack = 1; monthsBack <= 12; monthsBack += 1) {
+      const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthsBack, 1));
+      const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthsBack + 1, 1));
+      await db.query(
+        `CREATE TABLE answer_captures_p${start.toISOString().slice(0, 7).replace("-", "")}
+           PARTITION OF answer_captures FOR VALUES FROM ('${start.toISOString()}') TO ('${end.toISOString()}')`,
+      );
+    }
   }, 300_000);
 
   afterAll(async () => {
@@ -157,11 +170,10 @@ describe("STORY-137 · growth map", () => {
     await rollUpDay(db, workspaceId, projectId, date, "UTC");
   }
 
-  function read(timeframe: "7d" | "30d" | "90d" = "7d", entities?: string, engines?: string) {
-    return withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
+  function read(timeframe: GrowthMapTimeframe = "7d", entities?: string, engines?: string, client: Client = db) {
+    return withTenantContext(client, { workspaceId, actorId: randomUUID() }, () =>
       new GrowthMapService().growthMap(projectId, {
         timeframe,
-        granularity: "day",
         ...(entities === undefined ? {} : { entities }),
         ...(engines === undefined ? {} : { engines }),
       }),
@@ -385,6 +397,191 @@ describe("STORY-137 · growth map", () => {
       competitor_gap_start: null,
       competitor_gap_end: null,
     });
+  });
+
+
+  // ───────────────────────── STORY-066 — the series contract ─────────────────────────
+
+  /** One brand `engine_key='all'` row, written straight into the rollup layer. */
+  async function dailyRow(n: number, visibility: number, version = SCORING_VERSION, entity: { type: "brand" | "competitor"; id: string } = { type: "brand", id: projectId }): Promise<string> {
+    const { date } = dayAgo(n);
+    await db.query(
+      `INSERT INTO metric_daily (workspace_id,project_id,engine_key,entity_type,entity_id,metric_date,cells_total,cells_present,
+                                 presence_rate,sov,visibility_score,live_capture_ratio,scoring_version)
+       VALUES ($1,$2,'all',$3,$4,$5::date,10,5,0.5,$6,$7,1,$8)`,
+      [workspaceId, projectId, entity.type, entity.id, date, visibility / 200, visibility, version],
+    );
+    return date;
+  }
+
+  it("STORY-066 scenario 1 — each timeframe auto-selects its granularity (24h → hour, ≤90d → day, >90d → week)", async () => {
+    await measuredDay(1);
+    const expected: [GrowthMapTimeframe, string, number][] = [
+      ["24h", "hour", 24],
+      ["7d", "day", 7],
+      ["30d", "day", 30],
+      ["90d", "day", 90],
+      ["180d", "week", 26],
+      ["365d", "week", 53],
+    ];
+    for (const [timeframe, granularity, points] of expected) {
+      const document = await read(timeframe);
+      expect(document.granularity, timeframe).toBe(granularity);
+      expect(document.series[0]!.points, timeframe).toHaveLength(points);
+      expect(growthMapResponseSchema.safeParse(document).success, timeframe).toBe(true);
+    }
+  });
+
+  it("STORY-066 scenario 1 — 24h reads the captures directly: an hour with cells is scored with no rollup row at all", async () => {
+    const at = new Date(Date.now() - 2 * 3_600_000);
+    const cell = await addCell(at.toISOString(), "google_ai_mode", true);
+    await addMention(cell, at.toISOString());
+    expect((await db.query("SELECT 1 FROM metric_daily")).rowCount).toBe(0);
+
+    const document = await read("24h", "brand");
+    const hour = `${at.toISOString().slice(0, 13)}:00:00Z`;
+    const point = document.series[0]!.points.find((p) => p.d === hour);
+    expect(point, `no ${hour} bucket in ${document.series[0]!.points.map((p) => p.d).join(",")}`).toBeDefined();
+    expect(point!.cells).toBe(1);
+    expect(point!.visibility_score).not.toBeNull();
+    // Every other hour measured nothing: null, and announced as a gap.
+    expect(document.series[0]!.points.filter((p) => p.visibility_score !== null)).toHaveLength(1);
+    expect(document.annotations.data_gaps.length).toBeGreaterThan(0);
+    expect(document.timeframe.to).toBe(document.series[0]!.points.at(-1)!.d);
+  });
+
+  it("STORY-066 scenario 1 — every 24h read of answer_captures is pruned to at most the two partitions one day can span", async () => {
+    const at = new Date(Date.now() - 3_600_000).toISOString();
+    await addCell(at, "chatgpt", false, "failed");
+    const plans: string[] = [];
+    const explaining = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "query") {
+          return async (sql: unknown, values?: unknown[]) => {
+            if (typeof sql === "string" && /\banswer_captures\b/u.test(sql)) {
+              const explained = await target.query<Record<string, string>>(`EXPLAIN (COSTS OFF) ${sql}`, values);
+              plans.push(explained.rows.map((row) => row["QUERY PLAN"] ?? "").join("\n"));
+            }
+            return (target.query as (...a: unknown[]) => unknown).call(target, sql, values);
+          };
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+
+    await read("24h", undefined, undefined, explaining as unknown as Client);
+    expect(plans.length).toBeGreaterThan(0);
+    for (const plan of plans) {
+      const partitions = new Set([...plan.matchAll(/ on (answer_captures_[a-z0-9_]+)/gu)].map((match) => match[1]));
+      expect(partitions.size, `a 24h read reached ${String(partitions.size)} partitions:\n${plan}`).toBeGreaterThan(0);
+      expect(partitions.size, `a 24h read reached ${String(partitions.size)} partitions:\n${plan}`).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it("STORY-066 scenario 2 — the longest timeframe plots the MEAN of daily values, not a resampled last value", async () => {
+    // The last bucket is the seven days ending today.
+    await dailyRow(6, 10);
+    await dailyRow(5, 20);
+    await dailyRow(0, 90);
+    const document = await read("365d", "brand");
+    const last = document.series[0]!.points.at(-1)!;
+    expect(last.d).toBe(dayAgo(6).date);
+    expect(last.visibility_score).toBeCloseTo(40, 6);
+    expect(last.cells).toBe(30);
+    // The week before measured nothing: null, never carried across.
+    expect(document.series[0]!.points.at(-2)!.visibility_score).toBeNull();
+  });
+
+  it("STORY-066 scenario 6 — a cadence change is annotated, from the trigger's own milestone", async () => {
+    await measuredDay(1);
+    await db.query("UPDATE projects SET cadence = 'daily' WHERE id = $1", [projectId]);
+    // A system annotation whose detail is not the trigger's format is not a cadence change.
+    await db.query(
+      `INSERT INTO milestones (workspace_id,project_id,occurred_at,kind,title,detail,severity,source_type)
+       VALUES ($1,$2,now(),'annotation','Capture cadence changed','sometime to never','info','system')`,
+      [workspaceId, projectId],
+    );
+    const document = await read("7d");
+    expect(document.annotations.cadence_changes).toEqual([{ at: dayAgo(0).date, from: "weekly", to: "daily" }]);
+  });
+
+  it("STORY-066 scenario 14 — a series spanning two scoring versions plots both and marks the boundary", async () => {
+    await dailyRow(5, 40, "v0");
+    await dailyRow(4, 41, "v0");
+    const boundary = await dailyRow(2, 60);
+    await dailyRow(2, 30, "v0"); // the same day under the old version loses to the current one
+    await dailyRow(1, 61);
+    const document = await read("7d", "brand");
+    const byDay = new Map(document.series[0]!.points.map((p) => [p.d, p.visibility_score]));
+    expect(byDay.get(dayAgo(5).date)).toBeCloseTo(40, 6);
+    expect(byDay.get(boundary)).toBeCloseTo(60, 6);
+    expect(document.annotations.scoring_version_changes).toEqual([{ at: boundary, from: "v0", to: SCORING_VERSION }]);
+  });
+
+  it("STORY-066 scenario 14 / STORY-136 AC9 — the summary delta is null across a scoring-version boundary; the ends are still reported", async () => {
+    await dailyRow(5, 40, "v0");
+    await dailyRow(1, 61);
+    const summary = (await read("7d", "brand")).summary;
+    expect(summary.visibility_start).toBeCloseTo(40, 6);
+    expect(summary.visibility_end).toBeCloseTo(61, 6);
+    expect(summary.visibility_delta).toBeNull();
+  });
+
+  it("STORY-066 scenario 14 — best and worst engine are read under the same version pick as the series, so an older-version window still names them", async () => {
+    for (const [engine, visibility] of [["chatgpt", 20], ["gemini", 70]] as const) {
+      await db.query(
+        `INSERT INTO metric_daily (workspace_id,project_id,engine_key,entity_type,entity_id,metric_date,cells_total,cells_present,
+                                   presence_rate,sov,visibility_score,live_capture_ratio,scoring_version)
+         VALUES ($1,$2,$3,'brand',$2,$4::date,10,5,0.5,0.2,$5,1,'v0')`,
+        [workspaceId, projectId, engine, dayAgo(3).date, visibility],
+      );
+    }
+    await dailyRow(3, 45, "v0");
+    expect((await read("7d", "brand")).summary).toMatchObject({ best_engine: "gemini", worst_engine: "chatgpt" });
+  });
+
+  it("STORY-066 scenario 14 — a window under one scoring version has no boundary", async () => {
+    await dailyRow(2, 60);
+    await dailyRow(1, 61);
+    expect((await read("7d")).annotations.scoring_version_changes).toEqual([]);
+  });
+
+  it("STORY-066 scenario 15 — a full 90d × 6 engines × 4 entities series arrives in ONE request inside its 45 ms budget", async () => {
+    await setUp(3);
+    const engines = ["chatgpt", "perplexity", "google_aio", "google_ai_mode", "gemini", "claude", "all"];
+    const entities: [string, string][] = [["brand", projectId], ...competitorIds.map((id): [string, string] => ["competitor", id])];
+    for (const [entityType, entityId] of entities) {
+      await db.query(
+        `INSERT INTO metric_daily (workspace_id,project_id,engine_key,entity_type,entity_id,metric_date,cells_total,cells_present,
+                                   presence_rate,sov,visibility_score,live_capture_ratio,scoring_version)
+         SELECT $1,$2,e,$3,$4,(now() AT TIME ZONE 'UTC')::date - g,40,20,0.5,0.2,50 + (g % 7),1,$5
+           FROM generate_series(0,89) g CROSS JOIN unnest($6::text[]) e`,
+        [workspaceId, projectId, entityType, entityId, SCORING_VERSION, engines],
+      );
+    }
+    for (let i = 0; i < 12; i += 1) {
+      await db.query(
+        `INSERT INTO milestones (workspace_id,project_id,occurred_at,kind,title,severity)
+         VALUES ($1,$2,now() - make_interval(days => $3::int),'annotation','Note','info')`,
+        [workspaceId, projectId, i * 7],
+      );
+    }
+    await db.query("ANALYZE metric_daily");
+
+    const document = await read("90d");
+    // ONE payload carries every series, the pins and both annotation layers.
+    expect(document.series.map((s) => s.entity_type)).toEqual(["brand", "competitor", "competitor", "competitor", "derived"]);
+    expect(document.series.every((s) => s.points.length === 90 && s.points.every((p) => p.visibility_score !== null))).toBe(true);
+    expect(document.milestones).toHaveLength(12);
+
+    const timings: number[] = [];
+    for (let run = 0; run < 9; run += 1) {
+      const started = performance.now();
+      await read("90d");
+      timings.push(performance.now() - started);
+    }
+    const median = [...timings].sort((a, b) => a - b)[4]!;
+    expect(median, `median ${median.toFixed(1)} ms over ${timings.map((t) => t.toFixed(1)).join(", ")}`).toBeLessThanOrEqual(45);
   });
 
   it("404s for a project that does not exist", async () => {

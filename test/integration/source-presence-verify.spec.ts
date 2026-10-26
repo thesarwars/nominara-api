@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +8,8 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import type { GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
 import { verifyProjectSourcePresence } from "../../src/lib/sources/verify-presence.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
+import { createSourceVerifyPresenceHandler } from "../../src/lib/queue/handlers/source-verify-presence.handler.js";
+import { withProjectQueueLock } from "../../src/lib/queue/locks.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import type { Job } from "bullmq";
 
@@ -60,7 +62,7 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE answer_captures, citation_facts, project_source_index, source_domains, projects, workspaces CASCADE");
+    await db.query("TRUNCATE answer_captures, citation_facts, project_source_index, source_domains, milestones, tasks, projects, workspaces CASCADE");
     workspaceId = randomUUID();
     projectId = randomUUID();
     await db.query("INSERT INTO workspaces (id, name, slug, plan_key, timezone) VALUES ($1,'W',$2,'growth','UTC')", [workspaceId, `w-${workspaceId.slice(0, 8)}`]);
@@ -278,6 +280,199 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
       const gone = { data: { payload: { workspaceId, kid: "k", projectId: randomUUID() } } } as unknown as Job;
       await withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) => rollup(enqueue)(tx, gone));
       expect(enqueue).not.toHaveBeenCalled();
+    });
+  });
+
+
+  describe("STORY-066 AC8 · source_seeded — completing an authority task verifies ITS target, and the pin is at the completion", () => {
+    const TARGET = "https://reviews.dev/threads/acme";
+    /** An authority task on `domain`, in `status`, completed at `completedAt`; returns its id. */
+    async function authorityTask(
+      domain: string,
+      status: "done" | "in_progress",
+      opts: { kind?: string; completedAt?: Date; affectedUrl?: string | null } = {},
+    ): Promise<string> {
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO tasks (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status,
+                            source_domain_id, affected_url, completed_at)
+         VALUES ($1,$2,$3,$4,$5,$6,'Contribute to reviews.dev','d',$7,
+                 (SELECT id FROM source_domains WHERE domain = $8), $9, CASE WHEN $7 = 'done' THEN $10::timestamptz END)`,
+        [id, workspaceId, projectId, `T-${id.slice(0, 6)}`, opts.kind ?? "authority", randomBytes(16), status, domain,
+         opts.affectedUrl === undefined ? TARGET : opts.affectedUrl, opts.completedAt ?? new Date(NOW.getTime() - DAY)],
+      );
+      return id;
+    }
+
+    const pins = async () =>
+      (
+        await db.query<{ kind: string; source_type: string; source_id: string; occurred_at: Date; severity: string; visible_in_portal: boolean }>(
+          "SELECT kind, source_type, source_id::text, occurred_at, severity, visible_in_portal FROM milestones WHERE project_id = $1 ORDER BY occurred_at",
+          [projectId],
+        )
+      ).rows;
+
+    /** The completion's job, through the real handler (its phases composed on one client — the shape for a handler spec). */
+    const seededJob = (taskId: string, fetch: (url: string) => Promise<GuardedResponse>, now = NOW) =>
+      withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) =>
+        createSourceVerifyPresenceHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { fetch, now: () => now })(
+          tx,
+          { data: { payload: { workspaceId, kid: "k", projectId, taskId } } } as unknown as Job,
+        ),
+      );
+
+    it("THE HAZARD: the domain was verified absent the day before, the task is completed while that is cached — the pin is at the completion", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      const absentAt = new Date(NOW.getTime() - 2 * DAY);
+      await verify(vi.fn().mockResolvedValue(html("Only Globex")), absentAt); // verified ABSENT; cached for 30 days from here
+      const completedAt = new Date(NOW.getTime() - DAY);
+      const task = await authorityTask("reviews.dev", "done", { completedAt });
+
+      // The periodic run inside the cache fetches nothing, so it could never have pinned this.
+      const periodic = vi.fn();
+      await verify(periodic);
+      expect(periodic).not.toHaveBeenCalled();
+
+      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics answered the question"));
+      await seededJob(task, fetch);
+      expect(fetch).toHaveBeenCalledWith(TARGET); // the task's target, not the domain's most-cited page
+      const [pin, ...rest] = await pins();
+      expect(rest).toEqual([]);
+      expect(pin).toMatchObject({ kind: "source_seeded", source_type: "system", severity: "positive", visible_in_portal: true });
+      expect(pin!.occurred_at.toISOString()).toBe(completedAt.toISOString());
+      // and the domain now reads present, so the gap closes
+      for (const r of await rows("reviews.dev")) expect(r.brand_present_on_domain).toBe(true);
+    });
+
+    it("a redelivery pins once and fetches nothing more", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      const task = await authorityTask("reviews.dev", "done");
+      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics"));
+      await seededJob(task, fetch);
+      await seededJob(task, fetch);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(await pins()).toHaveLength(1);
+    });
+
+    it("the periodic presence job NEVER pins source_seeded, even when the domain's most-cited page carries the brand", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      await authorityTask("reviews.dev", "done");
+      await verify(vi.fn().mockResolvedValue(html("Acme Analytics is reviewed here")));
+      for (const r of await rows("reviews.dev")) expect(r.brand_present_on_domain).toBe(true);
+      expect(await pins()).toEqual([]);
+    });
+
+    it("review round 2 — a SOURCE-GAP task (affected_url NULL, exactly what the source-gap rule writes) is verified against the domain's most-cited indexed page and pins", async () => {
+      await cite("reviews.dev", 1); // the index's most-cited page on the domain is https://reviews.dev/best
+      await reindex();
+      await verify(vi.fn().mockResolvedValue(html("Only Globex")), new Date(NOW.getTime() - 2 * DAY)); // verified absent, cached
+      const completedAt = new Date(NOW.getTime() - DAY);
+      const task = await authorityTask("reviews.dev", "done", { affectedUrl: null, completedAt });
+      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics now answers here"));
+      await seededJob(task, fetch);
+      expect(fetch).toHaveBeenCalledWith("https://reviews.dev/best");
+      const [pin, ...rest] = await pins();
+      expect(rest).toEqual([]);
+      expect(pin).toMatchObject({ kind: "source_seeded", source_type: "system" });
+      expect(pin!.occurred_at.toISOString()).toBe(completedAt.toISOString());
+      for (const r of await rows("reviews.dev")) expect(r.brand_present_on_domain).toBe(true);
+    });
+
+    it("review round 3 — a SOURCE-GAP task on a domain whose index rows come only from demo-marked captures fetches nothing (the periodic run's demo exclusion)", async () => {
+      await cite("reviews.dev", 1, "gemini", await demoCapture("gemini")); // a live engine's key, but a demo-seeded capture
+      await reindex();
+      expect((await rows("reviews.dev")).length).toBeGreaterThan(0); // the index row (and its top URL) exists
+      const task = await authorityTask("reviews.dev", "done", { affectedUrl: null });
+      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics"));
+      await seededJob(task, fetch);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(await pins()).toEqual([]);
+    });
+
+    it("pins nothing for an open task, a non-authority task, or a target without the brand", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      const fetch = vi.fn().mockImplementation((url: string) => Promise.resolve(html(url.endsWith("/without") ? "Only Globex" : "Acme Analytics")));
+      await seededJob(await authorityTask("reviews.dev", "in_progress"), fetch);
+      await seededJob(await authorityTask("reviews.dev", "done", { kind: "content" }), fetch);
+      await seededJob(await authorityTask("reviews.dev", "done", { affectedUrl: "https://reviews.dev/without" }), fetch);
+      expect(fetch).toHaveBeenCalledTimes(1); // only the last one has a target to fetch
+      expect(await pins()).toEqual([]);
+    });
+
+    // Review round 2 — LOST UPDATE. The rollup's source-index refresh reads the carried presence, DELETEs and re-inserts the
+    // project's index under the rollup's per-project advisory lock. A presence commit that skips that lock UPDATEs rows the open
+    // rollup already deleted (0 rows) and then carries the rollup's stale "absent" over: the pin commits, the gap stays open.
+    /** Holds a rollup-shaped transaction open past its index rebuild, runs `write` against it, then commits the rollup. */
+    async function racingRollup(write: () => Promise<unknown>): Promise<void> {
+      const rollupTx = new Client({ connectionString: container.getConnectionUri() });
+      await rollupTx.connect();
+      try {
+        const rollupPid = (await rollupTx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!.pid;
+        const writerPid = (await db.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!.pid; // the write runs on `db`
+        await rollupTx.query("BEGIN");
+        await withProjectQueueLock(rollupTx, "rollup.metric_daily", projectId, () => refreshProjectSourceIndex(rollupTx, projectId, TODAY));
+        const pending = write();
+        // Wait (bounded) until THE WRITER is blocked BY THE ROLLUP — on its advisory lock with the fix, on the deleted rows without —
+        // so the race is provably set up before the rollup commits. Review round 3: not any ungranted lock in the database.
+        let raced = false;
+        for (let i = 0; i < 100 && !raced; i += 1) {
+          const blocked = await rollupTx.query<{ raced: boolean }>("SELECT $1::int = ANY(pg_blocking_pids($2::int)) AS raced", [rollupPid, writerPid]);
+          raced = blocked.rows[0]!.raced;
+          if (!raced) await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await rollupTx.query("COMMIT");
+        await pending;
+        expect(raced, "the write never waited on the rollup, so no race was exercised").toBe(true);
+      } finally {
+        await rollupTx.end();
+      }
+    }
+
+    it("review round 2 — a seeded commit racing a rollup's index rebuild leaves the domain PRESENT once both commit", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      await verify(vi.fn().mockResolvedValue(html("Only Globex")), new Date(NOW.getTime() - 2 * DAY)); // absent, cached
+      const task = await authorityTask("reviews.dev", "done");
+      await racingRollup(() => seededJob(task, vi.fn().mockResolvedValue(html("Acme Analytics"))));
+      expect(await pins()).toHaveLength(1);
+      const after = await rows("reviews.dev");
+      expect(after.length).toBeGreaterThan(0);
+      for (const r of after) expect(r.brand_present_on_domain).toBe(true);
+    });
+
+    it("review round 2 — a periodic presence commit racing a rollup's index rebuild keeps its verified value", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      await racingRollup(() => verify(vi.fn().mockResolvedValue(html("Acme Analytics is reviewed here"))));
+      const after = await rows("reviews.dev");
+      expect(after.length).toBeGreaterThan(0);
+      for (const r of after) expect(r.brand_present_on_domain).toBe(true);
+    });
+
+    it("another workspace's context cannot verify (or fetch for) this project's task", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      const task = await authorityTask("reviews.dev", "done");
+      const otherWorkspace = randomUUID();
+      await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'W2',$2,'growth','UTC')", [otherWorkspace, `w-${randomUUID().slice(0, 8)}`]);
+      const fetch = vi.fn();
+      await db.query("SET ROLE nominara_app");
+      try {
+        await withTenantContext(db, { workspaceId: otherWorkspace, actorId: randomUUID() }, (tx) =>
+          createSourceVerifyPresenceHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { fetch, now: () => NOW })(
+            tx,
+            { data: { payload: { workspaceId: otherWorkspace, kid: "k", projectId, taskId: task } } } as unknown as Job,
+          ),
+        );
+      } finally {
+        await db.query("RESET ROLE");
+      }
+      expect(fetch).not.toHaveBeenCalled();
+      expect(await pins()).toEqual([]);
     });
   });
 
