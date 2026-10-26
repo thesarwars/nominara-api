@@ -86,26 +86,38 @@ async function pinEngineModelChanges(tx: ClientBase, workspaceId: string, projec
     [projectId, metricDate, timezone, DEMO_SEED_MARKER, [...byEngine.keys()]],
   );
 
+  // ONE PIN PER (engine, from, to) PER DAY, named by the DAY and not by the instant. The rollup runs after every parse batch, and
+  // capture workers commit out of order: a capture taken EARLIER than one an earlier rollup already saw can commit after it, so a
+  // re-run finds the same change at an earlier instant. An instant in the name would pin it twice (AC7); the day cannot move. The
+  // pin's `occurred_at` is then moved to the earliest instant seen (`LEAST`), and a vendor whose fingerprint flips per request
+  // pins each distinct change once a day rather than once per flip.
   let pinned = 0;
   for (const row of previous.rows) {
     const label = row.display_name ?? row.engine_key;
+    const earliest = new Map<string, { from: string; to: string; at: Date }>();
     for (const transition of fingerprintTransitions(row.model_fingerprint, byEngine.get(row.engine_key) ?? [])) {
-      const result = await tx.query(
+      const key = JSON.stringify([transition.from, transition.to]);
+      if (!earliest.has(key)) earliest.set(key, transition);
+    }
+    for (const transition of earliest.values()) {
+      const result = await tx.query<{ inserted: boolean }>(
         `INSERT INTO milestones (workspace_id, project_id, occurred_at, kind, title, detail, severity, source_type, source_id,
                                  affected_engines, visible_in_portal)
          VALUES ($1, $2, $3, 'engine_model_change', $4, $5, 'warning', 'system', $6, ARRAY[$7::text], false)
-         ON CONFLICT (source_type, source_id) WHERE source_id IS NOT NULL DO NOTHING`,
+         ON CONFLICT (source_type, source_id) WHERE source_id IS NOT NULL
+         DO UPDATE SET occurred_at = LEAST(milestones.occurred_at, EXCLUDED.occurred_at)
+         RETURNING (xmax = 0) AS inserted`,
         [
           workspaceId,
           projectId,
           transition.at,
           `${label} model fingerprint changed`,
           `${transition.from} to ${transition.to}`,
-          nameUuid("engine_model_change", projectId, row.engine_key, transition.from, transition.to, transition.at.toISOString()),
+          nameUuid("engine_model_change", projectId, row.engine_key, transition.from, transition.to, metricDate),
           row.engine_key,
         ],
       );
-      pinned += result.rowCount ?? 0;
+      if (result.rows[0]?.inserted === true) pinned += 1;
     }
   }
   return pinned;
