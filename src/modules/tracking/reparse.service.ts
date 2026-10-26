@@ -1,14 +1,18 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import { SpanStatusCode, trace, type Span } from "@opentelemetry/api";
-import type { ClientBase } from "pg";
+import type { ClientBase, Pool } from "pg";
 import type { ReparseResponse, ReparseSnapshot } from "../../../contracts/tracking/index.js";
-import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
+import { ConflictError, NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
+import { PG_POOL } from "../../db/pg-pool.js";
+import { decodeRawObject, type RawObjectBody } from "../../lib/capture/raw-object.js";
+import { StorageTenancyError } from "../../lib/storage/storage-keys.js";
+import { TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
 import { loadParseContext, parseCapture, persistParse, type CaptureRow } from "../../lib/parser/parse-capture.js";
 import type { ResolvedCitation } from "../../lib/parser/citations.js";
 import { markDateDirty, type DirtyEntry } from "../../lib/rollup/dirty-dates.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { assertProjectInScope } from "../../tenancy/project-scope.js";
-import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 import { assertWithinRawRetention } from "./raw-retention.js";
 
 // STORY-034 AC9 - `POST /v1/results/{id}/reparse`: "re-run the parser on the stored capture, with a before-and-after diff, and charge
@@ -20,10 +24,13 @@ import { assertWithinRawRetention } from "./raw-retention.js";
 //
 // THE REQUEST PATH MAKES NO EXTERNAL CALL (KAD-06, NFR-ARCH-04), and two choices follow from that, both worth stating:
 //
-//   1. THE ANSWER IS READ FROM `answer_captures.payload`, NOT FROM THE RAW OBJECT. STORY-181 dual-writes: the object is the verbatim
-//      retained copy and `payload` keeps the same text. Reading S3 here would hold the request's tenant transaction open across an
-//      await on object storage, and a request handler cannot end that transaction (the interceptor owns it). The two copies are the
-//      same bytes by construction (written in one step); the capture worker's parse reads the object.
+//   1. THE ANSWER IS READ FROM THE STORED RAW OBJECT (tracking-engine.md section 8; STORY-181), BEFORE THE REQUEST'S TRANSACTION OPENS.
+//      The object is the verbatim retained copy and the parser's input (`capture.parse` reads it); `payload` is only the dual-written
+//      fallback for a legacy row that has no object. Reading S3 inside the request's transaction would hold it open across an await on
+//      object storage, and a handler cannot end that transaction (the interceptor owns it). So `ReparseGuard` (a route guard, which runs
+//      before the interceptor opens the transaction) calls `prefetchSource`: one short tenant transaction to read the key and check
+//      scope and retention, NO transaction for the read, and the decoded object is handed to `reparse`. `reparse` re-reads the row
+//      FOR UPDATE and refuses (409) if its key moved in between, then parses and writes in the ONE request transaction.
 //   2. CITATIONS ARE NOT RE-FETCHED. Resolving a citation follows a redirect on a third party's site. A re-parse re-uses the
 //      resolution already recorded for each citation (status, final URL, `resolved_at`); a URL the improved extractor finds that
 //      was never resolved is stored unresolved (`http_status` NULL, excluded from share), exactly like any unresolved citation,
@@ -46,6 +53,7 @@ interface CaptureRecord {
   captured_at: Date;
   status: "captured" | "parsed" | "failed" | "blocked" | "skipped";
   flags: string[];
+  raw_object_key: string | null;
   payload: { text?: unknown; structured_citations?: unknown; structured_elements?: unknown; raw_expired?: unknown } | null;
 }
 
@@ -77,14 +85,71 @@ interface RecordedResolution {
   readonly resolved_at: Date | null;
 }
 
+/** The decoded raw object `prefetchSource` read for a capture, with the key it was read from (the row is re-checked against it). */
+export interface ReparseSource {
+  readonly objectKey: string;
+  readonly body: RawObjectBody;
+}
+
 @Injectable()
 export class ReparseService {
-  constructor(@Inject(REPARSE_DIRTY_MARKER) private readonly markDirty: DirtyMarker) {}
+  constructor(
+    @Inject(REPARSE_DIRTY_MARKER) private readonly markDirty: DirtyMarker,
+    @Inject(PG_POOL) private readonly pool: Pool,
+    private readonly objects: TenantObjectStore,
+  ) {}
 
-  reparse(resultId: string): Promise<ReparseResponse> {
+  /**
+   * Reads the capture's raw object with NO transaction open. Called by `ReparseGuard`, before the request's transaction exists.
+   *
+   * Phase 1 is one short tenant transaction: the row's key, the caller's project scope and the retention window, so a request that
+   * will be refused costs no object read. The bound store is taken inside it (it only reads the workspace id). Phase 2 holds neither a
+   * transaction nor a pooled client. Returns undefined when there is nothing to read (no object, a cell with no answer, an expired
+   * capture, an unknown id): `reparse` then answers from the row exactly as before.
+   */
+  async prefetchSource(tenant: TenantContext, resultId: string): Promise<ReparseSource | undefined> {
+    const client = await this.pool.connect();
+    let target: { objectKey: string; reader: ReturnType<TenantObjectStore["bind"]> } | undefined;
+    try {
+      await withTenantContext(client, tenant, async (tx) => {
+        const found = await tx.query<{ project_id: string; captured_at: Date; status: string; raw_object_key: string | null; raw_expired: string | null }>(
+          `SELECT project_id, captured_at, status, raw_object_key, payload->>'raw_expired' AS raw_expired FROM answer_captures WHERE id = $1`,
+          [resultId],
+        );
+        const row = found.rows[0];
+        if (row === undefined || row.raw_object_key === null || row.status === "failed" || row.status === "blocked") return;
+        await assertProjectInScope(tx, row.project_id);
+        await assertWithinRawRetention(tx, tenant.workspaceId, { capturedAt: row.captured_at, rawExpired: row.raw_expired }, "reparse");
+        target = { objectKey: row.raw_object_key, reader: this.objects.bind() };
+      });
+    } finally {
+      client.release();
+    }
+    if (target === undefined) return undefined;
+
+    try {
+      const bytes = await target.reader.getStored("raw", target.objectKey);
+      incrementCounter("nominara_tracking_reparse_source_total", { source: "object" });
+      return { objectKey: target.objectKey, body: decodeRawObject(bytes) };
+    } catch (error) {
+      if (error instanceof StorageTenancyError) {
+        // A key outside this workspace's prefix is corruption or an attack, never a lookup miss. IDs only; never the key.
+        incrementCounter("nominara_tracking_reparse_source_total", { source: "tenancy_refused" });
+        logger.warn({ event: "raw_object_tenancy_refused", workspace_id: tenant.workspaceId, result_id: resultId });
+      } else if (error instanceof NotFoundError) {
+        incrementCounter("nominara_tracking_reparse_source_total", { source: "missing" });
+        throw new PreconditionUnmetError({ message: "the stored raw answer for this capture is missing" });
+      } else {
+        incrementCounter("nominara_tracking_reparse_source_total", { source: "failed" });
+      }
+      throw error;
+    }
+  }
+
+  reparse(resultId: string, source?: ReparseSource): Promise<ReparseResponse> {
     return tracer.startActiveSpan("tracking.reparse", async (span) => {
       try {
-        const response = await this.run(resultId, span);
+        const response = await this.run(resultId, span, source);
         span.setAttribute("nominara.tracking.reparse.changed", response.changed);
         return response;
       } catch (error) {
@@ -97,7 +162,7 @@ export class ReparseService {
     });
   }
 
-  private async run(resultId: string, _span: Span): Promise<ReparseResponse> {
+  private async run(resultId: string, _span: Span, source: ReparseSource | undefined): Promise<ReparseResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ReparseService requires an active tenant context");
     const client = store.client;
@@ -106,7 +171,7 @@ export class ReparseService {
     // FOR UPDATE: two re-parses of one capture (a double click, a retried request) serialise here instead of interleaving their
     // delete-then-insert. RLS makes another workspace's row absent.
     const found = await client.query<CaptureRecord>(
-      `SELECT id, project_id, prompt_id, engine_key, captured_at, status, flags, payload
+      `SELECT id, project_id, prompt_id, engine_key, captured_at, status, flags, raw_object_key, payload
          FROM answer_captures
         WHERE id = $1
         FOR UPDATE`,
@@ -119,7 +184,18 @@ export class ReparseService {
     // Past retention the stored answer is gone by policy: 507, and the facts already stored are left exactly as they are.
     await assertWithinRawRetention(client, workspaceId, { capturedAt: capture.captured_at, rawExpired: capture.payload?.raw_expired }, "reparse");
 
-    const text = capture.payload?.text;
+    // THE ANSWER IS THE STORED OBJECT when the row has one (tracking-engine.md section 8, AC9); `payload` only for a legacy row without
+    // an object. The object was read before this transaction opened; it is never read here. A row that names an object with none
+    // supplied is a caller that bypassed `ReparseGuard`: refused, because the only other way to get the text is to read S3 in here.
+    let body: RawObjectBody | null = null;
+    if (capture.raw_object_key !== null && capture.status !== "failed" && capture.status !== "blocked") {
+      if (source === undefined) throw new Error("ReparseService.reparse needs the prefetched raw object for a capture that has one");
+      if (source.objectKey !== capture.raw_object_key) {
+        throw new ConflictError({ message: "the stored answer changed while the re-parse was starting: retry" });
+      }
+      body = source.body;
+    }
+    const text = body !== null ? body.text : capture.payload?.text;
     if (capture.status === "failed" || capture.status === "blocked" || typeof text !== "string" || text.length === 0) {
       // A cell that was never captured, a refusal, and a reused row whose text lives with its source have no stored answer of their
       // own to re-run. Said plainly, not parsed as an empty answer (which would write "absent" facts for a question never answered).
@@ -139,7 +215,7 @@ export class ReparseService {
       capturedAt: capture.captured_at,
       text,
       flags: capture.flags,
-      ...structuredOf(capture),
+      ...structuredOf(capture, body),
     };
     const parsed = await parseCapture(row, {
       ...context,
@@ -171,9 +247,9 @@ export class ReparseService {
   }
 }
 
-function structuredOf(capture: CaptureRecord): Partial<Pick<CaptureRow, "structuredCitations" | "structuredElements">> {
-  const citations = capture.payload?.structured_citations;
-  const elements = capture.payload?.structured_elements;
+function structuredOf(capture: CaptureRecord, body: RawObjectBody | null): Partial<Pick<CaptureRow, "structuredCitations" | "structuredElements">> {
+  const citations = body !== null ? body.structured_citations : capture.payload?.structured_citations;
+  const elements = body !== null ? body.structured_elements : capture.payload?.structured_elements;
   return {
     ...(Array.isArray(citations) ? { structuredCitations: citations as NonNullable<CaptureRow["structuredCitations"]> } : {}),
     ...(Array.isArray(elements) ? { structuredElements: elements as NonNullable<CaptureRow["structuredElements"]> } : {}),

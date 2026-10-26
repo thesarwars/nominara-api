@@ -7,6 +7,7 @@ import { Client, Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { reparseResponseSchema, resultsListQuerySchema, type ResultsListQuery } from "../../contracts/tracking/index.js";
 import {
+  ConflictError,
   NotFoundError,
   PreconditionUnmetError,
   RetentionExceededError,
@@ -14,12 +15,20 @@ import {
 } from "../../src/api/errors/domain-errors.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { encodeRawObject, rawObjectRelativeKey } from "../../src/lib/capture/raw-object.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { S3Adapter } from "../../src/lib/storage/s3.adapter.js";
+import { resolveStorageConfig } from "../../src/lib/storage/storage-config.js";
+import { StorageTenancyError } from "../../src/lib/storage/storage-keys.js";
+import type { ObjectStoragePort } from "../../src/lib/storage/storage.port.js";
+import { TenantObjectStore } from "../../src/lib/storage/tenant-object-store.js";
+import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
 import type { DirtyEntry } from "../../src/lib/rollup/dirty-dates.js";
 import { ReparseService } from "../../src/modules/tracking/reparse.service.js";
 import { ResultDocumentService } from "../../src/modules/tracking/result-document.service.js";
 import { ResultsListService } from "../../src/modules/tracking/results-list.service.js";
 import { ProjectOutOfScopeException } from "../../src/tenancy/errors.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-034 - the remaining read/maintenance ACs: AC7 (the cursor list), AC9 (re-parse with a diff, free) and AC10 (retention
@@ -42,6 +51,8 @@ vi.mock("../../src/lib/telemetry/metrics.js", async () => {
 const exporter = new InMemorySpanExporter();
 
 const ANSWER = "## Best CRMs\n\n1. **HubSpot** - we recommend it for most teams.\n2. Salesforce - deeper reporting, however it has a steep learning curve.\n";
+const TAMPERED = "Zoho CRM is the only thing worth buying.";
+const KEY_ENV = "inttest";
 const DAY = 86_400_000;
 
 describe("STORY-034 · results list, re-parse and retention", () => {
@@ -56,9 +67,25 @@ describe("STORY-034 · results list, re-parse and retention", () => {
   let promptId: string;
   let competitorId: string;
   let marks: DirtyEntry[];
+  let localstack: LocalstackFixture;
+  let s3: S3Adapter;
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18").withDatabase("nominara_test").withUsername("nominara").withPassword("nominara").start();
+    localstack = await startLocalstack();
+    const config = resolveStorageConfig({
+      NODE_ENV: "test",
+      STORAGE_ENDPOINT: localstack.endpoint,
+      STORAGE_BUCKET_RAW: "nominara-raw",
+      STORAGE_BUCKET_REPORTS: "nominara-reports",
+      STORAGE_ACCESS_KEY_ID: "test",
+      STORAGE_SECRET_ACCESS_KEY: "test",
+      STORAGE_FORCE_PATH_STYLE: "true",
+      STORAGE_SSE: "AES256",
+      STORAGE_KEY_ENV: KEY_ENV,
+    } as never);
+    if (config === null) throw new Error("storage config unexpectedly null");
+    s3 = new S3Adapter(config);
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
     await migrateUp(db);
@@ -71,6 +98,7 @@ describe("STORY-034 · results list, re-parse and retention", () => {
   afterAll(async () => {
     await pool?.end();
     await db?.end();
+    await localstack?.stop();
     await container?.stop();
   });
 
@@ -117,7 +145,7 @@ describe("STORY-034 · results list, re-parse and retention", () => {
     marks.push(entry);
     return Promise.resolve();
   };
-  const reparseService = (): ReparseService => new ReparseService(dirtyMarker);
+  const reparseService = (port: ObjectStoragePort = s3): ReparseService => new ReparseService(dirtyMarker, pool, new TenantObjectStore(port, KEY_ENV));
 
   async function as<T>(fn: () => Promise<T>, over: { ws?: string; scope?: string[] } = {}): Promise<T> {
     const client = await pool.connect();
@@ -131,6 +159,40 @@ describe("STORY-034 · results list, re-parse and retention", () => {
       client.release();
     }
   }
+
+  /**
+   * What the route does: `ReparseGuard` calls `prefetchSource` BEFORE any request transaction exists, then the handler's transaction
+   * (the interceptor's `withTenantContext`) runs `reparse` with what the guard read.
+   */
+  async function reparseViaRoute(id: string, ctx: { ws?: string; scope?: string[]; port?: ObjectStoragePort } = {}) {
+    const service = reparseService(ctx.port);
+    const source = await service.prefetchSource(
+      { workspaceId: ctx.ws ?? workspaceId, actorId: randomUUID(), ...(ctx.scope !== undefined ? { scopeProjectIds: ctx.scope } : {}) },
+      id,
+    );
+    return as(() => service.reparse(id, source), ctx);
+  }
+
+  /** Writes an object for a capture (as the capture worker does) and returns its stored key. */
+  async function putObject(resultId: string, capturedAt: Date, text: string, extra: Record<string, unknown> = {}): Promise<string> {
+    const store = new TenantObjectStore(s3, KEY_ENV);
+    return withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () =>
+      store.put("raw", rawObjectRelativeKey(capturedAt, resultId), encodeRawObject({ format: "markdown", text, ...extra })),
+    );
+  }
+
+  /** A port that records every call, so a test can say what was (not) read and when. */
+  const spyingPort = (calls: string[], onGet?: () => Promise<void>): ObjectStoragePort => ({
+    put: s3.put.bind(s3),
+    head: s3.head.bind(s3),
+    delete: s3.delete.bind(s3),
+    presignGet: s3.presignGet.bind(s3),
+    get: async (bucket, key) => {
+      calls.push("get");
+      await onGet?.();
+      return s3.get(bucket, key);
+    },
+  });
 
   const query = (over: Record<string, unknown> = {}): ResultsListQuery => resultsListQuerySchema.parse(over);
   const list = (project: string, over: Record<string, unknown> = {}, ctx: { ws?: string; scope?: string[] } = {}) =>
@@ -474,6 +536,108 @@ describe("STORY-034 · results list, re-parse and retention", () => {
     await as(() => reparseService().reparse(id));
     expect((await captureRow(id)).status).toBe("skipped");
     expect((await factRows(id)).length).toBeGreaterThan(0);
+  });
+
+  // ---- AC9 + tracking-engine.md section 8: the re-parse reads the STORED RAW OBJECT, outside any transaction (round 3, finding 3)
+
+  /** A capture whose object says one thing and whose dual-written payload says another. */
+  async function seedDivergent(): Promise<string> {
+    const id = randomUUID();
+    const capturedAt = new Date();
+    const key = await putObject(id, capturedAt, ANSWER);
+    await seed({ id, capturedAt, text: TAMPERED, rawObjectKey: key });
+    return id;
+  }
+
+  it("034-AC9n · parses the stored OBJECT, not the dual-written payload: facts follow the object's text when the two diverge", async () => {
+    const id = await seedDivergent();
+    await reparseViaRoute(id);
+
+    const labels = (await factRows(id)).map((r) => r.entity_label);
+    expect(labels).toEqual(expect.arrayContaining(["HubSpot", "Salesforce"]));
+    expect(labels).not.toContain("Zoho CRM");
+  });
+
+  it("034-AC9n2 · the object's structured citations are used too, not the payload's", async () => {
+    const id = randomUUID();
+    const capturedAt = new Date();
+    const key = await putObject(id, capturedAt, ANSWER, { structured_citations: [{ url: "https://www.g2.com/categories/crm", slot: 1 }] });
+    await seed({ id, capturedAt, rawObjectKey: key });
+    const result = await reparseViaRoute(id);
+    expect(result.after.citation_count).toBe(1);
+  });
+
+  it("034-AC9o · KAD-06: the object is read with NO transaction open and NO pooled client checked out", async () => {
+    const id = await seedDivergent();
+    const observed: { idleInTx: number; checkedOut: number }[] = [];
+    const calls: string[] = [];
+    const port = spyingPort(calls, async () => {
+      const open = await db.query<{ n: string }>(
+        "SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() AND usename = 'nominara_app' AND state LIKE 'idle in transaction%'",
+      );
+      observed.push({ idleInTx: Number(open.rows[0]!.n), checkedOut: pool.totalCount - pool.idleCount });
+    });
+    await reparseViaRoute(id, { port });
+
+    expect(calls).toEqual(["get"]); // not vacuous: the read happened, once, and was observed
+    expect(observed).toEqual([{ idleInTx: 0, checkedOut: 0 }]);
+    expect(pool.totalCount - pool.idleCount).toBe(0);
+  });
+
+  it("034-AC9p · a LEGACY row (no object) is re-parsed from payload with no storage read at all", async () => {
+    const id = await seed();
+    const calls: string[] = [];
+    const result = await reparseViaRoute(id, { port: spyingPort(calls) });
+    expect(calls).toEqual([]);
+    expect(result.after.entities.map((e) => e.label)).toEqual(expect.arrayContaining(["HubSpot", "Salesforce"]));
+  });
+
+  it("034-AC9q · the row's key moved between the read and the transaction: 409, nothing written", async () => {
+    const id = await seedDivergent();
+    const service = reparseService();
+    const source = await service.prefetchSource({ workspaceId, actorId: randomUUID() }, id);
+    await db.query("UPDATE answer_captures SET raw_object_key = raw_object_key || 'x' WHERE id = $1", [id]);
+    await expect(as(() => service.reparse(id, source))).rejects.toBeInstanceOf(ConflictError);
+    expect(await factRows(id)).toEqual([]);
+    expect((await captureRow(id)).status).toBe("captured");
+  });
+
+  it("034-AC9r · a caller that bypasses the guard for a row WITH an object is refused: the transaction never reads storage itself", async () => {
+    const id = await seedDivergent();
+    const calls: string[] = [];
+    await expect(as(() => reparseService(spyingPort(calls)).reparse(id))).rejects.toThrow(/prefetched raw object/);
+    expect(calls).toEqual([]);
+    expect(await factRows(id)).toEqual([]);
+  });
+
+  it("034-AC9s · a key pointing at a MISSING object is 422 precondition_unmet, never parsed as an empty answer", async () => {
+    const id = randomUUID();
+    const capturedAt = new Date();
+    const ghost = `${KEY_ENV}/${workspaceId}/${String(capturedAt.getUTCFullYear())}/01/${randomUUID()}.json.gz`;
+    await seed({ id, capturedAt, rawObjectKey: ghost });
+    await expect(reparseViaRoute(id)).rejects.toBeInstanceOf(PreconditionUnmetError);
+    expect(await factRows(id)).toEqual([]);
+  });
+
+  it("034-AC9t · a FOREIGN stored key is refused (StorageTenancyError) and nothing is parsed", async () => {
+    const id = randomUUID();
+    const foreign = `${KEY_ENV}/${otherWorkspaceId}/2026/10/${randomUUID()}.json.gz`;
+    await s3.put({ bucket: "raw", key: foreign, body: encodeRawObject({ format: "markdown", text: "other tenant's HubSpot answer" }) });
+    await seed({ id, rawObjectKey: foreign });
+    await expect(reparseViaRoute(id)).rejects.toBeInstanceOf(StorageTenancyError);
+    expect(await factRows(id)).toEqual([]);
+  });
+
+  it("034-AC9u · a request that will be refused costs no object read: out-of-scope and past-retention captures never reach storage", async () => {
+    const calls: string[] = [];
+    const inScope = await seedDivergent();
+    await expect(reparseViaRoute(inScope, { port: spyingPort(calls), scope: [siblingProjectId] })).rejects.toBeInstanceOf(ProjectOutOfScopeException);
+
+    const oldId = randomUUID();
+    const oldAt = new Date(Date.now() - 200 * DAY);
+    await seed({ id: oldId, capturedAt: oldAt, rawObjectKey: await putObject(oldId, oldAt, ANSWER) });
+    await expect(reparseViaRoute(oldId, { port: spyingPort(calls) })).rejects.toBeInstanceOf(RetentionExceededError);
+    expect(calls).toEqual([]);
   });
 
   it("034-OBS1 · observability: a span, a counter and a log line per re-parse - IDs and counts only, never an entity label or the answer", async () => {

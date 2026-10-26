@@ -13,6 +13,7 @@ import { RollupDirtySet } from "../../lib/rollup/dirty-dates.js";
 import { RunEstimateService } from "./run-estimate.service.js";
 import { RunLifecycleService } from "./run-lifecycle.service.js";
 import { RawDownloadService } from "./raw-download.service.js";
+import { ReparseGuard } from "./reparse.guard.js";
 import { REPARSE_DIRTY_MARKER, ReparseService, type DirtyMarker } from "./reparse.service.js";
 import { ResultsListController } from "./results-list.controller.js";
 import { ResultsListService } from "./results-list.service.js";
@@ -48,6 +49,7 @@ import { TrackingService } from "./tracking.service.js";
     RawDownloadService,
     ResultsListService,
     ReparseService,
+    ReparseGuard,
     {
       // STORY-034 AC9 - a re-parse marks its capture's date dirty on the QUEUE instance (noeviction, persistent), the same set the
       // capture.parse worker writes. The API process holds no other handle on it.

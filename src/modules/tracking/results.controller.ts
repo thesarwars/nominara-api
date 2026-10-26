@@ -1,4 +1,4 @@
-import { Controller, Get, Header, HttpCode, Param, Post, Res } from "@nestjs/common";
+import { Controller, Get, Header, HttpCode, Param, Post, Res, UseGuards } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import { reparseResponseSchema, resultDocumentSchema, type ReparseResponse, type ResultDocument } from "../../../contracts/tracking/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
@@ -7,7 +7,8 @@ import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import { RawDownloadService } from "./raw-download.service.js";
-import { ReparseService } from "./reparse.service.js";
+import { PrefetchedReparseSource, ReparseGuard } from "./reparse.guard.js";
+import { ReparseService, type ReparseSource } from "./reparse.service.js";
 import { ResultDocumentService } from "./result-document.service.js";
 
 // STORY-034 AC7 — §3's `GET /results/{id}`, "the full parser document".
@@ -51,9 +52,10 @@ export class ResultsController {
 
   // STORY-034 AC9 - `POST /results/{id}/reparse` (owner decision 2026-10-23; FR-PA-08's "Re-parse, free" in the Live Answer drawer).
   //
-  //   `tracking:trigger`: it WRITES facts, so it is not a read. The permission matrix has no owner/admin-only tracking permission, so
-  //     a scoped manager (who already holds `tracking:trigger`) can re-parse inside their scope too; narrowing it to owner and admin
-  //     alone needs a matrix change, which is not this story's to make.
+  //   `tracking:trigger` (RbacGuard) AND `ReparseGuard`: it WRITES facts, so it is not a read, and the owner decision is that only owners
+  //     and admins may do it. `tracking:trigger` alone admits a scoped manager; `ReparseGuard` refuses any role but owner and admin
+  //     (the matrix has no owner/admin-only tracking permission and its spec pins the table at 34 rows), then reads the raw object
+  //     before the request transaction opens so the handler never awaits object storage inside it.
   //   FREE: no `@Credits`, no `@Meter`, no daily cap - a re-parse runs in-house (plans-and-entitlements.md: 0 credits, unmetered).
   //   `@Idempotent()`: a replayed key returns the first diff instead of a second pass.
   //   `@Audit`: records the OUTCOME only. The default would store the whole response, entity labels included; the diff is shown to the
@@ -62,6 +64,7 @@ export class ResultsController {
   @HttpCode(200)
   @Idempotent()
   @RequirePermission("tracking:trigger")
+  @UseGuards(ReparseGuard)
   @ScopedByQuery()
   @Audit({
     action: "result.reparsed",
@@ -72,7 +75,7 @@ export class ResultsController {
     },
   })
   @ApiContract({ operationId: "reparseResult", responseSchema: reparseResponseSchema, requiresIdempotencyKey: true })
-  reparse(@Param("id") resultId: string): Promise<ReparseResponse> {
-    return this.reparses.reparse(resultId);
+  reparse(@Param("id") resultId: string, @PrefetchedReparseSource() source: ReparseSource | undefined): Promise<ReparseResponse> {
+    return this.reparses.reparse(resultId, source);
   }
 }
