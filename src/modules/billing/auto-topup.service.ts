@@ -154,6 +154,9 @@ export class AutoTopupService {
       await this.email.send({
         to: contact,
         subject: AUTO_TOPUP_TRIGGERED_SUBJECT,
+        // Billing mail is transactional (owner decision 8 names only reports, digests and alerts as complaint-suppressed): a
+        // complaint about some other mail must not stop the notice that gates this charge. A hard bounce still refuses it.
+        transactional: true,
         textBody:
           `Your workspace's credit balance fell below its auto top-up threshold, so Nominara is charging your saved card ` +
           `${pack.priceUsd} ${pack.currency.trim()} for the ${pack.displayName} (${String(pack.credits)} credits). ` +
@@ -428,6 +431,7 @@ export class AutoTopupService {
       await this.email.send({
         to: contact,
         subject: AUTO_TOPUP_DISABLED_SUBJECT,
+        transactional: true,
         textBody:
           "Nominara could not charge your saved card for an automatic credit top-up, so auto top-up has been switched off and will not retry. " +
           "Update your payment method and turn it back on in Billing settings.",

@@ -246,6 +246,14 @@ export const envSchema = z
       blankIsUnset,
       z.string().trim().refine(isSenderIdentity, "must be an email address or `Display Name <address>`").optional(),
     ),
+    // STORY-178 — the Svix signing secret of the Resend webhook (`POST /v1/webhooks/resend`: bounces and complaints), in
+    // Resend's `whsec_<base64>` form. Unset, the route answers 503 `degraded` and writes nothing (fail closed). Under
+    // NODE_ENV=production it is REQUIRED whenever Resend is configured (see the superRefine below): without it no bounce or
+    // complaint is ever heard, and a bad address would be mailed forever, which is the harm the suppression list exists for.
+    RESEND_WEBHOOK_SECRET: z.preprocess(
+      blankIsUnset,
+      z.string().trim().regex(/^whsec_[A-Za-z0-9+/]+={0,2}$/u, "must be a Svix signing secret: `whsec_` followed by base64").optional(),
+    ),
     // DEV-ONLY OVERRIDE. Redirects EVERY outgoing message to this one address. Resend's shared test sender can only
     // deliver to the account owner's own address, so a developer sets this to that address and every code, alert and
     // report lands in one inbox. Refused at boot under NODE_ENV=production (see the superRefine below) and again by the
@@ -509,6 +517,19 @@ export const envSchema = z
         path: [env.RESEND_API_KEY === undefined ? "RESEND_API_KEY" : "RESEND_FROM_EMAIL"],
         message:
           "RESEND_API_KEY and RESEND_FROM_EMAIL must be set together: one without the other would fall back to a sender that delivers nothing.",
+      });
+    }
+    if (
+      env.NODE_ENV === "production" &&
+      env.RESEND_API_KEY !== undefined &&
+      env.RESEND_FROM_EMAIL !== undefined &&
+      env.RESEND_WEBHOOK_SECRET === undefined
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["RESEND_WEBHOOK_SECRET"],
+        message:
+          "RESEND_WEBHOOK_SECRET is required when Resend is configured under NODE_ENV=production: without it no bounce or complaint is heard and suppression never happens.",
       });
     }
     if (

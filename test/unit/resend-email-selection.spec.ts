@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EnvValidationError, KNOWN_KEYS, loadEnv } from "../../src/config/env.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
+import { transportOf } from "../support/email-transport.js";
 
 // Group C item 1 — which EmailSender a process runs with, and what the boot refuses.
 
@@ -18,7 +19,7 @@ afterEach(() => {
 
 async function select(): Promise<string> {
   const { selectEmailSender } = await import("../../src/modules/identity/identity.module.js");
-  return selectEmailSender().constructor.name;
+  return transportOf(selectEmailSender()).constructor.name;
 }
 
 describe("Resend selection matrix", () => {
@@ -38,6 +39,7 @@ describe("Resend selection matrix", () => {
     process.env.NODE_ENV = "production";
     process.env.RESEND_API_KEY = "re_test_PLACEHOLDER";
     process.env.RESEND_FROM_EMAIL = "Nominara <no-reply@nominara.test>";
+    process.env.RESEND_WEBHOOK_SECRET = "whsec_dGVzdA=="; // STORY-178: required in production once Resend is configured
     expect(await select()).toBe("ResendEmailSenderAdapter");
   });
 
@@ -61,7 +63,7 @@ describe("Resend selection matrix", () => {
     process.env.RESEND_FROM_EMAIL = "onboarding@resend.dev";
     process.env.RESEND_TO_EMAIL = "owner@example.net";
     const { selectEmailSender } = await import("../../src/modules/identity/identity.module.js");
-    const sender = selectEmailSender() as unknown as { toOverride?: string };
+    const sender = transportOf(selectEmailSender()) as unknown as { toOverride?: string };
     expect(sender.toOverride).toBe("owner@example.net");
   });
 });
@@ -99,6 +101,35 @@ describe("Resend boot validation", () => {
   });
 });
 
+describe("STORY-178 · RESEND_WEBHOOK_SECRET", () => {
+  const load = (overrides: Record<string, string>) => () => loadEnv({ ...process.env, ...overrides });
+  const PAIR = { RESEND_API_KEY: "re_x", RESEND_FROM_EMAIL: "a@b.test" };
+
+  it("is REQUIRED under production when Resend is configured, naming the key: without it no bounce is ever heard", () => {
+    const attempt = load({ NODE_ENV: "production", ...PAIR });
+    expect(attempt).toThrow(EnvValidationError);
+    expect(attempt).toThrow(/RESEND_WEBHOOK_SECRET/);
+    expect(load({ NODE_ENV: "production", ...PAIR, RESEND_WEBHOOK_SECRET: "whsec_dGVzdA==" })).not.toThrow();
+  });
+
+  it("is optional everywhere else: outside production, and under production when Resend is not configured", () => {
+    expect(load({ NODE_ENV: "development", ...PAIR })).not.toThrow();
+    expect(load({ NODE_ENV: "test", ...PAIR })).not.toThrow();
+    expect(load({ NODE_ENV: "production" })).not.toThrow();
+  });
+
+  it("must be a Svix secret (whsec_ + base64); anything else is refused at boot, never discovered on the first delivery", () => {
+    for (const bad of ["not-a-secret", "whsec_", "whsec_!!!", "sk_live_x"]) {
+      expect(load({ NODE_ENV: "development", RESEND_WEBHOOK_SECRET: bad }), bad).toThrow(EnvValidationError);
+    }
+    expect(load({ NODE_ENV: "development", RESEND_WEBHOOK_SECRET: "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw" })().RESEND_WEBHOOK_SECRET).toBe("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw");
+  });
+
+  it("is in KNOWN_KEYS", () => {
+    expect(KNOWN_KEYS as readonly string[]).toContain("RESEND_WEBHOOK_SECRET");
+  });
+});
+
 describe("ALERT_EMAIL_TO needs a real sender in production", () => {
   const load = (overrides: Record<string, string>) => () => loadEnv({ ...process.env, ...overrides });
 
@@ -109,7 +140,7 @@ describe("ALERT_EMAIL_TO needs a real sender in production", () => {
   });
 
   it("allows it under production with the pair, and outside production without it", () => {
-    expect(load({ NODE_ENV: "production", ALERT_EMAIL_TO: "oncall@example.net", RESEND_API_KEY: "re_x", RESEND_FROM_EMAIL: "a@b.test" })).not.toThrow();
+    expect(load({ NODE_ENV: "production", ALERT_EMAIL_TO: "oncall@example.net", RESEND_API_KEY: "re_x", RESEND_FROM_EMAIL: "a@b.test", RESEND_WEBHOOK_SECRET: "whsec_dGVzdA==" })).not.toThrow();
     expect(load({ NODE_ENV: "development", ALERT_EMAIL_TO: "oncall@example.net" })).not.toThrow();
   });
 });

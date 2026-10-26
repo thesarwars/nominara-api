@@ -27,6 +27,13 @@ export interface EmailMessage {
   readonly fromName?: string;
   /** STORY-100 AC10 / owner decision 6: the Reply-To address. Absent (a theme with none stored) means the header is omitted. */
   readonly replyTo?: string;
+  /**
+   * STORY-178 / owner decision 8 — true for mail a person needs to use the product (the sign-in code). A spam COMPLAINT
+   * suppresses everything that is not transactional (reports, digests, alerts) but still lets this through; a permanent
+   * bounce suppresses it too, because it cannot be delivered anyway. Absent means NOT transactional: the safe default for a
+   * message nobody classified is to honour a complaint.
+   */
+  readonly transactional?: boolean;
 }
 
 export interface EmailSender {
@@ -36,4 +43,24 @@ export interface EmailSender {
    */
   readonly delivers?: boolean;
   send(message: EmailMessage): Promise<void>;
+}
+
+/**
+ * STORY-178 — the send was refused because the recipient is suppressed (`bounce`: a permanent bounce; `complaint`: a spam
+ * complaint on non-transactional mail). Distinct from a delivery failure: it is not retryable, it is not the provider's, and a
+ * caller records it as "not sent, suppressed". The message names the KIND only, never the address.
+ */
+export class EmailSuppressedError extends Error {
+  constructor(readonly kind: "bounce" | "complaint") {
+    super(`email not sent: the recipient is suppressed (${kind})`);
+    this.name = "EmailSuppressedError";
+  }
+}
+
+/** STORY-178 — the suppression list could not be read, so the send FAILED CLOSED. Carries none of the database's own text. */
+export class EmailSuppressionLookupError extends Error {
+  constructor() {
+    super("email not sent: the suppression list could not be checked");
+    this.name = "EmailSuppressionLookupError";
+  }
 }

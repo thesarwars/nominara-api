@@ -1,8 +1,10 @@
 import { Logger } from "@nestjs/common";
 import { loadEnv } from "../../config/env.js";
+import { sharedSuppressionStore, type SuppressionStore } from "../../lib/email/suppression-store.js";
 import { DevEmailSenderAdapter } from "./adapters/dev-email-sender.adapter.js";
 import { LoggingEmailSenderAdapter } from "./adapters/logging-email-sender.adapter.js";
 import { ResendEmailSenderAdapter } from "./adapters/resend-email-sender.adapter.js";
+import { SuppressingEmailSender, type SuppressingEmailSenderOptions } from "./adapters/suppressing-email-sender.js";
 import type { EmailSender } from "./ports/email-sender.js";
 
 const logger = new Logger("email-sender");
@@ -22,7 +24,16 @@ let warnedHalfConfig = false;
  * refuses it again — this function is the third place the pair is checked,
  * and deliberately so: it is the one a reader lands on first.
  */
-export function selectEmailSender(): EmailSender {
+export function selectEmailSender(options: SuppressingEmailSenderOptions & { readonly store?: SuppressionStore } = {}): EmailSender {
+  const env = loadEnv();
+  // STORY-178 — whichever transport is chosen, it is wrapped: the suppression check is part of THE send path, so every
+  // mail kind honours it and no caller can forget to ask. `options.store` is for tests; production reads the shared store lazily.
+  return new SuppressingEmailSender(selectTransport(), options.store ?? sharedSuppressionStore(), env.OTP_EMAIL_HASH_PEPPER, {
+    ...(options.onLookupFailure !== undefined ? { onLookupFailure: options.onLookupFailure } : {}),
+  });
+}
+
+function selectTransport(): EmailSender {
   const env = loadEnv();
   if (env.RESEND_API_KEY !== undefined && env.RESEND_FROM_EMAIL !== undefined) {
     if (env.OTP_DEV_LOG_CODES === "true") {

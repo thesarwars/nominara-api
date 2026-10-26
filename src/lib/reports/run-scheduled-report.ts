@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
-import type { ExportRequest, ScheduledReport, ScheduledReportDelivery } from "../../../contracts/reports/index.js";
+import type { ExportRequest, ScheduledReport } from "../../../contracts/reports/index.js";
 import { DomainError } from "../../api/errors/domain-errors.js";
-import type { EmailSender } from "../../modules/identity/ports/email-sender.js";
+import { EmailSuppressedError, type EmailSender } from "../../modules/identity/ports/email-sender.js";
 import { isFeatureGranted, type FeatureFlagKey } from "../entitlements/classification.js";
 import type { EntitlementResolver } from "../entitlements/entitlement-resolver.js";
 import type { StructuralUsage } from "../entitlements/structural-usage.js";
@@ -170,8 +170,10 @@ async function recordedArtifacts(tx: ClientBase, report: ScheduledReportRow, del
 export interface SendReportEmailsResult {
   /** Recipients the sender accepted. */
   readonly sent: number;
-  /** Recipients it did not (a failure of any kind). */
+  /** Recipients it did not (a failure of any kind, a refused lookup included). */
   readonly failed: number;
+  /** STORY-178 — recipients NOT mailed because the address is suppressed (a bounce or a complaint). Not a failure: not retried. */
+  readonly suppressed: number;
 }
 
 /**
@@ -188,6 +190,7 @@ export async function sendReportEmails(
 ): Promise<SendReportEmailsResult> {
   const links = artifacts.map((a) => new URL(`/report-artifacts/${encodeURIComponent(a)}`, ARTIFACT_LINK_ORIGIN).href).join("\n");
   let failed = 0;
+  let suppressed = 0;
   for (const to of report.recipients) {
     try {
       await email.send({
@@ -198,11 +201,39 @@ export async function sendReportEmails(
         ...(sender.replyTo !== undefined ? { replyTo: sender.replyTo } : {}),
         ...(idempotencyBase !== undefined ? { idempotencyKey: `${idempotencyBase}:${recipientDigest(to)}` } : {}),
       });
-    } catch {
-      failed += 1;
+    } catch (error) {
+      // A suppressed address is a decision, not a fault: retrying cannot change it, so it is counted apart from `failed`.
+      if (error instanceof EmailSuppressedError) suppressed += 1;
+      else failed += 1;
     }
   }
-  return { sent: report.recipients.length - failed, failed };
+  return { sent: report.recipients.length - failed - suppressed, failed, suppressed };
+}
+
+/**
+ * STORY-178 AC3 — a delivery's final status and reason from what the sends did. Shared by the request path (send-now) and the
+ * cadence path, so both say the same thing. With no suppression the reason is exactly what it has always been.
+ *
+ *   any send failed            `failed`, "F of T recipients could not be sent" (+ the suppressed count when there is one)
+ *   all suppressed, none sent  `failed`, "Not sent: all T recipients are suppressed ..."
+ *   some suppressed, rest sent `delivered`/`logged`, with the reason naming how many were not sent
+ *   otherwise                  `delivered`/`logged`, no reason
+ * The wording names counts only: never an address.
+ */
+export function deliveryOutcome(result: { readonly sent: number; readonly failed: number; readonly suppressed: number }, total: number, delivers: boolean): { status: "delivered" | "logged" | "failed"; reason: string | null } {
+  const { sent, failed, suppressed } = result;
+  if (failed > 0) {
+    const tail = suppressed > 0 ? `; ${String(suppressed)} not sent because the address is suppressed` : "";
+    return { status: "failed", reason: `${String(failed)} of ${String(total)} recipients could not be sent${tail}` };
+  }
+  if (suppressed > 0 && sent === 0) {
+    return { status: "failed", reason: `Not sent: all ${String(total)} recipients are suppressed after a bounce or a spam complaint` };
+  }
+  const status = delivers ? "delivered" : "logged";
+  if (suppressed > 0) {
+    return { status, reason: `${String(suppressed)} of ${String(total)} recipients were not sent: their addresses are suppressed after a bounce or a spam complaint` };
+  }
+  return { status, reason: null };
 }
 
 function recipientDigest(address: string): string {
@@ -389,6 +420,7 @@ export class ReportSendError extends Error {
 export interface RunOutcome {
   readonly sent: number;
   readonly failed: number;
+  readonly suppressed: number;
   readonly delivers: boolean;
 }
 
@@ -403,7 +435,7 @@ export async function sendPreparedRun(email: EmailSender, prepared: PreparedRun)
     incrementCounter("nominara_reports_build_attempts_total", { outcome: "retry" });
     throw new ReportSendError(result.failed, prepared.recipients.length);
   }
-  return { sent: result.sent, failed: result.failed, delivers: email.delivers === true };
+  return { sent: result.sent, failed: result.failed, suppressed: result.suppressed, delivers: email.delivers === true };
 }
 
 /** The commit phase: the delivery's final status and the period advanced, in one short tenant transaction. */
@@ -412,18 +444,17 @@ export async function commitPreparedRun(tx: ClientBase, deps: ReportRunDeps, pre
   const report = found.rows[0];
   // Deleted while the send ran: the delivery cascaded away with it, so there is nothing to settle.
   if (report === undefined) return;
-  const failed = outcome.failed > 0;
   // `delivered` only when the sender really delivers mail; the logging/dev senders keep the owner's honesty rule (`logged`).
-  const status: ScheduledReportDelivery["status"] = failed ? "failed" : outcome.delivers ? "delivered" : "logged";
+  const { status, reason } = deliveryOutcome(outcome, prepared.recipients.length, outcome.delivers);
   await settleRun(tx, deps, report, {
     workspaceId: prepared.workspaceId,
     period: prepared.period,
     deliveryId: prepared.deliveryId,
     status,
-    reason: failed ? `${String(outcome.failed)} of ${String(prepared.recipients.length)} recipients could not be sent` : null,
+    reason,
     sent: outcome.sent,
     artifactId: null,
-    notification: failed ? "failed" : "none",
+    notification: status === "failed" ? "failed" : outcome.suppressed > 0 ? "suppressed" : "none",
   });
 }
 
@@ -450,7 +481,7 @@ export async function settleAfterFailure(tx: ClientBase, deps: ReportRunDeps, in
   incrementCounter("nominara_reports_build_attempts_total", { outcome: "recovered" });
 }
 
-type SettleNotification = "failed" | "none";
+type SettleNotification = "failed" | "suppressed" | "none";
 
 /** `workspaces.timezone` is free text; a zone Intl rejects must not stop a settled period from advancing (UTC is the fallback). */
 function usableZone(zone: string | undefined): string {
@@ -501,6 +532,20 @@ async function settleRun(tx: ClientBase, deps: ReportRunDeps, report: ScheduledR
       title: "A scheduled report could not be sent",
       body: `"${report.name}" was not sent for this period and will next run on its following date. Reason: ${reason ?? "unknown"}.`,
       eventKey: `report.failed:${report.id}:${s.period.toISOString()}`,
+      facts: { scheduled_report_id: report.id, period: s.period.toISOString() },
+    });
+  }
+
+  if (s.notification === "suppressed") {
+    await writeNotification(tx, {
+      workspaceId,
+      projectId: null,
+      userId: null,
+      kind: "report.recipient_suppressed",
+      severity: "warning",
+      title: "A scheduled report skipped a suppressed recipient",
+      body: `"${report.name}" was sent, but not to every recipient: ${reason ?? "some addresses are suppressed"}. Remove or replace the address in the report's recipients.`,
+      eventKey: `report.recipient_suppressed:${report.id}:${s.period.toISOString()}`,
       facts: { scheduled_report_id: report.id, period: s.period.toISOString() },
     });
   }

@@ -4,7 +4,7 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
 import { selectEmailSender } from "../../../modules/identity/email-sender.selector.js";
-import type { EmailSender } from "../../../modules/identity/ports/email-sender.js";
+import { EmailSuppressedError, type EmailSender } from "../../../modules/identity/ports/email-sender.js";
 import { prepareDigest } from "../../notifications/digest.js";
 import { emailIdempotencyKey, type EnqueueNotifyDispatch } from "../../notifications/routing.js";
 import { stampCreditThresholds } from "../../notifications/thresholds.js";
@@ -15,7 +15,7 @@ import type { QueueHandlerContext } from "../handlers.js";
 import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
 
 // STORY-068 — `notify.dispatch` (system-architecture.md §4: any producer, rollup group, key `ntf:{event}`). THE one send
-// path for notification email (STORY-178's suppression belongs here when it lands). A SIGNED TENANT job, PHASED
+// path for notification email. A SIGNED TENANT job, PHASED
 // (ADR-0003 / NFR-ARCH-04), on the STORY-077 downgrade-notice precedent:
 //
 //   prepare  one short tenant transaction:
@@ -27,8 +27,15 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 //                             ledger transaction committed; nothing to send in this job.
 //   run      NO transaction and no connection: the provider call. A failure is THROWN, so the queue retries the job; the
 //            provider idempotency key is derived from the outbox row id, so a send that reached the provider but timed
-//            out on the way back is not delivered twice by the retry (AC11).
-//   commit   a second short tenant transaction: mark it sent, only if still pending.
+//            out on the way back is not delivered twice by the retry (AC11). A SUPPRESSED recipient (STORY-178) is not a
+//            failure: it is the expected steady state for a bounced member, it cannot succeed on a retry, and a thrown error
+//            would walk the retry ladder and end in the dead-letter queue (the SLO-24 depth rule pages on that). The job
+//            ends normally, counted as `suppressed`.
+//   commit   a second short tenant transaction: mark it sent, only if still pending (nothing for a suppressed one).
+//
+// OPEN (needs a schema decision, reported with STORY-178): the outbox row of a suppressed send stays `pending`, because
+// `notification_emails.status` has no terminal "suppressed" value. The relay therefore still re-enqueues it every five minutes
+// until EMAIL_RELAY_MAX_AGE; each such job ends here at once, with nothing sent and nothing retried.
 //
 // The payload is `.strict()` and carries ids only: the address, subject and body are read from the database.
 
@@ -91,7 +98,7 @@ export function createNotifyDispatchHandler(context: QueueHandlerContext, deps: 
     });
   const appOrigin = (): { appOrigin?: string } => (typeof context.env.WEBAUTHN_ORIGIN === "string" ? { appOrigin: context.env.WEBAUTHN_ORIGIN } : {});
 
-  return phasedProcessor<Prepared, true>({
+  return phasedProcessor<Prepared, "sent" | "suppressed">({
     async prepare(tx: ClientBase, job: Job) {
       const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
       if (payload.kind === "credit_check") {
@@ -129,6 +136,10 @@ export function createNotifyDispatchHandler(context: QueueHandlerContext, deps: 
         try {
           await senderFor().send({ to: prepared.to, subject: prepared.subject, textBody: prepared.textBody, idempotencyKey: emailIdempotencyKey(prepared.id) });
         } catch (error) {
+          if (error instanceof EmailSuppressedError) {
+            span.setAttribute("nominara.email.suppressed", error.kind);
+            return "suppressed" as const;
+          }
           span.setStatus({ code: SpanStatusCode.ERROR });
           incrementCounter("nominara_notify_dispatch_failed_total", { kind: prepared.kind, reason: "send_failed" });
           logger.warn({
@@ -141,11 +152,16 @@ export function createNotifyDispatchHandler(context: QueueHandlerContext, deps: 
         } finally {
           span.end();
         }
-        return true as const;
+        return "sent" as const;
       });
     },
 
-    async commit(tx: ClientBase, prepared: Prepared) {
+    async commit(tx: ClientBase, prepared: Prepared, outcome) {
+      if (outcome === "suppressed") {
+        incrementCounter("nominara_notify_dispatch_jobs_total", { kind: prepared.kind, outcome: "suppressed" });
+        logger.log({ event: "notify.dispatch.suppressed", workspace_id: prepared.workspaceId, email_id: prepared.id, kind: prepared.kind });
+        return;
+      }
       await tx.query("UPDATE notification_emails SET status = 'sent', sent_at = now() WHERE id = $1 AND status = 'pending'", [prepared.id]);
       incrementCounter("nominara_notify_dispatch_jobs_total", { kind: prepared.kind, outcome: "sent" });
       // Ids only: never the address, the subject or the body.

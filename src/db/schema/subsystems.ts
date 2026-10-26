@@ -19,6 +19,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "oauth_authorization_requests",
     "email_otp_codes",
     "email_otp_requests",
+    "email_suppressions",
   ],
   tenancy: [
     "workspaces",

@@ -17,6 +17,9 @@ import { StructuralUsage } from "../../src/lib/entitlements/structural-usage.js"
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { reportBuildJobKey, scheduledRunDeliveryId, type ReportRunDeps } from "../../src/lib/reports/run-scheduled-report.js";
 import { findDueReports, ReportSweepBlindError, runReportSweep, type EnqueueReportBuild } from "../../src/lib/reports/report-sweep.js";
+import { hashEmailKey, normalizeEmail } from "../../src/lib/auth/email-otp.js";
+import type { SuppressionKind, SuppressionStore } from "../../src/lib/email/suppression-store.js";
+import { SuppressingEmailSender } from "../../src/modules/identity/adapters/suppressing-email-sender.js";
 import type { EmailMessage, EmailSender } from "../../src/modules/identity/ports/email-sender.js";
 import { TEST_SIGNING_KEYS } from "../support/queue-test-harness.js";
 
@@ -693,6 +696,82 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
       const r = await report(ws, [await project(ws)]);
       const now = () => { throw new Error("clock is down"); };
       await expect(processorFor(recordingSender(), { ...realRun(), now })(jobFor(ws, r.id, r.due, ATTEMPTS - 1))).rejects.toThrow(/clock is down/);
+    }, 60_000);
+  });
+
+  // ---- STORY-178 AC3 / AC4: a suppressed recipient is "not sent", with the reason, and the workspace is told ---------------
+
+  describe("STORY-178 · suppressed recipients", () => {
+    const PEPPER = "suppression-test-pepper-0000000000";
+    const suppressedStore = (kinds: Record<string, SuppressionKind[]>): SuppressionStore => ({
+      async activeKinds(hash: Buffer) {
+        return Object.entries(kinds).find(([address]) => hashEmailKey(normalizeEmail(address), PEPPER).equals(hash))?.[1] ?? [];
+      },
+    });
+    const guarded = (inner: EmailSender, kinds: Record<string, SuppressionKind[]>) => new SuppressingEmailSender(inner, suppressedStore(kinds), PEPPER);
+
+    it("STORY-178 s14 · one of two recipients is suppressed: the other is mailed, the delivery says why, the workspace is told naming the report and no address, and the period advances", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)], { recipients: ["bounced@example.test", "fine@example.test"] });
+      const inner = recordingSender();
+      await processorFor(guarded(inner, { "bounced@example.test": ["bounce"] }))(jobFor(ws, r.id, r.due, 0));
+      expect(inner.sent.map((m) => m.to)).toEqual(["fine@example.test"]);
+      const [delivery] = await deliveries(r.id);
+      expect(delivery).toMatchObject({ status: "delivered", recipient_count: 1 });
+      expect(delivery!.reason).toBe("1 of 2 recipients were not sent: their addresses are suppressed after a bounce or a spam complaint");
+      const [note] = await notes(ws, "report.recipient_suppressed");
+      expect(note!.body).toContain("Monthly client report");
+      expect(JSON.stringify([delivery, ...(await notes(ws, "report.recipient_suppressed"))])).not.toContain("example.test");
+      expect((await state(r.id)).next_send_at!.getTime()).toBeGreaterThan(Date.now());
+      expect((await unitsUsed(ws))!.used).toBe(1);
+    }, 60_000);
+
+    it("STORY-178 s14 · a suppression is NOT a transient failure: it is not retried (the job returns, never throws) and a replay writes one notification", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)], { recipients: ["bounced@example.test", "fine@example.test"] });
+      const inner = recordingSender();
+      const process = processorFor(guarded(inner, { "bounced@example.test": ["complaint"] }));
+      await process(jobFor(ws, r.id, r.due, 0));
+      await process(jobFor(ws, r.id, r.due, 1));
+      expect(inner.sent).toHaveLength(1);
+      expect(await notes(ws, "report.recipient_suppressed")).toHaveLength(1);
+    }, 60_000);
+
+    it("STORY-178 s14 · EVERY recipient suppressed: nothing is mailed, the period is `failed` with the reason, the workspace is notified and the period advances", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)], { recipients: ["a@example.test", "b@example.test"] });
+      const inner = recordingSender();
+      await processorFor(guarded(inner, { "a@example.test": ["bounce"], "b@example.test": ["complaint"] }))(jobFor(ws, r.id, r.due, 0));
+      expect(inner.sent).toEqual([]);
+      const [delivery] = await deliveries(r.id);
+      expect(delivery).toMatchObject({ status: "failed", recipient_count: 0 });
+      expect(delivery!.reason).toBe("Not sent: all 2 recipients are suppressed after a bounce or a spam complaint");
+      expect((await notes(ws, "report.failed"))[0]!.body).toContain("all 2 recipients are suppressed");
+      expect((await state(r.id)).next_send_at!.getTime()).toBeGreaterThan(Date.now());
+      // The artifacts were built before any send, so the unit is spent: the same as a send that exhausts its retries.
+      expect((await unitsUsed(ws))!.used).toBe(1);
+    }, 60_000);
+
+    it("STORY-178 s14 · a recipient that FAILED and one that is suppressed: the failure still retries before the final attempt, and the final reason names both", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)], { recipients: ["bounced@example.test", "flaky@example.test"] });
+      const inner = recordingSender();
+      inner.failNext = 99;
+      const process = processorFor(guarded(inner, { "bounced@example.test": ["bounce"] }));
+      await expect(process(jobFor(ws, r.id, r.due, 0))).rejects.toThrow(/1 of 2/);
+      await process(jobFor(ws, r.id, r.due, ATTEMPTS - 1));
+      const [delivery] = await deliveries(r.id);
+      expect(delivery).toMatchObject({ status: "failed" });
+      expect(delivery!.reason).toBe("1 of 2 recipients could not be sent; 1 not sent because the address is suppressed");
+    }, 60_000);
+
+    it("STORY-178 s14 · a suppression lookup that cannot run is a FAILED send (fail closed), retried like any other failure", async () => {
+      const ws = await workspace();
+      const r = await report(ws, [await project(ws)]);
+      const inner = recordingSender();
+      const broken: SuppressionStore = { activeKinds: () => Promise.reject(new Error("db down")) };
+      await expect(processorFor(new SuppressingEmailSender(inner, broken, PEPPER))(jobFor(ws, r.id, r.due, 0))).rejects.toThrow(/1 of 1/);
+      expect(inner.sent).toEqual([]);
     }, 60_000);
   });
 

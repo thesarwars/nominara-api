@@ -284,7 +284,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
   it("STORY-076 scenario 7 · the email names the pack and amount, goes to the billing contact, and an owner's address is the fallback when there is none", async () => {
     const { workspaceId } = await armed();
     await service.trigger(workspaceId);
-    expect(email.sent[0]).toMatchObject({ to: BILLING_EMAIL, subject: "Nominara auto top-up triggered" });
+    expect(email.sent[0]).toMatchObject({ to: BILLING_EMAIL, subject: "Nominara auto top-up triggered", transactional: true });
     expect(email.sent[0]!.textBody).toContain("1000");
     expect(email.sent[0]!.textBody).toContain("15.00");
 
@@ -369,7 +369,7 @@ describe("NEW-D-7 · auto-top-up trigger", () => {
     expect(await wallet(workspaceId)).toMatchObject({ auto_topup_enabled: false, auto_topup_count_cycle: 1 });
     expect((await autoPurchases(workspaceId))[0]).toMatchObject({ status: "failed" });
     expect(email.sent).toHaveLength(1);
-    expect(email.sent[0]).toMatchObject({ to: BILLING_EMAIL, subject: "Nominara auto top-up disabled after a failed payment" });
+    expect(email.sent[0]).toMatchObject({ to: BILLING_EMAIL, subject: "Nominara auto top-up disabled after a failed payment", transactional: true });
     expect(await audit(workspaceId, "billing.auto_topup.disabled")).toEqual([
       expect.objectContaining({ resource_type: "credit_wallet", after_state: expect.objectContaining({ reason: "payment_failed", enabled: false }) }),
     ]);

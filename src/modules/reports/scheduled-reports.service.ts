@@ -28,6 +28,7 @@ import {
   reportNeedsPdf,
   resolveReportSender,
   SCHEDULED_REPORT_COLUMNS,
+  deliveryOutcome,
   sendReportEmails,
   writeCapSkipNotification,
   type ReportSender,
@@ -315,12 +316,10 @@ export class ScheduledReportsService implements OnModuleDestroy {
       return;
     }
     // NOTE: `report.recipients` is the list captured at REQUEST time: edits made while the send runs do not change who is mailed.
-    const { sent, failed: failures } = await sendReportEmails(this.email, report, artifacts, sender);
-    const ok = failures === 0;
+    const result = await sendReportEmails(this.email, report, artifacts, sender);
     // `delivered` only when the sender really delivers mail; the logging/dev senders keep the owner's honesty rule (`logged`).
-    const status: ScheduledReportDelivery["status"] = ok ? (this.email.delivers === true ? "delivered" : "logged") : "failed";
-    const reason = ok ? null : `${String(failures)} of ${String(report.recipients.length)} recipients could not be sent`;
-    await this.recordOutcome(context, deliveryId, report.id, status, reason, sent);
+    const { status, reason } = deliveryOutcome(result, report.recipients.length, this.email.delivers === true);
+    await this.recordOutcome(context, deliveryId, report.id, status, reason, result.sent);
   }
 
   /**

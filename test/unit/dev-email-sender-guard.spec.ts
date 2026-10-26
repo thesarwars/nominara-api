@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EnvValidationError, loadEnv } from "../../src/config/env.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
+import { transportOf } from "../support/email-transport.js";
 
 // STORY-127 — DevEmailSenderAdapter prints a one-time code in plaintext, so
 // the only thing that matters about it is that production cannot reach it.
@@ -86,13 +87,13 @@ describe("STORY-127 · check 3 — selectEmailSender defaults to the non-logging
   it("returns the LOGGING adapter in development when the flag is unset — nothing prints a code unless asked", async () => {
     process.env.NODE_ENV = "development";
     delete process.env.OTP_DEV_LOG_CODES;
-    expect((await select()).constructor.name).toBe("LoggingEmailSenderAdapter");
+    expect(transportOf(await select()).constructor.name).toBe("LoggingEmailSenderAdapter");
   });
 
   it("returns the DEV adapter only when the flag is on and the mode is not production", async () => {
     process.env.NODE_ENV = "development";
     process.env.OTP_DEV_LOG_CODES = "true";
-    expect((await select()).constructor.name).toBe("DevEmailSenderAdapter");
+    expect(transportOf(await select()).constructor.name).toBe("DevEmailSenderAdapter");
   });
 
   it("cannot even be asked under production with the flag set — loadEnv refuses first", async () => {

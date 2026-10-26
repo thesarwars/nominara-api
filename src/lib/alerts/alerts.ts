@@ -1,6 +1,5 @@
 import { Logger, type OnModuleDestroy } from "@nestjs/common";
 import { loadEnv } from "../../config/env.js";
-import { ResendEmailSenderAdapter } from "../../modules/identity/adapters/resend-email-sender.adapter.js";
 import { selectEmailSender } from "../../modules/identity/email-sender.selector.js";
 import { EmailAlertAdapter } from "./email-alert.adapter.js";
 
@@ -23,8 +22,10 @@ export function getAlertEmailer(): EmailAlertAdapter | null {
     logger.warn("ALERT_EMAIL_TO is not set: operational alerts are logged and counted only, and nobody is emailed.");
     resolved = null;
   } else {
-    const sender = selectEmailSender();
-    const delivers = sender instanceof ResendEmailSenderAdapter;
+    // An operator page is never silenced by the suppression list being unreadable (see SuppressingEmailSenderOptions).
+    const sender = selectEmailSender({ onLookupFailure: "send" });
+    // `delivers` is forwarded through the suppression wrapper (STORY-178); an `instanceof` on the wrapper would always be false.
+    const delivers = sender.delivers === true;
     if (delivers) {
       // The address is configuration, but this line names the setting, not the value.
       logger.log("operational alerts are emailed to ALERT_EMAIL_TO through Resend.");
