@@ -33,8 +33,44 @@ export async function refreshProjectMilestones(
 ): Promise<number> {
   return (
     (await pinEngineModelChanges(tx, workspaceId, projectId, metricDate, timezone)) +
-    (await pinPromptSetChange(tx, workspaceId, projectId, metricDate, timezone))
+    (await pinPromptSetChanges(tx, workspaceId, projectId, metricDate, timezone))
   );
+}
+
+/** How far back one rollup catches up on `prompt_set_change`: the longest growth-map timeframe (365d). */
+export const PROMPT_SET_CATCH_UP_DAYS = 365;
+
+/**
+ * STORY-066 AC9, review round 2 — the days the rollup of `metricDate` evaluates for `prompt_set_change`: every day from the previous
+ * rolled-up day through `metricDate`. The rollup visits only days with captures (a parse batch, the closed-day sweep, a dirty
+ * date), so a project on a weekly or manual cadence that changes its prompt set on a day with no capture would otherwise never be
+ * evaluated for that day, and the next capture day would count the change in its `before` — the jump on the chart with no marker.
+ * The previous rolled-up day is included: a change made later that day, after its last rollup, is caught. Bounded to the trailing
+ * PROMPT_SET_CATCH_UP_DAYS. Pure; dates are `YYYY-MM-DD` calendar days.
+ */
+export function promptSetDaysToEvaluate(previousRolledUp: string | null, metricDate: string): string[] {
+  const end = Date.parse(`${metricDate}T00:00:00Z`);
+  const floor = end - PROMPT_SET_CATCH_UP_DAYS * DAY_MS;
+  const previous = previousRolledUp === null ? end : Date.parse(`${previousRolledUp}T00:00:00Z`);
+  const start = Math.max(Math.min(previous, end), floor);
+  const days: string[] = [];
+  for (let at = start; at <= end; at += DAY_MS) days.push(new Date(at).toISOString().slice(0, 10));
+  return days;
+}
+
+const DAY_MS = 86_400_000;
+
+async function pinPromptSetChanges(tx: ClientBase, workspaceId: string, projectId: string, metricDate: string, timezone: string): Promise<number> {
+  // The previous day this project was rolled up: the latest metric_daily date before this one (RLS scopes the read).
+  const previous = await tx.query<{ day: string | null }>(
+    `SELECT to_char(max(metric_date), 'YYYY-MM-DD') AS day FROM metric_daily WHERE project_id = $1 AND metric_date < $2::date`,
+    [projectId, metricDate],
+  );
+  let pinned = 0;
+  for (const day of promptSetDaysToEvaluate(previous.rows[0]?.day ?? null, metricDate)) {
+    pinned += await pinPromptSetChange(tx, workspaceId, projectId, day, timezone);
+  }
+  return pinned;
 }
 
 /**

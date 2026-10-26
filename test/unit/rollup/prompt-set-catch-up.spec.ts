@@ -24,6 +24,6 @@ describe("STORY-066 AC9 · the days a rollup evaluates for prompt_set_change", (
     const days = promptSetDaysToEvaluate("2020-01-01", "2026-10-24");
     expect(days).toHaveLength(PROMPT_SET_CATCH_UP_DAYS + 1);
     expect(days[days.length - 1]).toBe("2026-10-24");
-    expect(days[0]).toBe("2025-10-23");
+    expect(days[0]).toBe("2025-10-24"); // 365 calendar days earlier (no 29 February between)
   });
 });

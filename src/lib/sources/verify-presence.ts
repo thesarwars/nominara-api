@@ -7,6 +7,7 @@ import { refreshProjectSourceIndex } from "../rollup/refresh-project-source-inde
 import { incrementCounter } from "../telemetry/metrics.js";
 import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
 import { nameUuid } from "../ids/name-uuid.js";
+import { withProjectQueueLock } from "../queue/locks.js";
 
 // NEW-C-15 / STORY-054 AC4 + AC11 (scenarios 5, 6, 7) — brand presence on a cited
 // domain is VERIFIED BY FETCHING the cited URL and matching it against the
@@ -182,6 +183,17 @@ interface CandidateRow {
   context_weight: number;
 }
 
+/**
+ * STORY-066 review round 2 — LOST UPDATE. `refreshProjectSourceIndex` reads the presence it carries over, then DELETEs and
+ * re-inserts the project's whole index; `rollup.metric_daily` runs it under ITS per-project advisory lock. A presence write outside
+ * that lock can UPDATE rows a concurrent rollup has already deleted (0 rows once the rollup commits) and then carry the rollup's
+ * stale value across in its own refresh — the verification is lost and, for a seeded task, the pin commits while the gap stays
+ * open. So every presence commit takes the ROLLUP'S lock, and takes it FIRST: the rollup holds that lock before it updates the
+ * `projects` row (denormalisation) and a task row lock is never held by it, so lock-then-rows here is the same order and the two
+ * cannot deadlock. Transaction-scoped: released at COMMIT/ROLLBACK.
+ */
+const PRESENCE_WRITE_LOCK = "rollup.metric_daily";
+
 // ADR-0003 — THE RUN IS THREE PHASES, so the `source.verify_presence` job holds no transaction (and no pooled connection) across
 // a fetch: `preparePresenceRun` reads in one short transaction, `fetchPresence` fetches with no client at all, and
 // `commitPresenceRun` writes in a second short one. `verifyProjectSourcePresence` composes the three on ONE client, which is the
@@ -266,6 +278,18 @@ export async function commitPresenceRun(
   now: Date,
   today?: string,
 ): Promise<PresenceRunSummary | null> {
+  return withProjectQueueLock(tx, PRESENCE_WRITE_LOCK, projectId, () => commitPresenceRunLocked(tx, projectId, plan, results, now, today));
+}
+
+
+async function commitPresenceRunLocked(
+  tx: ClientBase,
+  projectId: string,
+  plan: PresenceRunPlan,
+  results: readonly PresenceResult[],
+  now: Date,
+  today?: string,
+): Promise<PresenceRunSummary | null> {
   const live = await tx.query(`SELECT id FROM projects WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE`, [projectId]);
   if (live.rows.length === 0) return null;
 
@@ -331,7 +355,13 @@ export async function verifyProjectSourcePresence(tx: ClientBase, projectId: str
 //
 // ⚠ Reference gap, recorded rather than invented: the reference says completing an authority task "requires a URL" (the
 // contribution the user made). `POST /tasks/{id}/complete` takes no body today, so the task's own target URL is the URL verified.
-// Accepting a contribution URL is a contract change the owner has not decided.
+// Accepting a contribution URL is a contract change the owner has not decided (plans-7day followups, STORY-066 round 2).
+//
+// THE URL, recorded choice (review round 2, option a): the task's `affected_url` when it is a page on the task's domain — a
+// displacement-recovery task carries the cited page — and otherwise the domain's MOST-CITED page in the project's index (by a live
+// engine, as the periodic run picks it). The source-gap rule, the ordinary producer of authority tasks, writes `affected_url`
+// NULL (its playbook has no page), so without the fallback AC8 never fired for it. The fallback is still fetched PAST the cache
+// and pinned at completion: the completion is the trigger, and the most-cited page is where the engines look.
 
 /** The task's target, when it is an http(s) page on the task's own domain (or a subdomain of it); otherwise null. */
 export function seededTargetUrl(affectedUrl: string | null, domain: string): string | null {
@@ -346,6 +376,14 @@ export function seededTargetUrl(affectedUrl: string | null, domain: string): str
   const host = url.hostname.toLowerCase().replace(/\.$/u, "");
   const target = domain.trim().toLowerCase().replace(/\.$/u, "");
   return host === target || host.endsWith(`.${target}`) ? affectedUrl : null;
+}
+
+/**
+ * The page a completed authority task is verified against: its own on-domain target, else the index's most-cited page on the
+ * domain, else nothing (nothing is fetched and nothing pins).
+ */
+export function seededVerificationUrl(affectedUrl: string | null, indexTopUrl: string | null, domain: string): string | null {
+  return seededTargetUrl(affectedUrl, domain) ?? seededTargetUrl(indexTopUrl, domain);
 }
 
 /** The stable source id of one task's `source_seeded` pin: one pin per task, for ever. */
@@ -376,6 +414,7 @@ export async function prepareSeededVerification(tx: ClientBase, projectId: strin
     source_domain_id: string;
     domain: string;
     affected_url: string | null;
+    index_top_url: string | null;
     completed_at: Date;
     workspace_id: string;
     name: string;
@@ -385,6 +424,10 @@ export async function prepareSeededVerification(tx: ClientBase, projectId: strin
     today: string;
   }>(
     `SELECT t.id::text AS task_id, t.source_domain_id::text AS source_domain_id, sd.domain, t.affected_url, t.completed_at,
+            -- The domain's most-cited page by a live engine: the same pick as the periodic run's candidate.
+            (SELECT psi.top_urls->0->>'url' FROM project_source_index psi
+              WHERE psi.project_id = t.project_id AND psi.source_domain_id = t.source_domain_id AND psi.engine_key = ANY($4::text[])
+              ORDER BY psi.window_days DESC, psi.citation_count DESC LIMIT 1) AS index_top_url,
             p.workspace_id::text AS workspace_id, p.name, p.brand_aliases, p.negative_aliases,
             EXISTS (SELECT 1 FROM milestones m WHERE m.source_type = 'system' AND m.source_id = $3) AS pinned,
             to_char((now() AT TIME ZONE w.timezone)::date, 'YYYY-MM-DD') AS today
@@ -394,11 +437,11 @@ export async function prepareSeededVerification(tx: ClientBase, projectId: strin
        JOIN source_domains sd ON sd.id = t.source_domain_id
       WHERE t.id = $2 AND t.project_id = $1
         AND t.kind = 'authority' AND t.status = 'done' AND t.deleted_at IS NULL AND t.completed_at IS NOT NULL`,
-    [projectId, taskId, sourceSeededSourceId(projectId, taskId)],
+    [projectId, taskId, sourceSeededSourceId(projectId, taskId), [...LIVE_CITATION_ENGINES]],
   );
   const row = found.rows[0];
   if (row === undefined || row.pinned || isDemoDomain(row.domain)) return null;
-  const url = seededTargetUrl(row.affected_url, row.domain);
+  const url = seededVerificationUrl(row.affected_url, row.index_top_url, row.domain);
   if (url === null) return null;
   return {
     workspaceId: row.workspace_id,
@@ -447,6 +490,12 @@ export async function commitSeededVerification(tx: ClientBase, plan: SeededVerif
     logger.log({ event: "source_seeded_not_verified", workspaceId: plan.workspaceId, projectId: plan.projectId, taskId: plan.taskId, outcome: outcome.status });
     return false;
   }
+  // The rollup's lock FIRST, before the task row lock (see PRESENCE_WRITE_LOCK): the presence written below must not be lost to a
+  // concurrent rollup's index rebuild.
+  return withProjectQueueLock(tx, PRESENCE_WRITE_LOCK, plan.projectId, () => commitSeededPresent(tx, plan, now));
+}
+
+async function commitSeededPresent(tx: ClientBase, plan: SeededVerificationPlan, now: Date): Promise<boolean> {
   const still = await tx.query(
     `SELECT id FROM tasks
       WHERE id = $1 AND project_id = $2 AND status = 'done' AND deleted_at IS NULL
