@@ -2,9 +2,9 @@ import { Body, Controller, Get, HttpCode, Put, Query } from "@nestjs/common";
 import {
   agencyThemeListQuerySchema,
   agencyThemeListResponseSchema,
-  agencyThemeSchema,
+  agencyThemeAdminSchema,
   updateAgencyThemeRequestSchema,
-  type AgencyTheme,
+  type AgencyThemeAdmin,
   type AgencyThemeListQuery,
   type UpdateAgencyThemeRequest,
 } from "../../../contracts/agency/index.js";
@@ -25,7 +25,7 @@ export class AgencyController {
   @Get("theme")
   @RequirePermission("agency:branding")
   @ApiContract({ operationId: "listAgencyThemes", querySchema: agencyThemeListQuerySchema, responseSchema: agencyThemeListResponseSchema, listOf: true })
-  list(@Query(new ZodValidationPipe(agencyThemeListQuerySchema)) query: AgencyThemeListQuery): Promise<Page<AgencyTheme>> {
+  list(@Query(new ZodValidationPipe(agencyThemeListQuerySchema)) query: AgencyThemeListQuery): Promise<Page<AgencyThemeAdmin>> {
     return this.service.listThemes(query);
   }
 
@@ -38,9 +38,9 @@ export class AgencyController {
   @ApiContract({
     operationId: "saveAgencyTheme",
     requestSchema: updateAgencyThemeRequestSchema,
-    responseSchema: agencyThemeSchema,
+    responseSchema: agencyThemeAdminSchema,
   })
-  save(@Body(new ZodValidationPipe(updateAgencyThemeRequestSchema)) body: UpdateAgencyThemeRequest): Promise<AgencyTheme> {
+  save(@Body(new ZodValidationPipe(updateAgencyThemeRequestSchema)) body: UpdateAgencyThemeRequest): Promise<AgencyThemeAdmin> {
     return this.service.saveTheme(body);
   }
 }

@@ -21,6 +21,18 @@ import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 //  - hide_nominara_brand = true without whitelabel.remove_branding is
 //    403 feature_not_in_plan (service-enforced).
 
+// Both are written into mail headers, so the schema refuses what could break out of one: no control characters (a CR or LF
+// is header injection), and no angle brackets, quotes or backslash in a display name (they would close or escape it). The
+// mail adapter sanitises again: a value stored before this rule, or by any other path, still cannot reach a header.
+const emailFromNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(80)
+  // eslint-disable-next-line no-control-regex -- the point of the rule: a control character in a header is an injection
+  .regex(/^[^\u0000-\u001f\u007f<>"\\]+$/, "a display name cannot contain control characters, angle brackets, quotes or a backslash");
+const emailReplyToSchema = z.email().max(254);
+
 export const agencyThemeSchema = z
   .object({
     theme_id: z.uuid(),
@@ -37,10 +49,22 @@ export const agencyThemeSchema = z
   })
   .strict();
 
+// STORY-100 AC10 — what the AGENCY's editor reads and writes: the portal's theme plus the two email fields. They are NOT
+// on `agencyThemeSchema`, because the portal response embeds that one and a portal viewer (a client of the agency, possibly
+// anonymous through a share link) must not be handed the agency's mail configuration.
+export const agencyThemeAdminSchema = agencyThemeSchema
+  .extend({
+    /** The display name a scheduled report's email is sent under. null = the platform's sender name alone. */
+    email_from_name: emailFromNameSchema.nullable(),
+    /** Owner decision 6: the Reply-To of a scheduled report's email. null = the header is omitted. */
+    email_reply_to: emailReplyToSchema.nullable(),
+  })
+  .strict();
+
 // NEW-E-7 checkpoint-6 — the cursor envelope; `pagination` is published by the route's `listOf` marker.
 export const agencyThemeListQuerySchema = paginationRequestSchema;
 export type AgencyThemeListQuery = z.infer<typeof agencyThemeListQuerySchema>;
-export const agencyThemeListResponseSchema = z.array(agencyThemeSchema);
+export const agencyThemeListResponseSchema = z.array(agencyThemeAdminSchema);
 
 export const updateAgencyThemeRequestSchema = z
   .object({
@@ -55,6 +79,10 @@ export const updateAgencyThemeRequestSchema = z
     color_fg: hexColorSchema.nullable().optional(),
     font_family: z.string().min(1).max(80).optional(),
     hide_nominara_brand: z.boolean().optional(),
+    /** STORY-100 AC10. Absent leaves it as stored; null clears it. */
+    email_from_name: emailFromNameSchema.nullable().optional(),
+    /** STORY-100 AC10 / owner decision 6. Absent leaves it as stored; null clears it (the Reply-To header is then omitted). */
+    email_reply_to: emailReplyToSchema.nullable().optional(),
   })
   .strict();
 
@@ -80,5 +108,6 @@ export const contrastRejectionDetailsSchema = validationFailedDetailsSchema.exte
 });
 
 export type AgencyTheme = z.infer<typeof agencyThemeSchema>;
+export type AgencyThemeAdmin = z.infer<typeof agencyThemeAdminSchema>;
 export type UpdateAgencyThemeRequest = z.infer<typeof updateAgencyThemeRequestSchema>;
 export type ContrastRejectionDetails = z.infer<typeof contrastRejectionDetailsSchema>;
