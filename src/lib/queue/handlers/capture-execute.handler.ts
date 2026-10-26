@@ -1,10 +1,12 @@
 import { Logger } from "@nestjs/common";
 import { nonMeasurementStatusSql } from "../../rollup/aggregate-day.js";
 import type { Job } from "bullmq";
+import { randomUUID } from "node:crypto";
 import { Redis } from "ioredis";
 import type { ClientBase } from "pg";
 import { z } from "zod";
 import type { Cache } from "../../cache/cache.port.js";
+import { cacheKeyNamespace } from "../../cache/key-namespace.js";
 import { ValkeyCacheAdapter } from "../../cache/valkey-cache.adapter.js";
 import type { RealtimePublisher } from "../../cache/realtime-publisher.js";
 import { ValkeyRealtimePublisher } from "../../cache/realtime-publisher.js";
@@ -12,13 +14,15 @@ import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { engineKeySchema } from "../../engines/contract.js";
 import { SpendMeter, ValkeySpendMeterStore } from "../../engines/spend-meter.js";
-import { captureCell, recordExhaustedCell, type CaptureCellInput, type CaptureCellOutcome } from "../../capture/execute-cell.js";
+import { rawObjectStores, type BoundRawObjects, type RawObjectStores } from "../../capture/raw-object-store.js";
+import type { ObjectStoragePort } from "../../storage/storage.port.js";
+import { commitCell, fetchCell, recordExhaustedCell, settledCell, type CaptureCellInput, type CaptureCellOutcome, type CellFetched } from "../../capture/execute-cell.js";
 import { finalizeRun } from "../../capture/finalize-run.js";
 import { readRunProgress } from "../../capture/run-progress.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
-import { signingKeysFromEnv } from "../worker-factory.js";
+import { PHASES_DONE, phasedProcessor, signingKeysFromEnv } from "../worker-factory.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 import { requestRollupIfRunComplete, type EnqueueRollup } from "./run-rollup-request.js";
@@ -60,6 +64,8 @@ export interface CaptureExecuteDeps {
   readonly enqueueRollup?: EnqueueRollup;
   /** Injected in tests; production builds the Valkey-backed meter from env on first use. */
   readonly spendMeter?: SpendMeter;
+  /** STORY-181 - the object-storage port the raw capture objects are written through (S3 from env when absent). Injectable so a test sees a real key or a failing upload. */
+  readonly storagePort?: ObjectStoragePort;
 }
 
 /** What `capture.parse` needs to find and re-read the row this handler wrote. */
@@ -87,6 +93,36 @@ export function buildSpendMeter(
   return new SpendMeter(new ValkeySpendMeterStore(redis), resolveEngineSpendCeilings(env.ENGINE_SPEND_CEILINGS_USD));
 }
 
+/**
+ * The in-flight claim's lifetime. It covers the longest vendor call (the Gemini adapter times out at 30 s) plus the object PUT and
+ * the commit, and it is shorter than the retry ladder's reach (5 s, 15 s, 45 s, 120 s), so a delivery that lost the claim is retried
+ * after the winner is done, or after a winner that died has let it lapse.
+ */
+export const CELL_CLAIM_TTL_MS = 90_000;
+
+/** A second delivery of a cell whose first delivery is still running. Thrown so the retry ladder tries again once the first is done. */
+export class CellInFlightError extends Error {
+  constructor() {
+    super("this cell is being captured by another delivery");
+    this.name = "CellInFlightError";
+  }
+}
+
+/** ADR-0003 - what `prepare` hands `run`: the verified payload, the cell, and whether an earlier delivery already settled it. */
+interface ExecutePrepared {
+  readonly payload: z.infer<typeof payloadSchema>;
+  readonly runStartedAt: Date | null;
+  readonly cellInput: CaptureCellInput;
+  readonly settled: CaptureCellOutcome | undefined;
+  /** Bound in `prepare`, inside the tenant context (it only reads the workspace id). Undefined: storage unconfigured outside production, or a settled cell. */
+  readonly rawObjects: BoundRawObjects | undefined;
+}
+
+type ExecuteFetched =
+  | { readonly kind: "settled" }
+  | { readonly kind: "fetched"; readonly cell: CellFetched; readonly claim: { readonly key: string; readonly token: string } }
+  | { readonly kind: "exhausted"; readonly error: unknown };
+
 export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?: CaptureExecuteDeps): JobProcessor {
   const logger = new Logger("capture.execute");
 
@@ -107,6 +143,8 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
   // E2E-B6 — the platform spend meter (EC-08), built on first use. RECORDING fails open inside the
   // meter (the money is already spent); the PRE-CALL gate below fails closed on an unreadable or corrupt
   // total (an absent total is zero spent, which is why the meter must live where a key cannot vanish).
+  let stores: RawObjectStores | undefined;
+  const rawStores = (): RawObjectStores => (stores ??= rawObjectStores(context.env, deps?.storagePort));
   let spendMeter: SpendMeter | undefined = deps?.spendMeter;
   const meter = (): SpendMeter => (spendMeter ??= buildSpendMeter(context.env, (message) => logger.warn(message)));
   const ceilingReached = async (engineKey: string): Promise<boolean> => {
@@ -176,8 +214,7 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       return producer.enqueueTenantJob(queue, workspaceId, rollupPayload, { idempotencyKey });
     });
 
-  return async (tx: ClientBase, job: Job): Promise<void> => {
-    const { cache: liveCache, realtime: livePublisher } = connections();
+  const prepare = async (tx: ClientBase, job: Job): Promise<ExecutePrepared | typeof PHASES_DONE> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
 
     // THE RUN ROW IS THE TRUTH, not the payload. A job is a snapshot from
@@ -187,14 +224,12 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     // "in-flight cells complete rather than being abandoned" mean the ones
     // that were genuinely mid-write, not every job the drain raced.
     //
-    // `FOR KEY SHARE`, NOT A PLAIN SELECT (SCANFIX D5). This transaction spans the vendor call, and a plain
-    // read locks nothing: the stuck-run reaper's `FOR UPDATE` did not wait for a cell still in flight, so it
-    // counted that cell as lost, finalised the run `failed`, refunded the full charge and committed - and
-    // the cell then committed a captured answer on a refunded run. KEY SHARE is the weakest lock that the
-    // reaper's FOR UPDATE conflicts with, so the reaper waits for every in-flight cell to commit and its
-    // idle re-check then sees the new capture. It does not conflict with this handler's own NO KEY UPDATEs
-    // (the run's non-key columns), with another cell's KEY SHARE, or with a cancel. The other direction:
-    // a cell arriving while the reaper holds the run waits here, then reads the terminal status below.
+    // `FOR KEY SHARE`, NOT A PLAIN SELECT (SCANFIX D5). A plain read locks nothing: the stuck-run reaper's `FOR UPDATE` did not wait
+    // for a cell still being written, so it counted that cell as lost, finalised the run `failed`, refunded the full charge and
+    // committed - and the cell then committed a captured answer on a refunded run. KEY SHARE is the weakest lock the reaper's
+    // FOR UPDATE conflicts with. It no longer spans the vendor call (ADR-0003: this job is phased, a transaction cannot span it);
+    // `commit` re-reads the run under the same lock, which is where a cell is now refused on a run the reaper already finalised.
+    // A cell arriving while the reaper holds the run waits here, then reads the terminal status below.
     const run = await tx.query<{ status: string; planned_cells: number; started_at: Date | null }>(
       "SELECT status, planned_cells, started_at FROM capture_runs WHERE id = $1 FOR KEY SHARE",
       [payload.runId],
@@ -205,7 +240,7 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       // capture and nothing wrong - throwing would send the job down the
       // retry ladder for a run that no longer exists.
       logger.log(`run ${payload.runId} is gone; skipping cell`);
-      return;
+      return PHASES_DONE;
     }
     // ANY TERMINAL RUN SKIPS THE CELL, not only canceled/failed. A late or replayed cell (admin DLQ replay,
     // a redelivery) on a run the reaper or the last live cell already finalised would otherwise call the
@@ -216,7 +251,7 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     if (runRow.status !== "queued" && runRow.status !== "running") {
       incrementCounter("nominara_capture_cells_skipped_terminal_run_total", { status: runRow.status });
       logger.log({ event: "capture.cell.skipped_terminal_run", workspace_id: payload.workspaceId, run_id: payload.runId, status: runRow.status });
-      return;
+      return PHASES_DONE;
     }
 
     // First cell to arrive moves the run to `running` and stamps the clock the
@@ -241,37 +276,92 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       personaHint: payload.personaHint,
       normalizerVersion: NORMALIZER_VERSION,
     };
-    let outcome: CaptureCellOutcome;
+    // IDEMPOTENT PER CELL, BEFORE ANY VENDOR CALL: a cell an earlier delivery settled is replayed, not captured again.
+    const settled = await settledCell(tx, cellInput);
+    // STORY-181: bound HERE, inside the job's tenant context (it only reads the workspace id; no I/O), so the raw object lands in this
+    // workspace's prefix and nowhere else. Not bound for a settled cell: a replay stores nothing.
+    const rawObjects = settled === undefined ? rawStores().bindForWrite() : undefined;
+    return { payload, runStartedAt: runRow.started_at, cellInput, settled, rawObjects };
+  };
+
+  // ADR-0003 RUN: NO transaction and NO pooled client. The vendor call, the spend meter and the raw-object PUT happen here.
+  const run = async (prepared: ExecutePrepared, job: Job): Promise<ExecuteFetched> => {
+    if (prepared.settled !== undefined) return { kind: "settled" };
+    const { cache: liveCache } = connections();
+    const { cellInput, payload } = prepared;
+    // THE IN-FLIGHT CLAIM. The cell's advisory lock used to span the vendor call, so two deliveries of one cell (a stalled-job
+    // redelivery, an admin replay) paid once. A transaction can no longer span the call, so the same guarantee is a short-lived claim
+    // on the cache: the loser throws CellInFlightError (retried later, by which time the winner's row exists) instead of paying twice.
+    // `onlyIfAbsent` is the whole mechanism; an unreachable cache throws too (fail closed: the alternative is a double charge).
+    const claim = {
+      key: [cacheKeyNamespace(), "ws", payload.workspaceId, "capture-cell", payload.runId, payload.promptId, payload.engineKey, String(payload.sampleIndex)].join(":"),
+      token: randomUUID(),
+    };
+    let claimed = false;
     try {
-      outcome = await captureCell(tx, liveCache, cellInput, undefined, recordSpend, ceilingReached);
-    } catch (error) {
-      // SCANFIX D1 - THE LAST ATTEMPT RECORDS INSTEAD OF DYING. Until this, a cell whose retry ladder ran
-      // out threw its way into the dead-letter queue and left NO row: `captured + failed + skipped` never
-      // reached `planned`, so the run sat at running/queued for ever, the rollup was never requested and
-      // the customer saw no scores - even for the cells that had captured. Every attempt before the last
-      // still throws (the ladder is untouched); the final one writes the terminal `failed` row and carries
-      // on, so the run can finish.
-      if (!isFinalAttempt(job)) throw error;
-      try {
-        outcome = await recordExhaustedCell(tx, cellInput, error);
-      } catch {
-        // The terminal record itself could not be written (a database error aborted this transaction).
-        // Surface the ORIGINAL failure: the job reaches the dead-letter queue as before and the stuck-run
-        // reaper accounts for the cell. Never swallow an error to keep the happy path.
-        throw error;
+      claimed = await liveCache.set(claim.key, claim.token, { ttlMs: CELL_CLAIM_TTL_MS, onlyIfAbsent: true });
+      if (!claimed) {
+        incrementCounter("nominara_capture_cell_claim_lost_total", { engine_key: payload.engineKey });
+        throw new CellInFlightError();
       }
-      incrementCounter("nominara_capture_cells_exhausted_total", {
-        engine_key: payload.engineKey,
-        error_code: outcome.kind === "captured" ? "replayed" : outcome.errorCode,
-      });
-      logger.warn({
-        event: "capture.cell.retries_exhausted",
-        workspace_id: payload.workspaceId,
-        run_id: payload.runId,
-        engine_key: payload.engineKey,
-        error_code: outcome.kind === "captured" ? "replayed" : outcome.errorCode,
-      });
+      const cell = await fetchCell(cellInput, { recordSpend, ceilingReached, ...(prepared.rawObjects !== undefined ? { rawObjects: prepared.rawObjects } : {}) });
+      return { kind: "fetched", cell, claim };
+    } catch (error) {
+      if (claimed) await liveCache.deleteIf(claim.key, claim.token).catch(() => undefined);
+      // Another delivery owns the cell: never record it as exhausted, that would write a failed row over the winner's answer.
+      if (error instanceof CellInFlightError) throw error;
+      // SCANFIX D1 - THE LAST ATTEMPT RECORDS INSTEAD OF DYING. Until this, a cell whose retry ladder ran out threw its way into the
+      // dead-letter queue and left NO row: `captured + failed + skipped` never reached `planned`, so the run sat at running/queued for
+      // ever, the rollup was never requested and the customer saw no scores - even for the cells that had captured. Every attempt
+      // before the last still throws (the ladder is untouched); the final one hands `commit` the terminal `failed` record to write.
+      if (!isFinalAttempt(job)) throw error;
+      return { kind: "exhausted", error };
     }
+  };
+
+  // ADR-0003 COMMIT: a second short transaction. It re-checks the run under FOR KEY SHARE, then writes the cell.
+  const commit = async (tx: ClientBase, prepared: ExecutePrepared, fetched: ExecuteFetched): Promise<void> => {
+    const { cache: liveCache, realtime: livePublisher } = connections();
+    const { payload, cellInput } = prepared;
+    let outcome: CaptureCellOutcome;
+    if (fetched.kind === "settled") {
+      outcome = prepared.settled!;
+    } else {
+      // THE RUN IS RE-READ UNDER `FOR KEY SHARE`, because the lock `prepare` took ended with its transaction (SCANFIX D5). The stuck-run
+      // reaper's `FOR UPDATE` waits for this statement's transaction, and this statement waits for a reaper that already holds the run;
+      // either way a cell can no longer commit a captured answer on a run the reaper refunded. A cell that arrives to find the run
+      // terminal is dropped: the vendor was paid and metered, and nothing is written (the object, if any, is an orphan).
+      const run = await tx.query<{ status: string }>("SELECT status FROM capture_runs WHERE id = $1 FOR KEY SHARE", [payload.runId]);
+      const status = run.rows[0]?.status;
+      if (status !== "queued" && status !== "running") {
+        incrementCounter("nominara_capture_cells_skipped_terminal_run_total", { status: status ?? "gone" });
+        logger.log({ event: "capture.cell.skipped_terminal_run", workspace_id: payload.workspaceId, run_id: payload.runId, status: status ?? "gone", phase: "commit" });
+        return;
+      }
+      try {
+        outcome = fetched.kind === "fetched" ? await commitCell(tx, liveCache, cellInput, fetched.cell) : await recordExhaustedCell(tx, cellInput, fetched.error);
+      } catch (error) {
+        // The claim is released so this job's own retry is not locked out by its failed attempt.
+        if (fetched.kind === "fetched") await liveCache.deleteIf(fetched.claim.key, fetched.claim.token).catch(() => undefined);
+        // The terminal record itself could not be written (a database error aborted this transaction). Surface the ORIGINAL failure:
+        // the job reaches the dead-letter queue as before and the stuck-run reaper accounts for the cell. Never swallow an error.
+        throw fetched.kind === "exhausted" ? fetched.error : error;
+      }
+      if (fetched.kind === "exhausted") {
+        incrementCounter("nominara_capture_cells_exhausted_total", {
+          engine_key: payload.engineKey,
+          error_code: outcome.kind === "captured" ? "replayed" : outcome.errorCode,
+        });
+        logger.warn({
+          event: "capture.cell.retries_exhausted",
+          workspace_id: payload.workspaceId,
+          run_id: payload.runId,
+          engine_key: payload.engineKey,
+          error_code: outcome.kind === "captured" ? "replayed" : outcome.errorCode,
+        });
+      }
+    }
+    const runRow = { started_at: prepared.runStartedAt };
 
     // E2E-B6a — `captured_cells` counts LIVE captures only (captures-and-facts.md).
     // An atomic increment, not a recount: concurrent cells each run in their own
@@ -391,6 +481,8 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       });
     }
   };
+
+  return phasedProcessor<ExecutePrepared, ExecuteFetched>({ prepare, run, commit });
 }
 
 /**

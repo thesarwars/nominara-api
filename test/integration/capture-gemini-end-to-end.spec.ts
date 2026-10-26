@@ -272,7 +272,15 @@ describe("NEW-A-7 AC4 · Gemini capture -> parse -> rollup -> GET /scorecards an
         });
       const copies = opts.executions ?? 1;
       if (opts.concurrent === true) {
-        await Promise.all(Array.from({ length: copies }, deliver));
+        // ADR-0003: no transaction spans the vendor call any more, so the cell's single-flight is the in-flight claim. The delivery that
+        // loses it is REJECTED (CellInFlightError, so the retry ladder retries it) and the winner captures the cell once.
+        const settled = await Promise.allSettled(Array.from({ length: copies }, deliver));
+        const rejected = settled.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+        expect(settled.filter((r) => r.status === "fulfilled"), "exactly one delivery owns the cell").toHaveLength(1);
+        expect(rejected).toHaveLength(copies - 1);
+        for (const r of rejected) expect((r.reason as Error).name).toBe("CellInFlightError");
+        // The retry of the loser arrives after the winner committed: it replays and pays nothing.
+        await deliver();
       } else {
         for (let attempt = 0; attempt < copies; attempt++) await deliver();
       }

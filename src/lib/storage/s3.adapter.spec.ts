@@ -1,5 +1,7 @@
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { createServer } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DegradedError } from "../../api/errors/domain-errors.js";
 import { S3Adapter } from "./s3.adapter.js";
 import { resolveStorageConfig } from "./storage-config.js";
 
@@ -47,4 +49,34 @@ describe("S3Adapter · every write is encrypted at rest", () => {
     expect(input.BucketKeyEnabled).toBe(true);
     expect(input.SSEKMSKeyId).toBeUndefined();
   });
+});
+
+describe("S3Adapter · a stalled store cannot hold its caller for ever", () => {
+  it("OS-A4 · a PUT to an endpoint that accepts the connection and never answers fails as DegradedError within the request timeout", async () => {
+    const sockets = new Set<import("node:net").Socket>();
+    const server = createServer((socket) => {
+      sockets.add(socket); // accept, read, never reply
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const config = resolveStorageConfig({
+        NODE_ENV: "test",
+        STORAGE_ENDPOINT: `http://127.0.0.1:${String(port)}`,
+        STORAGE_BUCKET_RAW: "r",
+        STORAGE_BUCKET_REPORTS: "p",
+        STORAGE_ACCESS_KEY_ID: "k",
+        STORAGE_SECRET_ACCESS_KEY: "s",
+        STORAGE_FORCE_PATH_STYLE: "true",
+        STORAGE_SSE: "AES256",
+      } as never);
+      if (config === null) throw new Error("config null");
+      const started = Date.now();
+      await expect(new S3Adapter(config, 150).put({ bucket: "raw", key: "k", body: "b" })).rejects.toBeInstanceOf(DegradedError);
+      expect(Date.now() - started).toBeLessThan(10_000);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }, 20_000);
 });

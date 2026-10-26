@@ -134,6 +134,17 @@ describe("STORY-124 · the queue-handler registry", () => {
     expect(typeof phases!.commit).toBe("function");
   });
 
+  it("ADR-0003 — the REGISTERED capture.execute handler is a phased processor: the vendor call and the raw-object PUT cannot run inside a transaction", () => {
+    const factory = handlerFor("capture.execute");
+    expect(factory, "capture.execute must be registered").toBeDefined();
+    const processor = factory!({ pool: {} as never, env: {} as never });
+    const phases = phasesOf(processor);
+    expect(phases).toBeDefined();
+    expect(typeof phases!.prepare).toBe("function");
+    expect(typeof phases!.run).toBe("function");
+    expect(typeof phases!.commit).toBe("function");
+  });
+
   // ---- scenario 3 --------------------------------------------------------
 
   it("scenario 3 — registering one handler autoruns that worker and leaves its siblings inert", async () => {
