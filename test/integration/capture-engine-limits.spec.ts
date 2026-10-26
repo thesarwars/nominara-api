@@ -439,6 +439,20 @@ describe("STORY-031 · engine limits in the live capture path", () => {
       expect(await refundedTotal()).toBe(0);
     });
 
+    it("refunds nothing while the run is still in flight: the skip count can still move, and a run that ends with nothing delivered is owed the full refund instead", async () => {
+      await addRun(3);
+      await chargeRun();
+      await openOnQuota();
+      await execute(job(await addPrompt("fine"), "fine"));
+      expect(await runStatus()).toBe("running");
+      const early = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => settleEngineSkippedCells(tx, { workspaceId, runId }));
+      expect(early.refunded).toBe(0);
+      await execute(job(await addPrompt("fine"), "fine"));
+      await execute(job(await addPrompt("fine"), "fine"));
+      expect(await runStatus()).toBe("failed");
+      expect(await refundedTotal()).toBe(CHARGE);
+    });
+
     it("rounds the refund down, never up: 1 skipped of 3 planned on 500 refunds 166", async () => {
       await addRun(3);
       await chargeRun();
