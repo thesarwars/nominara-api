@@ -28,6 +28,14 @@ const logger = new Logger("capture.engine-skip-refund-sweep");
 export const ENGINE_SKIP_REFUND_LOOKBACK_MS = 30 * 24 * 60 * 60 * 1000;
 const BATCH_LIMIT = 200;
 
+/** The sweep's connection is bound by RLS: its candidate query would find nothing and pay no refund, silently. */
+export class EngineSkipRefundSweepBlindError extends Error {
+  constructor(who: string) {
+    super(`engine-skip refund sweep refused: role "${who}" cannot see across tenants (needs the owner connection)`);
+    this.name = "EngineSkipRefundSweepBlindError";
+  }
+}
+
 export interface EngineSkipRefundSweepResult {
   readonly refundedRuns: number;
 }
