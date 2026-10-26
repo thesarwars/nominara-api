@@ -23299,7 +23299,11 @@
                       "properties": {
                         "granularity": {
                           "type": "string",
-                          "const": "day"
+                          "enum": [
+                            "hour",
+                            "day",
+                            "week"
+                          ]
                         },
                         "timeframe": {
                           "type": "object",
@@ -23666,11 +23670,35 @@
                                 ],
                                 "additionalProperties": false
                               }
+                            },
+                            "scoring_version_changes": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "at": {
+                                    "type": "string"
+                                  },
+                                  "from": {
+                                    "type": "string"
+                                  },
+                                  "to": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "at",
+                                  "from",
+                                  "to"
+                                ],
+                                "additionalProperties": false
+                              }
                             }
                           },
                           "required": [
                             "data_gaps",
-                            "cadence_changes"
+                            "cadence_changes",
+                            "scoring_version_changes"
                           ],
                           "additionalProperties": false
                         },
@@ -35023,7 +35051,11 @@
                       "properties": {
                         "granularity": {
                           "type": "string",
-                          "const": "day"
+                          "enum": [
+                            "hour",
+                            "day",
+                            "week"
+                          ]
                         },
                         "timeframe": {
                           "type": "object",
@@ -35396,11 +35428,35 @@
                                 ],
                                 "additionalProperties": false
                               }
+                            },
+                            "scoring_version_changes": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "at": {
+                                    "type": "string"
+                                  },
+                                  "from": {
+                                    "type": "string"
+                                  },
+                                  "to": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "at",
+                                  "from",
+                                  "to"
+                                ],
+                                "additionalProperties": false
+                              }
                             }
                           },
                           "required": [
                             "data_gaps",
-                            "cadence_changes"
+                            "cadence_changes",
+                            "scoring_version_changes"
                           ],
                           "additionalProperties": false
                         },

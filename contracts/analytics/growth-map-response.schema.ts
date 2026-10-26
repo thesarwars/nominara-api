@@ -21,9 +21,22 @@ export const engineFilterSchema = z
     { message: "engines is `all` or a comma list of engine keys" },
   );
 
+/**
+ * STORY-066 AC1/AC2 — the timeframes the chart serves. `scoring-models.md` §13:
+ * "Granularity auto-selects: `24h → hour`, `7d/30d/90d → day`, `>90d → week`".
+ * The two longer windows are named `180d` and `365d` (planner recommendation,
+ * 2026-10-26); a custom range is STORY-090's.
+ */
+export const growthMapTimeframeSchema = z.enum(["24h", "7d", "30d", "90d", "180d", "365d"]);
+export const growthMapGranularitySchema = z.enum(["hour", "day", "week"]);
+
+/** §13's auto-selection, as data, so the server and a client cannot disagree about it. */
+export const GROWTH_MAP_GRANULARITY: Readonly<Record<z.infer<typeof growthMapTimeframeSchema>, z.infer<typeof growthMapGranularitySchema>>> =
+  Object.freeze({ "24h": "hour", "7d": "day", "30d": "day", "90d": "day", "180d": "week", "365d": "week" });
+
 export const growthMapQuerySchema = z
   .object({
-    timeframe: z.enum(["7d", "30d", "90d"]).default("90d"),
+    timeframe: growthMapTimeframeSchema.default("90d"),
     /** `brand`, `competitors`, or both — §7's own query string. */
     entities: z.string().min(1).optional(),
     /**
@@ -32,9 +45,24 @@ export const growthMapQuerySchema = z
      * one. `all` means the entitled set and stands alone.
      */
     engines: engineFilterSchema.optional(),
-    granularity: z.enum(["day"]).default("day"),
+    /**
+     * AUTO-SELECTED from the timeframe (§13). Optional, and when sent it must
+     * be the one the timeframe selects: a client that asked for daily points
+     * over a year and was quietly served weekly ones would believe it had read
+     * daily values. A mismatch is a 400, never a silent substitution.
+     */
+    granularity: growthMapGranularitySchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((query, ctx) => {
+    if (query.granularity !== undefined && query.granularity !== GROWTH_MAP_GRANULARITY[query.timeframe]) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["granularity"],
+        message: `timeframe ${query.timeframe} is served at ${GROWTH_MAP_GRANULARITY[query.timeframe]} granularity`,
+      });
+    }
+  });
 
 /**
  * One day on one series.
@@ -51,6 +79,13 @@ export const growthMapQuerySchema = z
  */
 export const growthMapPointSchema = z
   .object({
+    /**
+     * The bucket's label. `day`: the workspace-local date (`YYYY-MM-DD`).
+     * `week`: the first workspace-local date of the seven-day bucket (buckets
+     * end on the window's last day, so the first one may be shorter). `hour`:
+     * the UTC instant the hour starts (`YYYY-MM-DDTHH:00:00Z`) — an instant,
+     * because a wall-clock hour repeats on the night the clocks go back.
+     */
     d: z.string(),
     visibility_score: z.number().nullable(),
     sov: z.number().nullable(),
@@ -127,7 +162,8 @@ export const dataGapSchema = z
 
 export const growthMapResponseSchema = z
   .object({
-    granularity: z.literal("day"),
+    granularity: growthMapGranularitySchema,
+    /** Workspace-local dates; at `hour` granularity, the UTC instants of the first and last hour. */
     timeframe: z.object({ from: z.string(), to: z.string(), timezone: z.string() }).strict(),
     series: z.array(growthMapSeriesSchema),
     /** NEW-A-5 — per-engine provenance over the window, one entry per engine measured. */
@@ -137,13 +173,25 @@ export const growthMapResponseSchema = z
       .object({
         data_gaps: z.array(dataGapSchema),
         /**
-         * ALWAYS EMPTY TODAY, and the contract keeps the field rather than
-         * dropping it. `project_engines` has no history table and nothing
-         * records a cadence change, so there is no source to read — see the
-         * service. Removing the field would make the chart's own annotation
-         * layer look complete when one of its two kinds is unimplemented.
+         * STORY-066 AC5 — every capture-cadence change in the window, so a
+         * weekly→daily switch does not read as a trend break. Read from the
+         * milestones the `record_cadence_change` trigger (migration 0017)
+         * writes. `at` is labelled like a point's `d`: a workspace-local date,
+         * or the UTC hour instant at `hour` granularity.
          */
         cadence_changes: z.array(
+          z.object({ at: z.string(), from: z.string(), to: z.string() }).strict(),
+        ),
+        /**
+         * STORY-066 AC12 — where the plotted series crosses from one
+         * `scoring_version` to another. A day is plotted under the current
+         * version when it has one and under the most recent older version
+         * otherwise (history past raw-capture retention cannot be rebuilt),
+         * and each change between consecutive measured buckets is announced
+         * here: `at` is the first bucket under `to`. Empty when the window
+         * is all one version.
+         */
+        scoring_version_changes: z.array(
           z.object({ at: z.string(), from: z.string(), to: z.string() }).strict(),
         ),
       })
@@ -165,6 +213,8 @@ export const growthMapResponseSchema = z
   .strict();
 
 export type GrowthMapQuery = z.infer<typeof growthMapQuerySchema>;
+export type GrowthMapTimeframe = z.infer<typeof growthMapTimeframeSchema>;
+export type GrowthMapGranularity = z.infer<typeof growthMapGranularitySchema>;
 export type GrowthMapPoint = z.infer<typeof growthMapPointSchema>;
 export type GrowthMapSeries = z.infer<typeof growthMapSeriesSchema>;
 export type Milestone = z.infer<typeof milestoneSchema>;
