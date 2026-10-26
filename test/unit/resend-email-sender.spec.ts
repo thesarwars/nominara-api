@@ -336,3 +336,62 @@ describe("Resend adapter · observability", () => {
     expect(metrics.some((line) => line.includes("nominara_email_send_total") && line.includes('"outcome":"sent"'))).toBe(true);
   });
 });
+
+// STORY-100 AC10 / owner decision 6 — the agency display name and Reply-To, on a platform-authenticated sender.
+describe("STORY-100 s12 · Resend adapter · agency display name and Reply-To", () => {
+  it("s12 · a fromName replaces the display name and keeps the platform's authenticated ADDRESS", async () => {
+    const f = fakeFetch([jsonResponse(200, { id: "msg_1" })]);
+    await make(f.impl).adapter.send({ ...MESSAGE, fromName: "Acme Agency" });
+    expect(f.calls[0]!.body.from).toBe("Acme Agency <no-reply@nominara.test>");
+  });
+
+  it("s12 · a bare configured address is wrapped the same way", async () => {
+    const f = fakeFetch([jsonResponse(200, { id: "msg_1" })]);
+    await make(f.impl, { from: "no-reply@nominara.test" }).adapter.send({ ...MESSAGE, fromName: "Acme Agency" });
+    expect(f.calls[0]!.body.from).toBe("Acme Agency <no-reply@nominara.test>");
+  });
+
+  it("s12 · a replyTo is sent as Resend's reply_to", async () => {
+    const f = fakeFetch([jsonResponse(200, { id: "msg_1" })]);
+    await make(f.impl).adapter.send({ ...MESSAGE, replyTo: "team@acme.example" });
+    expect(f.calls[0]!.body.reply_to).toBe("team@acme.example");
+  });
+
+  it("s12 · with neither, the from is the configured one and NO reply_to key is sent (null = omitted)", async () => {
+    const f = fakeFetch([jsonResponse(200, { id: "msg_1" })]);
+    await make(f.impl).adapter.send(MESSAGE);
+    expect(f.calls[0]!.body.from).toBe(FROM);
+    expect("reply_to" in f.calls[0]!.body).toBe(false);
+  });
+
+  it("s12 · header injection: CR/LF and angle brackets cannot leave a display name, so no second header or address is smuggled in", async () => {
+    const f = fakeFetch([jsonResponse(200, { id: "msg_1" })]);
+    await make(f.impl).adapter.send({ ...MESSAGE, fromName: 'Acme\r\nBcc: evil@example.org <evil@example.org>"' });
+    const from = String(f.calls[0]!.body.from);
+    expect(from).not.toMatch(/[\r\n]/);
+    expect(from).toMatch(/^[^<>"\\]+ <no-reply@nominara\.test>$/);
+    expect(from.match(/</g)).toHaveLength(1);
+  });
+
+  it("s12 · a display name that is nothing but control characters is dropped, and the configured from is used", async () => {
+    const f = fakeFetch([jsonResponse(200, { id: "msg_1" })]);
+    await make(f.impl).adapter.send({ ...MESSAGE, fromName: "\r\n\t " });
+    expect(f.calls[0]!.body.from).toBe(FROM);
+  });
+
+  it("s12 · header injection: a replyTo carrying CR/LF, a second address or a display form is DROPPED, never sent altered", async () => {
+    for (const hostile of ["a@acme.example\r\nBcc: evil@example.org", "a@acme.example, evil@example.org", "Evil <evil@example.org>", "no-at-sign", " a@acme.example", ""]) {
+      const f = fakeFetch([jsonResponse(200, { id: "msg_1" })]);
+      await make(f.impl).adapter.send({ ...MESSAGE, replyTo: hostile });
+      expect("reply_to" in f.calls[0]!.body, JSON.stringify(hostile)).toBe(false);
+    }
+  });
+
+  it("s12 · neither the display name nor the reply address appears in any log line", async () => {
+    const f = fakeFetch([jsonResponse(200, { id: "msg_1" })]);
+    await make(f.impl).adapter.send({ ...MESSAGE, fromName: "Acme Secret Agency", replyTo: "reply.person@acme.example" });
+    const all = logged.join("\n");
+    expect(all).not.toContain("Acme Secret Agency");
+    expect(all).not.toContain("reply.person@acme.example");
+  });
+});
