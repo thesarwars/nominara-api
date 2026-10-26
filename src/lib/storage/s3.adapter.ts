@@ -31,10 +31,20 @@ function isMissing(error: unknown): boolean {
   return error.name === "NoSuchKey" || error.name === "NotFound" || error.$metadata.httpStatusCode === 404 && error.name !== "NoSuchBucket";
 }
 
+/**
+ * A bounded request: the SDK's own default is NO timeout, so a stalled connection holds its caller (a worker slot, and for the
+ * request-handler paths a pooled connection) until the peer gives up. Per attempt; `maxAttempts` multiplies it.
+ */
+export const S3_REQUEST_TIMEOUT_MS = 20_000;
+export const S3_CONNECTION_TIMEOUT_MS = 3_000;
+
 export class S3Adapter implements ObjectStoragePort {
   private readonly client: S3Client;
 
-  constructor(private readonly config: StorageConfig) {
+  constructor(
+    private readonly config: StorageConfig,
+    requestTimeoutMs: number = S3_REQUEST_TIMEOUT_MS,
+  ) {
     this.client = new S3Client({
       region: config.region,
       ...(config.endpoint !== undefined ? { endpoint: config.endpoint } : {}),
@@ -44,6 +54,7 @@ export class S3Adapter implements ObjectStoragePort {
       requestChecksumCalculation: "WHEN_REQUIRED",
       responseChecksumValidation: "WHEN_REQUIRED",
       maxAttempts: 3,
+      requestHandler: { requestTimeout: requestTimeoutMs, connectionTimeout: S3_CONNECTION_TIMEOUT_MS, throwOnRequestTimeout: true },
     });
   }
 
