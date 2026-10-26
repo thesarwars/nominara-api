@@ -60,18 +60,25 @@ export interface EngineSkipRefundOutcome {
 
 const NOTHING: EngineSkipRefundOutcome = { refunded: 0, skippedCells: 0, debitBeforeCurrentCycle: false };
 
-/** Must run inside the run's tenant transaction (RLS scopes every statement), in a transaction that does no network I/O. */
+/**
+ * Must run inside the run's tenant transaction, in a transaction that does no network I/O.
+ *
+ * WORKSPACE-SCOPED READS (review round 3). The sweep refuses any connection RLS binds, so on the owner connection the tenant
+ * context is defence in depth, NOT the boundary: every read below names `workspace_id` itself, and a workspace that does not own
+ * the run settles nothing (no count, no row lock, no refund).
+ */
 export async function settleEngineSkippedCells(tx: ClientBase, input: EngineSkipRefundInput): Promise<EngineSkipRefundOutcome> {
   const run = await tx.query<{ status: string; trigger: string; planned_cells: number }>(
-    "SELECT status, trigger, planned_cells FROM capture_runs WHERE id = $1 FOR UPDATE",
-    [input.runId],
+    "SELECT status, trigger, planned_cells FROM capture_runs WHERE id = $1 AND workspace_id = $2 FOR UPDATE",
+    [input.runId, input.workspaceId],
   );
   const row = run.rows[0];
   if (row === undefined || row.status !== "partial" || row.trigger !== "manual" || row.planned_cells <= 0) return NOTHING;
 
   const skipped = await tx.query<{ n: string }>(
-    `SELECT count(*)::text AS n FROM answer_captures WHERE run_id = $1 AND ${blockedStatusSql("status")} AND error_code = ANY($2::text[])`,
-    [input.runId, [...ENGINE_UNAVAILABLE_SKIP_CODES]],
+    `SELECT count(*)::text AS n FROM answer_captures
+      WHERE run_id = $1 AND workspace_id = $3 AND ${blockedStatusSql("status")} AND error_code = ANY($2::text[])`,
+    [input.runId, [...ENGINE_UNAVAILABLE_SKIP_CODES], input.workspaceId],
   );
   const skippedCells = Math.min(Number(skipped.rows[0]?.n ?? 0), row.planned_cells);
   if (skippedCells === 0) return NOTHING;
