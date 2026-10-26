@@ -8,6 +8,7 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import type { GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
 import { verifyProjectSourcePresence } from "../../src/lib/sources/verify-presence.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
+import { createSourceVerifyPresenceHandler } from "../../src/lib/queue/handlers/source-verify-presence.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import type { Job } from "bullmq";
 
@@ -282,16 +283,22 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
   });
 
 
-  describe("STORY-066 AC8 · source_seeded — an authority task's target verified by fetch pins the Growth Map", () => {
-    /** An authority task on `domain`, in `status`; returns its id. */
-    async function authorityTask(domain: string, status: "done" | "in_progress", kind = "authority"): Promise<string> {
+  describe("STORY-066 AC8 · source_seeded — completing an authority task verifies ITS target, and the pin is at the completion", () => {
+    const TARGET = "https://reviews.dev/threads/acme";
+    /** An authority task on `domain`, in `status`, completed at `completedAt`; returns its id. */
+    async function authorityTask(
+      domain: string,
+      status: "done" | "in_progress",
+      opts: { kind?: string; completedAt?: Date; affectedUrl?: string | null } = {},
+    ): Promise<string> {
       const id = randomUUID();
       await db.query(
         `INSERT INTO tasks (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status,
-                            source_domain_id, completed_at)
+                            source_domain_id, affected_url, completed_at)
          VALUES ($1,$2,$3,$4,$5,$6,'Contribute to reviews.dev','d',$7,
-                 (SELECT id FROM source_domains WHERE domain = $8), CASE WHEN $7 = 'done' THEN $9::timestamptz END)`,
-        [id, workspaceId, projectId, `T-${id.slice(0, 6)}`, kind, randomBytes(16), status, domain, new Date(NOW.getTime() - DAY)],
+                 (SELECT id FROM source_domains WHERE domain = $8), $9, CASE WHEN $7 = 'done' THEN $10::timestamptz END)`,
+        [id, workspaceId, projectId, `T-${id.slice(0, 6)}`, opts.kind ?? "authority", randomBytes(16), status, domain,
+         opts.affectedUrl === undefined ? TARGET : opts.affectedUrl, opts.completedAt ?? new Date(NOW.getTime() - DAY)],
       );
       return id;
     }
@@ -304,30 +311,90 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
         )
       ).rows;
 
-    it("a completed authority task whose domain verifies present pins source_seeded, once, however often it re-verifies", async () => {
+    /** The completion's job, through the real handler (its phases composed on one client — the shape for a handler spec). */
+    const seededJob = (taskId: string, fetch: (url: string) => Promise<GuardedResponse>, now = NOW) =>
+      withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) =>
+        createSourceVerifyPresenceHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { fetch, now: () => now })(
+          tx,
+          { data: { payload: { workspaceId, kid: "k", projectId, taskId } } } as unknown as Job,
+        ),
+      );
+
+    it("THE HAZARD: the domain was verified absent the day before, the task is completed while that is cached — the pin is at the completion", async () => {
       await cite("reviews.dev", 1);
       await reindex();
-      await authorityTask("reviews.dev", "done");
-      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics is reviewed here"));
-      await verify(fetch);
+      const absentAt = new Date(NOW.getTime() - 2 * DAY);
+      await verify(vi.fn().mockResolvedValue(html("Only Globex")), absentAt); // verified ABSENT; cached for 30 days from here
+      const completedAt = new Date(NOW.getTime() - DAY);
+      const task = await authorityTask("reviews.dev", "done", { completedAt });
+
+      // The periodic run inside the cache fetches nothing, so it could never have pinned this.
+      const periodic = vi.fn();
+      await verify(periodic);
+      expect(periodic).not.toHaveBeenCalled();
+
+      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics answered the question"));
+      await seededJob(task, fetch);
+      expect(fetch).toHaveBeenCalledWith(TARGET); // the task's target, not the domain's most-cited page
       const [pin, ...rest] = await pins();
       expect(rest).toEqual([]);
       expect(pin).toMatchObject({ kind: "source_seeded", source_type: "system", severity: "positive", visible_in_portal: true });
-      expect(pin!.occurred_at.toISOString()).toBe(NOW.toISOString());
-      // Scenario 8's rule for this emitter: a later re-verification (past the cache) cannot double-pin.
-      await verify(fetch, new Date(NOW.getTime() + 31 * DAY));
-      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(pin!.occurred_at.toISOString()).toBe(completedAt.toISOString());
+      // and the domain now reads present, so the gap closes
+      for (const r of await rows("reviews.dev")) expect(r.brand_present_on_domain).toBe(true);
+    });
+
+    it("a redelivery pins once and fetches nothing more", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      const task = await authorityTask("reviews.dev", "done");
+      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics"));
+      await seededJob(task, fetch);
+      await seededJob(task, fetch);
+      expect(fetch).toHaveBeenCalledTimes(1);
       expect(await pins()).toHaveLength(1);
     });
 
-    it("pins nothing for an open task, a non-authority task, or a domain verified absent", async () => {
+    it("the periodic presence job NEVER pins source_seeded, even when the domain's most-cited page carries the brand", async () => {
       await cite("reviews.dev", 1);
-      await cite("forum.dev", 2);
       await reindex();
-      await authorityTask("reviews.dev", "in_progress");
-      await authorityTask("reviews.dev", "done", "content");
-      await authorityTask("forum.dev", "done");
-      await verify(vi.fn().mockImplementation((url: string) => Promise.resolve(html(url.includes("reviews.dev") ? "Acme Analytics" : "Only Globex"))));
+      await authorityTask("reviews.dev", "done");
+      await verify(vi.fn().mockResolvedValue(html("Acme Analytics is reviewed here")));
+      for (const r of await rows("reviews.dev")) expect(r.brand_present_on_domain).toBe(true);
+      expect(await pins()).toEqual([]);
+    });
+
+    it("pins nothing for an open task, a non-authority task, a task with no target, or a target without the brand", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      const fetch = vi.fn().mockImplementation((url: string) => Promise.resolve(html(url.endsWith("/without") ? "Only Globex" : "Acme Analytics")));
+      await seededJob(await authorityTask("reviews.dev", "in_progress"), fetch);
+      await seededJob(await authorityTask("reviews.dev", "done", { kind: "content" }), fetch);
+      await seededJob(await authorityTask("reviews.dev", "done", { affectedUrl: null }), fetch);
+      await seededJob(await authorityTask("reviews.dev", "done", { affectedUrl: "https://reviews.dev/without" }), fetch);
+      expect(fetch).toHaveBeenCalledTimes(1); // only the last one has a target to fetch
+      expect(await pins()).toEqual([]);
+    });
+
+    it("another workspace's context cannot verify (or fetch for) this project's task", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      const task = await authorityTask("reviews.dev", "done");
+      const otherWorkspace = randomUUID();
+      await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'W2',$2,'growth','UTC')", [otherWorkspace, `w-${randomUUID().slice(0, 8)}`]);
+      const fetch = vi.fn();
+      await db.query("SET ROLE nominara_app");
+      try {
+        await withTenantContext(db, { workspaceId: otherWorkspace, actorId: randomUUID() }, (tx) =>
+          createSourceVerifyPresenceHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { fetch, now: () => NOW })(
+            tx,
+            { data: { payload: { workspaceId: otherWorkspace, kid: "k", projectId, taskId: task } } } as unknown as Job,
+          ),
+        );
+      } finally {
+        await db.query("RESET ROLE");
+      }
+      expect(fetch).not.toHaveBeenCalled();
       expect(await pins()).toEqual([]);
     });
   });

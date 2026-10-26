@@ -11,6 +11,8 @@ import {
   pickScoringVersion,
   PROMPT_SET_CHANGE_THRESHOLD,
   resampleWeekly,
+  summaryDelta,
+  weekVersions,
   versionChanges,
   weekBuckets,
   type VersionedSeriesRow,
@@ -121,6 +123,34 @@ describe("STORY-066 AC12 · scoring-version boundary", () => {
     ]);
     expect(versionChanges(["d1", "d2"], ["v1", "v1"])).toEqual([]);
     expect(versionChanges(["d1", "d2"], [null, null])).toEqual([]);
+  });
+
+  // STORY-136 AC9 / the reviewer's round-1 finding: a week straddling the cut-over must not be the mean of a v0 day and a v1 day,
+  // a number no scoring version produced. The week carries ONE version — the latest measured in it — and its mean is of those days.
+  it("a week straddling a version change is the mean of its days under the week's LATEST version only", () => {
+    const days = calendarDays("2026-10-14", "2026-10-20");
+    const version = (d: string): string | null => (d < "2026-10-17" ? "v0" : "v1");
+    const points = days.map((d, i) => day(d, i < 3 ? 10 : 70));
+    const buckets = weekBuckets(days);
+    const [week] = resampleWeekly(buckets, points, version);
+    expect(week!.visibility_score).toBeCloseTo(70, 9);
+    expect(week!.cells).toBe(40);
+    expect(weekVersions(buckets, points, version)).toEqual(["v1"]);
+  });
+
+  it("a week entirely under one version is unchanged by the version rule, and an unmeasured week has no version", () => {
+    const days = calendarDays("2026-10-07", "2026-10-20");
+    const points = days.map((d, i) => day(d, i < 7 ? null : 50 + i));
+    const buckets = weekBuckets(days);
+    expect(resampleWeekly(buckets, points, () => "v1")).toEqual(resampleWeekly(buckets, points));
+    expect(weekVersions(buckets, points, () => "v1")).toEqual([null, "v1"]);
+  });
+
+  it("the summary delta is null across a version change (a v1 figure minus a v0 figure measures nothing), end − start otherwise", () => {
+    const points = [day("d1", 40), day("d2", null), day("d3", 61)];
+    expect(summaryDelta(points, ["v0", null, "v1"])).toBeNull();
+    expect(summaryDelta(points, ["v1", null, "v1"])).toBeCloseTo(21, 9);
+    expect(summaryDelta([day("d1", null)], [null])).toBeNull();
   });
 });
 

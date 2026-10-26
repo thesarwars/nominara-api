@@ -148,6 +148,26 @@ describe("STORY-066 · configuration milestones from the rollup", () => {
       expect(await pins("engine_model_change")).toHaveLength(1);
     });
 
+    it("AC7 — a capture committed AFTER a rollup but captured EARLIER (concurrent capture workers) cannot pin the same change twice; the pin moves to the earlier instant", async () => {
+      await capture(daysAgo(1), "gemini", "a");
+      await capture(daysAgo(0, 3), "gemini", "b");
+      await rollup();
+      await capture(daysAgo(0, 2), "gemini", "b"); // committed late, captured before the first "b"
+      await rollup();
+      const all = await pins("engine_model_change");
+      expect(all).toHaveLength(1);
+      expect(all[0]!.occurred_at.toISOString()).toBe(new Date(daysAgo(0, 2)).toISOString());
+    });
+
+    it("AC7 — a vendor whose fingerprint flips back and forth pins each distinct change once a day, not once per flip", async () => {
+      await capture(daysAgo(1), "gemini", "a");
+      await capture(daysAgo(0, 1), "gemini", "b");
+      await capture(daysAgo(0, 2), "gemini", "a");
+      await capture(daysAgo(0, 3), "gemini", "b");
+      await rollup();
+      expect((await pins("engine_model_change")).map((p) => p.detail)).toEqual(["a to b", "b to a"]);
+    });
+
     it("the first fingerprint ever seen, an unchanged one, a missing one and a demo-seeded capture pin nothing", async () => {
       await capture(daysAgo(0, 1), "gemini", "a");
       await capture(daysAgo(0, 2), "gemini", null);

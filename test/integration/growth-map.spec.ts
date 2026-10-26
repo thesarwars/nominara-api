@@ -518,6 +518,28 @@ describe("STORY-137 · growth map", () => {
     expect(document.annotations.scoring_version_changes).toEqual([{ at: boundary, from: "v0", to: SCORING_VERSION }]);
   });
 
+  it("STORY-066 scenario 14 / STORY-136 AC9 — the summary delta is null across a scoring-version boundary; the ends are still reported", async () => {
+    await dailyRow(5, 40, "v0");
+    await dailyRow(1, 61);
+    const summary = (await read("7d", "brand")).summary;
+    expect(summary.visibility_start).toBeCloseTo(40, 6);
+    expect(summary.visibility_end).toBeCloseTo(61, 6);
+    expect(summary.visibility_delta).toBeNull();
+  });
+
+  it("STORY-066 scenario 14 — best and worst engine are read under the same version pick as the series, so an older-version window still names them", async () => {
+    for (const [engine, visibility] of [["chatgpt", 20], ["gemini", 70]] as const) {
+      await db.query(
+        `INSERT INTO metric_daily (workspace_id,project_id,engine_key,entity_type,entity_id,metric_date,cells_total,cells_present,
+                                   presence_rate,sov,visibility_score,live_capture_ratio,scoring_version)
+         VALUES ($1,$2,$3,'brand',$2,$4::date,10,5,0.5,0.2,$5,1,'v0')`,
+        [workspaceId, projectId, engine, dayAgo(3).date, visibility],
+      );
+    }
+    await dailyRow(3, 45, "v0");
+    expect((await read("7d", "brand")).summary).toMatchObject({ best_engine: "gemini", worst_engine: "chatgpt" });
+  });
+
   it("STORY-066 scenario 14 — a window under one scoring version has no boundary", async () => {
     await dailyRow(2, 60);
     await dailyRow(1, 61);
