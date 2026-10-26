@@ -22,7 +22,7 @@ describe("STORY-100 · settling a period", () => {
       },
     } as unknown as ClientBase;
     const prepared: PreparedRun = { workspaceId: WS, reportId: REPORT, reportName: "r", period: new Date(0), deliveryId: REPORT, recipients: [], artifacts: [], sender: {}, finalAttempt: false };
-    await commitPreparedRun(tx, {} as ReportRunDeps, prepared, { sent: 0, failed: 0, delivers: true });
+    await commitPreparedRun(tx, {} as ReportRunDeps, prepared, { sent: 0, failed: 0, suppressed: 0, delivers: true });
     const tz = calls.find((c) => /FROM workspaces/.test(c.sql))!;
     expect(tz.sql).toMatch(/WHERE id = \$1/);
     expect(tz.params).toEqual([WS]);
