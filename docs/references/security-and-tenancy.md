@@ -264,6 +264,7 @@ Roles are workspace-scoped. `manager` may additionally be restricted to an expli
 - **`credits:spend` is separable from `billing:write` on purpose.** An `analyst` may run tools without any ability to buy credits, and a finance-focused `admin` may buy credits without spending them. This is the separation of duties agencies and finance teams ask for.
 - Every credit-debiting route additionally passes `CreditGuard`, so lacking balance is a `402`, distinct from lacking permission (`403`).
 - A permission denial returns `403 forbidden` naming the required permission — **never `404`**, since the resource's existence within the tenant is already known to the caller.
+- **`POST /results/{id}/reparse` additionally requires the `owner` or `admin` role** (owner decision 2026-10-23, STORY-034). A scoped `manager` holds `tracking:trigger` and is refused with `403` naming `tracking:trigger`; an API key has no membership and is refused. The check is a route guard (`ReparseGuard`) on the live membership role, not a row of the table above.
 
 ## 7. Revocation and freshness
 
