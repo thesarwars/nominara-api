@@ -164,7 +164,8 @@ async function pinPromptSetChange(tx: ClientBase, workspaceId: string, projectId
   // REMOVED that day when it was deleted, or archived (the archive is the
   // status change, stamped by `updated_at`), during it.
   //
-  // ⚠ KNOWN LIMITS, open for an owner decision (STORY-066 review round 1):
+  // ⚠ KNOWN LIMITS, open for an owner decision (STORY-066 review round 1; put to the owner in
+  // plans-7day/followups-2026-10-26-s066.md, items 1 and 2):
   //   1. `tracked_prompts` has no status-change timestamp, so `updated_at`
   //      stands in for the archive time. `touch_updated_at` bumps it on ANY
   //      later update of an archived row, so such an update moves the
