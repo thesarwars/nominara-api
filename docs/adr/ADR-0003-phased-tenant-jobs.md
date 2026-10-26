@@ -72,7 +72,9 @@ the pattern that class documents; the bound writer works in `run` with no contex
 - **Current violators of NFR-ARCH-04 (not changed by this ADR; each needs a follow-up story):**
   - `billing.auto_topup` and `billing.customer_email` hold an idle job transaction AND a second pooled connection across a Stripe
     call.
-  - `source.verify_presence` holds a job transaction across its fetch.
+  - ~~`source.verify_presence` holds a job transaction across its fetch.~~ Phased by STORY-066 (round 1, 2026-10-26), when it
+    gained the completed-authority-task verification; proven by `test/unit/sources/seeded-verification.spec.ts` (no pooled client
+    checked out during either kind of fetch).
   - `crawl.discover` holds a job transaction across its fetches.
   All four can adopt `phasedProcessor`; the billing two also need their second connection removed. Until then the claim "no
   handler holds a transaction across an external await" is false for them, and only `crawl.audit` is proven by test.
