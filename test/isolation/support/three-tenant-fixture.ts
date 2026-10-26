@@ -404,11 +404,22 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
       `Milestone ${i}`,
     ]);
   }
+  const notificationIds: string[] = [];
   for (let i = 0; i < R; i++) {
-    await client.query("INSERT INTO notifications (workspace_id, kind, severity, title) VALUES ($1, 'info', 'info', $2)", [
+    const notice = await client.query<{ id: string }>("INSERT INTO notifications (workspace_id, kind, severity, title) VALUES ($1, 'info', 'info', $2) RETURNING id", [
       workspaceId,
       `Notice ${i}`,
     ]);
+    notificationIds.push(notice.rows[0]!.id);
+  }
+  // STORY-068 (migration 0135) — a per-user read receipt and an email outbox row per notification.
+  for (let i = 0; i < R; i++) {
+    await client.query("INSERT INTO notification_reads (workspace_id, notification_id, user_id) VALUES ($1, $2, $3)", [workspaceId, notificationIds[i], userIds[i]]);
+    await client.query(
+      `INSERT INTO notification_emails (workspace_id, user_id, kind, dedupe_key, notification_id, notification_count, status, subject, text_body)
+       VALUES ($1, $2, 'immediate', $3, $4, 1, 'pending', 'subject', 'body')`,
+      [workspaceId, userIds[i], `immediate:${notificationIds[i]!}`, notificationIds[i]],
+    );
   }
 
   const auditIds: string[] = [];

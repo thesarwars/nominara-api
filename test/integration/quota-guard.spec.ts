@@ -92,7 +92,7 @@ describe("STORY-070 · QuotaGuard: a zero cap is never an exhausted counter", ()
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE usage_reservations, usage_counters, credit_wallets, subscriptions, workspaces CASCADE");
+    await db.query("TRUNCATE notifications, usage_reservations, usage_counters, credit_wallets, subscriptions, workspaces CASCADE");
     workspaceId = randomUUID();
     await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'W', $2, 'growth')", [
       workspaceId,
@@ -186,6 +186,36 @@ describe("STORY-070 · QuotaGuard: a zero cap is never an exhausted counter", ()
       usedValue: 25,
       reservedValue: 0,
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // STORY-068 scenario 7 / AC7 — "Cross a threshold, then load the dashboard
+  // repeatedly: ONE notification." The guard turns each crossing it stamps
+  // into one notification; a request that crosses nothing new writes none.
+  // -------------------------------------------------------------------------
+  it("[STORY-068 #7 / AC7] crossing 80% notifies once however many requests follow; 95% notifies once more; 90% is not a threshold", async () => {
+    const period = currentPeriod();
+    await db.query(
+      `INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value)
+       VALUES ($1, 'pdf_exports', $2, 25, 19)`,
+      [workspaceId, period.start],
+    );
+    const notes = async () =>
+      (await db.query("SELECT kind, severity, payload FROM notifications WHERE workspace_id = $1 ORDER BY created_at", [workspaceId])).rows.map((r) => [
+        r.kind,
+        r.severity,
+        r.payload.threshold,
+      ]);
+
+    await guard.canActivate(makeContext(request(), ExportPdfRoute)); // 20 of 25 = 80%
+    expect(await notes()).toEqual([["usage.quota_threshold", "warning", 80]]);
+    for (let i = 0; i < 3; i += 1) await guard.canActivate(makeContext(request(), ExportPdfRoute)); // 84%, 88%, 92%
+    expect(await notes(), "92% crosses nothing new").toEqual([["usage.quota_threshold", "warning", 80]]);
+    await guard.canActivate(makeContext(request(), ExportPdfRoute)); // 24 of 25 = 96%
+    expect(await notes()).toEqual([
+      ["usage.quota_threshold", "warning", 80],
+      ["usage.quota_threshold", "warning", 95],
+    ]);
   });
 
   it("an unlimited cap never refuses", async () => {

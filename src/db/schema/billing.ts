@@ -219,6 +219,7 @@ export const usageCounters = pgTable("usage_counters", {
   warnedAt80: timestamp("warned_at_80", { withTimezone: true }),
   warnedAt90: timestamp("warned_at_90", { withTimezone: true }),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  warnedAt95: timestamp("warned_at_95", { withTimezone: true }),
 }, (table) => [primaryKey({ columns: [table.workspaceId, table.metric, table.periodStart] })]);
 
 export const usageLedger = pgTable("usage_ledger", {

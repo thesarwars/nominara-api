@@ -57,6 +57,8 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       "0125_credit_hold_carries",
       // STORY-077 (owner 2026-10-23) — fifth post-0006 tenant table (downgrade_notices).
       "0134_downgrade_notices",
+      // STORY-068 — sixth and seventh post-0006 tenant tables (notification_reads, notification_emails).
+      "0135_notifications_alerts_digests",
       // CP2 decision 1 (ADR-0002) — checkRls() expects share_token_gate_lookup, a policy 0112 creates on share_tokens.
       // 0080 supplies the locked_until column the lookup function selects.
       "0080_portal_session_gate",

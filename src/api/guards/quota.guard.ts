@@ -8,6 +8,7 @@ import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver
 import { StructuralUsage } from "../../lib/entitlements/structural-usage.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { METRIC_SPECS } from "../../lib/usage/metrics.js";
+import { notifyQuotaThresholds } from "../../lib/notifications/thresholds.js";
 import { crossedWarningThresholds, provisionUsageCounters, reserveTierCap } from "../../lib/usage/tier-caps.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -199,7 +200,8 @@ export class QuotaGuard implements CanActivate {
         // now committed, not about what was true before this request. Fired
         // once per threshold per period by the `warned_at_NN IS NULL`
         // predicate, not by anything this process remembers.
-        for (const threshold of await crossedWarningThresholds(tx, workspaceId, spec.metric, period.start)) {
+        const crossed = await crossedWarningThresholds(tx, workspaceId, spec.metric, period.start);
+        for (const threshold of crossed) {
           logger.warn({
             message: "usage counter crossed a warning threshold",
             workspaceId,
@@ -208,6 +210,10 @@ export class QuotaGuard implements CanActivate {
             periodStart: period.start,
           });
         }
+        // STORY-068 AC7 — each crossing this statement stamped becomes ONE notification, in this same short transaction
+        // (no network I/O: a warning is digest-only, so nothing is enqueued). A request that crosses nothing new writes
+        // nothing, however many follow it: "one notification, not one per page view".
+        await notifyQuotaThresholds(tx, workspaceId, spec.metric, period.start, crossed);
       });
     } finally {
       client.release();

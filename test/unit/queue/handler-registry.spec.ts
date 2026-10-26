@@ -74,6 +74,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "domain.reverify",
       "identity.sweep_unverified",
       "maintenance.partition",
+      "notify.dispatch",
       "retention.purge",
       "rollup.metric_daily",
       "source.verify_presence",
@@ -94,6 +95,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       // STORY-063 — declared after topic.cluster in topology.ts, i.e. between the rollup and credit entries.
       "task.generate",
       "credit.reconcile",
+      // STORY-068 — declared after report.build (inert) and before maintenance.partition in topology.ts.
+      "notify.dispatch",
       "maintenance.partition",
       // Declared after maintenance.partition in topology.ts — STORY-143's
       // addition sits at the end of the rollup group's entries.

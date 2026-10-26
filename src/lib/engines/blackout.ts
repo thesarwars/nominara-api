@@ -1,5 +1,10 @@
 import type { EngineKey } from "./contract.js";
+import { alertRule } from "../alert-rules/catalog.js";
 import { defaultPager, type Pager } from "../queue/dead-letter.js";
+
+// STORY-068 AC5 — this monitor IS the §15 `engine_blackout` rule: internal only, routed to the ops pager under the
+// catalog's code, and never a customer notification (it imports nothing that writes one).
+const ENGINE_BLACKOUT = alertRule("engine_blackout").code;
 
 // STORY-031 Phase G stage 6 — EC-06: "blackout > 48h → page on-call; rotate
 // credentials or contact the vendor; customers see a status-page entry and
@@ -106,7 +111,7 @@ export class BlackoutMonitor {
 
     this.lastPagedAtMs.set(engineKey, now);
     this.pager.page(`engine '${engineKey}' has been dark (no successful capture) for over 48 hours`, {
-      alertName: "engine_blackout",
+      alertName: ENGINE_BLACKOUT,
       engineKey,
       darkDurationMs,
     });

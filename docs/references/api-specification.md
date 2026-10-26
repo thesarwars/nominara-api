@@ -199,9 +199,10 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | `POST` | `/projects/{id}/runs` ✚ **¢** | `tracking:trigger` | **Manual deep scan — one flat price.** Runs the full tracked set on every enabled engine plus the AUX audit, and refreshes every rollup exactly as a scheduled run does. **The body takes no scope or engine selection.** Requires `X-Nominara-Confirmed-Credits` |
 | `GET` | `/runs/{id}` | `tracking:read` | progress projection and, on a manual run, the charge with the live/cached split |
 | `POST` | `/runs/{id}/cancel` | `tracking:trigger` | drains queued cells |
-| `GET` | `/projects/{id}/results` | `tracking:read` | cursor over `answer_captures` |
-| `GET` | `/results/{id}` | `tracking:read` | §6 — the full parser document |
-| `GET` | `/results/{id}/raw` | `tracking:read` | 302 to a 60-second pre-signed URL |
+| `GET` | `/projects/{id}/results` | `tracking:read` | cursor over `answer_captures`, newest first on (`captured_at`, `id`) (STORY-034). Filters: `engine_key`, `prompt_id`, `run_id`, `status`, `from`, `to`. A `from` before the plan's raw-capture retention, a `to` at or before it, or a `run_id` that ended before it is `507 retention_exceeded`; with no `from` the list opens at the retention boundary. A failed or blocked cell is listed with its `error_code` and a null `brand_present` |
+| `GET` | `/results/{id}` | `tracking:read` | §6 — the full parser document. `507 retention_exceeded` past the plan's raw-capture retention (STORY-034) |
+| `GET` | `/results/{id}/raw` | `tracking:read` | 302 to a 60-second pre-signed URL (STORY-181; `Location` header, `Cache-Control: no-store`; the body is the ordinary envelope with `data: null`, because `@NoEnvelope` is reserved for the health probes). `404 not_found` when the capture has no stored raw object (captured before raw objects existed, or a reused L1/L2 row); `507 retention_exceeded` past the plan's raw-capture retention; a stored key outside the caller's workspace is refused (a security event, `500`) and never resolved |
+| `POST` | `/results/{id}/reparse` ✚ | `tracking:trigger`, and the owner or admin role | **STORY-034.** Re-runs the parser on the stored raw object (the dual-written `payload` only for a capture that has none), **saves** the corrected facts, marks the capture's workspace-local date dirty for the rollup, charges **0 credits**, audited (`result.reparsed`). Requires `Idempotency-Key`; no body. Returns `{result_id, scoring_version, changed, credits_charged: 0, before, after}`, each snapshot being the capture's figures plus one entry per entity. `404` / `403` (not owner or admin, or `project_out_of_scope`) / `409 conflict` (the stored answer changed while starting) / `422 precondition_unmet` (a cell that was not captured, a refusal, a reused row with no text of its own, or a stored raw object that is missing) / `507 retention_exceeded`. Citations are not re-fetched: each keeps its recorded resolution |
 | `GET` | `/projects/{id}/matrix` | `tracking:read` | prompt × engine grid |
 
 ### Analytics
@@ -222,7 +223,7 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | `POST` | `/geo/alignment/{id}/patch` ✚ | `optimizer:use` | immutable copy-ready patch with a precondition hash |
 | `GET`/`POST` | `/projects/{id}/milestones` | `tracking:read` / `task:create` | manual annotations permitted |
 | `GET`/`POST`/`PATCH` | `/projects/{id}/goals` | `task:create` | **STORY-065.** `POST` body `{title, kind, target: {metric, target_value, engine_key?, prompt_cluster_id?}, target_date?}`; six kinds are creatable, each with **one** metric: `engine_score` and `topic_authority` → `visibility_score`, `citation_presence` → `citation_share`, `rendering_quality` → `rendering_quality`, `sentiment_recovery` → `sentiment_score`, `prompt_recommendation` → `presence_rate`. `custom` is still `400` (no measured source). Every `target_value` is on a 0–100 scale (shares and rates as percentages). `prompt_cluster_id` is required for `topic_authority` and `prompt_recommendation` and refused for the rest; `engine_key` is allowed for every kind except `topic_authority`. `400 validation_failed` naming the field when the metric is not the kind's, the cluster is not this project's, the engine is unknown, or **`target_value` is at or below a baseline measured on a sufficient sample (n ≥ 30)** (owner 2026-10-23). The baseline is captured by the server; the request cannot carry `direction`, which the server sets from the metric and returns in `target.direction` (`up` for every metric today). The rollup refreshes `current` and sets `achieved`/`achieved_at` (inclusive, sufficient sample only, one system-actor `goal.achieved` audit row); `progress_pct` is null while the sample is insufficient or the baseline rested on fewer than 30 cells, until achieved. `PATCH` abandons (no reason) |
-| `GET` | `/workspaces/{id}/summary` · `/action-items` | `project:read` / `task:read` | Command Center matrix (each project carries `paused_by_downgrade_at`, STORY-077); cross-project queue, impact first, read from `ix_tasks_open`. **The queue collapses tasks across projects on the displayed rule code and `affected_url`** (STORY-064): each row is the group's highest-impact task and carries `project_count` (distinct readable projects, counted after the scope predicate) and `projects[]` `{id, name, slug}`; a task with no code or no URL never collapses |
+| `GET` | `/workspaces/{id}/summary` · `/action-items` | `project:read` / `task:read` | Command Center matrix (each project carries `paused_by_downgrade_at`, STORY-077); cross-project queue, impact first, read from `ix_tasks_open`. **The queue collapses tasks across projects on the displayed rule code and `affected_url`** (STORY-064): each row is the group's highest-impact task and carries `project_count` (distinct readable projects, counted after the scope predicate) and `projects[]` `{id, name, slug}`; a task with no code or no URL never collapses. On an `open_playbook` row, `primary_action.domain` is `source_domains.domain` of the task's source domain, the key of `GET /projects/{id}/sources/{domain}/playbook`, or `null` when the task names no source domain; no other `primary_action.kind` carries `domain` (STORY-089) |
 | `POST` | `/exports` ✚ ⛨ | `export:data` | async CSV/PDF → `report_artifact_id`. **0 credits**; PDF is tier-capped, CSV is entitlement-gated |
 
 ### AUX
@@ -231,9 +232,10 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 |---|---|---|---|
 | `POST` | `/projects/{id}/aux-audits` ✚ **¢** | `aux:trigger` | `{scope, target_urls}`. Scheduled, onboarding, and post-fix audits are **0** |
 | `GET` | `/aux-audits/{id}` | `aux:read` | score and category breakdown |
-| `GET` | `/projects/{id}/aux-findings` | `aux:read` | filter by severity, status, rule, URL |
+| `GET` | `/projects/{id}/aux-findings` | `aux:read` | filter by severity, status, rule, URL. **Each finding carries its latest copy-ready `patch` (or `null`) and, for a rule with no patch, `guidance` with an alignment link (STORY-053).** `patch` is `null` when the latest patch was made against a file that has since changed |
 | `PATCH` | `/aux-findings/{id}` | `task:create` | acknowledge / `wont_fix` (reason required). **`resolved` is never settable by a client** |
 | `POST` | `/aux-findings/{id}/create-task` ✚ | `task:create` | manual promotion |
+| `GET` | `/patches/{id}` | `aux:read` | **STORY-053.** One immutable copy-ready patch: `kind` (`markdown`, `html_fragment`, `jsonld`, `robots`), `content_after`, `unified_diff`, `reversal`, `preconditions`, `content_before_hash`, `derivation`, `requires_human_review` + `review_reason` (the copy control requires an acknowledgement first), `page_matches` (`true` unchanged / `false` changed since generation / `null` not re-checked since), `earlier_patch_ids`, and `free: true, credits_charged: 0`. A patch is made by the audit and **there is no route to create, regenerate or edit one**; a later audit that re-detects the finding with different content makes a new row, and this route still returns the original |
 
 ### Tasks
 
@@ -245,6 +247,17 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | `POST` | `/tasks/{id}/comments` | `task:comment` | |
 | `GET` | `/tasks/{id}/events` | `task:read` | timeline |
 | `POST` | `/tasks/{id}/complete` ✚ | `task:move` | emits a milestone and schedules +48 h / +14 d verification |
+
+### Notifications
+
+| Method | Path | Permission | Notes |
+|---|---|---|---|
+| `GET` | `/workspaces/{id}/notifications` | `workspace:read` | **The caller's inbox (STORY-068).** Cursor-paged, newest first; `unread=true` lists only what the caller has not read. Body `{notifications, unread_count}`: `unread_count` is the caller's over the whole inbox (the bell badge). Each item: `id, project_id, kind, severity (info\|warning\|critical), title, body, audience (workspace\|user), deep_link {path, query} \| null, task_id, read, read_at, created_at`. **Read state is per user**: `read`/`read_at` are the caller's, so one member reading never clears it for the team. A member sees workspace-wide rows, rows addressed to them, and only the projects their role may read (a scoped manager or viewer: their `project_scope`). `deep_link` names the surface that diagnoses an alert with its filters (`/p/{project_id}/prompts?engines=gemini&tf=7d`). Never for an API key (`403`) |
+| `POST` | `/workspaces/{id}/notifications/{notification_id}/read` | `workspace:read` | marks one notification read **for the caller**; idempotent (the first read time is kept). `200 {id, read_at, unread_count}`; `404` for a notification the caller cannot see (another user's, another project's, another tenant's). Audited as `notification.read` |
+| `POST` | `/workspaces/{id}/notifications/read-all` | `workspace:read` | marks everything the caller can see read, for the caller only. `200 {marked, unread_count}`. Audited as `notification.read_all` on the workspace |
+| `GET`/`PATCH` | `/workspaces/{id}/notification-preferences` | `workspace:read` | **the caller's own email digest cadence** (owner decision 2026-10-23). `{digest_cadence: off\|daily\|weekly, is_default}`; `PATCH {digest_cadence}` (`null` restores the role default). Default **weekly** for owner, admin and manager, **off** for analyst and viewer. `off` also stops the immediate email for critical alerts. Audited as `notification_preferences.updated` |
+
+Alerts are the §15 catalog of `scoring-models.md`, raised after each rollup by `task.generate` (kind `alert.<rule>`); usage warnings at 80% and 95% are `usage.quota_threshold`, credit warnings at 25% and 10% of the cycle's grant are `credits.threshold`; each fires once per threshold per cycle. **Severity is the channel:** `critical` is emailed at once, `warning` and `info` wait for the member's digest, which coalesces the period into one email and is **not sent when empty**. Email goes out through `notify.dispatch` (one outbox, idempotent by event key).
 
 ### Tools
 
@@ -267,7 +280,7 @@ One resource family for all six tools. `tool_key` selects behaviour; lifecycle, 
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/command/parse` **¢** | §10. **0 credits** when the local grammar resolves it or on a cache hit; 1 credit for a server-side model parse |
+| `POST` | `/command/parse` | §10. **0 credits**: the server parse is the grammar plus the cache; no model parse is built |
 | `POST` | `/command/execute` ✚ | executes a parsed action; requires `parse_id`, `action_id`, and `X-Nominara-Confirmed-Credits` when it spends credits |
 
 ### Agency, sharing & portal
@@ -509,7 +522,7 @@ The 15 archetypes, their funnel stage, and their required slots are specified in
 
 ## 6. Answer capture — the parser document
 
-`GET /v1/results/{id}` returns the canonical parser output. **This is also the shape stored in `answer_captures.payload`**, minus `raw_response.text`, which lives in S3 and is inlined only with `?include=raw`.
+`GET /v1/results/{id}` returns the canonical parser output. **This is also the shape stored in `answer_captures.payload`.** As built (STORY-181), the capture step dual-writes: the verbatim answer goes to object storage (`{env}/{ws}/{yyyy}/{mm}/{id}.json.gz`, `raw_object_key`), which the parser, re-parse and `GET /results/{id}/raw` read, **and** the same text stays in `payload`, from which this document returns `raw_response.text`. There is no `?include=raw`.
 
 ```json
 { "data": {
@@ -693,7 +706,7 @@ On timeout the terminal event is `scan.completed` with `"status":"partial"` and 
 
 `POST /v1/command/parse` is local-first. A deterministic grammar plus a trigram entity index over the workspace's projects, competitors, prompts, and tool runs resolves the top intents with **zero model cost and zero credits**. Only unresolved input escalates, and the parse is cached by `sha256(normalized_query | workspace_id | entity_index_version)` for 24 hours.
 
-**Credit rule.** `resolved_by: "grammar"` ⇒ `cost.credits = 0`. `resolved_by: "model"` ⇒ `cost.credits = 1`, debited on the parse itself. **A cache hit is always 0**, regardless of how the original parse resolved.
+**Credit rule.** A parse costs **0 credits** (lead decision 2026-10-08). As built, the server parse is the grammar plus the cache only: `resolved_by` is `"grammar"`, or `null` when nothing resolved (suggestions, no actions), and the contract types `cost.credits` as the literal `0`. No model parse is built, so no parse is debited; **a cache hit is always 0**.
 
 The response carries `parse_id`, `resolved_by`, `confidence`, `intent`, `slots`, `actions[]`, an optional `preview`, `cost`, and `wallet`. Each action carries `action_id`, `kind`, `label`, `is_mutating`, `requires_confirmation`, `required_permission`, and — when it would spend credits — a full `credit_estimate` with the exact figure and the wallet before/after.
 

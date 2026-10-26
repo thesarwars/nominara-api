@@ -393,9 +393,10 @@ describe("STORY-070 · the non-credit tier-cap lifecycle", () => {
   });
 
   it("crossing both thresholds at once reports both, once", async () => {
+    // STORY-068 / owner decision 2026-10-23: the thresholds are scoring-models.md §15's 80% and 95% (was 80/90).
     await setCounter("pdf_exports", 100, 95);
 
-    expect(await crossedWarningThresholds(db, workspaceId, "pdf_exports", PERIOD)).toEqual([80, 90]);
+    expect(await crossedWarningThresholds(db, workspaceId, "pdf_exports", PERIOD)).toEqual([80, 95]);
     expect(await crossedWarningThresholds(db, workspaceId, "pdf_exports", PERIOD)).toEqual([]);
   });
 
@@ -403,11 +404,22 @@ describe("STORY-070 · the non-credit tier-cap lifecycle", () => {
     await setCounter("pdf_exports", 100, 82);
     expect(await crossedWarningThresholds(db, workspaceId, "pdf_exports", PERIOD)).toEqual([80]);
 
+    // STORY-068 — 90% is no longer a threshold: 94 of 100 warns about nothing new.
     await db.query(
-      "UPDATE usage_counters SET used_value = 91 WHERE workspace_id = $1 AND metric = 'pdf_exports' AND period_start = $2",
+      "UPDATE usage_counters SET used_value = 94 WHERE workspace_id = $1 AND metric = 'pdf_exports' AND period_start = $2",
       [workspaceId, PERIOD],
     );
-    expect(await crossedWarningThresholds(db, workspaceId, "pdf_exports", PERIOD)).toEqual([90]);
+    expect(await crossedWarningThresholds(db, workspaceId, "pdf_exports", PERIOD)).toEqual([]);
+    await db.query(
+      "UPDATE usage_counters SET used_value = 95 WHERE workspace_id = $1 AND metric = 'pdf_exports' AND period_start = $2",
+      [workspaceId, PERIOD],
+    );
+    expect(await crossedWarningThresholds(db, workspaceId, "pdf_exports", PERIOD)).toEqual([95]);
+    const stamped = await db.query(
+      "SELECT warned_at_80 IS NOT NULL AS w80, warned_at_90 IS NULL AS no90, warned_at_95 IS NOT NULL AS w95 FROM usage_counters WHERE workspace_id = $1 AND metric = 'pdf_exports' AND period_start = $2",
+      [workspaceId, PERIOD],
+    );
+    expect(stamped.rows[0]).toEqual({ w80: true, no90: true, w95: true });
   });
 
   it("an unlimited ceiling never warns, and a zero one never warns", async () => {

@@ -13,6 +13,7 @@ import { createRetentionPurgeHandler } from "./handlers/retention-purge.handler.
 import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
 import { createIdentitySweepUnverifiedHandler } from "./handlers/identity-sweep-unverified.handler.js";
 import { createMaintenancePartitionHandler } from "./handlers/maintenance-partition.handler.js";
+import { createNotifyDispatchHandler } from "./handlers/notify-dispatch.handler.js";
 import { createCrawlAuditHandler } from "./handlers/crawl-audit.handler.js";
 import { createDomainReverifyHandler } from "./handlers/domain-reverify.handler.js";
 import { createTaskResurfaceHandler } from "./handlers/task-resurface.handler.js";
@@ -90,6 +91,10 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * `task.generate` lands with STORY-063: it evaluates the task rule catalog for one project and day. Its producers are the
  * rollup handler (after each day's rollup) and, later, the AUX finding lifecycle.
  *
+ * `notify.dispatch` lands with STORY-068: the notification email outbox's sender, the digest assembler and the
+ * post-settlement credit-threshold check. Its producers are the notification writer (after commit), the debit paths
+ * (after commit) and the rollup group's notify sweep (digests and the relay).
+ *
  * `maintenance.partition` is the obvious first real entry — non-tenant-
  * scoped, and its logic already exists in src/workers/rollup/maintenance.ts,
  * invoked today only by a hand-run script (README gap G-10). Wiring it is a
@@ -115,6 +120,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "billing.auto_topup": (context) => createBillingAutoTopupHandler(context),
   "billing.customer_email": (context) => createBillingCustomerEmailHandler(context),
   "billing.downgrade_notice": (context) => createBillingDowngradeNoticeHandler(context),
+  "notify.dispatch": (context) => createNotifyDispatchHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */
