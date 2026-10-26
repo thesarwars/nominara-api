@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -60,7 +60,7 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE answer_captures, citation_facts, project_source_index, source_domains, projects, workspaces CASCADE");
+    await db.query("TRUNCATE answer_captures, citation_facts, project_source_index, source_domains, milestones, tasks, projects, workspaces CASCADE");
     workspaceId = randomUUID();
     projectId = randomUUID();
     await db.query("INSERT INTO workspaces (id, name, slug, plan_key, timezone) VALUES ($1,'W',$2,'growth','UTC')", [workspaceId, `w-${workspaceId.slice(0, 8)}`]);
@@ -278,6 +278,57 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
       const gone = { data: { payload: { workspaceId, kid: "k", projectId: randomUUID() } } } as unknown as Job;
       await withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) => rollup(enqueue)(tx, gone));
       expect(enqueue).not.toHaveBeenCalled();
+    });
+  });
+
+
+  describe("STORY-066 AC8 · source_seeded — an authority task's target verified by fetch pins the Growth Map", () => {
+    /** An authority task on `domain`, in `status`; returns its id. */
+    async function authorityTask(domain: string, status: "done" | "in_progress", kind = "authority"): Promise<string> {
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO tasks (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status,
+                            source_domain_id, completed_at)
+         VALUES ($1,$2,$3,$4,$5,$6,'Contribute to reviews.dev','d',$7,
+                 (SELECT id FROM source_domains WHERE domain = $8), CASE WHEN $7 = 'done' THEN $9::timestamptz END)`,
+        [id, workspaceId, projectId, `T-${id.slice(0, 6)}`, kind, randomBytes(16), status, domain, new Date(NOW.getTime() - DAY)],
+      );
+      return id;
+    }
+
+    const pins = async () =>
+      (
+        await db.query<{ kind: string; source_type: string; source_id: string; occurred_at: Date; severity: string; visible_in_portal: boolean }>(
+          "SELECT kind, source_type, source_id::text, occurred_at, severity, visible_in_portal FROM milestones WHERE project_id = $1 ORDER BY occurred_at",
+          [projectId],
+        )
+      ).rows;
+
+    it("a completed authority task whose domain verifies present pins source_seeded, once, however often it re-verifies", async () => {
+      await cite("reviews.dev", 1);
+      await reindex();
+      await authorityTask("reviews.dev", "done");
+      const fetch = vi.fn().mockResolvedValue(html("Acme Analytics is reviewed here"));
+      await verify(fetch);
+      const [pin, ...rest] = await pins();
+      expect(rest).toEqual([]);
+      expect(pin).toMatchObject({ kind: "source_seeded", source_type: "system", severity: "positive", visible_in_portal: true });
+      expect(pin!.occurred_at.toISOString()).toBe(NOW.toISOString());
+      // Scenario 8's rule for this emitter: a later re-verification (past the cache) cannot double-pin.
+      await verify(fetch, new Date(NOW.getTime() + 31 * DAY));
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(await pins()).toHaveLength(1);
+    });
+
+    it("pins nothing for an open task, a non-authority task, or a domain verified absent", async () => {
+      await cite("reviews.dev", 1);
+      await cite("forum.dev", 2);
+      await reindex();
+      await authorityTask("reviews.dev", "in_progress");
+      await authorityTask("reviews.dev", "done", "content");
+      await authorityTask("forum.dev", "done");
+      await verify(vi.fn().mockImplementation((url: string) => Promise.resolve(html(url.includes("reviews.dev") ? "Acme Analytics" : "Only Globex"))));
+      expect(await pins()).toEqual([]);
     });
   });
 
