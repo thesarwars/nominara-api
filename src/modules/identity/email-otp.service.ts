@@ -207,7 +207,7 @@ export class EmailOtpService {
       // branch or otherwise (code-reviewer finding, STORY-016 fix 2).
       setImmediate(() => {
         const rendered = renderOtpEmail({ code: outcome.code, expiresInMinutes: OTP_TTL_MS / 60_000 });
-        this.emailSender.send({ to: normalizedEmail, subject: rendered.subject, textBody: rendered.textBody }).catch((error) => {
+        this.emailSender.send({ to: normalizedEmail, subject: rendered.subject, textBody: rendered.textBody, transactional: true }).catch((error) => {
           this.logger.warn(
             `otp email send failed user_id=${outcome.userId} message=${error instanceof Error ? error.message : String(error)}`,
           );

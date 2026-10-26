@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EnvValidationError, KNOWN_KEYS, loadEnv } from "../../src/config/env.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
+import { transportOf } from "../support/email-transport.js";
 
 // Group C item 1 — which EmailSender a process runs with, and what the boot refuses.
 
@@ -18,7 +19,7 @@ afterEach(() => {
 
 async function select(): Promise<string> {
   const { selectEmailSender } = await import("../../src/modules/identity/identity.module.js");
-  return selectEmailSender().constructor.name;
+  return transportOf(selectEmailSender()).constructor.name;
 }
 
 describe("Resend selection matrix", () => {
@@ -61,7 +62,7 @@ describe("Resend selection matrix", () => {
     process.env.RESEND_FROM_EMAIL = "onboarding@resend.dev";
     process.env.RESEND_TO_EMAIL = "owner@example.net";
     const { selectEmailSender } = await import("../../src/modules/identity/identity.module.js");
-    const sender = selectEmailSender() as unknown as { toOverride?: string };
+    const sender = transportOf(selectEmailSender()) as unknown as { toOverride?: string };
     expect(sender.toOverride).toBe("owner@example.net");
   });
 });
