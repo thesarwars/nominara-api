@@ -410,6 +410,37 @@ services:
       disable: true
     command: ["node", "dist/src/worker.js"]
 
+  # STORY-100 AC5 — the group that drains `report.build`: a scheduled report's cadence path.
+  #
+  # Its own process, like the other groups. It also runs the report sweep (src/lib/reports/report-sweep.ts): an in-process
+  # tick every 5 minutes, elected by an advisory lock, that enqueues one signed `report.build` job per report whose
+  # `next_send_at` has come. It sends mail through the same EMAIL_SENDER path as every other group (`.env` carries the
+  # Resend settings), so it needs the same environment as worker-rollup.
+  worker-report:
+    build: .
+    image: nominara-api
+    depends_on:
+      dev-credentials:
+        condition: service_completed_successfully
+      valkey-cache:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      valkey:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://nominara:nominara@postgres:5432/nominara
+      DATABASE_URL_POOLED: postgres://nominara_app:nominara_app_dev_local@pgbouncer:5432/nominara
+      VALKEY_CACHE_URL: redis://valkey-cache:6379
+      QUEUE_REDIS_URL: redis://valkey:6379
+      WORKER_GROUP: report
+    healthcheck:
+      disable: true
+    command: ["node", "dist/src/worker.js"]
+
   gateway:
     build: .
     image: nominara-api

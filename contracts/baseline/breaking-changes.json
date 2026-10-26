@@ -408,7 +408,9 @@
           "color_fg",
           "font_family",
           "logo_url",
-          "hide_nominara_brand"
+          "hide_nominara_brand",
+          "email_from_name",
+          "email_reply_to"
         ]
       }
     },

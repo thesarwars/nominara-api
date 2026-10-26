@@ -102,6 +102,17 @@ describe("NEW-E-099a · portal read endpoints", () => {
     expect(res.body).not.toContain(w.p2);
   });
 
+  it("STORY-100 AC10 · the agency's Reply-To and display name are never part of what a portal viewer is sent", async () => {
+    const w = await world();
+    await harness.db().query("UPDATE brand_themes SET email_from_name = 'Secret Agency Name', email_reply_to = 'private-inbox@agency.example' WHERE id = $1", [w.theme]);
+    const t = await token(w, { scope: [w.p1], themeId: w.theme });
+    const res = await get(t.cookie, "/portal/overview");
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.body).not.toContain("private-inbox@agency.example");
+    expect(res.body).not.toContain("Secret Agency Name");
+    expect(res.body).not.toContain("email_reply_to");
+  });
+
   it("STORY-099 s8 · a workspace with no stored theme gets the platform default (null colours), not an error", async () => {
     const w = await world();
     await harness.db().query("DELETE FROM brand_themes WHERE workspace_id = $1", [w.ws]);

@@ -49,6 +49,14 @@ export const RESEND_WORST_CASE_SEND_MS =
   RESEND_MAX_ATTEMPTS * RESEND_TIMEOUT_MS +
   Array.from({ length: RESEND_MAX_ATTEMPTS - 1 }, (_, i) => Math.max(RESEND_MAX_RETRY_AFTER_MS, maxBackoffMs(i + 1))).reduce((a, b) => a + b, 0);
 
+const MAX_FROM_NAME_LENGTH = 80;
+const MAX_ADDRESS_LENGTH = 254;
+// eslint-disable-next-line no-control-regex -- the point: control characters must never reach a header
+const CONTROL_AND_ADDRESS_SYNTAX = /[\u0000-\u001f\u007f<>"\\,;:@()[\]]/g;
+// One address, no display form, no list, no whitespace or control character, no quoting: the shape every mail client accepts.
+// eslint-disable-next-line no-control-regex -- as above
+const PLAIN_ADDRESS = /^[^\s\u0000-\u001f\u007f<>,;:"()[\]\\@]+@[^\s\u0000-\u001f\u007f<>,;:"()[\]\\@]+\.[^\s\u0000-\u001f\u007f<>,;:"()[\]\\@]+$/;
+
 export class EmailDeliveryError extends Error {
   constructor(
     message: string,
@@ -135,12 +143,14 @@ export class ResendEmailSenderAdapter implements EmailSender {
     const recipientHash = hashEmailKey(normalizeEmail(recipient), this.pepper).toString("hex");
     // A caller-supplied key (a queue job's, stable across its attempts) wins; otherwise one per send().
     const idempotencyKey = message.idempotencyKey ?? uuidV7();
+    const replyTo = this.replyToOf(message);
     const payload = JSON.stringify({
-      from: this.from,
+      from: this.fromOf(message),
       to: [recipient],
       subject: message.subject,
       text: message.textBody,
       ...(message.htmlBody !== undefined ? { html: message.htmlBody } : {}),
+      ...(replyTo !== undefined ? { reply_to: replyTo } : {}),
       headers: { "X-Entity-Ref-ID": idempotencyKey },
     });
 
@@ -180,6 +190,37 @@ export class ResendEmailSenderAdapter implements EmailSender {
     }
     // Unreachable: the loop always returns or throws on its last attempt. Fail closed if maxAttempts was < 1.
     throw new EmailDeliveryError("email delivery failed (resend, no attempt was made)", undefined, false, 0);
+  }
+
+  /**
+   * STORY-100 AC10 — the From header. The ADDRESS is always the configured, platform-authenticated one; an agency's display
+   * name replaces only the name before it. The name is a theme value, so it is untrusted: control characters (CR/LF is header
+   * injection) and every character that is address syntax in an unquoted display name (<>"\\ , ; : @ ( ) [ ]) are removed, so it can neither end the name early nor add an address.
+   * A name that is nothing but those characters is dropped, and the configured From is used unchanged.
+   */
+  private fromOf(message: EmailMessage): string {
+    if (message.fromName === undefined) return this.from;
+    const name = message.fromName
+      .replace(CONTROL_AND_ADDRESS_SYNTAX, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, MAX_FROM_NAME_LENGTH)
+      .trim();
+    if (name === "") return this.from;
+    const bracketed = /<([^<>\s]+)>\s*$/.exec(this.from);
+    return `${name} <${bracketed?.[1] ?? this.from.trim()}>`;
+  }
+
+  /**
+   * The Reply-To header: exactly one plain address, or nothing. An invalid value is DROPPED rather than repaired (a repaired
+   * address could route a client's reply somewhere the agency did not choose), counted, and logged without the value.
+   */
+  private replyToOf(message: EmailMessage): string | undefined {
+    if (message.replyTo === undefined) return undefined;
+    if (message.replyTo.length <= MAX_ADDRESS_LENGTH && PLAIN_ADDRESS.test(message.replyTo)) return message.replyTo;
+    incrementCounter("nominara_email_header_dropped_total", { header: "reply_to" });
+    this.logger.warn("email reply-to dropped: not a single plain address");
+    return undefined;
   }
 
   private async attempt(payload: string, idempotencyKey: string): Promise<AttemptOutcome> {

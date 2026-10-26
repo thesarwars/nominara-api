@@ -20,6 +20,13 @@ export interface EmailMessage {
    * retries. Never part of the delivered message.
    */
   readonly idempotencyKey?: string;
+  /**
+   * STORY-100 AC10: the agency's display name for the From header. The ADDRESS stays the platform's authenticated sender
+   * (never an agency domain); only the name before it changes. Sanitised against header injection by the adapter.
+   */
+  readonly fromName?: string;
+  /** STORY-100 AC10 / owner decision 6: the Reply-To address. Absent (a theme with none stored) means the header is omitted. */
+  readonly replyTo?: string;
 }
 
 export interface EmailSender {

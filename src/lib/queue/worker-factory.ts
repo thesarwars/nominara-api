@@ -40,10 +40,25 @@ export type JobProcessor<T = unknown> = (tx: ClientBase, job: Job) => Promise<T>
 /** What `prepare` returns to end the job without a `run`/`commit` (nothing to do, or already done). */
 export const PHASES_DONE: unique symbol = Symbol("nominara.phases.done");
 
+/** Where a phased job failed, and what the earlier phases had produced by then. */
+export interface PhaseFailure<Prepared, Fetched> {
+  readonly error: unknown;
+  readonly phase: "prepare" | "run" | "commit";
+  readonly prepared?: Prepared;
+  readonly fetched?: Fetched;
+}
+
 export interface JobPhases<Prepared, Fetched> {
   prepare(tx: ClientBase, job: Job): Promise<Prepared | typeof PHASES_DONE>;
   run(prepared: Prepared, job: Job): Promise<Fetched>;
   commit(tx: ClientBase, prepared: Prepared, fetched: Fetched, job: Job): Promise<void>;
+  /**
+   * Optional. Called when ANY phase throws, in a FRESH tenant transaction (the failed one is rolled back and may be aborted),
+   * after the signature was verified. Return true when the failure was settled (the job then ends without throwing, so the queue
+   * does not retry or dead-letter it); false to leave the original error to the queue. A hook that throws is ignored: the
+   * ORIGINAL error is what the queue sees. The handler decides whether this is the last attempt; the factory does not know.
+   */
+  recover?(tx: ClientBase, job: Job, failure: PhaseFailure<Prepared, Fetched>): Promise<boolean>;
 }
 
 const PHASES: unique symbol = Symbol("nominara.job-phases");
@@ -131,11 +146,28 @@ export function createJobProcessor(entry: QueueTopologyEntry, options: JobProces
 
     // ADR-0003: two short tenant transactions around a run that holds neither a transaction nor a connection.
     if (phases !== undefined) {
-      const prepared = await inTenantTransaction((tx) => phases.prepare(tx, job));
-      if (prepared === PHASES_DONE) return undefined;
-      const fetched = await phases.run(prepared, job);
-      await inTenantTransaction((tx) => phases.commit(tx, prepared, fetched, job));
-      return undefined;
+      let at: PhaseFailure<unknown, unknown> = { error: undefined, phase: "prepare" };
+      try {
+        const prepared = await inTenantTransaction((tx) => phases.prepare(tx, job));
+        if (prepared === PHASES_DONE) return undefined;
+        at = { error: undefined, phase: "run", prepared };
+        const fetched = await phases.run(prepared, job);
+        at = { error: undefined, phase: "commit", prepared, fetched };
+        await inTenantTransaction((tx) => phases.commit(tx, prepared, fetched, job));
+        return undefined;
+      } catch (error) {
+        const recover = phases.recover;
+        if (recover === undefined) throw error;
+        let settled = false;
+        try {
+          settled = await inTenantTransaction((tx) => recover.call(phases, tx, job, { ...at, error }));
+        } catch (recoveryError) {
+          // The original error is the one the queue (and the operator) must see; the recovery's own is only named.
+          logger.warn({ event: "job.recover_failed", queue: entry.name, error: recoveryError instanceof Error ? recoveryError.name : "unknown" });
+        }
+        if (!settled) throw error;
+        return undefined;
+      }
     }
 
     return inTenantTransaction((tx) => options.process(tx, job));

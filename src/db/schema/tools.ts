@@ -87,6 +87,7 @@ export const brandThemes = pgTable("brand_themes", {
   contrastReport: jsonb("contrast_report"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  emailReplyTo: text("email_reply_to"),
 });
 
 export const customDomains = pgTable("custom_domains", {

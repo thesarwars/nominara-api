@@ -75,6 +75,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "identity.sweep_unverified",
       "maintenance.partition",
       "notify.dispatch",
+      "report.build",
       "retention.purge",
       "rollup.metric_daily",
       "source.verify_presence",
@@ -95,7 +96,9 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       // STORY-063 — declared after topic.cluster in topology.ts, i.e. between the rollup and credit entries.
       "task.generate",
       "credit.reconcile",
-      // STORY-068 — declared after report.build (inert) and before maintenance.partition in topology.ts.
+      // STORY-100 — report.build (the cadence path of a scheduled report), declared before notify.dispatch in topology.ts.
+      "report.build",
+      // STORY-068 — declared after report.build and before maintenance.partition in topology.ts.
       "notify.dispatch",
       "maintenance.partition",
       // Declared after maintenance.partition in topology.ts — STORY-143's
@@ -145,18 +148,18 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   });
 
   it("liveQueueNames and inertQueueNames answer for a subset too — inertness is per worker group", () => {
-    // A report worker with no handlers is inert even when capture and rollup
+    // A deploy worker with no handlers is inert even when capture and rollup
     // are wired, so the boot line has to be able to ask about one group's set.
     //
     // This used the ROLLUP group until STORY-042 gave it a handler. The
     // property under test is "inertness is per group", not "rollup is inert",
     // so it moves to a group that is still empty rather than being deleted —
     // and the assertion below covers the other half, which the old version
-    // could not.
-    const report = QUEUE_TOPOLOGY.filter((entry) => entry.workerGroup === "report").map((entry) => entry.name);
-    expect(report.length).toBeGreaterThan(0);
-    expect(inertQueueNames(report)).toEqual(report);
-    expect(liveQueueNames(report)).toEqual([]);
+    // could not. (STORY-100 gave the report group its handler, so this is the deploy group now.)
+    const deploy = QUEUE_TOPOLOGY.filter((entry) => entry.workerGroup === "deploy").map((entry) => entry.name);
+    expect(deploy.length).toBeGreaterThan(0);
+    expect(inertQueueNames(deploy)).toEqual(deploy);
+    expect(liveQueueNames(deploy)).toEqual([]);
   });
 
   it("a group with SOME handlers reports both halves", () => {

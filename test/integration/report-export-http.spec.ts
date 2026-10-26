@@ -377,4 +377,70 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const hidden = fileOf(data<Exported>(await exportReport(a, p, body({ format: "csv", hide_competitors: true }))));
     expect(hidden.toString()).not.toContain("Rival Roofing");
   }, 120_000);
+  // STORY-100 AC2 / scenario 3 — the third suppression route (a section selection) and the second format (CSV).
+  const SECTIONS = ["overview", "growth_map", "matrix", "competitors", "sources", "tasks", "aux"] as const;
+
+  it("STORY-100 s3 — a section selection cannot drop the footer: an empty selection or a 'footer' section is a 400, and EVERY single-section selection keeps it in PDF and CSV", async () => {
+    const { a, p } = await seeded();
+    for (const sections of [[], ["footer"], ["methodology"], ["overview", "footer"]]) {
+      const res = await exportReport(a, p, body({ sections }));
+      expect(res.statusCode, JSON.stringify(sections)).toBe(400);
+      expect(errorOf(res).code).toBe("validation_failed");
+    }
+    expect(((await harness.db().query(`SELECT count(*)::int AS n FROM report_artifacts`)).rows[0] as { n: number }).n).toBe(0);
+    for (const section of SECTIONS) {
+      const pdf = await exportReport(a, p, body({ sections: [section] }));
+      expect(pdf.statusCode, `${section} pdf: ${pdf.body}`).toBe(201);
+      const stored = exportResponseSchema.parse(data(pdf));
+      expect(pdfRaw(fileOf(stored)), `${section} pdf`).toContain(METHODOLOGY_NOTE);
+      expect(stored.footer.note).toBe(METHODOLOGY_NOTE);
+
+      const csv = await exportReport(a, p, body({ format: "csv", sections: [section] }));
+      expect(csv.statusCode, `${section} csv: ${csv.body}`).toBe(201);
+      const text = fileOf(exportResponseSchema.parse(data(csv))).toString("utf8");
+      expect(text, `${section} csv`).toContain("methodology,,,,scoring_version,");
+      expect(text, `${section} csv`).toContain(METHODOLOGY_NOTE);
+    }
+  }, 240_000);
+
+  it("STORY-100 s2/s3 — on a CSV export, brand removal and a hostile theme stylesheet leave the footer rows in the file and in the stored artifact", async () => {
+    const { a, p } = await seeded("business");
+    await harness.db().query(
+      `INSERT INTO brand_themes (id, workspace_id, name, is_default, hide_nominara_brand, custom_css) VALUES ($1,$2,'T',true,true,'.footer{display:none}')`,
+      [uuidV7(), a.workspaceId],
+    );
+    const res = await exportReport(a, p, body({ format: "csv", sections: ["tasks"] }));
+    expect(res.statusCode, res.body).toBe(201);
+    const exported = exportResponseSchema.parse(data(res));
+    const text = fileOf(exported).toString("utf8");
+    expect(text).toContain("methodology,,,,scoring_version,");
+    expect(text).toContain("methodology,,,,note,");
+    expect(text).toContain(METHODOLOGY_NOTE);
+    const row = (await harness.db().query(`SELECT methodology_footer FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { methodology_footer: { note: string } };
+    expect(row.methodology_footer.note).toBe(METHODOLOGY_NOTE);
+  }, 120_000);
+
+  it("STORY-100 s6 — a low-confidence figure keeps its treatment: 'low confidence' in the PDF, `low` in the CSV confidence column; an absent figure is an empty cell, never 0", async () => {
+    const a = await owner("growth");
+    const p = await project(a.workspaceId);
+    await metric(a.workspaceId, p, "gemini", 2, { cells: 3, score: "70.000" });
+    await metric(a.workspaceId, p, "chatgpt", 2, { cells: 200, score: "50.000" });
+    await metric(a.workspaceId, p, "all", 2, { cells: 3, score: "60.000" });
+
+    const pdf = await exportReport(a, p, body({ sections: ["overview"] }));
+    expect(pdf.statusCode, pdf.body).toBe(201);
+    const text = pdfText(fileOf(exportResponseSchema.parse(data(pdf))));
+    expect(text).toContain("low confidence");
+    expect(text).toContain("high");
+
+    const csv = await exportReport(a, p, body({ format: "csv", sections: ["overview"] }));
+    expect(csv.statusCode, csv.body).toBe(201);
+    const rows = fileOf(exportResponseSchema.parse(data(csv))).toString("utf8");
+    expect(rows).toMatch(/overview,,brand,gemini,visibility_score,70,low,3,/);
+    expect(rows).toMatch(/overview,,brand,all,visibility_score,60,low,3,/);
+    expect(rows).toMatch(/overview,,brand,chatgpt,visibility_score,50,high,200,/);
+    // sentiment was never measured: an empty value cell, not a zero
+    expect(rows).toMatch(/overview,,brand,gemini,sentiment_score,,low,3,/);
+    expect(rows).not.toMatch(/sentiment_score,0,/);
+  }, 120_000);
 });

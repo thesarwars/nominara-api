@@ -239,4 +239,71 @@ describe("ADR-0003 · createJobProcessor with a PHASED processor", () => {
       }),
     ).toThrow(/tenant/i);
   });
+
+  describe("recover (a phase that throws)", () => {
+    const failing = (where: "prepare" | "run" | "commit", recover?: JobPhases<{ n: number }, string>["recover"]): JobPhases<{ n: number }, string> => ({
+      prepare: async () => {
+        if (where === "prepare") throw new Error("prepare boom");
+        return { n: 1 };
+      },
+      run: async () => {
+        if (where === "run") throw new Error("run boom");
+        return "fetched";
+      },
+      commit: async () => {
+        if (where === "commit") throw new Error("commit boom");
+      },
+      ...(recover !== undefined ? { recover } : {}),
+    });
+
+    it.each(["prepare", "run", "commit"] as const)("a %s failure the hook handles ends the job without throwing, in a FRESH tenant transaction", async (where) => {
+      const h = harness();
+      const seen: Array<{ phase: string; checkedOut: number; prepared?: { n: number }; fetched?: string }> = [];
+      const phases = failing(where, async (_tx, _job, failure) => {
+        seen.push({ phase: failure.phase, checkedOut: h.checkedOut, ...(failure.prepared !== undefined ? { prepared: failure.prepared } : {}), ...(failure.fetched !== undefined ? { fetched: failure.fetched } : {}) });
+        return true;
+      });
+      const processor = createJobProcessor(ENTRY, { keys: KEYS, getClient: h.getClient, releaseClient: h.releaseClient, process: phasedProcessor(phases) });
+      await expect(processor(signedJob())).resolves.toBeUndefined();
+      expect(seen).toEqual([
+        { phase: where, checkedOut: 1, ...(where !== "prepare" ? { prepared: { n: 1 } } : {}), ...(where === "commit" ? { fetched: "fetched" } : {}) },
+      ]);
+      expect(h.checkedOut).toBe(0);
+    });
+
+    it("a hook that declines (false) leaves the ORIGINAL error to the queue", async () => {
+      const h = harness();
+      const processor = createJobProcessor(ENTRY, { keys: KEYS, getClient: h.getClient, releaseClient: h.releaseClient, process: phasedProcessor(failing("commit", async () => false)) });
+      await expect(processor(signedJob())).rejects.toThrow("commit boom");
+    });
+
+    it("a hook that itself throws still surfaces the ORIGINAL error, never the hook's", async () => {
+      const h = harness();
+      const processor = createJobProcessor(ENTRY, {
+        keys: KEYS,
+        getClient: h.getClient,
+        releaseClient: h.releaseClient,
+        process: phasedProcessor(failing("run", async () => { throw new Error("hook boom"); })),
+      });
+      await expect(processor(signedJob())).rejects.toThrow("run boom");
+      expect(h.checkedOut).toBe(0);
+    });
+
+    it("no hook: the error propagates exactly as before", async () => {
+      const h = harness();
+      const processor = createJobProcessor(ENTRY, { keys: KEYS, getClient: h.getClient, releaseClient: h.releaseClient, process: phasedProcessor(failing("prepare")) });
+      await expect(processor(signedJob())).rejects.toThrow("prepare boom");
+    });
+
+    it("a failed signature is NOT given to the hook: nothing runs and no client is acquired", async () => {
+      const h = harness();
+      let called = false;
+      const processor = createJobProcessor(ENTRY, { keys: KEYS, getClient: h.getClient, releaseClient: h.releaseClient, process: phasedProcessor(failing("prepare", async () => { called = true; return true; })) });
+      const job = signedJob();
+      (job.data as { payload: { workspaceId: string } }).payload.workspaceId = "018bcfe5-0000-7000-8000-0000000000aa";
+      await expect(processor(job)).rejects.toThrow();
+      expect(called).toBe(false);
+      expect(h.events).toEqual([]);
+    });
+  });
 });

@@ -16,6 +16,7 @@ import { rollupDirtyKey } from "./lib/cache/valkey-keys.js";
 import { RollupDirtySet, type DirtyEntry } from "./lib/rollup/dirty-dates.js";
 import { RollupSweepRuntime } from "./lib/rollup/rollup-sweep.js";
 import { NotifySweepRuntime } from "./lib/notifications/notify-sweep.js";
+import { ReportSweepRuntime } from "./lib/reports/report-sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
 import { DegradationRuntime } from "./lib/engines/degradation-runtime.js";
@@ -89,6 +90,9 @@ export const ROLLUP_SWEEP_RUNTIME = "ROLLUP_SWEEP_RUNTIME";
 
 /** STORY-068 — DI token for the rollup group's notify sweep (digests and the email relay; elected, every 5 minutes). Rollup group only. */
 export const NOTIFY_SWEEP_RUNTIME = "NOTIFY_SWEEP_RUNTIME";
+
+/** STORY-100 AC5 — DI token for the report group's sweep over `scheduled_reports.next_send_at` (a tick every 5 minutes; elected). Report group only. */
+export const REPORT_SWEEP_RUNTIME = "REPORT_SWEEP_RUNTIME";
 
 class WorkerGroupRuntime implements OnModuleDestroy {
   constructor(
@@ -256,6 +260,20 @@ class NotifySweepHolder implements OnModuleDestroy {
 
   onModuleDestroy(): void {
     this.runtime.stop();
+  }
+}
+
+/** STORY-100 — owns the report sweep's timer and the producer it enqueues through. */
+class ReportSweepHolder implements OnModuleDestroy {
+  constructor(
+    public readonly runtime: ReportSweepRuntime,
+    private readonly producer: QueueProducer,
+  ) {}
+
+  async onModuleDestroy(): Promise<void> {
+    this.runtime.stop();
+    // Closes the producer's Queues only; the connection is the group's shared producer-side one, which WorkerGroupRuntime closes.
+    await this.producer.onModuleDestroy();
   }
 }
 
@@ -510,6 +528,21 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
     });
     notifySweep.start();
     providers.push({ provide: NOTIFY_SWEEP_RUNTIME, useValue: new NotifySweepHolder(notifySweep) });
+  }
+
+  // STORY-100 AC5 — the report sweep: each scheduled report whose `next_send_at` has come, as one signed `report.build` job
+  // (consumed by this same group). In-process, like the capture and rollup sweeps: `report.build` is tenant-scoped, so a bare
+  // cron cannot feed it, and `schedule.ts` keeps it at `cron: null`. It reads ids on the OWNER connection (it must see
+  // across tenants), enqueues through the group's shared producer-side connection, and holds no transaction.
+  if (env.WORKER_GROUP === "report") {
+    if (scheduleConnection === undefined) throw new WorkerGroupError("report sweep: the producer-side connection was not built");
+    const reportProducer = new QueueProducer(scheduleConnection, prefix, keys);
+    const reportSweep = new ReportSweepRuntime({
+      connect: () => connect(withKeepalives(env.DATABASE_URL)),
+      enqueue: (queue, workspaceId, payload, options) => reportProducer.enqueueTenantJob(queue, workspaceId, payload, options),
+    });
+    reportSweep.start();
+    providers.push({ provide: REPORT_SWEEP_RUNTIME, useValue: new ReportSweepHolder(reportSweep, reportProducer) });
   }
 
   @Module({ providers })
