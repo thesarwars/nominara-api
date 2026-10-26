@@ -29,6 +29,9 @@ import {
   pickScoringVersion,
   pointsFor,
   resampleWeekly,
+  summaryDelta,
+  type VersionOf,
+  weekVersions,
   versionChanges,
   weekBuckets,
   weekLabelFor,
@@ -139,23 +142,30 @@ export class GrowthMapService {
     const days = calendarDays(from, to);
     const buckets: readonly WeekBucket[] | null = granularity === "week" ? weekBuckets(days) : null;
     const labels = buckets === null ? days : buckets.map((bucket) => bucket.label);
-    /** Daily points → the points plotted: unchanged by the day, the mean of the dailies by the week (§13). */
-    const plot = (points: GrowthMapPoint[]): GrowthMapPoint[] => (buckets === null ? points : resampleWeekly(buckets, points));
+    /**
+     * Daily points → the points plotted: unchanged by the day, the mean of the dailies by the week (§13) — and, AC12, a week's
+     * mean only of the days under its own scoring version (`versionOf`, the series' version per day), never of two versions.
+     */
+    const plot = (points: GrowthMapPoint[], versionOf: VersionOf): GrowthMapPoint[] =>
+      buckets === null ? points : resampleWeekly(buckets, points, versionOf);
     const labelOfDay = (day: string): string => (buckets === null ? day : weekLabelFor(buckets, day));
 
     const rows = await this.seriesRows(tx, projectId, from, to, selected);
     // NEW-A-5 — the series are the cross-engine blend, so each one carries the
     // combination of every measured engine's provenance in the window.
-    const allSources = await engineDataSourcesForDates(tx, projectId, from, to, timezone, SCORING_VERSION);
+    // AC12 — every scoring version's captures: the series plots older-version days, so their provenance is counted too.
+    const allSources = await engineDataSourcesForDates(tx, projectId, from, to, timezone, null);
     const engineSources = new Map([...allSources].filter(([engine]) => selected === null || selected.includes(engine)));
     recordDemoDataServed("growth_map", store.context.workspaceId, [...engineSources.values()]);
     const blendSource: DataSource | null = combineDataSources([...engineSources.values()]);
 
     const brandRows = rows.filter((row) => row.entityType === "brand");
-    const competitorDaily = new Map<string, { label: string; points: GrowthMapPoint[] }>();
+    const competitorDaily = new Map<string, { label: string; points: GrowthMapPoint[]; versions: Map<string, string> }>();
     for (const row of rows) {
       if (row.entityType !== "competitor") continue;
-      competitorDaily.set(row.entityId, { label: competitorDaily.get(row.entityId)?.label ?? row.label, points: [] });
+      const entry = competitorDaily.get(row.entityId) ?? { label: row.label, points: [], versions: new Map<string, string>() };
+      entry.versions.set(row.metricDate, row.scoringVersion);
+      competitorDaily.set(row.entityId, entry);
     }
     for (const [entityId, entry] of competitorDaily) {
       entry.points = pointsFor(days, rows.filter((row) => row.entityType === "competitor" && row.entityId === entityId));
@@ -169,13 +179,18 @@ export class GrowthMapService {
     const failures = (await this.failureDays(tx, projectId, from, to, timezone)).filter(
       (failure) => selected === null || selected.includes(failure.engineKey),
     );
-    const brandPoints = plot(pointsFor(days, brandRows));
+    // AC12 — the brand's version per day. The baseline is bucketed by it too, so the brand and the baseline it is compared
+    // against are always the same days of a week.
+    const versionByDay = new Map(brandRows.map((row) => [row.metricDate, row.scoringVersion]));
+    const brandVersionOf: VersionOf = (day) => versionByDay.get(day) ?? null;
+    const dailyBrandPoints = pointsFor(days, brandRows);
+    const brandPoints = plot(dailyBrandPoints, brandVersionOf);
+    const brandVersions = buckets === null ? days.map(brandVersionOf) : weekVersions(buckets, dailyBrandPoints, brandVersionOf);
     // The gaps are the BRAND's. A competitor absent from an answer is not a gap in the measurement — it is the measurement.
     const dataGapsPlotted: DataGap[] =
       buckets === null ? dataGaps(brandPoints, failures) : extendGapsToBucketEnds(dataGaps(brandPoints, bucketFailures(failures, buckets)), buckets);
 
-    // AC12 — the brand's version per day, each change announced at the bucket holding its first day under the new version.
-    const versionByDay = new Map(brandRows.map((row) => [row.metricDate, row.scoringVersion]));
+    // AC12 — each change of the brand's version announced at the bucket holding its first day under the new version.
     const scoringVersionChanges = versionChanges(days, days.map((day) => versionByDay.get(day) ?? null)).map((change) => ({
       ...change,
       at: labelOfDay(change.at),
@@ -190,8 +205,13 @@ export class GrowthMapService {
       wanted,
       brandLabel,
       brandPoints,
-      competitors: [...competitorDaily].map(([entityId, entry]) => ({ entityId, label: entry.label, points: plot(entry.points) })),
-      baseline: plot(dailyBaseline),
+      brandVersions,
+      competitors: [...competitorDaily].map(([entityId, entry]) => ({
+        entityId,
+        label: entry.label,
+        points: plot(entry.points, (day) => entry.versions.get(day) ?? null),
+      })),
+      baseline: plot(dailyBaseline, brandVersionOf),
       blendSource,
       engineSources,
       milestones,
@@ -328,6 +348,8 @@ export class GrowthMapService {
     wanted: ReadonlySet<string>;
     brandLabel: string;
     brandPoints: GrowthMapPoint[];
+    /** Each brand point's scoring version (AC12); absent where the window has only the current one (24h). */
+    brandVersions?: readonly (string | null)[];
     competitors: readonly { entityId: string; label: string; points: GrowthMapPoint[] }[];
     baseline: GrowthMapPoint[];
     blendSource: DataSource | null;
@@ -393,7 +415,8 @@ export class GrowthMapService {
       summary: {
         visibility_start: brandEnds.start,
         visibility_end: brandEnds.end,
-        visibility_delta: brandEnds.start === null || brandEnds.end === null ? null : brandEnds.end - brandEnds.start,
+        // AC12 / STORY-136 AC9 — null across a scoring-version change: the ends were computed by two formulas.
+        visibility_delta: summaryDelta(parts.brandPoints, parts.brandVersions ?? parts.brandPoints.map(() => null)),
         ...parts.bestAndWorst,
         competitor_gap_start: gapBetween(brandEnds.start, baselineEnds.start),
         competitor_gap_end: gapBetween(brandEnds.end, baselineEnds.end),
@@ -597,15 +620,21 @@ export class GrowthMapService {
     to: string,
     selected: readonly string[] | null,
   ): Promise<{ best_engine: string | null; worst_engine: string | null }> {
+    // AC12 — the same version pick as the series: per (engine, day) the current version where the day has it, otherwise the most
+    // recently computed older one. Filtering to the current version alone would rank nothing over a window the series plots.
     const result = await tx.query<{ engine_key: string }>(
-      `SELECT engine_key
-         FROM metric_daily
-        WHERE project_id = $1
-          AND engine_key <> $2
-          AND ($6::text[] IS NULL OR engine_key = ANY($6::text[]))
-          AND entity_type = 'brand'
-          AND scoring_version = $3
-          AND metric_date BETWEEN $4::date AND $5::date
+      `WITH picked AS (
+         SELECT DISTINCT ON (engine_key, metric_date) engine_key, visibility_score, cells_total
+           FROM metric_daily
+          WHERE project_id = $1
+            AND engine_key <> $2
+            AND ($6::text[] IS NULL OR engine_key = ANY($6::text[]))
+            AND entity_type = 'brand'
+            AND metric_date BETWEEN $4::date AND $5::date
+          ORDER BY engine_key, metric_date, (scoring_version = $3) DESC, computed_at DESC
+       )
+       SELECT engine_key
+         FROM picked
         GROUP BY engine_key
        HAVING sum(cells_total) > 0
         ORDER BY sum(visibility_score * cells_total) / sum(cells_total) DESC, engine_key ASC`,

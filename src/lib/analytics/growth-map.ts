@@ -205,6 +205,27 @@ function mean(values: readonly number[]): number | null {
   return values.length === 0 ? null : values.reduce((total, value) => total + value, 0) / values.length;
 }
 
+/** The scoring version a day's value was computed under, or null when the day carries none. */
+export type VersionOf = (day: string) => string | null;
+
+/**
+ * AC12 / STORY-136 AC9 — the ONE scoring version each week is plotted under: the version of its latest measured day (null for a
+ * week with no measured day). A week straddling a cut-over is therefore a week of the NEW version, which is also where
+ * `versionChanges` puts the boundary marker.
+ */
+export function weekVersions(buckets: readonly WeekBucket[], points: readonly GrowthMapPoint[], versionOf: VersionOf): (string | null)[] {
+  const byDay = new Map(points.map((point) => [point.d, point]));
+  return buckets.map((bucket) => {
+    let latest: string | null = null;
+    for (const d of bucket.days) {
+      const point = byDay.get(d);
+      if (point === undefined || point.visibility_score === null) continue;
+      latest = versionOf(d) ?? latest;
+    }
+    return latest;
+  });
+}
+
 /**
  * §13 / AC2 — a week is THE MEAN OF ITS DAILY VALUES, never a resampled last
  * value. A last-value resample plots whichever day happened to close the
@@ -213,11 +234,19 @@ function mean(values: readonly number[]): number | null {
  * Only MEASURED days enter the mean: a null day is a gap, not a zero, and a
  * week with no measured day is null with zero cells — never carried across.
  * `points` must be the daily points over exactly the buckets' days, in order.
+ *
+ * AC12 / STORY-136 AC9 — TWO SCORING VERSIONS ARE NEVER AVERAGED. With
+ * `versionOf`, only the days under the week's own version (`weekVersions`)
+ * enter its mean: the mean of a v0 day and a v1 day is a number no version
+ * produced.
  */
-export function resampleWeekly(buckets: readonly WeekBucket[], points: readonly GrowthMapPoint[]): GrowthMapPoint[] {
+export function resampleWeekly(buckets: readonly WeekBucket[], points: readonly GrowthMapPoint[], versionOf?: VersionOf): GrowthMapPoint[] {
   const byDay = new Map(points.map((point) => [point.d, point]));
-  return buckets.map((bucket) => {
+  const versions = versionOf === undefined ? null : weekVersions(buckets, points, versionOf);
+  return buckets.map((bucket, index) => {
+    const version = versions?.[index] ?? null;
     const measured = bucket.days
+      .filter((d) => versionOf === undefined || version === null || versionOf(d) === version)
       .map((d) => byDay.get(d))
       .filter((point): point is GrowthMapPoint => point !== undefined && point.visibility_score !== null);
     if (measured.length === 0) return { d: bucket.label, visibility_score: null, sov: null, cells: 0, live_ratio: null };
@@ -229,6 +258,24 @@ export function resampleWeekly(buckets: readonly WeekBucket[], points: readonly 
       live_ratio: mean(measured.map((point) => point.live_ratio).filter((value): value is number => value !== null)),
     };
   });
+}
+
+/**
+ * §7's `summary.visibility_delta` — end − start over the plotted points, NULL when the first and last scored points were computed
+ * under different scoring versions (`versions[i]` is point i's). A v1 figure minus a v0 figure measures the change of formula as
+ * much as any change of visibility (STORY-136 AC9); the start and end themselves are still reported.
+ */
+export function summaryDelta(points: readonly GrowthMapPoint[], versions: readonly (string | null)[]): number | null {
+  let first = -1;
+  let last = -1;
+  points.forEach((point, index) => {
+    if (point.visibility_score === null) return;
+    if (first === -1) first = index;
+    last = index;
+  });
+  if (first === -1) return null;
+  if ((versions[first] ?? null) !== (versions[last] ?? null)) return null;
+  return points[last]!.visibility_score! - points[first]!.visibility_score!;
 }
 
 /** The bucket a day falls in, by label. */
