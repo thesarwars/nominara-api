@@ -390,7 +390,7 @@ describe("STORY-169 · TasksService.listActionItems — real SQL", () => {
 
       const page = await listAll(CTX(workspaceId));
       const item = page.items.find((i) => i.id === taskId)!;
-      expect(item.primary_action).toEqual({ kind: "open_playbook", target: "reddit-seeding" });
+      expect(item.primary_action).toEqual({ kind: "open_playbook", target: "reddit-seeding", domain: null });
       // Still traced back to the AUX finding on `source`, even though the
       // primary action is the playbook — these are independent fields.
       expect(item.source).toBe("aux");
@@ -406,7 +406,33 @@ describe("STORY-169 · TasksService.listActionItems — real SQL", () => {
 
       const page = await listAll(CTX(workspaceId));
       const item = page.items.find((i) => i.id === taskId)!;
-      expect(item.primary_action).toEqual({ kind: "open_playbook", target: "authority-backlink" });
+      expect(item.primary_action).toEqual({ kind: "open_playbook", target: "authority-backlink", domain: null });
+    });
+
+    // STORY-089 Actions AC2 — the playbook route is keyed by domain (GET /projects/{id}/sources/{domain}/playbook).
+    it("STORY-089 · open_playbook carries source_domains.domain of the task's source_domain_id", async () => {
+      const workspaceId = await createWorkspace();
+      const projectId = await createProject(workspaceId);
+      const sourceDomainId = await createSourceDomain(workspaceId);
+      const { rows } = await client.query<{ domain: string }>(`SELECT domain FROM source_domains WHERE id = $1`, [sourceDomainId]);
+      const taskId = await createTask(workspaceId, projectId, { sourceDomainId, playbookSlug: "reddit-seeding" });
+
+      const page = await listAll(CTX(workspaceId));
+      expect(page.items.find((i) => i.id === taskId)!.primary_action).toEqual({
+        kind: "open_playbook",
+        target: "reddit-seeding",
+        domain: rows[0]!.domain,
+      });
+    });
+
+    it("STORY-089 · a task naming a source domain but no playbook carries no domain on its action", async () => {
+      const workspaceId = await createWorkspace();
+      const projectId = await createProject(workspaceId);
+      const sourceDomainId = await createSourceDomain(workspaceId);
+      const taskId = await createTask(workspaceId, projectId, { sourceDomainId });
+
+      const page = await listAll(CTX(workspaceId));
+      expect(page.items.find((i) => i.id === taskId)!.primary_action).toStrictEqual({ kind: "open_task", target: taskId });
     });
 
     it("diagnose, targeting the displacement id, when no playbook_slug is set", async () => {

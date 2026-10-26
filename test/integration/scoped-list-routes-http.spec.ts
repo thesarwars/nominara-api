@@ -21,6 +21,7 @@ import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local
 import { ACCESS_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 import type { ProjectListItem } from "../../contracts/projects/index.js";
 import type { ActionItem } from "../../contracts/tasks/index.js";
+import type { WorkspaceSummaryResponse } from "../../contracts/workspaces/workspace-summary-response.schema.js";
 
 // STORY-169 re-audit (api:re-audit finding [blocker] 1) — `ef7e554` let a
 // project-scoped manager/viewer reach `GET /v1/projects` and
@@ -173,6 +174,76 @@ describe("STORY-169 re-audit · a project-scoped manager on GET /v1/projects and
     const ids = items.map((item) => item.id);
     expect(ids).toContain(inScope);
     expect(ids).not.toContain(outOfScope);
+  });
+
+  // STORY-089 Matrix AC5 (FR-DASH-04) — the Command Center now renders from ONE GET /workspaces/{id}/summary (owner decision
+  // 2026-10-23), so that route's scoped counts are what a scoped role sees: only in-scope projects, counts from the scoped set,
+  // no hint of the rest. Driven over the real guard -> interceptor -> handler chain, like the two routes above.
+  it("STORY-089 · a manager scoped to ONE project gets only that project and scoped counts on GET /v1/workspaces/{id}/summary", async () => {
+    const ownerId = await createUser();
+    const workspace = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
+    const inScope = await createProject(workspace.id, "In Scope Co");
+    const outOfScope = await createProject(workspace.id, "Out Of Scope Co");
+    await createProject(workspace.id, "Another Hidden Co");
+
+    const accessToken = await accessTokenForScopedManager(workspace.id, [inScope]);
+
+    const res = await app.inject({
+      method: "GET",
+      url: apiUrl(`/workspaces/${workspace.id}/summary`),
+      cookies: { [ACCESS_COOKIE_NAME]: accessToken },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = dataOf<WorkspaceSummaryResponse>(res);
+    expect(body.projects.map((p) => p.id)).toEqual([inScope]);
+    expect(body.health.projects_used).toBe(1);
+    expect(JSON.stringify(body)).not.toContain(outOfScope);
+    expect(JSON.stringify(body)).not.toContain("Out Of Scope Co");
+    expect(JSON.stringify(body)).not.toContain("Another Hidden Co");
+  });
+
+  // STORY-089 scenario 1 · FR-DASH-01 / data-model.md §perf: "Command Center summary, 50 projects — ≤ 250 ms p95, one
+  // request". Measured over the real HTTP chain (guard, tenant transaction, RLS, handler) against real Postgres, after a
+  // warm-up, so the figure is the route's own cost and not connection set-up.
+  it("STORY-089 · GET /v1/workspaces/{id}/summary for 50 projects answers within the documented 250 ms p95", async () => {
+    const ownerId = await createUser();
+    const workspace = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
+    for (let i = 0; i < 50; i += 1) await createProject(workspace.id, `Perf Co ${i}`);
+    const tokens = await sessions.createSession(ownerId);
+    const { accessToken } = await workspaces.switchTo(ownerId, tokens.sid, workspace.id, meta);
+    const once = async () => {
+      const started = performance.now();
+      const res = await app.inject({ method: "GET", url: apiUrl(`/workspaces/${workspace.id}/summary`), cookies: { [ACCESS_COOKIE_NAME]: accessToken } });
+      const ms = performance.now() - started;
+      expect(res.statusCode).toBe(200);
+      expect(dataOf<WorkspaceSummaryResponse>(res).projects).toHaveLength(50);
+      return ms;
+    };
+    for (let i = 0; i < 3; i += 1) await once();
+    const samples: number[] = [];
+    for (let i = 0; i < 40; i += 1) samples.push(await once());
+    samples.sort((a, b) => a - b);
+    const p95 = samples[Math.ceil(samples.length * 0.95) - 1]!;
+    console.log(`STORY-089 summary p95 for 50 projects: ${p95.toFixed(1)} ms (median ${samples[20]!.toFixed(1)} ms)`);
+    expect(p95).toBeLessThanOrEqual(250);
+  });
+
+  it("STORY-089 · a manager scoped to ZERO projects is refused GET /v1/workspaces/{id}/summary, never handed the workspace's matrix", async () => {
+    const ownerId = await createUser();
+    const workspace = await workspaces.create(ownerId, { name: `Workspace ${randomUUID()}` }, meta);
+    await createProject(workspace.id, "Any Project Co");
+
+    const accessToken = await accessTokenForScopedManager(workspace.id, []);
+
+    const res = await app.inject({
+      method: "GET",
+      url: apiUrl(`/workspaces/${workspace.id}/summary`),
+      cookies: { [ACCESS_COOKIE_NAME]: accessToken },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toMatchObject({ error: { code: "project_out_of_scope" } });
   });
 
   it("a manager scoped to ZERO projects is refused GET /v1/projects with 403 project_out_of_scope, not an empty 'all projects' page", async () => {

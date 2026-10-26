@@ -1035,6 +1035,8 @@ interface ActionItemRow {
   playbook_slug: string | null;
   source_finding_id: string | null;
   source_domain_id: string | null;
+  /** `source_domains.domain` of `source_domain_id` — the playbook route's key (STORY-089). Null when the task names no domain. */
+  playbook_domain: string | null;
   source_displacement_id: string | null;
   created_at: Date;
   created_at_key: string;
@@ -1099,6 +1101,7 @@ export const ACTION_ITEMS_SQL = `WITH open_tasks AS MATERIALIZED (
            t.playbook_slug,
            t.source_finding_id,
            t.source_domain_id,
+           sd.domain AS playbook_domain,
            t.source_displacement_id,
            t.created_at,
            t.created_at::text AS created_at_key,
@@ -1109,6 +1112,7 @@ export const ACTION_ITEMS_SQL = `WITH open_tasks AS MATERIALIZED (
          FROM open_tasks t
          JOIN projects p ON p.id = t.project_id
          LEFT JOIN aux_findings af ON af.id = t.source_finding_id
+         LEFT JOIN source_domains sd ON sd.id = t.source_domain_id
          LEFT JOIN LATERAL (
            SELECT gap_severity
              FROM project_source_index
@@ -1214,8 +1218,9 @@ function deriveSource(row: Pick<ActionItemRow, "source_finding_id" | "source_dom
  *      Manual/command_bar-origin tasks, and any task with no more specific
  *      evidence link.
  */
-function derivePrimaryAction(row: ActionItemRow): { kind: ActionItemPrimaryActionKind; target: string } {
-  if (row.playbook_slug !== null) return { kind: "open_playbook", target: row.playbook_slug };
+function derivePrimaryAction(row: ActionItemRow): { kind: ActionItemPrimaryActionKind; target: string; domain?: string | null } {
+  // STORY-089: the playbook route is keyed by domain, so open_playbook (and only it) carries the task's source domain.
+  if (row.playbook_slug !== null) return { kind: "open_playbook", target: row.playbook_slug, domain: row.playbook_domain };
   if (row.source_displacement_id !== null) return { kind: "diagnose", target: row.source_displacement_id };
   if (row.source_finding_id !== null) return { kind: "copy_patch", target: row.source_finding_id };
   return { kind: "open_task", target: row.id };

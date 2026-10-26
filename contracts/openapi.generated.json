@@ -57384,6 +57384,18 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "description": "Bare id, meaning fixed by `kind`, checked in this precedence order: playbook_slug set -> open_playbook, target the playbook slug (checked FIRST, even for an AUX-finding-derived task that also carries a finding or displacement id); else source_displacement_id set -> diagnose, target displacements.id; else source_finding_id set -> copy_patch, target aux_findings.id; else open_task, target tasks.id. Never a URL or patch text."
+                              },
+                              "domain": {
+                                "description": "open_playbook only (absent on every other kind): source_domains.domain of the task's source_domain_id, the key of GET /projects/{id}/sources/{domain}/playbook. Null when the task names no source domain.",
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "minLength": 1
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
                               }
                             },
                             "required": [

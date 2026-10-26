@@ -87,8 +87,31 @@ export const actionItemPrimaryActionSchema = z
         "target displacements.id; else source_finding_id set -> copy_patch, target aux_findings.id; " +
         "else open_task, target tasks.id. Never a URL or patch text.",
     ),
+    /**
+     * STORY-089 (Actions AC2) — the playbook route is keyed by DOMAIN
+     * (`GET /projects/{id}/sources/{domain}/playbook`), and a slug cannot be
+     * resolved to one client-side. So `open_playbook` carries the domain the
+     * task's `source_domain_id` names (`source_domains.domain`), and the
+     * client opens that playbook. Present on `open_playbook` ONLY — absent on
+     * every other kind. `null` when the task carries a playbook slug but no
+     * source domain: there is no playbook to open, and the client falls back
+     * to the project's Sources section rather than invent a domain.
+     */
+    domain: z
+      .string()
+      .min(1)
+      .nullable()
+      .optional()
+      .describe(
+        "open_playbook only (absent on every other kind): source_domains.domain of the task's source_domain_id, the key of " +
+          "GET /projects/{id}/sources/{domain}/playbook. Null when the task names no source domain.",
+      ),
   })
-  .strict();
+  .strict()
+  .refine((a) => a.kind === "open_playbook" || a.domain === undefined, {
+    message: "domain is carried by open_playbook only",
+    path: ["domain"],
+  });
 
 /** One project a collapsed queue row stands for. */
 export const actionItemProjectSchema = z

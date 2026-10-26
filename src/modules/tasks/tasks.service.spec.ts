@@ -56,6 +56,7 @@ describe("STORY-169 · TasksService.listActionItems", () => {
       playbook_slug: null,
       source_finding_id: "0195e5b7-0000-7000-8000-0000000000a1",
       source_domain_id: null,
+      playbook_domain: null,
       source_displacement_id: null,
       created_at: new Date("2026-09-01T00:00:00Z"),
       created_at_key: "2026-09-01 00:00:00+00",
@@ -232,7 +233,28 @@ describe("STORY-169 · TasksService.listActionItems", () => {
       const page = await serviceReading([
         row({ source_displacement_id: "0195e5b7-0000-7000-8000-0000000000e1", playbook_slug: "seed-reddit-thread" }),
       ]).listActionItems({ limit: 50 } as never);
-      expect(page.items[0]!.primary_action).toEqual({ kind: "open_playbook", target: "seed-reddit-thread" });
+      expect(page.items[0]!.primary_action).toEqual({ kind: "open_playbook", target: "seed-reddit-thread", domain: null });
+    });
+
+    // STORY-089 Actions AC2 — the playbook route is keyed by domain; the action carries it.
+    it("STORY-089 · open_playbook carries the source domain the playbook route is keyed by", async () => {
+      const page = await serviceReading([
+        row({ source_finding_id: null, source_domain_id: "0195e5b7-0000-7000-8000-0000000000d1", playbook_domain: "reddit.com", playbook_slug: "seed-reddit-thread" }),
+      ]).listActionItems({ limit: 50 } as never);
+      expect(page.items[0]!.primary_action).toEqual({ kind: "open_playbook", target: "seed-reddit-thread", domain: "reddit.com" });
+    });
+
+    it("STORY-089 · no other kind carries a domain, even when the task names a source domain", async () => {
+      const page = await serviceReading([
+        row({ source_finding_id: "0195e5b7-0000-7000-8000-0000000000a1", source_domain_id: "0195e5b7-0000-7000-8000-0000000000d1", playbook_domain: "reddit.com", playbook_slug: null }),
+      ]).listActionItems({ limit: 50 } as never);
+      expect(page.items[0]!.primary_action).toStrictEqual({ kind: "copy_patch", target: "0195e5b7-0000-7000-8000-0000000000a1" });
+    });
+
+    it("STORY-089 · the query reads the domain from source_domains via the task's source_domain_id", async () => {
+      await serviceReading([]).listActionItems({ limit: 50 } as never);
+      expect(calls[0]!.sql).toMatch(/LEFT JOIN source_domains sd ON sd\.id = t\.source_domain_id/);
+      expect(calls[0]!.sql).toContain("sd.domain AS playbook_domain");
     });
 
     it("copy_patch, targeting the finding id, when source_finding_id is set and no playbook", async () => {
