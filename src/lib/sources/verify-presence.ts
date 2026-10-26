@@ -213,6 +213,19 @@ export interface PresenceResult {
 }
 
 /**
+ * The one demo exclusion both candidate picks share (the periodic run's and the completion's): the index row `psi` on domain `sd`
+ * counts only through a live engine's citation that is not demo-marked. The seed marks its captures
+ * (`answer_captures.normalizer_version`) and writes them under live engines' keys too. `engines` and `marker` are the statement's
+ * placeholders for the live engine keys and `DEMO_SEED_MARKER`.
+ */
+function liveCitationExists(engines: string, marker: string): string {
+  return `EXISTS (
+          SELECT 1 FROM citation_facts cf
+           WHERE cf.project_id = psi.project_id AND cf.domain = sd.domain AND cf.engine_key = ANY(${engines}::text[])
+             AND NOT EXISTS (SELECT 1 FROM answer_captures ac WHERE ac.id = cf.result_id AND ac.normalizer_version = ${marker}))`;
+}
+
+/**
  * Phase 1 (one short tenant transaction): the project's brand and the domains due a fetch. Null when the project is not visible
  * (gone, or in another tenant) — nothing is fetched then.
  */
@@ -235,12 +248,7 @@ export async function preparePresenceRun(tx: ClientBase, projectId: string, now:
                 AND v.brand_present_on_domain IS NOT NULL) AS verified_at
        FROM project_source_index psi JOIN source_domains sd ON sd.id = psi.source_domain_id
       WHERE psi.project_id = $1 AND psi.engine_key = ANY($2::text[])
-        -- A domain is a candidate only through a citation that is not demo-marked. The seed marks its
-        -- captures (answer_captures.normalizer_version) and writes them under live engines' keys too.
-        AND EXISTS (
-          SELECT 1 FROM citation_facts cf
-           WHERE cf.project_id = psi.project_id AND cf.domain = sd.domain AND cf.engine_key = ANY($2::text[])
-             AND NOT EXISTS (SELECT 1 FROM answer_captures ac WHERE ac.id = cf.result_id AND ac.normalizer_version = $3))
+        AND ${liveCitationExists("$2", "$3")}
       ORDER BY psi.source_domain_id, psi.window_days DESC, psi.citation_count DESC`,
     [projectId, [...LIVE_CITATION_ENGINES], DEMO_SEED_MARKER],
   );
@@ -424,9 +432,11 @@ export async function prepareSeededVerification(tx: ClientBase, projectId: strin
     today: string;
   }>(
     `SELECT t.id::text AS task_id, t.source_domain_id::text AS source_domain_id, sd.domain, t.affected_url, t.completed_at,
-            -- The domain's most-cited page by a live engine: the same pick as the periodic run's candidate.
+            -- The domain's most-cited page by a live engine: the same pick as the periodic run's candidate, through the same
+            -- demo exclusion (review round 3), so a domain indexed only from demo-seeded captures offers no URL to fetch.
             (SELECT psi.top_urls->0->>'url' FROM project_source_index psi
               WHERE psi.project_id = t.project_id AND psi.source_domain_id = t.source_domain_id AND psi.engine_key = ANY($4::text[])
+                AND ${liveCitationExists("$4", "$5")}
               ORDER BY psi.window_days DESC, psi.citation_count DESC LIMIT 1) AS index_top_url,
             p.workspace_id::text AS workspace_id, p.name, p.brand_aliases, p.negative_aliases,
             EXISTS (SELECT 1 FROM milestones m WHERE m.source_type = 'system' AND m.source_id = $3) AS pinned,
@@ -437,7 +447,7 @@ export async function prepareSeededVerification(tx: ClientBase, projectId: strin
        JOIN source_domains sd ON sd.id = t.source_domain_id
       WHERE t.id = $2 AND t.project_id = $1
         AND t.kind = 'authority' AND t.status = 'done' AND t.deleted_at IS NULL AND t.completed_at IS NOT NULL`,
-    [projectId, taskId, sourceSeededSourceId(projectId, taskId), [...LIVE_CITATION_ENGINES]],
+    [projectId, taskId, sourceSeededSourceId(projectId, taskId), [...LIVE_CITATION_ENGINES], DEMO_SEED_MARKER],
   );
   const row = found.rows[0];
   if (row === undefined || row.pinned || isDemoDomain(row.domain)) return null;

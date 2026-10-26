@@ -411,17 +411,22 @@ describe("NEW-C-15 · verifyProjectSourcePresence", () => {
       const rollupTx = new Client({ connectionString: container.getConnectionUri() });
       await rollupTx.connect();
       try {
+        const rollupPid = (await rollupTx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!.pid;
+        const writerPid = (await db.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!.pid; // the write runs on `db`
         await rollupTx.query("BEGIN");
         await withProjectQueueLock(rollupTx, "rollup.metric_daily", projectId, () => refreshProjectSourceIndex(rollupTx, projectId, TODAY));
         const pending = write();
-        // Wait (bounded) until the write is blocked on the rollup — on its advisory lock with the fix, on the deleted rows without.
-        for (let i = 0; i < 100; i += 1) {
-          const waiting = await rollupTx.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_locks WHERE NOT granted");
-          if (waiting.rows[0]!.n > 0) break;
-          await new Promise((resolve) => setTimeout(resolve, 50));
+        // Wait (bounded) until THE WRITER is blocked BY THE ROLLUP — on its advisory lock with the fix, on the deleted rows without —
+        // so the race is provably set up before the rollup commits. Review round 3: not any ungranted lock in the database.
+        let raced = false;
+        for (let i = 0; i < 100 && !raced; i += 1) {
+          const blocked = await rollupTx.query<{ raced: boolean }>("SELECT $1::int = ANY(pg_blocking_pids($2::int)) AS raced", [rollupPid, writerPid]);
+          raced = blocked.rows[0]!.raced;
+          if (!raced) await new Promise((resolve) => setTimeout(resolve, 50));
         }
         await rollupTx.query("COMMIT");
         await pending;
+        expect(raced, "the write never waited on the rollup, so no race was exercised").toBe(true);
       } finally {
         await rollupTx.end();
       }

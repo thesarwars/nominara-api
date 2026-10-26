@@ -331,7 +331,7 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
   // `rollup.metric_daily`, which enqueues it after its own transaction commits.
   // STORY-066 AC8 adds a second producer: `TasksService.completeTask` enqueues
   // one job per completed authority task (payload `taskId`), after its commit,
-  // keyed `srcver:seeded:{task}` — the pattern below is the rollup's key.
+  // keyed `srcver:seeded:{task}:{completed_at_ms}` — the pattern below is the rollup's key.
   // Phased (ADR-0003): no transaction is held across either kind of fetch.
   {
     name: "source.verify_presence",

@@ -840,7 +840,7 @@ export class TasksService {
     this.logger.log({ message: "task completed", workspace_id: store.context.workspaceId, task_id: taskId, project_id: current.project_id, milestone_id: pinned.id });
     this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id });
     if (current.kind === "authority" && current.source_domain_id !== null) {
-      this.requestSeededVerification(store.context.workspaceId, current.project_id, taskId);
+      this.requestSeededVerification(store.context.workspaceId, current.project_id, taskId, pinned.occurred_at);
     }
 
     return {
@@ -854,10 +854,12 @@ export class TasksService {
    * STORY-066 AC8 — `source_seeded` fires on "completion of an authority task with a verified target URL" (`scoring-models.md`
    * §13). The fetch is never the request's (KAD-06): this enqueues `source.verify_presence` for THIS task AFTER COMMIT (a job
    * enqueued inside the transaction could run before the `done` row is visible; a rolled-back completion asks for nothing). One
-   * job per task: the key is the task's, so a double click cannot queue two. A failed enqueue is logged, never thrown — the
+   * job per COMPLETION: the key is the task's and its `completed_at`, so a double click (a 409 the second time) cannot queue two,
+   * while a task reopened and completed again is verified again rather than deduplicated by the first job's id. At most one pin
+   * still holds: the job skips a task already pinned, and `ux_milestones_source` is unique over the per-task source id. A failed enqueue is logged, never thrown — the
    * completion is durable, and the domain's next periodic verification still records its presence.
    */
-  private requestSeededVerification(workspaceId: string, projectId: string, taskId: string): void {
+  private requestSeededVerification(workspaceId: string, projectId: string, taskId: string, completedAt: Date): void {
     const queues = this.queues;
     if (queues === undefined) {
       this.logger.warn({ message: "no queue producer: the completed authority task's target is not verified", workspace_id: workspaceId, task_id: taskId });
@@ -865,7 +867,7 @@ export class TasksService {
     }
     afterCommit(() => {
       void queues
-        .enqueueTenantJob("source.verify_presence", workspaceId, { projectId, taskId }, { idempotencyKey: `srcver:seeded:${taskId}` })
+        .enqueueTenantJob("source.verify_presence", workspaceId, { projectId, taskId }, { idempotencyKey: `srcver:seeded:${taskId}:${completedAt.getTime()}` })
         .then(() => {
           incrementCounter("nominara_sources_seeded_requested_total", {});
         })
