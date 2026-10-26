@@ -14,6 +14,7 @@ import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
 import { createIdentitySweepUnverifiedHandler } from "./handlers/identity-sweep-unverified.handler.js";
 import { createMaintenancePartitionHandler } from "./handlers/maintenance-partition.handler.js";
 import { createNotifyDispatchHandler } from "./handlers/notify-dispatch.handler.js";
+import { createReportBuildHandler } from "./handlers/report-build.handler.js";
 import { createCrawlAuditHandler } from "./handlers/crawl-audit.handler.js";
 import { createDomainReverifyHandler } from "./handlers/domain-reverify.handler.js";
 import { createTaskResurfaceHandler } from "./handlers/task-resurface.handler.js";
@@ -95,6 +96,10 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * post-settlement credit-threshold check. Its producers are the notification writer (after commit), the debit paths
  * (after commit) and the rollup group's notify sweep (digests and the relay).
  *
+ * `report.build` lands with STORY-100: ONE scheduled report's ONE period (the cadence path). Its producer is the report group's
+ * in-process sweep over `scheduled_reports.next_send_at` (src/lib/reports/report-sweep.ts), not a cron: `schedule.ts` keeps it at
+ * `cron: null`.
+ *
  * `maintenance.partition` is the obvious first real entry — non-tenant-
  * scoped, and its logic already exists in src/workers/rollup/maintenance.ts,
  * invoked today only by a hand-run script (README gap G-10). Wiring it is a
@@ -121,6 +126,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "billing.customer_email": (context) => createBillingCustomerEmailHandler(context),
   "billing.downgrade_notice": (context) => createBillingDowngradeNoticeHandler(context),
   "notify.dispatch": (context) => createNotifyDispatchHandler(context),
+  "report.build": (context) => createReportBuildHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */

@@ -5,7 +5,8 @@
 //
 //   weekly / biweekly  `day` is the ISO weekday, 1 (Mon) - 7 (Sun). The first
 //                      fire is the next such weekday; the runner spaces a
-//                      biweekly report's repeats a fortnight apart.
+//                      biweekly report's repeats a fortnight apart
+//                      (advanceNextSendAt, below).
 //   monthly            `day` is the day of the month, 1-28 (every month has it).
 //   quarterly          `day` is the day of the month, in Jan, Apr, Jul, Oct.
 //
@@ -80,4 +81,25 @@ export function nextSendAt(spec: ScheduleSpec, after: Date): Date {
     if (at > after.getTime()) return new Date(at);
   }
   throw new Error("no next send instant within 400 days");
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * STORY-100 AC5 — the next fire AFTER a period has been fired (or skipped). `due` is the instant that just fired, `now` the
+ * clock of the run that fired it. The result is strictly after BOTH, so a run that happens days late (a worker outage) does
+ * not queue a burst of catch-up fires: the missed periods collapse into the one that just ran.
+ *
+ * weekly / monthly / quarterly  the next chosen day-of-period after `max(due, now)`.
+ * biweekly  the fortnight keeps the PHASE of `due` (the first fire is the next such weekday; repeats are 14 days on, at the
+ *           same local hour). Stepping 10 days from the previous fire and taking the next matching weekday lands exactly on
+ *           due + 14 days even when a DST change shifts the day's length by an hour, which a 7-day step would not.
+ */
+export function advanceNextSendAt(spec: ScheduleSpec, due: Date, now: Date): Date {
+  const floor = Math.max(due.getTime(), now.getTime());
+  if (spec.cadence !== "biweekly") return nextSendAt(spec, new Date(floor));
+  let next = nextSendAt(spec, new Date(due.getTime() + 10 * DAY_MS));
+  // A bounded loop: a fortnight at a time, so even a year of downtime is ~26 steps.
+  for (let i = 0; i < 200 && next.getTime() <= floor; i += 1) next = nextSendAt(spec, new Date(next.getTime() + 10 * DAY_MS));
+  return next;
 }

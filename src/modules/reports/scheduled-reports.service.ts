@@ -10,7 +10,7 @@ import type {
   ScheduledReportListQuery,
   UpdateScheduledReportRequest,
 } from "../../../contracts/reports/index.js";
-import { DomainError, FeatureNotInPlanError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { FeatureNotInPlanError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { pageFrom, Page } from "../../api/pagination/page.js";
 import { decodeTimestampIdCursor, MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import { isFeatureGranted, type FeatureFlagKey } from "../../lib/entitlements/classification.js";
@@ -18,9 +18,24 @@ import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver
 import { StructuralUsage } from "../../lib/entitlements/structural-usage.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { isDayValidFor, nextSendAt, type ScheduleCadence } from "../../lib/reports/next-send-at.js";
+import {
+  buildReportArtifacts,
+  CSV_ENTITLEMENT,
+  describeCapSkip,
+  failureReason,
+  PDF_ENTITLEMENT,
+  reportNeedsCsv,
+  reportNeedsPdf,
+  resolveReportSender,
+  SCHEDULED_REPORT_COLUMNS,
+  sendReportEmails,
+  writeCapSkipNotification,
+  type ReportSender,
+  type ScheduledReportRow,
+} from "../../lib/reports/run-scheduled-report.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
-import { commitTierCap, provisionUsageCounters, readCounter, releaseTierCap, reserveTierCap, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
+import { commitTierCap, provisionUsageCounters, releaseTierCap, reserveTierCap } from "../../lib/usage/tier-caps.js";
 import { afterCommit, currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 import { EMAIL_SENDER, type EmailSender } from "../identity/ports/email-sender.js";
 import { ExportService } from "./export.service.js";
@@ -59,29 +74,9 @@ export const STALE_SENDING_MS = SCHEDULED_REPORT_MAX_RECIPIENTS * RESEND_WORST_C
 export const DELIVERY_DRAIN_TIMEOUT_MS = 30_000;
 /** How long recording an outcome waits for a pooled connection before giving up (the row then stays `sending` and reads stale). */
 export const DELIVERY_CONNECT_TIMEOUT_MS = 10_000;
-const PDF_ENTITLEMENT = "exports.pdf_per_cycle";
-const CSV_ENTITLEMENT = "exports.csv";
-/**
- * The app origin an emailed artifact link is resolved against. A link is a URL, not an object-storage key (no
- * bucket key is built here; artifacts are inline this week). The download route is the signed-link story (scenario 11).
- */
-const ARTIFACT_LINK_ORIGIN = "https://app.nominara.com";
 
-interface ReportRow {
-  id: string;
-  name: string;
-  project_ids: string[];
-  cadence: ScheduleCadence;
-  day_of_period: number;
-  send_hour_local: number;
-  timeframe: ScheduledReport["timeframe"];
-  format: ScheduledReport["format"];
-  recipients: string[];
-  theme_id: string | null;
-  include_sections: ScheduledReport["sections"];
-  next_send_at: Date | string | null;
-  active: boolean;
-}
+/** The row shape and column list live with the cadence path (src/lib/reports/run-scheduled-report.ts) so the two cannot drift. */
+type ReportRow = ScheduledReportRow;
 
 interface DeliveryRow {
   id: string;
@@ -103,8 +98,7 @@ const deliveryColumns = (staleParam: number): string =>
   `id, scheduled_report_id, attempted_at, status, reason, recipient_count,
    (status = 'sending' AND now() - attempted_at > $${String(staleParam)} * interval '1 millisecond') AS stale`;
 
-const COLUMNS = `id, name, project_ids, cadence, day_of_period, send_hour_local, timeframe, format, recipients::text[] AS recipients,
-                 theme_id, include_sections, next_send_at, active`;
+const COLUMNS = SCHEDULED_REPORT_COLUMNS;
 
 const iso = (v: Date | string): string => new Date(v).toISOString();
 
@@ -132,11 +126,6 @@ function toReport(r: ReportRow, deliveries: DeliveryRow[]): ScheduledReport {
     next_run_at: r.next_send_at === null ? null : iso(r.next_send_at),
     deliveries: deliveries.filter((d) => d.scheduled_report_id === r.id).map((d) => toDelivery(d)),
   };
-}
-
-function failureReason(error: unknown): string {
-  if (error instanceof DomainError) return error.message;
-  return `report build failed (${error instanceof Error ? error.name : "unknown"})`;
 }
 
 @Injectable()
@@ -262,8 +251,8 @@ export class ScheduledReportsService implements OnModuleDestroy {
     const { client, workspaceId } = this.store();
     const report = await this.load(client, id);
     const entitlements = await this.resolver.resolveForWorkspace(workspaceId);
-    const needsPdf = report.format === "pdf" || report.format === "both";
-    const needsCsv = report.format === "csv" || report.format === "both";
+    const needsPdf = reportNeedsPdf(report.format);
+    const needsCsv = reportNeedsCsv(report.format);
 
     // No allowance is an upgrade problem, refused before anything is reserved or built.
     for (const [needed, key] of [[needsPdf, PDF_ENTITLEMENT], [needsCsv, CSV_ENTITLEMENT]] as const) {
@@ -295,18 +284,21 @@ export class ScheduledReportsService implements OnModuleDestroy {
 
     if (needsPdf) await commitTierCap(client, workspaceId, "pdf_exports", jobId);
     const recorded = await this.record(client, workspaceId, report, deliveryId, "sending", null, 0, artifacts[0] ?? null);
+    // STORY-100 AC10: the agency's display name and Reply-To, read from the theme row in THIS transaction (the send itself
+    // holds none) and carried to the post-commit send.
+    const sender = await resolveReportSender(client, report.theme_id);
     // The request's WHOLE tenant context (project scope included) carries to the second transaction.
     const context = currentTenantStore()!.context;
-    afterCommit(() => this.startDelivery(context, report, deliveryId, artifacts));
+    afterCommit(() => this.startDelivery(context, report, deliveryId, artifacts, sender));
     return recorded;
   }
 
   /** Runs after the request transaction has committed. Never throws; a failure to record leaves the row `sending` (read as stale `failed`). */
-  private startDelivery(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[]): void {
+  private startDelivery(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[], sender: ReportSender): void {
     // setImmediate: the request's own connection is released right after its afterCommit tasks run, so the work (and the pooled
     // connection it takes for the second transaction) starts on the next turn, never while the request still holds its own.
     const work = new Promise<void>((resolve) => setImmediate(resolve))
-      .then(() => this.deliver(context, report, deliveryId, artifacts))
+      .then(() => this.deliver(context, report, deliveryId, artifacts, sender))
       .catch((error: unknown) => {
         logger.error({ message: "scheduled report delivery could not be finalised; the row stays sending", workspace_id: context.workspaceId, scheduled_report_id: report.id, error: error instanceof Error ? error.name : "unknown" });
       })
@@ -314,7 +306,7 @@ export class ScheduledReportsService implements OnModuleDestroy {
     this.inflight.add(work);
   }
 
-  private async deliver(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[]): Promise<void> {
+  private async deliver(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[], sender: ReportSender): Promise<void> {
     if (this.stopping) {
       // Shutdown began before this delivery's turn: send NOTHING (the drain has already stopped waiting) and record it as
       // failed, best effort. If recording fails too, the row stays `sending`, reads `failed` after STALE_SENDING_MS, and no
@@ -323,8 +315,7 @@ export class ScheduledReportsService implements OnModuleDestroy {
       return;
     }
     // NOTE: `report.recipients` is the list captured at REQUEST time: edits made while the send runs do not change who is mailed.
-    const failures = await this.sendEmails(report, artifacts);
-    const sent = report.recipients.length - failures;
+    const { sent, failed: failures } = await sendReportEmails(this.email, report, artifacts, sender);
     const ok = failures === 0;
     // `delivered` only when the sender really delivers mail; the logging/dev senders keep the owner's honesty rule (`logged`).
     const status: ScheduledReportDelivery["status"] = ok ? (this.email.delivers === true ? "delivered" : "logged") : "failed";
@@ -385,48 +376,15 @@ export class ScheduledReportsService implements OnModuleDestroy {
     logger.log({ span: "reports.scheduled.deliver", workspace_id: workspaceId, scheduled_report_id: reportId, status });
   }
 
-  /** One export per project and format; the export path is given no Idempotency-Key, so it commits no unit - the run's one unit is committed above. */
-  private async build(report: ReportRow): Promise<string[]> {
-    const formats = report.format === "both" ? (["pdf", "csv"] as const) : ([report.format] as const);
-    const ids: string[] = [];
-    for (const projectId of report.project_ids) {
-      for (const format of formats) {
-        const out = await this.exports.export(
-          projectId,
-          { format, sections: report.include_sections, timeframe: report.timeframe, hide_competitors: false, hide_costs: false },
-          undefined,
-        );
-        ids.push(out.export_id);
-      }
-    }
-    return ids;
-  }
-
-  private async sendEmails(report: ReportRow, artifacts: string[]): Promise<number> {
-    const links = artifacts.map((a) => new URL(`/report-artifacts/${encodeURIComponent(a)}`, ARTIFACT_LINK_ORIGIN).href).join("\n");
-    let failures = 0;
-    for (const to of report.recipients) {
-      try {
-        await this.email.send({ to, subject: "Your scheduled Nominara report is ready", textBody: `Your report "${report.name}" is ready:\n${links}\n` });
-      } catch {
-        failures += 1;
-      }
-    }
-    return failures;
+  /** One export per project and format (the shared builder, so the request and cadence paths build identically). */
+  private build(report: ReportRow): Promise<string[]> {
+    return buildReportArtifacts(this.exports, report);
   }
 
   private async skipForCap(client: ClientBase, workspaceId: string, report: ReportRow, deliveryId: string, periodStart: string, resetsAt: string): Promise<ScheduledReportDelivery> {
-    const counter = await readCounter(client, workspaceId, "pdf_exports", periodStart);
-    const cap = counter === undefined || counter.limitValue === UNLIMITED_LIMIT ? null : counter.limitValue;
-    const capText = cap === null ? "the PDF export cap" : `the cap of ${String(cap)} PDF exports per cycle`;
-    const reason = `Skipped: ${capText} is reached; it resets on ${resetsAt}.`;
-    await client.query(
-      `INSERT INTO notifications (id, workspace_id, kind, severity, title, body, payload)
-       VALUES ($1,$2,'report.skipped_cap','warning',$3,$4,$5)`,
-      [uuidV7(), workspaceId, "A scheduled report was skipped", `"${report.name}" was not sent. ${reason}`,
-        JSON.stringify({ scheduled_report_id: report.id, cap, resets_at: resetsAt })],
-    );
-    return this.record(client, workspaceId, report, deliveryId, "skipped_cap", reason, 0, null);
+    const skip = await describeCapSkip(client, workspaceId, periodStart, resetsAt);
+    await writeCapSkipNotification(client, workspaceId, report, skip, resetsAt);
+    return this.record(client, workspaceId, report, deliveryId, "skipped_cap", skip.reason, 0, null);
   }
 
   private async record(client: ClientBase, workspaceId: string, report: ReportRow, deliveryId: string, status: ScheduledReportDelivery["status"], reason: string | null, recipients: number, artifactId: string | null): Promise<ScheduledReportDelivery> {

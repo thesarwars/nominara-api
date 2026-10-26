@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isDayValidFor, nextSendAt, type ScheduleSpec } from "../../../src/lib/reports/next-send-at.js";
+import { advanceNextSendAt, isDayValidFor, nextSendAt, type ScheduleSpec } from "../../../src/lib/reports/next-send-at.js";
 
 // NEW-E-100c — STORY-100 scenario 7: a schedule fires at the chosen day and the
 // WORKSPACE-LOCAL hour, for each cadence. The computation is pure, so it is
@@ -92,5 +92,60 @@ describe("NEW-E-100c · STORY-100 s7 · next_send_at at each cadence", () => {
 describe("NEW-E-100c · s7 · half-hour zones", () => {
   it("s7 · Asia/Kolkata (UTC+5:30) fires at the local hour, not an hour off", () => {
     expect(iso(nextSendAt(spec({ day: 1, hour: 9, timezone: "Asia/Kolkata" }), at("2026-10-05T00:00:00Z")))).toBe("2026-10-05T03:30:00.000Z");
+  });
+});
+
+// STORY-100 AC5 / owner decision 7 — after a period is FIRED (or skipped: a cap skip, a final failure), next_send_at moves on.
+// advanceNextSendAt(spec, due, now): `due` is the instant that just fired, `now` the clock of the run that fired it.
+describe("STORY-100 AC5 · s7 · next_send_at after a fire", () => {
+  it("s7 weekly · a fire on time moves a week on, at the same local hour", () => {
+    expect(iso(advanceNextSendAt(spec({ day: 3, hour: 9 }), at("2026-10-07T09:00:00Z"), at("2026-10-07T09:02:00Z")))).toBe("2026-10-14T09:00:00.000Z");
+  });
+
+  it("s7 biweekly · repeats are a FORTNIGHT apart, not a week (the first fire is the next such weekday)", () => {
+    const biweekly = spec({ cadence: "biweekly", day: 5, hour: 6 });
+    const first = at("2026-10-09T06:00:00Z");
+    const second = advanceNextSendAt(biweekly, first, at("2026-10-09T06:01:00Z"));
+    expect(iso(second)).toBe("2026-10-23T06:00:00.000Z");
+    expect(iso(advanceNextSendAt(biweekly, second, at("2026-10-23T06:01:00Z")))).toBe("2026-11-06T06:00:00.000Z");
+  });
+
+  it("s7 biweekly · the fortnight keeps its phase when a fire runs late by days (a worker outage)", () => {
+    const biweekly = spec({ cadence: "biweekly", day: 5, hour: 6 });
+    // due 10-09, but the run only happens on 10-26: the next on-phase fortnight is 10-23 (past) so 11-06.
+    expect(iso(advanceNextSendAt(biweekly, at("2026-10-09T06:00:00Z"), at("2026-10-26T12:00:00Z")))).toBe("2026-11-06T06:00:00.000Z");
+  });
+
+  it("s7 biweekly · the local hour survives a DST change inside the fortnight (New York, 2026-11-01)", () => {
+    const biweekly = spec({ cadence: "biweekly", day: 5, hour: 9, timezone: "America/New_York" });
+    // Fri 2026-10-23 09:00 EDT = 13:00Z; two weeks on is Fri 11-06 09:00 EST = 14:00Z.
+    expect(iso(advanceNextSendAt(biweekly, at("2026-10-23T13:00:00Z"), at("2026-10-23T13:01:00Z")))).toBe("2026-11-06T14:00:00.000Z");
+  });
+
+  it("s7 monthly · the next month's day; December rolls into the next year", () => {
+    expect(iso(advanceNextSendAt(spec({ cadence: "monthly", day: 15, hour: 6 }), at("2026-10-15T06:00:00Z"), at("2026-10-15T06:05:00Z")))).toBe("2026-11-15T06:00:00.000Z");
+    expect(iso(advanceNextSendAt(spec({ cadence: "monthly", day: 15, hour: 6 }), at("2026-12-15T06:00:00Z"), at("2026-12-15T06:05:00Z")))).toBe("2027-01-15T06:00:00.000Z");
+  });
+
+  it("s7 quarterly · the next quarter's month (Jan, Apr, Jul, Oct)", () => {
+    expect(iso(advanceNextSendAt(spec({ cadence: "quarterly", day: 1, hour: 0 }), at("2026-10-01T00:00:00Z"), at("2026-10-01T00:03:00Z")))).toBe("2027-01-01T00:00:00.000Z");
+  });
+
+  it("s7 · it never hands back an instant that is not strictly after BOTH the due instant and now (no catch-up flood after an outage)", () => {
+    // Weekly report due 2026-09-02, run on 2026-10-26: one fire for the missed period, then the next FUTURE week, not 7 more.
+    const next = advanceNextSendAt(spec({ day: 3, hour: 9 }), at("2026-09-02T09:00:00Z"), at("2026-10-26T12:00:00Z"));
+    expect(iso(next)).toBe("2026-10-28T09:00:00.000Z");
+    for (const cadence of ["weekly", "biweekly", "monthly", "quarterly"] as const) {
+      const due = at("2026-08-03T09:00:00Z");
+      const now = at("2026-10-26T12:00:00Z");
+      const advanced = advanceNextSendAt(spec({ cadence, day: 3, hour: 9, timezone: "Europe/Berlin" }), due, now);
+      expect(advanced.getTime()).toBeGreaterThan(now.getTime());
+      expect(advanced.getTime()).toBeGreaterThan(due.getTime());
+    }
+  });
+
+  it("s7 · a due instant in the FUTURE (a clock that ran behind) still advances past the due instant", () => {
+    const next = advanceNextSendAt(spec({ day: 3, hour: 9 }), at("2026-10-14T09:00:00Z"), at("2026-10-10T00:00:00Z"));
+    expect(iso(next)).toBe("2026-10-21T09:00:00.000Z");
   });
 });
