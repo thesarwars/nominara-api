@@ -14,6 +14,7 @@ import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { engineKeySchema } from "../../engines/contract.js";
 import { SpendMeter, ValkeySpendMeterStore } from "../../engines/spend-meter.js";
+import type { CaptureEngineGate } from "../../engines/capture-engine-gate.js";
 import { rawObjectStores, type BoundRawObjects, type RawObjectStores } from "../../capture/raw-object-store.js";
 import type { ObjectStoragePort } from "../../storage/storage.port.js";
 import { commitCell, fetchCell, recordExhaustedCell, settledCell, type CaptureCellInput, type CaptureCellOutcome, type CellFetched } from "../../capture/execute-cell.js";
@@ -66,6 +67,8 @@ export interface CaptureExecuteDeps {
   readonly spendMeter?: SpendMeter;
   /** STORY-181 - the object-storage port the raw capture objects are written through (S3 from env when absent). Injectable so a test sees a real key or a failing upload. */
   readonly storagePort?: ObjectStoragePort;
+  /** STORY-031 - the engine breaker + health telemetry the cell is admitted by and reported to. Production builds it on first use. */
+  readonly engineGate?: CaptureEngineGate;
 }
 
 /** What `capture.parse` needs to find and re-read the row this handler wrote. */

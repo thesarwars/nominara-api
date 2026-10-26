@@ -42,6 +42,34 @@ export interface EngineBreakerDecision {
   readonly retry: boolean;
 }
 
+/** Why the breaker last opened: EC-08 quota exhaustion, or the EC-06 stage-4 block ratio (or a failed half-open probe). */
+export type EngineBreakerOpenReason = "quota" | "ratio";
+
+/**
+ * STORY-031 AC6/AC7 - the breaker's current EPISODE: when it left `closed`, and why it last opened. `since` survives the
+ * half-open probe that fails and re-opens the breaker, so "circuit open > 30 min" (EC-06 stage 5) is measured across
+ * re-opens, not reset by each one.
+ */
+export interface EngineBreakerDetail {
+  readonly state: CircuitState;
+  /** The current open window's start (epoch ms), or null when closed. */
+  readonly openedAt: number | null;
+  /** When the breaker left `closed` for this episode (epoch ms), or null when closed. */
+  readonly since: number | null;
+  readonly reason: EngineBreakerOpenReason | null;
+}
+
+export interface EngineBreakerEpisode {
+  readonly since: number;
+  readonly reason: EngineBreakerOpenReason;
+}
+
+/** Where the episode lives (Valkey in production, next to the state key). Best-effort like the state store's writes. */
+export interface EngineBreakerEpisodeStore {
+  read(engineKey: EngineKey): Promise<EngineBreakerEpisode | null>;
+  write(engineKey: EngineKey, episode: EngineBreakerEpisode | null): Promise<void>;
+}
+
 export interface EngineBreakerStateStore {
   /** Returns the persisted `openedAt` (epoch ms), or null if closed / never opened. */
   read(engineKey: EngineKey): Promise<number | null>;
@@ -51,6 +79,8 @@ export interface EngineBreakerStateStore {
 export interface EngineBreakerRatioCounter {
   /** Records one attempt (and, if `isBlocked`, one block) into the rolling window; returns the window's current totals. */
   record(engineKey: EngineKey, isBlocked: boolean): Promise<{ attempts: number; blocks: number }>;
+  /** STORY-031 AC6 - the window's current totals WITHOUT recording an attempt (the ladder evaluator reads, it never counts). */
+  peek?(engineKey: EngineKey): Promise<{ attempts: number; blocks: number }>;
 }
 
 /**
@@ -181,6 +211,7 @@ export class EngineBreaker {
     private readonly store: EngineBreakerStateStore,
     private readonly ratioCounter: EngineBreakerRatioCounter,
     private readonly clock: () => number = () => Date.now(),
+    private readonly episodes: EngineBreakerEpisodeStore | null = null,
   ) {
     this.breaker = this.freshBreaker();
   }
@@ -212,6 +243,16 @@ export class EngineBreaker {
     if (openedAt !== null) {
       this.breaker.forceOpen(openedAt);
     }
+  }
+
+  /** RED: the episode read lands with the implementation. */
+  detail(): Promise<EngineBreakerDetail> {
+    return Promise.reject(new Error(`not implemented${this.episodes === null ? "" : ""}`));
+  }
+
+  /** RED: blocks/attempts over the rolling window, 0 with no attempts. */
+  blockRatio(): Promise<number> {
+    return Promise.reject(new Error("not implemented"));
   }
 
   async state(): Promise<CircuitState> {

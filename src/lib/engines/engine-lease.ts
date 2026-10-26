@@ -31,6 +31,8 @@ export interface EngineLeaseOptions {
   readonly clock?: () => number;
   /** SCANFIX D3 - when set, a rate_limited failure is deferred by the vendor's Retry-After instead of spending an attempt. */
   readonly rateLimitDeferral?: { readonly maxDeferrals: number };
+  /** STORY-031 AC6 (EC-06 stage 2) - the config actually spent from while a `rate_limited` refill reduction is active. */
+  readonly refillReduction?: { effectiveConfig(engineKey: EngineKey, base: TokenBucketConfig): Promise<TokenBucketConfig> };
 }
 
 /** SCANFIX D3 - how long a 429 that named no Retry-After is deferred: one vendor quota window. */
