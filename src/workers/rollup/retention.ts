@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Logger } from "@nestjs/common";
 import { fileURLToPath } from "node:url";
 import type { ClientBase } from "pg";
 import type { PurgeFailureDetail } from "../../../contracts/ops/purge-failure-detail.schema.js";
@@ -7,6 +8,7 @@ import { WorkspaceLockBusyError } from "../../lib/billing/errors.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { RECHAINED_MARKER_ACTION } from "../../lib/crypto/audit-chain.js";
 import { pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import { appendMark, appendTombstone, findBrokenMark, readChainHead } from "../../modules/audit/audit-chain-marks.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
@@ -14,6 +16,7 @@ import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { listPartitions } from "./maintenance.js";
 
 const auditChain = new AuditChainService();
+const logger = new Logger("retention.sweep");
 
 // STORY-013 — data-model.md §7 "Retention, erasure and the deletion
 // cascade". The nightly retention cascade + orphan scan. Same "plain,
@@ -88,15 +91,30 @@ export function resolveRetentionCutoff(window: RetentionWindow, referenceDate: D
 export interface WorkspaceRetention {
   readonly rawCapturesDays: RetentionWindow;
   readonly rollupsDays: RetentionWindow;
+  /**
+   * STORY-077 slice B (EC-41): while this is in the future the retention sweep expires NOTHING for the workspace, and the read
+   * paths hide nothing by window. A plan change that shortens retention sets it to day 15 (lib/billing/retention-shortening.ts).
+   * `null` is no deferral. It can only delay a purge; nothing reads it to purge more.
+   */
+  readonly purgeNotBefore: Date | null;
+}
+
+/**
+ * True while the workspace's retention purge is deferred: until `referenceDate` is STRICTLY after `purgeNotBefore`. At the
+ * instant itself it is still deferred, the side that keeps data (the first purge is day 15, never the moment day 15 begins).
+ */
+export function retentionPurgeDeferred(retention: WorkspaceRetention, referenceDate: Date): boolean {
+  return retention.purgeNotBefore !== null && retention.purgeNotBefore.getTime() >= referenceDate.getTime();
 }
 
 export async function resolveWorkspaceRetention(client: ClientBase, workspaceId: string): Promise<WorkspaceRetention> {
-  const result = await client.query<{ raw: unknown; rollups: unknown }>(
+  const result = await client.query<{ raw: unknown; rollups: unknown; purge_not_before: Date | null }>(
     // ->'value' because STORY-069 wrapped every entitlement as
     // {value, live}. Reading the key directly now yields the whole object,
     // which resolveRetentionWindow would see as neither a number nor null.
     `SELECT p.entitlements->'retention.raw_captures_days'->'value' AS raw,
-            p.entitlements->'retention.rollups_days'->'value'       AS rollups
+            p.entitlements->'retention.rollups_days'->'value'       AS rollups,
+            w.retention_purge_not_before                            AS purge_not_before
        FROM workspaces w
        JOIN plans p ON p.key = w.plan_key
       WHERE w.id = $1`,
@@ -106,7 +124,7 @@ export async function resolveWorkspaceRetention(client: ClientBase, workspaceId:
   if (!row) {
     throw new Error(`resolveWorkspaceRetention: workspace ${workspaceId} not found`);
   }
-  return { rawCapturesDays: row.raw as RetentionWindow, rollupsDays: row.rollups as RetentionWindow };
+  return { rawCapturesDays: row.raw as RetentionWindow, rollupsDays: row.rollups as RetentionWindow, purgeNotBefore: row.purge_not_before };
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +764,8 @@ export interface NightlySweepResult {
   readonly derivedAnalysesExpired: DerivedAnalysesExpired;
   readonly attributionDailyExpired: number;
   readonly toolSnapshotsExpired: number;
+  /** Workspaces skipped because their first purge is deferred past a retention-shortening notice (STORY-077 slice B). */
+  readonly deferredWorkspaces: number;
   readonly orphans: readonly OrphanReport[];
 }
 
@@ -764,8 +784,18 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
     topicClusters: 0,
   };
 
+  let workspacesDeferred = 0;
   for (const { id: workspaceId } of workspaces.rows) {
     const retention = await resolveWorkspaceRetention(privilegedClient, workspaceId);
+    // STORY-077 slice B (EC-41): a plan change that shortened retention defers the FIRST purge past its notice. The check can
+    // only SKIP this workspace's expiries (it adds no predicate to any DELETE or UPDATE below), so it cannot widen what this
+    // owner-role connection removes. A workspace with no deferral runs exactly as before.
+    if (retentionPurgeDeferred(retention, referenceDate)) {
+      workspacesDeferred += 1;
+      incrementCounter("nominara_retention_sweep_deferred_total");
+      logger.log({ message: "retention sweep deferred for a workspace (shortened-retention notice period)", workspace_id: workspaceId });
+      continue;
+    }
     rawCapturesExpired += await expireRawCaptures(privilegedClient, workspaceId, retention.rawCapturesDays, referenceDate);
     rollupsExpired += await expireRollups(privilegedClient, workspaceId, retention.rollupsDays, referenceDate);
     const derived = await expireDerivedAnalyses(privilegedClient, workspaceId, retention.rollupsDays, referenceDate);
@@ -784,6 +814,7 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
     derivedAnalysesExpired,
     attributionDailyExpired,
     toolSnapshotsExpired,
+    deferredWorkspaces: workspacesDeferred,
     orphans,
   };
 }

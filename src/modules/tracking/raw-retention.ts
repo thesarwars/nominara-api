@@ -1,7 +1,7 @@
 import type { ClientBase } from "pg";
 import { RetentionExceededError } from "../../api/errors/domain-errors.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { resolveRetentionCutoff, resolveWorkspaceRetention } from "../../workers/rollup/retention.js";
+import { resolveRetentionCutoff, resolveWorkspaceRetention, retentionPurgeDeferred } from "../../workers/rollup/retention.js";
 
 // STORY-034 AC10 / STORY-181 AC4 - the raw-capture retention window, as the READ paths see it.
 //
@@ -13,6 +13,9 @@ import { resolveRetentionCutoff, resolveWorkspaceRetention } from "../../workers
 /** The oldest `captured_at` still inside the workspace's raw-capture retention, or null when it is never purged. */
 export async function rawRetentionCutoff(client: ClientBase, workspaceId: string, now: Date = new Date()): Promise<Date | null> {
   const retention = await resolveWorkspaceRetention(client, workspaceId);
+  // STORY-077 slice B: while the first purge is deferred past a retention-shortening notice, the window hides nothing (the data
+  // is still there for the customer to export). A capture the sweep already expired stays hidden by its marker.
+  if (retentionPurgeDeferred(retention, now)) return null;
   return resolveRetentionCutoff(retention.rawCapturesDays, now);
 }
 

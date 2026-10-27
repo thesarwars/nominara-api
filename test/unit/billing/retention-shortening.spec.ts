@@ -1,0 +1,92 @@
+import { describe, expect, it } from "vitest";
+import {
+  RETENTION_FIRST_PURGE_DAYS,
+  RETENTION_NOTICE_DAYS,
+  retentionShorteningEmail,
+  windowShortened,
+} from "../../../src/lib/billing/retention-shortening.js";
+
+// STORY-077 slice B · EC-41 · test scenario 6 (the pure half): which plan changes count as shortening, and what the notice says.
+
+describe("STORY-077 R1 · windowShortened", () => {
+  it.each([
+    [395, 90, true],
+    [90, 90, false],
+    [90, 395, false],
+    ["unlimited", 1095, true],
+    [null, 395, false], // "—" (free tier rollups) is not a window that can be shortened
+    [395, "unlimited", false],
+    [395, null, false],
+    [null, null, false],
+    ["unlimited", null, false],
+    [null, "unlimited", false],
+  ] as const)("R1 · %s -> %s shortened = %s", (from, to, expected) => {
+    expect(windowShortened(from, to)).toBe(expected);
+  });
+});
+
+describe("STORY-077 R1 · the constants are the reference's", () => {
+  it("R1 · a 14-day notice and the first purge on day 15", () => {
+    expect(RETENTION_NOTICE_DAYS).toBe(14);
+    expect(RETENTION_FIRST_PURGE_DAYS).toBe(15);
+  });
+});
+
+describe("STORY-077 R1 · retentionShorteningEmail", () => {
+  const purgeNotBefore = new Date("2026-11-11T09:30:00.000Z");
+  const base = {
+    fromPlanName: "Business",
+    toPlanName: "Starter",
+    purgeNotBefore,
+    raw: {
+      from: 395 as number | "unlimited" | null,
+      to: 90 as number | "unlimited" | null,
+      cutoff: new Date("2026-08-13T09:30:00.000Z"),
+      projects: [
+        { name: "Acme Site", count: 120, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2026-08-12T00:00:00.000Z") },
+        { name: "Acme Blog", count: 1, oldest: new Date("2026-01-01T00:00:00.000Z"), newest: new Date("2026-01-01T00:00:00.000Z") },
+      ],
+    },
+    rollups: null,
+  };
+
+  it("R1 · names the purge date, each project's exact count and its oldest and newest capture dates", () => {
+    const m = retentionShorteningEmail("owner@example.com", base);
+    expect(m.to).toBe("owner@example.com");
+    expect(m.textBody).toContain("2026-11-11");
+    expect(m.textBody).toContain("Acme Site: 120 captures, 2025-10-01 to 2026-08-12");
+    expect(m.textBody).toContain("Acme Blog: 1 capture, 2026-01-01 to 2026-01-01");
+    expect(m.textBody).toContain("121");
+    expect(m.textBody).toContain("2026-08-13");
+  });
+
+  it("R1 · offers the report export and says nothing is deleted before the purge date", () => {
+    const body = retentionShorteningEmail("o@example.com", base).textBody;
+    expect(body).toMatch(/export/i);
+    expect(body).toMatch(/nothing is deleted before 2026-11-11/i);
+  });
+
+  it("R1 · says charts and milestones outlive the raw text", () => {
+    const body = retentionShorteningEmail("o@example.com", base).textBody;
+    expect(body).toMatch(/rollups|charts/i);
+    expect(body).toMatch(/milestones/i);
+  });
+
+  it("R1 · nothing older than the new window: says so rather than listing nothing", () => {
+    const body = retentionShorteningEmail("o@example.com", { ...base, raw: { ...base.raw, projects: [] } }).textBody;
+    expect(body).toMatch(/no existing .* older than/i);
+  });
+
+  it("R1 · bounds the named projects but keeps the totals exact", () => {
+    const many = Array.from({ length: 80 }, (_, i) => ({ name: `P${String(i)}`, count: 2, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-02-01T00:00:00.000Z") }));
+    const body = retentionShorteningEmail("o@example.com", { ...base, raw: { ...base.raw, projects: many } }).textBody;
+    expect(body).toContain("160");
+    expect(body).toMatch(/and 30 more/);
+    expect(body).not.toContain("P79:");
+  });
+
+  it("R1 · the body carries no workspace id and no raw engine text (names, counts and dates only)", () => {
+    const body = retentionShorteningEmail("o@example.com", base).textBody;
+    expect(body).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-/);
+  });
+});

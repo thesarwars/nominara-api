@@ -705,6 +705,35 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     }
   });
 
+  it("R4 · a project the purge skipped for an open export is purged on the NEXT cycle, once the export lock releases", async () => {
+    const workspaceId = await createWorkspace();
+    const projectId = await createProject(workspaceId);
+    const referenceDate = new Date("2026-06-01T00:00:00.000Z");
+    await client.query("UPDATE projects SET deleted_at = $2 WHERE id = $1", [projectId, new Date(referenceDate.getTime() - 31 * 86_400_000).toISOString()]);
+    const purged: string[] = [];
+    const options = { referenceDate, deleteObjectPrefix: async (prefix: string) => void purged.push(prefix) };
+
+    let releaseExport: () => void = () => undefined;
+    const exportHeld = new Promise<void>((resolve) => {
+      releaseExport = resolve;
+    });
+    const exportPromise = withExportLock(workerClient, projectId, async () => exportHeld);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const first = await runDailyPurgeCycle(client, options);
+    expect(first.skipped).toContainEqual({ scope: "project", scopeId: projectId, reason: "export-lock-held" });
+    expect(first.projectsPurged).not.toContain(projectId);
+    expect((await client.query("SELECT 1 FROM projects WHERE id = $1", [projectId])).rowCount, "still there: the export held it").toBe(1);
+
+    releaseExport();
+    await exportPromise;
+
+    const second = await runDailyPurgeCycle(client, options);
+    expect(second.projectsPurged).toContain(projectId);
+    expect(second.skipped.map((s) => s.scopeId)).not.toContain(projectId);
+    expect((await client.query("SELECT 1 FROM projects WHERE id = $1", [projectId])).rowCount).toBe(0);
+  });
+
   it("widen · two simultaneous exports on the same project — the second waits, it does not race or error", async () => {
     const workspaceId = await createWorkspace();
     const projectId = await createProject(workspaceId);

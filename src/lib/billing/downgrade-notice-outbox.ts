@@ -25,7 +25,7 @@ import { incrementCounter } from "../telemetry/metrics.js";
 // with the notice id; the relay sends it at its next hourly tick.
 
 export const DOWNGRADE_NOTICE_QUEUE = "billing.downgrade_notice" as const;
-export type DowngradeNoticeKind = "paused" | "resumed";
+export type DowngradeNoticeKind = "paused" | "resumed" | "retention_shortened";
 
 export interface RecordedNotice extends EmailMessage {
   /** `downgrade_notices.id`: the job's payload and the provider idempotency key. */

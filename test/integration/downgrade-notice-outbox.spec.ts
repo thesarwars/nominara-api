@@ -43,10 +43,19 @@ describe("STORY-077 owner decision 2026-10-23 · the downgrade email goes throug
     return sent;
   }
 
+  // STORY-077 slice B: a downgrade that shortens retention ALSO records and enqueues a `retention_shortened` notice through the same
+  // outbox (retention-notice.spec.ts and stripe-subscriptions.spec.ts own that). This spec is about the pause/resume emails, so
+  // `cutOver` registers that notice's job key and the spy files its job apart, in `retentionCalls`.
+  const retentionJobKeys = new Set<string>();
+  const retentionCalls: Array<{ queue: string; workspaceId: string; payload: Record<string, unknown>; key: string }> = [];
+
   function spyEnqueue() {
     const calls: Array<{ queue: string; workspaceId: string; payload: Record<string, unknown>; key: string }> = [];
+    retentionCalls.length = 0;
     vi.spyOn(QueueProducer.prototype, "enqueueTenantJob").mockImplementation(async (queue, workspaceId, payload, options) => {
-      calls.push({ queue, workspaceId, payload: payload as Record<string, unknown>, key: options.idempotencyKey });
+      const call = { queue, workspaceId, payload: payload as Record<string, unknown>, key: options.idempotencyKey };
+      if (retentionJobKeys.has(options.idempotencyKey)) retentionCalls.push(call);
+      else calls.push(call);
       return { id: options.idempotencyKey } as never;
     });
     return calls;
@@ -74,6 +83,7 @@ describe("STORY-077 owner decision 2026-10-23 · the downgrade email goes throug
   /** Five Business projects, a downgrade to Growth scheduled, then Stripe's cut-over delivered as `eventId`. */
   async function cutOver(eventId: string) {
     const { workspaceId, owner } = await f.newWorkspace("business");
+    retentionJobKeys.add(downgradeNoticeJobKey(workspaceId, eventId, "retention_shortened"));
     await f.projects(workspaceId, 5);
     const res = await f.post(owner, "/billing/subscription/change", { plan_key: "growth" });
     expect(res.statusCode, res.body).toBe(202);
@@ -87,7 +97,7 @@ describe("STORY-077 owner decision 2026-10-23 · the downgrade email goes throug
 
   const notices = async (workspaceId: string) =>
     (await db().query<{ id: string; request_id: string; kind: string; recipient: string; subject: string; text_body: string; sent_at: Date | null }>(
-      "SELECT id, request_id, kind, recipient, subject, text_body, sent_at FROM downgrade_notices WHERE workspace_id = $1 ORDER BY created_at, kind",
+      "SELECT id, request_id, kind, recipient, subject, text_body, sent_at FROM downgrade_notices WHERE workspace_id = $1 AND kind IN ('paused', 'resumed') ORDER BY created_at, kind",
       [workspaceId],
     )).rows;
 
@@ -104,6 +114,11 @@ describe("STORY-077 owner decision 2026-10-23 · the downgrade email goes throug
     expect(rows[0]!.text_body).toContain("P3");
     expect(rows[0]!.text_body).toContain("P4");
     expect(enqueued).toEqual([{ queue: "billing.downgrade_notice", workspaceId, payload: { noticeId: rows[0]!.id }, key: downgradeNoticeJobKey(workspaceId, eventId, "paused") }]);
+    // STORY-077 slice B: the same cut-over also recorded and enqueued the retention-shortening notice, one job, same queue, ids only.
+    const retention = await db().query<{ id: string; sent_at: Date | null }>("SELECT id, sent_at FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'retention_shortened'", [workspaceId]);
+    expect(retention.rows).toHaveLength(1);
+    expect(retention.rows[0]!.sent_at).toBeNull();
+    expect(retentionCalls).toEqual([{ queue: "billing.downgrade_notice", workspaceId, payload: { noticeId: retention.rows[0]!.id }, key: downgradeNoticeJobKey(workspaceId, eventId, "retention_shortened") }]);
   });
 
   it("a FAILED send is retried by the job and the email goes out exactly once; another run of the job, and a Stripe redelivery of the same event, send nothing more", async () => {
@@ -215,7 +230,8 @@ describe("STORY-077 owner decision 2026-10-23 · the downgrade email goes throug
         // A later tick finds nothing to relay for it; the relayed job delivered twice sends nothing more.
         const later = relayEnqueue();
         await relayUnsentDowngradeNotices(db(), later.enqueue, new Date(now.getTime() + 3_600_000));
-        expect(later.calls.filter((c) => c.workspaceId === workspaceId)).toEqual([]);
+        // (Filtered to THIS notice: the same cut-over's retention notice is a separate row this test never sends, and the relay rightly offers it.)
+        expect(later.calls.filter((c) => c.payload.noticeId === notice!.id)).toEqual([]);
         await runJob(jobFor(workspaceId, mine[0]!.payload));
         expect(attempts).toHaveLength(sentCount);
       } finally {
