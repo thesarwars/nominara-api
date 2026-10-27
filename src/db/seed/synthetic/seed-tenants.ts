@@ -7,6 +7,7 @@ import { PROMPT_OCCUPIES_SLOT } from "../../../lib/entitlements/structural-usage
 import { nextRunAfter } from "../../../lib/capture/scheduler.js";
 import { startingCadenceFor } from "../../../lib/capture/starting-cadence.js";
 import { uuidV7 } from "../../../lib/ids/uuidv7.js";
+import { promptTextHash } from "../../../lib/promptgen/text-hash.js";
 import { resolveBillingPeriod } from "../../../lib/usage/billing-period.js";
 import { AuditChainService } from "../../../modules/audit/audit-chain.service.js";
 import type { DekProvisioner } from "../../../modules/workspaces/ports/dek-provisioner.js";
@@ -35,7 +36,7 @@ import {
 // DATABASE_URL_POOLED that names a superuser is refused before any row.
 //
 // Per tenant, three steps, in this order on purpose:
-//   1. one transaction: the owner user (reused if the address already has an
+//   1. one transaction: the owner user (reused if the address already has an active or unverified
 //      account), and — only when the workspace row does not exist — the
 //      workspace, its DEK, the owner membership and the starting `free`
 //      subscription, audited `workspace.created`. This is the row set
@@ -110,16 +111,29 @@ async function inTenant<T>(pool: SyntheticSeedPool, workspaceId: string, fn: (tx
   }
 }
 
-/** The account at the owner address: reused when one exists (any status), created active and verified otherwise. */
+/** Account statuses the seed may attach an owner membership to: the account sign-in creates, and an active one. */
+const REUSABLE_OWNER_STATUSES: readonly string[] = ["active", "unverified"];
+
+/**
+ * The account at the owner address: reused when one exists and is `active` or `unverified` (the row email-OTP
+ * sign-up leaves), created active and verified otherwise. A `suspended` (or `deleted`) account is REFUSED: the seed
+ * must not hand a workspace to an account an operator has shut.
+ */
 async function ensureOwnerUser(tx: ClientBase, email: string): Promise<string> {
   await tx.query(
     `INSERT INTO users (id, email, status, email_verified_at) VALUES ($1, $2, 'active', now())
      ON CONFLICT (email) WHERE deleted_at IS NULL DO NOTHING`,
     [uuidV7(), email],
   );
-  const result = await tx.query<{ id: string }>(`SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL`, [email]);
+  const result = await tx.query<{ id: string; status: string }>(`SELECT id, status FROM users WHERE email = $1 AND deleted_at IS NULL`, [email]);
   const row = result.rows[0];
   if (row === undefined) throw new SyntheticSeedError(`could not resolve the owner account for ${email}`);
+  if (!REUSABLE_OWNER_STATUSES.includes(row.status)) {
+    throw new SyntheticSeedError(
+      `the account at ${email} is ${row.status}; the seed attaches a workspace only to an active or unverified account. ` +
+        "Run `pnpm db:reset --seed` to start over.",
+    );
+  }
   return row.id;
 }
 
@@ -243,18 +257,20 @@ async function ensureProject(
   let promptsCreated = 0;
   for (const prompt of project.prompts) {
     // Activated-and-free, as the demo seed writes them (STORY-046 AC3): the charge rule always has a fact.
+    // text_hash is sha256(normalise(text)) (schemas/projects-and-prompts.md), computed by the ONE implementation the
+    // API's dedupe uses, so the same question added through the API dedupes against a seeded row.
     const inserted = await tx.query(
       `INSERT INTO tracked_prompts
          (id, workspace_id, project_id, generation_source, text, text_hash, intent_archetype, funnel_stage, status, generator_meta,
           first_activated_at, activation_credits)
-       VALUES ($1,$2,$3,'manual',$4,sha256($5::bytea),$6,$7,'active',$8::jsonb, now(), 0)
+       VALUES ($1,$2,$3,'manual',$4,$5,$6,$7,'active',$8::jsonb, now(), 0)
        ON CONFLICT (project_id, text_hash) WHERE deleted_at IS NULL DO NOTHING`,
       [
         uuidV7(),
         workspaceId,
         project.id,
         prompt.text,
-        prompt.text,
+        promptTextHash(prompt.text).bytes,
         prompt.intentArchetype,
         prompt.funnelStage,
         JSON.stringify({ [SYNTHETIC_SEED_MARKER_KEY]: SYNTHETIC_SEED_MARKER }),
@@ -276,19 +292,18 @@ async function ensureProject(
     );
   }
 
+  // One statement per competitor, against ux_competitors_project_name (project_id, lower(name)) WHERE deleted_at IS
+  // NULL: a concurrent seed's uncommitted row makes this insert WAIT, and once it commits this one does nothing, where
+  // a SELECT-then-INSERT failed on the unique index.
   let competitorsCreated = 0;
   for (const [index, competitor] of project.competitors.entries()) {
-    const existing = await tx.query(`SELECT 1 FROM competitors WHERE project_id = $1 AND lower(name) = lower($2) AND deleted_at IS NULL`, [
-      project.id,
-      competitor.name,
-    ]);
-    if ((existing.rowCount ?? 0) > 0) continue;
-    await tx.query(
+    const inserted = await tx.query(
       `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source, is_primary)
-       VALUES ($1,$2,$3,$4,$5,ARRAY[]::text[],'user',$6)`,
+       VALUES ($1,$2,$3,$4,$5,ARRAY[]::text[],'user',$6)
+       ON CONFLICT (project_id, lower(name)) WHERE deleted_at IS NULL DO NOTHING`,
       [uuidV7(), workspaceId, project.id, competitor.name, competitor.rootDomain, index === 0],
     );
-    competitorsCreated += 1;
+    competitorsCreated += inserted.rowCount ?? 0;
   }
 
   return { projectsCreated: projectCreated ? 1 : 0, promptsCreated, competitorsCreated };
