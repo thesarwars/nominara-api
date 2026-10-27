@@ -37,12 +37,23 @@ one per paid tier, each set through `pnpm plan:set` and given one 500-credit gra
 `pnpm db:seed` runs on the host and refuses unless `NODE_ENV` is not production, `DATABASE_URL` and
 `DATABASE_URL_POOLED` both name a local host, and `NOMINARA_SYNTHETIC_SEED=1` (`dev:up` sets all of this
 from the stack's published ports). Every write goes through `DATABASE_URL_POOLED` as `nominara_app`.
+**Nothing loads `.env`**: run it through `pnpm dev:up`, or standalone with the whole environment exported
+(`set -a; . ./.env; set +a; NOMINARA_SYNTHETIC_SEED=1 pnpm db:seed`, plus the four connection URLs if you
+moved a host port). For the host-side steps `dev:up` takes `.env` over an exported shell variable, as the
+containers' `env_file` does, except for what compose interpolates (host ports, `NOMINARA_API_IMAGE`) and
+`COMPOSE_*`; it names any exported variable it ignored.
 
-**Starting over (AC7):** `pnpm dev:up --reset` runs `pnpm db:reset --seed` against the stack with the
-same derived environment: it drops everything this project owns, re-applies every migration, re-applies the
-role passwords and re-seeds (the seed guard is checked before anything is dropped). `pnpm db:reset --seed`
-can also be run directly with that environment exported. To discard the volumes as well:
+**Starting over (AC7):** `pnpm dev:up --reset` stops the API, gateway and workers, flushes **both**
+Valkeys (queue and cache: the seeded workspace and project ids are fixed, so a job or cache entry from
+before would otherwise attach to the rebuilt rows), runs `pnpm db:reset --seed` with the same derived
+environment (drops everything this project owns, re-applies every migration, re-applies the role passwords
+and re-seeds; the seed guard is checked before anything is dropped), then starts the services again.
+`pnpm db:reset --seed` on its own resets Postgres only. To discard the volumes as well:
 `docker compose down -v && pnpm dev:up`.
+
+**Object storage:** `dev:up` does not start the LocalStack emulator (compose profile `storage`, opt-in
+since nothing writes to it yet; STORY-181 switches it on). Until then: `COMPOSE_PROFILES=storage pnpm dev:up`,
+with the `STORAGE_*` keys set in `.env` as `.env.example` describes.
 
 **A second stack on one machine** (another worktree, a verification run): every host port and the image
 tag are overridable, and the seed follows the ports.

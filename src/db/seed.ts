@@ -12,11 +12,17 @@ import { runSyntheticSeed } from "./seed/synthetic/seed-tenants.js";
 // (src/db/seed/synthetic/constants.ts). Dev-only and idempotent: run it as
 // often as you like; a second run writes nothing.
 //
-// Usage (`pnpm dev:up` runs this for you with the right environment):
-//   NOMINARA_SYNTHETIC_SEED=1 pnpm db:seed
+// Usage: run it through `pnpm dev:up` (or `pnpm dev:up --reset`), which
+// derives the environment for you. NOTHING LOADS .env: run standalone, it
+// needs the full API environment EXPORTED: .env, with NOMINARA_SYNTHETIC_SEED=1
+// and, if you moved a host port, the four URLs (DATABASE_URL,
+// DATABASE_URL_POOLED, VALKEY_CACHE_URL, QUEUE_REDIS_URL) pointed at the moved
+// ports the way `dev:up` derives them (.env's URLs name the default ports):
+//   set -a; . ./.env; set +a; NOMINARA_SYNTHETIC_SEED=1 pnpm db:seed
 //
-// It needs the full API environment (the DEK wrapping key; `plan:set`, which
-// it runs, loads the whole config) and refuses unless NODE_ENV is not
+// The DEK wrapping key must be the one in .env, the one the API uses, or the
+// API cannot unwrap the seeded tenants' DEKs; `plan:set`, which it runs, loads
+// the whole config. It refuses unless NODE_ENV is not
 // production, DATABASE_URL and DATABASE_URL_POOLED both name a local host,
 // and NOMINARA_SYNTHETIC_SEED=1 (src/db/seed/synthetic/guard.ts). Every write
 // goes through DATABASE_URL_POOLED; DATABASE_URL is only checked, never used.

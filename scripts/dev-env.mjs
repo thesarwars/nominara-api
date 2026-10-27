@@ -137,3 +137,61 @@ export function ensureDevEnv(dir) {
   writeFileSync(path, generateDevEnv(readFileSync(join(dir, ".env.example"), "utf8")), { mode: 0o600 });
   return { created: true, path };
 }
+
+// ---- dev:up host-side environment (review round 1) --------------------------------------------------------------
+//
+// The containers read .env through `env_file`, and a shell variable NEVER overrides that; only compose's own
+// `${NAME}` interpolation (the host ports, the image tag) and its COMPOSE_* settings let the shell win. The host-side
+// seed and its plan:set child must see exactly what the containers see, or a stale exported
+// WORKSPACE_DEK_WRAPPING_KEY / QUEUE_JOB_SIGNING_KEY wraps the synthetic tenants' DEKs (and signs the plan job) with a
+// key the API and workers never hold. So: .env wins, except for what compose itself lets the shell decide.
+
+/** Compose's own settings, read from the shell by compose itself. */
+const COMPOSE_SETTINGS = Object.freeze(["COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES", "COMPOSE_FILE"]);
+
+/** Every `${NAME}` / `${NAME:-default}` that docker-compose.yml interpolates, read from the file itself so it cannot drift. */
+export function composeInterpolationNames(composeText) {
+  const names = new Set();
+  for (const match of composeText.matchAll(/\$\{([A-Z][A-Z0-9_]*)/gu)) names.add(match[1]);
+  return [...names];
+}
+
+/**
+ * The environment the host-side steps run with: the shell, then .env over it, then the shell again for the names
+ * compose interpolates or reads itself. `ignoredShell` names (never values) the shell variables .env overrode.
+ */
+export function hostSideEnv({ dotenv, shell, composeText }) {
+  const shellWins = new Set([...composeInterpolationNames(composeText), ...COMPOSE_SETTINGS]);
+  const env = { ...shell, ...dotenv };
+  const ignoredShell = [];
+  for (const [name, value] of Object.entries(shell)) {
+    if (value === undefined) continue;
+    if (shellWins.has(name)) env[name] = value;
+    else if (name in dotenv && dotenv[name] !== value) ignoredShell.push(name);
+  }
+  return { env, ignoredShell };
+}
+
+// ---- dev:up --reset (STORY-004 AC7, review round 1) ------------------------------------------------------------
+//
+// The seed's workspace and project ids are FIXED, so anything outside Postgres keyed by them survives a database
+// reset and attaches to the rebuilt rows: a queued or delayed BullMQ job, an entitlement or idempotency cache entry.
+// And the api and workers hold pooled connections while the schema is dropped. So the reset stops every service that
+// connects or consumes, flushes BOTH Valkeys, drops + re-migrates + re-seeds, then brings the services back.
+
+/** Infrastructure and one-shot services: kept running (or left exited) across a reset. */
+const RESET_KEEPS = Object.freeze(["postgres", "pgbouncer", "valkey", "valkey-cache", "localstack", "migrate", "dev-credentials"]);
+/** The two Valkey services: the QUEUE instance and the CACHE instance (system-architecture.md §11). */
+const RESET_FLUSHES = Object.freeze(["valkey", "valkey-cache"]);
+
+/** The ordered steps of `dev:up --reset`, given `docker compose config --services`. `seedEnv` marks the step run with the seed environment. */
+export function resetSteps(services) {
+  const consumers = services.filter((service) => !RESET_KEEPS.includes(service));
+  return [
+    ...(consumers.length > 0 ? [{ command: "docker", args: ["compose", "stop", ...consumers], seedEnv: false }] : []),
+    ...RESET_FLUSHES.map((service) => ({ command: "docker", args: ["compose", "exec", "-T", service, "valkey-cli", "FLUSHALL"], seedEnv: false })),
+    { command: "pnpm", args: ["--silent", "db:reset", "--seed"], seedEnv: true },
+    { command: "docker", args: ["compose", "up", "-d", "--no-build"], seedEnv: false },
+    { command: "docker", args: ["compose", "up", "-d", "--no-build", "--wait", "api"], seedEnv: false },
+  ];
+}

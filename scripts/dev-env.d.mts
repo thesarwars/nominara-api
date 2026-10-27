@@ -17,3 +17,18 @@ export interface ComposeHostUrls {
 export declare function composeHostUrls(env: Readonly<Record<string, string | undefined>>): ComposeHostUrls;
 /** Writes `<dir>/.env` from `<dir>/.env.example` when absent; never overwrites one. Refuses a .env still holding a placeholder. */
 export declare function ensureDevEnv(dir: string): { readonly created: boolean; readonly path: string };
+/** Every `${NAME}` / `${NAME:-default}` that docker-compose.yml interpolates. */
+export declare function composeInterpolationNames(composeText: string): string[];
+/** The host-side environment: .env over the shell, except for the names compose interpolates or reads itself. */
+export declare function hostSideEnv(input: {
+  readonly dotenv: Readonly<Record<string, string>>;
+  readonly shell: Readonly<Record<string, string | undefined>>;
+  readonly composeText: string;
+}): { readonly env: Record<string, string | undefined>; readonly ignoredShell: readonly string[] };
+export interface ResetStep {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly seedEnv: boolean;
+}
+/** The ordered steps of `dev:up --reset`, given `docker compose config --services`. */
+export declare function resetSteps(services: readonly string[]): readonly ResetStep[];

@@ -10,20 +10,27 @@
 //   4. seed         `pnpm db:seed` on the host, against the stack's published ports: three
 //                   awkward synthetic tenants (idempotent: a second run writes nothing)
 //
-// Everything compose reads is honoured as compose itself reads it: shell variables win over
-// .env. So `COMPOSE_PROJECT_NAME=other POSTGRES_PORT=15432 ... pnpm dev:up` runs a second,
-// independent stack, and the seed follows it to the moved ports.
+// The host-side steps see what the containers see (scripts/dev-env.mjs `hostSideEnv`): .env wins, as the
+// containers' `env_file` does, except for what compose itself lets the shell decide, the `${NAME}` it
+// interpolates (host ports, image tag) and COMPOSE_*. So `COMPOSE_PROJECT_NAME=other POSTGRES_PORT=15432 ...
+// pnpm dev:up` runs a second, independent stack and the seed follows it to the moved ports, while a stale
+// exported secret is ignored (and named) rather than used to wrap the seeded DEKs.
 //
 // Flags: --no-seed (skip step 4), --no-build (start the last built image), --reset (STORY-004 AC7: in place of
-// step 4, `pnpm db:reset --seed` — drop everything, re-migrate, re-apply the role passwords, re-seed — with the
-// same derived environment, so starting over is one command too).
+// step 4, stop the api/gateway/workers, flush BOTH Valkeys (queue and cache: the seed's ids are fixed, so a job or
+// cache entry from before would attach to the rebuilt rows), `pnpm db:reset --seed` (drop everything, re-migrate,
+// re-apply the role passwords, re-seed) with the same derived environment, then start the services again).
+// --reset covers Postgres and both Valkeys; `docker compose down -v && pnpm dev:up` also discards the volumes.
+//
+// Not started: the LocalStack object-storage emulator (compose profile `storage`), opt-in since 2026-10-16
+// because nothing writes to it yet. STORY-181 switches it on; until then `COMPOSE_PROFILES=storage pnpm dev:up`.
 import { spawnSync } from "node:child_process";
 import console from "node:console";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { composeHostUrls, ensureDevEnv, parseEnvText } from "./dev-env.mjs";
+import { composeHostUrls, ensureDevEnv, hostSideEnv, parseEnvText, resetSteps } from "./dev-env.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2).filter((arg) => arg !== "--");
@@ -64,7 +71,14 @@ step(".env");
 const { created, path } = ensureDevEnv(root);
 console.log(created ? `wrote ${path} with locally generated secrets (no vendor credentials)` : `kept existing ${path}`);
 
-const effective = { ...parseEnvText(readFileSync(path, "utf8")), ...process.env };
+const { env: effective, ignoredShell } = hostSideEnv({
+  dotenv: parseEnvText(readFileSync(path, "utf8")),
+  shell: process.env,
+  composeText: readFileSync(join(root, "docker-compose.yml"), "utf8"),
+});
+if (ignoredShell.length > 0) {
+  console.log(`note: .env wins over these exported shell variables, as it does in the containers: ${ignoredShell.join(", ")}`);
+}
 const urls = composeHostUrls(effective);
 
 step("docker compose up");
@@ -87,8 +101,16 @@ const seedEnv = {
 if (args.includes("--no-seed")) {
   console.log("\n--no-seed: skipping the synthetic seed");
 } else if (args.includes("--reset")) {
-  step("reset: drop, re-migrate, role passwords, seed");
-  run("pnpm", ["--silent", "db:reset", "--seed"], seedEnv);
+  step("reset: stop api/gateway/workers, flush both Valkeys, drop, re-migrate, role passwords, seed, start again");
+  const listed = spawnSync("docker", ["compose", "config", "--services"], { cwd: root, encoding: "utf8" });
+  if (listed.status !== 0) {
+    console.error(`dev:up: \`docker compose config --services\` exited ${String(listed.status)}: ${listed.stderr ?? ""}`);
+    process.exit(listed.status ?? 1);
+  }
+  const services = listed.stdout.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line !== "");
+  for (const { command, args: stepArgs, seedEnv: withSeedEnv } of resetSteps(services)) {
+    run(command, [...stepArgs], withSeedEnv ? seedEnv : process.env);
+  }
 } else {
   step("seed: three synthetic tenants");
   run("pnpm", ["--silent", "db:seed"], seedEnv);
@@ -100,4 +122,4 @@ nominara-api is up.
   gateway   ${urls.gatewayUrl}
   Postgres  ${urls.databaseUrl.replace("nominara:nominara@", "nominara:***@")}
 OTP codes are logged by the api container: docker compose logs -f api
-Start over: pnpm dev:up --reset (or, to drop the volumes too, docker compose down -v && pnpm dev:up)`);
+Start over: pnpm dev:up --reset (Postgres and both Valkeys; to drop the volumes too, docker compose down -v && pnpm dev:up)`);
