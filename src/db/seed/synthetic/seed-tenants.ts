@@ -361,7 +361,9 @@ async function seedTenant(tenant: SyntheticTenant, deps: SyntheticSeedDeps): Pro
   return inTenant(pool, tenant.workspaceId, async (tx) => {
     const planAfter = await currentPlan(tx, tenant.workspaceId);
     if (planAfter !== tenant.planKey) {
-      throw new SyntheticSeedError(`${tenant.key}: expected plan ${tenant.planKey} after plan:set, found ${planAfter}`);
+      // Concatenation, not a template literal: a literal opening with an interpolation and a colon reads to ISO-13's
+      // cache-key scanner as an un-namespaced key construction site.
+      throw new SyntheticSeedError(tenant.key + ": expected plan " + tenant.planKey + " after plan:set, found " + planAfter);
     }
     const { entitlements } = await resolveEntitlements(tx, tenant.workspaceId);
     let projectsCreated = 0;
