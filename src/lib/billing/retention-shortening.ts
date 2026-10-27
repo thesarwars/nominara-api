@@ -151,6 +151,9 @@ async function rawPurgeList(tx: ClientBase, workspaceId: string, cutoff: Date): 
   return r.rows.map((row) => ({ name: row.name, count: Number(row.count), oldest: row.oldest, newest: row.newest }));
 }
 
+/** A date-only ISO string (`YYYY-MM-DD`) is read as UTC midnight by the Date constructor. */
+const utcMidnightOf = (dateOnly: string): Date => new Date(dateOnly);
+
 /** Per project: rollup DAYS (not rows: a day has a row per engine and entity) older than `cutoff`. */
 async function rollupPurgeList(tx: ClientBase, workspaceId: string, cutoff: Date): Promise<PurgeProjectLine[]> {
   const r = await tx.query<{ name: string; count: string; oldest: string; newest: string }>(
@@ -160,7 +163,7 @@ async function rollupPurgeList(tx: ClientBase, workspaceId: string, cutoff: Date
       GROUP BY p.id, p.name ORDER BY p.name, p.id`,
     [workspaceId, day(cutoff)],
   );
-  return r.rows.map((row) => ({ name: row.name, count: Number(row.count), oldest: new Date(`${row.oldest}T00:00:00.000Z`), newest: new Date(`${row.newest}T00:00:00.000Z`) }));
+  return r.rows.map((row) => ({ name: row.name, count: Number(row.count), oldest: utcMidnightOf(row.oldest), newest: utcMidnightOf(row.newest) }));
 }
 
 export interface RetentionShorteningInput {
