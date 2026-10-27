@@ -66,7 +66,7 @@ describe("STORY-056 · migration 0142 — milestone kind displacement_recovered"
       kind,
     ]);
 
-  /** Roll back until 0098 itself is undone, whatever migrations a later lane stacks above it. */
+  /** Roll back until 0142 itself is undone, whatever migrations a later lane stacks above it. */
   async function rollbackThisMigration(): Promise<void> {
     for (let step = 0; step < 200; step += 1) {
       const name = await rollbackLast(client, MIGRATIONS_DIR);

@@ -38,14 +38,18 @@ import { datesWithFacts, measurementStatusSql } from "./aggregate-day.js";
 // link from an UNTRACKED entity to a slot, so none is guessed: its gap is empty.
 // `concept_gap` is `[]` — no corpus exists (STORY-058).
 //
-// A recovery that follows a COMPLETED task (the event's linked `task_id` is `done`,
-// not deleted, with `completed_at` strictly before `recovered_at`) pins a
+// A recovery that follows a COMPLETED task (ANY task reachable from the event — its linked
+// `task_id` (the plan's first task, or a deduped task shared from another displacement) or a task
+// with `source_displacement_id` = the event — is `done`, not deleted, with `completed_at`
+// strictly before `recovered_at`) pins a
 // `displacement_recovered` milestone at the recovery instant (STORY-056 AC9).
 // It is keyed `(system, event id)`, so a re-run can never pin it twice.
 //
 // Detection lag (AC11): the first insert of an event observes
 // `detected_at - after.captured_at` in seconds; a re-run only updates, so it does
-// not observe again.
+// not observe again. A backfill (the demo seed) never observes: its events are written
+// days after their captures and would skew the SLO p95. The observation measures the lag;
+// the p95 objective itself is proven by the production histogram, not by a test.
 //
 // NOT HERE: STORY-056 scenario 13 (the no-cooldown high-impact alert) belongs to
 // STORY-068's alert catalog (owner decision 2026-10-27) — no second alert path.
@@ -79,10 +83,16 @@ interface CellContext {
 
 const CLASS_ORDER = ["recommendation", "ranked", "neutral_list", "also_consider", "caveat"];
 
-export async function refreshProjectDisplacements(tx: ClientBase, projectId: string, date: string, timezone: string): Promise<number> {
+export async function refreshProjectDisplacements(
+  tx: ClientBase,
+  projectId: string,
+  date: string,
+  timezone: string,
+  options: { readonly observeLag?: boolean } = {},
+): Promise<number> {
   return tracer.startActiveSpan("displacement.refresh", async (span) => {
     try {
-      const persisted = await refreshProjectDisplacementsInner(tx, projectId, date, timezone);
+      const persisted = await refreshProjectDisplacementsInner(tx, projectId, date, timezone, options.observeLag ?? true);
       span.setAttribute("nominara.project_id", projectId);
       span.setAttribute("nominara.displacement.events", persisted);
       return persisted;
@@ -95,7 +105,13 @@ export async function refreshProjectDisplacements(tx: ClientBase, projectId: str
   });
 }
 
-async function refreshProjectDisplacementsInner(tx: ClientBase, projectId: string, date: string, timezone: string): Promise<number> {
+async function refreshProjectDisplacementsInner(
+  tx: ClientBase,
+  projectId: string,
+  date: string,
+  timezone: string,
+  observeLag: boolean,
+): Promise<number> {
   const project = await tx.query<{ workspace_id: string }>(`SELECT workspace_id FROM projects WHERE id = $1`, [projectId]);
   const workspaceId = project.rows[0]?.workspace_id;
   if (workspaceId === undefined) return 0; // not visible to this tenant context
@@ -140,7 +156,7 @@ async function refreshProjectDisplacementsInner(tx: ClientBase, projectId: strin
     ).rows[0];
 
     const afterSnapshot = await loadSnapshot(tx, after, competitorDomains);
-    await recoverOpenEvents(tx, projectId, after, afterSnapshot, competitorDomains);
+    await recoverOpenEvents(tx, workspaceId, projectId, after, afterSnapshot, competitorDomains);
     if (beforeRow === undefined) continue; // the first capture of a cell has nothing to be compared with
 
     const beforeSnapshot = await loadSnapshot(tx, beforeRow, competitorDomains);
@@ -181,7 +197,7 @@ async function refreshProjectDisplacementsInner(tx: ClientBase, projectId: strin
         ],
       );
       const row = written.rows[0];
-      if (row?.inserted === true) observeValue(LAG_METRIC, row.lag_seconds, { outcome: "ok" });
+      if (observeLag && row?.inserted === true) observeValue(LAG_METRIC, row.lag_seconds, { outcome: "ok" });
       persisted += 1;
     }
   }
@@ -201,13 +217,15 @@ export async function backfillProjectDisplacements(
 ): Promise<number> {
   let total = 0;
   for (const date of await datesWithFacts(tx, projectId, timezone, fromDate, toDate)) {
-    total += await refreshProjectDisplacements(tx, projectId, date, timezone);
+    // A backfill writes events long after their captures: its lag is not the live pipeline, so it is not observed.
+    total += await refreshProjectDisplacements(tx, projectId, date, timezone, { observeLag: false });
   }
   return total;
 }
 
 async function recoverOpenEvents(
   tx: ClientBase,
+  workspaceId: string,
   projectId: string,
   later: CaptureRow,
   laterSnapshot: CaptureSnapshot,
@@ -238,30 +256,34 @@ async function recoverOpenEvents(
       `UPDATE displacement_events SET recovered_at = $2::timestamptz WHERE id = $1 AND recovered_at IS NULL RETURNING id`,
       [event.id, later.captured_at],
     );
-    if (recovered.rowCount === 1) await pinRecoveryMilestone(tx, event.id, event.kind);
+    if (recovered.rowCount === 1) await pinRecoveryMilestone(tx, workspaceId, event.id, event.kind);
   }
 }
 
 /**
- * STORY-056 AC9 — only when the event's linked task was completed BEFORE the recovery. A task completed at or after the
- * recovery instant, still open, dismissed or soft-deleted did not cause it, so nothing is pinned. The pin names the event
+ * STORY-056 AC9 — only when a task of the event (the linked first task or any task born of it) was completed BEFORE the
+ * recovery. A task completed at or after the recovery instant, still open, dismissed or soft-deleted did not cause it, so
+ * nothing is pinned. `visible_in_portal` is explicitly true: a recovery after the client's own completed work is a win the
+ * portal shows (unlike the low-emphasis configuration pins). The pin names the event
  * (never the task or any answer text); `ON CONFLICT` on the (source_type, source_id) index makes it idempotent.
  */
-async function pinRecoveryMilestone(tx: ClientBase, eventId: string, kind: DetectedDisplacement["kind"]): Promise<void> {
+async function pinRecoveryMilestone(tx: ClientBase, workspaceId: string, eventId: string, kind: DetectedDisplacement["kind"]): Promise<void> {
   const pinned = await tx.query<{ id: string }>(
-    `INSERT INTO milestones (workspace_id, project_id, occurred_at, kind, title, severity, source_type, source_id, affected_engines)
-     SELECT e.workspace_id, e.project_id, e.recovered_at, 'displacement_recovered', $2, 'positive', 'system', e.id, ARRAY[e.engine_key]
+    `INSERT INTO milestones (workspace_id, project_id, occurred_at, kind, title, severity, source_type, source_id, affected_engines, visible_in_portal)
+     SELECT e.workspace_id, e.project_id, e.recovered_at, 'displacement_recovered', $2, 'positive', 'system', e.id, ARRAY[e.engine_key], true
        FROM displacement_events e
-       JOIN tasks t ON t.id = e.task_id
       WHERE e.id = $1 AND e.recovered_at IS NOT NULL
-        AND t.status = 'done' AND t.deleted_at IS NULL AND t.completed_at < e.recovered_at
+        AND EXISTS (
+          SELECT 1 FROM tasks t
+           WHERE (t.id = e.task_id OR t.source_displacement_id = e.id)
+             AND t.status = 'done' AND t.deleted_at IS NULL AND t.completed_at < e.recovered_at)
      ON CONFLICT (source_type, source_id) WHERE source_id IS NOT NULL DO NOTHING
      RETURNING id`,
     [eventId, RECOVERY_TITLE[kind]],
   );
   if (pinned.rowCount === 1) {
     incrementCounter("nominara_rollup_displacement_recovery_milestones_total", { outcome: "pinned" });
-    logger.log({ event: "displacement_recovery_milestone_pinned", displacementEventId: eventId, milestoneId: pinned.rows[0]!.id });
+    logger.log({ event: "displacement_recovery_milestone_pinned", workspaceId, displacementEventId: eventId, milestoneId: pinned.rows[0]!.id });
   }
 }
 
@@ -417,7 +439,7 @@ async function verifiedBrandPresence(tx: ClientBase, workspaceId: string, domain
  * so `1 / rank` is 1 and prompt_weight is `0.5 * commercial_intent + 0.5`.
  * Ranking `topic_clusters` by their commercial_intent is the alternative; it is
  * not taken because the spec does not say to, and a silent invention would move
- * every stored impact score. Pinned by the CP2 STORY-056 rank test; scoring-models.md section 9 states it.
+ * every stored impact score. Pinned by the CP2 STORY-056 rank test; scoring-models.md section 9 is to state it (docs batch, STORY-056 patch).
  *
  * GOLDEN-SET GATE: there is no golden-set runner for the D1 scoring change, so
  * that gate is UNAVAILABLE for STORY-056 and was not run. `scoring_version` is

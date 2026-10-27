@@ -7,7 +7,9 @@ import type { Job } from "bullmq";
 import { Client } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { citationGapSchema, conceptGapSchema, displacedBySchema } from "../../contracts/analytics/displacement-event.schema.js";
+import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { backfillProjectDisplacements, refreshProjectDisplacements } from "../../src/lib/rollup/refresh-project-displacements.js";
@@ -40,6 +42,7 @@ trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new Sim
 describe("NEW-C-3 · refreshProjectDisplacements", () => {
   let container: StartedPostgreSqlContainer;
   let db: Client;
+  let worker: Client;
   let workspaceId: string;
   let projectId: string;
   let promptId: string;
@@ -54,9 +57,20 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
     await migrateUp(db);
+    const password = resolvePassword("nominara_worker", {});
+    await db.query(`ALTER ROLE nominara_worker PASSWORD ${db.escapeLiteral(password)}`);
+    worker = new Client({
+      host: container.getHost(),
+      port: container.getMappedPort(5432),
+      database: container.getDatabase(),
+      user: "nominara_worker",
+      password,
+    });
+    await worker.connect();
   }, 300_000);
 
   afterAll(async () => {
+    await worker.end();
     await db.end();
     await container.stop();
   });
@@ -342,6 +356,14 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect(await recoveryMilestones()).toHaveLength(0);
   });
 
+  it.each(["dismissed", "in_progress"])("STORY-056 #11 · a %s task carrying a stale completed_at before the recovery is not a completed task: no milestone", async (status) => {
+    const { restoredAt } = await lostThenRecovered();
+    await linkTask(status, `${D2}T18:00:00Z`);
+    await capture({ at: restoredAt, present: true, position: 1 });
+    await run(D3);
+    expect(await recoveryMilestones()).toHaveLength(0);
+  });
+
   it("STORY-056 #11 · a task completed AFTER the recovery did not cause it: no milestone", async () => {
     const { restoredAt } = await lostThenRecovered();
     await linkTask("done", `${D3}T12:00:00Z`);
@@ -377,6 +399,102 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect(await recoveryMilestones()).toHaveLength(0);
   });
 
+  it("STORY-056 #11 · a plan of several tasks pins when ANY of its tasks was completed before the recovery, though the linked first task was dismissed", async () => {
+    const { eventId, restoredAt } = await lostThenRecovered();
+    await linkTask("dismissed", null); // displacement_events.task_id holds only the plan's FIRST task
+    const second = randomUUID();
+    await db.query(
+      `INSERT INTO tasks (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status, completed_at, source_displacement_id)
+       VALUES ($1,$2,$3,$4,'authority',sha256(random()::text::bytea),'t2','d','done',$5::timestamptz,$6)`,
+      [second, workspaceId, projectId, `T-${second.slice(0, 8)}`, `${D2}T18:00:00Z`, eventId],
+    );
+    await capture({ at: restoredAt, present: true, position: 1 });
+    await run(D3);
+    expect(await recoveryMilestones()).toHaveLength(1);
+  });
+
+  it("STORY-056 #11 · a sibling task born of the event that is dismissed or completed AFTER the recovery pins nothing", async () => {
+    const { eventId, restoredAt } = await lostThenRecovered();
+    await linkTask("dismissed", null);
+    for (const [status, at] of [["dismissed", null], ["done", `${D3}T12:00:00Z`]] as const) {
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO tasks (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status, completed_at, source_displacement_id)
+         VALUES ($1,$2,$3,$4,'authority',sha256(random()::text::bytea),'t2','d',$5,$6::timestamptz,$7)`,
+        [id, workspaceId, projectId, `T-${id.slice(0, 8)}`, status, at, eventId],
+      );
+    }
+    await capture({ at: restoredAt, present: true, position: 1 });
+    await run(D3);
+    expect(await recoveryMilestones()).toHaveLength(0);
+  });
+
+  it("STORY-056 #11 · pin is portal-visible, explicitly", async () => {
+    const { restoredAt } = await lostThenRecovered();
+    await linkTask("done", `${D2}T18:00:00Z`);
+    await capture({ at: restoredAt, present: true, position: 1 });
+    await run(D3);
+    expect((await recoveryMilestones())[0]!.visible_in_portal).toBe(true);
+  });
+
+  it("STORY-056 #11 · the pinned log line carries the workspace id, and no workspace name", async () => {
+    const lines: unknown[] = [];
+    const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(m));
+    const { restoredAt } = await lostThenRecovered();
+    await linkTask("done", `${D2}T18:00:00Z`);
+    await capture({ at: restoredAt, present: true, position: 1 });
+    await run(D3);
+    spy.mockRestore();
+    const pinned = lines.find((l) => (l as { event?: string }).event === "displacement_recovery_milestone_pinned") as { workspaceId?: string };
+    expect(pinned.workspaceId).toBe(workspaceId);
+  });
+
+  describe("STORY-056 #11 · the recovery pin as the runtime role, under RLS", () => {
+    const runAsWorker = (ws: string): Promise<number> =>
+      withTenantContext(worker, { workspaceId: ws, actorId: randomUUID() } as never, (tx) => refreshProjectDisplacements(tx, projectId, D3, "UTC"));
+
+    it("STORY-056 #11 · the connection is subject to RLS (so the cases below cannot pass vacuously)", async () => {
+      const role = await worker.query<{ rolbypassrls: boolean; rolsuper: boolean }>("SELECT rolbypassrls, rolsuper FROM pg_roles WHERE rolname = current_user");
+      expect(role.rows[0]).toEqual({ rolbypassrls: false, rolsuper: false });
+    });
+
+    it("STORY-056 #11 · positive control: in its own workspace's context the pin lands with that workspace_id", async () => {
+      const { restoredAt } = await lostThenRecovered();
+      await linkTask("done", `${D2}T18:00:00Z`);
+      await capture({ at: restoredAt, present: true, position: 1 });
+      await runAsWorker(workspaceId);
+      const [m, ...rest] = await recoveryMilestones();
+      expect(rest).toHaveLength(0);
+      expect(m!.workspace_id).toBe(workspaceId);
+    });
+
+    it("STORY-056 #11 · a completed task in ANOTHER workspace (linked by task_id and by source_displacement_id) is invisible and pins nothing", async () => {
+      const { eventId, restoredAt } = await lostThenRecovered();
+      const otherWs = randomUUID();
+      const otherProject = randomUUID();
+      await db.query("INSERT INTO workspaces (id, name, slug, plan_key, timezone) VALUES ($1,'W2',$2,'growth','UTC')", [otherWs, `w-${otherWs.slice(0, 8)}`]);
+      await db.query(
+        `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1,$2,'Other',$3,'https://other.com','other.com')`,
+        [otherProject, otherWs, `p-${otherProject.slice(0, 8)}`],
+      );
+      const foreign = async (sourceDisplacement: string | null): Promise<string> => {
+        const id = randomUUID();
+        await db.query(
+          `INSERT INTO tasks (id, workspace_id, project_id, short_ref, kind, dedupe_fingerprint, title, description, status, completed_at, source_displacement_id)
+           VALUES ($1,$2,$3,$4,'content',sha256(random()::text::bytea),'t','d','done',$5::timestamptz,$6)`,
+          [id, otherWs, otherProject, `T-${id.slice(0, 8)}`, `${D2}T18:00:00Z`, sourceDisplacement],
+        );
+        return id;
+      };
+      await foreign(eventId);
+      await db.query(`UPDATE displacement_events SET task_id = $1 WHERE id = $2`, [await foreign(null), eventId]);
+      await capture({ at: restoredAt, present: true, position: 1 });
+      await runAsWorker(workspaceId);
+      expect((await events())[0]!.recovered_at).not.toBeNull();
+      expect(await recoveryMilestones()).toHaveLength(0);
+    });
+  });
+
   // ---- STORY-056 #12 — detection lag --------------------------------------------------------------------------------
 
   const LAG_METRIC = "nominara_rollup_displacement_detection_lag_seconds";
@@ -400,7 +518,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
       return afterAt.toISOString().slice(0, 10);
     }
 
-    it("STORY-056 #12 · the lag from the after-capture's captured_at to detected_at is observed once per new event, and sits inside the 20-minute objective", async () => {
+    it("STORY-056 #12 · observes the lag as detected_at minus captured_at once per new event (a measurement; the SLO p95 proof needs the production histogram)", async () => {
       await run(await lossTwoMinutesAgo());
       const observed = lagLines();
       expect(observed).toHaveLength(1);
@@ -546,5 +664,18 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     const rows = await events();
     expect(rows).toHaveLength(1);
     expect(rows[0]!.recovered_at).not.toBeNull();
+  });
+
+  it("STORY-056 #12 · a backfill (demo seed) pass emits no outcome-ok lag line, so its days-old events cannot skew the SLO p95", async () => {
+    const lines: unknown[] = [];
+    const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(m));
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+    await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
+    await db.query("BEGIN");
+    await backfillProjectDisplacements(db, projectId, "UTC", D1, D3);
+    await db.query("COMMIT");
+    spy.mockRestore();
+    expect(lines.filter((l) => typeof l === "object" && l !== null && (l as { metric?: string }).metric === LAG_METRIC)).toHaveLength(0);
+    expect(await events()).toHaveLength(1);
   });
 });
