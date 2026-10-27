@@ -12,6 +12,7 @@ import {
 } from "../../src/db/seed/synthetic/constants.js";
 import { runSyntheticSeed, type SyntheticSeedPool, type SyntheticSeedPoolClient } from "../../src/db/seed/synthetic/seed-tenants.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
+import { promptTextHash } from "../../src/lib/promptgen/text-hash.js";
 import { readWallet } from "../../src/lib/credits/wallet.js";
 import { planSetViaCli } from "../../src/db/seed/synthetic/plan-set-cli.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
@@ -259,6 +260,83 @@ describe("STORY-004 · db:seed — three awkward synthetic tenants (scenario 4)"
     );
     expect(owner.rowCount).toBe(1);
   }, 120_000);
+
+  // schemas/projects-and-prompts.md: text_hash is sha256(normalise(text)), the dedupe key behind ux_prompts_project_hash.
+  // A seeded row hashed any other way never dedupes against the same question added through the API.
+  it("STORY-004 AC5 · every seeded prompt carries the schema's text_hash, sha256(normalise(text)), so API dedupe sees it", async () => {
+    await seed();
+    const rows = await client.query<{ text: string; text_hash: Buffer }>(
+      `SELECT text, text_hash FROM tracked_prompts WHERE workspace_id = ANY($1::uuid[]) ORDER BY text`,
+      [workspaceIds],
+    );
+    const expected = SYNTHETIC_TENANTS.flatMap((tenant) => tenant.projects.flatMap((project) => project.prompts)).length;
+    expect(rows.rows).toHaveLength(expected);
+    for (const row of rows.rows) {
+      expect(row.text_hash.toString("hex"), row.text).toBe(promptTextHash(row.text).bytes.toString("hex"));
+    }
+  }, 120_000);
+
+  it("STORY-004 AC5 · refuses to attach a workspace to a suspended account at an owner address, writing nothing", async () => {
+    const tenant = SYNTHETIC_TENANTS[0]!;
+    await client.query(`INSERT INTO users (id, email, status, email_verified_at) VALUES (gen_random_uuid(), $1, 'suspended', now())`, [
+      tenant.ownerEmail,
+    ]);
+
+    await expect(seed()).rejects.toThrow(/suspended/u);
+
+    const counts = await snapshot();
+    expect(counts.workspaces).toBe(0);
+    expect(counts.workspace_members).toBe(0);
+  }, 120_000);
+
+  // Two seeds at once: the other run has inserted "Cloud" and not yet committed. ux_competitors_project_name makes this
+  // run's insert wait for it; once it commits, this run must treat the name as present, not fail on the unique index
+  // or write a second row.
+  it("STORY-004 scenario 4 · a seed racing another seed's uncommitted competitor waits, then writes no second row and does not fail", async () => {
+    await seed();
+    const business = SYNTHETIC_TENANTS.find((tenant) => tenant.projects.some((project) => project.name === "Nimbus Hosting"))!;
+    const nimbus = business.projects.find((project) => project.name === "Nimbus Hosting")!;
+    const cloud = nimbus.competitors.find((competitor) => competitor.name === "Cloud")!;
+    // Leave the project as a first run would find it mid-way: prompts present, competitors not yet.
+    await client.query(`UPDATE competitors SET deleted_at = now() WHERE project_id = $1`, [nimbus.id]);
+
+    const other = new Client({ connectionString: container.getConnectionUri() });
+    await other.connect();
+    try {
+      await other.query("BEGIN");
+      await other.query(
+        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source, is_primary)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, ARRAY[]::text[], 'user', true)`,
+        [business.workspaceId, nimbus.id, cloud.name, cloud.rootDomain],
+      );
+
+      let done = false;
+      const racing = seed().finally(() => {
+        done = true;
+      });
+      racing.catch(() => {});
+      // Wait until this run is blocked behind the other's uncommitted row (or has finished without waiting).
+      const deadline = Date.now() + 60_000;
+      for (;;) {
+        if (done) break;
+        const waiting = await client.query(`SELECT 1 FROM pg_locks WHERE NOT granted AND locktype = 'transactionid'`);
+        if ((waiting.rowCount ?? 0) > 0) break;
+        if (Date.now() > deadline) throw new Error("the racing seed neither finished nor waited within 60s");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      await other.query("COMMIT");
+
+      await expect(racing).resolves.toBeDefined();
+    } finally {
+      await other.end();
+    }
+
+    const live = await client.query<{ name: string }>(
+      `SELECT name FROM competitors WHERE project_id = $1 AND deleted_at IS NULL ORDER BY name`,
+      [nimbus.id],
+    );
+    expect(live.rows.map((row) => row.name)).toEqual(["Cloud", "Cloudflare Systems"]);
+  }, 180_000);
 
   it("STORY-004 AC5 · refuses a pooled connection that is not nominara_app, before writing anything", async () => {
     await expect(seed(superuserPool())).rejects.toThrow(/not nominara_app/u);
