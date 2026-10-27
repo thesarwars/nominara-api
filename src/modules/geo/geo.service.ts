@@ -81,7 +81,7 @@ export class GeoService {
       const sentiment = slug === "sentiment" ? geoSentimentDetailSchema.safeParse(detail) : null;
       const actions =
         sentiment?.success === true
-          ? // One action per distinct reason class: a title, and no task id until the task engine exists.
+          ? // One action per distinct reason class: a title, and no task id yet. The digest levers resolve an open task (`openTaskLookup`); reuse it here once GEO-rule tasks are produced (STORY-063 follow-up), or the two surfaces will disagree.
             sentiment.data.reason_classes.map((rc) => ({ label: rc.task_title, task_title: rc.task_title, task_id: null, href: null, engines: [] as string[] }))
           : row !== null && row.sufficient
           ? validFindings(row)

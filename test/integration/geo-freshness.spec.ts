@@ -113,7 +113,11 @@ describe("STORY-062 AC12 · GEO recompute freshness", () => {
       const lines = spy.mock.calls.map((c) => c[0] as Record<string, unknown>).filter((l) => l.metric === "nominara_geo_recompute_freshness_seconds");
       expect(lines.map((l) => l.within_objective)).toEqual(["false", "true", "true"]);
       expect(lines[0]!.workspace_id).toBe(workspaceId);
-      expect(lines[0]!.project_id).toBe(projectId);
+      // project_id is a per-project cardinality bomb as a metric label: it rides a separate event line instead.
+      expect(lines.every((l) => !("project_id" in l))).toBe(true);
+      const events = spy.mock.calls.map((c) => c[0] as Record<string, unknown>).filter((l) => l.event === "geo.freshness");
+      expect(events).toHaveLength(3);
+      expect(events[0]).toMatchObject({ workspace_id: workspaceId, project_id: projectId, lag_seconds: 31 * 60 });
       expect(JSON.stringify(spy.mock.calls)).not.toContain(SECRET_WORKSPACE_NAME);
     } finally {
       spy.mockRestore();
@@ -138,7 +142,8 @@ describe("STORY-062 AC12 · GEO recompute freshness", () => {
       const lines = spy.mock.calls.map((c) => c[0] as Record<string, unknown>);
       const measure = lines.find((l) => l.metric === "nominara_geo_recompute_duration_seconds");
       expect(measure).toBeDefined();
-      expect(measure!.project_id).toBe(projectId);
+      expect("project_id" in measure!, "project_id is not a metric label").toBe(false);
+      expect(lines.find((l) => l.event === "geo.recompute")).toMatchObject({ project_id: projectId, workspace_id: workspaceId, windows: 3 });
       expect(measure!.workspace_id).toBe(workspaceId);
       expect(lines.find((l) => l.metric === "nominara_geo_recompute_freshness_seconds")).toBeUndefined(); // compute time is not freshness
       expect(measure!.value).toBeGreaterThanOrEqual(0);

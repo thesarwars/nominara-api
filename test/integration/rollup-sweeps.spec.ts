@@ -559,6 +559,13 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
       expect(geoFreshness((await runRollup("closed_day", undefined)).logs), "no enqueue time, no figure (never 0)").toHaveLength(0);
     }, 120_000);
 
+    it("STORY-062 AC12 · only the daily triggers (closed_day, run_parsed) count toward the GEO freshness objective; a dirty-date backfill or a rebuild reports no GEO figure", async () => {
+      for (const reason of ["dirty_date", "rebuild"]) {
+        expect(geoFreshness((await runRollup(reason, Date.now() - 31 * 60_000)).logs), reason).toHaveLength(0);
+      }
+      expect(geoFreshness((await runRollup("run_parsed", Date.now() - 60_000)).logs)).toHaveLength(1);
+    }, 120_000);
+
     it("STORY-042 AC11 · closed-day, dirty-date and rebuild rollups are not parse-to-metric latency and report nothing; neither does a job with no timestamp", async () => {
       for (const reason of ["closed_day", "dirty_date", "rebuild"]) {
         expect(observation((await runRollup(reason, Date.now() - 60_000)).logs), reason).toBeUndefined();

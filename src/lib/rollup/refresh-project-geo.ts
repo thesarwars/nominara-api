@@ -93,12 +93,12 @@ export const GEO_FRESHNESS_OBJECTIVE_SECONDS = 30 * 60;
 export function observeGeoFreshness(workspaceId: string, projectId: string, triggeredAtMs: number, nowMs: number = Date.now()): number {
   const lagSeconds = Math.max(0, nowMs - triggeredAtMs) / 1000;
   const withinObjective = lagSeconds <= GEO_FRESHNESS_OBJECTIVE_SECONDS;
-  // project_id stays in the log line; it is not a label a metrics backend should index (cardinality).
+  // project_id is not a label a metrics backend should index (cardinality), so it rides a separate event line.
   observeHistogram("nominara_geo_recompute_freshness_seconds", lagSeconds, {
     workspace_id: workspaceId,
-    project_id: projectId,
     within_objective: String(withinObjective),
   });
+  logger.log({ event: "geo.freshness", workspace_id: workspaceId, project_id: projectId, lag_seconds: lagSeconds, within_objective: withinObjective });
   return lagSeconds;
 }
 
@@ -118,11 +118,13 @@ export async function refreshProjectGeoWindows(
       const out: GeoAnalysisWrite[] = [];
       for (const windowDays of GEO_WINDOWS) out.push(await refreshProjectGeo(tx, projectId, { ...options, windowDays }));
       span.setAttribute("nominara.geo_refresh.windows", out.length);
+      const workspaceId = currentTenantStore()?.context.workspaceId ?? "none";
       observeHistogram("nominara_geo_recompute_duration_seconds", Math.round(((performance.now() - started) / 1000) * 1000) / 1000, {
-        workspace_id: currentTenantStore()?.context.workspaceId ?? "none",
-        project_id: projectId,
+        workspace_id: workspaceId,
         windows: out.length,
       });
+      // project_id is not a metric label (cardinality); it is on this event line.
+      logger.log({ event: "geo.recompute", workspace_id: workspaceId, project_id: projectId, windows: out.length });
       return out;
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });

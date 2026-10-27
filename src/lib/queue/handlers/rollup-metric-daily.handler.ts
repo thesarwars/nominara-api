@@ -147,8 +147,9 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
       // database (no network call), free and unmetered.
       await refreshProjectGeoWindows(tx, payload.projectId);
       // STORY-062 AC12 / SLO #28 — GEO freshness is trigger-to-VISIBLE: from the job's enqueue time to the commit, so queue wait
-      // and every other rollup step count. No enqueue time means no figure, never a 0.
-      if (currentTenantStore() !== undefined && typeof job.timestamp === "number") {
+      // and every other rollup step count. No enqueue time means no figure, never a 0. Only the daily triggers count: a
+      // dirty-date backfill or a rebuild is not the daily recompute the objective describes, and would skew its p95.
+      if (currentTenantStore() !== undefined && typeof job.timestamp === "number" && (payload.reason === "closed_day" || payload.reason === "run_parsed")) {
         const enqueuedAt = job.timestamp;
         const { projectId, workspaceId } = payload;
         afterCommit(() => void observeGeoFreshness(workspaceId, projectId, enqueuedAt));
