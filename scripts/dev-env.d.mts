@@ -8,6 +8,8 @@ export declare function generateDevEnv(exampleText: string): string;
 export interface ComposeHostUrls {
   readonly databaseUrl: string;
   readonly databaseUrlPooled: string;
+  readonly valkeyCacheUrl: string;
+  readonly queueRedisUrl: string;
   readonly apiUrl: string;
   readonly gatewayUrl: string;
 }

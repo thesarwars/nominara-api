@@ -68,16 +68,43 @@ describe("STORY-004 AC3 · dev env bootstrap (scenario 1, offline proxy)", () =>
     expect(parseEnvText(generateDevEnv(EXAMPLE)).OTP_DEV_LOG_CODES).toBe("true");
   });
 
-  it("derives the host URLs from the same port variables docker-compose.yml interpolates", () => {
-    expect(composeHostUrls({})).toEqual({
-      databaseUrl: "postgres://nominara:nominara@localhost:5432/nominara",
-      databaseUrlPooled: "postgres://nominara_app:nominara_app_dev_local@localhost:6432/nominara",
-      apiUrl: "http://localhost:4000",
-      gatewayUrl: "http://localhost:3001",
+  // The default host ports are read from docker-compose.yml itself (`${NAME:-default}`), so the seed's URLs and the
+  // stack's published ports cannot drift apart. Valkey URLs are checked by their parts: STORY-174's scanner refuses a
+  // literal Valkey URL anywhere in the test tree.
+  const COMPOSE = readFileSync(join(ROOT, "docker-compose.yml"), "utf8");
+  const composeDefault = (name: string): string => {
+    const match = new RegExp(`\\$\\{${name}:-(\\d+)\\}`, "u").exec(COMPOSE);
+    if (match === null) throw new Error(`docker-compose.yml has no default for ${name}`);
+    return match[1]!;
+  };
+  const hostAndPort = (url: string) => {
+    const parsed = new URL(url);
+    return { protocol: parsed.protocol, hostname: parsed.hostname, port: parsed.port };
+  };
+
+  it("derives the host URLs from the same port variables docker-compose.yml interpolates, with its defaults", () => {
+    const urls = composeHostUrls({});
+    expect(urls.databaseUrl).toBe(`postgres://nominara:nominara@localhost:${composeDefault("POSTGRES_PORT")}/nominara`);
+    expect(urls.databaseUrlPooled).toBe(`postgres://nominara_app:nominara_app_dev_local@localhost:${composeDefault("PGBOUNCER_PORT")}/nominara`);
+    expect(hostAndPort(urls.valkeyCacheUrl)).toEqual({ protocol: "redis:", hostname: "localhost", port: composeDefault("VALKEY_PORT") });
+    expect(hostAndPort(urls.queueRedisUrl)).toEqual({ protocol: "redis:", hostname: "localhost", port: composeDefault("VALKEY_QUEUE_PORT") });
+    expect(urls.apiUrl).toBe(`http://localhost:${composeDefault("API_PORT")}`);
+    expect(urls.gatewayUrl).toBe(`http://localhost:${composeDefault("GATEWAY_HOST_PORT")}`);
+  });
+
+  it("follows every port variable when a second stack moves them", () => {
+    const moved = composeHostUrls({
+      POSTGRES_PORT: "15432",
+      PGBOUNCER_PORT: "16432",
+      VALKEY_PORT: "16379",
+      VALKEY_QUEUE_PORT: "16390",
+      API_PORT: "14000",
+      GATEWAY_HOST_PORT: "13001",
     });
-    const moved = composeHostUrls({ POSTGRES_PORT: "15432", PGBOUNCER_PORT: "16432", API_PORT: "14000", GATEWAY_HOST_PORT: "13001" });
     expect(moved.databaseUrl).toBe("postgres://nominara:nominara@localhost:15432/nominara");
     expect(moved.databaseUrlPooled).toBe("postgres://nominara_app:nominara_app_dev_local@localhost:16432/nominara");
+    expect(hostAndPort(moved.valkeyCacheUrl)).toEqual({ protocol: "redis:", hostname: "localhost", port: "16379" });
+    expect(hostAndPort(moved.queueRedisUrl)).toEqual({ protocol: "redis:", hostname: "localhost", port: "16390" });
     expect(moved.apiUrl).toBe("http://localhost:14000");
     expect(moved.gatewayUrl).toBe("http://localhost:13001");
   });
