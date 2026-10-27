@@ -3,6 +3,7 @@ import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { applyDevCredentials, resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { main as dbResetMain } from "../../src/db/reset.js";
 import { resetDatabase } from "../../src/db/reset-database.js";
 import { SYNTHETIC_TENANTS } from "../../src/db/seed/synthetic/constants.js";
 import { runSyntheticSeed, type SyntheticSeedPool, type SyntheticSeedPoolClient } from "../../src/db/seed/synthetic/seed-tenants.js";
@@ -82,6 +83,33 @@ describe("STORY-004 · db:reset then db:seed (scenario 5)", () => {
       const outcomes = await runSyntheticSeed({ pool: appPool(), dekProvisioner, setPlan: setPlan(), log: () => {} });
 
       expect(outcomes.map((outcome) => outcome.workspaceCreated)).toEqual([true, true, true]);
+      expect(await count(client, "SELECT count(*)::text AS n FROM workspaces")).toBe(SYNTHETIC_TENANTS.length);
+      expect(await count(client, "SELECT count(*)::text AS n FROM credit_ledger WHERE entry_type = 'grant'")).toBe(SYNTHETIC_TENANTS.length);
+    } finally {
+      await client.end();
+    }
+  }, 240_000);
+  // reset.ts: "Refused BEFORE anything is dropped: a --seed that cannot seed must not leave an empty database behind."
+  // Every other guard condition passes here (local hosts, NODE_ENV=development); only the opt-in is missing.
+  it("STORY-004 AC7 · db:reset --seed without the seed opt-in refuses and drops nothing", async () => {
+    const client = new Client({ connectionString: container.getConnectionUri() });
+    await client.connect();
+    try {
+      await resetDatabase(client);
+      await applyDevCredentials(client, {});
+      await runSyntheticSeed({ pool: appPool(), dekProvisioner, setPlan: setPlan(), log: () => {} });
+      expect(await count(client, "SELECT count(*)::text AS n FROM workspaces")).toBe(SYNTHETIC_TENANTS.length);
+
+      const pooled = `postgres://nominara_app:${resolvePassword("nominara_app", {})}@${container.getHost()}:${String(container.getMappedPort(5432))}/${container.getDatabase()}`;
+      await expect(
+        dbResetMain(["--seed"], {
+          PATH: process.env.PATH,
+          NODE_ENV: "development",
+          DATABASE_URL: container.getConnectionUri(),
+          DATABASE_URL_POOLED: pooled,
+        }),
+      ).rejects.toThrow(/NOMINARA_SYNTHETIC_SEED/u);
+
       expect(await count(client, "SELECT count(*)::text AS n FROM workspaces")).toBe(SYNTHETIC_TENANTS.length);
       expect(await count(client, "SELECT count(*)::text AS n FROM credit_ledger WHERE entry_type = 'grant'")).toBe(SYNTHETIC_TENANTS.length);
     } finally {

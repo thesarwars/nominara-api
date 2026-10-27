@@ -7,27 +7,30 @@
 // back to the state `pnpm dev:up` leaves it in. Without the flag it behaves
 // exactly as before.
 import { fileURLToPath } from "node:url";
-import { connect, requireDatabaseUrl } from "./client.js";
+import { connect } from "./client.js";
 import { applyDevCredentials } from "./dev-credentials.js";
 import { resetDatabase } from "./reset-database.js";
 import { runSeedCli } from "./seed.js";
 import { assertSyntheticSeedAllowed, SYNTHETIC_SEED_OPT_IN } from "./seed/synthetic/guard.js";
 
-async function main(argv: readonly string[]): Promise<void> {
+/** `pnpm db:reset [--seed]`. Exported (with `env`) so the refuse-before-drop ordering is tested against a real database. */
+export async function main(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const unknown = argv.filter((arg) => arg !== "--seed");
   if (unknown.length > 0) throw new Error(`unknown argument(s): ${unknown.join(" ")} (only --seed is accepted)`);
   const seed = argv.includes("--seed");
   if (seed) {
     // Refused BEFORE anything is dropped: a --seed that cannot seed must not leave an empty database behind.
     assertSyntheticSeedAllowed({
-      nodeEnv: process.env.NODE_ENV,
-      databaseUrl: process.env.DATABASE_URL,
-      databaseUrlPooled: process.env.DATABASE_URL_POOLED,
-      optIn: process.env[SYNTHETIC_SEED_OPT_IN],
+      nodeEnv: env.NODE_ENV,
+      databaseUrl: env.DATABASE_URL,
+      databaseUrlPooled: env.DATABASE_URL_POOLED,
+      optIn: env[SYNTHETIC_SEED_OPT_IN],
     });
   }
 
-  const client = await connect(requireDatabaseUrl());
+  const databaseUrl = env.DATABASE_URL;
+  if (!databaseUrl) throw new Error("DATABASE_URL is not set");
+  const client = await connect(databaseUrl);
   try {
     const applied = await resetDatabase(client);
     console.log(`reset complete, applied ${applied} migration(s)`);
@@ -38,7 +41,7 @@ async function main(argv: readonly string[]): Promise<void> {
   } finally {
     await client.end();
   }
-  if (seed) await runSeedCli();
+  if (seed) await runSeedCli(env);
 }
 
 if (process.argv[1] !== undefined && process.argv[1] === fileURLToPath(import.meta.url)) {
