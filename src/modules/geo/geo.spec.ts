@@ -1,3 +1,4 @@
+import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
 import { Test } from "@nestjs/testing";
 import { describe, expect, it } from "vitest";
 import { GeoModule } from "./geo.module.js";
@@ -8,8 +9,16 @@ import { GeoController } from "./geo.controller.js";
 // area's own future story.
 describe("STORY-022 · GeoModule compiles", () => {
   it("resolves in a Nest testing module", async () => {
-    const moduleRef = await Test.createTestingModule({ imports: [GeoModule] }).compile();
-    expect(moduleRef.get(GeoController)).toBeInstanceOf(GeoController);
-    await moduleRef.close();
+    // STORY-062 AC10: GeoModule imports TasksModule (the digest links an open task through TasksService), which builds the
+    // realtime publisher and validates the env eagerly.
+    const originalEnv = { ...process.env };
+    applyFakeApiEnv();
+    try {
+      const moduleRef = await Test.createTestingModule({ imports: [GeoModule] }).compile();
+      expect(moduleRef.get(GeoController)).toBeInstanceOf(GeoController);
+      await moduleRef.close();
+    } finally {
+      process.env = originalEnv;
+    }
   });
 });

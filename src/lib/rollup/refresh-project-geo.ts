@@ -1,11 +1,12 @@
 import type { ClientBase } from "pg";
 import { Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { GeoAnalysisWrite } from "../../../contracts/analytics/index.js";
 import { writeGeoAnalysis } from "../geo/persist-analysis.js";
 import { rankGeoLevers } from "../geo/lever-rank.js";
 import { buildSentiment, loadSentimentInput } from "../geo/sentiment.js";
 import { buildStructure, loadStructureInput, windowStartFor } from "../geo/structure.js";
-import { incrementCounter } from "../telemetry/metrics.js";
+import { incrementCounter, observeHistogram } from "../telemetry/metrics.js";
 
 // STORY-060/061 — recompute a project's GEO analyses and persist them to
 // `geo_analyses` (through the one write path, `writeGeoAnalysis`). `structure`
@@ -13,6 +14,7 @@ import { incrementCounter } from "../telemetry/metrics.js";
 // function in their own stories. Nothing here is metered: no credit guard, no ledger.
 
 const logger = new Logger("rollup.geo");
+const tracer = trace.getTracer("nominara.geo-refresh");
 
 /** The canonical "current" window, the same one the dashboards read. */
 export const GEO_WINDOW_DAYS = 30;
@@ -73,13 +75,39 @@ export async function refreshProjectGeo(
 /** Every window the read endpoints serve (7d, 30d, 90d). A read of a window never computes one. */
 export const GEO_WINDOWS: readonly (7 | 30 | 90)[] = [7, 30, 90];
 
-/** Recompute A3 for all three served windows, so no timeframe on the read side answers "not computed yet". */
+/**
+ * The freshness objective (edge-cases-and-slos #28): GEO analyses recompute daily and are visible within 30 minutes of the
+ * trigger, p95 per project, read from `geo_analyses.computed_at`. The production p95 is observed on
+ * `nominara_geo_recompute_freshness_seconds`; the integration spec proves a fixture project fits.
+ */
+export const GEO_FRESHNESS_OBJECTIVE_SECONDS = 30 * 60;
+
+/**
+ * Recompute every analysis for all three served windows, so no timeframe on the read side answers "not computed yet".
+ * One span per project, and one freshness observation: seconds from the trigger (this call) until the last window's rows are
+ * written. The line carries the project ID and counts, never the workspace's name and never answer text.
+ */
 export async function refreshProjectGeoWindows(
   tx: ClientBase,
   projectId: string,
   options: Omit<RefreshProjectGeoOptions, "windowDays"> = {},
 ): Promise<GeoAnalysisWrite[]> {
-  const out: GeoAnalysisWrite[] = [];
-  for (const windowDays of GEO_WINDOWS) out.push(await refreshProjectGeo(tx, projectId, { ...options, windowDays }));
-  return out;
+  return tracer.startActiveSpan("geo.refresh", async (span) => {
+    const started = performance.now();
+    try {
+      const out: GeoAnalysisWrite[] = [];
+      for (const windowDays of GEO_WINDOWS) out.push(await refreshProjectGeo(tx, projectId, { ...options, windowDays }));
+      span.setAttribute("nominara.geo_refresh.windows", out.length);
+      observeHistogram("nominara_geo_recompute_freshness_seconds", Math.round(((performance.now() - started) / 1000) * 1000) / 1000, {
+        project_id: projectId,
+        windows: out.length,
+      });
+      return out;
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
 }

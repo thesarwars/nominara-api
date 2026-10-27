@@ -157,6 +157,34 @@ export class TasksService {
   ) {}
 
   /**
+   * STORY-062 AC10 — the OPEN task behind each GEO finding's rule, for the digest's levers. Read-only, one query for however many
+   * rules the digest promoted (at most three levers, but the caller passes the rules it needs).
+   *
+   * OPEN MEANS `todo` OR `in_progress`: a dismissed or done task is never shown as "the action" for a finding, so it is not
+   * returned and the lever's link is null. A match needs the rule code AND `source_geo_analysis` = the analysis, so a rule shared by
+   * two analyses cannot cross-link. When several tasks are open for the pair the highest-impact one wins, then the oldest, then the
+   * id, so the answer is deterministic. RLS bounds the workspace; the scope predicate (the same one the task list uses) bounds the
+   * project for a scoped caller, so a lever never links a task the caller could not open.
+   */
+  async openGeoTasks(
+    projectId: string,
+    ruleCodes: readonly string[],
+  ): Promise<{ task_id: string; title: string; rule_code: string; analysis: string }[]> {
+    if (ruleCodes.length === 0) return [];
+    const client = currentTenantStore()!.client;
+    const result = await client.query<{ id: string; title: string; rule_code: string; source_geo_analysis: string }>(
+      `SELECT DISTINCT ON (rule_code, source_geo_analysis) id, title, rule_code, source_geo_analysis
+         FROM tasks
+        WHERE project_id = $1 AND rule_code = ANY($2::text[]) AND source_geo_analysis IS NOT NULL
+          AND status IN ('todo', 'in_progress') AND deleted_at IS NULL
+          AND (cardinality(app.current_scope_projects()) = 0 OR project_id = ANY(app.current_scope_projects()))
+        ORDER BY rule_code, source_geo_analysis, impact_score DESC, created_at, id`,
+      [projectId, [...ruleCodes]],
+    );
+    return result.rows.map((r) => ({ task_id: r.id, title: r.title, rule_code: r.rule_code, analysis: r.source_geo_analysis }));
+  }
+
+  /**
    * `GET /v1/projects/{id}/tasks` — STORY-064 (step A). api-specification.md
    * §3: "list grouped by status, ordered by `impact_score`". Read-only.
    *

@@ -5,7 +5,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { rankGeoLevers } from "../../src/lib/geo/lever-rank.js";
 import { refreshProjectGeoWindows } from "../../src/lib/rollup/refresh-project-geo.js";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { GeoService } from "../../src/modules/geo/geo.service.js";
+import { TasksService } from "../../src/modules/tasks/tasks.service.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // NEW-C-13 (STORY-062 AC8/9/10/12) — the rollup's GEO hook ranks the Top Three
@@ -36,6 +38,15 @@ describe("NEW-C-13 · Top Three Levers (persisted)", () => {
     await db.end();
     await container.stop();
   });
+
+  async function makeProjectIn(ws: string): Promise<string> {
+    const project = randomUUID();
+    await db.query(
+      `INSERT INTO projects (id,workspace_id,name,slug,root_url,root_domain) VALUES ($1,$2,'P',$3,'https://acme.com','acme.com')`,
+      [project, ws, `p-${randomUUID().slice(0, 8)}`],
+    );
+    return project;
+  }
 
   async function makeProject(): Promise<{ ws: string; project: string }> {
     const ws = randomUUID();
@@ -72,7 +83,7 @@ describe("NEW-C-13 · Top Three Levers (persisted)", () => {
   }
 
   beforeEach(async () => {
-    await db.query("TRUNCATE geo_analyses, citation_facts, mention_facts, answer_captures, projects, workspaces CASCADE");
+    await db.query("TRUNCATE tasks, geo_analyses, citation_facts, mention_facts, answer_captures, projects, workspaces CASCADE");
     ({ ws: workspaceId, project: projectId } = await makeProject());
     for (let i = 0; i < 30; i++) await mention(workspaceId, projectId, "positive");
     for (let i = 0; i < 2; i++) await mention(workspaceId, projectId, "negative");
@@ -98,11 +109,112 @@ describe("NEW-C-13 · Top Three Levers (persisted)", () => {
     expect(s7).toMatchObject({ sufficient: false, lever_rank: null });
   });
 
-  it("[C13-3] the digest reads the ranked lever from the persisted rows; its task is null until the task engine exists", async () => {
+  const RULE = "TG-SENTIMENT-NEGATIVE";
+  interface TaskSeed {
+    status?: string;
+    rule?: string | null;
+    analysis?: string | null;
+    title?: string;
+    impact?: number;
+    deletedAt?: string | null;
+    ws?: string;
+    project?: string;
+  }
+  let taskSeq = 0;
+  /** A task row as the generator would leave it; owner role, so RLS never hides the seed. */
+  async function task(seed: TaskSeed = {}): Promise<string> {
+    const seq = ++taskSeq;
+    const status = seed.status ?? "todo";
+    const res = await db.query<{ id: string }>(
+      `INSERT INTO tasks (workspace_id, project_id, short_ref, kind, rule_code, dedupe_fingerprint, title, description, status,
+                          dismissed_reason, impact_score, source_geo_analysis, deleted_at)
+       VALUES ($1, $2, $3, 'content', $4, sha256(convert_to($5, 'UTF8')), $6, 'D', $7, $8, $9, $10, $11) RETURNING id`,
+      [
+        seed.ws ?? workspaceId, seed.project ?? projectId, `LEV-${seq}`,
+        seed.rule === undefined ? RULE : seed.rule, `fp-${seq}-${randomUUID()}`, seed.title ?? `Task ${seq}`,
+        status, status === "dismissed" ? "noise" : null, seed.impact ?? 0,
+        seed.analysis === undefined ? "sentiment" : seed.analysis, seed.deletedAt ?? null,
+      ],
+    );
+    return res.rows[0]!.id;
+  }
+  const digest = (scope?: string[]) =>
+    withTenantContext(db, { workspaceId, actorId: randomUUID(), ...(scope === undefined ? {} : { scopeProjectIds: scope }) }, () =>
+      new GeoService(new TasksService(new NoopRealtimePublisher())).digest(projectId, { timeframe: "30d" }),
+    );
+
+  it("[C13-3] the digest reads the ranked lever from the persisted rows; with no task for its rule the link is null", async () => {
     await refresh();
-    const d = await withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => new GeoService().digest(projectId, { timeframe: "30d" }));
+    const d = await digest();
     expect(d.levers).toHaveLength(1);
     expect(d.levers[0]).toMatchObject({ rank: 1, analysis_href: "geo?analysis=sentiment", task: null });
+  });
+
+  it("[C13-3a] STORY-062 AC10 · a lever links its analysis AND the open task for the finding's rule (todo)", async () => {
+    await refresh();
+    const id = await task({ title: "Answer the pricing complaints" });
+    const d = await digest();
+    expect(d.levers[0]).toMatchObject({
+      analysis_href: "geo?analysis=sentiment",
+      task: { task_id: id, label: "Answer the pricing complaints", href: `plan?task=${id}` },
+    });
+  });
+
+  it("[C13-3b] an in_progress task is open, so it links", async () => {
+    await refresh();
+    const id = await task({ status: "in_progress" });
+    expect((await digest()).levers[0]!.task?.task_id).toBe(id);
+  });
+
+  it.each(["dismissed", "done"])("[C13-3c] a %s task is never the action: the link is null", async (status) => {
+    await refresh();
+    await task({ status });
+    expect((await digest()).levers[0]!.task).toBeNull();
+  });
+
+  it("[C13-3d] a dismissed task and an open one for the same rule: the open task links", async () => {
+    await refresh();
+    await task({ status: "dismissed", impact: 99 });
+    const open = await task({ status: "todo", impact: 1 });
+    expect((await digest()).levers[0]!.task?.task_id).toBe(open);
+  });
+
+  it("[C13-3e] two open tasks for the rule: the higher impact one links, deterministically", async () => {
+    await refresh();
+    await task({ impact: 1 });
+    const top = await task({ impact: 5 });
+    expect((await digest()).levers[0]!.task?.task_id).toBe(top);
+  });
+
+  it("[C13-3f] a soft-deleted task, another rule, another analysis, or an unattributed task never links", async () => {
+    await refresh();
+    await task({ deletedAt: "2026-09-25T00:00:00Z" });
+    await task({ rule: "TG-CITATION-LOSS" });
+    await task({ analysis: "structure" });
+    await task({ analysis: null });
+    expect((await digest()).levers[0]!.task).toBeNull();
+  });
+
+  it("[C13-3g] a task of another project in the same workspace never links", async () => {
+    await refresh();
+    const other = await makeProjectIn(workspaceId);
+    await task({ project: other });
+    expect((await digest()).levers[0]!.task).toBeNull();
+  });
+
+  it("[C13-3h] under the application role: another workspace's open task never links, and a caller scoped away from the project gets no link", async () => {
+    await refresh();
+    const other = await makeProject();
+    await task({ ws: other.ws, project: other.project });
+    const mine = await task();
+    await db.query("SET ROLE nominara_app");
+    try {
+      expect((await digest()).levers[0]!.task?.task_id).toBe(mine); // RLS hid the other workspace's row
+      expect((await digest([projectId])).levers[0]!.task?.task_id).toBe(mine);
+      expect((await digest([other.project])).levers[0]!.task).toBeNull(); // in-scope only
+    } finally {
+      await db.query("RESET ROLE");
+    }
   });
 
   it("[C13-4] recomputing the same windows replaces rows: no duplicates, same ranks", async () => {

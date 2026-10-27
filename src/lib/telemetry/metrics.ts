@@ -12,3 +12,13 @@ const logger = new Logger("metrics");
 export function incrementCounter(name: string, labels: Record<string, string> = {}): void {
   logger.log({ metric: name, value: 1, ...labels });
 }
+
+/**
+ * A histogram observation (a duration or a lag), in the unit the metric name
+ * carries (`_ms`, `_seconds`). Same Logger-backed shape as the counter until a
+ * metrics backend is wired in by its own story: the aggregation (p95) happens
+ * where the log line is collected, not here.
+ */
+export function observeHistogram(name: string, value: number, labels: Record<string, string | number> = {}): void {
+  logger.log({ metric: name, value, ...labels });
+}
