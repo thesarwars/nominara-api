@@ -486,7 +486,9 @@ describe("STORY-076b · add-ons", () => {
     gateway.failAddonWith = new StripeUpstreamError(500);
     const failed = await post(owner, "/billing/addons", { kind: "extra_seat", quantity: 1 });
     expect(failed.statusCode).toBe(503);
-    expect(JSON.stringify(failed.json())).not.toContain("500");
+    // the random request_id can contain "500" by chance; the upstream status must not leak anywhere else
+    const { request_id: _requestId, ...errorBody } = failed.json().error;
+    expect(JSON.stringify({ ...failed.json(), error: errorBody })).not.toContain("500");
     expect(await addonRows(workspaceId)).toEqual([]);
     gateway.failAddonWith = undefined;
     gateway.configured = false;
